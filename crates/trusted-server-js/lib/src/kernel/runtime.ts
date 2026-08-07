@@ -61,6 +61,12 @@ export interface RuntimeKernel {
   readonly diagnostics: Readonly<object>;
 }
 
+/** Frozen activation boundary for document-lifetime owners created after preparation. */
+export interface RuntimeOwnerActivationContext extends CoreActivationContext {
+  readonly boot: Readonly<object>;
+  readonly generation: object;
+}
+
 export interface RuntimeOptions {
   readonly target: RuntimeTarget;
   /** Server assertion only; every decision and published value is bound to the build stamp. */
@@ -70,6 +76,7 @@ export interface RuntimeOptions {
   readonly boot?: unknown;
   readonly now?: () => number;
   readonly getBindings?: (id: string) => IntegrationBindings;
+  readonly activateOwner?: (context: RuntimeOwnerActivationContext) => void;
   readonly activateCore?: (context: CoreActivationContext) => void;
   readonly kernel: RuntimeKernel;
 }
@@ -205,7 +212,25 @@ class RuntimeOwner implements Runtime {
     let published: PublishedQueue | undefined;
     this.installPromise = this.registry
       .install({
-        activateCore: this.options.activateCore ?? (() => undefined),
+        activateCore: (context) => {
+          if (!this.ownsRegistrationHandshake()) {
+            throw new Error('Runtime owner generation changed');
+          }
+          const ownerContext: RuntimeOwnerActivationContext = Object.freeze({
+            boot: this.kernelBoot as Readonly<object>,
+            generation: this.generation,
+            onDispose: context.onDispose,
+            signal: context.signal,
+          });
+          this.invokeSynchronousActivation(this.options.activateOwner, ownerContext);
+          if (!this.ownsRegistrationHandshake()) {
+            throw new Error('Runtime owner generation changed');
+          }
+          this.invokeSynchronousActivation(this.options.activateCore, context);
+          if (!this.ownsRegistrationHandshake()) {
+            throw new Error('Runtime owner generation changed');
+          }
+        },
         publish: () => {
           if (!this.ownsRegistrationHandshake()) {
             throw new Error('Runtime owner generation changed');
@@ -296,6 +321,26 @@ class RuntimeOwner implements Runtime {
     if (this.options.boot !== undefined) return this.options.boot;
     const descriptor = Object.getOwnPropertyDescriptor(this.options.target, 'boot');
     return descriptor && 'value' in descriptor ? descriptor.value : undefined;
+  }
+
+  private invokeSynchronousActivation<Context>(
+    activation: ((context: Context) => void) | undefined,
+    context: Context
+  ): void {
+    if (!activation) return;
+    const returned = activation(context) as unknown;
+    if (
+      (typeof returned === 'object' || typeof returned === 'function') &&
+      returned !== null &&
+      typeof (returned as { then?: unknown }).then === 'function'
+    ) {
+      try {
+        void Promise.resolve(returned).catch(() => undefined);
+      } catch {
+        // Rejection observation cannot make an asynchronous activation valid.
+      }
+      throw new TypeError('Runtime activation must be synchronous');
+    }
   }
 }
 

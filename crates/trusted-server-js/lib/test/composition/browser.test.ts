@@ -8,6 +8,7 @@ import {
   createNoopBrowserComposition,
   createTestBrowserRuntimeComposition,
 } from '../../src/composition/browser';
+import { createTestNavigationIdentityIssuer } from '../../src/kernel/identity';
 
 function createTarget() {
   return {
@@ -165,6 +166,272 @@ describe('browser composition', () => {
     expect(Object.isFrozen(composition.runtime)).toBe(true);
   });
 
+  it('constructs one session lazily from accepted boot and keeps it across SPA replacement', async () => {
+    const projection = {
+      version: 1,
+      auction: {
+        version: 1,
+        auctionId: 'initial',
+        results: [{ slot: 'initial-slot', outcome: 'no_bid' }],
+      },
+      bids: [],
+    };
+    let prefix = 0;
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target: {},
+        releaseId: 'a'.repeat(64),
+        manifest: { version: 1, releaseId: 'a'.repeat(64), integrations: [] },
+        knownIntegrationIds: Object.freeze([]),
+        boot: {
+          auctionProjection: projection,
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        kernel: {
+          addAdUnits: vi.fn(),
+          diagnostics: Object.freeze({}),
+          requestAds: vi.fn(),
+        },
+      },
+      {
+        adapters: {
+          googletag: { bindingStatus: () => 'pending' },
+          prebid: { bindingStatus: () => 'pending' },
+          messaging: { installCaptureListener: () => vi.fn() },
+        },
+        coreActivations: {
+          bridgeRecognizer: vi.fn(),
+          correctnessGptListeners: vi.fn(),
+        },
+        createIdentityIssuerForTest: () => {
+          prefix += 1;
+          return createTestNavigationIdentityIssuer({
+            getRandomValues: (target) => {
+              target.fill(prefix);
+              return target;
+            },
+          });
+        },
+      }
+    );
+
+    expect(composition.runtimeSessionForTest()).toBeUndefined();
+    expect(composition.runtime.start()).toBe(true);
+    await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+    const session = composition.runtimeSessionForTest();
+    expect(session).toBeDefined();
+    expect(composition.runtimeSessionForTest()).toBe(session);
+    expect(session?.currentNavigation?.currentAuctionProjection).toEqual(projection);
+    expect(Object.isFrozen(session?.currentNavigation?.currentAuctionProjection)).toBe(true);
+
+    projection.auction.auctionId = 'publisher-mutated';
+    expect(
+      (
+        session?.currentNavigation?.currentAuctionProjection as {
+          auction: { auctionId: string };
+        }
+      ).auction.auctionId
+    ).toBe('initial');
+    const replacement = session?.replaceNavigation();
+    expect(replacement).toMatchObject({ ok: true });
+    if (!replacement?.ok) throw new Error('Expected SPA navigation');
+    expect(replacement.value.currentAuctionProjection).toBeUndefined();
+    expect(composition.runtimeSessionForTest()).toBe(session);
+
+    const pageBids = composition.pageBidsControllerForTest();
+    expect(
+      pageBids?.commit({
+        version: 1,
+        auction: {
+          version: 1,
+          auctionId: 'spa',
+          results: [{ slot: 'spa-slot', outcome: 'no_bid' }],
+        },
+        bids: [],
+      })
+    ).toEqual({ status: 'committed' });
+    expect(composition.projectionSlotsForTest()).toEqual(['spa-slot']);
+
+    composition.runtime.dispose();
+    expect(session?.disposed).toBe(true);
+  });
+
+  it('unwinds a lazily-created session when navigation identity generation fails', async () => {
+    const bridge = vi.fn();
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target: {},
+        releaseId: 'a'.repeat(64),
+        manifest: { version: 1, releaseId: 'a'.repeat(64), integrations: [] },
+        knownIntegrationIds: Object.freeze([]),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: { version: 1, auctionId: 'initial', results: [] },
+            bids: [],
+          },
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        coreActivations: {
+          bridgeRecognizer: bridge,
+          correctnessGptListeners: vi.fn(),
+        },
+        createIdentityIssuerForTest: () => ({
+          ok: false,
+          reason: 'identity_generation_failed',
+        }),
+      }
+    );
+
+    expect(composition.runtime.start()).toBe(true);
+    await expect(composition.runtime.install()).resolves.toEqual({
+      state: 'fallback',
+      reason: 'bundle_partial',
+    });
+    expect(composition.runtimeSessionForTest()).toBeUndefined();
+    expect(composition.projectionSlotsForTest()).toBeUndefined();
+    expect(bridge).not.toHaveBeenCalled();
+  });
+
+  it('releases initial programmatic slots before admitting a replacement SPA projection', async () => {
+    let prefix = 0;
+    const programmaticSlots = Object.freeze(
+      Array.from({ length: 256 }, (_, index) => `programmatic-${index}`)
+    );
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target: {},
+        releaseId: 'a'.repeat(64),
+        manifest: { version: 1, releaseId: 'a'.repeat(64), integrations: [] },
+        knownIntegrationIds: Object.freeze([]),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: { version: 1, auctionId: 'initial', results: [] },
+            bids: [],
+          },
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        admittedProgrammaticSlotsForTest: programmaticSlots,
+        coreActivations: {
+          bridgeRecognizer: vi.fn(),
+          correctnessGptListeners: vi.fn(),
+        },
+        createIdentityIssuerForTest: () => {
+          prefix += 1;
+          return createTestNavigationIdentityIssuer({
+            getRandomValues: (target) => {
+              target.fill(prefix);
+              return target;
+            },
+          });
+        },
+      }
+    );
+
+    expect(composition.runtime.start()).toBe(true);
+    await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+    expect(composition.projectionSlotsForTest()).toEqual(programmaticSlots);
+    const replacement = composition.runtimeSessionForTest()?.replaceNavigation();
+    expect(replacement).toMatchObject({ ok: true });
+    expect(composition.projectionSlotsForTest()).toEqual([]);
+
+    expect(
+      composition.pageBidsControllerForTest()?.commit({
+        version: 1,
+        auction: {
+          version: 1,
+          auctionId: 'spa',
+          results: [{ slot: 'spa-slot', outcome: 'no_bid' }],
+        },
+        bids: [],
+      })
+    ).toEqual({ status: 'committed' });
+    expect(composition.projectionSlotsForTest()).toEqual(['spa-slot']);
+  });
+
+  it('fails closed when admitted programmatic input contains duplicate slot ids', async () => {
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target: {},
+        releaseId: 'a'.repeat(64),
+        manifest: { version: 1, releaseId: 'a'.repeat(64), integrations: [] },
+        knownIntegrationIds: Object.freeze([]),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: { version: 1, auctionId: 'initial', results: [] },
+            bids: [],
+          },
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        admittedProgrammaticSlotsForTest: Object.freeze(['duplicate', 'duplicate']),
+        coreActivations: {
+          bridgeRecognizer: vi.fn(),
+          correctnessGptListeners: vi.fn(),
+        },
+      }
+    );
+
+    expect(composition.runtime.start()).toBe(true);
+    await expect(composition.runtime.install()).resolves.toEqual({
+      state: 'fallback',
+      reason: 'bundle_partial',
+    });
+    expect(composition.runtimeSessionForTest()).toBeUndefined();
+    expect(composition.projectionSlotsForTest()).toBeUndefined();
+  });
+
+  it('owns an immutable copy of admitted programmatic slot input for navigation cleanup', async () => {
+    const programmaticSlots = ['programmatic-one', 'programmatic-two'];
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target: {},
+        releaseId: 'a'.repeat(64),
+        manifest: { version: 1, releaseId: 'a'.repeat(64), integrations: [] },
+        knownIntegrationIds: Object.freeze([]),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: { version: 1, auctionId: 'initial', results: [] },
+            bids: [],
+          },
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        admittedProgrammaticSlotsForTest: programmaticSlots,
+        coreActivations: {
+          bridgeRecognizer: vi.fn(),
+          correctnessGptListeners: vi.fn(),
+        },
+      }
+    );
+
+    expect(composition.runtime.start()).toBe(true);
+    await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+    programmaticSlots[0] = 'publisher-mutated';
+    programmaticSlots.length = 1;
+
+    expect(composition.runtimeSessionForTest()?.replaceNavigation()).toMatchObject({ ok: true });
+    expect(composition.projectionSlotsForTest()).toEqual([]);
+  });
+
   it('constructs or activates nothing after a terminal fallback', async () => {
     vi.useFakeTimers();
     const serviceConstruction = vi.fn(() => ({
@@ -220,6 +487,8 @@ describe('browser composition', () => {
       state: 'fallback',
       reason: 'bundle_partial',
     });
+    expect(composition.runtimeSessionForTest()).toBeUndefined();
+    expect(composition.projectionSlotsForTest()).toBeUndefined();
     expect(vi.getTimerCount()).toBe(0);
 
     expect(
