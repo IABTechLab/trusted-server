@@ -12,8 +12,10 @@ import { createTestNavigationIdentityIssuer } from '../../src/kernel/identity';
 import { createRuntimeSession, type NavigationSession } from '../../src/kernel/sessions';
 import {
   MAX_ACTIVE_SLOT_RECORDS,
+  createBrowserSlotReconciliationBoundary,
   createSlotService,
   type GptSlotBinding,
+  type SlotReconciliationBoundary,
   type SlotRegistration,
   type SlotService,
 } from '../../src/services/slots';
@@ -206,6 +208,73 @@ function bindTrustedSlot(service: SlotService, navigation: NavigationSession, id
     })
   ).toEqual({ ok: true });
   return slot;
+}
+
+function createReconciliationBoundary() {
+  let listener: (() => void) | undefined;
+  const connected = new WeakSet<object>();
+  const elements = new Map<string, object[]>();
+  const observe = vi.fn((callback: () => void) => {
+    listener = callback;
+    return vi.fn(() => {
+      if (listener === callback) listener = undefined;
+    });
+  });
+  const boundary: SlotReconciliationBoundary = Object.freeze({
+    observe,
+    isConnected: (element: object) => connected.has(element),
+    resolve: (elementIds: readonly string[]) => {
+      const matches = new Set<object>();
+      let matchedId: string | undefined;
+      for (const elementId of elementIds) {
+        for (const element of elements.get(elementId) ?? []) {
+          if (!connected.has(element)) continue;
+          matches.add(element);
+          matchedId = elementId;
+        }
+      }
+      if (matches.size === 0) return Object.freeze({ status: 'unresolved' as const });
+      if (matches.size !== 1 || matchedId === undefined) {
+        return Object.freeze({ status: 'ambiguous' as const });
+      }
+      return Object.freeze({
+        status: 'unique' as const,
+        element: [...matches][0]!,
+        elementId: matchedId,
+      });
+    },
+  });
+  const put = (elementId: string, element: object): void => {
+    connected.add(element);
+    elements.set(elementId, [element]);
+  };
+  const replace = (elementId: string, element: object): void => {
+    const previous = elements.get(elementId) ?? [];
+    for (const candidate of previous) connected.delete(candidate);
+    put(elementId, element);
+    listener?.();
+  };
+  const replaceAmbiguously = (elementId: string, replacements: readonly object[]): void => {
+    const previous = elements.get(elementId) ?? [];
+    for (const candidate of previous) connected.delete(candidate);
+    for (const replacement of replacements) connected.add(replacement);
+    elements.set(elementId, [...replacements]);
+    listener?.();
+  };
+  const disconnect = (elementId: string): void => {
+    for (const candidate of elements.get(elementId) ?? []) connected.delete(candidate);
+    elements.delete(elementId);
+    listener?.();
+  };
+  return {
+    boundary,
+    disconnect,
+    observe,
+    put,
+    replace,
+    replaceAmbiguously,
+    trigger: () => listener?.(),
+  };
 }
 
 describe('slot registry', () => {
@@ -437,6 +506,317 @@ describe('slot registry', () => {
     expect(service.adoptGptSlot(generation, 'slot', { ownership: 'publisher', slot })).toEqual({
       ok: true,
     });
+  });
+});
+
+describe('navigation-owned DOM reconciliation', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it('reconciles a TS slot whose original DOM element was already absent at adoption', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const gpt = createGptHarness();
+    const dom = createReconciliationBoundary();
+    const service = createSlotService({
+      googletag: gpt.adapter,
+      now: () => Date.now(),
+      reconciliation: dom.boundary,
+    });
+    const navigation = createNavigation();
+    bindTrustedSlot(service, navigation);
+    service.activate();
+
+    dom.put('slot-div', {});
+    dom.trigger();
+    await vi.advanceTimersByTimeAsync(250);
+
+    expect(gpt.defineSlot).toHaveBeenCalledExactlyOnceWith(
+      '/network/slot',
+      [[300, 250]],
+      'slot-div'
+    );
+  });
+
+  it('debounces an exact disconnected TS slot through the 249/250 ms boundary', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const gpt = createGptHarness();
+    const dom = createReconciliationBoundary();
+    dom.put('slot-div', {});
+    const service = createSlotService({
+      googletag: gpt.adapter,
+      now: () => Date.now(),
+      reconciliation: dom.boundary,
+    });
+    const navigation = createNavigation();
+    bindTrustedSlot(service, navigation);
+    service.activate();
+
+    dom.replace('slot-div', {});
+    await vi.advanceTimersByTimeAsync(249);
+    expect(gpt.destroySlots).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(gpt.destroySlots).toHaveBeenCalledExactlyOnceWith([
+      expect.objectContaining({ id: 'slot' }),
+    ]);
+    expect(gpt.defineSlot).toHaveBeenCalledExactlyOnceWith(
+      '/network/slot',
+      [[300, 250]],
+      'slot-div'
+    );
+
+    const request = service.request({
+      intentId: 'after-rebind',
+      navigationGeneration: navigation.generation,
+      operation: 'display',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(request.status).toBe('active');
+    expect(gpt.display).toHaveBeenCalledExactlyOnceWith(gpt.defineSlot.mock.results[0]?.value);
+  });
+
+  it('runs one final unresolved pass at 5,000 ms and settles exact work', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const gpt = createGptHarness();
+    const dom = createReconciliationBoundary();
+    dom.put('slot-div', {});
+    const service = createSlotService({
+      googletag: gpt.adapter,
+      now: () => Date.now(),
+      reconciliation: dom.boundary,
+    });
+    const navigation = createNavigation();
+    bindTrustedSlot(service, navigation);
+    service.activate();
+    dom.disconnect('slot-div');
+    await vi.advanceTimersByTimeAsync(2_999);
+    const request = service.request({
+      intentId: 'orphaned',
+      navigationGeneration: navigation.generation,
+      operation: 'display',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(request.status).toBe('active');
+    expect(gpt.destroySlots).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(request.result).resolves.toEqual({ status: 'failed', reason: 'slot_unresolved' });
+    expect(gpt.destroySlots).toHaveBeenCalledExactlyOnceWith([
+      expect.objectContaining({ id: 'slot' }),
+    ]);
+    expect(gpt.defineSlot).not.toHaveBeenCalled();
+  });
+
+  it('commits a unique replacement found only by the final 5,000 ms pass', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const gpt = createGptHarness();
+    const dom = createReconciliationBoundary();
+    dom.put('slot-div', {});
+    const service = createSlotService({
+      googletag: gpt.adapter,
+      now: () => Date.now(),
+      reconciliation: dom.boundary,
+    });
+    const navigation = createNavigation();
+    bindTrustedSlot(service, navigation);
+    service.activate();
+
+    dom.disconnect('slot-div');
+    await vi.advanceTimersByTimeAsync(250);
+    expect(gpt.defineSlot).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(4_749);
+    dom.put('slot-div', {});
+    expect(gpt.defineSlot).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(gpt.defineSlot).toHaveBeenCalledExactlyOnceWith(
+      '/network/slot',
+      [[300, 250]],
+      'slot-div'
+    );
+    expect(gpt.destroySlots).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps an ambiguous replacement unresolved through the final pass', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const gpt = createGptHarness();
+    const dom = createReconciliationBoundary();
+    dom.put('slot-div', {});
+    const service = createSlotService({
+      googletag: gpt.adapter,
+      now: () => Date.now(),
+      reconciliation: dom.boundary,
+    });
+    const navigation = createNavigation();
+    bindTrustedSlot(service, navigation);
+    service.activate();
+    dom.replaceAmbiguously('slot-div', [{}, {}]);
+    await vi.advanceTimersByTimeAsync(2_999);
+    const request = service.request({
+      intentId: 'ambiguous',
+      navigationGeneration: navigation.generation,
+      operation: 'display',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+
+    await vi.advanceTimersByTimeAsync(2_001);
+    await expect(request.result).resolves.toEqual({ status: 'failed', reason: 'slot_unresolved' });
+    expect(gpt.defineSlot).not.toHaveBeenCalled();
+    expect(gpt.destroySlots).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['destroy', 'define'] as const)(
+    'settles %s transaction failure as gpt_request_failed without a second physical slot',
+    async (failure) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(0);
+      const gpt = createGptHarness();
+      if (failure === 'destroy') gpt.destroySlots.mockReturnValue(false);
+      else gpt.defineSlot.mockReturnValueOnce(undefined);
+      const dom = createReconciliationBoundary();
+      dom.put('slot-div', {});
+      const service = createSlotService({
+        googletag: gpt.adapter,
+        now: () => Date.now(),
+        reconciliation: dom.boundary,
+      });
+      const navigation = createNavigation();
+      bindTrustedSlot(service, navigation);
+      service.activate();
+      const request = service.request({
+        intentId: `failed-${failure}`,
+        navigationGeneration: navigation.generation,
+        operation: 'display',
+        registeredSlotId: 'slot',
+        requestClass: 'primary',
+      });
+      await vi.advanceTimersByTimeAsync(0);
+
+      dom.replace('slot-div', {});
+      await vi.advanceTimersByTimeAsync(250);
+      await expect(request.result).resolves.toEqual({
+        status: 'failed',
+        reason: 'gpt_request_failed',
+      });
+      expect(gpt.destroySlots).toHaveBeenCalledTimes(1);
+      expect(gpt.defineSlot).toHaveBeenCalledTimes(failure === 'define' ? 1 : 0);
+      expect(service.snapshotForTest().physicalSlots).toBe(0);
+    }
+  );
+
+  it('allows two successful rebinds and fails a third disconnect immediately', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const gpt = createGptHarness();
+    const dom = createReconciliationBoundary();
+    dom.put('slot-div', {});
+    const service = createSlotService({
+      googletag: gpt.adapter,
+      now: () => Date.now(),
+      reconciliation: dom.boundary,
+    });
+    const navigation = createNavigation();
+    bindTrustedSlot(service, navigation);
+    service.activate();
+
+    dom.replace('slot-div', {});
+    await vi.advanceTimersByTimeAsync(250);
+    dom.replace('slot-div', {});
+    await vi.advanceTimersByTimeAsync(250);
+    expect(gpt.defineSlot).toHaveBeenCalledTimes(2);
+
+    const request = service.request({
+      intentId: 'capacity',
+      navigationGeneration: navigation.generation,
+      operation: 'display',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+    dom.disconnect('slot-div');
+    await expect(request.result).resolves.toEqual({
+      status: 'failed',
+      reason: 'reconciliation_capacity',
+    });
+    expect(gpt.defineSlot).toHaveBeenCalledTimes(2);
+    expect(gpt.destroySlots).toHaveBeenCalledTimes(3);
+  });
+
+  it('cancels reconciliation on publisher transfer and disconnects with navigation', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const gpt = createGptHarness();
+    const dom = createReconciliationBoundary();
+    dom.put('slot-div', {});
+    const service = createSlotService({
+      googletag: gpt.adapter,
+      now: () => Date.now(),
+      reconciliation: dom.boundary,
+    });
+    const navigation = createNavigation();
+    const slot = bindTrustedSlot(service, navigation);
+    service.activate();
+    dom.disconnect('slot-div');
+
+    expect(
+      service.adoptGptSlot(navigation.generation, 'slot', {
+        ownership: 'publisher',
+        slot,
+      })
+    ).toEqual({ ok: true });
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(gpt.destroySlots).not.toHaveBeenCalled();
+
+    navigation.dispose();
+    expect(dom.observe).toHaveBeenCalledTimes(1);
+    dom.trigger();
+    await vi.runAllTimersAsync();
+    expect(gpt.destroySlots).not.toHaveBeenCalled();
+  });
+});
+
+describe('browser reconciliation boundary', () => {
+  it('resolves only one exact connected element and releases its observer', async () => {
+    const boundary = createBrowserSlotReconciliationBoundary(document, MutationObserver);
+    expect(boundary).toBeDefined();
+    if (!boundary) throw new Error('Expected the browser reconciliation boundary');
+    const host = document.createElement('section');
+    const first = document.createElement('div');
+    first.id = 'tsjs-reconciliation-exact';
+    host.append(first);
+    document.body.append(host);
+    const callback = vi.fn();
+    const release = boundary.observe(callback);
+
+    expect(boundary.resolve(['tsjs-reconciliation-exact'])).toEqual({
+      status: 'unique',
+      element: first,
+      elementId: 'tsjs-reconciliation-exact',
+    });
+    expect(boundary.isConnected(first)).toBe(true);
+
+    const duplicate = document.createElement('div');
+    duplicate.id = first.id;
+    host.append(duplicate);
+    await vi.waitFor(() => expect(callback).toHaveBeenCalled());
+    expect(boundary.resolve([first.id])).toEqual({ status: 'ambiguous' });
+
+    const callsBeforeRelease = callback.mock.calls.length;
+    release();
+    host.remove();
+    await Promise.resolve();
+    expect(callback).toHaveBeenCalledTimes(callsBeforeRelease);
+    expect(boundary.isConnected(first)).toBe(false);
+    expect(boundary.resolve([first.id])).toEqual({ status: 'unresolved' });
   });
 });
 
