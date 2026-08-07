@@ -1,14 +1,145 @@
 import type { RenderAttemptScope, WinnerContext } from '../kernel/sessions';
 
-import type { ReservationRenderSource } from './reservations';
+import type {
+  ReservationClaimAdmission,
+  ReservationClaimExpectation,
+  ReservationRenderSource,
+} from './reservations';
 
 const ATTEMPT_ID = /^a1_[A-Za-z0-9_-]{22}$/;
 const objectFreezeIntrinsic = Object.freeze;
 const arrayIncludesIntrinsic = Array.prototype.includes;
+const mapGetIntrinsic = Map.prototype.get;
+const mapSetIntrinsic = Map.prototype.set;
+const mapDeleteIntrinsic = Map.prototype.delete;
+const mapClearIntrinsic = Map.prototype.clear;
+const mapEntriesIntrinsic = Map.prototype.entries;
+const mapValuesIntrinsic = Map.prototype.values;
+const mapEntryIteratorNextIntrinsic = Object.getPrototypeOf(new Map().entries()).next as (
+  this: IterableIterator<unknown>
+) => IteratorResult<unknown>;
+const mapValueIteratorNextIntrinsic = Object.getPrototypeOf(new Map().values()).next as (
+  this: IterableIterator<unknown>
+) => IteratorResult<unknown>;
+const setAddIntrinsic = Set.prototype.add;
+const setHasIntrinsic = Set.prototype.has;
+const setDeleteIntrinsic = Set.prototype.delete;
+const setClearIntrinsic = Set.prototype.clear;
+const setValuesIntrinsic = Set.prototype.values;
+const setValueIteratorNextIntrinsic = Object.getPrototypeOf(new Set().values()).next as (
+  this: IterableIterator<unknown>
+) => IteratorResult<unknown>;
+const weakMapGetIntrinsic = WeakMap.prototype.get;
+const weakMapSetIntrinsic = WeakMap.prototype.set;
+const weakMapHasIntrinsic = WeakMap.prototype.has;
+const weakSetAddIntrinsic = WeakSet.prototype.add;
+const weakSetHasIntrinsic = WeakSet.prototype.has;
+const promiseThenIntrinsic = Promise.prototype.then;
 const artifactDisposals = new WeakMap<object, boolean>();
+const committedArtifactStores = new WeakSet<object>();
+const renderAttempts = new WeakSet<object>();
 
 function frozen<const Value extends object>(value: Value): Readonly<Value> {
   return Reflect.apply(objectFreezeIntrinsic, Object, [value]) as Readonly<Value>;
+}
+
+function mapGet<Key, Value>(map: Map<Key, Value>, key: Key): Value | undefined {
+  return Reflect.apply(mapGetIntrinsic, map, [key]) as Value | undefined;
+}
+
+function mapSet<Key, Value>(map: Map<Key, Value>, key: Key, value: Value): void {
+  Reflect.apply(mapSetIntrinsic, map, [key, value]);
+}
+
+function mapDelete<Key, Value>(map: Map<Key, Value>, key: Key): boolean {
+  return Reflect.apply(mapDeleteIntrinsic, map, [key]) as boolean;
+}
+
+function mapClear<Key, Value>(map: Map<Key, Value>): void {
+  Reflect.apply(mapClearIntrinsic, map, []);
+}
+
+function mapEntrySnapshot<Key, Value>(map: Map<Key, Value>): Array<[Key, Value]> {
+  const iterator = Reflect.apply(mapEntriesIntrinsic, map, []) as IterableIterator<[Key, Value]>;
+  const output: Array<[Key, Value]> = [];
+  while (true) {
+    const step = Reflect.apply(mapEntryIteratorNextIntrinsic, iterator, []) as IteratorResult<
+      [Key, Value]
+    >;
+    if (step.done) return output;
+    output[output.length] = step.value;
+  }
+}
+
+function mapValueSnapshot<Key, Value>(map: Map<Key, Value>): Value[] {
+  const iterator = Reflect.apply(mapValuesIntrinsic, map, []) as IterableIterator<Value>;
+  const output: Value[] = [];
+  while (true) {
+    const step = Reflect.apply(
+      mapValueIteratorNextIntrinsic,
+      iterator,
+      []
+    ) as IteratorResult<Value>;
+    if (step.done) return output;
+    output[output.length] = step.value;
+  }
+}
+
+function setAdd<Value>(set: Set<Value>, value: Value): void {
+  Reflect.apply(setAddIntrinsic, set, [value]);
+}
+
+function setHas<Value>(set: Set<Value>, value: Value): boolean {
+  return Reflect.apply(setHasIntrinsic, set, [value]) as boolean;
+}
+
+function setDelete<Value>(set: Set<Value>, value: Value): boolean {
+  return Reflect.apply(setDeleteIntrinsic, set, [value]) as boolean;
+}
+
+function setClear<Value>(set: Set<Value>): void {
+  Reflect.apply(setClearIntrinsic, set, []);
+}
+
+function setValueSnapshot<Value>(set: Set<Value>): Value[] {
+  const iterator = Reflect.apply(setValuesIntrinsic, set, []) as IterableIterator<Value>;
+  const output: Value[] = [];
+  while (true) {
+    const step = Reflect.apply(
+      setValueIteratorNextIntrinsic,
+      iterator,
+      []
+    ) as IteratorResult<Value>;
+    if (step.done) return output;
+    output[output.length] = step.value;
+  }
+}
+
+function weakMapGet<Key extends object, Value>(
+  map: WeakMap<Key, Value>,
+  key: Key
+): Value | undefined {
+  return Reflect.apply(weakMapGetIntrinsic, map, [key]) as Value | undefined;
+}
+
+function weakMapSet<Key extends object, Value>(
+  map: WeakMap<Key, Value>,
+  key: Key,
+  value: Value
+): void {
+  Reflect.apply(weakMapSetIntrinsic, map, [key, value]);
+}
+
+function weakMapHas<Key extends object, Value>(map: WeakMap<Key, Value>, key: Key): boolean {
+  return Reflect.apply(weakMapHasIntrinsic, map, [key]) as boolean;
+}
+
+function weakSetAdd<Value extends object>(set: WeakSet<Value>, value: Value): void {
+  Reflect.apply(weakSetAddIntrinsic, set, [value]);
+}
+
+function weakSetHas<Value extends object>(set: WeakSet<Value>, value: Value): boolean {
+  return Reflect.apply(weakSetHasIntrinsic, set, [value]) as boolean;
 }
 
 export const RENDER_FAILURE_REASONS = frozen([
@@ -141,6 +272,10 @@ export interface RenderAttemptOptions {
   readonly owner: RenderAttemptScope;
   readonly artifacts: CommittedArtifactStore;
   readonly prepareRenderSource: (candidate: unknown) => ReservationRenderSource | undefined;
+  readonly consumeClaimedWinner: (
+    claim: unknown,
+    expectation: ReservationClaimExpectation
+  ) => ReservationClaimAdmission | undefined;
   readonly parentAttemptId?: string;
   readonly scheduler?: RenderScheduler;
 }
@@ -201,6 +336,9 @@ export interface SlotOperation {
   readonly snapshot: () => SlotOperationSnapshot;
   readonly onSettled: (callback: (result: SlotOperationResult) => void) => boolean;
 }
+
+export type SlotOperationCreationResult =
+  Readonly<{ ok: true; value: SlotOperation }> | Readonly<{ ok: false; reason: 'invalid_attempt' }>;
 
 export interface SlotOperationOptions {
   readonly primary: RenderAttempt;
@@ -311,17 +449,50 @@ function validArtifact(
 function disposeArtifact(artifact: CommittedRenderArtifact | undefined): boolean {
   if (!artifact) return true;
   try {
-    if (artifactDisposals.has(artifact)) return artifactDisposals.get(artifact) === true;
-    artifactDisposals.set(artifact, false);
+    if (weakMapHas(artifactDisposals, artifact)) {
+      return weakMapGet(artifactDisposals, artifact) === true;
+    }
+    weakMapSet(artifactDisposals, artifact, false);
   } catch {
     return false;
   }
   try {
-    artifact.dispose();
-    artifactDisposals.set(artifact, true);
+    const result = Reflect.apply(artifact.dispose, artifact, []) as unknown;
+    if ((typeof result === 'object' || typeof result === 'function') && result !== null) {
+      try {
+        Reflect.apply(promiseThenIntrinsic, result, [undefined, () => undefined]);
+        return false;
+      } catch {
+        // Non-Promise thenables are contained through their own `then` method below.
+      }
+      let thenMethod: unknown;
+      try {
+        thenMethod = Reflect.get(result, 'then');
+      } catch {
+        return false;
+      }
+      if (typeof thenMethod === 'function') {
+        try {
+          Reflect.apply(thenMethod, result, [undefined, () => undefined]);
+        } catch {
+          // A hostile thenable is still an unsupported asynchronous disposer.
+        }
+        return false;
+      }
+    }
+    if (result !== undefined) return false;
+    weakMapSet(artifactDisposals, artifact, true);
     return true;
   } catch {
     return false;
+  }
+}
+
+function artifactDisposalStarted(artifact: CommittedRenderArtifact): boolean {
+  try {
+    return weakMapHas(artifactDisposals, artifact);
+  } catch {
+    return true;
   }
 }
 
@@ -329,18 +500,19 @@ function disposeArtifact(artifact: CommittedRenderArtifact | undefined): boolean
 export function createCommittedArtifactStore(): CommittedArtifactStore {
   const entries = new Map<string, CommittedRenderArtifact>();
   const pendingNavigationDisposals = new Set<object>();
+  const disposedNavigations = new WeakSet<object>();
   let disposed = false;
   let mutating = false;
   let disposeRequested = false;
 
   const disposeGeneration = (navigationGeneration: object): void => {
-    const snapshot = Array.from(entries.entries());
+    const snapshot = mapEntrySnapshot(entries);
     for (const [slot, artifact] of snapshot) {
       if (
         artifact.navigationGeneration === navigationGeneration &&
-        entries.get(slot) === artifact
+        mapGet(entries, slot) === artifact
       ) {
-        entries.delete(slot);
+        mapDelete(entries, slot);
         disposeArtifact(artifact);
       }
     }
@@ -350,111 +522,160 @@ export function createCommittedArtifactStore(): CommittedArtifactStore {
     if (mutating) return;
     if (disposeRequested) {
       disposeRequested = false;
-      const snapshot = Array.from(entries.values());
-      entries.clear();
+      const snapshot = mapValueSnapshot(entries);
+      mapClear(entries);
       disposed = true;
-      pendingNavigationDisposals.clear();
+      setClear(pendingNavigationDisposals);
       for (const artifact of snapshot) disposeArtifact(artifact);
       return;
     }
-    const generations = Array.from(pendingNavigationDisposals);
-    pendingNavigationDisposals.clear();
+    const generations = setValueSnapshot(pendingNavigationDisposals);
+    setClear(pendingNavigationDisposals);
     if (generations.length === 0) return;
     mutating = true;
     try {
       for (const generation of generations) disposeGeneration(generation);
     } finally {
       mutating = false;
-      if (disposeRequested || pendingNavigationDisposals.size > 0) drainDeferredDisposal();
+      if (disposeRequested || setValueSnapshot(pendingNavigationDisposals).length > 0) {
+        drainDeferredDisposal();
+      }
     }
   };
 
   const store: CommittedArtifactStore = {
     promote(artifact, stillCurrent): boolean {
-      if (disposed || mutating || !validArtifact(artifact)) return false;
-      const existing = entries.get(artifact.slot);
-      if (existing === artifact) return false;
-      mutating = true;
+      let ownsMutation = false;
       try {
-        if (existing) {
-          if (!disposeArtifact(existing) || entries.get(artifact.slot) !== existing) return false;
-        }
         if (
-          disposeRequested ||
-          pendingNavigationDisposals.has(artifact.navigationGeneration) ||
+          disposed ||
+          mutating ||
+          !validArtifact(artifact) ||
+          artifactDisposalStarted(artifact) ||
+          weakSetHas(disposedNavigations, artifact.navigationGeneration) ||
           !permitsPromotion(stillCurrent)
         ) {
-          if (existing && entries.get(artifact.slot) === existing) entries.delete(artifact.slot);
           return false;
         }
-        entries.set(artifact.slot, artifact);
-        return entries.get(artifact.slot) === artifact;
+        const existing = mapGet(entries, artifact.slot);
+        if (existing === artifact) return false;
+        mutating = true;
+        ownsMutation = true;
+        if (
+          disposed ||
+          disposeRequested ||
+          weakSetHas(disposedNavigations, artifact.navigationGeneration) ||
+          setHas(pendingNavigationDisposals, artifact.navigationGeneration) ||
+          !permitsPromotion(stillCurrent)
+        ) {
+          return false;
+        }
+        if (existing) {
+          if (!disposeArtifact(existing) || mapGet(entries, artifact.slot) !== existing)
+            return false;
+        }
+        if (
+          disposed ||
+          disposeRequested ||
+          weakSetHas(disposedNavigations, artifact.navigationGeneration) ||
+          setHas(pendingNavigationDisposals, artifact.navigationGeneration) ||
+          !permitsPromotion(stillCurrent) ||
+          artifactDisposalStarted(artifact)
+        ) {
+          if (existing && mapGet(entries, artifact.slot) === existing) {
+            mapDelete(entries, artifact.slot);
+          }
+          return false;
+        }
+        if (existing && mapGet(entries, artifact.slot) === existing) {
+          mapDelete(entries, artifact.slot);
+        }
+        mapSet(entries, artifact.slot, artifact);
+        return mapGet(entries, artifact.slot) === artifact;
       } catch {
         return false;
       } finally {
-        mutating = false;
-        drainDeferredDisposal();
+        if (ownsMutation) {
+          mutating = false;
+          drainDeferredDisposal();
+        }
       }
     },
     current(slot): CommittedRenderArtifact | undefined {
-      if (disposed || typeof slot !== 'string') return undefined;
       try {
-        return entries.get(slot);
+        if (disposed || typeof slot !== 'string') return undefined;
+        return mapGet(entries, slot);
       } catch {
         return undefined;
       }
     },
     release(artifact): boolean {
-      if (disposed || mutating || !validArtifact(artifact)) return false;
-      mutating = true;
+      let ownsMutation = false;
       try {
-        if (entries.get(artifact.slot) !== artifact) return false;
-        entries.delete(artifact.slot);
-        disposeArtifact(artifact);
-        return entries.get(artifact.slot) !== artifact;
+        if (disposed || mutating || !validArtifact(artifact)) return false;
+        mutating = true;
+        ownsMutation = true;
+        if (mapGet(entries, artifact.slot) !== artifact) return false;
+        mapDelete(entries, artifact.slot);
+        const cleaned = disposeArtifact(artifact);
+        return cleaned && mapGet(entries, artifact.slot) !== artifact;
       } catch {
         return false;
       } finally {
-        mutating = false;
-        drainDeferredDisposal();
+        if (ownsMutation) {
+          mutating = false;
+          drainDeferredDisposal();
+        }
       }
     },
     disposeNavigation(navigationGeneration): void {
-      if (disposed) return;
-      pendingNavigationDisposals.add(navigationGeneration);
-      if (mutating) return;
-      mutating = true;
+      let ownsMutation = false;
       try {
-        pendingNavigationDisposals.delete(navigationGeneration);
+        if (disposed) return;
+        weakSetAdd(disposedNavigations, navigationGeneration);
+        setAdd(pendingNavigationDisposals, navigationGeneration);
+        if (mutating) return;
+        mutating = true;
+        ownsMutation = true;
+        setDelete(pendingNavigationDisposals, navigationGeneration);
         disposeGeneration(navigationGeneration);
       } catch {
         // Disposal is best-effort and never publishes a replacement artifact.
       } finally {
-        mutating = false;
-        drainDeferredDisposal();
+        if (ownsMutation) {
+          mutating = false;
+          drainDeferredDisposal();
+        }
       }
     },
     dispose(): void {
-      if (disposed) return;
-      disposeRequested = true;
-      if (mutating) return;
-      mutating = true;
+      let ownsMutation = false;
       try {
-        const snapshot = Array.from(entries.values());
-        entries.clear();
+        if (disposed) return;
+        disposeRequested = true;
+        if (mutating) return;
+        mutating = true;
+        ownsMutation = true;
+        const snapshot = mapValueSnapshot(entries);
+        mapClear(entries);
         disposeRequested = false;
         disposed = true;
-        pendingNavigationDisposals.clear();
+        setClear(pendingNavigationDisposals);
         for (const artifact of snapshot) disposeArtifact(artifact);
       } catch {
         disposeRequested = false;
         disposed = true;
-        entries.clear();
+        try {
+          mapClear(entries);
+        } catch {
+          // The store remains terminal even under collection corruption.
+        }
       } finally {
-        mutating = false;
+        if (ownsMutation) mutating = false;
       }
     },
   };
+  weakSetAdd(committedArtifactStores, store);
   return frozen(store);
 }
 
@@ -482,6 +703,7 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
   let navigationGeneration: object;
   let parentAttemptId: string | undefined;
   let prepareRenderSource: (candidate: unknown) => ReservationRenderSource | undefined;
+  let consumeClaimedWinner: RenderAttemptOptions['consumeClaimedWinner'];
   let ownerIsCurrentMethod: RenderAttemptScope['isCurrent'];
   let ownerDisposeMethod: RenderAttemptScope['dispose'];
   let ownerOnDisposeMethod: RenderAttemptScope['onDispose'];
@@ -492,12 +714,16 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
   try {
     owner = options.owner;
     artifacts = options.artifacts;
+    if (!weakSetHas(committedArtifactStores, artifacts)) {
+      return frozen({ ok: false, reason: 'invalid_attempt' });
+    }
     id = owner.id;
     slot = owner.slot;
     generation = owner.generation;
     navigationGeneration = owner.navigationGeneration;
     parentAttemptId = options.parentAttemptId;
     prepareRenderSource = options.prepareRenderSource;
+    consumeClaimedWinner = options.consumeClaimedWinner;
     ownerIsCurrentMethod = owner.isCurrent;
     ownerDisposeMethod = owner.dispose;
     ownerOnDisposeMethod = owner.onDispose;
@@ -522,6 +748,7 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
       typeof ownerOnDisposeMethod !== 'function' ||
       typeof ownerPrepareWinnerMethod !== 'function' ||
       typeof prepareRenderSource !== 'function' ||
+      typeof consumeClaimedWinner !== 'function' ||
       (parentAttemptId !== undefined &&
         (!validAttemptId(parentAttemptId) || parentAttemptId === id))
     ) {
@@ -533,6 +760,19 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
   const ownerIsCurrent = (): boolean => {
     try {
       return Reflect.apply(ownerIsCurrentMethod, owner, []) === true;
+    } catch {
+      return false;
+    }
+  };
+  const ownerIdentityIsCurrent = (): boolean => {
+    try {
+      return (
+        owner.id === id &&
+        owner.slot === slot &&
+        owner.generation === generation &&
+        owner.navigationGeneration === navigationGeneration &&
+        ownerIsCurrent()
+      );
     } catch {
       return false;
     }
@@ -566,6 +806,57 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
     try {
       const source = prepareRenderSource(candidate);
       if (!source || !Object.isFrozen(source)) return undefined;
+      const type = Object.getOwnPropertyDescriptor(source, 'type');
+      const version = Object.getOwnPropertyDescriptor(source, 'version');
+      if (
+        !type ||
+        !('value' in type) ||
+        (type.value !== 'aps' && type.value !== 'adm' && type.value !== 'cache') ||
+        !version ||
+        !('value' in version) ||
+        version.value !== 1
+      ) {
+        return undefined;
+      }
+      return source;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const claimedSource = (
+    admission: unknown,
+    context: WinnerContext
+  ): ReservationRenderSource | undefined => {
+    try {
+      if (
+        typeof admission !== 'object' ||
+        admission === null ||
+        !Object.isFrozen(admission) ||
+        Object.getPrototypeOf(admission) !== Object.prototype ||
+        Object.getOwnPropertySymbols(admission).length !== 0
+      ) {
+        return undefined;
+      }
+      const names = Object.getOwnPropertyNames(admission).sort();
+      const renderSource = Object.getOwnPropertyDescriptor(admission, 'renderSource');
+      const winnerContext = Object.getOwnPropertyDescriptor(admission, 'winnerContext');
+      if (
+        names.length !== 2 ||
+        names[0] !== 'renderSource' ||
+        names[1] !== 'winnerContext' ||
+        !renderSource ||
+        !('value' in renderSource) ||
+        renderSource.enumerable !== true ||
+        !winnerContext ||
+        !('value' in winnerContext) ||
+        winnerContext.enumerable !== true ||
+        winnerContext.value !== context
+      ) {
+        return undefined;
+      }
+      const source = renderSource.value as ReservationRenderSource;
+      if (!Object.isFrozen(source)) return undefined;
       const type = Object.getOwnPropertyDescriptor(source, 'type');
       const version = Object.getOwnPropertyDescriptor(source, 'version');
       if (
@@ -669,7 +960,21 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
     }
     const context = readWinnerContext();
     if (!validWinnerContext(context)) return false;
-    const source = prepareSource(candidate);
+    let admission: ReservationClaimAdmission | undefined;
+    try {
+      admission = consumeClaimedWinner(
+        candidate,
+        frozen({
+          attemptId: id,
+          slot,
+          navigationGeneration,
+          winnerContext: context,
+        })
+      );
+    } catch {
+      return false;
+    }
+    const source = claimedSource(admission, context);
     if (!source || !ownerIsCurrent() || readWinnerContext() !== context) return false;
     admittedRenderSource = source;
     admittedWinnerContext = context;
@@ -779,9 +1084,17 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
     next: 'waiting_for_document' | 'waiting_for_adm',
     artifact: CommittedRenderArtifact
   ): boolean => {
+    const sourceType = admittedRenderSource?.type;
+    const sourceMatches =
+      next === 'waiting_for_document'
+        ? sourceType === 'aps'
+        : sourceType === 'adm' || sourceType === 'cache';
+    const artifactKind = state === 'rendering_direct' ? 'direct_iframe' : 'puc';
     if (
       pendingArtifact !== undefined ||
       !validArtifact(artifact, slot, navigationGeneration, id) ||
+      artifact.kind !== artifactKind ||
+      !sourceMatches ||
       outcome !== undefined ||
       !ownerIsCurrent() ||
       !allowed.includes(state as never)
@@ -808,7 +1121,10 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
     },
     admitDirectWinner,
     admitClaimedWinner,
-    beginGamClaim: () => enter(['created'], 'waiting_for_gam_and_claim'),
+    beginGamClaim: () =>
+      admittedRenderSource === undefined && admittedWinnerContext === undefined
+        ? enter(['created'], 'waiting_for_gam_and_claim')
+        : false,
     ownerClaimed: () =>
       admittedRenderSource && admittedWinnerContext
         ? enter(['waiting_for_gam_and_claim'], 'waiting_for_owner')
@@ -836,10 +1152,20 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
       ) {
         return false;
       }
-      clearDeadline();
       const candidate = pendingArtifact;
+      clearDeadline();
+      if (
+        outcome !== undefined ||
+        pendingArtifact !== candidate ||
+        (state !== 'waiting_for_aps_completion' && state !== 'waiting_for_adm') ||
+        !ownerIsCurrent()
+      ) {
+        return false;
+      }
       let promoted: boolean;
+      let promotionAttempted = false;
       try {
+        promotionAttempted = true;
         promoted = Reflect.apply(promoteArtifactMethod, artifacts, [
           candidate,
           () =>
@@ -857,13 +1183,19 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
             (state !== 'waiting_for_aps_completion' && state !== 'waiting_for_adm') ||
             !ownerIsCurrent())
         ) {
-          Reflect.apply(releaseArtifactMethod, artifacts, [candidate]);
           promoted = false;
         }
       } catch {
         promoted = false;
       }
       if (!promoted) {
+        if (promotionAttempted) {
+          try {
+            Reflect.apply(releaseArtifactMethod, artifacts, [candidate]);
+          } catch {
+            // The branded store contains release failure; attempt cleanup remains exact-once.
+          }
+        }
         fail('internal_error');
         return false;
       }
@@ -903,6 +1235,14 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
       }),
   };
 
+  const disposeRejectedOwner = (): void => {
+    try {
+      Reflect.apply(ownerDisposeMethod, owner, []);
+    } catch {
+      // Owner registration failure is terminal even if host disposal throws.
+    }
+  };
+
   try {
     Reflect.apply(ownerOnDisposeMethod, owner, [
       'render-lifecycle',
@@ -913,25 +1253,53 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
       },
     ]);
   } catch {
+    disposeRejectedOwner();
     return frozen({ ok: false, reason: 'stale_owner' });
   }
-  if (!ownerIsCurrent()) {
+  if (outcome !== undefined || !ownerIdentityIsCurrent()) {
     settle(frozen({ outcome: 'cancelled', reason: 'navigation_disposed' }), false);
+    disposeRejectedOwner();
     return frozen({ ok: false, reason: 'stale_owner' });
   }
+  weakSetAdd(renderAttempts, lifecycle);
   return frozen({ ok: true, value: frozen(lifecycle) });
 }
 
 /** Own one public per-slot result without overwriting either child attempt result. */
-export function createSlotOperation(options: SlotOperationOptions): SlotOperation {
+export function createSlotOperation(options: SlotOperationOptions): SlotOperationCreationResult {
   const observers: Array<(result: SlotOperationResult) => void> = [];
-  const primary = options.primary;
-  const primaryId = primary.id;
-  const primarySlot = primary.slot;
-  const primaryNavigationGeneration = primary.navigationGeneration;
-  const primaryOnSettledMethod = primary.onSettled;
-  const primarySnapshotMethod = primary.snapshot;
-  const createFallback = options.createFallback;
+  let primary: RenderAttempt;
+  let primaryId: string;
+  let primarySlot: string;
+  let primaryNavigationGeneration: object;
+  let primaryOnSettledMethod: RenderAttempt['onSettled'];
+  let primarySnapshotMethod: RenderAttempt['snapshot'];
+  let createFallback: SlotOperationOptions['createFallback'];
+  try {
+    const primaryDescriptor = Object.getOwnPropertyDescriptor(options, 'primary');
+    const fallbackDescriptor = Object.getOwnPropertyDescriptor(options, 'createFallback');
+    if (!primaryDescriptor || !('value' in primaryDescriptor)) {
+      return frozen({ ok: false, reason: 'invalid_attempt' });
+    }
+    primary = primaryDescriptor.value as RenderAttempt;
+    if (!weakSetHas(renderAttempts, primary)) {
+      return frozen({ ok: false, reason: 'invalid_attempt' });
+    }
+    primaryId = primary.id;
+    primarySlot = primary.slot;
+    primaryNavigationGeneration = primary.navigationGeneration;
+    primaryOnSettledMethod = primary.onSettled;
+    primarySnapshotMethod = primary.snapshot;
+    createFallback =
+      fallbackDescriptor && 'value' in fallbackDescriptor
+        ? (fallbackDescriptor.value as SlotOperationOptions['createFallback'])
+        : undefined;
+    if (createFallback !== undefined && typeof createFallback !== 'function') {
+      return frozen({ ok: false, reason: 'invalid_attempt' });
+    }
+  } catch {
+    return frozen({ ok: false, reason: 'invalid_attempt' });
+  }
   let result: SlotOperationResult | undefined;
 
   const settle = (terminal: SlotOperationResult): boolean => {
@@ -958,7 +1326,7 @@ export function createSlotOperation(options: SlotOperationOptions): SlotOperatio
   };
 
   const beginFallback = (primary: RenderOutcome): void => {
-    let created: RenderAttemptCreationResult;
+    let created: unknown;
     try {
       created =
         (createFallback ? Reflect.apply(createFallback, options, [primaryId]) : undefined) ??
@@ -968,32 +1336,77 @@ export function createSlotOperation(options: SlotOperationOptions): SlotOperatio
       return;
     }
     let createdOk: boolean;
+    let createdValue: unknown;
+    let creationReason: unknown;
     try {
-      createdOk = created.ok === true;
+      if (
+        (typeof created !== 'object' && typeof created !== 'function') ||
+        created === null ||
+        !Object.isFrozen(created) ||
+        Object.getPrototypeOf(created) !== Object.prototype ||
+        Object.getOwnPropertySymbols(created).length !== 0
+      ) {
+        throw new TypeError('invalid fallback result');
+      }
+      const ok = Object.getOwnPropertyDescriptor(created, 'ok');
+      if (!ok || !('value' in ok) || ok.enumerable !== true || typeof ok.value !== 'boolean') {
+        throw new TypeError('invalid fallback result');
+      }
+      createdOk = ok.value;
+      const field = Object.getOwnPropertyDescriptor(created, createdOk ? 'value' : 'reason');
+      if (!field || !('value' in field) || field.enumerable !== true) {
+        throw new TypeError('invalid fallback result');
+      }
+      const names = Object.getOwnPropertyNames(created).sort();
+      if (
+        names.length !== 2 ||
+        names[0] !== 'ok' ||
+        names[1] !== (createdOk ? 'value' : 'reason')
+      ) {
+        throw new TypeError('invalid fallback result');
+      }
+      if (createdOk) createdValue = field.value;
+      else creationReason = field.value;
     } catch {
       settleFallbackFailure(primary, 'internal_error');
       return;
     }
     if (!createdOk) {
-      let reason: 'identity_generation_failed' | 'invalid_attempt' | 'stale_owner';
-      try {
-        reason = (created as Extract<RenderAttemptCreationResult, { ok: false }>).reason;
-      } catch {
-        settleFallbackFailure(primary, 'internal_error');
-        return;
-      }
       settleFallbackFailure(
         primary,
-        reason === 'identity_generation_failed' ? 'identity_generation_failed' : 'internal_error'
+        creationReason === 'identity_generation_failed'
+          ? 'identity_generation_failed'
+          : 'internal_error'
       );
       return;
     }
-    let child: RenderAttempt;
+    let child: RenderAttempt | undefined;
     let childId: string;
     let childOnSettledMethod: RenderAttempt['onSettled'];
     let childCancelMethod: RenderAttempt['cancel'];
+    let cancelInvoked = false;
+    const cancelChild = (): void => {
+      if (cancelInvoked || !child || typeof childCancelMethod !== 'function') return;
+      cancelInvoked = true;
+      try {
+        Reflect.apply(childCancelMethod, child, ['superseded']);
+      } catch {
+        // Fallback cleanup cannot change the operation result.
+      }
+    };
     try {
-      child = (created as Extract<RenderAttemptCreationResult, { ok: true }>).value;
+      if (
+        (typeof createdValue !== 'object' && typeof createdValue !== 'function') ||
+        createdValue === null
+      ) {
+        throw new TypeError('invalid fallback child');
+      }
+      child = createdValue as RenderAttempt;
+      const cancel = Object.getOwnPropertyDescriptor(child, 'cancel');
+      if (cancel && 'value' in cancel && typeof cancel.value === 'function') {
+        childCancelMethod = cancel.value as RenderAttempt['cancel'];
+      }
+      if (!weakSetHas(renderAttempts, child)) throw new TypeError('invalid fallback child');
       childId = child.id;
       childOnSettledMethod = child.onSettled;
       childCancelMethod = child.cancel;
@@ -1009,15 +1422,7 @@ export function createSlotOperation(options: SlotOperationOptions): SlotOperatio
         throw new TypeError('invalid fallback child');
       }
     } catch {
-      try {
-        const candidate = (created as Partial<Extract<RenderAttemptCreationResult, { ok: true }>>)
-          .value as Partial<RenderAttempt> | undefined;
-        if (candidate && typeof candidate.cancel === 'function') {
-          Reflect.apply(candidate.cancel, candidate, ['superseded']);
-        }
-      } catch {
-        // Invalid fallback cleanup cannot change the operation result.
-      }
+      cancelChild();
       settleFallbackFailure(primary, 'internal_error');
       return;
     }
@@ -1025,6 +1430,7 @@ export function createSlotOperation(options: SlotOperationOptions): SlotOperatio
       const subscribed = Reflect.apply(childOnSettledMethod, child, [
         (fallbackOutcome: RenderOutcome) => {
           if (!validOutcome(fallbackOutcome)) {
+            cancelChild();
             settleFallbackFailure(primary, 'internal_error');
             return;
           }
@@ -1038,9 +1444,15 @@ export function createSlotOperation(options: SlotOperationOptions): SlotOperatio
           });
         },
       ]);
-      if (subscribed !== true && !result) settleFallbackFailure(primary, 'internal_error');
+      if (subscribed !== true && !result) {
+        cancelChild();
+        settleFallbackFailure(primary, 'internal_error');
+      }
     } catch {
-      settleFallbackFailure(primary, 'internal_error');
+      if (!result) {
+        cancelChild();
+        settleFallbackFailure(primary, 'internal_error');
+      }
     }
   };
 
@@ -1107,7 +1519,7 @@ export function createSlotOperation(options: SlotOperationOptions): SlotOperatio
     });
   }
 
-  return frozen({
+  const operation = frozen({
     snapshot: (): SlotOperationSnapshot =>
       result ? frozen({ settled: true, result }) : frozen({ settled: false }),
     onSettled(callback: (terminal: SlotOperationResult) => void): boolean {
@@ -1124,4 +1536,5 @@ export function createSlotOperation(options: SlotOperationOptions): SlotOperatio
       return true;
     },
   });
+  return frozen({ ok: true, value: operation });
 }

@@ -29,6 +29,7 @@ const mapSizeGetter = Object.getOwnPropertyDescriptor(Map.prototype, 'size')?.ge
 ) => number;
 const weakMapGetIntrinsic = WeakMap.prototype.get;
 const weakMapSetIntrinsic = WeakMap.prototype.set;
+const weakMapDeleteIntrinsic = WeakMap.prototype.delete;
 const performanceNowIntrinsic = performance.now;
 
 function mapValue<Key, Value>(map: Map<Key, Value>, key: Key): Value | undefined {
@@ -60,6 +61,13 @@ function setWeakMapValue<Key extends object, Value>(
   value: Value
 ): void {
   Reflect.apply(weakMapSetIntrinsic, map, [key, value]);
+}
+
+function deleteWeakMapValue<Key extends object, Value>(
+  map: WeakMap<Key, Value>,
+  key: Key
+): boolean {
+  return Reflect.apply(weakMapDeleteIntrinsic, map, [key]) as boolean;
 }
 
 function mapValueSnapshot<Key, Value>(map: Map<Key, Value>): Value[] {
@@ -305,6 +313,18 @@ export type ReservationClaimResult =
       expiresAt: number;
     }>;
 
+export interface ReservationClaimExpectation {
+  readonly attemptId: string;
+  readonly slot: string;
+  readonly navigationGeneration: object;
+  readonly winnerContext: WinnerContext;
+}
+
+export interface ReservationClaimAdmission {
+  readonly renderSource: ReservationRenderSource;
+  readonly winnerContext: WinnerContext;
+}
+
 export interface ReservationServiceInventory {
   readonly clockFaulted: boolean;
   readonly disposed: boolean;
@@ -325,6 +345,10 @@ export interface ReservationService {
     input: PromotePrebidSelectionInput
   ) => ReservationRegistrationResult;
   readonly claim: (input: ReservationClaimInput) => ReservationClaimResult;
+  readonly consumeClaim: (
+    claim: unknown,
+    expectation: ReservationClaimExpectation
+  ) => ReservationClaimAdmission | undefined;
   readonly recognize: (reservationId: unknown) => ReservationRecognition;
   readonly tombstone: (input: ReservationTombstoneInput, state: 'disposed' | 'stale') => boolean;
   readonly tombstonePrebidGroup: (
@@ -357,6 +381,14 @@ interface LiveReservation {
 interface ReservationTombstone {
   readonly expiresAt: number;
   readonly state: ReservationTombstoneState;
+}
+
+interface ClaimedAdmission {
+  readonly attemptId: string;
+  readonly slot: string;
+  readonly navigationGeneration: object;
+  readonly renderSource: ReservationRenderSource;
+  readonly winnerContext: WinnerContext;
 }
 
 type ReservationEntry = LiveReservation | ReservationTombstone;
@@ -595,6 +627,7 @@ export function createReservationService(options: ReservationServiceOptions): Re
   const readNow = monotonicClock(nowSource);
   const entries = new Map<string, ReservationEntry>();
   const ownerRegistrations = new WeakMap<object, OwnerRegistration>();
+  const claimAdmissions = new WeakMap<object, ClaimedAdmission>();
 
   const disposeStore = (): void => {
     disposed = true;
@@ -1090,7 +1123,46 @@ export function createReservationService(options: ReservationServiceOptions): Re
         const replacement = mapValue(entries, minimalId);
         return refusedClaim(replacement?.state ?? 'stale');
       }
+      try {
+        setWeakMapValue(claimAdmissions, result, {
+          attemptId: identity.id,
+          slot: identity.slot,
+          navigationGeneration: entry.navigationGeneration,
+          renderSource: entry.renderSource,
+          winnerContext: entry.winnerContext,
+        });
+      } catch {
+        storeFaulted = true;
+        rollbackWinnerAdmission(admission);
+        return refusedClaim('consumed');
+      }
       return result;
+    },
+    consumeClaim(claim, expectation): ReservationClaimAdmission | undefined {
+      const fields = ownDataRecord(expectation, [
+        'attemptId',
+        'slot',
+        'navigationGeneration',
+        'winnerContext',
+      ]);
+      if (!fields || (typeof claim !== 'object' && typeof claim !== 'function') || claim === null) {
+        return undefined;
+      }
+      const admission = weakMapValue(claimAdmissions, claim);
+      if (
+        !admission ||
+        fields.attemptId !== admission.attemptId ||
+        fields.slot !== admission.slot ||
+        fields.navigationGeneration !== admission.navigationGeneration ||
+        fields.winnerContext !== admission.winnerContext
+      ) {
+        return undefined;
+      }
+      if (!deleteWeakMapValue(claimAdmissions, claim)) return undefined;
+      return frozenResult({
+        renderSource: admission.renderSource,
+        winnerContext: admission.winnerContext,
+      });
     },
     recognize,
     tombstone(input, state): boolean {

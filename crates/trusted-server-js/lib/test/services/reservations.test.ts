@@ -200,6 +200,64 @@ describe('renderer reservation identity and registration', () => {
     }
   });
 
+  it('binds one consumed claim object to its exact attempt source and winner context', () => {
+    const { navigation } = runtimeNavigation();
+    const service = serviceAt(() => 5);
+    const attempt = renderAttempt(navigation);
+    expect(registerRender(service, navigation, attempt)).toMatchObject({ ok: true });
+    const result = claim(service, navigation, attempt);
+    if (!result.recognized || !result.claimed) throw new Error('Expected a claim');
+    const context = attempt.winnerContext;
+    if (!context) throw new Error('Expected an admitted winner context');
+
+    expect(
+      service.consumeClaim(result, {
+        attemptId: attempt.id,
+        slot: attempt.slot,
+        navigationGeneration: Object.freeze({}),
+        winnerContext: context,
+      })
+    ).toBeUndefined();
+    expect(
+      service.consumeClaim(result, {
+        attemptId: attempt.id,
+        slot: attempt.slot,
+        navigationGeneration: navigation.generation,
+        winnerContext: Object.freeze({ selectedCpm: context.selectedCpm }),
+      })
+    ).toBeUndefined();
+    expect(
+      service.consumeClaim(Object.freeze({ ...result }), {
+        attemptId: attempt.id,
+        slot: attempt.slot,
+        navigationGeneration: navigation.generation,
+        winnerContext: context,
+      })
+    ).toBeUndefined();
+
+    const admission = service.consumeClaim(result, {
+      attemptId: attempt.id,
+      slot: attempt.slot,
+      navigationGeneration: navigation.generation,
+      winnerContext: context,
+    });
+    expect(admission).toEqual({
+      renderSource: result.renderSource,
+      winnerContext: context,
+    });
+    expect(admission?.renderSource).toBe(result.renderSource);
+    expect(admission?.winnerContext).toBe(context);
+    expect(Object.isFrozen(admission)).toBe(true);
+    expect(
+      service.consumeClaim(result, {
+        attemptId: attempt.id,
+        slot: attempt.slot,
+        navigationGeneration: navigation.generation,
+        winnerContext: context,
+      })
+    ).toBeUndefined();
+  });
+
   it('rejects duplicate identity against live and tombstoned entries without overwriting either', () => {
     const { navigation } = runtimeNavigation();
     const service = serviceAt(() => 0);
