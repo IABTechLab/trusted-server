@@ -3375,7 +3375,7 @@ pub(crate) mod coordinated_cutover_v1 {
             {
                 Some(source.clone())
             }
-            (None, Some(raw_creative), _) => {
+            (None, Some(raw_creative), None) => {
                 let priced = crate::creative::expand_auction_price_macro(
                     raw_creative,
                     bid.price
@@ -4702,6 +4702,40 @@ mod tests {
             assert!(without_policy.projection.bids.is_empty());
             assert_eq!(
                 without_policy.projection.auction.results[0],
+                SlotAuctionDecisionV1::Failed {
+                    slot: "slot-1".to_string(),
+                    reason: AuctionSlotFailureReason::WinnerNotRenderable,
+                }
+            );
+        }
+
+        #[test]
+        fn projection_rejects_an_adm_with_a_coexisting_cache_pointer() {
+            let mut bid = tagged_adm_bid("slot-1", "AAAAAAAAAAAA", 1.5);
+            bid.renderer = None;
+            bid.creative = Some("<div>creative</div>".to_string());
+            bid.cache_id = Some("f47447a0-b759-4f2f-9887-af458b79b570".to_string());
+            bid.cache_host = Some("cache.example".to_string());
+            bid.cache_path = Some("/pbc/v1/cache".to_string());
+            let result = result_with_winners(vec![bid]);
+            let policy = CacheFetchPolicyV1 {
+                version: 1,
+                base_url: "https://cache.example/pbc/v1/cache".to_string(),
+            };
+
+            let canonical = coordinated_cutover_v1::build_browser_auction_projection_v1(
+                &result,
+                PriceGranularity::Dense,
+                &Settings::default(),
+                "https://publisher.example",
+                Some(&policy),
+                &ScriptedIdentityGenerator::new([vec![8; 16]]),
+            )
+            .expect("ambiguous source should remain an explicit winner failure");
+
+            assert!(canonical.projection.bids.is_empty());
+            assert_eq!(
+                canonical.projection.auction.results[0],
                 SlotAuctionDecisionV1::Failed {
                     slot: "slot-1".to_string(),
                     reason: AuctionSlotFailureReason::WinnerNotRenderable,
