@@ -103,9 +103,10 @@ describe('requestAds input contract', () => {
     const iteratorDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator);
     const everyDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, 'every');
     const includesDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, 'includes');
+    const someDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, 'some');
     const encodeDescriptor = Object.getOwnPropertyDescriptor(TextEncoder.prototype, 'encode');
     const testDescriptor = Object.getOwnPropertyDescriptor(RegExp.prototype, 'test');
-    const calls = { encode: 0, every: 0, includes: 0, iterator: 0, test: 0 };
+    const calls = { encode: 0, every: 0, includes: 0, iterator: 0, some: 0, test: 0 };
     let validated: ReturnType<typeof validateRequestAdsOptions> | undefined;
     let unknownKeyError: unknown;
     Object.defineProperty(Array.prototype, Symbol.iterator, {
@@ -143,6 +144,13 @@ describe('requestAds input contract', () => {
         throw new Error('poisoned array includes');
       },
     });
+    Object.defineProperty(Array.prototype, 'some', {
+      configurable: true,
+      value: () => {
+        calls.some += 1;
+        throw new Error('poisoned array some');
+      },
+    });
     try {
       validated = validateRequestAdsOptions({ slots: ['slot-one'], timeoutMs: 100 });
       try {
@@ -160,12 +168,13 @@ describe('requestAds input contract', () => {
       if (everyDescriptor) Object.defineProperty(Array.prototype, 'every', everyDescriptor);
       if (includesDescriptor)
         Object.defineProperty(Array.prototype, 'includes', includesDescriptor);
+      if (someDescriptor) Object.defineProperty(Array.prototype, 'some', someDescriptor);
     }
 
     expect(validated).toMatchObject({ slots: ['slot-one'], timeoutMs: 100 });
     expect(unknownKeyError).toBeInstanceOf(RequestAdsInputError);
     expect(unknownKeyError).toMatchObject({ code: 'invalid_options' });
-    expect(calls).toEqual({ encode: 0, every: 0, includes: 0, iterator: 0, test: 0 });
+    expect(calls).toEqual({ encode: 0, every: 0, includes: 0, iterator: 0, some: 0, test: 0 });
   });
 });
 
