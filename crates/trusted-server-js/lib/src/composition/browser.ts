@@ -28,10 +28,10 @@ import { createAuctionContextRegistry, type AuctionContextRegistry } from '../se
 import {
   createPageBidsController,
   type PageBidsController,
-  type PreparedProjectionSlots,
-  type ProjectionSlotRegistry,
   prepareInitialAuctionProjection,
 } from '../services/projections';
+import { createSlotService, type SlotService } from '../services/slots';
+import { createTargetingService, type TargetingService } from '../services/targeting';
 
 export interface BrowserAdapters {
   readonly googletag: GoogletagAdapter;
@@ -41,6 +41,11 @@ export interface BrowserAdapters {
 
 export interface BrowserComposition {
   readonly adapters: Readonly<BrowserAdapters>;
+}
+
+export interface BrowserServices {
+  readonly slots: SlotService;
+  readonly targeting: TargetingService;
 }
 
 export type BrowserAdapterTarget = GoogletagGlobalTarget & PrebidGlobalTarget & MessageEventTarget;
@@ -61,6 +66,10 @@ export interface BrowserRuntimeComposition extends BrowserComposition {
   readonly projectionSlotsForTest: () => readonly string[] | undefined;
   /** Return the lazily activated context registry for coordinated-cutover tests. */
   readonly auctionContextRegistryForTest: () => AuctionContextRegistry | undefined;
+  /** Return runtime-owned slot operations only in coordinated-cutover tests. */
+  readonly slotServiceForTest: () => SlotService | undefined;
+  /** Return runtime-owned targeting operations only in coordinated-cutover tests. */
+  readonly targetingServiceForTest: () => TargetingService | undefined;
 }
 
 export interface BrowserCoreActivations {
@@ -70,7 +79,8 @@ export interface BrowserCoreActivations {
   ) => void;
   readonly correctnessGptListeners: (
     context: CoreActivationContext,
-    adapters: Readonly<BrowserAdapters>
+    adapters: Readonly<BrowserAdapters>,
+    services: Readonly<BrowserServices>
   ) => void;
 }
 
@@ -86,94 +96,6 @@ interface AcceptedBrowserBoot {
   readonly manifest: {
     readonly integrations: readonly { readonly id: string }[];
   };
-}
-
-class BrowserProjectionSlotLedger {
-  private readonly slots = new Map<string, object>();
-
-  public bind(
-    navigation: NonNullable<RuntimeSession['currentNavigation']>
-  ): ProjectionSlotRegistry {
-    return Object.freeze({
-      prepareProjectionSlots: (
-        ownerGeneration: object,
-        slots: readonly string[],
-        maximumActiveSlots: number
-      ): PreparedProjectionSlots | undefined => {
-        const ownedSlots = Object.freeze([...slots]);
-        if (
-          ownerGeneration !== navigation.generation ||
-          !navigation.isCurrent() ||
-          ownedSlots.some((slot) => typeof slot !== 'string') ||
-          new Set(ownedSlots).size !== ownedSlots.length ||
-          this.slots.size + ownedSlots.length > maximumActiveSlots ||
-          ownedSlots.some((slot) => this.slots.has(slot))
-        ) {
-          return undefined;
-        }
-        let active = false;
-        let ownerDisposed = false;
-        const rollback = (): void => {
-          if (!active) return;
-          active = false;
-          for (const slot of ownedSlots) {
-            if (this.slots.get(slot) === ownerGeneration) this.slots.delete(slot);
-          }
-        };
-        return Object.freeze({
-          ownerGeneration,
-          commit: (): boolean => {
-            if (
-              active ||
-              ownerDisposed ||
-              !navigation.isCurrent() ||
-              this.slots.size + ownedSlots.length > maximumActiveSlots ||
-              ownedSlots.some((slot) => this.slots.has(slot))
-            ) {
-              return false;
-            }
-            navigation.onDispose('projection-slots', () => {
-              ownerDisposed = true;
-              rollback();
-            });
-            if (ownerDisposed || !navigation.isCurrent()) return false;
-            for (const slot of ownedSlots) this.slots.set(slot, ownerGeneration);
-            active = true;
-            return true;
-          },
-          rollback,
-        });
-      },
-    });
-  }
-
-  public seed(
-    navigation: NonNullable<RuntimeSession['currentNavigation']>,
-    slots: readonly string[]
-  ): boolean {
-    const reservation = this.bind(navigation).prepareProjectionSlots(
-      navigation.generation,
-      slots,
-      256
-    );
-    return reservation?.commit() ?? false;
-  }
-
-  public admitProgrammatic(
-    navigation: NonNullable<RuntimeSession['currentNavigation']>,
-    slots: readonly string[]
-  ): boolean {
-    const reservation = this.bind(navigation).prepareProjectionSlots(
-      navigation.generation,
-      slots,
-      256
-    );
-    return reservation?.commit() ?? false;
-  }
-
-  public snapshotForTest(): readonly string[] {
-    return Object.freeze([...this.slots.keys()]);
-  }
 }
 
 function projectionSlots(projection: object): readonly string[] {
@@ -252,7 +174,7 @@ export function createTestBrowserRuntimeComposition(
 ): BrowserRuntimeComposition {
   const composition = createBrowserComposition(compositionOptions);
   let runtimeSession: RuntimeSession | undefined;
-  let projectionSlotLedger: BrowserProjectionSlotLedger | undefined;
+  let browserServices: Readonly<BrowserServices> | undefined;
   let auctionContextRegistry: AuctionContextRegistry | undefined;
   let projectionParser: ((candidate: unknown) => object | undefined) | undefined;
   const runtime = createRuntime({
@@ -266,18 +188,23 @@ export function createTestBrowserRuntimeComposition(
         parseProjection
       );
       if (!initialProjection) throw new Error('Accepted boot projection is unavailable');
+      const slotService = createSlotService({ googletag: composition.adapters.googletag });
+      const targetingService = createTargetingService();
+      const services = Object.freeze({ slots: slotService, targeting: targetingService });
       const session = createRuntimeSession({
         createIdentityIssuer:
           compositionOptions.createIdentityIssuerForTest ?? createBrowserNavigationIdentityIssuer,
-        interfaces: Object.freeze({ adapters: composition.adapters }),
+        interfaces: Object.freeze({ adapters: composition.adapters, ...services }),
       });
       context.onDispose(() => {
         session.dispose();
+        slotService.dispose();
+        targetingService.dispose();
         composition.adapters.googletag.dispose();
         composition.adapters.prebid.dispose();
         if (runtimeSession === session) {
           runtimeSession = undefined;
-          projectionSlotLedger = undefined;
+          browserServices = undefined;
           auctionContextRegistry = undefined;
           projectionParser = undefined;
         }
@@ -285,31 +212,38 @@ export function createTestBrowserRuntimeComposition(
       const navigation = session.startInitialNavigation(initialProjection);
       if (!navigation.ok) throw new Error(navigation.reason);
 
-      const ledger = new BrowserProjectionSlotLedger();
-      if (
-        !ledger.admitProgrammatic(
-          navigation.value,
-          compositionOptions.admittedProgrammaticSlotsForTest ?? []
-        )
-      ) {
-        throw new Error('Initial programmatic slots exceed the shared registry');
-      }
-      if (!ledger.seed(navigation.value, projectionSlots(initialProjection))) {
-        throw new Error('Initial projection slots exceed the shared registry');
+      const initialRegistrations = [
+        ...projectionSlots(initialProjection).map((registeredSlotId) => ({
+          registeredSlotId,
+          source: 'server' as const,
+        })),
+        ...(compositionOptions.admittedProgrammaticSlotsForTest ?? []).map((registeredSlotId) => ({
+          registeredSlotId,
+          source: 'programmatic' as const,
+        })),
+      ];
+      if (!slotService.register(navigation.value, initialRegistrations).ok) {
+        throw new Error('Initial slots exceed the shared registry');
       }
       const contextRegistry = createAuctionContextRegistry({
         manifestIntegrationIds: Object.freeze(boot.manifest.integrations.map(({ id }) => id)),
         runtimeOwner: session,
       });
       runtimeSession = session;
-      projectionSlotLedger = ledger;
+      browserServices = services;
       auctionContextRegistry = contextRegistry;
       projectionParser = parseProjection;
       return runtimeOptions.activateOwner?.(context);
     },
     activateCore: (context) => {
+      if (!browserServices) throw new Error('Browser services are unavailable');
       compositionOptions.coreActivations.bridgeRecognizer(context, composition.adapters);
-      compositionOptions.coreActivations.correctnessGptListeners(context, composition.adapters);
+      browserServices.slots.activate();
+      compositionOptions.coreActivations.correctnessGptListeners(
+        context,
+        composition.adapters,
+        browserServices
+      );
       return runtimeOptions.activateCore?.(context);
     },
   });
@@ -319,14 +253,16 @@ export function createTestBrowserRuntimeComposition(
     runtimeSessionForTest: () => runtimeSession,
     pageBidsControllerForTest: (): PageBidsController | undefined => {
       const navigation = runtimeSession?.currentNavigation;
-      if (!navigation || !projectionSlotLedger || !projectionParser) return undefined;
+      if (!navigation || !browserServices || !projectionParser) return undefined;
       return createPageBidsController({
         navigation,
         parseProjection: projectionParser,
-        slotRegistry: projectionSlotLedger.bind(navigation),
+        slotRegistry: browserServices.slots.projectionRegistry(navigation),
       });
     },
-    projectionSlotsForTest: () => projectionSlotLedger?.snapshotForTest(),
+    projectionSlotsForTest: () => browserServices?.slots.registeredSlotIdsForTest(),
     auctionContextRegistryForTest: () => auctionContextRegistry,
+    slotServiceForTest: () => browserServices?.slots,
+    targetingServiceForTest: () => browserServices?.targeting,
   });
 }
