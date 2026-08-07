@@ -1,5 +1,10 @@
 const REQUEST_ADS_DEFAULT_TIMEOUT_MS = 10_000;
 const REQUEST_ADS_MAX_SLOTS = 256;
+const reflectApplyIntrinsic = Reflect.apply;
+const textEncoder = new TextEncoder();
+const textEncoderEncodeIntrinsic = TextEncoder.prototype.encode;
+const regExpTestIntrinsic = RegExp.prototype.test;
+const loneSurrogatePattern = /[\uD800-\uDFFF]/u;
 const abortSignalAbortedGetter =
   typeof AbortSignal === 'undefined'
     ? undefined
@@ -37,7 +42,10 @@ function ownDataOptions(value: unknown): Record<string, unknown> | undefined {
     if (prototype !== Object.prototype && prototype !== null) return undefined;
     if (Object.getOwnPropertySymbols(value).length !== 0) return undefined;
     const output: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
-    for (const key of Object.getOwnPropertyNames(value)) {
+    const names = Object.getOwnPropertyNames(value);
+    for (let index = 0; index < names.length; index += 1) {
+      const key = names[index];
+      if (key === undefined) return undefined;
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
       if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return undefined;
       output[key] = descriptor.value;
@@ -83,7 +91,7 @@ function ownDataSlots(value: unknown): readonly unknown[] | undefined {
 function readAbortSignal(signal: unknown): boolean | undefined {
   try {
     return typeof abortSignalAbortedGetter === 'function'
-      ? (Reflect.apply(abortSignalAbortedGetter, signal, []) as boolean)
+      ? (reflectApplyIntrinsic(abortSignalAbortedGetter, signal, []) as boolean)
       : undefined;
   } catch {
     return undefined;
@@ -123,13 +131,15 @@ export function validateRequestAdsOptions(value: unknown): ValidatedRequestAdsOp
     if (rawSlots.length === 0) throw new RequestAdsInputError('empty_slots');
     const seen = new Set<string>();
     const copy: string[] = [];
-    for (const slot of rawSlots) {
+    for (let index = 0; index < rawSlots.length; index += 1) {
+      const slot = rawSlots[index];
       if (
         typeof slot !== 'string' ||
         slot.length === 0 ||
-        new TextEncoder().encode(slot).byteLength > 256 ||
+        (reflectApplyIntrinsic(textEncoderEncodeIntrinsic, textEncoder, [slot]) as Uint8Array)
+          .byteLength > 256 ||
         hasAsciiControl(slot) ||
-        /[\uD800-\uDFFF]/u.test(slot)
+        reflectApplyIntrinsic(regExpTestIntrinsic, loneSurrogatePattern, [slot])
       ) {
         throw new RequestAdsInputError('invalid_slots');
       }
