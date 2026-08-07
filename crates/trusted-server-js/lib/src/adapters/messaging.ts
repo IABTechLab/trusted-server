@@ -1,4 +1,9 @@
 const MAX_GLOBAL_MESSAGE_BYTES = 4_096;
+const setDeleteIntrinsic = Set.prototype.delete;
+
+function deleteSetValue<T>(set: Set<T>, value: T): boolean {
+  return Reflect.apply(setDeleteIntrinsic, set, [value]) as boolean;
+}
 
 /** Every protocol literal shared by the §4.2–§4.5 message channels. */
 export const TSJS_MESSAGE_PROTOCOL_V1 = Object.freeze({
@@ -811,8 +816,11 @@ function wrapPort(raw: RawPort): MessagingPort {
       const dispose = (): void => {
         if (!active) return;
         active = false;
-        listeners.delete(dispose);
-        if (!setupInProgress) rollback();
+        try {
+          deleteSetValue(listeners, dispose);
+        } finally {
+          if (!setupInProgress) rollback();
+        }
       };
       const stopClosedSetup = (): boolean => {
         if (!closed && active) return false;
@@ -820,7 +828,20 @@ function wrapPort(raw: RawPort): MessagingPort {
         rollback();
         return true;
       };
-      listeners.add(dispose);
+      try {
+        listeners.add(dispose);
+      } catch {
+        setupInProgress = false;
+        active = false;
+        try {
+          deleteSetValue(listeners, dispose);
+        } catch {
+          // Failed bookkeeping cannot retain listener ownership.
+        } finally {
+          rollback();
+        }
+        return dispose;
+      }
       try {
         messageAttempted = true;
         Reflect.apply(raw.add, raw.binding, ['message', wrappedMessage]);
@@ -835,8 +856,13 @@ function wrapPort(raw: RawPort): MessagingPort {
       } catch {
         setupInProgress = false;
         active = false;
-        listeners.delete(dispose);
-        rollback();
+        try {
+          deleteSetValue(listeners, dispose);
+        } catch {
+          // Failed bookkeeping cannot interrupt exact listener rollback.
+        } finally {
+          rollback();
+        }
         return dispose;
       }
       setupInProgress = false;

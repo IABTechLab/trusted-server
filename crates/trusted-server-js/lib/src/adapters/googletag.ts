@@ -99,6 +99,7 @@ interface AbortRegistration {
 interface PendingOperation<T> {
   state: GoogletagOperationStatus;
   settled: boolean;
+  pendingReservation: boolean;
   timeout: ReturnType<typeof setTimeout> | undefined;
   readonly command: (googletag: Readonly<GoogletagFacade>) => T;
   readonly resolve: (value: T | PromiseLike<T>) => void;
@@ -117,6 +118,41 @@ interface SharedInitialLoadTracker {
 }
 
 const sharedInitialLoadTrackers = new WeakMap<object, SharedInitialLoadTracker>();
+const mapDeleteIntrinsic = Map.prototype.delete;
+const mapGetIntrinsic = Map.prototype.get;
+const mapKeysIntrinsic = Map.prototype.keys;
+const setDeleteIntrinsic = Set.prototype.delete;
+const weakMapDeleteIntrinsic = WeakMap.prototype.delete;
+const weakMapGetIntrinsic = WeakMap.prototype.get;
+const weakSetDeleteIntrinsic = WeakSet.prototype.delete;
+
+function mapValue<K, V>(map: Map<K, V>, key: K): V | undefined {
+  return Reflect.apply(mapGetIntrinsic, map, [key]) as V | undefined;
+}
+
+function mapKeys<K, V>(map: Map<K, V>): IterableIterator<K> {
+  return Reflect.apply(mapKeysIntrinsic, map, []) as IterableIterator<K>;
+}
+
+function deleteMapValue<K, V>(map: Map<K, V>, key: K): boolean {
+  return Reflect.apply(mapDeleteIntrinsic, map, [key]) as boolean;
+}
+
+function deleteSetValue<T>(set: Set<T>, value: T): boolean {
+  return Reflect.apply(setDeleteIntrinsic, set, [value]) as boolean;
+}
+
+function weakMapValue<K extends object, V>(map: WeakMap<K, V>, key: K): V | undefined {
+  return Reflect.apply(weakMapGetIntrinsic, map, [key]) as V | undefined;
+}
+
+function deleteWeakMapValue<K extends object, V>(map: WeakMap<K, V>, key: K): boolean {
+  return Reflect.apply(weakMapDeleteIntrinsic, map, [key]) as boolean;
+}
+
+function deleteWeakSetValue<T extends object>(set: WeakSet<T>, value: T): boolean {
+  return Reflect.apply(weakSetDeleteIntrinsic, set, [value]) as boolean;
+}
 
 function safeMember(binding: object, key: PropertyKey): unknown {
   try {
@@ -324,21 +360,36 @@ export function createBrowserGoogletagAdapter(
   const pending: PendingOperation<unknown>[] = [];
   const live = new Set<PendingOperation<unknown>>();
   const effects = new Set<() => void>();
-  const armedBindings = new WeakSet<object>();
+  let armedBindings = new WeakSet<object>();
   const initialLoadReleases = new Map<object, () => void>();
   const initialLoadOwner = Object.freeze({});
+  let pendingReservations = 0;
   let disposed = false;
 
   const registerAdapterEffect = (disposeEffect: () => void): void => {
-    if (disposed) {
+    const rollback = (): void => {
+      try {
+        deleteSetValue(effects, disposeEffect);
+      } catch {
+        // A hostile registry cannot retain the effect being rolled back.
+      }
       try {
         disposeEffect();
       } catch {
-        // Reentrant disposal keeps newly-created effects from escaping the adapter.
+        // Cleanup cannot replace the publication failure or escape disposal.
       }
+    };
+    if (disposed) {
+      rollback();
       return;
     }
-    effects.add(disposeEffect);
+    try {
+      effects.add(disposeEffect);
+    } catch (error) {
+      rollback();
+      throw error;
+    }
+    if (disposed) rollback();
   };
 
   const replaceMethod = (
@@ -430,25 +481,45 @@ export function createBrowserGoogletagAdapter(
   };
 
   const releaseInitialLoadBinding = (binding: object): void => {
-    const release = initialLoadReleases.get(binding);
+    const release = mapValue(initialLoadReleases, binding);
     if (!release) return;
-    initialLoadReleases.delete(binding);
     try {
-      effects.delete(release);
-    } catch {
-      // A hostile registry cannot retain adapter ownership of an old binding.
-    }
-    try {
-      release();
-    } catch {
-      // One historical binding cannot interrupt release of later bindings.
+      deleteMapValue(initialLoadReleases, binding);
+    } finally {
+      try {
+        deleteSetValue(effects, release);
+      } catch {
+        // A hostile registry cannot retain adapter ownership of an old binding.
+      } finally {
+        try {
+          release();
+        } catch {
+          // One historical binding cannot interrupt release of later bindings.
+        }
+      }
     }
   };
 
   const releaseHistoricalInitialLoadBindings = (current?: object): void => {
-    for (const binding of [...initialLoadReleases.keys()]) {
-      if (binding !== current) releaseInitialLoadBinding(binding);
+    for (const binding of [...mapKeys(initialLoadReleases)]) {
+      if (binding === current) continue;
+      try {
+        releaseInitialLoadBinding(binding);
+      } catch {
+        // One historical binding cannot interrupt release of later bindings.
+      }
     }
+  };
+
+  const rollbackNotificationArming = (binding: object): void => {
+    let released = false;
+    try {
+      deleteWeakSetValue(armedBindings, binding);
+      released = !armedBindings.has(binding);
+    } catch {
+      // A poisoned registry cannot prove that the exact marker was removed.
+    }
+    if (!released) armedBindings = new WeakSet<object>();
   };
 
   const ensureInitialLoadTracking = (
@@ -462,7 +533,7 @@ export function createBrowserGoogletagAdapter(
     };
     if (!expectedCurrent()) return undefined;
 
-    let tracker = sharedInitialLoadTrackers.get(expected.binding);
+    let tracker = weakMapValue(sharedInitialLoadTrackers, expected.binding);
     if (!tracker) {
       tracker = {
         disabled: false,
@@ -471,13 +542,27 @@ export function createBrowserGoogletagAdapter(
         restorers: new Set<() => void>(),
         services: new WeakMap<object, () => void>(),
       };
-      sharedInitialLoadTrackers.set(expected.binding, tracker);
+      try {
+        sharedInitialLoadTrackers.set(expected.binding, tracker);
+      } catch (error) {
+        if (weakMapValue(sharedInitialLoadTrackers, expected.binding) === tracker) {
+          deleteWeakMapValue(sharedInitialLoadTrackers, expected.binding);
+        }
+        throw error;
+      }
     }
+    const ownsInitialLoad = (): boolean => {
+      try {
+        return tracker!.owners.has(initialLoadOwner);
+      } catch {
+        return false;
+      }
+    };
     const trackingCurrent = (): boolean => {
       if (
         disposed ||
-        sharedInitialLoadTrackers.get(expected.binding) !== tracker ||
-        !tracker.owners.has(initialLoadOwner)
+        weakMapValue(sharedInitialLoadTrackers, expected.binding) !== tracker ||
+        !ownsInitialLoad()
       ) {
         return false;
       }
@@ -485,43 +570,84 @@ export function createBrowserGoogletagAdapter(
       return (
         !disposed &&
         current &&
-        sharedInitialLoadTrackers.get(expected.binding) === tracker &&
-        tracker.owners.has(initialLoadOwner)
+        weakMapValue(sharedInitialLoadTrackers, expected.binding) === tracker &&
+        ownsInitialLoad()
       );
     };
     let adoptedHere = false;
-    if (!initialLoadReleases.has(expected.binding)) {
+    let alreadyAdopted: boolean;
+    try {
+      alreadyAdopted = initialLoadReleases.has(expected.binding);
+    } catch {
+      if (
+        tracker.owners.size === 0 &&
+        weakMapValue(sharedInitialLoadTrackers, expected.binding) === tracker
+      ) {
+        deleteWeakMapValue(sharedInitialLoadTrackers, expected.binding);
+      }
+      return undefined;
+    }
+    if (!alreadyAdopted) {
       if (!expectedCurrent()) {
         if (
           tracker.owners.size === 0 &&
-          sharedInitialLoadTrackers.get(expected.binding) === tracker
+          weakMapValue(sharedInitialLoadTrackers, expected.binding) === tracker
         ) {
-          sharedInitialLoadTrackers.delete(expected.binding);
+          deleteWeakMapValue(sharedInitialLoadTrackers, expected.binding);
         }
         return undefined;
       }
-      tracker.owners.add(initialLoadOwner);
-      const adoptedTracker = tracker;
-      const release = (): void => {
-        if (initialLoadReleases.get(expected.binding) === release) {
-          initialLoadReleases.delete(expected.binding);
-        }
-        if (!adoptedTracker.owners.delete(initialLoadOwner) || adoptedTracker.owners.size > 0) {
-          return;
-        }
-        if (sharedInitialLoadTrackers.get(expected.binding) === adoptedTracker) {
-          sharedInitialLoadTrackers.delete(expected.binding);
-        }
-        for (const restore of [...adoptedTracker.restorers].reverse()) {
-          try {
-            restore();
-          } catch {
-            // One restoration cannot interrupt cleanup of the shared tracker.
+      try {
+        tracker.owners.add(initialLoadOwner);
+      } catch (error) {
+        try {
+          deleteSetValue(tracker.owners, initialLoadOwner);
+        } finally {
+          if (
+            tracker.owners.size === 0 &&
+            weakMapValue(sharedInitialLoadTrackers, expected.binding) === tracker
+          ) {
+            deleteWeakMapValue(sharedInitialLoadTrackers, expected.binding);
           }
         }
-        adoptedTracker.restorers.clear();
+        throw error;
+      }
+      const adoptedTracker = tracker;
+      const release = (): void => {
+        try {
+          if (mapValue(initialLoadReleases, expected.binding) === release) {
+            deleteMapValue(initialLoadReleases, expected.binding);
+          }
+        } finally {
+          const removedLastOwner =
+            deleteSetValue(adoptedTracker.owners, initialLoadOwner) &&
+            adoptedTracker.owners.size === 0;
+          if (removedLastOwner) {
+            if (weakMapValue(sharedInitialLoadTrackers, expected.binding) === adoptedTracker) {
+              deleteWeakMapValue(sharedInitialLoadTrackers, expected.binding);
+            }
+            for (const restore of [...adoptedTracker.restorers].reverse()) {
+              try {
+                restore();
+              } catch {
+                // One restoration cannot interrupt cleanup of the shared tracker.
+              }
+            }
+          }
+        }
       };
-      initialLoadReleases.set(expected.binding, release);
+      try {
+        initialLoadReleases.set(expected.binding, release);
+      } catch (error) {
+        try {
+          if (mapValue(initialLoadReleases, expected.binding) === release) {
+            deleteMapValue(initialLoadReleases, expected.binding);
+          }
+        } finally {
+          release();
+        }
+        throw error;
+      }
       registerAdapterEffect(release);
       adoptedHere = true;
     }
@@ -553,12 +679,21 @@ export function createBrowserGoogletagAdapter(
           const cleanup = (): void => {
             if (!active) return;
             active = false;
-            tracker!.restorers.delete(cleanup);
-            tracker!.rootWrapped = false;
-            restore();
+            try {
+              deleteSetValue(tracker!.restorers, cleanup);
+            } finally {
+              tracker!.rootWrapped = false;
+              restore();
+            }
           };
           tracker.rootWrapped = true;
-          tracker.restorers.add(cleanup);
+          try {
+            tracker.restorers.add(cleanup);
+          } catch (error) {
+            cleanup();
+            rollback();
+            throw error;
+          }
           installedHere.push(cleanup);
         }
         if (!trackingCurrent()) return rollback();
@@ -566,7 +701,11 @@ export function createBrowserGoogletagAdapter(
     }
 
     const trackService = (service: object): boolean => {
-      if (tracker!.services.has(service)) return true;
+      try {
+        if (tracker!.services.has(service)) return true;
+      } catch {
+        return false;
+      }
       if (!trackingCurrent()) return false;
       const originalDisable = safeMember(service, 'disableInitialLoad');
       if (!trackingCurrent()) return false;
@@ -582,12 +721,35 @@ export function createBrowserGoogletagAdapter(
         const cleanup = (): void => {
           if (!active) return;
           active = false;
-          tracker!.restorers.delete(cleanup);
-          tracker!.services.delete(service);
-          restore();
+          try {
+            deleteSetValue(tracker!.restorers, cleanup);
+          } finally {
+            try {
+              if (weakMapValue(tracker!.services, service) === cleanup) {
+                deleteWeakMapValue(tracker!.services, service);
+              }
+            } finally {
+              restore();
+            }
+          }
         };
-        tracker!.services.set(service, cleanup);
-        tracker!.restorers.add(cleanup);
+        try {
+          tracker!.services.set(service, cleanup);
+        } catch (error) {
+          try {
+            cleanup();
+          } finally {
+            rollback();
+          }
+          throw error;
+        }
+        try {
+          tracker!.restorers.add(cleanup);
+        } catch (error) {
+          cleanup();
+          rollback();
+          throw error;
+        }
         installedHere.push(cleanup);
       }
       if (!trackingCurrent()) return false;
@@ -598,14 +760,15 @@ export function createBrowserGoogletagAdapter(
       if (!trackService(knownService)) return rollback();
     } else {
       if (!trackingCurrent()) return rollback();
+      let service: unknown;
       try {
-        const service = Reflect.apply(expected.pubads, expected.binding, []);
-        if (!trackingCurrent()) return rollback();
-        if ((typeof service === 'object' && service !== null) || typeof service === 'function') {
-          if (!trackService(service as object)) return rollback();
-        }
+        service = Reflect.apply(expected.pubads, expected.binding, []);
       } catch {
         return rollback();
+      }
+      if (!trackingCurrent()) return rollback();
+      if ((typeof service === 'object' && service !== null) || typeof service === 'function') {
+        if (!trackService(service as object)) return rollback();
       }
     }
     if (!trackingCurrent()) return rollback();
@@ -660,12 +823,22 @@ export function createBrowserGoogletagAdapter(
     if (index >= 0) pending.splice(index, 1);
   };
 
+  const releasePendingReservation = (operation: PendingOperation<unknown>): void => {
+    if (!operation.pendingReservation) return;
+    operation.pendingReservation = false;
+    if (pendingReservations > 0) pendingReservations -= 1;
+  };
+
   const clearReadiness = (operation: PendingOperation<unknown>): void => {
-    if (operation.timeout !== undefined) {
-      clearTimeout(operation.timeout);
-      operation.timeout = undefined;
+    try {
+      if (operation.timeout !== undefined) {
+        clearTimeout(operation.timeout);
+        operation.timeout = undefined;
+      }
+      removePending(operation);
+    } finally {
+      releasePendingReservation(operation);
     }
-    removePending(operation);
   };
 
   const detachAbort = (operation: PendingOperation<unknown>): void => {
@@ -691,7 +864,7 @@ export function createBrowserGoogletagAdapter(
       try {
         detachAbort(operation);
       } finally {
-        live.delete(operation);
+        deleteSetValue(live, operation);
       }
     }
   };
@@ -735,12 +908,6 @@ export function createBrowserGoogletagAdapter(
     }
     operation.state = 'present';
     clearReadiness(operation);
-    ensureInitialLoadTracking(binding);
-    if (disposed) {
-      fail(operation, 'operation_disposed');
-      return;
-    }
-    if (operation.settled) return;
     const isDispatchCurrent = (): boolean => {
       if (disposed || operation.settled) return false;
       const current = sameBinding(binding);
@@ -752,7 +919,7 @@ export function createBrowserGoogletagAdapter(
       const release = (): void => {
         if (promoted) {
           try {
-            effects.delete(release);
+            deleteSetValue(effects, release);
           } catch {
             // A hostile registry cannot prevent exact external cleanup.
           }
@@ -857,6 +1024,17 @@ export function createBrowserGoogletagAdapter(
       }
     );
     try {
+      if (disposed) {
+        fail(operation, 'operation_disposed');
+        return;
+      }
+      if (operation.settled) return;
+      ensureInitialLoadTracking(binding);
+      if (disposed) {
+        fail(operation, 'operation_disposed');
+        return;
+      }
+      if (operation.settled) return;
       if (!isDispatchCurrent()) {
         if (disposed) fail(operation, 'operation_disposed');
         else fail(operation, 'external_artifact_incompatible');
@@ -945,20 +1123,34 @@ export function createBrowserGoogletagAdapter(
   const armNotification = (): void => {
     const current = currentBinding();
     if (disposed) return;
-    if (
-      current.status !== 'pending' ||
-      !current.binding ||
-      !current.commandQueue ||
-      armedBindings.has(current.binding)
-    ) {
+    if (current.status !== 'pending' || !current.binding || !current.commandQueue) {
       return;
     }
-    for (const operation of pending) operation.readinessBinding = current.binding;
-    armedBindings.add(current.binding);
+    let alreadyArmed = false;
     try {
-      queueCommand(current.commandQueue, () => notifyReady(current.binding));
+      alreadyArmed = armedBindings.has(current.binding);
     } catch {
-      // A later script-owned notification or operation may observe a replacement.
+      armedBindings = new WeakSet<object>();
+    }
+    if (alreadyArmed) return;
+    for (const operation of pending) operation.readinessBinding = current.binding;
+    try {
+      armedBindings.add(current.binding);
+    } catch {
+      rollbackNotificationArming(current.binding);
+      return;
+    }
+    let notificationActive = true;
+    const notify = (): void => {
+      if (!notificationActive) return;
+      notificationActive = false;
+      notifyReady(current.binding);
+    };
+    try {
+      queueCommand(current.commandQueue, notify);
+    } catch {
+      notificationActive = false;
+      rollbackNotificationArming(current.binding);
     }
   };
 
@@ -969,8 +1161,11 @@ export function createBrowserGoogletagAdapter(
     if (disposed) throw new GoogletagAdapterError('operation_disposed');
     const current = currentBinding();
     if (disposed) throw new GoogletagAdapterError('operation_disposed');
-    if (current.status === 'pending' && pending.length >= MAX_PENDING_OPERATIONS) {
-      throw new GoogletagAdapterError('external_queue_full');
+    if (current.status === 'pending') {
+      if (pendingReservations >= MAX_PENDING_OPERATIONS) {
+        throw new GoogletagAdapterError('external_queue_full');
+      }
+      pendingReservations += 1;
     }
 
     let resolve!: (value: T | PromiseLike<T>) => void;
@@ -982,6 +1177,7 @@ export function createBrowserGoogletagAdapter(
     const operation: PendingOperation<T> = {
       state: current.status,
       settled: false,
+      pendingReservation: current.status === 'pending',
       timeout: undefined,
       command,
       resolve,
@@ -990,7 +1186,6 @@ export function createBrowserGoogletagAdapter(
       readinessBinding: current.status === 'pending' ? current.binding : undefined,
       provisionalEffects: [],
     };
-    live.add(operation as PendingOperation<unknown>);
     const handle = Object.freeze({
       get status(): GoogletagOperationStatus {
         return operation.state;
@@ -999,8 +1194,19 @@ export function createBrowserGoogletagAdapter(
       dispose: (): void => fail(operation as PendingOperation<unknown>, 'operation_disposed'),
     });
 
+    try {
+      live.add(operation as PendingOperation<unknown>);
+    } catch (error) {
+      try {
+        deleteSetValue(live, operation as PendingOperation<unknown>);
+      } catch {
+        // Publication rollback preserves the original registry failure.
+      }
+      releasePendingReservation(operation as PendingOperation<unknown>);
+      throw error;
+    }
     if (current.status === 'pending') {
-      pending.push(operation as PendingOperation<unknown>);
+      pending[pending.length] = operation as PendingOperation<unknown>;
       operation.timeout = setTimeout(
         () => fail(operation as PendingOperation<unknown>, 'external_ready_timeout'),
         EXTERNAL_READY_TIMEOUT_MS
@@ -1088,6 +1294,22 @@ export function createBrowserGoogletagAdapter(
         fail(operation as PendingOperation<unknown>, 'operation_disposed');
         return handle;
       }
+      let abortedAfterRegistration: unknown;
+      try {
+        abortedAfterRegistration = Reflect.get(signal, 'aborted');
+      } catch (error) {
+        if (!operation.settled) rejectOperation(operation as PendingOperation<unknown>, error);
+        return handle;
+      }
+      if (operation.settled) return handle;
+      if (disposed) {
+        fail(operation as PendingOperation<unknown>, 'operation_disposed');
+        return handle;
+      }
+      if (abortedAfterRegistration === true) {
+        fail(operation as PendingOperation<unknown>, 'caller_aborted');
+        return handle;
+      }
     }
 
     if (current.status === 'incompatible') {
@@ -1110,20 +1332,22 @@ export function createBrowserGoogletagAdapter(
       if (disposed) return;
       disposed = true;
       for (const operation of [...live]) fail(operation, 'operation_disposed');
-      for (const binding of [...initialLoadReleases.keys()]) {
-        releaseInitialLoadBinding(binding);
-      }
-      initialLoadReleases.clear();
-      for (const disposeEffect of [...effects]) {
-        try {
-          effects.delete(disposeEffect);
-        } catch {
-          // A hostile registry cannot interrupt cleanup of remaining effects.
-        }
-        try {
-          disposeEffect();
-        } catch {
-          // One cleanup cannot interrupt the remaining adapter disposers.
+      try {
+        releaseHistoricalInitialLoadBindings();
+      } catch {
+        // Initial-load registry failure cannot interrupt independent adapter effects.
+      } finally {
+        for (const disposeEffect of [...effects]) {
+          try {
+            deleteSetValue(effects, disposeEffect);
+          } catch {
+            // A hostile registry cannot interrupt cleanup of remaining effects.
+          }
+          try {
+            disposeEffect();
+          } catch {
+            // One cleanup cannot interrupt the remaining adapter disposers.
+          }
         }
       }
     },
