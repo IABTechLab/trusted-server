@@ -24,11 +24,25 @@ interface TestAdUnit {
 }
 
 /** Window properties the prebid shim reads and writes in these tests. */
+interface InjectedPrebidTestConfig {
+  accountId?: string;
+  timeout?: number;
+  debug?: boolean;
+  bidders?: string[];
+  clientSideBidders?: string[];
+  excludedGamAdUnitPathSuffixes?: unknown;
+}
+
+interface TestGoogletag {
+  cmd: { push: (fn: () => void) => void };
+  pubads: () => unknown;
+}
+
 interface PrebidTestWindow {
   pbjs?: unknown;
   tsjs?: unknown;
-  googletag?: unknown;
-  __tsjs_prebid?: Record<string, unknown>;
+  googletag?: TestGoogletag;
+  __tsjs_prebid?: InjectedPrebidTestConfig;
   __tsjsPrebidShimInstalled?: boolean;
   __tsjs_prebid_bundle?: unknown;
   __tsjs_prebid_diagnostics?: {
@@ -994,13 +1008,16 @@ describe('prebid/installRefreshHandler', () => {
     mockRequestBids.mockReset();
     mockPbjs.requestBids = mockRequestBids;
     mockPbjs.adUnits = [];
+    mockPbjs.setTargetingForGPTAsync = undefined;
     testWindow.tsjs = undefined;
     delete testWindow.googletag;
+    delete testWindow.__tsjs_prebid;
   });
 
   afterEach(() => {
     testWindow.tsjs = undefined;
     delete testWindow.googletag;
+    delete testWindow.__tsjs_prebid;
   });
 
   it('builds refresh ad units from injected slot metadata', () => {
@@ -1493,6 +1510,219 @@ describe('prebid/installRefreshHandler', () => {
     expect(setTargetingForGPTAsync).toHaveBeenCalled();
     expect(originalRefresh).toHaveBeenCalledWith([gptSlot], undefined);
   });
+
+  it('passes an explicitly excluded path directly to GPT after clearing stale targeting', () => {
+    const originalRefresh = vi.fn();
+    const clearTargeting = vi.fn();
+    const gptSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-tracking'),
+      getAdUnitPath: vi.fn(() => '/123/trackingonly'),
+      getTargeting: vi.fn(() => []),
+      clearTargeting,
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [gptSlot]),
+    };
+    testWindow.googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    testWindow.__tsjs_prebid = {
+      excludedGamAdUnitPathSuffixes: ['/trackingonly'],
+    };
+    const options = { changeCorrelator: false };
+
+    installRefreshHandler(750);
+    pubads.refresh([gptSlot], options);
+
+    expect(mockRequestBids).not.toHaveBeenCalled();
+    expect(clearTargeting).toHaveBeenCalledWith('ts_initial');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_pb');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_bidder');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_adid');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_cache_host');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_cache_path');
+    expect(originalRefresh).toHaveBeenCalledWith([gptSlot], options);
+  });
+
+  it('passes an all-excluded global refresh directly to GPT', () => {
+    const originalRefresh = vi.fn();
+    const trackingSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-tracking'),
+      getAdUnitPath: vi.fn(() => '/123/trackingonly'),
+      getTargeting: vi.fn(() => []),
+      clearTargeting: vi.fn(),
+    };
+    const measurementSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-measurement'),
+      getAdUnitPath: vi.fn(() => '/123/measurement-only'),
+      getTargeting: vi.fn(() => []),
+      clearTargeting: vi.fn(),
+    };
+    const targetSlots = [trackingSlot, measurementSlot];
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => targetSlots),
+    };
+    testWindow.googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    testWindow.__tsjs_prebid = {
+      excludedGamAdUnitPathSuffixes: ['/trackingonly', '/measurement-only'],
+    };
+    const options = { changeCorrelator: false };
+
+    installRefreshHandler(750);
+    pubads.refresh(undefined, options);
+
+    expect(mockRequestBids).not.toHaveBeenCalled();
+    expect(trackingSlot.clearTargeting).toHaveBeenCalled();
+    expect(measurementSlot.clearTargeting).toHaveBeenCalled();
+    expect(originalRefresh).toHaveBeenCalledWith(undefined, options);
+  });
+
+  it('auctions eligible slots and refreshes every slot in a mixed global refresh', () => {
+    const setTargetingForGPTAsync = vi.fn();
+    mockPbjs.setTargetingForGPTAsync = setTargetingForGPTAsync;
+    mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+      opts?.bidsBackHandler?.();
+    });
+    const originalRefresh = vi.fn();
+    const displaySlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-display'),
+      getAdUnitPath: vi.fn(() => '/123/content'),
+      getTargeting: vi.fn(() => []),
+      clearTargeting: vi.fn(),
+    };
+    const trackingSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-tracking'),
+      getAdUnitPath: vi.fn(() => '/123/trackingonly'),
+      getTargeting: vi.fn(() => []),
+      clearTargeting: vi.fn(),
+    };
+    const targetSlots = [displaySlot, trackingSlot];
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => targetSlots),
+    };
+    testWindow.googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    testWindow.__tsjs_prebid = {
+      excludedGamAdUnitPathSuffixes: ['/trackingonly'],
+    };
+
+    installRefreshHandler(750);
+    pubads.refresh();
+
+    expect(displaySlot.clearTargeting).toHaveBeenCalled();
+    expect(trackingSlot.clearTargeting).toHaveBeenCalled();
+    expect(mockRequestBids).toHaveBeenCalledWith(
+      expect.objectContaining({
+        adUnits: [expect.objectContaining({ code: 'div-ad-display' })],
+      })
+    );
+    expect(setTargetingForGPTAsync).toHaveBeenCalledWith(['div-ad-display']);
+    expect(originalRefresh).toHaveBeenCalledWith(undefined, undefined);
+
+    mockPbjs.setTargetingForGPTAsync = undefined;
+  });
+
+  it.each([
+    ['a missing path getter', {}],
+    ['a non-string path', { getAdUnitPath: vi.fn(() => 123) }],
+    [
+      'a throwing path getter',
+      {
+        getAdUnitPath: vi.fn(() => {
+          throw new Error('path unavailable');
+        }),
+      },
+    ],
+  ])('fails open to an auction for %s', (_description, pathBehavior) => {
+    const originalRefresh = vi.fn();
+    const gptSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-display'),
+      getTargeting: vi.fn(() => []),
+      ...pathBehavior,
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [gptSlot]),
+    };
+    testWindow.googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    testWindow.__tsjs_prebid = {
+      excludedGamAdUnitPathSuffixes: ['/trackingonly'],
+    };
+
+    installRefreshHandler(750);
+    pubads.refresh([gptSlot]);
+
+    expect(mockRequestBids).toHaveBeenCalled();
+    expect(originalRefresh).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['an empty suffix', ['']],
+    ['a non-array suffix list', {}],
+  ])('ignores %s from injected config and runs the refresh auction', (_description, suffixes) => {
+    const originalRefresh = vi.fn();
+    const gptSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-display'),
+      getAdUnitPath: vi.fn(() => '/123/content'),
+      getTargeting: vi.fn(() => []),
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [gptSlot]),
+    };
+    testWindow.googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    testWindow.__tsjs_prebid = { excludedGamAdUnitPathSuffixes: suffixes };
+
+    installRefreshHandler(750);
+    pubads.refresh([gptSlot]);
+
+    expect(mockRequestBids).toHaveBeenCalled();
+    expect(originalRefresh).not.toHaveBeenCalled();
+  });
+
+  it.each(['/123/TrackingOnly', '/123/trackingonly/'])(
+    'uses literal case-sensitive suffix matching for %s',
+    (adUnitPath) => {
+      const originalRefresh = vi.fn();
+      const gptSlot = {
+        getSlotElementId: vi.fn(() => 'div-ad-display'),
+        getAdUnitPath: vi.fn(() => adUnitPath),
+        getTargeting: vi.fn(() => []),
+      };
+      const pubads = {
+        refresh: originalRefresh,
+        getSlots: vi.fn(() => [gptSlot]),
+      };
+      testWindow.googletag = {
+        cmd: { push: (fn: () => void) => fn() },
+        pubads: () => pubads,
+      };
+      testWindow.__tsjs_prebid = {
+        excludedGamAdUnitPathSuffixes: ['/trackingonly'],
+      };
+
+      installRefreshHandler(750);
+      pubads.refresh([gptSlot]);
+
+      expect(mockRequestBids).toHaveBeenCalled();
+      expect(originalRefresh).not.toHaveBeenCalled();
+    }
+  );
 
   it('passes the adInit internal refresh straight to GPT without a client-side auction', () => {
     const originalRefresh = vi.fn();
