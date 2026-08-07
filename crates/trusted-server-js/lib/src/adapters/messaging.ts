@@ -1,8 +1,29 @@
 const MAX_GLOBAL_MESSAGE_BYTES = 4_096;
 const setDeleteIntrinsic = Set.prototype.delete;
+const setValuesIntrinsic = Set.prototype.values;
+const setIteratorNextIntrinsic = Reflect.get(
+  Object.getPrototypeOf(Reflect.apply(setValuesIntrinsic, new Set(), [])),
+  'next'
+) as (...arguments_: unknown[]) => unknown;
+const weakMapGetIntrinsic = WeakMap.prototype.get;
+const weakMapSetIntrinsic = WeakMap.prototype.set;
+const weakSetAddIntrinsic = WeakSet.prototype.add;
+const weakSetHasIntrinsic = WeakSet.prototype.has;
 
 function deleteSetValue<T>(set: Set<T>, value: T): boolean {
   return Reflect.apply(setDeleteIntrinsic, set, [value]) as boolean;
+}
+
+function snapshotSetValues<T>(set: Set<T>): readonly T[] {
+  const iterator = Reflect.apply(setValuesIntrinsic, set, []) as object;
+  const values: T[] = [];
+  let index = 0;
+  while (true) {
+    const step = Reflect.apply(setIteratorNextIntrinsic, iterator, []) as IteratorResult<T>;
+    if (step.done) return values;
+    values[index] = step.value;
+    index += 1;
+  }
 }
 
 /** Every protocol literal shared by the §4.2–§4.5 message channels. */
@@ -169,11 +190,12 @@ export type CaptureMessageListener = (event: MessageEvent) => void;
 export interface MessageEventTarget {
   addEventListener(type: 'message', listener: CaptureMessageListener, capture: true): void;
   removeEventListener(type: 'message', listener: CaptureMessageListener, capture: true): void;
+  readonly MessageChannel?: new () => { readonly port1: unknown; readonly port2: unknown };
 }
 
 /** A narrow owned endpoint for one transferred browser message port. */
 export interface MessagingPort {
-  post(message: unknown, transferred: readonly unknown[]): void;
+  post(message: unknown, transferred: readonly unknown[]): boolean;
   listen(
     messageListener: (event: unknown) => void,
     messageErrorListener: (event: unknown) => void
@@ -181,8 +203,21 @@ export interface MessagingPort {
   close(): void;
 }
 
+/** One locally retained endpoint and one endpoint eligible for exact transfer. */
+export interface MessagingChannel {
+  readonly retained: MessagingPort;
+  readonly transferred: MessagingPort;
+}
+
 /** Cross-window boundary consumed by the kernel's capability recognizer. */
 export interface MessagingAdapter {
+  createChannel(): MessagingChannel | undefined;
+  postWindow(
+    target: unknown,
+    message: unknown,
+    targetOrigin: string,
+    transferred: readonly MessagingPort[]
+  ): boolean;
   installCaptureListener(listener: CaptureMessageListener): () => void;
   parseProtocolMessage(
     kind: ProtocolMessageKind,
@@ -712,37 +747,100 @@ function parseProtocolMessage(
   }
 }
 
-interface RawPort {
+interface CapturedPortClose {
   readonly binding: object;
-  readonly add: (...arguments_: unknown[]) => unknown;
   readonly closePort: (...arguments_: unknown[]) => unknown;
+}
+
+interface RawPort extends CapturedPortClose {
+  readonly add: (...arguments_: unknown[]) => unknown;
   readonly postMessage: (...arguments_: unknown[]) => unknown;
   readonly remove: (...arguments_: unknown[]) => unknown;
   readonly start?: (...arguments_: unknown[]) => unknown;
 }
 
-function rawPort(candidate: unknown): RawPort | undefined {
-  if ((typeof candidate !== 'object' || candidate === null) && typeof candidate !== 'function') {
-    return undefined;
-  }
+interface RawPortInspection {
+  readonly close: CapturedPortClose | undefined;
+  readonly raw: RawPort | undefined;
+}
+
+interface WrappedPortState {
+  readonly raw: RawPort;
+  readonly transferable: boolean;
+  closed: boolean;
+  transferred: boolean;
+  transferring: boolean;
+}
+
+interface TransferReservation {
+  readonly rawTransfers: readonly object[];
+  readonly states: readonly WrappedPortState[];
+}
+
+const wrappedPortStates = new WeakMap<MessagingPort, WrappedPortState>();
+const ownedPortBindings = new WeakSet<object>();
+
+function getWrappedPortState(port: MessagingPort): WrappedPortState | undefined {
+  return Reflect.apply(weakMapGetIntrinsic, wrappedPortStates, [port]) as
+    WrappedPortState | undefined;
+}
+
+function setWrappedPortState(port: MessagingPort, state: WrappedPortState): void {
+  Reflect.apply(weakMapSetIntrinsic, wrappedPortStates, [port, state]);
+}
+
+function ownsPortBinding(binding: object): boolean {
+  return Reflect.apply(weakSetHasIntrinsic, ownedPortBindings, [binding]) as boolean;
+}
+
+function claimPortBinding(binding: object): void {
+  Reflect.apply(weakSetAddIntrinsic, ownedPortBindings, [binding]);
+}
+
+function portCandidateBinding(candidate: unknown): object | undefined {
+  return (typeof candidate === 'object' && candidate !== null) || typeof candidate === 'function'
+    ? (candidate as object)
+    : undefined;
+}
+
+function claimPortCandidate(candidate: unknown): boolean {
+  const binding = portCandidateBinding(candidate);
+  if (!binding || ownsPortBinding(binding)) return false;
+  claimPortBinding(binding);
+  return true;
+}
+
+function inspectRawPort(candidate: unknown): RawPortInspection {
+  const binding = portCandidateBinding(candidate);
+  if (!binding) return { close: undefined, raw: undefined };
+  let closePort: unknown;
   try {
-    const add = Reflect.get(candidate, 'addEventListener');
-    const closePort = Reflect.get(candidate, 'close');
-    const postMessage = Reflect.get(candidate, 'postMessage');
-    const remove = Reflect.get(candidate, 'removeEventListener');
-    const start = Reflect.get(candidate, 'start');
+    closePort = Reflect.get(binding, 'close');
+  } catch {
+    return { close: undefined, raw: undefined };
+  }
+  if (typeof closePort !== 'function') return { close: undefined, raw: undefined };
+  const callableClose = closePort as (...arguments_: unknown[]) => unknown;
+  const close: CapturedPortClose = { binding, closePort: callableClose };
+  try {
+    const add = Reflect.get(binding, 'addEventListener');
+    const postMessage = Reflect.get(binding, 'postMessage');
+    const remove = Reflect.get(binding, 'removeEventListener');
+    const start = Reflect.get(binding, 'start');
     if (
       typeof add !== 'function' ||
-      typeof closePort !== 'function' ||
       typeof postMessage !== 'function' ||
       typeof remove !== 'function' ||
       (start !== undefined && typeof start !== 'function')
     ) {
-      return undefined;
+      return { close, raw: undefined };
     }
-    return { binding: candidate, add, closePort, postMessage, remove, start };
+    return {
+      close,
+      raw: { binding, add, closePort: callableClose, postMessage, remove, start },
+    };
   } catch {
-    return undefined;
+    return { close, raw: undefined };
   }
 }
 
@@ -758,25 +856,48 @@ function closeRawPort(candidate: unknown): void {
   }
 }
 
-function wrapPort(raw: RawPort): MessagingPort {
+function closeCapturedRawPort(raw: CapturedPortClose): void {
+  try {
+    Reflect.apply(raw.closePort, raw.binding, []);
+  } catch {
+    // A captured endpoint close cannot interrupt channel-construction cleanup.
+  }
+}
+
+function wrapPort(raw: RawPort, transferable = false): MessagingPort {
   const listeners = new Set<() => void>();
-  let closed = false;
-  return Object.freeze({
-    post: (message: unknown, transferred: readonly unknown[]): void => {
-      if (closed) return;
-      try {
-        Reflect.apply(raw.postMessage, raw.binding, [message, [...transferred]]);
-      } catch {
-        // A failed post remains local to the channel boundary.
+  const state: WrappedPortState = {
+    raw,
+    transferable,
+    closed: false,
+    transferred: false,
+    transferring: false,
+  };
+  const port: MessagingPort = Object.freeze({
+    post: (message: unknown, transferred: readonly unknown[]): boolean => {
+      if (state.transferable || state.closed || state.transferred || state.transferring) {
+        return false;
       }
+      const reservation = reserveTransferPorts(transferred);
+      if (!reservation) return false;
+      try {
+        Reflect.apply(raw.postMessage, raw.binding, [message, reservation.rawTransfers]);
+      } catch {
+        rollbackTransferReservation(reservation);
+        return false;
+      }
+      commitTransferReservation(reservation);
+      return true;
     },
     listen: (
       messageListener: (event: unknown) => void,
       messageErrorListener: (event: unknown) => void
     ): (() => void) => {
-      if (closed) return () => undefined;
+      if (state.transferable || state.closed || state.transferred || state.transferring) {
+        return () => undefined;
+      }
       const wrappedMessage = (event: unknown): void => {
-        if (closed) return;
+        if (state.closed || state.transferred) return;
         try {
           messageListener(event);
         } catch {
@@ -784,7 +905,7 @@ function wrapPort(raw: RawPort): MessagingPort {
         }
       };
       const wrappedMessageError = (event: unknown): void => {
-        if (closed) return;
+        if (state.closed || state.transferred) return;
         try {
           messageErrorListener(event);
         } catch {
@@ -823,7 +944,7 @@ function wrapPort(raw: RawPort): MessagingPort {
         }
       };
       const stopClosedSetup = (): boolean => {
-        if (!closed && active) return false;
+        if (!state.closed && !state.transferred && !state.transferring && active) return false;
         setupInProgress = false;
         rollback();
         return true;
@@ -869,9 +990,21 @@ function wrapPort(raw: RawPort): MessagingPort {
       return dispose;
     },
     close: (): void => {
-      if (closed) return;
-      closed = true;
-      for (const dispose of [...listeners]) dispose();
+      if (state.closed || state.transferred || state.transferring) return;
+      state.closed = true;
+      let disposers: readonly (() => void)[] = [];
+      try {
+        disposers = snapshotSetValues(listeners);
+      } catch {
+        // The captured native iterator should be total for the private native Set.
+      }
+      for (let index = 0; index < disposers.length; index += 1) {
+        try {
+          disposers[index]?.();
+        } catch {
+          // One listener cleanup cannot skip the remaining listeners or raw close.
+        }
+      }
       try {
         Reflect.apply(raw.closePort, raw.binding, []);
       } catch {
@@ -879,26 +1012,8 @@ function wrapPort(raw: RawPort): MessagingPort {
       }
     },
   });
-}
-
-function closeUniquePorts(candidates: readonly unknown[]): void {
-  const closed: object[] = [];
-  for (let index = 0; index < candidates.length; index += 1) {
-    const candidate = candidates[index];
-    if ((typeof candidate !== 'object' || candidate === null) && typeof candidate !== 'function') {
-      continue;
-    }
-    let duplicate = false;
-    for (let closedIndex = 0; closedIndex < closed.length; closedIndex += 1) {
-      if (closed[closedIndex] === candidate) {
-        duplicate = true;
-        break;
-      }
-    }
-    if (duplicate) continue;
-    closed[closed.length] = candidate as object;
-    closeRawPort(candidate);
-  }
+  setWrappedPortState(port, state);
+  return port;
 }
 
 function snapshotPortArray(
@@ -919,31 +1034,87 @@ function snapshotPortArray(
       return undefined;
     }
     const length = lengthDescriptor.value;
-    const descriptors = Object.getOwnPropertyDescriptors(candidate);
     const ownKeys = Reflect.ownKeys(candidate);
     const values: unknown[] = [];
     let valid = length <= 2 && ownKeys.length === length + 1;
-    const numericKeys = ownKeys
-      .filter(
-        (key): key is string =>
-          typeof key === 'string' &&
-          /^(?:0|[1-9]\d*)$/.test(key) &&
-          Number(key) < length &&
-          Number.isSafeInteger(Number(key))
-      )
-      .sort((left, right) => Number(left) - Number(right));
-    if (numericKeys.length !== length) valid = false;
-    for (const key of numericKeys) {
-      const descriptor = descriptors[key];
-      if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
-        valid = false;
-        continue;
+    if (length <= 2) {
+      for (let keyIndex = 0; keyIndex < ownKeys.length; keyIndex += 1) {
+        const key = ownKeys[keyIndex];
+        if (key === 'length') continue;
+        let expected = false;
+        for (let valueIndex = 0; valueIndex < length; valueIndex += 1) {
+          if (key === String(valueIndex)) {
+            expected = true;
+            break;
+          }
+        }
+        if (!expected) valid = false;
       }
-      values.push(descriptor.value);
+      for (let index = 0; index < length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(candidate, String(index));
+        if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+          valid = false;
+          continue;
+        }
+        values[values.length] = descriptor.value;
+      }
+    } else {
+      for (let keyIndex = 0; keyIndex < ownKeys.length; keyIndex += 1) {
+        const key = ownKeys[keyIndex];
+        if (typeof key !== 'string' || key === 'length') continue;
+        const index = Number(key);
+        if (!Number.isSafeInteger(index) || index < 0 || index >= length || String(index) !== key) {
+          continue;
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(candidate, key);
+        if (descriptor && Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+          values[values.length] = descriptor.value;
+        }
+      }
     }
     return { valid, values };
   } catch {
     return undefined;
+  }
+}
+
+function reserveTransferPorts(transferred: readonly unknown[]): TransferReservation | undefined {
+  const snapshot = snapshotPortArray(transferred);
+  if (!snapshot?.valid) return undefined;
+  const states: WrappedPortState[] = [];
+  const rawTransfers: object[] = [];
+  for (let index = 0; index < snapshot.values.length; index += 1) {
+    const port = snapshot.values[index];
+    const state = getWrappedPortState(port as MessagingPort);
+    if (!state || !state.transferable || state.closed || state.transferred || state.transferring) {
+      return undefined;
+    }
+    for (let prior = 0; prior < states.length; prior += 1) {
+      if (states[prior] === state) return undefined;
+    }
+    states[index] = state;
+    rawTransfers[index] = state.raw.binding;
+  }
+  for (let index = 0; index < states.length; index += 1) {
+    const state = states[index];
+    if (state) state.transferring = true;
+  }
+  return { rawTransfers, states };
+}
+
+function rollbackTransferReservation(reservation: TransferReservation): void {
+  for (let index = 0; index < reservation.states.length; index += 1) {
+    const state = reservation.states[index];
+    if (state) state.transferring = false;
+  }
+}
+
+function commitTransferReservation(reservation: TransferReservation): void {
+  for (let index = 0; index < reservation.states.length; index += 1) {
+    const state = reservation.states[index];
+    if (!state) continue;
+    state.transferring = false;
+    state.transferred = true;
   }
 }
 
@@ -960,26 +1131,129 @@ function extractTransferredPorts(
   }
   const snapshot = snapshotPortArray(candidates);
   if (!snapshot) return undefined;
-  if (!snapshot.valid || snapshot.values.length !== expectedCount) {
-    closeUniquePorts(snapshot.values);
-    return undefined;
-  }
-  if (expectedCount === 2 && snapshot.values[0] === snapshot.values[1]) {
-    closeRawPort(snapshot.values[0]);
-    return undefined;
-  }
-  const ports: RawPort[] = [];
+  const inspections: Array<RawPortInspection | undefined> = [];
+  const claimed: boolean[] = [];
+  let accepted = snapshot.valid && snapshot.values.length === expectedCount;
   for (let index = 0; index < snapshot.values.length; index += 1) {
-    const port = rawPort(snapshot.values[index]);
-    if (!port) {
-      closeUniquePorts(snapshot.values);
-      return undefined;
+    const candidate = snapshot.values[index];
+    const candidateClaimed = claimPortCandidate(candidate);
+    claimed[index] = candidateClaimed;
+    if (!candidateClaimed) {
+      accepted = false;
+      continue;
     }
-    ports.push(port);
+    const inspection = inspectRawPort(candidate);
+    inspections[index] = inspection;
+    if (!inspection.raw) accepted = false;
+  }
+  if (!accepted) {
+    for (let index = 0; index < snapshot.values.length; index += 1) {
+      if (!claimed[index]) continue;
+      const captured = inspections[index]?.close;
+      if (captured) closeCapturedRawPort(captured);
+      else closeRawPort(snapshot.values[index]);
+    }
+    return undefined;
   }
   const wrapped: MessagingPort[] = [];
-  for (const port of ports) wrapped.push(wrapPort(port));
-  return Object.freeze(wrapped);
+  try {
+    for (let index = 0; index < inspections.length; index += 1) {
+      const raw = inspections[index]?.raw;
+      if (!raw) throw new Error('Accepted raw port inspection is unavailable');
+      wrapped[index] = wrapPort(raw);
+    }
+    return Object.freeze(wrapped);
+  } catch {
+    for (let index = 0; index < inspections.length; index += 1) {
+      const captured = inspections[index]?.close;
+      if (claimed[index] && captured) closeCapturedRawPort(captured);
+    }
+    return undefined;
+  }
+}
+
+function createChannel(target: MessageEventTarget): MessagingChannel | undefined {
+  let first: unknown;
+  let second: unknown;
+  let retainedInspection: RawPortInspection | undefined;
+  let transferredInspection: RawPortInspection | undefined;
+  let claimedRetained = false;
+  let claimedTransferred = false;
+  const cleanup = (): void => {
+    if (claimedRetained) {
+      const captured = retainedInspection?.close;
+      if (captured) closeCapturedRawPort(captured);
+      else closeRawPort(first);
+    }
+    if (claimedTransferred) {
+      const captured = transferredInspection?.close;
+      if (captured) closeCapturedRawPort(captured);
+      else closeRawPort(second);
+    }
+  };
+  try {
+    const constructor = Reflect.get(target, 'MessageChannel');
+    if (typeof constructor !== 'function') return undefined;
+    const channel = Reflect.construct(constructor, [] as never[]) as object;
+    first = Reflect.get(channel, 'port1');
+    claimedRetained = claimPortCandidate(first);
+    if (claimedRetained) retainedInspection = inspectRawPort(first);
+    second = Reflect.get(channel, 'port2');
+    if (second !== first) claimedTransferred = claimPortCandidate(second);
+    if (claimedTransferred) transferredInspection = inspectRawPort(second);
+    if (first === second) {
+      if (claimedRetained) {
+        cleanup();
+      }
+      return undefined;
+    }
+    const retainedRaw = retainedInspection?.raw;
+    const transferredRaw = transferredInspection?.raw;
+    if (!claimedRetained || !claimedTransferred || !retainedRaw || !transferredRaw) {
+      cleanup();
+      return undefined;
+    }
+    return Object.freeze({
+      retained: wrapPort(retainedRaw),
+      transferred: wrapPort(transferredRaw, true),
+    });
+  } catch {
+    cleanup();
+    return undefined;
+  }
+}
+
+function postWindow(
+  target: unknown,
+  message: unknown,
+  targetOrigin: string,
+  transferred: readonly MessagingPort[]
+): boolean {
+  let postMessage: unknown;
+  try {
+    if (
+      ((typeof target !== 'object' || target === null) && typeof target !== 'function') ||
+      typeof targetOrigin !== 'string' ||
+      targetOrigin.length === 0 ||
+      targetOrigin.length > 2_048
+    ) {
+      return false;
+    }
+    postMessage = Reflect.get(target, 'postMessage');
+    if (typeof postMessage !== 'function') return false;
+  } catch {
+    return false;
+  }
+  const reservation = reserveTransferPorts(transferred);
+  if (!reservation) return false;
+  try {
+    Reflect.apply(postMessage, target, [message, targetOrigin, reservation.rawTransfers]);
+  } catch {
+    rollbackTransferReservation(reservation);
+    return false;
+  }
+  commitTransferReservation(reservation);
+  return true;
 }
 
 /**
@@ -993,6 +1267,8 @@ export function createBrowserMessagingAdapter(
   validation: MessagingValidationOptions = {}
 ): MessagingAdapter {
   return Object.freeze({
+    createChannel: () => createChannel(target),
+    postWindow,
     installCaptureListener(listener: CaptureMessageListener): () => void {
       let add: unknown;
       let remove: unknown;
@@ -1040,6 +1316,8 @@ export function createBrowserMessagingAdapter(
 /** Create a side-effect-free messaging boundary for tests and non-DOM runtimes. */
 export function createNoopMessagingAdapter(): MessagingAdapter {
   return Object.freeze({
+    createChannel: () => undefined,
+    postWindow: () => false,
     installCaptureListener: () => () => undefined,
     parseProtocolMessage: (kind: ProtocolMessageKind, candidate: unknown) =>
       parseProtocolMessage(kind, candidate, {}),
