@@ -164,6 +164,79 @@ describe('browser messaging adapter', () => {
     ).toBeUndefined();
   });
 
+  it.each(['before', 'after'] as const)(
+    'fails global JSON parsing closed when duplicate-key tracking throws %s insertion',
+    (failure) => {
+      const adapter = createBrowserMessagingAdapter(createTarget());
+      const originalSetAdd = Set.prototype.add;
+      Set.prototype.add = function (this: Set<unknown>, value: unknown): Set<unknown> {
+        if (failure === 'after') Reflect.apply(originalSetAdd, this, [value]);
+        throw new Error(`duplicate-key tracking failed ${failure} insertion`);
+      } as typeof Set.prototype.add;
+
+      let parsed: unknown;
+      let thrown: unknown;
+      try {
+        parsed = adapter.parseProtocolMessage(
+          'prebidRequest',
+          JSON.stringify({
+            message: 'Prebid Request',
+            adId: 'r1_1234567890123456789012',
+            adServerDomain: 'ads.example.com',
+          })
+        );
+      } catch (error) {
+        thrown = error;
+      } finally {
+        Set.prototype.add = originalSetAdd;
+      }
+
+      expect(thrown).toBeUndefined();
+      expect(parsed).toBeUndefined();
+    }
+  );
+
+  it.each(['duplicate-key', 'reason'] as const)(
+    'fails protocol %s membership checks closed when Set.has throws',
+    (lookup) => {
+      const adapter = createBrowserMessagingAdapter(createTarget());
+      const candidate =
+        lookup === 'duplicate-key'
+          ? JSON.stringify({
+              message: 'Prebid Request',
+              adId: 'r1_1234567890123456789012',
+              adServerDomain: 'ads.example.com',
+            })
+          : {
+              message: 'TS Owner Settled',
+              version: 1,
+              lifecycleTicket: 't1_abcdefghijklmnopqrstuv',
+              outcome: 'failed',
+              reason: 'internal_error',
+            };
+      const originalSetHas = Set.prototype.has;
+      Set.prototype.has = function (): boolean {
+        throw new Error(`${lookup} membership failed`);
+      } as typeof Set.prototype.has;
+
+      let parsed: unknown;
+      let thrown: unknown;
+      try {
+        parsed = adapter.parseProtocolMessage(
+          lookup === 'duplicate-key' ? 'prebidRequest' : 'ownerSettledFailed',
+          candidate
+        );
+      } catch (error) {
+        thrown = error;
+      } finally {
+        Set.prototype.has = originalSetHas;
+      }
+
+      expect(thrown).toBeUndefined();
+      expect(parsed).toBeUndefined();
+    }
+  );
+
   it('validates capability forms, field types, nested records, enums, and UTF-8 limits', () => {
     const adapter = createBrowserMessagingAdapter(createTarget());
     const request = (adId: unknown, adServerDomain: unknown) =>
@@ -531,14 +604,14 @@ describe('browser messaging adapter', () => {
     expect(raw.close).toHaveBeenCalledTimes(1);
   });
 
-  it('rolls back both port listeners when messageerror installation or start fails', () => {
-    for (const failure of ['messageerror', 'start'] as const) {
+  it('rolls back every attempted port listener when message, messageerror, or start fails', () => {
+    for (const failure of ['message', 'messageerror', 'start'] as const) {
       const adapter = createBrowserMessagingAdapter(createTarget());
       const raw = createPort();
       raw.addEventListener.mockImplementation((type, listener) => {
         (type === 'messageerror' ? raw.messageErrorListeners : raw.listeners).add(listener);
-        if (failure === 'messageerror' && type === 'messageerror') {
-          throw new Error('messageerror add failed');
+        if (failure === type) {
+          throw new Error(`${type} add failed`);
         }
       });
       if (failure === 'start') {
@@ -557,9 +630,125 @@ describe('browser messaging adapter', () => {
       expect(raw.listeners.size).toBe(0);
       expect(raw.messageErrorListeners.size).toBe(0);
       expect(raw.removeEventListener).toHaveBeenCalledWith('message', expect.any(Function));
-      expect(raw.removeEventListener).toHaveBeenCalledWith('messageerror', expect.any(Function));
-      expect(raw.removeEventListener).toHaveBeenCalledTimes(2);
+      if (failure !== 'message') {
+        expect(raw.removeEventListener).toHaveBeenCalledWith('messageerror', expect.any(Function));
+      }
+      expect(raw.removeEventListener).toHaveBeenCalledTimes(failure === 'message' ? 1 : 2);
     }
+  });
+
+  it.each(['before', 'after'] as const)(
+    'rolls back port listener ownership when its registry throws %s insertion',
+    (failure) => {
+      const adapter = createBrowserMessagingAdapter(createTarget());
+      const raw = createPort();
+      const [port] = adapter.extractTransferredPorts({ ports: [raw] }, 1) ?? [];
+      if (!port) throw new Error('Expected one port');
+      const messageListener = vi.fn();
+      const messageErrorListener = vi.fn();
+      const originalSetAdd = Set.prototype.add;
+      const originalSetDelete = Set.prototype.delete;
+      Set.prototype.add = function (this: Set<unknown>, value: unknown): Set<unknown> {
+        if (failure === 'after') Reflect.apply(originalSetAdd, this, [value]);
+        throw new Error(`listener registry failed ${failure} insertion`);
+      } as typeof Set.prototype.add;
+      Set.prototype.delete = function (): boolean {
+        throw new Error('listener publication rollback delete failed');
+      } as typeof Set.prototype.delete;
+
+      let dispose: (() => void) | undefined;
+      let thrown: unknown;
+      try {
+        dispose = port.listen(messageListener, messageErrorListener);
+      } catch (error) {
+        thrown = error;
+      } finally {
+        Set.prototype.add = originalSetAdd;
+        Set.prototype.delete = originalSetDelete;
+      }
+
+      expect(thrown).toBeUndefined();
+      expect(raw.listeners.size).toBe(0);
+      expect(raw.messageErrorListeners.size).toBe(0);
+      expect(() => dispose?.()).not.toThrow();
+      port.close();
+      expect(raw.removeEventListener).not.toHaveBeenCalled();
+      expect(raw.close).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it('removes port listeners when Set.delete is poisoned during unsubscribe and close', () => {
+    const adapter = createBrowserMessagingAdapter(createTarget());
+    const firstRaw = createPort();
+    const secondRaw = createPort();
+    const originalSetDelete = Set.prototype.delete;
+    for (const raw of [firstRaw, secondRaw]) {
+      raw.removeEventListener.mockImplementation((type, listener) => {
+        const registered = type === 'messageerror' ? raw.messageErrorListeners : raw.listeners;
+        Reflect.apply(originalSetDelete, registered, [listener]);
+      });
+    }
+    const [first] = adapter.extractTransferredPorts({ ports: [firstRaw] }, 1) ?? [];
+    const [second] = adapter.extractTransferredPorts({ ports: [secondRaw] }, 1) ?? [];
+    if (!first || !second) throw new Error('Expected two ports');
+    const unsubscribe = first.listen(vi.fn(), vi.fn());
+    second.listen(vi.fn(), vi.fn());
+
+    Set.prototype.delete = function (): boolean {
+      throw new Error('port listener registry delete failed');
+    } as typeof Set.prototype.delete;
+    try {
+      expect(() => unsubscribe()).not.toThrow();
+      expect(() => unsubscribe()).not.toThrow();
+      expect(() => second.close()).not.toThrow();
+      expect(() => second.close()).not.toThrow();
+    } finally {
+      Set.prototype.delete = originalSetDelete;
+    }
+
+    expect(firstRaw.listeners.size).toBe(0);
+    expect(firstRaw.messageErrorListeners.size).toBe(0);
+    expect(secondRaw.listeners.size).toBe(0);
+    expect(secondRaw.messageErrorListeners.size).toBe(0);
+    expect(firstRaw.removeEventListener).toHaveBeenCalledTimes(2);
+    expect(secondRaw.removeEventListener).toHaveBeenCalledTimes(2);
+    expect(secondRaw.close).toHaveBeenCalledTimes(1);
+    first.close();
+  });
+
+  it('rolls back both port listeners when setup and Set.delete fail together', () => {
+    const adapter = createBrowserMessagingAdapter(createTarget());
+    const raw = createPort();
+    const originalSetDelete = Set.prototype.delete;
+    raw.removeEventListener.mockImplementation((type, listener) => {
+      const registered = type === 'messageerror' ? raw.messageErrorListeners : raw.listeners;
+      Reflect.apply(originalSetDelete, registered, [listener]);
+    });
+    raw.addEventListener.mockImplementation((type, listener) => {
+      (type === 'messageerror' ? raw.messageErrorListeners : raw.listeners).add(listener);
+      if (type === 'messageerror') throw new Error('messageerror setup failed');
+    });
+    const [port] = adapter.extractTransferredPorts({ ports: [raw] }, 1) ?? [];
+    if (!port) throw new Error('Expected one port');
+    Set.prototype.delete = function (): boolean {
+      throw new Error('setup rollback registry delete failed');
+    } as typeof Set.prototype.delete;
+
+    let unsubscribe: (() => void) | undefined;
+    try {
+      expect(() => {
+        unsubscribe = port.listen(vi.fn(), vi.fn());
+      }).not.toThrow();
+      expect(() => unsubscribe?.()).not.toThrow();
+    } finally {
+      Set.prototype.delete = originalSetDelete;
+    }
+
+    expect(raw.listeners.size).toBe(0);
+    expect(raw.messageErrorListeners.size).toBe(0);
+    expect(raw.removeEventListener).toHaveBeenCalledTimes(2);
+    expect(() => port.close()).not.toThrow();
+    expect(raw.close).toHaveBeenCalledTimes(1);
   });
 
   it.each(['message', 'messageerror', 'start'] as const)(

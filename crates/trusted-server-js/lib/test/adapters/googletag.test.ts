@@ -95,6 +95,152 @@ describe('browser googletag adapter readiness', () => {
     expect(second.status).toBe('present');
   });
 
+  it.each(['before', 'after'] as const)(
+    'recovers GPT notification arming when WeakSet.add throws %s insertion',
+    async (failure) => {
+      const readinessCommands: Command[] = [];
+      const target: { googletag?: unknown } = { googletag: { cmd: readinessCommands } };
+      const adapter = createBrowserGoogletagAdapter(target);
+      const originalWeakSetAdd = WeakSet.prototype.add;
+      WeakSet.prototype.add = function (this: WeakSet<object>, value: object): WeakSet<object> {
+        if (failure === 'after') Reflect.apply(originalWeakSetAdd, this, [value]);
+        throw new Error(`GPT arming failed ${failure} insertion`);
+      } as typeof WeakSet.prototype.add;
+
+      let operation: ReturnType<typeof adapter.run> | undefined;
+      let thrown: unknown;
+      try {
+        operation = adapter.run(() => 'ready');
+      } catch (error) {
+        thrown = error;
+      } finally {
+        WeakSet.prototype.add = originalWeakSetAdd;
+      }
+
+      expect(thrown).toBeUndefined();
+      if (!operation) throw new Error('Expected a published GPT operation');
+      expect(readinessCommands).toHaveLength(0);
+      adapter.notifyReady();
+      expect(readinessCommands).toHaveLength(1);
+      target.googletag = createReadyGoogletag().googletag;
+      readinessCommands[0]?.();
+      await expect(operation.result).resolves.toBe('ready');
+      adapter.dispose();
+    }
+  );
+
+  it('recovers GPT notification arming when WeakSet.has throws after publication', async () => {
+    vi.useFakeTimers();
+    const readinessCommands: Command[] = [];
+    const target: { googletag?: unknown } = { googletag: { cmd: readinessCommands } };
+    const adapter = createBrowserGoogletagAdapter(target);
+    const order: number[] = [];
+    const originalWeakSetHas = WeakSet.prototype.has;
+    WeakSet.prototype.has = function (): boolean {
+      throw new Error('GPT armed lookup failed');
+    } as typeof WeakSet.prototype.has;
+
+    let first: ReturnType<typeof adapter.run> | undefined;
+    let thrown: unknown;
+    try {
+      first = adapter.run(() => order.push(1));
+    } catch (error) {
+      thrown = error;
+    } finally {
+      WeakSet.prototype.has = originalWeakSetHas;
+    }
+
+    expect(thrown).toBeUndefined();
+    if (!first) throw new Error('Expected a published GPT operation');
+    expect(readinessCommands).toHaveLength(1);
+    const second = adapter.run(() => order.push(2));
+    expect(readinessCommands).toHaveLength(1);
+    target.googletag = createReadyGoogletag().googletag;
+    readinessCommands[0]?.();
+    await expect(Promise.all([first.result, second.result])).resolves.toEqual([1, 2]);
+    expect(order).toEqual([1, 2]);
+    expect(vi.getTimerCount()).toBe(0);
+
+    target.googletag = undefined;
+    const recovered = Array.from({ length: 64 }, () => adapter.run(vi.fn()));
+    const recoveredResults = recovered.map(({ result }) => result.catch((error) => error));
+    expect(() => adapter.run(vi.fn())).toThrowError(
+      expect.objectContaining({ code: 'external_queue_full' })
+    );
+    for (const operation of recovered) operation.dispose();
+    await Promise.all(recoveredResults);
+    expect(vi.getTimerCount()).toBe(0);
+    adapter.dispose();
+  });
+
+  it.each([
+    { pushFailure: 'before', deleteFailure: 'throw' },
+    { pushFailure: 'after', deleteFailure: 'retain' },
+  ] as const)(
+    'retries GPT notification registration after $pushFailure enqueue failure and $deleteFailure rollback',
+    async ({ pushFailure, deleteFailure }) => {
+      vi.useFakeTimers();
+      const readinessCommands: Command[] = [];
+      let queueBroken = true;
+      const push = vi.fn((command: Command): number => {
+        if (queueBroken) {
+          if (pushFailure === 'after') readinessCommands.push(command);
+          throw new Error(`GPT queue failed ${pushFailure} enqueue`);
+        }
+        readinessCommands.push(command);
+        return readinessCommands.length;
+      });
+      const target: { googletag?: unknown } = { googletag: { cmd: { push } } };
+      const adapter = createBrowserGoogletagAdapter(target);
+      const order: number[] = [];
+      const originalWeakSetDelete = WeakSet.prototype.delete;
+      WeakSet.prototype.delete = function (): boolean {
+        if (deleteFailure === 'throw') throw new Error('GPT arming rollback failed');
+        return false;
+      } as typeof WeakSet.prototype.delete;
+
+      let first: ReturnType<typeof adapter.run> | undefined;
+      let thrown: unknown;
+      try {
+        first = adapter.run(() => order.push(1));
+      } catch (error) {
+        thrown = error;
+      } finally {
+        WeakSet.prototype.delete = originalWeakSetDelete;
+      }
+
+      expect(thrown).toBeUndefined();
+      if (!first) throw new Error('Expected a published GPT operation');
+      expect(readinessCommands).toHaveLength(pushFailure === 'after' ? 1 : 0);
+      queueBroken = false;
+      const second = adapter.run(() => order.push(2));
+      expect(readinessCommands).toHaveLength(pushFailure === 'after' ? 2 : 1);
+
+      target.googletag = createReadyGoogletag().googletag;
+      if (pushFailure === 'after') {
+        readinessCommands[0]?.();
+        expect(order).toEqual([]);
+      }
+      readinessCommands[readinessCommands.length - 1]?.();
+      await expect(Promise.all([first.result, second.result])).resolves.toEqual([1, 2]);
+      expect(order).toEqual([1, 2]);
+      for (const notify of readinessCommands) notify();
+      expect(order).toEqual([1, 2]);
+      expect(vi.getTimerCount()).toBe(0);
+
+      target.googletag = undefined;
+      const recovered = Array.from({ length: 64 }, () => adapter.run(vi.fn()));
+      const recoveredResults = recovered.map(({ result }) => result.catch((error) => error));
+      expect(() => adapter.run(vi.fn())).toThrowError(
+        expect.objectContaining({ code: 'external_queue_full' })
+      );
+      for (const operation of recovered) operation.dispose();
+      await Promise.all(recoveredResults);
+      expect(vi.getTimerCount()).toBe(0);
+      adapter.dispose();
+    }
+  );
+
   it('rejects a queued operation when its pending GPT stub becomes incompatible', async () => {
     const readinessCommands: Command[] = [];
     const ready = createReadyGoogletag();
@@ -279,6 +425,117 @@ describe('browser googletag adapter readiness', () => {
     expect(order).toEqual(Array.from({ length: 64 }, (_, index) => index));
   });
 
+  it('reserves pending GPT capacity before poisoned Set.add reenters', async () => {
+    const target: { googletag?: unknown } = {};
+    const adapter = createBrowserGoogletagAdapter(target);
+    const accepted: Array<ReturnType<typeof adapter.run>> = [];
+    const overflows: unknown[] = [];
+    const order: number[] = [];
+    const originalSetAdd = Set.prototype.add;
+    let reentered = false;
+    Set.prototype.add = function (this: Set<unknown>, value: unknown): Set<unknown> {
+      if (!reentered) {
+        reentered = true;
+        Set.prototype.add = originalSetAdd;
+        for (let index = 1; index <= 64; index += 1) {
+          try {
+            accepted.push(adapter.run(() => order.push(index)));
+          } catch (error) {
+            overflows.push(error);
+          }
+        }
+      }
+      return Reflect.apply(originalSetAdd, this, [value]) as Set<unknown>;
+    } as typeof Set.prototype.add;
+
+    let outer: ReturnType<typeof adapter.run> | undefined;
+    try {
+      outer = adapter.run(() => order.push(0));
+    } finally {
+      Set.prototype.add = originalSetAdd;
+    }
+    if (!outer) throw new Error('Expected a published GPT operation');
+
+    expect(accepted).toHaveLength(63);
+    expect(overflows).toHaveLength(1);
+    expect(overflows[0]).toMatchObject({ code: 'external_queue_full' });
+
+    target.googletag = createReadyGoogletag().googletag;
+    adapter.notifyReady();
+    await expect(
+      Promise.all([outer.result, ...accepted.map(({ result }) => result)])
+    ).resolves.toHaveLength(64);
+    expect(order).toEqual([...Array.from({ length: 63 }, (_, index) => index + 1), 0]);
+
+    target.googletag = undefined;
+    const recovered = Array.from({ length: 64 }, () => adapter.run(vi.fn()));
+    expect(() => adapter.run(vi.fn())).toThrowError(
+      expect.objectContaining({ code: 'external_queue_full' })
+    );
+    target.googletag = createReadyGoogletag().googletag;
+    adapter.notifyReady();
+    await expect(Promise.all(recovered.map(({ result }) => result))).resolves.toHaveLength(64);
+  });
+
+  it('rolls back pending GPT publication when poisoned Set.add throws', async () => {
+    vi.useFakeTimers();
+    const target: { googletag?: unknown } = {};
+    const adapter = createBrowserGoogletagAdapter(target);
+    const publicationError = new Error('GPT publication failed');
+    const command = vi.fn();
+    const signalGetter = vi.fn(() => undefined);
+    const options = Object.defineProperty({}, 'signal', {
+      get: signalGetter,
+    }) as { readonly signal?: AbortSignal };
+    const originalSetAdd = Set.prototype.add;
+    const originalSetDelete = Set.prototype.delete;
+    const poisonedDelete = function (): boolean {
+      throw new Error('GPT publication rollback delete failed');
+    } as typeof Set.prototype.delete;
+    let poisonNextAdd = true;
+    Set.prototype.add = function (this: Set<unknown>, value: unknown): Set<unknown> {
+      if (poisonNextAdd) {
+        poisonNextAdd = false;
+        Set.prototype.add = originalSetAdd;
+        Reflect.apply(originalSetAdd, this, [value]);
+        throw publicationError;
+      }
+      return Reflect.apply(originalSetAdd, this, [value]) as Set<unknown>;
+    } as typeof Set.prototype.add;
+    Set.prototype.delete = poisonedDelete;
+
+    let thrown: unknown;
+    try {
+      adapter.run(command, options);
+    } catch (error) {
+      thrown = error;
+    } finally {
+      Set.prototype.add = originalSetAdd;
+      Set.prototype.delete = originalSetDelete;
+    }
+
+    expect(thrown).toBe(publicationError);
+    expect(command).not.toHaveBeenCalled();
+    expect(signalGetter).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+
+    const recovered = Array.from({ length: 64 }, () => adapter.run(vi.fn()));
+    expect(() => adapter.run(vi.fn())).toThrowError(
+      expect.objectContaining({ code: 'external_queue_full' })
+    );
+    target.googletag = createReadyGoogletag().googletag;
+    adapter.notifyReady();
+    await expect(Promise.all(recovered.map(({ result }) => result))).resolves.toHaveLength(64);
+    expect(vi.getTimerCount()).toBe(0);
+    Set.prototype.delete = poisonedDelete;
+    try {
+      expect(() => adapter.dispose()).not.toThrow();
+    } finally {
+      Set.prototype.delete = originalSetDelete;
+    }
+    await Promise.resolve();
+  });
+
   it.each(['signal-getter', 'aborted-getter', 'add-throw', 'abort-remove-throw'] as const)(
     'contains hostile GPT AbortSignal ownership for %s',
     async (failure) => {
@@ -338,6 +595,80 @@ describe('browser googletag adapter readiness', () => {
       );
       adapter.dispose();
       await Promise.all(fillers.map(({ result }) => result.catch((error: unknown) => error)));
+    }
+  );
+
+  it.each([
+    'add-getter',
+    'before-install',
+    'after-install',
+    'reentrant-callback',
+    'post-check-throw',
+  ] as const)(
+    'settles GPT abort transitions during listener registration for %s',
+    async (transition) => {
+      vi.useFakeTimers();
+      const target: { googletag?: unknown } = {};
+      const adapter = createBrowserGoogletagAdapter(target);
+      const signalError = new Error(`abort transition failure: ${transition}`);
+      const listeners = new Set<() => void>();
+      let aborted = false;
+      let abortedReads = 0;
+      const addEventListener = vi.fn((_type: string, listener: () => void) => {
+        if (transition === 'before-install') aborted = true;
+        listeners.add(listener);
+        if (transition === 'after-install') aborted = true;
+        if (transition === 'reentrant-callback') {
+          aborted = true;
+          listener();
+        }
+      });
+      const removeEventListener = vi.fn((_type: string, listener: () => void) => {
+        listeners.delete(listener);
+      });
+      const signal = Object.defineProperties(
+        {},
+        {
+          aborted: {
+            get: () => {
+              abortedReads += 1;
+              if (transition === 'post-check-throw' && abortedReads === 2) throw signalError;
+              return aborted;
+            },
+          },
+          addEventListener: {
+            get: () => {
+              if (transition === 'add-getter') aborted = true;
+              return addEventListener;
+            },
+          },
+          removeEventListener: { value: removeEventListener },
+        }
+      ) as AbortSignal;
+      const command = vi.fn();
+      const operation = adapter.run(command, { signal });
+      const result = operation.result.catch((error: unknown) => error);
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      if (transition === 'post-check-throw') await expect(result).resolves.toBe(signalError);
+      else await expect(result).resolves.toMatchObject({ code: 'caller_aborted' });
+      expect(addEventListener).toHaveBeenCalledTimes(1);
+      expect(removeEventListener).toHaveBeenCalledTimes(1);
+      expect(listeners).toHaveLength(0);
+
+      target.googletag = createReadyGoogletag().googletag;
+      adapter.notifyReady();
+      expect(command).not.toHaveBeenCalled();
+
+      target.googletag = undefined;
+      const fillers = Array.from({ length: 64 }, () => adapter.run(vi.fn()));
+      expect(() => adapter.run(vi.fn())).toThrowError(
+        expect.objectContaining({ code: 'external_queue_full' })
+      );
+      adapter.dispose();
+      await Promise.all(
+        fillers.map(({ result: filler }) => filler.catch((error: unknown) => error))
+      );
     }
   );
 
@@ -767,6 +1098,581 @@ describe('browser googletag adapter readiness', () => {
       expect(ready.listeners.get('existing')?.size).toBe(0);
       expect(ready.listeners.get('failed')?.size).toBe(0);
       expect(ready.pubads.removeEventListener).toHaveBeenCalledTimes(2);
+    }
+  );
+
+  it('settles a live GPT operation and restores exact effects when Set.delete is poisoned', async () => {
+    const ready = createReadyGoogletag();
+    const nativeSetConfig = ready.googletag.setConfig;
+    const nativeDisable = ready.pubads.disableInitialLoad;
+    const originalSetDelete = Set.prototype.delete;
+    ready.pubads.removeEventListener.mockImplementation((type, listener) => {
+      const registered = ready.listeners.get(type);
+      if (registered) Reflect.apply(originalSetDelete, registered, [listener]);
+    });
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+    const listener = vi.fn();
+    const operation = adapter.run((gpt) => {
+      gpt.subscribe('slotRequested', listener);
+      return new Promise<never>(() => undefined);
+    });
+    expect(ready.googletag.setConfig).not.toBe(nativeSetConfig);
+    expect(ready.pubads.disableInitialLoad).not.toBe(nativeDisable);
+    expect(ready.listeners.get('slotRequested')).toHaveLength(1);
+
+    Set.prototype.delete = function (): boolean {
+      throw new Error('GPT live cleanup delete failed');
+    } as typeof Set.prototype.delete;
+    try {
+      expect(() => adapter.dispose()).not.toThrow();
+    } finally {
+      Set.prototype.delete = originalSetDelete;
+    }
+
+    await expect(operation.result).rejects.toMatchObject({ code: 'operation_disposed' });
+    expect(ready.listeners.get('slotRequested')).toHaveLength(0);
+    expect(ready.googletag.setConfig).toBe(nativeSetConfig);
+    expect(ready.pubads.disableInitialLoad).toBe(nativeDisable);
+    expect(() => adapter.dispose()).not.toThrow();
+  });
+
+  it.each(['keys', 'clear'] as const)(
+    'restores every GPT effect when Map.%s is poisoned during disposal',
+    async (method) => {
+      const ready = createReadyGoogletag();
+      const nativeSetConfig = ready.googletag.setConfig;
+      const nativeDisable = ready.pubads.disableInitialLoad;
+      const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+      const listener = vi.fn();
+      await adapter.run((gpt) => gpt.subscribe('slotRequested', listener)).result;
+      expect(ready.googletag.setConfig).not.toBe(nativeSetConfig);
+      expect(ready.pubads.disableInitialLoad).not.toBe(nativeDisable);
+      expect(ready.listeners.get('slotRequested')).toHaveLength(1);
+
+      const originalMapKeys = Map.prototype.keys;
+      const originalMapClear = Map.prototype.clear;
+      if (method === 'keys') {
+        Map.prototype.keys = function (): never {
+          throw new Error('GPT initial-load keys failed');
+        } as typeof Map.prototype.keys;
+      } else {
+        Map.prototype.clear = function (): never {
+          throw new Error('GPT initial-load clear failed');
+        } as typeof Map.prototype.clear;
+      }
+      try {
+        expect(() => adapter.dispose()).not.toThrow();
+        expect(() => adapter.dispose()).not.toThrow();
+      } finally {
+        Map.prototype.keys = originalMapKeys;
+        Map.prototype.clear = originalMapClear;
+      }
+
+      expect(ready.googletag.setConfig).toBe(nativeSetConfig);
+      expect(ready.pubads.disableInitialLoad).toBe(nativeDisable);
+      expect(ready.listeners.get('slotRequested')).toHaveLength(0);
+      expect(ready.pubads.removeEventListener).toHaveBeenCalledTimes(1);
+
+      const ownershipProbe = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+      await ownershipProbe.run((gpt) => gpt.serviceState()).result;
+      expect(ready.googletag.setConfig).not.toBe(nativeSetConfig);
+      expect(ready.pubads.disableInitialLoad).not.toBe(nativeDisable);
+      ownershipProbe.dispose();
+      expect(ready.googletag.setConfig).toBe(nativeSetConfig);
+      expect(ready.pubads.disableInitialLoad).toBe(nativeDisable);
+    }
+  );
+
+  it('settles GPT tracker publication failure and rolls back only its new owner', async () => {
+    const first = createReadyGoogletag();
+    const second = createReadyGoogletag();
+    const firstNativeSetConfig = first.googletag.setConfig;
+    const firstNativeDisable = first.pubads.disableInitialLoad;
+    const secondNativeSetConfig = second.googletag.setConfig;
+    const secondNativeDisable = second.pubads.disableInitialLoad;
+    const target: { googletag?: unknown } = { googletag: first.googletag };
+    const adapter = createBrowserGoogletagAdapter(target);
+    const priorListener = vi.fn();
+    await adapter.run((gpt) => gpt.subscribe('prior', priorListener)).result;
+    expect(first.listeners.get('prior')).toHaveLength(1);
+
+    target.googletag = second.googletag;
+    const registryError = new Error('GPT tracker effect publication failed');
+    const command = vi.fn();
+    const originalSetAdd = Set.prototype.add;
+    let additions = 0;
+    Set.prototype.add = function (this: Set<unknown>, value: unknown): Set<unknown> {
+      additions += 1;
+      const added = Reflect.apply(originalSetAdd, this, [value]) as Set<unknown>;
+      if (additions === 3) throw registryError;
+      return added;
+    } as typeof Set.prototype.add;
+
+    let operation: ReturnType<typeof adapter.run> | undefined;
+    let thrown: unknown;
+    try {
+      operation = adapter.run(command);
+    } catch (error) {
+      thrown = error;
+    } finally {
+      Set.prototype.add = originalSetAdd;
+    }
+
+    expect(additions).toBe(3);
+    expect(thrown).toBeUndefined();
+    if (!operation) throw new Error('Expected a published GPT operation');
+    await expect(operation.result).rejects.toBe(registryError);
+    expect(command).not.toHaveBeenCalled();
+    expect(first.listeners.get('prior')).toHaveLength(1);
+    expect(first.googletag.setConfig).toBe(firstNativeSetConfig);
+    expect(first.pubads.disableInitialLoad).toBe(firstNativeDisable);
+    expect(second.googletag.setConfig).toBe(secondNativeSetConfig);
+    expect(second.pubads.disableInitialLoad).toBe(secondNativeDisable);
+
+    const ownerProbe = createBrowserGoogletagAdapter({ googletag: second.googletag });
+    await ownerProbe.run((gpt) => gpt.serviceState()).result;
+    expect(second.googletag.setConfig).not.toBe(secondNativeSetConfig);
+    expect(second.pubads.disableInitialLoad).not.toBe(secondNativeDisable);
+    ownerProbe.dispose();
+    expect(second.googletag.setConfig).toBe(secondNativeSetConfig);
+    expect(second.pubads.disableInitialLoad).toBe(secondNativeDisable);
+
+    target.googletag = undefined;
+    const recovered = Array.from({ length: 64 }, () => adapter.run(() => 'recovered'));
+    expect(() => adapter.run(vi.fn())).toThrowError(
+      expect.objectContaining({ code: 'external_queue_full' })
+    );
+    target.googletag = second.googletag;
+    adapter.notifyReady();
+    await expect(Promise.all(recovered.map(({ result }) => result))).resolves.toEqual(
+      Array.from({ length: 64 }, () => 'recovered')
+    );
+    expect(first.listeners.get('prior')).toHaveLength(1);
+
+    adapter.dispose();
+    expect(first.listeners.get('prior')).toHaveLength(0);
+    expect(first.pubads.removeEventListener).toHaveBeenCalledTimes(1);
+    expect(second.googletag.setConfig).toBe(secondNativeSetConfig);
+    expect(second.pubads.disableInitialLoad).toBe(secondNativeDisable);
+  });
+
+  it.each(['owner', 'release', 'service'] as const)(
+    'settles and rolls back GPT tracking when the %s registry has lookup throws',
+    async (registry) => {
+      const ready = createReadyGoogletag();
+      const nativeSetConfig = ready.googletag.setConfig;
+      const nativeDisable = ready.pubads.disableInitialLoad;
+      const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+      const command = vi.fn(() => 'settled');
+      const originalSetHas = Set.prototype.has;
+      const originalMapHas = Map.prototype.has;
+      const originalWeakMapHas = WeakMap.prototype.has;
+      if (registry === 'owner') {
+        Set.prototype.has = function (): boolean {
+          throw new Error('GPT owner lookup failed');
+        } as typeof Set.prototype.has;
+      } else if (registry === 'release') {
+        Map.prototype.has = function (): boolean {
+          throw new Error('GPT release lookup failed');
+        } as typeof Map.prototype.has;
+      } else {
+        WeakMap.prototype.has = function (): boolean {
+          throw new Error('GPT service lookup failed');
+        } as typeof WeakMap.prototype.has;
+      }
+
+      let operation: ReturnType<typeof adapter.run> | undefined;
+      let thrown: unknown;
+      try {
+        operation = adapter.run(command);
+      } catch (error) {
+        thrown = error;
+      } finally {
+        Set.prototype.has = originalSetHas;
+        Map.prototype.has = originalMapHas;
+        WeakMap.prototype.has = originalWeakMapHas;
+      }
+
+      expect(thrown).toBeUndefined();
+      if (!operation) throw new Error('Expected a published GPT operation');
+      await expect(operation.result).resolves.toBe('settled');
+      expect(command).toHaveBeenCalledTimes(1);
+      expect(ready.googletag.setConfig).toBe(nativeSetConfig);
+      expect(ready.pubads.disableInitialLoad).toBe(nativeDisable);
+
+      const ownerProbe = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+      await ownerProbe.run((gpt) => gpt.serviceState()).result;
+      ownerProbe.dispose();
+      expect(ready.googletag.setConfig).toBe(nativeSetConfig);
+      expect(ready.pubads.disableInitialLoad).toBe(nativeDisable);
+      adapter.dispose();
+    }
+  );
+
+  it.each(['before', 'after'] as const)(
+    'rolls back shared GPT tracker publication when WeakMap.set throws %s insertion',
+    async (failure) => {
+      vi.useFakeTimers();
+      const ready = createReadyGoogletag();
+      const nativeSetConfig = ready.googletag.setConfig;
+      const nativeDisable = ready.pubads.disableInitialLoad;
+      const target: { googletag?: unknown } = { googletag: ready.googletag };
+      const adapter = createBrowserGoogletagAdapter(target);
+      const publicationError = new Error(`shared tracker failed ${failure} insertion`);
+      const command = vi.fn();
+      const originalWeakMapSet = WeakMap.prototype.set;
+      const originalWeakMapDelete = WeakMap.prototype.delete;
+      let publications = 0;
+      WeakMap.prototype.set = function (
+        this: WeakMap<object, unknown>,
+        key: object,
+        value: unknown
+      ): WeakMap<object, unknown> {
+        publications += 1;
+        if (publications === 1) {
+          if (failure === 'after') Reflect.apply(originalWeakMapSet, this, [key, value]);
+          throw publicationError;
+        }
+        return Reflect.apply(originalWeakMapSet, this, [key, value]) as WeakMap<object, unknown>;
+      } as typeof WeakMap.prototype.set;
+      WeakMap.prototype.delete = function (): boolean {
+        throw new Error('shared tracker rollback delete failed');
+      } as typeof WeakMap.prototype.delete;
+
+      let operation: ReturnType<typeof adapter.run> | undefined;
+      let thrown: unknown;
+      try {
+        operation = adapter.run(command);
+      } catch (error) {
+        thrown = error;
+      } finally {
+        WeakMap.prototype.set = originalWeakMapSet;
+        WeakMap.prototype.delete = originalWeakMapDelete;
+      }
+
+      expect(thrown).toBeUndefined();
+      expect(publications).toBe(1);
+      if (!operation) throw new Error('Expected a published GPT operation');
+      await expect(operation.result).rejects.toBe(publicationError);
+      expect(command).not.toHaveBeenCalled();
+      expect(ready.googletag.setConfig).toBe(nativeSetConfig);
+      expect(ready.pubads.disableInitialLoad).toBe(nativeDisable);
+
+      const ownerProbe = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+      let recoveredPublications = 0;
+      WeakMap.prototype.set = function (
+        this: WeakMap<object, unknown>,
+        key: object,
+        value: unknown
+      ): WeakMap<object, unknown> {
+        recoveredPublications += 1;
+        return Reflect.apply(originalWeakMapSet, this, [key, value]) as WeakMap<object, unknown>;
+      } as typeof WeakMap.prototype.set;
+      try {
+        await ownerProbe.run((gpt) => gpt.serviceState()).result;
+      } finally {
+        WeakMap.prototype.set = originalWeakMapSet;
+      }
+      expect(recoveredPublications).toBe(2);
+      ownerProbe.dispose();
+      expect(ready.googletag.setConfig).toBe(nativeSetConfig);
+      expect(ready.pubads.disableInitialLoad).toBe(nativeDisable);
+
+      target.googletag = undefined;
+      const recovered = Array.from({ length: 64 }, () => adapter.run(vi.fn()));
+      const recoveredResults = recovered.map(({ result }) => result.catch((error) => error));
+      expect(() => adapter.run(vi.fn())).toThrowError(
+        expect.objectContaining({ code: 'external_queue_full' })
+      );
+      for (const recoveredOperation of recovered) recoveredOperation.dispose();
+      await Promise.all(recoveredResults);
+      expect(vi.getTimerCount()).toBe(0);
+      adapter.dispose();
+    }
+  );
+
+  it.each(['before', 'after'] as const)(
+    'removes only the new GPT owner when its release Map.set throws %s insertion',
+    async (failure) => {
+      vi.useFakeTimers();
+      const ready = createReadyGoogletag();
+      const nativeSetConfig = ready.googletag.setConfig;
+      const nativeDisable = ready.pubads.disableInitialLoad;
+      const first = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+      await first.run((gpt) => gpt.serviceState()).result;
+      const sharedSetConfig = ready.googletag.setConfig;
+      const sharedDisable = ready.pubads.disableInitialLoad;
+      const secondTarget: { googletag?: unknown } = { googletag: ready.googletag };
+      const second = createBrowserGoogletagAdapter(secondTarget);
+      const publicationError = new Error(`release map failed ${failure} insertion`);
+      const command = vi.fn();
+      const originalMapSet = Map.prototype.set;
+      const originalMapDelete = Map.prototype.delete;
+      let publications = 0;
+      Map.prototype.set = function (
+        this: Map<unknown, unknown>,
+        key: unknown,
+        value: unknown
+      ): Map<unknown, unknown> {
+        publications += 1;
+        if (publications === 1) {
+          if (failure === 'after') Reflect.apply(originalMapSet, this, [key, value]);
+          throw publicationError;
+        }
+        return Reflect.apply(originalMapSet, this, [key, value]) as Map<unknown, unknown>;
+      } as typeof Map.prototype.set;
+      Map.prototype.delete = function (): boolean {
+        throw new Error('release map rollback delete failed');
+      } as typeof Map.prototype.delete;
+
+      let operation: ReturnType<typeof second.run> | undefined;
+      let thrown: unknown;
+      try {
+        operation = second.run(command);
+      } catch (error) {
+        thrown = error;
+      } finally {
+        Map.prototype.set = originalMapSet;
+        Map.prototype.delete = originalMapDelete;
+      }
+
+      expect(thrown).toBeUndefined();
+      expect(publications).toBe(1);
+      if (!operation) throw new Error('Expected a published GPT operation');
+      await expect(operation.result).rejects.toBe(publicationError);
+      expect(command).not.toHaveBeenCalled();
+      expect(ready.googletag.setConfig).toBe(sharedSetConfig);
+      expect(ready.pubads.disableInitialLoad).toBe(sharedDisable);
+
+      first.dispose();
+      expect(ready.googletag.setConfig).toBe(nativeSetConfig);
+      expect(ready.pubads.disableInitialLoad).toBe(nativeDisable);
+
+      secondTarget.googletag = undefined;
+      const recovered = Array.from({ length: 64 }, () => second.run(vi.fn()));
+      const recoveredResults = recovered.map(({ result }) => result.catch((error) => error));
+      expect(() => second.run(vi.fn())).toThrowError(
+        expect.objectContaining({ code: 'external_queue_full' })
+      );
+      for (const recoveredOperation of recovered) recoveredOperation.dispose();
+      await Promise.all(recoveredResults);
+      expect(vi.getTimerCount()).toBe(0);
+      second.dispose();
+      expect(ready.googletag.setConfig).toBe(nativeSetConfig);
+      expect(ready.pubads.disableInitialLoad).toBe(nativeDisable);
+    }
+  );
+
+  it.each(['before', 'after'] as const)(
+    'identity-restores GPT service publication when WeakMap.set throws %s insertion',
+    async (failure) => {
+      const ready = createReadyGoogletag();
+      const nativeSetConfig = ready.googletag.setConfig;
+      const nativeDisable = ready.pubads.disableInitialLoad;
+      const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+      const publicationError = new Error(`service map failed ${failure} insertion`);
+      const command = vi.fn();
+      const originalWeakMapSet = WeakMap.prototype.set;
+      const originalWeakMapDelete = WeakMap.prototype.delete;
+      let publications = 0;
+      WeakMap.prototype.set = function (
+        this: WeakMap<object, unknown>,
+        key: object,
+        value: unknown
+      ): WeakMap<object, unknown> {
+        publications += 1;
+        if (publications === 2) {
+          if (failure === 'after') Reflect.apply(originalWeakMapSet, this, [key, value]);
+          throw publicationError;
+        }
+        return Reflect.apply(originalWeakMapSet, this, [key, value]) as WeakMap<object, unknown>;
+      } as typeof WeakMap.prototype.set;
+      WeakMap.prototype.delete = function (): boolean {
+        throw new Error('service map rollback delete failed');
+      } as typeof WeakMap.prototype.delete;
+
+      let operation: ReturnType<typeof adapter.run> | undefined;
+      let thrown: unknown;
+      try {
+        operation = adapter.run(command);
+      } catch (error) {
+        thrown = error;
+      } finally {
+        WeakMap.prototype.set = originalWeakMapSet;
+        WeakMap.prototype.delete = originalWeakMapDelete;
+      }
+
+      expect(thrown).toBeUndefined();
+      expect(publications).toBe(2);
+      if (!operation) throw new Error('Expected a published GPT operation');
+      await expect(operation.result).rejects.toBe(publicationError);
+      expect(command).not.toHaveBeenCalled();
+      expect(ready.googletag.setConfig).toBe(nativeSetConfig);
+      expect(ready.pubads.disableInitialLoad).toBe(nativeDisable);
+
+      const ownerProbe = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+      await ownerProbe.run((gpt) => gpt.serviceState()).result;
+      ownerProbe.dispose();
+      expect(ready.googletag.setConfig).toBe(nativeSetConfig);
+      expect(ready.pubads.disableInitialLoad).toBe(nativeDisable);
+      adapter.dispose();
+    }
+  );
+
+  it.each(['before', 'after'] as const)(
+    'rolls back GPT tracker owner publication when Set.add throws %s insertion',
+    async (failure) => {
+      const ready = createReadyGoogletag();
+      const nativeSetConfig = ready.googletag.setConfig;
+      const nativeDisable = ready.pubads.disableInitialLoad;
+      const first = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+      await first.run((gpt) => gpt.serviceState()).result;
+      const sharedSetConfig = ready.googletag.setConfig;
+      const sharedDisable = ready.pubads.disableInitialLoad;
+      const second = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+      const registryError = new Error(`owner add failed ${failure} insertion`);
+      const command = vi.fn();
+      const originalSetAdd = Set.prototype.add;
+      const originalSetDelete = Set.prototype.delete;
+      let additions = 0;
+      Set.prototype.add = function (this: Set<unknown>, value: unknown): Set<unknown> {
+        additions += 1;
+        if (additions === 2) {
+          if (failure === 'after') Reflect.apply(originalSetAdd, this, [value]);
+          throw registryError;
+        }
+        return Reflect.apply(originalSetAdd, this, [value]) as Set<unknown>;
+      } as typeof Set.prototype.add;
+      Set.prototype.delete = function (): boolean {
+        throw new Error('owner rollback delete failed');
+      } as typeof Set.prototype.delete;
+      let operation: ReturnType<typeof second.run> | undefined;
+      let thrown: unknown;
+      try {
+        operation = second.run(command);
+      } catch (error) {
+        thrown = error;
+      } finally {
+        Set.prototype.add = originalSetAdd;
+        Set.prototype.delete = originalSetDelete;
+      }
+
+      expect(additions).toBe(2);
+      expect(thrown).toBeUndefined();
+      if (!operation) throw new Error('Expected a published GPT operation');
+      await expect(operation.result).rejects.toBe(registryError);
+      expect(command).not.toHaveBeenCalled();
+      expect(ready.googletag.setConfig).toBe(sharedSetConfig);
+      expect(ready.pubads.disableInitialLoad).toBe(sharedDisable);
+
+      second.dispose();
+      expect(ready.googletag.setConfig).toBe(sharedSetConfig);
+      expect(ready.pubads.disableInitialLoad).toBe(sharedDisable);
+      first.dispose();
+      expect(ready.googletag.setConfig).toBe(nativeSetConfig);
+      expect(ready.pubads.disableInitialLoad).toBe(nativeDisable);
+    }
+  );
+
+  it.each(['before', 'after'] as const)(
+    'identity-restores GPT root wrapper when restorer Set.add throws %s insertion',
+    async (failure) => {
+      const ready = createReadyGoogletag();
+      const nativeSetConfig = ready.googletag.setConfig;
+      const nativeDisable = ready.pubads.disableInitialLoad;
+      const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+      const registryError = new Error(`root restorer add failed ${failure} insertion`);
+      const command = vi.fn();
+      const originalSetAdd = Set.prototype.add;
+      const originalSetDelete = Set.prototype.delete;
+      let additions = 0;
+      Set.prototype.add = function (this: Set<unknown>, value: unknown): Set<unknown> {
+        additions += 1;
+        if (additions === 4) {
+          if (failure === 'after') Reflect.apply(originalSetAdd, this, [value]);
+          throw registryError;
+        }
+        return Reflect.apply(originalSetAdd, this, [value]) as Set<unknown>;
+      } as typeof Set.prototype.add;
+      Set.prototype.delete = function (): boolean {
+        throw new Error('root restorer cleanup delete failed');
+      } as typeof Set.prototype.delete;
+      let operation: ReturnType<typeof adapter.run> | undefined;
+      let thrown: unknown;
+      try {
+        operation = adapter.run(command);
+      } catch (error) {
+        thrown = error;
+      } finally {
+        Set.prototype.add = originalSetAdd;
+        Set.prototype.delete = originalSetDelete;
+      }
+
+      expect(additions).toBe(4);
+      expect(thrown).toBeUndefined();
+      if (!operation) throw new Error('Expected a published GPT operation');
+      await expect(operation.result).rejects.toBe(registryError);
+      expect(command).not.toHaveBeenCalled();
+      expect(ready.googletag.setConfig).toBe(nativeSetConfig);
+      expect(ready.pubads.disableInitialLoad).toBe(nativeDisable);
+
+      const ownerProbe = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+      await ownerProbe.run((gpt) => gpt.serviceState()).result;
+      ownerProbe.dispose();
+      expect(ready.googletag.setConfig).toBe(nativeSetConfig);
+      expect(ready.pubads.disableInitialLoad).toBe(nativeDisable);
+      adapter.dispose();
+    }
+  );
+
+  it.each(['before', 'after'] as const)(
+    'identity-restores GPT service wrapper when restorer Set.add throws %s insertion',
+    async (failure) => {
+      const ready = createReadyGoogletag();
+      const nativeSetConfig = ready.googletag.setConfig;
+      const nativeDisable = ready.pubads.disableInitialLoad;
+      const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+      const registryError = new Error(`service restorer add failed ${failure} insertion`);
+      const command = vi.fn();
+      const originalSetAdd = Set.prototype.add;
+      const originalSetDelete = Set.prototype.delete;
+      let additions = 0;
+      Set.prototype.add = function (this: Set<unknown>, value: unknown): Set<unknown> {
+        additions += 1;
+        if (additions === 5) {
+          if (failure === 'after') Reflect.apply(originalSetAdd, this, [value]);
+          throw registryError;
+        }
+        return Reflect.apply(originalSetAdd, this, [value]) as Set<unknown>;
+      } as typeof Set.prototype.add;
+      Set.prototype.delete = function (): boolean {
+        throw new Error('service restorer cleanup delete failed');
+      } as typeof Set.prototype.delete;
+      let operation: ReturnType<typeof adapter.run> | undefined;
+      let thrown: unknown;
+      try {
+        operation = adapter.run(command);
+      } catch (error) {
+        thrown = error;
+      } finally {
+        Set.prototype.add = originalSetAdd;
+        Set.prototype.delete = originalSetDelete;
+      }
+
+      expect(additions).toBe(5);
+      expect(thrown).toBeUndefined();
+      if (!operation) throw new Error('Expected a published GPT operation');
+      await expect(operation.result).rejects.toBe(registryError);
+      expect(command).not.toHaveBeenCalled();
+      expect(ready.googletag.setConfig).toBe(nativeSetConfig);
+      expect(ready.pubads.disableInitialLoad).toBe(nativeDisable);
+
+      const ownerProbe = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+      await ownerProbe.run((gpt) => gpt.serviceState()).result;
+      ownerProbe.dispose();
+      expect(ready.googletag.setConfig).toBe(nativeSetConfig);
+      expect(ready.pubads.disableInitialLoad).toBe(nativeDisable);
+      adapter.dispose();
     }
   );
 

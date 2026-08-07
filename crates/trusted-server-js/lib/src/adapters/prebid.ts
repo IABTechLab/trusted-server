@@ -3,6 +3,16 @@ const EXTERNAL_READY_TIMEOUT_MS = 10_000;
 const MAX_PENDING_OPERATIONS = 64;
 const MAX_NAME_BYTES = 128;
 const MAX_EID_SOURCE_BYTES = 256;
+const setDeleteIntrinsic = Set.prototype.delete;
+const weakSetDeleteIntrinsic = WeakSet.prototype.delete;
+
+function deleteSetValue<T>(set: Set<T>, value: T): boolean {
+  return Reflect.apply(setDeleteIntrinsic, set, [value]) as boolean;
+}
+
+function deleteWeakSetValue<T extends object>(set: WeakSet<T>, value: T): boolean {
+  return Reflect.apply(weakSetDeleteIntrinsic, set, [value]) as boolean;
+}
 
 /** The live state of the publisher-owned `window.pbjs` binding. */
 export type PrebidBindingStatus = 'present' | 'pending' | 'incompatible';
@@ -120,6 +130,7 @@ interface AbortRegistration {
 interface PendingOperation<T> {
   state: PrebidOperationStatus;
   settled: boolean;
+  pendingReservation: boolean;
   timeout: ReturnType<typeof setTimeout> | undefined;
   readonly command: (prebid: Readonly<PrebidFacade>) => T;
   readonly resolve: (value: T | PromiseLike<T>) => void;
@@ -452,24 +463,57 @@ export function createBrowserPrebidAdapter(
   const pending: PendingOperation<unknown>[] = [];
   const live = new Set<PendingOperation<unknown>>();
   const effects = new Set<() => void>();
-  const armedBindings = new WeakSet<object>();
-  const diagnosedBindings = new WeakSet<object>();
+  let armedBindings = new WeakSet<object>();
+  let diagnosedBindings = new WeakSet<object>();
   let diagnosedUnbound = false;
+  let pendingReservations = 0;
   let disposed = false;
+
+  const rollbackDiagnosticOwnership = (binding: object): void => {
+    let released = false;
+    try {
+      deleteWeakSetValue(diagnosedBindings, binding);
+      released = !diagnosedBindings.has(binding);
+    } catch {
+      // A poisoned registry cannot prove that the exact marker was removed.
+    }
+    if (!released) diagnosedBindings = new WeakSet<object>();
+  };
 
   const currentBinding = (): ReturnType<typeof inspectBinding> => {
     const inspected = inspectBinding(readTarget(target), requirements);
     if (inspected.status === 'incompatible') {
-      const shouldDiagnose = inspected.binding
-        ? !diagnosedBindings.has(inspected.binding)
-        : !diagnosedUnbound;
-      if (shouldDiagnose) {
-        if (inspected.binding) diagnosedBindings.add(inspected.binding);
-        else diagnosedUnbound = true;
+      let shouldDiagnose = !diagnosedUnbound;
+      if (inspected.binding) {
         try {
-          console.warn('[tsjs-prebid] external Prebid artifact is incompatible');
+          shouldDiagnose = !diagnosedBindings.has(inspected.binding);
         } catch {
-          // Diagnostics cannot change readiness behavior.
+          shouldDiagnose = false;
+        }
+      }
+      if (shouldDiagnose) {
+        let diagnosticOwned = false;
+        if (inspected.binding) {
+          try {
+            diagnosedBindings.add(inspected.binding);
+          } catch {
+            // A stateful add may still have published diagnostic ownership.
+          }
+          try {
+            diagnosticOwned = diagnosedBindings.has(inspected.binding);
+          } catch {
+            rollbackDiagnosticOwnership(inspected.binding);
+          }
+        } else {
+          diagnosedUnbound = true;
+          diagnosticOwned = diagnosedUnbound;
+        }
+        if (diagnosticOwned) {
+          try {
+            console.warn('[tsjs-prebid] external Prebid artifact is incompatible');
+          } catch {
+            // Diagnostics cannot change readiness behavior.
+          }
         }
       }
     }
@@ -584,12 +628,22 @@ export function createBrowserPrebidAdapter(
     if (index >= 0) pending.splice(index, 1);
   };
 
+  const releasePendingReservation = (operation: PendingOperation<unknown>): void => {
+    if (!operation.pendingReservation) return;
+    operation.pendingReservation = false;
+    if (pendingReservations > 0) pendingReservations -= 1;
+  };
+
   const clearReadiness = (operation: PendingOperation<unknown>): void => {
-    if (operation.timeout !== undefined) {
-      clearTimeout(operation.timeout);
-      operation.timeout = undefined;
+    try {
+      if (operation.timeout !== undefined) {
+        clearTimeout(operation.timeout);
+        operation.timeout = undefined;
+      }
+      removePending(operation);
+    } finally {
+      releasePendingReservation(operation);
     }
-    removePending(operation);
   };
 
   const detachAbort = (operation: PendingOperation<unknown>): void => {
@@ -608,6 +662,17 @@ export function createBrowserPrebidAdapter(
     }
   };
 
+  const rollbackNotificationArming = (binding: object): void => {
+    let released = false;
+    try {
+      deleteWeakSetValue(armedBindings, binding);
+      released = !armedBindings.has(binding);
+    } catch {
+      // A poisoned registry cannot prove that the exact marker was removed.
+    }
+    if (!released) armedBindings = new WeakSet<object>();
+  };
+
   const clearOperation = (operation: PendingOperation<unknown>): void => {
     try {
       clearReadiness(operation);
@@ -615,7 +680,7 @@ export function createBrowserPrebidAdapter(
       try {
         detachAbort(operation);
       } finally {
-        live.delete(operation);
+        deleteSetValue(live, operation);
       }
     }
   };
@@ -670,7 +735,7 @@ export function createBrowserPrebidAdapter(
       const release = (): void => {
         if (promoted) {
           try {
-            effects.delete(release);
+            deleteSetValue(effects, release);
           } catch {
             // A hostile registry cannot prevent exact external cleanup.
           }
@@ -856,20 +921,34 @@ export function createBrowserPrebidAdapter(
   const armNotification = (): void => {
     const current = currentBinding();
     if (disposed) return;
-    if (
-      current.status !== 'pending' ||
-      !current.binding ||
-      !current.commandQueue ||
-      armedBindings.has(current.binding)
-    ) {
+    if (current.status !== 'pending' || !current.binding || !current.commandQueue) {
       return;
     }
-    for (const operation of pending) operation.readinessBinding = current.binding;
-    armedBindings.add(current.binding);
+    let alreadyArmed = false;
     try {
-      queueCommand(current.commandQueue, () => notifyReady(current.binding));
+      alreadyArmed = armedBindings.has(current.binding);
     } catch {
-      // A later script-owned notification or operation may observe a replacement.
+      armedBindings = new WeakSet<object>();
+    }
+    if (alreadyArmed) return;
+    for (const operation of pending) operation.readinessBinding = current.binding;
+    try {
+      armedBindings.add(current.binding);
+    } catch {
+      rollbackNotificationArming(current.binding);
+      return;
+    }
+    let notificationActive = true;
+    const notify = (): void => {
+      if (!notificationActive) return;
+      notificationActive = false;
+      notifyReady(current.binding);
+    };
+    try {
+      queueCommand(current.commandQueue, notify);
+    } catch {
+      notificationActive = false;
+      rollbackNotificationArming(current.binding);
     }
   };
 
@@ -880,8 +959,11 @@ export function createBrowserPrebidAdapter(
     if (disposed) throw new PrebidAdapterError('operation_disposed');
     const current = currentBinding();
     if (disposed) throw new PrebidAdapterError('operation_disposed');
-    if (current.status === 'pending' && pending.length >= MAX_PENDING_OPERATIONS) {
-      throw new PrebidAdapterError('external_queue_full');
+    if (current.status === 'pending') {
+      if (pendingReservations >= MAX_PENDING_OPERATIONS) {
+        throw new PrebidAdapterError('external_queue_full');
+      }
+      pendingReservations += 1;
     }
 
     let resolve!: (value: T | PromiseLike<T>) => void;
@@ -893,6 +975,7 @@ export function createBrowserPrebidAdapter(
     const operation: PendingOperation<T> = {
       state: current.status,
       settled: false,
+      pendingReservation: current.status === 'pending',
       timeout: undefined,
       command,
       resolve,
@@ -901,7 +984,6 @@ export function createBrowserPrebidAdapter(
       readinessBinding: current.status === 'pending' ? current.binding : undefined,
       provisionalEffects: [],
     };
-    live.add(operation as PendingOperation<unknown>);
     const handle = Object.freeze({
       get status(): PrebidOperationStatus {
         return operation.state;
@@ -910,8 +992,19 @@ export function createBrowserPrebidAdapter(
       dispose: (): void => fail(operation as PendingOperation<unknown>, 'operation_disposed'),
     });
 
+    try {
+      live.add(operation as PendingOperation<unknown>);
+    } catch (error) {
+      try {
+        deleteSetValue(live, operation as PendingOperation<unknown>);
+      } catch {
+        // Publication rollback preserves the original registry failure.
+      }
+      releasePendingReservation(operation as PendingOperation<unknown>);
+      throw error;
+    }
     if (current.status === 'pending') {
-      pending.push(operation as PendingOperation<unknown>);
+      pending[pending.length] = operation as PendingOperation<unknown>;
       operation.timeout = setTimeout(
         () => fail(operation as PendingOperation<unknown>, 'external_ready_timeout'),
         EXTERNAL_READY_TIMEOUT_MS
@@ -999,6 +1092,22 @@ export function createBrowserPrebidAdapter(
         fail(operation as PendingOperation<unknown>, 'operation_disposed');
         return handle;
       }
+      let abortedAfterRegistration: unknown;
+      try {
+        abortedAfterRegistration = Reflect.get(signal, 'aborted');
+      } catch (error) {
+        if (!operation.settled) rejectOperation(operation as PendingOperation<unknown>, error);
+        return handle;
+      }
+      if (operation.settled) return handle;
+      if (disposed) {
+        fail(operation as PendingOperation<unknown>, 'operation_disposed');
+        return handle;
+      }
+      if (abortedAfterRegistration === true) {
+        fail(operation as PendingOperation<unknown>, 'caller_aborted');
+        return handle;
+      }
     }
 
     if (current.status === 'incompatible') {
@@ -1021,7 +1130,7 @@ export function createBrowserPrebidAdapter(
       for (const operation of [...live]) fail(operation, 'operation_disposed');
       for (const disposeEffect of [...effects]) {
         try {
-          effects.delete(disposeEffect);
+          deleteSetValue(effects, disposeEffect);
         } catch {
           // A hostile registry cannot interrupt cleanup of remaining effects.
         }

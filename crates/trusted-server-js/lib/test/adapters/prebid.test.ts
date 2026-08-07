@@ -116,6 +116,152 @@ describe('browser Prebid adapter readiness', () => {
     expect(order).toEqual([1, 2]);
   });
 
+  it.each(['before', 'after'] as const)(
+    'recovers Prebid notification arming when WeakSet.add throws %s insertion',
+    async (failure) => {
+      const readinessCommands: Command[] = [];
+      const target: { pbjs?: unknown } = { pbjs: { que: readinessCommands } };
+      const adapter = createBrowserPrebidAdapter(target);
+      const originalWeakSetAdd = WeakSet.prototype.add;
+      WeakSet.prototype.add = function (this: WeakSet<object>, value: object): WeakSet<object> {
+        if (failure === 'after') Reflect.apply(originalWeakSetAdd, this, [value]);
+        throw new Error(`Prebid arming failed ${failure} insertion`);
+      } as typeof WeakSet.prototype.add;
+
+      let operation: ReturnType<typeof adapter.run> | undefined;
+      let thrown: unknown;
+      try {
+        operation = adapter.run(() => 'ready');
+      } catch (error) {
+        thrown = error;
+      } finally {
+        WeakSet.prototype.add = originalWeakSetAdd;
+      }
+
+      expect(thrown).toBeUndefined();
+      if (!operation) throw new Error('Expected a published Prebid operation');
+      expect(readinessCommands).toHaveLength(0);
+      adapter.notifyReady();
+      expect(readinessCommands).toHaveLength(1);
+      target.pbjs = createReadyPrebid().pbjs;
+      readinessCommands[0]?.();
+      await expect(operation.result).resolves.toBe('ready');
+      adapter.dispose();
+    }
+  );
+
+  it('recovers Prebid notification arming when WeakSet.has throws after publication', async () => {
+    vi.useFakeTimers();
+    const readinessCommands: Command[] = [];
+    const target: { pbjs?: unknown } = { pbjs: { que: readinessCommands } };
+    const adapter = createBrowserPrebidAdapter(target);
+    const order: number[] = [];
+    const originalWeakSetHas = WeakSet.prototype.has;
+    WeakSet.prototype.has = function (): boolean {
+      throw new Error('Prebid armed lookup failed');
+    } as typeof WeakSet.prototype.has;
+
+    let first: ReturnType<typeof adapter.run> | undefined;
+    let thrown: unknown;
+    try {
+      first = adapter.run(() => order.push(1));
+    } catch (error) {
+      thrown = error;
+    } finally {
+      WeakSet.prototype.has = originalWeakSetHas;
+    }
+
+    expect(thrown).toBeUndefined();
+    if (!first) throw new Error('Expected a published Prebid operation');
+    expect(readinessCommands).toHaveLength(1);
+    const second = adapter.run(() => order.push(2));
+    expect(readinessCommands).toHaveLength(1);
+    target.pbjs = createReadyPrebid().pbjs;
+    readinessCommands[0]?.();
+    await expect(Promise.all([first.result, second.result])).resolves.toEqual([1, 2]);
+    expect(order).toEqual([1, 2]);
+    expect(vi.getTimerCount()).toBe(0);
+
+    target.pbjs = undefined;
+    const recovered = Array.from({ length: 64 }, () => adapter.run(vi.fn()));
+    const recoveredResults = recovered.map(({ result }) => result.catch((error) => error));
+    expect(() => adapter.run(vi.fn())).toThrowError(
+      expect.objectContaining({ code: 'external_queue_full' })
+    );
+    for (const operation of recovered) operation.dispose();
+    await Promise.all(recoveredResults);
+    expect(vi.getTimerCount()).toBe(0);
+    adapter.dispose();
+  });
+
+  it.each([
+    { pushFailure: 'before', deleteFailure: 'throw' },
+    { pushFailure: 'after', deleteFailure: 'retain' },
+  ] as const)(
+    'retries Prebid notification registration after $pushFailure enqueue failure and $deleteFailure rollback',
+    async ({ pushFailure, deleteFailure }) => {
+      vi.useFakeTimers();
+      const readinessCommands: Command[] = [];
+      let queueBroken = true;
+      const push = vi.fn((command: Command): number => {
+        if (queueBroken) {
+          if (pushFailure === 'after') readinessCommands.push(command);
+          throw new Error(`Prebid queue failed ${pushFailure} enqueue`);
+        }
+        readinessCommands.push(command);
+        return readinessCommands.length;
+      });
+      const target: { pbjs?: unknown } = { pbjs: { que: { push } } };
+      const adapter = createBrowserPrebidAdapter(target);
+      const order: number[] = [];
+      const originalWeakSetDelete = WeakSet.prototype.delete;
+      WeakSet.prototype.delete = function (): boolean {
+        if (deleteFailure === 'throw') throw new Error('Prebid arming rollback failed');
+        return false;
+      } as typeof WeakSet.prototype.delete;
+
+      let first: ReturnType<typeof adapter.run> | undefined;
+      let thrown: unknown;
+      try {
+        first = adapter.run(() => order.push(1));
+      } catch (error) {
+        thrown = error;
+      } finally {
+        WeakSet.prototype.delete = originalWeakSetDelete;
+      }
+
+      expect(thrown).toBeUndefined();
+      if (!first) throw new Error('Expected a published Prebid operation');
+      expect(readinessCommands).toHaveLength(pushFailure === 'after' ? 1 : 0);
+      queueBroken = false;
+      const second = adapter.run(() => order.push(2));
+      expect(readinessCommands).toHaveLength(pushFailure === 'after' ? 2 : 1);
+
+      target.pbjs = createReadyPrebid().pbjs;
+      if (pushFailure === 'after') {
+        readinessCommands[0]?.();
+        expect(order).toEqual([]);
+      }
+      readinessCommands[readinessCommands.length - 1]?.();
+      await expect(Promise.all([first.result, second.result])).resolves.toEqual([1, 2]);
+      expect(order).toEqual([1, 2]);
+      for (const notify of readinessCommands) notify();
+      expect(order).toEqual([1, 2]);
+      expect(vi.getTimerCount()).toBe(0);
+
+      target.pbjs = undefined;
+      const recovered = Array.from({ length: 64 }, () => adapter.run(vi.fn()));
+      const recoveredResults = recovered.map(({ result }) => result.catch((error) => error));
+      expect(() => adapter.run(vi.fn())).toThrowError(
+        expect.objectContaining({ code: 'external_queue_full' })
+      );
+      for (const operation of recovered) operation.dispose();
+      await Promise.all(recoveredResults);
+      expect(vi.getTimerCount()).toBe(0);
+      adapter.dispose();
+    }
+  );
+
   it('rejects a queued operation when its pending Prebid stub becomes incompatible', async () => {
     const readinessCommands: Command[] = [];
     const binding: Record<string, unknown> = { que: readinessCommands };
@@ -528,6 +674,108 @@ describe('browser Prebid adapter readiness', () => {
     }
   });
 
+  it.each(['before', 'after'] as const)(
+    'bounds Prebid diagnostics when WeakSet.add persistently throws %s insertion',
+    async (failure) => {
+      const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const incompatible = createReadyPrebid({ stamp: createStamp({ abi: 2 }) });
+      const adapter = createBrowserPrebidAdapter({ pbjs: incompatible.pbjs });
+      const originalWeakSetAdd = WeakSet.prototype.add;
+      WeakSet.prototype.add = function (this: WeakSet<object>, value: object): WeakSet<object> {
+        if (failure === 'after') Reflect.apply(originalWeakSetAdd, this, [value]);
+        throw new Error(`diagnostic tracking failed ${failure} insertion`);
+      } as typeof WeakSet.prototype.add;
+
+      const poisoned: Array<ReturnType<typeof adapter.run>> = [];
+      const thrown: unknown[] = [];
+      try {
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            poisoned.push(adapter.run(vi.fn()));
+          } catch (error) {
+            thrown.push(error);
+          }
+        }
+      } finally {
+        WeakSet.prototype.add = originalWeakSetAdd;
+      }
+
+      try {
+        expect(thrown).toEqual([]);
+        expect(poisoned).toHaveLength(3);
+        for (const operation of poisoned) {
+          await expect(operation.result).rejects.toMatchObject({
+            code: 'external_artifact_incompatible',
+          });
+        }
+        expect(warning).toHaveBeenCalledTimes(failure === 'after' ? 1 : 0);
+
+        const healthy = adapter.run(vi.fn());
+        const suppressed = adapter.run(vi.fn());
+        await expect(healthy.result).rejects.toMatchObject({
+          code: 'external_artifact_incompatible',
+        });
+        await expect(suppressed.result).rejects.toMatchObject({
+          code: 'external_artifact_incompatible',
+        });
+        expect(warning).toHaveBeenCalledTimes(1);
+      } finally {
+        warning.mockRestore();
+        adapter.dispose();
+      }
+    }
+  );
+
+  it.each(['preflight', 'observation'] as const)(
+    'recovers bounded Prebid diagnostics when WeakSet.has poisons %s',
+    async (failure) => {
+      const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const incompatible = createReadyPrebid({ stamp: createStamp({ abi: 2 }) });
+      const adapter = createBrowserPrebidAdapter({ pbjs: incompatible.pbjs });
+      const originalWeakSetHas = WeakSet.prototype.has;
+      let lookups = 0;
+      WeakSet.prototype.has = function (this: WeakSet<object>, value: object): boolean {
+        lookups += 1;
+        if (failure === 'preflight' || lookups === 2) {
+          throw new Error(`diagnostic ${failure} lookup failed`);
+        }
+        return Reflect.apply(originalWeakSetHas, this, [value]) as boolean;
+      } as typeof WeakSet.prototype.has;
+
+      let poisoned: ReturnType<typeof adapter.run> | undefined;
+      let thrown: unknown;
+      try {
+        poisoned = adapter.run(vi.fn());
+      } catch (error) {
+        thrown = error;
+      } finally {
+        WeakSet.prototype.has = originalWeakSetHas;
+      }
+
+      try {
+        expect(thrown).toBeUndefined();
+        if (!poisoned) throw new Error('Expected a published Prebid operation');
+        await expect(poisoned.result).rejects.toMatchObject({
+          code: 'external_artifact_incompatible',
+        });
+        expect(warning).not.toHaveBeenCalled();
+
+        const healthy = adapter.run(vi.fn());
+        const suppressed = adapter.run(vi.fn());
+        await expect(healthy.result).rejects.toMatchObject({
+          code: 'external_artifact_incompatible',
+        });
+        await expect(suppressed.result).rejects.toMatchObject({
+          code: 'external_artifact_incompatible',
+        });
+        expect(warning).toHaveBeenCalledTimes(1);
+      } finally {
+        warning.mockRestore();
+        adapter.dispose();
+      }
+    }
+  );
+
   it('releases pending capacity immediately on abort and adapter disposal', async () => {
     vi.useFakeTimers();
     const target: { pbjs?: unknown } = {};
@@ -781,6 +1029,35 @@ describe('browser Prebid adapter readiness', () => {
     }
   );
 
+  it('settles a live Prebid operation and restores listeners when Set.delete is poisoned', async () => {
+    const ready = createReadyPrebid();
+    const originalSetDelete = Set.prototype.delete;
+    ready.pbjs.offEvent.mockImplementation((type, listener) => {
+      const registered = ready.listeners.get(type);
+      if (registered) Reflect.apply(originalSetDelete, registered, [listener]);
+    });
+    const adapter = createBrowserPrebidAdapter({ pbjs: ready.pbjs });
+    const listener = vi.fn();
+    const operation = adapter.run((prebid) => {
+      prebid.subscribe('bidResponse', listener);
+      return new Promise<never>(() => undefined);
+    });
+    expect(ready.listeners.get('bidResponse')).toHaveLength(1);
+
+    Set.prototype.delete = function (): boolean {
+      throw new Error('Prebid live cleanup delete failed');
+    } as typeof Set.prototype.delete;
+    try {
+      expect(() => adapter.dispose()).not.toThrow();
+    } finally {
+      Set.prototype.delete = originalSetDelete;
+    }
+
+    await expect(operation.result).rejects.toMatchObject({ code: 'operation_disposed' });
+    expect(ready.listeners.get('bidResponse')).toHaveLength(0);
+    expect(() => adapter.dispose()).not.toThrow();
+  });
+
   it('rolls back a failed Prebid command subscription without touching prior global effects', async () => {
     const ready = createReadyPrebid();
     const adapter = createBrowserPrebidAdapter({ pbjs: ready.pbjs });
@@ -904,6 +1181,117 @@ describe('browser Prebid adapter readiness', () => {
     expect(order).toEqual(Array.from({ length: 64 }, (_, index) => index));
   });
 
+  it('reserves pending Prebid capacity before poisoned Set.add reenters', async () => {
+    const target: { pbjs?: unknown } = {};
+    const adapter = createBrowserPrebidAdapter(target);
+    const accepted: Array<ReturnType<typeof adapter.run>> = [];
+    const overflows: unknown[] = [];
+    const order: number[] = [];
+    const originalSetAdd = Set.prototype.add;
+    let reentered = false;
+    Set.prototype.add = function (this: Set<unknown>, value: unknown): Set<unknown> {
+      if (!reentered) {
+        reentered = true;
+        Set.prototype.add = originalSetAdd;
+        for (let index = 1; index <= 64; index += 1) {
+          try {
+            accepted.push(adapter.run(() => order.push(index)));
+          } catch (error) {
+            overflows.push(error);
+          }
+        }
+      }
+      return Reflect.apply(originalSetAdd, this, [value]) as Set<unknown>;
+    } as typeof Set.prototype.add;
+
+    let outer: ReturnType<typeof adapter.run> | undefined;
+    try {
+      outer = adapter.run(() => order.push(0));
+    } finally {
+      Set.prototype.add = originalSetAdd;
+    }
+    if (!outer) throw new Error('Expected a published Prebid operation');
+
+    expect(accepted).toHaveLength(63);
+    expect(overflows).toHaveLength(1);
+    expect(overflows[0]).toMatchObject({ code: 'external_queue_full' });
+
+    target.pbjs = createReadyPrebid().pbjs;
+    adapter.notifyReady();
+    await expect(
+      Promise.all([outer.result, ...accepted.map(({ result }) => result)])
+    ).resolves.toHaveLength(64);
+    expect(order).toEqual([...Array.from({ length: 63 }, (_, index) => index + 1), 0]);
+
+    target.pbjs = undefined;
+    const recovered = Array.from({ length: 64 }, () => adapter.run(vi.fn()));
+    expect(() => adapter.run(vi.fn())).toThrowError(
+      expect.objectContaining({ code: 'external_queue_full' })
+    );
+    target.pbjs = createReadyPrebid().pbjs;
+    adapter.notifyReady();
+    await expect(Promise.all(recovered.map(({ result }) => result))).resolves.toHaveLength(64);
+  });
+
+  it('rolls back pending Prebid publication when poisoned Set.add throws', async () => {
+    vi.useFakeTimers();
+    const target: { pbjs?: unknown } = {};
+    const adapter = createBrowserPrebidAdapter(target);
+    const publicationError = new Error('Prebid publication failed');
+    const command = vi.fn();
+    const signalGetter = vi.fn(() => undefined);
+    const options = Object.defineProperty({}, 'signal', {
+      get: signalGetter,
+    }) as { readonly signal?: AbortSignal };
+    const originalSetAdd = Set.prototype.add;
+    const originalSetDelete = Set.prototype.delete;
+    const poisonedDelete = function (): boolean {
+      throw new Error('Prebid publication rollback delete failed');
+    } as typeof Set.prototype.delete;
+    let poisonNextAdd = true;
+    Set.prototype.add = function (this: Set<unknown>, value: unknown): Set<unknown> {
+      if (poisonNextAdd) {
+        poisonNextAdd = false;
+        Set.prototype.add = originalSetAdd;
+        Reflect.apply(originalSetAdd, this, [value]);
+        throw publicationError;
+      }
+      return Reflect.apply(originalSetAdd, this, [value]) as Set<unknown>;
+    } as typeof Set.prototype.add;
+    Set.prototype.delete = poisonedDelete;
+
+    let thrown: unknown;
+    try {
+      adapter.run(command, options);
+    } catch (error) {
+      thrown = error;
+    } finally {
+      Set.prototype.add = originalSetAdd;
+      Set.prototype.delete = originalSetDelete;
+    }
+
+    expect(thrown).toBe(publicationError);
+    expect(command).not.toHaveBeenCalled();
+    expect(signalGetter).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+
+    const recovered = Array.from({ length: 64 }, () => adapter.run(vi.fn()));
+    expect(() => adapter.run(vi.fn())).toThrowError(
+      expect.objectContaining({ code: 'external_queue_full' })
+    );
+    target.pbjs = createReadyPrebid().pbjs;
+    adapter.notifyReady();
+    await expect(Promise.all(recovered.map(({ result }) => result))).resolves.toHaveLength(64);
+    expect(vi.getTimerCount()).toBe(0);
+    Set.prototype.delete = poisonedDelete;
+    try {
+      expect(() => adapter.dispose()).not.toThrow();
+    } finally {
+      Set.prototype.delete = originalSetDelete;
+    }
+    await Promise.resolve();
+  });
+
   it.each(['signal-getter', 'aborted-getter', 'add-throw', 'abort-remove-throw'] as const)(
     'contains hostile Prebid AbortSignal ownership for %s',
     async (failure) => {
@@ -963,6 +1351,80 @@ describe('browser Prebid adapter readiness', () => {
       );
       adapter.dispose();
       await Promise.all(fillers.map(({ result }) => result.catch((error: unknown) => error)));
+    }
+  );
+
+  it.each([
+    'add-getter',
+    'before-install',
+    'after-install',
+    'reentrant-callback',
+    'post-check-throw',
+  ] as const)(
+    'settles Prebid abort transitions during listener registration for %s',
+    async (transition) => {
+      vi.useFakeTimers();
+      const target: { pbjs?: unknown } = {};
+      const adapter = createBrowserPrebidAdapter(target);
+      const signalError = new Error(`abort transition failure: ${transition}`);
+      const listeners = new Set<() => void>();
+      let aborted = false;
+      let abortedReads = 0;
+      const addEventListener = vi.fn((_type: string, listener: () => void) => {
+        if (transition === 'before-install') aborted = true;
+        listeners.add(listener);
+        if (transition === 'after-install') aborted = true;
+        if (transition === 'reentrant-callback') {
+          aborted = true;
+          listener();
+        }
+      });
+      const removeEventListener = vi.fn((_type: string, listener: () => void) => {
+        listeners.delete(listener);
+      });
+      const signal = Object.defineProperties(
+        {},
+        {
+          aborted: {
+            get: () => {
+              abortedReads += 1;
+              if (transition === 'post-check-throw' && abortedReads === 2) throw signalError;
+              return aborted;
+            },
+          },
+          addEventListener: {
+            get: () => {
+              if (transition === 'add-getter') aborted = true;
+              return addEventListener;
+            },
+          },
+          removeEventListener: { value: removeEventListener },
+        }
+      ) as AbortSignal;
+      const command = vi.fn();
+      const operation = adapter.run(command, { signal });
+      const result = operation.result.catch((error: unknown) => error);
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      if (transition === 'post-check-throw') await expect(result).resolves.toBe(signalError);
+      else await expect(result).resolves.toMatchObject({ code: 'caller_aborted' });
+      expect(addEventListener).toHaveBeenCalledTimes(1);
+      expect(removeEventListener).toHaveBeenCalledTimes(1);
+      expect(listeners).toHaveLength(0);
+
+      target.pbjs = createReadyPrebid().pbjs;
+      adapter.notifyReady();
+      expect(command).not.toHaveBeenCalled();
+
+      target.pbjs = undefined;
+      const fillers = Array.from({ length: 64 }, () => adapter.run(vi.fn()));
+      expect(() => adapter.run(vi.fn())).toThrowError(
+        expect.objectContaining({ code: 'external_queue_full' })
+      );
+      adapter.dispose();
+      await Promise.all(
+        fillers.map(({ result: filler }) => filler.catch((error: unknown) => error))
+      );
     }
   );
 
