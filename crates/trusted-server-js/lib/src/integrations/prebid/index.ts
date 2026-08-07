@@ -413,7 +413,7 @@ type RefreshGptSlot = {
 
 function recordPrebidRefreshForDiagnostics(slots: RefreshGptSlot[]): void {
   try {
-    window.tsjs?.gptDiagnostics?.recordPrebidRefresh?.(slots);
+    window.tsjs?.gptDiagnosticsRecorder?.recordPrebidRefresh(slots);
   } catch {
     // Diagnostics must not suppress the GAM request.
   }
@@ -775,6 +775,18 @@ function serverSideBidderParamsForRefresh(
 function publisherZoneForRefresh(candidateCodes: Array<string | undefined>): string | undefined {
   const match = findRefreshAdUnit(candidateCodes);
   return match ? match.mediaTypes?.banner?.name : findRefreshSnapshot(candidateCodes)?.zone;
+}
+
+// The server only de-duplicates the configured suffix list, so validate here
+// too: an empty suffix matches every ad unit path and would pull every slot out
+// of the refresh auction, and a non-array value would throw inside the
+// publisher's own `refresh()` call.
+function isUsableRefreshAuctionExclusionSuffix(suffix: unknown): suffix is string {
+  return typeof suffix === 'string' && suffix.startsWith('/') && suffix.length > 1;
+}
+
+function refreshAuctionExclusionSuffixes(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter(isUsableRefreshAuctionExclusionSuffix) : [];
 }
 
 function isExcludedFromRefreshAuction(
@@ -1410,7 +1422,7 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       independentSlots.forEach(clearRefreshTargeting);
 
       const excludedGamAdUnitPathSuffixes = new Set(
-        getInjectedConfig()?.excludedGamAdUnitPathSuffixes ?? []
+        refreshAuctionExclusionSuffixes(getInjectedConfig()?.excludedGamAdUnitPathSuffixes)
       );
       const auctionSlots = independentSlots.filter(
         (slot) => !isExcludedFromRefreshAuction(slot, excludedGamAdUnitPathSuffixes)

@@ -1,10 +1,14 @@
 # GPT Delivery Evidence and Auction Competition
 
 **Date:** 2026-08-04  
-**Status:** Proposed  
+**Status:** Implemented  
 **Scope:** Opt-in GPT diagnostics only; no publisher-code changes
 
 ## Relationship to the Existing Diagnostics Design
+
+**Extended by** `2026-08-05-gpt-refresh-source-and-replacement-diagnostics-design.md`,
+which adds the `publisher_refresh` request path and the replacement facts. Read that
+document alongside this one: the request-path union defined below is not the final one.
 
 This design is a corrective extension to
 `2026-07-28-gpt-runtime-diagnostics-overlay-design.md`. The existing overlay

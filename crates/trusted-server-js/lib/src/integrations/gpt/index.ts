@@ -1075,14 +1075,18 @@ export function installTsAdInit(): void {
         try {
           const opportunity = trustedServerOpportunity(bid);
           if (bid.hb_auction_id !== undefined) {
-            ts.gptDiagnostics?.recordTrustedServerOpportunity?.(
+            ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
               gptSlot,
               slot.id,
               opportunity,
               bid.hb_auction_id
             );
           } else {
-            ts.gptDiagnostics?.recordTrustedServerOpportunity?.(gptSlot, slot.id, opportunity);
+            ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
+              gptSlot,
+              slot.id,
+              opportunity
+            );
           }
         } catch {
           // Diagnostics must not alter ad delivery.
@@ -1611,7 +1615,8 @@ function recordConsumedPrebidApsId(
 
 function safelyRecordCreativeRequest(slotId: string): number | undefined {
   try {
-    const attemptId = window.tsjs?.gptDiagnostics?.recordTrustedServerCreativeRequest?.(slotId);
+    const attemptId =
+      window.tsjs?.gptDiagnosticsRecorder?.recordTrustedServerCreativeRequest(slotId);
     return typeof attemptId === 'number' && Number.isFinite(attemptId) ? attemptId : undefined;
   } catch {
     return undefined;
@@ -1622,7 +1627,7 @@ function safelyRecordCreativeResponse(attemptId: number | undefined): void {
   if (attemptId === undefined) return;
 
   try {
-    window.tsjs?.gptDiagnostics?.recordTrustedServerCreativeResponse?.(attemptId);
+    window.tsjs?.gptDiagnosticsRecorder?.recordTrustedServerCreativeResponse(attemptId);
   } catch {
     // Diagnostics must not alter creative delivery.
   }
@@ -1635,7 +1640,7 @@ function safelyRecordCreativeFailure(
   if (attemptId === undefined) return;
 
   try {
-    window.tsjs?.gptDiagnostics?.recordTrustedServerCreativeFailure?.(attemptId, reason);
+    window.tsjs?.gptDiagnosticsRecorder?.recordTrustedServerCreativeFailure(attemptId, reason);
   } catch {
     // Diagnostics must not alter creative delivery.
   }

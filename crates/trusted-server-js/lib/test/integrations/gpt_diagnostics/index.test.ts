@@ -102,6 +102,7 @@ describe('GPT diagnostics integration composition', () => {
     expect(installGptDiagnosticsRuntime(target)).toBeUndefined();
 
     expect(target.tsjs?.gptDiagnostics).toBeUndefined();
+    expect(target.tsjs?.gptDiagnosticsRecorder).toBeUndefined();
     expect(target.googletag).toBeUndefined();
     expect(target.__tsjs_gpt_diagnostics_runtime).toBeUndefined();
     expect(document.getElementById(GPT_DIAGNOSTICS_HOST_ID)).toBeNull();
@@ -120,6 +121,15 @@ describe('GPT diagnostics integration composition', () => {
     expect(second).toBe(first);
     expect(target.tsjs).toBe(previousApi);
     expect(target.tsjs?.gptDiagnostics).toBe(first);
+    // Evidence writers live on their own channel; the operator API stays read-only.
+    expect(Object.keys(first!).sort()).toEqual(['export', 'hide', 'show', 'snapshot', 'subscribe']);
+    expect(Object.keys(target.tsjs!.gptDiagnosticsRecorder!).sort()).toEqual([
+      'recordPrebidRefresh',
+      'recordTrustedServerCreativeFailure',
+      'recordTrustedServerCreativeRequest',
+      'recordTrustedServerCreativeResponse',
+      'recordTrustedServerOpportunity',
+    ]);
     expect(gpt.queue.push).toHaveBeenCalledTimes(1);
     expect(gpt.addEventListener).toHaveBeenCalledTimes(6);
     expect(gpt.addEventListener.mock.calls.map(([name]) => name).sort()).toEqual(
@@ -218,6 +228,22 @@ describe('GPT diagnostics integration composition', () => {
     expect(document.querySelector(`#${GPT_DIAGNOSTICS_HOST_ID}`)).not.toBeNull();
     expect(document.querySelectorAll(`#${GPT_DIAGNOSTICS_HOST_ID}`)).toHaveLength(1);
     expect(element.getAttributeNames()).toEqual(['id']);
+  });
+
+  it('removes both diagnostics channels on teardown', () => {
+    target.__tsjs_gpt_diagnostics_active = true;
+    installGptStub();
+    installGptDiagnosticsRuntime(target);
+
+    expect(target.tsjs?.gptDiagnostics).toBeDefined();
+    expect(target.tsjs?.gptDiagnosticsRecorder).toBeDefined();
+
+    target.__tsjs_gpt_diagnostics_runtime!.destroy();
+
+    expect(target.tsjs).toBeDefined();
+    expect(target.tsjs?.gptDiagnostics).toBeUndefined();
+    expect(target.tsjs?.gptDiagnosticsRecorder).toBeUndefined();
+    expect(target.__tsjs_gpt_diagnostics_runtime).toBeUndefined();
   });
 
   it('leaves no half-initialized API when the core API is unavailable', () => {

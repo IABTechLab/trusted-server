@@ -78,6 +78,28 @@ beforeEach(() => {
 });
 
 describe('GptDiagnosticsApiController', () => {
+  it('keeps evidence writers off the public read-only API', () => {
+    const controller = new GptDiagnosticsApiController(fakeApiStore(), new FakeBindings(), {
+      show: vi.fn(),
+      hide: vi.fn(),
+    });
+
+    expect(Object.keys(controller.api).sort()).toEqual([
+      'export',
+      'hide',
+      'show',
+      'snapshot',
+      'subscribe',
+    ]);
+    expect(Object.keys(controller.recorder).sort()).toEqual([
+      'recordPrebidRefresh',
+      'recordTrustedServerCreativeFailure',
+      'recordTrustedServerCreativeRequest',
+      'recordTrustedServerCreativeResponse',
+      'recordTrustedServerOpportunity',
+    ]);
+  });
+
   it('delegates attribution writers with exact arguments and returns the attempt ID', () => {
     const store = fakeApiStore();
     const controller = new GptDiagnosticsApiController(store, new FakeBindings(), {
@@ -87,15 +109,16 @@ describe('GptDiagnosticsApiController', () => {
     const slot = fakeSlot();
     const slots = [slot];
 
-    controller.api.recordTrustedServerOpportunity(
+    controller.recorder.recordTrustedServerOpportunity(
       slot,
       'auction-slot-example',
       'renderable_candidate'
     );
-    controller.api.recordPrebidRefresh(slots);
-    const attemptId = controller.api.recordTrustedServerCreativeRequest('auction-slot-example');
-    controller.api.recordTrustedServerCreativeResponse(41);
-    controller.api.recordTrustedServerCreativeFailure(41, 'cache_fetch_failed');
+    controller.recorder.recordPrebidRefresh(slots);
+    const attemptId =
+      controller.recorder.recordTrustedServerCreativeRequest('auction-slot-example');
+    controller.recorder.recordTrustedServerCreativeResponse(41);
+    controller.recorder.recordTrustedServerCreativeFailure(41, 'cache_fetch_failed');
 
     expect(store.recordTrustedServerOpportunity).toHaveBeenCalledTimes(1);
     expect(store.recordTrustedServerOpportunity).toHaveBeenCalledWith(
@@ -122,7 +145,7 @@ describe('GptDiagnosticsApiController', () => {
     });
     const slot = fakeSlot();
 
-    controller.api.recordTrustedServerOpportunity(
+    controller.recorder.recordTrustedServerOpportunity(
       slot,
       'auction-slot-example',
       'renderable_candidate',
@@ -164,19 +187,19 @@ describe('GptDiagnosticsApiController', () => {
     const slot = fakeSlot();
 
     expect(() =>
-      controller.api.recordTrustedServerOpportunity(
+      controller.recorder.recordTrustedServerOpportunity(
         slot,
         'auction-slot-example',
         'renderable_candidate'
       )
     ).not.toThrow();
-    expect(() => controller.api.recordPrebidRefresh([slot])).not.toThrow();
+    expect(() => controller.recorder.recordPrebidRefresh([slot])).not.toThrow();
     expect(
-      controller.api.recordTrustedServerCreativeRequest('auction-slot-example')
+      controller.recorder.recordTrustedServerCreativeRequest('auction-slot-example')
     ).toBeUndefined();
-    expect(() => controller.api.recordTrustedServerCreativeResponse(41)).not.toThrow();
+    expect(() => controller.recorder.recordTrustedServerCreativeResponse(41)).not.toThrow();
     expect(() =>
-      controller.api.recordTrustedServerCreativeFailure(41, 'response_post_failed')
+      controller.recorder.recordTrustedServerCreativeFailure(41, 'response_post_failed')
     ).not.toThrow();
   });
 
@@ -296,7 +319,51 @@ describe('GptDiagnosticsApiController', () => {
     });
     expect(JSON.stringify(snapshot.page)).not.toContain('private');
     expect(JSON.stringify(snapshot.page)).not.toContain('fragment');
-    expect(JSON.stringify(snapshot)).not.toMatch(/bidder|targeting|creativeMarkup|cookie|userId/i);
+    // Pin the exported shape rather than blocklisting known-bad names: the
+    // export is built by spreading store records, so any new field must be
+    // added here deliberately before it can reach a downloaded snapshot.
+    expect(Object.keys(snapshot).sort()).toEqual([
+      'attributionIssues',
+      'callbackIssues',
+      'capturedAt',
+      'coverage',
+      'metadata',
+      'page',
+      'slots',
+      'version',
+    ]);
+    expect(Object.keys(snapshot.slots[0]!).sort()).toEqual([
+      'adUnitPath',
+      'binding',
+      'currentVisibilityPercentage',
+      'maximumVisibilityPercentage',
+      'requests',
+      'runtimeSlotNumber',
+      'slotElementId',
+    ]);
+    expect(Object.keys(snapshot.slots[0]!.requests[0]!).sort()).toEqual([
+      'adManager',
+      'delivery',
+      'durations',
+      'incompleteSequence',
+      'isBackfill',
+      'isEmpty',
+      'renderAtMs',
+      'requestNumber',
+      'requestPath',
+      'requestedAtMs',
+      'responseAtMs',
+      'responseClass',
+      'size',
+      'slotContentChanged',
+      'trustedServerCreativeFailures',
+    ]);
+    expect(Object.keys(snapshot.metadata).sort()).toEqual([
+      'droppedAttributionIssues',
+      'droppedCallbacks',
+      'evictedRequestCycles',
+      'evictedSlots',
+    ]);
 
     const second = controller.api.snapshot();
     expect(second).not.toBe(snapshot);

@@ -76,22 +76,22 @@ Server's Prebid refresh auctions without suppressing the corresponding GAM refre
 
 1. Add `excludedGamAdUnitPathSuffixes?: string[]` to `InjectedPrebidConfig` and
    `getAdUnitPath?: () => string` to `RefreshGptSlot`.
-2. Add a small private predicate that receives a slot and configured suffix set. It
+2. Add a small private predicate that receives a slot and configured suffix list. It
    must call `getAdUnitPath()` only when it exists, catch a getter exception, require
-   a string result, and use `path.endsWith(suffix)` for any configured suffix. A
-   missing, non-string, empty, or throwing getter returns `false` (fail open).
+   a string result, and use `path.endsWith(suffix)` for any configured suffix. Filter
+   injected values to non-root slash-prefixed strings so malformed direct injection
+   fails open rather than excluding every slot.
 3. In `installRefreshHandler()`, leave the
    `window.tsjs?.adInitRefreshInProgress` branch byte-for-byte behaviorally first.
    Keep target-slot resolution unchanged.
-4. Keep `targetSlots.forEach(clearRefreshTargeting)` before filtering. Build
-   `auctionSlots` from `targetSlots` by applying the new predicate.
-5. When `auctionSlots` is empty, call `originalRefresh(targetSlots, opts)`
-   immediately. Do not call `pbjs.requestBids()` or
-   `pbjs.setTargetingForGPTAsync()`.
+4. Clear targeting from independent slots before filtering. Build `auctionSlots`
+   from those independent slots by applying the new predicate.
+5. When `auctionSlots` is empty, call `originalRefresh(slots, opts)` immediately.
+   Do not call `pbjs.requestBids()` or `pbjs.setTargetingForGPTAsync()`.
 6. Otherwise, build synthetic ad units and `refreshAdUnitCodes` from
    `auctionSlots` only. In the bids-back handler, target only those eligible codes,
-   then call `originalRefresh(targetSlots, opts)` so mixed refreshes retain excluded
-   slots in the GAM list.
+   then call `originalRefresh(slots, opts)` so the publisher's explicit or bare GPT
+   refresh form is preserved.
 7. Do not alter `TS_REFRESH_TARGETING_KEYS`, size fallback logic, injected-slot
    lookup, bidder-parameter recovery, or client-side-bid recovery except to ensure
    they run only for eligible auction slots.
@@ -104,16 +104,17 @@ Add tests in the existing `prebid/installRefreshHandler` suite. Make the mocked
 `requestBids` invoke its callback synchronously only where post-auction behavior is
 being asserted.
 
-| Case                          | Assertions                                                                                                                                 |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| Normal explicit slot          | Nonmatching path still creates an ad unit, requests bids, scopes targeting to its code, and refreshes after callback.                      |
-| Explicit excluded slot        | Each TS/Prebid key is cleared; no Prebid request/targeting call; original GPT refresh receives the same slot list and options immediately. |
-| All-excluded global refresh   | `getSlots()` supplies the concrete list; all targets are cleaned; no Prebid call; GPT receives the complete concrete list and options.     |
-| Mixed global refresh          | Both slots are cleaned; only the normal slot occurs in ad units and scoped targeting; GPT receives both slots after callback.              |
-| Missing getter                | Slot is auctioned and wrapper does not throw.                                                                                              |
-| Throwing or non-string getter | Slot is auctioned and wrapper does not throw.                                                                                              |
-| Literal semantics             | Case mismatch and trailing-slash mismatch do not exclude.                                                                                  |
-| Regression                    | Existing `adInitRefreshInProgress` direct-pass-through test and normal client-side bidder/param-recovery tests remain unchanged and green. |
+| Case                          | Assertions                                                                                                                                       |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Normal explicit slot          | Nonmatching path still creates an ad unit, requests bids, scopes targeting to its code, and refreshes after callback.                            |
+| Explicit excluded slot        | Each TS/Prebid key is cleared; no Prebid request/targeting call; original GPT refresh receives the same slot list and options immediately.       |
+| All-excluded global refresh   | `getSlots()` supplies the working list; all targets are cleaned; no Prebid call; the original bare GPT refresh remains bare with its options.    |
+| Mixed global refresh          | Both slots are cleaned; only the normal slot occurs in ad units and scoped targeting; the original bare GPT refresh remains bare after callback. |
+| Missing getter                | Slot is auctioned and wrapper does not throw.                                                                                                    |
+| Throwing or non-string getter | Slot is auctioned and wrapper does not throw.                                                                                                    |
+| Malformed injected suffixes   | Empty suffixes and non-array suffix lists fail open and do not suppress the auction.                                                             |
+| Literal semantics             | Case mismatch and trailing-slash mismatch do not exclude.                                                                                        |
+| Regression                    | Existing `adInitRefreshInProgress` direct-pass-through test and normal client-side bidder/param-recovery tests remain unchanged and green.       |
 
 Run the JS suite after each change and format it:
 
@@ -135,9 +136,13 @@ npm run format
    - matching is case-sensitive literal suffix matching via `getAdUnitPath()`;
    - invalid/empty/root suffixes are rejected and a missing getter fails open;
    - use a specific terminal path rather than a size or div-ID rule;
-   - mixed global refreshes still auction normal slots.
-3. Include the external-bundle/config rollout dependency and direct-Prebid/APS
-   non-goals. Do not add real inventory names, production domains, or tracking IDs.
+   - mixed global refreshes still auction normal slots;
+   - excluded slots in mixed refreshes wait for the auction or refresh watchdog before
+     GAM refresh, while an all-excluded refresh passes through immediately.
+3. Explain that the server-served shim and injected configuration deploy together
+   for this option; retain the pre-split external-bundle migration caveat and the
+   direct-Prebid/APS non-goals. Do not add real inventory names, production domains,
+   or tracking IDs.
 4. Format docs:
 
    ```bash
@@ -166,10 +171,10 @@ npm run format
    cd docs && npm run format
    ```
 
-3. Regenerate the external browser bundle through the supported `ts prebid bundle`
-   workflow, upload the generated artifact, and update the operator-managed
-   URL/hash/SRI configuration. Deploy that bundle together with the Trusted Server
-   application/config carrying the suffix list.
+3. Deploy the Trusted Server application/config carrying the suffix list. This
+   browser-shim option does not require an external bundle regeneration; follow the
+   existing bundle workflow only for the pre-split migration or external adapter/User
+   ID changes.
 4. On a controlled staging page, use browser request instrumentation to verify:
    - the injected browser config contains the expected suffixes;
    - a matching path still produces a GAM request/impression but no refresh
@@ -178,9 +183,9 @@ npm run format
      scoped refreshed targeting, and GAM refreshes both slots;
    - `disableInitialLoad()`/initial Trusted Server loading still uses the existing
      `adInitRefreshInProgress` direct GPT path.
-5. Record deployed bundle hash, configuration version, test page, and observations
-   in the implementation handoff. Do not treat an unstable production page as the
-   sole verification environment.
+5. Record the deployed application/configuration version, test page, and
+   observations in the implementation handoff. Do not treat an unstable external
+   page as the sole verification environment.
 
 ## Acceptance criteria
 
@@ -190,6 +195,7 @@ npm run format
 - An all-excluded refresh produces no `requestBids()` or targeting call.
 - A mixed refresh auctions and targets only eligible slots while refreshing every
   requested GPT slot.
-- Stale Trusted Server/Prebid targeting is cleared from every target slot, and the
-  initial-load bypass remains untouched.
-- The deployed external bundle and injected configuration are version-compatible.
+- Stale Trusted Server/Prebid targeting is cleared from every independent slot,
+  including excluded slots, while publisher delivery-slot targeting and the
+  initial-load bypass remain untouched.
+- The deployed server shim and injected configuration are version-compatible.

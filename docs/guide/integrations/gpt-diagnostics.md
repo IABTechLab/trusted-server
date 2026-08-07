@@ -111,13 +111,13 @@ Request-path labels describe integration paths observed immediately before one G
 `slotRequested` callback. They do not identify a bidder winner or the owner of the
 actual network request.
 
-| Request path            | Meaning                                                                                                        |
-| ----------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `trusted_server_direct` | Only the `adInit` observation was consumed by the request.                                                     |
-| `prebid_refresh`        | Only the installed Prebid refresh path was observed.                                                           |
-| `publisher_refresh`     | The request crossed the installed publisher `pubads.refresh` boundary.                                         |
-| `competing`             | Two or more observed paths contributed evidence; competition or overwrite is possible, but unproven.           |
-| `unattributed`          | No observed intent was consumed; diagnostics do not infer a path from timing, element IDs, or targeting names. |
+| Request path            | Meaning                                                                                                          |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `trusted_server_direct` | Only the `adInit` observation was consumed by the request.                                                       |
+| `prebid_refresh`        | Only the installed Prebid refresh path was observed, including a `pubads.refresh` Prebid consumed and delegated. |
+| `publisher_refresh`     | The request crossed the `pubads.refresh` boundary without Prebid consuming it.                                   |
+| `competing`             | Two or more observed paths contributed evidence; competition or overwrite is possible, but unproven.             |
+| `unattributed`          | No observed intent was consumed; diagnostics do not infer a path from timing, element IDs, or targeting names.   |
 
 Each source in a per-slot request intent lives for five seconds and is consumed once.
 Sources expire independently: re-observing one source cannot extend another source's
@@ -127,9 +127,11 @@ path did or did not own a later request. Because documented GPT callbacks expose
 values were sent or selected.
 
 The publisher-refresh observer delegates exactly once with the original receiver,
-arguments, result, and synchronous throw. Bare `refresh()` calls use GPT's current
-slot list only for diagnostics. A stale refresh function reference captured before
-installation bypasses that boundary and remains `unattributed`. Prebid sets a scoped,
+arguments, result, and synchronous throw. A `refresh()` call that omits its slot
+list, or passes `null` or `undefined` for it, refreshes every slot; the observer
+reads GPT's current slot list for diagnostics only. A stale refresh function
+reference captured before installation bypasses that boundary and remains
+`unattributed`. Prebid sets a scoped,
 synchronous diagnostics context while delegating its own refresh, so nesting does not
 mislabel a Prebid refresh as `competing`. Diagnostics never suppresses or changes a
 GPT request.
@@ -219,6 +221,11 @@ classes are similarly limited to GPT facts:
 | `reservation`            | GPT reported a non-empty result with reservation identifiers. |
 | `unclassified_non_empty` | GPT explicitly reported non-empty without classifying IDs.    |
 
+GPT populates its source-agnostic line item and creative IDs for reservation and
+line-item backfill alike, so they classify as `reservation` only when GPT also
+reported the render as explicitly non-backfill. On their own they remain
+`unclassified_non_empty` rather than becoming an unsupported conclusion.
+
 ## Attribution Issues and Callback Coverage
 
 Creative-correlation problems are exported separately from GPT callback issues. The
@@ -293,7 +300,10 @@ have elapsed. GPT callback capture and integration evidence can begin earlier.
 
 ## Browser API
 
-When active, the integration exposes a read-only operator API:
+When active, the integration exposes a read-only operator API. It has exactly the
+five methods below; the evidence writers Trusted Server's own integration modules
+use live on a separate internal channel (`window.tsjs.gptDiagnosticsRecorder`) that
+is not part of this contract and is not supported for operator use.
 
 ```js
 const diagnostics = window.tsjs.gptDiagnostics
@@ -323,7 +333,13 @@ The allowlisted export contains:
 - `version: 1` and an ISO `capturedAt` timestamp.
 - Current page origin and pathname, excluding query parameters and fragments.
 - Retained slots, binding facts, visibility, and request cycles.
-- Request path, opportunity, creative-progress timestamps, and safe failure enums.
+- Request path, request intent ID, opportunity, creative-progress timestamps, and
+  safe failure enums.
+- The per-auction diagnostics token (`trustedServerAuctionId`) and the
+  opportunity-to-request duration, when a direct opportunity was observed.
+- Replacement facts for a re-rendered slot: `replacedRequestNumber`,
+  `previousRenderToRequestMs`, `previousCreativeId`, and `creativeChanged`.
+- The derived `delivery` state, `responseClass`, and `loadObservedBeforeRender`.
 - Source-neutral GAM identifiers and response classes.
 - Non-negative derived durations only.
 - Separate callback issues, attribution issues, coverage counters, and retention
@@ -331,7 +347,10 @@ The allowlisted export contains:
 
 It does not contain raw targeting, bid IDs, bid prices, bidder identity, creative
 markup, cache URLs, cache payloads, cache or bridge error details, cookies, user
-identifiers, query strings, or URL fragments.
+identifiers, query strings, or URL fragments. The exported
+`trustedServerAuctionId` is a token minted fresh for each server-side auction: it
+is not derived from the Edge Cookie ID or any other visitor identifier, and it does
+not repeat across auctions, so it cannot be joined back to a visitor.
 
 Captured records are memory-only. Diagnostics do not add an upload, diagnostics
 network request, `localStorage`, `sessionStorage`, IndexedDB, or other persistence.
@@ -341,7 +360,9 @@ inaccessible to JavaScript.
 
 ## Timing and Retention Bounds
 
-- Direct and Prebid request-path markers: five seconds, one-shot, generation-safe.
+- Direct, Prebid, and publisher request-path markers: five seconds, one-shot.
+  Expiry is evaluated when the slot is next recorded or requested, so retained
+  intents hold no timer.
 - Delivery observation after `slotRenderEnded`: five seconds.
 - Creative-attempt mutation lifetime: 30 seconds from the first matched request.
 - Retained GPT slot objects: 64.
@@ -357,7 +378,9 @@ remain monotonic. The oldest request cycle or issue is removed at its own bound.
 Export metadata reports `evictedSlots`, `evictedRequestCycles`, `droppedCallbacks`,
 and `droppedAttributionIssues`.
 
-Timers schedule only diagnostics cleanup or presentation notification. They never
+Timers schedule only presentation notification, and at most one is outstanding: the
+delivery-evidence boundary re-arms itself from retained cycles instead of queueing
+one callback per render, so a refresh burst cannot grow the timer queue. They never
 trigger GPT or Prebid work, gate an auction, or delay delivery.
 
 ## Troubleshooting
@@ -405,11 +428,13 @@ possible.
 
 ## Limits
 
-The integration observes six documented PubAdsService events and the existing
-Trusted Server `adInit`, Prebid refresh, and creative-bridge boundaries. It does not
-patch arbitrary publisher `display()` or `refresh()` calls, inspect GPT network
-payloads, or identify demand ownership from GAM IDs. It cannot prove inner-iframe
-execution or visual correctness without a controlled creative acknowledgement.
+The integration observes six documented PubAdsService events, wraps
+`pubads.refresh` once, and reads the existing Trusted Server `adInit`, Prebid
+refresh, and creative-bridge boundaries. It does not patch publisher `display()`
+calls, inspect GPT network payloads, or identify demand ownership from GAM IDs. A
+refresh function reference the publisher captured before installation bypasses the
+wrapper and stays `unattributed`. It cannot prove inner-iframe execution or visual
+correctness without a controlled creative acknowledgement.
 
 ## Related
 

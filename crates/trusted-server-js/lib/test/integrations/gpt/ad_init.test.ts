@@ -196,9 +196,9 @@ describe('installTsAdInit', () => {
         },
       ],
       bids: bid ? { atf_sidebar_ad: bid } : {},
-      gptDiagnostics: {
+      gptDiagnosticsRecorder: {
         recordTrustedServerOpportunity,
-      } as unknown as TsjsApi['gptDiagnostics'],
+      } as unknown as TsjsApi['gptDiagnosticsRecorder'],
     };
 
     return { mockPubads, mockSlot };
@@ -362,9 +362,9 @@ describe('installTsAdInit', () => {
           adm: '<div>New</div>',
         },
       },
-      gptDiagnostics: {
+      gptDiagnosticsRecorder: {
         recordTrustedServerOpportunity,
-      } as unknown as TsjsApi['gptDiagnostics'],
+      } as unknown as TsjsApi['gptDiagnosticsRecorder'],
     };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
@@ -3335,11 +3335,11 @@ describe('installTsRenderBridge', () => {
     const recordTrustedServerCreativeResponse = vi.fn();
     const recordTrustedServerCreativeFailure = vi.fn();
     const tsjs = (window as TestWindow).tsjs!;
-    tsjs.gptDiagnostics = {
+    tsjs.gptDiagnosticsRecorder = {
       recordTrustedServerCreativeRequest,
       recordTrustedServerCreativeResponse,
       recordTrustedServerCreativeFailure,
-    } as unknown as TsjsApi['gptDiagnostics'];
+    } as unknown as TsjsApi['gptDiagnosticsRecorder'];
     tsjs.bids.homepage_header.adm = '<div>Creative</div>';
     delete tsjs.bids.homepage_header.nurl;
     delete tsjs.bids.homepage_header.burl;
@@ -3369,11 +3369,11 @@ describe('installTsRenderBridge', () => {
     const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(42);
     const recordTrustedServerCreativeResponse = vi.fn();
     const recordTrustedServerCreativeFailure = vi.fn();
-    (window as TestWindow).tsjs!.gptDiagnostics = {
+    (window as TestWindow).tsjs!.gptDiagnosticsRecorder = {
       recordTrustedServerCreativeRequest,
       recordTrustedServerCreativeResponse,
       recordTrustedServerCreativeFailure,
-    } as unknown as TsjsApi['gptDiagnostics'];
+    } as unknown as TsjsApi['gptDiagnosticsRecorder'];
 
     const bridgeListener = await captureBridgeListener();
     const source = createTrustedSlotIframe();
@@ -3401,11 +3401,11 @@ describe('installTsRenderBridge', () => {
       const recordTrustedServerCreativeResponse = vi.fn();
       const recordTrustedServerCreativeFailure = vi.fn();
       const tsjs = (window as TestWindow).tsjs!;
-      tsjs.gptDiagnostics = {
+      tsjs.gptDiagnosticsRecorder = {
         recordTrustedServerCreativeRequest,
         recordTrustedServerCreativeResponse,
         recordTrustedServerCreativeFailure,
-      } as unknown as TsjsApi['gptDiagnostics'];
+      } as unknown as TsjsApi['gptDiagnosticsRecorder'];
       delete tsjs.bids.homepage_header.hb_cache_host;
       delete tsjs.bids.homepage_header.hb_cache_path;
       Object.assign(tsjs.bids.homepage_header, cacheFields);
@@ -3431,17 +3431,51 @@ describe('installTsRenderBridge', () => {
     }
   );
 
+  it('records no failure when diagnostics declined to open a creative attempt', async () => {
+    const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(undefined);
+    const recordTrustedServerCreativeResponse = vi.fn();
+    const recordTrustedServerCreativeFailure = vi.fn();
+    const tsjs = (window as TestWindow).tsjs!;
+    tsjs.gptDiagnosticsRecorder = {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } as unknown as TsjsApi['gptDiagnosticsRecorder'];
+    delete tsjs.bids.homepage_header.hb_cache_host;
+    delete tsjs.bids.homepage_header.hb_cache_path;
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const stopImmediatePropagation = vi.fn();
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [{ postMessage: vi.fn() }],
+        source,
+        stopImmediatePropagation,
+      }) as unknown as MessageEvent
+    );
+
+    // Without an attempt ID there is nothing to attribute the failure to, and
+    // the missing-source fallback must still run untouched.
+    expect(recordTrustedServerCreativeRequest).toHaveBeenCalledWith('homepage_header');
+    expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
+    expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
+    expect(stopImmediatePropagation).not.toHaveBeenCalled();
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
   it('records response_post_failed when posting inline markup throws', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
     const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(46);
     const recordTrustedServerCreativeResponse = vi.fn();
     const recordTrustedServerCreativeFailure = vi.fn();
     const tsjs = (window as TestWindow).tsjs!;
-    tsjs.gptDiagnostics = {
+    tsjs.gptDiagnosticsRecorder = {
       recordTrustedServerCreativeRequest,
       recordTrustedServerCreativeResponse,
       recordTrustedServerCreativeFailure,
-    } as unknown as TsjsApi['gptDiagnostics'];
+    } as unknown as TsjsApi['gptDiagnosticsRecorder'];
     tsjs.bids.homepage_header.adm = '<div>Creative</div>';
 
     const bridgeListener = await captureBridgeListener();
@@ -3477,11 +3511,11 @@ describe('installTsRenderBridge', () => {
     const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(43);
     const recordTrustedServerCreativeResponse = vi.fn();
     const recordTrustedServerCreativeFailure = vi.fn();
-    (window as TestWindow).tsjs!.gptDiagnostics = {
+    (window as TestWindow).tsjs!.gptDiagnosticsRecorder = {
       recordTrustedServerCreativeRequest,
       recordTrustedServerCreativeResponse,
       recordTrustedServerCreativeFailure,
-    } as unknown as TsjsApi['gptDiagnostics'];
+    } as unknown as TsjsApi['gptDiagnosticsRecorder'];
     const mockAd = '<div>Test Creative</div>';
     // PBS Cache (returnCreative=false) returns the cached bid as a JSON object;
     // the creative lives under `adm`, not as the raw response body. The bridge
@@ -3570,11 +3604,11 @@ describe('installTsRenderBridge', () => {
     const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(54);
     const recordTrustedServerCreativeResponse = vi.fn();
     const recordTrustedServerCreativeFailure = vi.fn();
-    (window as TestWindow).tsjs!.gptDiagnostics = {
+    (window as TestWindow).tsjs!.gptDiagnosticsRecorder = {
       recordTrustedServerCreativeRequest,
       recordTrustedServerCreativeResponse,
       recordTrustedServerCreativeFailure,
-    } as unknown as TsjsApi['gptDiagnostics'];
+    } as unknown as TsjsApi['gptDiagnosticsRecorder'];
     fetchStub.mockResolvedValue({
       ok: true,
       text: () => Promise.resolve(JSON.stringify({ adm: '<div>Creative</div>' })),
@@ -3641,11 +3675,11 @@ describe('installTsRenderBridge', () => {
     const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(47);
     const recordTrustedServerCreativeResponse = vi.fn();
     const recordTrustedServerCreativeFailure = vi.fn();
-    (window as TestWindow).tsjs!.gptDiagnostics = {
+    (window as TestWindow).tsjs!.gptDiagnosticsRecorder = {
       recordTrustedServerCreativeRequest,
       recordTrustedServerCreativeResponse,
       recordTrustedServerCreativeFailure,
-    } as unknown as TsjsApi['gptDiagnostics'];
+    } as unknown as TsjsApi['gptDiagnosticsRecorder'];
     arrangeFetch(fetchStub);
 
     const bridgeListener = await captureBridgeListener();
@@ -3673,11 +3707,11 @@ describe('installTsRenderBridge', () => {
     const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(48);
     const recordTrustedServerCreativeResponse = vi.fn();
     const recordTrustedServerCreativeFailure = vi.fn();
-    (window as TestWindow).tsjs!.gptDiagnostics = {
+    (window as TestWindow).tsjs!.gptDiagnosticsRecorder = {
       recordTrustedServerCreativeRequest,
       recordTrustedServerCreativeResponse,
       recordTrustedServerCreativeFailure,
-    } as unknown as TsjsApi['gptDiagnostics'];
+    } as unknown as TsjsApi['gptDiagnosticsRecorder'];
     fetchStub.mockResolvedValue({
       ok: true,
       text: () => Promise.resolve(JSON.stringify({ adm: '<div>Creative</div>' })),
@@ -3721,11 +3755,11 @@ describe('installTsRenderBridge', () => {
       });
       const recordTrustedServerCreativeFailure = vi.fn();
       const tsjs = (window as TestWindow).tsjs!;
-      tsjs.gptDiagnostics = {
+      tsjs.gptDiagnosticsRecorder = {
         recordTrustedServerCreativeRequest,
         recordTrustedServerCreativeResponse,
         recordTrustedServerCreativeFailure,
-      } as unknown as TsjsApi['gptDiagnostics'];
+      } as unknown as TsjsApi['gptDiagnosticsRecorder'];
       tsjs.bids.homepage_header.adm = '<div>Creative</div>';
 
       const bridgeListener = await captureBridgeListener();
@@ -3763,11 +3797,11 @@ describe('installTsRenderBridge', () => {
       throw new Error('diagnostics response failed');
     });
     const recordTrustedServerCreativeFailure = vi.fn();
-    (window as TestWindow).tsjs!.gptDiagnostics = {
+    (window as TestWindow).tsjs!.gptDiagnosticsRecorder = {
       recordTrustedServerCreativeRequest,
       recordTrustedServerCreativeResponse,
       recordTrustedServerCreativeFailure,
-    } as unknown as TsjsApi['gptDiagnostics'];
+    } as unknown as TsjsApi['gptDiagnosticsRecorder'];
     fetchStub.mockResolvedValue({
       ok: true,
       text: () => Promise.resolve(JSON.stringify({ adm: '<div>Creative</div>' })),
@@ -3799,11 +3833,11 @@ describe('installTsRenderBridge', () => {
       throw new Error('diagnostics failure writer failed');
     });
     const tsjs = (window as TestWindow).tsjs!;
-    tsjs.gptDiagnostics = {
+    tsjs.gptDiagnosticsRecorder = {
       recordTrustedServerCreativeRequest,
       recordTrustedServerCreativeResponse: vi.fn(),
       recordTrustedServerCreativeFailure,
-    } as unknown as TsjsApi['gptDiagnostics'];
+    } as unknown as TsjsApi['gptDiagnosticsRecorder'];
     delete tsjs.bids.homepage_header.hb_cache_host;
     delete tsjs.bids.homepage_header.hb_cache_path;
 
@@ -3831,11 +3865,11 @@ describe('installTsRenderBridge', () => {
     const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(44);
     const recordTrustedServerCreativeResponse = vi.fn();
     const recordTrustedServerCreativeFailure = vi.fn();
-    (window as TestWindow).tsjs!.gptDiagnostics = {
+    (window as TestWindow).tsjs!.gptDiagnosticsRecorder = {
       recordTrustedServerCreativeRequest,
       recordTrustedServerCreativeResponse,
       recordTrustedServerCreativeFailure,
-    } as unknown as TsjsApi['gptDiagnostics'];
+    } as unknown as TsjsApi['gptDiagnosticsRecorder'];
     // A returnCreative=false JSON entry with no `adm` (VAST-only, or malformed).
     // The bridge must NOT forward the serialized bid document to PUC.
     fetchStub.mockResolvedValue({
@@ -4432,11 +4466,11 @@ describe('installTsRenderBridge', () => {
     const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(52);
     const recordTrustedServerCreativeResponse = vi.fn();
     const recordTrustedServerCreativeFailure = vi.fn();
-    (window as TestWindow).tsjs!.gptDiagnostics = {
+    (window as TestWindow).tsjs!.gptDiagnosticsRecorder = {
       recordTrustedServerCreativeRequest,
       recordTrustedServerCreativeResponse,
       recordTrustedServerCreativeFailure,
-    } as unknown as TsjsApi['gptDiagnostics'];
+    } as unknown as TsjsApi['gptDiagnosticsRecorder'];
     await import('../../../src/integrations/gpt/index');
     fetchStub.mockResolvedValue({ ok: true, text: () => Promise.resolve('') } as Response);
 
@@ -4486,11 +4520,11 @@ describe('installTsRenderBridge', () => {
     const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(53);
     const recordTrustedServerCreativeResponse = vi.fn();
     const recordTrustedServerCreativeFailure = vi.fn();
-    (window as TestWindow).tsjs!.gptDiagnostics = {
+    (window as TestWindow).tsjs!.gptDiagnosticsRecorder = {
       recordTrustedServerCreativeRequest,
       recordTrustedServerCreativeResponse,
       recordTrustedServerCreativeFailure,
-    } as unknown as TsjsApi['gptDiagnostics'];
+    } as unknown as TsjsApi['gptDiagnosticsRecorder'];
 
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
     await import('../../../src/integrations/gpt/index');

@@ -2,6 +2,7 @@ import type {
   GptDiagnosticsApi,
   GptDiagnosticsCreativeFailure,
   GptDiagnosticsExportV1,
+  GptDiagnosticsRecorder,
   GptDiagnosticsSlotHandle,
   GptDiagnosticsTrustedServerOpportunity,
 } from '../../core/types';
@@ -51,18 +52,6 @@ interface ApiOptions {
 
 type ApiListener = (snapshot: GptDiagnosticsExportV1) => void;
 
-type InstalledGptDiagnosticsApi = GptDiagnosticsApi &
-  Required<
-    Pick<
-      GptDiagnosticsApi,
-      | 'recordTrustedServerOpportunity'
-      | 'recordPrebidRefresh'
-      | 'recordTrustedServerCreativeRequest'
-      | 'recordTrustedServerCreativeResponse'
-      | 'recordTrustedServerCreativeFailure'
-    >
-  >;
-
 function safelyRecord(action: () => void): void {
   try {
     action();
@@ -81,7 +70,9 @@ function safelyCreateAttempt(action: () => number | undefined): number | undefin
 
 /** Owns the public read-only diagnostics API and its source subscriptions. */
 export class GptDiagnosticsApiController {
-  readonly api: InstalledGptDiagnosticsApi;
+  readonly api: GptDiagnosticsApi;
+  /** Internal evidence channel for Trusted Server integration modules. */
+  readonly recorder: GptDiagnosticsRecorder;
 
   private readonly store: ApiStore;
   private readonly bindings: ApiBindingManager;
@@ -118,6 +109,9 @@ export class GptDiagnosticsApiController {
       subscribe: (listener) => this.subscribe(listener),
       show: () => this.presentation.show(),
       hide: () => this.presentation.hide(),
+    };
+
+    this.recorder = {
       recordTrustedServerOpportunity: (slot, auctionSlotId, opportunity, trustedServerAuctionId) =>
         safelyRecord(() => {
           if (trustedServerAuctionId === undefined) {
@@ -178,14 +172,11 @@ export class GptDiagnosticsApiController {
         })),
       })),
       callbackIssues: store.callbackIssues.map((issue) => ({ ...issue })),
-      attributionIssues: (store.attributionIssues ?? []).map((issue) => ({ ...issue })),
+      attributionIssues: store.attributionIssues.map((issue) => ({ ...issue })),
       coverage: Object.fromEntries(
         Object.entries(store.coverage).map(([kind, counters]) => [kind, { ...counters }])
       ) as GptDiagnosticsExportV1['coverage'],
-      metadata: {
-        ...store.metadata,
-        droppedAttributionIssues: store.metadata.droppedAttributionIssues ?? 0,
-      },
+      metadata: { ...store.metadata },
     };
   }
 
@@ -230,9 +221,20 @@ export class GptDiagnosticsApiController {
       this.notificationScheduled = false;
       if (this.destroyed) return;
 
+      // One snapshot per notification: every subscriber must see the same
+      // `capturedAt` and the same derived delivery states, and deriving it once
+      // keeps the cost independent of the subscriber count.
+      let snapshot: GptDiagnosticsExportV1;
+      try {
+        snapshot = this.snapshot();
+      } catch {
+        // A snapshot failure must not escape the scheduled callback.
+        return;
+      }
+
       for (const listener of this.listeners) {
         try {
-          listener(this.snapshot());
+          listener(snapshot);
         } catch {
           // One API subscriber must not block the rest.
         }

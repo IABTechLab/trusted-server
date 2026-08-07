@@ -1,6 +1,7 @@
 import type { GptDiagnosticsRequestCycle } from '../../core/types';
 
 import type { GptDiagnosticsBindingManager } from './binding';
+import { unhandledCase } from './exhaustive';
 import type {
   GptDiagnosticsBindingInput,
   GptDiagnosticsStoreSlotSnapshot,
@@ -76,10 +77,14 @@ function formatMilliseconds(value: number | undefined): string | undefined {
   return `${Math.round(value)} ms`;
 }
 
+/**
+ * Label the delivery state the store already derived.
+ *
+ * The badge must not re-derive precedence from raw timestamps: the store owns
+ * that ladder, and a second copy of it can disagree — for instance by claiming
+ * a Trusted Server response on a cycle GPT reported empty.
+ */
 function deliveryLabel(cycle: GptDiagnosticsRequestCycle): string | undefined {
-  if (cycle.trustedServerCreativeResponseAtMs !== undefined) return 'TS response sent';
-  if (cycle.trustedServerCreativeRequestAtMs !== undefined) return 'TS selected';
-
   switch (cycle.delivery) {
     case 'trusted_server_response_sent':
       return 'TS response sent';
@@ -94,8 +99,10 @@ function deliveryLabel(cycle: GptDiagnosticsRequestCycle): string | undefined {
     case 'unknown':
       return 'Delivery unknown';
     case 'not_applicable':
-    default:
+    case undefined:
       return undefined;
+    default:
+      return unhandledCase(cycle.delivery);
   }
 }
 

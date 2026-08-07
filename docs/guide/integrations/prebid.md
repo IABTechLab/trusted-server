@@ -354,7 +354,10 @@ the configured suffixes with an exact, case-sensitive `endsWith()` match. A matc
 slot is omitted from the synthetic Prebid refresh ad units, but it remains in the
 original GPT refresh call. In a mixed global refresh, normal display slots still
 auction and receive refreshed Prebid targeting while excluded slots still refresh in
-GAM.
+GAM. The wrapper still issues one GPT call for the whole target set, so an
+excluded slot in that mixed refresh waits for the auction to complete or the
+refresh watchdog to fire (up to 1.5 seconds by default); an all-excluded refresh
+passes through immediately.
 
 Each suffix must be a non-empty slash-prefixed path with no surrounding whitespace.
 The root suffix (`"/"`) is rejected, as are suffixes without a leading slash; exact
@@ -367,11 +370,12 @@ Server fails open and runs the normal refresh auction. The option affects only t
 Trusted Server GPT-refresh wrapper; it does not block direct publisher Prebid,
 APS, or other auction flows.
 
-The external Prebid bundle and the injected Trusted Server configuration must be
-rolled out together. Regenerate and upload the bundle with `ts prebid bundle`, then
-deploy the configuration containing the suffix list and its corresponding bundle
-URL/hash/SRI metadata. A new configuration paired with an old cached external bundle
-cannot apply the browser filter.
+The filter runs in the server-served `tsjs-prebid` shim, and the server injects its
+suffix list into the same page. Deploy the updated Trusted Server application and
+configuration together; this option does not require regenerating the external Prebid
+bundle. Follow the [External Bundle Generation](#external-bundle-generation) migration
+note only when upgrading a bundle generated before the shim split, or when changing
+external Prebid adapters or User ID modules.
 
 ## Client-Side Bidders
 
