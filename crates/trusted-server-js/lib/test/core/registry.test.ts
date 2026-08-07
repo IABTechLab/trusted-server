@@ -1,7 +1,11 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 import type { AdUnit } from '../../src/core/types';
-import { AdUnitRegistrationError, prepareProgrammaticAdUnits } from '../../src/core/registry';
+import {
+  AdUnitRegistrationError,
+  prepareProgrammaticAdUnits,
+  serializeAuctionRequestBody,
+} from '../../src/core/registry';
 
 function unit(code = 'programmatic-slot'): Record<string, unknown> {
   return {
@@ -191,5 +195,31 @@ describe('registry', () => {
       () => prepareProgrammaticAdUnits(candidate, new Set()),
       'request_body_too_large'
     );
+  });
+
+  it('serializes detached auction data without invoking inherited toJSON hooks', () => {
+    const prepared = prepareProgrammaticAdUnits(unit(), new Set());
+    const context = Object.freeze({ segments: Object.freeze(['one']) });
+    const publisherHook = vi.fn(() => {
+      throw new Error('publisher toJSON hook');
+    });
+    Object.defineProperty(Object.prototype, 'toJSON', {
+      configurable: true,
+      value: publisherHook,
+    });
+    Object.defineProperty(Array.prototype, 'toJSON', {
+      configurable: true,
+      value: publisherHook,
+    });
+    let body: string | undefined;
+    try {
+      body = serializeAuctionRequestBody(prepared, context);
+    } finally {
+      Reflect.deleteProperty(Object.prototype, 'toJSON');
+      Reflect.deleteProperty(Array.prototype, 'toJSON');
+    }
+
+    expect(publisherHook).not.toHaveBeenCalled();
+    expect(body).toBe(JSON.stringify({ adUnits: prepared, config: context }));
   });
 });

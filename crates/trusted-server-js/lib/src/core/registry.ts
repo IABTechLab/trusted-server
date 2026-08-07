@@ -9,6 +9,11 @@ const MAX_PROGRAMMATIC_UNITS = 256;
 const MAX_ACTIVE_SLOT_RECORDS = 256;
 const MAX_JSON_STRUCTURE_ENTRIES = Math.floor((MAX_AUCTION_BODY_BYTES - 1) / 2);
 const textEncoder = new TextEncoder();
+const reflectApplyIntrinsic = Reflect.apply;
+const jsonStringifyIntrinsic = JSON.stringify;
+const objectCreateIntrinsic = Object.create;
+const objectSetPrototypeOfIntrinsic = Object.setPrototypeOf;
+const textEncoderEncodeIntrinsic = TextEncoder.prototype.encode;
 
 export type AdUnitRegistrationErrorCode =
   | 'invalid_units'
@@ -196,6 +201,80 @@ function copyJsonRecord(value: unknown): Readonly<Record<string, unknown>> | und
       stack.push({ index: 0, output: child, snapshot: childSnapshot, source: entry.value });
     }
     return Object.freeze(root);
+  } catch {
+    return undefined;
+  }
+}
+
+function safeSerializationContainer(array: boolean): Record<string, unknown> | unknown[] {
+  if (!array) {
+    return reflectApplyIntrinsic(objectCreateIntrinsic, Object, [null]) as Record<string, unknown>;
+  }
+  const output: unknown[] = [];
+  reflectApplyIntrinsic(objectSetPrototypeOfIntrinsic, Object, [output, null]);
+  return output;
+}
+
+/** Copy accepted JSON data onto containers that inherit no publisher hooks. */
+function copyJsonForSerialization(value: object): object | undefined {
+  const rootSnapshot = snapshotJsonContainer(value);
+  if (!rootSnapshot) return undefined;
+  const root = safeSerializationContainer(rootSnapshot.array);
+  const active = new Set<object>([value]);
+  const completed = new WeakMap<object, Record<string, unknown> | unknown[]>();
+  const stack: JsonCloneFrame[] = [
+    { index: 0, output: root, snapshot: rootSnapshot, source: value },
+  ];
+  let structureEntries = 1;
+  try {
+    while (stack.length > 0) {
+      const frame = stack[stack.length - 1];
+      if (!frame) return undefined;
+      if (frame.index >= frame.snapshot.entries.length) {
+        completed.set(frame.source, frame.output);
+        active.delete(frame.source);
+        stack.pop();
+        continue;
+      }
+      const entry = frame.snapshot.entries[frame.index];
+      frame.index += 1;
+      if (!entry || ++structureEntries > MAX_JSON_STRUCTURE_ENTRIES) return undefined;
+      const primitive = jsonPrimitive(entry.value);
+      if (primitive !== undefined || entry.value === null) {
+        Object.defineProperty(frame.output, entry.key, {
+          configurable: true,
+          enumerable: true,
+          value: primitive,
+          writable: true,
+        });
+        continue;
+      }
+      if (typeof entry.value !== 'object' || entry.value === null || active.has(entry.value)) {
+        return undefined;
+      }
+      const completedChild = completed.get(entry.value);
+      if (completedChild) {
+        Object.defineProperty(frame.output, entry.key, {
+          configurable: true,
+          enumerable: true,
+          value: completedChild,
+          writable: true,
+        });
+        continue;
+      }
+      const childSnapshot = snapshotJsonContainer(entry.value);
+      if (!childSnapshot) return undefined;
+      const child = safeSerializationContainer(childSnapshot.array);
+      Object.defineProperty(frame.output, entry.key, {
+        configurable: true,
+        enumerable: true,
+        value: child,
+        writable: true,
+      });
+      active.add(entry.value);
+      stack.push({ index: 0, output: child, snapshot: childSnapshot, source: entry.value });
+    }
+    return root;
   } catch {
     return undefined;
   }
@@ -434,6 +513,25 @@ export function prepareProgrammaticAdUnits(
 
 export function addAdUnitsResult(units: readonly ProgrammaticAdUnit[]): AddAdUnitsResult {
   return Object.freeze({ registered: Object.freeze(units.map(({ code }) => code)) });
+}
+
+/** Serialize one bounded `/auction` body without consulting inherited `toJSON` hooks. */
+export function serializeAuctionRequestBody(
+  adUnits: readonly Readonly<object>[],
+  config: Readonly<Record<string, unknown>>
+): string | undefined {
+  try {
+    const detached = copyJsonForSerialization({ adUnits, config });
+    if (!detached) return undefined;
+    const serialized = reflectApplyIntrinsic(jsonStringifyIntrinsic, JSON, [detached]) as unknown;
+    if (typeof serialized !== 'string') return undefined;
+    const bytes = reflectApplyIntrinsic(textEncoderEncodeIntrinsic, textEncoder, [
+      serialized,
+    ]) as Uint8Array;
+    return bytes.byteLength <= MAX_AUCTION_BODY_BYTES ? serialized : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // The mutable merge registry remains connected only to the pre-cutover core entry.
