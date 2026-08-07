@@ -1,6 +1,10 @@
 const ADTECH_GLOBALS = new Set(['googletag', 'pbjs']);
 const GLOBAL_ROOTS = new Set(['globalThis', 'self', 'window']);
 
+// Known blind spots include computed composition (`globalThis['goog' + 'letag']`)
+// and function-returned roots (`getWin().googletag`); adapter boundaries and
+// restricted imports remain defense in depth.
+
 export const LEGACY_ADTECH_GLOBAL_ALLOWLIST = Object.freeze([
   'src/integrations/gpt/index.ts',
   'src/integrations/gpt_diagnostics/observer.ts',

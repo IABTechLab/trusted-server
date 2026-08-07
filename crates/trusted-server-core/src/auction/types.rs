@@ -266,6 +266,9 @@ pub enum AuctionDropReason {
 
 impl AuctionDropReason {
     /// Return the exact existing debug/projection literal.
+    ///
+    /// This hand-written mapping also drives [`Ord`] so serialized-map output stays
+    /// alphabetically stable even when declaration order changes.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {

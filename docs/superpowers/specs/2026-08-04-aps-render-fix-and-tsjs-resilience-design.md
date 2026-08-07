@@ -2503,7 +2503,11 @@ subscription methods. The final schema is:
 ```ts
 type RenderTracePathV1 = 'auction' | 'ssat' | 'gam-refresh'
 type RenderTraceServedFromV1 =
-  'inline' | 'gam' | 'debug-adm' | 'pbs-cache' | 'prebid'
+  | 'inline'
+  | 'gam'
+  | 'debug-adm'
+  | 'pbs-cache'
+  | 'prebid'
 
 interface RenderTraceRecord {
   readonly slotId: string
@@ -2778,9 +2782,10 @@ After that upgrade, the lockfile compiler is the authority. CI runs a checked-in
 `exactOptionalPropertyTypes`, `verbatimModuleSyntax`, `noImplicitOverride`, and
 `useUnknownInCatchVariables`. Production bundles contain no dynamic imports.
 
-Before implementation, CI records deterministic gzip/Brotli baselines for minimal,
-reference, and maximal integration sets; each may grow at most 5% unless separately
-approved. Boot-to-first-display p90 uses a pinned Chromium version, CI runner class,
+Before implementation, CI records deterministic gzip/Brotli baselines for the
+minimal `[core]`, reference `[core, creative, gpt, prebid, datadome]`, and maximal
+all-built-integration sets; each may grow at most 5% unless separately approved.
+Boot-to-first-display p90 uses a pinned Chromium version, CI runner class,
 fixture, warmup count, and sample count and must stay within 10% of that pre-change
 baseline. Retained heap uses Chromium CDP only, with forced-GC checkpoints after
 boot, first render, refresh, and SPA navigation, and the same 10% limit. Correctness
