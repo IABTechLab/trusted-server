@@ -1425,14 +1425,17 @@ artifact object.
 
 ### 4.2 Universal Creative claim
 
-The supported GAM creative pins Prebid Universal Creative 1.17.2 by exact artifact,
-not `latest` or a publisher-selectable version. Its cross-domain request is a JSON
+The supported GAM creative selects Prebid Universal Creative 1.17.2 outside the
+Trusted Server source tree, never `latest` or a publisher-selectable version. No PUC
+bytes, checksum, or distributable artifact is vendored into this repository. Its
+cross-domain request is a JSON
 string decoding to exactly
 `{message:"Prebid Request",adId,adServerDomain}` and carries exactly one transferred
 response port. All three values are strings; `adId` and `adServerDomain` are
 nonempty. Object-form or extended payloads are rejected. Universal Creative owns
-this shape, so it cannot carry a TS nonce. The checked-in hermetic PUC fixture is
-generated from or pinned byte-for-byte to the supported source behavior.
+this shape, so it cannot carry a TS nonce. Hermetic unit and browser tests exercise a
+locally authored contract harness limited to that public message/helper behavior;
+the pre-production real-GAM conformance gate exercises the actual PUC release.
 
 The bridge is one capture-phase dispatcher installed as the first reversible core
 effect in the synchronous activation barrier, before any integration-module
@@ -3098,7 +3101,7 @@ adding a hidden analytics subsystem here.
 
 | Risk                                                  | Mitigation                                                                                                                                                                             |
 | ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| PUC behavior differs from mocks                       | vendor and checksum the exact supported PUC 1.17.2 behavior, exercise its `h.sendMessage` channel, and gate on real GAM                                                                |
+| PUC behavior differs from the local contract harness  | keep the harness limited to the public message/helper contract, exercise `h.sendMessage`, and gate the actual externally hosted PUC release on real GAM; do not vendor PUC bytes       |
 | Same-realm publisher code can interfere               | explicitly trust TS-authored owner code; capability checks defend unrelated frames, replays, and stale work, not arbitrary same-realm compromise                                       |
 | A module activation never returns                     | activation is generated first-party code with boundary tests; elapsed returning calls fail through monotonic checks, but JavaScript cannot preempt a nonreturning same-thread function |
 | Strict parsing rejects a future APS field             | descriptor is versioned; outer transport remains tolerant; add a reviewed version/corpus update rather than silently accepting new semantics                                           |

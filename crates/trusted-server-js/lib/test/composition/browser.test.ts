@@ -185,14 +185,12 @@ describe('browser composition', () => {
         adapters: {
           googletag: fakeGoogletagAdapter(),
           prebid: fakePrebidAdapter(),
-          messaging: fakeMessagingAdapter(),
+          messaging: fakeMessagingAdapter(() => {
+            order.push('bridge');
+            return () => order.push('dispose-bridge');
+          }),
         },
         coreActivations: {
-          bridgeRecognizer: ({ onDispose }, adapters) => {
-            expect(Object.isFrozen(adapters)).toBe(true);
-            onDispose(() => order.push('dispose-bridge'));
-            order.push('bridge');
-          },
           correctnessGptListeners: ({ onDispose }, adapters) => {
             expect(Object.isFrozen(adapters)).toBe(true);
             onDispose(() => order.push('dispose-gpt'));
@@ -216,6 +214,7 @@ describe('browser composition', () => {
     ).toBe(true);
     await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
     expect(order).toEqual(['bridge', 'gpt', 'module']);
+    expect(composition.pucBridgeForTest()).toBeDefined();
 
     composition.runtime.dispose();
     expect(order).toEqual([
@@ -226,6 +225,7 @@ describe('browser composition', () => {
       'dispose-gpt',
       'dispose-bridge',
     ]);
+    expect(composition.pucBridgeForTest()).toBeUndefined();
     expect(() => composition.adapters.googletag.run(() => undefined)).toThrowError(
       expect.objectContaining({ code: 'operation_disposed' })
     );
@@ -289,9 +289,6 @@ describe('browser composition', () => {
           prebid: fakePrebidAdapter(),
         },
         coreActivations: {
-          bridgeRecognizer: vi.fn(() => {
-            expect(subscriptions).toEqual([]);
-          }),
           correctnessGptListeners: correctness,
         },
       }
@@ -339,7 +336,6 @@ describe('browser composition', () => {
           messaging: fakeMessagingAdapter(),
         },
         coreActivations: {
-          bridgeRecognizer: vi.fn(),
           correctnessGptListeners: vi.fn(),
         },
         createIdentityIssuerForTest: () => {
@@ -429,7 +425,6 @@ describe('browser composition', () => {
   });
 
   it('unwinds a lazily-created session when navigation identity generation fails', async () => {
-    const bridge = vi.fn();
     const composition = createTestBrowserRuntimeComposition(
       {
         target: {},
@@ -449,7 +444,6 @@ describe('browser composition', () => {
       },
       {
         coreActivations: {
-          bridgeRecognizer: bridge,
           correctnessGptListeners: vi.fn(),
         },
         createIdentityIssuerForTest: () => ({
@@ -466,7 +460,7 @@ describe('browser composition', () => {
     });
     expect(composition.runtimeSessionForTest()).toBeUndefined();
     expect(composition.projectionSlotsForTest()).toBeUndefined();
-    expect(bridge).not.toHaveBeenCalled();
+    expect(composition.pucBridgeForTest()).toBeUndefined();
   });
 
   it('releases initial programmatic slots before admitting a replacement SPA projection', async () => {
@@ -494,7 +488,6 @@ describe('browser composition', () => {
       {
         admittedProgrammaticSlotsForTest: programmaticSlots,
         coreActivations: {
-          bridgeRecognizer: vi.fn(),
           correctnessGptListeners: vi.fn(),
         },
         createIdentityIssuerForTest: () => {
@@ -551,7 +544,6 @@ describe('browser composition', () => {
       {
         admittedProgrammaticSlotsForTest: Object.freeze(['duplicate', 'duplicate']),
         coreActivations: {
-          bridgeRecognizer: vi.fn(),
           correctnessGptListeners: vi.fn(),
         },
       }
@@ -601,7 +593,6 @@ describe('browser composition', () => {
             Array.from({ length: programmaticCount }, (_, index) => `programmatic-${index}`)
           ),
           coreActivations: {
-            bridgeRecognizer: vi.fn(),
             correctnessGptListeners: vi.fn(),
           },
         }
@@ -640,7 +631,6 @@ describe('browser composition', () => {
       {
         admittedProgrammaticSlotsForTest: programmaticSlots,
         coreActivations: {
-          bridgeRecognizer: vi.fn(),
           correctnessGptListeners: vi.fn(),
         },
       }
@@ -690,7 +680,6 @@ describe('browser composition', () => {
           prebid: fakePrebidAdapter(),
         },
         coreActivations: {
-          bridgeRecognizer: vi.fn(),
           correctnessGptListeners: vi.fn(),
         },
       }
@@ -723,7 +712,6 @@ describe('browser composition', () => {
     }));
     const adapterActivation = vi.fn(() => 'pending' as const);
     const listenerActivation = vi.fn(() => vi.fn());
-    const timerActivation = vi.fn(() => setTimeout(vi.fn(), 1));
     const latePreparation = vi.fn();
     const target = {};
     const composition = createTestBrowserRuntimeComposition(
@@ -759,7 +747,6 @@ describe('browser composition', () => {
           messaging: fakeMessagingAdapter(listenerActivation),
         },
         coreActivations: {
-          bridgeRecognizer: timerActivation,
           correctnessGptListeners: adapterActivation,
         },
       }
@@ -786,7 +773,6 @@ describe('browser composition', () => {
     expect(serviceConstruction).not.toHaveBeenCalled();
     expect(adapterActivation).not.toHaveBeenCalled();
     expect(listenerActivation).not.toHaveBeenCalled();
-    expect(timerActivation).not.toHaveBeenCalled();
     expect(latePreparation).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
   });

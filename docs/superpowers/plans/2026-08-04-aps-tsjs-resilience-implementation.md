@@ -1635,11 +1635,12 @@ collapse those checkpoints or carry unverified behavior between them.
 - Modify: `crates/trusted-server-js/lib/test/integrations/gpt/ad_init.test.ts`
 - Modify: `crates/trusted-server-js/lib/src/composition/browser.ts`
 - Modify: `crates/trusted-server-js/lib/test/composition/browser.test.ts`
-- Create: `crates/trusted-server-integration-tests/browser/fixtures/prebid-universal-creative-1.17.2.js`
-- Create: `crates/trusted-server-integration-tests/browser/fixtures/prebid-universal-creative-1.17.2.sha256`
 
-- [ ] **Step 1: Vendor the exact supported PUC 1.17.2 artifact and checksum for hermetic tests;**
-      the GAM template pins the same version and never `latest`. Add failing tests for
+- [ ] **Step 1: Build a locally authored PUC contract harness without copying or vendoring PUC**
+      **bytes.** Keep it limited to the public `prebidMessenger`, dynamic-renderer,
+      and `h.sendMessage` behavior exercised by this protocol. The external GAM
+      configuration selects PUC 1.17.2 and never `latest`; the real-GAM gate, not a
+      repository artifact, validates that release. Add failing tests for
       the exact JSON string
       `{message:"Prebid Request",adId,adServerDomain}`, object/extended shapes,
       zero/two ports, native id, live/tombstoned TS id, duplicate simultaneous claim,
@@ -2750,7 +2751,6 @@ implementation change.
 - Modify: `crates/trusted-server-integration-tests/browser/helpers/infra.ts`
 - Modify: `crates/trusted-server-integration-tests/browser/helpers/state.ts`
 - Modify: `crates/trusted-server-integration-tests/browser/fixtures/fictional-aps-runner.js`
-- Modify: `crates/trusted-server-integration-tests/browser/fixtures/prebid-universal-creative-1.17.2.js`
 - Modify: `scripts/integration-tests-browser.sh`
 - Modify: `.github/workflows/integration-tests.yml`
 
@@ -2763,12 +2763,14 @@ implementation change.
   `npm --prefix ... exec -- playwright`; it must retain the release-WASM, Viceroy
   config, Docker image, npm install, and TSJS fixture preparation from Task 0.
 
-- [ ] **Step 2: Create deterministic local GPT and locally authored fictional APS-runner**
-      success/failure fixtures; run the vendored exact PUC 1.17.2 artifact for the
-      creative path. The fictional runner must not copy, transform, derive from, or
-      archive APS runner bytes and must never be packaged as a production fallback. Do
-      not replace PUC's `prebidMessenger`, `runDynamicRenderer`, or `h.sendMessage`
-      behavior and do not mock the kernel/services under test.
+- [ ] **Step 2: Create deterministic local GPT, PUC-contract, and locally authored**
+      **fictional APS-runner success/failure fixtures.** The PUC harness implements
+      only the public `prebidMessenger`, `runDynamicRenderer`, and `h.sendMessage`
+      behavior required to drive the protocol and contains no copied PUC bytes. The
+      fictional runner must not copy, transform, derive from, or archive APS runner
+      bytes and must never be packaged as a production fallback. Do not mock the
+      kernel/services under test; exercise the actual externally hosted PUC release
+      only in the real-GAM pre-production gate.
 
 - [ ] **Step 3: Implement every spec §7.2 browser-observable race as grouped tables with exact**
       terminal, DOM, targeting, listener, port, timer, and network assertions:

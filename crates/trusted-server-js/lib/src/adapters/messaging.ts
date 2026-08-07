@@ -234,6 +234,13 @@ export interface MessagingAdapter {
     event: unknown,
     expectedCount: 0 | 1 | 2
   ): readonly MessagingPort[] | undefined;
+  inspectTransferredPorts(event: unknown):
+    | Readonly<{
+        exactShape: boolean;
+        originalCount: number;
+        ports: readonly MessagingPort[];
+      }>
+    | undefined;
 }
 
 /** Semantic validators injected by composition without reversing adapter layering. */
@@ -1053,9 +1060,14 @@ function wrapPort(raw: RawPort, transferable = false): MessagingPort {
   return port;
 }
 
-function snapshotPortArray(
-  candidate: unknown
-): { readonly valid: boolean; readonly values: readonly unknown[] } | undefined {
+function snapshotPortArray(candidate: unknown):
+  | {
+      readonly exactShape: boolean;
+      readonly originalCount: number;
+      readonly valid: boolean;
+      readonly values: readonly unknown[];
+    }
+  | undefined {
   try {
     if (!Array.isArray(candidate) || Object.getPrototypeOf(candidate) !== Array.prototype) {
       return undefined;
@@ -1073,7 +1085,8 @@ function snapshotPortArray(
     const length = lengthDescriptor.value;
     const ownKeys = Reflect.ownKeys(candidate);
     const values: unknown[] = [];
-    let valid = length <= 2 && ownKeys.length === length + 1;
+    let exactShape = ownKeys.length === length + 1;
+    let valid = length <= 2 && exactShape;
     if (length <= 2) {
       for (let keyIndex = 0; keyIndex < ownKeys.length; keyIndex += 1) {
         const key = ownKeys[keyIndex];
@@ -1085,11 +1098,15 @@ function snapshotPortArray(
             break;
           }
         }
-        if (!expected) valid = false;
+        if (!expected) {
+          exactShape = false;
+          valid = false;
+        }
       }
       for (let index = 0; index < length; index += 1) {
         const descriptor = Object.getOwnPropertyDescriptor(candidate, String(index));
         if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+          exactShape = false;
           valid = false;
           continue;
         }
@@ -1098,18 +1115,25 @@ function snapshotPortArray(
     } else {
       for (let keyIndex = 0; keyIndex < ownKeys.length; keyIndex += 1) {
         const key = ownKeys[keyIndex];
-        if (typeof key !== 'string' || key === 'length') continue;
+        if (key === 'length') continue;
+        if (typeof key !== 'string') {
+          exactShape = false;
+          continue;
+        }
         const index = Number(key);
         if (!Number.isSafeInteger(index) || index < 0 || index >= length || String(index) !== key) {
+          exactShape = false;
           continue;
         }
         const descriptor = Object.getOwnPropertyDescriptor(candidate, key);
         if (descriptor && Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
           values[values.length] = descriptor.value;
+        } else {
+          exactShape = false;
         }
       }
     }
-    return { valid, values };
+    return { exactShape, originalCount: length, valid, values };
   } catch {
     return undefined;
   }
@@ -1155,9 +1179,10 @@ function commitTransferReservation(reservation: TransferReservation): void {
   }
 }
 
-function extractTransferredPorts(
+function extractTransferredPortsInRange(
   event: unknown,
-  expectedCount: 0 | 1 | 2
+  minimumCount: 0 | 1 | 2,
+  maximumCount: 0 | 1 | 2
 ): readonly MessagingPort[] | undefined {
   let candidates: unknown;
   try {
@@ -1170,7 +1195,10 @@ function extractTransferredPorts(
   if (!snapshot) return undefined;
   const inspections: Array<RawPortInspection | undefined> = [];
   const claimed: boolean[] = [];
-  let accepted = snapshot.valid && snapshot.values.length === expectedCount;
+  let accepted =
+    snapshot.valid &&
+    snapshot.values.length >= minimumCount &&
+    snapshot.values.length <= maximumCount;
   for (let index = 0; index < snapshot.values.length; index += 1) {
     const candidate = snapshot.values[index];
     const candidateClaimed = claimPortCandidate(candidate);
@@ -1205,6 +1233,53 @@ function extractTransferredPorts(
       const captured = inspections[index]?.close;
       if (claimed[index] && captured) closeCapturedRawPort(captured);
     }
+    return undefined;
+  }
+}
+
+function extractTransferredPorts(
+  event: unknown,
+  expectedCount: 0 | 1 | 2
+): readonly MessagingPort[] | undefined {
+  return extractTransferredPortsInRange(event, expectedCount, expectedCount);
+}
+
+function inspectTransferredPorts(event: unknown):
+  | Readonly<{
+      exactShape: boolean;
+      originalCount: number;
+      ports: readonly MessagingPort[];
+    }>
+  | undefined {
+  let candidates: unknown;
+  try {
+    if (typeof event !== 'object' || event === null) return undefined;
+    candidates = Reflect.get(event, 'ports');
+  } catch {
+    return undefined;
+  }
+  const snapshot = snapshotPortArray(candidates);
+  if (!snapshot) return undefined;
+  const wrapped: MessagingPort[] = [];
+  try {
+    for (let index = 0; index < snapshot.values.length; index += 1) {
+      const candidate = snapshot.values[index];
+      if (!claimPortCandidate(candidate)) continue;
+      const inspection = inspectRawPort(candidate);
+      if (!inspection.raw) {
+        if (inspection.close) closeCapturedRawPort(inspection.close);
+        else closeRawPort(candidate);
+        continue;
+      }
+      wrapped[wrapped.length] = wrapPort(inspection.raw);
+    }
+    return Object.freeze({
+      exactShape: snapshot.exactShape,
+      originalCount: snapshot.originalCount,
+      ports: Object.freeze(wrapped),
+    });
+  } catch {
+    for (let index = 0; index < wrapped.length; index += 1) wrapped[index]?.close();
     return undefined;
   }
 }
@@ -1348,6 +1423,7 @@ export function createBrowserMessagingAdapter(
     parseProtocolMessage: (kind: ProtocolMessageKind, candidate: unknown) =>
       parseProtocolMessage(kind, candidate, validation),
     extractTransferredPorts,
+    inspectTransferredPorts,
   });
 }
 
@@ -1361,5 +1437,6 @@ export function createNoopMessagingAdapter(): MessagingAdapter {
     parseProtocolMessage: (kind: ProtocolMessageKind, candidate: unknown) =>
       parseProtocolMessage(kind, candidate, {}),
     extractTransferredPorts,
+    inspectTransferredPorts,
   });
 }
