@@ -561,7 +561,13 @@ export function createBrowserSlotReconciliationBoundary(
       isConnected,
       observe: (callback: () => void): (() => void) => {
         if (typeof callback !== 'function') throw new TypeError('reconciliation callback required');
-        const observer = new Observer(() => callback());
+        const observer = new Observer(() => {
+          try {
+            callback();
+          } catch {
+            // DOM observation cannot escape the service boundary.
+          }
+        });
         observer.observe(root, { childList: true, subtree: true });
         let active = true;
         return (): void => {
@@ -1477,7 +1483,17 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     window.operation = undefined;
     record.reconciliation = undefined;
     record.reconciliationSuccesses += 1;
+    const active = record.activeIntent;
+    if (
+      active &&
+      !active.terminal &&
+      (active.requestStartedAt !== undefined || window.orphan.activeCycle?.intent === active)
+    ) {
+      settle(active, failed('gpt_request_failed'));
+    }
+    window.orphan.activeCycle = undefined;
     detachDestroyedReconciliationPhysical(window.orphan);
+    advanceQueued(record);
     return true;
   };
 
@@ -1659,7 +1675,12 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       const record = records[index];
       const physical = record?.physical;
       if (!record || !physical) continue;
-      if (physical.ownership !== 'trusted_server' || !physical.definition) {
+      if (
+        physical.ownership !== 'trusted_server' ||
+        physical.state !== 'live' ||
+        physical.publisherIntentCount > 0 ||
+        !physical.definition
+      ) {
         cancelReconciliation(record);
         continue;
       }
@@ -2503,6 +2524,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       const physical = weakMapValue(physicalByObject, slot);
       if (!physical) return false;
       const record = physical.record;
+      if (record) cancelReconciliation(record);
       const cycleIntent = physical.activeCycle?.intent;
       if (cycleIntent && !cycleIntent.terminal) settle(cycleIntent, failed('gpt_request_failed'));
       if (record?.activeIntent) settle(record.activeIntent, failed('gpt_request_failed'));
