@@ -2398,7 +2398,7 @@ async fn collect_non_html_auction(
     let auction_id = telemetry
         .auction_request
         .as_ref()
-        .map(|request| request.id.clone());
+        .and_then(|_| diagnostics_auction_id(settings));
     let placeholder = mediator_placeholder_request();
     let result = orchestrator
         .collect_dispatched_auction(
@@ -2451,7 +2451,7 @@ async fn collect_stream_auction(
     let auction_id = telemetry
         .auction_request
         .as_ref()
-        .map(|request| request.id.clone());
+        .and_then(|_| diagnostics_auction_id(settings));
     log::info!("body_close_hold_loop: collecting dispatched auction before held body tail");
     let placeholder = mediator_placeholder_request();
     let collect_ctx = make_collect_context(settings, services, &placeholder);
@@ -3215,6 +3215,21 @@ pub(crate) fn build_auction_request(
     }
 }
 
+/// Mint the browser-visible auction correlation token for GPT diagnostics.
+///
+/// The token is freshly generated per auction and carries no user identity.
+/// [`AuctionRequest::id`] must never be used here: for a consented visitor it is
+/// `ts-{ec_id}`, so publishing it in `window.tsjs.bids` would hand the `HttpOnly`
+/// EC identifier to any script on the page, and — being stable per visitor — it
+/// could not distinguish one auction from the next either.
+///
+/// Returns `None` unless the GPT diagnostics integration is enabled, since
+/// nothing else consumes the value.
+fn diagnostics_auction_id(settings: &Settings) -> Option<String> {
+    crate::integrations::gpt_diagnostics::is_enabled(settings)
+        .then(|| format!("ts-auc-{}", uuid::Uuid::new_v4().simple()))
+}
+
 /// Escape a JSON string so it is safe to embed inside a JS double-quoted string literal
 /// inside an HTML `<script>` block.
 ///
@@ -3903,7 +3918,7 @@ pub async fn handle_page_bids(
                         )
                     })
                     .await;
-                    (winning_bids, Some(auction_request.id))
+                    (winning_bids, diagnostics_auction_id(settings))
                 }
                 Err(e) => {
                     log::warn!("page-bids auction failed: {e:?}");
@@ -8088,7 +8103,7 @@ mod tests {
     mod creative_opportunities_tests {
         use super::super::{
             MatchedSlotsContext, build_ad_slots_script, build_auction_request, build_bid_map,
-            build_bids_script, html_escape_for_script, write_bids_to_state,
+            build_bids_script, diagnostics_auction_id, html_escape_for_script, write_bids_to_state,
         };
         use crate::auction::types::{Bid, MediaType};
         use crate::consent::ConsentContext;
@@ -8332,6 +8347,33 @@ mod tests {
                 Some("https://ssp/bill"),
                 "should include burl"
             );
+        }
+
+        /// Guards the browser-visible token every auction path shares: it must
+        /// be fresh per auction and absent unless diagnostics can consume it.
+        #[test]
+        fn diagnostics_auction_id_is_fresh_and_gated() {
+            let mut settings = test_settings();
+            assert_eq!(
+                diagnostics_auction_id(&settings),
+                None,
+                "no token should be minted without the diagnostics integration"
+            );
+
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+                .expect("should enable diagnostics");
+            let first =
+                diagnostics_auction_id(&settings).expect("enabled diagnostics should mint a token");
+            let second =
+                diagnostics_auction_id(&settings).expect("enabled diagnostics should mint a token");
+
+            assert!(
+                first.starts_with("ts-auc-"),
+                "token should use the diagnostics prefix, got `{first}`"
+            );
+            assert_ne!(first, second, "each auction should mint its own token");
         }
 
         #[test]
@@ -9661,6 +9703,10 @@ mod tests {
         async fn page_bids_response_includes_auction_id_only_for_winning_bids() {
             let mut settings = settings_with_co();
             settings.auction.providers = vec![AUCTION_ID_TEST_PROVIDER.to_string()];
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+                .expect("should enable diagnostics");
             let slots = article_slot();
             let winning_stub = Arc::new(StubHttpClient::new());
             winning_stub.push_response(200, b"winner".to_vec());
@@ -9709,9 +9755,21 @@ mod tests {
                 auction_request.id, "ts-page-auction-example-123",
                 "test EC ID should produce a deterministic auction request ID"
             );
-            assert_eq!(
-                winning_body["bids"]["atf"]["hb_auction_id"], auction_request.id,
-                "page-bids should expose the current request ID only on the winner"
+            let winning_auction_id = winning_body["bids"]["atf"]["hb_auction_id"]
+                .as_str()
+                .expect("page-bids should expose an auction ID on the winner")
+                .to_string();
+            assert!(
+                winning_auction_id.starts_with("ts-auc-"),
+                "page-bids should expose a freshly minted diagnostics token, got `{winning_auction_id}`"
+            );
+            assert_ne!(
+                winning_auction_id, auction_request.id,
+                "browser-visible auction ID must not be the EC-derived request ID"
+            );
+            assert!(
+                !winning_auction_id.contains("page-auction-example-123"),
+                "browser-visible auction ID must not embed the EC ID"
             );
 
             let no_winner_stub = Arc::new(StubHttpClient::new());
@@ -9749,6 +9807,82 @@ mod tests {
                     .expect("page-bids should return a bids object")
                     .is_empty(),
                 "page-bids should not fabricate auction metadata without a winner"
+            );
+        }
+
+        /// The browser-visible auction ID is minted per auction and only for
+        /// deployments that run the diagnostics integration, so it can neither
+        /// carry EC identity across auctions nor reach pages that ignore it.
+        #[tokio::test]
+        async fn page_bids_auction_id_is_per_auction_and_gated_on_diagnostics() {
+            async fn winning_auction_id(settings: &Settings) -> Option<String> {
+                let slots = article_slot();
+                let stub = Arc::new(StubHttpClient::new());
+                stub.push_response(200, b"winner".to_vec());
+                let services = build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                );
+                let orchestrator =
+                    auction_id_test_orchestrator(settings, Arc::new(Mutex::new(None)), true);
+                let ec_context = EcContext::new_for_test(
+                    Some("page-auction-example-123".to_string()),
+                    crate::consent::ConsentContext {
+                        jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                        ..Default::default()
+                    },
+                );
+                let response = handle_page_bids(
+                    settings,
+                    &services,
+                    None,
+                    AuctionDispatch {
+                        orchestrator: &orchestrator,
+                        slots: &slots,
+                        registry: None,
+                    },
+                    &ec_context,
+                    make_page_bids_request("/2024/01/my-article/"),
+                )
+                .await
+                .expect("should return page-bids response");
+                let body: serde_json::Value = serde_json::from_slice(
+                    &response
+                        .into_body()
+                        .into_bytes()
+                        .expect("should read page-bids response body"),
+                )
+                .expect("should serialize page-bids response as JSON");
+                body["bids"]["atf"]["hb_auction_id"]
+                    .as_str()
+                    .map(str::to_string)
+            }
+
+            let mut settings = settings_with_co();
+            settings.auction.providers = vec![AUCTION_ID_TEST_PROVIDER.to_string()];
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+                .expect("should enable diagnostics");
+
+            let first = winning_auction_id(&settings)
+                .await
+                .expect("first auction should expose a diagnostics token");
+            let second = winning_auction_id(&settings)
+                .await
+                .expect("second auction should expose a diagnostics token");
+            assert_ne!(
+                first, second,
+                "each auction for the same visitor should mint its own token"
+            );
+
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": false }))
+                .expect("should disable diagnostics");
+            assert_eq!(
+                winning_auction_id(&settings).await,
+                None,
+                "no auction metadata should reach the page without the diagnostics integration"
             );
         }
 
