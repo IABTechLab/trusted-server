@@ -140,8 +140,133 @@ export function isAuctionProviderIdV1(value: unknown): value is string {
   return typeof value === 'string' && providerPattern.test(value);
 }
 
+function boundedJsonBytes(left: number, right: number, maximum: number): number {
+  return left > maximum - right ? maximum + 1 : left + right;
+}
+
+function encodedJsonStringBytes(value: string, maximum: number): number {
+  let bytes = 2;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    let encodedBytes: number;
+    if (code === 0x22 || code === 0x5c) encodedBytes = 2;
+    else if (code <= 0x1f) {
+      encodedBytes =
+        code === 0x08 || code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d ? 2 : 6;
+    } else if (code <= 0x7f) encodedBytes = 1;
+    else if (code <= 0x7ff) encodedBytes = 2;
+    else if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        encodedBytes = 4;
+        index += 1;
+      } else encodedBytes = 6;
+    } else if (code >= 0xdc00 && code <= 0xdfff) encodedBytes = 6;
+    else encodedBytes = 3;
+    bytes = boundedJsonBytes(bytes, encodedBytes, maximum);
+    if (bytes > maximum) return bytes;
+  }
+  return bytes;
+}
+
+interface JsonMeasureSnapshot {
+  readonly array: boolean;
+  readonly entries: readonly Readonly<{ key: string; value: unknown }>[];
+}
+
+interface JsonMeasureFrame extends JsonMeasureSnapshot {
+  readonly source: object;
+  bytes: number;
+  index: number;
+}
+
+function jsonPrimitiveBytes(value: unknown): number | undefined {
+  if (value === null) return 4;
+  if (typeof value === 'boolean') return value ? 4 : 5;
+  if (typeof value === 'number' && Number.isFinite(value)) return `${value}`.length;
+  return typeof value === 'string'
+    ? encodedJsonStringBytes(value, MAX_BROWSER_AUCTION_PROJECTION_BYTES)
+    : undefined;
+}
+
+function snapshotJsonForMeasurement(value: object): JsonMeasureSnapshot | undefined {
+  const array = Array.isArray(value);
+  const values = array ? ownDataArray(value, MAX_AUCTION_RESULTS) : undefined;
+  if (array && !values) return undefined;
+  const record = array ? undefined : ownDataObject(value);
+  if (!array && !record) return undefined;
+  return {
+    array,
+    entries: array
+      ? values!.map((entry, index) => ({ key: String(index), value: entry }))
+      : Object.keys(record!).map((key) => ({ key, value: record![key] })),
+  };
+}
+
+/** Measure exact own JSON data without consulting accessors or inherited `toJSON` hooks. */
 export function jsonUtf8ByteLength(value: unknown): number {
-  return textEncoder.encode(JSON.stringify(value)).length;
+  const primitive = jsonPrimitiveBytes(value);
+  if (primitive !== undefined) return primitive;
+  if (typeof value !== 'object' || value === null) return Number.POSITIVE_INFINITY;
+  const root = snapshotJsonForMeasurement(value);
+  if (!root) return Number.POSITIVE_INFINITY;
+  const memo = new WeakMap<object, number>();
+  const active = new Set<object>([value]);
+  const stack: JsonMeasureFrame[] = [{ ...root, bytes: 2, index: 0, source: value }];
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    if (!frame) return Number.POSITIVE_INFINITY;
+    if (frame.index >= frame.entries.length) {
+      memo.set(frame.source, frame.bytes);
+      active.delete(frame.source);
+      stack.pop();
+      const parent = stack[stack.length - 1];
+      if (!parent) return frame.bytes;
+      parent.bytes = boundedJsonBytes(
+        parent.bytes,
+        frame.bytes,
+        MAX_BROWSER_AUCTION_PROJECTION_BYTES
+      );
+      if (parent.bytes > MAX_BROWSER_AUCTION_PROJECTION_BYTES) return parent.bytes;
+      continue;
+    }
+    const entry = frame.entries[frame.index];
+    const entryIndex = frame.index;
+    frame.index += 1;
+    if (!entry) return Number.POSITIVE_INFINITY;
+    const keyBytes = frame.array ? 0 : jsonPrimitiveBytes(entry.key);
+    if (keyBytes === undefined) return Number.POSITIVE_INFINITY;
+    frame.bytes = boundedJsonBytes(
+      frame.bytes,
+      (entryIndex === 0 ? 0 : 1) + (frame.array ? 0 : keyBytes + 1),
+      MAX_BROWSER_AUCTION_PROJECTION_BYTES
+    );
+    if (frame.bytes > MAX_BROWSER_AUCTION_PROJECTION_BYTES) return frame.bytes;
+    const childPrimitive = jsonPrimitiveBytes(entry.value);
+    if (childPrimitive !== undefined) {
+      frame.bytes = boundedJsonBytes(
+        frame.bytes,
+        childPrimitive,
+        MAX_BROWSER_AUCTION_PROJECTION_BYTES
+      );
+      if (frame.bytes > MAX_BROWSER_AUCTION_PROJECTION_BYTES) return frame.bytes;
+      continue;
+    }
+    if (typeof entry.value !== 'object' || entry.value === null || active.has(entry.value)) {
+      return Number.POSITIVE_INFINITY;
+    }
+    const completed = memo.get(entry.value);
+    if (completed !== undefined) {
+      frame.bytes = boundedJsonBytes(frame.bytes, completed, MAX_BROWSER_AUCTION_PROJECTION_BYTES);
+      if (frame.bytes > MAX_BROWSER_AUCTION_PROJECTION_BYTES) return frame.bytes;
+      continue;
+    }
+    const child = snapshotJsonForMeasurement(entry.value);
+    if (!child) return Number.POSITIVE_INFINITY;
+    active.add(entry.value);
+    stack.push({ ...child, bytes: 2, index: 0, source: entry.value });
+  }
+  return Number.POSITIVE_INFINITY;
 }
 
 /** Whether a value is one exact server-minted renderer reservation identity. */
