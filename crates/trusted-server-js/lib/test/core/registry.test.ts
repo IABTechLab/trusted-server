@@ -222,6 +222,58 @@ describe('registry', () => {
     expect(ownKeysCalls).toBeLessThanOrEqual(4);
   });
 
+  it('uses captured validation intrinsics after platform prototypes are poisoned', () => {
+    const validCandidate = unit('poison-safe');
+    const invalidCandidate = { ...unit('invalid-bidder'), bids: [{ bidder: '' }] };
+    const iteratorDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator);
+    const encodeDescriptor = Object.getOwnPropertyDescriptor(TextEncoder.prototype, 'encode');
+    const testDescriptor = Object.getOwnPropertyDescriptor(RegExp.prototype, 'test');
+    const calls = { encode: 0, iterator: 0, test: 0 };
+    let prepared: ReturnType<typeof prepareProgrammaticAdUnits> | undefined;
+    let invalidError: unknown;
+    Object.defineProperty(Array.prototype, Symbol.iterator, {
+      configurable: true,
+      value: () => {
+        calls.iterator += 1;
+        throw new Error('poisoned array iterator');
+      },
+    });
+    Object.defineProperty(TextEncoder.prototype, 'encode', {
+      configurable: true,
+      value: () => {
+        calls.encode += 1;
+        throw new Error('poisoned text encoder');
+      },
+    });
+    Object.defineProperty(RegExp.prototype, 'test', {
+      configurable: true,
+      value: () => {
+        calls.test += 1;
+        throw new Error('poisoned regular expression');
+      },
+    });
+    try {
+      prepared = prepareProgrammaticAdUnits(validCandidate, new Set());
+      try {
+        prepareProgrammaticAdUnits(invalidCandidate, new Set());
+      } catch (error) {
+        invalidError = error;
+      }
+    } finally {
+      if (iteratorDescriptor) {
+        Object.defineProperty(Array.prototype, Symbol.iterator, iteratorDescriptor);
+      }
+      if (encodeDescriptor)
+        Object.defineProperty(TextEncoder.prototype, 'encode', encodeDescriptor);
+      if (testDescriptor) Object.defineProperty(RegExp.prototype, 'test', testDescriptor);
+    }
+
+    expect(prepared?.[0]?.code).toBe('poison-safe');
+    expect(invalidError).toBeInstanceOf(AdUnitRegistrationError);
+    expect(invalidError).toMatchObject({ code: 'invalid_bidder', unitIndex: 0 });
+    expect(calls).toEqual({ encode: 0, iterator: 0, test: 0 });
+  });
+
   it('serializes detached auction data without invoking inherited toJSON hooks', () => {
     const prepared = prepareProgrammaticAdUnits(unit(), new Set());
     const context = Object.freeze({ segments: Object.freeze(['one']) });

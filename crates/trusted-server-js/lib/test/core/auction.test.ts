@@ -657,6 +657,54 @@ describe('auction/parseBrowserAuctionProjectionV1', () => {
     }
   });
 
+  it('uses captured validation intrinsics after platform prototypes are poisoned', () => {
+    const valid = largeAdmProjection([16]);
+    const invalid = largeAdmProjection([16]);
+    invalid.bids[0]!.provider = '-invalid';
+    const iteratorDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator);
+    const encodeDescriptor = Object.getOwnPropertyDescriptor(TextEncoder.prototype, 'encode');
+    const testDescriptor = Object.getOwnPropertyDescriptor(RegExp.prototype, 'test');
+    const calls = { encode: 0, iterator: 0, test: 0 };
+    let parsed: BrowserAuctionProjectionV1 | undefined;
+    let rejected: BrowserAuctionProjectionV1 | undefined;
+    Object.defineProperty(Array.prototype, Symbol.iterator, {
+      configurable: true,
+      value: () => {
+        calls.iterator += 1;
+        throw new Error('poisoned array iterator');
+      },
+    });
+    Object.defineProperty(TextEncoder.prototype, 'encode', {
+      configurable: true,
+      value: () => {
+        calls.encode += 1;
+        throw new Error('poisoned text encoder');
+      },
+    });
+    Object.defineProperty(RegExp.prototype, 'test', {
+      configurable: true,
+      value: () => {
+        calls.test += 1;
+        throw new Error('poisoned regular expression');
+      },
+    });
+    try {
+      parsed = parseBrowserAuctionProjectionV1(valid);
+      rejected = parseBrowserAuctionProjectionV1(invalid);
+    } finally {
+      if (iteratorDescriptor) {
+        Object.defineProperty(Array.prototype, Symbol.iterator, iteratorDescriptor);
+      }
+      if (encodeDescriptor)
+        Object.defineProperty(TextEncoder.prototype, 'encode', encodeDescriptor);
+      if (testDescriptor) Object.defineProperty(RegExp.prototype, 'test', testDescriptor);
+    }
+
+    expect(parsed).toBeDefined();
+    expect(rejected).toBeUndefined();
+    expect(calls).toEqual({ encode: 0, iterator: 0, test: 0 });
+  });
+
   it('requires cache sources to match one frozen cache policy exactly', () => {
     const cacheId = 'f47447a0-b759-4f2f-9887-af458b79b570';
     const policy = parseCacheFetchPolicyV1({

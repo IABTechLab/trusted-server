@@ -93,6 +93,56 @@ describe('requestAds input contract', () => {
     });
     expectInputError(() => validateRequestAdsOptions({ slots: ['slot\u007fid'] }), 'invalid_slots');
   });
+
+  it('uses captured validation intrinsics after platform prototypes are poisoned', () => {
+    const iteratorDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator);
+    const encodeDescriptor = Object.getOwnPropertyDescriptor(TextEncoder.prototype, 'encode');
+    const testDescriptor = Object.getOwnPropertyDescriptor(RegExp.prototype, 'test');
+    const calls = { encode: 0, iterator: 0, test: 0 };
+    let validated: ReturnType<typeof validateRequestAdsOptions> | undefined;
+    let duplicateError: unknown;
+    Object.defineProperty(Array.prototype, Symbol.iterator, {
+      configurable: true,
+      value: () => {
+        calls.iterator += 1;
+        throw new Error('poisoned array iterator');
+      },
+    });
+    Object.defineProperty(TextEncoder.prototype, 'encode', {
+      configurable: true,
+      value: () => {
+        calls.encode += 1;
+        throw new Error('poisoned text encoder');
+      },
+    });
+    Object.defineProperty(RegExp.prototype, 'test', {
+      configurable: true,
+      value: () => {
+        calls.test += 1;
+        throw new Error('poisoned regular expression');
+      },
+    });
+    try {
+      validated = validateRequestAdsOptions({ slots: ['slot-one'], timeoutMs: 100 });
+      try {
+        validateRequestAdsOptions({ slots: ['slot-one', 'slot-one'] });
+      } catch (error) {
+        duplicateError = error;
+      }
+    } finally {
+      if (iteratorDescriptor) {
+        Object.defineProperty(Array.prototype, Symbol.iterator, iteratorDescriptor);
+      }
+      if (encodeDescriptor)
+        Object.defineProperty(TextEncoder.prototype, 'encode', encodeDescriptor);
+      if (testDescriptor) Object.defineProperty(RegExp.prototype, 'test', testDescriptor);
+    }
+
+    expect(validated).toMatchObject({ slots: ['slot-one'], timeoutMs: 100 });
+    expect(duplicateError).toBeInstanceOf(RequestAdsInputError);
+    expect(duplicateError).toMatchObject({ code: 'duplicate_slot' });
+    expect(calls).toEqual({ encode: 0, iterator: 0, test: 0 });
+  });
 });
 
 describe('request.requestAds', () => {

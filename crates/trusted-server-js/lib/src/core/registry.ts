@@ -87,7 +87,10 @@ function ownDataRecord(value: unknown): Record<string, unknown> | undefined {
     if (prototype !== Object.prototype && prototype !== null) return undefined;
     if (Object.getOwnPropertySymbols(value).length !== 0) return undefined;
     const output: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
-    for (const key of Object.getOwnPropertyNames(value)) {
+    const names = Object.getOwnPropertyNames(value);
+    for (let index = 0; index < names.length; index += 1) {
+      const key = names[index];
+      if (key === undefined) return undefined;
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
       if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return undefined;
       Object.defineProperty(output, key, {
@@ -171,7 +174,8 @@ function copyJsonRecord(
   const rootSnapshot = measurements?.get(value)?.snapshot ?? snapshotJsonContainer(value);
   if (!rootSnapshot || rootSnapshot.array) return undefined;
   const root: Record<string, unknown> = {};
-  const active = new Set<object>([value]);
+  const active = new Set<object>();
+  active.add(value);
   const stack: JsonCloneFrame[] = [
     { index: 0, output: root, snapshot: rootSnapshot, source: value },
   ];
@@ -246,7 +250,8 @@ function copyJsonForSerialization(value: object): object | undefined {
   const rootSnapshot = snapshotJsonContainer(value);
   if (!rootSnapshot) return undefined;
   const root = safeSerializationContainer(rootSnapshot.array);
-  const active = new Set<object>([value]);
+  const active = new Set<object>();
+  active.add(value);
   const completed = new WeakMap<object, Record<string, unknown> | unknown[]>();
   const stack: JsonCloneFrame[] = [
     { index: 0, output: root, snapshot: rootSnapshot, source: value },
@@ -357,7 +362,8 @@ function measureJson(
   if (completedRoot) return completedRoot;
   const root = snapshotJsonContainer(value);
   if (!root) return undefined;
-  const active = new Set<object>([value]);
+  const active = new Set<object>();
+  active.add(value);
   const stack: JsonMeasureFrame[] = [
     {
       array: root.array,
@@ -491,7 +497,8 @@ export function prepareProgrammaticAdUnits(
       throw new AdUnitRegistrationError('invalid_media_types', index);
     }
     const sizes: Array<readonly [number, number]> = [];
-    for (const rawSize of rawSizes) {
+    for (let sizeIndex = 0; sizeIndex < rawSizes.length; sizeIndex += 1) {
+      const rawSize = rawSizes[sizeIndex];
       const dimensions = ownDataArray(rawSize, 2);
       if (
         !dimensions ||
@@ -517,7 +524,8 @@ export function prepareProgrammaticAdUnits(
       const rawBids = ownDataArray(unit.bids, MAX_JSON_STRUCTURE_ENTRIES);
       if (!rawBids) throw new AdUnitRegistrationError('invalid_bids', index);
       const pendingBids: PendingProgrammaticBid[] = [];
-      for (const rawBid of rawBids) {
+      for (let bidIndex = 0; bidIndex < rawBids.length; bidIndex += 1) {
+        const rawBid = rawBids[bidIndex];
         const bid = ownDataRecord(rawBid);
         if (!bid || (!exactKeys(bid, ['bidder']) && !exactKeys(bid, ['bidder', 'params']))) {
           throw new AdUnitRegistrationError('invalid_bids', index);
@@ -525,7 +533,11 @@ export function prepareProgrammaticAdUnits(
         if (
           typeof bid.bidder !== 'string' ||
           bid.bidder.length === 0 ||
-          textEncoder.encode(bid.bidder).byteLength > 64
+          (
+            reflectApplyIntrinsic(textEncoderEncodeIntrinsic, textEncoder, [
+              bid.bidder,
+            ]) as Uint8Array
+          ).byteLength > 64
         ) {
           throw new AdUnitRegistrationError('invalid_bidder', index);
         }
@@ -639,7 +651,9 @@ export function serializeAuctionRequestBody(
 const legacyRegistry = new Map<string, AdUnit>();
 
 export function addAdUnits(units: AdUnit | AdUnit[]): void {
-  for (const unit of toArray(units)) {
+  const normalized = toArray(units);
+  for (let index = 0; index < normalized.length; index += 1) {
+    const unit = normalized[index];
     if (!unit?.code) continue;
     legacyRegistry.set(unit.code, { ...legacyRegistry.get(unit.code), ...unit });
   }

@@ -19,7 +19,10 @@ export const MAX_AUCTION_RESULTS = 256;
 const MAX_TARGETING_ENTRIES = 32;
 const MAX_ADM_BYTES = 512 * 1024;
 const MAX_URL_BYTES = 4096;
+const reflectApplyIntrinsic = Reflect.apply;
 const textEncoder = new TextEncoder();
+const textEncoderEncodeIntrinsic = TextEncoder.prototype.encode;
+const regExpTestIntrinsic = RegExp.prototype.test;
 const candidateIdPattern = /^[A-Za-z0-9_-]{12}$/;
 const reservationIdPattern = /^r1_[A-Za-z0-9_-]{22}$/;
 const auctionIdPattern = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -55,7 +58,9 @@ export function ownDataObject(
       return undefined;
     }
     const snapshot: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
-    for (const name of names) {
+    for (let index = 0; index < names.length; index += 1) {
+      const name = names[index];
+      if (name === undefined) return undefined;
       const descriptor = Object.getOwnPropertyDescriptor(value, name);
       if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return undefined;
       snapshot[name] = descriptor.value;
@@ -85,18 +90,20 @@ export function ownDataArray(value: unknown, maximum: number): unknown[] | undef
   }
 }
 
-function validUnicodeScalars(value: string): boolean {
+function unicodeScalarCount(value: string): number | undefined {
+  let scalars = 0;
   for (let index = 0; index < value.length; index += 1) {
     const code = value.charCodeAt(index);
     if (code >= 0xd800 && code <= 0xdbff) {
       const next = value.charCodeAt(index + 1);
-      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return undefined;
       index += 1;
     } else if (code >= 0xdc00 && code <= 0xdfff) {
-      return false;
+      return undefined;
     }
+    scalars += 1;
   }
-  return true;
+  return scalars;
 }
 
 function hasAsciiControl(value: string): boolean {
@@ -112,14 +119,19 @@ export function validBoundedString(
   maximumBytes: number,
   options: { allowControls?: boolean; maximumScalars?: number } = {}
 ): value is string {
+  if (typeof value !== 'string' || value.length === 0) return false;
+  const scalarCount = unicodeScalarCount(value);
   return (
-    typeof value === 'string' &&
-    value.length > 0 &&
-    validUnicodeScalars(value) &&
+    scalarCount !== undefined &&
     (options.allowControls === true || !hasAsciiControl(value)) &&
-    textEncoder.encode(value).length <= maximumBytes &&
-    (options.maximumScalars === undefined || Array.from(value).length <= options.maximumScalars)
+    (reflectApplyIntrinsic(textEncoderEncodeIntrinsic, textEncoder, [value]) as Uint8Array)
+      .length <= maximumBytes &&
+    (options.maximumScalars === undefined || scalarCount <= options.maximumScalars)
   );
+}
+
+function matches(pattern: RegExp, value: string): boolean {
+  return reflectApplyIntrinsic(regExpTestIntrinsic, pattern, [value]) as boolean;
 }
 
 export function validDimension(value: unknown): value is number {
@@ -133,11 +145,11 @@ export function validDimension(value: unknown): value is number {
 }
 
 export function isAuctionCandidateIdV1(value: unknown): value is string {
-  return typeof value === 'string' && candidateIdPattern.test(value);
+  return typeof value === 'string' && matches(candidateIdPattern, value);
 }
 
 export function isAuctionProviderIdV1(value: unknown): value is string {
-  return typeof value === 'string' && providerPattern.test(value);
+  return typeof value === 'string' && matches(providerPattern, value);
 }
 
 function boundedJsonBytes(left: number, right: number, maximum: number): number {
@@ -211,7 +223,8 @@ export function jsonUtf8ByteLength(value: unknown): number {
   const root = snapshotJsonForMeasurement(value);
   if (!root) return Number.POSITIVE_INFINITY;
   const memo = new WeakMap<object, number>();
-  const active = new Set<object>([value]);
+  const active = new Set<object>();
+  active.add(value);
   const stack: JsonMeasureFrame[] = [{ ...root, bytes: 2, index: 0, source: value }];
   while (stack.length > 0) {
     const frame = stack[stack.length - 1];
@@ -271,7 +284,7 @@ export function jsonUtf8ByteLength(value: unknown): number {
 
 /** Whether a value is one exact server-minted renderer reservation identity. */
 export function isRendererReservationIdV1(value: unknown): value is string {
-  return typeof value === 'string' && reservationIdPattern.test(value);
+  return typeof value === 'string' && matches(reservationIdPattern, value);
 }
 
 /** Validate and copy one exact browser render-source contract. */
@@ -283,18 +296,30 @@ export function parseBidRenderSourceV1(
   if (!record || typeof record.type !== 'string') return undefined;
 
   if (record.type === 'aps') {
-    const keys = [
-      'type',
-      'version',
-      'accountId',
-      'bidId',
-      ...(Object.prototype.hasOwnProperty.call(record, 'creativeId') ? ['creativeId'] : []),
-      'tagType',
-      'creativeUrl',
-      'aaxResponse',
-      'width',
-      'height',
-    ];
+    const keys = Object.prototype.hasOwnProperty.call(record, 'creativeId')
+      ? [
+          'type',
+          'version',
+          'accountId',
+          'bidId',
+          'creativeId',
+          'tagType',
+          'creativeUrl',
+          'aaxResponse',
+          'width',
+          'height',
+        ]
+      : [
+          'type',
+          'version',
+          'accountId',
+          'bidId',
+          'tagType',
+          'creativeUrl',
+          'aaxResponse',
+          'width',
+          'height',
+        ];
     if (!ownDataObject(value, keys)) return undefined;
     const renderer = validateApsRenderer(record);
     if (!renderer) return undefined;
@@ -345,7 +370,7 @@ export function parseBidRenderSourceV1(
       !source ||
       source.version !== 1 ||
       typeof source.cacheId !== 'string' ||
-      !cacheIdPattern.test(source.cacheId) ||
+      !matches(cacheIdPattern, source.cacheId) ||
       !validBoundedString(source.fetchUrl, MAX_URL_BYTES) ||
       !validDimension(source.width) ||
       !validDimension(source.height) ||
@@ -403,14 +428,15 @@ export function parseBidRenderSourceV1(
 export function parseAuctionDecisionSetV1(value: unknown): AuctionDecisionSetV1 | undefined {
   const record = ownDataObject(value, ['version', 'auctionId', 'results']);
   if (!record || record.version !== 1 || typeof record.auctionId !== 'string') return undefined;
-  if (!auctionIdPattern.test(record.auctionId)) return undefined;
+  if (!matches(auctionIdPattern, record.auctionId)) return undefined;
   const results = ownDataArray(record.results, MAX_AUCTION_RESULTS);
   if (!results) return undefined;
 
   const parsed: SlotAuctionDecisionV1[] = [];
   const slots = new Set<string>();
   const candidates = new Set<string>();
-  for (const raw of results) {
+  for (let index = 0; index < results.length; index += 1) {
+    const raw = results[index];
     const base = ownDataObject(raw);
     if (!base || !validBoundedString(base.slot, 256) || slots.has(base.slot)) return undefined;
     slots.add(base.slot);
@@ -456,12 +482,19 @@ function parseTargeting(value: unknown): Record<string, string> | undefined {
   const entries = Object.entries(record);
   if (entries.length > MAX_TARGETING_ENTRIES) return undefined;
   const targeting: Record<string, string> = {};
-  for (const [key, entry] of entries.sort(([left], [right]) =>
-    left < right ? -1 : left > right ? 1 : 0
-  )) {
+  entries.sort((leftEntry, rightEntry) => {
+    const left = leftEntry[0];
+    const right = rightEntry[0];
+    return left < right ? -1 : left > right ? 1 : 0;
+  });
+  for (let index = 0; index < entries.length; index += 1) {
+    const pair = entries[index];
+    if (!pair) return undefined;
+    const key = pair[0];
+    const entry = pair[1];
     if (
       key === 'hb_adid' ||
-      !targetingKeyPattern.test(key) ||
+      !matches(targetingKeyPattern, key) ||
       !validBoundedString(entry, 160, { maximumScalars: 40 })
     ) {
       return undefined;
@@ -538,7 +571,8 @@ export function parseBrowserAuctionProjectionV1(
     const bids: BrowserAuctionBidV1[] = [];
     const candidateIds = new Set<string>();
     const reservationIds = new Set<string>();
-    for (const raw of rawBids) {
+    for (let index = 0; index < rawBids.length; index += 1) {
+      const raw = rawBids[index];
       const bid = parseBrowserBid(raw, cachePolicy);
       if (
         !bid ||
