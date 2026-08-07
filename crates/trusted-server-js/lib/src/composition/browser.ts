@@ -159,6 +159,7 @@ export interface TestBrowserRuntimeCompositionOptions extends BrowserComposition
   readonly createIdentityIssuerForTest?: NavigationIdentityIssuerFactory;
   readonly admittedProgrammaticSlotsForTest?: readonly string[];
   readonly gptStartupForTest?: (config: unknown) => void;
+  readonly prebidStartupForTest?: (config: unknown) => void;
 }
 
 interface AcceptedBrowserBoot {
@@ -254,6 +255,8 @@ export function createTestBrowserRuntimeComposition(
   const providedBindings = runtimeOptions.getBindings;
   const startGpt = compositionOptions.gptStartupForTest ?? (() => undefined);
   const gptRuntime = Object.freeze({ start: startGpt });
+  const startPrebid = compositionOptions.prebidStartupForTest ?? (() => undefined);
+  const prebidRuntime = Object.freeze({ start: startPrebid });
   let runtimeSession: RuntimeSession | undefined;
   const getBindings: NonNullable<RuntimeOptions['getBindings']> = (id) => {
     const provided = providedBindings?.(id);
@@ -659,7 +662,12 @@ export function createTestBrowserRuntimeComposition(
       const session = createRuntimeSession({
         createIdentityIssuer:
           compositionOptions.createIdentityIssuerForTest ?? createBrowserNavigationIdentityIssuer,
-        interfaces: Object.freeze({ adapters: composition.adapters, gpt: gptRuntime, ...services }),
+        interfaces: Object.freeze({
+          adapters: composition.adapters,
+          gpt: gptRuntime,
+          prebid: prebidRuntime,
+          ...services,
+        }),
         onNavigationDispose: (navigationGeneration) =>
           artifacts.disposeNavigation(navigationGeneration),
       });
