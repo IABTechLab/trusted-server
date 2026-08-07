@@ -1502,7 +1502,7 @@ describe('Prebid admission leases and selection', () => {
     expect(service.recognize('native')).toEqual({ recognized: false });
   });
 
-  it('keeps a ten-second suppress-only lease, then atomically promotes the selected id to 15 minutes', () => {
+  it('promotes one selected cache lease from ten seconds to 15 minutes', () => {
     let now = 10;
     const { navigation } = runtimeNavigation();
     const service = serviceAt(() => now);
@@ -1512,7 +1512,7 @@ describe('Prebid admission leases and selection', () => {
       navigation,
       auctionId: 'fictional-auction',
       adUnitCode: 'fictional-slot',
-      renderSource: admSource(),
+      renderSource: cacheSource(),
       winnerContext: { selectedCpm: 1.25 },
       prebidBid: bid,
     };
@@ -1549,6 +1549,20 @@ describe('Prebid admission leases and selection', () => {
       state: 'unselected',
       expiresAt: 10 + PREBID_ADMISSION_LEASE_MS,
     });
+    const selected = claim(service, navigation, attempt, reservationId(1));
+    const winnerContext = attempt.winnerContext;
+    if (!selected.recognized || !selected.claimed || !winnerContext) {
+      throw new Error('Expected the promoted cache lease to remain claimable');
+    }
+    expect(
+      service.consumeClaim(selected, {
+        attempt,
+        attemptId: attempt.id,
+        slot: attempt.slot,
+        navigationGeneration: navigation.generation,
+        winnerContext,
+      })
+    ).toEqual({ renderSource: cacheSource(), winnerContext });
   });
 
   it('promotes only before the admission boundary and prunes at and after ten seconds', () => {
@@ -1894,11 +1908,11 @@ describe('atomic claims and disposal', () => {
     expect(attempt.winnerContext).toBeUndefined();
     expect(service.snapshotInventoryForTest().entriesWithPucSource).toBe(0);
   });
-  it('transfers immutable context before consumption and preserves it after projection replacement', () => {
+  it('preserves one cache source and immutable context after projection replacement', () => {
     const { navigation } = runtimeNavigation();
     const attempt = renderAttempt(navigation);
     const service = serviceAt(() => 0);
-    const source = admSource('<div>original winner</div>');
+    const source = cacheSource();
     const context = { selectedCpm: 7.5 };
     service.registerRender({
       reservationId: reservationId(),
@@ -1937,6 +1951,19 @@ describe('atomic claims and disposal', () => {
     expect(attempt.winnerContext).toEqual({ selectedCpm: 7.5 });
     expect(Object.isFrozen(attempt.winnerContext)).toBe(true);
     expect(service.recognize(reservationId())).toMatchObject({ state: 'consumed' });
+    const winnerContext = attempt.winnerContext;
+    if (!result.recognized || !result.claimed || !winnerContext) {
+      throw new Error('Expected one claimed cache winner');
+    }
+    expect(
+      service.consumeClaim(result, {
+        attempt: sink,
+        attemptId: attempt.id,
+        slot: attempt.slot,
+        navigationGeneration: navigation.generation,
+        winnerContext,
+      })
+    ).toEqual({ renderSource: source, winnerContext });
   });
 
   it('allows exactly one of two simultaneous/reentrant claims and never replaces its PUC source', () => {
