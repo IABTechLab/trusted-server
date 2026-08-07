@@ -18,11 +18,18 @@ import {
   type PrebidGlobalTarget,
 } from '../adapters/prebid';
 import { parseCacheFetchPolicyV1 } from '../core/config';
+import { parseTrustedServerAuctionResponseV1 } from '../core/auction';
 import {
   parseBidRenderSourceV1,
   parseBrowserAuctionProjectionV1,
 } from '../core/contracts/auction_projection';
 import { validateApsRenderer } from '../core/contracts/aps_renderer';
+import {
+  AdUnitRegistrationError,
+  addAdUnitsResult,
+  prepareProgrammaticAdUnits,
+} from '../core/registry';
+import { validateRequestAdsOptions } from '../core/request';
 import { prepareAdmIframe } from '../core/render';
 import { APS_RENDERER_V1_PATH, renderDirectApsAttempt } from '../integrations/aps/render';
 import { createBrowserNavigationIdentityIssuer } from '../kernel/identity';
@@ -32,21 +39,29 @@ import type { CoreActivationContext } from '../kernel/integration_registry';
 import { createRuntime, type Runtime, type RuntimeOptions } from '../kernel/runtime';
 import { createAuctionContextRegistry, type AuctionContextRegistry } from '../services/context';
 import {
+  createAuctionBatchService,
+  type AuctionBatchFetcher,
+  type AuctionBatchService,
+} from '../services/auction_batch';
+import {
   createPageBidsController,
   type PageBidsController,
   prepareInitialAuctionProjection,
 } from '../services/projections';
 import { createReservationService, type ReservationService } from '../services/reservations';
 import {
+  createCommittedArtifactStore,
+  createRenderAttempt,
   createRendererNonceRegistry,
   resolveCacheAdmAttempt,
   renderDirectCacheAttempt,
   renderDirectAdmAttempt,
   type RenderAttempt,
+  type CommittedArtifactStore,
   type RendererNonceRegistry,
 } from '../services/render';
 import { createPucBridge, type PucBridge, type PucBridgeOptions } from '../services/puc_bridge';
-import { createSlotService, type SlotService } from '../services/slots';
+import { createSlotService, type SlotRecord, type SlotService } from '../services/slots';
 import { createTargetingService, type TargetingService } from '../services/targeting';
 
 export interface BrowserAdapters {
@@ -60,6 +75,8 @@ export interface BrowserComposition {
 }
 
 export interface BrowserServices {
+  readonly artifacts: CommittedArtifactStore;
+  readonly auctionBatches: AuctionBatchService;
   readonly pucBridge: PucBridge;
   readonly reservations: ReservationService;
   readonly rendererNonces: RendererNonceRegistry;
@@ -109,6 +126,7 @@ export interface BrowserCoreActivations {
 }
 
 export interface TestBrowserRuntimeCompositionOptions extends BrowserCompositionOptions {
+  readonly auctionFetcherForTest?: AuctionBatchFetcher;
   readonly coreActivations: BrowserCoreActivations;
   readonly createIdentityIssuerForTest?: NavigationIdentityIssuerFactory;
   readonly admittedProgrammaticSlotsForTest?: readonly string[];
@@ -208,9 +226,177 @@ export function createTestBrowserRuntimeComposition(
   let preparedBrowserServices: PreparedBrowserServices | undefined;
   let browserServices: Readonly<BrowserServices> | undefined;
   let auctionContextRegistry: AuctionContextRegistry | undefined;
+  let auctionBatchService: AuctionBatchService | undefined;
   let projectionParser: ((candidate: unknown) => object | undefined) | undefined;
+  const frozenSlotResult = (result: Record<string, unknown>): Readonly<Record<string, unknown>> =>
+    Object.freeze(result);
+  const combineRequestResults = (
+    requestedSlots: readonly string[],
+    records: readonly (SlotRecord | undefined)[],
+    validResults: readonly Readonly<Record<string, unknown>>[]
+  ): Readonly<{ slots: readonly Readonly<Record<string, unknown>>[] }> => {
+    let validIndex = 0;
+    return Object.freeze({
+      slots: Object.freeze(
+        requestedSlots.map((slot, index) => {
+          if (!records[index]) {
+            return frozenSlotResult({
+              slot,
+              path: 'primary',
+              outcome: 'failed',
+              reason: 'slot_unresolved',
+            });
+          }
+          const result = validResults[validIndex];
+          validIndex += 1;
+          return (
+            result ??
+            frozenSlotResult({
+              slot,
+              path: 'primary',
+              outcome: 'failed',
+              reason: 'internal_error',
+            })
+          );
+        })
+      ),
+    });
+  };
+  const addProgrammaticAdUnits = (candidate: unknown): unknown => {
+    const navigation = runtimeSession?.currentNavigation;
+    const slots = browserServices?.slots;
+    const snapshot = navigation && slots?.snapshotRegisteredSlots(navigation);
+    if (!navigation || !slots || !snapshot) throw new Error('TSJS navigation is unavailable');
+    const knownSlots = new Set(snapshot.map(({ registeredSlotId }) => registeredSlotId));
+    const prepared = prepareProgrammaticAdUnits(candidate, knownSlots);
+    const registered = slots.register(
+      navigation,
+      prepared.map((unit) => ({
+        directAuctionUnit: unit,
+        registeredSlotId: unit.code,
+        source: 'programmatic' as const,
+      }))
+    );
+    if (!registered.ok) {
+      if (registered.reason === 'registry_capacity') {
+        throw new AdUnitRegistrationError('registry_capacity');
+      }
+      if (registered.reason === 'duplicate_slot') {
+        throw new AdUnitRegistrationError('slot_collision');
+      }
+      throw new Error('TSJS navigation changed during registration');
+    }
+    return addAdUnitsResult(prepared);
+  };
+  const requestDirectAds = (candidate?: unknown): Promise<unknown> => {
+    let validated: ReturnType<typeof validateRequestAdsOptions>;
+    try {
+      validated = validateRequestAdsOptions(candidate);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const navigation = runtimeSession?.currentNavigation;
+    const slots = browserServices?.slots;
+    const snapshot = navigation && slots?.snapshotRegisteredSlots(navigation);
+    if (!navigation || !slots || !snapshot) {
+      const requested = validated.slots ?? Object.freeze([]);
+      return Promise.resolve(
+        Object.freeze({
+          slots: Object.freeze(
+            requested.map((slot) =>
+              frozenSlotResult({
+                slot,
+                path: 'primary',
+                outcome: 'cancelled',
+                reason: 'navigation_disposed',
+              })
+            )
+          ),
+        })
+      );
+    }
+
+    const recordsById = new Map(snapshot.map((record) => [record.registeredSlotId, record]));
+    const requestedSlots = Object.freeze(
+      validated.slots
+        ? Array.from(validated.slots)
+        : snapshot.map(({ registeredSlotId }) => registeredSlotId)
+    );
+    const selectedRecords = Object.freeze(requestedSlots.map((slot) => recordsById.get(slot)));
+    const validRecords = selectedRecords.filter(
+      (record): record is SlotRecord => record !== undefined
+    );
+    if (validRecords.length === 0) {
+      return Promise.resolve(combineRequestResults(requestedSlots, selectedRecords, []));
+    }
+
+    const context = auctionContextRegistry?.snapshot() ?? Object.freeze({});
+    const adUnits = validRecords.map((record) =>
+      record.directAuctionUnit
+        ? record.directAuctionUnit
+        : Object.freeze({
+            code: record.registeredSlotId,
+            mediaTypes: Object.freeze({}),
+            bids: Object.freeze([]),
+          })
+    );
+    let requestBody: string;
+    try {
+      requestBody = JSON.stringify({ adUnits, config: context });
+      if (new TextEncoder().encode(requestBody).byteLength > 256 * 1024) {
+        throw new Error('auction request body exceeds limit');
+      }
+    } catch {
+      return Promise.resolve(
+        combineRequestResults(
+          requestedSlots,
+          selectedRecords,
+          validRecords.map((record) =>
+            frozenSlotResult({
+              slot: record.registeredSlotId,
+              path: 'primary',
+              outcome: 'failed',
+              reason: 'internal_error',
+            })
+          )
+        )
+      );
+    }
+    const batches = auctionBatchService;
+    if (!batches) {
+      return Promise.resolve(
+        combineRequestResults(
+          requestedSlots,
+          selectedRecords,
+          validRecords.map((record) =>
+            frozenSlotResult({
+              slot: record.registeredSlotId,
+              path: 'primary',
+              outcome: 'cancelled',
+              reason: 'navigation_disposed',
+            })
+          )
+        )
+      );
+    }
+    const batch = batches.create({
+      navigation,
+      requestBody,
+      ...(validated.signal ? { signal: validated.signal } : {}),
+      slots: Object.freeze(validRecords.map(({ registeredSlotId }) => registeredSlotId)),
+      timeoutMs: validated.timeoutMs,
+    });
+    return batch.result.then((result) =>
+      combineRequestResults(requestedSlots, selectedRecords, result.slots)
+    );
+  };
   const runtime = createRuntime({
     ...runtimeOptions,
+    kernel: {
+      addAdUnits: addProgrammaticAdUnits,
+      diagnostics: runtimeOptions.kernel.diagnostics,
+      requestAds: requestDirectAds,
+    },
     activateOwner: (context) => {
       const boot = context.boot as unknown as AcceptedBrowserBoot;
       const cachePolicy =
@@ -227,6 +413,7 @@ export function createTestBrowserRuntimeComposition(
       const reservationService = createReservationService({
         prepareRenderSource: (candidate) => parseBidRenderSourceV1(candidate, cachePolicy),
       });
+      const artifacts = createCommittedArtifactStore();
       const rendererNonces = createRendererNonceRegistry();
       const publisherOrigin = window.location.origin;
       const fetchCache = globalThis.fetch;
@@ -318,7 +505,53 @@ export function createTestBrowserRuntimeComposition(
           return false;
         }
       };
+      const resolveDirectContainer = (record: SlotRecord): HTMLElement | undefined => {
+        try {
+          if (typeof document === 'undefined' || record.domAliases.length === 0) return undefined;
+          const aliases = new Set(record.domAliases);
+          const matches = new Set<HTMLElement>();
+          const elements = document.querySelectorAll('[id]');
+          for (let index = 0; index < elements.length; index += 1) {
+            const element = elements.item(index);
+            if (element instanceof HTMLElement && aliases.has(element.id)) matches.add(element);
+          }
+          return matches.size === 1 ? Array.from(matches)[0] : undefined;
+        } catch {
+          return undefined;
+        }
+      };
+      const fetchAuction = compositionOptions.auctionFetcherForTest ?? globalThis.fetch;
+      const batchCoordinator = createAuctionBatchService({
+        ...(cachePolicy ? { cachePolicy } : {}),
+        createAttempt: (owner) =>
+          createRenderAttempt({
+            artifacts,
+            owner,
+            prepareRenderSource: (candidate) => parseBidRenderSourceV1(candidate, cachePolicy),
+            reservations: reservationService,
+          }),
+        fetcher: (input, init) => {
+          if (typeof fetchAuction !== 'function') return Promise.reject(new Error('unavailable'));
+          return fetchAuction(input, init);
+        },
+        parseResponse: parseTrustedServerAuctionResponseV1,
+        renderWinner: (attempt) => {
+          const record = slotService.resolveRegisteredSlot(attempt.slot);
+          const container = record && resolveDirectContainer(record);
+          if (!container) {
+            attempt.fail('slot_unresolved');
+            return false;
+          }
+          if (attempt.renderSource?.type === 'aps') return renderDirectAps(attempt, container);
+          if (attempt.renderSource?.type === 'adm') return renderDirectAdm(attempt, container);
+          if (attempt.renderSource?.type === 'cache') return renderDirectCache(attempt, container);
+          attempt.fail('winner_not_renderable');
+          return false;
+        },
+      });
       const services = Object.freeze({
+        artifacts,
+        auctionBatches: batchCoordinator,
         reservations: reservationService,
         rendererNonces,
         renderDirectAdm,
@@ -339,7 +572,9 @@ export function createTestBrowserRuntimeComposition(
         interfaces: Object.freeze({ adapters: composition.adapters, ...services }),
       });
       context.onDispose(() => {
+        batchCoordinator.dispose();
         session.dispose();
+        artifacts.dispose();
         reservationService.dispose();
         rendererNonces.dispose();
         slotService.dispose();
@@ -350,6 +585,7 @@ export function createTestBrowserRuntimeComposition(
           runtimeSession = undefined;
           preparedBrowserServices = undefined;
           browserServices = undefined;
+          auctionBatchService = undefined;
           auctionContextRegistry = undefined;
           projectionParser = undefined;
         }
@@ -375,6 +611,7 @@ export function createTestBrowserRuntimeComposition(
         runtimeOwner: session,
       });
       runtimeSession = session;
+      auctionBatchService = batchCoordinator;
       auctionContextRegistry = contextRegistry;
       projectionParser = parseProjection;
       return runtimeOptions.activateOwner?.(context);

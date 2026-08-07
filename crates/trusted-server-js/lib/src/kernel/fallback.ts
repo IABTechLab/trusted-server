@@ -1,12 +1,12 @@
 import { parseCacheFetchPolicyV1 } from '../core/config';
 import { parseBrowserAuctionProjectionV1 } from '../core/contracts/auction_projection';
+import { validateRequestAdsOptions } from '../core/contracts/request_ads';
 import { log } from '../core/log';
 import { prepareProgrammaticAdUnits } from '../core/registry';
-import { validateRequestAdsOptions } from '../core/request';
 import type { BootManifestV1 } from '../core/types';
 
 export { AdUnitRegistrationError, type AdUnitRegistrationErrorCode } from '../core/registry';
-export { RequestAdsInputError, type RequestAdsInputErrorCode } from '../core/request';
+export { RequestAdsInputError, type RequestAdsInputErrorCode } from '../core/contracts/request_ads';
 
 import type { BootFailureReason } from './integration_registry';
 
