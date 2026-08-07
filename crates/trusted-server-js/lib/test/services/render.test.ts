@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import apsEnvelope from '../fixtures/aps-renderer-v1.json';
 import { createBrowserMessagingAdapter, type MessagingAdapter } from '../../src/adapters/messaging';
+import { prepareAdmIframe } from '../../src/core/render';
 import { createTestNavigationIdentityIssuer } from '../../src/kernel/identity';
 import { createRuntimeSession } from '../../src/kernel/sessions';
 import type { RenderAttemptScope, WinnerContext } from '../../src/kernel/sessions';
@@ -16,7 +17,10 @@ import {
   createRenderAttempt,
   createRendererNonceRegistry,
   createSlotOperation,
+  renderDirectAdmAttempt,
   type CommittedRenderArtifact,
+  type DirectAdmIframeConstructor,
+  type DirectAdmIframeHandle,
   type RenderAttempt,
   type RenderAttemptState,
   type SlotOperation,
@@ -1914,6 +1918,367 @@ function slotOperation(options: SlotOperationOptions): SlotOperation {
   if (!result.ok) throw new Error('should create a slot operation');
   return result.value;
 }
+
+describe('direct ADM attempt rendering', () => {
+  it('accepts the exact intended srcdoc and promotes its iframe artifact', () => {
+    document.body.innerHTML = '<div id="fictional-slot"><span>placeholder</span></div>';
+    const artifacts = createCommittedArtifactStore();
+    const render = attempt(owner(), { artifacts });
+    expect(render.admitDirectWinner(ADM_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const container = document.getElementById('fictional-slot')!;
+
+    expect(
+      renderDirectAdmAttempt({
+        attempt: render,
+        container,
+        prepareIframe: prepareAdmIframe,
+        publisherOrigin: window.location.origin,
+      })
+    ).toBe(true);
+    expect(render.snapshot()).toMatchObject({ outcome: undefined, state: 'waiting_for_adm' });
+    const frame = container.querySelector('iframe');
+    expect(frame).not.toBeNull();
+    expect(frame?.srcdoc).toContain('fictional creative');
+    expect(frame?.hasAttribute('src')).toBe(false);
+    expect(container.querySelector('span')).not.toBeNull();
+
+    frame?.dispatchEvent(new Event('load'));
+    expect(render.snapshot().outcome).toEqual({ outcome: 'accepted' });
+    expect(container.querySelector('span')).toBeNull();
+    expect(container.querySelector('iframe')).toBe(frame);
+    expect(artifacts.current('fictional-slot')).toMatchObject({
+      attemptId: render.id,
+      kind: 'direct_iframe',
+    });
+
+    artifacts.dispose();
+    expect(frame?.isConnected).toBe(false);
+    document.body.innerHTML = '';
+  });
+
+  it('commits predecessors despite settlement-time iterator poisoning', () => {
+    document.body.innerHTML = '<div id="fictional-slot"><span>placeholder</span></div>';
+    const container = document.getElementById('fictional-slot')!;
+    const predecessor = container.querySelector('span');
+    const render = attempt();
+    expect(render.admitDirectWinner(ADM_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const iteratorDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator);
+    const nativeIterator = Array.prototype[Symbol.iterator];
+    let ownedIteratorCalls = 0;
+    expect(iteratorDescriptor).toBeDefined();
+    expect(
+      render.onSettled(() => {
+        Object.defineProperty(Array.prototype, Symbol.iterator, {
+          ...iteratorDescriptor,
+          value: function (this: unknown[]) {
+            const first = this[0];
+            const isAttributeTuple =
+              this.length === 2 &&
+              typeof first === 'string' &&
+              (first === 'sandbox' ||
+                first === 'referrerpolicy' ||
+                first === 'width' ||
+                first === 'height' ||
+                first === 'scrolling' ||
+                first === 'frameborder' ||
+                first === 'marginwidth' ||
+                first === 'marginheight' ||
+                first === 'title' ||
+                first === 'aria-label' ||
+                first === 'style');
+            const isAttributeList =
+              this.length === 11 && Array.isArray(first) && first[0] === 'sandbox';
+            const isPredecessorSnapshot = this.length === 1 && first === predecessor;
+            if (isAttributeTuple || isAttributeList || isPredecessorSnapshot) {
+              ownedIteratorCalls += 1;
+              throw new Error('hostile owned-array iterator');
+            }
+            return Reflect.apply(nativeIterator, this, []);
+          },
+        });
+      })
+    ).toBe(true);
+    expect(
+      renderDirectAdmAttempt({
+        attempt: render,
+        container,
+        prepareIframe: prepareAdmIframe,
+        publisherOrigin: window.location.origin,
+      })
+    ).toBe(true);
+    const frame = container.querySelector('iframe');
+    expect(frame).not.toBeNull();
+
+    try {
+      frame?.dispatchEvent(new Event('load'));
+    } finally {
+      if (iteratorDescriptor) {
+        Object.defineProperty(Array.prototype, Symbol.iterator, iteratorDescriptor);
+      }
+    }
+
+    expect(render.snapshot().outcome).toEqual({ outcome: 'accepted' });
+    expect(ownedIteratorCalls).toBe(0);
+    expect(predecessor?.isConnected).toBe(false);
+    expect(frame?.isConnected).toBe(true);
+    document.body.innerHTML = '';
+  });
+
+  it.each(['property', 'append', 'current', 'activate'] as const)(
+    'contains a throwing ADM handle %s phase and disposes its exact frame',
+    (phase) => {
+      document.body.innerHTML = '<div id="fictional-slot"></div>';
+      const container = document.getElementById('fictional-slot')!;
+      const render = attempt();
+      expect(render.admitDirectWinner(ADM_SOURCE, WINNER_CONTEXT)).toBe(true);
+      let underlying: DirectAdmIframeHandle | undefined;
+      const prepareIframe: DirectAdmIframeConstructor = (options) => {
+        underlying = prepareAdmIframe(options);
+        if (!underlying) return undefined;
+        if (phase === 'property') {
+          return new Proxy(underlying, {
+            get(target, property, receiver) {
+              if (property === 'append') throw new Error('hostile append property');
+              return Reflect.get(target, property, receiver);
+            },
+          });
+        }
+        return Object.freeze({
+          frame: underlying.frame,
+          append: () => {
+            const appended = underlying?.append() === true;
+            if (phase === 'append') throw new Error('hostile append');
+            return appended;
+          },
+          activate: () => {
+            const activated = underlying?.activate() === true;
+            if (phase === 'activate') throw new Error('hostile activate');
+            return activated;
+          },
+          commit: () => underlying?.commit() === true,
+          current: () => {
+            if (phase === 'current') throw new Error('hostile current');
+            return underlying?.current() === true;
+          },
+          dispose: () => underlying?.dispose(),
+        });
+      };
+
+      expect(() =>
+        renderDirectAdmAttempt({
+          attempt: render,
+          container,
+          prepareIframe,
+          publisherOrigin: window.location.origin,
+        })
+      ).not.toThrow();
+      expect(render.snapshot().outcome).toEqual({
+        outcome: 'failed',
+        reason: 'adm_document_no_load',
+      });
+      expect(container.querySelector('iframe')).toBeNull();
+      expect(underlying?.append()).toBe(false);
+      document.body.innerHTML = '';
+    }
+  );
+
+  it('rejects a non-publisher creative origin before inserting a frame', () => {
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const render = attempt();
+    expect(render.admitDirectWinner(ADM_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const container = document.getElementById('fictional-slot')!;
+
+    expect(
+      renderDirectAdmAttempt({
+        attempt: render,
+        container,
+        prepareIframe: prepareAdmIframe,
+        publisherOrigin: 'https://not-the-publisher.example',
+      })
+    ).toBe(false);
+    expect(container.querySelector('iframe')).toBeNull();
+    expect(render.snapshot().outcome).toEqual({
+      outcome: 'failed',
+      reason: 'winner_not_renderable',
+    });
+    document.body.innerHTML = '';
+  });
+
+  it('anchors the five-second deadline after inserting a complete srcdoc frame', () => {
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const render = attempt(owner(), {
+      scheduler: Object.freeze({
+        clear: vi.fn(),
+        set: (callback: () => void) => {
+          callback();
+          return Object.freeze({});
+        },
+      }),
+    });
+    expect(render.admitDirectWinner(ADM_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const container = document.getElementById('fictional-slot')!;
+    const observer = new MutationObserver(() => undefined);
+    observer.observe(container, { childList: true });
+
+    expect(
+      renderDirectAdmAttempt({
+        attempt: render,
+        container,
+        prepareIframe: prepareAdmIframe,
+        publisherOrigin: window.location.origin,
+      })
+    ).toBe(false);
+    expect(render.snapshot().outcome).toEqual({
+      outcome: 'failed',
+      reason: 'adm_document_no_load',
+    });
+    const mutations = observer.takeRecords();
+    const inserted = mutations
+      .flatMap((mutation) => [...mutation.addedNodes])
+      .find((node): node is HTMLIFrameElement => node instanceof HTMLIFrameElement);
+    expect(inserted?.srcdoc).toContain('fictional creative');
+    expect(inserted?.hasAttribute('src')).toBe(false);
+    expect(mutations.some((mutation) => mutation.removedNodes.length === 1)).toBe(true);
+    expect(container.querySelector('iframe')).toBeNull();
+    observer.disconnect();
+    document.body.innerHTML = '';
+  });
+
+  it.each(['error', 'removed', 'replaced-srcdoc'] as const)(
+    'fails and removes an unaccepted frame when it is %s',
+    (failure) => {
+      document.body.innerHTML = '<div id="fictional-slot"></div>';
+      const render = attempt();
+      expect(render.admitDirectWinner(ADM_SOURCE, WINNER_CONTEXT)).toBe(true);
+      const container = document.getElementById('fictional-slot')!;
+      expect(
+        renderDirectAdmAttempt({
+          attempt: render,
+          container,
+          prepareIframe: prepareAdmIframe,
+          publisherOrigin: window.location.origin,
+        })
+      ).toBe(true);
+      const frame = container.querySelector('iframe');
+      expect(frame).not.toBeNull();
+      if (!frame) throw new Error('should insert an ADM frame');
+
+      if (failure === 'error') frame.dispatchEvent(new Event('error'));
+      if (failure === 'removed') {
+        frame.remove();
+        frame.dispatchEvent(new Event('load'));
+      }
+      if (failure === 'replaced-srcdoc') {
+        frame.srcdoc = '<!doctype html><title>publisher replacement</title>';
+        frame.dispatchEvent(new Event('load'));
+      }
+
+      expect(render.snapshot().outcome).toEqual({
+        outcome: 'failed',
+        reason: 'adm_document_no_load',
+      });
+      expect(frame.isConnected).toBe(false);
+      document.body.innerHTML = '';
+    }
+  );
+
+  it.each([
+    ['sandbox', (frame: HTMLIFrameElement) => frame.setAttribute('sandbox', 'allow-scripts')],
+    [
+      'referrer policy',
+      (frame: HTMLIFrameElement) => frame.setAttribute('referrerpolicy', 'unsafe-url'),
+    ],
+    ['dimensions', (frame: HTMLIFrameElement) => frame.setAttribute('width', '301')],
+    ['layout style', (frame: HTMLIFrameElement) => frame.style.setProperty('width', '301px')],
+  ] as const)(
+    'refuses acceptance after publisher mutation of the exact %s contract',
+    (_field, mutate) => {
+      document.body.innerHTML = '<div id="fictional-slot"></div>';
+      const render = attempt();
+      expect(render.admitDirectWinner(ADM_SOURCE, WINNER_CONTEXT)).toBe(true);
+      const container = document.getElementById('fictional-slot')!;
+      expect(
+        renderDirectAdmAttempt({
+          attempt: render,
+          container,
+          prepareIframe: prepareAdmIframe,
+          publisherOrigin: window.location.origin,
+        })
+      ).toBe(true);
+      const frame = container.querySelector('iframe');
+      expect(frame).not.toBeNull();
+      if (!frame) throw new Error('should insert an ADM frame');
+
+      mutate(frame);
+      frame.dispatchEvent(new Event('load'));
+
+      expect(render.snapshot().outcome).toEqual({
+        outcome: 'failed',
+        reason: 'adm_document_no_load',
+      });
+      expect(frame.isConnected).toBe(false);
+      document.body.innerHTML = '';
+    }
+  );
+
+  it('removes on cancellation and makes every late frame event inert', () => {
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const render = attempt();
+    expect(render.admitDirectWinner(ADM_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const container = document.getElementById('fictional-slot')!;
+    expect(
+      renderDirectAdmAttempt({
+        attempt: render,
+        container,
+        prepareIframe: prepareAdmIframe,
+        publisherOrigin: window.location.origin,
+      })
+    ).toBe(true);
+    const frame = container.querySelector('iframe');
+    expect(frame).not.toBeNull();
+
+    expect(render.cancel('caller_aborted')).toBe(true);
+    expect(frame?.isConnected).toBe(false);
+    frame?.dispatchEvent(new Event('load'));
+    frame?.dispatchEvent(new Event('error'));
+    expect(render.snapshot().outcome).toEqual({
+      outcome: 'cancelled',
+      reason: 'caller_aborted',
+    });
+    document.body.innerHTML = '';
+  });
+
+  it('rejects an admitted but malformed frozen ADM source before DOM mutation', () => {
+    const malformed = Object.freeze({
+      type: 'adm' as const,
+      version: 1 as const,
+      adm: '',
+      width: 0,
+      height: 250,
+    });
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const render = attempt(owner(), {
+      prepareRenderSource: (candidate) => (candidate === malformed ? malformed : undefined),
+    });
+    expect(render.admitDirectWinner(malformed, WINNER_CONTEXT)).toBe(true);
+    const container = document.getElementById('fictional-slot')!;
+
+    expect(
+      renderDirectAdmAttempt({
+        attempt: render,
+        container,
+        prepareIframe: prepareAdmIframe,
+        publisherOrigin: window.location.origin,
+      })
+    ).toBe(false);
+    expect(container.querySelector('iframe')).toBeNull();
+    expect(render.snapshot().outcome).toEqual({
+      outcome: 'failed',
+      reason: 'winner_not_renderable',
+    });
+    document.body.innerHTML = '';
+  });
+});
 
 describe('RenderAttempt state machine', () => {
   it('implements the exact PUC APS state table and makes invalid/replay transitions inert', () => {
