@@ -23,6 +23,7 @@ import {
   parseBrowserAuctionProjectionV1,
 } from '../core/contracts/auction_projection';
 import { validateApsRenderer } from '../core/contracts/aps_renderer';
+import { prepareAdmIframe } from '../core/render';
 import { renderDirectApsAttempt } from '../integrations/aps/render';
 import { createBrowserNavigationIdentityIssuer } from '../kernel/identity';
 import type { NavigationIdentityIssuerFactory, RuntimeSession } from '../kernel/sessions';
@@ -38,6 +39,7 @@ import {
 import { createReservationService, type ReservationService } from '../services/reservations';
 import {
   createRendererNonceRegistry,
+  renderDirectAdmAttempt,
   type RenderAttempt,
   type RendererNonceRegistry,
 } from '../services/render';
@@ -57,6 +59,7 @@ export interface BrowserComposition {
 export interface BrowserServices {
   readonly reservations: ReservationService;
   readonly rendererNonces: RendererNonceRegistry;
+  readonly renderDirectAdm: (attempt: RenderAttempt, container: HTMLElement) => boolean;
   readonly renderDirectAps: (attempt: RenderAttempt, container: HTMLElement) => boolean;
   readonly slots: SlotService;
   readonly targeting: TargetingService;
@@ -215,6 +218,18 @@ export function createTestBrowserRuntimeComposition(
       });
       const rendererNonces = createRendererNonceRegistry();
       const publisherOrigin = window.location.origin;
+      const renderDirectAdm = (attempt: RenderAttempt, container: HTMLElement): boolean => {
+        try {
+          return renderDirectAdmAttempt({
+            attempt,
+            container,
+            prepareIframe: prepareAdmIframe,
+            publisherOrigin,
+          });
+        } catch {
+          return false;
+        }
+      };
       const renderDirectAps = (attempt: RenderAttempt, container: HTMLElement): boolean => {
         try {
           return renderDirectApsAttempt({
@@ -231,6 +246,7 @@ export function createTestBrowserRuntimeComposition(
       const services = Object.freeze({
         reservations: reservationService,
         rendererNonces,
+        renderDirectAdm,
         renderDirectAps,
         slots: slotService,
         targeting: targetingService,

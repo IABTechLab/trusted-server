@@ -14,6 +14,12 @@ const ATTEMPT_ID = /^a1_[A-Za-z0-9_-]{22}$/;
 const RENDERER_NONCE = /^n1_[A-Za-z0-9_-]{22}$/;
 const MAX_RENDERER_NONCES = 256;
 const MAX_RENDERER_NONCE_DRAWS = 8;
+const reflectApplyIntrinsic = Reflect.apply;
+const directAdmDocument = typeof document === 'undefined' ? undefined : document;
+const directAdmOwnerDocumentGetter =
+  typeof Node === 'undefined'
+    ? undefined
+    : Object.getOwnPropertyDescriptor(Node.prototype, 'ownerDocument')?.get;
 const objectFreezeIntrinsic = Object.freeze;
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayPushIntrinsic = Array.prototype.push;
@@ -59,7 +65,7 @@ const renderAttempts = new WeakSet<object>();
 const ignoreAsyncDisposal = (): void => undefined;
 
 function frozen<const Value extends object>(value: Value): Readonly<Value> {
-  return Reflect.apply(objectFreezeIntrinsic, Object, [value]) as Readonly<Value>;
+  return reflectApplyIntrinsic(objectFreezeIntrinsic, Object, [value]) as Readonly<Value>;
 }
 
 function arrayPush<Value>(array: Value[], value: Value): number {
@@ -361,6 +367,31 @@ export interface RenderAttempt {
   readonly onSettled: (callback: (outcome: RenderOutcome) => void) => boolean;
   readonly snapshot: () => RenderAttemptSnapshot;
 }
+
+export interface DirectAdmAttemptOptions {
+  readonly attempt: RenderAttempt;
+  readonly container: HTMLElement;
+  readonly prepareIframe: DirectAdmIframeConstructor;
+  readonly publisherOrigin: string;
+}
+
+export interface DirectAdmIframeHandle {
+  readonly frame: HTMLIFrameElement;
+  append(): boolean;
+  activate(): boolean;
+  commit(): boolean;
+  current(): boolean;
+  dispose(): void;
+}
+
+export type DirectAdmIframeConstructor = (options: {
+  readonly adm: string;
+  readonly container: HTMLElement;
+  readonly height: number;
+  readonly onError: () => void;
+  readonly onLoad: () => void;
+  readonly width: number;
+}) => DirectAdmIframeHandle | undefined;
 
 /** Retained endpoint whose lifetime is owned by one renderer nonce binding. */
 export interface RendererNoncePort {
@@ -1394,6 +1425,239 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
   }
   weakSetAdd(renderAttempts, lifecycle);
   return frozen({ ok: true, value: frozen(lifecycle) });
+}
+
+type DirectAdmSource = Readonly<{
+  adm: string;
+  height: number;
+  type: 'adm';
+  version: 1;
+  width: number;
+}>;
+
+function readDirectAdmSource(value: unknown): DirectAdmSource | undefined {
+  try {
+    if (
+      typeof value !== 'object' ||
+      value === null ||
+      !Object.isFrozen(value) ||
+      Object.getPrototypeOf(value) !== Object.prototype ||
+      Object.getOwnPropertySymbols(value).length !== 0
+    ) {
+      return undefined;
+    }
+    const names = Object.getOwnPropertyNames(value).sort();
+    const expected = ['adm', 'height', 'type', 'version', 'width'];
+    if (names.length !== expected.length) return undefined;
+    for (let index = 0; index < expected.length; index += 1) {
+      if (names[index] !== expected[index]) return undefined;
+    }
+    const fields = Object.create(null) as Record<string, unknown>;
+    for (const name of expected) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, name);
+      if (
+        !descriptor ||
+        !('value' in descriptor) ||
+        descriptor.enumerable !== true ||
+        descriptor.configurable !== false ||
+        descriptor.writable !== false
+      ) {
+        return undefined;
+      }
+      fields[name] = descriptor.value;
+    }
+    if (
+      fields['type'] !== 'adm' ||
+      fields['version'] !== 1 ||
+      typeof fields['adm'] !== 'string' ||
+      fields['adm'].trim().length === 0 ||
+      new TextEncoder().encode(fields['adm']).byteLength > 512 * 1024 ||
+      typeof fields['width'] !== 'number' ||
+      !Number.isInteger(fields['width']) ||
+      fields['width'] < 1 ||
+      fields['width'] > 4096 ||
+      typeof fields['height'] !== 'number' ||
+      !Number.isInteger(fields['height']) ||
+      fields['height'] < 1 ||
+      fields['height'] > 4096
+    ) {
+      return undefined;
+    }
+    return value as DirectAdmSource;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Drive one admitted direct ADM attempt through the shared iframe constructor. */
+export function renderDirectAdmAttempt(options: DirectAdmAttemptOptions): boolean {
+  let attempt: RenderAttempt;
+  let container: HTMLElement;
+  let prepareIframe: DirectAdmIframeConstructor;
+  let publisherOrigin: string;
+  try {
+    attempt = options.attempt;
+    container = options.container;
+    prepareIframe = options.prepareIframe;
+    publisherOrigin = options.publisherOrigin;
+  } catch {
+    return false;
+  }
+  if (!weakSetHas(renderAttempts, attempt) || typeof prepareIframe !== 'function') return false;
+
+  let exactDocumentOrigin: boolean;
+  try {
+    exactDocumentOrigin =
+      !!directAdmDocument &&
+      typeof directAdmOwnerDocumentGetter === 'function' &&
+      reflectApplyIntrinsic(directAdmOwnerDocumentGetter, container, []) === directAdmDocument &&
+      directAdmDocument.defaultView?.location.origin === publisherOrigin;
+  } catch {
+    exactDocumentOrigin = false;
+  }
+  if (!exactDocumentOrigin) {
+    attempt.fail('winner_not_renderable');
+    return false;
+  }
+
+  const source = readDirectAdmSource(attempt.renderSource);
+  if (!source) {
+    attempt.fail('winner_not_renderable');
+    return false;
+  }
+  if (!attempt.beginDirect()) return false;
+
+  let activeHandle: DirectAdmIframeHandle | undefined;
+  let activateHandleMethod: DirectAdmIframeHandle['activate'] | undefined;
+  let appendHandleMethod: DirectAdmIframeHandle['append'] | undefined;
+  let commitHandleMethod: DirectAdmIframeHandle['commit'] | undefined;
+  let currentHandleMethod: DirectAdmIframeHandle['current'] | undefined;
+  let disposeHandleMethod: DirectAdmIframeHandle['dispose'] | undefined;
+  let handleDisposed = false;
+  let artifactOwnedByAttempt = false;
+  const disposeHandle = (): void => {
+    if (handleDisposed) return;
+    handleDisposed = true;
+    if (!activeHandle || typeof disposeHandleMethod !== 'function') return;
+    try {
+      reflectApplyIntrinsic(disposeHandleMethod, activeHandle, []);
+    } catch {
+      // The attempt remains terminal even if an injected cleanup boundary is hostile.
+    }
+  };
+  const currentHandle = (): boolean => {
+    if (!activeHandle || typeof currentHandleMethod !== 'function') return false;
+    try {
+      return reflectApplyIntrinsic(currentHandleMethod, activeHandle, []) === true;
+    } catch {
+      return false;
+    }
+  };
+  const failAttempt = (reason: RenderFailureReason): void => {
+    try {
+      attempt.fail(reason);
+    } catch {
+      if (artifactOwnedByAttempt) disposeHandle();
+    }
+  };
+  const fail = (reason: RenderFailureReason): false => {
+    if (!artifactOwnedByAttempt) disposeHandle();
+    failAttempt(reason);
+    return false;
+  };
+  try {
+    activeHandle = prepareIframe({
+      adm: source.adm,
+      container,
+      height: source.height,
+      onError: () => {
+        if (artifactOwnedByAttempt) failAttempt('adm_document_no_load');
+      },
+      onLoad: () => {
+        if (!artifactOwnedByAttempt || !currentHandle()) {
+          if (artifactOwnedByAttempt) failAttempt('adm_document_no_load');
+          return;
+        }
+        let accepted = false;
+        try {
+          accepted = attempt.accept() === true;
+        } catch {
+          failAttempt('internal_error');
+        }
+        if (!accepted || !activeHandle || typeof commitHandleMethod !== 'function') return;
+        try {
+          reflectApplyIntrinsic(commitHandleMethod, activeHandle, []);
+        } catch {
+          // Terminal acceptance is already authoritative; cleanup cannot be replayed here.
+        }
+      },
+      width: source.width,
+    });
+  } catch {
+    return fail('adm_document_no_load');
+  }
+  const handle = activeHandle;
+  if (!handle) return fail('adm_document_no_load');
+  try {
+    disposeHandleMethod = handle.dispose;
+    appendHandleMethod = handle.append;
+    currentHandleMethod = handle.current;
+    activateHandleMethod = handle.activate;
+    commitHandleMethod = handle.commit;
+    if (
+      typeof disposeHandleMethod !== 'function' ||
+      typeof appendHandleMethod !== 'function' ||
+      typeof currentHandleMethod !== 'function' ||
+      typeof activateHandleMethod !== 'function' ||
+      typeof commitHandleMethod !== 'function'
+    ) {
+      return fail('adm_document_no_load');
+    }
+  } catch {
+    return fail('adm_document_no_load');
+  }
+
+  const artifact = frozen<CommittedRenderArtifact>({
+    kind: 'direct_iframe',
+    attemptId: attempt.id,
+    slot: attempt.slot,
+    navigationGeneration: attempt.navigationGeneration,
+    dispose: disposeHandle,
+  });
+  try {
+    if (reflectApplyIntrinsic(appendHandleMethod, handle, []) !== true) {
+      return fail('adm_document_no_load');
+    }
+  } catch {
+    return fail('adm_document_no_load');
+  }
+  try {
+    if (!attempt.beginAdm(artifact)) return fail('internal_error');
+  } catch {
+    return fail('internal_error');
+  }
+  artifactOwnedByAttempt = true;
+  let state: RenderAttemptState;
+  try {
+    state = attempt.snapshot().state;
+  } catch {
+    return fail('internal_error');
+  }
+  if (state !== 'waiting_for_adm') return false;
+  if (!currentHandle()) return fail('adm_document_no_load');
+  try {
+    if (reflectApplyIntrinsic(activateHandleMethod, handle, []) !== true) {
+      return fail('adm_document_no_load');
+    }
+  } catch {
+    return fail('adm_document_no_load');
+  }
+  try {
+    state = attempt.snapshot().state;
+  } catch {
+    return fail('internal_error');
+  }
+  return state === 'waiting_for_adm' || state === 'accepted';
 }
 
 interface RendererNonceBinding {

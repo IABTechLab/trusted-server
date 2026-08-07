@@ -372,6 +372,7 @@ describe('browser composition', () => {
     expect(session?.interfaces['reservations']).toBe(reservationService);
     expect(session?.interfaces['rendererNonces']).toBe(rendererNonces);
     expect(session?.interfaces['renderDirectAps']).toBeTypeOf('function');
+    expect(session?.interfaces['renderDirectAdm']).toBeTypeOf('function');
     expect(session?.currentNavigation?.interfaces).toBe(session?.interfaces);
     expect(session?.currentNavigation?.currentAuctionProjection).toEqual(projection);
     expect(Object.isFrozen(session?.currentNavigation?.currentAuctionProjection)).toBe(true);
