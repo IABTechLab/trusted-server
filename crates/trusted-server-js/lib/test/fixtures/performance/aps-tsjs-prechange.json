@@ -33,12 +33,13 @@
         "tsjs-core.js",
         "tsjs-creative.js",
         "tsjs-gpt.js",
-        "tsjs-prebid.js"
+        "tsjs-prebid.js",
+        "tsjs-datadome.js"
       ],
-      "rawBytes": 107265,
-      "gzipBytes": 33428,
-      "brotliBytes": 25236,
-      "sha256": "8b9a440310ad358c292864dfa2e088c895c59199c2518fe9a3044236e459d19d"
+      "rawBytes": 113756,
+      "gzipBytes": 35163,
+      "brotliBytes": 26051,
+      "sha256": "232b734406d9baec8f244d5ab1501535d0296d9f1e0d87e30fc9e30b6c96d204"
     },
     "maximal": {
       "files": [

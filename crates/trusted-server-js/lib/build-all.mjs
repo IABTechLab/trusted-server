@@ -31,7 +31,7 @@ const metricsFile = 'tsjs-build-metrics-v1.json';
 const releaseFile = 'tsjs-release-v1.json';
 const fallbackFile = 'gpt-bootstrap-fallback.js';
 
-const REFERENCE_INTEGRATIONS = ['creative', 'gpt', 'prebid'];
+const REFERENCE_INTEGRATIONS = ['creative', 'gpt', 'prebid', 'datadome'];
 
 function compress(bytes) {
   return {
