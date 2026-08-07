@@ -18,6 +18,7 @@ import { JSDOM } from 'jsdom';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { main } from '../build-prebid-external.mjs';
+import { createBrowserPrebidAdapter } from '../src/adapters/prebid';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const libDir = path.resolve(__dirname, '..');
@@ -293,6 +294,9 @@ describe('external bundle + served shim evaluated together', () => {
     expect(Object.isFrozen(artifactDescriptor.value.userIdModules[0])).toBe(true);
     expect(Object.isFrozen(artifactDescriptor.value.userIdModules[0].configNames)).toBe(true);
     expect(Object.isFrozen(artifactDescriptor.value.userIdModules[0].eidSources)).toBe(true);
+    const adapter = createBrowserPrebidAdapter(pageWindow);
+    expect(adapter.bindingStatus()).toBe('present');
+    adapter.dispose();
 
     // Count trustedServer registrations across repeated shim evaluations.
     const originalRegisterBidAdapter = pageWindow.pbjs.registerBidAdapter.bind(pageWindow.pbjs);
