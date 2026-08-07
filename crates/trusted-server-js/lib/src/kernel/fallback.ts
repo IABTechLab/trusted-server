@@ -1,64 +1,20 @@
 import { parseCacheFetchPolicyV1 } from '../core/config';
-import {
-  parseBrowserAuctionProjectionV1,
-  validBoundedString,
-} from '../core/contracts/auction_projection';
+import { parseBrowserAuctionProjectionV1 } from '../core/contracts/auction_projection';
 import { log } from '../core/log';
+import { prepareProgrammaticAdUnits } from '../core/registry';
+import { validateRequestAdsOptions } from '../core/request';
 import type { BootManifestV1 } from '../core/types';
+
+export { AdUnitRegistrationError, type AdUnitRegistrationErrorCode } from '../core/registry';
+export { RequestAdsInputError, type RequestAdsInputErrorCode } from '../core/request';
 
 import type { BootFailureReason } from './integration_registry';
 
-const textEncoder = new TextEncoder();
-const MAX_AUCTION_BODY_BYTES = 256 * 1024;
-const MAX_JSON_ARRAY_ITEMS = Math.floor((MAX_AUCTION_BODY_BYTES - 1) / 2);
 const SAFE_PROJECTION = {
   version: 1,
   auction: { version: 1, auctionId: 'fallback', results: [] },
   bids: [],
 } as const;
-
-export class RequestAdsInputError extends Error {
-  public readonly code:
-    | 'invalid_options'
-    | 'invalid_slots'
-    | 'empty_slots'
-    | 'duplicate_slot'
-    | 'invalid_timeout'
-    | 'invalid_signal';
-
-  public constructor(code: RequestAdsInputError['code']) {
-    super(code);
-    this.name = 'RequestAdsInputError';
-    this.code = code;
-  }
-}
-
-export type AdUnitRegistrationErrorCode =
-  | 'invalid_units'
-  | 'invalid_unit'
-  | 'invalid_code'
-  | 'duplicate_code'
-  | 'slot_collision'
-  | 'invalid_media_types'
-  | 'invalid_dimensions'
-  | 'dimensions_out_of_range'
-  | 'invalid_bids'
-  | 'invalid_bidder'
-  | 'invalid_params'
-  | 'request_body_too_large'
-  | 'registry_capacity';
-
-export class AdUnitRegistrationError extends Error {
-  public readonly code: AdUnitRegistrationErrorCode;
-  public readonly unitIndex?: number;
-
-  public constructor(code: AdUnitRegistrationErrorCode, unitIndex?: number) {
-    super(code);
-    this.name = 'AdUnitRegistrationError';
-    this.code = code;
-    if (unitIndex !== undefined) this.unitIndex = unitIndex;
-  }
-}
 
 export class TsjsUnavailableError extends Error {
   public readonly code = 'runtime_unavailable' as const;
@@ -248,318 +204,6 @@ export function buildFallbackBoot(releaseId: string, candidate: unknown): Readon
   });
 }
 
-function validSlotId(value: unknown): value is string {
-  return validBoundedString(value, 256);
-}
-
-function readAborted(signal: unknown): boolean | undefined {
-  try {
-    const getter = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted')?.get;
-    return getter?.call(signal) as boolean | undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function validateRequestOptions(value: unknown): {
-  readonly slots: readonly string[] | undefined;
-  readonly aborted: boolean;
-} {
-  if (value === undefined) return { slots: undefined, aborted: false };
-  const options = ownDataRecord(value);
-  if (
-    !options ||
-    !Object.keys(options).every((key) => ['slots', 'timeoutMs', 'signal'].includes(key))
-  ) {
-    throw new RequestAdsInputError('invalid_options');
-  }
-  let slots: readonly string[] | undefined;
-  if (Object.prototype.hasOwnProperty.call(options, 'slots')) {
-    const candidateSlots = snapshotOwnArray(options.slots, 256);
-    if (!candidateSlots) {
-      throw new RequestAdsInputError('invalid_slots');
-    }
-    if (candidateSlots.length === 0) throw new RequestAdsInputError('empty_slots');
-    const seen = new Set<string>();
-    const copy: string[] = [];
-    for (const slot of candidateSlots) {
-      if (!validSlotId(slot)) throw new RequestAdsInputError('invalid_slots');
-      if (seen.has(slot)) throw new RequestAdsInputError('duplicate_slot');
-      seen.add(slot);
-      copy.push(slot);
-    }
-    slots = Object.freeze(copy);
-  }
-  if (
-    Object.prototype.hasOwnProperty.call(options, 'timeoutMs') &&
-    (!Number.isInteger(options.timeoutMs) ||
-      (options.timeoutMs as number) < 100 ||
-      (options.timeoutMs as number) > 30_000)
-  ) {
-    throw new RequestAdsInputError('invalid_timeout');
-  }
-  let aborted = false;
-  if (Object.prototype.hasOwnProperty.call(options, 'signal')) {
-    const candidate = readAborted(options.signal);
-    if (candidate === undefined) throw new RequestAdsInputError('invalid_signal');
-    aborted = candidate;
-  }
-  return { slots, aborted };
-}
-
-interface JsonMeasurement {
-  readonly bytes: number;
-}
-
-interface JsonMeasurementContext {
-  readonly memo: WeakMap<object, JsonMeasurement>;
-  readonly snapshots: WeakMap<object, JsonNode | typeof JSON_TOO_LARGE | null>;
-}
-
-interface JsonNode {
-  readonly entries: readonly JsonEntry[];
-}
-
-interface JsonEntry {
-  readonly prefixBytes: number;
-  readonly value: unknown;
-}
-
-interface JsonFrame {
-  readonly object: object;
-  readonly node: JsonNode;
-  bytes: number;
-  index: number;
-}
-
-const JSON_TOO_LARGE = Symbol('json_too_large');
-const TOO_LARGE_MEASUREMENT = Object.freeze({ bytes: MAX_AUCTION_BODY_BYTES + 1 });
-
-function boundedByteSum(left: number, right: number): number {
-  return Math.min(MAX_AUCTION_BODY_BYTES + 1, left + right);
-}
-
-function primitiveJsonBytes(value: unknown): number | undefined {
-  if (value === null) return 4;
-  if (typeof value === 'boolean') return value ? 4 : 5;
-  if (typeof value === 'string') return textEncoder.encode(JSON.stringify(value)).length;
-  if (typeof value === 'number' && Number.isFinite(value)) return String(value).length;
-  return undefined;
-}
-
-function snapshotJsonNode(
-  value: unknown,
-  context: JsonMeasurementContext,
-  recordSnapshot?: Record<string, unknown>
-): JsonNode | typeof JSON_TOO_LARGE | undefined {
-  if (typeof value !== 'object' || value === null) return undefined;
-  if (context.snapshots.has(value)) {
-    return context.snapshots.get(value) ?? undefined;
-  }
-  let node: JsonNode | typeof JSON_TOO_LARGE | undefined;
-  try {
-    let entries: JsonEntry[];
-    if (recordSnapshot) {
-      entries = Object.keys(recordSnapshot).map((key, index) => ({
-        prefixBytes: (index === 0 ? 0 : 1) + textEncoder.encode(JSON.stringify(key)).length + 1,
-        value: recordSnapshot[key],
-      }));
-    } else if (Array.isArray(value)) {
-      if (value.length > MAX_JSON_ARRAY_ITEMS) {
-        node = JSON_TOO_LARGE;
-        return node;
-      }
-      const values = snapshotOwnArray(value, MAX_JSON_ARRAY_ITEMS);
-      if (!values) return undefined;
-      entries = values.map((entry, index) => ({
-        prefixBytes: index === 0 ? 0 : 1,
-        value: entry,
-      }));
-    } else {
-      const record = ownDataRecord(value);
-      if (!record) return undefined;
-      entries = Object.keys(record).map((key, index) => ({
-        prefixBytes: (index === 0 ? 0 : 1) + textEncoder.encode(JSON.stringify(key)).length + 1,
-        value: record[key],
-      }));
-    }
-    node = Object.freeze({ entries: Object.freeze(entries) });
-    return node;
-  } catch {
-    return undefined;
-  } finally {
-    context.snapshots.set(value, node ?? null);
-  }
-}
-
-function measureJsonData(
-  value: unknown,
-  context: JsonMeasurementContext,
-  recordSnapshot?: Record<string, unknown>
-): JsonMeasurement | undefined {
-  const primitiveBytes = primitiveJsonBytes(value);
-  if (primitiveBytes !== undefined) return { bytes: primitiveBytes };
-  if (typeof value !== 'object' || value === null) return undefined;
-  const cached = context.memo.get(value);
-  if (cached) return cached;
-  const root = snapshotJsonNode(value, context, recordSnapshot);
-  if (root === JSON_TOO_LARGE) return TOO_LARGE_MEASUREMENT;
-  if (!root) return undefined;
-
-  const active = new Set<object>([value]);
-  const stack: JsonFrame[] = [{ object: value, node: root, bytes: 2, index: 0 }];
-  while (stack.length > 0) {
-    const frame = stack[stack.length - 1];
-    if (!frame) return undefined;
-    if (frame.index >= frame.node.entries.length) {
-      const measurement = Object.freeze({ bytes: frame.bytes });
-      context.memo.set(frame.object, measurement);
-      active.delete(frame.object);
-      stack.pop();
-      const parent = stack[stack.length - 1];
-      if (!parent) return measurement;
-      parent.bytes = boundedByteSum(parent.bytes, measurement.bytes);
-      if (parent.bytes > MAX_AUCTION_BODY_BYTES) return TOO_LARGE_MEASUREMENT;
-      continue;
-    }
-
-    const entry = frame.node.entries[frame.index];
-    frame.index += 1;
-    if (!entry) return undefined;
-    frame.bytes = boundedByteSum(frame.bytes, entry.prefixBytes);
-    if (frame.bytes > MAX_AUCTION_BODY_BYTES) return TOO_LARGE_MEASUREMENT;
-    const childBytes = primitiveJsonBytes(entry.value);
-    if (childBytes !== undefined) {
-      frame.bytes = boundedByteSum(frame.bytes, childBytes);
-      if (frame.bytes > MAX_AUCTION_BODY_BYTES) return TOO_LARGE_MEASUREMENT;
-      continue;
-    }
-    if (typeof entry.value !== 'object' || entry.value === null || active.has(entry.value)) {
-      return undefined;
-    }
-    const childMeasurement = context.memo.get(entry.value);
-    if (childMeasurement) {
-      frame.bytes = boundedByteSum(frame.bytes, childMeasurement.bytes);
-      if (frame.bytes > MAX_AUCTION_BODY_BYTES) return TOO_LARGE_MEASUREMENT;
-      continue;
-    }
-    const childNode = snapshotJsonNode(entry.value, context);
-    if (childNode === JSON_TOO_LARGE) return TOO_LARGE_MEASUREMENT;
-    if (!childNode) return undefined;
-    active.add(entry.value);
-    stack.push({ object: entry.value, node: childNode, bytes: 2, index: 0 });
-  }
-  return undefined;
-}
-
-function measureJsonRecord(
-  value: unknown,
-  context: JsonMeasurementContext
-): JsonMeasurement | undefined {
-  try {
-    if (Array.isArray(value)) return undefined;
-  } catch {
-    return undefined;
-  }
-  const record = ownDataRecord(value);
-  return record ? measureJsonData(value, context, record) : undefined;
-}
-
-function validateProgrammaticUnits(value: unknown, knownSlots: ReadonlySet<string>): void {
-  let units: readonly unknown[] | undefined;
-  try {
-    units = Array.isArray(value) ? snapshotOwnArray(value, 256) : [value];
-  } catch {
-    throw new AdUnitRegistrationError('invalid_units');
-  }
-  if (!units) throw new AdUnitRegistrationError('invalid_units');
-  if (units.length === 0 || units.length > 256) throw new AdUnitRegistrationError('invalid_units');
-  const seen = new Set<string>();
-  const measurementContext: JsonMeasurementContext = {
-    memo: new WeakMap(),
-    snapshots: new WeakMap(),
-  };
-  for (let index = 0; index < units.length; index += 1) {
-    const unit = ownDataRecord(units[index]);
-    if (
-      !unit ||
-      (!exactKeys(unit, ['code', 'mediaTypes']) && !exactKeys(unit, ['code', 'mediaTypes', 'bids']))
-    ) {
-      throw new AdUnitRegistrationError('invalid_unit', index);
-    }
-    if (!validSlotId(unit.code)) throw new AdUnitRegistrationError('invalid_code', index);
-    if (seen.has(unit.code)) throw new AdUnitRegistrationError('duplicate_code', index);
-    if (knownSlots.has(unit.code)) throw new AdUnitRegistrationError('slot_collision', index);
-    seen.add(unit.code);
-    const mediaTypes = ownDataRecord(unit.mediaTypes);
-    const banner = ownDataRecord(mediaTypes?.banner);
-    if (
-      !mediaTypes ||
-      !exactKeys(mediaTypes, ['banner']) ||
-      !banner ||
-      !exactKeys(banner, ['sizes'])
-    ) {
-      throw new AdUnitRegistrationError('invalid_media_types', index);
-    }
-    const sizes = snapshotOwnArray(banner.sizes, MAX_JSON_ARRAY_ITEMS);
-    if (!sizes || sizes.length === 0) {
-      throw new AdUnitRegistrationError('invalid_media_types', index);
-    }
-    for (const size of sizes) {
-      const dimensions = snapshotOwnArray(size, 2);
-      if (
-        !dimensions ||
-        dimensions.length !== 2 ||
-        dimensions.some(
-          (dimension) =>
-            typeof dimension !== 'number' ||
-            !Number.isFinite(dimension) ||
-            !Number.isInteger(dimension) ||
-            dimension <= 0
-        )
-      ) {
-        throw new AdUnitRegistrationError('invalid_dimensions', index);
-      }
-      if (dimensions.some((dimension) => (dimension as number) > 4096)) {
-        throw new AdUnitRegistrationError('dimensions_out_of_range', index);
-      }
-    }
-    if (unit.bids !== undefined) {
-      const bids = snapshotOwnArray(unit.bids, MAX_JSON_ARRAY_ITEMS);
-      if (!bids) throw new AdUnitRegistrationError('invalid_bids', index);
-      for (const rawBid of bids) {
-        const bid = ownDataRecord(rawBid);
-        if (!bid || (!exactKeys(bid, ['bidder']) && !exactKeys(bid, ['bidder', 'params']))) {
-          throw new AdUnitRegistrationError('invalid_bids', index);
-        }
-        if (
-          typeof bid.bidder !== 'string' ||
-          textEncoder.encode(bid.bidder).length > 64 ||
-          bid.bidder.length === 0
-        ) {
-          throw new AdUnitRegistrationError('invalid_bidder', index);
-        }
-        if (bid.params !== undefined) {
-          const measured = measureJsonRecord(bid.params, measurementContext);
-          if (!measured) {
-            throw new AdUnitRegistrationError('invalid_params', index);
-          }
-        }
-      }
-    }
-  }
-  const measured = measureJsonData(units, measurementContext);
-  if (!measured) {
-    throw new AdUnitRegistrationError('invalid_params');
-  }
-  if (measured.bytes > MAX_AUCTION_BODY_BYTES) {
-    throw new AdUnitRegistrationError('request_body_too_large');
-  }
-  if (knownSlots.size + units.length > 256) {
-    throw new AdUnitRegistrationError('registry_capacity');
-  }
-}
-
 const LOG_LEVELS = Object.freeze({
   silent: true,
   error: true,
@@ -620,14 +264,14 @@ export function createFallbackFields(
     addAdUnits: {
       enumerable: true,
       value: (units: unknown) => {
-        validateProgrammaticUnits(units, known);
+        prepareProgrammaticAdUnits(units, known);
         throw new TsjsUnavailableError(options.releaseId, options.reason);
       },
     },
     requestAds: {
       enumerable: true,
       value: async (requestOptions?: unknown) => {
-        const validated = validateRequestOptions(requestOptions);
+        const validated = validateRequestAdsOptions(requestOptions);
         const selected = validated.slots ?? knownSlots;
         return deepFreeze({
           slots: selected.map((slot) =>

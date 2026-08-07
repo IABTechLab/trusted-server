@@ -7,10 +7,91 @@ import {
 } from '../../src/integrations/aps/render';
 import envelope from '../fixtures/aps-renderer-v1.json';
 import type { addAdUnits } from '../../src/core/registry';
+import { RequestAdsInputError, validateRequestAdsOptions } from '../../src/core/request';
+
+/** Test view of the global scope with a mockable `fetch`. */
+const testGlobal = globalThis as unknown as { fetch: ReturnType<typeof vi.fn> };
+
+type AddAdUnitsArg = Parameters<typeof addAdUnits>[0];
+
+function expectInputError(callback: () => unknown, code: RequestAdsInputError['code']): void {
+  try {
+    callback();
+    throw new Error('should reject request options');
+  } catch (error) {
+    expect(error).toBeInstanceOf(RequestAdsInputError);
+    expect(error).toMatchObject({ code });
+  }
+}
 
 async function flushRequestAds(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
+
+describe('requestAds input contract', () => {
+  it('accepts omitted options and snapshots ordered slots with the exact default timeout', () => {
+    expect(validateRequestAdsOptions(undefined)).toEqual({
+      aborted: false,
+      signal: undefined,
+      slots: undefined,
+      timeoutMs: 10_000,
+    });
+    const slots = ['server-slot', 'programmatic-slot'];
+    const validated = validateRequestAdsOptions({ slots, timeoutMs: 100 });
+    slots.reverse();
+    expect(validated).toEqual({
+      aborted: false,
+      signal: undefined,
+      slots: ['server-slot', 'programmatic-slot'],
+      timeoutMs: 100,
+    });
+    expect(Object.isFrozen(validated)).toBe(true);
+    expect(Object.isFrozen(validated.slots)).toBe(true);
+  });
+
+  it.each([null, [], new Date(), { unknown: true }])(
+    'rejects non-exact options %#',
+    (candidate) => {
+      expectInputError(() => validateRequestAdsOptions(candidate), 'invalid_options');
+    }
+  );
+
+  it('rejects accessors without invoking them', () => {
+    const getter = vi.fn(() => ['slot']);
+    const options = {};
+    Object.defineProperty(options, 'slots', { enumerable: true, get: getter });
+    expectInputError(() => validateRequestAdsOptions(options), 'invalid_options');
+    expect(getter).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ slots: 'slot' }, 'invalid_slots'],
+    [{ slots: [] }, 'empty_slots'],
+    [{ slots: ['slot', 'slot'] }, 'duplicate_slot'],
+    [{ slots: [''] }, 'invalid_slots'],
+    [{ slots: ['x'.repeat(257)] }, 'invalid_slots'],
+    [{ slots: Array.from({ length: 257 }, (_, index) => `slot-${index}`) }, 'invalid_slots'],
+    [{ timeoutMs: 99 }, 'invalid_timeout'],
+    [{ timeoutMs: 30_001 }, 'invalid_timeout'],
+    [{ timeoutMs: 100.5 }, 'invalid_timeout'],
+    [{ signal: { aborted: false } }, 'invalid_signal'],
+  ] as const)('rejects request boundary %#', (candidate, code) => {
+    expectInputError(() => validateRequestAdsOptions(candidate), code);
+  });
+
+  it('accepts exact timeout and AbortSignal boundaries through the platform brand getter', () => {
+    const controller = new AbortController();
+    expect(
+      validateRequestAdsOptions({ timeoutMs: 30_000, signal: controller.signal })
+    ).toMatchObject({ aborted: false, signal: controller.signal, timeoutMs: 30_000 });
+    controller.abort();
+    expect(validateRequestAdsOptions({ timeoutMs: 100, signal: controller.signal })).toMatchObject({
+      aborted: true,
+      signal: controller.signal,
+      timeoutMs: 100,
+    });
+  });
+});
 
 describe('request.requestAds', () => {
   let originalFetch: typeof globalThis.fetch;
