@@ -357,7 +357,7 @@ export interface ReservationService {
   readonly tombstone: (input: ReservationTombstoneInput, state: 'disposed' | 'stale') => boolean;
   readonly tombstonePrebidGroup: (
     input: PrebidGroupOwnerInput,
-    state: 'aborted' | 'prebid_selection_timeout'
+    state: 'aborted' | 'prebid_selection_timeout' | 'unselected'
   ) => number;
   readonly tombstonePrebidLease: (
     input: PrebidLeaseOwnerInput,
@@ -439,8 +439,8 @@ function validPrebidLeaseTombstoneState(
 
 function validPrebidGroupTombstoneState(
   value: unknown
-): value is 'aborted' | 'prebid_selection_timeout' {
-  return value === 'aborted' || value === 'prebid_selection_timeout';
+): value is 'aborted' | 'prebid_selection_timeout' | 'unselected' {
+  return value === 'aborted' || value === 'prebid_selection_timeout' || value === 'unselected';
 }
 
 function winnerContext(value: unknown): WinnerContext | undefined {

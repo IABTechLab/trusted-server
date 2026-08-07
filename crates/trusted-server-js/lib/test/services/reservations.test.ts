@@ -1726,7 +1726,7 @@ describe('Prebid admission leases and selection', () => {
     expect(service.recognize(reservationId(2))).toMatchObject({ state: 'unselected' });
   });
 
-  it.each(['aborted', 'prebid_selection_timeout'] as const)(
+  it.each(['aborted', 'prebid_selection_timeout', 'unselected'] as const)(
     'tombstones %s leases only through their original admission expiry',
     (reason) => {
       let now = 25;
