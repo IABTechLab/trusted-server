@@ -563,4 +563,35 @@ describe('auction batch service', () => {
     });
     expect(fetcher).not.toHaveBeenCalled();
   });
+
+  it('contains an attempt that claims cancellation without notifying its observer', async () => {
+    const pending = abortablePendingFetcher();
+    const service = createService({
+      createAttempt: (owner) => {
+        const attempt = attemptHarness(owner).attempt;
+        return {
+          ok: true,
+          value: {
+            ...attempt,
+            cancel: vi.fn(() => true),
+          } as RenderAttempt,
+        };
+      },
+      fetcher: pending.fetcher,
+      renderWinner: () => false,
+    });
+    const batch = service.create({
+      navigation: navigation(),
+      requestBody: '{}',
+      slots: Object.freeze(['slot-a']),
+      timeoutMs: 10_000,
+    });
+
+    batch.cancel();
+
+    await expect(batch.result).resolves.toEqual({
+      slots: [{ slot: 'slot-a', path: 'primary', outcome: 'cancelled', reason: 'caller_aborted' }],
+    });
+    expect(pending.signals[0]?.aborted).toBe(true);
+  });
 });

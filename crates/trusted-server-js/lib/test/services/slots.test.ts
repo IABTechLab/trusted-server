@@ -254,6 +254,46 @@ describe('slot registry', () => {
     expect(service.snapshotForTest().records).toBe(MAX_ACTIVE_SLOT_RECORDS);
   });
 
+  it('snapshots navigation-local registration order with detached programmatic auction units', () => {
+    const service = createSlotService({ googletag: createGptHarness().adapter });
+    const { navigation, runtime } = createRuntimeWithNavigation();
+    const directAuctionUnit = Object.freeze({ code: 'programmatic' });
+
+    expect(
+      service.register(navigation, [
+        serverRegistration('server'),
+        {
+          directAuctionUnit,
+          registeredSlotId: 'programmatic',
+          source: 'programmatic',
+        },
+      ])
+    ).toMatchObject({ ok: true });
+    expect(service.snapshotRegisteredSlots(navigation)).toEqual([
+      expect.objectContaining({ ordinal: 0, registeredSlotId: 'server', source: 'server' }),
+      expect.objectContaining({
+        directAuctionUnit,
+        ordinal: 1,
+        registeredSlotId: 'programmatic',
+        source: 'programmatic',
+      }),
+    ]);
+    expect(Object.isFrozen(service.snapshotRegisteredSlots(navigation))).toBe(true);
+
+    expect(
+      service.register(navigation, [
+        {
+          directAuctionUnit: { code: 'unfrozen' },
+          registeredSlotId: 'unfrozen',
+          source: 'programmatic',
+        },
+      ])
+    ).toEqual({ ok: false, reason: 'invalid_slot_id' });
+
+    runtime.dispose();
+    expect(service.snapshotRegisteredSlots(navigation)).toBeUndefined();
+  });
+
   it('rejects exact registered-id collisions without partial indexes', () => {
     const service = createSlotService({ googletag: createGptHarness().adapter });
     const navigation = createNavigation();
