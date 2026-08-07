@@ -4,6 +4,12 @@ import { createBrowserPrebidAdapter, type PrebidEventFacade } from '../../src/ad
 
 type Command = () => void;
 
+function wrapBids(bids: object[] = []): object[] & { bids: object[] } {
+  const response = [...bids] as object[] & { bids: object[] };
+  response.bids = response;
+  return response;
+}
+
 function recursivelyFreeze<T>(value: T): T {
   if (value && typeof value === 'object') {
     for (const child of Object.values(value)) recursivelyFreeze(child);
@@ -41,7 +47,7 @@ function createReadyPrebid(
   const listeners = new Map<string, Set<(event: unknown) => void>>();
   const pbjs = {
     addAdUnits: vi.fn(),
-    getBidResponsesForAdUnitCode: vi.fn<() => { bids: object[] }>(() => ({ bids: [] })),
+    getBidResponsesForAdUnitCode: vi.fn<() => object[] & { bids: object[] }>(() => wrapBids()),
     getHighestCpmBids: vi.fn<() => object[]>(() => []),
     offEvent: vi.fn((type: string, listener: (event: unknown) => void) => {
       listeners.get(type)?.delete(listener);
@@ -1552,9 +1558,9 @@ describe('version-pinned Trusted Server bid admission', () => {
   function admissionFixture() {
     const ready = createReadyPrebid();
     const stored: object[] = [];
-    ready.pbjs.getBidResponsesForAdUnitCode.mockImplementation((adUnitCode?: string) => ({
-      bids: stored.filter((bid) => (bid as { adUnitCode?: unknown }).adUnitCode === adUnitCode),
-    }));
+    ready.pbjs.getBidResponsesForAdUnitCode.mockImplementation((adUnitCode?: string) =>
+      wrapBids(stored.filter((bid) => (bid as { adUnitCode?: unknown }).adUnitCode === adUnitCode))
+    );
     const target: { pbjs: unknown } = { pbjs: ready.pbjs };
     const adapter = createBrowserPrebidAdapter(target);
     const auctions: unknown[] = [];
@@ -1587,7 +1593,16 @@ describe('version-pinned Trusted Server bid admission', () => {
     bidder?.callBids(
       {
         auctionId: 'auction-one',
-        bids: [{ adUnitCode: 'slot-one', bidId: 'request-one' }],
+        bids: [
+          {
+            adUnitCode: 'slot-one',
+            adUnitId: 'ad-unit-one',
+            auctionId: 'auction-one',
+            bidId: 'request-one',
+            src: 'client',
+            transactionId: 'transaction-one',
+          },
+        ],
       },
       admit,
       done
@@ -1630,8 +1645,16 @@ describe('version-pinned Trusted Server bid admission', () => {
     expect(fixture.boundary.admitTrustedBid(prepared)).toBe('admitted');
     expect(fixture.admit).toHaveBeenCalledTimes(1);
     const admitted = fixture.admit.mock.calls[0]?.[1];
-    expect(admitted).toEqual(prepared.bid);
+    expect(admitted).toMatchObject(prepared.bid);
     expect(admitted).not.toBe(prepared.bid);
+    expect(admitted).toMatchObject({
+      adUnitId: 'ad-unit-one',
+      auctionId: 'auction-one',
+      mediaType: 'banner',
+      source: 'client',
+      transactionId: 'transaction-one',
+    });
+    expect(Reflect.apply(admitted?.['getSize'] as () => string, admitted, [])).toBe('300x250');
     expect(admitted?.['meta']).not.toBe(prepared.bid.meta);
     expect((admitted?.['meta'] as { advertiserDomains?: unknown })?.advertiserDomains).not.toBe(
       prepared.bid.meta.advertiserDomains
@@ -1652,6 +1675,19 @@ describe('version-pinned Trusted Server bid admission', () => {
     expect(fixture.stored).toEqual([]);
   });
 
+  it('rejects a response query that does not use the pinned self-wrapped array shape', async () => {
+    const fixture = admissionFixture();
+    await fixture.operation.result;
+    fixture.ready.pbjs.getBidResponsesForAdUnitCode.mockImplementation(
+      () => ({ bids: [] }) as never
+    );
+
+    expect(() => fixture.boundary.admitTrustedBid(preparedBid())).toThrowError(
+      expect.objectContaining({ code: 'external_artifact_incompatible' })
+    );
+    expect(fixture.admit).not.toHaveBeenCalled();
+  });
+
   it('makes a request terminal after not_admitted instead of retrying publication', async () => {
     const fixture = admissionFixture();
     await fixture.operation.result;
@@ -1668,19 +1704,19 @@ describe('version-pinned Trusted Server bid admission', () => {
     expect(fixture.stored).toEqual([]);
   });
 
-  it('matches response state and events by exact request and ad-unit identity', async () => {
+  it('matches response state and events by exact auction, request, and ad-unit identity', async () => {
     const fixture = admissionFixture();
     await fixture.operation.result;
     const prepared = preparedBid();
     fixture.stored.push({
       ...prepared.bid,
-      requestId: 'other-request',
+      auctionId: 'other-auction',
       adUnitCode: prepared.adUnitCode,
     });
     fixture.admit.mockImplementation((adUnitCode, bid) => {
       fixture.emitBidResponse({
         ...bid,
-        requestId: 'other-request',
+        auctionId: 'other-auction',
         adUnitCode,
       });
       const published = { ...bid, adUnitCode };

@@ -203,6 +203,96 @@ describe('external bundle + served shim evaluated together', () => {
     dom.window.close();
   });
 
+  it('admits one exact TS bid through the real 10.26.0 response callback', async () => {
+    const dom = new JSDOM('<!doctype html><html><body></body></html>', {
+      url: 'https://pub.example.com/article',
+      runScripts: 'outside-only',
+      pretendToBeVisual: true,
+    });
+    const pageWindow = dom.window;
+    pageWindow.fetch = vi.fn(async () => new Response('{}'));
+    pageWindow.Request = Request;
+    pageWindow.Headers = Headers;
+    pageWindow.Response = Response;
+    pageWindow.AbortController = AbortController;
+    if (!('isSecureContext' in pageWindow)) pageWindow.isSecureContext = true;
+    pageWindow.eval('window.pbjs = { que: [], cmd: [] };');
+    pageWindow.eval(bundleCode);
+
+    const adapter = createBrowserPrebidAdapter(pageWindow);
+    let resolveAuction;
+    const auctionReady = new Promise((resolve) => {
+      resolveAuction = resolve;
+    });
+    let resolveBidsBack;
+    const bidsBack = new Promise((resolve) => {
+      resolveBidsBack = resolve;
+    });
+    const operation = adapter.run((prebid) => {
+      prebid.registerTrustedServerBidder(resolveAuction);
+      return prebid.requestBids({
+        adUnits: [
+          {
+            code: 'slot-one',
+            mediaTypes: { banner: { sizes: [[300, 250]] } },
+            bids: [{ bidder: 'trustedServer', params: {} }],
+          },
+        ],
+        timeout: 1_000,
+        bidsBackHandler: resolveBidsBack,
+      });
+    });
+    await operation.result;
+    const auction = await auctionReady;
+    expect(Object.isFrozen(auction)).toBe(true);
+    expect(auction.bids).toHaveLength(1);
+
+    const request = auction.bids[0];
+    const reservationId = `r1_${'z'.repeat(22)}`;
+    const prepared = Object.freeze({
+      auctionId: auction.auctionId,
+      adUnitCode: request.adUnitCode,
+      bid: Object.freeze({
+        requestId: request.requestId,
+        adId: reservationId,
+        cpm: 1.25,
+        width: 300,
+        height: 250,
+        ad: '',
+        ttl: 300,
+        creativeId: 'creative-one',
+        netRevenue: true,
+        currency: 'USD',
+        bidderCode: 'trustedServer',
+        meta: Object.freeze({
+          advertiserDomains: Object.freeze([]),
+          tsAuctionId: auction.auctionId,
+          tsBidId: 'server-bid-one',
+        }),
+      }),
+    });
+
+    const beforeAdmission = pageWindow.pbjs.getBidResponsesForAdUnitCode('slot-one');
+    expect(Array.isArray(beforeAdmission)).toBe(true);
+    expect(Array.isArray(beforeAdmission.bids)).toBe(true);
+    expect(beforeAdmission.bids).toHaveLength(0);
+    expect(adapter.admitTrustedBid(prepared)).toBe('admitted');
+    const stored = pageWindow.pbjs.getBidResponsesForAdUnitCode('slot-one').bids;
+    const admitted = stored.filter((bid) => bid.adId === reservationId);
+    expect(admitted).toHaveLength(1);
+    expect(admitted[0]).toMatchObject({
+      adId: reservationId,
+      adUnitCode: 'slot-one',
+      auctionId: auction.auctionId,
+      requestId: request.requestId,
+      adserverTargeting: { hb_adid: reservationId },
+    });
+    auction.complete();
+    await bidsBack;
+    adapter.dispose();
+    dom.window.close();
+  }, 60_000);
+
   it('populates the public API, installs the shim exactly once, and routes an /auction request', async () => {
     const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
       url: 'https://pub.example.com/article',
