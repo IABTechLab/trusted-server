@@ -24,10 +24,19 @@ const directAdmOwnerDocumentGetter =
     ? undefined
     : Object.getOwnPropertyDescriptor(Node.prototype, 'ownerDocument')?.get;
 const objectFreezeIntrinsic = Object.freeze;
+const objectIsFrozenIntrinsic = Object.isFrozen;
+const objectGetPrototypeOfIntrinsic = Object.getPrototypeOf;
+const objectGetOwnPropertyNamesIntrinsic = Object.getOwnPropertyNames;
+const objectGetOwnPropertySymbolsIntrinsic = Object.getOwnPropertySymbols;
+const objectGetOwnPropertyDescriptorIntrinsic = Object.getOwnPropertyDescriptor;
+const objectCreateIntrinsic = Object.create;
 const objectToStringIntrinsic = Object.prototype.toString;
+const objectHasOwnIntrinsic = Object.prototype.hasOwnProperty;
+const arrayIsArrayIntrinsic = Array.isArray;
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayPushIntrinsic = Array.prototype.push;
 const arraySliceIntrinsic = Array.prototype.slice;
+const arraySortIntrinsic = Array.prototype.sort;
 const arraySpliceIntrinsic = Array.prototype.splice;
 const mapGetIntrinsic = Map.prototype.get;
 const mapSetIntrinsic = Map.prototype.set;
@@ -63,13 +72,71 @@ const weakSetAddIntrinsic = WeakSet.prototype.add;
 const weakSetHasIntrinsic = WeakSet.prototype.has;
 const weakSetDeleteIntrinsic = WeakSet.prototype.delete;
 const promiseThenIntrinsic = Promise.prototype.then;
+const numberIsFiniteIntrinsic = Number.isFinite;
+const numberIsIntegerIntrinsic = Number.isInteger;
+const regexpTestIntrinsic = RegExp.prototype.test;
+const stringCharCodeAtIntrinsic = String.prototype.charCodeAt;
 const stringIndexOfIntrinsic = String.prototype.indexOf;
 const stringSliceIntrinsic = String.prototype.slice;
+const stringTrimIntrinsic = String.prototype.trim;
 const stringIntrinsic = String;
 const jsonParseIntrinsic = JSON.parse;
+const urlIntrinsic = URL;
+type UrlTextProperty =
+  | 'href'
+  | 'protocol'
+  | 'hostname'
+  | 'username'
+  | 'password'
+  | 'origin'
+  | 'port'
+  | 'pathname'
+  | 'search'
+  | 'hash';
+
+function captureUrlGetter(name: UrlTextProperty): ((this: URL) => string) | undefined {
+  let prototype: object | null = URL.prototype;
+  while (prototype) {
+    const getter = Object.getOwnPropertyDescriptor(prototype, name)?.get;
+    if (typeof getter === 'function') return getter as (this: URL) => string;
+    prototype = Object.getPrototypeOf(prototype) as object | null;
+  }
+  return undefined;
+}
+
+const urlGetters: Readonly<Record<UrlTextProperty, ((this: URL) => string) | undefined>> =
+  Object.freeze({
+    href: captureUrlGetter('href'),
+    protocol: captureUrlGetter('protocol'),
+    hostname: captureUrlGetter('hostname'),
+    username: captureUrlGetter('username'),
+    password: captureUrlGetter('password'),
+    origin: captureUrlGetter('origin'),
+    port: captureUrlGetter('port'),
+    pathname: captureUrlGetter('pathname'),
+    search: captureUrlGetter('search'),
+    hash: captureUrlGetter('hash'),
+  });
+const encodeURIComponentIntrinsic = encodeURIComponent;
+const textEncoder = new TextEncoder();
+const textEncoderEncodeIntrinsic = TextEncoder.prototype.encode;
+const fatalTextDecoder = new TextDecoder('utf-8', { fatal: true });
+const textDecoderDecodeIntrinsic = TextDecoder.prototype.decode;
+const abortControllerIntrinsic = AbortController;
+const abortControllerAbortIntrinsic = AbortController.prototype.abort;
+const abortControllerSignalGetter = Object.getOwnPropertyDescriptor(
+  AbortController.prototype,
+  'signal'
+)?.get as (this: AbortController) => AbortSignal;
+const abortSignalAbortedGetter = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted')
+  ?.get as (this: AbortSignal) => boolean;
 const artifactDisposals = new WeakMap<object, boolean>();
 const committedArtifactStores = new WeakSet<object>();
 const renderAttempts = new WeakSet<object>();
+const cacheAttemptControls = new WeakMap<
+  object,
+  Readonly<{ begin: () => boolean; complete: () => boolean }>
+>();
 const ignoreAsyncDisposal = (): void => undefined;
 
 function frozen<const Value extends object>(value: Value): Readonly<Value> {
@@ -78,6 +145,62 @@ function frozen<const Value extends object>(value: Value): Readonly<Value> {
 
 function arrayPush<Value>(array: Value[], value: Value): number {
   return Reflect.apply(arrayPushIntrinsic, array, [value]) as number;
+}
+
+function utf8Length(value: string): number {
+  return (reflectApplyIntrinsic(textEncoderEncodeIntrinsic, textEncoder, [value]) as Uint8Array)
+    .byteLength;
+}
+
+function isFiniteNumber(value: number): boolean {
+  return reflectApplyIntrinsic(numberIsFiniteIntrinsic, Number, [value]) as boolean;
+}
+
+function isInteger(value: number): boolean {
+  return reflectApplyIntrinsic(numberIsIntegerIntrinsic, Number, [value]) as boolean;
+}
+
+function regexpTest(pattern: RegExp, value: string): boolean {
+  return reflectApplyIntrinsic(regexpTestIntrinsic, pattern, [value]) as boolean;
+}
+
+function hasOwn(value: object, name: PropertyKey): boolean {
+  return reflectApplyIntrinsic(objectHasOwnIntrinsic, value, [name]) as boolean;
+}
+
+function objectIsFrozen(value: object): boolean {
+  return reflectApplyIntrinsic(objectIsFrozenIntrinsic, Object, [value]) as boolean;
+}
+
+function objectPrototype(value: object): object | null {
+  return reflectApplyIntrinsic(objectGetPrototypeOfIntrinsic, Object, [value]) as object | null;
+}
+
+function ownPropertyNames(value: object): string[] {
+  return reflectApplyIntrinsic(objectGetOwnPropertyNamesIntrinsic, Object, [value]) as string[];
+}
+
+function ownPropertySymbols(value: object): symbol[] {
+  return reflectApplyIntrinsic(objectGetOwnPropertySymbolsIntrinsic, Object, [value]) as symbol[];
+}
+
+function ownPropertyDescriptor(value: object, name: PropertyKey): PropertyDescriptor | undefined {
+  return reflectApplyIntrinsic(objectGetOwnPropertyDescriptorIntrinsic, Object, [value, name]) as
+    PropertyDescriptor | undefined;
+}
+
+function isArray(value: unknown): value is unknown[] {
+  return reflectApplyIntrinsic(arrayIsArrayIntrinsic, Array, [value]) as boolean;
+}
+
+function sortedStrings(values: string[]): string[] {
+  return reflectApplyIntrinsic(arraySortIntrinsic, values, []) as string[];
+}
+
+function urlPart(url: URL, name: UrlTextProperty): string {
+  const getter = urlGetters[name];
+  if (typeof getter !== 'function') throw new TypeError('missing URL accessor');
+  return reflectApplyIntrinsic(getter, url, []) as string;
 }
 
 function isUint8Array(value: unknown): value is Uint8Array {
@@ -377,8 +500,6 @@ export interface RenderAttempt {
   readonly beginGamClaim: () => boolean;
   readonly ownerClaimed: () => boolean;
   readonly ownerRegistered: () => boolean;
-  readonly beginCacheFetch: () => boolean;
-  readonly cacheFetchCompleted: () => boolean;
   readonly beginDirect: () => boolean;
   readonly beginApsDocument: (artifact: CommittedRenderArtifact) => boolean;
   readonly beginAdm: (artifact: CommittedRenderArtifact) => boolean;
@@ -407,12 +528,35 @@ interface CacheFetchReader {
 interface CacheFetchResponse {
   readonly body: Readonly<{ getReader: () => CacheFetchReader }> | null;
   readonly ok: boolean;
-  readonly type?: Response['type'];
+  readonly type: Response['type'];
+}
+
+type CacheFetcher = (input: string, init: RequestInit) => Promise<unknown>;
+
+export interface CacheAdmSource {
+  readonly adm: string;
+  readonly height: number;
+  readonly type: 'adm';
+  readonly version: 1;
+  readonly width: number;
+}
+
+export interface CacheFetchPolicy {
+  readonly baseUrl: string;
+  readonly version: 1;
+}
+
+export interface CacheAdmResolutionOptions {
+  readonly attempt: RenderAttempt;
+  readonly cachePolicy: Readonly<CacheFetchPolicy>;
+  readonly fetcher: CacheFetcher;
+  readonly onResolved: (source: Readonly<CacheAdmSource>) => boolean;
+  readonly publisherOrigin: string;
 }
 
 export interface DirectCacheAttemptOptions extends DirectAdmAttemptOptions {
-  readonly cachePolicy: Readonly<{ version: 1; baseUrl: string }>;
-  readonly fetcher: (input: string, init: RequestInit) => Promise<unknown>;
+  readonly cachePolicy: Readonly<CacheFetchPolicy>;
+  readonly fetcher: CacheFetcher;
 }
 
 export interface DirectAdmIframeHandle {
@@ -528,9 +672,9 @@ function validOutcome(value: unknown): value is RenderOutcome {
     if (
       typeof value !== 'object' ||
       value === null ||
-      !Object.isFrozen(value) ||
-      Object.getPrototypeOf(value) !== Object.prototype ||
-      Object.getOwnPropertySymbols(value).length !== 0
+      !objectIsFrozen(value) ||
+      objectPrototype(value) !== Object.prototype ||
+      ownPropertySymbols(value).length !== 0
     ) {
       return false;
     }
@@ -570,7 +714,7 @@ function validArtifact(
   try {
     if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return false;
     if (!Object.isFrozen(value) || Object.getPrototypeOf(value) !== Object.prototype) return false;
-    const names = Object.getOwnPropertyNames(value).sort();
+    const names = sortedStrings(ownPropertyNames(value));
     if (
       names.length !== 5 ||
       names[0] !== 'attemptId' ||
@@ -1080,20 +1224,20 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
       if (
         (typeof context !== 'object' && typeof context !== 'function') ||
         context === null ||
-        !Object.isFrozen(context) ||
-        Object.getPrototypeOf(context) !== Object.prototype ||
-        Object.getOwnPropertyNames(context).length !== 1 ||
-        Object.getOwnPropertySymbols(context).length !== 0
+        !objectIsFrozen(context) ||
+        objectPrototype(context) !== Object.prototype ||
+        ownPropertyNames(context).length !== 1 ||
+        ownPropertySymbols(context).length !== 0
       ) {
         return false;
       }
-      const selectedCpm = Object.getOwnPropertyDescriptor(context, 'selectedCpm');
+      const selectedCpm = ownPropertyDescriptor(context, 'selectedCpm');
       return (
         !!selectedCpm &&
         'value' in selectedCpm &&
         selectedCpm.enumerable === true &&
         typeof selectedCpm.value === 'number' &&
-        Number.isFinite(selectedCpm.value) &&
+        isFiniteNumber(selectedCpm.value) &&
         selectedCpm.value >= 0
       );
     } catch {
@@ -1360,21 +1504,6 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
         ? enter(['waiting_for_gam_and_claim'], 'waiting_for_owner')
         : false,
     ownerRegistered: () => enter(['waiting_for_owner'], 'waiting_for_insertion'),
-    beginCacheFetch,
-    cacheFetchCompleted: () => {
-      if (
-        admittedRenderSource?.type !== 'cache' ||
-        !admittedWinnerContext ||
-        outcome !== undefined ||
-        (state !== 'rendering_direct' && state !== 'waiting_for_insertion') ||
-        deadlineState !== state ||
-        !ownerIsCurrent()
-      ) {
-        return false;
-      }
-      clearDeadline();
-      return true;
-    },
     beginDirect: () =>
       (admittedRenderSource?.type === 'aps' || admittedRenderSource?.type === 'adm') &&
       admittedWinnerContext
@@ -1507,17 +1636,37 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
     disposeRejectedOwner();
     return frozen({ ok: false, reason: 'stale_owner' });
   }
-  weakSetAdd(renderAttempts, lifecycle);
-  return frozen({ ok: true, value: frozen(lifecycle) });
+  const exposedLifecycle = frozen(lifecycle);
+  weakSetAdd(renderAttempts, exposedLifecycle);
+  weakMapSet(
+    cacheAttemptControls,
+    exposedLifecycle,
+    frozen({
+      begin: beginCacheFetch,
+      complete: () => {
+        const cacheState = state;
+        if (
+          admittedRenderSource?.type !== 'cache' ||
+          !admittedWinnerContext ||
+          outcome !== undefined ||
+          (cacheState !== 'rendering_direct' && cacheState !== 'waiting_for_insertion') ||
+          deadlineState !== cacheState ||
+          !ownerIsCurrent()
+        ) {
+          return false;
+        }
+        clearDeadline();
+        if (cacheState === 'waiting_for_insertion' && outcome === undefined) {
+          armDeadline(cacheState);
+        }
+        return outcome === undefined && state === cacheState && ownerIsCurrent();
+      },
+    })
+  );
+  return frozen({ ok: true, value: exposedLifecycle });
 }
 
-type DirectAdmSource = Readonly<{
-  adm: string;
-  height: number;
-  type: 'adm';
-  version: 1;
-  width: number;
-}>;
+type DirectAdmSource = Readonly<CacheAdmSource>;
 
 type DirectCacheSource = Readonly<{
   cacheId: string;
@@ -1540,19 +1689,22 @@ function exactFrozenDataRecord(
     if (
       typeof value !== 'object' ||
       value === null ||
-      !Object.isFrozen(value) ||
-      Object.getPrototypeOf(value) !== Object.prototype ||
-      Object.getOwnPropertySymbols(value).length !== 0
+      !objectIsFrozen(value) ||
+      objectPrototype(value) !== Object.prototype ||
+      ownPropertySymbols(value).length !== 0
     ) {
       return undefined;
     }
-    const names = Object.getOwnPropertyNames(value).sort();
+    const names = sortedStrings(ownPropertyNames(value));
     if (names.length !== expectedNames.length) return undefined;
-    const fields = Object.create(null) as Record<string, unknown>;
+    const fields = reflectApplyIntrinsic(objectCreateIntrinsic, Object, [null]) as Record<
+      string,
+      unknown
+    >;
     for (let index = 0; index < expectedNames.length; index += 1) {
       const name = expectedNames[index];
       if (!name || names[index] !== name) return undefined;
-      const descriptor = Object.getOwnPropertyDescriptor(value, name);
+      const descriptor = ownPropertyDescriptor(value, name);
       if (
         !descriptor ||
         !('value' in descriptor) ||
@@ -1579,30 +1731,32 @@ function readCachePolicyBase(value: unknown): URL | undefined {
       fields['version'] !== 1 ||
       typeof baseUrl !== 'string' ||
       baseUrl.length === 0 ||
-      new TextEncoder().encode(baseUrl).byteLength > MAX_CACHE_URL_BYTES
+      utf8Length(baseUrl) > MAX_CACHE_URL_BYTES
     ) {
       return undefined;
     }
     for (let index = 0; index < baseUrl.length; index += 1) {
-      const code = baseUrl.charCodeAt(index);
+      const code = reflectApplyIntrinsic(stringCharCodeAtIntrinsic, baseUrl, [index]) as number;
       if (code <= 0x1f || code === 0x7f) return undefined;
       if (code >= 0xd800 && code <= 0xdbff) {
-        const next = baseUrl.charCodeAt(index + 1);
+        const next = reflectApplyIntrinsic(stringCharCodeAtIntrinsic, baseUrl, [
+          index + 1,
+        ]) as number;
         if (next < 0xdc00 || next > 0xdfff) return undefined;
         index += 1;
       } else if (code >= 0xdc00 && code <= 0xdfff) {
         return undefined;
       }
     }
-    const base = new URL(baseUrl);
+    const base = Reflect.construct(urlIntrinsic, [baseUrl]) as URL;
     if (
-      base.protocol !== 'https:' ||
-      base.hostname === '' ||
-      base.username !== '' ||
-      base.password !== '' ||
-      base.search !== '' ||
-      base.hash !== '' ||
-      base.pathname === '/'
+      urlPart(base, 'protocol') !== 'https:' ||
+      urlPart(base, 'hostname') === '' ||
+      urlPart(base, 'username') !== '' ||
+      urlPart(base, 'password') !== '' ||
+      urlPart(base, 'search') !== '' ||
+      urlPart(base, 'hash') !== '' ||
+      urlPart(base, 'pathname') === '/'
     ) {
       return undefined;
     }
@@ -1632,16 +1786,16 @@ function readDirectCacheSource(
       fields['type'] !== 'cache' ||
       fields['version'] !== 1 ||
       typeof fields['cacheId'] !== 'string' ||
-      !CACHE_ID.test(fields['cacheId']) ||
+      !regexpTest(CACHE_ID, fields['cacheId']) ||
       typeof fields['fetchUrl'] !== 'string' ||
       fields['fetchUrl'].length === 0 ||
-      new TextEncoder().encode(fields['fetchUrl']).byteLength > MAX_CACHE_URL_BYTES ||
+      utf8Length(fields['fetchUrl']) > MAX_CACHE_URL_BYTES ||
       typeof fields['width'] !== 'number' ||
-      !Number.isInteger(fields['width']) ||
+      !isInteger(fields['width']) ||
       fields['width'] < 1 ||
       fields['width'] > 4096 ||
       typeof fields['height'] !== 'number' ||
-      !Number.isInteger(fields['height']) ||
+      !isInteger(fields['height']) ||
       fields['height'] < 1 ||
       fields['height'] > 4096
     ) {
@@ -1649,32 +1803,36 @@ function readDirectCacheSource(
     }
     const sourceFetchUrl = fields['fetchUrl'] as string;
     for (let index = 0; index < sourceFetchUrl.length; index += 1) {
-      const code = sourceFetchUrl.charCodeAt(index);
+      const code = reflectApplyIntrinsic(stringCharCodeAtIntrinsic, sourceFetchUrl, [
+        index,
+      ]) as number;
       if (code <= 0x1f || code === 0x7f) return undefined;
       if (code >= 0xd800 && code <= 0xdbff) {
-        const next = sourceFetchUrl.charCodeAt(index + 1);
+        const next = reflectApplyIntrinsic(stringCharCodeAtIntrinsic, sourceFetchUrl, [
+          index + 1,
+        ]) as number;
         if (next < 0xdc00 || next > 0xdfff) return undefined;
         index += 1;
       } else if (code >= 0xdc00 && code <= 0xdfff) {
         return undefined;
       }
     }
-    const fetchUrl = new URL(sourceFetchUrl);
-    const expected = new URL(base.href);
-    expected.search = `?uuid=${encodeURIComponent(fields['cacheId'])}`;
+    const fetchUrl = Reflect.construct(urlIntrinsic, [sourceFetchUrl]) as URL;
+    const canonicalSearch = `?uuid=${
+      reflectApplyIntrinsic(encodeURIComponentIntrinsic, undefined, [fields['cacheId']]) as string
+    }`;
+    const expectedHref = `${urlPart(base, 'href')}${canonicalSearch}`;
     if (
-      fetchUrl.protocol !== 'https:' ||
-      fetchUrl.username !== '' ||
-      fetchUrl.password !== '' ||
-      fetchUrl.hash !== '' ||
-      fetchUrl.origin !== base.origin ||
-      fetchUrl.port !== base.port ||
-      fetchUrl.pathname !== base.pathname ||
-      [...fetchUrl.searchParams.keys()].length !== 1 ||
-      fetchUrl.searchParams.get('uuid') !== fields['cacheId'] ||
-      fetchUrl.search !== `?uuid=${encodeURIComponent(fields['cacheId'])}` ||
-      fetchUrl.href !== fields['fetchUrl'] ||
-      fetchUrl.href !== expected.href
+      urlPart(fetchUrl, 'protocol') !== 'https:' ||
+      urlPart(fetchUrl, 'username') !== '' ||
+      urlPart(fetchUrl, 'password') !== '' ||
+      urlPart(fetchUrl, 'hash') !== '' ||
+      urlPart(fetchUrl, 'origin') !== urlPart(base, 'origin') ||
+      urlPart(fetchUrl, 'port') !== urlPart(base, 'port') ||
+      urlPart(fetchUrl, 'pathname') !== urlPart(base, 'pathname') ||
+      urlPart(fetchUrl, 'search') !== canonicalSearch ||
+      urlPart(fetchUrl, 'href') !== fields['fetchUrl'] ||
+      urlPart(fetchUrl, 'href') !== expectedHref
     ) {
       return undefined;
     }
@@ -1687,7 +1845,7 @@ function readDirectCacheSource(
 function readSelectedCpm(value: unknown): number | undefined {
   const fields = exactFrozenDataRecord(value, ['selectedCpm']);
   const selectedCpm = fields?.['selectedCpm'];
-  return typeof selectedCpm === 'number' && Number.isFinite(selectedCpm) && selectedCpm >= 0
+  return typeof selectedCpm === 'number' && isFiniteNumber(selectedCpm) && selectedCpm >= 0
     ? selectedCpm
     : undefined;
 }
@@ -1718,46 +1876,47 @@ function parseCacheAdm(
     if (
       typeof value !== 'object' ||
       value === null ||
-      Array.isArray(value) ||
-      Object.getPrototypeOf(value) !== Object.prototype ||
-      Object.getOwnPropertySymbols(value).length !== 0
+      isArray(value) ||
+      objectPrototype(value) !== Object.prototype ||
+      ownPropertySymbols(value).length !== 0
     ) {
       return undefined;
     }
     const record = value as Record<string, unknown>;
-    const names = Object.getOwnPropertyNames(record);
+    const names = ownPropertyNames(record);
     for (let index = 0; index < names.length; index += 1) {
       const name = names[index];
       if (!name) return undefined;
-      const descriptor = Object.getOwnPropertyDescriptor(record, name);
+      const descriptor = ownPropertyDescriptor(record, name);
       if (!descriptor || !('value' in descriptor) || descriptor.enumerable !== true) {
         return undefined;
       }
     }
-    const hasOwn = (name: string): boolean => Object.prototype.hasOwnProperty.call(record, name);
-    if (hasOwn('width') || hasOwn('height')) return undefined;
-    const admDescriptor = Object.getOwnPropertyDescriptor(record, 'adm');
+    const recordHasOwn = (name: string): boolean => hasOwn(record, name);
+    if (recordHasOwn('width') || recordHasOwn('height')) return undefined;
+    const admDescriptor = ownPropertyDescriptor(record, 'adm');
     if (
       !admDescriptor ||
       !('value' in admDescriptor) ||
       typeof admDescriptor.value !== 'string' ||
-      admDescriptor.value.trim().length === 0 ||
-      new TextEncoder().encode(admDescriptor.value).byteLength > MAX_CACHE_BODY_BYTES
+      (reflectApplyIntrinsic(stringTrimIntrinsic, admDescriptor.value, []) as string).length ===
+        0 ||
+      utf8Length(admDescriptor.value) > MAX_CACHE_BODY_BYTES
     ) {
       return undefined;
     }
-    const hasWidth = hasOwn('w');
-    const hasHeight = hasOwn('h');
+    const hasWidth = recordHasOwn('w');
+    const hasHeight = recordHasOwn('h');
     if (hasWidth !== hasHeight) return undefined;
     if (
       hasWidth &&
       (typeof record['w'] !== 'number' ||
-        !Number.isInteger(record['w']) ||
+        !isInteger(record['w']) ||
         record['w'] < 1 ||
         record['w'] > 4096 ||
         record['w'] !== source.width ||
         typeof record['h'] !== 'number' ||
-        !Number.isInteger(record['h']) ||
+        !isInteger(record['h']) ||
         record['h'] < 1 ||
         record['h'] > 4096 ||
         record['h'] !== source.height)
@@ -1765,15 +1924,15 @@ function parseCacheAdm(
       return undefined;
     }
     if (
-      hasOwn('price') &&
+      recordHasOwn('price') &&
       (typeof record['price'] !== 'number' ||
-        !Number.isFinite(record['price']) ||
+        !isFiniteNumber(record['price']) ||
         record['price'] < 0)
     ) {
       return undefined;
     }
     const adm = expandAuctionPrice(admDescriptor.value, selectedCpm);
-    if (new TextEncoder().encode(adm).byteLength > MAX_CACHE_BODY_BYTES) return undefined;
+    if (utf8Length(adm) > MAX_CACHE_BODY_BYTES) return undefined;
     return frozen({
       adm,
       height: source.height,
@@ -1786,41 +1945,50 @@ function parseCacheAdm(
   }
 }
 
-async function readCacheBody(response: CacheFetchResponse): Promise<CacheBodyResult> {
+interface CacheBodyReadHooks {
+  readonly active: () => boolean;
+  readonly retain: (
+    reader: CacheFetchReader,
+    cancel: NonNullable<CacheFetchReader['cancel']>
+  ) => boolean;
+  readonly cancel: () => void;
+  readonly release: (reader: CacheFetchReader) => void;
+}
+
+async function readCacheBody(
+  response: CacheFetchResponse,
+  hooks: CacheBodyReadHooks
+): Promise<CacheBodyResult> {
   let reader: CacheFetchReader | undefined;
-  let cancel: CacheFetchReader['cancel'];
   let releaseLock: (() => void) | undefined;
   try {
-    if (
-      response.type === 'error' ||
-      response.type === 'opaque' ||
-      response.type === 'opaqueredirect'
-    ) {
-      return frozen({ ok: false, reason: 'cache_network_error' });
-    }
     if (!response.ok) return frozen({ ok: false, reason: 'cache_invalid_response' });
     if (!response.body) return frozen({ ok: true, text: '' });
     reader = response.body.getReader();
-    cancel = reader.cancel;
+    const cancel = reader.cancel;
+    const read = reader.read;
     releaseLock = reader.releaseLock;
-    if (typeof reader.read !== 'function' || typeof cancel !== 'function') {
+    if (
+      typeof read !== 'function' ||
+      typeof cancel !== 'function' ||
+      !hooks.active() ||
+      !hooks.retain(reader, cancel)
+    ) {
       return frozen({ ok: false, reason: 'cache_network_error' });
     }
     const chunks: Uint8Array[] = [];
     let total = 0;
     while (true) {
-      const step = await reader.read();
+      if (!hooks.active()) return frozen({ ok: false, reason: 'cache_network_error' });
+      const step = await reflectApplyIntrinsic(read, reader, []);
+      if (!hooks.active()) return frozen({ ok: false, reason: 'cache_network_error' });
       if (step.done) break;
       if (!isUint8Array(step.value)) {
         return frozen({ ok: false, reason: 'cache_network_error' });
       }
       total += step.value.byteLength;
       if (total > MAX_CACHE_BODY_BYTES) {
-        try {
-          await cancel.call(reader);
-        } catch {
-          // The byte limit is authoritative even if stream cancellation is hostile.
-        }
+        hooks.cancel();
         return frozen({ ok: false, reason: 'cache_invalid_response' });
       }
       arrayPush(chunks, step.value);
@@ -1833,16 +2001,23 @@ async function readCacheBody(response: CacheFetchResponse): Promise<CacheBodyRes
       bytes.set(chunk, offset);
       offset += chunk.byteLength;
     }
-    return frozen({
-      ok: true,
-      text: new TextDecoder('utf-8', { fatal: true }).decode(bytes),
-    });
+    try {
+      return frozen({
+        ok: true,
+        text: reflectApplyIntrinsic(textDecoderDecodeIntrinsic, fatalTextDecoder, [
+          bytes,
+        ]) as string,
+      });
+    } catch {
+      return frozen({ ok: false, reason: 'cache_invalid_response' });
+    }
   } catch {
     return frozen({ ok: false, reason: 'cache_network_error' });
   } finally {
+    if (reader) hooks.release(reader);
     if (reader && typeof releaseLock === 'function') {
       try {
-        releaseLock.call(reader);
+        reflectApplyIntrinsic(releaseLock, reader, []);
       } catch {
         // The bounded result remains authoritative if stream lock release is hostile.
       }
@@ -1867,9 +2042,12 @@ function readDirectAdmSource(value: unknown): DirectAdmSource | undefined {
     for (let index = 0; index < expected.length; index += 1) {
       if (names[index] !== expected[index]) return undefined;
     }
-    const fields = Object.create(null) as Record<string, unknown>;
+    const fields = reflectApplyIntrinsic(objectCreateIntrinsic, Object, [null]) as Record<
+      string,
+      unknown
+    >;
     for (const name of expected) {
-      const descriptor = Object.getOwnPropertyDescriptor(value, name);
+      const descriptor = ownPropertyDescriptor(value, name);
       if (
         !descriptor ||
         !('value' in descriptor) ||
@@ -1885,14 +2063,14 @@ function readDirectAdmSource(value: unknown): DirectAdmSource | undefined {
       fields['type'] !== 'adm' ||
       fields['version'] !== 1 ||
       typeof fields['adm'] !== 'string' ||
-      fields['adm'].trim().length === 0 ||
-      new TextEncoder().encode(fields['adm']).byteLength > 512 * 1024 ||
+      (reflectApplyIntrinsic(stringTrimIntrinsic, fields['adm'], []) as string).length === 0 ||
+      utf8Length(fields['adm']) > MAX_CACHE_BODY_BYTES ||
       typeof fields['width'] !== 'number' ||
-      !Number.isInteger(fields['width']) ||
+      !isInteger(fields['width']) ||
       fields['width'] < 1 ||
       fields['width'] > 4096 ||
       typeof fields['height'] !== 'number' ||
-      !Number.isInteger(fields['height']) ||
+      !isInteger(fields['height']) ||
       fields['height'] < 1 ||
       fields['height'] > 4096
     ) {
@@ -1943,12 +2121,8 @@ function renderAdmAttempt(
     return false;
   }
   if (admittedCacheAdm === undefined && !attempt.beginDirect()) return false;
-  let artifactKind: CommittedRenderArtifact['kind'];
   try {
-    const pathState = attempt.snapshot().state;
-    if (pathState === 'waiting_for_insertion') artifactKind = 'puc';
-    else if (pathState === 'rendering_direct') artifactKind = 'direct_iframe';
-    else return false;
+    if (attempt.snapshot().state !== 'rendering_direct') return false;
   } catch {
     attempt.fail('internal_error');
     return false;
@@ -2045,7 +2219,7 @@ function renderAdmAttempt(
   }
 
   const artifact = frozen<CommittedRenderArtifact>({
-    kind: artifactKind,
+    kind: 'direct_iframe',
     attemptId: attempt.id,
     slot: attempt.slot,
     navigationGeneration: attempt.navigationGeneration,
@@ -2092,20 +2266,18 @@ export function renderDirectAdmAttempt(options: DirectAdmAttemptOptions): boolea
   return renderAdmAttempt(options);
 }
 
-/** Fetch one admitted cache source, then enter the exact shared direct-ADM lifecycle. */
-export function renderDirectCacheAttempt(options: DirectCacheAttemptOptions): boolean {
+/** Resolve one admitted cache source without assuming direct or PUC DOM ownership. */
+export function resolveCacheAdmAttempt(options: CacheAdmResolutionOptions): boolean {
   let attempt: RenderAttempt;
-  let cachePolicy: DirectCacheAttemptOptions['cachePolicy'];
-  let container: HTMLElement;
-  let fetchCache: DirectCacheAttemptOptions['fetcher'];
-  let prepareIframe: DirectAdmIframeConstructor;
+  let cachePolicy: CacheAdmResolutionOptions['cachePolicy'];
+  let fetchCache: CacheAdmResolutionOptions['fetcher'];
+  let onResolved: CacheAdmResolutionOptions['onResolved'];
   let publisherOrigin: string;
   try {
     attempt = options.attempt;
     cachePolicy = options.cachePolicy;
-    container = options.container;
     fetchCache = options.fetcher;
-    prepareIframe = options.prepareIframe;
+    onResolved = options.onResolved;
     publisherOrigin = options.publisherOrigin;
   } catch {
     return false;
@@ -2113,48 +2285,89 @@ export function renderDirectCacheAttempt(options: DirectCacheAttemptOptions): bo
   if (
     !weakSetHas(renderAttempts, attempt) ||
     typeof fetchCache !== 'function' ||
-    typeof prepareIframe !== 'function'
+    typeof onResolved !== 'function'
   ) {
     return false;
   }
-
-  let exactDocumentOrigin: boolean;
-  try {
-    exactDocumentOrigin =
-      !!directAdmDocument &&
-      typeof directAdmOwnerDocumentGetter === 'function' &&
-      reflectApplyIntrinsic(directAdmOwnerDocumentGetter, container, []) === directAdmDocument &&
-      directAdmDocument.defaultView?.location.origin === publisherOrigin;
-  } catch {
-    exactDocumentOrigin = false;
-  }
-  if (!exactDocumentOrigin) {
-    attempt.fail('winner_not_renderable');
-    return false;
-  }
+  const cacheControls = weakMapGet(cacheAttemptControls, attempt);
+  if (!cacheControls) return false;
 
   const source = readDirectCacheSource(attempt.renderSource, cachePolicy);
   const winnerContext = attempt.winnerContext;
   const selectedCpm = readSelectedCpm(winnerContext);
-  if (!source || selectedCpm === undefined) {
+  let cacheOrigin: string | undefined;
+  try {
+    cacheOrigin = source
+      ? urlPart(Reflect.construct(urlIntrinsic, [source.fetchUrl]) as URL, 'origin')
+      : undefined;
+  } catch {
+    cacheOrigin = undefined;
+  }
+  if (!source || selectedCpm === undefined || cacheOrigin === undefined) {
     attempt.fail('descriptor_invalid');
     return false;
   }
-  if (!attempt.beginCacheFetch()) return false;
+  if (reflectApplyIntrinsic(cacheControls.begin, cacheControls, []) !== true) return false;
 
   let controller: AbortController;
+  let signal: AbortSignal;
   try {
-    controller = new AbortController();
+    controller = Reflect.construct(abortControllerIntrinsic, []) as AbortController;
+    signal = reflectApplyIntrinsic(abortControllerSignalGetter, controller, []) as AbortSignal;
   } catch {
     attempt.fail('cache_network_error');
     return false;
   }
 
   let pending = true;
-  const abortFetch = (): void => {
-    if (controller.signal.aborted) return;
+  let activeReader: CacheFetchReader | undefined;
+  let activeReaderCancel: NonNullable<CacheFetchReader['cancel']> | undefined;
+  let activeReaderCancelled = false;
+  const retainBodyReader = (
+    reader: CacheFetchReader,
+    cancel: NonNullable<CacheFetchReader['cancel']>
+  ): boolean => {
+    if (!pending || activeReader !== undefined) return false;
+    activeReader = reader;
+    activeReaderCancel = cancel;
+    activeReaderCancelled = false;
+    return true;
+  };
+  const releaseBodyReader = (reader: CacheFetchReader): void => {
+    if (activeReader !== reader) return;
+    activeReader = undefined;
+    activeReaderCancel = undefined;
+    activeReaderCancelled = false;
+  };
+  const cancelBodyReader = (): void => {
+    const reader = activeReader;
+    const cancel = activeReaderCancel;
+    if (!reader || !cancel || activeReaderCancelled) return;
+    activeReaderCancelled = true;
     try {
-      controller.abort();
+      const cancellation = reflectApplyIntrinsic(cancel, reader, []) as unknown;
+      if (
+        (typeof cancellation === 'object' || typeof cancellation === 'function') &&
+        cancellation !== null
+      ) {
+        try {
+          reflectApplyIntrinsic(promiseThenIntrinsic, cancellation, [
+            ignoreAsyncDisposal,
+            ignoreAsyncDisposal,
+          ]);
+        } catch {
+          // Cancellation authority is exact-once even for a hostile promise boundary.
+        }
+      }
+    } catch {
+      // Terminal settlement remains authoritative if reader cancellation throws.
+    }
+  };
+  const abortFetch = (): void => {
+    cancelBodyReader();
+    try {
+      if (reflectApplyIntrinsic(abortSignalAbortedGetter, signal, []) === true) return;
+      reflectApplyIntrinsic(abortControllerAbortIntrinsic, controller, []);
     } catch {
       // Abort is best-effort after the attempt has already settled.
     }
@@ -2191,7 +2404,7 @@ export function renderDirectCacheAttempt(options: DirectCacheAttemptOptions): bo
         redirect: 'error',
         referrer: '',
         referrerPolicy: 'no-referrer',
-        signal: controller.signal,
+        signal,
       } satisfies RequestInit,
     ]) as Promise<unknown>;
   } catch {
@@ -2210,7 +2423,7 @@ export function renderDirectCacheAttempt(options: DirectCacheAttemptOptions): bo
     if (!pending) return;
     let response: CacheFetchResponse;
     let responseOk: boolean;
-    let responseType: Response['type'] | undefined;
+    let responseType: Response['type'];
     try {
       if ((typeof fetched !== 'object' && typeof fetched !== 'function') || fetched === null) {
         throw new TypeError('invalid cache response');
@@ -2218,16 +2431,15 @@ export function renderDirectCacheAttempt(options: DirectCacheAttemptOptions): bo
       response = fetched as CacheFetchResponse;
       responseOk = response.ok;
       responseType = response.type;
-      if (typeof responseOk !== 'boolean') throw new TypeError('invalid cache status');
+      if (typeof responseOk !== 'boolean' || typeof responseType !== 'string') {
+        throw new TypeError('invalid cache response metadata');
+      }
     } catch {
       failCache('cache_network_error');
       return;
     }
-    if (
-      responseType === 'error' ||
-      responseType === 'opaque' ||
-      responseType === 'opaqueredirect'
-    ) {
+    const expectedResponseType = cacheOrigin === publisherOrigin ? 'basic' : 'cors';
+    if (responseType !== expectedResponseType) {
       failCache('cache_network_error');
       return;
     }
@@ -2235,13 +2447,18 @@ export function renderDirectCacheAttempt(options: DirectCacheAttemptOptions): bo
       failCache('cache_http_error');
       return;
     }
-    const body = await readCacheBody(response);
+    const body = await readCacheBody(response, {
+      active: () => pending,
+      cancel: cancelBodyReader,
+      release: releaseBodyReader,
+      retain: retainBodyReader,
+    });
     if (!pending) return;
     if (!body.ok) {
       failCache(body.reason);
       return;
     }
-    if (!attempt.cacheFetchCompleted()) {
+    if (reflectApplyIntrinsic(cacheControls.complete, cacheControls, []) !== true) {
       failCache('cache_network_error');
       return;
     }
@@ -2255,15 +2472,18 @@ export function renderDirectCacheAttempt(options: DirectCacheAttemptOptions): bo
       return;
     }
     pending = false;
+    let resolved: boolean;
     try {
-      if (
-        !renderAdmAttempt({ attempt, container, prepareIframe, publisherOrigin }, admSource) &&
-        attempt.snapshot().outcome === undefined
-      ) {
-        attempt.fail('internal_error');
-      }
+      resolved = reflectApplyIntrinsic(onResolved, undefined, [admSource]) === true;
     } catch {
-      attempt.fail('internal_error');
+      resolved = false;
+    }
+    if (!resolved) {
+      try {
+        if (attempt.snapshot().outcome === undefined) attempt.fail('internal_error');
+      } catch {
+        // The terminal latch remains authoritative across a hostile consumer boundary.
+      }
     }
   };
   const completion = complete();
@@ -2277,6 +2497,59 @@ export function renderDirectCacheAttempt(options: DirectCacheAttemptOptions): bo
     return false;
   }
   return true;
+}
+
+/** Fetch and render one admitted direct cache source through the shared ADM constructor. */
+export function renderDirectCacheAttempt(options: DirectCacheAttemptOptions): boolean {
+  let attempt: RenderAttempt;
+  let cachePolicy: DirectCacheAttemptOptions['cachePolicy'];
+  let container: HTMLElement;
+  let fetcher: DirectCacheAttemptOptions['fetcher'];
+  let prepareIframe: DirectAdmIframeConstructor;
+  let publisherOrigin: string;
+  try {
+    attempt = options.attempt;
+    cachePolicy = options.cachePolicy;
+    container = options.container;
+    fetcher = options.fetcher;
+    prepareIframe = options.prepareIframe;
+    publisherOrigin = options.publisherOrigin;
+  } catch {
+    return false;
+  }
+  if (!weakSetHas(renderAttempts, attempt) || typeof prepareIframe !== 'function') return false;
+
+  let created = false;
+  let exactDirectContainer: boolean;
+  try {
+    created = attempt.snapshot().state === 'created';
+    exactDirectContainer =
+      created &&
+      !!directAdmDocument &&
+      typeof directAdmOwnerDocumentGetter === 'function' &&
+      reflectApplyIntrinsic(directAdmOwnerDocumentGetter, container, []) === directAdmDocument &&
+      directAdmDocument.defaultView?.location.origin === publisherOrigin;
+  } catch {
+    exactDirectContainer = false;
+  }
+  if (!created) return false;
+  if (!exactDirectContainer) {
+    try {
+      attempt.fail('winner_not_renderable');
+    } catch {
+      // The exact direct-container boundary fails closed.
+    }
+    return false;
+  }
+
+  return resolveCacheAdmAttempt({
+    attempt,
+    cachePolicy,
+    fetcher,
+    onResolved: (source) =>
+      renderAdmAttempt({ attempt, container, prepareIframe, publisherOrigin }, source),
+    publisherOrigin,
+  });
 }
 
 interface RendererNonceBinding {
