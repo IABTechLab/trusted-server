@@ -9,6 +9,7 @@ import {
   createNoopMessagingAdapter,
   type MessageEventTarget,
   type MessagingAdapter,
+  type MessagingValidationOptions,
 } from '../adapters/messaging';
 import {
   createBrowserPrebidAdapter,
@@ -17,6 +18,7 @@ import {
   type PrebidGlobalTarget,
 } from '../adapters/prebid';
 import { parseBrowserAuctionProjectionV1 } from '../core/contracts/auction_projection';
+import { validateApsRenderer } from '../core/contracts/aps_renderer';
 import { createBrowserNavigationIdentityIssuer } from '../kernel/identity';
 import type { NavigationIdentityIssuerFactory, RuntimeSession } from '../kernel/sessions';
 import { createRuntimeSession } from '../kernel/sessions';
@@ -45,6 +47,7 @@ export type BrowserAdapterTarget = GoogletagGlobalTarget & PrebidGlobalTarget & 
 
 export interface BrowserCompositionOptions {
   readonly adapters?: Partial<BrowserAdapters>;
+  readonly messagingValidation?: MessagingValidationOptions;
   readonly target?: BrowserAdapterTarget;
 }
 
@@ -189,6 +192,21 @@ function projectionSlots(projection: object): readonly string[] {
 export function createBrowserComposition(
   options: BrowserCompositionOptions = {}
 ): BrowserComposition {
+  const defaultValidator = (candidate: unknown): boolean =>
+    validateApsRenderer(candidate) !== undefined;
+  const browserMessagingValidation = (): MessagingValidationOptions => {
+    try {
+      const expectedPublisherOrigin = window.location.origin;
+      return {
+        expectedPublisherOrigin,
+        expectedRendererUrl: new URL('/integrations/aps/renderer/v1', expectedPublisherOrigin).href,
+        validateApsRenderer: defaultValidator,
+        ...options.messagingValidation,
+      };
+    } catch {
+      return { validateApsRenderer: defaultValidator, ...options.messagingValidation };
+    }
+  };
   const googletag =
     options.adapters?.googletag ??
     (options.target
@@ -197,8 +215,11 @@ export function createBrowserComposition(
   const messaging =
     options.adapters?.messaging ??
     (options.target
-      ? createBrowserMessagingAdapter(options.target)
-      : createBrowserMessagingAdapter());
+      ? createBrowserMessagingAdapter(options.target, {
+          validateApsRenderer: defaultValidator,
+          ...options.messagingValidation,
+        })
+      : createBrowserMessagingAdapter(undefined, browserMessagingValidation()));
   const prebid =
     options.adapters?.prebid ??
     (options.target ? createBrowserPrebidAdapter(options.target) : createBrowserPrebidAdapter());
@@ -252,6 +273,8 @@ export function createTestBrowserRuntimeComposition(
       });
       context.onDispose(() => {
         session.dispose();
+        composition.adapters.googletag.dispose();
+        composition.adapters.prebid.dispose();
         if (runtimeSession === session) {
           runtimeSession = undefined;
           projectionSlotLedger = undefined;

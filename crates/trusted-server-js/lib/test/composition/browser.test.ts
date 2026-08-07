@@ -1,8 +1,20 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { GoogletagAdapter } from '../../src/adapters/googletag';
-import type { CaptureMessageListener, MessagingAdapter } from '../../src/adapters/messaging';
-import type { PrebidAdapter } from '../../src/adapters/prebid';
+import {
+  createNoopGoogletagAdapter,
+  type GoogletagAdapter,
+  type GoogletagBindingStatus,
+} from '../../src/adapters/googletag';
+import {
+  createNoopMessagingAdapter,
+  type CaptureMessageListener,
+  type MessagingAdapter,
+} from '../../src/adapters/messaging';
+import {
+  createNoopPrebidAdapter,
+  type PrebidAdapter,
+  type PrebidBindingStatus,
+} from '../../src/adapters/prebid';
 import {
   createBrowserComposition,
   createNoopBrowserComposition,
@@ -21,6 +33,24 @@ function createTarget() {
   };
 }
 
+function fakeGoogletagAdapter(
+  bindingStatus: () => GoogletagBindingStatus = () => 'pending'
+): GoogletagAdapter {
+  return Object.freeze({ ...createNoopGoogletagAdapter(), bindingStatus });
+}
+
+function fakePrebidAdapter(
+  bindingStatus: () => PrebidBindingStatus = () => 'pending'
+): PrebidAdapter {
+  return Object.freeze({ ...createNoopPrebidAdapter(), bindingStatus });
+}
+
+function fakeMessagingAdapter(
+  installCaptureListener: MessagingAdapter['installCaptureListener'] = () => vi.fn()
+): MessagingAdapter {
+  return Object.freeze({ ...createNoopMessagingAdapter(), installCaptureListener });
+}
+
 describe('browser composition', () => {
   afterEach(() => vi.useRealTimers());
 
@@ -34,13 +64,49 @@ describe('browser composition', () => {
 
     target.googletag = {};
     target.pbjs = {};
-    expect(composition.adapters.googletag.bindingStatus()).toBe('present');
-    expect(composition.adapters.prebid.bindingStatus()).toBe('present');
+    expect(composition.adapters.googletag.bindingStatus()).toBe('incompatible');
+    expect(composition.adapters.prebid.bindingStatus()).toBe('incompatible');
 
     target.googletag = 1;
     target.pbjs = 'not-prebid';
     expect(composition.adapters.googletag.bindingStatus()).toBe('incompatible');
     expect(composition.adapters.prebid.bindingStatus()).toBe('incompatible');
+  });
+
+  it('derives exact APS validation coordinates only for the real browser target', () => {
+    const renderer = {
+      type: 'aps',
+      version: 1,
+      accountId: 'publisher-account',
+      bidId: 'bid-1',
+      tagType: 'iframe',
+      creativeUrl: 'https://creative.example/render',
+      width: 300,
+      height: 250,
+      aaxResponse: 'renderer-envelope',
+    };
+    const message = {
+      message: 'TS APS Start',
+      version: 1,
+      lifecycleTicket: 't1_abcdefghijklmnopqrstuv',
+      rendererUrl: new URL('/integrations/aps/renderer/v1', window.location.origin).href,
+      envelope: {
+        version: 1,
+        nonce: 'n1_abcdefghijklmnopqrstuv',
+        publisherOrigin: window.location.origin,
+        renderer,
+      },
+    };
+    const validation = { validateApsRenderer: () => true };
+
+    const browser = createBrowserComposition({ messagingValidation: validation });
+    expect(browser.adapters.messaging.parseProtocolMessage('apsStart', message)).toBeDefined();
+
+    const injected = createBrowserComposition({
+      target: createTarget(),
+      messagingValidation: validation,
+    });
+    expect(injected.adapters.messaging.parseProtocolMessage('apsStart', message)).toBeUndefined();
   });
 
   it('installs the capture-phase message listener synchronously and disposes once', () => {
@@ -51,24 +117,20 @@ describe('browser composition', () => {
     const dispose = composition.adapters.messaging.installCaptureListener(listener);
 
     expect(target.addEventListener).toHaveBeenCalledTimes(1);
-    expect(target.addEventListener).toHaveBeenCalledWith('message', listener, true);
+    const installed = target.addEventListener.mock.calls[0]?.[1];
+    expect(installed).toBeTypeOf('function');
+    expect(target.addEventListener).toHaveBeenCalledWith('message', installed, true);
 
     dispose();
     dispose();
     expect(target.removeEventListener).toHaveBeenCalledTimes(1);
-    expect(target.removeEventListener).toHaveBeenCalledWith('message', listener, true);
+    expect(target.removeEventListener).toHaveBeenCalledWith('message', installed, true);
   });
 
   it('uses exact injected fakes without constructing concrete adapters', () => {
-    const googletag: GoogletagAdapter = {
-      bindingStatus: () => 'present',
-    };
-    const prebid: PrebidAdapter = {
-      bindingStatus: () => 'incompatible',
-    };
-    const messaging: MessagingAdapter = {
-      installCaptureListener: () => vi.fn(),
-    };
+    const googletag = fakeGoogletagAdapter(() => 'present');
+    const prebid = fakePrebidAdapter(() => 'incompatible');
+    const messaging = fakeMessagingAdapter();
 
     const composition = createBrowserComposition({
       adapters: { googletag, messaging, prebid },
@@ -119,9 +181,9 @@ describe('browser composition', () => {
       },
       {
         adapters: {
-          googletag: { bindingStatus: () => 'pending' },
-          prebid: { bindingStatus: () => 'pending' },
-          messaging: { installCaptureListener: () => vi.fn() },
+          googletag: fakeGoogletagAdapter(),
+          prebid: fakePrebidAdapter(),
+          messaging: fakeMessagingAdapter(),
         },
         coreActivations: {
           bridgeRecognizer: ({ onDispose }, adapters) => {
@@ -162,6 +224,12 @@ describe('browser composition', () => {
       'dispose-gpt',
       'dispose-bridge',
     ]);
+    expect(() => composition.adapters.googletag.run(() => undefined)).toThrowError(
+      expect.objectContaining({ code: 'operation_disposed' })
+    );
+    expect(() => composition.adapters.prebid.run(() => undefined)).toThrowError(
+      expect.objectContaining({ code: 'operation_disposed' })
+    );
     expect(Object.isFrozen(composition)).toBe(true);
     expect(Object.isFrozen(composition.runtime)).toBe(true);
   });
@@ -196,9 +264,9 @@ describe('browser composition', () => {
       },
       {
         adapters: {
-          googletag: { bindingStatus: () => 'pending' },
-          prebid: { bindingStatus: () => 'pending' },
-          messaging: { installCaptureListener: () => vi.fn() },
+          googletag: fakeGoogletagAdapter(),
+          prebid: fakePrebidAdapter(),
+          messaging: fakeMessagingAdapter(),
         },
         coreActivations: {
           bridgeRecognizer: vi.fn(),
@@ -471,9 +539,9 @@ describe('browser composition', () => {
       },
       {
         adapters: {
-          googletag: { bindingStatus: adapterActivation },
-          prebid: { bindingStatus: adapterActivation },
-          messaging: { installCaptureListener: listenerActivation },
+          googletag: fakeGoogletagAdapter(adapterActivation),
+          prebid: fakePrebidAdapter(adapterActivation),
+          messaging: fakeMessagingAdapter(listenerActivation),
         },
         coreActivations: {
           bridgeRecognizer: timerActivation,
