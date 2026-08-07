@@ -41,6 +41,7 @@ import {
   type GptWinnerPublicationInput,
   type GptWinnerPublicationResult,
 } from '../integrations/gpt/module';
+import { createGptStartup } from '../integrations/gpt/startup';
 import { createBrowserNavigationIdentityIssuer } from '../kernel/identity';
 import type { NavigationIdentityIssuerFactory, RuntimeSession } from '../kernel/sessions';
 import { createRuntimeSession } from '../kernel/sessions';
@@ -253,8 +254,17 @@ export function createTestBrowserRuntimeComposition(
 ): BrowserRuntimeComposition {
   const composition = createBrowserComposition(compositionOptions);
   const providedBindings = runtimeOptions.getBindings;
+  let browserServices: Readonly<BrowserServices> | undefined;
   const startGpt = compositionOptions.gptStartupForTest ?? (() => undefined);
-  const gptRuntime = Object.freeze({ start: startGpt });
+  const gptRuntime = createGptStartup({
+    googletag: composition.adapters.googletag,
+    slots: () => {
+      const slots = browserServices?.slots;
+      if (!slots) throw new Error('GPT slot service is unavailable');
+      return slots;
+    },
+    start: startGpt,
+  });
   const startPrebid = compositionOptions.prebidStartupForTest ?? (() => undefined);
   const prebidRuntime = Object.freeze({ start: startPrebid });
   let runtimeSession: RuntimeSession | undefined;
@@ -274,7 +284,6 @@ export function createTestBrowserRuntimeComposition(
     });
   };
   let preparedBrowserServices: PreparedBrowserServices | undefined;
-  let browserServices: Readonly<BrowserServices> | undefined;
   let auctionContextRegistry: AuctionContextRegistry | undefined;
   let auctionBatchService: AuctionBatchService | undefined;
   let projectionParser: ((candidate: unknown) => object | undefined) | undefined;

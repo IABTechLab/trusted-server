@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  createBrowserGoogletagAdapter,
   createNoopGoogletagAdapter,
   type GoogletagAdapter,
   type GoogletagBindingStatus,
@@ -671,6 +672,124 @@ describe('browser composition', () => {
       resetGuardState();
     }
     expect(isGuardInstalled()).toBe(false);
+  });
+
+  it('hands late publisher GPT calls through the adapter into runtime-owned slot state', async () => {
+    const releaseId = 'a'.repeat(64);
+    const slot = Object.freeze({ id: 'trusted-slot' });
+    const unrelated = Object.freeze({ id: 'publisher-slot' });
+    const refresh = vi.fn((_slots?: readonly object[], _options?: unknown) => undefined);
+    const display = vi.fn((_target: unknown) => undefined);
+    const destroySlots = vi.fn((_slots?: readonly object[]) => true);
+    const listeners = new Map<string, Set<(event: unknown) => void>>();
+    const pubads = {
+      addEventListener: vi.fn((type: string, listener: (event: unknown) => void) => {
+        const registered = listeners.get(type) ?? new Set();
+        registered.add(listener);
+        listeners.set(type, registered);
+      }),
+      disableInitialLoad: vi.fn(),
+      getSlots: vi.fn(() => [slot, unrelated]),
+      refresh,
+      removeEventListener: vi.fn((type: string, listener: (event: unknown) => void) => {
+        listeners.get(type)?.delete(listener);
+      }),
+    };
+    const nativeDefineSlot = vi.fn((_path: string, _sizes: unknown, _elementId: string) =>
+      Object.freeze({ id: 'duplicate' })
+    );
+    const googletag = {
+      apiReady: true,
+      pubadsReady: true,
+      cmd: { push: (command: () => void) => (command(), 0) },
+      defineSlot: nativeDefineSlot,
+      destroySlots,
+      display,
+      getConfig: vi.fn(() => ({ disableInitialLoad: true })),
+      pubads: () => pubads,
+      setConfig: vi.fn(),
+    };
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target: {},
+        releaseId,
+        manifest: { version: 1, releaseId, integrations: [{ id: 'gpt', required: true }] },
+        knownIntegrationIds: Object.freeze(['gpt']),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: {
+              version: 1,
+              auctionId: 'initial',
+              results: [{ slot: 'slot', outcome: 'no_bid' }],
+            },
+            bids: [],
+          },
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        getBindings: () => ({ config: Object.freeze({}), interfaces: Object.freeze({}) }),
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag: createBrowserGoogletagAdapter({ googletag }),
+          messaging: fakeMessagingAdapter(() => vi.fn()),
+          prebid: fakePrebidAdapter(),
+        },
+        coreActivations: { correctnessGptListeners: vi.fn() },
+      }
+    );
+
+    try {
+      expect(composition.runtime.start()).toBe(true);
+      expect(
+        composition.runtime.registerIntegration(createGptIntegrationRegistration(releaseId))
+      ).toBe(true);
+      await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+      const navigation = composition.runtimeSessionForTest()?.currentNavigation;
+      const slots = composition.slotServiceForTest();
+      if (!navigation || !slots) throw new Error('Expected active GPT composition');
+      expect(
+        slots.adoptGptSlot(navigation.generation, 'slot', {
+          definition: {
+            adUnitPath: '/trusted/path',
+            elementId: 'slot-div',
+            sizes: Object.freeze([[300, 250]]),
+          },
+          elementIdPrefix: 'slot-',
+          ownership: 'trusted_server',
+          slot,
+        })
+      ).toEqual({ ok: true });
+
+      expect(googletag.defineSlot('/publisher/mismatch', [728, 90], 'slot-div')).toBe(slot);
+      expect(nativeDefineSlot).not.toHaveBeenCalled();
+      expect(googletag.display('slot-div')).toBeUndefined();
+      expect(display).not.toHaveBeenCalled();
+      const options = Object.freeze({ changeCorrelator: true, publisher: 'preserved' });
+      expect(pubads.refresh(undefined, options)).toBeUndefined();
+      expect(refresh).toHaveBeenCalledExactlyOnceWith([unrelated], options);
+      pubads.refresh([slot], options);
+      expect(refresh).toHaveBeenLastCalledWith([slot], options);
+      const request = slots.request({
+        intentId: 'publisher-owned',
+        navigationGeneration: navigation.generation,
+        operation: 'refresh',
+        registeredSlotId: 'slot',
+        requestClass: 'primary',
+      });
+      await expect(request.result).resolves.toEqual({
+        status: 'failed',
+        reason: 'cycle_unattributable',
+      });
+      expect(googletag.destroySlots([slot])).toBe(true);
+      expect(slots.isBoundGptSlot(navigation.generation, 'slot', slot)).toBe(false);
+    } finally {
+      composition.runtime.dispose();
+      resetGuardState();
+    }
+    expect(destroySlots).toHaveBeenCalledTimes(1);
   });
 
   it('constructs one session lazily from accepted boot and keeps it across SPA replacement', async () => {

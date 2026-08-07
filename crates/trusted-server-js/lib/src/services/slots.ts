@@ -2,6 +2,9 @@ import type {
   GoogletagAdapter,
   GoogletagFacade,
   GoogletagOperation,
+  GoogletagPublisherDefineSlotCall,
+  GoogletagPublisherDisplayCall,
+  GoogletagPublisherRefreshCall,
   GoogletagReplacementCommitAdmission,
   GoogletagReplacementDefinition,
   GoogletagReplacementResult,
@@ -60,6 +63,8 @@ export type SlotRegistrationResult =
 /** Binding metadata required for safe TS-owned replacement. */
 export interface GptSlotBinding {
   readonly definition?: GoogletagReplacementDefinition;
+  /** Stable configured prefix accepted only for an unambiguous hydration handoff. */
+  readonly elementIdPrefix?: string;
   readonly ownership: GptSlotOwnership;
   readonly slot: object;
 }
@@ -142,6 +147,18 @@ export interface SlotService {
     owner: NavigationSession,
     slots: readonly string[]
   ) => PreparedProjectionSlots | undefined;
+  readonly claimPublisherGptSlot: (
+    call: GoogletagPublisherDefineSlotCall
+  ) => Readonly<{ action: 'forward' }> | Readonly<{ action: 'handoff'; slot: object }>;
+  readonly preparePublisherDisplay: (
+    call: GoogletagPublisherDisplayCall
+  ) => Readonly<{ action: 'forward' }> | Readonly<{ action: 'suppress' }>;
+  readonly preparePublisherRefresh: (
+    call: GoogletagPublisherRefreshCall
+  ) =>
+    | Readonly<{ action: 'forward' }>
+    | Readonly<{ action: 'replace'; slots: readonly object[] }>
+    | Readonly<{ action: 'suppress' }>;
   readonly projectionRegistry: (owner: NavigationSession) => ProjectionSlotRegistry;
   readonly recordPublisherDestruction: (slot: object) => boolean;
   readonly recordPublisherIntent: (slot: object) => boolean;
@@ -210,10 +227,14 @@ interface PhysicalSlot {
   artifactRetirementAttempted: boolean;
   definition: GoogletagReplacementDefinition | undefined;
   domElement: object | undefined;
+  elementIdPrefix: string | undefined;
   lastResponseIdentifier: string | undefined;
   ownership: GptSlotOwnership;
   placementKeys: readonly string[];
   publisherIntentCount: number;
+  publisherElementIds: readonly string[];
+  suppressPublisherDisplay: boolean;
+  suppressPublisherRefresh: boolean;
   quarantineReason: 'completion' | 'navigation' | 'request' | undefined;
   record: InternalSlotRecord | undefined;
   saturationOwner: boolean;
@@ -487,6 +508,30 @@ function copyReplacementSizes(sizes: unknown): unknown | undefined {
   } catch {
     return undefined;
   }
+}
+
+function replacementSizesEqual(left: unknown, right: unknown): boolean {
+  const leftCopy = copyReplacementSizes(left);
+  const rightCopy = copyReplacementSizes(right);
+  if (!Array.isArray(leftCopy) || !Array.isArray(rightCopy)) return false;
+  const pair = (value: unknown): value is readonly [number, number] =>
+    Array.isArray(value) &&
+    value.length === 2 &&
+    typeof value[0] === 'number' &&
+    typeof value[1] === 'number';
+  const normalized = (value: readonly unknown[]): readonly (readonly [number, number])[] =>
+    pair(value) ? Object.freeze([value]) : (value as readonly (readonly [number, number])[]);
+  const leftPairs = normalized(leftCopy);
+  const rightPairs = normalized(rightCopy);
+  if (leftPairs.length !== rightPairs.length) return false;
+  for (let index = 0; index < leftPairs.length; index += 1) {
+    const leftPair = leftPairs[index];
+    const rightPair = rightPairs[index];
+    if (!leftPair || !rightPair || leftPair[0] !== rightPair[0] || leftPair[1] !== rightPair[1]) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function snapshotReplacementDefinition(input: unknown): GoogletagReplacementDefinition | undefined {
@@ -888,16 +933,20 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       artifactRetirementAttempted: false,
       definition,
       domElement,
+      elementIdPrefix: oldPhysical.elementIdPrefix,
       destroyAttempted: false,
       lastResponseIdentifier: undefined,
       ownership: 'trusted_server',
       placementKeys: oldPhysical.placementKeys,
       publisherIntentCount: 0,
+      publisherElementIds: Object.freeze([]),
       quarantineReason: undefined,
       record,
       saturationOwner: false,
       slot: replacement,
       state: 'live',
+      suppressPublisherDisplay: false,
+      suppressPublisherRefresh: false,
     };
     let committed = false;
     const rollback = (): void => {
@@ -949,16 +998,20 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       artifactRetirementAttempted: true,
       definition: source.definition,
       domElement: undefined,
+      elementIdPrefix: source.elementIdPrefix,
       destroyAttempted: true,
       lastResponseIdentifier: undefined,
       ownership: 'trusted_server',
       placementKeys: source.placementKeys,
       publisherIntentCount: 0,
+      publisherElementIds: Object.freeze([]),
       quarantineReason: 'request',
       record: undefined,
       saturationOwner: false,
       slot: orphanedSlot,
       state: 'quarantined',
+      suppressPublisherDisplay: false,
+      suppressPublisherRefresh: false,
     };
     try {
       setWeakMapValue(physicalByObject, orphan.slot, orphan);
@@ -1978,10 +2031,12 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     let slot: unknown;
     let ownership: unknown;
     let externalDefinition: unknown;
+    let externalElementIdPrefix: unknown;
     try {
       slot = binding.slot;
       ownership = binding.ownership;
       externalDefinition = binding.definition;
+      externalElementIdPrefix = binding.elementIdPrefix;
     } catch {
       return Object.freeze({ ok: false, reason: 'gpt_request_failed' });
     }
@@ -1994,6 +2049,13 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     if (ownership !== 'publisher' && ownership !== 'trusted_server') {
       return Object.freeze({ ok: false, reason: 'gpt_request_failed' });
     }
+    if (
+      externalElementIdPrefix !== undefined &&
+      (typeof externalElementIdPrefix !== 'string' || !validSlotIdentity(externalElementIdPrefix))
+    ) {
+      return Object.freeze({ ok: false, reason: 'gpt_request_failed' });
+    }
+    const elementIdPrefix = externalElementIdPrefix as string | undefined;
     const definition =
       externalDefinition === undefined
         ? undefined
@@ -2044,7 +2106,9 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       const previousOwnership = existing.ownership;
       const previousDefinition = existing.definition;
       const previousDomElement = existing.domElement;
+      const previousElementIdPrefix = existing.elementIdPrefix;
       const previousPlacementKeys = existing.placementKeys;
+      const previousPublisherElementIds = existing.publisherElementIds;
       try {
         if (!wasStrong) addSetValue(physicalSlots, existing);
         if (!setHasValue(physicalSlots, existing)) throw new Error('physical publication failed');
@@ -2053,7 +2117,12 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         existing.ownership = ownership;
         existing.definition = definition;
         existing.domElement = domElement;
+        existing.elementIdPrefix = elementIdPrefix;
         existing.placementKeys = bindingPlacementKeys;
+        existing.publisherElementIds =
+          ownership === 'publisher' && definition
+            ? Object.freeze([definition.elementId])
+            : Object.freeze([]);
         record.physical = existing;
         if (ownership === 'publisher') cancelReconciliation(record);
         return Object.freeze({ ok: true });
@@ -2063,7 +2132,9 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         existing.ownership = previousOwnership;
         existing.definition = previousDefinition;
         existing.domElement = previousDomElement;
+        existing.elementIdPrefix = previousElementIdPrefix;
         existing.placementKeys = previousPlacementKeys;
+        existing.publisherElementIds = previousPublisherElementIds;
         if (!wasStrong) deleteSetValue(physicalSlots, existing);
         return Object.freeze({ ok: false, reason: 'stale_owner' });
       }
@@ -2076,16 +2147,23 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       artifactRetirementAttempted: false,
       definition,
       domElement,
+      elementIdPrefix,
       destroyAttempted: false,
       lastResponseIdentifier: undefined,
       ownership,
       placementKeys: bindingPlacementKeys,
       publisherIntentCount: 0,
+      publisherElementIds:
+        ownership === 'publisher' && definition
+          ? Object.freeze([definition.elementId])
+          : Object.freeze([]),
       quarantineReason: undefined,
       record,
       saturationOwner: false,
       slot: slotObject,
       state: 'live',
+      suppressPublisherDisplay: false,
+      suppressPublisherRefresh: false,
     };
     try {
       setWeakMapValue(physicalByObject, slotObject, physical);
@@ -2471,6 +2549,212 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     return Object.freeze(handles);
   };
 
+  const recordPublisherDestruction = (slot: object): boolean => {
+    const physical = weakMapValue(physicalByObject, slot);
+    if (!physical) return false;
+    const record = physical.record;
+    if (record) cancelReconciliation(record);
+    const cycleIntent = physical.activeCycle?.intent;
+    if (cycleIntent && !cycleIntent.terminal) settle(cycleIntent, failed('gpt_request_failed'));
+    if (record?.activeIntent) settle(record.activeIntent, failed('gpt_request_failed'));
+    if (record?.queuedIntent) settle(record.queuedIntent, failed('gpt_request_failed'));
+    if (record) retireCommittedArtifact(record, physical);
+    if (record?.physical === physical) record.physical = undefined;
+    physical.record = undefined;
+    physical.activeCycle = undefined;
+    physical.publisherIntentCount = 0;
+    physical.publisherElementIds = Object.freeze([]);
+    physical.suppressPublisherDisplay = false;
+    physical.suppressPublisherRefresh = false;
+    physical.state = 'retired';
+    releasePhysicalPlacement(physical);
+    deleteSetValue(physicalSlots, physical);
+    if (weakMapValue(physicalByObject, slot) === physical) {
+      deleteWeakMapValue(physicalByObject, slot);
+    }
+    return true;
+  };
+
+  const recordPublisherIntent = (slot: object): boolean => {
+    const physical = weakMapValue(physicalByObject, slot);
+    if (!physical || (physical.state !== 'live' && !physical.activeCycle)) return false;
+    if (physical.publisherIntentCount >= MAX_PENDING_PUBLISHER_INTENTS) {
+      physical.state = 'quarantined';
+      physical.quarantineReason = 'request';
+      quarantinePhysicalPlacement(physical);
+      if (physical.record?.activeIntent) {
+        settle(physical.record.activeIntent, failed('cycle_unattributable'));
+      }
+      if (physical.record?.queuedIntent) {
+        settle(physical.record.queuedIntent, failed('cycle_unattributable'));
+      }
+      return false;
+    }
+    if (physical.record?.activeIntent) {
+      settle(physical.record.activeIntent, failed('cycle_unattributable'));
+    }
+    if (physical.record?.queuedIntent) {
+      settle(physical.record.queuedIntent, failed('cycle_unattributable'));
+    }
+    physical.publisherIntentCount += 1;
+    if (physical.activeCycle?.kind === 'trusted_server') {
+      physical.activeCycle = { intent: undefined, kind: 'publisher' };
+      physical.state = 'quarantined';
+      physical.quarantineReason = 'completion';
+    }
+    return true;
+  };
+
+  const publisherPhysicalForTarget = (target: unknown): PhysicalSlot | undefined => {
+    if ((typeof target === 'object' && target !== null) || typeof target === 'function') {
+      const exact = weakMapValue(physicalByObject, target as object);
+      return exact?.ownership === 'publisher' && exact.state === 'live' ? exact : undefined;
+    }
+    if (typeof target !== 'string') return undefined;
+    let match: PhysicalSlot | undefined;
+    for (const candidate of setValueSnapshot(physicalSlots)) {
+      if (candidate.ownership !== 'publisher' || candidate.state !== 'live') continue;
+      let matches = false;
+      for (let index = 0; index < candidate.publisherElementIds.length; index += 1) {
+        if (candidate.publisherElementIds[index] === target) {
+          matches = true;
+          break;
+        }
+      }
+      if (!matches) continue;
+      if (match && match !== candidate) return undefined;
+      match = candidate;
+    }
+    return match;
+  };
+
+  const claimPublisherGptSlot = (
+    call: GoogletagPublisherDefineSlotCall
+  ): Readonly<{ action: 'forward' }> | Readonly<{ action: 'handoff'; slot: object }> => {
+    let elementId: unknown;
+    let adUnitPath: unknown;
+    let sizes: unknown;
+    let initialLoadDisabled: unknown;
+    try {
+      elementId = call.elementId;
+      adUnitPath = call.adUnitPath;
+      sizes = call.sizes;
+      initialLoadDisabled = call.initialLoadDisabled;
+    } catch {
+      return Object.freeze({ action: 'forward' });
+    }
+    if (typeof elementId !== 'string' || !validSlotIdentity(elementId)) {
+      return Object.freeze({ action: 'forward' });
+    }
+    const exact: PhysicalSlot[] = [];
+    const hydration: PhysicalSlot[] = [];
+    for (const physical of setValueSnapshot(physicalSlots)) {
+      const record = physical.record;
+      const definition = physical.definition;
+      if (
+        physical.ownership !== 'trusted_server' ||
+        physical.state !== 'live' ||
+        !record ||
+        !record.state.owner.isCurrent() ||
+        !definition
+      ) {
+        continue;
+      }
+      if (definition.elementId === elementId) {
+        exact[exact.length] = physical;
+        continue;
+      }
+      if (
+        physical.elementIdPrefix &&
+        elementId.startsWith(physical.elementIdPrefix) &&
+        !reconciliationElementConnected(physical.domElement) &&
+        adUnitPath === definition.adUnitPath &&
+        replacementSizesEqual(sizes, definition.sizes)
+      ) {
+        hydration[hydration.length] = physical;
+      }
+    }
+    const matches = exact.length > 0 ? exact : hydration;
+    if (matches.length !== 1) return Object.freeze({ action: 'forward' });
+    const physical = matches[0];
+    const record = physical?.record;
+    if (!physical || !record || !record.state.owner.isCurrent()) {
+      return Object.freeze({ action: 'forward' });
+    }
+    const definitionElementId = physical.definition?.elementId;
+    const aliases =
+      definitionElementId === undefined || definitionElementId === elementId
+        ? Object.freeze([elementId])
+        : Object.freeze([definitionElementId, elementId]);
+    cancelReconciliation(record);
+    if (
+      physical.record !== record ||
+      record.physical !== physical ||
+      physical.state !== 'live' ||
+      !record.state.owner.isCurrent()
+    ) {
+      return Object.freeze({ action: 'forward' });
+    }
+    physical.ownership = 'publisher';
+    physical.publisherElementIds = aliases;
+    physical.suppressPublisherDisplay = true;
+    physical.suppressPublisherRefresh = initialLoadDisabled === true;
+    return Object.freeze({ action: 'handoff', slot: physical.slot });
+  };
+
+  const preparePublisherDisplay = (
+    call: GoogletagPublisherDisplayCall
+  ): Readonly<{ action: 'forward' }> | Readonly<{ action: 'suppress' }> => {
+    let target: unknown;
+    let initialLoadDisabled: unknown;
+    try {
+      target = call.target;
+      initialLoadDisabled = call.initialLoadDisabled;
+    } catch {
+      return Object.freeze({ action: 'forward' });
+    }
+    const physical = publisherPhysicalForTarget(target);
+    if (!physical) return Object.freeze({ action: 'forward' });
+    if (physical.suppressPublisherDisplay) {
+      physical.suppressPublisherDisplay = false;
+      return Object.freeze({ action: 'suppress' });
+    }
+    if (initialLoadDisabled !== true) recordPublisherIntent(physical.slot);
+    return Object.freeze({ action: 'forward' });
+  };
+
+  const preparePublisherRefresh = (
+    call: GoogletagPublisherRefreshCall
+  ):
+    | Readonly<{ action: 'forward' }>
+    | Readonly<{ action: 'replace'; slots: readonly object[] }>
+    | Readonly<{ action: 'suppress' }> => {
+    let slots: readonly object[];
+    try {
+      slots = call.slots;
+    } catch {
+      return Object.freeze({ action: 'forward' });
+    }
+    if (!Array.isArray(slots)) return Object.freeze({ action: 'forward' });
+    let suppressed = false;
+    const forwarded: object[] = [];
+    for (let index = 0; index < slots.length; index += 1) {
+      const slot = slots[index];
+      if (!slot) continue;
+      const physical = weakMapValue(physicalByObject, slot);
+      if (physical?.ownership === 'publisher' && physical.suppressPublisherRefresh) {
+        physical.suppressPublisherRefresh = false;
+        suppressed = true;
+        continue;
+      }
+      forwarded[forwarded.length] = slot;
+      if (physical?.ownership === 'publisher') recordPublisherIntent(slot);
+    }
+    if (!suppressed) return Object.freeze({ action: 'forward' });
+    if (forwarded.length === 0) return Object.freeze({ action: 'suppress' });
+    return Object.freeze({ action: 'replace', slots: Object.freeze(forwarded) });
+  };
+
   const service: SlotService = Object.freeze({
     activate: (): GoogletagOperation<void> => {
       if (activation) return activation;
@@ -2589,6 +2873,9 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         },
       });
     },
+    claimPublisherGptSlot,
+    preparePublisherDisplay,
+    preparePublisherRefresh,
     projectionRegistry: (owner: NavigationSession): ProjectionSlotRegistry =>
       Object.freeze({
         prepareProjectionSlots: (
@@ -2605,57 +2892,8 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
           return service.prepareProjectionSlots(owner, slots);
         },
       }),
-    recordPublisherDestruction: (slot: object): boolean => {
-      const physical = weakMapValue(physicalByObject, slot);
-      if (!physical) return false;
-      const record = physical.record;
-      if (record) cancelReconciliation(record);
-      const cycleIntent = physical.activeCycle?.intent;
-      if (cycleIntent && !cycleIntent.terminal) settle(cycleIntent, failed('gpt_request_failed'));
-      if (record?.activeIntent) settle(record.activeIntent, failed('gpt_request_failed'));
-      if (record?.queuedIntent) settle(record.queuedIntent, failed('gpt_request_failed'));
-      if (record) retireCommittedArtifact(record, physical);
-      if (record?.physical === physical) record.physical = undefined;
-      physical.record = undefined;
-      physical.activeCycle = undefined;
-      physical.publisherIntentCount = 0;
-      physical.state = 'retired';
-      releasePhysicalPlacement(physical);
-      deleteSetValue(physicalSlots, physical);
-      if (weakMapValue(physicalByObject, slot) === physical) {
-        deleteWeakMapValue(physicalByObject, slot);
-      }
-      return true;
-    },
-    recordPublisherIntent: (slot: object): boolean => {
-      const physical = weakMapValue(physicalByObject, slot);
-      if (!physical || (physical.state !== 'live' && !physical.activeCycle)) return false;
-      if (physical.publisherIntentCount >= MAX_PENDING_PUBLISHER_INTENTS) {
-        physical.state = 'quarantined';
-        physical.quarantineReason = 'request';
-        quarantinePhysicalPlacement(physical);
-        if (physical.record?.activeIntent) {
-          settle(physical.record.activeIntent, failed('cycle_unattributable'));
-        }
-        if (physical.record?.queuedIntent) {
-          settle(physical.record.queuedIntent, failed('cycle_unattributable'));
-        }
-        return false;
-      }
-      if (physical.record?.activeIntent) {
-        settle(physical.record.activeIntent, failed('cycle_unattributable'));
-      }
-      if (physical.record?.queuedIntent) {
-        settle(physical.record.queuedIntent, failed('cycle_unattributable'));
-      }
-      physical.publisherIntentCount += 1;
-      if (physical.activeCycle?.kind === 'trusted_server') {
-        physical.activeCycle = { intent: undefined, kind: 'publisher' };
-        physical.state = 'quarantined';
-        physical.quarantineReason = 'completion';
-      }
-      return true;
-    },
+    recordPublisherDestruction,
+    recordPublisherIntent,
     registeredSlotIdsForTest: (): readonly string[] => {
       const records = mapValueSnapshot(registeredSlots);
       records.sort((left, right) => left.view.ordinal - right.view.ordinal);
