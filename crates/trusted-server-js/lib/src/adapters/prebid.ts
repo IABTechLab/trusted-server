@@ -66,7 +66,7 @@ export interface PreparedTrustedBidV1 {
     readonly creativeId: string;
     readonly netRevenue: true;
     readonly currency: 'USD';
-    readonly bidderCode: string;
+    readonly bidderCode: 'trustedServer';
     readonly meta: Readonly<{
       readonly advertiserDomains: readonly string[];
       readonly tsAuctionId: string;
