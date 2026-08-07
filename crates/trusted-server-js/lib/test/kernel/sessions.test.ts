@@ -321,7 +321,7 @@ describe('runtime and navigation sessions', () => {
     });
   });
 
-  it('adopts one immutable winner context and rejects replacement or stale adoption', () => {
+  it('prepares, commits, and rolls back one immutable winner-context admission', () => {
     const runtime = createRuntimeSession({ createIdentityIssuer: identityFactory() });
     const navigation = runtime.startInitialNavigation();
     if (!navigation.ok) throw new Error('Expected navigation');
@@ -332,13 +332,24 @@ describe('runtime and navigation sessions', () => {
     const accepted = Object.freeze({ selectedCpm: 1.25 });
 
     expect(attempt.value.winnerContext).toBeUndefined();
-    expect(attempt.value.adoptWinnerContext(accepted)).toBe(true);
+    const first = attempt.value.prepareWinnerContext(accepted);
+    expect(first).toBeDefined();
+    expect(attempt.value.winnerContext).toBeUndefined();
+    expect(first?.commit()).toBe(true);
     expect(attempt.value.winnerContext).toBe(accepted);
-    expect(attempt.value.adoptWinnerContext(accepted)).toBe(true);
-    expect(attempt.value.adoptWinnerContext(Object.freeze({ selectedCpm: 1.25 }))).toBe(false);
+    expect(first?.rollback()).toBe(true);
+    expect(attempt.value.winnerContext).toBeUndefined();
+
+    const committed = attempt.value.prepareWinnerContext(accepted);
+    expect(committed?.commit()).toBe(true);
+    expect(attempt.value.winnerContext).toBe(accepted);
+    expect(attempt.value.prepareWinnerContext(accepted)?.commit()).toBe(true);
+    expect(
+      attempt.value.prepareWinnerContext(Object.freeze({ selectedCpm: 1.25 }))
+    ).toBeUndefined();
 
     attempt.value.dispose();
-    expect(attempt.value.adoptWinnerContext(Object.freeze({ selectedCpm: 2 }))).toBe(false);
+    expect(attempt.value.prepareWinnerContext(Object.freeze({ selectedCpm: 2 }))).toBeUndefined();
     expect(attempt.value.winnerContext).toBe(accepted);
   });
 

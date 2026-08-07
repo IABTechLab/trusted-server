@@ -283,6 +283,28 @@ describe('APS renderer validation', () => {
     expect(prepared?.width).toBe(300);
   });
 
+  it('prepares a cached validated source after Object.freeze is poisoned', () => {
+    const validated = validateApsRenderer(descriptor());
+    if (!validated) throw new Error('Expected a validated renderer');
+    const originalFreeze = Object.freeze;
+    let prepared: ReturnType<typeof prepareApsRenderSource> | undefined;
+    let thrown: unknown;
+    Object.freeze = function poisonedFreeze() {
+      throw new Error('poisoned Object.freeze');
+    };
+    try {
+      prepared = prepareApsRenderSource(validated);
+    } catch (error) {
+      thrown = error;
+    } finally {
+      Object.freeze = originalFreeze;
+    }
+
+    expect(thrown).toBeUndefined();
+    expect(prepared).toBe(validated);
+    expect(Object.isFrozen(prepared)).toBe(true);
+  });
+
   it('matches every shared cross-language contract vector', () => {
     for (const vector of rendererCorpus.vectors.map(materializeCorpusVector)) {
       const actual = classifyApsRendererV1(vector.descriptor, vector.publisherOrigin);
