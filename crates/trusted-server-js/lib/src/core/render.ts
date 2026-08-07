@@ -8,7 +8,7 @@ import IFRAME_TEMPLATE from './templates/iframe.html?raw';
 
 // Sandbox permissions granted to creative iframes.
 //
-// Ad creatives routinely contain scripts for tracking, click handling, and
+// Ad creatives routinely contain scripts for impression reporting, click handling, and
 // viewability measurement, so `allow-scripts` is required for them to render.
 //
 // `allow-same-origin` is deliberately excluded: combined with `allow-scripts` on
