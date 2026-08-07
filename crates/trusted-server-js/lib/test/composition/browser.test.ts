@@ -25,6 +25,7 @@ import { log as localLog } from '../../src/core/log';
 import type { BrowserAuctionBidV1 } from '../../src/core/types';
 import { createGptIntegrationRegistration } from '../../src/integrations/gpt/module';
 import { isGuardInstalled, resetGuardState } from '../../src/integrations/gpt/script_guard';
+import { createPrebidIntegrationRegistration } from '../../src/integrations/prebid/module';
 import { publicLog } from '../../src/kernel/fallback';
 import { createTestNavigationIdentityIssuer } from '../../src/kernel/identity';
 import {
@@ -590,16 +591,21 @@ describe('browser composition', () => {
     expect(releases).toEqual(['slotRenderEnded', 'slotRequested']);
   });
 
-  it('injects the GPT module boundary and retains only server-frozen configuration', async () => {
+  it('injects GPT and Prebid module boundaries with only server-frozen configuration', async () => {
     const releaseId = 'a'.repeat(64);
     const target = {};
-    const config = Object.freeze({ scriptUrl: '/integrations/gpt/script' });
-    const providedBindings = vi.fn(() => ({
-      config,
+    const gptConfig = Object.freeze({ scriptUrl: '/integrations/gpt/script' });
+    const prebidConfig = Object.freeze({ clientSideBidders: Object.freeze(['rubicon']) });
+    const providedBindings = vi.fn((id: string) => ({
+      config: id === 'prebid' ? prebidConfig : gptConfig,
       interfaces: Object.freeze({ publisherControlled: Object.freeze({}) }),
     }));
     const startGpt = vi.fn((received: unknown) => {
-      expect(received).toBe(config);
+      expect(received).toBe(gptConfig);
+      expect((target as { version?: unknown }).version).toBe('1.0.0');
+    });
+    const startPrebid = vi.fn((received: unknown) => {
+      expect(received).toBe(prebidConfig);
       expect((target as { version?: unknown }).version).toBe('1.0.0');
     });
     const composition = createTestBrowserRuntimeComposition(
@@ -609,9 +615,12 @@ describe('browser composition', () => {
         manifest: {
           version: 1,
           releaseId,
-          integrations: [{ id: 'gpt', required: true }],
+          integrations: [
+            { id: 'gpt', required: true },
+            { id: 'prebid', required: true },
+          ],
         },
-        knownIntegrationIds: Object.freeze(['gpt']),
+        knownIntegrationIds: Object.freeze(['gpt', 'prebid']),
         boot: {
           auctionProjection: {
             version: 1,
@@ -632,6 +641,7 @@ describe('browser composition', () => {
         },
         coreActivations: { correctnessGptListeners: vi.fn() },
         gptStartupForTest: startGpt,
+        prebidStartupForTest: startPrebid,
       }
     );
 
@@ -640,10 +650,16 @@ describe('browser composition', () => {
       expect(
         composition.runtime.registerIntegration(createGptIntegrationRegistration(releaseId))
       ).toBe(true);
+      expect(
+        composition.runtime.registerIntegration(createPrebidIntegrationRegistration(releaseId))
+      ).toBe(true);
       await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
 
-      expect(providedBindings).toHaveBeenCalledExactlyOnceWith('gpt');
-      expect(startGpt).toHaveBeenCalledExactlyOnceWith(config);
+      expect(providedBindings).toHaveBeenCalledTimes(2);
+      expect(providedBindings).toHaveBeenNthCalledWith(1, 'gpt');
+      expect(providedBindings).toHaveBeenNthCalledWith(2, 'prebid');
+      expect(startGpt).toHaveBeenCalledExactlyOnceWith(gptConfig);
+      expect(startPrebid).toHaveBeenCalledExactlyOnceWith(prebidConfig);
       expect(isGuardInstalled()).toBe(true);
       expect(composition.runtimeSessionForTest()?.interfaces).not.toHaveProperty(
         'publisherControlled'
