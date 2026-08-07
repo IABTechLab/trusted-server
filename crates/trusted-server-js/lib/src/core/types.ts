@@ -257,11 +257,11 @@ export interface GptDiagnosticsExportV1 {
   };
   slots: GptDiagnosticsSlotExport[];
   callbackIssues: GptDiagnosticsCallbackIssue[];
-  attributionIssues?: GptDiagnosticsAttributionIssue[];
+  attributionIssues: GptDiagnosticsAttributionIssue[];
   coverage: Record<GptDiagnosticsCallbackKind, GptDiagnosticsCoverageCounters>;
   metadata: {
     droppedCallbacks: number;
-    droppedAttributionIssues?: number;
+    droppedAttributionIssues: number;
     evictedSlots: number;
     evictedRequestCycles: number;
   };
@@ -273,27 +273,39 @@ export interface GptDiagnosticsSlotHandle {
   getAdUnitPath?(): string;
 }
 
+/** The documented, read-only operator API. It records no evidence. */
 export interface GptDiagnosticsApi {
   snapshot(): GptDiagnosticsExportV1;
   export(): void;
   subscribe(listener: (snapshot: GptDiagnosticsExportV1) => void): () => void;
   show(): void;
   hide(): void;
+}
+
+/**
+ * Evidence writers used by Trusted Server's own integration modules.
+ *
+ * Separate bundles can only reach each other through `window.tsjs`, so this
+ * channel is reachable from the page like anything else there. Keeping it off
+ * [`GptDiagnosticsApi`] is what makes the documented operator surface read-only
+ * and stops the writers from becoming part of the public contract.
+ */
+export interface GptDiagnosticsRecorder {
   /** Record Trusted Server's creative opportunity for an associated GPT slot. */
-  recordTrustedServerOpportunity?(
+  recordTrustedServerOpportunity(
     slot: GptDiagnosticsSlotHandle,
     auctionSlotId: string,
     opportunity: GptDiagnosticsTrustedServerOpportunity,
     trustedServerAuctionId?: string
   ): void;
   /** Mark slots whose next observed GPT request follows the Prebid refresh path. */
-  recordPrebidRefresh?(slots: GptDiagnosticsSlotHandle[]): void;
+  recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
   /** Record a creative markup request and return its opaque attempt ID. */
-  recordTrustedServerCreativeRequest?(auctionSlotId: string): number | undefined;
+  recordTrustedServerCreativeRequest(auctionSlotId: string): number | undefined;
   /** Record that a creative attempt successfully posted markup. */
-  recordTrustedServerCreativeResponse?(attemptId: number): void;
+  recordTrustedServerCreativeResponse(attemptId: number): void;
   /** Record a safe failure category for a creative attempt. */
-  recordTrustedServerCreativeFailure?(
+  recordTrustedServerCreativeFailure(
     attemptId: number,
     reason: GptDiagnosticsCreativeFailure
   ): void;
@@ -390,4 +402,9 @@ export interface TsjsApi {
   scheduleInitialAdInit?: (initialBids?: Record<string, AuctionBidData>) => void;
   /** Read-only GPT lifecycle diagnostics API, present only in an activated tab. */
   gptDiagnostics?: GptDiagnosticsApi;
+  /**
+   * Internal evidence channel for Trusted Server integration modules. Not part
+   * of the operator API; present only in an activated tab.
+   */
+  gptDiagnosticsRecorder?: GptDiagnosticsRecorder;
 }

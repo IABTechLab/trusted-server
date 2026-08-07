@@ -1,7 +1,7 @@
 # GPT Refresh Source and Replacement Diagnostics
 
 **Date:** 2026-08-05  
-**Status:** Approved
+**Status:** Implemented
 **Scope:** Opt-in GPT diagnostics only; zero publisher-code changes
 
 ## Relationship to Existing Diagnostics
@@ -141,10 +141,16 @@ Invalid values are omitted without dropping the otherwise-valid Trusted Server
 intent. The auction ID is opaque correlation data; no auction payload is
 retained. The target branch does not currently expose this identifier in its
 injected bid metadata, so the implementation adds only a target-native
-diagnostic path: the existing `AuctionRequest.id` is copied to the winning
-bid's optional `hb_auction_id` metadata for both the initial document and
-page-bids response, then GPT `adInit` forwards it to the diagnostic opportunity
-method. This must not import RC tracing fields, APS renderer data, or change
+diagnostic path: a token minted per auction is carried on the winning bid's
+optional `hb_auction_id` metadata for both the initial document and page-bids
+response, then GPT `adInit` forwards it to the diagnostic opportunity method.
+
+**Revised during review:** an earlier draft of this section reused
+`AuctionRequest.id`. That value is `ts-{ec_id}` for a consented visitor, so
+publishing it to page JavaScript would have disclosed the HttpOnly Edge Cookie
+identifier — and, being stable per visitor, it could not distinguish auctions
+either. The shipped implementation mints an unrelated random `ts-auc-{uuid}`
+per auction and emits it only when the diagnostics integration is enabled. This must not import RC tracing fields, APS renderer data, or change
 auction selection, targeting, markup, or delivery behavior.
 
 ### Source classification

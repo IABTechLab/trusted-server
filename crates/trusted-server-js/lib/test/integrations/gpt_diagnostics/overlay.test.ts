@@ -137,6 +137,8 @@ describe('GptDiagnosticsOverlay', () => {
         lineItemId: 6543210987,
         campaignId: 2345678901,
         creativeId: 3456789012,
+        yieldGroupIds: [4567890123],
+        companyIds: [5678901234],
       },
     });
     now = 13;
@@ -260,7 +262,9 @@ describe('GptDiagnosticsOverlay', () => {
     expect(responseSentArticle).toContain(
       'Ad Manager reported line item 6543210987 · order 2345678901'
     );
-    expect(responseSentArticle).toContain('Ad Manager reservation line item');
+    expect(responseSentArticle).toContain('yield group 4567890123');
+    expect(responseSentArticle).toContain('company 5678901234');
+    expect(responseSentArticle).toContain('Ad Manager response class: reservation');
     expect(responseSentArticle).toContain('GPT slot onload observed');
     expect(responseSentArticle).toContain('GPT impressionViewable observed');
     expect(responseSentArticle).not.toMatch(/creative rendered|ad visible|pixels confirmed/i);
@@ -324,7 +328,13 @@ describe('GptDiagnosticsOverlay', () => {
   it('renders publisher, replacement, creative, and independent content-change facts', () => {
     const frames: Array<() => void> = [];
     let now = 1;
-    const store = new GptDiagnosticsStore({ now: () => now, schedule: (callback) => callback() });
+    const store = new GptDiagnosticsStore({
+      now: () => now,
+      schedule: (callback) => callback(),
+      // Without a defer stub a candidate render leaves a real 5s timer running
+      // past the end of the test.
+      defer: () => undefined,
+    });
     const replacementSlot = slot('replacement-facts');
     store.recordPublisherRefresh([replacementSlot]);
     store.recordSlotRequested(replacementSlot);

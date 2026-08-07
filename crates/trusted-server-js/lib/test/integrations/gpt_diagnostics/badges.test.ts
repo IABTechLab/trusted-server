@@ -115,8 +115,10 @@ describe('GptDiagnosticsBadgeManager', () => {
     manager.destroy();
   });
 
-  it('prioritizes positive creative timestamps over stale delivery states', () => {
-    const responseSentBadge = gptDiagnosticsBadgeTextForTest({
+  it('labels the delivery state the store derived rather than raw timestamps', () => {
+    // The store owns the delivery ladder; a badge that re-derived it from these
+    // timestamps could contradict the panel and the export.
+    const pendingBadge = gptDiagnosticsBadgeTextForTest({
       requestNumber: 1,
       isEmpty: false,
       incompleteSequence: false,
@@ -127,10 +129,9 @@ describe('GptDiagnosticsBadgeManager', () => {
       trustedServerCreativeResponseAtMs: 11,
       delivery: 'pending',
     });
-    expect(responseSentBadge).toBe('Filled · TS response sent · Competing paths');
-    expect(responseSentBadge).not.toMatch(/TS candidate|TS unconfirmed/);
+    expect(pendingBadge).toBe('Filled · TS candidate (pending) · Competing paths');
 
-    const selectedBadge = gptDiagnosticsBadgeTextForTest({
+    const unconfirmedBadge = gptDiagnosticsBadgeTextForTest({
       requestNumber: 1,
       isEmpty: false,
       incompleteSequence: false,
@@ -140,11 +141,21 @@ describe('GptDiagnosticsBadgeManager', () => {
       trustedServerCreativeRequestAtMs: 10,
       delivery: 'candidate_unconfirmed',
     });
-    expect(selectedBadge).toBe('Filled · TS selected');
-    expect(selectedBadge).not.toMatch(/TS candidate|TS unconfirmed/);
+    expect(unconfirmedBadge).toBe('Filled · TS unconfirmed');
+
+    const emptyBadge = gptDiagnosticsBadgeTextForTest({
+      requestNumber: 1,
+      isEmpty: true,
+      incompleteSequence: false,
+      durations: {},
+      trustedServerCreativeRequestAtMs: 10,
+      trustedServerCreativeResponseAtMs: 11,
+      delivery: 'not_applicable',
+    });
+    expect(emptyBadge, 'an empty cycle must not claim a Trusted Server response').toBe('Empty');
   });
 
-  it('falls back to compact evidence-safe delivery labels when timestamps are absent', () => {
+  it('renders compact evidence-safe labels for every delivery state', () => {
     const responseSentBadge = gptDiagnosticsBadgeTextForTest({
       requestNumber: 1,
       isEmpty: false,
@@ -273,7 +284,36 @@ describe('GptDiagnosticsBadgeManager', () => {
         durations: {},
       })
     ).toBe('Pending');
-    expect(gptDiagnosticsBadgeTextForTest.toString()).not.toMatch(/GAM winner|bidder|provenance/i);
+    expect(
+      gptDiagnosticsBadgeTextForTest({
+        requestNumber: 1,
+        isEmpty: false,
+        renderAtMs: 5,
+        incompleteSequence: true,
+        durations: {},
+      })
+    ).toBe('Filled\nIncomplete sequence');
+    // Assert over rendered text: the delivery vocabulary lives in a helper that
+    // a `toString()` of this function would not include.
+    for (const delivery of [
+      'trusted_server_response_sent',
+      'trusted_server_selected',
+      'candidate_unconfirmed',
+      'no_candidate',
+      'unknown',
+      'pending',
+      'not_applicable',
+    ] as const) {
+      expect(
+        gptDiagnosticsBadgeTextForTest({
+          requestNumber: 1,
+          isEmpty: false,
+          incompleteSequence: false,
+          durations: {},
+          delivery,
+        })
+      ).not.toMatch(/GAM winner|bidder|provenance/i);
+    }
   });
 
   it('positions in the overlay layer and coalesces scroll and resize updates', () => {

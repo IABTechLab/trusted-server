@@ -2,6 +2,7 @@ import { log } from '../../core/log';
 import type { GptDiagnosticsRequestCycle } from '../../core/types';
 
 import type { GptDiagnosticsBindingManager } from './binding';
+import { unhandledCase } from './exhaustive';
 import type { GptDiagnosticsStoreSlotSnapshot, GptDiagnosticsStoreSnapshot } from './store';
 
 export const GPT_DIAGNOSTICS_HOST_ID = 'trusted-server-gpt-diagnostics';
@@ -141,9 +142,10 @@ function deliveryFact(cycle: GptDiagnosticsRequestCycle): string | undefined {
     case 'pending':
       return 'Waiting for Trusted Server creative evidence';
     case 'not_applicable':
+    case undefined:
       return undefined;
     default:
-      return undefined;
+      return unhandledCase(cycle.delivery);
   }
 }
 
@@ -159,7 +161,7 @@ function requestPathFact(cycle: GptDiagnosticsRequestCycle): string {
       return 'Request path: Competing paths';
     case 'unattributed':
       return 'Request path: Unattributed';
-    default:
+    case undefined:
       return 'Request path: Unknown (not observed)';
   }
 }
@@ -172,7 +174,7 @@ function trustedServerOpportunityFact(cycle: GptDiagnosticsRequestCycle): string
       return 'Direct opportunity: Unrenderable candidate';
     case 'no_candidate':
       return 'Direct opportunity: No candidate';
-    default:
+    case undefined:
       return 'Direct opportunity: Unknown (not observed)';
   }
 }
@@ -216,11 +218,13 @@ function responseClassFact(cycle: GptDiagnosticsRequestCycle): string | undefine
     case 'backfill':
       return 'Ad Manager response class: backfill';
     case 'reservation':
-      return 'Ad Manager reservation line item';
+      return 'Ad Manager response class: reservation';
     case 'unclassified_non_empty':
       return 'Ad Manager response class: unclassified non-empty';
-    default:
+    case undefined:
       return undefined;
+    default:
+      return unhandledCase(cycle.responseClass);
   }
 }
 

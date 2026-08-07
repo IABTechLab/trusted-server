@@ -371,7 +371,7 @@ type RefreshGptSlot = {
 
 function recordPrebidRefreshForDiagnostics(slots: RefreshGptSlot[]): void {
   try {
-    window.tsjs?.gptDiagnostics?.recordPrebidRefresh?.(slots);
+    window.tsjs?.gptDiagnosticsRecorder?.recordPrebidRefresh(slots);
   } catch {
     // Diagnostics must not suppress the GAM request.
   }

@@ -1579,7 +1579,7 @@ describe('prebid/installRefreshHandler', () => {
       pubads: () => pubads,
     };
     testWindow.tsjs = {
-      gptDiagnostics: {
+      gptDiagnosticsRecorder: {
         recordPrebidRefresh: (slots: object[]) => store.recordPrebidRefresh(slots),
       },
     };
@@ -1615,13 +1615,123 @@ describe('prebid/installRefreshHandler', () => {
 
     testWindow.tsjs = {
       adInitRefreshInProgress: true,
-      gptDiagnostics: {
+      gptDiagnosticsRecorder: {
         recordPrebidRefresh: (slots: object[]) => store.recordPrebidRefresh(slots),
       },
     };
     throwRefresh = false;
     expect(pubads.refresh([explicitSlot])).toBe('delegated refresh result');
     expect(store.snapshot().slots[0].requests[2].requestPath).toBe('unattributed');
+  });
+
+  it.each([
+    { order: 'diagnostics observer first', diagnosticsFirst: true, expectedPath: 'prebid_refresh' },
+    { order: 'Prebid wrapper first', diagnosticsFirst: false, expectedPath: 'competing' },
+  ])(
+    'attributes a Prebid-consumed refresh as $expectedPath when installed with the $order',
+    ({ diagnosticsFirst, expectedPath }) => {
+      const listeners = new Map<string, (event: { slot: object }) => void>();
+      const store = new GptDiagnosticsStore({ defer: () => undefined });
+      const slot = {
+        getSlotElementId: () => 'install-order',
+        getTargeting: () => [],
+        clearTargeting: vi.fn(),
+      };
+      const originalRefresh = vi.fn((slots?: unknown[]) => {
+        for (const refreshed of slots ?? []) listeners.get('slotRequested')?.({ slot: refreshed });
+        return 'delegated refresh result';
+      });
+      const pubads = {
+        addEventListener: vi.fn((name: string, listener: (event: { slot: object }) => void) => {
+          listeners.set(name, listener);
+        }),
+        refresh: originalRefresh as (slots?: unknown[], opts?: unknown) => unknown,
+        getSlots: vi.fn(() => [slot]),
+      };
+      testWindow.googletag = {
+        cmd: { push: (fn: () => void) => fn() },
+        pubads: () => pubads,
+      };
+      testWindow.tsjs = {
+        gptDiagnosticsRecorder: {
+          recordPrebidRefresh: (slots: object[]) => store.recordPrebidRefresh(slots),
+        },
+      };
+
+      // Only the bundle evaluation order enforces this today, so pin both
+      // outcomes: the diagnostics wrapper must sit inside the Prebid one to see
+      // the dispatch context that marks a refresh as Prebid's.
+      if (diagnosticsFirst) {
+        new GptDiagnosticsObserver(store).install();
+        installRefreshHandler(750);
+      } else {
+        installRefreshHandler(750);
+        new GptDiagnosticsObserver(store).install();
+      }
+      const pbjs = installPrebidNpm();
+      mockRequestBids.mockImplementationOnce((options) => options.bidsBackHandler?.());
+      pbjs.requestBids({
+        adUnits: [{ code: 'install-order', bids: [{ bidder: 'exampleServer', params: {} }] }],
+        bidsBackHandler: vi.fn(),
+      } as unknown as RequestBidsArg);
+
+      pubads.refresh([slot]);
+
+      expect(store.snapshot().slots[0].requests[0].requestPath).toBe(expectedPath);
+    }
+  );
+
+  it('keeps the outer dispatch context set across a nested Prebid refresh', () => {
+    const store = new GptDiagnosticsStore({ defer: () => undefined });
+    const slot = {
+      getSlotElementId: () => 'nested-reentrant',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const contextAfterInner: Array<boolean | undefined> = [];
+    let reentered = false;
+    const originalRefresh = vi.fn(() => {
+      if (!reentered) {
+        reentered = true;
+        pubads.refresh([slot]);
+        contextAfterInner.push(
+          (testWindow.tsjs as { prebidRefreshDispatchInProgress?: boolean })
+            .prebidRefreshDispatchInProgress
+        );
+      }
+      return 'delegated refresh result';
+    });
+    const pubads = {
+      refresh: originalRefresh as (slots?: unknown[], opts?: unknown) => unknown,
+      getSlots: vi.fn(() => [slot]),
+    };
+    testWindow.googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    testWindow.tsjs = {
+      gptDiagnosticsRecorder: {
+        recordPrebidRefresh: (slots: object[]) => store.recordPrebidRefresh(slots),
+      },
+    };
+
+    const pbjs = installPrebidNpm();
+    installRefreshHandler(750);
+    mockRequestBids.mockImplementation((options) => options.bidsBackHandler?.());
+    pbjs.requestBids({
+      adUnits: [{ code: 'nested-reentrant', bids: [{ bidder: 'exampleServer', params: {} }] }],
+      bidsBackHandler: vi.fn(),
+    } as unknown as RequestBidsArg);
+
+    expect(pubads.refresh([slot])).toBe('delegated refresh result');
+    // The inner dispatch owns the flag while it runs and must hand it back, or
+    // the observer would stop attributing every later publisher refresh.
+    expect(contextAfterInner).toEqual([true]);
+    expect(
+      originalRefresh,
+      'the nested refresh must reach the delegated call'
+    ).toHaveBeenCalledTimes(2);
+    expect(Object.hasOwn(testWindow.tsjs as object, 'prebidRefreshDispatchInProgress')).toBe(false);
   });
 
   it('restores diagnostics context when its setter mutates and then throws', () => {
@@ -1758,7 +1868,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     implementation?: (slots: Array<Record<string, unknown>>) => void
   ) {
     const recordPrebidRefresh = vi.fn(implementation);
-    testWindow.tsjs = { gptDiagnostics: { recordPrebidRefresh } };
+    testWindow.tsjs = { gptDiagnosticsRecorder: { recordPrebidRefresh } };
     return recordPrebidRefresh;
   }
 
@@ -1945,7 +2055,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     const recordPrebidRefresh = vi.fn();
     testWindow.tsjs = {
       adInitRefreshInProgress: true,
-      gptDiagnostics: { recordPrebidRefresh },
+      gptDiagnosticsRecorder: { recordPrebidRefresh },
     };
     const { originalRefresh, pubads } = installGpt([slot]);
 

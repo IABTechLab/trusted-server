@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   GptDiagnosticsObserver,
   type GptDiagnosticsObserverStore,
+  type GptObserverWindow,
 } from '../../../src/integrations/gpt_diagnostics/observer';
 import type { GptDiagnosticsSlotLike } from '../../../src/integrations/gpt_diagnostics/store';
 
@@ -148,19 +149,36 @@ describe('GptDiagnosticsObserver', () => {
 
     expect(gpt.pubads.refresh()).toEqual({ receiver: gpt.pubads, args: [] });
     expect(store.recordPublisherRefresh).toHaveBeenLastCalledWith([slot, secondSlot]);
+
+    // GPT treats an omitted, undefined, or null slot list as "refresh all", and
+    // `refresh(null, opts)` is the documented way to pass options while doing so.
     expect(gpt.pubads.refresh(undefined)).toEqual({ receiver: gpt.pubads, args: [undefined] });
-    expect(store.recordPublisherRefresh).toHaveBeenCalledTimes(1);
+    expect(gpt.pubads.refresh(null, { changeCorrelator: false })).toEqual({
+      receiver: gpt.pubads,
+      args: [null, { changeCorrelator: false }],
+    });
+    expect(store.recordPublisherRefresh).toHaveBeenCalledTimes(3);
+    expect(store.recordPublisherRefresh).toHaveBeenLastCalledWith([slot, secondSlot]);
+
     getSlots.mockImplementationOnce(() => {
       throw new Error('getSlots failure');
     });
     expect(gpt.pubads.refresh()).toEqual({ receiver: gpt.pubads, args: [] });
     expect(() => gpt.pubads.refresh('throw')).toThrow('refresh failure');
+    expect(
+      store.recordPublisherRefresh,
+      'a failed slot lookup records nothing'
+    ).toHaveBeenCalledTimes(3);
+
     (
       observer as unknown as { window: { tsjs: { prebidRefreshDispatchInProgress?: boolean } } }
     ).window.tsjs.prebidRefreshDispatchInProgress = true;
     gpt.pubads.refresh([slot]);
-    expect(store.recordPublisherRefresh).toHaveBeenCalledTimes(1);
-    expect(originalRefresh).toHaveBeenCalledTimes(5);
+    expect(
+      store.recordPublisherRefresh,
+      'a Prebid-delegated refresh is not publisher intent'
+    ).toHaveBeenCalledTimes(3);
+    expect(originalRefresh).toHaveBeenCalledTimes(6);
   });
 
   it('delegates when the shared diagnostics context accessor throws', () => {
@@ -170,10 +188,7 @@ describe('GptDiagnosticsObserver', () => {
     const originalRefresh = vi.fn(() => 'delegated');
     gpt.pubads.refresh = originalRefresh;
     Object.assign(gpt.pubads, { getSlots: () => [slot] });
-    const target = { googletag: gpt.googletag } as {
-      googletag: typeof gpt.googletag;
-      tsjs?: unknown;
-    };
+    const target = { googletag: gpt.googletag } as unknown as GptObserverWindow;
     Object.defineProperty(target, 'tsjs', {
       get: () => {
         throw new Error('context unavailable');

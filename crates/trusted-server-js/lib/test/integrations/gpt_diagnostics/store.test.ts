@@ -8,6 +8,7 @@ import {
   MAX_CREATIVE_ATTEMPTS,
   MAX_DIAGNOSTIC_SLOTS,
   MAX_REQUEST_CYCLES_PER_SLOT,
+  MAX_TRUSTED_SERVER_ASSOCIATIONS,
   REQUEST_PATH_ATTRIBUTION_WINDOW_MS,
   TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS,
   type GptDiagnosticsSlotLike,
@@ -619,7 +620,6 @@ describe('GptDiagnosticsStore', () => {
       const cycle = store.snapshot().slots[0].requests[0];
       expect(cycle.requestPath).toBe(expectedPath);
       expect(cycle.trustedServerOpportunity).toBe(expectedOpportunity);
-      expect(JSON.stringify(store.snapshot())).not.toContain('other_demand');
     }
   );
 
@@ -681,7 +681,7 @@ describe('GptDiagnosticsStore', () => {
       { requestPath: 'unattributed' },
     ]);
     expect(cycles[1].requestIntentId).toBeUndefined();
-    expect(deferred).toHaveLength(3);
+    expect(deferred, 'source evidence must not schedule deferred work').toHaveLength(0);
   });
 
   it('keeps repeated source evidence single-source and increments consumed intent IDs', () => {
@@ -708,68 +708,56 @@ describe('GptDiagnosticsStore', () => {
     });
   });
 
-  it('coalesces repeated-source expiry work and expires the latest evidence', () => {
+  it('expires repeated source evidence lazily without scheduling timer work', () => {
     let now = 0;
     const deferred: Array<{ callback: () => void; delayMs: number }> = [];
     const store = new GptDiagnosticsStore({
       now: () => now,
       defer: (callback, delayMs) => deferred.push({ callback, delayMs }),
     });
-    const consumed = fakeSlot('coalesced-expiry-consumed');
-    const expired = fakeSlot('coalesced-expiry-expired');
+    const consumed = fakeSlot('lazy-expiry-consumed');
+    const expired = fakeSlot('lazy-expiry-expired');
 
     for (let observation = 0; observation < 1_000; observation += 1) {
       now = observation;
       store.recordPublisherRefresh([consumed, expired]);
     }
 
-    expect(deferred, 'should keep one outstanding expiry per slot and source').toHaveLength(2);
+    expect(deferred, 'a refresh burst must not queue deferred work').toHaveLength(0);
 
-    now = REQUEST_PATH_ATTRIBUTION_WINDOW_MS;
-    deferred.shift()?.callback();
-    deferred.shift()?.callback();
-    expect(deferred).toMatchObject([{ delayMs: 999 }, { delayMs: 999 }]);
-
-    now = REQUEST_PATH_ATTRIBUTION_WINDOW_MS + 998;
+    // The window runs from the newest observation, at t = 999.
+    now = 999 + REQUEST_PATH_ATTRIBUTION_WINDOW_MS - 1;
     store.recordSlotRequested(consumed);
     now += 1;
-    deferred.shift()?.callback();
-    deferred.shift()?.callback();
     store.recordSlotRequested(expired);
 
     expect(store.snapshot().slots[0].requests[0].requestPath).toBe('publisher_refresh');
     expect(store.snapshot().slots[1].requests[0].requestPath).toBe('unattributed');
+    expect(deferred, 'expiry must stay free of deferred work').toHaveLength(0);
   });
 
-  it('coalesces and expires repeated-source work when WeakRef is unavailable', () => {
-    const weakRefGlobal = globalThis as unknown as Record<string, unknown>;
-    const previousWeakRef = weakRefGlobal.WeakRef;
-    weakRefGlobal.WeakRef = undefined;
-    try {
-      let now = 0;
-      const deferred: Array<{ callback: () => void; delayMs: number }> = [];
-      const store = new GptDiagnosticsStore({
-        now: () => now,
-        defer: (callback, delayMs) => deferred.push({ callback, delayMs }),
-      });
-      const slot = fakeSlot('coalesced-expiry-without-weak-ref');
+  it('replaces a fully expired intent instead of reviving its intent ID', () => {
+    let now = 0;
+    const deferred: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({
+      now: () => now,
+      defer: (callback) => deferred.push(callback),
+    });
+    const slot = fakeSlot('expired-intent-replacement');
 
-      for (let observation = 0; observation < 1_000; observation += 1) {
-        now = observation;
-        store.recordPublisherRefresh([slot]);
-      }
+    store.recordTrustedServerOpportunity(slot, 'auction-slot', 'renderable_candidate', 'stale');
+    now = REQUEST_PATH_ATTRIBUTION_WINDOW_MS;
+    store.recordPublisherRefresh([slot]);
+    store.recordSlotRequested(slot);
 
-      expect(deferred).toMatchObject([{ delayMs: REQUEST_PATH_ATTRIBUTION_WINDOW_MS }]);
-
-      now += REQUEST_PATH_ATTRIBUTION_WINDOW_MS;
-      deferred.shift()?.callback();
-      store.recordSlotRequested(slot);
-
-      expect(deferred).toHaveLength(0);
-      expect(store.snapshot().slots[0].requests[0].requestPath).toBe('unattributed');
-    } finally {
-      weakRefGlobal.WeakRef = previousWeakRef;
-    }
+    const cycle = store.snapshot().slots[0].requests[0];
+    expect(cycle).toMatchObject({ requestPath: 'publisher_refresh', requestIntentId: 2 });
+    expect(
+      cycle.trustedServerOpportunity,
+      'expired direct evidence must not survive'
+    ).toBeUndefined();
+    expect(cycle.trustedServerAuctionId).toBeUndefined();
+    expect(deferred).toHaveLength(0);
   });
 
   it('derives a replacement from the most recent earlier filled render', () => {
@@ -892,14 +880,31 @@ describe('GptDiagnosticsStore', () => {
     store.recordSlotRequested(slot);
     now += 1;
     store.recordSlotRenderEnded(slot, { isEmpty: false, adManager: { creativeId: 101 } });
+    // Complete every filler cycle so the eviction pushes the only filled render
+    // out of retention and the final render still matches exactly one cycle.
     for (let index = 0; index < MAX_REQUEST_CYCLES_PER_SLOT; index += 1) {
       now += 1;
       store.recordSlotRequested(slot);
+      now += 1;
+      store.recordSlotResponseReceived(slot);
+      now += 1;
+      store.recordSlotRenderEnded(slot, { isEmpty: true });
     }
+    now += 1;
+    store.recordSlotRequested(slot);
+    now += 1;
+    store.recordSlotResponseReceived(slot);
     now += 1;
     store.recordSlotRenderEnded(slot, { isEmpty: false, adManager: { creativeId: 202 } });
 
-    const latestCycle = last(store.snapshot().slots[0].requests)!;
+    const requests = store.snapshot().slots[0].requests;
+    expect(
+      requests.some((cycle) => cycle.adManager?.creativeId === 101),
+      'the earlier filled cycle should have been evicted'
+    ).toBe(false);
+    const latestCycle = last(requests)!;
+    expect(latestCycle.renderAtMs, 'the final render must have been matched').toBeDefined();
+    expect(latestCycle.adManager?.creativeId).toBe(202);
     expect(latestCycle.replacedRequestNumber).toBeUndefined();
     expect(latestCycle.previousRenderToRequestMs).toBeUndefined();
     expect(latestCycle.previousCreativeId).toBeUndefined();
@@ -959,34 +964,31 @@ describe('GptDiagnosticsStore', () => {
     });
     expect(expired).toMatchObject({ requestPath: 'unattributed' });
     expect(expired.trustedServerOpportunity).toBeUndefined();
-    expect(deferred, 'should not need to run marker timers to enforce the boundary').toHaveLength(
-      4
-    );
+    expect(deferred, 'the boundary must be enforced without marker timers').toHaveLength(0);
   });
 
-  it('does not let delayed expiry callbacks delete newer marker generations', () => {
+  it('keeps the newest evidence when a source is re-observed inside the window', () => {
     let now = 0;
     const deferred: Array<() => void> = [];
     const store = new GptDiagnosticsStore({
       now: () => now,
       defer: (callback) => deferred.push(callback),
     });
-    const slot = fakeSlot('marker-generation');
+    const slot = fakeSlot('re-observed-source');
 
     store.recordTrustedServerOpportunity(slot, 'auction-slot', 'renderable_candidate');
     store.recordPrebidRefresh([slot]);
     now = 100;
     store.recordTrustedServerOpportunity(slot, 'auction-slot', 'unrenderable_candidate');
     store.recordPrebidRefresh([slot]);
-
-    deferred[0]();
-    deferred[1]();
     store.recordSlotRequested(slot);
 
     expect(store.snapshot().slots[0].requests[0]).toMatchObject({
       requestPath: 'competing',
+      requestIntentId: 1,
       trustedServerOpportunity: 'unrenderable_candidate',
     });
+    expect(deferred).toHaveLength(0);
   });
 
   it('expires sources independently and replaces Trusted Server auction metadata', () => {
@@ -1002,9 +1004,7 @@ describe('GptDiagnosticsStore', () => {
     store.recordPrebidRefresh([slot]);
     now = 2;
     store.recordTrustedServerOpportunity(slot, 'auction-slot', 'no_candidate');
-    deferred[0]();
     now = REQUEST_PATH_ATTRIBUTION_WINDOW_MS + 1;
-    deferred[1]();
     store.recordSlotRequested(slot);
 
     expect(store.snapshot().slots[0].requests[0]).toMatchObject({
@@ -1039,7 +1039,6 @@ describe('GptDiagnosticsStore', () => {
     now = 60;
     store.recordTrustedServerOpportunity(unconsumed, 'other-auction-slot', 'no_candidate');
     now += REQUEST_PATH_ATTRIBUTION_WINDOW_MS;
-    deferred[1]();
     store.recordSlotRequested(unconsumed);
 
     const unconsumedCycle = store.snapshot().slots[1].requests[0];
@@ -1125,8 +1124,7 @@ describe('GptDiagnosticsStore', () => {
 
       store.recordTrustedServerOpportunity(slot, 'auction-slot', opportunity);
       store.recordSlotRequested(slot);
-      expect(deferred).toHaveLength(1);
-      deferred.shift()!.callback();
+      expect(deferred, 'recording intent must not defer work').toHaveLength(0);
       listener.mockClear();
 
       now = 30;
@@ -1213,8 +1211,22 @@ describe('GptDiagnosticsStore', () => {
     },
     {
       name: 'an explicit reservation',
-      facts: { isEmpty: false, adManager: { sourceAgnosticLineItemId: 123 } },
+      facts: { isEmpty: false, adManager: { lineItemId: 123 } },
       expected: 'reservation',
+    },
+    {
+      name: 'a source-agnostic identity confirmed as non-backfill',
+      facts: {
+        isEmpty: false,
+        isBackfill: false,
+        adManager: { sourceAgnosticLineItemId: 123 },
+      },
+      expected: 'reservation',
+    },
+    {
+      name: 'a source-agnostic identity without a backfill fact',
+      facts: { isEmpty: false, adManager: { sourceAgnosticLineItemId: 123 } },
+      expected: 'unclassified_non_empty',
     },
     {
       name: 'an otherwise unclassified non-empty render',
@@ -1441,6 +1453,16 @@ describe('GptDiagnosticsStore', () => {
         slotElementId: 'provisional-empty',
       }),
     ]);
+
+    // The attempt is dead once its cycle rendered empty, so a late response
+    // cannot claim a Trusted Server delivery against that empty render.
+    store.recordTrustedServerCreativeResponse(attemptId!);
+    const cycle = store.snapshot().slots[0].requests[0];
+    expect(cycle.trustedServerCreativeResponseAtMs).toBeUndefined();
+    expect(cycle.delivery, 'an empty cycle must not report a markup response').toBe(
+      'trusted_server_selected'
+    );
+    expect(last(store.snapshot().attributionIssues)?.reason).toBe('creative_attempt_evicted');
   });
 
   it('preserves provisional evidence when the render omits isEmpty', () => {
@@ -1819,5 +1841,149 @@ describe('GptDiagnosticsStore', () => {
     const second = store.snapshot();
     expect(second.slots[0].requests[0].requestNumber).toBe(1);
     expect(second.coverage.slotRequested.matched).toBe(1);
+  });
+  it('ignores malformed publisher refresh inputs without recording intent', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+    const slot = fakeSlot('publisher-refresh-malformed');
+
+    expect(() => store.recordPublisherRefresh(null as never)).not.toThrow();
+    expect(() => store.recordPublisherRefresh('slots' as never)).not.toThrow();
+    expect(() => store.recordPublisherRefresh([null, 7, undefined, slot] as never)).not.toThrow();
+
+    store.recordSlotRequested(slot);
+    expect(store.snapshot().slots[0].requests[0].requestPath).toBe('publisher_refresh');
+    expect(store.snapshot().slots).toHaveLength(1);
+  });
+
+  it('trims the oldest auction-slot association beyond the retention bound', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+    const oldest = fakeSlot('association-oldest');
+    associateSlot(store, oldest, 'auction-oldest');
+    for (let index = 0; index < MAX_TRUSTED_SERVER_ASSOCIATIONS; index += 1) {
+      associateSlot(store, fakeSlot(`association-${index}`), `auction-${index}`);
+    }
+    store.recordSlotRequested(oldest);
+
+    expect(store.recordTrustedServerCreativeRequest('auction-oldest')).toBeUndefined();
+    expect(last(store.snapshot().attributionIssues)?.reason).toBe('creative_request_without_slot');
+    expect(store.recordTrustedServerCreativeRequest('auction-0')).toBeUndefined();
+    expect(last(store.snapshot().attributionIssues)?.reason).toBe('creative_request_without_cycle');
+  });
+
+  it.each([
+    {
+      name: 'a render that precedes its response',
+      kind: 'slotRenderEnded',
+      record: (store: GptDiagnosticsStore, slot: GptDiagnosticsSlotLike) =>
+        store.recordSlotRenderEnded(slot, { isEmpty: false }),
+      arrange: (store: GptDiagnosticsStore, slot: GptDiagnosticsSlotLike) =>
+        store.recordSlotResponseReceived(slot),
+    },
+    {
+      name: 'a load that precedes its render',
+      kind: 'slotOnload',
+      record: (store: GptDiagnosticsStore, slot: GptDiagnosticsSlotLike) =>
+        store.recordSlotOnload(slot),
+      arrange: (store: GptDiagnosticsStore, slot: GptDiagnosticsSlotLike) => {
+        store.recordSlotResponseReceived(slot);
+        store.recordSlotRenderEnded(slot, { isEmpty: false });
+      },
+    },
+    {
+      name: 'a viewable impression that precedes its render',
+      kind: 'impressionViewable',
+      record: (store: GptDiagnosticsStore, slot: GptDiagnosticsSlotLike) =>
+        store.recordImpressionViewable(slot),
+      arrange: (store: GptDiagnosticsStore, slot: GptDiagnosticsSlotLike) => {
+        store.recordSlotResponseReceived(slot);
+        store.recordSlotRenderEnded(slot, { isEmpty: false });
+      },
+    },
+  ])('reports $name as an invalid event order', ({ kind, record, arrange }) => {
+    let now = 100;
+    const store = new GptDiagnosticsStore({ now: () => now, defer: () => undefined });
+    const slot = fakeSlot(`out-of-order-${kind}`);
+
+    store.recordSlotRequested(slot);
+    arrange(store, slot);
+    // A backwards clock is the only way GPT can report a later callback with an
+    // earlier timestamp; diagnostics record the contradiction rather than hide it.
+    now = 1;
+    record(store, slot);
+
+    expect(store.snapshot().slots[0].requests[0].incompleteSequence).toBe(true);
+    expect(store.snapshot().callbackIssues).toContainEqual(
+      expect.objectContaining({ kind, disposition: 'matched', reason: 'invalid_event_order' })
+    );
+    assertCoverageEquation(store);
+  });
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY])(
+    'rejects the non-finite visibility percentage %s',
+    (percentage) => {
+      const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+      const slot = fakeSlot('visibility-non-finite');
+
+      store.recordSlotRequested(slot);
+      store.recordSlotVisibilityChanged(slot, percentage);
+
+      const snapshot = store.snapshot();
+      expect(snapshot.slots[0].currentVisibilityPercentage).toBeUndefined();
+      expect(snapshot.slots[0].maximumVisibilityPercentage).toBeUndefined();
+      expect(snapshot.callbackIssues).toContainEqual(
+        expect.objectContaining({
+          kind: 'slotVisibilityChanged',
+          disposition: 'unmatched',
+          reason: 'invalid_visibility_percentage',
+        })
+      );
+      assertCoverageEquation(store);
+    }
+  );
+
+  it('reports an unknown attempt ID for a creative failure without recording one', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+    const slot = fakeSlot('failure-unknown-attempt');
+    associateSlot(store, slot, 'auction-failure-unknown');
+    store.recordSlotRequested(slot);
+
+    store.recordTrustedServerCreativeFailure(4242, 'cache_fetch_failed');
+
+    expect(store.snapshot().slots[0].requests[0].trustedServerCreativeFailures).toBeUndefined();
+    expect(last(store.snapshot().attributionIssues)?.reason).toBe('creative_attempt_unknown');
+  });
+
+  it('keeps one outstanding delivery-boundary timer across a refresh burst', () => {
+    let now = 0;
+    const deferred: Array<{ callback: () => void; delayMs: number }> = [];
+    const store = new GptDiagnosticsStore({
+      now: () => now,
+      schedule: (callback) => callback(),
+      defer: (callback, delayMs) => deferred.push({ callback, delayMs }),
+    });
+    const slots = Array.from({ length: 8 }, (_, index) => fakeSlot(`burst-${index}`));
+
+    for (const [index, slot] of slots.entries()) {
+      now = index;
+      store.recordTrustedServerOpportunity(slot, `burst-auction-${index}`, 'renderable_candidate');
+      store.recordSlotRequested(slot);
+      store.recordSlotRenderEnded(slot, { isEmpty: false });
+    }
+
+    expect(deferred, 'a burst of candidate renders must share one timer').toMatchObject([
+      { delayMs: TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS },
+    ]);
+
+    // Firing at the earliest deadline re-arms once for the next one, never per render.
+    now = TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS;
+    deferred.shift()!.callback();
+    expect(deferred).toMatchObject([{ delayMs: 1 }]);
+
+    now = 7 + TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS;
+    deferred.shift()!.callback();
+    expect(deferred, 'no boundary remains once every candidate crossed it').toHaveLength(0);
+    for (const slot of store.snapshot().slots) {
+      expect(slot.requests[0].delivery).toBe('candidate_unconfirmed');
+    }
   });
 });

@@ -5,8 +5,11 @@ import type {
   GptDiagnosticsAttributionIssue,
   GptDiagnosticsAttributionIssueReason,
   GptDiagnosticsExportV1,
+  GptDiagnosticsRecorder,
   GptDiagnosticsRequestCycle,
+  GptDiagnosticsRequestPath,
   GptDiagnosticsSlotExport,
+  TsjsApi,
 } from '../../../src/core/types';
 
 describe('GPT diagnostics public types', () => {
@@ -18,6 +21,7 @@ describe('GPT diagnostics public types', () => {
         page: { origin: 'https://example.com', pathname: '/' },
         slots: [],
         callbackIssues: [],
+        attributionIssues: [],
         coverage: {
           slotRequested: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
           slotResponseReceived: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
@@ -26,7 +30,12 @@ describe('GPT diagnostics public types', () => {
           impressionViewable: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
           slotVisibilityChanged: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
         },
-        metadata: { droppedCallbacks: 0, evictedSlots: 0, evictedRequestCycles: 0 },
+        metadata: {
+          droppedCallbacks: 0,
+          droppedAttributionIssues: 0,
+          evictedSlots: 0,
+          evictedRequestCycles: 0,
+        },
       }),
       export: () => undefined,
       subscribe: () => () => undefined,
@@ -35,6 +44,23 @@ describe('GPT diagnostics public types', () => {
     };
 
     expectTypeOf(readOnlyApi).toEqualTypeOf<GptDiagnosticsApi>();
+  });
+
+  it('keeps evidence writers off the operator API and on the internal channel', () => {
+    expectTypeOf<keyof GptDiagnosticsApi>().toEqualTypeOf<
+      'snapshot' | 'export' | 'subscribe' | 'show' | 'hide'
+    >();
+    expectTypeOf<keyof GptDiagnosticsRecorder>().toEqualTypeOf<
+      | 'recordTrustedServerOpportunity'
+      | 'recordPrebidRefresh'
+      | 'recordTrustedServerCreativeRequest'
+      | 'recordTrustedServerCreativeResponse'
+      | 'recordTrustedServerCreativeFailure'
+    >();
+    expectTypeOf<TsjsApi['gptDiagnostics']>().toEqualTypeOf<GptDiagnosticsApi | undefined>();
+    expectTypeOf<TsjsApi['gptDiagnosticsRecorder']>().toEqualTypeOf<
+      GptDiagnosticsRecorder | undefined
+    >();
   });
 
   it('represents the versioned allowlist schema', () => {
@@ -62,6 +88,7 @@ describe('GPT diagnostics public types', () => {
       },
       slots: [slot],
       callbackIssues: [],
+      attributionIssues: [],
       coverage: {
         slotRequested: { observed: 1, matched: 1, unmatched: 0, ambiguous: 0 },
         slotResponseReceived: { observed: 1, matched: 1, unmatched: 0, ambiguous: 0 },
@@ -72,6 +99,7 @@ describe('GPT diagnostics public types', () => {
       },
       metadata: {
         droppedCallbacks: 0,
+        droppedAttributionIssues: 0,
         evictedSlots: 0,
         evictedRequestCycles: 0,
       },
@@ -82,7 +110,7 @@ describe('GPT diagnostics public types', () => {
       incompleteSequence: false,
       requestPath: 'publisher_refresh',
       requestIntentId: 7,
-      trustedServerAuctionId: 'auction-123',
+      trustedServerAuctionId: 'ts-auc-example',
       opportunityToRequestMs: 24,
       replacedRequestNumber: 1,
       previousRenderToRequestMs: 6048,
@@ -100,16 +128,6 @@ describe('GPT diagnostics public types', () => {
       runtimeSlotNumber: 1,
       slotElementId: 'ad-slot-example',
     };
-    const issueReasons: GptDiagnosticsAttributionIssueReason[] = [
-      'creative_request_without_slot',
-      'creative_request_without_cycle',
-      'creative_request_ambiguous_cycle',
-      'creative_request_on_empty_cycle',
-      'creative_attempt_capacity',
-      'creative_attempt_unknown',
-      'creative_attempt_expired',
-      'creative_attempt_evicted',
-    ];
     const evidenceSnapshot: GptDiagnosticsExportV1 = {
       ...snapshot,
       slots: [{ ...slot, requests: [evidenceCycle] }],
@@ -120,21 +138,29 @@ describe('GPT diagnostics public types', () => {
       },
     };
 
-    expect(snapshot.version).toBe(1);
-    expect(evidenceSnapshot.slots[0]?.requests[0]).toBe(evidenceCycle);
-    expect(evidenceSnapshot.attributionIssues?.[0]).toBe(issue);
-    expect(issueReasons).toHaveLength(8);
-    expect(JSON.stringify(snapshot)).not.toContain('requestIntentId');
-    expect(JSON.stringify(snapshot)).not.toContain('trustedServerAuctionId');
-    expectTypeOf(evidenceCycle.requestPath).toEqualTypeOf<'publisher_refresh' | undefined>();
-    expectTypeOf(evidenceCycle.requestIntentId).toEqualTypeOf<number | undefined>();
-    expectTypeOf(evidenceCycle.trustedServerAuctionId).toEqualTypeOf<string | undefined>();
     expect(JSON.stringify(snapshot)).not.toMatch(
       /bidder|targeting|creativeMarkup|auction|userId|cookie/i
     );
     expect(JSON.stringify(evidenceSnapshot)).not.toMatch(
       /price|targeting|bidId|markup|cacheUrl|payload|userId|cookie/i
     );
+    expectTypeOf(evidenceCycle.requestPath).toEqualTypeOf<GptDiagnosticsRequestPath | undefined>();
+    expectTypeOf(evidenceCycle.requestIntentId).toEqualTypeOf<number | undefined>();
+    expectTypeOf(evidenceCycle.trustedServerAuctionId).toEqualTypeOf<string | undefined>();
+    expectTypeOf(evidenceSnapshot.attributionIssues).toEqualTypeOf<
+      GptDiagnosticsAttributionIssue[]
+    >();
+    expectTypeOf(evidenceSnapshot.metadata.droppedAttributionIssues).toEqualTypeOf<number>();
+    expectTypeOf<GptDiagnosticsAttributionIssueReason>().toEqualTypeOf<
+      | 'creative_request_without_slot'
+      | 'creative_request_without_cycle'
+      | 'creative_request_ambiguous_cycle'
+      | 'creative_request_on_empty_cycle'
+      | 'creative_attempt_capacity'
+      | 'creative_attempt_unknown'
+      | 'creative_attempt_expired'
+      | 'creative_attempt_evicted'
+    >();
     expectTypeOf(snapshot).toEqualTypeOf<GptDiagnosticsExportV1>();
     expectTypeOf<GptDiagnosticsSlotExport>().not.toHaveProperty('bidder');
     expectTypeOf<GptDiagnosticsSlotExport>().not.toHaveProperty('targeting');

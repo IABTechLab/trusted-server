@@ -253,7 +253,10 @@ export class GptDiagnosticsObserver {
             observerWindow.tsjs?.prebidRefreshDispatchInProgress
           )
         ) {
-          const rawSlots = args.length === 0 ? pubads.getSlots?.() : args[0];
+          // GPT treats a missing or null `slots` argument as "refresh every
+          // slot", and `refresh(null, opts)` is the documented way to pass
+          // options while doing so.
+          const rawSlots = args.length === 0 || args[0] == null ? pubads.getSlots?.() : args[0];
           const slots = Array.isArray(rawSlots)
             ? rawSlots.filter(
                 (slot): slot is GptDiagnosticsSlotLike => typeof slot === 'object' && slot !== null

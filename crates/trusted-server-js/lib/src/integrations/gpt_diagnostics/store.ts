@@ -12,6 +12,7 @@ import type {
   GptDiagnosticsRequestCycle,
   GptDiagnosticsRequestPath,
   GptDiagnosticsResponseClass,
+  GptDiagnosticsSlotHandle,
   GptDiagnosticsTrustedServerOpportunity,
   Size,
 } from '../../core/types';
@@ -39,10 +40,11 @@ const CALLBACK_KINDS: GptDiagnosticsCallbackKind[] = [
   'slotVisibilityChanged',
 ];
 
-export interface GptDiagnosticsSlotLike {
-  getSlotElementId?(): string;
-  getAdUnitPath?(): string;
-}
+/**
+ * The GPT slot shape diagnostics reads. Aliased to the exported handle type so
+ * the writer signatures and the store implementation cannot drift apart.
+ */
+export type GptDiagnosticsSlotLike = GptDiagnosticsSlotHandle;
 
 export interface GptRenderFacts {
   isEmpty?: boolean;
@@ -101,15 +103,9 @@ interface StoreOptions {
 type RequestIntentSource = 'trusted_server_direct' | 'prebid_refresh' | 'publisher_refresh';
 
 interface PendingSourceEvidence {
-  generation: number;
   observedAtMs: number;
-  expiryScheduled: boolean;
   trustedServerOpportunity?: GptDiagnosticsTrustedServerOpportunity;
   trustedServerAuctionId?: string;
-}
-
-interface WeakSlotReference {
-  deref(): object | undefined;
 }
 
 interface PendingRequestIntent {
@@ -214,11 +210,23 @@ function responseClass(cycle: MutableRequestCycle): GptDiagnosticsResponseClass 
   if (cycle.isEmpty === true) return 'empty';
   if (cycle.isEmpty !== false) return undefined;
   if (cycle.isBackfill === true) return 'backfill';
-  return cycle.adManager?.lineItemId !== undefined ||
-    cycle.adManager?.creativeId !== undefined ||
-    cycle.adManager?.sourceAgnosticLineItemId !== undefined
-    ? 'reservation'
-    : 'unclassified_non_empty';
+
+  const identity = cycle.adManager;
+  // Reservation-specific IDs are absent on backfill, so their presence is
+  // direct evidence of a reservation line item.
+  if (identity?.lineItemId !== undefined || identity?.creativeId !== undefined) {
+    return 'reservation';
+  }
+  // Source-agnostic IDs are populated for reservation and backfill alike, so
+  // they prove a reservation only alongside an explicit non-backfill fact.
+  if (
+    cycle.isBackfill === false &&
+    (identity?.sourceAgnosticLineItemId !== undefined ||
+      identity?.sourceAgnosticCreativeId !== undefined)
+  ) {
+    return 'reservation';
+  }
+  return 'unclassified_non_empty';
 }
 
 /** Resolve delivery state from positive observations without guessing ownership. */
@@ -285,9 +293,9 @@ export class GptDiagnosticsStore {
   };
   private nextRuntimeSlotNumber = 1;
   private nextRequestIntentId = 1;
-  private nextIntentSourceGeneration = 1;
   private nextCreativeAttemptId = 1;
   private notificationScheduled = false;
+  private deliveryBoundaryScheduled = false;
   private gptObserved = false;
 
   constructor(options: StoreOptions = {}) {
@@ -382,6 +390,9 @@ export class GptDiagnosticsStore {
         return undefined;
       }
       if (existingAttempt.status === 'live') return existingAttempt.id;
+      // Defensive: a completed attempt always stamped the response timestamp on
+      // this same cycle, so the check above returns first. Unreachable today,
+      // kept so a future lifecycle change cannot fall through to an issue.
       if (existingAttempt.status === 'completed') return undefined;
 
       this.reportAttributionIssue(
@@ -393,6 +404,10 @@ export class GptDiagnosticsStore {
       );
       return undefined;
     }
+    // Defensive: a response timestamp is only ever written through an attempt,
+    // which leaves an entry in `attemptIdsByCycle` and so takes the branch
+    // above. Unreachable today, kept so no cycle can be re-attempted after a
+    // response was already recorded against it.
     if (cycle.trustedServerCreativeResponseAtMs !== undefined) return undefined;
 
     const retainedCreativeRequestAtMs = cycle.trustedServerCreativeRequestAtMs;
@@ -620,6 +635,10 @@ export class GptDiagnosticsStore {
 
         if (facts.isEmpty === true && provisionalCreativeRequest) {
           this.addAttributionIssue('creative_request_on_empty_cycle', timestampMs, record);
+          // The attempt was matched to a cycle GPT then reported empty, so it
+          // must not complete here and report a creative response against an
+          // empty render. The attribution issue above records why it stopped.
+          this.evictCreativeAttempt(cycle);
         }
 
         if (
@@ -627,7 +646,7 @@ export class GptDiagnosticsStore {
           (cycle.trustedServerOpportunity === 'renderable_candidate' ||
             cycle.trustedServerOpportunity === 'unrenderable_candidate')
         ) {
-          this.defer(() => this.notify(), TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS);
+          this.scheduleDeliveryBoundaryNotification();
         }
 
         if (cycle.responseAtMs === undefined) {
@@ -831,66 +850,41 @@ export class GptDiagnosticsStore {
     return false;
   }
 
+  /**
+   * Record one source's evidence for the slot's next GPT request.
+   *
+   * Evidence expires lazily — on the next recording for the same slot and on
+   * consumption — so retained intents never own a timer. Pending intents are
+   * keyed weakly by GPT slot object, which bounds them by the slots the page
+   * itself still holds.
+   */
   private recordRequestIntentSource(
     slot: object,
     source: RequestIntentSource,
     facts: Pick<PendingSourceEvidence, 'trustedServerOpportunity' | 'trustedServerAuctionId'> = {}
   ): void {
+    const observedAtMs = this.now();
     let intent = this.pendingRequestIntents.get(slot);
+    if (intent) {
+      this.expireRequestIntentSources(intent, observedAtMs);
+      // A fully expired intent is replaced rather than revived, so its intent
+      // ID cannot outlive the observation window it was issued for.
+      if (intent.sources.size === 0) intent = undefined;
+    }
     if (!intent) {
       intent = { intentId: this.nextRequestIntentId, sources: new Map() };
       this.nextRequestIntentId += 1;
       this.pendingRequestIntents.set(slot, intent);
     }
-    const generation = this.nextIntentSourceGeneration;
-    this.nextIntentSourceGeneration += 1;
-    const evidence: PendingSourceEvidence = {
-      generation,
-      observedAtMs: this.now(),
-      expiryScheduled: intent.sources.get(source)?.expiryScheduled ?? false,
-      ...facts,
-    };
-    intent.sources.set(source, evidence);
-    if (evidence.expiryScheduled) return;
-
-    const WeakRefConstructor = (
-      globalThis as typeof globalThis & {
-        WeakRef?: new (target: object) => WeakSlotReference;
-      }
-    ).WeakRef;
-    const slotReference = WeakRefConstructor ? new WeakRefConstructor(slot) : { deref: () => slot };
-
-    evidence.expiryScheduled = true;
-    this.scheduleRequestIntentSourceExpiry(
-      slotReference,
-      intent,
-      source,
-      REQUEST_PATH_ATTRIBUTION_WINDOW_MS
-    );
+    intent.sources.set(source, { observedAtMs, ...facts });
   }
 
-  private scheduleRequestIntentSourceExpiry(
-    slotReference: WeakSlotReference,
-    intent: PendingRequestIntent,
-    source: RequestIntentSource,
-    delayMs: number
-  ): void {
-    this.defer(() => {
-      const slot = slotReference.deref();
-      if (!slot) return;
-      const currentIntent = this.pendingRequestIntents.get(slot);
-      if (currentIntent !== intent) return;
-      const currentEvidence = currentIntent.sources.get(source);
-      if (!currentEvidence) return;
-      const remainingMs =
-        REQUEST_PATH_ATTRIBUTION_WINDOW_MS - (this.now() - currentEvidence.observedAtMs);
-      if (remainingMs > 0) {
-        this.scheduleRequestIntentSourceExpiry(slotReference, intent, source, remainingMs);
-        return;
+  private expireRequestIntentSources(intent: PendingRequestIntent, timestampMs: number): void {
+    for (const [source, evidence] of intent.sources) {
+      if (timestampMs - evidence.observedAtMs >= REQUEST_PATH_ATTRIBUTION_WINDOW_MS) {
+        intent.sources.delete(source);
       }
-      currentIntent.sources.delete(source);
-      if (currentIntent.sources.size === 0) this.pendingRequestIntents.delete(slot);
-    }, delayMs);
+    }
   }
 
   private consumeRequestIntent(
@@ -900,12 +894,52 @@ export class GptDiagnosticsStore {
     const intent = this.pendingRequestIntents.get(slot);
     this.pendingRequestIntents.delete(slot);
     if (!intent) return undefined;
-    for (const [source, evidence] of intent.sources) {
-      if (timestampMs - evidence.observedAtMs >= REQUEST_PATH_ATTRIBUTION_WINDOW_MS) {
-        intent.sources.delete(source);
+    this.expireRequestIntentSources(intent, timestampMs);
+    return intent.sources.size > 0 ? intent : undefined;
+  }
+
+  /**
+   * Keep at most one outstanding timer for the delivery-evidence boundary.
+   *
+   * Each candidate render flips from `pending` to `candidate_unconfirmed` once
+   * its window elapses, and subscribers need one notification per boundary. A
+   * single timer that re-arms from retained cycles bounds the timer queue by
+   * retained state instead of by refresh rate.
+   */
+  private scheduleDeliveryBoundaryNotification(
+    delayMs: number = TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS
+  ): void {
+    if (this.deliveryBoundaryScheduled) return;
+    this.deliveryBoundaryScheduled = true;
+    this.defer(() => {
+      this.deliveryBoundaryScheduled = false;
+      this.notify();
+      const nextDelayMs = this.nextDeliveryBoundaryDelayMs();
+      if (nextDelayMs !== undefined) this.scheduleDeliveryBoundaryNotification(nextDelayMs);
+    }, delayMs);
+  }
+
+  private nextDeliveryBoundaryDelayMs(): number | undefined {
+    const nowMs = this.now();
+    let earliestDeadlineMs: number | undefined;
+    for (const record of this.slots.values()) {
+      for (const cycle of record.requests) {
+        if (
+          cycle.renderAtMs === undefined ||
+          cycle.isEmpty !== false ||
+          (cycle.trustedServerOpportunity !== 'renderable_candidate' &&
+            cycle.trustedServerOpportunity !== 'unrenderable_candidate')
+        ) {
+          continue;
+        }
+        const deadlineMs = cycle.renderAtMs + TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS;
+        if (deadlineMs <= nowMs) continue;
+        if (earliestDeadlineMs === undefined || deadlineMs < earliestDeadlineMs) {
+          earliestDeadlineMs = deadlineMs;
+        }
       }
     }
-    return intent.sources.size > 0 ? intent : undefined;
+    return earliestDeadlineMs === undefined ? undefined : earliestDeadlineMs - nowMs;
   }
 
   private requestPath(intent: PendingRequestIntent | undefined): GptDiagnosticsRequestPath {
