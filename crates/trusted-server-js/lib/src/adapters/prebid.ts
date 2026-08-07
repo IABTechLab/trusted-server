@@ -64,6 +64,11 @@ export interface PrebidArtifactRequirements {
   }>[];
 }
 
+/** Read-only Prebid queries valid only while one subscribed event callback is active. */
+export interface PrebidEventFacade {
+  highestBids(adUnitCode?: string): readonly object[];
+}
+
 /** The small Prebid surface exposed to an accepted operation. */
 export interface PrebidFacade {
   addAdUnits(adUnits: readonly unknown[]): unknown;
@@ -72,7 +77,10 @@ export interface PrebidFacade {
   registerBidAdapter(adapter: unknown, bidderCode: string, spec?: object): unknown;
   renderAd(targetDocument: object, adId: string): unknown;
   requestBids(options: object): unknown;
-  subscribe(eventType: string, listener: (event: unknown) => void): () => void;
+  subscribe(
+    eventType: string,
+    listener: (event: unknown, prebid: Readonly<PrebidEventFacade>) => void
+  ): () => void;
 }
 
 /** Options owned by one Prebid operation. */
@@ -548,6 +556,24 @@ export function createBrowserPrebidAdapter(
     return result;
   };
 
+  const highestBids = (
+    binding: PresentPrebid,
+    adUnitCode: string | undefined,
+    isCurrent: () => boolean
+  ): readonly object[] => {
+    const value = callBound(
+      binding,
+      'getHighestCpmBids',
+      adUnitCode === undefined ? [] : [adUnitCode],
+      isCurrent
+    );
+    if (!Array.isArray(value) || value.some((bid) => typeof bid !== 'object' || bid === null)) {
+      throw new PrebidAdapterError('external_artifact_incompatible');
+    }
+    if (!isCurrent()) throw new PrebidAdapterError('external_artifact_incompatible');
+    return Object.freeze([...value]);
+  };
+
   const createFacade = (
     binding: PresentPrebid,
     registerOperationEffect: (disposeEffect: () => void) => () => void,
@@ -557,19 +583,8 @@ export function createBrowserPrebidAdapter(
     Object.freeze({
       addAdUnits: (adUnits: readonly unknown[]): unknown =>
         callBound(binding, 'addAdUnits', [[...adUnits]], isOperationCurrent),
-      highestBids: (adUnitCode?: string): readonly object[] => {
-        const value = callBound(
-          binding,
-          'getHighestCpmBids',
-          adUnitCode === undefined ? [] : [adUnitCode],
-          isOperationCurrent
-        );
-        if (!Array.isArray(value) || value.some((bid) => typeof bid !== 'object' || bid === null)) {
-          throw new PrebidAdapterError('external_artifact_incompatible');
-        }
-        if (!isOperationCurrent()) throw new PrebidAdapterError('external_artifact_incompatible');
-        return Object.freeze([...value]);
-      },
+      highestBids: (adUnitCode?: string): readonly object[] =>
+        highestBids(binding, adUnitCode, isOperationCurrent),
       processQueue: (): unknown => callBound(binding, 'processQueue', [], isOperationCurrent),
       registerBidAdapter: (adapter: unknown, bidderCode: string, spec?: object): unknown =>
         callBound(
@@ -582,7 +597,10 @@ export function createBrowserPrebidAdapter(
         callBound(binding, 'renderAd', [targetDocument, adId], isOperationCurrent),
       requestBids: (options: object): unknown =>
         callBound(binding, 'requestBids', [options], isOperationCurrent),
-      subscribe: (eventType: string, listener: (event: unknown) => void): (() => void) => {
+      subscribe: (
+        eventType: string,
+        listener: (event: unknown, prebid: Readonly<PrebidEventFacade>) => void
+      ): (() => void) => {
         if (!isOperationCurrent()) throw new PrebidAdapterError('external_artifact_incompatible');
         const add = safeMember(binding.binding, 'onEvent');
         if (!isOperationCurrent() || typeof add !== 'function')
@@ -592,10 +610,18 @@ export function createBrowserPrebidAdapter(
           throw new PrebidAdapterError('external_artifact_incompatible');
         const wrapped = (event: unknown): void => {
           if (!isBindingCurrent()) return;
+          let callbackActive = true;
+          const isEventCurrent = (): boolean => callbackActive && isBindingCurrent();
+          const eventFacade: Readonly<PrebidEventFacade> = Object.freeze({
+            highestBids: (adUnitCode?: string): readonly object[] =>
+              highestBids(binding, adUnitCode, isEventCurrent),
+          });
           try {
-            listener(event);
+            listener(event, eventFacade);
           } catch {
             // Publisher callbacks cannot escape the Prebid boundary.
+          } finally {
+            callbackActive = false;
           }
         };
         let attempted = false;

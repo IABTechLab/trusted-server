@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { createBrowserPrebidAdapter } from '../../src/adapters/prebid';
+import { createBrowserPrebidAdapter, type PrebidEventFacade } from '../../src/adapters/prebid';
 
 type Command = () => void;
 
@@ -956,6 +956,32 @@ describe('browser Prebid adapter readiness', () => {
     const installed = first.pbjs.onEvent.mock.calls[0]?.[1];
     expect(first.pbjs.offEvent).toHaveBeenCalledWith('bidResponse', installed);
     expect(first.listeners.get('bidResponse')?.size).toBe(0);
+  });
+
+  it('grants synchronous highest-bid access only for the active event callback', async () => {
+    const ready = createReadyPrebid();
+    const selected = Object.freeze({ adId: 'r1_selected', adUnitCode: 'slot-one' });
+    ready.pbjs.getHighestCpmBids.mockReturnValue([selected]);
+    const adapter = createBrowserPrebidAdapter({ pbjs: ready.pbjs });
+    let eventFacade: Readonly<PrebidEventFacade> | undefined;
+    const listener = vi.fn((event: unknown, prebid: Readonly<PrebidEventFacade>) => {
+      eventFacade = prebid;
+      expect(event).toEqual({ auctionId: 'auction-one' });
+      expect(Object.isFrozen(prebid)).toBe(true);
+      expect(Reflect.ownKeys(prebid)).toEqual(['highestBids']);
+      expect(prebid.highestBids('slot-one')).toEqual([selected]);
+    });
+
+    await adapter.run((prebid) => prebid.subscribe('auctionEnd', listener)).result;
+    const installed = [...(ready.listeners.get('auctionEnd') ?? [])][0];
+    expect(() => installed?.({ auctionId: 'auction-one' })).not.toThrow();
+
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(ready.pbjs.getHighestCpmBids).toHaveBeenCalledExactlyOnceWith('slot-one');
+    expect(() => eventFacade?.highestBids('slot-one')).toThrowError(
+      expect.objectContaining({ code: 'external_artifact_incompatible' })
+    );
+    adapter.dispose();
   });
 
   it('rolls back a Prebid listener when installation disposes and cleanup throws', async () => {
