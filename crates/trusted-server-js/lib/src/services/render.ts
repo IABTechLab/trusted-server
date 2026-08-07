@@ -271,7 +271,7 @@ export function resizeCollapsedPucShell(input: CollapsedPucShellResizeInput): bo
       !onePixelAttribute(frame, 'width') ||
       !onePixelAttribute(frame, 'height') ||
       !ordinaryCollapsedElement(frame) ||
-      reflectApplyIntrinsic(elementClosestIntrinsic, frame, ['[data-anchor-status]']) !== null
+      reflectApplyIntrinsic(elementClosestIntrinsic, frame, ['a,[data-anchor-status]']) !== null
     ) {
       return false;
     }
@@ -284,7 +284,7 @@ export function resizeCollapsedPucShell(input: CollapsedPucShellResizeInput): bo
       wrapper instanceof HTMLAnchorElement ||
       reflectApplyIntrinsic(nodeIsConnectedGetter, wrapper, []) !== true ||
       !ordinaryCollapsedElement(wrapper) ||
-      reflectApplyIntrinsic(elementClosestIntrinsic, wrapper, ['[data-anchor-status]']) !== null
+      reflectApplyIntrinsic(elementClosestIntrinsic, wrapper, ['a,[data-anchor-status]']) !== null
     ) {
       return false;
     }

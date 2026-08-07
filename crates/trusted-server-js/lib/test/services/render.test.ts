@@ -194,6 +194,27 @@ describe('collapsed PUC shell resize', () => {
       invalid.wrapper.remove();
     }
   });
+
+  it('rejects a collapsed ordinary wrapper nested inside an anchor shell', () => {
+    const shell = collapsedShell();
+    const anchor = document.createElement('a');
+    shell.wrapper.replaceWith(anchor);
+    anchor.appendChild(shell.wrapper);
+
+    try {
+      expect(
+        resizeCollapsedPucShell({
+          source: shell.frame.contentWindow!,
+          width: 300,
+          height: 250,
+        })
+      ).toBe(false);
+      expect(shell.frame.style.width).toBe('1px');
+      expect(shell.wrapper.style.width).toBe('1px');
+    } finally {
+      anchor.remove();
+    }
+  });
 });
 
 function prepareRenderSource(candidate: unknown) {
