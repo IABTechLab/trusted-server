@@ -1,0 +1,118 @@
+name: "APS real-GAM attestation"
+run-name: >-
+  APS real-GAM / ${{ inputs.evidence_id }} / ${{ inputs.release_id }}
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: Exact TSJS release id deployed to the protected test network
+        required: true
+        type: string
+      evidence_id:
+        description: Unique cutover evidence identifier
+        required: true
+        type: string
+      previous_artifact_id:
+        description: Immutable artifact identifier used for rollback
+        required: true
+        type: string
+
+jobs:
+  attest:
+    name: Chromium, Firefox, and WebKit attestation
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: aps-real-gam
+    env:
+      TS_REAL_GAM_PAGE_URL: ${{ secrets.TS_REAL_GAM_PAGE_URL }}
+      TS_REAL_GAM_AUTH_HEADER: ${{ secrets.TS_REAL_GAM_AUTH_HEADER }}
+      TS_REAL_GAM_EXPECTED_RELEASE_ID: ${{ vars.TS_REAL_GAM_EXPECTED_RELEASE_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate protected inputs and release binding
+        env:
+          DISPATCH_RELEASE_ID: ${{ inputs.release_id }}
+        run: |
+          test -n "$TS_REAL_GAM_PAGE_URL"
+          test -n "$TS_REAL_GAM_AUTH_HEADER"
+          test -n "$TS_REAL_GAM_EXPECTED_RELEASE_ID"
+          test -n "$DISPATCH_RELEASE_ID"
+          test "$DISPATCH_RELEASE_ID" = "$TS_REAL_GAM_EXPECTED_RELEASE_ID"
+          test -n "${{ inputs.evidence_id }}"
+          test -n "${{ inputs.previous_artifact_id }}"
+
+      - name: Read Node.js version
+        id: node-version
+        run: echo "version=$(awk '$1 == \"nodejs\" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node-version.outputs.version }}
+          cache: npm
+          cache-dependency-path: crates/trusted-server-integration-tests/browser/package-lock.json
+
+      - name: Install isolated browser-test dependencies
+        working-directory: crates/trusted-server-integration-tests/browser
+        run: npm ci
+
+      - name: Install all required browsers
+        working-directory: crates/trusted-server-integration-tests/browser
+        run: npx playwright install --with-deps chromium firefox webkit
+
+      - name: Run protected real-GAM contract
+        id: real-gam
+        working-directory: crates/trusted-server-integration-tests/browser
+        run: >-
+          npm exec -- playwright test
+          --config=playwright.real-gam.config.ts
+          tests/shared/aps-real-gam.spec.ts
+          --project=chromium --project=firefox --project=webkit
+
+      - name: Write release attestation
+        if: always()
+        env:
+          ATTESTATION_EVIDENCE_ID: ${{ inputs.evidence_id }}
+          ATTESTATION_RELEASE_ID: ${{ inputs.release_id }}
+          ATTESTATION_PREVIOUS_ARTIFACT_ID: ${{ inputs.previous_artifact_id }}
+          ATTESTATION_TEST_OUTCOME: ${{ steps.real-gam.outcome }}
+        run: >-
+          node -e 'const fs=require("node:fs");
+          const path="crates/trusted-server-integration-tests/browser/real-gam-evidence/attestation-v1.json";
+          fs.mkdirSync(require("node:path").dirname(path),{recursive:true});
+          fs.writeFileSync(path,JSON.stringify({schemaVersion:1,evidenceId:process.env.ATTESTATION_EVIDENCE_ID,
+          releaseId:process.env.ATTESTATION_RELEASE_ID,previousArtifactId:process.env.ATTESTATION_PREVIOUS_ARTIFACT_ID,
+          commitSha:process.env.GITHUB_SHA,runId:process.env.GITHUB_RUN_ID,
+          conclusion:process.env.ATTESTATION_TEST_OUTCOME},null,2)+"\n",{mode:384});'
+
+      - name: Scrub browser evidence before upload
+        if: always()
+        env:
+          REAL_GAM_TEST_OUTCOME: ${{ steps.real-gam.outcome }}
+        working-directory: crates/trusted-server-integration-tests/browser
+        run: >-
+          node -e 'const fs=require("node:fs"),path=require("node:path");
+          const roots=["real-gam-evidence","playwright-report","test-results"];
+          const forbiddenExt=new Set([".har",".zip",".webm"]), secrets=[process.env.TS_REAL_GAM_PAGE_URL,process.env.TS_REAL_GAM_AUTH_HEADER].filter(Boolean);
+          const files=[]; const walk=p=>{if(!fs.existsSync(p))return; for(const e of fs.readdirSync(p,{withFileTypes:true})){const q=path.join(p,e.name); e.isDirectory()?walk(q):files.push(q)}}; roots.forEach(walk);
+          for(const file of files){if(forbiddenExt.has(path.extname(file)))throw Error("native capture forbidden: "+path.extname(file)); const body=fs.readFileSync(file); for(const secret of secrets){if(body.includes(Buffer.from(secret)))throw Error("protected value found in browser evidence")}}
+          const traces=files.filter(file=>file.endsWith("sanitized-trace-v1.json"));
+          for(const file of traces){const text=fs.readFileSync(file,"utf8"); if(/"(?:accountId|aaxResponse|adm|authorization|creativeBody|descriptor|lifecycleTicket|nonce|postData|requestHeaders|responseBody|responseHeaders)"\s*:/.test(text)||text.includes("<script")||text.includes("<!doctype"))throw Error("unsafe field or body found in sanitized evidence")}
+          if(process.env.REAL_GAM_TEST_OUTCOME==="success"&&traces.length!==60)throw Error("successful three-browser run must emit 60 sanitized case traces");'
+
+      - name: Upload real-GAM evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aps-real-gam-${{ github.run_id }}
+          path: |
+            crates/trusted-server-integration-tests/browser/real-gam-evidence/
+            crates/trusted-server-integration-tests/browser/playwright-report/
+            crates/trusted-server-integration-tests/browser/test-results/
+          if-no-files-found: error
+          retention-days: 30
