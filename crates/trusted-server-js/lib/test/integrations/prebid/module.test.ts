@@ -1089,6 +1089,7 @@ describe('Prebid selection coordination', () => {
       activateResult?: boolean;
       synchronousTimer?: boolean;
       throwCreateAttempt?: boolean;
+      throwFail?: boolean;
       throwPromotion?: boolean;
     }> = {}
   ) {
@@ -1133,7 +1134,20 @@ describe('Prebid selection coordination', () => {
               : undefined,
           reservations,
         });
-        if (result.ok) attempts.push(result.value);
+        if (result.ok) {
+          attempts.push(result.value);
+          if (options.throwFail) {
+            return Object.freeze({
+              ok: true as const,
+              value: Object.freeze({
+                ...result.value,
+                fail: () => {
+                  throw new Error('attempt failure settlement failed');
+                },
+              }),
+            });
+          }
+        }
         return result;
       },
       reservations: {
@@ -1220,6 +1234,28 @@ describe('Prebid selection coordination', () => {
       timers,
     };
   }
+
+  it('contains a hostile publication failure settlement and releases its ephemeral owner', () => {
+    const harness = prepareSelection({ throwFail: true });
+
+    expect(
+      harness.coordinator.settlePublicationFailure(
+        harness.navigation,
+        'auction-one',
+        'slot-one',
+        'prebid_admission_failed'
+      )
+    ).toBe(false);
+    expect(harness.attempts[0]?.snapshot().outcome).toEqual({
+      outcome: 'cancelled',
+      reason: 'navigation_disposed',
+    });
+    expect(harness.navigation.snapshotInventoryForTest()).toMatchObject({
+      attempts: 0,
+      batches: 0,
+    });
+    harness.runtime.dispose();
+  });
 
   it('promotes only the exact selected TS id and suppresses its group losers', () => {
     const harness = prepareSelection();
