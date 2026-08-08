@@ -348,12 +348,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     for insert in integrations.head_inserts(&ctx) {
                         snippet.push_str(&insert);
                     }
-                    if let Some(bootstrap) = gpt_diagnostics
-                        .as_ref()
-                        .and_then(GptDiagnosticsRequestDecision::bootstrap_script)
-                    {
-                        snippet.push_str(&bootstrap);
-                    }
                     // Main bundle: core + non-deferred integrations (synchronous).
                     let immediate_ids = integrations.js_module_ids_immediate();
                     snippet.push_str(&tsjs::tsjs_script_tag(&immediate_ids));
@@ -871,14 +865,13 @@ mod tests {
             .process(Cursor::new(html.as_bytes()), &mut output)
             .expect("should process HTML");
         let processed = String::from_utf8(output).expect("should produce valid UTF-8");
-        let bootstrap_marker = "__tsjs_gpt_diagnostics_active";
         let bundle_marker = "id=\"trustedserver-js\"";
         let diagnostics_marker = "tsjs-gpt_diagnostics.min.js";
 
         assert_eq!(
-            processed.matches(bootstrap_marker).count(),
-            1,
-            "should inject the diagnostics bootstrap once"
+            processed.matches("__tsjs_gpt_diagnostics_active").count(),
+            0,
+            "server boot data must be the only browser-visible activation result"
         );
         assert_eq!(
             processed.matches(bundle_marker).count(),
@@ -890,19 +883,12 @@ mod tests {
             1,
             "should inject one standalone diagnostics module"
         );
-        let bootstrap_index = processed
-            .find(bootstrap_marker)
-            .expect("should include diagnostics bootstrap");
         let bundle_index = processed
             .find(bundle_marker)
             .expect("should include immediate TSJS bundle");
         let diagnostics_index = processed
             .find(diagnostics_marker)
             .expect("should include standalone diagnostics module");
-        assert!(
-            bootstrap_index < bundle_index,
-            "should activate before core executes"
-        );
         assert!(
             bundle_index < diagnostics_index,
             "should load diagnostics after core"

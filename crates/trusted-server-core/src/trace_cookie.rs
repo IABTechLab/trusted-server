@@ -13,7 +13,7 @@
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use http::{HeaderValue, Response, StatusCode, header};
+use http::{HeaderValue, Request, Response, StatusCode, header};
 
 use crate::constants::COOKIE_TS_TRACE;
 use crate::error::TrustedServerError;
@@ -24,6 +24,32 @@ use crate::settings::Settings;
 /// One hour: long enough for a debugging session across reloads and SPA
 /// navigations, short enough that a forgotten toggle expires on its own.
 const TRACE_COOKIE_MAX_AGE_SECS: u32 = 3600;
+
+/// Resolve the server-owned render-trace overlay bit for `DiagnosticsBootV1`.
+///
+/// Only the exact cookie emitted by [`handle_trace_mode`] activates the overlay.
+/// Duplicate reserved cookies fail closed so request header ordering cannot
+/// choose the browser-visible diagnostics state.
+#[must_use]
+pub fn render_trace_overlay_active(request: &Request<EdgeBody>) -> bool {
+    let mut occurrences = 0_usize;
+    let mut active = false;
+    for value in request.headers().get_all(header::COOKIE) {
+        let Ok(value) = value.to_str() else {
+            return false;
+        };
+        for cookie in value.split(';').map(str::trim) {
+            let Some((name, value)) = cookie.split_once('=') else {
+                continue;
+            };
+            if name == COOKIE_TS_TRACE {
+                occurrences += 1;
+                active = value == "1";
+            }
+        }
+    }
+    occurrences == 1 && active
+}
 
 /// Formats the trace cookie `Set-Cookie` header value.
 ///
@@ -109,6 +135,7 @@ pub fn handle_trace_mode(
 mod tests {
     use super::*;
     use crate::test_support::tests::create_test_settings;
+    use http::{Request, header};
 
     fn trace_enabled_settings() -> Settings {
         let mut settings = create_test_settings();
@@ -214,5 +241,35 @@ mod tests {
             response.headers().get(header::SET_COOKIE).is_none(),
             "disabled trace route should not set a cookie"
         );
+    }
+
+    #[test]
+    fn trace_cookie_boot_resolver_accepts_only_one_exact_server_cookie() {
+        for (cookie, expected) in [
+            (None, false),
+            (Some("ts-trace=1"), true),
+            (Some("other=value; ts-trace=1"), true),
+            (Some("ts-trace=0"), false),
+            (Some("ts-trace=true"), false),
+            (Some("ts-trace =1"), false),
+            (Some("ts-trace= 1"), false),
+            (Some("ts-trace=1; ts-trace=1"), false),
+        ] {
+            let mut builder = Request::builder()
+                .method("GET")
+                .uri("https://publisher.example/article");
+            if let Some(cookie) = cookie {
+                builder = builder.header(header::COOKIE, cookie);
+            }
+            let request = builder
+                .body(EdgeBody::empty())
+                .expect("should build trace-cookie request");
+
+            assert_eq!(
+                render_trace_overlay_active(&request),
+                expected,
+                "unexpected boot resolution for {cookie:?}"
+            );
+        }
     }
 }

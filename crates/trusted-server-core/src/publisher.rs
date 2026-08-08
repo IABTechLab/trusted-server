@@ -2964,7 +2964,7 @@ pub async fn handle_publisher_request(
             .await;
         }
 
-        let response = Response::builder()
+        let mut response = Response::builder()
             .status(StatusCode::BAD_GATEWAY)
             .header(header::CACHE_CONTROL, "private, no-store")
             .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
@@ -2974,6 +2974,7 @@ pub async fn handle_publisher_request(
             .change_context(TrustedServerError::Proxy {
                 message: "failed to build unexpected origin 304 response".to_string(),
             })?;
+        crate::integrations::gpt_diagnostics::finalize_response(&gpt_diagnostics, &mut response);
         return Ok(PublisherResponse::Buffered(response));
     }
 
@@ -5182,8 +5183,8 @@ mod tests {
 
         let html = String::from_utf8(output).expect("should produce UTF-8 HTML");
         assert!(
-            html.contains("__tsjs_gpt_diagnostics_active"),
-            "should inject the activation flag"
+            !html.contains("__tsjs_gpt_diagnostics_active"),
+            "should not inject the removed activation flag"
         );
         assert!(
             html.contains("tsjs-gpt_diagnostics.min.js"),
@@ -5874,6 +5875,54 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn ts_console_finalizes_session_on_replaced_origin_304_response() {
+            let mut settings = settings_with_enabled_auction_and_creative_opportunities();
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+                .expect("should enable diagnostics");
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                304,
+                Vec::new(),
+                vec![
+                    ("cache-control", "public, max-age=300"),
+                    ("etag", ORIGIN_ETAG),
+                ],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let slots = [article_slot()];
+            let mut req = conditional_navigation_request();
+            *req.uri_mut() = "https://ts.example.com/article?keep=1&ts_console=1"
+                .parse()
+                .expect("should parse activation URI");
+
+            let response = run_with_slots(&settings, &services, &slots, req).await;
+            let response = match response {
+                PublisherResponse::Buffered(response) => response,
+                PublisherResponse::PassThrough { .. } | PublisherResponse::Stream { .. } => {
+                    panic!("unexpected origin 304 should return a buffered response")
+                }
+            };
+
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                response.headers()[header::SET_COOKIE],
+                "__Host-ts-console=1; Path=/; Secure; HttpOnly; SameSite=Lax"
+            );
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "private, no-store"
+            );
+            assert_eq!(
+                stub.recorded_request_uris(),
+                vec!["https://origin.test-publisher.com/article?keep=1"]
+            );
+        }
+
+        #[tokio::test]
         async fn noneligible_origin_304_preserves_conditional_response_metadata() {
             // Arrange
             let settings = settings_with_enabled_auction_and_creative_opportunities();
@@ -5984,6 +6033,69 @@ mod tests {
             vec!["stub-backend".to_string()],
             "should proxy through the platform http client"
         );
+    }
+
+    #[tokio::test]
+    async fn ts_console_publisher_pipeline_strips_reserved_input_and_finalizes_session() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+            .expect("should enable diagnostics");
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"<html><head></head><body>origin</body></html>".to_vec(),
+            vec![
+                ("content-type", "text/html; charset=utf-8"),
+                ("cache-control", "public, max-age=300"),
+                ("surrogate-control", "max-age=300"),
+            ],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/article?keep=%2F&ts_console=true")
+            .header(header::HOST, "publisher.example")
+            .header("sec-fetch-dest", "document")
+            .header(
+                header::COOKIE,
+                "other=value; __Host-ts-console=1; second=two",
+            )
+            .body(EdgeBody::empty())
+            .expect("should build diagnostics navigation");
+
+        let response = run_publisher_proxy(&settings, &services, req).await;
+        let headers = match response {
+            PublisherResponse::Buffered(response)
+            | PublisherResponse::PassThrough { response, .. }
+            | PublisherResponse::Stream { response, .. } => response.into_parts().0.headers,
+        };
+
+        let origin_uri = stub
+            .recorded_request_uris()
+            .into_iter()
+            .next()
+            .expect("should forward one publisher request");
+        assert!(origin_uri.contains("keep=%2F"));
+        assert!(!origin_uri.contains("ts_console"));
+        let outbound_headers = stub.recorded_request_headers();
+        let outbound_cookies = outbound_headers
+            .first()
+            .expect("should record publisher request headers")
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(header::COOKIE.as_str()))
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(outbound_cookies, vec!["other=value; second=two"]);
+        assert_eq!(
+            headers[header::SET_COOKIE],
+            "__Host-ts-console=1; Path=/; Secure; HttpOnly; SameSite=Lax"
+        );
+        assert_eq!(headers[header::CACHE_CONTROL], "private, no-store");
+        assert!(!headers.contains_key("surrogate-control"));
     }
 
     #[tokio::test]
