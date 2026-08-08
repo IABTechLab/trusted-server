@@ -46,6 +46,9 @@ import { installClickGuard } from '../integrations/creative/click';
 import { installDynamicIframeProxy } from '../integrations/creative/iframe';
 import { installDynamicImageProxy } from '../integrations/creative/image';
 import { createCreativeStartup } from '../integrations/creative/startup';
+import { createDataDomeRuntime } from '../integrations/datadome/module';
+import { createDidomiRuntime } from '../integrations/didomi/module';
+import { createGoogleTagManagerRuntime } from '../integrations/google_tag_manager/module';
 import {
   publishGptWinner,
   startGptSlotOperation,
@@ -69,6 +72,11 @@ import {
   type PrebidSelectionCoordinator,
 } from '../integrations/prebid/module';
 import { createPrebidStartup } from '../integrations/prebid/startup';
+import { createLockrRuntime } from '../integrations/lockr/module';
+import { createOsanoRuntime } from '../integrations/osano/module';
+import { createPermutiveRuntime } from '../integrations/permutive/module';
+import { createSourcepointRuntime } from '../integrations/sourcepoint/module';
+import { createTestlightRuntime } from '../integrations/testlight/module';
 import { createBrowserNavigationIdentityIssuer } from '../kernel/identity';
 import {
   createDiagnosticsBus,
@@ -83,7 +91,12 @@ import type {
 import { createRuntimeSession } from '../kernel/sessions';
 import type { CoreActivationContext } from '../kernel/integration_registry';
 import { createRuntime, type Runtime, type RuntimeOptions } from '../kernel/runtime';
-import { createAuctionContextRegistry, type AuctionContextRegistry } from '../services/context';
+import {
+  createAuctionContextRegistry,
+  type AuctionContextContributor,
+  type AuctionContextRegistry,
+  type ContextContributorOwner,
+} from '../services/context';
 import {
   createAuctionBatchService,
   type AuctionBatchFetcher,
@@ -207,7 +220,9 @@ interface AcceptedBrowserBoot {
   readonly cachePolicy?: unknown;
   readonly creative: Readonly<CreativeBootV1>;
   readonly diagnostics: Readonly<DiagnosticsBootV1>;
+  readonly didomi?: unknown;
   readonly manifest: Readonly<BootManifestV1>;
+  readonly sourcepoint?: unknown;
 }
 
 interface PreparedBrowserServices {
@@ -223,6 +238,38 @@ function projectionSlots(projection: object): readonly string[] {
     readonly auction: { readonly results: readonly { readonly slot: string }[] };
   };
   return Object.freeze(accepted.auction.results.map(({ slot }) => slot));
+}
+
+function registerScopedContextContributor(
+  registry: AuctionContextRegistry,
+  runtimeOwner: RuntimeSession,
+  integrationId: string,
+  contributor: AuctionContextContributor
+): (() => void) | undefined {
+  let active = true;
+  let releaseRegistration: (() => void) | undefined;
+  const owner: ContextContributorOwner = Object.freeze({
+    generation: Object.freeze({}),
+    isCurrent: () => active && runtimeOwner.isCurrent(),
+    onDispose: (kind: string, callback: () => void) => {
+      if (kind !== 'auction-context-contributor' || !active || releaseRegistration) {
+        throw new Error('Auction context contributor disposer is unavailable');
+      }
+      releaseRegistration = callback;
+    },
+  });
+  if (!registry.register(integrationId, contributor, owner)) {
+    active = false;
+    releaseRegistration?.();
+    return undefined;
+  }
+  return (): void => {
+    if (!active) return;
+    active = false;
+    const release = releaseRegistration;
+    releaseRegistration = undefined;
+    release?.();
+  };
 }
 
 /**
@@ -301,6 +348,7 @@ export function createTestBrowserRuntimeComposition(
   let gptDiagnosticsFacts: GptDiagnosticsFactBuffer | undefined;
   let gptDiagnosticsRuntime: GptDiagnosticsRuntime | undefined;
   let renderTrace: RenderTraceRuntimeOwner | undefined;
+  let acceptedBrowserBoot: AcceptedBrowserBoot | undefined;
   const consumeCoreObservation = (observation: DiagnosticsObservation): void => {
     if (
       observation['kind'] !== 'render_attempt' ||
@@ -369,6 +417,10 @@ export function createTestBrowserRuntimeComposition(
       return slots;
     },
     start: startGpt,
+  });
+  const gptIntegrationRuntime = Object.freeze({
+    activate: gptRuntime.activate,
+    start: gptRuntime.start,
   });
   let runtimeSession: RuntimeSession | undefined;
   let prebidCoordinator: PrebidSelectionCoordinator | undefined;
@@ -451,6 +503,8 @@ export function createTestBrowserRuntimeComposition(
     }
     if (id === 'creative' && config === undefined) config = creativeBoot;
     if (id === 'gpt_diagnostics' && config === undefined) config = diagnosticsBoot?.gpt;
+    if (id === 'didomi' && config === undefined) config = acceptedBrowserBoot?.didomi;
+    if (id === 'sourcepoint' && config === undefined) config = acceptedBrowserBoot?.sourcepoint;
     const interfaces = runtimeSession?.interfaces;
     if (!interfaces) throw new Error(`Integration interfaces are unavailable for ${id}`);
     return Object.freeze({
@@ -460,6 +514,32 @@ export function createTestBrowserRuntimeComposition(
   };
   let preparedBrowserServices: PreparedBrowserServices | undefined;
   let auctionContextRegistry: AuctionContextRegistry | undefined;
+  const dataDomeRuntime = createDataDomeRuntime();
+  const didomiRuntime = createDidomiRuntime();
+  const googleTagManagerRuntime = createGoogleTagManagerRuntime();
+  const lockrRuntime = createLockrRuntime();
+  const osanoRuntime = createOsanoRuntime();
+  const permutiveRuntime = createPermutiveRuntime({
+    registerContext: (contributor) => {
+      const registry = auctionContextRegistry;
+      const owner = runtimeSession;
+      return registry && owner
+        ? registerScopedContextContributor(registry, owner, 'permutive', contributor)
+        : undefined;
+    },
+  });
+  const sourcepointRuntime = createSourcepointRuntime();
+  const testlightRuntime = createTestlightRuntime({
+    enqueue: (callback) => {
+      const queue = (runtimeOptions.target as { readonly que?: unknown }).que;
+      if (!Array.isArray(queue) || typeof queue.push !== 'function') {
+        throw new Error('Testlight TSJS queue is unavailable');
+      }
+      queue.push(callback);
+    },
+    started: () => log.info('Testlight integration initialized'),
+    target: window as typeof window & { testlight?: { que?: unknown[] } },
+  });
   let auctionBatchService: AuctionBatchService | undefined;
   let projectionParser: ((candidate: unknown) => object | undefined) | undefined;
   const frozenSlotResult = (result: Record<string, unknown>): Readonly<Record<string, unknown>> =>
@@ -649,6 +729,7 @@ export function createTestBrowserRuntimeComposition(
     },
     prepareOwner: (context) => {
       const boot = context.boot as unknown as AcceptedBrowserBoot;
+      acceptedBrowserBoot = boot;
       creativeBoot = boot.creative;
       diagnosticsBoot = boot.diagnostics;
       const cachePolicy =
@@ -889,12 +970,20 @@ export function createTestBrowserRuntimeComposition(
         interfaces: Object.freeze({
           adapters: composition.adapters,
           creative: creativeRuntime,
+          datadome: dataDomeRuntime,
           diagnostics: Object.freeze({ subscribe: preparedDiagnosticsBus.subscribe }),
+          didomi: didomiRuntime,
+          google_tag_manager: googleTagManagerRuntime,
           ...(preparedGptDiagnosticsRuntime
             ? { gpt_diagnostics: preparedGptDiagnosticsRuntime }
             : {}),
-          gpt: gptRuntime,
+          gpt: gptIntegrationRuntime,
+          lockr: lockrRuntime,
+          osano: osanoRuntime,
+          permutive: permutiveRuntime,
           prebid: prebidRuntime,
+          sourcepoint: sourcepointRuntime,
+          testlight: testlightRuntime,
           ...services,
         }),
         onNavigationDispose: (navigationGeneration) =>
@@ -917,6 +1006,7 @@ export function createTestBrowserRuntimeComposition(
           auctionBatchService = undefined;
           auctionContextRegistry = undefined;
           projectionParser = undefined;
+          acceptedBrowserBoot = undefined;
           creativeBoot = undefined;
           diagnosticsBoot = undefined;
         }
