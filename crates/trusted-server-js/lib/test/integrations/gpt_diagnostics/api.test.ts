@@ -450,9 +450,7 @@ describe('GptDiagnosticsApiController', () => {
       new FakeBindings(),
       { show: vi.fn(), hide: vi.fn() }
     );
-    const releases = Array.from({ length: 32 }, () =>
-      controller.api.subscribe(() => undefined)
-    );
+    const releases = Array.from({ length: 32 }, () => controller.api.subscribe(() => undefined));
 
     expect(() => controller.api.subscribe(null as never)).toThrow(TypeError);
     expect(() => controller.api.subscribe(() => undefined)).toThrow(
