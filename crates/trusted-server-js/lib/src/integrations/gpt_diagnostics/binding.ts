@@ -17,7 +17,7 @@ type BindingWindow = Window & {
 interface BindingOptions {
   document?: Document | undefined;
   window?: BindingWindow | undefined;
-  scheduleFrame?: ((callback: () => void) => void) | undefined;
+  scheduleFrame?: ((callback: () => void) => () => void) | undefined;
 }
 
 export interface GptDiagnosticsBindingView {
@@ -27,6 +27,20 @@ export interface GptDiagnosticsBindingView {
 }
 
 type BindingListener = () => void;
+
+function defaultScheduleFrame(callback: () => void): () => void {
+  if (typeof requestAnimationFrame === 'function' && typeof cancelAnimationFrame === 'function') {
+    const frame = requestAnimationFrame(() => callback());
+    return () => cancelAnimationFrame(frame);
+  }
+  let active = true;
+  queueMicrotask(() => {
+    if (active) callback();
+  });
+  return () => {
+    active = false;
+  };
+}
 
 function isVisibleInViewport(element: HTMLElement, window: BindingWindow): boolean {
   const rectangle = element.getBoundingClientRect();
@@ -77,12 +91,13 @@ export class GptDiagnosticsBindingManager {
   private readonly store: BindingStore;
   private readonly document: Document;
   private readonly window: BindingWindow;
-  private readonly scheduleFrame: (callback: () => void) => void;
+  private readonly scheduleFrame: (callback: () => void) => () => void;
   private readonly bindings = new Map<number, GptDiagnosticsBindingView>();
   private readonly listeners = new Set<BindingListener>();
   private readonly slotElementIds = new Set<string>();
   private readonly unsubscribeStore: () => void;
   private mutationObserver?: MutationObserver;
+  private cancelScheduledRefresh: (() => void) | undefined;
   private refreshScheduled = false;
   private destroyed = false;
 
@@ -149,6 +164,14 @@ export class GptDiagnosticsBindingManager {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    const cancelRefresh = this.cancelScheduledRefresh;
+    this.cancelScheduledRefresh = undefined;
+    this.refreshScheduled = false;
+    try {
+      cancelRefresh?.();
+    } catch {
+      // Continue releasing every independently owned binding resource.
+    }
     this.unsubscribeStore();
     this.mutationObserver?.disconnect();
     this.window.removeEventListener('scroll', this.scheduleRefresh);
@@ -160,10 +183,40 @@ export class GptDiagnosticsBindingManager {
   private readonly scheduleRefresh = (): void => {
     if (this.destroyed || this.refreshScheduled) return;
     this.refreshScheduled = true;
-    this.scheduleFrame(() => {
+    let active = true;
+    let cancelFrame: (() => void) | undefined;
+    const run = (): void => {
+      if (!active) return;
+      active = false;
+      this.cancelScheduledRefresh = undefined;
+      try {
+        cancelFrame?.();
+      } catch {
+        // A completed frame remains authoritative when scheduler cleanup fails.
+      }
       this.refreshScheduled = false;
       this.refresh();
-    });
+    };
+    try {
+      cancelFrame = this.scheduleFrame(run);
+      if (typeof cancelFrame !== 'function') {
+        throw new TypeError('Invalid binding frame scheduler');
+      }
+      if (active) {
+        this.cancelScheduledRefresh = (): void => {
+          if (!active) return;
+          active = false;
+          this.refreshScheduled = false;
+          cancelFrame?.();
+        };
+      } else {
+        cancelFrame();
+      }
+    } catch {
+      active = false;
+      this.cancelScheduledRefresh = undefined;
+      this.refreshScheduled = false;
+    }
   };
 
   private resolveBinding(

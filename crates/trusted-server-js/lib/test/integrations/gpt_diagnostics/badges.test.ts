@@ -64,6 +64,16 @@ function runFrame(frames: Array<() => void>): void {
   frame();
 }
 
+function queueFrame(frames: Array<() => void>): (callback: () => void) => () => void {
+  return (callback) => {
+    frames.push(callback);
+    return () => {
+      const index = frames.indexOf(callback);
+      if (index >= 0) frames.splice(index, 1);
+    };
+  };
+}
+
 beforeEach(() => {
   document.body.replaceChildren();
   Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1024 });
@@ -105,7 +115,7 @@ describe('GptDiagnosticsBadgeManager', () => {
     const layer = document.createElement('div');
     document.body.append(layer);
     const manager = new GptDiagnosticsBadgeManager(store, bindings, {
-      scheduleFrame: (callback) => frames.push(callback),
+      scheduleFrame: queueFrame(frames),
     });
     manager.setLayer(layer);
     runFrame(frames);
@@ -357,7 +367,7 @@ describe('GptDiagnosticsBadgeManager', () => {
     const layer = document.createElement('div');
     document.body.append(layer);
     const manager = new GptDiagnosticsBadgeManager(store, bindings, {
-      scheduleFrame: (callback) => frames.push(callback),
+      scheduleFrame: queueFrame(frames),
     });
     manager.setLayer(layer);
     runFrame(frames);
@@ -394,7 +404,7 @@ describe('GptDiagnosticsBadgeManager', () => {
     const layer = document.createElement('div');
     document.body.append(layer);
     const manager = new GptDiagnosticsBadgeManager(store, bindings, {
-      scheduleFrame: (callback) => frames.push(callback),
+      scheduleFrame: queueFrame(frames),
     });
     manager.setLayer(layer);
     runFrame(frames);
@@ -433,7 +443,7 @@ describe('GptDiagnosticsBadgeManager', () => {
         MutationObserver: undefined,
         ResizeObserver: undefined,
       }),
-      scheduleFrame: (callback) => frames.push(callback),
+      scheduleFrame: queueFrame(frames),
     });
 
     expect(() => {
@@ -441,5 +451,57 @@ describe('GptDiagnosticsBadgeManager', () => {
       runFrame(frames);
     }).not.toThrow();
     manager.destroy();
+  });
+
+  it('cancels a pending badge update on destroy and suppresses a hostile late callback', () => {
+    const frames: Array<() => void> = [];
+    const cancel = vi.fn();
+    const layer = document.createElement('div');
+    document.body.append(layer);
+    const manager = new GptDiagnosticsBadgeManager(new GptDiagnosticsStore(), new FakeBindings(), {
+      scheduleFrame: (callback) => {
+        frames.push(callback);
+        return cancel;
+      },
+    });
+    const update = vi.spyOn(manager, 'update');
+    manager.setLayer(layer);
+
+    manager.destroy();
+    frames[0]?.();
+
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it('runs one scheduled badge callback at most once', () => {
+    const frames: Array<() => void> = [];
+    const manager = new GptDiagnosticsBadgeManager(new GptDiagnosticsStore(), new FakeBindings(), {
+      scheduleFrame: (callback) => {
+        frames.push(callback);
+        return vi.fn();
+      },
+    });
+    const update = vi.spyOn(manager, 'update');
+    manager.setLayer(document.createElement('div'));
+
+    frames[0]?.();
+    frames[0]?.();
+
+    expect(update).toHaveBeenCalledOnce();
+    manager.destroy();
+  });
+
+  it('isolates a hostile frame cancellation during destroy', () => {
+    const cancel = vi.fn(() => {
+      throw new Error('cancel failed');
+    });
+    const manager = new GptDiagnosticsBadgeManager(new GptDiagnosticsStore(), new FakeBindings(), {
+      scheduleFrame: () => cancel,
+    });
+    manager.setLayer(document.createElement('div'));
+
+    expect(() => manager.destroy()).not.toThrow();
+    expect(cancel).toHaveBeenCalledOnce();
   });
 });
