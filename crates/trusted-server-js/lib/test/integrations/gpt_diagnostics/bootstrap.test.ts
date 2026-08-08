@@ -34,7 +34,11 @@ describe('GPT diagnostics activation ownership', () => {
       throw new Error('fictional history failure');
     });
     expect(() =>
-      Function('location', 'history', bootstrapSource)(
+      Function(
+        'location',
+        'history',
+        bootstrapSource
+      )(
         Object.freeze({ href: 'https://publisher.example/?ts_console=false#kept' }),
         Object.freeze({ replaceState, state: null })
       )
@@ -42,7 +46,11 @@ describe('GPT diagnostics activation ownership', () => {
     expect(replaceState).toHaveBeenCalledOnce();
 
     replaceState.mockClear();
-    Function('location', 'history', bootstrapSource)(
+    Function(
+      'location',
+      'history',
+      bootstrapSource
+    )(
       Object.freeze({ href: 'https://publisher.example/?contest_console=1#kept' }),
       Object.freeze({ replaceState, state: null })
     );
@@ -52,17 +60,15 @@ describe('GPT diagnostics activation ownership', () => {
   it.each([
     ['https://publisher.example/a?ts_console=1', 'https://publisher.example/a'],
     ['https://publisher.example/a?ts_console=1&', 'https://publisher.example/a'],
-    [
-      'https://publisher.example/a?&ts_console=1&keep=%2F',
-      'https://publisher.example/a?&keep=%2F',
-    ],
+    ['https://publisher.example/a?&ts_console=1&keep=%2F', 'https://publisher.example/a?&keep=%2F'],
   ])('matches the server sanitizer for empty raw query segments', (href, expected) => {
     const replaceState = vi.fn();
 
-    Function('location', 'history', bootstrapSource)(
-      Object.freeze({ href }),
-      Object.freeze({ replaceState, state: null })
-    );
+    Function(
+      'location',
+      'history',
+      bootstrapSource
+    )(Object.freeze({ href }), Object.freeze({ replaceState, state: null }));
 
     expect(replaceState).toHaveBeenCalledExactlyOnceWith(null, '', expected);
   });
