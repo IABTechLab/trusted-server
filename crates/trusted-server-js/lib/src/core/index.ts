@@ -38,10 +38,7 @@ export type BrowserRuntimeCompositionFactory = (
 function bootstrapTarget(): BootstrapTarget | undefined {
   try {
     const current = (window as unknown as { tsjs?: unknown }).tsjs;
-    if (
-      (typeof current === 'object' || typeof current === 'function') &&
-      current !== null
-    ) {
+    if ((typeof current === 'object' || typeof current === 'function') && current !== null) {
       return current as BootstrapTarget;
     }
     const target: BootstrapTarget = {};
@@ -58,11 +55,7 @@ function snapshotConfigValue(
   state: { nodes: number },
   depth = 0
 ): unknown | typeof INVALID_CONFIG {
-  if (
-    candidate === null ||
-    typeof candidate === 'string' ||
-    typeof candidate === 'boolean'
-  ) {
+  if (candidate === null || typeof candidate === 'string' || typeof candidate === 'boolean') {
     return candidate;
   }
   if (typeof candidate === 'number') {
@@ -119,14 +112,10 @@ function snapshotConfigValue(
   }
 }
 
-function consumeIntegrationConfig(
-  target: BootstrapTarget
+function snapshotIntegrationConfig(
+  candidate: unknown
 ): Readonly<Record<string, unknown>> | undefined {
   try {
-    const descriptor = Object.getOwnPropertyDescriptor(target, '_integrationConfig');
-    if (!descriptor) return Object.freeze({});
-    if (!('value' in descriptor) || !descriptor.configurable) return undefined;
-    const candidate = descriptor.value;
     if (
       typeof candidate !== 'object' ||
       candidate === null ||
@@ -152,11 +141,31 @@ function consumeIntegrationConfig(
       if (value === INVALID_CONFIG) return undefined;
       configs[name] = value;
     }
-    if (!Reflect.deleteProperty(target, '_integrationConfig')) return undefined;
     return Object.freeze(configs);
   } catch {
     return undefined;
   }
+}
+
+function consumeIntegrationConfig(
+  target: BootstrapTarget
+): Readonly<Record<string, unknown>> | undefined {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(target, '_integrationConfig');
+  } catch {
+    return undefined;
+  }
+  if (!descriptor) return Object.freeze({});
+  if (!('value' in descriptor) || !descriptor.configurable) return undefined;
+
+  const configs = snapshotIntegrationConfig(descriptor.value);
+  try {
+    if (!Reflect.deleteProperty(target, '_integrationConfig')) return undefined;
+  } catch {
+    return undefined;
+  }
+  return configs;
 }
 
 function bootManifest(target: BootstrapTarget): unknown {
@@ -173,9 +182,7 @@ function bootManifest(target: BootstrapTarget): unknown {
 }
 
 /** Claim the browser namespace and start the injected sole composition root. */
-export function startProductionRuntime(
-  createComposition: BrowserRuntimeCompositionFactory
-): void {
+export function startProductionRuntime(createComposition: BrowserRuntimeCompositionFactory): void {
   const target = bootstrapTarget();
   if (!target) return;
   const configs = consumeIntegrationConfig(target);

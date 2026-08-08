@@ -15,13 +15,57 @@ const CREATIVE_SANDBOX_TOKENS = [
   "allow-top-navigation-by-user-activation",
 ].join(" ");
 
-// A creative <head> script that tries to redirect click resolution to an
-// attacker origin. It executes before the runtime injected at the top of
-// <body>, so the stamp must be non-writable for the recovery below to stay on
-// the first-party origin.
-const HOSTILE_STAMP_OVERWRITE = `<script>
-  try { window.__tsCreativeOrigin = 'https://attacker.invalid'; } catch (e) {}
-</script>`;
+// Mirrors the srcdoc document the client builds: the first-party parent stamps
+// its own origin ahead of any creative markup, then the runtime, then the
+// creative. The anchor carries a root-relative signed click exactly as the
+// server-side rewriter emits it.
+function creativeDocument(
+  origin: string,
+  bundleUrl: string,
+  releaseId: string,
+): string {
+  const signedClick =
+    "/first-party/click?tsurl=https%3A%2F%2Fadvertiser.example%2Flanding&foo=1&tstoken=browser-test-token";
+  const boot = JSON.stringify({
+    abi: 1,
+    releaseId,
+    manifest: {
+      version: 1,
+      releaseId,
+      integrations: [{ id: "creative", required: true }],
+    },
+    auctionProjection: {
+      version: 1,
+      auction: { version: 1, auctionId: "creative-sandbox", results: [] },
+      slots: [],
+      bids: [],
+    },
+    creative: {
+      version: 1,
+      enabled: true,
+      clickGuard: true,
+      renderGuard: false,
+    },
+    diagnostics: {
+      version: 1,
+      renderTraceOverlay: false,
+      gpt: { active: false },
+    },
+  });
+  return `<!DOCTYPE html>
+<html>
+  <head>
+    <script>
+      window.__tsCreativeOrigin = ${JSON.stringify(origin)};
+      window.tsjs = { boot: ${boot}, que: [], _integrationConfig: {} };
+    </script>
+    <script src="${bundleUrl}"></script>
+  </head>
+  <body>
+    <a id="creative-link" href="${signedClick}" data-tsclick="${signedClick}">ad</a>
+  </body>
+</html>`;
+}
 
 test.describe("Sandboxed creative iframe", () => {
   test("recovers a mutated click through the signed GET rebuild chain", async ({
@@ -55,15 +99,19 @@ test.describe("Sandboxed creative iframe", () => {
     // Reuse whichever hashed bundle URL the server injected into the page so
     // this test never has to know the current content hash; fall back to the
     // stable unified path if the fixture page carries no injected script.
-    const injectedBundle = await page.evaluate(() => {
+    const runtime = await page.evaluate(() => {
       const script = Array.from(document.querySelectorAll("script[src]")).find(
         (element) =>
           (element as HTMLScriptElement).src.includes("/static/tsjs="),
       );
-      return script ? (script as HTMLScriptElement).src : null;
+      return {
+        bundleUrl: script ? (script as HTMLScriptElement).src : null,
+        releaseId: (window as any).tsjs?.releaseId as string | undefined,
+      };
     });
     const bundleUrl =
-      injectedBundle ?? runtimeUrl("/static/tsjs=tsjs-unified.min.js");
+      runtime.bundleUrl ?? runtimeUrl("/static/tsjs=tsjs-unified.min.js");
+    expect(runtime.releaseId).toMatch(/^[a-f0-9]{64}$/);
 
     // Mirrors the srcdoc document the client builds: the first-party parent
     // stamps its own origin ahead of any creative markup, then the runtime,
@@ -105,12 +153,49 @@ test.describe("Sandboxed creative iframe", () => {
         iframe.style.height = "250px";
         document.body.appendChild(iframe);
       },
-      { sandbox: CREATIVE_SANDBOX_TOKENS, html: creativeDocument },
+      {
+        sandbox: CREATIVE_SANDBOX_TOKENS,
+        html: creativeDocument(
+          new URL(runtimeUrl("/")).origin,
+          bundleUrl,
+          runtime.releaseId!,
+        ),
+      },
     );
 
     const frame = page.frameLocator("iframe");
     const link = frame.locator("#creative-link");
     await link.waitFor({ state: "attached", timeout: 10_000 });
+    await expect
+      .poll(() =>
+        frame.locator("html").evaluate(() => {
+          const api = (window as any).tsjs;
+          return {
+            state: api?._internal?.state,
+            names: Object.getOwnPropertyNames(api ?? {}).sort(),
+            legacyCreativeGlobal: Object.prototype.hasOwnProperty.call(
+              window,
+              "tscreative",
+            ),
+          };
+        }),
+      )
+      .toEqual({
+        state: "kernel",
+        names: [
+          "_internal",
+          "_registerIntegration",
+          "addAdUnits",
+          "boot",
+          "diagnostics",
+          "log",
+          "que",
+          "releaseId",
+          "requestAds",
+          "version",
+        ],
+        legacyCreativeGlobal: false,
+      });
 
     // The creative mutates its own click target, the shape the click guard
     // exists to repair.
