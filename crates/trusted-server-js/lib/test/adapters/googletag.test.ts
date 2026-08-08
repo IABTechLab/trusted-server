@@ -1103,6 +1103,70 @@ describe('browser googletag adapter readiness', () => {
     expect(first.pubads.removeEventListener).toHaveBeenCalledTimes(1);
   });
 
+  it('publishes frozen diagnostics facts after the sole adapter listener completes', async () => {
+    const ready = createReadyGoogletag();
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+    const order: string[] = [];
+    const facts: unknown[] = [];
+    const releaseDiagnostics = adapter.observeDiagnostics?.((fact) => {
+      order.push('diagnostics');
+      facts.push(fact);
+      throw new Error('fictional diagnostics failure');
+    });
+    expect(releaseDiagnostics).toEqual(expect.any(Function));
+    expect(ready.pubads.addEventListener).not.toHaveBeenCalled();
+
+    await adapter.run((gpt) =>
+      gpt.subscribe('slotRenderEnded', () => {
+        order.push('correctness');
+      })
+    ).result;
+    expect(ready.pubads.addEventListener).toHaveBeenCalledTimes(1);
+    const slot = Object.freeze({ id: 'fictional-slot' });
+    const emit = (event: unknown): void => {
+      for (const listener of ready.listeners.get('slotRenderEnded') ?? []) listener(event);
+    };
+    expect(() =>
+      emit({
+        slot,
+        isEmpty: false,
+        size: [300, 250],
+        isBackfill: true,
+        slotContentChanged: false,
+      })
+    ).not.toThrow();
+
+    expect(order).toEqual(['correctness', 'diagnostics']);
+    expect(facts).toEqual([
+      {
+        kind: 'slotRenderEnded',
+        slot,
+        isEmpty: false,
+        size: [300, 250],
+        isBackfill: true,
+        slotContentChanged: false,
+      },
+    ]);
+    expect(Object.isFrozen(facts[0])).toBe(true);
+    expect(Object.isFrozen((facts[0] as { size: unknown }).size)).toBe(true);
+
+    releaseDiagnostics?.();
+    emit({ slot, isEmpty: true });
+    expect(facts).toHaveLength(1);
+  });
+
+  it('admits only one diagnostics observer without adding GPT listeners', () => {
+    const ready = createReadyGoogletag();
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+    const release = adapter.observeDiagnostics?.(vi.fn());
+
+    expect(adapter.observeDiagnostics?.(vi.fn())).toBeUndefined();
+    expect(ready.pubads.addEventListener).not.toHaveBeenCalled();
+    release?.();
+    expect(adapter.observeDiagnostics?.(vi.fn())).toEqual(expect.any(Function));
+    expect(ready.pubads.addEventListener).not.toHaveBeenCalled();
+  });
+
   it('rolls back an exact GPT listener when installation replaces the binding', async () => {
     const first = createReadyGoogletag();
     const replacement = createReadyGoogletag();

@@ -183,6 +183,7 @@ export interface GoogletagOperation<T> {
 /** Narrow GPT boundary consumed by kernel sessions and services. */
 export interface GoogletagAdapter {
   bindingStatus(): GoogletagBindingStatus;
+  observeDiagnostics?(observer: GoogletagDiagnosticsObserver): (() => void) | undefined;
   observePublisherCalls(observer: GoogletagPublisherCallObserver): () => void;
   run<T>(
     command: (googletag: Readonly<GoogletagFacade>) => T,
@@ -191,6 +192,26 @@ export interface GoogletagAdapter {
   notifyReady(): void;
   dispose(): void;
 }
+
+export type GoogletagDiagnosticsEventName =
+  | 'slotRequested'
+  | 'slotResponseReceived'
+  | 'slotRenderEnded'
+  | 'slotOnload'
+  | 'impressionViewable'
+  | 'slotVisibilityChanged';
+
+export interface GoogletagDiagnosticsFact {
+  readonly kind: GoogletagDiagnosticsEventName;
+  readonly slot: object;
+  readonly isEmpty?: boolean;
+  readonly size?: readonly [number, number];
+  readonly isBackfill?: boolean;
+  readonly slotContentChanged?: boolean;
+  readonly inViewPercentage?: number;
+}
+
+export type GoogletagDiagnosticsObserver = (fact: Readonly<GoogletagDiagnosticsFact>) => void;
 
 /** Browser surface owned by the concrete GPT adapter. */
 export interface GoogletagGlobalTarget {
@@ -412,7 +433,8 @@ function createFacade(
     receiver: unknown,
     arguments_: readonly unknown[]
   ) => unknown,
-  consumeFacadeCall: (callable: (...arguments_: unknown[]) => unknown) => boolean
+  consumeFacadeCall: (callable: (...arguments_: unknown[]) => unknown) => boolean,
+  publishDiagnostics: (eventType: string, event: unknown) => void
 ): Readonly<GoogletagFacade> {
   const member = (external: object, key: PropertyKey): ((...args: unknown[]) => unknown) => {
     if (!isOperationCurrent()) throw new GoogletagAdapterError('external_artifact_incompatible');
@@ -674,6 +696,7 @@ function createFacade(
         } catch {
           // Publisher and service callbacks cannot escape the GPT boundary.
         }
+        publishDiagnostics(eventType, event);
       };
       let attempted = false;
       const rollback = (): void => {
@@ -831,9 +854,82 @@ export function createBrowserGoogletagAdapter(
   const bindingTokens = new WeakMap<object, object>();
   const initialLoadReleases = new Map<object, () => void>();
   const initialLoadOwner = Object.freeze({});
+  let diagnosticsObserver: GoogletagDiagnosticsObserver | undefined;
   let pendingReservations = 0;
   let disposed = false;
   let firstDisplayObserved = false;
+
+  const diagnosticFact = (
+    eventType: string,
+    event: unknown
+  ): Readonly<GoogletagDiagnosticsFact> | undefined => {
+    try {
+      if ((typeof event !== 'object' || event === null) && typeof event !== 'function') {
+        return undefined;
+      }
+      const slot = safeMember(event as object, 'slot');
+      if ((typeof slot !== 'object' || slot === null) && typeof slot !== 'function') {
+        return undefined;
+      }
+      const base = { kind: eventType, slot: slot as object };
+      switch (eventType) {
+        case 'slotRequested':
+        case 'slotResponseReceived':
+        case 'slotOnload':
+        case 'impressionViewable':
+          return Object.freeze({ ...base, kind: eventType });
+        case 'slotVisibilityChanged': {
+          const percentage = safeMember(event as object, 'inViewPercentage');
+          return typeof percentage === 'number' && Number.isFinite(percentage)
+            ? Object.freeze({ ...base, kind: eventType, inViewPercentage: percentage })
+            : Object.freeze({ ...base, kind: eventType });
+        }
+        case 'slotRenderEnded': {
+          const isEmpty = safeMember(event as object, 'isEmpty');
+          const isBackfill = safeMember(event as object, 'isBackfill');
+          const slotContentChanged = safeMember(event as object, 'slotContentChanged');
+          const sizeCandidate = safeMember(event as object, 'size');
+          let size: readonly [number, number] | undefined;
+          if (Array.isArray(sizeCandidate) && sizeCandidate.length === 2) {
+            const width = safeMember(sizeCandidate, '0');
+            const height = safeMember(sizeCandidate, '1');
+            if (
+              typeof width === 'number' &&
+              Number.isFinite(width) &&
+              typeof height === 'number' &&
+              Number.isFinite(height)
+            ) {
+              size = Object.freeze([width, height]);
+            }
+          }
+          return Object.freeze({
+            ...base,
+            kind: eventType,
+            ...(typeof isEmpty === 'boolean' ? { isEmpty } : {}),
+            ...(size ? { size } : {}),
+            ...(typeof isBackfill === 'boolean' ? { isBackfill } : {}),
+            ...(typeof slotContentChanged === 'boolean' ? { slotContentChanged } : {}),
+          });
+        }
+        default:
+          return undefined;
+      }
+    } catch {
+      return undefined;
+    }
+  };
+
+  const publishDiagnostics = (eventType: string, event: unknown): void => {
+    const observer = diagnosticsObserver;
+    if (!observer || disposed) return;
+    const fact = diagnosticFact(eventType, event);
+    if (!fact) return;
+    try {
+      observer(fact);
+    } catch {
+      // Diagnostics observation cannot escape the GPT correctness callback.
+    }
+  };
 
   const invokeFacadeCall = (
     callable: (...arguments_: unknown[]) => unknown,
@@ -1548,7 +1644,8 @@ export function createBrowserGoogletagAdapter(
       bindingToken,
       markFirstDisplay,
       invokeFacadeCall,
-      consumeFacadeCall
+      consumeFacadeCall,
+      publishDiagnostics
     );
     try {
       if (disposed) {
@@ -2156,8 +2253,32 @@ export function createBrowserGoogletagAdapter(
     return release;
   };
 
+  const observeDiagnostics = (observer: GoogletagDiagnosticsObserver): (() => void) | undefined => {
+    if (disposed || typeof observer !== 'function' || diagnosticsObserver) return undefined;
+    diagnosticsObserver = observer;
+    let active = true;
+    const release = (): void => {
+      if (!active) return;
+      active = false;
+      if (diagnosticsObserver === observer) diagnosticsObserver = undefined;
+      try {
+        deleteSetValue(effects, release);
+      } catch {
+        // Exact observer release remains authoritative under registry failure.
+      }
+    };
+    try {
+      registerAdapterEffect(release);
+    } catch (error) {
+      release();
+      throw error;
+    }
+    return release;
+  };
+
   return Object.freeze({
     bindingStatus: (): GoogletagBindingStatus => currentBinding().status,
+    observeDiagnostics,
     observePublisherCalls,
     run,
     notifyReady,
