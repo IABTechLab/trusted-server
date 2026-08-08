@@ -327,9 +327,7 @@ export function preparePrebidRegisteredRefreshAuction(
       const mediaTypes = ownDataObject(source.mediaTypes);
       if (!mediaTypes || !Object.isFrozen(source.mediaTypes)) return undefined;
       const rawBids =
-        source.bids === undefined
-          ? []
-          : ownDataArray(source.bids, MAX_CONFIG_MEMBERS);
+        source.bids === undefined ? [] : ownDataArray(source.bids, MAX_CONFIG_MEMBERS);
       if (!rawBids || (source.bids !== undefined && !Object.isFrozen(source.bids))) {
         return undefined;
       }
