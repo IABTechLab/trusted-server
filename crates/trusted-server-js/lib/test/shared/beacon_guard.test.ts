@@ -147,6 +147,20 @@ describe('Beacon Guard', () => {
     });
   });
 
+  it('restores the exact publisher-owned descriptors on reset', () => {
+    const sendBeaconDescriptor = Object.getOwnPropertyDescriptor(navigator, 'sendBeacon');
+    const fetchDescriptor = Object.getOwnPropertyDescriptor(window, 'fetch');
+    const guard = createBeaconGuard(config);
+
+    guard.install();
+    guard.reset();
+
+    expect(Object.getOwnPropertyDescriptor(navigator, 'sendBeacon')).toEqual(
+      sendBeaconDescriptor
+    );
+    expect(Object.getOwnPropertyDescriptor(window, 'fetch')).toEqual(fetchDescriptor);
+  });
+
   describe('multiple guards', () => {
     it('should allow independent guards to coexist', () => {
       const config2: BeaconGuardConfig = {

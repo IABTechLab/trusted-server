@@ -16,6 +16,33 @@ const libDirectory = path.resolve(testDirectory, '../..');
 const repositoryRoot = path.resolve(libDirectory, '../../..');
 const bundle = (id, logical) => ({ id, bytes: Buffer.from(`${logical}${RELEASE_SENTINEL}`) });
 
+const EXPECTED_RELEASE_BUNDLE_ORDER = [
+  'core',
+  'creative',
+  'datadome',
+  'didomi',
+  'google_tag_manager',
+  'gpt',
+  'gpt_diagnostics',
+  'lockr',
+  'osano',
+  'permutive',
+  'prebid',
+  'sourcepoint',
+  'testlight',
+];
+
+test('generated release inventory pins the server bundle order', () => {
+  const manifest = JSON.parse(
+    fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-release-v1.json'), 'utf8')
+  );
+
+  assert.deepEqual(
+    manifest.bundles.map(({ id }) => id),
+    EXPECTED_RELEASE_BUNDLE_ORDER
+  );
+});
+
 test('bundle metrics use the required five-module reference vector', () => {
   const metrics = JSON.parse(
     fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-build-metrics-v1.json'), 'utf8')
