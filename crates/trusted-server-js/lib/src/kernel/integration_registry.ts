@@ -273,6 +273,7 @@ class IntegrationRegistryOwner {
   private deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   private failureReason: BootFailureReason | undefined;
   private installPromise: Promise<IntegrationInstallResult> | undefined;
+  private registrationWaiter: (() => void) | undefined;
   private registryState: IntegrationRegistryState = 'collecting';
   private ownedCallbackDepth = 0;
   private unwindPending = false;
@@ -371,6 +372,7 @@ class IntegrationRegistryOwner {
           prepare: prepare as IntegrationRegistration['prepare'],
         })
       );
+      if (this.hasEveryRequiredRegistration()) this.wakeRegistrationWaiter();
       return true;
     } catch {
       this.fail('abi_mismatch');
@@ -415,6 +417,7 @@ class IntegrationRegistryOwner {
     if (this.registryState !== 'failed') this.registryState = 'disposed';
     this.abortController.abort();
     this.clearBootOwnership();
+    this.wakeRegistrationWaiter();
     this.requestUnwind();
   }
 
@@ -456,7 +459,32 @@ class IntegrationRegistryOwner {
     this.registryState = 'failed';
     this.abortController.abort();
     this.clearBootOwnership();
+    this.wakeRegistrationWaiter();
     this.requestUnwind();
+  }
+
+  private hasEveryRequiredRegistration(): boolean {
+    return Boolean(
+      this.manifestValue?.integrations.every((entry) => this.registrations.has(entry.id))
+    );
+  }
+
+  private wakeRegistrationWaiter(): void {
+    const wake = this.registrationWaiter;
+    this.registrationWaiter = undefined;
+    wake?.();
+  }
+
+  private waitForRequiredRegistrations(): Promise<void> {
+    if (this.registryState !== 'collecting' || this.hasEveryRequiredRegistration()) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      this.registrationWaiter = resolve;
+      if (this.registryState !== 'collecting' || this.hasEveryRequiredRegistration()) {
+        this.wakeRegistrationWaiter();
+      }
+    });
   }
 
   private enterOwnedCallback(): void {
@@ -566,14 +594,21 @@ class IntegrationRegistryOwner {
     if (this.registryState === 'failed' || this.registryState === 'disposed') {
       return this.fallbackResult();
     }
-    if (
-      !this.manifestValue ||
-      !this.ownerIsCurrent() ||
-      this.deadlineExpired() ||
-      this.manifestValue.integrations.some((entry) => !this.registrations.has(entry.id))
-    ) {
+    if (!this.manifestValue || !this.ownerIsCurrent() || this.deadlineExpired()) {
       this.fail('bundle_partial');
       return this.fallbackResult();
+    }
+    if (!this.hasEveryRequiredRegistration()) {
+      await this.waitForRequiredRegistrations();
+      if (
+        this.registryState !== 'collecting' ||
+        !this.ownerIsCurrent() ||
+        this.deadlineExpired() ||
+        !this.hasEveryRequiredRegistration()
+      ) {
+        this.fail('bundle_partial');
+        return this.fallbackResult();
+      }
     }
 
     this.registryState = 'preparing';

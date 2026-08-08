@@ -278,21 +278,66 @@ describe('integration manifest and registration admission', () => {
     expect(swappedPrepare).not.toHaveBeenCalled();
   });
 
-  it('fails missing required modules without executing registered module code', async () => {
-    const prepare = vi.fn(() => ({ activate: () => undefined }));
+  it('waits for required modules registered after install starts without early execution', async () => {
+    const order: string[] = [];
+    const gptPrepare = vi.fn(() => {
+      order.push('prepare:gpt');
+      return { activate: () => order.push('activate:gpt') };
+    });
+    const prebidPrepare = vi.fn(() => {
+      order.push('prepare:prebid');
+      return { activate: () => order.push('activate:prebid') };
+    });
     const registry = createIntegrationRegistry({
       manifest: manifest(['gpt', 'prebid']),
       releaseId: RELEASE_ID,
       startedAtMs: 0,
       now: () => 0,
     });
+    registry.register(registration('gpt', { prepare: gptPrepare }));
+
+    const installed = install(registry, order);
+    await Promise.resolve();
+    expect(registry.state).toBe('collecting');
+    expect(order).toEqual([]);
+    expect(registry.register(registration('prebid', { prepare: prebidPrepare }))).toBe(true);
+
+    await expect(installed).resolves.toMatchObject({ state: 'kernel' });
+    expect(order).toEqual([
+      'prepare:gpt',
+      'prepare:prebid',
+      'activate:gpt',
+      'activate:prebid',
+      'publish',
+      'drain',
+    ]);
+  });
+
+  it('fails missing required modules only at the shared boot deadline', async () => {
+    vi.useFakeTimers();
+    let now = 0;
+    const prepare = vi.fn(() => ({ activate: () => undefined }));
+    const registry = createIntegrationRegistry({
+      manifest: manifest(['gpt', 'prebid']),
+      releaseId: RELEASE_ID,
+      startedAtMs: 0,
+      now: () => now,
+    });
     registry.register(registration('gpt', { prepare }));
 
-    await expect(install(registry)).resolves.toMatchObject({
+    const installed = install(registry);
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(registry.state).toBe('collecting');
+    expect(prepare).not.toHaveBeenCalled();
+    now = 10_000;
+    await vi.advanceTimersByTimeAsync(1);
+
+    await expect(installed).resolves.toMatchObject({
       state: 'fallback',
       reason: 'bundle_partial',
     });
     expect(prepare).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('accepts exactly 16 required modules in manifest order', async () => {
@@ -1200,7 +1245,7 @@ describe('integration preparation and activation transaction', () => {
       manifest: manifest(['gpt']),
       releaseId: RELEASE_ID,
       startedAtMs: 0,
-      now: () => 0,
+      now: () => 10_000,
     });
     await install(fallbackRegistry);
     const fallbackPrepare = vi.fn();
