@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { createBrowserGoogletagAdapter } from '../../src/adapters/googletag';
+import {
+  createBrowserGoogletagAdapter,
+  type GoogletagDiagnosticsFact,
+} from '../../src/adapters/googletag';
 
 type Command = () => void;
 
@@ -1181,6 +1184,45 @@ describe('browser googletag adapter readiness', () => {
     release?.();
     expect(adapter.observeDiagnostics?.(vi.fn())).toEqual(expect.any(Function));
     expect(ready.pubads.addEventListener).not.toHaveBeenCalled();
+  });
+
+  it('keeps one non-capability token per physical Slot and never freezes publisher authority', async () => {
+    const ready = createReadyGoogletag();
+    const adapter = createBrowserGoogletagAdapter({
+      googletag: ready.googletag,
+      performance: { now: () => 7 },
+    });
+    const facts: GoogletagDiagnosticsFact[] = [];
+    adapter.observeDiagnostics?.((fact) => facts.push(fact));
+    await adapter.run((gpt) => gpt.subscribe('slotRequested', () => undefined)).result;
+    const first = {
+      getSlotElementId: () => 'same-id',
+      getAdUnitPath: () => '/example/first',
+      setTargeting: vi.fn(),
+    };
+    const replacement = {
+      getSlotElementId: () => 'same-id',
+      getAdUnitPath: () => '/example/replacement',
+      setTargeting: vi.fn(),
+    };
+    const emit = (slot: object): void => {
+      for (const listener of ready.listeners.get('slotRequested') ?? []) listener({ slot });
+    };
+
+    emit(first);
+    emit(first);
+    emit(replacement);
+
+    expect(facts).toHaveLength(3);
+    expect(facts[0]?.slot.token).toBe(facts[1]?.slot.token);
+    expect(facts[2]?.slot.token).not.toBe(facts[0]?.slot.token);
+    expect(Object.isFrozen(first)).toBe(false);
+    expect(Object.isFrozen(replacement)).toBe(false);
+    expect(Reflect.ownKeys(facts[0]?.slot ?? {}).sort()).toEqual([
+      'adUnitPath',
+      'elementId',
+      'token',
+    ]);
   });
 
   it('rolls back an exact GPT listener when installation replaces the binding', async () => {

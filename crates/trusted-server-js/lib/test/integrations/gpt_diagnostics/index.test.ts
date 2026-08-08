@@ -101,6 +101,25 @@ describe('GPT diagnostics runtime', () => {
     release();
   });
 
+  it('retains adapter callback timing across delayed fact-buffer replay', () => {
+    const buffer = createGptDiagnosticsFactBuffer();
+    const observedSlot = slot('timed-slot');
+    buffer.publish(fact('slotRequested', observedSlot, { observedAtMs: 10 }));
+    buffer.publish(fact('slotResponseReceived', observedSlot, { observedAtMs: 25 }));
+    const runtime = createGptDiagnosticsRuntime(buffer, { window, document });
+
+    const release = runtime.activate();
+    buffer.publish(fact('slotRenderEnded', observedSlot, { observedAtMs: 30, isEmpty: false }));
+
+    expect(runtime.currentApi()?.snapshot().slots[0]?.requests[0]).toMatchObject({
+      requestedAtMs: 10,
+      responseAtMs: 25,
+      renderAtMs: 30,
+      durations: { requestToResponseMs: 15, responseToRenderMs: 5, requestToRenderMs: 20 },
+    });
+    release();
+  });
+
   it('releases its consumer so replacement activation receives intervening buffered facts', () => {
     const buffer = createGptDiagnosticsFactBuffer();
     const runtime = createGptDiagnosticsRuntime(buffer, { window, document });
