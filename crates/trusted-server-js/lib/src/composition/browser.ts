@@ -302,11 +302,7 @@ function composedPrebidRefreshAuction(
       const record = records[recordIndex];
       if (
         !record ||
-        !slots.isBoundGptSlot(
-          navigation.generation,
-          record.registeredSlotId,
-          physicalSlot
-        )
+        !slots.isBoundGptSlot(navigation.generation, record.registeredSlotId, physicalSlot)
       ) {
         continue;
       }
@@ -1030,7 +1026,6 @@ export function createTestBrowserRuntimeComposition(
             cachePolicy,
             fetcher: (input, init) => fetchCache(input, init),
             onResolved,
-            publisherOrigin,
           });
         } catch {
           return false;
@@ -1133,8 +1128,8 @@ export function createTestBrowserRuntimeComposition(
         }),
         onNavigationDispose: (navigationGeneration) => {
           artifacts.disposeNavigation(navigationGeneration);
-          for (const registeredSlotId of
-            renderTraceSlotsByNavigation.get(navigationGeneration) ?? []) {
+          for (const registeredSlotId of renderTraceSlotsByNavigation.get(navigationGeneration) ??
+            []) {
             preparedRenderTrace.prune(registeredSlotId);
           }
           renderTraceSlotsByNavigation.delete(navigationGeneration);
