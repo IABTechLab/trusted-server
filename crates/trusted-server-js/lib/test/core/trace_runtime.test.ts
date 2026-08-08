@@ -159,6 +159,44 @@ describe('render trace diagnostics runtime', () => {
     expect(second.count).toBe(2);
   });
 
+  it('evicts the counter paired with current-state rollover without resetting retained slots', () => {
+    const { owner } = harness();
+    for (let index = 0; index < 256; index += 1) {
+      owner.record({ slotId: `slot-${index}`, path: 'auction', rendered: true });
+    }
+    const refreshedA = owner.record({ slotId: 'slot-0', path: 'ssat', rendered: true });
+    expect(refreshedA.count).toBe(2);
+
+    owner.record({ slotId: 'slot-256', path: 'auction', rendered: true });
+    expect(owner.diagnostics.current()).not.toHaveProperty('slot-0');
+    const refreshedB = owner.record({ slotId: 'slot-1', path: 'ssat', rendered: true });
+
+    expect(refreshedB.count).toBe(2);
+    expect(owner.diagnostics.current()['slot-1']?.count).toBe(2);
+    expect(Object.values(owner.diagnostics.current()).every(({ count }) => count >= 1)).toBe(true);
+  });
+
+  it('retains pruned counts until bounded capacity requires their eviction', () => {
+    const { owner } = harness();
+    const first = owner.record({ slotId: 'reused-slot', path: 'auction', rendered: true });
+    expect(owner.prune('reused-slot', first.seq)).toBe(true);
+    const second = owner.record({ slotId: 'reused-slot', path: 'ssat', rendered: true });
+    expect(second.count).toBe(2);
+    expect(owner.prune('reused-slot', second.seq)).toBe(true);
+
+    for (let index = 0; index < 255; index += 1) {
+      owner.record({ slotId: `capacity-${index}`, path: 'auction', rendered: true });
+    }
+    owner.record({ slotId: 'capacity-255', path: 'auction', rendered: true });
+    const afterBoundedEviction = owner.record({
+      slotId: 'reused-slot',
+      path: 'auction',
+      rendered: true,
+    });
+
+    expect(afterBoundedEviction.count).toBe(1);
+  });
+
   it('retains impression bookkeeping and refuses truth-weakening enrichment', () => {
     const { owner } = harness();
     const record = owner.record({

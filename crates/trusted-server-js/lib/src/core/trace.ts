@@ -1085,6 +1085,10 @@ export function createRenderTraceDiagnostics(
       }
     }
     const previous = current.get(input.slotId);
+    const evictedCurrentSlot =
+      !previous && current.size >= MAX_RENDER_TRACE_SLOTS
+        ? (current.keys().next().value as string | undefined)
+        : undefined;
     let at: number;
     try {
       at = (options.now ?? Date.now)();
@@ -1093,10 +1097,16 @@ export function createRenderTraceDiagnostics(
     }
     const previousCount = counts.get(input.slotId) ?? 0;
     if (!counts.has(input.slotId) && counts.size >= MAX_RENDER_TRACE_SLOTS) {
-      const oldestCount = counts.keys().next().value as string | undefined;
-      if (oldestCount !== undefined) counts.delete(oldestCount);
+      let evictedCounter: string | undefined;
+      for (const candidate of counts.keys()) {
+        if (!current.has(candidate)) {
+          evictedCounter = candidate;
+          break;
+        }
+      }
+      evictedCounter ??= evictedCurrentSlot;
+      if (evictedCounter !== undefined) counts.delete(evictedCounter);
     }
-    counts.delete(input.slotId);
     counts.set(input.slotId, previousCount + 1);
     const committed = copyRenderTraceRecord({
       ...input,
@@ -1105,12 +1115,9 @@ export function createRenderTraceDiagnostics(
       at,
     });
     if (disposed) return committed;
-    if (!previous && current.size >= MAX_RENDER_TRACE_SLOTS) {
-      const oldestSlot = current.keys().next().value as string | undefined;
-      if (oldestSlot !== undefined) {
-        current.delete(oldestSlot);
-        presentation.prune(oldestSlot);
-      }
+    if (evictedCurrentSlot !== undefined) {
+      current.delete(evictedCurrentSlot);
+      presentation.prune(evictedCurrentSlot);
     }
     current.set(committed.slotId, committed);
     recordsBySequence.set(committed.seq, committed);
