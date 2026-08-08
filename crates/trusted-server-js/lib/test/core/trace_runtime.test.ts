@@ -28,7 +28,7 @@ function harness() {
 describe('render trace diagnostics runtime', () => {
   it('exposes one exact frozen read-only public surface with copied snapshots', () => {
     const { owner } = harness();
-    const target = window as typeof window & { tsjs?: Record<string, unknown> };
+    const target = window as unknown as { tsjs?: Record<string, unknown> };
     const existingApi = (target.tsjs = {});
     const event = vi.fn();
     window.addEventListener('tsjs:adRendered', event);
