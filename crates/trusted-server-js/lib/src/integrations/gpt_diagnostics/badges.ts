@@ -29,15 +29,21 @@ const BADGE_EDGE_GUTTER_PX = 4;
 interface BadgeOptions {
   window?: BadgeWindow | undefined;
   document?: Document | undefined;
-  scheduleFrame?: ((callback: () => void) => void) | undefined;
+  scheduleFrame?: ((callback: () => void) => () => void) | undefined;
 }
 
-function defaultScheduleFrame(callback: () => void): void {
-  if (typeof requestAnimationFrame === 'function') {
-    requestAnimationFrame(() => callback());
-  } else {
-    queueMicrotask(callback);
+function defaultScheduleFrame(callback: () => void): () => void {
+  if (typeof requestAnimationFrame === 'function' && typeof cancelAnimationFrame === 'function') {
+    const frame = requestAnimationFrame(() => callback());
+    return () => cancelAnimationFrame(frame);
   }
+  let active = true;
+  queueMicrotask(() => {
+    if (active) callback();
+  });
+  return () => {
+    active = false;
+  };
 }
 
 function intersectsViewport(rectangle: DOMRect, window: Window): boolean {
@@ -110,7 +116,7 @@ export class GptDiagnosticsBadgeManager {
   private readonly bindings: BadgeBindings;
   private readonly window: BadgeWindow;
   private readonly document: Document;
-  private readonly scheduleFrame: (callback: () => void) => void;
+  private readonly scheduleFrame: (callback: () => void) => () => void;
   private readonly unsubscribeStore: () => void;
   private readonly unsubscribeBindings: () => void;
   private readonly slotElementIds = new Set<string>();
@@ -118,6 +124,7 @@ export class GptDiagnosticsBadgeManager {
   private layer: HTMLElement | undefined;
   private mutationObserver?: MutationObserver;
   private resizeObserver?: ResizeObserver;
+  private cancelScheduledUpdate: (() => void) | undefined;
   private scheduled = false;
   private destroyed = false;
 
@@ -192,6 +199,14 @@ export class GptDiagnosticsBadgeManager {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    const cancelUpdate = this.cancelScheduledUpdate;
+    this.cancelScheduledUpdate = undefined;
+    this.scheduled = false;
+    try {
+      cancelUpdate?.();
+    } catch {
+      // Continue releasing every independently owned badge resource.
+    }
     this.unsubscribeStore();
     this.unsubscribeBindings();
     this.window.removeEventListener('scroll', this.scheduleUpdate);
@@ -205,10 +220,40 @@ export class GptDiagnosticsBadgeManager {
   private readonly scheduleUpdate = (): void => {
     if (this.destroyed || this.scheduled) return;
     this.scheduled = true;
-    this.scheduleFrame(() => {
+    let active = true;
+    let cancelFrame: (() => void) | undefined;
+    const run = (): void => {
+      if (!active) return;
+      active = false;
+      this.cancelScheduledUpdate = undefined;
+      try {
+        cancelFrame?.();
+      } catch {
+        // A completed frame remains authoritative when scheduler cleanup fails.
+      }
       this.scheduled = false;
       this.update();
-    });
+    };
+    try {
+      cancelFrame = this.scheduleFrame(run);
+      if (typeof cancelFrame !== 'function') {
+        throw new TypeError('Invalid badge frame scheduler');
+      }
+      if (active) {
+        this.cancelScheduledUpdate = (): void => {
+          if (!active) return;
+          active = false;
+          this.scheduled = false;
+          cancelFrame?.();
+        };
+      } else {
+        cancelFrame();
+      }
+    } catch {
+      active = false;
+      this.cancelScheduledUpdate = undefined;
+      this.scheduled = false;
+    }
   };
 
   private refreshSlots(): void {

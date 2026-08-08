@@ -59,6 +59,16 @@ function runNextFrame(frames: Array<() => void>): void {
   frame();
 }
 
+function queueFrame(frames: Array<() => void>): (callback: () => void) => () => void {
+  return (callback) => {
+    frames.push(callback);
+    return () => {
+      const index = frames.indexOf(callback);
+      if (index >= 0) frames.splice(index, 1);
+    };
+  };
+}
+
 beforeEach(() => {
   document.body.replaceChildren();
   vi.spyOn(document, 'readyState', 'get').mockReturnValue('complete');
@@ -76,7 +86,7 @@ describe('GptDiagnosticsOverlay', () => {
     store.recordSlotRequested(slot('early-slot'));
     let root: ShadowRoot | undefined;
     const overlay = new GptDiagnosticsOverlay(store, new FakeBindings(), {
-      scheduleFrame: (callback) => frames.push(callback),
+      scheduleFrame: queueFrame(frames),
       onShadowRoot: (createdRoot) => {
         root = createdRoot;
       },
@@ -140,7 +150,7 @@ describe('GptDiagnosticsOverlay', () => {
     const exportSnapshot = vi.fn();
     let root: ShadowRoot | undefined;
     const overlay = new GptDiagnosticsOverlay(store, bindings, {
-      scheduleFrame: (callback) => frames.push(callback),
+      scheduleFrame: queueFrame(frames),
       onExport: exportSnapshot,
       onShadowRoot: (createdRoot) => {
         root = createdRoot;
@@ -215,7 +225,7 @@ describe('GptDiagnosticsOverlay', () => {
     document.body.append(publisherElement);
     const warn = vi.spyOn(log, 'warn');
     const overlay = new GptDiagnosticsOverlay(new GptDiagnosticsStore(), new FakeBindings(), {
-      scheduleFrame: (callback) => frames.push(callback),
+      scheduleFrame: queueFrame(frames),
     });
     runNextFrame(frames);
     runNextFrame(frames);
@@ -244,7 +254,7 @@ describe('GptDiagnosticsOverlay', () => {
     store.recordSlotRequested(diagnosticSlot);
     let root: ShadowRoot | undefined;
     const overlay = new GptDiagnosticsOverlay(store, new FakeBindings(), {
-      scheduleFrame: (callback) => frames.push(callback),
+      scheduleFrame: queueFrame(frames),
       onShadowRoot: (createdRoot) => {
         root = createdRoot;
       },
@@ -270,7 +280,7 @@ describe('GptDiagnosticsOverlay', () => {
     const store = new GptDiagnosticsStore();
     let root: ShadowRoot | undefined;
     const overlay = new GptDiagnosticsOverlay(store, new FakeBindings(), {
-      scheduleFrame: (callback) => frames.push(callback),
+      scheduleFrame: queueFrame(frames),
       onShadowRoot: (createdRoot) => {
         root = createdRoot;
       },
@@ -303,5 +313,51 @@ describe('GptDiagnosticsOverlay', () => {
     overlay.show();
     expect(document.querySelectorAll(`#${GPT_DIAGNOSTICS_HOST_ID}`)).toHaveLength(1);
     overlay.destroy();
+  });
+
+  it('cancels a pending mount frame on destroy and suppresses a hostile late callback', () => {
+    const frames: Array<() => void> = [];
+    const cancel = vi.fn();
+    const overlay = new GptDiagnosticsOverlay(new GptDiagnosticsStore(), new FakeBindings(), {
+      scheduleFrame: (callback) => {
+        frames.push(callback);
+        return cancel;
+      },
+    });
+
+    overlay.destroy();
+    frames[0]?.();
+
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(frames).toHaveLength(1);
+    expect(document.getElementById(GPT_DIAGNOSTICS_HOST_ID)).toBeNull();
+  });
+
+  it('runs one scheduled mount callback at most once', () => {
+    const frames: Array<() => void> = [];
+    const overlay = new GptDiagnosticsOverlay(new GptDiagnosticsStore(), new FakeBindings(), {
+      scheduleFrame: (callback) => {
+        frames.push(callback);
+        return vi.fn();
+      },
+    });
+
+    frames[0]?.();
+    frames[0]?.();
+
+    expect(frames).toHaveLength(2);
+    overlay.destroy();
+  });
+
+  it('isolates a hostile frame cancellation during destroy', () => {
+    const cancel = vi.fn(() => {
+      throw new Error('cancel failed');
+    });
+    const overlay = new GptDiagnosticsOverlay(new GptDiagnosticsStore(), new FakeBindings(), {
+      scheduleFrame: () => cancel,
+    });
+
+    expect(() => overlay.destroy()).not.toThrow();
+    expect(cancel).toHaveBeenCalledOnce();
   });
 });

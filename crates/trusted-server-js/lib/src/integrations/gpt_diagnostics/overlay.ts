@@ -25,7 +25,7 @@ type OverlayWindow = Window & {
 interface OverlayOptions {
   window?: OverlayWindow | undefined;
   document?: Document | undefined;
-  scheduleFrame?: ((callback: () => void) => void) | undefined;
+  scheduleFrame?: ((callback: () => void) => () => void) | undefined;
   onExport?: (() => void) | undefined;
   onShadowRoot?: ((root: ShadowRoot) => void) | undefined;
   onBadgeLayerChange?: ((layer: HTMLElement | undefined) => void) | undefined;
@@ -98,12 +98,18 @@ const PANEL_STYLES = `
   }
 `;
 
-function defaultScheduleFrame(callback: () => void): void {
-  if (typeof requestAnimationFrame === 'function') {
-    requestAnimationFrame(() => callback());
-  } else {
-    queueMicrotask(callback);
+function defaultScheduleFrame(callback: () => void): () => void {
+  if (typeof requestAnimationFrame === 'function' && typeof cancelAnimationFrame === 'function') {
+    const frame = requestAnimationFrame(() => callback());
+    return () => cancelAnimationFrame(frame);
   }
+  let active = true;
+  queueMicrotask(() => {
+    if (active) callback();
+  });
+  return () => {
+    active = false;
+  };
 }
 
 function latestCycle(
@@ -189,7 +195,7 @@ export class GptDiagnosticsOverlay {
   private readonly bindings: OverlayBindings;
   private readonly window: OverlayWindow;
   private readonly document: Document;
-  private readonly scheduleFrame: (callback: () => void) => void;
+  private readonly scheduleFrame: (callback: () => void) => () => void;
   private readonly onExport: () => void;
   private readonly onShadowRoot: ((root: ShadowRoot) => void) | undefined;
   private readonly onBadgeLayerChange: ((layer: HTMLElement | undefined) => void) | undefined;
@@ -198,6 +204,7 @@ export class GptDiagnosticsOverlay {
   private host: HTMLElement | undefined;
   private panel: HTMLElement | undefined;
   private lifecycleObserver?: MutationObserver;
+  private readonly cancelScheduledFrames = new Set<() => void>();
   private visualReady = false;
   private mountWaitStarted = false;
   private renderScheduled = false;
@@ -240,6 +247,14 @@ export class GptDiagnosticsOverlay {
     if (this.destroyed) return;
     this.destroyed = true;
     this.dismissed = true;
+    for (const cancelFrame of [...this.cancelScheduledFrames]) {
+      this.cancelScheduledFrames.delete(cancelFrame);
+      try {
+        cancelFrame();
+      } catch {
+        // Continue releasing every independently owned overlay resource.
+      }
+    }
     this.unsubscribeStore();
     this.unsubscribeBindings();
     this.lifecycleObserver?.disconnect();
@@ -262,8 +277,8 @@ export class GptDiagnosticsOverlay {
 
     this.mountWaitStarted = true;
     this.document.removeEventListener('readystatechange', this.handleReadyStateChange);
-    this.scheduleFrame(() => {
-      this.scheduleFrame(() => {
+    this.scheduleOwnedFrame(() => {
+      this.scheduleOwnedFrame(() => {
         this.visualReady = true;
         if (!this.dismissed) this.mount();
       });
@@ -331,10 +346,14 @@ export class GptDiagnosticsOverlay {
         this.hostCollision = false;
       }
       this.remountScheduled = true;
-      this.scheduleFrame(() => {
+      if (
+        !this.scheduleOwnedFrame(() => {
+          this.remountScheduled = false;
+          this.mount();
+        })
+      ) {
         this.remountScheduled = false;
-        this.mount();
-      });
+      }
     });
     this.lifecycleObserver.observe(this.document.documentElement, {
       childList: true,
@@ -345,10 +364,50 @@ export class GptDiagnosticsOverlay {
   private scheduleRender(): void {
     if (this.destroyed || this.renderScheduled) return;
     this.renderScheduled = true;
-    this.scheduleFrame(() => {
+    if (
+      !this.scheduleOwnedFrame(() => {
+        this.renderScheduled = false;
+        this.render();
+      })
+    ) {
       this.renderScheduled = false;
-      this.render();
-    });
+    }
+  }
+
+  private scheduleOwnedFrame(callback: () => void): boolean {
+    if (this.destroyed) return false;
+    let active = true;
+    let cancelFrame: (() => void) | undefined;
+    let release: (() => void) | undefined;
+    const run = (): void => {
+      if (!active) return;
+      active = false;
+      if (release) this.cancelScheduledFrames.delete(release);
+      try {
+        cancelFrame?.();
+      } catch {
+        // A completed frame remains authoritative when scheduler cleanup fails.
+      }
+      if (!this.destroyed) callback();
+    };
+    try {
+      cancelFrame = this.scheduleFrame(run);
+      if (typeof cancelFrame !== 'function') {
+        throw new TypeError('Invalid overlay frame scheduler');
+      }
+      release = (): void => {
+        if (!active) return;
+        active = false;
+        cancelFrame?.();
+      };
+      if (active) this.cancelScheduledFrames.add(release);
+      else cancelFrame();
+      return true;
+    } catch {
+      active = false;
+      if (release) this.cancelScheduledFrames.delete(release);
+      return false;
+    }
   }
 
   private render(): void {
