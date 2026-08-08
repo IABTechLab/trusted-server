@@ -22,6 +22,12 @@ const SUCCESS_HEADERS: [&str; 5] = [
     "x-content-type-options",
 ];
 
+// The platform policy owns an exact five-second dispatch-through-final-byte
+// deadline. This black-box clock additionally observes downstream request
+// dispatch, local error serialization, and response delivery, so retain a
+// bounded allowance for work outside the transport window.
+const DOWNSTREAM_DEADLINE_OBSERVATION_ALLOWANCE: Duration = Duration::from_millis(250);
+
 struct CorpusCase {
     name: &'static str,
     upstream: FictionalResponse,
@@ -53,7 +59,9 @@ impl CorpusCase {
 
     fn deadline(name: &'static str, upstream: FictionalResponse) -> Self {
         Self {
-            maximum_elapsed: Some(Duration::from_secs(5)),
+            maximum_elapsed: Some(
+                Duration::from_secs(5) + DOWNSTREAM_DEADLINE_OBSERVATION_ALLOWANCE,
+            ),
             ..Self::failure(name, upstream)
         }
     }
@@ -404,7 +412,8 @@ fn actual_adapter_proxy_corpus() {
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         // This is only a downstream dead-test guard. Deadline corpus cases
-        // retain their independent, stricter five-second elapsed assertion.
+        // retain their independent five-second transport assertion plus the
+        // bounded black-box observation allowance above.
         // Leave enough headroom for an 8 MiB boundary response through local
         // wasm runtimes on a loaded CI worker.
         .timeout(Duration::from_secs(30))
