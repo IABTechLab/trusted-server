@@ -31,10 +31,18 @@ import {
 import { log as localLog } from '../../src/core/log';
 import type { BrowserAuctionBidV1 } from '../../src/core/types';
 import { createCreativeIntegrationRegistration } from '../../src/integrations/creative/module';
+import { createDataDomeIntegrationRegistration } from '../../src/integrations/datadome/module';
+import { createDidomiIntegrationRegistration } from '../../src/integrations/didomi/module';
+import { createGoogleTagManagerIntegrationRegistration } from '../../src/integrations/google_tag_manager/module';
 import { createGptIntegrationRegistration } from '../../src/integrations/gpt/module';
 import { isGuardInstalled, resetGuardState } from '../../src/integrations/gpt/script_guard';
 import { createGptDiagnosticsIntegrationRegistration } from '../../src/integrations/gpt_diagnostics/module';
+import { createLockrIntegrationRegistration } from '../../src/integrations/lockr/module';
+import { createOsanoIntegrationRegistration } from '../../src/integrations/osano/module';
+import { createPermutiveIntegrationRegistration } from '../../src/integrations/permutive/module';
 import { createPrebidIntegrationRegistration } from '../../src/integrations/prebid/module';
+import { createSourcepointIntegrationRegistration } from '../../src/integrations/sourcepoint/module';
+import { createTestlightIntegrationRegistration } from '../../src/integrations/testlight/module';
 import { publicLog } from '../../src/kernel/fallback';
 import { createTestNavigationIdentityIssuer } from '../../src/kernel/identity';
 import {
@@ -988,6 +996,85 @@ describe('browser composition', () => {
       resetGuardState();
     }
     expect(isGuardInstalled()).toBe(false);
+  });
+
+  it('owns every remaining integration in one maximal composed transaction', async () => {
+    vi.useFakeTimers();
+    const releaseId = 'a'.repeat(64);
+    const target = {};
+    const members = Object.freeze([
+      ['datadome', createDataDomeIntegrationRegistration] as const,
+      ['didomi', createDidomiIntegrationRegistration] as const,
+      ['google_tag_manager', createGoogleTagManagerIntegrationRegistration] as const,
+      ['lockr', createLockrIntegrationRegistration] as const,
+      ['osano', createOsanoIntegrationRegistration] as const,
+      ['permutive', createPermutiveIntegrationRegistration] as const,
+      ['sourcepoint', createSourcepointIntegrationRegistration] as const,
+      ['testlight', createTestlightIntegrationRegistration] as const,
+    ]);
+    const ids = Object.freeze(members.map(([id]) => id));
+    const configFor = (id: string): unknown => {
+      if (id === 'didomi') return Object.freeze({ proxyPath: '/integrations/didomi/consent/' });
+      if (id === 'sourcepoint') return Object.freeze({ rewriteSdk: true });
+      return undefined;
+    };
+    const appendChildBefore = Element.prototype.appendChild;
+    const insertBeforeBefore = Element.prototype.insertBefore;
+    const didomiBefore = Object.getOwnPropertyDescriptor(window, 'didomiConfig');
+    const testlightBefore = Object.getOwnPropertyDescriptor(window, 'testlight');
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target,
+        releaseId,
+        manifest: {
+          version: 1,
+          releaseId,
+          integrations: ids.map((id) => ({ id, required: true })),
+        },
+        knownIntegrationIds: ids,
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: { version: 1, auctionId: 'initial', results: [] },
+            bids: [],
+          },
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        getBindings: (id) => ({ config: configFor(id), interfaces: Object.freeze({}) }),
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag: fakeGoogletagAdapter(),
+          messaging: fakeMessagingAdapter(),
+          prebid: fakePrebidAdapter(),
+        },
+        coreActivations: { correctnessGptListeners: vi.fn() },
+      }
+    );
+
+    expect(composition.runtime.start()).toBe(true);
+    for (const [, createRegistration] of members) {
+      expect(composition.runtime.registerIntegration(createRegistration(releaseId))).toBe(true);
+    }
+    await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+    expect(composition.auctionContextRegistryForTest()?.snapshotInventoryForTest()).toEqual({
+      disposed: false,
+      registrations: ['permutive'],
+    });
+    expect(composition.runtimeSessionForTest()?.interfaces).toMatchObject(
+      Object.fromEntries(ids.map((id) => [id, expect.any(Object)]))
+    );
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+
+    composition.runtime.dispose();
+    composition.runtime.dispose();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(Element.prototype.appendChild).toBe(appendChildBefore);
+    expect(Element.prototype.insertBefore).toBe(insertBeforeBefore);
+    expect(Object.getOwnPropertyDescriptor(window, 'didomiConfig')).toEqual(didomiBefore);
+    expect(Object.getOwnPropertyDescriptor(window, 'testlight')).toEqual(testlightBefore);
   });
 
   it('injects the exact creative boot into reversible activation and post-commit startup', async () => {
