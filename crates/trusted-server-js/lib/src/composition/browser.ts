@@ -591,7 +591,7 @@ export function createTestBrowserRuntimeComposition(
         if (bids.length !== 1) continue;
         const bid = bids[0];
         if (!bid) continue;
-        publishPrebidBid({
+        const publication = publishPrebidBid({
           admitTrustedBid: (preparedBid) =>
             composition.adapters.prebid.admitTrustedBid(preparedBid),
           auctionId: auction.auctionId,
@@ -608,6 +608,18 @@ export function createTestBrowserRuntimeComposition(
           reservations,
           trackAdmittedBid: coordinator.track,
         });
+        if (
+          !publication.ok &&
+          (publication.reason === 'prebid_admission_failed' ||
+            publication.reason === 'prebid_contract_violation')
+        ) {
+          coordinator.settlePublicationFailure(
+            navigation,
+            auction.auctionId,
+            request.adUnitCode,
+            publication.reason
+          );
+        }
       }
     } catch {
       // Invalid/stale projection state publishes no Prebid bid.
