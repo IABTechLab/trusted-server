@@ -136,6 +136,59 @@ describe('external bundle + served shim evaluated together', () => {
     dom.window.close();
   });
 
+  it('reuses separately constructed identical artifacts without reporting a conflict', () => {
+    const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
+      url: 'https://pub.example.com/article',
+      runScripts: 'outside-only',
+    });
+    const pageWindow = dom.window;
+    const watchdogs = [];
+    const originalSetTimeout = pageWindow.setTimeout.bind(pageWindow);
+    pageWindow.setTimeout = (callback, delay, ...arguments_) => {
+      if (delay === 5_000 && String(callback).includes('__tsWatchdogFired')) {
+        watchdogs.push(callback);
+        return 1;
+      }
+      return originalSetTimeout(callback, delay, ...arguments_);
+    };
+    pageWindow.fetch = vi.fn(async () => new Response('{}'));
+    pageWindow.Request = Request;
+    pageWindow.Headers = Headers;
+    pageWindow.Response = Response;
+    pageWindow.AbortController = AbortController;
+    if (!('isSecureContext' in pageWindow)) pageWindow.isSecureContext = true;
+    pageWindow.eval('window.pbjs = { que: [], cmd: [] };');
+    const warn = vi.fn();
+    pageWindow.console.warn = warn;
+    const firstBytes = Buffer.from(bundleCode, 'utf8');
+    const duplicateBytes = Buffer.from(bundleCode, 'utf8');
+    expect(firstBytes).not.toBe(duplicateBytes);
+    expect(firstBytes.equals(duplicateBytes)).toBe(true);
+
+    pageWindow.eval(firstBytes.toString('utf8'));
+    const firstBinding = pageWindow.pbjs;
+    const firstRequestBids = firstBinding.requestBids;
+    const firstRegisterBidAdapter = firstBinding.registerBidAdapter;
+    const firstStamp = firstBinding.__trustedServerArtifactV1;
+    pageWindow.eval(duplicateBytes.toString('utf8'));
+
+    expect(pageWindow.pbjs).toBe(firstBinding);
+    expect(pageWindow.pbjs.requestBids).toBe(firstRequestBids);
+    expect(pageWindow.pbjs.registerBidAdapter).toBe(firstRegisterBidAdapter);
+    expect(pageWindow.pbjs.__trustedServerArtifactV1).toBe(firstStamp);
+    expect(warn).not.toHaveBeenCalled();
+    expect(watchdogs).toHaveLength(2);
+
+    const processQueue = vi.fn(firstBinding.processQueue.bind(firstBinding));
+    firstBinding.processQueue = processQueue;
+    for (const watchdog of watchdogs) {
+      watchdog();
+      watchdog();
+    }
+    expect(processQueue).toHaveBeenCalledTimes(2);
+    dom.window.close();
+  });
+
   it('refuses a different valid artifact without disturbing the working binding', () => {
     const dom = new JSDOM('<!doctype html><html></html>', {
       url: 'https://pub.example.com/article',
