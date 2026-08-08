@@ -543,6 +543,157 @@ describe('RCJ-PREBID-04 adapter-backed synthetic refresh runner', () => {
     expect(Object.isFrozen(prepared?.adUnits[0])).toBe(true);
   });
 
+  it('preserves legacy last-write precedence when folded params follow direct bids', () => {
+    const slot = Object.freeze({ id: 'slot-order' });
+    const unit = Object.freeze({
+      code: 'slot-order',
+      mediaTypes: Object.freeze({ banner: Object.freeze({ sizes: Object.freeze([]) }) }),
+      bids: Object.freeze([
+        Object.freeze({
+          bidder: 'server',
+          params: Object.freeze({ placement: 'direct-first' }),
+        }),
+        Object.freeze({
+          bidder: 'trustedServer',
+          params: Object.freeze({
+            bidderParams: Object.freeze({
+              preserved: Object.freeze({ placement: 'folded-only' }),
+              server: Object.freeze({ placement: 'folded-last' }),
+            }),
+          }),
+        }),
+      ]),
+    });
+
+    const prepared = preparePrebidRegisteredRefreshAuction({
+      clientSideBidders: Object.freeze([]),
+      resolveAdUnit: () => unit,
+      slots: Object.freeze([slot]),
+    });
+
+    expect(prepared?.adUnits).toEqual([
+      {
+        code: 'slot-order',
+        mediaTypes: { banner: { sizes: [] } },
+        bids: [
+          {
+            bidder: 'trustedServer',
+            params: {
+              bidderParams: {
+                server: { placement: 'folded-last' },
+                preserved: { placement: 'folded-only' },
+              },
+            },
+          },
+        ],
+      },
+    ]);
+    const bidderParams = (
+      prepared?.adUnits[0] as {
+        bids: readonly [{ params: { bidderParams: Readonly<Record<string, unknown>> } }];
+      }
+    ).bids[0].params.bidderParams;
+    expect(Object.keys(bidderParams)).toEqual(['server', 'preserved']);
+  });
+
+  it('fails closed when detached registrations contain duplicate trustedServer bids', () => {
+    const slot = Object.freeze({ id: 'slot-duplicate-trusted' });
+    const trustedBid = Object.freeze({
+      bidder: 'trustedServer',
+      params: Object.freeze({ bidderParams: Object.freeze({}) }),
+    });
+    const unit = Object.freeze({
+      code: 'slot-duplicate-trusted',
+      mediaTypes: Object.freeze({ banner: Object.freeze({ sizes: Object.freeze([]) }) }),
+      bids: Object.freeze([trustedBid, trustedBid]),
+    });
+
+    expect(
+      preparePrebidRegisteredRefreshAuction({
+        clientSideBidders: Object.freeze([]),
+        resolveAdUnit: () => unit,
+        slots: Object.freeze([slot]),
+      })
+    ).toBeUndefined();
+  });
+
+  it('keeps deterministic order while resolving duplicate direct and client bids', () => {
+    const slot = Object.freeze({ id: 'slot-duplicates' });
+    const unit = Object.freeze({
+      code: 'slot-duplicates',
+      mediaTypes: Object.freeze({ banner: Object.freeze({ sizes: Object.freeze([]) }) }),
+      bids: Object.freeze([
+        Object.freeze({ bidder: 'alpha', params: Object.freeze({ sequence: 1 }) }),
+        Object.freeze({ bidder: 'client', params: Object.freeze({ sequence: 1 }) }),
+        Object.freeze({ bidder: 'beta', params: Object.freeze({ sequence: 1 }) }),
+        Object.freeze({ bidder: 'alpha', params: Object.freeze({ sequence: 2 }) }),
+        Object.freeze({ bidder: 'client', params: Object.freeze({ sequence: 2 }) }),
+      ]),
+    });
+
+    const prepared = preparePrebidRegisteredRefreshAuction({
+      clientSideBidders: Object.freeze(['client']),
+      resolveAdUnit: () => unit,
+      slots: Object.freeze([slot]),
+    });
+
+    expect(prepared?.adUnits).toEqual([
+      {
+        code: 'slot-duplicates',
+        mediaTypes: { banner: { sizes: [] } },
+        bids: [
+          {
+            bidder: 'trustedServer',
+            params: { bidderParams: { alpha: { sequence: 2 }, beta: { sequence: 1 } } },
+          },
+          { bidder: 'client', params: { sequence: 1 } },
+          { bidder: 'client', params: { sequence: 2 } },
+        ],
+      },
+    ]);
+    const bidderParams = (
+      prepared?.adUnits[0] as {
+        bids: readonly [{ params: { bidderParams: Readonly<Record<string, unknown>> } }];
+      }
+    ).bids[0].params.bidderParams;
+    expect(Object.keys(bidderParams)).toEqual(['alpha', 'beta']);
+  });
+
+  it('returns a recursively frozen synthetic refresh preparation', () => {
+    const slot = Object.freeze({ id: 'slot-frozen' });
+    const unit = Object.freeze({
+      code: 'slot-frozen',
+      mediaTypes: Object.freeze({
+        banner: Object.freeze({ sizes: Object.freeze([Object.freeze([300, 250])]) }),
+      }),
+      bids: Object.freeze([
+        Object.freeze({
+          bidder: 'server',
+          params: Object.freeze({
+            placement: Object.freeze({
+              rules: Object.freeze([Object.freeze({ label: 'frozen' })]),
+            }),
+          }),
+        }),
+      ]),
+    });
+    const prepared = preparePrebidRegisteredRefreshAuction({
+      clientSideBidders: Object.freeze([]),
+      resolveAdUnit: () => unit,
+      slots: Object.freeze([slot]),
+    });
+    const seen = new Set<object>();
+    const expectRecursivelyFrozen = (value: unknown): void => {
+      if (value === null || typeof value !== 'object' || seen.has(value)) return;
+      seen.add(value);
+      expect(Object.isFrozen(value)).toBe(true);
+      for (const child of Object.values(value)) expectRecursivelyFrozen(child);
+    };
+
+    expect(prepared).toBeDefined();
+    expectRecursivelyFrozen(prepared);
+  });
+
   it('fails closed when a physical slot has no detached registered ad unit', () => {
     const slot = Object.freeze({ id: 'unregistered' });
 
