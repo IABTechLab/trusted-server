@@ -574,7 +574,16 @@ describe('browser composition', () => {
       composition.runtime.registerIntegration({
         id: 'test',
         release: 'a'.repeat(64),
-        prepare: ({ onDispose }: { onDispose(callback: () => void): void }) => {
+        prepare: ({
+          interfaces,
+          onDispose,
+        }: {
+          interfaces: Readonly<Record<string, unknown>>;
+          onDispose(callback: () => void): void;
+        }) => {
+          expect(Reflect.ownKeys(interfaces['diagnostics'] as object)).toEqual(['subscribe']);
+          expect(interfaces['diagnostics']).not.toHaveProperty('publish');
+          expect(interfaces['diagnostics']).not.toHaveProperty('dispose');
           onDispose(() => order.push('dispose-module'));
           return { activate: () => order.push('module') };
         },
@@ -583,6 +592,26 @@ describe('browser composition', () => {
     await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
     expect(order).toEqual(['bridge', 'gpt', 'module']);
     expect(composition.pucBridgeForTest()).toBeDefined();
+    const diagnostics = (
+      target as {
+        diagnostics?: {
+          renderTrace?: {
+            current(): Readonly<Record<string, unknown>>;
+            history(): readonly unknown[];
+            subscribe(listener: (record: unknown) => void): () => void;
+          };
+        };
+      }
+    ).diagnostics;
+    expect(Object.isFrozen(diagnostics)).toBe(true);
+    expect(Reflect.ownKeys(diagnostics ?? {})).toEqual(['renderTrace']);
+    expect(Reflect.ownKeys(diagnostics?.renderTrace ?? {}).sort()).toEqual([
+      'current',
+      'history',
+      'subscribe',
+    ]);
+    expect(diagnostics).not.toHaveProperty('publish');
+    expect(diagnostics).not.toHaveProperty('dispose');
 
     composition.runtime.dispose();
     expect(order).toEqual([
@@ -602,6 +631,8 @@ describe('browser composition', () => {
     );
     expect(Object.isFrozen(composition)).toBe(true);
     expect(Object.isFrozen(composition.runtime)).toBe(true);
+    expect(diagnostics?.renderTrace?.current()).toEqual({});
+    expect(diagnostics?.renderTrace?.history()).toEqual([]);
   });
 
   it('starts slot listeners before post-commit GPT startup and disposes both listeners', async () => {
@@ -1792,6 +1823,10 @@ describe('browser composition', () => {
       await expect(api.requestAds({ slots: ['server-slot'] })).resolves.toEqual({
         slots: [{ slot: 'server-slot', path: 'primary', outcome: 'no_bid' }],
       });
+      const diagnostics = target as {
+        diagnostics?: { renderTrace?: { history(): readonly unknown[] } };
+      };
+      expect(diagnostics.diagnostics?.renderTrace?.history()).toEqual([]);
 
       expect(requestConfigs).toEqual([{}]);
       expect(warn).toHaveBeenCalledExactlyOnceWith('auction context: contributor failed', {
@@ -1973,6 +2008,30 @@ describe('browser composition', () => {
         { slot: 'programmatic-slot', path: 'primary', outcome: 'accepted' },
       ],
     });
+    const renderTrace = (
+      target as {
+        diagnostics?: {
+          renderTrace?: {
+            current(): Readonly<Record<string, Readonly<Record<string, unknown>>>>;
+            history(): readonly Readonly<Record<string, unknown>>[];
+          };
+        };
+      }
+    ).diagnostics?.renderTrace;
+    expect(renderTrace?.current()['programmatic-slot']).toEqual(
+      expect.objectContaining({
+        slotId: 'programmatic-slot',
+        path: 'auction',
+        rendered: true,
+        servedFrom: 'inline',
+        count: 1,
+      })
+    );
+    expect(renderTrace?.history()).toHaveLength(1);
+    expect(Object.isFrozen(renderTrace?.history()[0])).toBe(true);
+    expect(target).not.toHaveProperty('renders');
+    expect(target).not.toHaveProperty('renderLog');
+    expect(target).not.toHaveProperty('renderSeq');
     expect(requestBodies[0]).toEqual({
       adUnits: [programmatic],
       config: { page: 'context' },

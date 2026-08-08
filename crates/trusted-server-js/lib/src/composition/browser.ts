@@ -20,7 +20,13 @@ import {
 } from '../adapters/prebid';
 import { parseCacheFetchPolicyV1 } from '../core/config';
 import { parseTrustedServerAuctionResponseV1 } from '../core/auction';
-import type { BrowserAuctionProjectionV1, CreativeBootV1 } from '../core/types';
+import type {
+  BootManifestV1,
+  BrowserAuctionProjectionV1,
+  CreativeBootV1,
+  DiagnosticsBootV1,
+} from '../core/types';
+import { createRenderTrace, type RenderTraceRuntimeOwner } from '../core/trace';
 import {
   parseBidRenderSourceV1,
   parseBrowserAuctionProjectionV1,
@@ -55,6 +61,11 @@ import {
 } from '../integrations/prebid/module';
 import { createPrebidStartup } from '../integrations/prebid/startup';
 import { createBrowserNavigationIdentityIssuer } from '../kernel/identity';
+import {
+  createDiagnosticsBus,
+  type DiagnosticsBus,
+  type DiagnosticsObservation,
+} from '../kernel/diagnostics';
 import type {
   NavigationIdentityIssuerFactory,
   RenderAttemptScope,
@@ -186,9 +197,8 @@ interface AcceptedBrowserBoot {
   readonly auctionProjection: object;
   readonly cachePolicy?: unknown;
   readonly creative: Readonly<CreativeBootV1>;
-  readonly manifest: {
-    readonly integrations: readonly { readonly id: string }[];
-  };
+  readonly diagnostics: Readonly<DiagnosticsBootV1>;
+  readonly manifest: Readonly<BootManifestV1>;
 }
 
 interface PreparedBrowserServices {
@@ -277,6 +287,47 @@ export function createTestBrowserRuntimeComposition(
   const providedBindings = runtimeOptions.getBindings;
   let browserServices: Readonly<BrowserServices> | undefined;
   let creativeBoot: Readonly<CreativeBootV1> | undefined;
+  let diagnosticsBus: DiagnosticsBus | undefined;
+  let renderTrace: RenderTraceRuntimeOwner | undefined;
+  const consumeCoreObservation = (observation: DiagnosticsObservation): void => {
+    if (
+      observation['kind'] !== 'render_attempt' ||
+      typeof observation['slotId'] !== 'string' ||
+      (observation['path'] !== 'auction' && observation['path'] !== 'ssat') ||
+      typeof observation['rendered'] !== 'boolean'
+    ) {
+      return;
+    }
+    const state = observation['state'];
+    const terminal = observation['outcome'];
+    const terminalRecord =
+      typeof terminal === 'object' && terminal !== null
+        ? (terminal as Readonly<Record<string, unknown>>)
+        : undefined;
+    const attributableEmpty =
+      state === 'failed' &&
+      terminalRecord?.['outcome'] === 'failed' &&
+      terminalRecord['reason'] === 'gam_empty';
+    if (state !== 'accepted' && !attributableEmpty) return;
+    if ((state === 'accepted') !== observation['rendered']) return;
+    const servedFrom = observation['servedFrom'];
+    if (servedFrom !== undefined && servedFrom !== 'inline' && servedFrom !== 'pbs-cache') return;
+    try {
+      renderTrace?.record({
+        slotId: observation['slotId'],
+        path: observation['path'],
+        rendered: observation['rendered'],
+        ...(servedFrom === undefined ? {} : { servedFrom }),
+      });
+    } catch {
+      // Render diagnostics never affect the already-committed attempt.
+    }
+  };
+  const diagnosticsForPublish = (): Readonly<object> => {
+    const trace = renderTrace;
+    if (!trace) throw new Error('Render diagnostics are unavailable');
+    return Object.freeze({ renderTrace: trace.diagnostics });
+  };
   const defaultCreativeRuntime =
     typeof document === 'undefined'
       ? Object.freeze({
@@ -573,6 +624,7 @@ export function createTestBrowserRuntimeComposition(
   const runtime = createRuntime({
     ...runtimeOptions,
     getBindings,
+    getDiagnosticsForPublish: diagnosticsForPublish,
     kernel: {
       addAdUnits: addProgrammaticAdUnits,
       diagnostics: runtimeOptions.kernel.diagnostics,
@@ -590,6 +642,22 @@ export function createTestBrowserRuntimeComposition(
         parseProjection
       );
       if (!initialProjection) throw new Error('Accepted boot projection is unavailable');
+      const preparedRenderTrace = createRenderTrace({
+        onSubscriberError: (error) => log.warn('render diagnostics: subscriber failed', error),
+      });
+      const preparedDiagnosticsBus = createDiagnosticsBus({
+        manifest: boot.manifest,
+        onObservation: consumeCoreObservation,
+        onSubscriberError: (error) => log.warn('diagnostics bus: subscriber failed', error),
+      });
+      renderTrace = preparedRenderTrace;
+      diagnosticsBus = preparedDiagnosticsBus;
+      context.onDispose(() => {
+        preparedDiagnosticsBus.dispose();
+        preparedRenderTrace.dispose();
+        if (diagnosticsBus === preparedDiagnosticsBus) diagnosticsBus = undefined;
+        if (renderTrace === preparedRenderTrace) renderTrace = undefined;
+      });
       const reconciliation =
         typeof document === 'undefined' || typeof MutationObserver === 'undefined'
           ? undefined
@@ -737,6 +805,7 @@ export function createTestBrowserRuntimeComposition(
             const source = parseBidRenderSourceV1(candidate, cachePolicy);
             return source ? Object.freeze(source) : undefined;
           },
+          publishDiagnostics: preparedDiagnosticsBus.publish,
           reservations: reservationService,
         });
       const batchCoordinator = createAuctionBatchService({
@@ -785,6 +854,7 @@ export function createTestBrowserRuntimeComposition(
         interfaces: Object.freeze({
           adapters: composition.adapters,
           creative: creativeRuntime,
+          diagnostics: Object.freeze({ subscribe: preparedDiagnosticsBus.subscribe }),
           gpt: gptRuntime,
           prebid: prebidRuntime,
           ...services,

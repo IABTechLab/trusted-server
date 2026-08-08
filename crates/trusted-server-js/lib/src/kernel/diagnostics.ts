@@ -16,6 +16,8 @@ export interface DiagnosticsScheduler {
 
 export interface DiagnosticsBusOptions {
   readonly manifest: Readonly<BootManifestV1>;
+  /** Closure-private core observer; never included in the returned bus facade. */
+  readonly onObservation?: (observation: DiagnosticsObservation) => void;
   readonly onOverflow?: (droppedObservations: number) => void;
   readonly onSubscriberError?: (error: unknown) => void;
   readonly pendingCapacity?: number;
@@ -170,6 +172,11 @@ export function createDiagnosticsBus(options: DiagnosticsBusOptions): Diagnostic
   return Object.freeze({
     publish: (observation: DiagnosticsObservation): boolean => {
       if (disposed || !recursivelyFrozenRecord(observation)) return false;
+      try {
+        options.onObservation?.(observation);
+      } catch {
+        // Core diagnostics consumption cannot affect correctness publication.
+      }
       const captured = Object.freeze([...subscriptions.values()]);
       if (captured.length === 0) return true;
       if (pending.length >= pendingCapacity) {

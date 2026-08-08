@@ -641,10 +641,13 @@ export interface RenderAttemptOptions {
   readonly scheduler?: RenderScheduler;
 }
 
-export interface RenderAttemptDiagnosticsObservation {
+export interface RenderAttemptDiagnosticsObservation extends Readonly<Record<string, unknown>> {
   readonly kind: 'render_attempt';
   readonly attemptId: string;
   readonly slotId: string;
+  readonly path: 'auction' | 'ssat';
+  readonly rendered: boolean;
+  readonly servedFrom?: 'inline' | 'pbs-cache';
   readonly state: 'accepted' | 'no_bid' | 'failed' | 'cancelled';
   readonly outcome: RenderOutcome;
 }
@@ -1199,8 +1202,7 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
   let prepareRenderSource: (candidate: unknown) => ReservationRenderSource | undefined;
   let reservations: ReservationService;
   let publishDiagnostics:
-    | ((observation: RenderAttemptDiagnosticsObservation) => unknown)
-    | undefined;
+    ((observation: RenderAttemptDiagnosticsObservation) => unknown) | undefined;
   let consumeClaimMethod: ReservationService['consumeClaim'];
   let ownerIsCurrentMethod: RenderAttemptScope['isCurrent'];
   let ownerDisposeMethod: RenderAttemptScope['dispose'];
@@ -1533,6 +1535,7 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
 
   const settle = (terminal: RenderOutcome, disposeOwner: boolean): boolean => {
     if (outcome !== undefined) return false;
+    const terminalRenderSource = admittedRenderSource;
     outcome = terminal;
     state = terminalState(terminal);
     arrayPush(history, state);
@@ -1555,10 +1558,19 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
       }
     }
     if (publishDiagnostics) {
+      const servedFrom =
+        terminal.outcome === 'accepted' && terminalRenderSource?.type === 'cache'
+          ? ('pbs-cache' as const)
+          : terminal.outcome === 'accepted'
+            ? ('inline' as const)
+            : undefined;
       const observation = frozen<RenderAttemptDiagnosticsObservation>({
         kind: 'render_attempt',
         attemptId: id,
         slotId: slot,
+        path: history.includes('waiting_for_gam_and_claim') ? 'ssat' : 'auction',
+        rendered: terminal.outcome === 'accepted',
+        ...(servedFrom === undefined ? {} : { servedFrom }),
         state: terminal.outcome,
         outcome: terminal,
       });
