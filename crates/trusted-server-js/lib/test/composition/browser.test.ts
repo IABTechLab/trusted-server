@@ -35,7 +35,7 @@ import {
 } from '../../src/composition/browser';
 import { log as localLog } from '../../src/core/log';
 import { TRACE_PANEL_ID } from '../../src/core/trace';
-import type { BrowserAuctionBidV1 } from '../../src/core/types';
+import type { BrowserAuctionBidV1, BrowserAuctionProjectionV1 } from '../../src/core/types';
 import { createCreativeIntegrationRegistration } from '../../src/integrations/creative/module';
 import { createDataDomeIntegrationRegistration } from '../../src/integrations/datadome/module';
 import { createDidomiIntegrationRegistration } from '../../src/integrations/didomi/module';
@@ -69,20 +69,51 @@ function createTarget() {
   };
 }
 
+function browserSlotPlacement(slot: string, divId = slot) {
+  return Object.freeze({
+    slot,
+    gamUnitPath: `/123/${slot}`,
+    divId,
+    formats: Object.freeze([Object.freeze([300, 250] as const)]),
+    targeting: Object.freeze({}),
+  });
+}
+
 function fakeGoogletagAdapter(
   bindingStatus: () => GoogletagBindingStatus = () => 'pending'
 ): GoogletagAdapter {
   return Object.freeze({ ...createNoopGoogletagAdapter(), bindingStatus });
 }
 
-function synchronousGptAdapter() {
+function synchronousGptAdapter(initialSlots: readonly object[] = []) {
   const listeners = new Map<string, Set<(event: unknown) => void>>();
+  const physicalSlots: object[] = [...initialSlots];
   const targeting = new WeakMap<object, Map<string, readonly string[]>>();
   const bindingToken = Object.freeze({});
+  const display = vi.fn();
   const refresh = vi.fn();
   const diagnosticsSlots = new WeakMap<object, GoogletagDiagnosticsFact['slot']>();
   let diagnosticsObserver: GoogletagDiagnosticsObserver | undefined;
   let publisherObserver: GoogletagPublisherCallObserver | undefined;
+  const transactionalDefine: GoogletagFacade['transactionalDefine'] = (
+    definition,
+    isGenerationCurrent,
+    prepareCommit
+  ) => {
+    if (!isGenerationCurrent()) return Object.freeze({ status: 'discarded' as const });
+    const slot = {
+      addService: vi.fn(),
+      getAdUnitPath: () => definition.adUnitPath,
+      getSlotElementId: () => definition.elementId,
+    };
+    const admission = prepareCommit(slot);
+    if (!admission.commit() || !isGenerationCurrent()) {
+      admission.rollback();
+      return Object.freeze({ status: 'discarded' as const });
+    }
+    physicalSlots.push(slot);
+    return Object.freeze({ status: 'defined' as const, slot });
+  };
   const facade: GoogletagFacade = Object.freeze({
     adUnitPath: (slot: object) =>
       'getAdUnitPath' in slot && typeof slot.getAdUnitPath === 'function'
@@ -94,7 +125,8 @@ function synchronousGptAdapter() {
       if (key === undefined) values?.clear();
       else values?.delete(key);
     }),
-    display: vi.fn(),
+    transactionalDefine,
+    display,
     getTargeting: vi.fn((slot: object, key: string) =>
       Object.freeze([...(targeting.get(slot)?.get(key) ?? [])])
     ),
@@ -107,7 +139,11 @@ function synchronousGptAdapter() {
       targeting.set(slot, values);
       values.set(key, Object.freeze(typeof value === 'string' ? [value] : [...value]));
     }),
-    slots: () => Object.freeze([]),
+    slotElementId: (slot: object) =>
+      'getSlotElementId' in slot && typeof slot.getSlotElementId === 'function'
+        ? slot.getSlotElementId()
+        : undefined,
+    slots: () => Object.freeze([...physicalSlots]),
     subscribe: (eventType: string, listener: (event: unknown) => void) => {
       const registered = listeners.get(eventType) ?? new Set();
       registered.add(listener);
@@ -180,6 +216,7 @@ function synchronousGptAdapter() {
       }
     },
     diagnosticsObserverActive: () => diagnosticsObserver !== undefined,
+    display,
     listenerInventory: () =>
       Object.freeze(
         [...listeners.entries()]
@@ -191,7 +228,9 @@ function synchronousGptAdapter() {
       if (!observer?.refresh) throw new Error('Publisher observer is unavailable');
       return observer.refresh(call);
     },
+    physicalSlots: () => Object.freeze([...physicalSlots]),
     refresh,
+    targetingFor: (slot: object) => new Map(targeting.get(slot) ?? []),
   };
 }
 
@@ -386,6 +425,7 @@ describe('browser composition', () => {
           }),
         ]),
       }),
+      slots: Object.freeze([browserSlotPlacement('slot-one')]),
       bids: Object.freeze([bid]),
     });
     const composition = createTestBrowserRuntimeComposition(
@@ -484,6 +524,10 @@ describe('browser composition', () => {
       navigation.currentAuctionProjection as Readonly<{ bids: readonly BrowserAuctionBidV1[] }>
     ).bids[0];
     if (!projectedBid) throw new Error('Expected the parsed projected winner');
+    const projectedPlacement = (
+      navigation.currentAuctionProjection as Readonly<Pick<BrowserAuctionProjectionV1, 'slots'>>
+    ).slots[0];
+    if (!projectedPlacement) throw new Error('Expected the parsed projected placement');
     let fallback: RenderAttempt | undefined;
     const operation = await composition.publishGptWinnerForTest({
       artifact,
@@ -495,6 +539,7 @@ describe('browser composition', () => {
       },
       operation: 'refresh',
       owner: ownerResult.value,
+      placement: projectedPlacement,
       requestClass: 'primary',
       slot: physicalSlot,
     });
@@ -527,6 +572,203 @@ describe('browser composition', () => {
     });
     composition.runtime.dispose();
     slotElement.remove();
+  });
+
+  it('publishes the accepted initial projection through the production GPT lifecycle', async () => {
+    const releaseId = 'a'.repeat(64);
+    const gpt = synchronousGptAdapter();
+    const placement = browserSlotPlacement('initial-slot');
+    const bid = Object.freeze({
+      candidateId: 'AAAAAAAAAAAA',
+      slot: placement.slot,
+      provider: 'trusted',
+      upstreamBidId: 'initial-upstream',
+      cpm: 1.5,
+      currency: 'USD' as const,
+      targeting: Object.freeze({ hb_bidder: 'trusted', pos: 'bid' }),
+      rendererReservationId: `r1_${'i'.repeat(22)}`,
+      renderSource: Object.freeze({
+        type: 'adm' as const,
+        version: 1 as const,
+        adm: '<main>initial winner</main>',
+        width: 300,
+        height: 250,
+      }),
+    });
+    const projection = {
+      version: 1,
+      auction: {
+        version: 1,
+        auctionId: 'initial-production',
+        results: [
+          { slot: placement.slot, outcome: 'winner' as const, candidateId: bid.candidateId },
+        ],
+      },
+      slots: [{ ...placement, targeting: { pos: 'placement', section: 'news' } }],
+      bids: [bid],
+    };
+    const element = document.createElement('div');
+    element.id = placement.divId;
+    document.body.append(element);
+    let prefix = 0;
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target: {},
+        releaseId,
+        manifest: { version: 1, releaseId, integrations: [{ id: 'gpt', required: true }] },
+        knownIntegrationIds: Object.freeze(['gpt']),
+        boot: {
+          auctionProjection: projection,
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        getBindings: () => ({ config: Object.freeze({}), interfaces: Object.freeze({}) }),
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag: gpt.adapter,
+          messaging: fakeMessagingAdapter(),
+          prebid: fakePrebidAdapter(),
+        },
+        coreActivations: { correctnessGptListeners: vi.fn() },
+        createIdentityIssuerForTest: () => {
+          prefix += 1;
+          return createTestNavigationIdentityIssuer({
+            getRandomValues: (target) => {
+              target.fill(prefix);
+              return target;
+            },
+          });
+        },
+      }
+    );
+
+    try {
+      expect(composition.runtime.start()).toBe(true);
+      expect(
+        composition.runtime.registerIntegration(createGptIntegrationRegistration(releaseId))
+      ).toBe(true);
+      await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+      await vi.waitFor(() => expect(gpt.physicalSlots()).toHaveLength(1));
+      const physicalSlot = gpt.physicalSlots()[0];
+      expect(physicalSlot).toBeDefined();
+      expect(gpt.display).toHaveBeenCalledExactlyOnceWith(physicalSlot);
+      expect(gpt.refresh).not.toHaveBeenCalled();
+      expect(gpt.targetingFor(physicalSlot!)).toEqual(
+        new Map([
+          ['hb_adid', [bid.rendererReservationId]],
+          ['hb_bidder', ['trusted']],
+          ['pos', ['bid']],
+          ['section', ['news']],
+        ])
+      );
+      gpt.emit('slotRequested', { slot: physicalSlot });
+      gpt.emit('slotRenderEnded', {
+        isEmpty: true,
+        responseIdentifier: 'initial-empty-response',
+        slot: physicalSlot,
+      });
+      await vi.waitFor(() => expect(element.querySelector('iframe')).not.toBeNull());
+    } finally {
+      composition.runtime.dispose();
+      element.remove();
+    }
+  });
+
+  it('reuses one publisher GPT slot resolved through a unique responsive DOM prefix', async () => {
+    const releaseId = 'a'.repeat(64);
+    const publisherSlot = {
+      getAdUnitPath: () => '/publisher/existing',
+      getSlotElementId: () => 'responsive-mobile',
+    };
+    const gpt = synchronousGptAdapter([publisherSlot]);
+    const placement = {
+      slot: 'responsive-slot',
+      gamUnitPath: '/123/responsive-slot',
+      divId: 'responsive-',
+      formats: [[300, 250]],
+      targeting: {},
+    };
+    const bid = {
+      candidateId: 'CCCCCCCCCCCC',
+      slot: placement.slot,
+      provider: 'trusted',
+      upstreamBidId: 'responsive-upstream',
+      cpm: 1,
+      currency: 'USD' as const,
+      targeting: {},
+      rendererReservationId: `r1_${'r'.repeat(22)}`,
+      renderSource: {
+        type: 'adm' as const,
+        version: 1 as const,
+        adm: '<main>responsive winner</main>',
+        width: 300,
+        height: 250,
+      },
+    };
+    const element = document.createElement('div');
+    element.id = 'responsive-mobile';
+    document.body.append(element);
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target: {},
+        releaseId,
+        manifest: { version: 1, releaseId, integrations: [{ id: 'gpt', required: true }] },
+        knownIntegrationIds: Object.freeze(['gpt']),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: {
+              version: 1,
+              auctionId: 'responsive-initial',
+              results: [
+                { slot: placement.slot, outcome: 'winner' as const, candidateId: bid.candidateId },
+              ],
+            },
+            slots: [placement],
+            bids: [bid],
+          },
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        getBindings: () => ({ config: Object.freeze({}), interfaces: Object.freeze({}) }),
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag: gpt.adapter,
+          messaging: fakeMessagingAdapter(),
+          prebid: fakePrebidAdapter(),
+        },
+        coreActivations: { correctnessGptListeners: vi.fn() },
+        createIdentityIssuerForTest: () =>
+          createTestNavigationIdentityIssuer({
+            getRandomValues: (target) => {
+              target.fill(7);
+              return target;
+            },
+          }),
+      }
+    );
+
+    try {
+      expect(composition.runtime.start()).toBe(true);
+      expect(
+        composition.runtime.registerIntegration(createGptIntegrationRegistration(releaseId))
+      ).toBe(true);
+      await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+      await vi.waitFor(() => expect(gpt.refresh).toHaveBeenCalledOnce());
+      expect(gpt.physicalSlots()).toEqual([publisherSlot]);
+      expect(gpt.display).not.toHaveBeenCalled();
+      expect(gpt.refresh).toHaveBeenCalledExactlyOnceWith(
+        [publisherSlot],
+        Object.freeze({ changeCorrelator: false })
+      );
+    } finally {
+      composition.runtime.dispose();
+      element.remove();
+    }
   });
 
   it('derives exact APS validation coordinates only for the real browser target', () => {
@@ -629,6 +871,7 @@ describe('browser composition', () => {
             auctionProjection: {
               version: 1,
               auction: { version: 1, auctionId: 'boot', results: [] },
+              slots: [],
               bids: [],
             },
             creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
@@ -709,6 +952,7 @@ describe('browser composition', () => {
           auctionProjection: {
             version: 1,
             auction: { version: 1, auctionId: 'boot', results: [] },
+            slots: [],
             bids: [],
           },
           creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
@@ -852,6 +1096,7 @@ describe('browser composition', () => {
           auctionProjection: {
             version: 1,
             auction: { version: 1, auctionId: 'initial', results: [] },
+            slots: [],
             bids: [],
           },
           creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
@@ -905,6 +1150,7 @@ describe('browser composition', () => {
           auctionProjection: {
             version: 1,
             auction: { version: 1, auctionId: 'initial', results: [] },
+            slots: [],
             bids: [],
           },
           creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
@@ -992,6 +1238,7 @@ describe('browser composition', () => {
           auctionProjection: {
             version: 1,
             auction: { version: 1, auctionId: 'initial', results: [] },
+            slots: [],
             bids: [],
           },
           creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
@@ -1080,6 +1327,7 @@ describe('browser composition', () => {
           auctionProjection: {
             version: 1,
             auction: { version: 1, auctionId: 'initial', results: [] },
+            slots: [],
             bids: [],
           },
           creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
@@ -1210,6 +1458,7 @@ describe('browser composition', () => {
           auctionProjection: {
             version: 1,
             auction: { version: 1, auctionId: 'initial', results: [] },
+            slots: [],
             bids: [],
           },
           creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
@@ -1328,6 +1577,7 @@ describe('browser composition', () => {
           auctionProjection: {
             version: 1,
             auction: { version: 1, auctionId: 'initial', results: [] },
+            slots: [],
             bids: [],
           },
           creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
@@ -1411,6 +1661,7 @@ describe('browser composition', () => {
           auctionProjection: {
             version: 1,
             auction: { version: 1, auctionId: 'initial', results: [] },
+            slots: [],
             bids: [],
           },
           creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
@@ -1542,6 +1793,7 @@ describe('browser composition', () => {
           auctionProjection: {
             version: 1,
             auction: { version: 1, auctionId: 'initial', results: [] },
+            slots: [],
             bids: [],
           },
           creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
@@ -1615,6 +1867,7 @@ describe('browser composition', () => {
           auctionProjection: {
             version: 1,
             auction: { version: 1, auctionId: 'initial', results: [] },
+            slots: [],
             bids: [],
           },
           creative,
@@ -1666,6 +1919,7 @@ describe('browser composition', () => {
           auctionProjection: {
             version: 1,
             auction: { version: 1, auctionId: 'initial', results: [] },
+            slots: [],
             bids: [],
           },
           creative: { version: 1, enabled: true, clickGuard: false, renderGuard: false },
@@ -1735,6 +1989,7 @@ describe('browser composition', () => {
           auctionProjection: {
             version: 1,
             auction: { version: 1, auctionId: 'initial', results: [] },
+            slots: [],
             bids: [],
           },
           creative,
@@ -1786,6 +2041,7 @@ describe('browser composition', () => {
           auctionProjection: {
             version: 1,
             auction: { version: 1, auctionId: 'initial', results: [] },
+            slots: [],
             bids: [],
           },
           creative: { version: 1, enabled: true, clickGuard: true, renderGuard: false },
@@ -1864,6 +2120,7 @@ describe('browser composition', () => {
           }),
         ]),
       }),
+      slots: Object.freeze([browserSlotPlacement(bid.slot)]),
       bids: Object.freeze([bid]),
     });
     const composition = createTestBrowserRuntimeComposition(
@@ -2015,6 +2272,7 @@ describe('browser composition', () => {
             }),
           ]),
         }),
+        slots: Object.freeze([browserSlotPlacement(bid.slot)]),
         bids: Object.freeze([bid]),
       });
       const composition = createTestBrowserRuntimeComposition(
@@ -2168,6 +2426,7 @@ describe('browser composition', () => {
               auctionId: 'initial',
               results: [{ slot: 'slot', outcome: 'no_bid' }],
             },
+            slots: [browserSlotPlacement('slot')],
             bids: [],
           },
           creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
@@ -2245,6 +2504,7 @@ describe('browser composition', () => {
         auctionId: 'initial',
         results: [{ slot: 'initial-slot', outcome: 'no_bid' }],
       },
+      slots: [browserSlotPlacement('initial-slot')],
       bids: [],
     };
     let prefix = 0;
@@ -2375,6 +2635,7 @@ describe('browser composition', () => {
           auctionId: 'spa',
           results: [{ slot: 'spa-slot', outcome: 'no_bid' }],
         },
+        slots: [browserSlotPlacement('spa-slot')],
         bids: [],
       })
     ).toEqual({ status: 'committed' });
@@ -2400,6 +2661,225 @@ describe('browser composition', () => {
     expect(composition.rendererNonceRegistryForTest()).toBeUndefined();
   });
 
+  it('commits canonical page-bids into a replacement navigation without mutating boot', async () => {
+    const nativeReplaceState = history.replaceState.bind(history);
+    const releaseId = 'a'.repeat(64);
+    const initialProjection = {
+      version: 1,
+      auction: {
+        version: 1,
+        auctionId: 'initial',
+        results: [{ slot: 'initial-slot', outcome: 'no_bid' }],
+      },
+      slots: [browserSlotPlacement('initial-slot')],
+      bids: [],
+    };
+    const spaProjection = {
+      version: 1,
+      auction: {
+        version: 1,
+        auctionId: 'spa-auction',
+        results: [{ slot: 'spa-slot', outcome: 'no_bid' }],
+      },
+      slots: [browserSlotPlacement('spa-slot')],
+      bids: [],
+    };
+    const fetchPageBids = vi.fn(async () => ({
+      ok: true,
+      json: async () => spaProjection,
+    }));
+    const target: Record<string, unknown> = {};
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target,
+        releaseId,
+        manifest: { version: 1, releaseId, integrations: [{ id: 'gpt', required: true }] },
+        knownIntegrationIds: Object.freeze(['gpt']),
+        boot: {
+          auctionProjection: initialProjection,
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        getBindings: () => ({ config: Object.freeze({}), interfaces: Object.freeze({}) }),
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag: fakeGoogletagAdapter(),
+          messaging: fakeMessagingAdapter(),
+          prebid: fakePrebidAdapter(),
+        },
+        coreActivations: { correctnessGptListeners: vi.fn() },
+        pageBidsFetcherForTest: fetchPageBids,
+      }
+    );
+
+    try {
+      expect(composition.runtime.start()).toBe(true);
+      expect(
+        composition.runtime.registerIntegration(createGptIntegrationRegistration(releaseId))
+      ).toBe(true);
+      await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+      const boot = (target as { boot: Readonly<{ auctionProjection: object }> }).boot;
+      const initialNavigation = composition.runtimeSessionForTest()?.currentNavigation;
+
+      history.pushState({}, '', '/spa-route?section=one');
+      await vi.waitFor(() => expect(fetchPageBids).toHaveBeenCalledOnce());
+      expect(fetchPageBids).toHaveBeenCalledWith(
+        '/_ts/page-bids?path=%2Fspa-route%3Fsection%3Done',
+        expect.objectContaining({
+          credentials: 'include',
+          headers: { 'X-TSJS-Page-Bids': '1' },
+          signal: expect.any(AbortSignal),
+        })
+      );
+      await vi.waitFor(() =>
+        expect(
+          composition.runtimeSessionForTest()?.currentNavigation?.currentAuctionProjection
+        ).toMatchObject({ auction: { auctionId: 'spa-auction' } })
+      );
+
+      expect(composition.runtimeSessionForTest()?.currentNavigation).not.toBe(initialNavigation);
+      expect(initialNavigation?.disposed).toBe(true);
+      expect(composition.projectionSlotsForTest()).toEqual(['spa-slot']);
+      expect(boot.auctionProjection).toMatchObject({ auction: { auctionId: 'initial' } });
+      expect(Object.isFrozen(boot.auctionProjection)).toBe(true);
+
+      history.replaceState({}, '', '/spa-replaced');
+      await vi.waitFor(() => expect(fetchPageBids).toHaveBeenCalledTimes(2));
+      expect(fetchPageBids).toHaveBeenLastCalledWith(
+        '/_ts/page-bids?path=%2Fspa-replaced',
+        expect.objectContaining({ signal: expect.any(AbortSignal) })
+      );
+
+      nativeReplaceState({}, '', '/spa-popped');
+      window.dispatchEvent(new PopStateEvent('popstate'));
+      await vi.waitFor(() => expect(fetchPageBids).toHaveBeenCalledTimes(3));
+      window.dispatchEvent(new PopStateEvent('popstate'));
+      await Promise.resolve();
+      expect(fetchPageBids).toHaveBeenCalledTimes(3);
+
+      fetchPageBids.mockResolvedValueOnce({
+        ok: false,
+        json: async () => spaProjection,
+      });
+      history.pushState({}, '', '/spa-retry');
+      await vi.waitFor(() => expect(fetchPageBids).toHaveBeenCalledTimes(4));
+      history.replaceState({}, '', '/spa-retry');
+      await vi.waitFor(() => expect(fetchPageBids).toHaveBeenCalledTimes(5));
+      expect(fetchPageBids).toHaveBeenLastCalledWith(
+        '/_ts/page-bids?path=%2Fspa-retry',
+        expect.objectContaining({ signal: expect.any(AbortSignal) })
+      );
+    } finally {
+      composition.runtime.dispose();
+      history.replaceState({}, '', '/');
+    }
+  });
+
+  it('publishes a committed page-bids winner through the replacement navigation GPT lifecycle', async () => {
+    const releaseId = 'a'.repeat(64);
+    const gpt = synchronousGptAdapter();
+    const placement = browserSlotPlacement('spa-winner');
+    const bid = {
+      candidateId: 'BBBBBBBBBBBB',
+      slot: placement.slot,
+      provider: 'trusted',
+      upstreamBidId: 'spa-upstream',
+      cpm: 2,
+      currency: 'USD' as const,
+      targeting: { hb_bidder: 'trusted' },
+      rendererReservationId: `r1_${'s'.repeat(22)}`,
+      renderSource: {
+        type: 'adm' as const,
+        version: 1 as const,
+        adm: '<main>spa winner</main>',
+        width: 300,
+        height: 250,
+      },
+    };
+    const spaProjection = {
+      version: 1,
+      auction: {
+        version: 1,
+        auctionId: 'spa-production',
+        results: [
+          { slot: placement.slot, outcome: 'winner' as const, candidateId: bid.candidateId },
+        ],
+      },
+      slots: [placement],
+      bids: [bid],
+    };
+    const fetchPageBids = vi.fn(async () => ({ ok: true, json: async () => spaProjection }));
+    const element = document.createElement('div');
+    element.id = placement.divId;
+    document.body.append(element);
+    let prefix = 0;
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target: {},
+        releaseId,
+        manifest: { version: 1, releaseId, integrations: [{ id: 'gpt', required: true }] },
+        knownIntegrationIds: Object.freeze(['gpt']),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: { version: 1, auctionId: 'initial-empty', results: [] },
+            slots: [],
+            bids: [],
+          },
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        getBindings: () => ({ config: Object.freeze({}), interfaces: Object.freeze({}) }),
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag: gpt.adapter,
+          messaging: fakeMessagingAdapter(),
+          prebid: fakePrebidAdapter(),
+        },
+        coreActivations: { correctnessGptListeners: vi.fn() },
+        createIdentityIssuerForTest: () => {
+          prefix += 1;
+          return createTestNavigationIdentityIssuer({
+            getRandomValues: (target) => {
+              target.fill(prefix);
+              return target;
+            },
+          });
+        },
+        pageBidsFetcherForTest: fetchPageBids,
+      }
+    );
+
+    try {
+      expect(composition.runtime.start()).toBe(true);
+      expect(
+        composition.runtime.registerIntegration(createGptIntegrationRegistration(releaseId))
+      ).toBe(true);
+      await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+      history.pushState({}, '', '/spa-production');
+      await vi.waitFor(() => expect(fetchPageBids).toHaveBeenCalledOnce());
+      await vi.waitFor(() => expect(gpt.physicalSlots()).toHaveLength(1));
+      const physicalSlot = gpt.physicalSlots()[0];
+      expect(gpt.display).toHaveBeenCalledExactlyOnceWith(physicalSlot);
+      expect(gpt.targetingFor(physicalSlot!)).toEqual(
+        new Map([
+          ['hb_adid', [bid.rendererReservationId]],
+          ['hb_bidder', ['trusted']],
+        ])
+      );
+      expect(
+        composition.runtimeSessionForTest()?.currentNavigation?.currentAuctionProjection
+      ).toMatchObject({ auction: { auctionId: 'spa-production' } });
+    } finally {
+      composition.runtime.dispose();
+      element.remove();
+    }
+  });
+
   it('unwinds a lazily-created session when navigation identity generation fails', async () => {
     const composition = createTestBrowserRuntimeComposition(
       {
@@ -2411,6 +2891,7 @@ describe('browser composition', () => {
           auctionProjection: {
             version: 1,
             auction: { version: 1, auctionId: 'initial', results: [] },
+            slots: [],
             bids: [],
           },
           creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
@@ -2451,6 +2932,7 @@ describe('browser composition', () => {
           auctionProjection: {
             version: 1,
             auction: { version: 1, auctionId: 'initial', results: [] },
+            slots: [],
             bids: [],
           },
           creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
@@ -2493,6 +2975,7 @@ describe('browser composition', () => {
           auctionProjection: {
             version: 1,
             auction: { version: 1, auctionId: 'initial', results: [] },
+            slots: [],
             bids: [],
           },
           creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
@@ -2532,6 +3015,7 @@ describe('browser composition', () => {
           auctionId: 'spa',
           results: [{ slot: 'spa-slot', outcome: 'no_bid' }],
         },
+        slots: [browserSlotPlacement('spa-slot')],
         bids: [],
       })
     ).toEqual({ status: 'committed' });
@@ -2549,6 +3033,7 @@ describe('browser composition', () => {
           auctionProjection: {
             version: 1,
             auction: { version: 1, auctionId: 'initial', results: [] },
+            slots: [],
             bids: [],
           },
           creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
@@ -2596,6 +3081,9 @@ describe('browser composition', () => {
                   slot: `server-${index}`,
                 })),
               },
+              slots: Array.from({ length: serverCount }, (_, index) =>
+                browserSlotPlacement(`server-${index}`)
+              ),
               bids: [],
             },
             creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
@@ -2636,6 +3124,7 @@ describe('browser composition', () => {
           auctionProjection: {
             version: 1,
             auction: { version: 1, auctionId: 'initial', results: [] },
+            slots: [],
             bids: [],
           },
           creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
@@ -2677,6 +3166,7 @@ describe('browser composition', () => {
           auctionProjection: {
             version: 1,
             auction: { version: 1, auctionId: 'initial', results: [] },
+            slots: [],
             bids: [],
           },
           cachePolicy: {
@@ -2743,6 +3233,7 @@ describe('browser composition', () => {
           auctionProjection: {
             version: 1,
             auction: { version: 1, auctionId: 'boot', results: [] },
+            slots: [],
             bids: [],
           },
           creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
@@ -2836,6 +3327,7 @@ describe('browser composition', () => {
               auctionId: 'initial',
               results: [{ slot: 'server-slot', outcome: 'no_bid' }],
             },
+            slots: [browserSlotPlacement('server-slot')],
             bids: [],
           },
           creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
@@ -2990,6 +3482,7 @@ describe('browser composition', () => {
               auctionId: 'initial',
               results: [{ slot: 'server-slot', outcome: 'no_bid' }],
             },
+            slots: [browserSlotPlacement('server-slot')],
             bids: [],
           },
           creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },

@@ -60,7 +60,6 @@ async fn route(router: RouterService, req: Request) -> Response {
     router.oneshot(req).await.expect("should route request")
 }
 
-#[cfg(feature = "aps-runner-proxy-integration-test")]
 async fn route_reserved(req: Request) -> Response {
     trusted_server_adapter_spin::app::dispatch_reserved_with_settings(test_settings(), req)
         .await
@@ -75,7 +74,6 @@ fn routes_build_without_panic() {
     let _router = TrustedServerApp::routes();
 }
 
-#[cfg(feature = "aps-runner-proxy-integration-test")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn aps_cutover_renderer_and_family_failures_are_local() {
     let renderer = request_builder()
@@ -417,53 +415,35 @@ async fn auction_is_routed() {
     assert_ne!(resp.status().as_u16(), 404, "/auction must be routed");
 }
 
-/// `GET` on the SPA re-auction endpoint must reach the page-bids handler on
-/// both the canonical path and its deprecated `/__ts/` alias.
-///
-/// The alias is what pre-rename tsjs bundles still request, and on a SPA that
-/// path is what delivers ads for in-session navigations — so a dropped or
-/// misspelled registration silently costs revenue rather than erroring loudly.
-/// Spin registers `GET` and `OPTIONS` separately, so the preflight-denial parity
-/// test does not imply the `GET` side is wired.
-///
-/// Paths are literals rather than `PAGE_BIDS_PATH` / `PAGE_BIDS_LEGACY_PATH`:
-/// this pins the actual URL the client fetches, which asserting a const against
-/// itself would not.
-///
-/// These test settings configure no creative opportunities, so the handler's own
-/// deterministic answer is a 404 `Creative opportunities not configured`. That
-/// body is the anchor: an unregistered path would instead fall through to the
-/// publisher fallback and attempt an outbound fetch to the (nonexistent) test
-/// origin, which cannot produce this message. A bare `!= 404` check would be
-/// wrong here — the handler legitimately returns 404 under this config.
+/// The canonical SPA re-auction path reaches page-bids, while the hard cutover
+/// leaves the former double-underscore alias to the publisher fallback.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn page_bids_get_is_routed_on_canonical_path_and_alias() {
-    let mut responses = Vec::new();
-
-    for path in ["/_ts/page-bids", "/__ts/page-bids"] {
-        let req = request_builder()
-            .method("GET")
-            .uri(path)
-            .header("sec-fetch-site", "same-origin")
-            .body(edgezero_core::body::Body::empty())
-            .expect("should build request");
-        let resp = route(test_router(), req).await;
-        let status = resp.status().as_u16();
-        let body = String::from_utf8_lossy(&resp.into_body().into_bytes().unwrap_or_default())
+async fn page_bids_get_is_routed_only_on_the_canonical_path() {
+    let canonical = request_builder()
+        .method("GET")
+        .uri("/_ts/page-bids")
+        .header("sec-fetch-site", "same-origin")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build request");
+    let canonical = route(test_router(), canonical).await;
+    let canonical_body =
+        String::from_utf8_lossy(&canonical.into_body().into_bytes().unwrap_or_default())
             .into_owned();
+    assert!(canonical_body.contains("Creative opportunities not configured"));
 
-        assert!(
-            body.contains("Creative opportunities not configured"),
-            "GET {path} must reach the page-bids handler, \
-             got status {status} body {body:?}"
-        );
-
-        responses.push((status, body));
-    }
-
-    assert_eq!(
-        responses[0], responses[1],
-        "the deprecated alias must answer identically to the canonical path"
+    let former_alias = request_builder()
+        .method("GET")
+        .uri("/__ts/page-bids")
+        .header("sec-fetch-site", "same-origin")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build request");
+    let former_alias = route(test_router(), former_alias).await;
+    let alias_body =
+        String::from_utf8_lossy(&former_alias.into_body().into_bytes().unwrap_or_default())
+            .into_owned();
+    assert!(
+        !alias_body.contains("Creative opportunities not configured"),
+        "former compatibility alias must not reach page-bids"
     );
 }
 

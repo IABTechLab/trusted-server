@@ -15,10 +15,7 @@ pub mod platform;
 #[cfg(target_arch = "wasm32")]
 use worker::{Context, Env, Request, Response, Result, event};
 
-#[cfg(all(
-    feature = "aps-runner-proxy-integration-test",
-    any(target_arch = "wasm32", test)
-))]
+#[cfg(any(target_arch = "wasm32", test))]
 fn preserved_reserved_method(value: &str) -> Option<edgezero_core::http::Method> {
     edgezero_core::http::Method::from_bytes(value.as_bytes()).ok()
 }
@@ -36,11 +33,9 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
         app::set_cloudflare_config_json(config.to_string());
     }
 
-    #[cfg(feature = "aps-runner-proxy-integration-test")]
     let is_reserved = req
         .url()
         .is_ok_and(|url| trusted_server_core::integrations::aps::is_aps_family_path(url.path()));
-    #[cfg(feature = "aps-runner-proxy-integration-test")]
     if is_reserved {
         // workers-rs maps unknown methods to GET; the underlying Fetch request
         // preserves the original method token, so capture it before conversion.
@@ -56,7 +51,7 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
             .map_err(|error| worker::Error::RustError(error.to_string()))?
             .ok_or_else(|| {
                 worker::Error::RustError(
-                    "reserved APS path has no coordinated-cutover handler".to_string(),
+                    "reserved APS path has no hard-cutover handler".to_string(),
                 )
             })?;
         return edgezero_adapter_cloudflare::response::from_core_response(response)
@@ -72,7 +67,7 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
 }
 
-#[cfg(all(test, feature = "aps-runner-proxy-integration-test"))]
+#[cfg(test)]
 mod tests {
     use super::preserved_reserved_method;
 

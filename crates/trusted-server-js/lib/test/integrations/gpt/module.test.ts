@@ -534,6 +534,13 @@ describe('ordered GPT winner publication', () => {
       rendererReservationId: RESERVATION_ID,
       renderSource: source,
     });
+    const placement = Object.freeze({
+      slot: bid.slot,
+      gamUnitPath: '/123/gpt-slot',
+      divId: 'gpt-slot',
+      formats: Object.freeze([Object.freeze([300, 250] as const)]),
+      targeting: Object.freeze({ hb_bidder: 'publisher', pos: 'top' }),
+    });
     const projection = Object.freeze({
       version: 1,
       auction: Object.freeze({
@@ -547,6 +554,7 @@ describe('ordered GPT winner publication', () => {
           }),
         ]),
       }),
+      slots: Object.freeze([placement]),
       bids: Object.freeze([bid]),
     });
     expect(harness.navigation.installAuctionProjection(projection)).toBe(true);
@@ -567,6 +575,7 @@ describe('ordered GPT winner publication', () => {
     const facade: GoogletagFacade = Object.freeze({
       bindingToken: () => Object.freeze({}),
       clearTargeting: (target: object, key?: string) => (target as typeof slot).clearTargeting(key),
+      transactionalDefine: () => Object.freeze({ status: 'discarded' as const }),
       display: vi.fn(),
       getTargeting: (target: object, key: string) => (target as typeof slot).getTargeting(key),
       observeTargeting: () => {
@@ -578,6 +587,7 @@ describe('ordered GPT winner publication', () => {
         Object.freeze({ apiReady: true, initialLoadDisabled: false, pubadsReady: true }),
       setTargeting: (target: object, key: string, value: string | readonly string[]) =>
         (target as typeof slot).setTargeting(key, value),
+      slotElementId: () => undefined,
       slots: () => Object.freeze([slot]),
       subscribe: () => vi.fn(),
       transactionalReplace: () => Object.freeze({ status: 'destroyed' as const }),
@@ -636,6 +646,7 @@ describe('ordered GPT winner publication', () => {
       navigation: harness.navigation,
       operation: 'refresh',
       owner: harness.primaryOwner,
+      placement,
       pucBridge,
       requestClass: 'primary',
       reservations,
@@ -671,6 +682,7 @@ describe('ordered GPT winner publication', () => {
       'slot:validate',
       'target:hb_adid',
       'target:hb_bidder',
+      'target:pos',
       'slot:validate',
       'bridge',
       'request',
@@ -679,6 +691,7 @@ describe('ordered GPT winner publication', () => {
       new Map([
         ['hb_adid', [RESERVATION_ID]],
         ['hb_bidder', ['trusted']],
+        ['pos', ['top']],
       ])
     );
     publication.bridgeArtifact()?.dispose();
@@ -745,6 +758,7 @@ describe('ordered GPT winner publication', () => {
       'slot:validate',
       'target:hb_adid',
       'target:hb_bidder',
+      'target:pos',
       'slot:validate',
     ]);
     expect(publication.values.size).toBe(0);
@@ -795,6 +809,7 @@ describe('ordered GPT winner publication', () => {
       'slot:validate',
       'target:hb_adid',
       'target:hb_bidder',
+      'target:pos',
       'slot:validate',
       'bridge',
       'request',

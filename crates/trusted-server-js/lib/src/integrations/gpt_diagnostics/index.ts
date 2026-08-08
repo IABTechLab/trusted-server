@@ -1,4 +1,5 @@
 import type { GptDiagnosticsApi } from '../../core/types';
+import { EMBEDDED_RELEASE_ID } from '../../core/release';
 
 import { GptDiagnosticsApiController } from './api';
 import { GptDiagnosticsBadgeManager } from './badges';
@@ -7,6 +8,7 @@ import type { GptDiagnosticsFactBuffer } from './facts';
 import { GptDiagnosticsObserver } from './observer';
 import { GptDiagnosticsOverlay } from './overlay';
 import { GptDiagnosticsStore } from './store';
+import { createGptDiagnosticsIntegrationRegistration } from './module';
 
 type GptDiagnosticsWindow = Window & typeof globalThis;
 
@@ -104,4 +106,14 @@ export function createGptDiagnosticsRuntime(
     activate,
     currentApi: (): GptDiagnosticsApi | undefined => active?.api,
   });
+}
+
+if (typeof window !== 'undefined') {
+  const register = (window.tsjs as unknown as { _registerIntegration?: unknown } | undefined)
+    ?._registerIntegration;
+  if (typeof register === 'function') {
+    Reflect.apply(register, window.tsjs, [
+      createGptDiagnosticsIntegrationRegistration(EMBEDDED_RELEASE_ID),
+    ]);
+  }
 }

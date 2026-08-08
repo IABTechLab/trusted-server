@@ -2559,7 +2559,11 @@ implementation change.
 **Files:**
 
 - Modify: `crates/trusted-server-js/lib/src/core/index.ts`
+- Modify: `crates/trusted-server-js/lib/src/core/types.ts`
+- Modify: `crates/trusted-server-js/lib/src/core/contracts/auction_projection.ts`
 - Modify: `crates/trusted-server-js/lib/src/composition/browser.ts`
+- Modify: `crates/trusted-server-js/lib/src/services/projections.ts`
+- Modify: `crates/trusted-server-js/lib/src/services/slots.ts`
 - Modify: `crates/trusted-server-js/lib/src/integrations/gpt/index.ts`
 - Modify: `crates/trusted-server-js/lib/src/integrations/prebid/index.ts`
 - Modify: `crates/trusted-server-js/lib/src/integrations/creative/index.ts`
@@ -2577,11 +2581,20 @@ implementation change.
 - Modify: `crates/trusted-server-core/src/tsjs.rs`
 - Modify: `crates/trusted-server-core/src/auction/endpoints.rs`
 - Modify: `crates/trusted-server-core/src/auction/formats.rs`
+- Modify: `crates/trusted-server-core/src/auction/types.rs`
 - Modify: `crates/trusted-server-core/src/integrations/registry.rs`
+- Modify: `crates/trusted-server-core/src/integrations/aps.rs`
+- Modify: `crates/trusted-server-core/src/integrations/mod.rs`
+- Modify: `crates/trusted-server-core/src/platform/mod.rs`
+- Modify: `crates/trusted-server-core/src/platform/types.rs`
 - Modify: `crates/trusted-server-adapter-fastly/src/app.rs`
+- Modify: `crates/trusted-server-adapter-fastly/src/main.rs`
 - Modify: `crates/trusted-server-adapter-axum/src/app.rs`
+- Modify: `crates/trusted-server-adapter-axum/src/main.rs`
 - Modify: `crates/trusted-server-adapter-cloudflare/src/app.rs`
+- Modify: `crates/trusted-server-adapter-cloudflare/src/lib.rs`
 - Modify: `crates/trusted-server-adapter-spin/src/app.rs`
+- Modify: `crates/trusted-server-adapter-spin/src/lib.rs`
 - Modify: `crates/trusted-server-core/src/html_processor.rs`
 - Modify: `crates/trusted-server-core/src/integrations/prebid.rs`
 - Modify: `crates/trusted-server-core/src/integrations/didomi.rs`
@@ -2590,6 +2603,12 @@ implementation change.
 - Modify: `crates/trusted-server-core/src/integrations/gpt_diagnostics.rs`
 - Modify: `crates/trusted-server-core/src/integrations/gpt_diagnostics_bootstrap.js`
 - Modify: `crates/trusted-server-js/lib/build-all.mjs`
+- Modify: `crates/trusted-server-js/lib/test/core/auction.test.ts`
+- Modify: `crates/trusted-server-js/lib/test/services/projections.test.ts`
+- Modify: `crates/trusted-server-js/lib/test/services/slots.test.ts`
+- Modify: `crates/trusted-server-js/lib/test/adapters/googletag.test.ts`
+- Modify: `crates/trusted-server-js/lib/test/integrations/gpt/module.test.ts`
+- Modify: `crates/trusted-server-js/lib/test/composition/browser.test.ts`
 
 - [ ] **Step 1: Complete the pre-switch checklist with no production-wiring changes staged.**
       The atomic switch is allowed to flip wiring only after every behavior suite
@@ -2648,6 +2667,19 @@ implementation change.
   - point `/auction`, initial HTML, and page-bids production emitters at the
     already-tested exact decision/projection serializers and boot-script fragments,
     including the preimplemented `tsjs:bids-script` mark;
+  - carry one exact ordered placement record for every initial/page-bids decision,
+    reject missing/extra/out-of-order placement coverage in the browser parser, and
+    keep only the direct `/auction` serializer's internal `slots:[]` exception;
+  - have the sole composition resolve each placement, adopt exactly one existing
+    publisher GPT slot or transactionally define/adopt one TS slot, merge static then
+    bid targeting with runtime-owned `hb_adid`, and publish both initial and committed
+    SPA winners through the same GPT/PUC lifecycle. Cover responsive-prefix ambiguity,
+    stale candidate destruction, publisher refresh versus TS display, attributable
+    empty-GAM direct fallback, and page-bids alias registration;
+  - preserve rc/july SPA route semantics in that composition: pathname-plus-query
+    identity across push/replace/pop, same-route suppression, stale-response
+    inertness, and rollback to the last committed path after a current failure so an
+    identical route can retry;
   - make the sole browser composition root construct the already-tested runtime,
     services, adapters, integration modules, fallback, and queue handoff, then have
     each thin integration `index.ts` delegate to that composition without retaining a
@@ -2655,7 +2687,9 @@ implementation change.
   - switch generated release/manifest/config/bootstrap emission and the independently
     built pure Prebid 10.26.0 artifact to those already-tested entry points; and
   - register the already-tested versioned APS renderer and live unversioned runner
-    proxy through all four adapter dispatchers while preserving the negative routes.
+    proxy in the production registry and pre-router entry points of all four adapters,
+    preserving exact response headers and the negative routes before auth, generic
+    finalization, EC, integration filters, or publisher fallback can run.
 
   The switch is a hard cutover: add no selector, dual manifest, compatibility alias,
   protocol autodetection, or fallback to old behavior. The old implementation may

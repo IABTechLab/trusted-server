@@ -291,6 +291,15 @@ describe('generated terminal bootstrap fallback proposal', () => {
             auctionId: 'boot',
             results: [{ slot: 'known', outcome: 'no_bid' }],
           },
+          slots: [
+            {
+              slot: 'known',
+              gamUnitPath: '/123/known',
+              divId: 'known',
+              formats: [[300, 250]],
+              targeting: {},
+            },
+          ],
           bids: [],
         },
       },
@@ -347,6 +356,7 @@ describe('generated terminal bootstrap fallback proposal', () => {
       auctionProjection: {
         version: 1,
         auction: { version: 1, auctionId: 'fallback', results: [] },
+        slots: [],
         bids: [],
       },
     });

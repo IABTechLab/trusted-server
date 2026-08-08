@@ -16,7 +16,6 @@ use super::{
 /// Adapter finalizers must not append geo, deployment, or operator-configured
 /// headers to a marked response. HTTP runtimes may still add transport framing
 /// such as `Content-Length`.
-#[cfg(any(test, feature = "test-utils"))]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExactResponseHeadersV1;
 

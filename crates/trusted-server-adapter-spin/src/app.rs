@@ -22,9 +22,8 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherResponse,
-    buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
-    handle_tsjs_dynamic, page_bids_preflight_denied,
+    AuctionDispatch, PAGE_BIDS_PATH, PublisherResponse, buffer_publisher_response_async,
+    handle_page_bids, handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
@@ -82,9 +81,6 @@ fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let orchestrator = build_orchestrator(&settings)?;
-    #[cfg(feature = "aps-runner-proxy-integration-test")]
-    let registry = IntegrationRegistry::new_with_aps_v1_for_tests(&settings)?;
-    #[cfg(not(feature = "aps-runner-proxy-integration-test"))]
     let registry = IntegrationRegistry::new(&settings)?;
 
     Ok(Arc::new(AppState {
@@ -94,7 +90,6 @@ fn build_state_with_settings(
     }))
 }
 
-#[cfg(feature = "aps-runner-proxy-integration-test")]
 async fn dispatch_reserved_for_state(state: &Arc<AppState>, req: Request) -> Option<Response> {
     if !state.registry.has_reserved_path(req.uri().path()) {
         return None;
@@ -106,17 +101,16 @@ async fn dispatch_reserved_for_state(state: &Arc<AppState>, req: Request) -> Opt
             .registry
             .handle_reserved_proxy(&state.settings, &services, ctx.into_request())
             .await
-            .expect("reserved path should have a coordinated-cutover handler")
+            .expect("reserved path should have a hard-cutover handler")
             .unwrap_or_else(|report| http_error(&report)),
     )
 }
 
-#[cfg(feature = "aps-runner-proxy-integration-test")]
 /// Dispatch a reserved APS request using explicit settings.
 ///
 /// # Errors
 ///
-/// Returns an error when the feature-only application state cannot be
+/// Returns an error when the application state cannot be
 /// initialized from `settings`.
 pub async fn dispatch_reserved_with_settings(
     settings: Settings,
@@ -126,12 +120,11 @@ pub async fn dispatch_reserved_with_settings(
     Ok(dispatch_reserved_for_state(&state, req).await)
 }
 
-#[cfg(feature = "aps-runner-proxy-integration-test")]
 /// Dispatch a reserved APS request using startup settings.
 ///
 /// # Errors
 ///
-/// Returns an error when startup settings or the feature-only application
+/// Returns an error when startup settings or the application
 /// state cannot be initialized.
 pub async fn dispatch_reserved(
     req: Request,
@@ -209,7 +202,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 14] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 13] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
@@ -220,7 +213,6 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 14] {
         ("/_ts/trace", &[Method::GET]),
         ("/auction", &[Method::POST]),
         (PAGE_BIDS_PATH, &[Method::GET, Method::OPTIONS]),
-        (PAGE_BIDS_LEGACY_PATH, &[Method::GET, Method::OPTIONS]),
         ("/first-party/proxy", &[Method::GET]),
         ("/first-party/click", &[Method::GET]),
         ("/first-party/sign", &[Method::GET, Method::POST]),
@@ -843,18 +835,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .post("/_ts/admin/keys/deactivate", admin_not_supported_handler)
             .get("/_ts/trace", trace_mode_handler)
             .post("/auction", auction_handler)
-            .get(PAGE_BIDS_PATH, page_bids_handler.clone())
+            .get(PAGE_BIDS_PATH, page_bids_handler)
             .route(PAGE_BIDS_PATH, Method::OPTIONS, page_bids_options_handler)
-            // Deprecated double-underscore alias, kept so tsjs bundles served
-            // before the `/_ts/page-bids` rename keep getting ads on SPA
-            // navigations until they age out of browser caches. See
-            // `PAGE_BIDS_LEGACY_PATH`.
-            .get(PAGE_BIDS_LEGACY_PATH, page_bids_handler)
-            .route(
-                PAGE_BIDS_LEGACY_PATH,
-                Method::OPTIONS,
-                page_bids_options_handler,
-            )
             .get("/first-party/proxy", fp_proxy_handler)
             .get("/first-party/click", fp_click_handler)
             .get("/first-party/sign", fp_sign_handler)

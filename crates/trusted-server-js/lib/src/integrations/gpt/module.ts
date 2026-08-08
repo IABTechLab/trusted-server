@@ -8,7 +8,11 @@ import {
   isAuctionCandidateIdV1,
   isRendererReservationIdV1,
 } from '../../core/contracts/auction_projection';
-import type { BrowserAuctionBidV1, BrowserAuctionProjectionV1 } from '../../core/types';
+import type {
+  BrowserAuctionBidV1,
+  BrowserAuctionProjectionV1,
+  BrowserAuctionSlotV1,
+} from '../../core/types';
 import type { NavigationSession } from '../../kernel/sessions';
 import {
   createSlotOperation,
@@ -80,6 +84,7 @@ export interface GptWinnerPublicationInput extends Omit<
   readonly bid: BrowserAuctionBidV1;
   readonly googletag: GoogletagAdapter;
   readonly navigation: NavigationSession;
+  readonly placement: BrowserAuctionSlotV1;
   readonly pucBridge: Pick<PucBridge, 'recordNonemptyGam' | 'registerGamAttempt'>;
   readonly reservations: Pick<ReservationService, 'registerRender' | 'tombstone'>;
   readonly slot: object;
@@ -92,15 +97,20 @@ function currentProjectedWinner(input: GptWinnerPublicationInput): boolean {
     const projection = input.navigation.currentAuctionProjection as
       BrowserAuctionProjectionV1 | undefined;
     const bid = input.bid;
+    const placement = input.placement;
     if (
       !projection ||
       !objectIsFrozenIntrinsic(projection) ||
       !objectIsFrozenIntrinsic(bid) ||
       !objectIsFrozenIntrinsic(bid.renderSource) ||
       !objectIsFrozenIntrinsic(bid.targeting) ||
+      !objectIsFrozenIntrinsic(placement) ||
+      !objectIsFrozenIntrinsic(placement.formats) ||
+      !objectIsFrozenIntrinsic(placement.targeting) ||
       !isAuctionCandidateIdV1(bid.candidateId) ||
       !isRendererReservationIdV1(bid.rendererReservationId) ||
       bid.slot !== input.attempt.slot ||
+      placement.slot !== bid.slot ||
       input.attempt.navigationGeneration !== input.navigation.generation ||
       input.owner.id !== input.attempt.id ||
       input.owner.slot !== input.attempt.slot ||
@@ -126,6 +136,14 @@ function currentProjectedWinner(input: GptWinnerPublicationInput): boolean {
       }
     }
     if (!exactBid) return false;
+    let exactPlacement = false;
+    for (let index = 0; index < projection.slots.length; index += 1) {
+      if (projection.slots[index] === placement) {
+        if (exactPlacement) return false;
+        exactPlacement = true;
+      }
+    }
+    if (!exactPlacement) return false;
     let exactWinner = false;
     for (let index = 0; index < projection.auction.results.length; index += 1) {
       const result = projection.auction.results[index];
@@ -145,31 +163,45 @@ function currentProjectedWinner(input: GptWinnerPublicationInput): boolean {
 }
 
 function targetingEntries(
-  bid: BrowserAuctionBidV1
+  bid: BrowserAuctionBidV1,
+  placement: BrowserAuctionSlotV1
 ): readonly (readonly [string, string])[] | undefined {
   try {
-    const unsortedNames = objectGetOwnPropertyNamesIntrinsic(bid.targeting);
-    const names: string[] = [];
-    for (let index = 0; index < unsortedNames.length; index += 1) {
-      const name = unsortedNames[index];
-      if (name === undefined) return undefined;
-      let insertion = names.length;
-      while (insertion > 0 && (names[insertion - 1] as string) > name) insertion -= 1;
-      for (let move = names.length; move > insertion; move -= 1) {
-        names[move] = names[move - 1] as string;
-      }
-      names[insertion] = name;
-    }
-    if (names.length > 32 || objectGetOwnPropertySymbolsIntrinsic(bid.targeting).length !== 0) {
+    const bidNames = objectGetOwnPropertyNamesIntrinsic(bid.targeting);
+    const placementNames = objectGetOwnPropertyNamesIntrinsic(placement.targeting);
+    if (
+      bidNames.length > 32 ||
+      placementNames.length > 32 ||
+      objectGetOwnPropertySymbolsIntrinsic(bid.targeting).length !== 0 ||
+      objectGetOwnPropertySymbolsIntrinsic(placement.targeting).length !== 0
+    ) {
       return undefined;
     }
+    const names: string[] = [];
+    const insertNames = (source: readonly string[]): boolean => {
+      for (let index = 0; index < source.length; index += 1) {
+        const name = source[index];
+        if (!name || name === 'hb_adid') return false;
+        let insertion = 0;
+        while (insertion < names.length && (names[insertion] as string) < name) insertion += 1;
+        if (names[insertion] === name) continue;
+        for (let move = names.length; move > insertion; move -= 1) {
+          names[move] = names[move - 1] as string;
+        }
+        names[insertion] = name;
+      }
+      return true;
+    };
+    if (!insertNames(placementNames) || !insertNames(bidNames)) return undefined;
     const entries: Array<readonly [string, string]> = [
       Object.freeze(['hb_adid', bid.rendererReservationId]),
     ];
     for (let index = 0; index < names.length; index += 1) {
       const key = names[index];
-      if (!key || key === 'hb_adid') return undefined;
-      const descriptor = objectGetOwnPropertyDescriptorIntrinsic(bid.targeting, key);
+      if (!key) return undefined;
+      const bidDescriptor = objectGetOwnPropertyDescriptorIntrinsic(bid.targeting, key);
+      const placementDescriptor = objectGetOwnPropertyDescriptorIntrinsic(placement.targeting, key);
+      const descriptor = bidDescriptor ?? placementDescriptor;
       if (
         !descriptor ||
         !descriptor.enumerable ||
@@ -266,7 +298,7 @@ export async function publishGptWinner(
     disposeArtifact();
     return failAttempt('slot_unresolved');
   }
-  const entries = targetingEntries(input.bid);
+  const entries = targetingEntries(input.bid, input.placement);
   if (!entries) {
     disposeArtifact();
     return failAttempt('descriptor_invalid');

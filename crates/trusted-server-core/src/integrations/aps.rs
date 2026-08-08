@@ -23,7 +23,6 @@ use crate::auction::types::{
     MediaType, RENDER_DIMENSION_MAX, classify_aps_renderer_v1, record_auction_drop,
 };
 use crate::error::TrustedServerError;
-#[cfg(any(test, feature = "test-utils"))]
 use crate::integrations::ensure_integration_backend_with_transport_timeouts;
 use crate::integrations::{
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
@@ -34,9 +33,10 @@ use crate::openrtb::{
     Banner, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs, RegsExt, Site, ToExt, User,
     UserExt, to_openrtb_i32,
 };
-use crate::platform::{PlatformHttpRequest, PlatformResponse, RuntimeServices};
-#[cfg(any(test, feature = "test-utils"))]
-use crate::platform::{ProxyHeaderEvidenceV1, RawProxyPolicyV1, RawProxyResponseV1};
+use crate::platform::{
+    PlatformHttpRequest, PlatformResponse, ProxyHeaderEvidenceV1, RawProxyPolicyV1,
+    RawProxyResponseV1, RuntimeServices,
+};
 use crate::settings::{IntegrationConfig, Settings};
 
 const APS_INTEGRATION_ID: &str = "aps";
@@ -58,13 +58,10 @@ const MAX_CREATIVE_URL_BYTES: usize = 4096;
 const MAX_LANGUAGE_BYTES: usize = 8;
 const MAX_PAGE_URL_BYTES: usize = 8192;
 const MAX_RENDER_ENVELOPE_BYTES: usize = 256 * 1024;
-#[cfg(any(test, feature = "test-utils"))]
 // Exact transport window from dispatch through the final upstream byte.
 const APS_RUNNER_TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(any(test, feature = "test-utils"))]
 /// Maximum wait for the APS runner response headers.
 pub const APS_RUNNER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(4);
-#[cfg(any(test, feature = "test-utils"))]
 /// Maximum duration of one blocking APS runner response-body read.
 pub const APS_RUNNER_BLOCKING_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const APS_RENDERER_CSP: &str = "default-src 'none'; sandbox allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation; script-src 'unsafe-inline' https:; connect-src https:; frame-src https:; img-src https: data:; media-src https: blob:; style-src 'unsafe-inline' https:; font-src https: data:;";
@@ -74,7 +71,6 @@ const APS_RENDERER_CSP: &str = "default-src 'none'; sandbox allow-forms allow-po
 pub fn is_aps_family_path(path: &str) -> bool {
     path == "/integrations/aps" || path.starts_with("/integrations/aps/")
 }
-#[cfg(any(test, feature = "test-utils"))]
 const APS_RENDERER_V1_CSP: &str = "default-src 'none'; sandbox allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline' 'self' https:; connect-src https:; frame-src https: data: blob:; img-src https: data: blob:; media-src https: data: blob:; style-src 'unsafe-inline' https:; font-src https: data:; worker-src https: blob:; form-action https:;";
 
 const APS_RENDERER_DOCUMENT: &str = concat!(
@@ -118,7 +114,6 @@ addEventListener('message',receive);
 "#
 );
 
-#[cfg(any(test, feature = "test-utils"))]
 const APS_RENDERER_V1_DOCUMENT: &str = concat!(
     r#"<!doctype html>
 <meta charset="utf-8">
@@ -1405,13 +1400,11 @@ impl IntegrationProxy for ApsRendererIntegration {
     }
 }
 
-#[cfg(any(test, feature = "test-utils"))]
 #[derive(Debug)]
 pub(crate) struct ApsV1Integration {
     enabled: bool,
 }
 
-#[cfg(any(test, feature = "test-utils"))]
 impl ApsV1Integration {
     fn mark_exact_headers(mut response: http::Response<EdgeBody>) -> http::Response<EdgeBody> {
         response
@@ -1638,7 +1631,6 @@ impl ApsV1Integration {
     }
 }
 
-#[cfg(any(test, feature = "test-utils"))]
 #[async_trait(?Send)]
 impl IntegrationProxy for ApsV1Integration {
     fn integration_name(&self) -> &'static str {

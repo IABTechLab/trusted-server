@@ -1,10 +1,22 @@
+import fs from 'node:fs';
 import path from 'node:path';
 
 import { configDefaults, defineConfig } from 'vitest/config';
 
+const integrationIds = fs
+  .readdirSync(path.resolve(import.meta.dirname, 'src/integrations'), { withFileTypes: true })
+  .filter(
+    (entry) =>
+      entry.isDirectory() &&
+      fs.existsSync(path.resolve(import.meta.dirname, 'src/integrations', entry.name, 'index.ts'))
+  )
+  .map((entry) => entry.name)
+  .sort();
+
 export default defineConfig({
   define: {
     __TSJS_EMBEDDED_RELEASE_ID_V1__: JSON.stringify('a'.repeat(64)),
+    __TSJS_EMBEDDED_INTEGRATION_IDS_V1__: JSON.stringify(integrationIds),
   },
   resolve: {
     alias: {

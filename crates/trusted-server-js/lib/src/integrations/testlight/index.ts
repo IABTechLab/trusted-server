@@ -1,82 +1,13 @@
-import type { LegacyTsjsApi } from '../../core/types';
-import { installQueue } from '../../core/queue';
-import { log } from '../../core/log';
-import { resolvePrebidWindow } from '../../shared/globals';
-import type { PrebidWindow } from '../../shared/globals';
+import { EMBEDDED_RELEASE_ID } from '../../core/release';
 
-type TestlightCallback = () => void;
-
-type TestlightGlobal = {
-  que?: TestlightCallback[];
-};
-
-type TestlightWindow = PrebidWindow & {
-  testlight?: TestlightGlobal;
-};
-
-function ensureTsjsApi(win: TestlightWindow): LegacyTsjsApi {
-  if (win.tsjs) return win.tsjs;
-  const stub: LegacyTsjsApi = {
-    version: '0.0.0',
-    que: [],
-    addAdUnits: () => undefined,
-    renderAdUnit: () => undefined,
-    renderAllAdUnits: () => undefined,
-  };
-  win.tsjs = stub;
-  return stub;
-}
-
-function installTestlightQueue(api: LegacyTsjsApi, win: TestlightWindow): void {
-  if (!Array.isArray(api.que)) {
-    installQueue(api, win);
-  }
-}
-
-function flushCallbacks(queue: TestlightCallback[], api: LegacyTsjsApi): void {
-  while (queue.length > 0) {
-    const fn = queue.shift();
-    if (typeof fn !== 'function') {
-      continue;
-    }
-    try {
-      if (Array.isArray(api.que)) {
-        api.que.push(fn);
-      } else {
-        fn.call(api);
-      }
-      log.debug('testlight shim: flushed callback');
-    } catch (err) {
-      log.debug('testlight shim: queued callback threw', err);
-    }
-  }
-}
-
-export function installTestlightShim(): boolean {
-  const win = resolvePrebidWindow() as TestlightWindow;
-  const api = ensureTsjsApi(win);
-  installTestlightQueue(api, win);
-
-  const testlight = (win.testlight = win.testlight ?? {});
-  const pending: TestlightCallback[] = Array.isArray(testlight.que) ? [...testlight.que] : [];
-  const queue: TestlightCallback[] = [];
-  testlight.que = queue;
-
-  const originalPush = queue.push.bind(queue);
-  queue.push = function (...callbacks: TestlightCallback[]): number {
-    const len = originalPush(...callbacks);
-    flushCallbacks(queue, api);
-    return len;
-  };
-
-  if (pending.length > 0) {
-    queue.push(...pending);
-  }
-
-  log.info('testlight shim installed', { queuedCallbacks: queue.length });
-  return true;
-}
+import { createTestlightIntegrationRegistration } from './module';
 
 if (typeof window !== 'undefined') {
-  installTestlightShim();
+  const register = (window.tsjs as unknown as { _registerIntegration?: unknown } | undefined)
+    ?._registerIntegration;
+  if (typeof register === 'function') {
+    Reflect.apply(register, window.tsjs, [
+      createTestlightIntegrationRegistration(EMBEDDED_RELEASE_ID),
+    ]);
+  }
 }

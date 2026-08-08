@@ -244,6 +244,8 @@ export function parseTrustedServerAuctionResponseV1(
   const canonicalProjection: BrowserAuctionProjectionV1 = {
     version: 1,
     auction,
+    // Direct `/auction` units are programmatic DOM placements, not GAM slots.
+    slots: [],
     bids: canonicalBids,
   };
   if (jsonUtf8ByteLength(canonicalProjection) > MAX_BROWSER_AUCTION_PROJECTION_BYTES) {

@@ -7,6 +7,7 @@ import {
   createPageBidsController,
   prepareInitialAuctionProjection,
   type PreparedProjectionSlots,
+  type ProjectionSlotRegistration,
   type ProjectionSlotRegistry,
 } from '../../src/services/projections';
 
@@ -33,6 +34,13 @@ function projection(slots: readonly string[], auctionId = 'page-bids') {
       auctionId,
       results: slots.map((slot) => ({ slot, outcome: 'no_bid' as const })),
     },
+    slots: slots.map((slot) => ({
+      slot,
+      gamUnitPath: `/123/${slot}`,
+      divId: `div-${slot}`,
+      formats: [[300, 250]],
+      targeting: {},
+    })),
     bids: [],
   };
 }
@@ -50,13 +58,13 @@ class SlotLedger implements ProjectionSlotRegistry {
 
   public prepareProjectionSlots(
     ownerGeneration: object,
-    slots: readonly string[],
+    slots: readonly ProjectionSlotRegistration[],
     maximumActiveSlots: number
   ): PreparedProjectionSlots | undefined {
     this.prepareCalls += 1;
     if (
       this.slots.size + slots.length > maximumActiveSlots ||
-      slots.some((slot) => this.slots.has(slot))
+      slots.some((slot) => this.slots.has(slot.registeredSlotId))
     ) {
       return undefined;
     }
@@ -65,13 +73,13 @@ class SlotLedger implements ProjectionSlotRegistry {
       ownerGeneration,
       commit: () => {
         this.commitHook?.();
-        for (const slot of slots) this.slots.add(slot);
+        for (const slot of slots) this.slots.add(slot.registeredSlotId);
         committed = true;
         return true;
       },
       rollback: () => {
         if (!committed) return;
-        for (const slot of slots) this.slots.delete(slot);
+        for (const slot of slots) this.slots.delete(slot.registeredSlotId);
         committed = false;
       },
     });
@@ -107,6 +115,36 @@ describe('initial auction projection', () => {
 });
 
 describe('SPA page-bids projection controller', () => {
+  it('prepares exact placement aliases in the same transaction as projected slot ids', () => {
+    const runtime = runtimeSession();
+    const initial = runtime.startInitialNavigation(
+      prepareInitialAuctionProjection(projection([], 'initial'), parseBrowserAuctionProjectionV1)
+    );
+    if (!initial.ok) throw new Error(initial.reason);
+    const replacement = runtime.replaceNavigation();
+    if (!replacement.ok) throw new Error(replacement.reason);
+    const prepareProjectionSlots = vi.fn(() => ({
+      ownerGeneration: replacement.value.generation,
+      commit: () => true,
+      rollback: vi.fn(),
+    }));
+
+    expect(
+      controller(replacement.value, { prepareProjectionSlots }).commit(projection(['server-slot']))
+    ).toEqual({ status: 'committed' });
+    expect(prepareProjectionSlots).toHaveBeenCalledExactlyOnceWith(
+      replacement.value.generation,
+      [
+        {
+          registeredSlotId: 'server-slot',
+          domAliases: ['div-server-slot'],
+        },
+      ],
+      256
+    );
+    runtime.dispose();
+  });
+
   it('atomically reserves slots and commits one immutable current-generation projection', () => {
     const runtime = runtimeSession();
     const navigation = runtime.startInitialNavigation(

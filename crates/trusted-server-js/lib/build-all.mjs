@@ -21,6 +21,7 @@ import { brotliCompressSync, constants as zlibConstants, gzipSync } from 'node:z
 import { fileURLToPath } from 'node:url';
 import { build } from 'vite';
 
+import { discoverIntegrationModules } from './scripts/integration-inventory-v1.mjs';
 import { computeReleaseId, RELEASE_SENTINEL, stampRelease } from './scripts/release-v1.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -66,17 +67,7 @@ fs.rmSync(distDir, { recursive: true, force: true });
 fs.mkdirSync(distDir, { recursive: true });
 
 // Discover integration modules: directories in src/integrations/ with index.ts
-const integrationModules = fs.existsSync(integrationsDir)
-  ? fs
-      .readdirSync(integrationsDir)
-      .filter((name) => {
-        const fullPath = path.join(integrationsDir, name);
-        return (
-          fs.statSync(fullPath).isDirectory() && fs.existsSync(path.join(fullPath, 'index.ts'))
-        );
-      })
-      .sort()
-  : [];
+const integrationModules = discoverIntegrationModules(integrationsDir);
 
 console.log('[build-all] Discovered integrations:', integrationModules);
 
@@ -89,6 +80,7 @@ async function buildModule(name, entryPath, outFile = `tsjs-${name}.js`) {
     root: __dirname,
     define: {
       __TSJS_EMBEDDED_RELEASE_ID_V1__: JSON.stringify(RELEASE_SENTINEL),
+      __TSJS_EMBEDDED_INTEGRATION_IDS_V1__: JSON.stringify(integrationModules),
     },
     build: {
       emptyOutDir: false,
@@ -115,7 +107,7 @@ async function buildModule(name, entryPath, outFile = `tsjs-${name}.js`) {
 }
 
 // Build core first (synchronously), then all integrations in parallel
-await buildModule('core', path.join(srcDir, 'core', 'index.ts'));
+await buildModule('core', path.join(srcDir, 'composition', 'index.ts'));
 
 await Promise.all(
   integrationModules.map((name) => buildModule(name, path.join(integrationsDir, name, 'index.ts')))

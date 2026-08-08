@@ -1,6 +1,6 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
-import { disposeImportedCreativeModule, importCreativeModule, waitForExpect } from './helpers';
+import { activateCreativeRuntime, disposeImportedCreativeModule, waitForExpect } from './helpers';
 
 describe('creative/iframe.ts', () => {
   const ORIGINAL_FETCH = global.fetch;
@@ -25,7 +25,7 @@ describe('creative/iframe.ts', () => {
     });
     global.fetch = fetchMock as unknown as typeof fetch;
 
-    await importCreativeModule({ renderGuard: true });
+    await activateCreativeRuntime({ renderGuard: true });
 
     const iframe = document.createElement('iframe');
     iframe.src = 'https://frame.example/widget.html?cb=1';
@@ -44,7 +44,7 @@ describe('creative/iframe.ts', () => {
     const fetchMock = vi.fn().mockRejectedValue(new Error('network'));
     global.fetch = fetchMock as unknown as typeof fetch;
 
-    await importCreativeModule({ renderGuard: true });
+    await activateCreativeRuntime({ renderGuard: true });
 
     const iframe = document.createElement('iframe');
     iframe.src = 'https://frame.example/fallback.html';

@@ -125,9 +125,19 @@ export interface BrowserAuctionBidV1 {
   renderSource: BidRenderSourceV1;
 }
 
+/** Exact GAM placement metadata required to publish one server-projected slot. */
+export interface BrowserAuctionSlotV1 {
+  slot: string;
+  gamUnitPath: string;
+  divId: string;
+  formats: ReadonlyArray<Size>;
+  targeting: Record<string, string>;
+}
+
 export interface BrowserAuctionProjectionV1 {
   version: 1;
   auction: AuctionDecisionSetV1;
+  slots: BrowserAuctionSlotV1[];
   bids: BrowserAuctionBidV1[];
 }
 

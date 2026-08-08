@@ -36,6 +36,16 @@ function reservationId(index = 0): string {
   return `r1_${index.toString(36).padStart(22, 'A')}`;
 }
 
+function browserSlot(slot: string) {
+  return {
+    slot,
+    gamUnitPath: `/123/${slot}`,
+    divId: `div-${slot}`,
+    formats: [[300, 250]] as Array<[number, number]>,
+    targeting: { pos: slot } as Record<string, string>,
+  };
+}
+
 function browserProjection() {
   const renderer = apsRenderer('fictional-creative-id');
   return {
@@ -49,6 +59,7 @@ function browserProjection() {
         { slot: 'slot-3', outcome: 'failed', reason: 'provider_timeout' },
       ],
     },
+    slots: [browserSlot('slot-1'), browserSlot('slot-2'), browserSlot('slot-3')],
     bids: [
       {
         candidateId: candidateId(),
@@ -77,6 +88,7 @@ function largeAdmProjection(admLengths: number[]): BrowserAuctionProjectionV1 {
         candidateId: candidateId(index),
       })),
     },
+    slots: admLengths.map((_, index) => browserSlot(`slot-${index}`)),
     bids: admLengths.map((length, index) => ({
       candidateId: candidateId(index),
       slot: `slot-${index}`,
@@ -464,22 +476,38 @@ describe('auction/parseBrowserAuctionProjectionV1', () => {
     }
   });
 
+  it('requires exact GAM slot definitions in the canonical projection', () => {
+    const missingSlots = browserProjection() as Record<string, unknown>;
+    delete missingSlots['slots'];
+    expect(parseBrowserAuctionProjectionV1(missingSlots)).toBeUndefined();
+
+    const emptySlots = browserProjection();
+    emptySlots.slots = [];
+    expect(parseBrowserAuctionProjectionV1(emptySlots)).toBeUndefined();
+
+    const valid = browserProjection();
+    expect(parseBrowserAuctionProjectionV1(valid)?.slots).toEqual(valid.slots);
+  });
+
   it('enforces result and bid count boundaries', () => {
     expect(
       parseBrowserAuctionProjectionV1({
         version: 1,
         auction: { version: 1, auctionId: 'auction-empty', results: [] },
+        slots: [],
         bids: [],
       })
     ).toBeDefined();
 
     const atLimit = browserProjection();
     atLimit.auction.results = [];
+    atLimit.slots = [];
     atLimit.bids = [];
     for (let index = 0; index < 256; index += 1) {
       const slot = `slot-${index}`;
       const id = candidateId(index);
       atLimit.auction.results.push({ slot, outcome: 'winner', candidateId: id });
+      atLimit.slots.push(browserSlot(slot));
       atLimit.bids.push({
         ...browserProjection().bids[0]!,
         slot,
@@ -508,6 +536,7 @@ describe('auction/parseBrowserAuctionProjectionV1', () => {
     const valid = browserProjection();
     valid.auction.auctionId = 'A'.repeat(128);
     valid.auction.results[0]!.slot = 'é'.repeat(128);
+    valid.slots[0]!.slot = 'é'.repeat(128);
     valid.bids[0]!.slot = 'é'.repeat(128);
     valid.bids[0]!.upstreamBidId = 'é'.repeat(32);
     valid.bids[0]!.targeting = Object.fromEntries(
@@ -837,6 +866,7 @@ describe('auction/parseTrustedServerAuctionResponseV1', () => {
     const canonical: BrowserAuctionProjectionV1 = {
       version: 1,
       auction: projected.auction,
+      slots: [],
       bids: projected.bids.map((bid) => ({
         ...bid,
         upstreamBidId: bid.rendererReservationId,
@@ -909,7 +939,10 @@ describe('auction/parseTrustedServerAuctionResponseV1', () => {
       expect(new TextEncoder().encode(JSON.stringify(wire)).byteLength).toBeGreaterThan(
         MAX_BROWSER_AUCTION_PROJECTION_BYTES
       );
-      expect(parseBrowserAuctionProjectionV1(canonical) !== undefined).toBe(accepted);
+      expect(
+        new TextEncoder().encode(JSON.stringify(canonical)).length <=
+          MAX_BROWSER_AUCTION_PROJECTION_BYTES
+      ).toBe(accepted);
       expect(parseTrustedServerAuctionResponseV1(wire) !== undefined).toBe(accepted);
     }
   });

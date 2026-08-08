@@ -37,6 +37,92 @@ pub fn tsjs_boot_manifest_v1(module_ids: &[&str]) -> Result<String, Report<Trust
     ))
 }
 
+/// Exact immutable creative boot bits emitted for one document generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CreativeBootConfigV1 {
+    /// Whether the creative integration is a required manifest member.
+    pub enabled: bool,
+    /// Whether automatic click interception activates after kernel commit.
+    pub click_guard: bool,
+    /// Whether automatic render interception activates after kernel commit.
+    pub render_guard: bool,
+}
+
+/// Inputs for the one hard-cutover browser boot transport.
+#[derive(Clone, Copy, Debug)]
+pub struct TsjsBootScriptConfigV1<'a> {
+    /// Enabled integration bundles in their actual injection order.
+    pub module_ids: &'a [&'a str],
+    /// Canonical exact [`BrowserAuctionProjectionV1`](crate::auction::types::BrowserAuctionProjectionV1)
+    /// JSON produced by the auction projection boundary.
+    pub auction_projection_json: &'a str,
+    /// Exact creative integration boot configuration.
+    pub creative: CreativeBootConfigV1,
+    /// Whether the local render-trace overlay is active for this document.
+    pub render_trace_overlay: bool,
+    /// Whether request/session-scoped GPT diagnostics is active.
+    pub gpt_diagnostics_active: bool,
+}
+
+/// Serialize the sole pre-core `TsjsBootV1` assignment and bids-ready mark.
+///
+/// The returned inline script keeps the publisher-created `window.tsjs` object,
+/// writes only the exact boot transport, and escapes every HTML-significant JSON
+/// character before insertion into a script element.
+///
+/// # Errors
+///
+/// Returns an error for an invalid manifest, non-object projection JSON, or a
+/// creative/diagnostics enabled bit that disagrees with manifest membership.
+pub fn tsjs_boot_script_v1(
+    config: TsjsBootScriptConfigV1<'_>,
+) -> Result<String, Report<TrustedServerError>> {
+    let manifest = tsjs_boot_manifest_v1(config.module_ids)?;
+    let projection = serde_json::from_str::<serde_json::Value>(config.auction_projection_json)
+        .map_err(|_| boot_manifest_error("auction projection is not valid JSON"))?;
+    if !projection.is_object() {
+        return Err(boot_manifest_error("auction projection must be an object"));
+    }
+
+    let creative_in_manifest = config.module_ids.contains(&"creative");
+    if creative_in_manifest != config.creative.enabled
+        || (!config.creative.enabled
+            && (config.creative.click_guard || config.creative.render_guard))
+    {
+        return Err(boot_manifest_error(
+            "creative boot bits disagree with manifest membership",
+        ));
+    }
+    let diagnostics_in_manifest = config.module_ids.contains(&"gpt_diagnostics");
+    if diagnostics_in_manifest != config.gpt_diagnostics_active {
+        return Err(boot_manifest_error(
+            "GPT diagnostics boot bit disagrees with manifest membership",
+        ));
+    }
+
+    let manifest = escape_json_for_inline_script(&manifest);
+    let projection = escape_json_for_inline_script(config.auction_projection_json);
+    Ok(format!(
+        "<script>(function(){{var t=window.tsjs=window.tsjs||{{}};t.boot={{\"abi\":1,\"releaseId\":\"{}\",\"manifest\":{},\"auctionProjection\":{},\"creative\":{{\"version\":1,\"enabled\":{},\"clickGuard\":{},\"renderGuard\":{}}},\"diagnostics\":{{\"version\":1,\"renderTraceOverlay\":{},\"gpt\":{{\"active\":{}}}}}}};(function(){{try{{window.performance.mark(\"tsjs:bids-script\");}}catch(_){{}}}})();}})();</script>",
+        release_id(),
+        manifest,
+        projection,
+        config.creative.enabled,
+        config.creative.click_guard,
+        config.creative.render_guard,
+        config.render_trace_overlay,
+        config.gpt_diagnostics_active,
+    ))
+}
+
+fn escape_json_for_inline_script(json: &str) -> String {
+    json.replace('&', "\\u0026")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
 fn valid_integration_id(id: &str) -> bool {
     let bytes = id.as_bytes();
     !bytes.is_empty()
@@ -187,6 +273,74 @@ mod tests {
         ] {
             assert!(tsjs_boot_manifest_v1(ids).is_err(), "should reject {ids:?}");
         }
+    }
+
+    #[test]
+    fn boot_script_serializes_the_exact_hard_cutover_transport_and_mark() {
+        let script = tsjs_boot_script_v1(TsjsBootScriptConfigV1 {
+            module_ids: &["creative", "gpt", "gpt_diagnostics"],
+            auction_projection_json:
+                r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"bids":[]}"#,
+            creative: CreativeBootConfigV1 {
+                enabled: true,
+                click_guard: true,
+                render_guard: false,
+            },
+            render_trace_overlay: true,
+            gpt_diagnostics_active: true,
+        })
+        .expect("should serialize boot transport");
+
+        assert!(script.starts_with("<script>(function(){var t=window.tsjs=window.tsjs||{};"));
+        assert!(script.contains(&format!(
+            r#"t.boot={{"abi":1,"releaseId":"{}","manifest":{{"version":1,"releaseId":"{}","integrations":[{{"id":"creative","required":true}},{{"id":"gpt","required":true}},{{"id":"gpt_diagnostics","required":true}}]}},"auctionProjection":{{"version":1,"auction":{{"version":1,"auctionId":"initial","results":[]}},"bids":[]}},"creative":{{"version":1,"enabled":true,"clickGuard":true,"renderGuard":false}},"diagnostics":{{"version":1,"renderTraceOverlay":true,"gpt":{{"active":true}}}}}};"#,
+            release_id(),
+            release_id()
+        )));
+        assert_eq!(script.matches("tsjs:bids-script").count(), 1);
+        assert!(!script.contains("__tsjs"));
+        assert!(script.ends_with("})();</script>"));
+    }
+
+    #[test]
+    fn boot_script_rejects_manifest_diagnostics_mismatch_and_escapes_projection_markup() {
+        let mismatched = tsjs_boot_script_v1(TsjsBootScriptConfigV1 {
+            module_ids: &["creative"],
+            auction_projection_json: r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"bids":[]}"#,
+            creative: CreativeBootConfigV1 {
+                enabled: true,
+                click_guard: true,
+                render_guard: false,
+            },
+            render_trace_overlay: false,
+            gpt_diagnostics_active: true,
+        });
+        assert!(
+            mismatched.is_err(),
+            "should reject an active diagnostics bit without its module"
+        );
+
+        let script = tsjs_boot_script_v1(TsjsBootScriptConfigV1 {
+            module_ids: &["creative"],
+            auction_projection_json:
+                r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"bids":[],"probe":"</ScRiPt><script>&\u2028"}"#,
+            creative: CreativeBootConfigV1 {
+                enabled: true,
+                click_guard: true,
+                render_guard: false,
+            },
+            render_trace_overlay: false,
+            gpt_diagnostics_active: false,
+        })
+        .expect("should escape valid projection JSON");
+        let inner = script
+            .trim_start_matches("<script>")
+            .trim_end_matches("</script>");
+
+        assert!(!inner.contains('<'));
+        assert!(!inner.contains('>'));
+        assert!(!inner.contains('&'));
+        assert!(inner.contains(r#"\u003c/ScRiPt\u003e\u003cscript\u003e\u0026\u2028"#));
     }
 
     #[test]

@@ -31,7 +31,8 @@ use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
     IntegrationRegistration, UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
-    ensure_integration_backend_with_timeout, predict_integration_backend_name,
+    ensure_integration_backend_with_timeout, integration_config_script,
+    predict_integration_backend_name,
 };
 use crate::openrtb::{
     Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, ImpExt, ImpStoredRequest,
@@ -1100,8 +1101,9 @@ impl IntegrationHeadInjector for PrebidIntegration {
             })
             .replace("</", "<\\/");
 
-        let mut inserts = vec![format!(
-            r#"<script>window.pbjs=window.pbjs||{{}};window.pbjs.que=window.pbjs.que||[];window.pbjs.cmd=window.pbjs.cmd||[];window.__tsjs_prebid={config_json};</script>"#
+        let mut inserts = vec![integration_config_script(
+            PREBID_INTEGRATION_ID,
+            &config_json,
         )];
 
         inserts.push(self.external_bundle_script_tag());
@@ -4020,6 +4022,9 @@ external_bundle_sri = "sha384-AAAA"
             "should omit empty refresh-auction exclusions: {}",
             script
         );
+        assert!(script.contains("c.prebid="));
+        assert!(!script.contains("window.__tsjs_prebid"));
+        assert!(!script.contains("window.pbjs"));
     }
 
     #[test]

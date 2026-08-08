@@ -154,8 +154,10 @@ class RuntimeOwner implements Runtime {
       const bootCandidate = this.bootCandidate();
       this.fallbackBoot = buildFallbackBoot(EMBEDDED_RELEASE_ID, bootCandidate);
       this.registry = createIntegrationRegistry({
-        manifest:
-          this.options.releaseId === EMBEDDED_RELEASE_ID ? this.options.manifest : undefined,
+        // The manifest validator binds releaseId directly to the embedded build
+        // stamp, so a separate comparison would duplicate the stamp in minified
+        // core output without strengthening the ABI check.
+        manifest: this.options.manifest,
         releaseId: EMBEDDED_RELEASE_ID,
         knownIntegrationIds: this.options.knownIntegrationIds,
         startedAtMs,

@@ -118,9 +118,8 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, handle_page_bids,
-    handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
-    publisher_response_into_streaming_response,
+    AuctionDispatch, PAGE_BIDS_PATH, handle_page_bids, handle_publisher_request,
+    handle_tsjs_dynamic, page_bids_preflight_denied, publisher_response_into_streaming_response,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -165,7 +164,6 @@ pub(crate) fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>>
     build_state_from_settings(load_settings_from_config_store()?)
 }
 
-#[cfg(feature = "aps-runner-proxy-integration-test")]
 pub(crate) async fn dispatch_reserved_for_state(
     state: &Arc<AppState>,
     req: Request,
@@ -180,7 +178,7 @@ pub(crate) async fn dispatch_reserved_for_state(
             .registry
             .handle_reserved_proxy(&state.settings, &services, ctx.into_request())
             .await
-            .expect("reserved path should have a coordinated-cutover handler")
+            .expect("reserved path should have a hard-cutover handler")
             .unwrap_or_else(|report| http_error(&report)),
     )
 }
@@ -197,9 +195,6 @@ pub(crate) fn build_state_from_settings(
     warn_if_certificate_check_disabled(&settings);
 
     let orchestrator = build_orchestrator(&settings)?;
-    #[cfg(feature = "aps-runner-proxy-integration-test")]
-    let registry = IntegrationRegistry::new_with_aps_v1_for_tests(&settings)?;
-    #[cfg(not(feature = "aps-runner-proxy-integration-test"))]
     let registry = IntegrationRegistry::new(&settings)?;
 
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
@@ -1133,16 +1128,6 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         primary_methods: &[Method::GET, Method::OPTIONS],
         handler: NamedRouteHandler::PageBids,
     },
-    // Deprecated double-underscore alias. tsjs bundles served before the
-    // `/_ts/page-bids` rename keep requesting this path from already-loaded
-    // pages and browser caches; dropping it would strand SPA navigations
-    // without ads until those bundles age out. See `PAGE_BIDS_LEGACY_PATH`;
-    // removal is tracked by IABTechLab/trusted-server#970.
-    NamedRoute {
-        path: PAGE_BIDS_LEGACY_PATH,
-        primary_methods: &[Method::GET, Method::OPTIONS],
-        handler: NamedRouteHandler::PageBids,
-    },
     NamedRoute {
         path: "/first-party/proxy",
         primary_methods: &[Method::GET],
@@ -1272,8 +1257,8 @@ mod tests {
     #[cfg(feature = "aps-runner-proxy-integration-test")]
     use super::dispatch_reserved_for_state;
     use super::{
-        AppState, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH,
-        TrustedServerApp, build_state_from_settings, startup_error_router,
+        AppState, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_PATH, TrustedServerApp,
+        build_state_from_settings, startup_error_router,
     };
     use bytes::Bytes;
     use edgezero_core::body::Body;
@@ -1780,45 +1765,26 @@ mod tests {
     }
 
     #[test]
-    fn page_bids_serves_canonical_path_and_deprecated_alias() {
-        // The SPA re-auction endpoint lives at the canonical single-underscore
-        // `/_ts/page-bids`, matching every other internal route. The deprecated
-        // `/__ts/page-bids` alias must stay registered to the same handler with
-        // the same methods until pre-rename tsjs bundles age out of browser
-        // caches — dropping it would leave those clients without ads on SPA
-        // navigations.
-        //
-        // The paths are literals, not `PAGE_BIDS_PATH` / `PAGE_BIDS_LEGACY_PATH`.
-        // Looking a route up by the same const it was registered with is
-        // tautological: it keeps passing if the const's value changes, which is
-        // exactly the break that would silently desync the server from the tsjs
-        // client's hardcoded fetch path. Pin the consts to their literals too so
-        // a rename has to be deliberate.
+    fn page_bids_serves_only_the_canonical_path() {
+        // The hard cutover exposes only the canonical single-underscore path.
+        // Pin the literal the client fetches and reject accidental reintroduction
+        // of the former compatibility alias.
         assert_eq!(
             PAGE_BIDS_PATH, "/_ts/page-bids",
             "canonical page-bids path must match the path tsjs fetches"
         );
-        assert_eq!(
-            PAGE_BIDS_LEGACY_PATH, "/__ts/page-bids",
-            "legacy alias must match the path pre-rename tsjs bundles fetch"
-        );
-
-        for path in ["/_ts/page-bids", "/__ts/page-bids"] {
-            let route = NAMED_ROUTES
+        let route = NAMED_ROUTES
+            .iter()
+            .find(|route| route.path == "/_ts/page-bids")
+            .expect("canonical page-bids path should be registered");
+        assert!(matches!(route.handler, NamedRouteHandler::PageBids));
+        assert_eq!(route.primary_methods, &[Method::GET, Method::OPTIONS]);
+        assert!(
+            NAMED_ROUTES
                 .iter()
-                .find(|route| route.path == path)
-                .unwrap_or_else(|| panic!("{path} should be registered"));
-
-            assert!(
-                matches!(route.handler, NamedRouteHandler::PageBids),
-                "{path} must map to the page-bids handler"
-            );
-            assert_eq!(
-                route.primary_methods,
-                &[Method::GET, Method::OPTIONS],
-                "{path} must handle GET and OPTIONS directly, not fall through to the publisher"
-            );
-        }
+                .all(|route| route.path != "/__ts/page-bids"),
+            "hard cutover must not retain the deprecated page-bids alias"
+        );
     }
 
     #[test]

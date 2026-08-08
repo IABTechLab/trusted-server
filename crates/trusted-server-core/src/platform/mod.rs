@@ -54,7 +54,6 @@ pub use image_optimizer::{
 };
 pub use kv::UnavailableKvStore;
 pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
-#[cfg(any(test, feature = "test-utils"))]
 pub use types::ExactResponseHeadersV1;
 pub use types::{
     ClientInfo, GeoInfo, PlatformBackendSpec, RuntimeServices, RuntimeServicesBuilder, StoreId,

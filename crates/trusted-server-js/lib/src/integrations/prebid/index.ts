@@ -14,6 +14,7 @@
 import type _pbjsDefault from 'prebid.js';
 
 import { log } from '../../core/log';
+import { EMBEDDED_RELEASE_ID } from '../../core/release';
 import { isEffectivelyVisible, recordRender, stampCreativeTrace } from '../../core/trace';
 import {
   buildAdRequest,
@@ -25,6 +26,7 @@ import type { AuctionBid, AuctionEid } from '../../core/auction';
 import type { AuctionSlot, BrowserAuctionBidV1, RenderRecord } from '../../core/types';
 
 import { PREBID_USER_ID_MODULE_REGISTRY } from './user_id_modules';
+import { createPrebidIntegrationRegistration } from './module';
 
 /**
  * Prebid.js public API surface (type-only; erased at build time).
@@ -1695,30 +1697,13 @@ export function installPrebidRenderTrace(): void {
   listen('adRenderFailed', 'failed');
 }
 
-// Self-initialize when loaded in a browser (same pattern as other integrations).
 if (typeof window !== 'undefined') {
-  installPrebidNpm();
-  // When the external bundle failed to load, installPrebidNpm bailed out and
-  // pbjs.requestBids is undefined. Installing the refresh handler anyway
-  // would clear TS-applied GPT targeting on every publisher refresh and then
-  // fail to run the replacement auction — leave GPT untouched instead.
-  if (hasPrebidJsApi()) {
-    installRefreshHandler();
-    installPrebidRenderTrace();
-    // The slim-Prebid lazy loader appends this bundle from a window.load
-    // handler, so `load` may already have fired by the time this code runs —
-    // waiting for it again would skip user ID setup entirely on that path.
-    if (document.readyState === 'complete') {
-      installUserIdModules();
-    } else {
-      window.addEventListener(
-        'load',
-        () => {
-          installUserIdModules();
-        },
-        { once: true }
-      );
-    }
+  const register = (window.tsjs as unknown as { _registerIntegration?: unknown } | undefined)
+    ?._registerIntegration;
+  if (typeof register === 'function') {
+    Reflect.apply(register, window.tsjs, [
+      createPrebidIntegrationRegistration(EMBEDDED_RELEASE_ID),
+    ]);
   }
 }
 

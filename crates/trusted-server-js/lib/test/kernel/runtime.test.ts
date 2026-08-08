@@ -15,6 +15,16 @@ function boot(results: readonly object[] = []) {
     auctionProjection: {
       version: 1,
       auction: { version: 1, auctionId: 'boot', results },
+      slots: results.map((result) => {
+        const slot = (result as { readonly slot?: unknown }).slot;
+        return {
+          slot,
+          gamUnitPath: `/123/${String(slot)}`,
+          divId: String(slot),
+          formats: [[300, 250]],
+          targeting: {},
+        };
+      }),
       bids: [],
     },
     creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
@@ -837,6 +847,7 @@ describe('Runtime bootstrap owner', () => {
     ).toEqual({
       version: 1,
       auction: { version: 1, auctionId: 'fallback', results: [] },
+      slots: [],
       bids: [],
     });
   });
@@ -988,6 +999,7 @@ describe('Runtime bootstrap owner', () => {
       ).toEqual({
         version: 1,
         auction: { version: 1, auctionId: 'fallback', results: [] },
+        slots: [],
         bids: [],
       });
     }
@@ -1017,6 +1029,7 @@ describe('Runtime bootstrap owner', () => {
     ).toEqual({
       version: 1,
       auction: { version: 1, auctionId: 'fallback', results: [] },
+      slots: [],
       bids: [],
     });
   });

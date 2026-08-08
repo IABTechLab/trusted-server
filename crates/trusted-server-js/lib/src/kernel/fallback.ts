@@ -13,6 +13,7 @@ import type { BootFailureReason } from './integration_registry';
 const SAFE_PROJECTION = {
   version: 1,
   auction: { version: 1, auctionId: 'fallback', results: [] },
+  slots: [],
   bids: [],
 } as const;
 

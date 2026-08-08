@@ -6,6 +6,7 @@ import type {
   BidRenderSourceV1,
   BrowserAuctionBidV1,
   BrowserAuctionProjectionV1,
+  BrowserAuctionSlotV1,
   CacheFetchPolicyV1,
   CacheRenderSourceV1,
   SlotAuctionDecisionV1,
@@ -17,6 +18,7 @@ export const MAX_BROWSER_AUCTION_PROJECTION_BYTES = 8 * 1024 * 1024;
 
 export const MAX_AUCTION_RESULTS = 256;
 const MAX_TARGETING_ENTRIES = 32;
+const MAX_SLOT_FORMATS = 64;
 const MAX_ADM_BYTES = 512 * 1024;
 const MAX_URL_BYTES = 4096;
 const reflectApplyIntrinsic = Reflect.apply;
@@ -571,6 +573,37 @@ function parseBrowserBid(
   };
 }
 
+function parseBrowserSlot(value: unknown): BrowserAuctionSlotV1 | undefined {
+  const slot = ownDataObject(value, ['slot', 'gamUnitPath', 'divId', 'formats', 'targeting']);
+  if (
+    !slot ||
+    !validBoundedString(slot.slot, 256) ||
+    !validBoundedString(slot.gamUnitPath, 256) ||
+    !validBoundedString(slot.divId, 256)
+  ) {
+    return undefined;
+  }
+  const rawFormats = ownDataArray(slot.formats, MAX_SLOT_FORMATS);
+  if (!rawFormats || rawFormats.length === 0) return undefined;
+  const formats: Array<readonly [number, number]> = [];
+  for (let index = 0; index < rawFormats.length; index += 1) {
+    const pair = ownDataArray(rawFormats[index], 2);
+    if (!pair || pair.length !== 2 || !validDimension(pair[0]) || !validDimension(pair[1])) {
+      return undefined;
+    }
+    formats.push([pair[0], pair[1]]);
+  }
+  const targeting = parseTargeting(slot.targeting);
+  if (!targeting) return undefined;
+  return {
+    slot: slot.slot,
+    gamUnitPath: slot.gamUnitPath,
+    divId: slot.divId,
+    formats,
+    targeting,
+  };
+}
+
 /** Validate, canonicalize, and deep-copy a complete browser auction projection. */
 export function parseBrowserAuctionProjectionV1(
   value: unknown,
@@ -580,11 +613,24 @@ export function parseBrowserAuctionProjectionV1(
     const cachePolicy =
       cachePolicyValue === undefined ? undefined : parseCacheFetchPolicyV1(cachePolicyValue);
     if (cachePolicyValue !== undefined && !cachePolicy) return undefined;
-    const record = ownDataObject(value, ['version', 'auction', 'bids']);
+    const record = ownDataObject(value, ['version', 'auction', 'slots', 'bids']);
     if (!record || record.version !== 1) return undefined;
     const auction = parseAuctionDecisionSetV1(record.auction);
+    const rawSlots = ownDataArray(record.slots, MAX_AUCTION_RESULTS);
     const rawBids = ownDataArray(record.bids, MAX_AUCTION_RESULTS);
-    if (!auction || !rawBids) return undefined;
+    if (!auction || !rawSlots || !rawBids || rawSlots.length !== auction.results.length) {
+      return undefined;
+    }
+    const slots: BrowserAuctionSlotV1[] = [];
+    const slotIds = new Set<string>();
+    for (let index = 0; index < rawSlots.length; index += 1) {
+      const slot = parseBrowserSlot(rawSlots[index]);
+      if (!slot || slotIds.has(slot.slot) || slot.slot !== auction.results[index]?.slot) {
+        return undefined;
+      }
+      slotIds.add(slot.slot);
+      slots.push(slot);
+    }
     const bids: BrowserAuctionBidV1[] = [];
     const candidateIds = new Set<string>();
     const reservationIds = new Set<string>();
@@ -613,7 +659,7 @@ export function parseBrowserAuctionProjectionV1(
     }
     if (winnerIndex !== bids.length) return undefined;
 
-    const projection: BrowserAuctionProjectionV1 = { version: 1, auction, bids };
+    const projection: BrowserAuctionProjectionV1 = { version: 1, auction, slots, bids };
     if (jsonUtf8ByteLength(projection) > MAX_BROWSER_AUCTION_PROJECTION_BYTES) {
       return undefined;
     }

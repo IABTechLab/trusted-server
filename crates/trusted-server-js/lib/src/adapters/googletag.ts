@@ -39,6 +39,25 @@ export interface GoogletagReplacementCommitAdmission {
   rollback(): void;
 }
 
+/** Outcome of one adapter-owned initial GPT slot-definition transaction. */
+export type GoogletagDefinitionResult = Readonly<
+  { status: 'discarded' } | { status: 'defined'; slot: object }
+>;
+
+/** Failure to define or synchronously retire one adapter-owned GPT slot. */
+export class GoogletagDefinitionError extends Error {
+  public readonly code = 'gpt_definition_failed';
+  public readonly cause: unknown;
+  public readonly orphanedSlot: object | undefined;
+
+  public constructor(orphanedSlot?: object, cause?: unknown) {
+    super('gpt_definition_failed');
+    this.name = 'GoogletagDefinitionError';
+    this.orphanedSlot = orphanedSlot;
+    this.cause = cause;
+  }
+}
+
 /** Successful outcome of one GPT destroy/redefine transaction. */
 export type GoogletagReplacementResult = Readonly<
   { status: 'destroyed' } | { status: 'replaced'; slot: object }
@@ -153,6 +172,11 @@ export interface GoogletagFacade {
   adUnitPath?(slot: object): unknown;
   bindingToken(): object;
   clearTargeting(slot: object, key?: string): unknown;
+  transactionalDefine(
+    definition: GoogletagReplacementDefinition,
+    isGenerationCurrent: () => boolean,
+    prepareCommit: (slot: object) => GoogletagReplacementCommitAdmission
+  ): GoogletagDefinitionResult;
   display(slot: string | object): unknown;
   getTargeting(slot: object, key: string): readonly string[];
   observeTargeting(
@@ -166,6 +190,7 @@ export interface GoogletagFacade {
     pubadsReady: boolean;
   }>;
   setTargeting(slot: object, key: string, value: string | readonly string[]): unknown;
+  slotElementId?(slot: object): unknown;
   slots(): readonly object[];
   subscribe(eventType: string, listener: (event: unknown) => void): () => void;
   transactionalReplace(
@@ -553,6 +578,92 @@ function createFacade(
     bindingToken: (): object => bindingToken,
     clearTargeting: (slot: object, key?: string): unknown =>
       call(slot, 'clearTargeting', key === undefined ? [] : [key]),
+    transactionalDefine: (
+      definition: GoogletagReplacementDefinition,
+      isGenerationCurrent: () => boolean,
+      prepareCommit: (slot: object) => GoogletagReplacementCommitAdmission
+    ): GoogletagDefinitionResult => {
+      if (
+        typeof isGenerationCurrent !== 'function' ||
+        typeof prepareCommit !== 'function' ||
+        !isOperationCurrent()
+      ) {
+        throw new GoogletagAdapterError('external_artifact_incompatible');
+      }
+      const destroy = (slot: object): boolean => {
+        try {
+          return call(binding.binding, 'destroySlots', [[slot]]) === true;
+        } catch {
+          return false;
+        }
+      };
+      const discarded = Object.freeze({ status: 'discarded' as const });
+      let candidate: object | undefined;
+      let admission: GoogletagReplacementCommitAdmission | undefined;
+      let commitAttempted = false;
+      const discard = (slot: object, cause?: unknown): GoogletagDefinitionResult => {
+        if (!destroy(slot)) throw new GoogletagDefinitionError(slot, cause);
+        return discarded;
+      };
+      try {
+        if (!isGenerationCurrent() || !isOperationCurrent()) return discarded;
+        const defined = call(binding.binding, 'defineSlot', [
+          definition.adUnitPath,
+          definition.sizes,
+          definition.elementId,
+        ]);
+        if ((typeof defined !== 'object' || defined === null) && typeof defined !== 'function') {
+          throw new GoogletagDefinitionError();
+        }
+        candidate = defined as object;
+        if (!isGenerationCurrent() || !isOperationCurrent()) {
+          const stale = candidate;
+          candidate = undefined;
+          return discard(stale);
+        }
+        admission = prepareCommit(candidate);
+        if (
+          !admission ||
+          typeof admission.commit !== 'function' ||
+          typeof admission.rollback !== 'function'
+        ) {
+          throw new GoogletagDefinitionError();
+        }
+        call(candidate, 'addService', [service()]);
+        if (!isGenerationCurrent() || !isOperationCurrent()) {
+          const stale = candidate;
+          candidate = undefined;
+          return discard(stale);
+        }
+        commitAttempted = true;
+        if (!admission.commit()) throw new GoogletagDefinitionError();
+        if (!isGenerationCurrent() || !isOperationCurrent()) {
+          try {
+            admission.rollback();
+          } finally {
+            commitAttempted = false;
+          }
+          const stale = candidate;
+          candidate = undefined;
+          return discard(stale);
+        }
+        return Object.freeze({ status: 'defined' as const, slot: candidate });
+      } catch (error) {
+        if (commitAttempted) {
+          try {
+            admission?.rollback();
+          } catch {
+            // Candidate retirement remains mandatory after bookkeeping rollback failure.
+          }
+        }
+        if (candidate) {
+          const failed = candidate;
+          if (!destroy(failed)) throw new GoogletagDefinitionError(failed, error);
+        }
+        if (error instanceof GoogletagDefinitionError) throw error;
+        throw new GoogletagDefinitionError(undefined, error);
+      }
+    },
     display: (slot: string | object): unknown => {
       const display = member(binding.binding, 'display');
       if (!isOperationCurrent()) throw new GoogletagAdapterError('external_artifact_incompatible');
@@ -691,6 +802,7 @@ function createFacade(
     },
     setTargeting: (slot: object, key: string, value: string | readonly string[]): unknown =>
       call(slot, 'setTargeting', [key, Array.isArray(value) ? [...value] : value]),
+    slotElementId: (slot: object): unknown => call(slot, 'getSlotElementId', []),
     slots: (): readonly object[] => {
       const currentSlots = call(service(), 'getSlots', []);
       if (

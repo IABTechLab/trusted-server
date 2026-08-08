@@ -24,6 +24,7 @@ import { parseTrustedServerAuctionResponseV1 } from '../core/auction';
 import type {
   BootManifestV1,
   BrowserAuctionProjectionV1,
+  BrowserAuctionSlotV1,
   CreativeBootV1,
   DiagnosticsBootV1,
 } from '../core/types';
@@ -220,6 +221,7 @@ export interface TestBrowserRuntimeCompositionOptions extends BrowserComposition
   readonly createIdentityIssuerForTest?: NavigationIdentityIssuerFactory;
   readonly admittedProgrammaticSlotsForTest?: readonly string[];
   readonly gptStartupForTest?: (config: unknown) => void;
+  readonly pageBidsFetcherForTest?: PageBidsFetcher;
   readonly prebidStartupForTest?: (config: unknown) => void;
   readonly pucSchedulerForTest?: PucBridgeOptions['scheduler'];
 }
@@ -235,18 +237,241 @@ interface AcceptedBrowserBoot {
 }
 
 interface PreparedBrowserServices {
-  readonly createAttempt: (owner: RenderAttemptScope) => ReturnType<typeof createRenderAttempt>;
+  readonly createAttempt: (
+    owner: RenderAttemptScope,
+    parentAttemptId?: string
+  ) => ReturnType<typeof createRenderAttempt>;
   readonly publisherOrigin: string;
+  readonly renderProjectedFallback: (attempt: RenderAttempt) => boolean;
   readonly rendererUrl: string;
   readonly resolveCacheAdm: NonNullable<PucBridgeOptions['resolveCacheAdm']>;
   readonly services: Readonly<Omit<BrowserServices, 'pucBridge'>>;
 }
 
-function projectionSlots(projection: object): readonly string[] {
-  const accepted = projection as {
-    readonly auction: { readonly results: readonly { readonly slot: string }[] };
+interface PageBidsResponse {
+  readonly ok: boolean;
+  readonly json: () => Promise<unknown>;
+}
+
+type PageBidsFetcher = (
+  input: string,
+  init: Readonly<{
+    credentials: 'include';
+    headers: Readonly<{ 'X-TSJS-Page-Bids': '1' }>;
+    signal: AbortSignal;
+  }>
+) => PromiseLike<PageBidsResponse>;
+
+interface PageBidsNavigationLifecycle {
+  readonly activate: () => () => void;
+  readonly start: () => void;
+}
+
+type GptProjectionPublisher = (
+  navigation: NonNullable<RuntimeSession['currentNavigation']>,
+  projection: Readonly<BrowserAuctionProjectionV1>,
+  requestClass: string
+) => void;
+
+const noopGptProjectionPublisher: GptProjectionPublisher = () => undefined;
+
+function resolveProjectedSlotElement(
+  placement: Readonly<BrowserAuctionSlotV1>
+): HTMLElement | undefined {
+  try {
+    if (typeof document === 'undefined') return undefined;
+    const exact = document.getElementById(placement.divId);
+    if (exact instanceof HTMLElement) return exact;
+    const prefixMatches = [...document.querySelectorAll<HTMLElement>('[id]')].filter(
+      (element) => element.id.startsWith(placement.divId) && !element.id.endsWith('-container')
+    );
+    if (prefixMatches.length === 1) return prefixMatches[0];
+    const visible = prefixMatches.filter((element) => isEffectivelyVisible(element));
+    if (visible.length === 1) return visible[0];
+    const active = visible.filter((element) => {
+      const bounds = element.getBoundingClientRect();
+      return bounds.width > 0 && bounds.height > 0;
+    });
+    return active.length === 1 ? active[0] : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function currentBrowserPath(): string | undefined {
+  try {
+    return `${window.location.pathname}${window.location.search}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function restoreHistoryMethod(
+  name: 'pushState' | 'replaceState',
+  previous: PropertyDescriptor | undefined,
+  installed: History['pushState']
+): void {
+  try {
+    const current = Object.getOwnPropertyDescriptor(window.history, name);
+    if (!current || !('value' in current) || current.value !== installed) return;
+    if (previous) Object.defineProperty(window.history, name, previous);
+    else Reflect.deleteProperty(window.history, name);
+  } catch {
+    // A publisher replacement remains authoritative; the disposed wrapper is inert.
+  }
+}
+
+/** Own the canonical page-bids fetch and one replacement session per SPA navigation. */
+function createPageBidsNavigationLifecycle(options: {
+  readonly fetcher?: PageBidsFetcher;
+  readonly onProjectionCommitted?: (
+    navigation: NonNullable<RuntimeSession['currentNavigation']>,
+    projection: Readonly<object>
+  ) => void;
+  readonly runtimeSession: () => RuntimeSession | undefined;
+  readonly services: () => Readonly<BrowserServices> | undefined;
+  readonly projectionParser: () => ((candidate: unknown) => object | undefined) | undefined;
+}): PageBidsNavigationLifecycle {
+  let active = false;
+  let disposed = false;
+  let started = false;
+  let appliedPath: string | undefined;
+  let currentPath: string | undefined;
+  let release: (() => void) | undefined;
+
+  const rollBackPath = (
+    path: string,
+    navigation?: NonNullable<RuntimeSession['currentNavigation']>
+  ): void => {
+    if (currentPath !== path || (navigation && !navigation.isCurrent())) return;
+    currentPath = appliedPath;
   };
-  return Object.freeze(accepted.auction.results.map(({ slot }) => slot));
+
+  const requestProjection = async (path: string): Promise<void> => {
+    const session = options.runtimeSession();
+    const replacement = session?.replaceNavigation();
+    if (!replacement?.ok) {
+      rollBackPath(path);
+      return;
+    }
+    const navigation = replacement.value;
+    const services = options.services();
+    const parseProjection = options.projectionParser();
+    if (!services || !parseProjection) {
+      rollBackPath(path, navigation);
+      return;
+    }
+    const controller = createPageBidsController({
+      navigation,
+      parseProjection,
+      slotRegistry: services.slots.projectionRegistry(navigation),
+    });
+    const fetcher = options.fetcher ?? globalThis.fetch;
+    if (typeof fetcher !== 'function') {
+      rollBackPath(path, navigation);
+      return;
+    }
+    let committed = false;
+    try {
+      const response = await fetcher(`/_ts/page-bids?path=${encodeURIComponent(path)}`, {
+        credentials: 'include',
+        headers: { 'X-TSJS-Page-Bids': '1' },
+        signal: navigation.signal,
+      });
+      if (!navigation.isCurrent()) return;
+      if (!response.ok) {
+        rollBackPath(path, navigation);
+        return;
+      }
+      const candidate = await response.json();
+      if (!navigation.isCurrent()) return;
+      const result = controller.commit(candidate);
+      if (result.status === 'committed') {
+        committed = true;
+        appliedPath = path;
+        const projection = navigation.currentAuctionProjection;
+        if (projection) options.onProjectionCommitted?.(navigation, projection);
+      }
+      if (result.status === 'rejected' && result.reason !== 'stale') {
+        rollBackPath(path, navigation);
+        log.warn('page-bids: rejected navigation projection', result.reason);
+      }
+    } catch (error) {
+      if (!navigation.signal.aborted) {
+        if (!committed) rollBackPath(path, navigation);
+        log.warn('page-bids: projection request failed', error);
+      }
+    }
+  };
+
+  const navigateIfChanged = (): void => {
+    if (!active || !started || disposed) return;
+    const path = currentBrowserPath();
+    if (path === undefined || path === currentPath) return;
+    currentPath = path;
+    void requestProjection(path);
+  };
+
+  return Object.freeze({
+    activate: (): (() => void) => {
+      if (active || disposed) throw new Error('Page-bids navigation owner is unavailable');
+      const history = window.history;
+      const previousPushState = Object.getOwnPropertyDescriptor(history, 'pushState');
+      const previousReplaceState = Object.getOwnPropertyDescriptor(history, 'replaceState');
+      const pushState = history.pushState;
+      const replaceState = history.replaceState;
+      const wrap = (original: History['pushState']): History['pushState'] =>
+        function wrappedHistoryState(
+          this: History,
+          data: unknown,
+          unused: string,
+          url?: string | URL | null
+        ): void {
+          Reflect.apply(original, this, [data, unused, url]);
+          navigateIfChanged();
+        };
+      const wrappedPushState = wrap(pushState);
+      const wrappedReplaceState = wrap(replaceState);
+      const onPopState = (): void => navigateIfChanged();
+      try {
+        Object.defineProperty(history, 'pushState', {
+          configurable: true,
+          enumerable: previousPushState?.enumerable ?? false,
+          value: wrappedPushState,
+          writable: true,
+        });
+        Object.defineProperty(history, 'replaceState', {
+          configurable: true,
+          enumerable: previousReplaceState?.enumerable ?? false,
+          value: wrappedReplaceState,
+          writable: true,
+        });
+        window.addEventListener('popstate', onPopState);
+        active = true;
+      } catch (error) {
+        restoreHistoryMethod('replaceState', previousReplaceState, wrappedReplaceState);
+        restoreHistoryMethod('pushState', previousPushState, wrappedPushState);
+        throw error;
+      }
+      let released = false;
+      release = (): void => {
+        if (released) return;
+        released = true;
+        disposed = true;
+        active = false;
+        window.removeEventListener('popstate', onPopState);
+        restoreHistoryMethod('replaceState', previousReplaceState, wrappedReplaceState);
+        restoreHistoryMethod('pushState', previousPushState, wrappedPushState);
+      };
+      return release;
+    },
+    start: (): void => {
+      if (!active || disposed) return;
+      currentPath = currentBrowserPath();
+      appliedPath = currentPath;
+      started = true;
+    },
+  });
 }
 
 interface ComposedPrebidRefreshConfig {
@@ -426,6 +651,9 @@ export function createBrowserRuntimeComposition(
   const composition = createBrowserComposition(compositionOptions);
   const providedBindings = runtimeOptions.getBindings;
   let browserServices: Readonly<BrowserServices> | undefined;
+  let gptProjectionPublisher = noopGptProjectionPublisher;
+  let projectionParser: ((candidate: unknown) => object | undefined) | undefined;
+  let runtimeSession: RuntimeSession | undefined;
   let creativeBoot: Readonly<CreativeBootV1> | undefined;
   let diagnosticsBoot: Readonly<DiagnosticsBootV1> | undefined;
   let diagnosticsBus: DiagnosticsBus | undefined;
@@ -570,6 +798,20 @@ export function createBrowserRuntimeComposition(
     start: compositionOptions.creativeStartupForTest ?? defaultCreativeRuntime.start,
   });
   const startGpt = compositionOptions.gptStartupForTest ?? (() => undefined);
+  const pageBidsNavigation = createPageBidsNavigationLifecycle({
+    ...(compositionOptions.pageBidsFetcherForTest
+      ? { fetcher: compositionOptions.pageBidsFetcherForTest }
+      : {}),
+    onProjectionCommitted: (navigation, projection) =>
+      gptProjectionPublisher(
+        navigation,
+        projection as Readonly<BrowserAuctionProjectionV1>,
+        'page-bids'
+      ),
+    projectionParser: () => projectionParser,
+    runtimeSession: () => runtimeSession,
+    services: () => browserServices,
+  });
   const gptRuntime = createGptStartup({
     googletag: composition.adapters.googletag,
     slots: () => {
@@ -580,10 +822,34 @@ export function createBrowserRuntimeComposition(
     start: startGpt,
   });
   const gptIntegrationRuntime = Object.freeze({
-    activate: gptRuntime.activate,
-    start: gptRuntime.start,
+    activate: (): (() => void) => {
+      const releaseGpt = gptRuntime.activate();
+      let releaseNavigation: (() => void) | undefined;
+      try {
+        releaseNavigation = pageBidsNavigation.activate();
+      } catch (error) {
+        releaseGpt();
+        throw error;
+      }
+      return (): void => {
+        releaseNavigation?.();
+        releaseGpt();
+      };
+    },
+    start: (config: unknown): void => {
+      gptRuntime.start(config);
+      pageBidsNavigation.start();
+      const navigation = runtimeSession?.currentNavigation;
+      const projection = navigation?.currentAuctionProjection;
+      if (navigation && projection) {
+        gptProjectionPublisher(
+          navigation,
+          projection as Readonly<BrowserAuctionProjectionV1>,
+          'initial'
+        );
+      }
+    },
   });
-  let runtimeSession: RuntimeSession | undefined;
   let prebidCoordinator: PrebidSelectionCoordinator | undefined;
   let prebidRefreshConfig = EMPTY_PREBID_REFRESH_CONFIG;
   const startPrebid = compositionOptions.prebidStartupForTest ?? (() => undefined);
@@ -736,7 +1002,168 @@ export function createBrowserRuntimeComposition(
     target: window as typeof window & { testlight?: { que?: unknown[] } },
   });
   let auctionBatchService: AuctionBatchService | undefined;
-  let projectionParser: ((candidate: unknown) => object | undefined) | undefined;
+  const publishProjectionThroughGpt = async (
+    navigation: NonNullable<RuntimeSession['currentNavigation']>,
+    projection: Readonly<BrowserAuctionProjectionV1>,
+    requestClass: string
+  ): Promise<void> => {
+    const prepared = preparedBrowserServices;
+    const services = browserServices;
+    if (!prepared || !services || !navigation.isCurrent() || projection.slots.length === 0) return;
+    const physicalBySlot = new Map<
+      string,
+      Readonly<{ operation: 'display' | 'refresh'; slot: object }>
+    >();
+    const operation = composition.adapters.googletag.run(
+      (gpt) => {
+        for (let index = 0; index < projection.slots.length; index += 1) {
+          const placement = projection.slots[index];
+          if (!placement || !navigation.isCurrent()) break;
+          const element = resolveProjectedSlotElement(placement);
+          if (!element) continue;
+          const definition = Object.freeze({
+            adUnitPath: placement.gamUnitPath,
+            elementId: element.id,
+            sizes: placement.formats,
+          });
+          const existing = gpt.slots().filter((slot) => gpt.slotElementId?.(slot) === element.id);
+          if (existing.length > 1) continue;
+          const publisherSlot = existing[0];
+          if (publisherSlot) {
+            const adopted = services.slots.adoptGptSlot(navigation.generation, placement.slot, {
+              definition,
+              elementIdPrefix: placement.divId,
+              ownership: 'publisher',
+              slot: publisherSlot,
+            });
+            if (adopted.ok) {
+              physicalBySlot.set(
+                placement.slot,
+                Object.freeze({ operation: 'refresh', slot: publisherSlot })
+              );
+            }
+            continue;
+          }
+          const defined = gpt.transactionalDefine(
+            definition,
+            () => navigation.isCurrent(),
+            (candidate) => {
+              let committed = false;
+              return Object.freeze({
+                commit: (): boolean => {
+                  const adopted = services.slots.adoptGptSlot(
+                    navigation.generation,
+                    placement.slot,
+                    {
+                      definition,
+                      elementIdPrefix: placement.divId,
+                      ownership: 'trusted_server',
+                      slot: candidate,
+                    }
+                  );
+                  committed = adopted.ok;
+                  return committed;
+                },
+                rollback: (): void => {
+                  if (!committed) return;
+                  committed = false;
+                  services.slots.recordPublisherDestruction(candidate);
+                },
+              });
+            }
+          );
+          if (defined.status === 'defined') {
+            physicalBySlot.set(
+              placement.slot,
+              Object.freeze({ operation: 'display', slot: defined.slot })
+            );
+          }
+        }
+      },
+      { signal: navigation.signal }
+    );
+    try {
+      await operation.result;
+    } catch (error) {
+      if (!navigation.signal.aborted) log.warn('GPT projection: slot binding failed', error);
+    }
+    if (!navigation.isCurrent()) return;
+    const batch = navigation.createAuctionBatch(`gpt:${projection.auction.auctionId}`);
+    if (!batch) return;
+    let winnerIndex = 0;
+    for (let index = 0; index < projection.auction.results.length; index += 1) {
+      const decision = projection.auction.results[index];
+      const placement = projection.slots[index];
+      if (!decision || !placement || decision.outcome !== 'winner') continue;
+      const bid = projection.bids[winnerIndex];
+      winnerIndex += 1;
+      if (!bid || !navigation.isCurrent()) continue;
+      const owner = batch.createRenderAttempt(decision.slot);
+      if (!owner.ok) continue;
+      const created = prepared.createAttempt(owner.value);
+      if (!created.ok) continue;
+      const binding = physicalBySlot.get(decision.slot);
+      if (!binding) {
+        created.value.fail('slot_unresolved');
+        continue;
+      }
+      const artifact = Object.freeze({
+        kind: 'puc' as const,
+        attemptId: created.value.id,
+        slot: created.value.slot,
+        navigationGeneration: created.value.navigationGeneration,
+        dispose: () => undefined,
+      });
+      const published = await publishGptWinner({
+        artifact,
+        attempt: created.value,
+        bid,
+        googletag: composition.adapters.googletag,
+        navigation,
+        operation: binding.operation,
+        owner: owner.value,
+        placement,
+        pucBridge: services.pucBridge,
+        requestClass,
+        reservations: services.reservations,
+        slot: binding.slot,
+        slots: services.slots,
+        targeting: services.targeting,
+        createFallback: (parentAttemptId) => {
+          const fallbackOwner = batch.createRenderAttempt(decision.slot);
+          if (!fallbackOwner.ok) {
+            return Object.freeze({
+              ok: false as const,
+              reason:
+                fallbackOwner.reason === 'identity_generation_failed'
+                  ? ('identity_generation_failed' as const)
+                  : fallbackOwner.reason === 'stale_owner'
+                    ? ('stale_owner' as const)
+                    : ('invalid_attempt' as const),
+            });
+          }
+          const fallback = prepared.createAttempt(fallbackOwner.value, parentAttemptId);
+          if (!fallback.ok) return fallback;
+          if (
+            !fallback.value.admitDirectWinner(
+              bid.renderSource,
+              Object.freeze({ selectedCpm: bid.cpm })
+            )
+          ) {
+            fallback.value.fail('winner_not_renderable');
+            return fallback;
+          }
+          if (!prepared.renderProjectedFallback(fallback.value)) {
+            fallback.value.fail('winner_not_renderable');
+          }
+          return fallback;
+        },
+      });
+      if (!published.ok && navigation.isCurrent()) {
+        log.warn('GPT projection: winner publication failed', published.reason);
+      }
+    }
+  };
   const frozenSlotResult = (result: Record<string, unknown>): Readonly<Record<string, unknown>> =>
     Object.freeze(result);
   const combineRequestResults = (
@@ -1109,10 +1536,11 @@ export function createBrowserRuntimeComposition(
         }
       };
       const fetchAuction = compositionOptions.auctionFetcherForTest ?? globalThis.fetch;
-      const createOwnedAttempt = (owner: RenderAttemptScope) =>
+      const createOwnedAttempt = (owner: RenderAttemptScope, parentAttemptId?: string) =>
         createRenderAttempt({
           artifacts,
           owner,
+          ...(parentAttemptId === undefined ? {} : { parentAttemptId }),
           prepareRenderSource: (candidate) => {
             const source = parseBidRenderSourceV1(candidate, cachePolicy);
             return source ? Object.freeze(source) : undefined;
@@ -1120,6 +1548,19 @@ export function createBrowserRuntimeComposition(
           publishDiagnostics: preparedDiagnosticsBus.publish,
           reservations: reservationService,
         });
+      const renderProjectedFallback = (attempt: RenderAttempt): boolean => {
+        const record = slotService.resolveRegisteredSlot(attempt.slot);
+        const container = record && resolveDirectContainer(record);
+        if (!container) {
+          attempt.fail('slot_unresolved');
+          return false;
+        }
+        if (attempt.renderSource?.type === 'aps') return renderDirectAps(attempt, container);
+        if (attempt.renderSource?.type === 'adm') return renderDirectAdm(attempt, container);
+        if (attempt.renderSource?.type === 'cache') return renderDirectCache(attempt, container);
+        attempt.fail('winner_not_renderable');
+        return false;
+      };
       const batchCoordinator = createAuctionBatchService({
         ...(cachePolicy ? { cachePolicy } : {}),
         createAttempt: createOwnedAttempt,
@@ -1128,19 +1569,7 @@ export function createBrowserRuntimeComposition(
           return fetchAuction(input, init);
         },
         parseResponse: parseTrustedServerAuctionResponseV1,
-        renderWinner: (attempt) => {
-          const record = slotService.resolveRegisteredSlot(attempt.slot);
-          const container = record && resolveDirectContainer(record);
-          if (!container) {
-            attempt.fail('slot_unresolved');
-            return false;
-          }
-          if (attempt.renderSource?.type === 'aps') return renderDirectAps(attempt, container);
-          if (attempt.renderSource?.type === 'adm') return renderDirectAdm(attempt, container);
-          if (attempt.renderSource?.type === 'cache') return renderDirectCache(attempt, container);
-          attempt.fail('winner_not_renderable');
-          return false;
-        },
+        renderWinner: renderProjectedFallback,
       });
       const services = Object.freeze({
         artifacts,
@@ -1156,6 +1585,7 @@ export function createBrowserRuntimeComposition(
       preparedBrowserServices = Object.freeze({
         createAttempt: createOwnedAttempt,
         publisherOrigin,
+        renderProjectedFallback,
         rendererUrl,
         resolveCacheAdm,
         services,
@@ -1217,9 +1647,11 @@ export function createBrowserRuntimeComposition(
       const navigation = session.startInitialNavigation(initialProjection);
       if (!navigation.ok) throw new Error(navigation.reason);
 
+      const acceptedInitialProjection = initialProjection as Readonly<BrowserAuctionProjectionV1>;
       const initialRegistrations = [
-        ...projectionSlots(initialProjection).map((registeredSlotId) => ({
-          registeredSlotId,
+        ...acceptedInitialProjection.slots.map((placement) => ({
+          domAliases: Object.freeze([placement.divId]),
+          registeredSlotId: placement.slot,
           source: 'server' as const,
         })),
         ...(compositionOptions.admittedProgrammaticSlotsForTest ?? []).map((registeredSlotId) => ({
@@ -1271,6 +1703,14 @@ export function createBrowserRuntimeComposition(
       });
       context.onDispose(() => pucBridge.dispose());
       browserServices = Object.freeze({ ...prepared.services, pucBridge });
+      gptProjectionPublisher = (navigation, projection, requestClass): void => {
+        void publishProjectionThroughGpt(navigation, projection, requestClass).catch((error) => {
+          if (navigation.isCurrent()) log.warn('GPT projection: coordinator failed', error);
+        });
+      };
+      context.onDispose(() => {
+        gptProjectionPublisher = noopGptProjectionPublisher;
+      });
       const coordinator = createPrebidSelectionCoordinator({
         activateAttempt: ({ attempt, owner, preparedBid }): boolean => {
           const artifact = Object.freeze({

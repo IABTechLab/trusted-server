@@ -13,7 +13,7 @@ use crate::error::TrustedServerError;
 use crate::integrations::{
     INTEGRATION_MAX_BODY_BYTES, IntegrationEndpoint, IntegrationHeadInjector,
     IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, collect_body_bounded,
-    ensure_integration_backend,
+    ensure_integration_backend, integration_config_script,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -356,8 +356,9 @@ impl IntegrationHeadInjector for DidomiIntegration {
             })
             .replace("</", "<\\/");
 
-        vec![format!(
-            r#"<script>window.__tsjs_didomi={config_json};</script>"#
+        vec![integration_config_script(
+            DIDOMI_INTEGRATION_ID,
+            &config_json,
         )]
     }
 }
@@ -573,8 +574,9 @@ mod tests {
         assert_eq!(inserts.len(), 1);
         assert_eq!(
             inserts[0],
-            r#"<script>window.__tsjs_didomi={"proxyPath":"/my-consent/"};</script>"#
+            r#"<script>(function(t){var c=t._integrationConfig=t._integrationConfig||{};c.didomi={"proxyPath":"/my-consent/"};})(window.tsjs=window.tsjs||{});</script>"#
         );
+        assert!(!inserts[0].contains("__tsjs_didomi"));
     }
 
     #[test]
@@ -648,7 +650,7 @@ mod tests {
         let inserts = integration.head_inserts(&ctx);
         assert_eq!(
             inserts[0],
-            r#"<script>window.__tsjs_didomi={"proxyPath":"/integrations/didomi/consent/"};</script>"#
+            r#"<script>(function(t){var c=t._integrationConfig=t._integrationConfig||{};c.didomi={"proxyPath":"/integrations/didomi/consent/"};})(window.tsjs=window.tsjs||{});</script>"#
         );
     }
 }

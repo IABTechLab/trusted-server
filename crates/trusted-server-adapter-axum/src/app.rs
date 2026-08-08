@@ -19,8 +19,8 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, buffer_publisher_response_async,
-    handle_page_bids, handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
+    AuctionDispatch, PAGE_BIDS_PATH, buffer_publisher_response_async, handle_page_bids,
+    handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
@@ -71,9 +71,6 @@ fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let orchestrator = build_orchestrator(&settings)?;
-    #[cfg(feature = "aps-runner-proxy-integration-test")]
-    let registry = IntegrationRegistry::new_with_aps_v1_for_tests(&settings)?;
-    #[cfg(not(feature = "aps-runner-proxy-integration-test"))]
     let registry = IntegrationRegistry::new(&settings)?;
 
     Ok(Arc::new(AppState {
@@ -83,7 +80,6 @@ fn build_state_with_settings(
     }))
 }
 
-#[cfg(feature = "aps-runner-proxy-integration-test")]
 async fn dispatch_reserved_for_state(state: &Arc<AppState>, req: Request) -> Option<Response> {
     if !state.registry.has_reserved_path(req.uri().path()) {
         return None;
@@ -95,25 +91,23 @@ async fn dispatch_reserved_for_state(state: &Arc<AppState>, req: Request) -> Opt
             .registry
             .handle_reserved_proxy(&state.settings, &services, ctx.into_request())
             .await
-            .expect("reserved path should have a coordinated-cutover handler")
+            .expect("reserved path should have a hard-cutover handler")
             .unwrap_or_else(|report| http_error(&report)),
     )
 }
 
-#[cfg(feature = "aps-runner-proxy-integration-test")]
 #[derive(Clone)]
-/// Feature-artifact dispatcher that owns one startup-built APS registry.
+/// Dispatcher that owns one startup-built registry for hard-cutover route families.
 pub struct ReservedApsDispatcher {
     state: Arc<AppState>,
 }
 
-#[cfg(feature = "aps-runner-proxy-integration-test")]
 impl ReservedApsDispatcher {
     /// Build the dispatcher from the adapter's startup settings.
     ///
     /// # Errors
     ///
-    /// Returns an error when settings, the orchestrator, or the APS test
+    /// Returns an error when settings, the orchestrator, or the integration
     /// registry cannot be initialized.
     pub fn from_startup_settings() -> Result<Self, Report<TrustedServerError>> {
         Ok(Self {
@@ -125,7 +119,7 @@ impl ReservedApsDispatcher {
     ///
     /// # Errors
     ///
-    /// Returns an error when the orchestrator or APS test registry cannot be
+    /// Returns an error when the orchestrator or integration registry cannot be
     /// initialized from `settings`.
     pub fn from_settings(settings: Settings) -> Result<Self, Report<TrustedServerError>> {
         Ok(Self {
@@ -139,12 +133,11 @@ impl ReservedApsDispatcher {
     }
 }
 
-#[cfg(feature = "aps-runner-proxy-integration-test")]
 /// Dispatch a reserved APS request using explicit settings.
 ///
 /// # Errors
 ///
-/// Returns an error when the feature-only dispatcher cannot be initialized.
+/// Returns an error when the dispatcher cannot be initialized.
 pub async fn dispatch_reserved_with_settings(
     settings: Settings,
     req: Request,
@@ -154,12 +147,11 @@ pub async fn dispatch_reserved_with_settings(
         .await)
 }
 
-#[cfg(feature = "aps-runner-proxy-integration-test")]
 /// Dispatch a reserved APS request using startup settings.
 ///
 /// # Errors
 ///
-/// Returns an error when startup settings or the feature-only dispatcher
+/// Returns an error when startup settings or the dispatcher
 /// cannot be initialized.
 pub async fn dispatch_reserved(
     req: Request,
@@ -377,7 +369,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 14] {
+fn named_routes() -> [NamedRoute; 13] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -432,14 +424,6 @@ fn named_routes() -> [NamedRoute; 14] {
         // preflight guard for this side-effecting endpoint.
         NamedRoute {
             path: PAGE_BIDS_PATH,
-            primary_methods: &[Method::GET, Method::OPTIONS],
-            handler: NamedRouteHandler::PageBids,
-        },
-        // Deprecated double-underscore alias, kept so tsjs bundles served before
-        // the `/_ts/page-bids` rename keep getting ads on SPA navigations until
-        // they age out of browser caches. See `PAGE_BIDS_LEGACY_PATH`.
-        NamedRoute {
-            path: PAGE_BIDS_LEGACY_PATH,
             primary_methods: &[Method::GET, Method::OPTIONS],
             handler: NamedRouteHandler::PageBids,
         },

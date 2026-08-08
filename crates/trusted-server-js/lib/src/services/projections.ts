@@ -13,11 +13,17 @@ export interface PreparedProjectionSlots {
   readonly rollback: () => void;
 }
 
+/** Exact slot identity and DOM aliases reserved with one admitted projection. */
+export interface ProjectionSlotRegistration {
+  readonly registeredSlotId: string;
+  readonly domAliases: readonly string[];
+}
+
 /** Slot-registry transaction boundary consumed by the page-bids controller. */
 export interface ProjectionSlotRegistry {
   readonly prepareProjectionSlots: (
     ownerGeneration: object,
-    slots: readonly string[],
+    slots: readonly ProjectionSlotRegistration[],
     maximumActiveSlots: number
   ) => PreparedProjectionSlots | undefined;
 }
@@ -72,31 +78,36 @@ function recursivelyFreeze(value: unknown, visited = new Set<object>()): boolean
   }
 }
 
-function projectedSlots(projection: object): readonly string[] | undefined {
+function projectedSlots(projection: object): readonly ProjectionSlotRegistration[] | undefined {
   try {
-    const auctionDescriptor = Object.getOwnPropertyDescriptor(projection, 'auction');
-    if (!auctionDescriptor || !('value' in auctionDescriptor)) return undefined;
-    const auction = auctionDescriptor.value;
-    if (typeof auction !== 'object' || auction === null) return undefined;
-    const resultsDescriptor = Object.getOwnPropertyDescriptor(auction, 'results');
-    if (!resultsDescriptor || !('value' in resultsDescriptor)) return undefined;
-    const results = resultsDescriptor.value;
-    if (!Array.isArray(results) || results.length > MAX_ACTIVE_SLOT_RECORDS) return undefined;
-    const slots: string[] = [];
+    const slotsDescriptor = Object.getOwnPropertyDescriptor(projection, 'slots');
+    if (!slotsDescriptor || !('value' in slotsDescriptor)) return undefined;
+    const projected = slotsDescriptor.value;
+    if (!Array.isArray(projected) || projected.length > MAX_ACTIVE_SLOT_RECORDS) return undefined;
+    const slots: ProjectionSlotRegistration[] = [];
     const seen = new Set<string>();
-    for (const result of results) {
-      if (typeof result !== 'object' || result === null) return undefined;
-      const slotDescriptor = Object.getOwnPropertyDescriptor(result, 'slot');
+    for (const placement of projected) {
+      if (typeof placement !== 'object' || placement === null) return undefined;
+      const slotDescriptor = Object.getOwnPropertyDescriptor(placement, 'slot');
+      const divDescriptor = Object.getOwnPropertyDescriptor(placement, 'divId');
       if (
         !slotDescriptor ||
         !('value' in slotDescriptor) ||
-        typeof slotDescriptor.value !== 'string'
+        typeof slotDescriptor.value !== 'string' ||
+        !divDescriptor ||
+        !('value' in divDescriptor) ||
+        typeof divDescriptor.value !== 'string'
       ) {
         return undefined;
       }
       if (seen.has(slotDescriptor.value)) return undefined;
       seen.add(slotDescriptor.value);
-      slots.push(slotDescriptor.value);
+      slots.push(
+        Object.freeze({
+          registeredSlotId: slotDescriptor.value,
+          domAliases: Object.freeze([divDescriptor.value]),
+        })
+      );
     }
     return Object.freeze(slots);
   } catch {
