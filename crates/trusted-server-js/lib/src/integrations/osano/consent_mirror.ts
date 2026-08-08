@@ -207,7 +207,7 @@ function readUspSignal(win: OsanoWindow): Promise<SignalResult> {
   if (typeof win.__uspapi !== 'function') return Promise.resolve(unavailableResult());
 
   return new Promise((resolve) => {
-    let timer: number | undefined;
+    let timer: number | undefined = undefined;
     let cancelPending = (): void => undefined;
     const done = finishOnce((result: SignalResult) => {
       if (timer !== undefined) window.clearTimeout(timer);
@@ -248,7 +248,7 @@ function readGppSignal(win: OsanoWindow): Promise<SignalResult> {
   if (typeof win.__gpp !== 'function') return Promise.resolve(unavailableResult());
 
   return new Promise((resolve) => {
-    let timer: number | undefined;
+    let timer: number | undefined = undefined;
     let cancelPending = (): void => undefined;
     const done = finishOnce((result: SignalResult) => {
       if (timer !== undefined) window.clearTimeout(timer);
@@ -313,7 +313,7 @@ function readTcfSignal(win: OsanoWindow): Promise<SignalResult> {
   if (typeof win.__tcfapi !== 'function') return Promise.resolve(unavailableResult());
 
   return new Promise((resolve) => {
-    let timer: number | undefined;
+    let timer: number | undefined = undefined;
     let cancelPending = (): void => undefined;
     const done = finishOnce((result: SignalResult) => {
       if (timer !== undefined) window.clearTimeout(timer);
