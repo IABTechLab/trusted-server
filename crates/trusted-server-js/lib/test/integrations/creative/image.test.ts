@@ -1,16 +1,18 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
-import { importCreativeModule, waitForExpect } from './helpers';
+import { disposeImportedCreativeModule, importCreativeModule, waitForExpect } from './helpers';
 
 const ORIGINAL_FETCH = global.fetch;
 
 describe('creative/image.ts', () => {
   beforeEach(() => {
+    disposeImportedCreativeModule();
     vi.resetModules();
     document.body.innerHTML = '';
   });
 
   afterEach(() => {
+    disposeImportedCreativeModule();
     global.fetch = ORIGINAL_FETCH;
   });
 
@@ -51,5 +53,31 @@ describe('creative/image.ts', () => {
       expect(fetchMock).toHaveBeenCalled();
       expect(img.src).toContain('https://img.example/fallback.png');
     });
+  });
+
+  it('defers the baseline scan and restores only its exact hooks on disposal', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ href: '/first-party/proxy?tsurl=image&tstoken=token&tsexp=1' }),
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const image = document.createElement('img');
+    image.setAttribute('src', 'https://img.example/preexisting.png');
+    document.body.appendChild(image);
+    const baselineSrc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+    const baselineSetAttribute = HTMLImageElement.prototype.setAttribute;
+    const { installDynamicImageProxy } = await import('../../../src/integrations/creative/image');
+
+    const handle = installDynamicImageProxy(false);
+    await Promise.resolve();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    handle.scan();
+    await waitForExpect(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    handle.dispose();
+    handle.dispose();
+
+    expect(Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src')).toEqual(baselineSrc);
+    expect(HTMLImageElement.prototype.setAttribute).toBe(baselineSetAttribute);
   });
 });
