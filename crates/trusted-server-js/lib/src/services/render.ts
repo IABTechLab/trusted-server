@@ -637,7 +637,16 @@ export interface RenderAttemptOptions {
   readonly prepareRenderSource: (candidate: unknown) => ReservationRenderSource | undefined;
   readonly reservations: ReservationService;
   readonly parentAttemptId?: string;
+  readonly publishDiagnostics?: (observation: RenderAttemptDiagnosticsObservation) => unknown;
   readonly scheduler?: RenderScheduler;
+}
+
+export interface RenderAttemptDiagnosticsObservation {
+  readonly kind: 'render_attempt';
+  readonly attemptId: string;
+  readonly slotId: string;
+  readonly state: 'accepted' | 'no_bid' | 'failed' | 'cancelled';
+  readonly outcome: RenderOutcome;
 }
 
 export type RenderAttemptCreationResult =
@@ -1189,6 +1198,9 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
   let parentAttemptId: string | undefined;
   let prepareRenderSource: (candidate: unknown) => ReservationRenderSource | undefined;
   let reservations: ReservationService;
+  let publishDiagnostics:
+    | ((observation: RenderAttemptDiagnosticsObservation) => unknown)
+    | undefined;
   let consumeClaimMethod: ReservationService['consumeClaim'];
   let ownerIsCurrentMethod: RenderAttemptScope['isCurrent'];
   let ownerDisposeMethod: RenderAttemptScope['dispose'];
@@ -1229,6 +1241,7 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
     parentAttemptId = options.parentAttemptId;
     prepareRenderSource = options.prepareRenderSource;
     reservations = options.reservations;
+    publishDiagnostics = options.publishDiagnostics;
     if (!isReservationService(reservations)) {
       return rejectConstruction('invalid_attempt');
     }
@@ -1257,6 +1270,7 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
       typeof ownerPrepareWinnerMethod !== 'function' ||
       typeof prepareRenderSource !== 'function' ||
       typeof consumeClaimMethod !== 'function' ||
+      (publishDiagnostics !== undefined && typeof publishDiagnostics !== 'function') ||
       (parentAttemptId !== undefined &&
         (!validAttemptId(parentAttemptId) || parentAttemptId === id))
     ) {
@@ -1538,6 +1552,20 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
         // The terminal latch and owned-resource cleanup remain authoritative.
       } finally {
         settlingInternally = false;
+      }
+    }
+    if (publishDiagnostics) {
+      const observation = frozen<RenderAttemptDiagnosticsObservation>({
+        kind: 'render_attempt',
+        attemptId: id,
+        slotId: slot,
+        state: terminal.outcome,
+        outcome: terminal,
+      });
+      try {
+        Reflect.apply(publishDiagnostics, undefined, [observation]);
+      } catch {
+        // Diagnostics publication cannot change terminal render authority.
       }
     }
     notify(terminal);

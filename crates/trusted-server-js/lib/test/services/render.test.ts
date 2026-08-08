@@ -26,6 +26,8 @@ import {
   type DirectAdmIframeConstructor,
   type DirectAdmIframeHandle,
   type RenderAttempt,
+  type RenderAttemptDiagnosticsObservation,
+  type RenderAttemptSnapshot,
   type RenderAttemptState,
   type SlotOperation,
   type SlotOperationOptions,
@@ -337,6 +339,9 @@ function attempt(
     prepareRenderSource: options.prepareRenderSource ?? prepareRenderSource,
     reservations: reservationService,
     ...(options.parentAttemptId === undefined ? {} : { parentAttemptId: options.parentAttemptId }),
+    ...(options.publishDiagnostics === undefined
+      ? {}
+      : { publishDiagnostics: options.publishDiagnostics }),
     ...(options.scheduler === undefined ? {} : { scheduler: options.scheduler }),
   });
   expect(result).toMatchObject({ ok: true });
@@ -4538,6 +4543,58 @@ describe('committed artifact ownership', () => {
     expect(promoted).toBe(true);
     expect(dispose).toHaveBeenCalledOnce();
     expect(store.current('fictional-slot')).toBe(replacement);
+  });
+});
+
+describe('RenderAttempt diagnostics producer', () => {
+  it('publishes one frozen terminal observation only after accepted artifact state commits', () => {
+    const artifacts = createCommittedArtifactStore();
+    const attemptReference: { current?: RenderAttempt } = {};
+    const snapshots: RenderAttemptSnapshot[] = [];
+    const publishDiagnostics = vi.fn((observation: RenderAttemptDiagnosticsObservation) => {
+      expect(Object.isFrozen(observation)).toBe(true);
+      expect(Object.isFrozen(observation.outcome)).toBe(true);
+      snapshots.push(attemptReference.current!.snapshot());
+      throw new Error('fictional diagnostics failure');
+    });
+    const renderAttempt = attempt(owner(), { artifacts, publishDiagnostics });
+    attemptReference.current = renderAttempt;
+    expect(renderAttempt.admitDirectWinner(ADM_SOURCE, WINNER_CONTEXT)).toBe(true);
+    expect(renderAttempt.beginDirect()).toBe(true);
+    const committed = artifact(renderAttempt);
+    expect(renderAttempt.beginAdm(committed)).toBe(true);
+
+    expect(renderAttempt.accept()).toBe(true);
+
+    expect(artifacts.current(renderAttempt.slot)).toBe(committed);
+    expect(snapshots).toEqual([
+      expect.objectContaining({ state: 'accepted', outcome: { outcome: 'accepted' } }),
+    ]);
+    expect(publishDiagnostics).toHaveBeenCalledOnce();
+    expect(publishDiagnostics).toHaveBeenCalledWith({
+      kind: 'render_attempt',
+      attemptId: renderAttempt.id,
+      slotId: renderAttempt.slot,
+      state: 'accepted',
+      outcome: { outcome: 'accepted' },
+    });
+  });
+
+  it('publishes terminal failure after the lifecycle state commit and never republishes', () => {
+    const attemptReference: { current?: RenderAttempt } = {};
+    const observedStates: RenderAttemptState[] = [];
+    const publishDiagnostics = vi.fn(() => {
+      observedStates.push(attemptReference.current!.snapshot().state);
+      return false;
+    });
+    const renderAttempt = attempt(owner(), { publishDiagnostics });
+    attemptReference.current = renderAttempt;
+
+    expect(renderAttempt.fail('runner_failed')).toBe(true);
+    expect(renderAttempt.cancel('superseded')).toBe(false);
+
+    expect(observedStates).toEqual(['failed']);
+    expect(publishDiagnostics).toHaveBeenCalledOnce();
   });
 });
 
