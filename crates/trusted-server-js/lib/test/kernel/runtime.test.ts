@@ -401,7 +401,7 @@ describe('Runtime bootstrap owner', () => {
     ).toBe(false);
   });
 
-  it('removes legacy and fallback-forbidden surfaces at terminal publication', async () => {
+  it('publishes an exact terminal namespace with no publisher-owned fields', async () => {
     const target = {
       que: [] as unknown[],
       diagnostics: { legacy: true },
@@ -429,7 +429,7 @@ describe('Runtime bootstrap owner', () => {
     expect(Object.prototype.hasOwnProperty.call(target, 'adInit')).toBe(false);
     expect(Object.prototype.hasOwnProperty.call(target, 'renderAdUnit')).toBe(false);
     expect(Object.prototype.hasOwnProperty.call(target, 'setConfig')).toBe(false);
-    expect(target.publisher).toEqual({ retained: true });
+    expect(target).not.toHaveProperty('publisher');
   });
 
   it('allows exactly one bootstrap owner for a namespace', () => {
