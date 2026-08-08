@@ -10,6 +10,11 @@ use crate::error::TrustedServerError;
 /// `module_ids` contains enabled integration bundles in actual injection order;
 /// core is implicit and therefore rejected here. Unknown, duplicate, malformed,
 /// or over-capacity inventories fail closed.
+///
+/// # Errors
+///
+/// Returns an error when the integration inventory exceeds the bounded capacity,
+/// contains an invalid module ID, or cannot be serialized.
 pub fn tsjs_boot_manifest_v1(module_ids: &[&str]) -> Result<String, Report<TrustedServerError>> {
     if module_ids.len() > 16 {
         return Err(boot_manifest_error("more than 16 integration modules"));
