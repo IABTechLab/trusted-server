@@ -126,6 +126,42 @@ describe('creative startup ownership', () => {
     expect(order).toEqual(['dispose:image', 'dispose:click']);
   });
 
+  it('removes an exact ready listener when hostile registration throws after installing it', () => {
+    const order: string[] = [];
+    const click = guard('click', order);
+    let listener: (() => void) | undefined;
+    const document = {
+      readyState: 'loading' as const,
+      addEventListener: vi.fn(
+        (_type: 'DOMContentLoaded', candidate: () => void, _options: { once: true }) => {
+          listener = candidate;
+          throw new Error('fictional ready listener registration failure');
+        }
+      ),
+      removeEventListener: vi.fn((_type: 'DOMContentLoaded', candidate: () => void) => {
+        if (listener === candidate) listener = undefined;
+      }),
+    };
+    const startup = createCreativeStartup({
+      document,
+      installClickGuard: () => click,
+      installDynamicImageProxy: () => guard('image', order),
+      installDynamicIframeProxy: () => guard('iframe', order),
+    });
+
+    expect(() => startup.activate(config({ renderGuard: false }))).toThrow(
+      'fictional ready listener registration failure'
+    );
+    expect(document.removeEventListener).toHaveBeenCalledExactlyOnceWith(
+      'DOMContentLoaded',
+      expect.any(Function)
+    );
+    expect(click.dispose).toHaveBeenCalledTimes(1);
+
+    listener?.();
+    expect(click.scan).not.toHaveBeenCalled();
+  });
+
   it('contains hostile scans and still visits every active guard', async () => {
     const order: string[] = [];
     const click = guard('click', order);
