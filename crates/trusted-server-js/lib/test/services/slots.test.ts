@@ -142,6 +142,7 @@ function createGptHarness(
     bindingStatus: () => 'present',
     dispose: vi.fn(),
     notifyReady: vi.fn(),
+    observeDiagnostics: () => vi.fn(),
     observePublisherCalls: () => vi.fn(),
     run: <T>(command: (gpt: Readonly<GoogletagFacade>) => T) => {
       let disposed = false;
@@ -4297,6 +4298,7 @@ describe('Task 11 adversarial ownership review', () => {
         bindingStatus: () => 'present',
         dispose: vi.fn(),
         notifyReady: vi.fn(),
+        observeDiagnostics: () => vi.fn(),
         observePublisherCalls: () => vi.fn(),
         run: <T>(command: (gpt: Readonly<GoogletagFacade>) => T) => {
           let value: T;

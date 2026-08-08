@@ -55,6 +55,15 @@ import {
 } from '../integrations/gpt/module';
 import { createGptStartup } from '../integrations/gpt/startup';
 import {
+  activateGptDiagnosticsFactCapture,
+  createGptDiagnosticsFactBuffer,
+  type GptDiagnosticsFactBuffer,
+} from '../integrations/gpt_diagnostics/facts';
+import {
+  createGptDiagnosticsRuntime,
+  type GptDiagnosticsRuntime,
+} from '../integrations/gpt_diagnostics';
+import {
   createPrebidSelectionCoordinator,
   publishPrebidBid,
   type PrebidSelectionCoordinator,
@@ -287,7 +296,10 @@ export function createTestBrowserRuntimeComposition(
   const providedBindings = runtimeOptions.getBindings;
   let browserServices: Readonly<BrowserServices> | undefined;
   let creativeBoot: Readonly<CreativeBootV1> | undefined;
+  let diagnosticsBoot: Readonly<DiagnosticsBootV1> | undefined;
   let diagnosticsBus: DiagnosticsBus | undefined;
+  let gptDiagnosticsFacts: GptDiagnosticsFactBuffer | undefined;
+  let gptDiagnosticsRuntime: GptDiagnosticsRuntime | undefined;
   let renderTrace: RenderTraceRuntimeOwner | undefined;
   const consumeCoreObservation = (observation: DiagnosticsObservation): void => {
     if (
@@ -326,7 +338,11 @@ export function createTestBrowserRuntimeComposition(
   const diagnosticsForPublish = (): Readonly<object> => {
     const trace = renderTrace;
     if (!trace) throw new Error('Render diagnostics are unavailable');
-    return Object.freeze({ renderTrace: trace.diagnostics });
+    const gpt = gptDiagnosticsRuntime?.currentApi();
+    if (diagnosticsBoot?.gpt.active && !gpt) {
+      throw new Error('GPT diagnostics are unavailable');
+    }
+    return Object.freeze({ renderTrace: trace.diagnostics, ...(gpt ? { gpt } : {}) });
   };
   const defaultCreativeRuntime =
     typeof document === 'undefined'
@@ -434,6 +450,7 @@ export function createTestBrowserRuntimeComposition(
       config = descriptor.value;
     }
     if (id === 'creative' && config === undefined) config = creativeBoot;
+    if (id === 'gpt_diagnostics' && config === undefined) config = diagnosticsBoot?.gpt;
     const interfaces = runtimeSession?.interfaces;
     if (!interfaces) throw new Error(`Integration interfaces are unavailable for ${id}`);
     return Object.freeze({
@@ -633,6 +650,7 @@ export function createTestBrowserRuntimeComposition(
     prepareOwner: (context) => {
       const boot = context.boot as unknown as AcceptedBrowserBoot;
       creativeBoot = boot.creative;
+      diagnosticsBoot = boot.diagnostics;
       const cachePolicy =
         boot.cachePolicy === undefined ? undefined : parseCacheFetchPolicyV1(boot.cachePolicy);
       const parseProjection = (candidate: unknown): object | undefined =>
@@ -652,9 +670,26 @@ export function createTestBrowserRuntimeComposition(
       });
       renderTrace = preparedRenderTrace;
       diagnosticsBus = preparedDiagnosticsBus;
+      const preparedGptDiagnosticsFacts = boot.diagnostics.gpt.active
+        ? createGptDiagnosticsFactBuffer({
+            onConsumerError: (error) => log.warn('gpt diagnostics: fact consumer failed', error),
+          })
+        : undefined;
+      const preparedGptDiagnosticsRuntime = preparedGptDiagnosticsFacts
+        ? createGptDiagnosticsRuntime(preparedGptDiagnosticsFacts)
+        : undefined;
+      gptDiagnosticsFacts = preparedGptDiagnosticsFacts;
+      gptDiagnosticsRuntime = preparedGptDiagnosticsRuntime;
       context.onDispose(() => {
+        preparedGptDiagnosticsFacts?.dispose();
         preparedDiagnosticsBus.dispose();
         preparedRenderTrace.dispose();
+        if (gptDiagnosticsFacts === preparedGptDiagnosticsFacts) {
+          gptDiagnosticsFacts = undefined;
+        }
+        if (gptDiagnosticsRuntime === preparedGptDiagnosticsRuntime) {
+          gptDiagnosticsRuntime = undefined;
+        }
         if (diagnosticsBus === preparedDiagnosticsBus) diagnosticsBus = undefined;
         if (renderTrace === preparedRenderTrace) renderTrace = undefined;
       });
@@ -855,6 +890,9 @@ export function createTestBrowserRuntimeComposition(
           adapters: composition.adapters,
           creative: creativeRuntime,
           diagnostics: Object.freeze({ subscribe: preparedDiagnosticsBus.subscribe }),
+          ...(preparedGptDiagnosticsRuntime
+            ? { gpt_diagnostics: preparedGptDiagnosticsRuntime }
+            : {}),
           gpt: gptRuntime,
           prebid: prebidRuntime,
           ...services,
@@ -880,6 +918,7 @@ export function createTestBrowserRuntimeComposition(
           auctionContextRegistry = undefined;
           projectionParser = undefined;
           creativeBoot = undefined;
+          diagnosticsBoot = undefined;
         }
       });
       const navigation = session.startInitialNavigation(initialProjection);
@@ -912,6 +951,15 @@ export function createTestBrowserRuntimeComposition(
     activateCore: (context) => {
       const prepared = preparedBrowserServices;
       if (!prepared) throw new Error('Browser services are unavailable');
+      const facts = gptDiagnosticsFacts;
+      if (facts) {
+        const releaseCapture = activateGptDiagnosticsFactCapture(
+          composition.adapters.googletag,
+          facts
+        );
+        if (!releaseCapture) throw new Error('GPT diagnostics capture is unavailable');
+        context.onDispose(releaseCapture);
+      }
       const pucBridge = createPucBridge({
         messaging: composition.adapters.messaging,
         publisherOrigin: prepared.publisherOrigin,
@@ -952,6 +1000,7 @@ export function createTestBrowserRuntimeComposition(
         if (prebidCoordinator === coordinator) prebidCoordinator = undefined;
       });
       browserServices.slots.activate();
+      browserServices.slots.start();
       compositionOptions.coreActivations.correctnessGptListeners(
         context,
         composition.adapters,

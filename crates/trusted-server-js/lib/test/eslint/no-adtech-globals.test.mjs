@@ -222,7 +222,6 @@ test('permits external-global ownership only in adapter source files', () => {
 test('temporary allowlists are exact, narrow, and inventoried for Task 22 removal', () => {
   assert.deepEqual(LEGACY_ADTECH_GLOBAL_ALLOWLIST, [
     'src/integrations/gpt/index.ts',
-    'src/integrations/gpt_diagnostics/observer.ts',
     'src/integrations/prebid/index.ts',
   ]);
   assert.deepEqual(LEGACY_RESTRICTED_IMPORT_ALLOWLIST, [

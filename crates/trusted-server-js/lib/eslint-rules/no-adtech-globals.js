@@ -7,7 +7,6 @@ const GLOBAL_ROOTS = new Set(['globalThis', 'self', 'window']);
 
 export const LEGACY_ADTECH_GLOBAL_ALLOWLIST = Object.freeze([
   'src/integrations/gpt/index.ts',
-  'src/integrations/gpt_diagnostics/observer.ts',
   'src/integrations/prebid/index.ts',
 ]);
 
