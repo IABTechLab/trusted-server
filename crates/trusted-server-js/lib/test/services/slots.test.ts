@@ -42,6 +42,7 @@ function createRuntimeWithNavigation() {
 function createGptHarness(
   options: {
     initialLoadDisabled?: boolean;
+    deferDestroyedResult?: boolean;
     missingRefresh?: boolean;
     orphanOnReplace?: object;
     returnOldOnReplace?: boolean;
@@ -63,6 +64,12 @@ function createGptHarness(
   const addService = vi.fn();
   const operationDisposals: Array<ReturnType<typeof vi.fn>> = [];
   const bindingToken = Object.freeze({});
+  let deferredDestroyedResolved = false;
+  let resolveDeferredDestroyedPromise!: () => void;
+  const deferredDestroyedPromise = new Promise<void>((resolve) => {
+    resolveDeferredDestroyedPromise = resolve;
+  });
+  let deferredDestroyedUsed = false;
   const facade: GoogletagFacade = Object.freeze({
     bindingToken: () => bindingToken,
     clearTargeting: vi.fn(),
@@ -144,7 +151,20 @@ function createGptHarness(
       let result: Promise<T>;
       if (options.synchronousRun !== false) {
         try {
-          result = Promise.resolve(command(facade));
+          const value = command(facade);
+          const deferResult =
+            options.deferDestroyedResult === true &&
+            !deferredDestroyedUsed &&
+            typeof value === 'object' &&
+            value !== null &&
+            'status' in value &&
+            value.status === 'destroyed';
+          if (deferResult) {
+            deferredDestroyedUsed = true;
+            result = deferredDestroyedPromise.then(() => value);
+          } else {
+            result = Promise.resolve(value);
+          }
         } catch (error) {
           result = Promise.reject(error);
         }
@@ -173,6 +193,11 @@ function createGptHarness(
     facade,
     operationDisposals,
     refresh,
+    resolveDeferredDestroyed: () => {
+      if (deferredDestroyedResolved) return;
+      deferredDestroyedResolved = true;
+      resolveDeferredDestroyedPromise();
+    },
   };
 }
 
@@ -965,7 +990,7 @@ describe('navigation-owned DOM reconciliation', () => {
   it('keeps final cleanup pending and lets navigation cancellation beat its late result', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
-    const gpt = createGptHarness();
+    const gpt = createGptHarness({ deferDestroyedResult: true });
     const dom = createReconciliationBoundary();
     dom.put('slot-div', {});
     const service = createSlotService({
@@ -974,7 +999,7 @@ describe('navigation-owned DOM reconciliation', () => {
       reconciliation: dom.boundary,
     });
     const { navigation, runtime } = createRuntimeWithNavigation();
-    bindTrustedSlot(service, navigation);
+    const oldSlot = bindTrustedSlot(service, navigation);
     service.activate();
     dom.disconnect('slot-div');
     await vi.advanceTimersByTimeAsync(4_999);
@@ -989,16 +1014,38 @@ describe('navigation-owned DOM reconciliation', () => {
     vi.advanceTimersByTime(1);
     expect(request.status).toBe('active');
     expect(gpt.destroySlots).toHaveBeenCalledTimes(1);
-    expect(runtime.replaceNavigation().ok).toBe(true);
+    const nextResult = runtime.replaceNavigation();
+    expect(nextResult.ok).toBe(true);
+    if (!nextResult.ok) throw new Error('Expected replacement navigation');
+    const next = nextResult.value;
     await expect(request.result).resolves.toEqual({
       status: 'cancelled',
       reason: 'navigation_disposed',
     });
+    expect(
+      service.register(next, [
+        serverRegistration('slot', {
+          adUnitCode: '/network/slot',
+          domAliases: ['slot-div'],
+        }),
+      ])
+    ).toEqual({ ok: false, reason: 'slot_quarantined' });
+
+    gpt.resolveDeferredDestroyed();
     await Promise.resolve();
     await Promise.resolve();
 
     expect(request.status).toBe('terminal');
     expect(gpt.destroySlots).toHaveBeenCalledTimes(1);
+    const replacement = bindTrustedSlot(service, next);
+    gpt.resolveDeferredDestroyed();
+    service.handleGptEvent('slotRenderEnded', {
+      isEmpty: false,
+      responseIdentifier: 'late-old-slot',
+      slot: oldSlot,
+    });
+    expect(service.recordPublisherDestruction(oldSlot)).toBe(false);
+    expect(service.isBoundGptSlot(next.generation, 'slot', replacement)).toBe(true);
   });
 
   it('lets request supersession win while final cleanup completes later', async () => {

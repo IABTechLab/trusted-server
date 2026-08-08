@@ -266,6 +266,51 @@ describe('owner-aware targeting journal', () => {
       expect(service.snapshotForTest()).toEqual({ frames: 0, slots: 0 });
     }
   );
+
+  it('invalidates when a targeting read replaces an observed wrapper during release', async () => {
+    const values = new Map<string, readonly string[]>([['key', ['publisher']]]);
+    const publisherReplacement = vi.fn((key: string, value: string | readonly string[]): void => {
+      values.set(key, Object.freeze(typeof value === 'string' ? [value] : [...value]));
+    });
+    const slot = {
+      clearTargeting: vi.fn((key?: string) => {
+        if (key === undefined) values.clear();
+        else values.delete(key);
+      }),
+      getTargeting: vi.fn((key: string) => Object.freeze([...(values.get(key) ?? [])])),
+      setTargeting: vi.fn((key: string, value: string | readonly string[]) => {
+        values.set(key, Object.freeze(typeof value === 'string' ? [value] : [...value]));
+      }),
+    };
+    const adapter = adapterForTargetingSlot(slot);
+    const service = createTargetingService();
+    await expect(service.observePublisherMutations(slot, adapter).result).resolves.toBeUndefined();
+    const frame = service.own(slot, 'key', 'trusted', 'owner', {
+      clearTargeting: (key) => {
+        adapter.run((gpt) => gpt.clearTargeting(slot, key));
+      },
+      getTargeting: (key) => {
+        let current: readonly string[] = Object.freeze([]);
+        adapter.run((gpt) => {
+          current = gpt.getTargeting(slot, key);
+        });
+        return current;
+      },
+      setTargeting: (key, value) => {
+        adapter.run((gpt) => gpt.setTargeting(slot, key, value));
+      },
+    });
+    slot.getTargeting.mockImplementationOnce((key: string) => {
+      slot.setTargeting = publisherReplacement;
+      return Object.freeze([...(values.get(key) ?? [])]);
+    });
+
+    frame?.release();
+
+    expect(publisherReplacement).not.toHaveBeenCalled();
+    expect(values.get('key')).toEqual(['trusted']);
+    expect(service.snapshotForTest()).toEqual({ frames: 0, slots: 0 });
+  });
 });
 
 function adapterForTargetingSlot(slot: object) {

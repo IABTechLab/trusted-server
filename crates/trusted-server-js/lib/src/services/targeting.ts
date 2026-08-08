@@ -284,6 +284,10 @@ export function createTargetingService(): TargetingService {
     } catch {
       return false;
     }
+    if (frame.observation && !observationIsCurrent(frame.observation)) {
+      invalidateChain(frame.slot, slotChains, frame.key, chain);
+      return true;
+    }
     if (!exactInstalledValue(actual, frame.installed)) {
       invalidateChain(frame.slot, slotChains, frame.key, chain);
       return true;
@@ -291,6 +295,10 @@ export function createTargetingService(): TargetingService {
 
     const expected = expectedPredecessor(frame);
     if (!expected) return false;
+    if (frame.observation && !observationIsCurrent(frame.observation)) {
+      invalidateChain(frame.slot, slotChains, frame.key, chain);
+      return true;
+    }
     try {
       restorePredecessor(frame);
     } catch {
