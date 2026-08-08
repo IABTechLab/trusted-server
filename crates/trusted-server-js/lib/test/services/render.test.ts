@@ -4577,10 +4577,35 @@ describe('RenderAttempt diagnostics producer', () => {
       slotId: renderAttempt.slot,
       path: 'auction',
       rendered: true,
+      injected: true,
       servedFrom: 'inline',
       state: 'accepted',
       outcome: { outcome: 'accepted' },
     });
+  });
+
+  it('publishes source-owned APS trace identity without exposing the creative payload', () => {
+    const publishDiagnostics = vi.fn();
+    const renderAttempt = attempt(owner(), { publishDiagnostics });
+    expect(renderAttempt.admitDirectWinner(DIRECT_APS_SOURCE, WINNER_CONTEXT)).toBe(true);
+    expect(renderAttempt.beginDirect()).toBe(true);
+    const committed = artifact(renderAttempt);
+    expect(renderAttempt.beginApsDocument(committed)).toBe(true);
+    expect(renderAttempt.apsDocumentAccepted()).toBe(true);
+
+    expect(renderAttempt.accept()).toBe(true);
+
+    expect(publishDiagnostics).toHaveBeenCalledWith(
+      expect.objectContaining({
+        bidId: DIRECT_APS_SOURCE.bidId,
+        creativeId: DIRECT_APS_SOURCE.creativeId,
+        injected: true,
+        rendered: true,
+      })
+    );
+    const observation = publishDiagnostics.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(observation).not.toHaveProperty('aaxResponse');
+    expect(observation).not.toHaveProperty('creativeUrl');
   });
 
   it('publishes terminal failure after the lifecycle state commit and never republishes', () => {

@@ -101,7 +101,7 @@ type PanelStatus = 'ok' | 'hidden' | 'gam-only' | 'empty';
 
 function panelStatus(record: RenderRecord): PanelStatus {
   if (!record.rendered || record.gamEmpty === true) return 'empty';
-  if (record.visible === false) return 'hidden';
+  if (record.visible !== true) return 'hidden';
   // `ok` requires a *confirmed* TS placement. Anything else — TS applied
   // targeting only (injected false, creative is GAM's and cross-origin
   // unreadable), or a path that never reported placement (undefined) — must not
@@ -568,9 +568,13 @@ export interface RenderTraceRuntimeScheduler {
 }
 
 export interface RenderTraceRuntimeOptions {
+  readonly document?: Document | undefined;
+  readonly exportRecord?: (record: Readonly<RenderTraceRecord>) => void;
   readonly now?: () => number;
   readonly onOverflow?: (droppedNotifications: number) => void;
+  readonly onPresentationError?: (error: unknown) => void;
   readonly onSubscriberError?: (error: unknown) => void;
+  readonly overlayEnabled?: boolean;
   readonly schedule?: (callback: () => void) => () => void;
   readonly scheduler?: RenderTraceRuntimeScheduler;
 }
@@ -642,6 +646,287 @@ function scheduleRenderTraceTask(callback: () => void): () => void {
   return (): void => globalThis.clearTimeout(handle);
 }
 
+const RUNTIME_TRACE_ATTRIBUTES = [
+  'data-ts-slot-id',
+  'data-ts-render-path',
+  'data-ts-rendered',
+  'data-ts-auction-id',
+  'data-ts-bidder',
+  'data-ts-ad-id',
+  'data-ts-bid-id',
+  'data-ts-creative-id',
+  'data-ts-adm-hash',
+  'data-ts-served-from',
+  'data-ts-gam-empty',
+  'data-ts-injected',
+  'data-ts-visible',
+] as const;
+
+interface PresentedTraceSlot {
+  readonly element: HTMLElement;
+  readonly priorInlinePosition?: string;
+}
+
+interface RenderTracePresentation {
+  readonly present: (record: Readonly<RenderTraceRecord>) => void;
+  readonly prune: (slotId: string) => void;
+  readonly dispose: () => void;
+}
+
+function createRenderTracePresentation(
+  options: RenderTraceRuntimeOptions,
+  history: () => readonly Readonly<RenderTraceRecord>[]
+): RenderTracePresentation {
+  const targetDocument =
+    options.document ?? (typeof document === 'undefined' ? undefined : document);
+  const overlayEnabled = options.overlayEnabled === true;
+  const presented = new Map<string, PresentedTraceSlot>();
+  const panelRecords = new Map<number, Readonly<RenderTraceRecord>>();
+  const panelRows = new Map<number, HTMLButtonElement>();
+  let panel: HTMLElement | undefined;
+  let panelHeading: HTMLElement | undefined;
+  let panelRowsHost: HTMLElement | undefined;
+
+  const report = (error: unknown): void => {
+    try {
+      options.onPresentationError?.(error);
+    } catch {
+      // Presentation reporting is diagnostics-only.
+    }
+  };
+
+  const removeBadge = (element: HTMLElement): void => {
+    for (const badge of element.querySelectorAll(`:scope > .${TRACE_BADGE_CLASS}`)) badge.remove();
+  };
+
+  const clearElement = (presentedSlot: PresentedTraceSlot): void => {
+    const { element, priorInlinePosition } = presentedSlot;
+    for (const attribute of RUNTIME_TRACE_ATTRIBUTES) element.removeAttribute(attribute);
+    removeBadge(element);
+    if (priorInlinePosition !== undefined && element.style.position === 'relative') {
+      element.style.position = priorInlinePosition;
+    }
+  };
+
+  const createBadge = (
+    element: HTMLElement,
+    record: Readonly<RenderTraceRecord>
+  ): PresentedTraceSlot => {
+    let priorInlinePosition: string | undefined;
+    try {
+      const position = targetDocument?.defaultView?.getComputedStyle(element).position;
+      if (position === 'static' || position === '') {
+        priorInlinePosition = element.style.position;
+        element.style.position = 'relative';
+      }
+    } catch {
+      // A badge remains noninteractive even if its containing block is publisher-owned.
+    }
+    const status = panelStatus(record as RenderRecord);
+    const style = STATUS_STYLE[status];
+    const badge = targetDocument?.createElement('div');
+    if (!badge) {
+      return {
+        element,
+        ...(priorInlinePosition === undefined ? {} : { priorInlinePosition }),
+      };
+    }
+    badge.className = TRACE_BADGE_CLASS;
+    badge.textContent =
+      `TS ${style.mark} #${record.seq}` +
+      `${record.bidder ? ` · ${record.bidder}` : ''}` +
+      `${style.label === 'ok' ? '' : ` · ${style.label}`}`;
+    badge.style.setProperty('position', 'absolute');
+    badge.style.setProperty('top', '4px');
+    badge.style.setProperty('left', '4px');
+    badge.style.setProperty('z-index', '2147483646');
+    badge.style.setProperty('pointer-events', 'none');
+    badge.style.setProperty('font', '10px/1.5 ui-monospace, Menlo, Consolas, monospace');
+    badge.style.setProperty('padding', '1px 5px');
+    badge.style.setProperty('color', '#fff');
+    badge.style.setProperty('background', style.color);
+    badge.style.setProperty('border-radius', '3px');
+    element.appendChild(badge);
+    return { element, ...(priorInlinePosition === undefined ? {} : { priorInlinePosition }) };
+  };
+
+  const exportRow = (record: Readonly<RenderTraceRecord>): void => {
+    const copied = copyRenderTraceRecord(record);
+    try {
+      if (options.exportRecord) {
+        options.exportRecord(copied);
+        return;
+      }
+      const clipboard = targetDocument?.defaultView?.navigator.clipboard;
+      const write = clipboard?.writeText;
+      if (typeof write !== 'function') return;
+      const pending = Reflect.apply(write, clipboard, [JSON.stringify(copied, null, 2)]) as
+        Promise<void> | undefined;
+      void pending?.catch(report);
+    } catch (error) {
+      report(error);
+    }
+  };
+
+  const renderPanel = (record?: Readonly<RenderTraceRecord>): void => {
+    if (!overlayEnabled || !targetDocument?.body) return;
+    if (!panel) {
+      const collision = targetDocument.getElementById(TRACE_PANEL_ID);
+      if (collision) return;
+      panel = targetDocument.createElement('div');
+      panel.id = TRACE_PANEL_ID;
+      panel.setAttribute('data-ts-render-trace-owner', '1');
+      panel.style.setProperty('position', 'fixed');
+      panel.style.setProperty('bottom', '12px');
+      panel.style.setProperty('right', '12px');
+      panel.style.setProperty('z-index', '2147483647');
+      panel.style.setProperty('max-width', '360px');
+      panel.style.setProperty('max-height', '45vh');
+      panel.style.setProperty('overflow', 'auto');
+      panel.style.setProperty('background', 'rgba(17,17,17,0.94)');
+      panel.style.setProperty('color', '#eee');
+      panel.style.setProperty('font', '11px/1.5 ui-monospace, Menlo, Consolas, monospace');
+      panel.style.setProperty('border', '1px solid #333');
+      panel.style.setProperty('border-radius', '6px');
+      panel.style.setProperty('box-shadow', '0 4px 16px rgba(0,0,0,0.4)');
+      panelHeading = targetDocument.createElement('div');
+      panelHeading.style.setProperty('padding', '6px 10px');
+      panelHeading.style.setProperty('font-weight', '700');
+      panelRowsHost = targetDocument.createElement('div');
+      panel.append(panelHeading, panelRowsHost);
+      targetDocument.body.appendChild(panel);
+    }
+    const retained = history();
+    panelHeading!.textContent = `TS Render Trace · ${retained.length} renders`;
+    const retainedSequences = new Set(retained.map(({ seq }) => seq));
+    for (const [sequence, row] of panelRows) {
+      if (retainedSequences.has(sequence)) continue;
+      row.remove();
+      panelRows.delete(sequence);
+      panelRecords.delete(sequence);
+    }
+    if (record && retainedSequences.has(record.seq)) {
+      panelRecords.set(record.seq, record);
+      let row = panelRows.get(record.seq);
+      if (!row) {
+        row = targetDocument.createElement('button');
+        row.type = 'button';
+        row.setAttribute('data-ts-trace-seq', String(record.seq));
+        row.style.setProperty('display', 'block');
+        row.style.setProperty('width', '100%');
+        row.style.setProperty('padding', '6px 10px');
+        row.style.setProperty('border', '0');
+        row.style.setProperty('border-top', '1px solid #2a2a2a');
+        row.style.setProperty('background', 'transparent');
+        row.style.setProperty('font', 'inherit');
+        row.style.setProperty('text-align', 'left');
+        row.style.setProperty('cursor', 'pointer');
+        row.addEventListener('click', () => {
+          const exported = panelRecords.get(record.seq);
+          if (exported) exportRow(exported);
+        });
+        panelRows.set(record.seq, row);
+        panelRowsHost!.prepend(row);
+      }
+      const status = panelStatus(record as RenderRecord);
+      const style = STATUS_STYLE[status];
+      row.textContent = `#${record.seq} ${style.mark} ${record.slotId} · ${style.label} · ${record.path}`;
+      row.style.setProperty('border-left', `3px solid ${style.color}`);
+      row.style.setProperty('color', style.color);
+    }
+  };
+
+  const present = (record: Readonly<RenderTraceRecord>): void => {
+    try {
+      const prior = presented.get(record.slotId);
+      const elementId = record.elementId ?? record.slotId;
+      const candidate = targetDocument?.getElementById(elementId);
+      const element = candidate && candidate instanceof HTMLElement ? candidate : undefined;
+      if (prior && prior.element !== element) {
+        clearElement(prior);
+        presented.delete(record.slotId);
+      }
+      if (element) {
+        const retainedPosition = prior?.element === element ? prior.priorInlinePosition : undefined;
+        removeBadge(element);
+        const values: Readonly<
+          Record<(typeof RUNTIME_TRACE_ATTRIBUTES)[number], string | undefined>
+        > = {
+          'data-ts-slot-id': record.slotId,
+          'data-ts-render-path': record.path,
+          'data-ts-rendered': String(record.rendered),
+          'data-ts-auction-id': record.auctionId,
+          'data-ts-bidder': record.bidder,
+          'data-ts-ad-id': record.adId,
+          'data-ts-bid-id': record.bidId,
+          'data-ts-creative-id': record.creativeId,
+          'data-ts-adm-hash': record.admHash,
+          'data-ts-served-from': record.servedFrom,
+          'data-ts-gam-empty': record.gamEmpty === undefined ? undefined : String(record.gamEmpty),
+          'data-ts-injected': record.injected === undefined ? undefined : String(record.injected),
+          'data-ts-visible': record.visible === undefined ? undefined : String(record.visible),
+        };
+        for (const attribute of RUNTIME_TRACE_ATTRIBUTES) {
+          const value = values[attribute];
+          if (value === undefined || value === '') element.removeAttribute(attribute);
+          else element.setAttribute(attribute, value);
+        }
+        const status = panelStatus(record as RenderRecord);
+        if (
+          overlayEnabled &&
+          element.tagName !== 'IFRAME' &&
+          (status === 'ok' || status === 'gam-only')
+        ) {
+          const next = createBadge(element, record);
+          presented.set(record.slotId, {
+            element,
+            ...(retainedPosition === undefined
+              ? next.priorInlinePosition === undefined
+                ? {}
+                : { priorInlinePosition: next.priorInlinePosition }
+              : { priorInlinePosition: retainedPosition }),
+          });
+        } else {
+          if (retainedPosition !== undefined && element.style.position === 'relative') {
+            element.style.position = retainedPosition;
+          }
+          presented.set(record.slotId, { element });
+        }
+      }
+      renderPanel(record);
+    } catch (error) {
+      report(error);
+    }
+  };
+
+  const prune = (slotId: string): void => {
+    try {
+      const existing = presented.get(slotId);
+      if (existing) clearElement(existing);
+      presented.delete(slotId);
+      renderPanel();
+    } catch (error) {
+      report(error);
+    }
+  };
+
+  const dispose = (): void => {
+    for (const slotId of [...presented.keys()]) prune(slotId);
+    try {
+      panel?.remove();
+    } catch (error) {
+      report(error);
+    }
+    panel = undefined;
+    panelHeading = undefined;
+    panelRowsHost = undefined;
+    panelRecords.clear();
+    panelRows.clear();
+  };
+
+  return Object.freeze({ present, prune, dispose });
+}
+
 /** Create one document-runtime render trace without exposing its mutation authority. */
 export function createRenderTraceDiagnostics(
   options: RenderTraceRuntimeOptions = {}
@@ -658,6 +943,7 @@ export function createRenderTraceDiagnostics(
   let reportedDroppedNotifications = 0;
   let cancelScheduled: (() => void) | undefined;
   let disposed = false;
+  const presentation = createRenderTracePresentation(options, () => history);
 
   const schedule = (callback: () => void): (() => void) => {
     if (options.schedule) return options.schedule(callback);
@@ -760,7 +1046,10 @@ export function createRenderTraceDiagnostics(
     if (disposed) return committed;
     if (!previous && current.size >= MAX_RENDER_TRACE_SLOTS) {
       const oldestSlot = current.keys().next().value as string | undefined;
-      if (oldestSlot !== undefined) current.delete(oldestSlot);
+      if (oldestSlot !== undefined) {
+        current.delete(oldestSlot);
+        presentation.prune(oldestSlot);
+      }
     }
     current.set(committed.slotId, committed);
     recordsBySequence.set(committed.seq, committed);
@@ -771,6 +1060,7 @@ export function createRenderTraceDiagnostics(
     }
     if (previous && !retained(previous)) recordsBySequence.delete(previous.seq);
     enqueue(committed);
+    presentation.present(committed);
     return committed;
   };
 
@@ -811,6 +1101,7 @@ export function createRenderTraceDiagnostics(
     const historyIndex = history.findIndex(({ seq }) => seq === targetSequence);
     if (historyIndex >= 0) history[historyIndex] = committed;
     enqueue(committed);
+    presentation.present(committed);
     return committed;
   };
 
@@ -822,6 +1113,7 @@ export function createRenderTraceDiagnostics(
     }
     current.delete(slotId);
     if (!retained(existing)) recordsBySequence.delete(existing.seq);
+    presentation.prune(slotId);
     return true;
   };
 
@@ -874,6 +1166,7 @@ export function createRenderTraceDiagnostics(
     current.clear();
     history.length = 0;
     recordsBySequence.clear();
+    presentation.dispose();
   };
 
   return Object.freeze({ api, diagnostics: api, record, enrich, prune, dispose });

@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { createRenderTrace, DiagnosticsSubscriberLimitError } from '../../src/core/trace';
+import {
+  createRenderTrace,
+  DiagnosticsSubscriberLimitError,
+  TRACE_BADGE_CLASS,
+  TRACE_PANEL_ID,
+} from '../../src/core/trace';
 
 function harness() {
   const tasks: Array<() => void> = [];
@@ -197,5 +202,183 @@ describe('render trace diagnostics runtime', () => {
     expect(owner.diagnostics.history()).toEqual([]);
     expect(owner.diagnostics.subscribe(() => undefined)).toBeTypeOf('function');
     expect(() => owner.diagnostics.subscribe(null as never)).toThrow(TypeError);
+  });
+
+  it('uses the server-resolved boot bit instead of reading the trace cookie', () => {
+    document.cookie = 'ts-trace=1; Path=/';
+    const disarmedSlot = document.createElement('div');
+    disarmedSlot.id = 'disarmed-slot';
+    document.body.append(disarmedSlot);
+    const disarmed = createRenderTrace({ document, overlayEnabled: false });
+
+    disarmed.record({
+      slotId: 'disarmed-slot',
+      elementId: 'disarmed-slot',
+      path: 'auction',
+      rendered: true,
+      injected: true,
+      visible: true,
+    });
+
+    expect(disarmedSlot.getAttribute('data-ts-rendered')).toBe('true');
+    expect(disarmedSlot.querySelector(`.${TRACE_BADGE_CLASS}`)).toBeNull();
+    expect(document.getElementById(TRACE_PANEL_ID)).toBeNull();
+    disarmed.dispose();
+    disarmedSlot.remove();
+    document.cookie = 'ts-trace=; Max-Age=0; Path=/';
+
+    const armedSlot = document.createElement('div');
+    armedSlot.id = 'armed-slot';
+    document.body.append(armedSlot);
+    const armed = createRenderTrace({ document, overlayEnabled: true });
+    armed.record({
+      slotId: 'armed-slot',
+      elementId: 'armed-slot',
+      path: 'ssat',
+      rendered: true,
+      injected: true,
+      visible: true,
+    });
+
+    const badge = armedSlot.querySelector(`.${TRACE_BADGE_CLASS}`) as HTMLElement | null;
+    expect(badge).not.toBeNull();
+    expect(badge?.style.pointerEvents).toBe('none');
+    expect(document.getElementById(TRACE_PANEL_ID)).not.toBeNull();
+    armed.dispose();
+    armedSlot.remove();
+  });
+
+  it('removes stale stamps and badges on a later physical impression', () => {
+    const slot = document.createElement('div');
+    slot.id = 'restamped-slot';
+    document.body.append(slot);
+    const owner = createRenderTrace({ document, overlayEnabled: true });
+    owner.record({
+      slotId: 'restamped-slot',
+      elementId: 'restamped-slot',
+      path: 'ssat',
+      rendered: true,
+      injected: true,
+      visible: true,
+      bidder: 'first-bidder',
+      admHash: 'first-hash',
+    });
+    expect(slot.getAttribute('data-ts-bidder')).toBe('first-bidder');
+    expect(slot.querySelector(`.${TRACE_BADGE_CLASS}`)).not.toBeNull();
+
+    owner.record({
+      slotId: 'restamped-slot',
+      elementId: 'restamped-slot',
+      path: 'gam-refresh',
+      rendered: true,
+      injected: true,
+      visible: false,
+    });
+
+    expect(slot.hasAttribute('data-ts-bidder')).toBe(false);
+    expect(slot.hasAttribute('data-ts-adm-hash')).toBe(false);
+    expect(slot.querySelector(`.${TRACE_BADGE_CLASS}`)).toBeNull();
+    owner.dispose();
+    expect(slot.hasAttribute('data-ts-slot-id')).toBe(false);
+    slot.remove();
+  });
+
+  it('stamps iframe slots without placing UI inside the creative frame', () => {
+    const iframe = document.createElement('iframe');
+    iframe.id = 'iframe-slot';
+    document.body.append(iframe);
+    const owner = createRenderTrace({ document, overlayEnabled: true });
+
+    owner.record({
+      slotId: 'iframe-slot',
+      elementId: 'iframe-slot',
+      path: 'ssat',
+      rendered: true,
+      injected: true,
+      visible: true,
+    });
+
+    expect(iframe.getAttribute('data-ts-rendered')).toBe('true');
+    expect(iframe.querySelector(`.${TRACE_BADGE_CLASS}`)).toBeNull();
+    owner.dispose();
+    iframe.remove();
+  });
+
+  it('does not claim an ok badge before visibility is positively observed', () => {
+    const slot = document.createElement('div');
+    slot.id = 'unobserved-slot';
+    document.body.append(slot);
+    const owner = createRenderTrace({ document, overlayEnabled: true });
+
+    owner.record({
+      slotId: 'unobserved-slot',
+      elementId: 'unobserved-slot',
+      path: 'auction',
+      rendered: true,
+      injected: true,
+    });
+
+    expect(slot.querySelector(`.${TRACE_BADGE_CLASS}`)).toBeNull();
+    expect(document.getElementById(TRACE_PANEL_ID)?.textContent).toContain('hidden');
+    owner.dispose();
+    slot.remove();
+  });
+
+  it('does not claim or remove a publisher-owned overlay id collision', () => {
+    const publisherPanel = document.createElement('div');
+    publisherPanel.id = TRACE_PANEL_ID;
+    publisherPanel.textContent = 'publisher';
+    document.body.append(publisherPanel);
+    const owner = createRenderTrace({ document, overlayEnabled: true });
+
+    owner.record({ slotId: 'slot-a', path: 'auction', rendered: true });
+
+    expect(document.getElementById(TRACE_PANEL_ID)).toBe(publisherPanel);
+    expect(publisherPanel.textContent).toBe('publisher');
+    owner.dispose();
+    expect(document.getElementById(TRACE_PANEL_ID)).toBe(publisherPanel);
+    publisherPanel.remove();
+  });
+
+  it('keeps a bounded newest-first overlay and exports frozen row data', () => {
+    const exportRecord = vi.fn();
+    const owner = createRenderTrace({ document, overlayEnabled: true, exportRecord });
+    for (let index = 1; index <= 201; index += 1) {
+      owner.record({ slotId: `slot-${index}`, path: 'auction', rendered: true });
+    }
+
+    const panel = document.getElementById(TRACE_PANEL_ID)!;
+    const rows = [...panel.querySelectorAll<HTMLElement>('[data-ts-trace-seq]')];
+    expect(rows).toHaveLength(200);
+    expect(rows[0]?.dataset['tsTraceSeq']).toBe('201');
+    expect(rows[rows.length - 1]?.dataset['tsTraceSeq']).toBe('2');
+    rows[0]?.click();
+    expect(exportRecord).toHaveBeenCalledOnce();
+    expect(exportRecord).toHaveBeenCalledWith(
+      expect.objectContaining({ slotId: 'slot-201', seq: 201 })
+    );
+    expect(Object.isFrozen(exportRecord.mock.calls[0]?.[0])).toBe(true);
+    owner.dispose();
+    expect(document.getElementById(TRACE_PANEL_ID)).toBeNull();
+  });
+
+  it('isolates presentation failures after committing diagnostics state', () => {
+    const onPresentationError = vi.fn();
+    const hostileDocument = {
+      getElementById: () => {
+        throw new Error('hostile document');
+      },
+    } as unknown as Document;
+    const owner = createRenderTrace({
+      document: hostileDocument,
+      overlayEnabled: true,
+      onPresentationError,
+    });
+
+    expect(() => owner.record({ slotId: 'slot-a', path: 'auction', rendered: true })).not.toThrow();
+    expect(owner.diagnostics.current()['slot-a']).toEqual(
+      expect.objectContaining({ slotId: 'slot-a', rendered: true })
+    );
+    expect(onPresentationError).toHaveBeenCalledOnce();
   });
 });
