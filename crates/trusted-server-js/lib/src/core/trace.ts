@@ -964,6 +964,7 @@ export function createRenderTraceDiagnostics(
     object,
     {
       readonly baselineSequence: number | undefined;
+      reconciled?: boolean;
       renderEnded?: boolean;
       sequence?: number;
       readonly slotId: string;
@@ -1065,6 +1066,24 @@ export function createRenderTraceDiagnostics(
     history.some((candidate) => candidate.seq === record.seq);
 
   const record = (input: RenderTraceInputV1): Readonly<RenderTraceRecord> => {
+    if (!disposed && input.path !== 'gam-refresh') {
+      for (const impression of gptImpressions.values()) {
+        if (
+          impression.slotId !== input.slotId ||
+          impression.renderEnded !== true ||
+          impression.reconciled === true ||
+          impression.sequence === undefined ||
+          current.get(input.slotId)?.seq !== impression.sequence
+        ) {
+          continue;
+        }
+        const reconciled = enrich(impression.sequence, input);
+        if (reconciled) {
+          impression.reconciled = true;
+          return reconciled;
+        }
+      }
+    }
     const previous = current.get(input.slotId);
     let at: number;
     try {

@@ -226,6 +226,74 @@ describe('render trace diagnostics runtime', () => {
     expect(owner.diagnostics.history()).toHaveLength(1);
   });
 
+  it('reconciles a later trusted terminal into the GPT-first impression', () => {
+    const { owner, tasks, drain } = harness();
+    const listener = vi.fn();
+    const token = Object.freeze(Object.create(null) as object);
+    const slot = Object.freeze({ token, elementId: 'reverse-slot' });
+    const resolve = () =>
+      Object.freeze({ slotId: 'reverse-slot', elementId: 'reverse-slot', visible: true });
+    owner.diagnostics.subscribe(listener);
+
+    owner.observeGptFact(Object.freeze({ kind: 'slotRequested', observedAtMs: 1, slot }), resolve);
+    owner.observeGptFact(
+      Object.freeze({ kind: 'slotRenderEnded', observedAtMs: 2, slot, isEmpty: false }),
+      resolve
+    );
+    const provisional = owner.diagnostics.current()['reverse-slot'];
+    expect(provisional).toEqual(
+      expect.objectContaining({ path: 'gam-refresh', rendered: true, injected: false })
+    );
+
+    const terminal = owner.record({
+      slotId: 'reverse-slot',
+      path: 'ssat',
+      rendered: true,
+      injected: true,
+      bidder: 'trusted-bidder',
+      bidId: 'trusted-bid',
+      creativeId: 'trusted-creative',
+      servedFrom: 'pbs-cache',
+    });
+
+    expect(terminal).toEqual(
+      expect.objectContaining({
+        seq: provisional?.seq,
+        count: provisional?.count,
+        at: provisional?.at,
+        path: 'ssat',
+        bidder: 'trusted-bidder',
+        bidId: 'trusted-bid',
+        creativeId: 'trusted-creative',
+        servedFrom: 'pbs-cache',
+        rendered: true,
+        injected: true,
+        gamEmpty: false,
+      })
+    );
+    expect(owner.diagnostics.history()).toEqual([terminal]);
+    expect(tasks).toHaveLength(1);
+    drain();
+    expect(listener).toHaveBeenCalledOnce();
+    expect(listener).toHaveBeenCalledWith(
+      expect.objectContaining({ seq: terminal.seq, path: 'ssat' })
+    );
+
+    owner.observeGptFact(
+      Object.freeze({
+        kind: 'slotVisibilityChanged',
+        observedAtMs: 3,
+        slot,
+        inViewPercentage: 0,
+      }),
+      resolve
+    );
+    expect(owner.diagnostics.current()['reverse-slot']).toEqual(
+      expect.objectContaining({ seq: terminal.seq, path: 'ssat', visible: false })
+    );
+    expect(owner.diagnostics.history()).toHaveLength(1);
+  });
+
   it('enriches only the same GPT impression without weakening TS placement truth', () => {
     const { owner } = harness();
     const token = Object.freeze(Object.create(null) as object);

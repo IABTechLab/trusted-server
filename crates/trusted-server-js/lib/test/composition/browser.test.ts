@@ -1141,6 +1141,159 @@ describe('browser composition', () => {
     }
   });
 
+  it('reconciles a trusted terminal that arrives after the GPT render fact', async () => {
+    const releaseId = 'a'.repeat(64);
+    const target: Record<string, unknown> = {};
+    const gpt = synchronousGptAdapter();
+    const renderSource = Object.freeze({
+      type: 'adm' as const,
+      version: 1 as const,
+      adm: '<div>reverse-order winner</div>',
+      width: 300,
+      height: 250,
+    });
+    const auctionFetcher = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        id: 'reverse-auction',
+        cur: 'USD',
+        seatbid: [
+          {
+            seat: 'fictional',
+            bid: [
+              {
+                id: 'r1_AAAAAAAAAAAAAAAAAAAAAA',
+                impid: 'reverse-order-slot',
+                price: 1,
+                adm: renderSource.adm,
+                w: renderSource.width,
+                h: renderSource.height,
+                ext: {
+                  trusted_server: {
+                    candidate_id: 'AAAAAAAAAAAA',
+                    slot_id: 'reverse-order-slot',
+                    render_source: renderSource,
+                  },
+                },
+              },
+            ],
+          },
+        ],
+        ext: {
+          trusted_server: {
+            slot_results: {
+              version: 1,
+              auctionId: 'reverse-auction',
+              results: [
+                {
+                  slot: 'reverse-order-slot',
+                  outcome: 'winner',
+                  candidateId: 'AAAAAAAAAAAA',
+                },
+              ],
+            },
+          },
+        },
+      }),
+    }));
+    const composition = createBrowserRuntimeComposition(
+      {
+        target,
+        releaseId,
+        manifest: {
+          version: 1,
+          releaseId,
+          integrations: [{ id: 'gpt_diagnostics', required: true }],
+        },
+        knownIntegrationIds: Object.freeze(['gpt_diagnostics']),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: { version: 1, auctionId: 'initial', results: [] },
+            bids: [],
+          },
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: true } },
+        },
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag: gpt.adapter,
+          messaging: fakeMessagingAdapter(),
+          prebid: fakePrebidAdapter(),
+        },
+        auctionFetcherForTest: auctionFetcher,
+        coreActivations: { correctnessGptListeners: vi.fn() },
+      }
+    );
+
+    try {
+      expect(composition.runtime.start()).toBe(true);
+      expect(
+        composition.runtime.registerIntegration(
+          createGptDiagnosticsIntegrationRegistration(releaseId)
+        )
+      ).toBe(true);
+      await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+      const api = target as {
+        addAdUnits(value: unknown): unknown;
+        requestAds(options: unknown): Promise<unknown>;
+        diagnostics: {
+          renderTrace: {
+            current(): Readonly<Record<string, Readonly<Record<string, unknown>>>>;
+            history(): readonly Readonly<Record<string, unknown>>[];
+          };
+        };
+      };
+      api.addAdUnits({
+        code: 'reverse-order-slot',
+        mediaTypes: { banner: { sizes: [[300, 250]] } },
+      });
+      document.body.innerHTML = '<div id="reverse-order-slot"></div>';
+      const physicalSlot = Object.freeze({
+        getSlotElementId: () => 'reverse-order-slot',
+        getAdUnitPath: () => '/example/reverse-order-slot',
+      });
+      gpt.emit('slotRequested', { slot: physicalSlot });
+      gpt.emit('slotRenderEnded', { slot: physicalSlot, isEmpty: false });
+      const provisional = api.diagnostics.renderTrace.current()['reverse-order-slot'];
+
+      const request = api.requestAds({ slots: ['reverse-order-slot'] });
+      await vi.waitFor(() =>
+        expect(document.querySelector('#reverse-order-slot iframe')).not.toBeNull()
+      );
+      document
+        .querySelector<HTMLIFrameElement>('#reverse-order-slot iframe')
+        ?.dispatchEvent(new Event('load'));
+      await expect(request).resolves.toEqual({
+        slots: [{ slot: 'reverse-order-slot', path: 'primary', outcome: 'accepted' }],
+      });
+
+      expect(api.diagnostics.renderTrace.current()['reverse-order-slot']).toEqual(
+        expect.objectContaining({
+          seq: provisional?.['seq'],
+          count: provisional?.['count'],
+          at: provisional?.['at'],
+          path: 'auction',
+          rendered: true,
+          injected: true,
+          gamEmpty: false,
+          servedFrom: 'inline',
+        })
+      );
+      expect(api.diagnostics.renderTrace.history()).toHaveLength(1);
+      gpt.emit('slotVisibilityChanged', { slot: physicalSlot, inViewPercentage: 0 });
+      expect(api.diagnostics.renderTrace.current()['reverse-order-slot']).toEqual(
+        expect.objectContaining({ seq: provisional?.['seq'], path: 'auction', visible: false })
+      );
+      expect(api.diagnostics.renderTrace.history()).toHaveLength(1);
+    } finally {
+      composition.runtime.dispose();
+      document.body.innerHTML = '';
+    }
+  });
+
   it('injects GPT and Prebid module boundaries with only server-frozen configuration', async () => {
     const releaseId = 'a'.repeat(64);
     const target = {};
