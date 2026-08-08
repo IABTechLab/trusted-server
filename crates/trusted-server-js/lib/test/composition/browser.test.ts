@@ -49,6 +49,7 @@ import { createSourcepointIntegrationRegistration } from '../../src/integrations
 import { createTestlightIntegrationRegistration } from '../../src/integrations/testlight/module';
 import { publicLog } from '../../src/kernel/fallback';
 import { createTestNavigationIdentityIssuer } from '../../src/kernel/identity';
+import type { IntegrationPrepareContext } from '../../src/kernel/integration_registry';
 import {
   createRenderAttempt,
   type CommittedRenderArtifact,
@@ -944,6 +945,93 @@ describe('browser composition', () => {
     await Promise.resolve();
     expect(gpt.diagnosticsObserverActive()).toBe(false);
     expect(gpt.listenerInventory()).toEqual([]);
+  });
+
+  it('publishes committed GPT facts through the kernel diagnostics bus', async () => {
+    const releaseId = 'a'.repeat(64);
+    const gpt = synchronousGptAdapter();
+    const observations: Readonly<Record<string, unknown>>[] = [];
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target: {},
+        releaseId,
+        manifest: {
+          version: 1,
+          releaseId,
+          integrations: [
+            { id: 'diagnostics_probe', required: true },
+            { id: 'gpt_diagnostics', required: true },
+          ],
+        },
+        knownIntegrationIds: Object.freeze(['diagnostics_probe', 'gpt_diagnostics']),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: { version: 1, auctionId: 'initial', results: [] },
+            bids: [],
+          },
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: true } },
+        },
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag: gpt.adapter,
+          messaging: fakeMessagingAdapter(),
+          prebid: fakePrebidAdapter(),
+        },
+        coreActivations: { correctnessGptListeners: vi.fn() },
+      }
+    );
+
+    try {
+      expect(composition.runtime.start()).toBe(true);
+      expect(
+        composition.runtime.registerIntegration({
+          id: 'diagnostics_probe',
+          release: releaseId,
+          prepare: ({ interfaces, onDispose }: IntegrationPrepareContext) => {
+            const diagnostics = interfaces['diagnostics'] as {
+              subscribe(
+                id: string,
+                listener: (observation: Readonly<Record<string, unknown>>) => void
+              ): (() => void) | undefined;
+            };
+            const release = diagnostics.subscribe('diagnostics_probe', (observation) =>
+              observations.push(observation)
+            );
+            if (!release) throw new Error('Expected the diagnostics bus subscription');
+            onDispose(release);
+            return { activate: vi.fn() };
+          },
+        })
+      ).toBe(true);
+      expect(
+        composition.runtime.registerIntegration(
+          createGptDiagnosticsIntegrationRegistration(releaseId)
+        )
+      ).toBe(true);
+      await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+
+      const observedSlot = Object.freeze({
+        getSlotElementId: () => 'bus-slot',
+        getAdUnitPath: () => '/example/bus-slot',
+      });
+      gpt.emit('slotRenderEnded', { slot: observedSlot, isEmpty: false });
+
+      await vi.waitFor(() =>
+        expect(observations).toContainEqual(
+          expect.objectContaining({
+            kind: 'slotRenderEnded',
+            slot: observedSlot,
+            isEmpty: false,
+          })
+        )
+      );
+    } finally {
+      composition.runtime.dispose();
+    }
   });
 
   it('injects GPT and Prebid module boundaries with only server-frozen configuration', async () => {

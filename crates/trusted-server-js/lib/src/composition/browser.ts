@@ -2,6 +2,7 @@ import {
   createBrowserGoogletagAdapter,
   createNoopGoogletagAdapter,
   type GoogletagAdapter,
+  type GoogletagDiagnosticsFact,
   type GoogletagGlobalTarget,
 } from '../adapters/googletag';
 import {
@@ -433,6 +434,23 @@ export function createTestBrowserRuntimeComposition(
   const renderTraceSlotsByNavigation = new Map<object, Set<string>>();
   let acceptedBrowserBoot: AcceptedBrowserBoot | undefined;
   const consumeCoreObservation = (observation: DiagnosticsObservation): void => {
+    if (
+      observation['kind'] === 'slotRequested' ||
+      observation['kind'] === 'slotResponseReceived' ||
+      observation['kind'] === 'slotRenderEnded' ||
+      observation['kind'] === 'slotOnload' ||
+      observation['kind'] === 'impressionViewable' ||
+      observation['kind'] === 'slotVisibilityChanged'
+    ) {
+      try {
+        gptDiagnosticsFacts?.publish(
+          observation as unknown as Readonly<GoogletagDiagnosticsFact>
+        );
+      } catch {
+        // GPT diagnostics never affect an already-committed adapter observation.
+      }
+      return;
+    }
     if (
       observation['kind'] !== 'render_attempt' ||
       typeof observation['slotId'] !== 'string' ||
@@ -1201,10 +1219,14 @@ export function createTestBrowserRuntimeComposition(
       const prepared = preparedBrowserServices;
       if (!prepared) throw new Error('Browser services are unavailable');
       const facts = gptDiagnosticsFacts;
-      if (facts) {
+      const bus = diagnosticsBus;
+      if (facts && bus) {
         const releaseCapture = activateGptDiagnosticsFactCapture(
           composition.adapters.googletag,
-          facts
+          Object.freeze({
+            publish: (fact: Readonly<GoogletagDiagnosticsFact>) =>
+              bus.publish(fact as unknown as DiagnosticsObservation),
+          })
         );
         if (!releaseCapture) throw new Error('GPT diagnostics capture is unavailable');
         context.onDispose(releaseCapture);
