@@ -5,6 +5,7 @@ import {
   createNoopGoogletagAdapter,
   type GoogletagAdapter,
   type GoogletagBindingStatus,
+  type GoogletagDiagnosticsObserver,
   type GoogletagFacade,
 } from '../../src/adapters/googletag';
 import {
@@ -32,6 +33,7 @@ import type { BrowserAuctionBidV1 } from '../../src/core/types';
 import { createCreativeIntegrationRegistration } from '../../src/integrations/creative/module';
 import { createGptIntegrationRegistration } from '../../src/integrations/gpt/module';
 import { isGuardInstalled, resetGuardState } from '../../src/integrations/gpt/script_guard';
+import { createGptDiagnosticsIntegrationRegistration } from '../../src/integrations/gpt_diagnostics/module';
 import { createPrebidIntegrationRegistration } from '../../src/integrations/prebid/module';
 import { publicLog } from '../../src/kernel/fallback';
 import { createTestNavigationIdentityIssuer } from '../../src/kernel/identity';
@@ -63,6 +65,7 @@ function synchronousGptAdapter() {
   const targeting = new WeakMap<object, Map<string, readonly string[]>>();
   const bindingToken = Object.freeze({});
   const refresh = vi.fn();
+  let diagnosticsObserver: GoogletagDiagnosticsObserver | undefined;
   const facade: GoogletagFacade = Object.freeze({
     bindingToken: () => bindingToken,
     clearTargeting: vi.fn((slot: object, key?: string) => {
@@ -96,6 +99,13 @@ function synchronousGptAdapter() {
     bindingStatus: () => 'present',
     dispose: vi.fn(),
     notifyReady: vi.fn(),
+    observeDiagnostics: (observer: GoogletagDiagnosticsObserver) => {
+      if (diagnosticsObserver) return undefined;
+      diagnosticsObserver = observer;
+      return () => {
+        if (diagnosticsObserver === observer) diagnosticsObserver = undefined;
+      };
+    },
     observePublisherCalls: () => vi.fn(),
     run: <Value>(command: (gpt: Readonly<GoogletagFacade>) => Value) => {
       let result: Promise<Value>;
@@ -110,8 +120,25 @@ function synchronousGptAdapter() {
   return {
     adapter,
     emit: (eventType: string, event: unknown): void => {
-      for (const listener of listeners.get(eventType) ?? []) listener(event);
+      for (const listener of listeners.get(eventType) ?? []) {
+        listener(event);
+        if (typeof event !== 'object' || event === null || !('slot' in event)) continue;
+        diagnosticsObserver?.(
+          Object.freeze({
+            ...event,
+            kind: eventType,
+            slot: event.slot,
+          }) as Parameters<GoogletagDiagnosticsObserver>[0]
+        );
+      }
     },
+    diagnosticsObserverActive: () => diagnosticsObserver !== undefined,
+    listenerInventory: () =>
+      Object.freeze(
+        [...listeners.entries()]
+          .filter(([, registered]) => registered.size > 0)
+          .map(([eventType, registered]) => Object.freeze([eventType, registered.size] as const))
+      ),
     refresh,
   };
 }
@@ -521,6 +548,89 @@ describe('browser composition', () => {
     expect(listener).not.toHaveBeenCalled();
   });
 
+  it.each([false, true])(
+    'installs only the active GPT diagnostics fact path when boot active is %s',
+    async (active) => {
+      const releaseId = 'a'.repeat(64);
+      const target: Record<string, unknown> = {};
+      const gpt = synchronousGptAdapter();
+      const composition = createTestBrowserRuntimeComposition(
+        {
+          target,
+          releaseId,
+          manifest: {
+            version: 1,
+            releaseId,
+            integrations: active ? [{ id: 'gpt_diagnostics', required: true }] : [],
+          },
+          knownIntegrationIds: active ? Object.freeze(['gpt_diagnostics']) : Object.freeze([]),
+          boot: {
+            auctionProjection: {
+              version: 1,
+              auction: { version: 1, auctionId: 'boot', results: [] },
+              bids: [],
+            },
+            creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+            diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active } },
+          },
+          kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+        },
+        {
+          adapters: {
+            googletag: gpt.adapter,
+            messaging: fakeMessagingAdapter(),
+            prebid: fakePrebidAdapter(),
+          },
+          coreActivations: { correctnessGptListeners: vi.fn() },
+        }
+      );
+
+      expect(composition.runtime.start()).toBe(true);
+      if (active) {
+        expect(
+          composition.runtime.registerIntegration(
+            createGptDiagnosticsIntegrationRegistration(releaseId)
+          )
+        ).toBe(true);
+      }
+      await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+
+      const inventory = Object.fromEntries(gpt.listenerInventory());
+      expect(inventory).toEqual(
+        active
+          ? {
+              impressionViewable: 1,
+              slotOnload: 1,
+              slotRenderEnded: 1,
+              slotRequested: 1,
+              slotResponseReceived: 1,
+              slotVisibilityChanged: 1,
+            }
+          : { slotRenderEnded: 1, slotRequested: 1 }
+      );
+      expect(gpt.diagnosticsObserverActive()).toBe(active);
+      const diagnostics = target['diagnostics'] as
+        { readonly gpt?: { snapshot(): { slots: readonly unknown[] } } } | undefined;
+      expect(Reflect.ownKeys(diagnostics ?? {}).sort()).toEqual(
+        active ? ['gpt', 'renderTrace'] : ['renderTrace']
+      );
+
+      if (active) {
+        const observedSlot = Object.freeze({
+          getSlotElementId: () => 'diagnostic-slot',
+          getAdUnitPath: () => '/diagnostic/slot',
+        });
+        gpt.emit('slotRequested', { slot: observedSlot });
+        gpt.emit('slotResponseReceived', { slot: observedSlot });
+        gpt.emit('slotRenderEnded', { slot: observedSlot, isEmpty: false, size: [300, 250] });
+        expect(diagnostics?.gpt?.snapshot().slots).toHaveLength(1);
+      }
+
+      composition.runtime.dispose();
+      expect(gpt.diagnosticsObserverActive()).toBe(false);
+    }
+  );
+
   it('activates reversible core effects in exact order and disposes them in reverse', async () => {
     const target = {};
     const order: string[] = [];
@@ -635,7 +745,7 @@ describe('browser composition', () => {
     expect(diagnostics?.renderTrace?.history()).toEqual([]);
   });
 
-  it('starts slot listeners before post-commit GPT startup and disposes both listeners', async () => {
+  it('starts core slot listeners before module activation and disposes both listeners', async () => {
     const releaseId = 'a'.repeat(64);
     const subscriptions: string[] = [];
     const releases: string[] = [];
@@ -650,6 +760,7 @@ describe('browser composition', () => {
       bindingStatus: () => 'present',
       dispose: vi.fn(),
       notifyReady: vi.fn(),
+      observeDiagnostics: () => vi.fn(),
       observePublisherCalls: () => vi.fn(),
       run: <T>(command: (gpt: Readonly<GoogletagFacade>) => T) => {
         const result = Promise.resolve(command(facade));
@@ -662,7 +773,7 @@ describe('browser composition', () => {
         _adapters: unknown,
         services: { readonly slots: { readonly snapshotForTest: () => { records: number } } }
       ) => {
-        expect(subscriptions).toEqual([]);
+        expect(subscriptions).toEqual(['slotRequested', 'slotRenderEnded']);
         expect(services.slots.snapshotForTest().records).toBe(0);
       }
     );
@@ -713,6 +824,90 @@ describe('browser composition', () => {
     expect(correctness).toHaveBeenCalledOnce();
     composition.runtime.dispose();
     expect(releases).toEqual(['slotRenderEnded', 'slotRequested']);
+  });
+
+  it('activates one six-fact GPT diagnostics stream and publishes only diagnostics.gpt', async () => {
+    const releaseId = 'a'.repeat(64);
+    const target: Record<string, unknown> = {};
+    const gpt = synchronousGptAdapter();
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target,
+        releaseId,
+        manifest: {
+          version: 1,
+          releaseId,
+          integrations: [{ id: 'gpt_diagnostics', required: true }],
+        },
+        knownIntegrationIds: Object.freeze(['gpt_diagnostics']),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: { version: 1, auctionId: 'initial', results: [] },
+            bids: [],
+          },
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: true } },
+        },
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag: gpt.adapter,
+          messaging: fakeMessagingAdapter(),
+          prebid: fakePrebidAdapter(),
+        },
+        coreActivations: { correctnessGptListeners: vi.fn() },
+      }
+    );
+
+    expect(composition.runtime.start()).toBe(true);
+    expect(
+      composition.runtime.registerIntegration(
+        createGptDiagnosticsIntegrationRegistration(releaseId)
+      )
+    ).toBe(true);
+    await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+
+    expect(gpt.diagnosticsObserverActive()).toBe(true);
+    expect(
+      [...gpt.listenerInventory()].sort(([left], [right]) => left.localeCompare(right))
+    ).toEqual([
+      ['impressionViewable', 1],
+      ['slotOnload', 1],
+      ['slotRenderEnded', 1],
+      ['slotRequested', 1],
+      ['slotResponseReceived', 1],
+      ['slotVisibilityChanged', 1],
+    ]);
+    const diagnostics = target['diagnostics'] as
+      | {
+          readonly gpt?: {
+            snapshot(): { readonly slots: readonly { readonly slotElementId?: string }[] };
+          };
+          readonly renderTrace?: object;
+        }
+      | undefined;
+    expect(Reflect.ownKeys(diagnostics ?? {}).sort()).toEqual(['gpt', 'renderTrace']);
+    expect(Reflect.ownKeys(diagnostics?.gpt ?? {}).sort()).toEqual(
+      ['export', 'hide', 'show', 'snapshot', 'subscribe'].sort()
+    );
+    expect(diagnostics).not.toHaveProperty('publish');
+    expect(target['gptDiagnostics']).toBeUndefined();
+    expect(target['__tsjs_gpt_diagnostics_runtime']).toBeUndefined();
+
+    const observedSlot = Object.freeze({
+      getSlotElementId: () => 'composition-slot',
+      getAdUnitPath: () => '/example/composition-slot',
+    });
+    gpt.emit('slotRequested', { slot: observedSlot });
+    gpt.emit('slotResponseReceived', { slot: observedSlot });
+    expect(diagnostics?.gpt?.snapshot().slots[0]?.slotElementId).toBe('composition-slot');
+
+    composition.runtime.dispose();
+    await Promise.resolve();
+    expect(gpt.diagnosticsObserverActive()).toBe(false);
+    expect(gpt.listenerInventory()).toEqual([]);
   });
 
   it('injects GPT and Prebid module boundaries with only server-frozen configuration', async () => {

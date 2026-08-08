@@ -122,11 +122,10 @@ export function createGptDiagnosticsFactBuffer(
 export function activateGptDiagnosticsFactCapture(
   adapter: Pick<GoogletagAdapter, 'observeDiagnostics' | 'run'>,
   buffer: Pick<GptDiagnosticsFactBuffer, 'publish'>
-): () => void {
+): (() => void) | undefined {
   let disposed = false;
   let releases: readonly (() => void)[] = Object.freeze([]);
   const observeDiagnostics = adapter.observeDiagnostics;
-  if (!observeDiagnostics) return () => undefined;
   const releaseObserver = observeDiagnostics((fact) => {
     try {
       buffer.publish(fact);
@@ -134,7 +133,7 @@ export function activateGptDiagnosticsFactCapture(
       // Fact buffering cannot alter the already-completed GPT callback.
     }
   });
-  if (!releaseObserver) return () => undefined;
+  if (!releaseObserver) return undefined;
 
   let operation: ReturnType<GoogletagAdapter['run']> | undefined;
   try {
@@ -181,7 +180,7 @@ export function activateGptDiagnosticsFactCapture(
     );
   } catch {
     releaseObserver();
-    return () => undefined;
+    return undefined;
   }
 
   return (): void => {

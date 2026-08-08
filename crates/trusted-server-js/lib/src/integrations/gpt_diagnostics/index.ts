@@ -1,111 +1,108 @@
-import { log } from '../../core/log';
-import type { GptDiagnosticsApi, LegacyTsjsApi } from '../../core/types';
+import type { GptDiagnosticsApi } from '../../core/types';
 
 import { GptDiagnosticsApiController } from './api';
 import { GptDiagnosticsBadgeManager } from './badges';
 import { GptDiagnosticsBindingManager } from './binding';
+import type { GptDiagnosticsFactBuffer } from './facts';
 import { GptDiagnosticsObserver } from './observer';
-import type { GptObserverWindow } from './observer';
 import { GptDiagnosticsOverlay } from './overlay';
 import { GptDiagnosticsSlotSizeObserver } from './slot_size_observer';
 import { GptDiagnosticsStore } from './store';
 
-interface GptDiagnosticsRuntime {
-  api: GptDiagnosticsApi;
-  destroy(): void;
+type GptDiagnosticsWindow = Window & typeof globalThis;
+
+export interface GptDiagnosticsRuntimeOptions {
+  readonly document?: Document | undefined;
+  readonly window?: GptDiagnosticsWindow | undefined;
 }
 
-type GptDiagnosticsWindow = Window &
-  typeof globalThis &
-  GptObserverWindow & {
-    __tsjs_gpt_diagnostics_active?: boolean;
-    __tsjs_gpt_diagnostics_runtime?: GptDiagnosticsRuntime;
-    tsjs?: LegacyTsjsApi;
-  };
-
-/** Whether the early bootstrap activated diagnostics for this document. */
-export function isGptDiagnosticsActive(
-  target: Pick<
-    GptDiagnosticsWindow,
-    '__tsjs_gpt_diagnostics_active'
-  > = window as GptDiagnosticsWindow
-): boolean {
-  return target.__tsjs_gpt_diagnostics_active === true;
+export interface GptDiagnosticsRuntime {
+  readonly activate: () => () => void;
+  readonly currentApi: () => GptDiagnosticsApi | undefined;
 }
 
-/** Installs one active diagnostics runtime for the current document. */
-export function installGptDiagnosticsRuntime(
-  target: GptDiagnosticsWindow = window as GptDiagnosticsWindow
-): GptDiagnosticsApi | undefined {
-  if (!isGptDiagnosticsActive(target)) return undefined;
-  if (target.__tsjs_gpt_diagnostics_runtime) {
-    return target.__tsjs_gpt_diagnostics_runtime.api;
-  }
+interface ActiveRuntime {
+  readonly api: GptDiagnosticsApi;
+  readonly release: () => void;
+}
 
-  let bindings: GptDiagnosticsBindingManager | undefined;
-  let badges: GptDiagnosticsBadgeManager | undefined;
-  let overlay: GptDiagnosticsOverlay | undefined;
-  let slotSizeObserver: GptDiagnosticsSlotSizeObserver | undefined;
-  let apiController: GptDiagnosticsApiController | undefined;
-
+function isolate(callback: () => void): void {
   try {
-    if (!target.tsjs) throw new Error('TSJS core API unavailable');
+    callback();
+  } catch {
+    // Diagnostics cleanup cannot retain another independently owned resource.
+  }
+}
+
+/** Creates an inert GPT diagnostics runtime over the adapter-owned fact transport. */
+export function createGptDiagnosticsRuntime(
+  facts: Pick<GptDiagnosticsFactBuffer, 'activate'>,
+  options: GptDiagnosticsRuntimeOptions = {}
+): GptDiagnosticsRuntime {
+  const targetWindow = options.window ?? (window as GptDiagnosticsWindow);
+  const targetDocument = options.document ?? document;
+  let active: ActiveRuntime | undefined;
+
+  const activate = (): (() => void) => {
+    if (active) throw new Error('GPT diagnostics runtime is already active');
 
     const store = new GptDiagnosticsStore();
-    const observer = new GptDiagnosticsObserver(store, { window: target });
-    bindings = new GptDiagnosticsBindingManager(store, {
-      window: target,
-      document: target.document,
-    });
-    badges = new GptDiagnosticsBadgeManager(store, bindings, {
-      window: target,
-      document: target.document,
-    });
-    slotSizeObserver = new GptDiagnosticsSlotSizeObserver(store, bindings, { window: target });
-    overlay = new GptDiagnosticsOverlay(store, bindings, {
-      window: target,
-      document: target.document,
-      onExport: () => apiController?.api.export(),
-      onBadgeLayerChange: (layer) => badges?.setLayer(layer),
-    });
-    apiController = new GptDiagnosticsApiController(store, bindings, overlay, {
-      window: target,
-      document: target.document,
-    });
+    const observer = new GptDiagnosticsObserver(store);
+    let releaseFacts: (() => void) | undefined;
+    let bindings: GptDiagnosticsBindingManager | undefined;
+    let badges: GptDiagnosticsBadgeManager | undefined;
+    let overlay: GptDiagnosticsOverlay | undefined;
+    let apiController: GptDiagnosticsApiController | undefined;
 
-    observer.install();
-    const api = apiController.api;
-    const recorder = apiController.recorder;
-    const runtime: GptDiagnosticsRuntime = {
-      api,
-      destroy: () => {
-        if (target.tsjs?.gptDiagnostics === api) delete target.tsjs.gptDiagnostics;
-        if (target.tsjs?.gptDiagnosticsRecorder === recorder) {
-          delete target.tsjs.gptDiagnosticsRecorder;
-        }
-        apiController?.destroy();
-        overlay?.destroy();
-        badges?.destroy();
-        slotSizeObserver?.destroy();
-        bindings?.destroy();
-        delete target.__tsjs_gpt_diagnostics_runtime;
-      },
+    const cleanup = (): void => {
+      isolate(() => releaseFacts?.());
+      isolate(() => apiController?.destroy());
+      isolate(() => overlay?.destroy());
+      isolate(() => badges?.destroy());
+      isolate(() => bindings?.destroy());
     };
-    target.tsjs.gptDiagnostics = api;
-    target.tsjs.gptDiagnosticsRecorder = recorder;
-    target.__tsjs_gpt_diagnostics_runtime = runtime;
-    return api;
-  } catch (error) {
-    apiController?.destroy();
-    overlay?.destroy();
-    badges?.destroy();
-    slotSizeObserver?.destroy();
-    bindings?.destroy();
-    log.warn('gpt diagnostics: runtime installation failed', error);
-    return undefined;
-  }
-}
 
-if (typeof window !== 'undefined' && isGptDiagnosticsActive(window as GptDiagnosticsWindow)) {
-  installGptDiagnosticsRuntime(window as GptDiagnosticsWindow);
+    try {
+      observer.start();
+      releaseFacts = facts.activate((fact) => observer.consume(fact));
+      if (!releaseFacts) throw new Error('GPT diagnostics fact consumer is unavailable');
+      bindings = new GptDiagnosticsBindingManager(store, {
+        window: targetWindow,
+        document: targetDocument,
+      });
+      badges = new GptDiagnosticsBadgeManager(store, bindings, {
+        window: targetWindow,
+        document: targetDocument,
+      });
+      overlay = new GptDiagnosticsOverlay(store, bindings, {
+        window: targetWindow,
+        document: targetDocument,
+        onExport: () => apiController?.api.export(),
+        onBadgeLayerChange: (layer) => badges?.setLayer(layer),
+      });
+      apiController = new GptDiagnosticsApiController(store, bindings, overlay, {
+        window: targetWindow,
+        document: targetDocument,
+      });
+    } catch (error) {
+      cleanup();
+      throw error;
+    }
+
+    const api = apiController.api;
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      if (active?.release === release) active = undefined;
+      cleanup();
+    };
+    active = Object.freeze({ api, release });
+    return release;
+  };
+
+  return Object.freeze({
+    activate,
+    currentApi: (): GptDiagnosticsApi | undefined => active?.api,
+  });
 }

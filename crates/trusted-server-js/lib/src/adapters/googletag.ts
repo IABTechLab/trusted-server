@@ -183,7 +183,7 @@ export interface GoogletagOperation<T> {
 /** Narrow GPT boundary consumed by kernel sessions and services. */
 export interface GoogletagAdapter {
   bindingStatus(): GoogletagBindingStatus;
-  observeDiagnostics?(observer: GoogletagDiagnosticsObserver): (() => void) | undefined;
+  observeDiagnostics(observer: GoogletagDiagnosticsObserver): (() => void) | undefined;
   observePublisherCalls(observer: GoogletagPublisherCallObserver): () => void;
   run<T>(
     command: (googletag: Readonly<GoogletagFacade>) => T,

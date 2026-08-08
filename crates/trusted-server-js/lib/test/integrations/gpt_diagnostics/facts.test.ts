@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 
 import type {
   GoogletagAdapter,
@@ -16,6 +16,12 @@ function fact(index: number): Readonly<GoogletagDiagnosticsFact> {
 }
 
 describe('GPT diagnostics fact transport', () => {
+  it('requires diagnostics observation on every GPT adapter', () => {
+    expectTypeOf<GoogletagAdapter>().toMatchTypeOf<{
+      observeDiagnostics(observer: GoogletagDiagnosticsObserver): (() => void) | undefined;
+    }>();
+  });
+
   it('buffers 512 facts, evicts the oldest, replays in order, then releases the buffer', () => {
     const buffer = createGptDiagnosticsFactBuffer();
     for (let index = 0; index < 513; index += 1) expect(buffer.publish(fact(index))).toBe(true);
@@ -95,10 +101,23 @@ describe('GPT diagnostics fact transport', () => {
     expect(subscriptions.sort()).toEqual(
       ['impressionViewable', 'slotOnload', 'slotResponseReceived', 'slotVisibilityChanged'].sort()
     );
-    dispose();
-    dispose();
+    dispose?.();
+    dispose?.();
     expect(operationDispose).toHaveBeenCalledOnce();
     expect(releases.every((release) => release.mock.calls.length === 1)).toBe(true);
     expect(observer).toBeUndefined();
+  });
+
+  it('rejects capture when another diagnostics observer owns the adapter', () => {
+    const run = vi.fn();
+    const adapter = Object.freeze({
+      observeDiagnostics: () => undefined,
+      run,
+    }) as unknown as Pick<GoogletagAdapter, 'observeDiagnostics' | 'run'>;
+
+    expect(
+      activateGptDiagnosticsFactCapture(adapter, createGptDiagnosticsFactBuffer())
+    ).toBeUndefined();
+    expect(run).not.toHaveBeenCalled();
   });
 });
