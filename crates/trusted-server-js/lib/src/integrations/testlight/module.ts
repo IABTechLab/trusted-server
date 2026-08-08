@@ -190,11 +190,15 @@ export function createTestlightRuntime(
         }
         const pending = ownQueueValues(queue);
         queue.length = 0;
+        const nativePush = queue.push.bind(queue);
         Object.defineProperty(queue, 'push', {
           configurable: true,
           enumerable: false,
           value: (...candidates: unknown[]): number => {
-            for (const candidate of candidates) {
+            const length = nativePush(...candidates);
+            const forwarded = ownQueueValues(queue);
+            queue.length = 0;
+            for (const candidate of forwarded) {
               if (typeof candidate !== 'function') continue;
               try {
                 dependencies.enqueue(candidate as () => void);
@@ -203,7 +207,7 @@ export function createTestlightRuntime(
                 log.debug('testlight shim: queued callback threw', error);
               }
             }
-            return 0;
+            return length;
           },
           writable: false,
         });

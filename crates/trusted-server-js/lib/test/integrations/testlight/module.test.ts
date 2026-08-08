@@ -50,6 +50,25 @@ describe('transactional Testlight integration module', () => {
     expect(original).toEqual([expect.any(Function), later]);
   });
 
+  it('returns the captured native push result after forwarding a later callback', () => {
+    const callback = vi.fn();
+    const target = { testlight: { que: [] as unknown[] } };
+    const runtime = createTestlightRuntime({
+      enqueue: (candidate) => candidate(),
+      started: vi.fn(),
+      target,
+    });
+
+    const release = runtime.activate(undefined);
+    runtime.start(undefined);
+
+    expect(target.testlight.que.push(callback)).toBe(1);
+    expect(callback).toHaveBeenCalledOnce();
+    expect(target.testlight.que).toHaveLength(0);
+
+    release();
+  });
+
   it('does not overwrite a publisher queue replacement during disposal', () => {
     const target = { testlight: { que: [] as unknown[] } };
     const runtime = createTestlightRuntime({
