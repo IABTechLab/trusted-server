@@ -29,6 +29,7 @@ import {
 } from '../../src/composition/browser';
 import { log as localLog } from '../../src/core/log';
 import type { BrowserAuctionBidV1 } from '../../src/core/types';
+import { createCreativeIntegrationRegistration } from '../../src/integrations/creative/module';
 import { createGptIntegrationRegistration } from '../../src/integrations/gpt/module';
 import { isGuardInstalled, resetGuardState } from '../../src/integrations/gpt/script_guard';
 import { createPrebidIntegrationRegistration } from '../../src/integrations/prebid/module';
@@ -73,7 +74,7 @@ function synchronousGptAdapter() {
     getTargeting: vi.fn((slot: object, key: string) =>
       Object.freeze([...(targeting.get(slot)?.get(key) ?? [])])
     ),
-    observeTargeting: () => vi.fn(),
+    observeTargeting: () => Object.assign(vi.fn(), { isCurrent: () => true }),
     refresh,
     serviceState: () =>
       Object.freeze({ apiReady: true, initialLoadDisabled: false, pubadsReady: true }),
@@ -603,7 +604,8 @@ describe('browser composition', () => {
     expect(Object.isFrozen(composition.runtime)).toBe(true);
   });
 
-  it('subscribes the injected slot service before correctness activation and disposes both listeners', async () => {
+  it('starts slot listeners before post-commit GPT startup and disposes both listeners', async () => {
+    const releaseId = 'a'.repeat(64);
     const subscriptions: string[] = [];
     const releases: string[] = [];
     const facade = {
@@ -629,16 +631,20 @@ describe('browser composition', () => {
         _adapters: unknown,
         services: { readonly slots: { readonly snapshotForTest: () => { records: number } } }
       ) => {
-        expect(subscriptions).toEqual(['slotRequested', 'slotRenderEnded']);
+        expect(subscriptions).toEqual([]);
         expect(services.slots.snapshotForTest().records).toBe(0);
       }
     );
     const composition = createTestBrowserRuntimeComposition(
       {
         target: {},
-        releaseId: 'a'.repeat(64),
-        manifest: { version: 1, releaseId: 'a'.repeat(64), integrations: [] },
-        knownIntegrationIds: Object.freeze([]),
+        releaseId,
+        manifest: {
+          version: 1,
+          releaseId,
+          integrations: [{ id: 'gpt', required: true }],
+        },
+        knownIntegrationIds: Object.freeze(['gpt']),
         boot: {
           auctionProjection: {
             version: 1,
@@ -662,10 +668,16 @@ describe('browser composition', () => {
         coreActivations: {
           correctnessGptListeners: correctness,
         },
+        gptStartupForTest: () => {
+          expect(subscriptions).toEqual(['slotRequested', 'slotRenderEnded']);
+        },
       }
     );
 
     expect(composition.runtime.start()).toBe(true);
+    expect(
+      composition.runtime.registerIntegration(createGptIntegrationRegistration(releaseId))
+    ).toBe(true);
     await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
     expect(correctness).toHaveBeenCalledOnce();
     composition.runtime.dispose();
@@ -750,6 +762,123 @@ describe('browser composition', () => {
       resetGuardState();
     }
     expect(isGuardInstalled()).toBe(false);
+  });
+
+  it('injects the exact creative boot into reversible activation and post-commit startup', async () => {
+    const releaseId = 'a'.repeat(64);
+    const creative = Object.freeze({
+      version: 1 as const,
+      enabled: true,
+      clickGuard: true,
+      renderGuard: false,
+    });
+    const release = vi.fn();
+    const activateCreative = vi.fn((received: unknown) => {
+      expect(received).toEqual(creative);
+      expect(Object.isFrozen(received)).toBe(true);
+      return release;
+    });
+    const startCreative = vi.fn((received: unknown) => {
+      expect(received).toEqual(creative);
+      expect(Object.isFrozen(received)).toBe(true);
+    });
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target: {},
+        releaseId,
+        manifest: {
+          version: 1,
+          releaseId,
+          integrations: [{ id: 'creative', required: true }],
+        },
+        knownIntegrationIds: Object.freeze(['creative']),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: { version: 1, auctionId: 'initial', results: [] },
+            bids: [],
+          },
+          creative,
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag: fakeGoogletagAdapter(),
+          messaging: fakeMessagingAdapter(),
+          prebid: fakePrebidAdapter(),
+        },
+        coreActivations: { correctnessGptListeners: vi.fn() },
+        creativeActivationForTest: activateCreative,
+        creativeStartupForTest: startCreative,
+      }
+    );
+
+    expect(composition.runtime.start()).toBe(true);
+    expect(
+      composition.runtime.registerIntegration(createCreativeIntegrationRegistration(releaseId))
+    ).toBe(true);
+    await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+    expect(activateCreative).toHaveBeenCalledTimes(1);
+    expect(startCreative).toHaveBeenCalledTimes(1);
+    expect(activateCreative.mock.calls[0]?.[0]).toBe(startCreative.mock.calls[0]?.[0]);
+
+    composition.runtime.dispose();
+    composition.runtime.dispose();
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it('owns the real creative click guard through the composition lifecycle', async () => {
+    const releaseId = 'a'.repeat(64);
+    const addEventListener = vi.spyOn(document, 'addEventListener');
+    const removeEventListener = vi.spyOn(document, 'removeEventListener');
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target: {},
+        releaseId,
+        manifest: {
+          version: 1,
+          releaseId,
+          integrations: [{ id: 'creative', required: true }],
+        },
+        knownIntegrationIds: Object.freeze(['creative']),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: { version: 1, auctionId: 'initial', results: [] },
+            bids: [],
+          },
+          creative: { version: 1, enabled: true, clickGuard: true, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag: fakeGoogletagAdapter(),
+          messaging: fakeMessagingAdapter(),
+          prebid: fakePrebidAdapter(),
+        },
+        coreActivations: { correctnessGptListeners: vi.fn() },
+      }
+    );
+
+    try {
+      expect(composition.runtime.start()).toBe(true);
+      expect(
+        composition.runtime.registerIntegration(createCreativeIntegrationRegistration(releaseId))
+      ).toBe(true);
+      await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+      expect(addEventListener.mock.calls.filter(([type]) => type === 'click')).toHaveLength(1);
+      expect(addEventListener.mock.calls.filter(([type]) => type === 'auxclick')).toHaveLength(1);
+    } finally {
+      composition.runtime.dispose();
+      addEventListener.mockRestore();
+    }
+    expect(removeEventListener.mock.calls.filter(([type]) => type === 'click')).toHaveLength(1);
+    expect(removeEventListener.mock.calls.filter(([type]) => type === 'auxclick')).toHaveLength(1);
+    removeEventListener.mockRestore();
   });
 
   it('publishes and promotes one exact Prebid winner through runtime-owned PUC state', async () => {
