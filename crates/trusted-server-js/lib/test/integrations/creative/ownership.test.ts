@@ -81,6 +81,16 @@ describe('creative guard ownership', () => {
     expect(Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src')).toEqual(
       descriptorBefore
     );
+
+    const replacement = installDynamicImageProxy(false);
+    expect(replacement).not.toBe(guard);
+    expect(Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src')).not.toEqual(
+      descriptorBefore
+    );
+    replacement.dispose();
+    expect(Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src')).toEqual(
+      descriptorBefore
+    );
   });
 
   it('does not overwrite a foreign iframe hook installed after activation', async () => {

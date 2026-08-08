@@ -116,7 +116,7 @@ export function createDynamicSrcProxy<E extends ElementWithSrc>(
     let installedCreateElement: PropertyDescriptor | undefined;
     let factoryTarget: Record<string, unknown> | undefined;
     let factoryOriginal: PropertyDescriptor | undefined;
-    let installedFactory: unknown;
+    let installedFactory: PropertyDescriptor | undefined;
 
     const restore = (
       target: object,
@@ -268,24 +268,13 @@ export function createDynamicSrcProxy<E extends ElementWithSrc>(
       if (targetDocument) {
         restore(targetDocument, 'createElement', installedCreateElement, originalCreateElement);
       }
-      if (
-        factoryTarget &&
-        options.factoryName &&
-        factoryTarget[options.factoryName] === installedFactory
-      ) {
-        try {
-          if (factoryOriginal) {
-            Object.defineProperty(factoryTarget, options.factoryName, factoryOriginal);
-          } else {
-            Reflect.deleteProperty(factoryTarget, options.factoryName);
-          }
-        } catch (error) {
-          log.debug(`${options.logPrefix}: failed to restore ${options.factoryName}`, error);
-        }
+      if (factoryTarget && options.factoryName) {
+        restore(factoryTarget, options.factoryName, installedFactory, factoryOriginal);
       }
       restore(ctor.prototype, 'setAttributeNS', installedSetAttributeNS, originalSetAttributeNS);
       restore(ctor.prototype, 'setAttribute', installedSetAttribute, originalSetAttribute);
       restore(ctor.prototype, attr, installedSource, sourceDescriptor);
+      if (installedHandle === handle) installedHandle = undefined;
     };
 
     const handle = Object.freeze({ dispose, scan });
@@ -398,7 +387,7 @@ export function createDynamicSrcProxy<E extends ElementWithSrc>(
             WrappedFactory.prototype = factoryFunction.prototype;
             Object.setPrototypeOf(WrappedFactory, factoryFunction);
             globalObject[options.factoryName] = WrappedFactory;
-            installedFactory = WrappedFactory;
+            installedFactory = Object.getOwnPropertyDescriptor(globalObject, options.factoryName);
           }
         }
       }
