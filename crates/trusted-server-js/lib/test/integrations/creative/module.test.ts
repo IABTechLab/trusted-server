@@ -97,10 +97,13 @@ describe('transactional creative integration module', () => {
     expect(release).toHaveBeenCalledTimes(1);
   });
 
-  it.each([
-    Object.freeze({ version: 1, enabled: false, clickGuard: true, renderGuard: true }),
-    Object.freeze({ version: 1, enabled: true, clickGuard: false, renderGuard: false }),
-  ])('performs no runtime work for an inactive creative boot %#', async (config) => {
+  it('performs no runtime work when enabled with both guards false', async () => {
+    const config = Object.freeze({
+      version: 1 as const,
+      enabled: true,
+      clickGuard: false,
+      renderGuard: false,
+    });
     const activate = vi.fn();
     const start = vi.fn();
     const registry = createIntegrationRegistry({
@@ -192,6 +195,14 @@ describe('transactional creative integration module', () => {
       ),
     ],
     ['mutable object', { version: 1, enabled: true, clickGuard: true, renderGuard: false }],
+    [
+      'disabled click guard',
+      Object.freeze({ version: 1, enabled: false, clickGuard: true, renderGuard: false }),
+    ],
+    [
+      'disabled render guard',
+      Object.freeze({ version: 1, enabled: false, clickGuard: false, renderGuard: true }),
+    ],
   ])('rejects %s configuration during inert preparation', async (_caseName, config) => {
     const activate = vi.fn();
     const start = vi.fn();

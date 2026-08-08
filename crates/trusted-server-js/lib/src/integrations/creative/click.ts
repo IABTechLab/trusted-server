@@ -165,7 +165,12 @@ function buildProxyRebuildUrl(tsClickStr: string, diff: Diff): string {
 // does not answer, and always fails — so the guard skips it and recovers via
 // the GET navigation fallback, which the edge answers with a 302 chain (no
 // CORS applies to navigations).
-async function rebuildClick(a: AnchorLike, tsClickStr: string, diff: Diff): Promise<string> {
+async function rebuildClick(
+  a: AnchorLike,
+  tsClickStr: string,
+  diff: Diff,
+  isActive: () => boolean
+): Promise<string> {
   const addKeys = Object.keys(diff.add);
   const delKeys = diff.del;
   if (addKeys.length === 0 && delKeys.length === 0) {
@@ -175,6 +180,7 @@ async function rebuildClick(a: AnchorLike, tsClickStr: string, diff: Diff): Prom
   const fallback = buildProxyRebuildUrl(tsClickStr, diff);
 
   if (typeof fetch !== 'function' || hasOpaqueOrigin()) {
+    if (!isActive()) return tsClickStr;
     try {
       const el = a as Element;
       el.setAttribute('href', fallback);
@@ -195,6 +201,7 @@ async function rebuildClick(a: AnchorLike, tsClickStr: string, diff: Diff): Prom
       body: JSON.stringify(payload),
       credentials: 'same-origin',
     });
+    if (!isActive()) return tsClickStr;
     if (!resp.ok) {
       log.warn('tsjs-creative:click: proxy-rebuild HTTP error', resp.status);
       try {
@@ -206,6 +213,7 @@ async function rebuildClick(a: AnchorLike, tsClickStr: string, diff: Diff): Prom
       return fallback;
     }
     const data = (await resp.json()) as { href?: string; base?: string } | null;
+    if (!isActive()) return tsClickStr;
     const href = data && typeof data.href === 'string' ? data.href : null;
     if (href) {
       persistRebuiltClick(a, href);
@@ -216,9 +224,11 @@ async function rebuildClick(a: AnchorLike, tsClickStr: string, diff: Diff): Prom
       return href;
     }
   } catch (err) {
+    if (!isActive()) return tsClickStr;
     log.warn('tsjs-creative:click: proxy-rebuild request failed', err);
   }
 
+  if (!isActive()) return tsClickStr;
   try {
     const el = a as Element;
     el.setAttribute('href', fallback);
@@ -229,7 +239,11 @@ async function rebuildClick(a: AnchorLike, tsClickStr: string, diff: Diff): Prom
 }
 
 // Work out the href we should navigate to after accounting for creative rewrites.
-async function computeFinalUrl(a: AnchorLike, tsClickStr: string): Promise<string> {
+async function computeFinalUrl(
+  a: AnchorLike,
+  tsClickStr: string,
+  isActive: () => boolean
+): Promise<string> {
   const orig = canonFromFirstPartyClick(tsClickStr);
   if (!orig) return tsClickStr;
 
@@ -266,7 +280,7 @@ async function computeFinalUrl(a: AnchorLike, tsClickStr: string): Promise<strin
     del: diff.del,
   });
 
-  return rebuildClick(a, tsClickStr, diff);
+  return rebuildClick(a, tsClickStr, diff, isActive);
 }
 
 // Resolve a click URL against the pinned trusted base and require an http(s)
@@ -277,10 +291,14 @@ async function computeFinalUrl(a: AnchorLike, tsClickStr: string): Promise<strin
 function resolveSafeNavigationUrl(url: string): string | null {
   try {
     const resolved = new URL(url, TRUSTED_BASE_URL);
-    if (resolved.protocol === 'http:' || resolved.protocol === 'https:') {
+    if (
+      (resolved.protocol === 'http:' || resolved.protocol === 'https:') &&
+      resolved.username === '' &&
+      resolved.password === ''
+    ) {
       return resolved.toString();
     }
-    log.warn('tsjs-creative:click: refusing non-http(s) navigation', resolved.protocol);
+    log.warn('tsjs-creative:click: refusing unsafe navigation URL', resolved.protocol);
   } catch (err) {
     log.debug('tsjs-creative:click: could not resolve navigation URL', err);
   }
@@ -405,11 +423,17 @@ function persistRebuiltClick(anchor: AnchorLike, finalUrl: string): void {
 }
 
 // Give the creative one microtask to finish mutations before we lock in the href.
-async function rebuildIfNeeded(anchor: AnchorLike, tsClickStr: string): Promise<string> {
-  let finalUrl = await computeFinalUrl(anchor, tsClickStr);
+async function rebuildIfNeeded(
+  anchor: AnchorLike,
+  tsClickStr: string,
+  isActive: () => boolean
+): Promise<string> {
+  let finalUrl = await computeFinalUrl(anchor, tsClickStr, isActive);
+  if (!isActive()) return tsClickStr;
   if (finalUrl === tsClickStr) {
     await delay();
-    finalUrl = await computeFinalUrl(anchor, tsClickStr);
+    if (!isActive()) return tsClickStr;
+    finalUrl = await computeFinalUrl(anchor, tsClickStr, isActive);
   }
   return finalUrl;
 }
@@ -421,7 +445,7 @@ async function guardNavigation(
   isMiddle: boolean,
   isActive: () => boolean
 ): Promise<void> {
-  const finalUrl = await rebuildIfNeeded(anchor, tsClickStr);
+  const finalUrl = await rebuildIfNeeded(anchor, tsClickStr, isActive);
   if (!isActive()) return;
   if (finalUrl && finalUrl !== tsClickStr) {
     persistRebuiltClick(anchor, finalUrl);
@@ -461,7 +485,7 @@ function monitorAnchorMutations(isActive: () => boolean): CreativeGuardHandle {
     if (!isActive()) return;
     const tsClickStr = anchor.getAttribute('data-tsclick') || '';
     if (!tsClickStr) return;
-    void rebuildIfNeeded(anchor, tsClickStr)
+    void rebuildIfNeeded(anchor, tsClickStr, isActive)
       .then((finalUrl) => {
         if (!isActive()) return;
         if (finalUrl && finalUrl !== tsClickStr) {

@@ -47,6 +47,16 @@ function ownDataRecord(value: unknown): Record<string, unknown> | undefined {
   }
 }
 
+function ownPlainDataRecord(value: unknown): Record<string, unknown> | undefined {
+  const record = ownDataRecord(value);
+  if (!record) return undefined;
+  try {
+    return Object.getPrototypeOf(value) === Object.prototype ? record : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function exactKeys(record: Record<string, unknown>, keys: readonly string[]): boolean {
   const actual = Object.keys(record);
   return actual.length === keys.length && actual.every((key) => keys.includes(key));
@@ -138,7 +148,7 @@ export function buildKernelBoot(
     record.cachePolicy === undefined ? undefined : parseCachePolicy(record.cachePolicy);
   if (record.cachePolicy !== undefined && !cachePolicy) return undefined;
   const auctionProjection = parseBrowserAuctionProjectionV1(record.auctionProjection, cachePolicy);
-  const creative = ownDataRecord(record.creative);
+  const creative = ownPlainDataRecord(record.creative);
   const diagnostics = ownDataRecord(record.diagnostics);
   const gptDiagnostics = ownDataRecord(diagnostics?.gpt);
   if (
@@ -149,6 +159,7 @@ export function buildKernelBoot(
     typeof creative.enabled !== 'boolean' ||
     typeof creative.clickGuard !== 'boolean' ||
     typeof creative.renderGuard !== 'boolean' ||
+    (!creative.enabled && (creative.clickGuard || creative.renderGuard)) ||
     !diagnostics ||
     !exactKeys(diagnostics, ['version', 'renderTraceOverlay', 'gpt']) ||
     diagnostics.version !== 1 ||
@@ -160,7 +171,10 @@ export function buildKernelBoot(
     return undefined;
   }
   const diagnosticsModule = manifest.integrations.filter(({ id }) => id === 'gpt_diagnostics');
+  const creativeModule = manifest.integrations.filter(({ id }) => id === 'creative');
   if (
+    (creative.enabled && creativeModule.length !== 1) ||
+    (!creative.enabled && creativeModule.length !== 0) ||
     (gptDiagnostics.active && diagnosticsModule.length !== 1) ||
     (!gptDiagnostics.active && diagnosticsModule.length !== 0)
   ) {

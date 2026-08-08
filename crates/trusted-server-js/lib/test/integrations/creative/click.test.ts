@@ -375,4 +375,96 @@ describe('creative/click.ts', () => {
     // unhandled navigation error is the assertion that location.href was
     // never assigned the javascript: URL.
   });
+
+  it.each([
+    'https://user@example.com/landing',
+    'https://:password@example.com/landing',
+    'https://%75ser:%70assword@example.com/landing',
+  ])('refuses a credential-bearing navigation URL: %s', async (targetUrl) => {
+    vi.useFakeTimers();
+    const openMock = vi.fn();
+    const originalOpen = window.open;
+    window.open = openMock as unknown as typeof window.open;
+    const anchor = document.createElement('a');
+    anchor.setAttribute('data-tsclick', targetUrl);
+    anchor.setAttribute('href', targetUrl);
+    anchor.setAttribute('target', '_blank');
+    document.body.appendChild(anchor);
+
+    try {
+      await importCreativeModule();
+      anchor.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+      await vi.runAllTimersAsync();
+
+      expect(openMock).not.toHaveBeenCalled();
+      expect(anchor.getAttribute('href')).toBe(targetUrl);
+    } finally {
+      window.open = originalOpen;
+    }
+  });
+
+  it.each([
+    ['absolute', 'https://example.com/landing?campaign=fictional'],
+    ['root-relative', '/first-party/landing?campaign=fictional'],
+  ])('preserves valid %s HTTP(S) navigation', async (_caseName, targetUrl) => {
+    vi.useFakeTimers();
+    const openMock = vi.fn();
+    const originalOpen = window.open;
+    window.open = openMock as unknown as typeof window.open;
+    const anchor = document.createElement('a');
+    anchor.setAttribute('data-tsclick', targetUrl);
+    anchor.setAttribute('href', targetUrl);
+    anchor.setAttribute('target', '_blank');
+    document.body.appendChild(anchor);
+
+    try {
+      await importCreativeModule();
+      anchor.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+      await vi.runAllTimersAsync();
+
+      expect(openMock).toHaveBeenCalledWith(absolute(targetUrl), '_blank', 'noopener,noreferrer');
+    } finally {
+      window.open = originalOpen;
+    }
+  });
+
+  it.each(['success', 'error'] as const)(
+    'does not persist a late proxy-rebuild %s after disposal',
+    async (outcome) => {
+      let resolveFetch: ((response: Response) => void) | undefined;
+      let rejectFetch: ((reason: unknown) => void) | undefined;
+      global.fetch = vi.fn(
+        () =>
+          new Promise<Response>((resolve, reject) => {
+            resolveFetch = resolve;
+            rejectFetch = reject;
+          })
+      );
+      const anchor = document.createElement('a');
+      anchor.setAttribute('data-tsclick', FIRST_PARTY_CLICK);
+      anchor.setAttribute('href', MUTATED_CLICK);
+      document.body.appendChild(anchor);
+      const { installClickGuard } = await import('../../../src/integrations/creative/click');
+      const handle = installClickGuard(false);
+
+      handle.scan();
+      await vi.waitFor(() => expect(global.fetch).toHaveBeenCalledTimes(1));
+      handle.dispose();
+      if (outcome === 'success') {
+        resolveFetch?.({
+          ok: true,
+          json: async () => ({ href: PROXY_RESPONSE }),
+        } as Response);
+      } else {
+        rejectFetch?.(new Error('fictional late proxy failure'));
+      }
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(anchor.getAttribute('href')).toBe(MUTATED_CLICK);
+      expect(anchor.getAttribute('data-tsclick')).toBe(FIRST_PARTY_CLICK);
+    }
+  );
 });

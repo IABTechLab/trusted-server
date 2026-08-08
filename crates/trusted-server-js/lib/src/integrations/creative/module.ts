@@ -40,7 +40,8 @@ function readCreativeBoot(candidate: unknown): Readonly<CreativeBootV1> | undefi
     return values['version'] === 1 &&
       typeof values['enabled'] === 'boolean' &&
       typeof values['clickGuard'] === 'boolean' &&
-      typeof values['renderGuard'] === 'boolean'
+      typeof values['renderGuard'] === 'boolean' &&
+      (values['enabled'] || (!values['clickGuard'] && !values['renderGuard']))
       ? (candidate as Readonly<CreativeBootV1>)
       : undefined;
   } catch {
