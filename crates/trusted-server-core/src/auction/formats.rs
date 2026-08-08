@@ -285,32 +285,6 @@ pub fn convert_tsjs_to_auction_request(
     })
 }
 
-/// Delivery facts produced while serializing winning bids.
-#[derive(Debug, Default)]
-pub(crate) struct AuctionDeliveryReport {
-    /// Winning slot IDs included in the serialized response.
-    pub delivered_winner_slots: HashSet<String>,
-    /// Winners omitted because they could not be delivered safely.
-    pub dropped_winner_count: usize,
-    /// Machine-readable reasons for omitted winners.
-    pub dropped_winner_reasons: AuctionDropReasons,
-}
-
-impl AuctionDeliveryReport {
-    fn record_drop(&mut self, reason: AuctionDropReason) {
-        self.dropped_winner_count += 1;
-        record_auction_drop(&mut self.dropped_winner_reasons, reason);
-    }
-}
-
-/// Serialized response and the delivery facts used to produce it.
-pub(crate) struct OpenRtbResponseConversion {
-    /// HTTP response returned to the auction client.
-    pub response: Response<EdgeBody>,
-    /// Delivery facts for telemetry and diagnostics.
-    pub delivery: AuctionDeliveryReport,
-}
-
 /// Attach the consent/EID headers shared by every `/auction` response wire.
 pub(crate) fn attach_auction_response_headers(
     response: &mut Response<EdgeBody>,
@@ -853,20 +827,9 @@ pub fn convert_to_openrtb_response(
     auction_request: &AuctionRequest,
     ec_allowed: bool,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    Ok(
-        convert_to_openrtb_response_with_report(result, settings, auction_request, ec_allowed)?
-            .response,
-    )
-}
-
-pub(crate) fn convert_to_openrtb_response_with_report(
-    result: &OrchestrationResult,
-    settings: &Settings,
-    auction_request: &AuctionRequest,
-    ec_allowed: bool,
-) -> Result<OpenRtbResponseConversion, Report<TrustedServerError>> {
     let mut seatbids = Vec::with_capacity(result.winning_bids.len());
-    let mut delivery = AuctionDeliveryReport::default();
+    let mut dropped_winner_count = 0;
+    let mut dropped_winner_reasons = AuctionDropReasons::new();
 
     for (slot_id, bid) in &result.winning_bids {
         let price = bid.price.ok_or_else(|| {
@@ -896,7 +859,11 @@ pub(crate) fn convert_to_openrtb_response_with_report(
                 slot_id,
                 bid.bidder
             );
-            delivery.record_drop(AuctionDropReason::MultipleRenderSources);
+            dropped_winner_count += 1;
+            record_auction_drop(
+                &mut dropped_winner_reasons,
+                AuctionDropReason::MultipleRenderSources,
+            );
             continue;
         }
 
@@ -929,7 +896,11 @@ pub(crate) fn convert_to_openrtb_response_with_report(
                     slot_id,
                     bid.bidder
                 );
-                delivery.record_drop(AuctionDropReason::RendererExtensionSerializationFailed);
+                dropped_winner_count += 1;
+                record_auction_drop(
+                    &mut dropped_winner_reasons,
+                    AuctionDropReason::RendererExtensionSerializationFailed,
+                );
                 continue;
             };
             (None, Some(ext))
@@ -940,7 +911,11 @@ pub(crate) fn convert_to_openrtb_response_with_report(
                 slot_id,
                 bid.bidder
             );
-            delivery.record_drop(AuctionDropReason::NoRenderSource);
+            dropped_winner_count += 1;
+            record_auction_drop(
+                &mut dropped_winner_reasons,
+                AuctionDropReason::NoRenderSource,
+            );
             continue;
         };
 
@@ -966,7 +941,6 @@ pub(crate) fn convert_to_openrtb_response_with_report(
             bid: vec![openrtb_bid],
             ..Default::default()
         });
-        delivery.delivered_winner_slots.insert(slot_id.clone());
     }
 
     // Determine strategy name for response metadata
@@ -993,8 +967,8 @@ pub(crate) fn convert_to_openrtb_response_with_report(
                 total_bids: result.total_bids(),
                 time_ms: result.total_time_ms,
                 provider_details,
-                dropped_winner_count: delivery.dropped_winner_count,
-                dropped_winner_reasons: delivery.dropped_winner_reasons.clone(),
+                dropped_winner_count,
+                dropped_winner_reasons,
             },
         }
         .to_ext(),
@@ -1016,7 +990,7 @@ pub(crate) fn convert_to_openrtb_response_with_report(
 
     attach_auction_response_headers(&mut response, auction_request, ec_allowed)?;
 
-    Ok(OpenRtbResponseConversion { response, delivery })
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -1965,20 +1939,9 @@ mod tests {
             metadata: HashMap::new(),
         };
 
-        let conversion =
-            convert_to_openrtb_response_with_report(&result, &settings, &auction_request, false)
-                .expect("should omit invalid winners and preserve valid slots");
-        assert_eq!(
-            conversion.delivery.delivered_winner_slots,
-            HashSet::from(["ordinary".to_string(), "renderer".to_string()]),
-            "should report only serialized winners as delivered"
-        );
-        assert_eq!(conversion.delivery.dropped_winner_count, 2);
-        assert_eq!(
-            conversion.delivery.dropped_winner_reasons[&AuctionDropReason::NoRenderSource],
-            2
-        );
-        let json = response_json(conversion.response);
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
+            .expect("should omit invalid winners and preserve valid slots");
+        let json = response_json(response);
         let bids: Vec<&JsonValue> = json["seatbid"]
             .as_array()
             .expect("should include valid seatbids")
@@ -2029,20 +1992,16 @@ mod tests {
         }));
         let result = make_result(bid);
 
-        let conversion =
-            convert_to_openrtb_response_with_report(&result, &settings, &auction_request, false)
-                .expect("should reject an ambiguous render source");
-        let json = response_json(conversion.response);
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
+            .expect("should reject an ambiguous render source");
+        let json = response_json(response);
         assert!(
             json["seatbid"].as_array().is_none_or(Vec::is_empty),
             "should not serialize an ambiguous winner"
         );
-        assert_eq!(conversion.delivery.dropped_winner_count, 1);
-        assert!(
-            conversion
-                .delivery
-                .dropped_winner_reasons
-                .contains_key(&AuctionDropReason::MultipleRenderSources),
+        assert_eq!(json["ext"]["orchestrator"]["dropped_winner_count"], 1);
+        assert_eq!(
+            json["ext"]["orchestrator"]["dropped_winner_reasons"]["multiple_render_sources"], 1,
             "should report the exact ambiguous-source reason"
         );
     }

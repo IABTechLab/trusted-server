@@ -43,7 +43,7 @@ providers = ["aps", "prebid"]
 timeout_ms = 2000
 ```
 
-`account_id` is the canonical field. `pub_id` remains a compatibility alias for migration, including integer values, but new configuration should not use it. Supplying both names is an error.
+`account_id` is required. It accepts a non-empty string or integer account identifier; no alternate field name is supported.
 
 `debug` defaults to `false`. Enable it only on controlled test sites because it includes the raw APS request and response, including identity, consent, device, page, account, bid, and creative data, in the client-visible `/auction` response.
 
@@ -51,7 +51,7 @@ timeout_ms = 2000
 
 Set `inventory_domain` and `inventory_page_origin` together only when the public deployment hostname differs from the inventory identity authorized by APS. The domain becomes `site.domain`. The HTTPS page origin replaces the current page's scheme and host while preserving its path and query. The origin must be the inventory domain or one of its subdomains and cannot include credentials, a port, path, query, or fragment. These values come only from operator configuration; Trusted Server never accepts APS inventory identity from the client auction payload.
 
-APS uses ordinary auction slot IDs and banner formats. Legacy creative-opportunity APS `slot_id` configuration is accepted for compatibility but ignored, and `bidders.aps.slotID` is not required. Remove both during migration.
+APS uses ordinary auction slot IDs and banner formats. It does not read APS-specific creative-opportunity slot IDs or `bidders.aps.slotID`.
 
 The APS provider may also participate through a configured mediator:
 
@@ -150,7 +150,7 @@ Trusted Server does not insert APS creative markup into the publisher document. 
 
 Seats, `impid`, markup, notifications, user-sync data, sibling bids, losing seats, and unknown fields are not exposed. The browser decodes this envelope and cross-checks the ID, dimensions, URL, and tag type before any DOM mutation or message suppression.
 
-Both rendering paths use `GET /integrations/aps/renderer`, a static Trusted Server document with its own restrictive CSP. The document initializes the account-keyed APS queue and then loads only the fixed runner at `https://client.aps.amazon-adsystem.com/prebid-creative.js`.
+Both rendering paths use `GET /integrations/aps/renderer/v1`, a versioned static Trusted Server document with its own restrictive CSP. The document initializes the account-keyed APS queue and then loads the live runner through the fixed first-party proxy at `GET /integrations/aps/runner.js`. Trusted Server neither vendors nor pins the upstream runner bytes.
 
 The outer iframe uses these sandbox permissions:
 
@@ -202,7 +202,7 @@ If script rendering requires weakening the outer sandbox, leave `allow_script_cr
 This release is a direct protocol cutover:
 
 1. Replace the legacy `/e/dtb/bid` endpoint with `/e/pb/bid`.
-2. Rename `pub_id` to `account_id`.
+2. Configure the required `account_id` field.
 3. Remove APS-specific slot ID configuration and remove `aps` from Prebid Server bidder lists. Trusted Server also filters APS from PBS requests for this path.
 4. Prepare GAM line items and Universal Creative for `hb_bidder=aps` and the selected APS `hb_adid`.
 5. Disable publisher-native APS demand for the Trusted Server test cohort.
@@ -235,10 +235,10 @@ Use fictional values in source-controlled configuration and fixtures. Supply con
 
 ### Winner targets but does not render
 
-- Confirm `GET /integrations/aps/renderer` returns HTML with its CSP and `Referrer-Policy: no-referrer`.
+- Confirm `GET /integrations/aps/renderer/v1` returns HTML with its CSP and `Referrer-Policy: no-referrer`.
 - Confirm publisher CSP permits `frame-src 'self'`.
 - Confirm the GAM creative uses the supported Prebid Universal Creative bridge and the winning `hb_adid`.
-- For client-side `trustedServer` adapter auctions, confirm Prebid's `bidResponse` contains a generated `adId` and that the corresponding capability appears briefly in `window.tsjs.apsPrebidRenderers` before rendering.
+- For client-side `trustedServer` adapter auctions, confirm the bid joins the server-minted `r1_` reservation and that the private PUC bridge accepts exactly one claim for it.
 - Ensure no native APS path is trying to handle the same cohort.
 - Keep script creatives disabled while diagnosing iframe rendering.
 

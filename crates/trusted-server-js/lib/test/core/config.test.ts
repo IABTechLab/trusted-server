@@ -1,25 +1,6 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 
 describe('config', () => {
-  beforeEach(async () => {
-    // reset module state between tests
-    await vi.resetModules();
-  });
-
-  it('sets and gets config, controls log level', async () => {
-    const { setConfig, getConfig } = await import('../../src/core/config');
-    const { log } = await import('../../src/core/log');
-
-    setConfig({ a: 1 });
-    expect(getConfig()).toMatchObject({ a: 1 });
-
-    setConfig({ debug: true });
-    expect(log.getLevel()).toBe('debug');
-
-    setConfig({ logLevel: 'info' });
-    expect(log.getLevel()).toBe('info');
-  });
-
   it('validates, snapshots, and freezes one exact cache fetch policy', async () => {
     const { parseCacheFetchPolicyV1 } = await import('../../src/core/config');
     const input = {

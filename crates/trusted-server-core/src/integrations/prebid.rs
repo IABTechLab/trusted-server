@@ -205,9 +205,8 @@ pub struct PrebidIntegrationConfig {
     pub enabled: bool,
     #[validate(url)]
     pub server_url: String,
-    /// Prebid Server account ID, injected into the client-side bundle via
-    /// `window.__tsjs_prebid.accountId` so publishers don't need to configure
-    /// it in JavaScript.
+    /// Prebid Server account ID delivered through the release-bound immutable
+    /// integration configuration so publishers do not configure it in JavaScript.
     #[serde(default)]
     pub account_id: Option<String>,
     #[serde(default = "default_timeout_ms")]

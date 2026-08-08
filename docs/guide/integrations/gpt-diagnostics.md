@@ -104,7 +104,7 @@ The visual host mounts only after the document is complete and two animation fra
 When active, the integration exposes a read-only API:
 
 ```js
-const diagnostics = window.tsjs.gptDiagnostics
+const diagnostics = window.tsjs.diagnostics.gpt
 
 diagnostics.snapshot()
 diagnostics.export()

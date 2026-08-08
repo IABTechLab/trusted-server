@@ -49,6 +49,19 @@ function descriptor() {
 }
 
 test.describe("APS renderer v1 protocol", () => {
+  test("leaves every removed or unknown APS route unserved", async ({
+    page,
+  }) => {
+    for (const path of [
+      "/integrations/aps/renderer",
+      "/integrations/aps/renderer/v2",
+      "/integrations/aps/runner/v1.js",
+    ]) {
+      const response = await page.request.get(runtimeUrl(path));
+      expect(response.status(), path).toBe(404);
+    }
+  });
+
   test("uses one port, reports ordered progress, and fails closed", async ({
     page,
   }) => {

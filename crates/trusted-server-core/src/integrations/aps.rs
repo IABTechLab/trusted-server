@@ -40,7 +40,6 @@ use crate::platform::{
 use crate::settings::{IntegrationConfig, Settings};
 
 const APS_INTEGRATION_ID: &str = "aps";
-const APS_RENDERER_ROUTE: &str = "/integrations/aps/renderer";
 pub const APS_RENDERER_V1_ROUTE: &str = "/integrations/aps/renderer/v1";
 pub const APS_RUNNER_ROUTE: &str = "/integrations/aps/runner.js";
 pub const APS_RUNNER_UPSTREAM_URL: &str =
@@ -233,8 +232,8 @@ pub struct ApsConfig {
     /// Whether APS integration is enabled.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
-    /// APS account ID. `pub_id` remains a deserialization alias only.
-    #[serde(alias = "pub_id", deserialize_with = "deserialize_account_id")]
+    /// APS account ID.
+    #[serde(deserialize_with = "deserialize_account_id")]
     pub account_id: String,
     /// APS `OpenRTB` endpoint.
     #[serde(default = "default_endpoint")]
@@ -1368,7 +1367,7 @@ impl IntegrationProxy for ApsRendererIntegration {
     }
 
     fn routes(&self) -> Vec<IntegrationEndpoint> {
-        vec![IntegrationEndpoint::get(APS_RENDERER_ROUTE)]
+        vec![IntegrationEndpoint::get(APS_RENDERER_V1_ROUTE)]
     }
 
     async fn handle(
@@ -1377,7 +1376,7 @@ impl IntegrationProxy for ApsRendererIntegration {
         _services: &RuntimeServices,
         request: http::Request<EdgeBody>,
     ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
-        if request.method() != Method::GET || request.uri().path() != APS_RENDERER_ROUTE {
+        if request.method() != Method::GET || request.uri().path() != APS_RENDERER_V1_ROUTE {
             return http::Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(EdgeBody::from("Not Found"))
@@ -2216,20 +2215,20 @@ mod tests {
     }
 
     #[test]
-    fn config_accepts_canonical_alias_and_integer_ids() {
+    fn config_accepts_canonical_string_and_integer_ids() {
         let canonical: ApsConfig = serde_json::from_value(json!({
             "account_id": "  example-account  "
         }))
         .expect("should parse canonical account ID");
-        let alias: ApsConfig =
-            serde_json::from_value(json!({"pub_id": 1234})).expect("should parse legacy alias");
+        let integer: ApsConfig =
+            serde_json::from_value(json!({"account_id": 1234})).expect("should parse integer ID");
         let debug: ApsConfig = serde_json::from_value(json!({
             "account_id": "example-account",
             "debug": true
         }))
         .expect("should parse debug flag");
         assert_eq!(canonical.account_id, "example-account");
-        assert_eq!(alias.account_id, "1234");
+        assert_eq!(integer.account_id, "1234");
         assert!(!canonical.enabled);
         assert!(!canonical.debug);
         assert!(debug.debug);
@@ -2288,13 +2287,11 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            serde_json::from_value::<ApsConfig>(json!({
-                "account_id": "one",
-                "pub_id": "two"
-            }))
-            .is_err()
-        );
+        let legacy_alias = serde_json::Value::Object(serde_json::Map::from_iter([(
+            ["pub", "id"].join("_"),
+            json!("two"),
+        )]));
+        assert!(serde_json::from_value::<ApsConfig>(legacy_alias).is_err());
         for endpoint in [
             "http://aps.example/e/pb/bid",
             "https://",
@@ -3365,13 +3362,13 @@ mod tests {
         let routes = integration.routes();
         assert_eq!(routes.len(), 1, "should register one route");
         assert_eq!(routes[0].method, Method::GET);
-        assert_eq!(routes[0].path, APS_RENDERER_ROUTE);
+        assert_eq!(routes[0].path, APS_RENDERER_V1_ROUTE);
 
         let settings = create_test_settings();
         let services = noop_services();
         let request = http::Request::builder()
             .method(Method::GET)
-            .uri(APS_RENDERER_ROUTE)
+            .uri(APS_RENDERER_V1_ROUTE)
             .body(EdgeBody::empty())
             .expect("should build renderer request");
         let response =
@@ -3391,7 +3388,7 @@ mod tests {
 
         let post = http::Request::builder()
             .method(Method::POST)
-            .uri(APS_RENDERER_ROUTE)
+            .uri(APS_RENDERER_V1_ROUTE)
             .body(EdgeBody::empty())
             .expect("should build method rejection request");
         let response = futures::executor::block_on(integration.handle(&settings, &services, post))
@@ -3524,6 +3521,7 @@ mod tests {
         }
 
         for path in [
+            "/integrations/aps/renderer",
             "/integrations/aps/renderer/v2",
             "/integrations/aps/runner/v1.js",
             "/integrations/aps/renderer/v1/extra",

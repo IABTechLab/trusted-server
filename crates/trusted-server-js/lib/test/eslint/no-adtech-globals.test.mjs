@@ -6,14 +6,8 @@ import test from 'node:test';
 import { ESLint, Linter } from 'eslint';
 import ts from 'typescript';
 
-import noAdtechGlobals, {
-  LEGACY_ADTECH_GLOBAL_ALLOWLIST,
-  LEGACY_RESTRICTED_IMPORT_ALLOWLIST,
-} from '../../eslint-rules/no-adtech-globals.js';
-import {
-  ARCHITECTURE_INTEGRATION_DIRECTORIES,
-  ARCHITECTURE_RESTRICTED_LAYER_ZONES,
-} from '../../eslint.config.js';
+import noAdtechGlobals from '../../eslint-rules/no-adtech-globals.js';
+import { ARCHITECTURE_INTEGRATION_DIRECTORIES } from '../../eslint.config.js';
 
 const ruleId = 'tsjs/no-adtech-globals';
 const packageRoot = path.resolve(import.meta.dirname, '../..');
@@ -43,12 +37,7 @@ function lint(source, filename = 'src/kernel/new-runtime.js') {
           },
         },
         rules: {
-          [ruleId]: [
-            'error',
-            {
-              allowFiles: LEGACY_ADTECH_GLOBAL_ALLOWLIST,
-            },
-          ],
+          [ruleId]: 'error',
         },
       },
     ],
@@ -219,57 +208,9 @@ test('permits external-global ownership only in adapter source files', () => {
   assertRejected('window.googletag;', 'src/adapters-pretender/googletag.js');
 });
 
-test('temporary allowlists are exact, narrow, and inventoried for Task 22 removal', () => {
-  assert.deepEqual(LEGACY_ADTECH_GLOBAL_ALLOWLIST, [
-    'src/integrations/gpt/index.ts',
-    'src/integrations/prebid/index.ts',
-  ]);
-  assert.deepEqual(LEGACY_RESTRICTED_IMPORT_ALLOWLIST, [
-    'src/core/request.ts',
-    'src/integrations/gpt/index.ts',
-    'src/integrations/prebid/index.ts',
-  ]);
-
-  assert.deepEqual(lint('window.googletag;', 'src/integrations/gpt/index.ts'), []);
-  assertRejected('window.googletag;', 'src/integrations/gpt/index-copy.ts');
-  assertRejected('window.googletag;', 'src/new/src/integrations/gpt/index.ts');
-});
-
-test('every temporary exemption still maps to an active legacy violation', async () => {
-  const strictEslint = new ESLint({
-    cwd: packageRoot,
-    overrideConfig: {
-      files: ['src/**/*.ts', 'src/**/*.tsx'],
-      rules: {
-        'tsjs/no-adtech-globals': ['error', { allowFiles: [] }],
-        'import-x/no-restricted-paths': [
-          'error',
-          {
-            basePath: packageRoot,
-            zones: ARCHITECTURE_RESTRICTED_LAYER_ZONES,
-          },
-        ],
-      },
-    },
-  });
-
-  for (const relativeFilename of LEGACY_ADTECH_GLOBAL_ALLOWLIST) {
-    const [result] = await strictEslint.lintFiles([relativeFilename]);
-    assert.ok(result);
-    assert.ok(
-      result.messages.some((message) => message.ruleId === 'tsjs/no-adtech-globals'),
-      `${relativeFilename} no longer needs its ad-tech-global exemption`
-    );
-  }
-
-  for (const relativeFilename of LEGACY_RESTRICTED_IMPORT_ALLOWLIST) {
-    const [result] = await strictEslint.lintFiles([relativeFilename]);
-    assert.ok(result);
-    assert.ok(
-      result.messages.some((message) => message.ruleId === 'import-x/no-restricted-paths'),
-      `${relativeFilename} no longer needs its restricted-import exemption`
-    );
-  }
+test('integration entrypoints have no ad-tech-global exemption', () => {
+  assertRejected('window.googletag;', 'src/integrations/gpt/index.ts');
+  assertRejected('globalThis.pbjs;', 'src/integrations/prebid/index.ts');
 });
 
 test('restricted paths enforce dependency direction and exact target-file exemptions', async () => {
@@ -348,9 +289,9 @@ test('restricted paths enforce dependency direction and exact target-file exempt
       .length > 0
   );
 
-  assert.deepEqual(
-    await restrictedMessages("import '../integrations/aps/render';", 'src/core/request.ts'),
-    []
+  assert.ok(
+    (await restrictedMessages("import '../integrations/aps/render';", 'src/core/request.ts')).length >
+      0
   );
   assert.ok(
     (await restrictedMessages("import '../integrations/aps/render';", 'src/kernel/request.ts'))

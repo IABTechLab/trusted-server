@@ -110,7 +110,7 @@ function largeAdmProjection(admLengths: number[]): BrowserAuctionProjectionV1 {
 }
 
 describe('auction/buildAdRequest', () => {
-  it('builds from tsjs AdUnit objects', () => {
+  it('builds from direct-auction programmatic units', () => {
     const units = [
       {
         code: 'div-1',

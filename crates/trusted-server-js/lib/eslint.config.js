@@ -7,10 +7,7 @@ import tseslint from 'typescript-eslint';
 import jsdoc from 'eslint-plugin-jsdoc';
 import unicorn from 'eslint-plugin-unicorn';
 
-import noAdtechGlobals, {
-  LEGACY_ADTECH_GLOBAL_ALLOWLIST,
-  LEGACY_RESTRICTED_IMPORT_ALLOWLIST,
-} from './eslint-rules/no-adtech-globals.js';
+import noAdtechGlobals from './eslint-rules/no-adtech-globals.js';
 
 export const ARCHITECTURE_INTEGRATION_DIRECTORIES = Object.freeze([
   'aps',
@@ -118,15 +115,12 @@ export default [
       'import-x/order': ['error', { 'newlines-between': 'always' }],
     },
   },
-  // New architecture paths are clean by default. These exact legacy files are
-  // removed from the exemption list during the Task 22 hard cutover.
   {
     files: ['src/**/*.ts', 'src/**/*.tsx'],
     rules: {
       'tsjs/no-adtech-globals': [
         'error',
         {
-          allowFiles: LEGACY_ADTECH_GLOBAL_ALLOWLIST,
           rootDirectory: import.meta.dirname,
         },
       ],
@@ -134,7 +128,6 @@ export default [
   },
   {
     files: ['src/**/*.ts', 'src/**/*.tsx'],
-    ignores: LEGACY_RESTRICTED_IMPORT_ALLOWLIST,
     rules: {
       'import-x/no-restricted-paths': [
         'error',

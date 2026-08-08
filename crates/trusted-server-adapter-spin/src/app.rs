@@ -202,7 +202,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 13] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 14] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
@@ -213,6 +213,7 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 13] {
         ("/_ts/trace", &[Method::GET]),
         ("/auction", &[Method::POST]),
         (PAGE_BIDS_PATH, &[Method::GET, Method::OPTIONS]),
+        ("/__ts/page-bids", LEGACY_ADMIN_DENY_METHODS),
         ("/first-party/proxy", &[Method::GET]),
         ("/first-party/click", &[Method::GET]),
         ("/first-party/sign", &[Method::GET, Method::POST]),
@@ -847,6 +848,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         for method in LEGACY_ADMIN_DENY_METHODS {
             builder = builder.route("/admin/keys/rotate", method.clone(), legacy_admin_deny);
             builder = builder.route("/admin/keys/deactivate", method.clone(), legacy_admin_deny);
+            builder = builder.route("/__ts/page-bids", method.clone(), legacy_admin_deny);
         }
 
         // Mirror the Fastly/Axum publisher fallback: every supported method that is

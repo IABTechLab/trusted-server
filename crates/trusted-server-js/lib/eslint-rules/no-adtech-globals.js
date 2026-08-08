@@ -5,17 +5,6 @@ const GLOBAL_ROOTS = new Set(['globalThis', 'self', 'window']);
 // and function-returned roots (`getWin().googletag`); adapter boundaries and
 // restricted imports remain defense in depth.
 
-export const LEGACY_ADTECH_GLOBAL_ALLOWLIST = Object.freeze([
-  'src/integrations/gpt/index.ts',
-  'src/integrations/prebid/index.ts',
-]);
-
-export const LEGACY_RESTRICTED_IMPORT_ALLOWLIST = Object.freeze([
-  'src/core/request.ts',
-  'src/integrations/gpt/index.ts',
-  'src/integrations/prebid/index.ts',
-]);
-
 function normalizeFilename(filename, rootDirectory) {
   const normalized = filename.replaceAll('\\', '/');
   if (!rootDirectory) return normalized.startsWith('./') ? normalized.slice(2) : normalized;
@@ -108,11 +97,6 @@ export default {
       {
         type: 'object',
         properties: {
-          allowFiles: {
-            type: 'array',
-            items: { type: 'string' },
-            uniqueItems: true,
-          },
           rootDirectory: { type: 'string' },
         },
         additionalProperties: false,
@@ -127,10 +111,9 @@ export default {
   create(context) {
     const sourceCode = context.sourceCode;
     const relativeFilename = normalizeFilename(context.filename, context.options[0]?.rootDirectory);
-    const allowFiles = new Set(context.options[0]?.allowFiles ?? []);
     const isAdapter = relativeFilename.startsWith('src/adapters/');
 
-    if (isAdapter || allowFiles.has(relativeFilename)) return {};
+    if (isAdapter) return {};
 
     const assignments = new Map();
     const patternAssignments = new Map();

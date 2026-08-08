@@ -20,11 +20,7 @@ type HeapCheckpoint =
   | "afterSpaNavigation";
 
 interface PerfApi {
-  addAdUnits(unit: {
-    code: string;
-    mediaTypes: { banner: { sizes: Array<[number, number]> } };
-  }): void;
-  renderAdUnit(code: string): void;
+  requestAds(options?: { slots?: readonly string[] }): Promise<unknown>;
 }
 
 function fixtureDocument(): string {
@@ -33,10 +29,10 @@ function fixtureDocument(): string {
 <title>TSJS deterministic performance fixture v1</title>
 <div id="perf-slot"></div>
 <script>
-  window.__tsjsPerf = { bootStartedAt: performance.now(), firstDisplayAt: null };
+  performance.mark("tsjs:boot");
   new MutationObserver(function recordFirstDisplay() {
-    if (window.__tsjsPerf.firstDisplayAt === null) {
-      window.__tsjsPerf.firstDisplayAt = performance.now();
+    if (performance.getEntriesByName("tsjs:first-display").length === 0) {
+      performance.mark("tsjs:first-display");
     }
   }).observe(document.getElementById("perf-slot"), {
     childList: true,
@@ -57,19 +53,13 @@ async function openFixture(
 }
 
 async function render(page: Page): Promise<number> {
-  return page.evaluate(() => {
-    const perfWindow = window as unknown as {
-      tsjs: PerfApi;
-      __tsjsPerf: { bootStartedAt: number; firstDisplayAt: number | null };
-    };
-    perfWindow.tsjs.addAdUnits({
-      code: "perf-slot",
-      mediaTypes: { banner: { sizes: [[300, 250]] } },
-    });
-    perfWindow.tsjs.renderAdUnit("perf-slot");
-    const firstDisplayAt =
-      perfWindow.__tsjsPerf.firstDisplayAt ?? performance.now();
-    return firstDisplayAt - perfWindow.__tsjsPerf.bootStartedAt;
+  return page.evaluate(async () => {
+    const perfWindow = window as unknown as { tsjs: PerfApi };
+    await perfWindow.tsjs.requestAds({ slots: ["perf-slot"] });
+    const boot = performance.getEntriesByName("tsjs:boot")[0]?.startTime ?? performance.now();
+    const firstDisplay =
+      performance.getEntriesByName("tsjs:first-display")[0]?.startTime ?? performance.now();
+    return firstDisplay - boot;
   });
 }
 
@@ -134,19 +124,19 @@ test.describe("TSJS deterministic performance evidence", () => {
       retainedHeapBytes.afterBoot = await collectHeap(heapFixture.page);
       await render(heapFixture.page);
       retainedHeapBytes.afterFirstRender = await collectHeap(heapFixture.page);
-      await heapFixture.page.evaluate(() => {
+      await heapFixture.page.evaluate(async () => {
         const perfWindow = window as unknown as { tsjs: PerfApi };
-        perfWindow.tsjs.renderAdUnit("perf-slot");
+        await perfWindow.tsjs.requestAds({ slots: ["perf-slot"] });
       });
       retainedHeapBytes.afterRefresh = await collectHeap(heapFixture.page);
-      await heapFixture.page.evaluate(() => {
+      await heapFixture.page.evaluate(async () => {
         location.hash = "performance-fixture-navigation";
         const oldSlot = document.getElementById("perf-slot");
         const replacement = document.createElement("div");
         replacement.id = "perf-slot";
         oldSlot?.replaceWith(replacement);
         const perfWindow = window as unknown as { tsjs: PerfApi };
-        perfWindow.tsjs.renderAdUnit("perf-slot");
+        await perfWindow.tsjs.requestAds({ slots: ["perf-slot"] });
       });
       retainedHeapBytes.afterSpaNavigation = await collectHeap(
         heapFixture.page,

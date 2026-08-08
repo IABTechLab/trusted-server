@@ -156,7 +156,7 @@ sequenceDiagram
   %% === Creative Rendering ===
   rect rgb(239,246,255)
     Note over Client,Mock: Creative Rendering
-    Client->>Client: Validate renderer descriptor<br/>Create opaque sandbox iframe<br/>Load /integrations/aps/renderer
+    Client->>Client: Validate renderer descriptor<br/>Create opaque sandbox iframe<br/>Load /integrations/aps/renderer/v1
     Note right of Client: Fragment-bound nonce and one-time acknowledgement<br/>No allow-same-origin on the outer frame
     deactivate Client
   end
@@ -710,16 +710,16 @@ environment overrides to apply; see
 
 #### `[integrations.aps]`
 
-| Field                    | Type   | Default                       | Description                                                       |
-| ------------------------ | ------ | ----------------------------- | ----------------------------------------------------------------- |
-| `enabled`                | bool   | `false`                       | Enable APS provider                                               |
-| `account_id`             | string | —                             | APS account ID (required; `pub_id` is an alias)                   |
-| `endpoint`               | string | Built-in APS OpenRTB endpoint | Optional APS OpenRTB endpoint override                            |
-| `timeout_ms`             | u32    | `800`                         | Request timeout                                                   |
-| `debug`                  | bool   | `false`                       | Include the raw APS HTTP exchange in `/auction` provider metadata |
-| `inventory_domain`       | string | —                             | Override `site.domain` for APS-authorized inventory               |
-| `inventory_page_origin`  | string | —                             | HTTPS origin paired with `inventory_domain` for `site.page`       |
-| `allow_script_creatives` | bool   | `false`                       | Admit script bids before APS candidate reduction                  |
+| Field                    | Type              | Default                       | Description                                                       |
+| ------------------------ | ----------------- | ----------------------------- | ----------------------------------------------------------------- |
+| `enabled`                | bool              | `false`                       | Enable APS provider                                               |
+| `account_id`             | string or integer | —                             | APS account ID (required)                                         |
+| `endpoint`               | string            | Built-in APS OpenRTB endpoint | Optional APS OpenRTB endpoint override                            |
+| `timeout_ms`             | u32               | `800`                         | Request timeout                                                   |
+| `debug`                  | bool              | `false`                       | Include the raw APS HTTP exchange in `/auction` provider metadata |
+| `inventory_domain`       | string            | —                             | Override `site.domain` for APS-authorized inventory               |
+| `inventory_page_origin`  | string            | —                             | HTTPS origin paired with `inventory_domain` for `site.page`       |
+| `allow_script_creatives` | bool              | `false`                       | Admit script bids before APS candidate reduction                  |
 
 #### `[integrations.adserver_mock]`
 

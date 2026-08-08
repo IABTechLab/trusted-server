@@ -614,6 +614,9 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             );
             router = router.route("/admin/keys/deactivate", method, legacy_admin_deny.clone());
         }
+        for method in publisher_fallback_methods() {
+            router = router.route("/__ts/page-bids", method, legacy_admin_deny.clone());
+        }
 
         for method in publisher_fallback_methods() {
             router = router.route("/", method.clone(), fallback.clone());

@@ -259,6 +259,9 @@ jobs:
       - name: Verify generated APS renderer contract
         run: npm run check:aps-contract
 
+      - name: Enforce hard-cutover architecture
+        run: npm run check:architecture
+
       - name: Run embedded APS renderer contract
         run: node --test test/contract/aps-renderer-es5.test.mjs
 
