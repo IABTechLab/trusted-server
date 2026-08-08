@@ -307,6 +307,7 @@ export class GptDiagnosticsStore {
   private readonly slots = new Map<number, MutableSlotRecord>();
   private readonly slotOrder: number[] = [];
   private readonly slotActivityOrder: number[] = [];
+  private readonly commitListeners = new Set<StoreListener>();
   private readonly listeners = new Set<StoreListener>();
   private readonly coverage = emptyCoverage();
   private readonly callbackIssues: GptDiagnosticsCallbackIssue[] = [];
@@ -574,6 +575,11 @@ export class GptDiagnosticsStore {
   subscribe(listener: StoreListener): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  subscribeCommits(listener: StoreListener): () => void {
+    this.commitListeners.add(listener);
+    return () => this.commitListeners.delete(listener);
   }
 
   recordSlotRequested(slot: GptDiagnosticsSlotLike, observedAtMs?: number): void {
@@ -963,6 +969,13 @@ export class GptDiagnosticsStore {
   }
 
   private notify(): void {
+    for (const listener of [...this.commitListeners]) {
+      try {
+        listener();
+      } catch {
+        // One correctness observer must not block the committed store mutation.
+      }
+    }
     if (this.notificationScheduled) return;
     this.notificationScheduled = true;
     this.schedule(() => {
