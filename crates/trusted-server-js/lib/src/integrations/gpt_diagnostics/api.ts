@@ -6,7 +6,7 @@ import type { GptDiagnosticsStoreSnapshot } from './store';
 
 interface ApiStore {
   snapshot(): GptDiagnosticsStoreSnapshot;
-  subscribe(listener: () => void): () => void;
+  subscribeCommits(listener: () => void): () => void;
 }
 
 interface ApiBindingManager {
@@ -76,7 +76,7 @@ export class GptDiagnosticsApiController {
     this.document = options.document ?? document;
     this.now = options.now ?? (() => new Date());
     this.schedule = options.schedule ?? scheduleTask;
-    this.unsubscribeStore = this.store.subscribe(() => this.scheduleNotification());
+    this.unsubscribeStore = this.store.subscribeCommits(() => this.scheduleNotification());
     this.unsubscribeBindings = this.bindings.subscribe(() => this.scheduleNotification());
 
     this.api = Object.freeze({

@@ -412,6 +412,27 @@ describe('GptDiagnosticsStore', () => {
     expect(goodListener).toHaveBeenCalledTimes(1);
   });
 
+  it('announces correctness commits synchronously while coalescing presentation work', () => {
+    const scheduled: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({
+      now: () => 1,
+      schedule: (callback) => scheduled.push(callback),
+    });
+    const commitListener = vi.fn();
+    const presentationListener = vi.fn();
+    store.subscribeCommits(commitListener);
+    store.subscribe(presentationListener);
+
+    store.markGptObserved();
+    store.recordSlotRequested(fakeSlot('commit-membership'));
+
+    expect(commitListener).toHaveBeenCalledTimes(2);
+    expect(presentationListener).not.toHaveBeenCalled();
+    expect(scheduled).toHaveLength(1);
+    scheduled.shift()?.();
+    expect(presentationListener).toHaveBeenCalledOnce();
+  });
+
   it('returns detached snapshot data', () => {
     const store = new GptDiagnosticsStore({ now: () => 1 });
     const slot = fakeSlot('detached');

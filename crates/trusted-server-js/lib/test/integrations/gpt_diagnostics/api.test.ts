@@ -192,6 +192,80 @@ describe('GptDiagnosticsApiController', () => {
     );
   });
 
+  it('excludes a subscriber registered after the store commit but before source microtasks', () => {
+    const sourceTasks: Array<() => void> = [];
+    const publicTasks: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({
+      now: () => 1,
+      schedule: (callback) => sourceTasks.push(callback),
+    });
+    const controller = new GptDiagnosticsApiController(
+      store,
+      new FakeBindings(),
+      { show: vi.fn(), hide: vi.fn() },
+      { schedule: scheduleInto(publicTasks) }
+    );
+
+    store.recordSlotRequested(fakeSlot());
+    const late = vi.fn();
+    controller.api.subscribe(late);
+    while (sourceTasks.length > 0) sourceTasks.shift()?.();
+    while (publicTasks.length > 0) publicTasks.shift()?.();
+
+    expect(late).not.toHaveBeenCalled();
+  });
+
+  it('includes a subscriber registered before the store commit without calling it inline', () => {
+    const sourceTasks: Array<() => void> = [];
+    const publicTasks: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({
+      now: () => 1,
+      schedule: (callback) => sourceTasks.push(callback),
+    });
+    const controller = new GptDiagnosticsApiController(
+      store,
+      new FakeBindings(),
+      { show: vi.fn(), hide: vi.fn() },
+      { schedule: scheduleInto(publicTasks) }
+    );
+    const listener = vi.fn();
+    controller.api.subscribe(listener);
+
+    store.recordSlotRequested(fakeSlot());
+    expect(listener).not.toHaveBeenCalled();
+    while (sourceTasks.length > 0) sourceTasks.shift()?.();
+    expect(listener).not.toHaveBeenCalled();
+    while (publicTasks.length > 0) publicTasks.shift()?.();
+
+    expect(listener).toHaveBeenCalledOnce();
+  });
+
+  it('defers a subscriber registered during dispatch until the next commit', () => {
+    const publicTasks: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({ now: () => 1, schedule: (callback) => callback() });
+    const controller = new GptDiagnosticsApiController(
+      store,
+      new FakeBindings(),
+      { show: vi.fn(), hide: vi.fn() },
+      { schedule: scheduleInto(publicTasks) }
+    );
+    const second = vi.fn();
+    const first = vi.fn(() => controller.api.subscribe(second));
+    controller.api.subscribe(first);
+
+    const observedSlot = fakeSlot();
+    store.recordSlotRequested(observedSlot);
+    expect(first).not.toHaveBeenCalled();
+    publicTasks.shift()?.();
+    expect(first).toHaveBeenCalledOnce();
+    expect(second).not.toHaveBeenCalled();
+
+    store.recordSlotVisibilityChanged(observedSlot, 10);
+    publicTasks.shift()?.();
+    expect(first).toHaveBeenCalledTimes(2);
+    expect(second).toHaveBeenCalledOnce();
+  });
+
   it('validates callability before enforcing the shared 32-subscriber cap', () => {
     const controller = new GptDiagnosticsApiController(
       new GptDiagnosticsStore({ now: () => 1 }),
