@@ -466,13 +466,8 @@ mod tests {
     }
 
     #[test]
-    fn register_excludes_diagnostics_from_unified_and_deferred_bundles() {
-        let settings = settings(true);
-        let plan = std::sync::Arc::new(
-            crate::auction::compile_auction_plan(&settings).expect("should compile auction plan"),
-        );
-        let registry =
-            IntegrationRegistry::with_plan(&settings, plan).expect("should build registry");
+    fn ts_console_register_excludes_diagnostics_from_unified_and_deferred_bundles() {
+        let registry = IntegrationRegistry::new(&settings(true)).expect("should build registry");
 
         assert!(registry.integration_enabled(GPT_DIAGNOSTICS_INTEGRATION_ID));
         assert!(
@@ -488,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_directive_activates_cleans_and_strips_cookie() {
+    fn ts_console_exact_directive_activates_cleans_and_strips_cookie() {
         let mut request = navigation(
             "https://publisher.example/page?keep=%2F&ts_console=true#fragment",
             Some("other=value; __Host-ts-console=1"),
@@ -512,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn prefetch_directive_is_sanitized_without_activating_session() {
+    fn ts_console_prefetch_directive_is_sanitized_without_activating_session() {
         let mut request = navigation("https://publisher.example/page?ts_console=1&keep=1", None);
         request
             .headers_mut()
@@ -529,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn active_cookie_enables_clean_navigation_but_duplicates_fail_closed() {
+    fn ts_console_active_cookie_enables_clean_navigation_but_duplicates_fail_closed() {
         let mut active = navigation(
             "https://publisher.example/page",
             Some("__Host-ts-console=1; other=value"),
@@ -548,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_duplicate_and_disable_directives_fail_closed() {
+    fn ts_console_invalid_duplicate_and_disable_directives_fail_closed() {
         for query in [
             "ts_console=True",
             "ts_console=",
@@ -577,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn finalization_sets_cookie_and_strips_shared_cache_headers() {
+    fn ts_console_finalization_sets_cookie_and_strips_shared_cache_headers() {
         let mut request = navigation("https://publisher.example/?ts_console=1", None);
         let decision = prepare_request(&settings(true), &mut request).expect("should prepare");
         let mut response = Response::builder()
@@ -676,7 +671,51 @@ mod tests {
     }
 
     #[test]
-    fn config_rejects_unknown_fields() {
+    fn ts_console_only_eligible_get_document_navigations_activate() {
+        for (method, destination) in [(Method::POST, "document"), (Method::GET, "script")] {
+            let mut request = Request::builder()
+                .method(method.clone())
+                .uri("https://publisher.example/page?keep=1&ts_console=1")
+                .header("sec-fetch-dest", destination)
+                .header(header::COOKIE, "__Host-ts-console=1; other=value")
+                .body(EdgeBody::empty())
+                .expect("should build ineligible request");
+
+            let decision = prepare_request(&settings(true), &mut request)
+                .expect("should sanitize ineligible request");
+
+            assert!(
+                !decision.active(),
+                "{method} {destination} must not activate"
+            );
+            assert_eq!(decision.cookie_action, GptDiagnosticsCookieAction::None);
+            assert_eq!(request.uri().query(), Some("keep=1"));
+            assert_eq!(request.headers()[header::COOKIE], "other=value");
+        }
+    }
+
+    #[test]
+    fn ts_console_disable_emits_the_exact_session_cookie_clear() {
+        let mut request = navigation(
+            "https://publisher.example/page?ts_console=0&keep=1",
+            Some("__Host-ts-console=1"),
+        );
+        let decision = prepare_request(&settings(true), &mut request).expect("should prepare");
+        let mut response = Response::new(EdgeBody::empty());
+
+        finalize_response(&decision, &mut response);
+
+        assert!(!decision.active());
+        assert_eq!(request.uri().query(), Some("keep=1"));
+        assert_eq!(response.headers()[header::SET_COOKIE], CLEAR_CONSOLE_COOKIE);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+    }
+
+    #[test]
+    fn ts_console_config_rejects_unknown_fields() {
         let mut settings = create_test_settings();
         settings
             .integrations
