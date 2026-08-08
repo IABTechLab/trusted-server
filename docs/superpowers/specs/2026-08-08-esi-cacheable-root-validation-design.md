@@ -33,7 +33,7 @@ about three days of measurement.
 | --- | -------------------------------------------------------------------------------------------------------------------------------- | ------------- |
 | D1  | **ESI is deferred.** Revival condition: #418 resolved _and_ the `window.load` gate removed. Not a rejection — a dated condition. | Eng + product |
 | D2  | **Fund ~3 days of measurement** (§3). No dependencies. Can start immediately.                                                    | Eng           |
-| D3  | **Approve Stage 0** (remove `with_cache_bypass`), subject to the origin-`Vary` check in §3.                                      | Eng           |
+| D3  | **Approve Stage 0** — an operator flag disabling the origin cache bypass, subject to the `Vary` check in §3.                     | Eng           |
 | D4  | **Stages 1–2 queue behind the SSAT price defect and #418.** Stages 3b–5 unscheduled.                                             | Product       |
 
 Rationale for D4 in [§8](#8-priority). Everything this document recommends _against_
@@ -55,10 +55,10 @@ client fetch — no round trip — is worth nothing while bids are not consumed 
 `window.load`. Separately, enabling ESI's Dynamic Content Assembly would be an SSRF
 vector: bid payloads carry partner-controlled creative markup, so an SSP could embed
 `<esi:include src="…">` and make the edge fetch an arbitrary URL. Details in
-[Appendix E](#appendix-e--esi-implementation-notes).
+[Appendix E](#appendix-e--esi-notes-condensed).
 
 **The auction is already out of band; the hold is ~free.** It is dispatched _before_
-the origin fetch and does not block ([publisher.rs:2698-2701](../../../crates/trusted-server-core/src/publisher.rs#L2698-L2701)),
+the origin fetch and does not block — dispatched at [publisher.rs:2751-2755](../../../crates/trusted-server-core/src/publisher.rs#L2751-L2755), sent at [:2870](../../../crates/trusted-server-core/src/publisher.rs#L2870) —
 with a 500 ms budget. The actual cost is `with_cache_bypass`
 ([publisher.rs:2867](../../../crates/trusted-server-core/src/publisher.rs#L2867)),
 which forces every ad-eligible navigation to miss the Fastly readthrough cache.
@@ -93,13 +93,37 @@ path that already emits `public, s-maxage`
 twice and look for `x-cache`/`age` on TS's _own_ response. **Gates the Stage 3a/3b
 split** — see [§7](#7-deferred-work-specified-not-scheduled).
 
-**Step C — server-side latency breakdown (1 day + a measurement window).** Emit four
-timings per ad-eligible navigation: origin fetch duration (this is `O`, the quantity
-the model lacks), auction collect duration, rewrite duration, total. Capture with the
-bypass both on and off.
+**Step C — measure the hold directly (1 day + a measurement window).**
 
-- **Mechanism: `Server-Timing`.** Chosen, not offered — it needs no new plumbing and is
-  readable from the same browser harness that produced #1009's numbers.
+The hold's cost is literally the duration of one `.await`: `collect_stream_auction` at
+[publisher.rs:793](../../../crates/trusted-server-core/src/publisher.rs#L793), plus the
+two EOF variants in `hold_finish_ready_segments` and `hold_finish_tail_segments`. Two
+`Instant`s around it yield **`hold_wait_ms`** — the number this entire document is
+arguing about, measured rather than modelled.
+
+Emit two timings per ad-eligible navigation:
+
+| Metric            | Why                                                                    |
+| ----------------- | ---------------------------------------------------------------------- |
+| `hold_wait_ms`    | **The decision.** How long the response was actually held for bids.    |
+| `origin_fetch_ms` | Attribution — how much of the win Stage 0 can claim. Origin TTFB only. |
+
+`hold_wait_ms` replaces the proxy comparison an earlier draft proposed. Comparing `O`
+against `A` was an indirect way of asking "does the hold block?"; this asks it directly,
+costs less to build, and removes the modelling error corrected in
+[§6.2](#62-what-the-hold-actually-costs).
+
+Deliberately not measured: auction collect duration is already instrumented
+(`OrchestrationResult::total_time_ms`, `auction/orchestrator.rs:285`, flowing to
+`auction_events_raw`) — read it, don't rebuild it. Rewrite duration decides nothing and
+would mean touching two finalizers.
+
+- **Mechanism: a `log::info!` line behind a debug flag, not `Server-Timing`.** A response
+  header would in fact work for the origin-fetch figure — that value is known before
+  headers commit — but a server-side log needs no browser harness to collect it, `log` is
+  this project's instrumentation crate, and the auction path already measures itself with
+  `web_time::Instant`. Gate it behind config: one line per eligible navigation is real log
+  spend and the instrumentation is temporary.
 - **Sample: enough navigations per arm to separate the medians with confidence**, across
   both page types, and state the N alongside any result. #1009's sample was small enough
   that its conclusion did not survive contact with the code; replacing it with another
@@ -107,22 +131,54 @@ bypass both on and off.
 
 **Step C has two outcomes, both actionable:**
 
-| Outcome                    | Meaning               | Effect on staging                                            |
-| -------------------------- | --------------------- | ------------------------------------------------------------ |
-| `O` materially exceeds `A` | The model in §6 holds | Proceed as staged: Stage 0 primary, Stage 2 protects its win |
-| `A` exceeds `O`            | The hold _is_ costing | **Staging inverts** — Stage 2 primary, Stage 0 secondary     |
+| `hold_wait_ms` median | Meaning                 | Effect on staging                                            |
+| --------------------- | ----------------------- | ------------------------------------------------------------ |
+| Near zero             | The hold is free        | Proceed as staged: Stage 0 primary, Stage 2 protects its win |
+| Materially non-zero   | The hold **is** costing | **Staging inverts** — Stage 2 primary, Stage 0 secondary     |
 
 The work does not change; its order and justification do. **The staging in §7 is
-conditional on this measurement.**
+conditional on this measurement**, and the second outcome is a live possibility rather
+than a formality — §6.2's argument for the first is weaker than an earlier draft claimed.
 
-Step C also yields the client fetch latency that sets Stage 1's bids timeout, replacing
-an invented constant.
+Stage 1's bids-fetch timeout still needs a measured client-side figure rather than an
+invented constant, but Step C is server-side and does not supply it. Capture it from the
+browser harness when Stage 1 is actually scheduled.
 
 ---
 
 ## 4. Stage 0 — the only build item recommended now
 
-Remove `with_cache_bypass` at [publisher.rs:2867](../../../crates/trusted-server-core/src/publisher.rs#L2867).
+Stop bypassing the read-through cache on ad-eligible navigations
+([publisher.rs:2867](../../../crates/trusted-server-core/src/publisher.rs#L2867)).
+
+**Ship it as an operator flag, not a deletion.** Add
+`publisher.bypass_origin_cache`, defaulting to today's behaviour, in the same release as
+the Step C instrumentation. Then turn it off with `ts config push`.
+
+The diff is slightly larger than deleting a line, and that is the point. The risk being
+gated here is **cache poisoning** — serving one representation in response to a request
+for another. For that class of failure, rollback speed dominates diff size: a config push
+reverts in seconds, a release does not. The flag also buys an A/B on a byte-identical
+build, removing build difference as a confound in the very measurement this depends on,
+and allows flipping for a tester-cookie population before all traffic.
+
+Retire the flag once the change has held: flip the default, then delete the setting and
+its branch. A temporary flag left in place becomes permanent configuration surface.
+
+### What to watch after the flip
+
+Two regression signals, both checked before the win is:
+
+- **`unexpected_origin_304` abandonment rate.** That reason
+  ([publisher.rs:2894-2916](../../../crates/trusted-server-core/src/publisher.rs#L2894-L2916),
+  emitted via `emit_abandoned_auction` at `:2360`) exists precisely because the ad-stack
+  path refuses cached and conditional origin responses. Re-enabling the cache is what
+  could revive it. **Any non-zero rate is a rollback signal** — it means a 304 is reaching
+  TS that the conditional-header strip was supposed to make impossible.
+- **Representation mixing.** Spot-check that HTML navigations still return HTML and RSC
+  fetches still return `text/x-component`. A mismatch means the `Vary` risk materialized
+  despite a PASS verdict. Roll back immediately; this is cache poisoning, not a
+  performance regression.
 
 **Why it is safe in principle.** The conditional-header strip runs 34 lines earlier
 under the same gate ([publisher.rs:2832-2836](../../../crates/trusted-server-core/src/publisher.rs#L2832),
@@ -146,11 +202,35 @@ The classification is also not airtight: `is_navigation_request` falls back to t
 weaker — `fetch()` can set Accept: text/html"_
 ([http_util.rs:84-88](../../../crates/trusted-server-core/src/http_util.rs#L84)).
 
+**A FAIL is not merely a Stage 0 blocker — it is a live production defect.** RSC fetches
+already transit the read-through cache today, because they never set the bypass. If the
+origin varies on `Next-Router-*` without declaring it, TS is cross-serving RSC variants
+right now. On a FAIL, file that immediately and treat "ask the origin to declare `Vary`"
+as urgent rather than as the cheaper of two options.
+
+**The `Vary` check is necessary but not sufficient.** Turning the read-through cache on
+for HTML navigations exposes three things a representation check does not cover, and all
+three are a larger class than the RSC split:
+
+- **Client `Cookie`.** TS forwards client cookies to origin unchanged — there is no
+  `COOKIE` strip on the publisher path. Any cookie-personalized HTML (logged-in state,
+  paywall meter, publisher-side A/B assignment) becomes cross-servable unless the origin
+  declares `Vary: Cookie` or marks those responses private.
+- **Origin `Set-Cookie`.** If the origin emits `Set-Cookie` alongside a shared-cacheable
+  `Cache-Control`, the read-through cache can replay one visitor's cookie to the next.
+  TS's own privacy net downgrades **TS's** response — it runs after the cache has already
+  stored the origin's.
+- **`Authorization`.** #1009 describes a basic-auth-gated deployment. Responses to
+  authorized requests entering a shared cache needs its own check.
+
+So Step A must capture `Cache-Control` and `Set-Cookie` too, and repeat each request with
+and without a session cookie. Same minutes of work; closes the bigger hole.
+
 **Two effort branches, and Step A decides which:**
 
 | Step A result          | Stage 0 is…                                   | Effort |
 | ---------------------- | --------------------------------------------- | ------ |
-| Origin declares `Vary` | a one-line deletion plus test updates         | 1–2 d  |
+| Origin declares `Vary` | the flag, its tests, then a config push       | 1–2 d  |
 | Origin does **not**    | a TS-side cache-key discriminator — a feature | 4–8 d  |
 
 The discriminator is the safer design either way, because it keys on the headers that
@@ -208,33 +288,54 @@ changes here is its _causal weight_. Likewise, #1009's own observation that TS _
 the auction cost from client-side to server-side rather than adding new work"_ is the
 argument for client-fill, which the issue then declines in favour of ESI.
 
-### 6.2 Why the hold is free — the strong form first
+### 6.2 What the hold actually costs
 
-On a Next.js publisher, `lol_html` never sees the `</body>` end tag until the **final**
-chunk: with any post-processor registered, `HtmlWithPostProcessing` accumulates and
-emits nothing before then ([html_processor.rs:62-65](../../../crates/trusted-server-core/src/html_processor.rs#L62)),
-and the Next.js integration always registers one when enabled
-([nextjs/mod.rs:107](../../../crates/trusted-server-core/src/integrations/nextjs/mod.rs#L107)).
+**An earlier draft of this section claimed a stronger argument than the code supports.
+It was wrong, and the correction matters.**
 
-So the auction has the _entire origin download plus rewrite_ to finish before the hold
-can block on anything. **The hold cannot cost anything unless the auction outlives the
-whole document fetch.** The auction is bounded by the configured `auction_timeout_ms`
-([settings.rs:5000](../../../crates/trusted-server-core/src/settings.rs#L5000)), so this
-reduces to a single comparison an operator can check against their own config: is the
-auction budget larger than a full document fetch and rewrite? If not, the hold is free.
+The hold does not key off `lol_html` at all. `BodyCloseHoldBuffer::push`
+([publisher.rs:2190-2202](../../../crates/trusted-server-core/src/publisher.rs#L2190))
+scans the **decoded origin input** for `</body`, and `hold_collect_close_tail` awaits
+`collect_stream_auction` ([publisher.rs:793](../../../crates/trusted-server-core/src/publisher.rs#L793))
+the moment that byte sequence appears — with `is_last = false`, before post-processing
+runs. Post-processor buffering is irrelevant to when the hold fires, so the argument
+applies identically to every publisher or to none.
 
-**This argument uses no timing data at all** — only the code path and one config value.
+What is true, and all that is true:
 
-The weaker, general form, for publishers with no post-processor registered: because
-dispatch precedes the origin fetch, the hold costs `max(0, A − O)`, which is zero
-whenever the origin build `O` exceeds the auction budget `A`.
+> Dispatch precedes the origin fetch, so the hold costs `max(0, A − T)`, where `A` is the
+> auction collect duration and `T` is origin TTFB plus body transfer up to the `</body>`
+> byte. Since `</body>` sits at the end of a document, `T` is close to the full download.
+
+`A` is bounded by `auction_timeout_ms`, resolved as
+`creative_opportunities.auction_timeout_ms` falling back to `auction.timeout_ms`
+([publisher.rs:2680-2684](../../../crates/trusted-server-core/src/publisher.rs#L2680-L2684))
+— check the resolution order against your own config rather than trusting a number; the
+shipped example sets different values at each level.
+
+**This is a claim requiring measurement, not a proof.** §3 Step C measures the hold's
+cost directly rather than inferring it.
+
+A finding that does survive, and belongs with [the ceiling](#64-the-ceiling): because
+`HtmlWithPostProcessing` withholds all output until the final chunk, the streaming-prefix
+design at [publisher.rs:1343-1348](../../../crates/trusted-server-core/src/publisher.rs#L1343-L1348)
+— whose comment promises "the client receives the document up to `</body>` while the
+auction rides alongside transfer" — is **inert on a Next.js publisher**. Every
+`step.ready` yields empty bytes. That comment is misleading on exactly the publisher
+under discussion.
 
 ### 6.3 The quantity nobody has measured
 
-Write the origin build time under `Pass` as `O`. Recovery depends on it, and it has
-never been captured. #1009's timings cannot supply it: they compare a POP hit against a
+Write the fetch time under `Pass` as `O`. Recovery depends on it, and it has never been
+captured. #1009's timings cannot supply it: they compare a POP hit against a
 shield-served fetch, both of which are _cached_ paths, whereas `CacheOverride::Pass`
-bypasses every layer and reaches the true origin. The two are different quantities.
+bypasses TS's read-through cache and its shield.
+
+Note `Pass` bypasses **TS's** caches only. It has no authority over any CDN the publisher
+runs in front of their own origin — and #1009's `x-cache: MISS, MISS` on the TS-on arm
+hints one may exist. So `O` may not be origin build time at all. Since `O` is the single
+quantity this model depends on, that ambiguity is worth resolving in Step C rather than
+assuming.
 
 What follows from code alone, without any number:
 
@@ -283,7 +384,7 @@ navigation generation 0. Endpoint, same-origin gate, wire shape, and client cons
 already exist. Three decisions must be made before planning: the `slots: []` precedence
 rule when head-open already injected a non-empty `ts.adSlots`; the new terminal-event
 emission point; and whether the dispatch/collect split survives at all. Plumbing detail
-in [Appendix B](#appendix-b--stage-1-plumbing). Estimated 8–13 d, low-to-medium
+in [Appendix B](#appendix-b--stage-1-plumbing-condensed). Estimated 8–13 d, low-to-medium
 confidence, uncertainty concentrated client-side.
 
 Three companions are mandatory, not optional: **suppress the server bids script
@@ -320,7 +421,7 @@ body the document is no longer per-user. Record it as a deliberate decision.
 which shared-cached replays one visitor's geo to the next; geo is not a request header
 so suppression is the only option. Second, `Vary`: the publisher path emits none, and at
 least eleven request signals change the rewritten bytes for one URL — five are per-user
-and can never be shared-cached ([Appendix C](#appendix-c--vary-signal-inventory)).
+and can never be shared-cached ([Appendix C](#appendix-c--vary-signals-condensed)).
 **Also gated on Step B**: if nothing consumes TS's response headers, this tier is inert
 until a topology change.
 
@@ -355,13 +456,18 @@ a path that 404s in a fresh checkout.
 
 ## 8. Priority
 
-**Run §3 Steps A–C now, regardless of everything else.** Under three days combined,
-useful independent of this effort, and Step C's instrumentation is a permanent
-operational asset.
+**Run §3 Steps A–C now, regardless of everything else.** Under three days combined, and
+useful independent of this effort. Step C's instrumentation is deliberately temporary and
+config-gated; if these timings become a standing regression gate, the right home is the
+access-log telemetry already scaffolded but unwired in `TinybirdSettings`
+(`settings.rs:1718-1731` — `access_enabled`, `access_dataset`, and a sample rate, with the
+comment that it is _"rejected until an access-log emitter is wired"_). That is a
+follow-on, not part of this work.
 
-**Stage 0 next.** Small, gated on a `curl`, and it reverses an origin-load cost the
-prior design explicitly accepted. Closer to a defect fix than an optimization — TS
-opted out of a cache it did not need to opt out of.
+**Stage 0 next**, shipped as the operator flag in §4 rather than a deletion. Gated on a
+`curl`, reverses an origin-load cost the prior design explicitly accepted, and rolls back
+with a config push. Closer to a defect fix than an optimization — TS opted out of a cache
+it did not need to opt out of.
 
 **Stages 1–2 queue behind the correctness defects.** Their failure mode is silent
 revenue loss, against a publisher whose ads currently fill reliably. The SSAT price
@@ -384,7 +490,7 @@ whatever hydration gate lands, and doing that twice is waste.
    human to make.
 
 Implementation-level open items for unscheduled work are in
-[Appendix F](#appendix-f--deferred-open-items).
+[Appendix F](#appendix-f--deferred-open-items-condensed).
 
 ---
 
@@ -400,14 +506,14 @@ Rows 1–6 are in [§6.1](#61-corrections-to-1009s-premises). The remainder:
 
 **`should_run_ad_stack` carries four meanings across six sites:**
 
-| Line                                                                        | Meaning                                                         | Disposition                                                        |
-| --------------------------------------------------------------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------ |
-| [2651](../../../crates/trusted-server-core/src/publisher.rs#L2651), `:2660` | eligibility and auction gate                                    | keep                                                               |
-| [2832-2836](../../../crates/trusted-server-core/src/publisher.rs#L2832)     | strip `If-None-Match`, `If-Modified-Since`, `Range`, `If-Range` | **keep** — needed for any injection                                |
-| [2866](../../../crates/trusted-server-core/src/publisher.rs#L2866)          | `with_cache_bypass()`                                           | **remove** — [§4](#4-stage-0--the-only-build-item-recommended-now) |
-| [2894](../../../crates/trusted-server-core/src/publisher.rs#L2894)          | 304 → 502 guard                                                 | keep as safety net                                                 |
-| [2920](../../../crates/trusted-server-core/src/publisher.rs#L2920)          | build `adSlots`                                                 | keep — per-URL                                                     |
-| [2945](../../../crates/trusted-server-core/src/publisher.rs#L2945)          | strip cacheability                                              | **replace** — Stage 3a                                             |
+| Line                                                                        | Meaning                                                         | Disposition                                                                          |
+| --------------------------------------------------------------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| [2651](../../../crates/trusted-server-core/src/publisher.rs#L2651), `:2660` | eligibility and auction gate                                    | keep                                                                                 |
+| [2832-2836](../../../crates/trusted-server-core/src/publisher.rs#L2832)     | strip `If-None-Match`, `If-Modified-Since`, `Range`, `If-Range` | **keep** — needed for any injection                                                  |
+| [2866](../../../crates/trusted-server-core/src/publisher.rs#L2866)          | `with_cache_bypass()`                                           | **make operator-controlled** — [§4](#4-stage-0--the-only-build-item-recommended-now) |
+| [2894](../../../crates/trusted-server-core/src/publisher.rs#L2894)          | 304 → 502 guard                                                 | keep as safety net                                                                   |
+| [2920](../../../crates/trusted-server-core/src/publisher.rs#L2920)          | build `adSlots`                                                 | keep — per-URL                                                                       |
+| [2945](../../../crates/trusted-server-core/src/publisher.rs#L2945)          | strip cacheability                                              | **replace** — Stage 3a                                                               |
 
 **Cache tiers.** T1 backend readthrough (already available; TS opts out). T2 TS-owned
 template cache (adds KV latency, eventual consistency, a full invalidation design).
@@ -416,87 +522,58 @@ Compute is not invoked on a HIT). T2 and T3 both introduce a cache TS cannot pur
 
 ---
 
-## Appendix B — Stage 1 plumbing
+## Appendix B — Stage 1 plumbing (condensed)
 
-All references below are `crates/trusted-server-js/lib/src/integrations/gpt/index.ts`
-unless the filename says otherwise.
+Full detail lives in the plan when Stage 1 is scheduled. The decisions that must be made
+before any of it is written:
 
-**Client plumbing.** `pageBidsEndpoint` (`index.ts:925`), `requestPageBids`
-(`index.ts:927-944`), and the `inflight` / `currentPath` / `lastAppliedPath` state
-(`index.ts:910`, `:915`, `:921`) are closure-trapped in `installSpaAuctionHook` and must
-be hoisted to module scope so one abort domain covers both generations. Do **not** route
-the initial load through `onNavigate`: `index.ts:947` no-ops it and `index.ts:949`
-increments `navGeneration`, cancelling generation 0 at the guards on `index.ts:538` and
-`:541`.
-
-**Suppress the server bids script.** Today the body end-tag handler is gated on
-`has_slots`, which stays true because `adSlots` is still injected — so it would emit
-`build_empty_bids_script()`, which calls `scheduleInitialAdInit({})` and assigns
-`ts.bids = {}` synchronously at `index.ts:539`. Whether real bids survive would then
-depend on unspecified ordering against the client fetch. The gate must become "did this
-response carry bids," not "does this page have slots."
-
-**Gate restructuring — the real work.** `adInit` snapshots bids at call time
-(`index.ts:566`) and applies `hb_*` targeting at `index.ts:657-661`; the
-`slotRenderEnded` listener's live read at `index.ts:712` serves adm injection only and
-cannot retarget a requested slot. **Bids arriving after `adInit` are lost.**
-`installScheduleInitialAdInit` becomes a two-condition join — hydration-ready AND
-bids-settled — with a bounded timeout that fires `adInit` untargeted rather than
-stranding the slot. Derive the timeout from §3 Step C; `SPA_SLOT_WAIT_MS = 2000` is
-precedent but was derived for DOM readiness, not network. This composes badly with the
-958 branch's poll-and-grace gate — two timeout budgets in series.
-
-**Server contract.** `handle_page_bids` runs a fresh `run_auction`
-(`publisher.rs:3903`) tagged `AuctionSource::SpaNavigation` (`publisher.rs:3859`). Not a
-drop-in — it cannot reuse in-flight dispatched requests. Required: navigation-path
-dispatch **suppressed** (running both doubles SSP/APS spend); a new `AuctionSource` for
-initial loads **plus the mechanism that delivers it** — a request header alongside the
-existing `X-TSJS-Page-Bids` marker, behind the same-origin gate, or it becomes a
-caller-controlled telemetry-poisoning knob; and the `slots: []` precedence rule
-(`publisher.rs:3975-3985`).
-
-**Telemetry.** Navigation `Completed` is emitted only from the two collect functions
-(`publisher.rs:2410`, `:2456`); `Abandoned` only via `emit_abandoned_auction`
-(`publisher.rs:2360`) across nine reasons, three of which live only inside the hold
-helpers. The `[debug].auction_html_comment` `ts-debug` dump prepends onto the same
-`ad_bids_state` string inside the collect function (`publisher.rs:2478`) and disappears
-with the hold — relocate or retire deliberately.
-
-**Sequencing.** (a) decide bid delivery, (b) decide whether dispatch/collect survives,
-(c) delete the hold. Doing (c) first produces the silent failure in [§5](#5-the-trap-in-the-deferred-work--read-this-before-scheduling-stages-12).
-Leaving `OwnedProcessResponseParams` (`publisher.rs:1072-1086`) carrying five unread
-auction fields is exactly that configuration.
-
-**Preserve the multi-member gzip guarantee.** `GzipDecodeReader` exists because
-`flate2::read::GzDecoder` drops every member after the first, which can drop the
-`</body>` carrying the injection point.
+- **Suppress the server bids script entirely** under client-fill, not emit an empty one.
+  The body end-tag handler is gated on `has_slots`, which stays true; the gate must become
+  "did this response carry bids."
+- **`adInit` snapshots bids at call time** (`gpt/index.ts:566`) and applies `hb_*`
+  targeting at `:657-661`. Bids arriving later are lost, so
+  `installScheduleInitialAdInit` must become a hydration-ready AND bids-settled join with
+  a bounded timeout that fires untargeted rather than stranding the slot.
+- **Do not route the initial load through `onNavigate`** — `gpt/index.ts:949` increments
+  `navGeneration` and cancels generation 0.
+- **`handle_page_bids` is not a drop-in.** It runs a fresh `run_auction`
+  (`publisher.rs:3903`) tagged `AuctionSource::SpaNavigation` (`:3859`) and cannot reuse
+  in-flight dispatched requests. Needs dispatch suppression (or spend doubles), a new
+  `AuctionSource` **plus the mechanism that delivers it**, and a `slots: []` precedence
+  rule (`:3975-3985`).
+- **Telemetry moves with it.** Navigation `Completed` is emitted only from the collect
+  functions (`publisher.rs:2410`, `:2456`); `Abandoned` only via `emit_abandoned_auction`
+  (`:2360`). The `ts-debug` dump rides the same `ad_bids_state` string (`:2478`) and
+  disappears with the hold.
+- **Sequencing is strict:** decide bid delivery, then whether dispatch/collect survives,
+  then delete the hold. Any other order produces the silent failure in [§5](#5-the-trap-in-the-deferred-work--read-this-before-scheduling-stages-12).
 
 ---
 
-## Appendix C — `Vary` signal inventory
+## Appendix C — `Vary` signals (condensed)
 
-Needed for Stage 3b only.
+Needed for Stage 3b only, which is unscheduled.
 
-**Per-user — never shared-cacheable:** consent state (`euconsent-v2`, `__gpp`,
+At least eleven request signals change the rewritten bytes for one URL. **Five are
+per-user and can never be shared-cached:** consent state (`euconsent-v2`, `__gpp`,
 `__gpp_sid`, `us_privacy`, `Sec-GPC`, IP-derived jurisdiction); the GPT-diagnostics
-`__Host-ts-console` cookie / `ts_console` query; the `tsjs.bids` payload (removed by
-Stage 1, which is what makes the rest tractable); IP-derived geo; DataDome's request
-filter, which can replace the document entirely.
+`__Host-ts-console` cookie; the `tsjs.bids` payload (removed by Stage 1, which is what
+makes the rest tractable); IP-derived geo; and DataDome's request filter, which can
+replace the document entirely.
 
-**Per-variant — safe in a cache key:** request host and scheme; `Accept-Encoding`;
-request-class headers (`Sec-Fetch-Dest`, `Accept`, `Sec-Purpose`/`Purpose`, bot UA
-fragments, method); the origin `Content-Type` fork (HTML vs `text/x-component` vs plain
-URL replacer); the enabled-integration set; the build-time tsjs content hash.
+**Six are per-variant and safe in a cache key:** request host and scheme,
+`Accept-Encoding`, request-class headers, the origin `Content-Type` fork, the enabled
+integration set, and the tsjs content hash.
 
-**Two pre-existing holes, worth filing regardless of this work:** the consent-denied /
-bot / prefetch / no-slot variant keeps the origin's cacheability while still carrying
-per-user `x-geo-*`; and the RSC-versus-HTML split is unguarded because TS never reads
-`RSC` or `Next-Router-*`.
+Two pre-existing holes worth filing regardless of this work: the consent-denied / bot /
+prefetch / no-slot variant keeps the origin's cacheability while carrying per-user
+`x-geo-*`; and the RSC-versus-HTML split is unguarded because TS never reads `RSC` or
+`Next-Router-*`.
 
-**Invalidation signals TS has today:** config push changing slots — none; consent change
-— request-side, belongs in the cache key; experiment rollover — origin-side only;
-article edit — origin `Cache-Control`; tsjs rebuild — content hash, already in the URL;
-integration enable/disable — none.
+Invalidation signals TS has today: config push — none; consent change — request-side,
+belongs in the cache key; experiment rollover — origin-side only; article edit — origin
+`Cache-Control`; tsjs rebuild — content hash already in the URL; integration toggle —
+none.
 
 ---
 
@@ -528,73 +605,43 @@ exists.
 
 ---
 
-## Appendix E — ESI implementation notes
+## Appendix E — ESI notes (condensed)
 
-For if and when D1's revival condition is met.
+For if and when [D1](#1-decision-requested)'s revival condition is met. Expand then;
+recording only what would otherwise be re-derived:
 
-Pin `esi = "0.7"`; pre-1.0, irregular cadence, two yanked betas in the 0.7 line.
-
-**Use `process_stream`, not the wrappers.** `process_response` and
-`process_response_streaming` consume `self` _and_ send the response themselves, taking
-ownership away from the finalize / `ec_finalize` / apply-effects ordering.
-
-**Order it esi → lol_html**, never the reverse, via a newtype implementing `io::Write`
-that forwards to `HtmlRewriter::write`, with `end()` after `process_stream` returns.
-Mind the `StreamingBody`-is-a-`BufWriter` hazard already recorded for this repo: esi
-flushes after each parse batch, so any adapter in between must propagate `flush()`.
-
-**Always supply a custom fragment dispatcher.** The built-in one builds a dynamic
-backend per URL host and panics on a hostless URL; dynamic backends are also the known
-Viceroy local-dev failure mode here. Signature is
-`Fn(Request, Option<u32>) -> Result<PendingFragmentContent>` — `Fn`, not `FnMut`, so
-captured counters need `Cell`/`RefCell`. Map the maxwait onto the quantized
-backend-timeout scheme from #847. Fragment concurrency is free: includes dispatch at
-parse time and harvest through one `select()` pool.
-
-**Streaming mode loses** `$add_header`, `$set_response_code`, `$set_redirect`, and the
-auto `Cache-Control` from fragment TTLs — all announced via `println!`, not `log`.
-
-**Config explicitly:** `with_escaped(false)` for non-HTML templates; `with_chunk_size`
-aligned to existing chunking, not the 16 KB default.
-
-**DCA off, and asserted off.** Defaults are `DcaMode::None` and
-`inherit_parent_dca: false`, but set both explicitly — pre-1.0 defaults can move and
-this one fails open. Rationale is the SSRF vector in [§2](#2-why--the-three-findings).
-`max_include_depth` and `function_recursion_depth` bound the blast radius; they do not
-close the hole.
-
-**Error semantics, non-obvious:** `alt` is attempted before `onerror="continue"` takes
-effect; `<esi:try>` runs _all_ attempts in document order and concatenates every
-non-failed output — not first-success-wins, so primary/fallback pairs render both; an
-include with `onerror="continue"` inside `<esi:attempt>` never marks that attempt
-failed, suppressing `except`. Wrap `ESIError` in `Report<...>` via `change_context()`.
-
-**Single include, not per-slot.** The auction is one operation producing all slots'
-bids; there is no per-slot TTL or partial-failure boundary to exploit.
-
-**Before committing:** `cargo check-fastly` with `esi` added on Rust 1.95.0 /
-`wasm32-wasip1`, and confirm the root lockfile does not desync from the
-integration-tests lockfile on shared `regex`, `bytes`, `log`.
+- Pin `esi = "0.7"`. Pre-1.0, irregular cadence, two yanked betas in the 0.7 line.
+- **Use `process_stream`, not the wrappers.** `process_response` and
+  `process_response_streaming` consume `self` _and_ send the response themselves, taking
+  ownership away from the finalize / `ec_finalize` ordering.
+- **Order esi → lol_html**, never the reverse, via a newtype implementing `io::Write`.
+  Mind the `StreamingBody`-is-a-`BufWriter` hazard: esi flushes per parse batch, so any
+  adapter in between must propagate `flush()`.
+- **Always supply a custom fragment dispatcher.** The built-in one builds a dynamic
+  backend per URL host and panics on a hostless URL; dynamic backends are also the known
+  Viceroy local-dev failure mode here.
+- **DCA off, asserted explicitly** — not merely left at its default. Rationale is the SSRF
+  vector in [§2](#2-why--the-three-findings): partner-controlled creative markup would
+  become ESI-executable at the edge.
+- **`<esi:try>` runs _all_ attempts and concatenates every non-failed output** — not
+  first-success-wins, so primary/fallback pairs render both. Least obvious behaviour in
+  the crate.
+- Single include, not per-slot: the auction is one operation producing all slots' bids.
 
 ---
 
-## Appendix F — deferred open items
+## Appendix F — deferred open items (condensed)
 
-Implementation-level, for unscheduled work only. The decisions that need a human are in
+Implementation-level, for unscheduled work only. Decisions needing a human are in
 [§9](#9-decisions-needed-from-this-review).
 
-1. Should `collect_non_html_auction` (`publisher.rs:2388`) be removed with the hold or
-   kept? It is independently reachable and collects before any byte streams.
-2. Is `body_close_hold_loop_stream` (`publisher.rs:2109`, no production caller) safe to
-   delete, or is the buffered-adapter streaming cutover (#495) still on the roadmap?
-3. Does hidden-tab behaviour (rAF unserviced while hidden) interact badly with a bids
-   timeout that could burn freshness before the rAF fires?
-4. Fastly's pending-request semantics when a `DispatchedAuction` drops mid-flight —
-   unverified; relevant only if dispatch/collect survives.
-5. Does `stale-if-error` on a cached root serve acceptable content, given stale HTML
-   carries stale slot markup? Product call, surfaced by Stage 0.
-6. The googletag shim discards listeners queued before it loads, breaking third-party
-   viewability tooling (#1009 Part 1). Not filed. Should be.
+Should `collect_non_html_auction` (`publisher.rs:2388`) go with the hold or stay? Is
+`body_close_hold_loop_stream` (`:2109`, no production caller) safe to delete, or is the
+buffered-adapter streaming cutover (#495) still live? Does hidden-tab rAF behaviour
+interact badly with a bids timeout? What are Fastly's pending-request semantics when a
+`DispatchedAuction` drops mid-flight? Does `stale-if-error` on a cached root serve
+acceptable content given stale slot markup? And the googletag shim discards listeners
+queued before it loads (#1009 Part 1) — not filed, should be.
 
 ---
 
@@ -608,7 +655,7 @@ All pinned to `cfb98f4`.
 | `is_navigation_request`                     | `http_util.rs:73-98`                                                            |
 | Auction dispatch (pre-origin, non-blocking) | `publisher.rs:2698-2760`                                                        |
 | Auction overlap intent                      | `auction/orchestrator.rs:950-952`                                               |
-| Auction timeout (500 ms)                    | `settings.rs:5000`; `trusted-server.example.toml:174`                           |
+| Auction timeout resolution                  | `publisher.rs:2680-2684` (creative_opportunities, else auction.timeout_ms)      |
 | Conditional/range header strip              | `publisher.rs:2832-2836`                                                        |
 | Origin cache bypass                         | `publisher.rs:2866-2868`                                                        |
 | Origin 304 → 502 guard                      | `publisher.rs:2894-2916`                                                        |
