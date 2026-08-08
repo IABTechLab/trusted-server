@@ -16,9 +16,11 @@ import {
   createNoopPrebidAdapter,
   type PrebidAdapter,
   type PrebidGlobalTarget,
+  type PrebidTrustedServerAuctionV1,
 } from '../adapters/prebid';
 import { parseCacheFetchPolicyV1 } from '../core/config';
 import { parseTrustedServerAuctionResponseV1 } from '../core/auction';
+import type { BrowserAuctionProjectionV1 } from '../core/types';
 import {
   parseBidRenderSourceV1,
   parseBrowserAuctionProjectionV1,
@@ -42,8 +44,18 @@ import {
   type GptWinnerPublicationResult,
 } from '../integrations/gpt/module';
 import { createGptStartup } from '../integrations/gpt/startup';
+import {
+  createPrebidSelectionCoordinator,
+  publishPrebidBid,
+  type PrebidSelectionCoordinator,
+} from '../integrations/prebid/module';
+import { createPrebidStartup } from '../integrations/prebid/startup';
 import { createBrowserNavigationIdentityIssuer } from '../kernel/identity';
-import type { NavigationIdentityIssuerFactory, RuntimeSession } from '../kernel/sessions';
+import type {
+  NavigationIdentityIssuerFactory,
+  RenderAttemptScope,
+  RuntimeSession,
+} from '../kernel/sessions';
 import { createRuntimeSession } from '../kernel/sessions';
 import type { CoreActivationContext } from '../kernel/integration_registry';
 import { createRuntime, type Runtime, type RuntimeOptions } from '../kernel/runtime';
@@ -161,6 +173,7 @@ export interface TestBrowserRuntimeCompositionOptions extends BrowserComposition
   readonly admittedProgrammaticSlotsForTest?: readonly string[];
   readonly gptStartupForTest?: (config: unknown) => void;
   readonly prebidStartupForTest?: (config: unknown) => void;
+  readonly pucSchedulerForTest?: PucBridgeOptions['scheduler'];
 }
 
 interface AcceptedBrowserBoot {
@@ -172,6 +185,7 @@ interface AcceptedBrowserBoot {
 }
 
 interface PreparedBrowserServices {
+  readonly createAttempt: (owner: RenderAttemptScope) => ReturnType<typeof createRenderAttempt>;
   readonly publisherOrigin: string;
   readonly rendererUrl: string;
   readonly resolveCacheAdm: NonNullable<PucBridgeOptions['resolveCacheAdm']>;
@@ -265,9 +279,77 @@ export function createTestBrowserRuntimeComposition(
     },
     start: startGpt,
   });
-  const startPrebid = compositionOptions.prebidStartupForTest ?? (() => undefined);
-  const prebidRuntime = Object.freeze({ start: startPrebid });
   let runtimeSession: RuntimeSession | undefined;
+  let prebidCoordinator: PrebidSelectionCoordinator | undefined;
+  const startPrebid = compositionOptions.prebidStartupForTest ?? (() => undefined);
+  const completePrebidAuction = (auction: Readonly<PrebidTrustedServerAuctionV1>): void => {
+    try {
+      auction.complete();
+    } catch {
+      // The private bidder completion boundary cannot escape into publisher code.
+    }
+  };
+  const publishPrebidAuction = (auction: Readonly<PrebidTrustedServerAuctionV1>): void => {
+    const navigation = runtimeSession?.currentNavigation;
+    const reservations = browserServices?.reservations;
+    const coordinator = prebidCoordinator;
+    if (!navigation || !reservations || !coordinator || !navigation.isCurrent()) {
+      completePrebidAuction(auction);
+      return;
+    }
+    try {
+      const projection = navigation.currentAuctionProjection as
+        Readonly<BrowserAuctionProjectionV1> | undefined;
+      if (!projection || projection.auction.auctionId !== auction.auctionId) return;
+      for (let index = 0; index < auction.bids.length; index += 1) {
+        const request = auction.bids[index];
+        if (!request) continue;
+        const winners = projection.auction.results.filter(
+          (result) => result.slot === request.adUnitCode && result.outcome === 'winner'
+        );
+        if (winners.length !== 1) continue;
+        const winner = winners[0];
+        if (!winner || winner.outcome !== 'winner') continue;
+        const bids = projection.bids.filter(
+          (bid) => bid.slot === request.adUnitCode && bid.candidateId === winner.candidateId
+        );
+        if (bids.length !== 1) continue;
+        const bid = bids[0];
+        if (!bid) continue;
+        publishPrebidBid({
+          admitTrustedBid: (preparedBid) =>
+            composition.adapters.prebid.admitTrustedBid(preparedBid),
+          auctionId: auction.auctionId,
+          adUnitCode: request.adUnitCode,
+          bid,
+          generatedBid: Object.freeze({
+            requestId: request.requestId,
+            adId: request.requestId,
+            cpm: bid.cpm,
+            width: bid.renderSource.width,
+            height: bid.renderSource.height,
+          }),
+          navigation,
+          reservations,
+          trackAdmittedBid: coordinator.track,
+        });
+      }
+    } catch {
+      // Invalid/stale projection state publishes no Prebid bid.
+    } finally {
+      completePrebidAuction(auction);
+    }
+  };
+  const prebidRuntime = createPrebidStartup({
+    dispose: () => {
+      prebidCoordinator?.dispose();
+      prebidCoordinator = undefined;
+    },
+    onAuction: publishPrebidAuction,
+    onAuctionEnd: (event, prebid) => prebidCoordinator?.auctionEnded(event, prebid),
+    prebid: composition.adapters.prebid,
+    start: startPrebid,
+  });
   const getBindings: NonNullable<RuntimeOptions['getBindings']> = (id) => {
     const provided = providedBindings?.(id);
     let config: unknown;
@@ -620,18 +702,19 @@ export function createTestBrowserRuntimeComposition(
         }
       };
       const fetchAuction = compositionOptions.auctionFetcherForTest ?? globalThis.fetch;
+      const createOwnedAttempt = (owner: RenderAttemptScope) =>
+        createRenderAttempt({
+          artifacts,
+          owner,
+          prepareRenderSource: (candidate) => {
+            const source = parseBidRenderSourceV1(candidate, cachePolicy);
+            return source ? Object.freeze(source) : undefined;
+          },
+          reservations: reservationService,
+        });
       const batchCoordinator = createAuctionBatchService({
         ...(cachePolicy ? { cachePolicy } : {}),
-        createAttempt: (owner) =>
-          createRenderAttempt({
-            artifacts,
-            owner,
-            prepareRenderSource: (candidate) => {
-              const source = parseBidRenderSourceV1(candidate, cachePolicy);
-              return source ? Object.freeze(source) : undefined;
-            },
-            reservations: reservationService,
-          }),
+        createAttempt: createOwnedAttempt,
         fetcher: (input, init) => {
           if (typeof fetchAuction !== 'function') return Promise.reject(new Error('unavailable'));
           return fetchAuction(input, init);
@@ -663,6 +746,7 @@ export function createTestBrowserRuntimeComposition(
         targeting: targetingService,
       });
       preparedBrowserServices = Object.freeze({
+        createAttempt: createOwnedAttempt,
         publisherOrigin,
         rendererUrl,
         resolveCacheAdm,
@@ -732,6 +816,9 @@ export function createTestBrowserRuntimeComposition(
       const pucBridge = createPucBridge({
         messaging: composition.adapters.messaging,
         publisherOrigin: prepared.publisherOrigin,
+        ...(compositionOptions.pucSchedulerForTest
+          ? { scheduler: compositionOptions.pucSchedulerForTest }
+          : {}),
         rendererNonces: prepared.services.rendererNonces,
         rendererUrl: prepared.rendererUrl,
         reservations: prepared.services.reservations,
@@ -740,6 +827,31 @@ export function createTestBrowserRuntimeComposition(
       });
       context.onDispose(() => pucBridge.dispose());
       browserServices = Object.freeze({ ...prepared.services, pucBridge });
+      const coordinator = createPrebidSelectionCoordinator({
+        activateAttempt: ({ attempt, owner, preparedBid }): boolean => {
+          const artifact = Object.freeze({
+            kind: 'puc' as const,
+            attemptId: attempt.id,
+            slot: attempt.slot,
+            navigationGeneration: attempt.navigationGeneration,
+            dispose: () => undefined,
+          });
+          const input = Object.freeze({
+            artifact,
+            attempt,
+            owner,
+            reservationId: preparedBid.bid.adId,
+          });
+          return pucBridge.registerGamAttempt(input);
+        },
+        createAttempt: prepared.createAttempt,
+        reservations: prepared.services.reservations,
+      });
+      prebidCoordinator = coordinator;
+      context.onDispose(() => {
+        coordinator.dispose();
+        if (prebidCoordinator === coordinator) prebidCoordinator = undefined;
+      });
       browserServices.slots.activate();
       compositionOptions.coreActivations.correctnessGptListeners(
         context,
