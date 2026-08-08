@@ -30,6 +30,7 @@ import type {
 import {
   createRenderTrace,
   isEffectivelyVisible,
+  type RenderTraceGptFactV1,
   type RenderTraceRuntimeOwner,
 } from '../core/trace';
 import {
@@ -213,7 +214,7 @@ export interface BrowserCoreActivations {
 
 export interface TestBrowserRuntimeCompositionOptions extends BrowserCompositionOptions {
   readonly auctionFetcherForTest?: AuctionBatchFetcher;
-  readonly coreActivations: BrowserCoreActivations;
+  readonly coreActivations?: BrowserCoreActivations;
   readonly creativeActivationForTest?: (config: Readonly<CreativeBootV1>) => () => void;
   readonly creativeStartupForTest?: (config: Readonly<CreativeBootV1>) => void;
   readonly createIdentityIssuerForTest?: NavigationIdentityIssuerFactory;
@@ -413,12 +414,12 @@ export function createNoopBrowserComposition(): BrowserComposition {
 }
 
 /**
- * Construct the single runtime only for coordinated-cutover tests.
+ * Construct the sole browser runtime composition without claiming a global.
  *
- * The shipped core remains on its existing bootstrap until Task 19; keeping this
- * explicit prevents an import of the composition module from claiming globals.
+ * The core entry point owns the one production claim; tests may construct the
+ * same composition against explicit targets and adapters.
  */
-export function createTestBrowserRuntimeComposition(
+export function createBrowserRuntimeComposition(
   runtimeOptions: RuntimeOptions,
   compositionOptions: TestBrowserRuntimeCompositionOptions
 ): BrowserRuntimeComposition {
@@ -442,6 +443,33 @@ export function createTestBrowserRuntimeComposition(
       observation['kind'] === 'impressionViewable' ||
       observation['kind'] === 'slotVisibilityChanged'
     ) {
+      try {
+        renderTrace?.observeGptFact(
+          observation as unknown as Readonly<RenderTraceGptFactV1>,
+          (elementId) => {
+            if (typeof elementId !== 'string' || elementId === '') return undefined;
+            const slots = browserServices?.slots;
+            const slot =
+              slots?.resolveDomAlias(elementId) ?? slots?.resolveRegisteredSlot(elementId);
+            if (!slot) return undefined;
+            let element: HTMLElement | undefined;
+            if (typeof document !== 'undefined') {
+              const matches = [...document.querySelectorAll<HTMLElement>('[id]')].filter(
+                (candidate) => candidate.id === elementId
+              );
+              if (matches.length === 1) element = matches[0];
+            }
+            return Object.freeze({
+              slotId: slot.registeredSlotId,
+              ...(element === undefined
+                ? {}
+                : { elementId: element.id, visible: isEffectivelyVisible(element) }),
+            });
+          }
+        );
+      } catch {
+        // Render tracing never affects an already-committed adapter observation.
+      }
       try {
         gptDiagnosticsFacts?.publish(observation as unknown as Readonly<GoogletagDiagnosticsFact>);
       } catch {
@@ -1270,7 +1298,7 @@ export function createTestBrowserRuntimeComposition(
       });
       browserServices.slots.activate();
       browserServices.slots.start();
-      compositionOptions.coreActivations.correctnessGptListeners(
+      compositionOptions.coreActivations?.correctnessGptListeners(
         context,
         composition.adapters,
         browserServices
@@ -1332,3 +1360,6 @@ export function createTestBrowserRuntimeComposition(
     },
   });
 }
+
+/** Temporary test import alias; production has only one composition implementation. */
+export const createTestBrowserRuntimeComposition = createBrowserRuntimeComposition;
