@@ -642,8 +642,12 @@ export interface RenderAttemptOptions {
 }
 
 export interface RenderAttemptDiagnosticsObservation extends Readonly<Record<string, unknown>> {
+  readonly adId?: string;
   readonly kind: 'render_attempt';
   readonly attemptId: string;
+  readonly bidId?: string;
+  readonly creativeId?: string;
+  readonly injected: boolean;
   readonly slotId: string;
   readonly path: 'auction' | 'ssat';
   readonly rendered: boolean;
@@ -1558,19 +1562,45 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
       }
     }
     if (publishDiagnostics) {
+      const accepted = terminal.outcome === 'accepted';
       const servedFrom =
-        terminal.outcome === 'accepted' && terminalRenderSource?.type === 'cache'
+        accepted && terminalRenderSource?.type === 'cache'
           ? ('pbs-cache' as const)
-          : terminal.outcome === 'accepted'
+          : accepted
             ? ('inline' as const)
             : undefined;
+      let sourceIdentity: Readonly<{ adId?: string; bidId?: string; creativeId?: string }> =
+        Object.freeze({});
+      if (accepted && terminalRenderSource) {
+        try {
+          const readString = (name: string): string | undefined => {
+            const descriptor = Object.getOwnPropertyDescriptor(terminalRenderSource, name);
+            return descriptor && 'value' in descriptor && typeof descriptor.value === 'string'
+              ? descriptor.value
+              : undefined;
+          };
+          const bidId = terminalRenderSource.type === 'aps' ? readString('bidId') : undefined;
+          const creativeId =
+            terminalRenderSource.type === 'aps' ? readString('creativeId') : undefined;
+          const adId = terminalRenderSource.type === 'cache' ? readString('cacheId') : undefined;
+          sourceIdentity = frozen({
+            ...(adId === undefined ? {} : { adId }),
+            ...(bidId === undefined ? {} : { bidId }),
+            ...(creativeId === undefined ? {} : { creativeId }),
+          });
+        } catch {
+          // Optional trace identity cannot affect the committed terminal state.
+        }
+      }
       const observation = frozen<RenderAttemptDiagnosticsObservation>({
         kind: 'render_attempt',
         attemptId: id,
         slotId: slot,
         path: history.includes('waiting_for_gam_and_claim') ? 'ssat' : 'auction',
-        rendered: terminal.outcome === 'accepted',
+        rendered: accepted,
+        injected: accepted,
         ...(servedFrom === undefined ? {} : { servedFrom }),
+        ...sourceIdentity,
         state: terminal.outcome,
         outcome: terminal,
       });
