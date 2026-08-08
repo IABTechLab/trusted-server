@@ -5149,7 +5149,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_publisher_body_injects_active_diagnostics_for_materialized_html() {
+    fn ts_console_stream_publisher_body_injects_active_diagnostics_for_materialized_html() {
         let mut settings = create_test_settings();
         settings
             .integrations
