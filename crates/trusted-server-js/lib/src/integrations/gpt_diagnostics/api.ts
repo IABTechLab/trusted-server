@@ -152,7 +152,8 @@ export class GptDiagnosticsApiController {
   }
 
   private subscribe(listener: ApiListener): () => void {
-    if (typeof listener !== 'function') throw new TypeError('Diagnostics listener must be callable');
+    if (typeof listener !== 'function')
+      throw new TypeError('Diagnostics listener must be callable');
     if (this.destroyed) return () => undefined;
     if (this.listeners.size >= MAX_API_SUBSCRIBERS) {
       throw new DiagnosticsSubscriberLimitError('gpt');
