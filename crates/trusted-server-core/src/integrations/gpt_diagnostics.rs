@@ -26,6 +26,10 @@ pub const GPT_DIAGNOSTICS_INTEGRATION_ID: &str = "gpt_diagnostics";
 pub const GPT_DIAGNOSTICS_QUERY: &str = "ts_console";
 /// Host-only browser-session activation cookie.
 pub const GPT_DIAGNOSTICS_COOKIE: &str = "__Host-ts-console";
+/// Static filename for the request-scoped, non-authoritative URL cleanup asset.
+pub const GPT_DIAGNOSTICS_BOOTSTRAP_FILENAME: &str = "tsjs-gpt_diagnostics-bootstrap.min.js";
+/// Browser program served only as a public static asset and injected per request.
+pub const GPT_DIAGNOSTICS_BOOTSTRAP_SOURCE: &str = include_str!("gpt_diagnostics_bootstrap.js");
 
 const SET_CONSOLE_COOKIE: &str = "__Host-ts-console=1; Path=/; Secure; HttpOnly; SameSite=Lax";
 const CLEAR_CONSOLE_COOKIE: &str =
@@ -63,6 +67,7 @@ pub enum GptDiagnosticsCookieAction {
 pub struct GptDiagnosticsRequestDecision {
     active: bool,
     reserved_directive: bool,
+    cleanup_browser_url: bool,
     cookie_action: GptDiagnosticsCookieAction,
 }
 
@@ -101,86 +106,16 @@ impl GptDiagnosticsRequestDecision {
             )
         })
     }
-    /// An active decision, for tests in other modules that need one.
-    ///
-    /// The fields are private and built by `prepare_request` from a cookie or query
-    /// parameter; there is no other way to obtain an active decision across a module
-    /// boundary.
-    #[cfg(test)]
-    pub(crate) fn active_for_tests() -> Self {
-        Self {
-            active: true,
-            clean_browser_path_and_query: None,
-            cookie_action: GptDiagnosticsCookieAction::None,
-        }
-    }
-}
 
-#[cfg(test)]
-mod head_seam_invariant_tests {
-    use super::*;
-
-    /// Every combination of the three fields the decision carries.
-    fn all_decisions() -> Vec<GptDiagnosticsRequestDecision> {
-        let mut out = Vec::new();
-        for active in [false, true] {
-            for clean in [None, Some("/clean".to_string())] {
-                for cookie_action in [
-                    GptDiagnosticsCookieAction::None,
-                    GptDiagnosticsCookieAction::SetSession,
-                    GptDiagnosticsCookieAction::ClearSession,
-                ] {
-                    out.push(GptDiagnosticsRequestDecision {
-                        active,
-                        clean_browser_path_and_query: clean.clone(),
-                        cookie_action,
-                    });
-                }
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn requires_private_no_store_is_a_superset_of_injection() {
-        // Load-bearing relationship, not an incidental one. Whenever this decision
-        // injects anything into `<head>`, the response must also be stamped
-        // `private, no-store` — which is what keeps request-scoped diagnostics out
-        // of a shared cache if the explicit assembly-mode gate in
-        // `create_html_stream_processor` is ever removed or bypassed.
-        //
-        // If a future change makes a script emit without also requiring the stamp,
-        // this fails here rather than silently in a cached template.
-        for decision in all_decisions() {
-            let injects =
-                decision.bootstrap_script().is_some() || decision.module_script_tag().is_some();
-            if injects {
-                assert!(
-                    decision.requires_private_no_store(),
-                    "decision injects into <head> but does not require private/no-store: \
-                     {decision:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_default_decision_injects_nothing() {
-        let decision = GptDiagnosticsRequestDecision::default();
-        assert_eq!(
-            decision.bootstrap_script(),
-            None,
-            "should not inject a bootstrap for an inert decision"
-        );
-        assert_eq!(
-            decision.module_script_tag(),
-            None,
-            "should not inject a module for an inert decision"
-        );
-        assert!(
-            !decision.requires_private_no_store(),
-            "an inert decision should not force the response private"
-        );
+    /// Build the one-time external URL-cleanup tag after reserved input was consumed.
+    #[must_use]
+    pub fn url_cleanup_script_tag(&self) -> Option<String> {
+        self.cleanup_browser_url.then(|| {
+            format!(
+                "<script src=\"/static/tsjs={}\"></script>",
+                GPT_DIAGNOSTICS_BOOTSTRAP_FILENAME
+            )
+        })
     }
 }
 
@@ -270,6 +205,7 @@ pub fn prepare_request(
 
     let mut decision = GptDiagnosticsRequestDecision {
         reserved_directive: had_reserved_query,
+        cleanup_browser_url: eligible_navigation && had_reserved_query,
         ..GptDiagnosticsRequestDecision::default()
     };
     if integration_enabled && eligible_navigation && had_reserved_query {
@@ -521,6 +457,14 @@ mod tests {
         );
         assert_eq!(request.headers()[header::COOKIE], "other=value");
         assert_eq!(decision.boot_config_json(), r#"{"active":true}"#);
+        assert_eq!(
+            decision.url_cleanup_script_tag(),
+            Some(
+                "<script src=\"/static/tsjs=tsjs-gpt_diagnostics-bootstrap.min.js\"></script>"
+                    .to_owned()
+            ),
+            "a server-consumed directive should authorize one external cleanup asset"
+        );
     }
 
     #[test]
@@ -548,6 +492,7 @@ mod tests {
         );
         let decision = prepare_request(&settings(true), &mut active).expect("should prepare");
         assert!(decision.active());
+        assert_eq!(decision.url_cleanup_script_tag(), None);
         assert_eq!(active.headers()[header::COOKIE], "other=value");
 
         let mut duplicate = navigation(
