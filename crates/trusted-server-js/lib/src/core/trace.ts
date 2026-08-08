@@ -562,6 +562,27 @@ const MAX_RENDER_TRACE_NOTIFICATIONS = 200;
 type RenderTraceInputV1 = Omit<RenderTraceRecord, 'at' | 'count' | 'seq'>;
 type RenderTraceUpdateV1 = Partial<Omit<RenderTraceRecord, 'at' | 'count' | 'seq' | 'slotId'>>;
 
+/** Safe GPT fact shape admitted by the closure-private diagnostics bus. */
+export interface RenderTraceGptFactV1 extends Readonly<Record<string, unknown>> {
+  readonly kind:
+    | 'slotRequested'
+    | 'slotResponseReceived'
+    | 'slotRenderEnded'
+    | 'slotOnload'
+    | 'impressionViewable'
+    | 'slotVisibilityChanged';
+  readonly slot: Readonly<{ readonly token: object; readonly elementId?: string }>;
+  readonly isEmpty?: boolean;
+  readonly inViewPercentage?: number;
+}
+
+/** Current registered-slot identity and presentation state for one safe GPT fact. */
+export interface RenderTraceGptResolutionV1 {
+  readonly slotId: string;
+  readonly elementId?: string;
+  readonly visible?: boolean;
+}
+
 export interface RenderTraceRuntimeScheduler {
   readonly set: (callback: () => void, milliseconds: number) => unknown;
   readonly clear: (handle: unknown) => void;
@@ -588,6 +609,10 @@ export interface RenderTraceRuntimeOwner {
     patch: RenderTraceUpdateV1
   ) => Readonly<RenderTraceRecord> | undefined;
   readonly prune: (slotId: string, sequence?: number) => boolean;
+  readonly observeGptFact: (
+    fact: Readonly<RenderTraceGptFactV1>,
+    resolve: (elementId: string | undefined) => RenderTraceGptResolutionV1 | undefined
+  ) => void;
   readonly dispose: () => void;
 }
 
@@ -935,6 +960,10 @@ export function createRenderTraceDiagnostics(
   const counts = new Map<string, number>();
   const history: Array<Readonly<RenderTraceRecord>> = [];
   const recordsBySequence = new Map<number, Readonly<RenderTraceRecord>>();
+  const gptImpressions = new Map<
+    object,
+    { readonly baselineSequence: number | undefined; sequence?: number; readonly slotId: string }
+  >();
   const subscribers = new Map<number, RenderTraceSubscription>();
   const pendingOrder: number[] = [];
   const pendingBySequence = new Map<number, PendingRenderTraceNotification>();
@@ -1125,6 +1154,87 @@ export function createRenderTraceDiagnostics(
     return true;
   };
 
+  const observeGptFact = (
+    fact: Readonly<RenderTraceGptFactV1>,
+    resolve: (elementId: string | undefined) => RenderTraceGptResolutionV1 | undefined
+  ): void => {
+    if (disposed || typeof resolve !== 'function') return;
+    try {
+      const token = fact.slot.token;
+      if (typeof token !== 'object' || token === null || !Object.isFrozen(token)) return;
+      const resolution = resolve(fact.slot.elementId);
+      if (!resolution || typeof resolution.slotId !== 'string' || resolution.slotId === '') return;
+
+      if (fact.kind === 'slotRequested') {
+        for (const [candidateToken, impression] of gptImpressions) {
+          if (impression.slotId === resolution.slotId) gptImpressions.delete(candidateToken);
+        }
+        if (gptImpressions.size >= MAX_RENDER_TRACE_SLOTS) {
+          const oldestToken = gptImpressions.keys().next().value as object | undefined;
+          if (oldestToken) gptImpressions.delete(oldestToken);
+        }
+        gptImpressions.set(token, {
+          baselineSequence: current.get(resolution.slotId)?.seq,
+          slotId: resolution.slotId,
+        });
+        return;
+      }
+
+      const impression = gptImpressions.get(token);
+      if (!impression || impression.slotId !== resolution.slotId) return;
+      if (fact.kind === 'slotResponseReceived') return;
+      if (fact.kind === 'slotRenderEnded') {
+        if (typeof fact.isEmpty !== 'boolean') return;
+        const latest = current.get(impression.slotId);
+        const target =
+          latest && latest.seq !== impression.baselineSequence
+            ? latest
+            : record({
+                slotId: impression.slotId,
+                path: 'gam-refresh',
+                rendered: !fact.isEmpty,
+                gamEmpty: fact.isEmpty,
+                injected: false,
+                ...(resolution.elementId === undefined ? {} : { elementId: resolution.elementId }),
+                ...(resolution.visible === undefined
+                  ? {}
+                  : { visible: !fact.isEmpty && resolution.visible }),
+                servedFrom: 'gam',
+              });
+        const enriched = enrich(target, {
+          rendered: !fact.isEmpty,
+          gamEmpty: fact.isEmpty,
+          injected: false,
+          ...(target.servedFrom === undefined ? { servedFrom: 'gam' as const } : {}),
+          ...(resolution.elementId === undefined ? {} : { elementId: resolution.elementId }),
+          ...(resolution.visible === undefined
+            ? {}
+            : { visible: !fact.isEmpty && resolution.visible }),
+        });
+        impression.sequence = enriched?.seq ?? target.seq;
+        return;
+      }
+
+      const targetSequence = impression.sequence;
+      if (targetSequence === undefined || current.get(impression.slotId)?.seq !== targetSequence) {
+        return;
+      }
+      if (fact.kind === 'impressionViewable') {
+        enrich(targetSequence, { visible: true });
+      } else if (
+        fact.kind === 'slotVisibilityChanged' &&
+        typeof fact.inViewPercentage === 'number' &&
+        Number.isFinite(fact.inViewPercentage)
+      ) {
+        enrich(targetSequence, { visible: fact.inViewPercentage > 0 });
+      } else if (fact.kind === 'slotOnload' && resolution.visible !== undefined) {
+        enrich(targetSequence, { visible: resolution.visible });
+      }
+    } catch {
+      // GPT diagnostics cannot affect the committed render or adapter callback.
+    }
+  };
+
   const api: RenderTraceDiagnostics = Object.freeze({
     current: (): Readonly<Record<string, Readonly<RenderTraceRecord>>> => {
       const snapshot = Object.create(null) as Record<string, Readonly<RenderTraceRecord>>;
@@ -1175,10 +1285,19 @@ export function createRenderTraceDiagnostics(
     history.length = 0;
     recordsBySequence.clear();
     counts.clear();
+    gptImpressions.clear();
     presentation.dispose();
   };
 
-  return Object.freeze({ api, diagnostics: api, record, enrich, prune, dispose });
+  return Object.freeze({
+    api,
+    diagnostics: api,
+    record,
+    enrich,
+    prune,
+    observeGptFact,
+    dispose,
+  });
 }
 
 /** Short name used by the browser composition owner. */

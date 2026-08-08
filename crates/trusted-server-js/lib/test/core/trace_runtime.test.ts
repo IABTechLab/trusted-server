@@ -188,6 +188,111 @@ describe('render trace diagnostics runtime', () => {
     expect(owner.diagnostics.history()).toHaveLength(1);
   });
 
+  it('records an unattributed GPT request as one GAM-refresh impression', () => {
+    const { owner } = harness();
+    const token = Object.freeze(Object.create(null) as object);
+    const resolve = () =>
+      Object.freeze({ slotId: 'publisher-slot', elementId: 'publisher-slot', visible: true });
+
+    owner.observeGptFact(
+      Object.freeze({
+        kind: 'slotRequested',
+        observedAtMs: 1,
+        slot: Object.freeze({ token, elementId: 'publisher-slot' }),
+      }),
+      resolve
+    );
+    owner.observeGptFact(
+      Object.freeze({
+        kind: 'slotRenderEnded',
+        observedAtMs: 2,
+        slot: Object.freeze({ token, elementId: 'publisher-slot' }),
+        isEmpty: false,
+      }),
+      resolve
+    );
+
+    expect(owner.diagnostics.current()['publisher-slot']).toEqual(
+      expect.objectContaining({
+        path: 'gam-refresh',
+        rendered: true,
+        gamEmpty: false,
+        injected: false,
+        visible: true,
+        servedFrom: 'gam',
+      })
+    );
+    expect(owner.diagnostics.history()).toHaveLength(1);
+  });
+
+  it('enriches only the same GPT impression without weakening TS placement truth', () => {
+    const { owner } = harness();
+    const token = Object.freeze(Object.create(null) as object);
+    const slot = Object.freeze({ token, elementId: 'ts-slot' });
+    const resolve = () => Object.freeze({ slotId: 'ts-slot', elementId: 'ts-slot', visible: true });
+    owner.record({ slotId: 'ts-slot', path: 'gam-refresh', rendered: false, injected: false });
+    owner.observeGptFact(Object.freeze({ kind: 'slotRequested', observedAtMs: 1, slot }), resolve);
+    const trusted = owner.record({
+      slotId: 'ts-slot',
+      path: 'ssat',
+      rendered: true,
+      injected: true,
+      servedFrom: 'pbs-cache',
+    });
+
+    owner.observeGptFact(
+      Object.freeze({ kind: 'slotRenderEnded', observedAtMs: 2, slot, isEmpty: false }),
+      resolve
+    );
+    owner.observeGptFact(
+      Object.freeze({ kind: 'slotRenderEnded', observedAtMs: 3, slot, isEmpty: true }),
+      resolve
+    );
+
+    expect(owner.diagnostics.history()).toHaveLength(2);
+    expect(owner.diagnostics.current()['ts-slot']).toEqual(
+      expect.objectContaining({
+        seq: trusted.seq,
+        path: 'ssat',
+        rendered: true,
+        injected: true,
+        gamEmpty: true,
+        servedFrom: 'pbs-cache',
+      })
+    );
+  });
+
+  it('routes all GPT lifecycle facts and scopes visibility to the active physical request', () => {
+    const { owner } = harness();
+    const firstToken = Object.freeze(Object.create(null) as object);
+    const secondToken = Object.freeze(Object.create(null) as object);
+    const resolve = () => Object.freeze({ slotId: 'visible-slot', visible: false });
+    const fact = (
+      kind: string,
+      token: object,
+      fields: Readonly<Record<string, unknown>> = Object.freeze({})
+    ) => Object.freeze({ kind, observedAtMs: 1, slot: Object.freeze({ token }), ...fields });
+
+    owner.observeGptFact(fact('slotRequested', firstToken), resolve);
+    owner.observeGptFact(fact('slotResponseReceived', firstToken), resolve);
+    owner.observeGptFact(fact('slotRenderEnded', firstToken, { isEmpty: false }), resolve);
+    owner.observeGptFact(fact('slotOnload', firstToken), resolve);
+    owner.observeGptFact(fact('impressionViewable', firstToken), resolve);
+    expect(owner.diagnostics.current()['visible-slot']?.visible).toBe(true);
+    owner.observeGptFact(
+      fact('slotVisibilityChanged', firstToken, { inViewPercentage: 0 }),
+      resolve
+    );
+    expect(owner.diagnostics.current()['visible-slot']?.visible).toBe(false);
+
+    owner.observeGptFact(fact('slotRequested', secondToken), resolve);
+    owner.observeGptFact(fact('impressionViewable', secondToken), resolve);
+    expect(
+      owner.diagnostics.current()['visible-slot']?.visible,
+      'a pre-render callback for a replacement physical request must not enrich the old impression'
+    ).toBe(false);
+  });
+
   it('drops the oldest of 201 pending records and cancels work on disposal', () => {
     const { owner, tasks, drain } = harness();
     const listener = vi.fn();
