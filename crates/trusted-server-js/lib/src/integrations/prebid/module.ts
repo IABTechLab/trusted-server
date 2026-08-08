@@ -334,7 +334,7 @@ export function preparePrebidRegisteredRefreshAuction(
         return undefined;
       }
 
-      const bidderParams: Record<string, unknown> = {};
+      const bidderParamEntries = new Map<string, unknown>();
       const trustedParams: Record<string, unknown> = {};
       const clientBids: object[] = [];
       let foundTrustedBid = false;
@@ -357,7 +357,7 @@ export function preparePrebidRegisteredRefreshAuction(
             if (!foldedRecord || !Object.isFrozen(folded)) return undefined;
             for (const [bidder, bidderValue] of Object.entries(foldedRecord)) {
               if (!validBoundedString(bidder, 64) || !ownDataObject(bidderValue)) return undefined;
-              defineDataProperty(bidderParams, bidder, bidderValue);
+              if (!clientSideBidders.has(bidder)) bidderParamEntries.set(bidder, bidderValue);
             }
           }
           continue;
@@ -366,9 +366,13 @@ export function preparePrebidRegisteredRefreshAuction(
           clientBids.push(Object.freeze({ bidder: bid.bidder, params }));
           continue;
         }
-        defineDataProperty(bidderParams, bid.bidder, params);
+        bidderParamEntries.set(bid.bidder, params);
       }
 
+      const bidderParams: Record<string, unknown> = {};
+      for (const [bidder, params] of bidderParamEntries) {
+        defineDataProperty(bidderParams, bidder, params);
+      }
       defineDataProperty(trustedParams, 'bidderParams', Object.freeze(bidderParams));
       const synthetic = Object.freeze({
         code: source.code,
