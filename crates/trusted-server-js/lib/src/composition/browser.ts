@@ -443,9 +443,7 @@ export function createTestBrowserRuntimeComposition(
       observation['kind'] === 'slotVisibilityChanged'
     ) {
       try {
-        gptDiagnosticsFacts?.publish(
-          observation as unknown as Readonly<GoogletagDiagnosticsFact>
-        );
+        gptDiagnosticsFacts?.publish(observation as unknown as Readonly<GoogletagDiagnosticsFact>);
       } catch {
         // GPT diagnostics never affect an already-committed adapter observation.
       }
