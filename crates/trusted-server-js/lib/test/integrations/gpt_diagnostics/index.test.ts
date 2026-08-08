@@ -5,24 +5,20 @@ import { createGptDiagnosticsFactBuffer } from '../../../src/integrations/gpt_di
 import { createGptDiagnosticsRuntime } from '../../../src/integrations/gpt_diagnostics';
 import { GPT_DIAGNOSTICS_HOST_ID } from '../../../src/integrations/gpt_diagnostics/overlay';
 
-interface FakeSlot {
-  getSlotElementId(): string;
-  getAdUnitPath(): string;
-}
-
-function slot(id: string): FakeSlot {
+function slot(id: string): GoogletagDiagnosticsFact['slot'] {
   return Object.freeze({
-    getSlotElementId: () => id,
-    getAdUnitPath: () => `/example/site/${id}`,
+    token: Object.freeze(Object.create(null) as object),
+    elementId: id,
+    adUnitPath: `/example/site/${id}`,
   });
 }
 
 function fact(
   kind: GoogletagDiagnosticsFact['kind'],
-  observedSlot: object,
+  observedSlot: GoogletagDiagnosticsFact['slot'],
   fields: Partial<GoogletagDiagnosticsFact> = {}
 ): Readonly<GoogletagDiagnosticsFact> {
-  return Object.freeze({ kind, slot: observedSlot, ...fields });
+  return Object.freeze({ kind, observedAtMs: 1, slot: observedSlot, ...fields });
 }
 
 beforeEach(() => {

@@ -211,12 +211,20 @@ export type GoogletagDiagnosticsEventName =
 
 export interface GoogletagDiagnosticsFact {
   readonly kind: GoogletagDiagnosticsEventName;
-  readonly slot: object;
+  readonly observedAtMs: number;
+  readonly slot: GoogletagDiagnosticsSlotSnapshot;
   readonly isEmpty?: boolean;
   readonly size?: readonly [number, number];
   readonly isBackfill?: boolean;
   readonly slotContentChanged?: boolean;
   readonly inViewPercentage?: number;
+}
+
+/** Frozen, non-authoritative identity and metadata captured from one physical GPT slot. */
+export interface GoogletagDiagnosticsSlotSnapshot {
+  readonly token: object;
+  readonly elementId?: string;
+  readonly adUnitPath?: string;
 }
 
 export type GoogletagDiagnosticsObserver = (fact: Readonly<GoogletagDiagnosticsFact>) => void;
@@ -861,6 +869,7 @@ export function createBrowserGoogletagAdapter(
   const targetingObservations = new WeakMap<object, TargetingObservation>();
   const facadeCalls = new WeakMap<(...arguments_: unknown[]) => unknown, number>();
   const bindingTokens = new WeakMap<object, object>();
+  const diagnosticsSlots = new WeakMap<object, GoogletagDiagnosticsSlotSnapshot>();
   const initialLoadReleases = new Map<object, () => void>();
   const initialLoadOwner = Object.freeze({});
   let diagnosticsObserver: GoogletagDiagnosticsObserver | undefined;
@@ -870,7 +879,8 @@ export function createBrowserGoogletagAdapter(
 
   const diagnosticFact = (
     eventType: string,
-    event: unknown
+    event: unknown,
+    observedAtMs: number
   ): Readonly<GoogletagDiagnosticsFact> | undefined => {
     try {
       if ((typeof event !== 'object' || event === null) && typeof event !== 'function') {
@@ -880,7 +890,30 @@ export function createBrowserGoogletagAdapter(
       if ((typeof slot !== 'object' || slot === null) && typeof slot !== 'function') {
         return undefined;
       }
-      const base = { kind: eventType, slot: slot as object };
+      const physicalSlot = slot as object;
+      let safeSlot = weakMapValue(diagnosticsSlots, physicalSlot);
+      if (!safeSlot) {
+        const optionalStringCall = (key: 'getSlotElementId' | 'getAdUnitPath'): string | undefined => {
+          const method = safeMember(physicalSlot, key);
+          if (typeof method !== 'function') return undefined;
+          try {
+            const value = Reflect.apply(method, physicalSlot, []);
+            return typeof value === 'string' && value.length > 0 ? value : undefined;
+          } catch {
+            return undefined;
+          }
+        };
+        const token = Object.freeze(Object.create(null) as object);
+        const elementId = optionalStringCall('getSlotElementId');
+        const adUnitPath = optionalStringCall('getAdUnitPath');
+        safeSlot = Object.freeze({
+          token,
+          ...(elementId === undefined ? {} : { elementId }),
+          ...(adUnitPath === undefined ? {} : { adUnitPath }),
+        });
+        setWeakMapValue(diagnosticsSlots, physicalSlot, safeSlot);
+      }
+      const base = { kind: eventType, observedAtMs, slot: safeSlot };
       switch (eventType) {
         case 'slotRequested':
         case 'slotResponseReceived':
@@ -931,7 +964,20 @@ export function createBrowserGoogletagAdapter(
   const publishDiagnostics = (eventType: string, event: unknown): void => {
     const observer = diagnosticsObserver;
     if (!observer || disposed) return;
-    const fact = diagnosticFact(eventType, event);
+    let observedAtMs = 0;
+    try {
+      const performance = safeMember(target, 'performance');
+      if ((typeof performance === 'object' && performance !== null) || typeof performance === 'function') {
+        const now = safeMember(performance as object, 'now');
+        if (typeof now === 'function') {
+          const value = Reflect.apply(now, performance, []);
+          if (typeof value === 'number' && Number.isFinite(value)) observedAtMs = value;
+        }
+      }
+    } catch {
+      // A missing or hostile clock cannot suppress the observed GPT fact.
+    }
+    const fact = diagnosticFact(eventType, event, observedAtMs);
     if (!fact) return;
     try {
       observer(fact);

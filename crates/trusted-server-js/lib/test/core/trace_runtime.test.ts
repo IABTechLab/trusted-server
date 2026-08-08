@@ -148,6 +148,16 @@ describe('render trace diagnostics runtime', () => {
     expect(history[0]?.seq).toBeGreaterThan(1);
   });
 
+  it('retains a bounded document-lifetime slot count after current-state pruning', () => {
+    const { owner } = harness();
+    const first = owner.record({ slotId: 'reused-slot', path: 'auction', rendered: true });
+
+    expect(owner.prune('reused-slot', first.seq)).toBe(true);
+    const second = owner.record({ slotId: 'reused-slot', path: 'gam-refresh', rendered: false });
+
+    expect(second.count).toBe(2);
+  });
+
   it('retains impression bookkeeping and refuses truth-weakening enrichment', () => {
     const { owner } = harness();
     const record = owner.record({

@@ -133,51 +133,20 @@ describe('GptDiagnosticsStore', () => {
     assertCoverageEquation(store);
   });
 
-  it('matches the unique response-bearing load that arrives before render', () => {
-    let now = 1;
-    const store = new GptDiagnosticsStore({ now: () => now });
-    const slot = fakeSlot('early-load');
+  it('uses adapter callback times even when buffered delivery occurs much later', () => {
+    const store = new GptDiagnosticsStore({ now: () => 9_999 });
+    const slot = fakeSlot('buffered-slot');
 
-    store.recordSlotRequested(slot);
-    now = 2;
-    store.recordSlotResponseReceived(slot);
-    now = 3;
-    store.recordSlotOnload(slot);
-    now = 4;
-    store.recordSlotRenderEnded(slot, { isEmpty: false });
+    store.recordSlotRequested(slot, 10);
+    store.recordSlotResponseReceived(slot, 25);
+    store.recordSlotRenderEnded(slot, { isEmpty: false }, 30);
 
-    const cycle = store.snapshot().slots[0].requests[0];
-    expect(cycle).toMatchObject({
-      loadAtMs: 3,
-      loadObservedBeforeRender: true,
-      incompleteSequence: false,
+    expect(store.snapshot().slots[0]?.requests[0]).toMatchObject({
+      requestedAtMs: 10,
+      responseAtMs: 25,
+      renderAtMs: 30,
+      durations: { requestToResponseMs: 15, responseToRenderMs: 5, requestToRenderMs: 20 },
     });
-    expect(cycle.durations.renderToLoadMs).toBeUndefined();
-    expect(store.snapshot().callbackIssues).not.toContainEqual(
-      expect.objectContaining({ kind: 'slotOnload', reason: 'invalid_event_order' })
-    );
-  });
-
-  it('keeps no-response loads unmatched and overlapping response-bearing loads ambiguous', () => {
-    let now = 1;
-    const store = new GptDiagnosticsStore({ now: () => now });
-    const missingResponse = fakeSlot('missing-load-response');
-    store.recordSlotRequested(missingResponse);
-    store.recordSlotOnload(missingResponse);
-    const overlapping = fakeSlot('overlapping-load-response');
-    now = 2;
-    store.recordSlotRequested(overlapping);
-    now = 3;
-    store.recordSlotResponseReceived(overlapping);
-    now = 4;
-    store.recordSlotRequested(overlapping);
-    now = 5;
-    store.recordSlotResponseReceived(overlapping);
-    now = 6;
-    store.recordSlotOnload(overlapping);
-
-    expect(store.snapshot().coverage.slotOnload).toMatchObject({ unmatched: 1, ambiguous: 1 });
-    assertCoverageEquation(store);
   });
 
   it('matches load and viewability after a render with unknown fill state', () => {

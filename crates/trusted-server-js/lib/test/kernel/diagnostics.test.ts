@@ -152,6 +152,20 @@ describe('kernel diagnostics bus', () => {
     bus.dispose();
   });
 
+  it('rejects frozen functions and exotic objects instead of transporting capabilities', () => {
+    const bus = createDiagnosticsBus({ manifest: manifest([]) });
+    const callable = Object.freeze(() => undefined);
+    const exotic = Object.freeze(new (class PublisherSlot {})());
+
+    expect(
+      bus.publish(Object.freeze({ kind: 'gpt', slot: callable }) as DiagnosticsObservation)
+    ).toBe(false);
+    expect(
+      bus.publish(Object.freeze({ kind: 'gpt', slot: exotic }) as DiagnosticsObservation)
+    ).toBe(false);
+    bus.dispose();
+  });
+
   it('commits to the private core observer before asynchronous module delivery', () => {
     vi.useFakeTimers();
     const order: string[] = [];

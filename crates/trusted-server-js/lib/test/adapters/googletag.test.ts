@@ -1105,7 +1105,8 @@ describe('browser googletag adapter readiness', () => {
 
   it('publishes frozen diagnostics facts after the sole adapter listener completes', async () => {
     const ready = createReadyGoogletag();
-    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+    const performance = { now: vi.fn(() => 42.25) };
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag, performance });
     const order: string[] = [];
     const facts: unknown[] = [];
     const releaseDiagnostics = adapter.observeDiagnostics?.((fact) => {
@@ -1122,7 +1123,11 @@ describe('browser googletag adapter readiness', () => {
       })
     ).result;
     expect(ready.pubads.addEventListener).toHaveBeenCalledTimes(1);
-    const slot = Object.freeze({ id: 'fictional-slot' });
+    const slot = Object.freeze({
+      getSlotElementId: () => 'fictional-slot',
+      getAdUnitPath: () => '/example/fictional-slot',
+      setTargeting: vi.fn(),
+    });
     const emit = (event: unknown): void => {
       for (const listener of ready.listeners.get('slotRenderEnded') ?? []) listener(event);
     };
@@ -1140,7 +1145,12 @@ describe('browser googletag adapter readiness', () => {
     expect(facts).toEqual([
       {
         kind: 'slotRenderEnded',
-        slot,
+        observedAtMs: 42.25,
+        slot: {
+          token: expect.any(Object),
+          elementId: 'fictional-slot',
+          adUnitPath: '/example/fictional-slot',
+        },
         isEmpty: false,
         size: [300, 250],
         isBackfill: true,
@@ -1149,6 +1159,12 @@ describe('browser googletag adapter readiness', () => {
     ]);
     expect(Object.isFrozen(facts[0])).toBe(true);
     expect(Object.isFrozen((facts[0] as { size: unknown }).size)).toBe(true);
+    const safeSlot = (facts[0] as { slot: Record<string, unknown> }).slot;
+    expect(Object.isFrozen(safeSlot)).toBe(true);
+    expect(Object.isFrozen(safeSlot['token'])).toBe(true);
+    expect(Reflect.ownKeys(safeSlot).sort()).toEqual(['adUnitPath', 'elementId', 'token']);
+    expect(Object.values(safeSlot).some((value) => typeof value === 'function')).toBe(false);
+    expect(safeSlot).not.toBe(slot);
 
     releaseDiagnostics?.();
     emit({ slot, isEmpty: true });

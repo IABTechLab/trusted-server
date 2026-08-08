@@ -42,6 +42,9 @@ const CALLBACK_KINDS: GptDiagnosticsCallbackKind[] = [
 ];
 
 export interface GptDiagnosticsSlotLike {
+  readonly token?: object | undefined;
+  readonly elementId?: string | undefined;
+  readonly adUnitPath?: string | undefined;
   getSlotElementId?: (() => string) | undefined;
   getAdUnitPath?: (() => string) | undefined;
 }
@@ -573,8 +576,8 @@ export class GptDiagnosticsStore {
     return () => this.listeners.delete(listener);
   }
 
-  recordSlotRequested(slot: GptDiagnosticsSlotLike): void {
-    const timestampMs = this.timestamp();
+  recordSlotRequested(slot: GptDiagnosticsSlotLike, observedAtMs?: number): void {
+    const timestampMs = this.timestamp(observedAtMs);
     const record = this.prepareCallback('slotRequested', slot, timestampMs);
     if (!record) return;
 
@@ -585,11 +588,9 @@ export class GptDiagnosticsStore {
       this.metadata.evictedRequestCycles += 1;
     }
 
-    const requestNumber = (this.requestNumbers.get(slot) ?? 0) + 1;
-    this.requestNumbers.set(slot, requestNumber);
-    const intent = this.consumeRequestIntent(slot, timestampMs);
-    const trustedServerEvidence = intent?.sources.get('trusted_server_direct');
-    const requestPath = this.requestPath(intent);
+    const identity = slot.token ?? slot;
+    const requestNumber = (this.requestNumbers.get(identity) ?? 0) + 1;
+    this.requestNumbers.set(identity, requestNumber);
     record.requests.push({
       requestNumber,
       requestedAtMs: timestampMs,
@@ -616,8 +617,8 @@ export class GptDiagnosticsStore {
     this.notify();
   }
 
-  recordSlotResponseReceived(slot: GptDiagnosticsSlotLike): void {
-    const timestampMs = this.timestamp();
+  recordSlotResponseReceived(slot: GptDiagnosticsSlotLike, observedAtMs?: number): void {
+    const timestampMs = this.timestamp(observedAtMs);
     this.matchCycle(
       'slotResponseReceived',
       slot,
@@ -642,8 +643,12 @@ export class GptDiagnosticsStore {
     );
   }
 
-  recordSlotRenderEnded(slot: GptDiagnosticsSlotLike, facts: GptRenderFacts): void {
-    const timestampMs = this.timestamp();
+  recordSlotRenderEnded(
+    slot: GptDiagnosticsSlotLike,
+    facts: GptRenderFacts,
+    observedAtMs?: number
+  ): void {
+    const timestampMs = this.timestamp(observedAtMs);
     this.matchCycle(
       'slotRenderEnded',
       slot,
@@ -694,49 +699,8 @@ export class GptDiagnosticsStore {
     );
   }
 
-  /**
-   * Retain an outer CSS box only when this exact slot and request cycle still
-   * identify a filled render. Async DOM measurements use this guard so a prior
-   * render cannot alter a later refresh cycle.
-   */
-  recordObservedSlotSize(runtimeSlotNumber: number, requestNumber: number, size: Size): void {
-    if (
-      !Number.isSafeInteger(requestNumber) ||
-      requestNumber <= 0 ||
-      !Number.isFinite(size[0]) ||
-      !Number.isFinite(size[1]) ||
-      size[0] < 0 ||
-      size[1] < 0
-    ) {
-      return;
-    }
-
-    const record = this.slots.get(runtimeSlotNumber);
-    if (!record) return;
-
-    const cycle = record.requests.find((candidate) => candidate.requestNumber === requestNumber);
-    if (
-      !cycle ||
-      record.requests[record.requests.length - 1] !== cycle ||
-      cycle.isEmpty !== false ||
-      cycle.renderAtMs === undefined
-    ) {
-      return;
-    }
-
-    const observedSlotSize: Size = [size[0], size[1]];
-    if (
-      cycle.observedSlotSize?.[0] === observedSlotSize[0] &&
-      cycle.observedSlotSize[1] === observedSlotSize[1]
-    ) {
-      return;
-    }
-    cycle.observedSlotSize = observedSlotSize;
-    this.notify();
-  }
-
-  recordSlotOnload(slot: GptDiagnosticsSlotLike): void {
-    const timestampMs = this.timestamp();
+  recordSlotOnload(slot: GptDiagnosticsSlotLike, observedAtMs?: number): void {
+    const timestampMs = this.timestamp(observedAtMs);
     this.matchCycle(
       'slotOnload',
       slot,
@@ -754,8 +718,8 @@ export class GptDiagnosticsStore {
     );
   }
 
-  recordImpressionViewable(slot: GptDiagnosticsSlotLike): void {
-    const timestampMs = this.timestamp();
+  recordImpressionViewable(slot: GptDiagnosticsSlotLike, observedAtMs?: number): void {
+    const timestampMs = this.timestamp(observedAtMs);
     this.matchCycle(
       'impressionViewable',
       slot,
@@ -780,8 +744,12 @@ export class GptDiagnosticsStore {
     );
   }
 
-  recordSlotVisibilityChanged(slot: GptDiagnosticsSlotLike, percentage: number): void {
-    const timestampMs = this.timestamp();
+  recordSlotVisibilityChanged(
+    slot: GptDiagnosticsSlotLike,
+    percentage: number,
+    observedAtMs?: number
+  ): void {
+    const timestampMs = this.timestamp(observedAtMs);
     const record = this.prepareCallback('slotVisibilityChanged', slot, timestampMs);
     if (!record) return;
 
@@ -848,202 +816,11 @@ export class GptDiagnosticsStore {
     };
   }
 
-  private attributionIdentity(slot: GptDiagnosticsSlotLike & object): AttributionIdentity {
-    const runtimeSlotNumber = this.slotNumbers.get(slot);
-    const record = runtimeSlotNumber === undefined ? undefined : this.slots.get(runtimeSlotNumber);
-    const slotElementId =
-      record?.slotElementId ??
-      optionalNonEmptyString(
-        typeof slot.getSlotElementId === 'function' ? slot.getSlotElementId.bind(slot) : undefined
-      );
-    return {
-      ...(runtimeSlotNumber !== undefined ? { runtimeSlotNumber } : {}),
-      ...(slotElementId !== undefined ? { slotElementId } : {}),
-    };
-  }
-
-  private addAttributionIssue(
-    reason: GptDiagnosticsAttributionIssueReason,
-    timestampMs: number,
-    identity: AttributionIdentity = {}
-  ): void {
-    if (this.attributionIssues.length >= MAX_ATTRIBUTION_ISSUES) {
-      this.attributionIssues.shift();
-      this.metadata.droppedAttributionIssues += 1;
-    }
-
-    this.attributionIssues.push({
-      reason,
-      timestampMs,
-      ...(identity.runtimeSlotNumber !== undefined && identity.runtimeSlotNumber > 0
-        ? { runtimeSlotNumber: identity.runtimeSlotNumber }
-        : {}),
-      ...(identity.slotElementId !== undefined ? { slotElementId: identity.slotElementId } : {}),
-    });
-  }
-
-  private reportAttributionIssue(
-    reason: GptDiagnosticsAttributionIssueReason,
-    timestampMs: number,
-    identity: AttributionIdentity = {}
-  ): void {
-    this.addAttributionIssue(reason, timestampMs, identity);
-    this.notify();
-  }
-
-  private expireCreativeAttempts(timestampMs: number): void {
-    for (const attempt of this.creativeAttempts.values()) {
-      if (attempt.status !== 'live' || timestampMs < attempt.expiresAtMs) continue;
-      attempt.status = 'expired';
-      attempt.cycle = undefined;
-    }
-  }
-
-  private evictCreativeAttempt(cycle: MutableRequestCycle): void {
-    const attemptId = this.attemptIdsByCycle.get(cycle);
-    if (attemptId === undefined) return;
-    const attempt = this.creativeAttempts.get(attemptId);
-    if (!attempt || attempt.status !== 'live') return;
-    attempt.status = 'evicted';
-    attempt.cycle = undefined;
-  }
-
-  private ensureCreativeAttemptCapacity(): boolean {
-    if (this.creativeAttempts.size < MAX_CREATIVE_ATTEMPTS) return true;
-
-    for (const [attemptId, attempt] of this.creativeAttempts) {
-      if (attempt.status === 'live') continue;
-      this.creativeAttempts.delete(attemptId);
-      return true;
-    }
-    return false;
-  }
-
-  /**
-   * Record one source's evidence for the slot's next GPT request.
-   *
-   * Evidence expires lazily — on the next recording for the same slot and on
-   * consumption — so retained intents never own a timer. Pending intents are
-   * keyed weakly by GPT slot object, which bounds them by the slots the page
-   * itself still holds.
-   */
-  private recordRequestIntentSource(
-    slot: object,
-    source: RequestIntentSource,
-    facts: Pick<
-      PendingSourceEvidence,
-      'trustedServerOpportunity' | 'trustedServerAuctionId' | 'requestedSlotSizes'
-    > = {}
-  ): void {
-    const observedAtMs = this.now();
-    let intent = this.pendingRequestIntents.get(slot);
-    if (intent) {
-      this.expireRequestIntentSources(intent, observedAtMs);
-      // A fully expired intent is replaced rather than revived, so its intent
-      // ID cannot outlive the observation window it was issued for.
-      if (intent.sources.size === 0) intent = undefined;
-    }
-    if (!intent) {
-      intent = { intentId: this.nextRequestIntentId, sources: new Map() };
-      this.nextRequestIntentId += 1;
-      this.pendingRequestIntents.set(slot, intent);
-    }
-    intent.sources.set(source, { observedAtMs, ...facts });
-  }
-
-  private expireRequestIntentSources(intent: PendingRequestIntent, timestampMs: number): void {
-    for (const [source, evidence] of intent.sources) {
-      if (timestampMs - evidence.observedAtMs >= REQUEST_PATH_ATTRIBUTION_WINDOW_MS) {
-        intent.sources.delete(source);
-      }
-    }
-  }
-
-  private consumeRequestIntent(
-    slot: object,
-    timestampMs: number
-  ): PendingRequestIntent | undefined {
-    const intent = this.pendingRequestIntents.get(slot);
-    this.pendingRequestIntents.delete(slot);
-    if (!intent) return undefined;
-    this.expireRequestIntentSources(intent, timestampMs);
-    return intent.sources.size > 0 ? intent : undefined;
-  }
-
-  /**
-   * Keep at most one outstanding timer for the delivery-evidence boundary.
-   *
-   * Each candidate render flips from `pending` to `candidate_unconfirmed` once
-   * its window elapses, and subscribers need one notification per boundary. A
-   * single timer that re-arms from retained cycles bounds the timer queue by
-   * retained state instead of by refresh rate.
-   */
-  private scheduleDeliveryBoundaryNotification(
-    delayMs: number = TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS
-  ): void {
-    if (this.deliveryBoundaryScheduled) return;
-    this.deliveryBoundaryScheduled = true;
-    this.defer(() => {
-      this.deliveryBoundaryScheduled = false;
-      this.notify();
-      const nextDelayMs = this.nextDeliveryBoundaryDelayMs();
-      if (nextDelayMs !== undefined) this.scheduleDeliveryBoundaryNotification(nextDelayMs);
-    }, delayMs);
-  }
-
-  private nextDeliveryBoundaryDelayMs(): number | undefined {
-    const nowMs = this.now();
-    let earliestDeadlineMs: number | undefined;
-    for (const record of this.slots.values()) {
-      for (const cycle of record.requests) {
-        if (
-          cycle.renderAtMs === undefined ||
-          cycle.isEmpty !== false ||
-          (cycle.trustedServerOpportunity !== 'renderable_candidate' &&
-            cycle.trustedServerOpportunity !== 'unrenderable_candidate')
-        ) {
-          continue;
-        }
-        const deadlineMs = cycle.renderAtMs + TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS;
-        if (deadlineMs <= nowMs) continue;
-        if (earliestDeadlineMs === undefined || deadlineMs < earliestDeadlineMs) {
-          earliestDeadlineMs = deadlineMs;
-        }
-      }
-    }
-    return earliestDeadlineMs === undefined ? undefined : earliestDeadlineMs - nowMs;
-  }
-
-  private requestPath(intent: PendingRequestIntent | undefined): GptDiagnosticsRequestPath {
-    if (!intent) return 'unattributed';
-    if (intent.sources.size > 1) return 'competing';
-    const source = intent.sources.keys().next().value as RequestIntentSource | undefined;
-    return source ?? 'unattributed';
-  }
-
-  private recordReplacement(record: MutableSlotRecord, cycle: MutableRequestCycle): void {
-    const currentIndex = record.requests.indexOf(cycle);
-    if (currentIndex <= 0) return;
-    const previous = record.requests
-      .slice(0, currentIndex)
-      .reverse()
-      .find((candidate) => candidate.isEmpty === false && candidate.renderAtMs !== undefined);
-    if (!previous) return;
-    cycle.replacedRequestNumber = previous.requestNumber;
-    cycle.previousRenderToRequestMs = validDuration(previous.renderAtMs, cycle.requestedAtMs);
-    const previousCreativeId =
-      previous.adManager?.creativeId ?? previous.adManager?.sourceAgnosticCreativeId;
-    const currentCreativeId =
-      cycle.adManager?.creativeId ?? cycle.adManager?.sourceAgnosticCreativeId;
-    if (previousCreativeId !== undefined) cycle.previousCreativeId = previousCreativeId;
-    if (previousCreativeId !== undefined && currentCreativeId !== undefined) {
-      cycle.creativeChanged = previousCreativeId !== currentCreativeId;
-    }
-  }
-
-  private timestamp(): number {
+  private timestamp(observedAtMs?: number): number {
     this.gptObserved = true;
-    return this.now();
+    return typeof observedAtMs === 'number' && Number.isFinite(observedAtMs)
+      ? observedAtMs
+      : this.now();
   }
 
   private prepareCallback(
@@ -1052,7 +829,8 @@ export class GptDiagnosticsStore {
     timestampMs: number
   ): MutableSlotRecord | undefined {
     this.coverage[kind].observed += 1;
-    const existingNumber = this.slotNumbers.get(slot);
+    const identity = slot.token ?? slot;
+    const existingNumber = this.slotNumbers.get(identity);
     if (existingNumber !== undefined) {
       const existingRecord = this.slots.get(existingNumber);
       if (existingRecord) {
@@ -1095,7 +873,7 @@ export class GptDiagnosticsStore {
       runtimeSlotNumber,
       requests: [],
     };
-    this.slotNumbers.set(slot, runtimeSlotNumber);
+    this.slotNumbers.set(identity, runtimeSlotNumber);
     this.refreshSlotMetadata(record, slot);
     this.slots.set(runtimeSlotNumber, record);
     this.slotOrder.push(runtimeSlotNumber);
@@ -1104,10 +882,16 @@ export class GptDiagnosticsStore {
   }
 
   private refreshSlotMetadata(record: MutableSlotRecord, slot: GptDiagnosticsSlotLike): void {
-    record.slotElementId ??= optionalNonEmptyString(
+    record.slotElementId ??=
+      (typeof slot.elementId === 'string' && slot.elementId.length > 0
+        ? slot.elementId
+        : undefined) ?? optionalNonEmptyString(
       typeof slot.getSlotElementId === 'function' ? slot.getSlotElementId.bind(slot) : undefined
     );
-    record.adUnitPath ??= optionalNonEmptyString(
+    record.adUnitPath ??=
+      (typeof slot.adUnitPath === 'string' && slot.adUnitPath.length > 0
+        ? slot.adUnitPath
+        : undefined) ?? optionalNonEmptyString(
       typeof slot.getAdUnitPath === 'function' ? slot.getAdUnitPath.bind(slot) : undefined
     );
   }

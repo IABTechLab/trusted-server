@@ -56,17 +56,16 @@ function recursivelyFrozenRecord(candidate: unknown): candidate is DiagnosticsOb
   const visited = new Set<object>();
   let nodes = 0;
   const visit = (value: unknown, depth: number): boolean => {
-    if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return true;
+    if (typeof value === 'function') return false;
+    if (typeof value !== 'object' || value === null) return true;
     if (visited.has(value)) return true;
     if (depth > MAX_OBSERVATION_DEPTH || nodes >= MAX_OBSERVATION_NODES) return false;
     visited.add(value);
     nodes += 1;
     try {
-      if (typeof value === 'function') return true;
       const prototype = Object.getPrototypeOf(value) as unknown;
       if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) {
-        // GPT physical-slot objects are opaque identities, not diagnostic data.
-        return true;
+        return false;
       }
       if (!Object.isFrozen(value)) return false;
       const keys = Reflect.ownKeys(value);
