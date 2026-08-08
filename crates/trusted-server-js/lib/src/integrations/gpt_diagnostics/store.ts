@@ -885,15 +885,17 @@ export class GptDiagnosticsStore {
     record.slotElementId ??=
       (typeof slot.elementId === 'string' && slot.elementId.length > 0
         ? slot.elementId
-        : undefined) ?? optionalNonEmptyString(
-      typeof slot.getSlotElementId === 'function' ? slot.getSlotElementId.bind(slot) : undefined
-    );
+        : undefined) ??
+      optionalNonEmptyString(
+        typeof slot.getSlotElementId === 'function' ? slot.getSlotElementId.bind(slot) : undefined
+      );
     record.adUnitPath ??=
       (typeof slot.adUnitPath === 'string' && slot.adUnitPath.length > 0
         ? slot.adUnitPath
-        : undefined) ?? optionalNonEmptyString(
-      typeof slot.getAdUnitPath === 'function' ? slot.getAdUnitPath.bind(slot) : undefined
-    );
+        : undefined) ??
+      optionalNonEmptyString(
+        typeof slot.getAdUnitPath === 'function' ? slot.getAdUnitPath.bind(slot) : undefined
+      );
   }
 
   private markRecentlyActive(runtimeSlotNumber: number): void {

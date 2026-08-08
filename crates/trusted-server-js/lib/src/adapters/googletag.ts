@@ -893,7 +893,9 @@ export function createBrowserGoogletagAdapter(
       const physicalSlot = slot as object;
       let safeSlot = weakMapValue(diagnosticsSlots, physicalSlot);
       if (!safeSlot) {
-        const optionalStringCall = (key: 'getSlotElementId' | 'getAdUnitPath'): string | undefined => {
+        const optionalStringCall = (
+          key: 'getSlotElementId' | 'getAdUnitPath'
+        ): string | undefined => {
           const method = safeMember(physicalSlot, key);
           if (typeof method !== 'function') return undefined;
           try {
@@ -967,7 +969,10 @@ export function createBrowserGoogletagAdapter(
     let observedAtMs = 0;
     try {
       const performance = safeMember(target, 'performance');
-      if ((typeof performance === 'object' && performance !== null) || typeof performance === 'function') {
+      if (
+        (typeof performance === 'object' && performance !== null) ||
+        typeof performance === 'function'
+      ) {
         const now = safeMember(performance as object, 'now');
         if (typeof now === 'function') {
           const value = Reflect.apply(now, performance, []);
