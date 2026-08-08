@@ -1,23 +1,16 @@
 // Render-trace registry, DOM markers, and a floating debug panel: joins a
 // creative rendered on the page back to the winning server-side auction bid.
-// Every render writes a RenderRecord to window.tsjs.renders (keyed by slot ID),
-// stamps the slot element with data-ts-* attributes carrying the same trace
-// tuple, and fires a 'tsjs:adRendered' CustomEvent. When the ts-trace cookie is
-// armed (via GET /_ts/trace), a Google-Publisher-Console-style overlay panel
-// summarises every traced slot so an operator can confirm on the page itself
-// that creatives came through Trusted Server — on both the SSAT/GAM and
-// /auction render paths.
 import { log } from './log';
-import type { LegacyTsjsApi, RenderRecord } from './types';
+import type {
+  LegacyTsjsApi,
+  RenderRecord,
+  RenderTraceDiagnostics,
+  RenderTraceRecord,
+} from './types';
 
 /** CustomEvent fired on window after each render-trace record is written. */
 export const RENDER_EVENT_NAME = 'tsjs:adRendered';
 
-/**
- * Cookie armed by `GET /_ts/trace` (server-side, `ts-trace=1`). While present,
- * the floating trace panel is shown so an operator can see on the page itself
- * that creatives were delivered by Trusted Server.
- */
 const TRACE_COOKIE_NAME = 'ts-trace';
 
 /** DOM id of the floating trace panel (body-level overlay). */
@@ -29,23 +22,8 @@ export const TRACE_PANEL_ID = 'ts-render-trace-panel';
  * history is trimmed from the front rather than growing without limit.
  */
 const MAX_RENDER_LOG_ENTRIES = 200;
-
-/**
- * Fallback for [`nextRenderSeq`] when `window.tsjs` is unreachable (no DOM, or
- * a throwing property access). Never the primary counter — see below.
- */
 let fallbackRenderSeq = 0;
 
-/**
- * Allocate the next value for [`RenderRecord.seq`].
- *
- * The counter lives on the shared `window.tsjs` object, not in module scope:
- * `build-all.mjs` emits core, GPT and every integration as separate
- * self-contained IIFEs, each with its own inlined copy of this module. A
- * module-scoped counter would therefore restart at 1 in each bundle and hand
- * two different renders the same number — duplicate `#1` panel rows and
- * badges across the SSAT and `/auction` paths.
- */
 function nextRenderSeq(): number {
   try {
     const ts = (window.tsjs ??= {} as LegacyTsjsApi);
@@ -450,8 +428,6 @@ export function recordRender(record: Omit<RenderRecord, 'count' | 'at' | 'seq'>)
     const prev = renders[record.slotId];
     if (prev) full.count = prev.count + 1;
     renders[record.slotId] = full;
-
-    // Keep each render as its own history entry, trimmed from the front.
     const history = (ts.renderLog ??= []);
     history.push(full);
     if (history.length > MAX_RENDER_LOG_ENTRIES) {
@@ -463,7 +439,6 @@ export function recordRender(record: Omit<RenderRecord, 'count' | 'at' | 'seq'>)
   try {
     window.dispatchEvent(new CustomEvent(RENDER_EVENT_NAME, { detail: full }));
   } catch (err) {
-    // CustomEvent unavailable — registry entry above is still written.
     log.debug('trace: failed to dispatch render event', { slotId: record.slotId, err });
   }
   renderTracePanel();
@@ -518,7 +493,6 @@ export function updateRender(record: RenderRecord, patch: RenderUpdate): RenderR
   try {
     window.dispatchEvent(new CustomEvent(RENDER_EVENT_NAME, { detail: record }));
   } catch (err) {
-    // CustomEvent unavailable — the mutated record above still stands.
     log.debug('trace: failed to dispatch render update event', { slotId: record.slotId, err });
   }
   renderTracePanel();
@@ -580,3 +554,330 @@ export function stampCreativeTrace(el: Element, record: RenderRecord): void {
     log.warn('trace: failed to stamp element', { slotId: record.slotId, err });
   }
 }
+
+const MAX_RENDER_TRACE_SLOTS = 256;
+const MAX_RENDER_TRACE_SUBSCRIBERS = 32;
+const MAX_RENDER_TRACE_NOTIFICATIONS = 200;
+
+type RenderTraceInputV1 = Omit<RenderTraceRecord, 'at' | 'count' | 'seq'>;
+type RenderTraceUpdateV1 = Partial<Omit<RenderTraceRecord, 'at' | 'count' | 'seq' | 'slotId'>>;
+
+export interface RenderTraceRuntimeScheduler {
+  readonly set: (callback: () => void, milliseconds: number) => unknown;
+  readonly clear: (handle: unknown) => void;
+}
+
+export interface RenderTraceRuntimeOptions {
+  readonly now?: () => number;
+  readonly onOverflow?: (droppedNotifications: number) => void;
+  readonly onSubscriberError?: (error: unknown) => void;
+  readonly schedule?: (callback: () => void) => () => void;
+  readonly scheduler?: RenderTraceRuntimeScheduler;
+}
+
+export interface RenderTraceRuntimeOwner {
+  readonly api: RenderTraceDiagnostics;
+  readonly diagnostics: RenderTraceDiagnostics;
+  readonly record: (input: RenderTraceInputV1) => Readonly<RenderTraceRecord>;
+  readonly enrich: (
+    recordOrSequence: Readonly<RenderTraceRecord> | number,
+    patch: RenderTraceUpdateV1
+  ) => Readonly<RenderTraceRecord> | undefined;
+  readonly prune: (slotId: string, sequence?: number) => boolean;
+  readonly dispose: () => void;
+}
+
+export class DiagnosticsSubscriberLimitError extends Error {
+  public readonly code = 'subscriber_capacity' as const;
+  public readonly surface: 'renderTrace' | 'gpt';
+
+  public constructor(surface: 'renderTrace' | 'gpt') {
+    super('subscriber_capacity');
+    this.name = 'DiagnosticsSubscriberLimitError';
+    this.surface = surface;
+  }
+}
+
+interface RenderTraceSubscription {
+  readonly id: number;
+  readonly listener: (record: Readonly<RenderTraceRecord>) => void;
+}
+
+interface PendingRenderTraceNotification {
+  readonly record: Readonly<RenderTraceRecord>;
+  readonly subscriberIds: readonly number[];
+}
+
+function copyRenderTraceRecord(record: Readonly<RenderRecord>): Readonly<RenderTraceRecord> {
+  const copy: Record<string, unknown> = {
+    slotId: record.slotId,
+    path: record.path,
+    rendered: record.rendered,
+  };
+  const optional = [
+    'elementId',
+    'auctionId',
+    'bidder',
+    'adId',
+    'bidId',
+    'creativeId',
+    'admHash',
+    'servedFrom',
+    'gamEmpty',
+    'injected',
+    'visible',
+  ] as const;
+  for (const key of optional) {
+    const value = record[key];
+    if (value !== undefined) copy[key] = value;
+  }
+  copy.count = record.count;
+  copy.seq = record.seq;
+  copy.at = record.at;
+  return Object.freeze(copy) as unknown as Readonly<RenderTraceRecord>;
+}
+
+function scheduleRenderTraceTask(callback: () => void): () => void {
+  const handle = globalThis.setTimeout(callback, 0);
+  return (): void => globalThis.clearTimeout(handle);
+}
+
+/** Create one document-runtime render trace without exposing its mutation authority. */
+export function createRenderTraceDiagnostics(
+  options: RenderTraceRuntimeOptions = {}
+): RenderTraceRuntimeOwner {
+  const current = new Map<string, Readonly<RenderTraceRecord>>();
+  const history: Array<Readonly<RenderTraceRecord>> = [];
+  const recordsBySequence = new Map<number, Readonly<RenderTraceRecord>>();
+  const subscribers = new Map<number, RenderTraceSubscription>();
+  const pendingOrder: number[] = [];
+  const pendingBySequence = new Map<number, PendingRenderTraceNotification>();
+  let sequence = 0;
+  let subscriberSequence = 0;
+  let droppedNotifications = 0;
+  let reportedDroppedNotifications = 0;
+  let cancelScheduled: (() => void) | undefined;
+  let disposed = false;
+
+  const schedule = (callback: () => void): (() => void) => {
+    if (options.schedule) return options.schedule(callback);
+    if (options.scheduler) {
+      const handle = options.scheduler.set(callback, 0);
+      return (): void => options.scheduler?.clear(handle);
+    }
+    return scheduleRenderTraceTask(callback);
+  };
+
+  const reportSubscriberError = (error: unknown): void => {
+    try {
+      options.onSubscriberError?.(error);
+    } catch {
+      // Diagnostics error reporting cannot affect correctness work.
+    }
+  };
+
+  const drain = (): void => {
+    cancelScheduled = undefined;
+    if (droppedNotifications !== reportedDroppedNotifications) {
+      reportedDroppedNotifications = droppedNotifications;
+      try {
+        options.onOverflow?.(droppedNotifications);
+      } catch {
+        // Diagnostics-only overflow reporting stays inside the diagnostics task.
+      }
+    }
+    while (!disposed && pendingOrder.length > 0) {
+      const next = pendingOrder.shift();
+      if (next === undefined) continue;
+      const pending = pendingBySequence.get(next);
+      pendingBySequence.delete(next);
+      if (!pending) continue;
+      for (const id of pending.subscriberIds) {
+        const subscription = subscribers.get(id);
+        if (!subscription) continue;
+        try {
+          subscription.listener(pending.record);
+        } catch (error) {
+          reportSubscriberError(error);
+        }
+      }
+    }
+  };
+
+  const ensureDrain = (): boolean => {
+    if (cancelScheduled) return true;
+    try {
+      const cancel = schedule(drain);
+      if (typeof cancel !== 'function') throw new TypeError('invalid diagnostics scheduler');
+      if (!disposed && pendingOrder.length > 0) cancelScheduled = cancel;
+      return true;
+    } catch {
+      pendingOrder.length = 0;
+      pendingBySequence.clear();
+      cancelScheduled = undefined;
+      return false;
+    }
+  };
+
+  const enqueue = (record: Readonly<RenderTraceRecord>): void => {
+    if (disposed || subscribers.size === 0) return;
+    const pending = Object.freeze({
+      record: copyRenderTraceRecord(record),
+      subscriberIds: Object.freeze([...subscribers.keys()]),
+    });
+    if (pendingBySequence.has(record.seq)) {
+      pendingBySequence.set(record.seq, pending);
+      return;
+    }
+    if (pendingOrder.length >= MAX_RENDER_TRACE_NOTIFICATIONS) {
+      const dropped = pendingOrder.shift();
+      if (dropped !== undefined) pendingBySequence.delete(dropped);
+      droppedNotifications += 1;
+    }
+    pendingOrder.push(record.seq);
+    pendingBySequence.set(record.seq, pending);
+    ensureDrain();
+  };
+
+  const retained = (record: Readonly<RenderTraceRecord>): boolean =>
+    current.get(record.slotId)?.seq === record.seq ||
+    history.some((candidate) => candidate.seq === record.seq);
+
+  const record = (input: RenderTraceInputV1): Readonly<RenderTraceRecord> => {
+    const previous = current.get(input.slotId);
+    let at: number;
+    try {
+      at = (options.now ?? Date.now)();
+    } catch {
+      at = Date.now();
+    }
+    const committed = copyRenderTraceRecord({
+      ...input,
+      count: (previous?.count ?? 0) + 1,
+      seq: (sequence += 1),
+      at,
+    });
+    if (disposed) return committed;
+    if (!previous && current.size >= MAX_RENDER_TRACE_SLOTS) {
+      const oldestSlot = current.keys().next().value as string | undefined;
+      if (oldestSlot !== undefined) current.delete(oldestSlot);
+    }
+    current.set(committed.slotId, committed);
+    recordsBySequence.set(committed.seq, committed);
+    history.push(committed);
+    if (history.length > MAX_RENDER_LOG_ENTRIES) {
+      const evicted = history.shift();
+      if (evicted && !retained(evicted)) recordsBySequence.delete(evicted.seq);
+    }
+    if (previous && !retained(previous)) recordsBySequence.delete(previous.seq);
+    enqueue(committed);
+    return committed;
+  };
+
+  const enrich = (
+    recordOrSequence: Readonly<RenderTraceRecord> | number,
+    patch: RenderTraceUpdateV1
+  ): Readonly<RenderTraceRecord> | undefined => {
+    if (disposed) return undefined;
+    const targetSequence =
+      typeof recordOrSequence === 'number' ? recordOrSequence : recordOrSequence?.seq;
+    if (!Number.isSafeInteger(targetSequence) || targetSequence <= 0) return undefined;
+    const existing = recordsBySequence.get(targetSequence);
+    if (!existing) return undefined;
+    const injected =
+      existing.injected === true || patch.injected === true
+        ? { injected: true as const }
+        : existing.injected === false || patch.injected === false
+          ? { injected: false as const }
+          : {};
+    const merged = {
+      ...existing,
+      ...patch,
+      rendered:
+        existing.rendered === true && patch.rendered === false
+          ? true
+          : (patch.rendered ?? existing.rendered),
+      ...injected,
+      slotId: existing.slotId,
+      count: existing.count,
+      seq: existing.seq,
+      at: existing.at,
+    } as RenderTraceRecord;
+    const committed = copyRenderTraceRecord(merged);
+    recordsBySequence.set(targetSequence, committed);
+    if (current.get(existing.slotId)?.seq === targetSequence) {
+      current.set(existing.slotId, committed);
+    }
+    const historyIndex = history.findIndex(({ seq }) => seq === targetSequence);
+    if (historyIndex >= 0) history[historyIndex] = committed;
+    enqueue(committed);
+    return committed;
+  };
+
+  const prune = (slotId: string, expectedSequence?: number): boolean => {
+    if (disposed || typeof slotId !== 'string') return false;
+    const existing = current.get(slotId);
+    if (!existing || (expectedSequence !== undefined && existing.seq !== expectedSequence)) {
+      return false;
+    }
+    current.delete(slotId);
+    if (!retained(existing)) recordsBySequence.delete(existing.seq);
+    return true;
+  };
+
+  const api: RenderTraceDiagnostics = Object.freeze({
+    current: (): Readonly<Record<string, Readonly<RenderTraceRecord>>> => {
+      const snapshot = Object.create(null) as Record<string, Readonly<RenderTraceRecord>>;
+      for (const [slotId, traceRecord] of current) {
+        Object.defineProperty(snapshot, slotId, {
+          configurable: false,
+          enumerable: true,
+          value: copyRenderTraceRecord(traceRecord),
+          writable: false,
+        });
+      }
+      return Object.freeze(snapshot);
+    },
+    history: (): readonly Readonly<RenderTraceRecord>[] =>
+      Object.freeze(history.map((traceRecord) => copyRenderTraceRecord(traceRecord))),
+    subscribe: (listener: (record: Readonly<RenderTraceRecord>) => void): (() => void) => {
+      if (typeof listener !== 'function')
+        throw new TypeError('diagnostics listener must be callable');
+      if (disposed) return () => undefined;
+      if (subscribers.size >= MAX_RENDER_TRACE_SUBSCRIBERS) {
+        throw new DiagnosticsSubscriberLimitError('renderTrace');
+      }
+      const id = (subscriberSequence += 1);
+      const subscription = Object.freeze({ id, listener });
+      subscribers.set(id, subscription);
+      let active = true;
+      return (): void => {
+        if (!active) return;
+        active = false;
+        if (subscribers.get(id) === subscription) subscribers.delete(id);
+      };
+    },
+  });
+
+  const dispose = (): void => {
+    if (disposed) return;
+    disposed = true;
+    try {
+      cancelScheduled?.();
+    } catch {
+      // The disposed latch suppresses a hostile late callback.
+    }
+    cancelScheduled = undefined;
+    subscribers.clear();
+    pendingOrder.length = 0;
+    pendingBySequence.clear();
+    current.clear();
+    history.length = 0;
+    recordsBySequence.clear();
+  };
+
+  return Object.freeze({ api, diagnostics: api, record, enrich, prune, dispose });
+}
+
+/** Short name used by the browser composition owner. */
+export const createRenderTrace = createRenderTraceDiagnostics;
