@@ -352,6 +352,7 @@ export function createTestBrowserRuntimeComposition(
   let gptDiagnosticsFacts: GptDiagnosticsFactBuffer | undefined;
   let gptDiagnosticsRuntime: GptDiagnosticsRuntime | undefined;
   let renderTrace: RenderTraceRuntimeOwner | undefined;
+  const renderTraceSlotsByNavigation = new Map<object, Set<string>>();
   let acceptedBrowserBoot: AcceptedBrowserBoot | undefined;
   const consumeCoreObservation = (observation: DiagnosticsObservation): void => {
     if (
@@ -398,6 +399,12 @@ export function createTestBrowserRuntimeComposition(
       const adId = optionalString('adId');
       const bidId = optionalString('bidId');
       const creativeId = optionalString('creativeId');
+      const navigation = runtimeSession?.currentNavigation;
+      if (navigation?.isCurrent()) {
+        const tracedSlots = renderTraceSlotsByNavigation.get(navigation.generation) ?? new Set();
+        tracedSlots.add(slotId);
+        renderTraceSlotsByNavigation.set(navigation.generation, tracedSlots);
+      }
       renderTrace?.record({
         slotId,
         path: observation['path'],
@@ -1020,8 +1027,14 @@ export function createTestBrowserRuntimeComposition(
           testlight: testlightRuntime,
           ...services,
         }),
-        onNavigationDispose: (navigationGeneration) =>
-          artifacts.disposeNavigation(navigationGeneration),
+        onNavigationDispose: (navigationGeneration) => {
+          artifacts.disposeNavigation(navigationGeneration);
+          for (const registeredSlotId of
+            renderTraceSlotsByNavigation.get(navigationGeneration) ?? []) {
+            preparedRenderTrace.prune(registeredSlotId);
+          }
+          renderTraceSlotsByNavigation.delete(navigationGeneration);
+        },
       });
       context.onDispose(() => {
         batchCoordinator.dispose();
@@ -1043,6 +1056,7 @@ export function createTestBrowserRuntimeComposition(
           acceptedBrowserBoot = undefined;
           creativeBoot = undefined;
           diagnosticsBoot = undefined;
+          renderTraceSlotsByNavigation.clear();
         }
       });
       const navigation = session.startInitialNavigation(initialProjection);
