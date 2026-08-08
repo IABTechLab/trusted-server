@@ -5,6 +5,7 @@ import {
   GoogletagReplacementError,
   type GoogletagAdapter,
   type GoogletagFacade,
+  type GoogletagPublisherCallAdmission,
   type GoogletagReplacementCommitAdmission,
   type GoogletagReplacementDefinition,
 } from '../../src/adapters/googletag';
@@ -550,12 +551,15 @@ describe('slot registry', () => {
         slots: Object.freeze([slot, unrelated]),
       })
     ).toEqual({ action: 'replace', slots: [unrelated] });
-    expect(
-      service.preparePublisherRefresh({
-        requestedSlots: Object.freeze([slot]),
-        slots: Object.freeze([slot]),
-      })
-    ).toEqual({ action: 'forward' });
+    const forwardedRefresh = service.preparePublisherRefresh({
+      requestedSlots: Object.freeze([slot]),
+      slots: Object.freeze([slot]),
+    });
+    expect(forwardedRefresh.action).toBe('forward');
+    if (forwardedRefresh.action === 'forward') {
+      expect(forwardedRefresh.admission).toBeDefined();
+      forwardedRefresh.admission?.commit();
+    }
 
     const request = service.request({
       intentId: 'after-publisher-refresh',
@@ -591,6 +595,213 @@ describe('slot registry', () => {
       })
     ).toEqual({ action: 'handoff', slot });
     expect(warnPublisherHandoffMismatch).not.toHaveBeenCalled();
+  });
+
+  it('rolls back a pending publisher display without settling active or queued TS work', async () => {
+    const service = createSlotService({ googletag: createGptHarness().adapter });
+    const navigation = createNavigation();
+    const slot = bindTrustedSlot(service, navigation);
+    expect(
+      service.claimPublisherGptSlot({
+        adUnitPath: '/network/slot',
+        elementId: 'slot-div',
+        initialLoadDisabled: false,
+        sizes: [300, 250],
+      })
+    ).toEqual({ action: 'handoff', slot });
+    expect(
+      service.preparePublisherDisplay({ initialLoadDisabled: false, target: 'slot-div' })
+    ).toEqual({ action: 'suppress' });
+    const active = service.request({
+      intentId: 'active-before-publisher-display',
+      navigationGeneration: navigation.generation,
+      operation: 'refresh',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+    const queued = service.request({
+      intentId: 'queued-before-publisher-display',
+      navigationGeneration: navigation.generation,
+      operation: 'refresh',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+    expect(active.status).toBe('active');
+    expect(queued.status).toBe('queued');
+
+    const decision = service.preparePublisherDisplay({
+      initialLoadDisabled: false,
+      target: 'slot-div',
+    }) as Readonly<{ action: 'forward'; admission?: GoogletagPublisherCallAdmission }>;
+    expect(decision.action).toBe('forward');
+    expect(decision.admission).toBeDefined();
+    expect(active.status).toBe('active');
+    expect(queued.status).toBe('queued');
+
+    decision.admission?.rollback();
+    decision.admission?.rollback();
+
+    expect(active.status).toBe('active');
+    expect(queued.status).toBe('queued');
+    service.dispose();
+    await expect(active.result).resolves.toMatchObject({ status: 'cancelled' });
+    await expect(queued.result).resolves.toMatchObject({ status: 'cancelled' });
+  });
+
+  it('keeps a publisher cycle consumed before display rollback and makes later rollback inert', () => {
+    const service = createSlotService({ googletag: createGptHarness().adapter });
+    const navigation = createNavigation();
+    const slot = bindTrustedSlot(service, navigation);
+    service.claimPublisherGptSlot({
+      adUnitPath: '/network/slot',
+      elementId: 'slot-div',
+      initialLoadDisabled: false,
+      sizes: [300, 250],
+    });
+    service.preparePublisherDisplay({ initialLoadDisabled: false, target: 'slot-div' });
+    const decision = service.preparePublisherDisplay({
+      initialLoadDisabled: false,
+      target: 'slot-div',
+    }) as Readonly<{ action: 'forward'; admission?: GoogletagPublisherCallAdmission }>;
+    expect(decision.admission).toBeDefined();
+
+    service.handleGptEvent('slotRequested', { slot });
+    expect(service.snapshotForTest().cycles).toBe(1);
+    decision.admission?.rollback();
+    decision.admission?.commit();
+    expect(service.snapshotForTest().cycles).toBe(1);
+
+    service.handleGptEvent('slotRenderEnded', { isEmpty: false, slot });
+    expect(service.snapshotForTest().cycles).toBe(0);
+  });
+
+  it('rolls back repeated display plus explicit and global refresh admissions without residue', () => {
+    const service = createSlotService({ googletag: createGptHarness().adapter });
+    const navigation = createNavigation();
+    const first = bindTrustedSlot(service, navigation, 'first');
+    const second = bindTrustedSlot(service, navigation, 'second');
+    for (const registeredSlotId of ['first', 'second'] as const) {
+      service.claimPublisherGptSlot({
+        adUnitPath: `/network/${registeredSlotId}`,
+        elementId: `${registeredSlotId}-div`,
+        initialLoadDisabled: false,
+        sizes: [300, 250],
+      });
+      service.preparePublisherDisplay({
+        initialLoadDisabled: false,
+        target: `${registeredSlotId}-div`,
+      });
+    }
+
+    for (let attempt = 0; attempt < 70; attempt += 1) {
+      const display = service.preparePublisherDisplay({
+        initialLoadDisabled: false,
+        target: 'first-div',
+      }) as Readonly<{ action: 'forward'; admission?: GoogletagPublisherCallAdmission }>;
+      expect(display.admission).toBeDefined();
+      display.admission?.rollback();
+    }
+    const explicit = service.preparePublisherRefresh({
+      requestedSlots: Object.freeze([first]),
+      slots: Object.freeze([first]),
+    }) as Readonly<{ action: 'forward'; admission?: GoogletagPublisherCallAdmission }>;
+    const global = service.preparePublisherRefresh({
+      requestedSlots: undefined,
+      slots: Object.freeze([first, second]),
+    }) as Readonly<{ action: 'forward'; admission?: GoogletagPublisherCallAdmission }>;
+    expect(explicit.admission).toBeDefined();
+    expect(global.admission).toBeDefined();
+    explicit.admission?.rollback();
+    global.admission?.rollback();
+
+    const firstRequest = service.request({
+      intentId: 'after-rolled-back-explicit-refresh',
+      navigationGeneration: navigation.generation,
+      operation: 'refresh',
+      registeredSlotId: 'first',
+      requestClass: 'primary',
+    });
+    const secondRequest = service.request({
+      intentId: 'after-rolled-back-global-refresh',
+      navigationGeneration: navigation.generation,
+      operation: 'refresh',
+      registeredSlotId: 'second',
+      requestClass: 'primary',
+    });
+    expect(firstRequest.status).toBe('active');
+    expect(secondRequest.status).toBe('active');
+  });
+
+  it('commits a global refresh only for the publisher physicals snapshotted before native entry', async () => {
+    const service = createSlotService({ googletag: createGptHarness().adapter });
+    const navigation = createNavigation();
+    const first = bindTrustedSlot(service, navigation, 'first');
+    bindTrustedSlot(service, navigation, 'second');
+    service.claimPublisherGptSlot({
+      adUnitPath: '/network/first',
+      elementId: 'first-div',
+      initialLoadDisabled: false,
+      sizes: [300, 250],
+    });
+    const global = service.preparePublisherRefresh({
+      requestedSlots: undefined,
+      slots: Object.freeze([first]),
+    });
+    expect(global.action).toBe('forward');
+    if (global.action !== 'forward') throw new Error('Expected global refresh forwarding');
+    expect(global.admission).toBeDefined();
+
+    service.claimPublisherGptSlot({
+      adUnitPath: '/network/second',
+      elementId: 'second-div',
+      initialLoadDisabled: false,
+      sizes: [300, 250],
+    });
+    global.admission?.commit();
+
+    const firstRequest = service.request({
+      intentId: 'global-snapshot-first',
+      navigationGeneration: navigation.generation,
+      operation: 'refresh',
+      registeredSlotId: 'first',
+      requestClass: 'primary',
+    });
+    const secondRequest = service.request({
+      intentId: 'global-snapshot-second',
+      navigationGeneration: navigation.generation,
+      operation: 'refresh',
+      registeredSlotId: 'second',
+      requestClass: 'primary',
+    });
+    await expect(firstRequest.result).resolves.toMatchObject({ reason: 'cycle_unattributable' });
+    expect(secondRequest.status).toBe('active');
+  });
+
+  it('makes a pending publisher admission inert after navigation and service disposal', () => {
+    const service = createSlotService({ googletag: createGptHarness().adapter });
+    const { navigation, runtime } = createRuntimeWithNavigation();
+    bindTrustedSlot(service, navigation);
+    service.claimPublisherGptSlot({
+      adUnitPath: '/network/slot',
+      elementId: 'slot-div',
+      initialLoadDisabled: false,
+      sizes: [300, 250],
+    });
+    service.preparePublisherDisplay({ initialLoadDisabled: false, target: 'slot-div' });
+    const decision = service.preparePublisherDisplay({
+      initialLoadDisabled: false,
+      target: 'slot-div',
+    });
+    expect(decision.action).toBe('forward');
+    if (decision.action !== 'forward') throw new Error('Expected display forwarding');
+    expect(decision.admission).toBeDefined();
+
+    runtime.dispose();
+    expect(() => decision.admission?.commit()).not.toThrow();
+    expect(() => decision.admission?.rollback()).not.toThrow();
+    service.dispose();
+    expect(() => decision.admission?.commit()).not.toThrow();
+    expect(() => decision.admission?.rollback()).not.toThrow();
   });
 
   it('hydrates only one disconnected TS fallback with the configured prefix, path, and sizes', () => {
@@ -667,12 +878,15 @@ describe('slot registry', () => {
         slots: Object.freeze([slot]),
       })
     ).toEqual({ action: 'suppress' });
-    expect(
-      service.preparePublisherRefresh({
-        requestedSlots: Object.freeze([slot]),
-        slots: Object.freeze([slot]),
-      })
-    ).toEqual({ action: 'forward' });
+    const forwarded = service.preparePublisherRefresh({
+      requestedSlots: Object.freeze([slot]),
+      slots: Object.freeze([slot]),
+    });
+    expect(forwarded.action).toBe('forward');
+    if (forwarded.action === 'forward') {
+      expect(forwarded.admission).toBeDefined();
+      forwarded.admission?.commit();
+    }
   });
 
   it('uses captured Set validation intrinsics on a hostile page', () => {
