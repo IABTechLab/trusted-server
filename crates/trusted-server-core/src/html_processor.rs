@@ -333,6 +333,15 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             move |el| {
                 if !injected_tsjs.get() {
                     let mut snippet = String::new();
+                    // The server has already interpreted and removed the reserved
+                    // directive. Its external cleanup asset only updates the
+                    // browser-visible URL and must run before publisher/core code.
+                    if let Some(cleanup_tag) = gpt_diagnostics
+                        .as_ref()
+                        .and_then(GptDiagnosticsRequestDecision::url_cleanup_script_tag)
+                    {
+                        snippet.push_str(&cleanup_tag);
+                    }
                     // Inject ad slots script first so it appears before tsjs bundle.
                     if let Some(ref slots_script) = ad_slots_script {
                         snippet.push_str(slots_script);
@@ -867,6 +876,7 @@ mod tests {
         let processed = String::from_utf8(output).expect("should produce valid UTF-8");
         let bundle_marker = "id=\"trustedserver-js\"";
         let diagnostics_marker = "tsjs-gpt_diagnostics.min.js";
+        let cleanup_marker = "tsjs-gpt_diagnostics-bootstrap.min.js";
 
         assert_eq!(
             processed.matches("__tsjs_gpt_diagnostics_active").count(),
@@ -883,6 +893,10 @@ mod tests {
             1,
             "should inject one standalone diagnostics module"
         );
+        assert_eq!(processed.matches(cleanup_marker).count(), 1);
+        let cleanup_index = processed
+            .find(cleanup_marker)
+            .expect("should include the request-scoped cleanup asset");
         let bundle_index = processed
             .find(bundle_marker)
             .expect("should include immediate TSJS bundle");
@@ -890,8 +904,12 @@ mod tests {
             .find(diagnostics_marker)
             .expect("should include standalone diagnostics module");
         assert!(
-            bundle_index < diagnostics_index,
-            "should load diagnostics after core"
+            cleanup_index < bundle_index && bundle_index < diagnostics_index,
+            "cleanup must be an external CSP-compatible script before publisher/core work"
+        );
+        assert!(
+            !processed.contains("<script>(function"),
+            "cleanup should not require an unsafe-inline CSP exception"
         );
     }
 

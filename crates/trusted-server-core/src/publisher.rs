@@ -306,6 +306,18 @@ pub fn handle_tsjs_dynamic(
     }
     let filename = &path[PREFIX.len()..];
 
+    if filename == crate::integrations::gpt_diagnostics::GPT_DIAGNOSTICS_BOOTSTRAP_FILENAME {
+        let mut response = serve_static_with_etag(
+            crate::integrations::gpt_diagnostics::GPT_DIAGNOSTICS_BOOTSTRAP_SOURCE,
+            req,
+            "application/javascript; charset=utf-8",
+        );
+        response
+            .headers_mut()
+            .insert(HEADER_X_COMPRESS_HINT, HeaderValue::from_static("on"));
+        return Ok(response);
+    }
+
     if UNIFIED_FILENAMES.contains(&filename) {
         // Serve core + immediate modules (excludes deferred like prebid)
         let module_ids = integration_registry.js_module_ids_immediate();
@@ -5313,6 +5325,73 @@ mod tests {
         .expect("should proxy publisher request")
     }
 
+    struct TsConsolePipelineResult {
+        response: Response<EdgeBody>,
+        origin_uri: String,
+        outbound_cookie: Option<String>,
+    }
+
+    async fn run_ts_console_pipeline(
+        method: Method,
+        destination: &str,
+        uri: &str,
+        cookie: Option<&str>,
+    ) -> TsConsolePipelineResult {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+            .expect("should enable diagnostics");
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"<html><head><script>publisher()</script></head><body>origin</body></html>".to_vec(),
+            vec![("content-type", "text/html; charset=utf-8")],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let mut request = Request::builder()
+            .method(method.clone())
+            .uri(uri)
+            .header(header::HOST, "publisher.example")
+            .header("sec-fetch-dest", destination);
+        if let Some(cookie) = cookie {
+            request = request.header(header::COOKIE, cookie);
+        }
+        let request = request
+            .body(EdgeBody::empty())
+            .expect("should build diagnostics pipeline request");
+        let publisher_response = run_publisher_proxy(&settings, &services, request).await;
+        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let response = buffer_publisher_response_async(
+            publisher_response,
+            &method,
+            &settings,
+            &registry,
+            &orchestrator,
+            &services,
+        )
+        .await
+        .expect("should buffer diagnostics pipeline response");
+        let outbound_cookie = stub.recorded_request_headers().first().and_then(|headers| {
+            headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(header::COOKIE.as_str()))
+                .map(|(_, value)| value.clone())
+        });
+        TsConsolePipelineResult {
+            response,
+            origin_uri: stub
+                .recorded_request_uris()
+                .into_iter()
+                .next()
+                .expect("should forward one origin request"),
+            outbound_cookie,
+        }
+    }
+
     mod ssat_cache_policy_tests {
         use super::*;
         use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
@@ -6096,6 +6175,96 @@ mod tests {
         );
         assert_eq!(headers[header::CACHE_CONTROL], "private, no-store");
         assert!(!headers.contains_key("surrogate-control"));
+    }
+
+    #[tokio::test]
+    async fn ts_console_publisher_pipeline_duplicate_and_invalid_fail_closed_but_clean_url() {
+        for uri in [
+            "https://publisher.example/article?keep=a%2Fb&ts_console=1&ts_console=true",
+            "https://publisher.example/article?ts_console=True&keep=a%2Fb",
+        ] {
+            let result = run_ts_console_pipeline(
+                Method::GET,
+                "document",
+                uri,
+                Some("__Host-ts-console=1; publisher=value"),
+            )
+            .await;
+            let body = response_body_string(result.response);
+
+            assert_eq!(
+                result.origin_uri,
+                "https://origin.test-publisher.com/article?keep=a%2Fb"
+            );
+            assert_eq!(result.outbound_cookie.as_deref(), Some("publisher=value"));
+            assert!(!body.contains("tsjs-gpt_diagnostics.min.js"));
+            assert_eq!(
+                body.matches("tsjs-gpt_diagnostics-bootstrap.min.js")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ts_console_publisher_pipeline_cookie_session_and_disable_are_exact() {
+        let active = run_ts_console_pipeline(
+            Method::GET,
+            "document",
+            "https://publisher.example/article?keep=%2F",
+            Some("publisher=value; __Host-ts-console=1"),
+        )
+        .await;
+        let active_body = response_body_string(active.response);
+        assert_eq!(active.outbound_cookie.as_deref(), Some("publisher=value"));
+        assert!(active_body.contains("tsjs-gpt_diagnostics.min.js"));
+        assert!(!active_body.contains("tsjs-gpt_diagnostics-bootstrap.min.js"));
+
+        let disabled = run_ts_console_pipeline(
+            Method::GET,
+            "document",
+            "https://publisher.example/article?ts_console=false&keep=%2F",
+            Some("publisher=value; __Host-ts-console=1"),
+        )
+        .await;
+        assert_eq!(
+            disabled.response.headers()[header::SET_COOKIE],
+            "__Host-ts-console=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0"
+        );
+        assert_eq!(
+            disabled.origin_uri,
+            "https://origin.test-publisher.com/article?keep=%2F"
+        );
+        let disabled_body = response_body_string(disabled.response);
+        assert!(!disabled_body.contains("tsjs-gpt_diagnostics.min.js"));
+        assert_eq!(
+            disabled_body
+                .matches("tsjs-gpt_diagnostics-bootstrap.min.js")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn ts_console_publisher_pipeline_method_and_document_ineligibility_stay_inert() {
+        for (method, destination) in [(Method::POST, "document"), (Method::GET, "script")] {
+            let result = run_ts_console_pipeline(
+                method,
+                destination,
+                "https://publisher.example/article?keep=%2F&ts_console=1",
+                Some("publisher=value; __Host-ts-console=1"),
+            )
+            .await;
+            assert_eq!(
+                result.origin_uri,
+                "https://origin.test-publisher.com/article?keep=%2F"
+            );
+            assert_eq!(result.outbound_cookie.as_deref(), Some("publisher=value"));
+            assert!(!result.response.headers().contains_key(header::SET_COOKIE));
+            let body = response_body_string(result.response);
+            assert!(!body.contains("tsjs-gpt_diagnostics.min.js"));
+            assert!(!body.contains("tsjs-gpt_diagnostics-bootstrap.min.js"));
+        }
     }
 
     #[tokio::test]
@@ -7110,6 +7279,24 @@ mod tests {
                 .is_some_and(|value| value.contains("private") || value.contains("no-store")),
             "standalone module should remain cookie-independent and publicly cacheable"
         );
+    }
+
+    #[test]
+    fn ts_console_dynamic_serves_the_non_authoritative_cleanup_asset() {
+        let settings = create_test_settings();
+        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
+        let req = Request::builder()
+            .uri("https://publisher.example/static/tsjs=tsjs-gpt_diagnostics-bootstrap.min.js")
+            .body(EdgeBody::empty())
+            .expect("should build cleanup asset request");
+
+        let response = handle_tsjs_dynamic(&req, &registry).expect("should serve cleanup asset");
+        let source = response_body_string(response);
+
+        assert!(source.contains("history.replaceState"));
+        assert!(source.contains("ts_console"));
+        assert!(!source.contains("sessionStorage"));
+        assert!(!source.contains("__tsjs_gpt_diagnostics_active"));
     }
 
     #[test]

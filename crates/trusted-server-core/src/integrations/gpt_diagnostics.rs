@@ -26,6 +26,10 @@ pub const GPT_DIAGNOSTICS_INTEGRATION_ID: &str = "gpt_diagnostics";
 pub const GPT_DIAGNOSTICS_QUERY: &str = "ts_console";
 /// Host-only browser-session activation cookie.
 pub const GPT_DIAGNOSTICS_COOKIE: &str = "__Host-ts-console";
+/// Static filename for the request-scoped, non-authoritative URL cleanup asset.
+pub const GPT_DIAGNOSTICS_BOOTSTRAP_FILENAME: &str = "tsjs-gpt_diagnostics-bootstrap.min.js";
+/// Browser program served only as a public static asset and injected per request.
+pub const GPT_DIAGNOSTICS_BOOTSTRAP_SOURCE: &str = include_str!("gpt_diagnostics_bootstrap.js");
 
 const SET_CONSOLE_COOKIE: &str = "__Host-ts-console=1; Path=/; Secure; HttpOnly; SameSite=Lax";
 const CLEAR_CONSOLE_COOKIE: &str =
@@ -63,6 +67,7 @@ pub enum GptDiagnosticsCookieAction {
 pub struct GptDiagnosticsRequestDecision {
     active: bool,
     reserved_directive: bool,
+    cleanup_browser_url: bool,
     cookie_action: GptDiagnosticsCookieAction,
 }
 
@@ -98,6 +103,17 @@ impl GptDiagnosticsRequestDecision {
             format!(
                 "<script src=\"{}\"></script>",
                 tsjs::tsjs_single_module_script_src(GPT_DIAGNOSTICS_INTEGRATION_ID)
+            )
+        })
+    }
+
+    /// Build the one-time external URL-cleanup tag after reserved input was consumed.
+    #[must_use]
+    pub fn url_cleanup_script_tag(&self) -> Option<String> {
+        self.cleanup_browser_url.then(|| {
+            format!(
+                "<script src=\"/static/tsjs={}\"></script>",
+                GPT_DIAGNOSTICS_BOOTSTRAP_FILENAME
             )
         })
     }
@@ -174,6 +190,7 @@ pub fn prepare_request(
 
     let mut decision = GptDiagnosticsRequestDecision {
         reserved_directive: had_reserved_query,
+        cleanup_browser_url: eligible_navigation && had_reserved_query,
         ..GptDiagnosticsRequestDecision::default()
     };
     if integration_enabled && eligible_navigation && had_reserved_query {
@@ -426,6 +443,14 @@ mod tests {
         );
         assert_eq!(request.headers()[header::COOKIE], "other=value");
         assert_eq!(decision.boot_config_json(), r#"{"active":true}"#);
+        assert_eq!(
+            decision.url_cleanup_script_tag(),
+            Some(
+                "<script src=\"/static/tsjs=tsjs-gpt_diagnostics-bootstrap.min.js\"></script>"
+                    .to_owned()
+            ),
+            "a server-consumed directive should authorize one external cleanup asset"
+        );
     }
 
     #[test]
@@ -453,6 +478,7 @@ mod tests {
         );
         let decision = prepare_request(&settings(true), &mut active).expect("should prepare");
         assert!(decision.active());
+        assert_eq!(decision.url_cleanup_script_tag(), None);
         assert_eq!(active.headers()[header::COOKIE], "other=value");
 
         let mut duplicate = navigation(
