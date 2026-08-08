@@ -437,10 +437,7 @@ function installOsanoListeners(): boolean {
     return true;
   }
 
-  if (
-    typeof cm.addEventListener !== 'function' ||
-    typeof cm.removeEventListener !== 'function'
-  ) {
+  if (typeof cm.addEventListener !== 'function' || typeof cm.removeEventListener !== 'function') {
     return false;
   }
 

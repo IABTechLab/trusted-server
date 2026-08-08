@@ -37,12 +37,12 @@ function didomiBootConfig(candidate: unknown): candidate is Readonly<{ proxyPath
     const descriptor = Object.getOwnPropertyDescriptor(candidate, 'proxyPath');
     return Boolean(
       descriptor?.enumerable &&
-        'value' in descriptor &&
-        typeof descriptor.value === 'string' &&
-        descriptor.value.startsWith('/') &&
-        !descriptor.value.startsWith('//') &&
-        !descriptor.value.startsWith('/\\') &&
-        descriptor.value.length <= 2_048 &&
+      'value' in descriptor &&
+      typeof descriptor.value === 'string' &&
+      descriptor.value.startsWith('/') &&
+      !descriptor.value.startsWith('//') &&
+      !descriptor.value.startsWith('/\\') &&
+      descriptor.value.length <= 2_048 &&
       !descriptor.value.includes('?') &&
       !descriptor.value.includes('#')
     );
