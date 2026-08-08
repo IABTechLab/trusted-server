@@ -199,6 +199,11 @@
     if (!divId) {
       return { element: null, prefixMatchCount: 0, activeMatchCount: 0 };
     }
+    // Exact-id matches intentionally skip the visibility tiers below: a
+    // configured literal id is unambiguous, so a hidden match is still the
+    // right element. Prefix matches go through the tiers because a prefix can
+    // match several candidates and only visibility/layout disambiguates them —
+    // so a hidden exact-id match resolves while a hidden prefix match does not.
     var exact = document.getElementById(divId);
     if (exact) {
       return { element: exact, prefixMatchCount: 1, activeMatchCount: 1 };
@@ -408,17 +413,33 @@
         var resolution = resolveSlotElementByDivId(slot.div_id);
         var el = resolution.element;
         if (!el) {
-          if (
-            resolution.prefixMatchCount > 1 &&
-            !warnedResolutionFailures[slot.div_id]
-          ) {
-            warnedResolutionFailures[slot.div_id] = true;
-            if (ts.log && typeof ts.log.warn === "function") {
-              ts.log.warn("GPT slot prefix did not resolve to one active element", {
-                divId: slot.div_id,
-                prefixMatchCount: resolution.prefixMatchCount,
-                activeMatchCount: resolution.activeMatchCount,
-              });
+          if (!warnedResolutionFailures[slot.div_id]) {
+            if (resolution.prefixMatchCount > 1) {
+              warnedResolutionFailures[slot.div_id] = true;
+              if (ts.log && typeof ts.log.warn === "function") {
+                ts.log.warn(
+                  "GPT slot prefix did not resolve to one active element",
+                  {
+                    divId: slot.div_id,
+                    prefixMatchCount: resolution.prefixMatchCount,
+                    activeMatchCount: resolution.activeMatchCount,
+                  },
+                );
+              }
+            } else if (
+              resolution.prefixMatchCount === 1 &&
+              resolution.activeMatchCount === 0
+            ) {
+              // The common breakpoint-hidden config: the prefix matched one
+              // element but it is hidden, so the slot is skipped. Logged so a
+              // blank placement is diagnosable without stepping the resolver.
+              warnedResolutionFailures[slot.div_id] = true;
+              if (ts.log && typeof ts.log.debug === "function") {
+                ts.log.debug(
+                  "GPT slot prefix matched only a hidden element; skipping slot",
+                  { divId: slot.div_id },
+                );
+              }
             }
           }
           return;

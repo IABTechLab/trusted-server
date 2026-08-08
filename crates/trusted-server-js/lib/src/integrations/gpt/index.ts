@@ -133,6 +133,12 @@ function resolveSlotElementByDivId(divId: string): SlotElementResolution {
   if (!divId) {
     return { element: null, prefixMatchCount: 0, activeMatchCount: 0 };
   }
+  // Exact-id matches intentionally skip the visibility tiers below: a
+  // configured literal id is unambiguous, so a hidden match is still the
+  // right element (adInit defines the slot; GPT simply renders nothing while
+  // it is hidden). Prefix matches go through the tiers because a prefix can
+  // match several candidates and only visibility/layout disambiguates them —
+  // so a hidden exact-id match resolves while a hidden prefix match does not.
   const exact = document.getElementById(divId);
   if (exact) {
     return { element: exact, prefixMatchCount: 1, activeMatchCount: 1 };
@@ -959,13 +965,23 @@ export function installTsAdInit(): void {
         const resolution = resolveSlotElementByDivId(slot.div_id);
         const el = resolution.element;
         if (!el) {
-          if (resolution.prefixMatchCount > 1 && !warnedResolutionFailures.has(slot.div_id)) {
-            warnedResolutionFailures.add(slot.div_id);
-            log.warn('GPT slot prefix did not resolve to one active element', {
-              divId: slot.div_id,
-              prefixMatchCount: resolution.prefixMatchCount,
-              activeMatchCount: resolution.activeMatchCount,
-            });
+          if (!warnedResolutionFailures.has(slot.div_id)) {
+            if (resolution.prefixMatchCount > 1) {
+              warnedResolutionFailures.add(slot.div_id);
+              log.warn('GPT slot prefix did not resolve to one active element', {
+                divId: slot.div_id,
+                prefixMatchCount: resolution.prefixMatchCount,
+                activeMatchCount: resolution.activeMatchCount,
+              });
+            } else if (resolution.prefixMatchCount === 1 && resolution.activeMatchCount === 0) {
+              // The common breakpoint-hidden config: the prefix matched one
+              // element but it is hidden, so the slot is skipped. Logged so a
+              // blank placement is diagnosable without stepping the resolver.
+              warnedResolutionFailures.add(slot.div_id);
+              log.debug('GPT slot prefix matched only a hidden element; skipping slot', {
+                divId: slot.div_id,
+              });
+            }
           }
           return;
         }
@@ -1229,7 +1245,17 @@ function waitForSlotElements(slots: AuctionSlot[], signal: AbortSignal): Promise
   // A newer navigation may have aborted this signal before we were called; skip
   // installing an observer/timer that the stale run would only tear down.
   if (signal.aborted) return Promise.resolve();
-  const allPresent = (): boolean => slots.every((slot) => !!findSlotElementByDivId(slot.div_id));
+  // Presence and eligibility are different questions here. The tiered
+  // resolver returns no element for a prefix match that is hidden (e.g. a
+  // breakpoint-hidden mobile-only placement), but such a slot has rendered and
+  // will never "appear" — waiting on it would stall every slot on the route
+  // for the full timeout. Count it as present; adInit still applies the strict
+  // tiers when it runs and skips ineligible slots.
+  const allPresent = (): boolean =>
+    slots.every((slot) => {
+      const resolution = resolveSlotElementByDivId(slot.div_id);
+      return resolution.element !== null || resolution.prefixMatchCount > 0;
+    });
   if (slots.length === 0 || allPresent() || typeof MutationObserver === 'undefined') {
     return Promise.resolve();
   }

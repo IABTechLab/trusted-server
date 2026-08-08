@@ -287,6 +287,42 @@ describe('installSpaAuctionHook', () => {
     expect(adInit).toHaveBeenCalledTimes(1);
   });
 
+  it('applies bids immediately when a prefix-configured placement exists but is hidden', async () => {
+    // A breakpoint-hidden placement (mobile-only config while on desktop) has
+    // rendered its div but the tiered resolver returns no element for it. The
+    // slot wait must count it as present — otherwise every navigation to the
+    // route stalls for the full SPA_SLOT_WAIT_MS before applying bids to the
+    // visible slots, and adInit skips the hidden slot anyway.
+    document.body.innerHTML =
+      '<div id="div-visible"></div>' + '<div id="ad-hidden-r1x" style="display:none"></div>';
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        slots: [
+          { id: 'visible', div_id: 'div-visible' },
+          { id: 'hidden', div_id: 'ad-hidden-' },
+        ],
+        bids: { visible: { hb_pb: '2.00' } },
+      }),
+    });
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    history.pushState({}, '', '/mixed-route');
+    await flushAsync();
+
+    // Bids apply without waiting out the slot timeout.
+    expect(ts.adSlots).toEqual([
+      { id: 'visible', div_id: 'div-visible' },
+      { id: 'hidden', div_id: 'ad-hidden-' },
+    ]);
+    expect(ts.bids).toEqual({ visible: { hb_pb: '2.00' } });
+    expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
   it('checks for route containers directly in a hidden document', async () => {
     vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
     vi.stubGlobal('requestAnimationFrame', undefined);
