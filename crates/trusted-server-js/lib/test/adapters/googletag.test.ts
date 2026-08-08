@@ -2010,6 +2010,208 @@ describe('browser googletag adapter readiness', () => {
     });
   });
 
+  it('observes publisher GPT calls reentered by one facade-driven native display', async () => {
+    const ready = createReadyGoogletag();
+    const slot = Object.freeze({ id: 'nested-publisher-slot' });
+    ready.pubads.getSlots.mockReturnValue([slot]);
+    ready.googletag.defineSlot.mockReturnValue(slot);
+    ready.googletag.destroySlots.mockReturnValue(true);
+    ready.display.mockImplementation(() => {
+      ready.pubads.refresh([slot], { changeCorrelator: true });
+      ready.googletag.defineSlot('/publisher', [300, 250], 'nested-slot');
+      ready.googletag.destroySlots([slot]);
+    });
+    const observer = {
+      defineSlot: vi.fn(() => Object.freeze({ action: 'forward' as const })),
+      destroySlots: vi.fn(),
+      display: vi.fn(() => Object.freeze({ action: 'forward' as const })),
+      refresh: vi.fn(() => Object.freeze({ action: 'forward' as const })),
+    };
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+    adapter.observePublisherCalls(observer);
+
+    await expect(adapter.run((gpt) => gpt.display('trusted-slot')).result).resolves.toBeUndefined();
+
+    expect(observer.display).not.toHaveBeenCalled();
+    expect(observer.refresh).toHaveBeenCalledExactlyOnceWith({
+      requestedSlots: [slot],
+      slots: [slot],
+    });
+    expect(observer.defineSlot).toHaveBeenCalledExactlyOnceWith({
+      adUnitPath: '/publisher',
+      elementId: 'nested-slot',
+      initialLoadDisabled: false,
+      sizes: [300, 250],
+    });
+    expect(observer.destroySlots).toHaveBeenCalledExactlyOnceWith({ slots: [slot] });
+  });
+
+  it('observes a publisher wrapper call made inside a TS command but outside a facade invocation', async () => {
+    const ready = createReadyGoogletag();
+    const observer = {
+      defineSlot: vi.fn(() => Object.freeze({ action: 'forward' as const })),
+      display: vi.fn(() => Object.freeze({ action: 'forward' as const })),
+    };
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+    adapter.observePublisherCalls(observer);
+
+    await expect(
+      adapter.run((gpt) => {
+        ready.googletag.defineSlot('/publisher', [300, 250], 'publisher-inside-command');
+        gpt.display('trusted-slot');
+      }).result
+    ).resolves.toBeUndefined();
+
+    expect(observer.defineSlot).toHaveBeenCalledExactlyOnceWith({
+      adUnitPath: '/publisher',
+      elementId: 'publisher-inside-command',
+      initialLoadDisabled: false,
+      sizes: [300, 250],
+    });
+    expect(observer.display).not.toHaveBeenCalled();
+  });
+
+  it('commits publisher display and refresh admissions only after exact native returns', () => {
+    const ready = createReadyGoogletag();
+    const slot = Object.freeze({ id: 'publisher-slot' });
+    const receiver = Object.freeze({ publisher: true });
+    const refreshOptions = Object.freeze({ changeCorrelator: false, publisher: 'exact' });
+    const order: string[] = [];
+    const displayAdmission = Object.freeze({
+      commit: vi.fn(() => order.push('commit:display')),
+      rollback: vi.fn(),
+    });
+    const refreshAdmission = Object.freeze({
+      commit: vi.fn(() => order.push('commit:refresh')),
+      rollback: vi.fn(),
+    });
+    const nativeDisplay = vi.fn(function (this: unknown, ...arguments_: unknown[]) {
+      order.push('native:display');
+      return Object.freeze({ arguments_, receiver: this });
+    });
+    const nativeRefresh = vi.fn(function (this: unknown, ...arguments_: unknown[]) {
+      order.push('native:refresh');
+      return Object.freeze({ arguments_, receiver: this });
+    });
+    ready.googletag.display = nativeDisplay;
+    ready.pubads.refresh = nativeRefresh;
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+    adapter.observePublisherCalls({
+      display: () => Object.freeze({ action: 'forward' as const, admission: displayAdmission }),
+      refresh: () => Object.freeze({ action: 'forward' as const, admission: refreshAdmission }),
+    });
+
+    const display = ready.googletag.display as (...arguments_: unknown[]) => unknown;
+    expect(Reflect.apply(display, receiver, ['slot'])).toEqual({
+      arguments_: ['slot'],
+      receiver,
+    });
+    const refresh = ready.pubads.refresh as (...arguments_: unknown[]) => unknown;
+    expect(Reflect.apply(refresh, receiver, [[slot], refreshOptions])).toEqual({
+      arguments_: [[slot], refreshOptions],
+      receiver,
+    });
+
+    expect(order).toEqual(['native:display', 'commit:display', 'native:refresh', 'commit:refresh']);
+    expect(displayAdmission.rollback).not.toHaveBeenCalled();
+    expect(refreshAdmission.rollback).not.toHaveBeenCalled();
+  });
+
+  it('rolls back each unconsumed publisher admission on native throw and rethrows the exact error', () => {
+    const ready = createReadyGoogletag();
+    const displayError = new Error('exact display failure');
+    const refreshError = new Error('exact refresh failure');
+    const displayAdmissions = [0, 1].map(() =>
+      Object.freeze({ commit: vi.fn(), rollback: vi.fn() })
+    );
+    const refreshAdmission = Object.freeze({ commit: vi.fn(), rollback: vi.fn() });
+    ready.googletag.display = vi.fn(() => {
+      throw displayError;
+    });
+    ready.pubads.refresh = vi.fn(() => {
+      throw refreshError;
+    });
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+    let displayAttempt = 0;
+    adapter.observePublisherCalls({
+      display: () =>
+        Object.freeze({
+          action: 'forward' as const,
+          admission: displayAdmissions[displayAttempt++]!,
+        }),
+      refresh: () => Object.freeze({ action: 'forward' as const, admission: refreshAdmission }),
+    });
+
+    const display = ready.googletag.display as (...arguments_: unknown[]) => unknown;
+    expect(() => display('slot')).toThrow(displayError);
+    expect(() => display('slot')).toThrow(displayError);
+    const refresh = ready.pubads.refresh as (...arguments_: unknown[]) => unknown;
+    expect(() => refresh(undefined, { changeCorrelator: true })).toThrow(refreshError);
+
+    for (const admission of displayAdmissions) {
+      expect(admission.rollback).toHaveBeenCalledOnce();
+      expect(admission.commit).not.toHaveBeenCalled();
+    }
+    expect(refreshAdmission.rollback).toHaveBeenCalledOnce();
+    expect(refreshAdmission.commit).not.toHaveBeenCalled();
+  });
+
+  it.each(['pubads', 'target_getter'] as const)(
+    'fails open to captured publisher natives when %s identity probing throws',
+    (failure) => {
+      const ready = createReadyGoogletag();
+      const target: { googletag?: unknown } = { googletag: ready.googletag };
+      const slot = Object.freeze({ id: 'publisher-slot' });
+      const nativeDefine = vi.fn(() => 'defined');
+      const nativeDisplay = vi.fn(() => 'displayed');
+      const nativeRefresh = vi.fn(() => 'refreshed');
+      const nativeDestroy = vi.fn(() => true);
+      ready.googletag.defineSlot = nativeDefine;
+      ready.googletag.display = nativeDisplay;
+      ready.googletag.destroySlots = nativeDestroy;
+      ready.pubads.refresh = nativeRefresh;
+      ready.pubads.getSlots.mockReturnValue([slot]);
+      const adapter = createBrowserGoogletagAdapter(target);
+      const observer = {
+        defineSlot: vi.fn(() => Object.freeze({ action: 'forward' as const })),
+        destroySlots: vi.fn(),
+        display: vi.fn(() => Object.freeze({ action: 'forward' as const })),
+        refresh: vi.fn(() => Object.freeze({ action: 'forward' as const })),
+      };
+      adapter.observePublisherCalls(observer);
+      const define = ready.googletag.defineSlot as (...arguments_: unknown[]) => unknown;
+      const display = ready.googletag.display as (...arguments_: unknown[]) => unknown;
+      const refresh = ready.pubads.refresh as (...arguments_: unknown[]) => unknown;
+      const destroy = ready.googletag.destroySlots as (...arguments_: unknown[]) => unknown;
+      const identityError = new Error(`throwing ${failure}`);
+      if (failure === 'pubads') {
+        ready.googletag.pubads.mockImplementation(() => {
+          throw identityError;
+        });
+      } else {
+        Object.defineProperty(target, 'googletag', {
+          configurable: true,
+          get: () => {
+            throw identityError;
+          },
+        });
+      }
+
+      expect(define('/publisher', [300, 250], 'slot')).toBe('defined');
+      expect(display('slot')).toBe('displayed');
+      expect(refresh([slot], { changeCorrelator: false })).toBe('refreshed');
+      expect(destroy([slot])).toBe(true);
+      expect(nativeDefine).toHaveBeenCalledOnce();
+      expect(nativeDisplay).toHaveBeenCalledOnce();
+      expect(nativeRefresh).toHaveBeenCalledOnce();
+      expect(nativeDestroy).toHaveBeenCalledOnce();
+      expect(observer.defineSlot).not.toHaveBeenCalled();
+      expect(observer.display).not.toHaveBeenCalled();
+      expect(observer.refresh).not.toHaveBeenCalled();
+      expect(observer.destroySlots).not.toHaveBeenCalled();
+    }
+  );
+
   it('mediates only explicit publisher decisions and preserves receiver, arguments, return, throw, and order', () => {
     const ready = createReadyGoogletag({ initialLoadDisabled: true });
     const handoffSlot = Object.freeze({ id: 'handoff' });
