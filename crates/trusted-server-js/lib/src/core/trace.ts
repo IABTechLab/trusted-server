@@ -962,7 +962,12 @@ export function createRenderTraceDiagnostics(
   const recordsBySequence = new Map<number, Readonly<RenderTraceRecord>>();
   const gptImpressions = new Map<
     object,
-    { readonly baselineSequence: number | undefined; sequence?: number; readonly slotId: string }
+    {
+      readonly baselineSequence: number | undefined;
+      renderEnded?: boolean;
+      sequence?: number;
+      readonly slotId: string;
+    }
   >();
   const subscribers = new Map<number, RenderTraceSubscription>();
   const pendingOrder: number[] = [];
@@ -1185,6 +1190,8 @@ export function createRenderTraceDiagnostics(
       if (fact.kind === 'slotResponseReceived') return;
       if (fact.kind === 'slotRenderEnded') {
         if (typeof fact.isEmpty !== 'boolean') return;
+        if (impression.renderEnded) return;
+        impression.renderEnded = true;
         const latest = current.get(impression.slotId);
         const target =
           latest && latest.seq !== impression.baselineSequence
