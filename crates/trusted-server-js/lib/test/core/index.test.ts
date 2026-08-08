@@ -80,7 +80,7 @@ describe('core production bootstrap', () => {
     }
   });
 
-  it('fails closed when the transient integration-config transport is not plain data', async () => {
+  it('publishes no terminal API when the transient integration-config transport is malformed', async () => {
     const preload = {
       boot: boot(),
       que: [],
@@ -89,13 +89,27 @@ describe('core production bootstrap', () => {
     (window as unknown as { tsjs?: unknown }).tsjs = preload;
 
     await import('../../src/composition/index');
-    await vi.waitFor(() =>
-      expect((window as unknown as { tsjs?: TsjsApi }).tsjs?._internal.state).toBe('fallback')
-    );
+    await Promise.resolve();
 
-    const api = (window as unknown as { tsjs: TsjsApi }).tsjs;
-    expect(api._internal).toMatchObject({ state: 'fallback', reason: 'abi_mismatch' });
-    expect(api).not.toHaveProperty('diagnostics');
-    expect(api).not.toHaveProperty('_integrationConfig');
+    expect(preload).not.toHaveProperty('_integrationConfig');
+    expect(preload).not.toHaveProperty('_internal');
+    expect(preload).not.toHaveProperty('requestAds');
+  });
+
+  it('does not publish a fallback API over a non-configurable integration transport', async () => {
+    const preload = { boot: boot(), que: [] };
+    Object.defineProperty(preload, '_integrationConfig', {
+      configurable: false,
+      enumerable: true,
+      value: {},
+    });
+    (window as unknown as { tsjs?: unknown }).tsjs = preload;
+
+    await import('../../src/composition/index');
+    await Promise.resolve();
+
+    expect(preload).toHaveProperty('_integrationConfig');
+    expect(preload).not.toHaveProperty('_internal');
+    expect(preload).not.toHaveProperty('requestAds');
   });
 });

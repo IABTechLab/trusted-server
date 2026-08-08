@@ -1,6 +1,5 @@
 import { prepareQueue, publishQueue, type PublishedQueue } from '../core/queue';
 import { EMBEDDED_RELEASE_ID } from '../core/release';
-import { FALLBACK_REMOVED_FIELDS, LEGACY_TSJS_FIELDS } from '../core/surface';
 
 import { buildFallbackBoot, buildKernelBoot, createFallbackFields, publicLog } from './fallback';
 import {
@@ -27,7 +26,6 @@ const TERMINAL_FIELDS = Object.freeze([
   'diagnostics',
   '_internal',
   'que',
-  ...LEGACY_TSJS_FIELDS,
 ]);
 
 function canClaimRuntimeTarget(target: RuntimeTarget): boolean {
@@ -262,12 +260,7 @@ class RuntimeOwner implements Runtime {
           if (!this.ownsRegistrationHandshake()) {
             throw new Error('Runtime owner generation changed');
           }
-          published = publishQueue(
-            this.options.target,
-            this.ingress as unknown[],
-            this.kernelFields(),
-            LEGACY_TSJS_FIELDS
-          );
+          published = publishQueue(this.options.target, this.ingress as unknown[], this.kernelFields());
         },
         drainPreload: () => published?.drain(),
       })
@@ -320,16 +313,11 @@ class RuntimeOwner implements Runtime {
 
   private commitFallback(reason: BootFailureReason): void {
     if (!this.ownsRegistrationHandshake() || !this.ingress) return;
-    const published = publishQueue(
-      this.options.target,
-      this.ingress,
-      createFallbackFields({
-        releaseId: EMBEDDED_RELEASE_ID,
-        reason,
-        boot: this.fallbackBoot,
-      }),
-      FALLBACK_REMOVED_FIELDS
-    );
+    const published = publishQueue(this.options.target, this.ingress, createFallbackFields({
+      releaseId: EMBEDDED_RELEASE_ID,
+      reason,
+      boot: this.fallbackBoot,
+    }));
     this.runtimeState = 'fallback';
     published.drain();
   }

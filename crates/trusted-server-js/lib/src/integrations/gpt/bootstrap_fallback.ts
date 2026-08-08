@@ -1,6 +1,5 @@
 import { canPublishTerminalFields, prepareQueue, publishQueue } from '../../core/queue';
 import { EMBEDDED_RELEASE_ID } from '../../core/release';
-import { FALLBACK_REMOVED_FIELDS } from '../../core/surface';
 import { createFallbackFields } from '../../kernel/fallback';
 
 function installGeneratedBootstrapFallback(
@@ -13,9 +12,9 @@ function installGeneratedBootstrapFallback(
     reason: 'bundle_partial',
     boot,
   });
-  if (!canPublishTerminalFields(target, fields, FALLBACK_REMOVED_FIELDS)) return;
+  if (!canPublishTerminalFields(target, fields)) return;
   const ingress = prepareQueue(target);
-  const published = publishQueue(target, ingress, fields, FALLBACK_REMOVED_FIELDS);
+  const published = publishQueue(target, ingress, fields);
   published.drain();
 }
 

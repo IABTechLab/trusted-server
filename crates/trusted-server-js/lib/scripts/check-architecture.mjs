@@ -31,6 +31,7 @@ function lineNumber(source, offset) {
 
 const jsPackageFiles = collect(packageRoot);
 const shippedTsjsFiles = collect(path.join(packageRoot, 'src'));
+const generatedTsjsFiles = collect(path.join(packageRoot, 'dist'));
 const currentGuideFiles = collect(path.join(repositoryRoot, 'docs/guide'));
 const browserTestFiles = collect(
   path.join(repositoryRoot, 'crates/trusted-server-integration-tests/browser')
@@ -51,6 +52,7 @@ const auxiliaryFiles = [
 ].filter((file) => path.resolve(file) !== thisScript);
 const legacySurfaceFiles = [
   ...shippedTsjsFiles,
+  ...generatedTsjsFiles,
   ...currentGuideFiles,
 ];
 const uniqueFiles = (files) => [...new Set(files)];
@@ -103,12 +105,9 @@ forbid(
   'legacy creative global',
   new RegExp(`(?:globalThis\\.)?${oldCreativeGlobal}|tsCreativeConfig`, 'g'),
 );
-const legacyDeclarationFiles = legacySurfaceFiles.filter(
-  (file) => relative(file) !== 'crates/trusted-server-js/lib/src/core/surface.ts'
-);
 for (const name of legacyPublicTokens) {
   forbid(
-    legacyDeclarationFiles,
+    legacySurfaceFiles,
     `legacy TSJS surface ${name}`,
     new RegExp(name.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'),
   );
@@ -159,8 +158,8 @@ const routeAndConfigFiles = [...shippedTsjsFiles, ...currentGuideFiles];
 forbid(routeAndConfigFiles, 'deprecated page-bids route', /\/__ts\/page-bids/g);
 forbid(
   routeAndConfigFiles,
-  'unversioned APS renderer route',
-  /\/integrations\/aps\/renderer(?!\/(?:v1|v2))/g,
+  'non-canonical APS renderer route',
+  /\/integrations\/aps\/renderer(?!\/v1(?![A-Za-z0-9_./-]))/g,
 );
 const apsIntegrationFile = path.join(
   repositoryRoot,
@@ -170,9 +169,15 @@ const apsIntegrationSource = fs.readFileSync(apsIntegrationFile, 'utf8');
 forbidSource(
   apsIntegrationFile,
   apsIntegrationSource.split('\n#[cfg(test)]')[0] ?? apsIntegrationSource,
-  'unversioned APS renderer route',
-  /\/integrations\/aps\/renderer(?!\/(?:v1|v2))/g,
+  'non-canonical APS renderer route',
+  /\/integrations\/aps\/renderer(?!\/v1(?![A-Za-z0-9_./-]))/g,
 );
+if (!apsIntegrationSource.includes('pub const APS_RUNNER_ROUTE: &str = "/integrations/aps/runner.js";')) {
+  violations.push(`${relative(apsIntegrationFile)}:1: missing canonical APS runner route`);
+}
+if (/APS_RUNNER_ROUTE:\s*&str\s*=\s*"\/integrations\/aps\/runner\/v1\.js"/.test(apsIntegrationSource)) {
+  violations.push(`${relative(apsIntegrationFile)}:1: versioned APS runner route is served`);
+}
 forbid(
   currentGuideFiles,
   'APS pub_id compatibility alias',

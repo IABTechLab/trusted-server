@@ -63,55 +63,12 @@ const APS_RUNNER_TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
 pub const APS_RUNNER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(4);
 /// Maximum duration of one blocking APS runner response-body read.
 pub const APS_RUNNER_BLOCKING_READ_TIMEOUT: Duration = Duration::from_millis(250);
-const APS_RENDERER_CSP: &str = "default-src 'none'; sandbox allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation; script-src 'unsafe-inline' https:; connect-src https:; frame-src https:; img-src https: data:; media-src https: blob:; style-src 'unsafe-inline' https:; font-src https: data:;";
-
 /// Whether `path` belongs to the reserved APS integration family.
 #[must_use]
 pub fn is_aps_family_path(path: &str) -> bool {
     path == "/integrations/aps" || path.starts_with("/integrations/aps/")
 }
 const APS_RENDERER_V1_CSP: &str = "default-src 'none'; sandbox allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline' 'self' https:; connect-src https:; frame-src https: data: blob:; img-src https: data: blob:; media-src https: data: blob:; style-src 'unsafe-inline' https:; font-src https: data:; worker-src https: blob:; form-action https:;";
-
-const APS_RENDERER_DOCUMENT: &str = concat!(
-    r#"<!doctype html>
-<meta charset="utf-8">
-<script>
-(function(){
-'use strict';
-"#,
-    include_str!("generated/aps_renderer_validator_v1.js"),
-    r#"
-var match=/^#tsaps=([A-Za-z0-9_-]{22,128})$/.exec(location.hash);
-var expected=match&&match[1];
-try{history.replaceState(null,'',location.pathname+location.search);}catch(_error){}
-if(!expected)return;
-function receive(event){
- if(event.source!==parent)return;
- var message=event.data;
- if(!apsExactRecord(message,['nonce','renderer'])||message.nonce!==expected||
-    classifyApsRendererV1(message.renderer,location.origin)!=='accepted')return;
- removeEventListener('message',receive);
- var acceptedNonce=expected;
- expected='';
- var renderer=message.renderer;
- window._aps=window._aps instanceof Map?window._aps:new Map();
- var account=window._aps.get(renderer.accountId);
- if(!account){
-  account={queue:[],store:new Map([['listeners',new Map()]])};
-  window._aps.set(renderer.accountId,account);
- }
- account.queue.push(new CustomEvent('prebid/creative/render',{detail:{aaxResponse:renderer.aaxResponse,seatBidId:renderer.bidId}}));
- var script=document.createElement('script');
- script.src='https://client.aps.amazon-adsystem.com/prebid-creative.js';
- script.onload=function(){parent.postMessage({message:'trusted-server/aps/renderer-ready',nonce:acceptedNonce},'*');};
- script.onerror=function(){parent.postMessage({message:'trusted-server/aps/renderer-failed',nonce:acceptedNonce},'*');};
- document.head.appendChild(script);
-}
-addEventListener('message',receive);
-})();
-</script>
-"#
-);
 
 const APS_RENDERER_V1_DOCUMENT: &str = concat!(
     r#"<!doctype html>
@@ -1358,48 +1315,6 @@ impl AuctionProvider for ApsAuctionProvider {
 }
 
 #[derive(Debug)]
-struct ApsRendererIntegration;
-
-#[async_trait(?Send)]
-impl IntegrationProxy for ApsRendererIntegration {
-    fn integration_name(&self) -> &'static str {
-        APS_INTEGRATION_ID
-    }
-
-    fn routes(&self) -> Vec<IntegrationEndpoint> {
-        vec![IntegrationEndpoint::get(APS_RENDERER_V1_ROUTE)]
-    }
-
-    async fn handle(
-        &self,
-        _settings: &Settings,
-        _services: &RuntimeServices,
-        request: http::Request<EdgeBody>,
-    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
-        if request.method() != Method::GET || request.uri().path() != APS_RENDERER_V1_ROUTE {
-            return http::Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(EdgeBody::from("Not Found"))
-                .change_context(TrustedServerError::Integration {
-                    integration: APS_INTEGRATION_ID.to_string(),
-                    message: "Failed to build APS not-found response".to_string(),
-                });
-        }
-        http::Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .header("x-content-type-options", "nosniff")
-            .header("referrer-policy", "no-referrer")
-            .header(header::CONTENT_SECURITY_POLICY, APS_RENDERER_CSP)
-            .body(EdgeBody::from(APS_RENDERER_DOCUMENT))
-            .change_context(TrustedServerError::Integration {
-                integration: APS_INTEGRATION_ID.to_string(),
-                message: "Failed to build APS renderer response".to_string(),
-            })
-    }
-}
-
-#[derive(Debug)]
 pub(crate) struct ApsV1Integration {
     enabled: bool,
 }
@@ -1681,10 +1596,8 @@ pub fn register(
     let Some(_config) = settings.integration_config::<ApsConfig>(APS_INTEGRATION_ID)? else {
         return Ok(None);
     };
-    let integration = Arc::new(ApsRendererIntegration);
     Ok(Some(
         IntegrationRegistration::builder(APS_INTEGRATION_ID)
-            .with_proxy(integration)
             .without_js()
             .build(),
     ))
@@ -3357,47 +3270,7 @@ mod tests {
     }
 
     #[test]
-    fn registers_and_serves_only_static_renderer_route() {
-        let integration = ApsRendererIntegration;
-        let routes = integration.routes();
-        assert_eq!(routes.len(), 1, "should register one route");
-        assert_eq!(routes[0].method, Method::GET);
-        assert_eq!(routes[0].path, APS_RENDERER_V1_ROUTE);
-
-        let settings = create_test_settings();
-        let services = noop_services();
-        let request = http::Request::builder()
-            .method(Method::GET)
-            .uri(APS_RENDERER_V1_ROUTE)
-            .body(EdgeBody::empty())
-            .expect("should build renderer request");
-        let response =
-            futures::executor::block_on(integration.handle(&settings, &services, request))
-                .expect("should serve renderer");
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers()[header::CONTENT_TYPE],
-            "text/html; charset=utf-8"
-        );
-        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
-        assert_eq!(response.headers()["referrer-policy"], "no-referrer");
-        assert_eq!(
-            response.headers()[header::CONTENT_SECURITY_POLICY],
-            APS_RENDERER_CSP
-        );
-
-        let post = http::Request::builder()
-            .method(Method::POST)
-            .uri(APS_RENDERER_V1_ROUTE)
-            .body(EdgeBody::empty())
-            .expect("should build method rejection request");
-        let response = futures::executor::block_on(integration.handle(&settings, &services, post))
-            .expect("should reject unsupported method");
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn enabled_config_registers_renderer_proxy() {
+    fn enabled_config_does_not_register_a_second_renderer_proxy() {
         let mut settings = create_test_settings();
         settings
             .integrations
@@ -3412,7 +3285,7 @@ mod tests {
             .expect("should return enabled registration");
 
         assert_eq!(registration.integration_id, APS_INTEGRATION_ID);
-        assert_eq!(registration.proxies.len(), 1);
+        assert!(registration.proxies.is_empty());
         assert!(registration.js_disabled);
     }
 
@@ -3434,38 +3307,6 @@ mod tests {
         let _error = register_providers(&settings)
             .err()
             .expect("should reject invalid enabled APS configuration");
-    }
-
-    #[test]
-    fn renderer_document_is_static_and_nonce_bound() {
-        assert!(APS_RENDERER_DOCUMENT.contains("^#tsaps="));
-        assert!(APS_RENDERER_DOCUMENT.contains("event.source!==parent"));
-        assert!(APS_RENDERER_DOCUMENT.contains("message.nonce!==expected"));
-        assert!(APS_RENDERER_DOCUMENT.contains("prebid/creative/render"));
-        assert!(APS_RENDERER_DOCUMENT.contains("window._aps instanceof Map"));
-        assert!(APS_RENDERER_DOCUMENT.contains("store:new Map([['listeners',new Map()]])"));
-        assert!(APS_RENDERER_DOCUMENT.contains("account.queue.push(new CustomEvent"));
-        assert!(
-            APS_RENDERER_DOCUMENT.contains("trusted-server/aps/renderer-ready")
-                && APS_RENDERER_DOCUMENT.contains("trusted-server/aps/renderer-failed")
-        );
-        assert!(!APS_RENDERER_DOCUMENT.contains("window.apstag"));
-        assert!(
-            APS_RENDERER_DOCUMENT
-                .contains("https://client.aps.amazon-adsystem.com/prebid-creative.js")
-        );
-        assert!(!APS_RENDERER_DOCUMENT.contains("<script src="));
-        let queue_index = APS_RENDERER_DOCUMENT
-            .find("account.queue.push(new CustomEvent")
-            .expect("should queue render event");
-        let runner_index = APS_RENDERER_DOCUMENT
-            .find("document.head.appendChild(script)")
-            .expect("should dynamically load the APS runner");
-        assert!(queue_index < runner_index);
-        assert!(!APS_RENDERER_DOCUMENT.contains("allow-same-origin"));
-        assert!(APS_RENDERER_CSP.contains("default-src 'none'"));
-        assert!(APS_RENDERER_CSP.contains("sandbox allow-forms"));
-        assert!(!APS_RENDERER_CSP.contains("allow-same-origin"));
     }
 
     #[test]

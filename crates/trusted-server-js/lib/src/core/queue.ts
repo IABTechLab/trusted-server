@@ -85,6 +85,17 @@ function preflightTerminalFields(
     }
     removed.push(key);
   }
+  // A terminal publication is an exact replacement, not a compatibility
+  // merge. Remove every other own string field without carrying an inventory
+  // of retired public names into the shipped bundle.
+  for (const key of Object.getOwnPropertyNames(target)) {
+    if (key === 'que' || seen.has(key) || removed.includes(key)) continue;
+    const existing = Object.getOwnPropertyDescriptor(target, key);
+    if (existing && !existing.configurable) {
+      throw new TypeError(`TSJS unpublished field is not configurable: ${key}`);
+    }
+    removed.push(key);
+  }
   const queueDescriptor = Object.getOwnPropertyDescriptor(target, 'que');
   if (queueDescriptor && !queueDescriptor.configurable) {
     throw new TypeError('TSJS terminal field is not configurable: que');

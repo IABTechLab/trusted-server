@@ -185,11 +185,14 @@ export function startProductionRuntime(createComposition: BrowserRuntimeComposit
   const target = bootstrapTarget();
   if (!target) return;
   const configs = consumeIntegrationConfig(target);
+  // A malformed, accessor-backed, or undeletable transport must not survive
+  // beneath either terminal namespace. Leave the namespace unclaimed.
+  if (!configs) return;
   const composition = createComposition(
     {
       target,
       releaseId: EMBEDDED_RELEASE_ID,
-      manifest: configs ? bootManifest(target) : undefined,
+      manifest: bootManifest(target),
       knownIntegrationIds: EMBEDDED_INTEGRATION_IDS,
       getBindings: (id) =>
         Object.freeze({
