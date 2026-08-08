@@ -96,5 +96,6 @@ describe('core production bootstrap', () => {
     const api = (window as unknown as { tsjs: TsjsApi }).tsjs;
     expect(api._internal).toMatchObject({ state: 'fallback', reason: 'abi_mismatch' });
     expect(api).not.toHaveProperty('diagnostics');
+    expect(api).not.toHaveProperty('_integrationConfig');
   });
 });

@@ -326,14 +326,14 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  browser-tests-aps-v1:
-    name: browser integration tests (APS v1 feature artifact)
+  browser-tests-aps-tsjs-conformance:
+    name: browser integration tests (APS/TSJS conformance)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up APS v1 browser test runtime
+      - name: Set up APS/TSJS browser test runtime
         id: shared-setup
         uses: ./.github/actions/setup-integration-test-env
         with:
@@ -353,21 +353,25 @@ jobs:
             crates/trusted-server-integration-tests/browser/package-lock.json
             crates/trusted-server-js/lib/package-lock.json
 
-      - name: Run focused APS v1 Chromium test with explicit feature artifact
+      - name: Run focused APS/TSJS three-browser conformance matrix
         env:
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
           TS_BROWSER_FRAMEWORKS: nextjs
-          TS_TEST_APS_V1: "1"
+          TS_BROWSER_PROJECTS: chromium,firefox,webkit
         run: >-
           ./scripts/integration-tests-browser.sh
           tests/shared/aps-renderer.spec.ts
-          --project=chromium
-          --grep="uses one port, reports ordered progress, and fails closed"
+          tests/shared/aps-puc-lifecycle.spec.ts
+          tests/shared/tsjs-runtime.spec.ts
+          tests/shared/creative-sandbox.spec.ts
+          tests/nextjs/gpt-diagnostics.spec.ts
+          tests/nextjs/navigation.spec.ts
+          --project=chromium --project=firefox --project=webkit
 
-      - name: Upload APS v1 Playwright report
+      - name: Upload APS/TSJS Playwright report
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: playwright-report-aps-v1
+          name: playwright-report-aps-tsjs-conformance
           path: crates/trusted-server-integration-tests/browser/playwright-report/
           retention-days: 7

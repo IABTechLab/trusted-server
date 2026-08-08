@@ -2132,6 +2132,26 @@ describe('browser googletag adapter readiness', () => {
     expect(ready.pubads.refresh).toBe(nativeRefresh);
   });
 
+  it('keeps an existing event subscription live while installing publisher-call wrappers', async () => {
+    const ready = createReadyGoogletag();
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+    const listener = vi.fn();
+    let unsubscribe: (() => void) | undefined;
+    const subscription = adapter.run((gpt) => {
+      unsubscribe = gpt.subscribe('slotRequested', listener);
+    });
+    await expect(subscription.result).resolves.toBeUndefined();
+    const installed = [...(ready.listeners.get('slotRequested') ?? [])][0];
+    expect(installed).toBeTypeOf('function');
+
+    const releasePublisherObserver = adapter.observePublisherCalls(Object.freeze({}));
+    installed?.({ slot: Object.freeze({ id: 'slot-a' }) });
+
+    expect(listener).toHaveBeenCalledOnce();
+    unsubscribe?.();
+    releasePublisherObserver();
+  });
+
   it('installs the publisher observer when an accepted command-queue stub becomes ready', () => {
     const commands: Array<() => void> = [];
     const pending = {

@@ -980,6 +980,10 @@ export function createBrowserGoogletagAdapter(
   let armedBindings = new WeakSet<object>();
   const targetingObservations = new WeakMap<object, TargetingObservation>();
   const facadeCalls = new WeakMap<(...arguments_: unknown[]) => unknown, number>();
+  const adapterMethodOrigins = new WeakMap<
+    (...arguments_: unknown[]) => unknown,
+    (...arguments_: unknown[]) => unknown
+  >();
   const bindingTokens = new WeakMap<object, object>();
   const diagnosticsSlots = new WeakMap<object, GoogletagDiagnosticsSlotSnapshot>();
   const initialLoadReleases = new Map<object, () => void>();
@@ -1576,13 +1580,33 @@ export function createBrowserGoogletagAdapter(
   };
 
   const sameBinding = (expected: PresentGoogletag): boolean => {
+    const canonicalAdapterMethod = (
+      candidate: (...arguments_: unknown[]) => unknown
+    ): ((...arguments_: unknown[]) => unknown) | undefined => {
+      let current = candidate;
+      for (let depth = 0; depth < 16; depth += 1) {
+        const origin = weakMapValue(adapterMethodOrigins, current);
+        if (!origin) return current;
+        if (origin === current) return undefined;
+        current = origin;
+      }
+      return undefined;
+    };
+    const sameAdapterMethod = (
+      left: (...arguments_: unknown[]) => unknown,
+      right: (...arguments_: unknown[]) => unknown
+    ): boolean => {
+      if (left === right) return true;
+      const canonicalLeft = canonicalAdapterMethod(left);
+      return canonicalLeft !== undefined && canonicalLeft === canonicalAdapterMethod(right);
+    };
     const matchesCapturedBinding = (): boolean => {
       const inspected = inspectBinding(expected.binding);
       return (
         inspected.status === 'present' &&
         inspected.value.commandQueue.binding === expected.commandQueue.binding &&
         inspected.value.commandQueue.push === expected.commandQueue.push &&
-        inspected.value.display === expected.display &&
+        sameAdapterMethod(inspected.value.display, expected.display) &&
         inspected.value.pubads === expected.pubads
       );
     };
@@ -2300,9 +2324,19 @@ export function createBrowserGoogletagAdapter(
         }
         return mediate(callable, this, arguments_);
       };
-      const restore = replaceMethod(external, key, wrapper, stillCurrent);
-      if (!restore) throw new GoogletagAdapterError('external_artifact_incompatible');
-      restorers[restorers.length] = restore;
+      setWeakMapValue(adapterMethodOrigins, wrapper, callable);
+      const restoreMethod = replaceMethod(external, key, wrapper, stillCurrent);
+      if (!restoreMethod) {
+        deleteWeakMapValue(adapterMethodOrigins, wrapper);
+        throw new GoogletagAdapterError('external_artifact_incompatible');
+      }
+      restorers[restorers.length] = (): void => {
+        try {
+          restoreMethod();
+        } finally {
+          deleteWeakMapValue(adapterMethodOrigins, wrapper);
+        }
+      };
     };
     try {
       install(currentBindingObject, 'defineSlot', (original, receiver, arguments_) => {

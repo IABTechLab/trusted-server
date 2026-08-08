@@ -20,7 +20,7 @@ test.beforeEach(async ({ page }, testInfo) => {
 
 async function waitForApi(page: Page): Promise<void> {
     await page.waitForFunction(() =>
-        Boolean((window as any).tsjs?.gptDiagnostics),
+        Boolean((window as any).tsjs?.diagnostics?.gpt),
     );
 }
 
@@ -64,7 +64,11 @@ test.describe("GPT runtime diagnostics", () => {
 
         expect(
             await page.evaluate(() => ({
-                api: Boolean((window as any).tsjs?.gptDiagnostics),
+                api: Boolean((window as any).tsjs?.diagnostics?.gpt),
+                legacyApi: Object.prototype.hasOwnProperty.call(
+                    (window as any).tsjs,
+                    "gptDiagnostics",
+                ),
                 host: Boolean(
                     document.getElementById("trusted-server-gpt-diagnostics"),
                 ),
@@ -72,7 +76,12 @@ test.describe("GPT runtime diagnostics", () => {
                     window as any
                 ).__gptDiagnosticsStub.listenerCounts(),
             })),
-        ).toEqual({ api: false, host: false, listenerCounts: {} });
+        ).toEqual({
+            api: false,
+            legacyApi: false,
+            host: false,
+            listenerCounts: { slotRequested: 1, slotRenderEnded: 1 },
+        });
         expect(diagnosticNetworkRequests).toEqual([]);
         expect(diagnosticModuleRequests).toEqual([]);
     });
@@ -118,7 +127,7 @@ test.describe("GPT runtime diagnostics", () => {
         await page.waitForURL("**/");
         expect(
             await page.evaluate(() =>
-                Boolean((window as any).tsjs?.gptDiagnostics),
+                Boolean((window as any).tsjs?.diagnostics?.gpt),
             ),
         ).toBe(true);
         await page.goBack();
@@ -158,7 +167,11 @@ test.describe("GPT runtime diagnostics", () => {
         ).toBe(false);
         expect(
             await page.evaluate(() => ({
-                api: Boolean((window as any).tsjs?.gptDiagnostics),
+                api: Boolean((window as any).tsjs?.diagnostics?.gpt),
+                legacyApi: Object.prototype.hasOwnProperty.call(
+                    (window as any).tsjs,
+                    "gptDiagnostics",
+                ),
                 host: Boolean(
                     document.getElementById("trusted-server-gpt-diagnostics"),
                 ),
@@ -166,7 +179,12 @@ test.describe("GPT runtime diagnostics", () => {
                     window as any
                 ).__gptDiagnosticsStub.listenerCounts(),
             })),
-        ).toEqual({ api: false, host: false, listeners: {} });
+        ).toEqual({
+            api: false,
+            legacyApi: false,
+            host: false,
+            listeners: { slotRequested: 1, slotRenderEnded: 1 },
+        });
 
         const separateContext = await browser.newContext();
         const separatePage = await separateContext.newPage();
@@ -176,7 +194,7 @@ test.describe("GPT runtime diagnostics", () => {
         });
         expect(
             await separatePage.evaluate(() =>
-                Boolean((window as any).tsjs?.gptDiagnostics),
+                Boolean((window as any).tsjs?.diagnostics?.gpt),
             ),
         ).toBe(false);
         await separatePage.waitForLoadState("networkidle");
@@ -252,14 +270,14 @@ test.describe("GPT runtime diagnostics", () => {
         );
 
         await page.waitForFunction(() => {
-            const snapshot = (window as any).tsjs.gptDiagnostics.snapshot();
+            const snapshot = (window as any).tsjs.diagnostics.gpt.snapshot();
             return (
                 snapshot.slots.length === 2 &&
                 snapshot.callbackIssues.length > 0
             );
         });
         const snapshot = await page.evaluate(() =>
-            (window as any).tsjs.gptDiagnostics.snapshot(),
+            (window as any).tsjs.diagnostics.gpt.snapshot(),
         );
         expect(snapshot.slots).toHaveLength(2);
         const primary = snapshot.slots.find(
@@ -303,13 +321,13 @@ test.describe("GPT runtime diagnostics", () => {
         await page.getByRole("button", { name: "Toggle duplicate ID" }).click();
         await page.waitForFunction(
             () =>
-                (window as any).tsjs.gptDiagnostics.snapshot().slots[0].binding
+                (window as any).tsjs.diagnostics.gpt.snapshot().slots[0].binding
                     .status === "ambiguous",
         );
         expect(
             await page.evaluate(
                 () =>
-                    (window as any).tsjs.gptDiagnostics.snapshot().slots[0]
+                    (window as any).tsjs.diagnostics.gpt.snapshot().slots[0]
                         .binding,
             ),
         ).toEqual({ status: "ambiguous", reason: "duplicate_dom_id" });
@@ -319,7 +337,7 @@ test.describe("GPT runtime diagnostics", () => {
             .click();
         await page.waitForFunction(
             () =>
-                (window as any).tsjs.gptDiagnostics.snapshot().slots[0].binding
+                (window as any).tsjs.diagnostics.gpt.snapshot().slots[0].binding
                     .status === "bound",
         );
 
@@ -328,13 +346,13 @@ test.describe("GPT runtime diagnostics", () => {
             .click();
         await expect(page.locator(`#${HOST_ID}`)).toHaveCount(1);
 
-        await page.evaluate(() => (window as any).tsjs.gptDiagnostics.hide());
+        await page.evaluate(() => (window as any).tsjs.diagnostics.gpt.hide());
         await expect(page.locator(`#${HOST_ID}`)).toHaveCount(0);
         await emit(page, "slotRequested", "gpt-diagnostics-slot-secondary");
-        await page.evaluate(() => (window as any).tsjs.gptDiagnostics.show());
+        await page.evaluate(() => (window as any).tsjs.diagnostics.gpt.show());
         await expect(page.locator(`#${HOST_ID}`)).toHaveCount(1);
         const hiddenPeriodSnapshot = await page.evaluate(() =>
-            (window as any).tsjs.gptDiagnostics.snapshot(),
+            (window as any).tsjs.diagnostics.gpt.snapshot(),
         );
         expect(
             hiddenPeriodSnapshot.slots.find(
@@ -344,7 +362,9 @@ test.describe("GPT runtime diagnostics", () => {
         ).toHaveLength(2);
 
         const downloadPromise = page.waitForEvent("download");
-        await page.evaluate(() => (window as any).tsjs.gptDiagnostics.export());
+        await page.evaluate(() =>
+            (window as any).tsjs.diagnostics.gpt.export(),
+        );
         const download = await downloadPromise;
         expect(download.suggestedFilename()).toMatch(
             /^trusted-server-gpt-diagnostics-.*\.json$/,
