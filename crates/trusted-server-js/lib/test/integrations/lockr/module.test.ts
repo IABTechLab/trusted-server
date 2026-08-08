@@ -84,4 +84,39 @@ describe('transactional Lockr integration module', () => {
     expect(sdk.host).toBe('https://identity.loc.kr');
     expect(vi.getTimerCount()).toBe(0);
   });
+
+  it('isolates a hostile timer release from SDK and guard cleanup', () => {
+    const sdk = { host: 'https://identity.loc.kr' };
+    let sdkAvailable = false;
+    const clearTimeout = vi.fn(() => {
+      throw new Error('publisher clearTimeout failed');
+    });
+    const resetGuard = vi.fn(() => {
+      throw new Error('publisher guard reset failed');
+    });
+    const runtime = createLockrRuntime({
+      clearTimeout,
+      getSdk: () => (sdkAvailable ? sdk : undefined),
+      installGuard: vi.fn(),
+      location: { host: 'news.example', protocol: 'https:' },
+      resetGuard,
+      setTimeout: (callback) => {
+        sdkAvailable = true;
+        callback();
+        return 17;
+      },
+      started: vi.fn(),
+      timedOut: vi.fn(),
+    });
+    const release = runtime.activate(undefined);
+    runtime.start(undefined);
+
+    expect(sdk.host).toBe('https://news.example/integrations/lockr/api');
+    expect(() => release()).not.toThrow();
+    expect(() => release()).not.toThrow();
+
+    expect(clearTimeout).toHaveBeenCalledOnce();
+    expect(sdk.host).toBe('https://identity.loc.kr');
+    expect(resetGuard).toHaveBeenCalledOnce();
+  });
 });

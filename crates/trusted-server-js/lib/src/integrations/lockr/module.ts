@@ -24,6 +24,14 @@ export interface LockrRuntimeDependencies {
   readonly timedOut: () => void;
 }
 
+function bestEffort(action: () => void): void {
+  try {
+    action();
+  } catch {
+    // Cleanup is isolated so one hostile publisher hook cannot retain another resource.
+  }
+}
+
 /** Own the Lockr guard, bounded SDK readiness timer, and installed API host. */
 export function createLockrRuntime(
   dependencies: LockrRuntimeDependencies = {
@@ -78,11 +86,12 @@ export function createLockrRuntime(
         active = false;
         started = false;
         if (timer !== undefined) {
-          dependencies.clearTimeout(timer);
+          const ownedTimer = timer;
           timer = undefined;
+          bestEffort(() => dependencies.clearTimeout(ownedTimer));
         }
-        resetSdk();
-        dependencies.resetGuard();
+        bestEffort(resetSdk);
+        bestEffort(dependencies.resetGuard);
       };
     },
     start: (_config: unknown): void => {
