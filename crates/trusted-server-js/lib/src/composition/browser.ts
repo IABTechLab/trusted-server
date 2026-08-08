@@ -71,7 +71,10 @@ import {
   type GptDiagnosticsRuntime,
 } from '../integrations/gpt_diagnostics';
 import {
+  createPrebidRefreshPolicy,
   createPrebidSelectionCoordinator,
+  createPrebidSyntheticRefreshRunner,
+  preparePrebidRegisteredRefreshAuction,
   publishPrebidBid,
   type PrebidSelectionCoordinator,
 } from '../integrations/prebid/module';
@@ -242,6 +245,85 @@ function projectionSlots(projection: object): readonly string[] {
     readonly auction: { readonly results: readonly { readonly slot: string }[] };
   };
   return Object.freeze(accepted.auction.results.map(({ slot }) => slot));
+}
+
+interface ComposedPrebidRefreshConfig {
+  readonly clientSideBidders: readonly string[];
+  readonly excludedGamAdUnitPathSuffixes: readonly string[];
+}
+
+const EMPTY_PREBID_REFRESH_CONFIG: ComposedPrebidRefreshConfig = Object.freeze({
+  clientSideBidders: Object.freeze([]),
+  excludedGamAdUnitPathSuffixes: Object.freeze([]),
+});
+
+function composedPrebidRefreshConfig(candidate: unknown): ComposedPrebidRefreshConfig {
+  try {
+    if (typeof candidate !== 'object' || candidate === null || Array.isArray(candidate)) {
+      return EMPTY_PREBID_REFRESH_CONFIG;
+    }
+    const strings = (name: string): readonly string[] => {
+      const descriptor = Object.getOwnPropertyDescriptor(candidate, name);
+      if (!descriptor || !('value' in descriptor) || !Array.isArray(descriptor.value)) {
+        return Object.freeze([]);
+      }
+      const values: string[] = [];
+      for (let index = 0; index < descriptor.value.length; index += 1) {
+        const value = descriptor.value[index];
+        if (typeof value !== 'string') return Object.freeze([]);
+        values.push(value);
+      }
+      return Object.freeze(values);
+    };
+    return Object.freeze({
+      clientSideBidders: strings('clientSideBidders'),
+      excludedGamAdUnitPathSuffixes: strings('excludedGamAdUnitPathSuffixes'),
+    });
+  } catch {
+    return EMPTY_PREBID_REFRESH_CONFIG;
+  }
+}
+
+function composedPrebidRefreshAuction(
+  physicalSlots: readonly object[],
+  navigation: RuntimeSession['currentNavigation'],
+  slots: SlotService,
+  config: ComposedPrebidRefreshConfig
+): unknown {
+  if (!navigation?.isCurrent()) return undefined;
+  const records = slots.snapshotRegisteredSlots(navigation);
+  if (!records) return undefined;
+  const resolved = new Map<object, Readonly<object>>();
+  for (let slotIndex = 0; slotIndex < physicalSlots.length; slotIndex += 1) {
+    const physicalSlot = physicalSlots[slotIndex];
+    if (!physicalSlot) return undefined;
+    let matched: SlotRecord | undefined;
+    for (let recordIndex = 0; recordIndex < records.length; recordIndex += 1) {
+      const record = records[recordIndex];
+      if (
+        !record ||
+        !slots.isBoundGptSlot(
+          navigation.generation,
+          record.registeredSlotId,
+          physicalSlot
+        )
+      ) {
+        continue;
+      }
+      if (matched) return undefined;
+      matched = record;
+    }
+    const source = matched?.directAuctionUnit;
+    if (!source || !Object.isFrozen(source)) {
+      return undefined;
+    }
+    resolved.set(physicalSlot, source);
+  }
+  return preparePrebidRegisteredRefreshAuction({
+    clientSideBidders: config.clientSideBidders,
+    resolveAdUnit: (slot) => resolved.get(slot),
+    slots: physicalSlots,
+  });
 }
 
 function registerScopedContextContributor(
@@ -463,7 +545,22 @@ export function createTestBrowserRuntimeComposition(
   });
   let runtimeSession: RuntimeSession | undefined;
   let prebidCoordinator: PrebidSelectionCoordinator | undefined;
+  let prebidRefreshConfig = EMPTY_PREBID_REFRESH_CONFIG;
   const startPrebid = compositionOptions.prebidStartupForTest ?? (() => undefined);
+  const prebidRefreshRunner = createPrebidSyntheticRefreshRunner({
+    prebid: composition.adapters.prebid,
+    prepareAuction: (slots, navigation) => {
+      const slotService = browserServices?.slots;
+      if (!slotService) return undefined;
+      return composedPrebidRefreshAuction(slots, navigation, slotService, prebidRefreshConfig);
+    },
+  });
+  const prebidRefreshPolicy = createPrebidRefreshPolicy({
+    currentNavigation: () => runtimeSession?.currentNavigation,
+    excludedGamAdUnitPathSuffixes: () => prebidRefreshConfig.excludedGamAdUnitPathSuffixes,
+    googletag: composition.adapters.googletag,
+    runSyntheticAuction: prebidRefreshRunner,
+  });
   const completePrebidAuction = (auction: Readonly<PrebidTrustedServerAuctionV1>): void => {
     try {
       auction.complete();
@@ -530,6 +627,13 @@ export function createTestBrowserRuntimeComposition(
     onAuction: publishPrebidAuction,
     onAuctionEnd: (event, prebid) => prebidCoordinator?.auctionEnded(event, prebid),
     prebid: composition.adapters.prebid,
+    refresh: Object.freeze({
+      configure: (config: unknown): void => {
+        prebidRefreshConfig = composedPrebidRefreshConfig(config);
+      },
+      install: gptRuntime.installRefreshPolicy,
+      policy: prebidRefreshPolicy,
+    }),
     start: startPrebid,
   });
   const getBindings: NonNullable<RuntimeOptions['getBindings']> = (id) => {

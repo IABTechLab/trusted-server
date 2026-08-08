@@ -1,5 +1,6 @@
 import {
   isRendererReservationIdV1,
+  ownDataArray,
   ownDataObject,
   validBoundedString,
   validDimension,
@@ -35,6 +36,7 @@ import type {
 import type { ReservationService } from '../../services/reservations';
 
 export const PREBID_INTEGRATION_ID = 'prebid' as const;
+const TRUSTED_SERVER_PREBID_BIDDER = 'trustedServer';
 export type { PreparedTrustedBidV1 } from '../../adapters/prebid';
 
 const MAX_CONFIG_DEPTH = 16;
@@ -192,6 +194,12 @@ export interface PrebidRefreshAuctionPreparation {
   readonly adUnits: readonly object[];
 }
 
+export interface PrebidRegisteredRefreshAuctionOptions {
+  readonly clientSideBidders: readonly string[];
+  readonly resolveAdUnit: (slot: object) => unknown;
+  readonly slots: readonly object[];
+}
+
 export interface PrebidRefreshAuctionOperation {
   readonly completion: Promise<void>;
   readonly dispose: () => void;
@@ -267,6 +275,120 @@ function validRefreshAuctionPreparation(
       codes.add(code);
     }
     return record as unknown as PrebidRefreshAuctionPreparation;
+  } catch {
+    return undefined;
+  }
+}
+
+function defineDataProperty(target: Record<string, unknown>, key: string, value: unknown): void {
+  Object.defineProperty(target, key, {
+    configurable: false,
+    enumerable: true,
+    value,
+    writable: false,
+  });
+}
+
+/**
+ * Rebuild synthetic Prebid units from detached runtime-owned registrations.
+ *
+ * The composition root resolves physical GPT identities to registered units;
+ * this integration-owned boundary performs all bidder routing without reading
+ * mutable `pbjs.adUnits` publisher state.
+ */
+export function preparePrebidRegisteredRefreshAuction(
+  options: PrebidRegisteredRefreshAuctionOptions
+): PrebidRefreshAuctionPreparation | undefined {
+  try {
+    if (
+      options.slots.length === 0 ||
+      options.slots.length > MAX_PREBID_REFRESH_AD_UNITS ||
+      !Object.isFrozen(options.slots)
+    ) {
+      return undefined;
+    }
+    const clientSideBidders = new Set<string>();
+    for (let index = 0; index < options.clientSideBidders.length; index += 1) {
+      const bidder = options.clientSideBidders[index];
+      if (!validBoundedString(bidder, 64)) return undefined;
+      clientSideBidders.add(bidder);
+    }
+
+    const adUnitCodes: string[] = [];
+    const adUnits: object[] = [];
+    const seenCodes = new Set<string>();
+    for (let slotIndex = 0; slotIndex < options.slots.length; slotIndex += 1) {
+      const slot = options.slots[slotIndex];
+      if (!slot) return undefined;
+      const source = ownDataObject(options.resolveAdUnit(slot));
+      if (!source || !validBoundedString(source.code, 128) || seenCodes.has(source.code)) {
+        return undefined;
+      }
+      const mediaTypes = ownDataObject(source.mediaTypes);
+      if (!mediaTypes || !Object.isFrozen(source.mediaTypes)) return undefined;
+      const rawBids =
+        source.bids === undefined
+          ? []
+          : ownDataArray(source.bids, MAX_CONFIG_MEMBERS);
+      if (!rawBids || (source.bids !== undefined && !Object.isFrozen(source.bids))) {
+        return undefined;
+      }
+
+      const bidderParams: Record<string, unknown> = {};
+      const trustedParams: Record<string, unknown> = {};
+      const clientBids: object[] = [];
+      let foundTrustedBid = false;
+      for (let bidIndex = 0; bidIndex < rawBids.length; bidIndex += 1) {
+        const bid = ownDataObject(rawBids[bidIndex]);
+        if (!bid || !validBoundedString(bid.bidder, 64)) return undefined;
+        const params = bid.params === undefined ? Object.freeze({}) : bid.params;
+        if (!ownDataObject(params) || !Object.isFrozen(params)) return undefined;
+        if (bid.bidder === TRUSTED_SERVER_PREBID_BIDDER) {
+          if (foundTrustedBid) return undefined;
+          foundTrustedBid = true;
+          const existingParams = ownDataObject(params);
+          if (!existingParams) return undefined;
+          for (const [key, value] of Object.entries(existingParams)) {
+            if (key !== 'bidderParams') defineDataProperty(trustedParams, key, value);
+          }
+          const folded = existingParams['bidderParams'];
+          if (folded !== undefined) {
+            const foldedRecord = ownDataObject(folded);
+            if (!foldedRecord || !Object.isFrozen(folded)) return undefined;
+            for (const [bidder, bidderValue] of Object.entries(foldedRecord)) {
+              if (!validBoundedString(bidder, 64) || !ownDataObject(bidderValue)) return undefined;
+              defineDataProperty(bidderParams, bidder, bidderValue);
+            }
+          }
+          continue;
+        }
+        if (clientSideBidders.has(bid.bidder)) {
+          clientBids.push(Object.freeze({ bidder: bid.bidder, params }));
+          continue;
+        }
+        defineDataProperty(bidderParams, bid.bidder, params);
+      }
+
+      defineDataProperty(trustedParams, 'bidderParams', Object.freeze(bidderParams));
+      const synthetic = Object.freeze({
+        code: source.code,
+        mediaTypes: source.mediaTypes,
+        bids: Object.freeze([
+          Object.freeze({
+            bidder: TRUSTED_SERVER_PREBID_BIDDER,
+            params: Object.freeze(trustedParams),
+          }),
+          ...clientBids,
+        ]),
+      });
+      seenCodes.add(source.code);
+      adUnitCodes.push(source.code);
+      adUnits.push(synthetic);
+    }
+    return Object.freeze({
+      adUnitCodes: Object.freeze(adUnitCodes),
+      adUnits: Object.freeze(adUnits),
+    });
   } catch {
     return undefined;
   }

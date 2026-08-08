@@ -7,6 +7,8 @@ import {
   type GoogletagBindingStatus,
   type GoogletagDiagnosticsObserver,
   type GoogletagFacade,
+  type GoogletagPublisherCallObserver,
+  type GoogletagPublisherRefreshCall,
 } from '../../src/adapters/googletag';
 import {
   createBrowserMessagingAdapter,
@@ -75,7 +77,12 @@ function synchronousGptAdapter() {
   const bindingToken = Object.freeze({});
   const refresh = vi.fn();
   let diagnosticsObserver: GoogletagDiagnosticsObserver | undefined;
+  let publisherObserver: GoogletagPublisherCallObserver | undefined;
   const facade: GoogletagFacade = Object.freeze({
+    adUnitPath: (slot: object) =>
+      'getAdUnitPath' in slot && typeof slot.getAdUnitPath === 'function'
+        ? slot.getAdUnitPath()
+        : undefined,
     bindingToken: () => bindingToken,
     clearTargeting: vi.fn((slot: object, key?: string) => {
       const values = targeting.get(slot);
@@ -115,7 +122,12 @@ function synchronousGptAdapter() {
         if (diagnosticsObserver === observer) diagnosticsObserver = undefined;
       };
     },
-    observePublisherCalls: () => vi.fn(),
+    observePublisherCalls: (observer: GoogletagPublisherCallObserver) => {
+      publisherObserver = observer;
+      return () => {
+        if (publisherObserver === observer) publisherObserver = undefined;
+      };
+    },
     run: <Value>(command: (gpt: Readonly<GoogletagFacade>) => Value) => {
       let result: Promise<Value>;
       try {
@@ -148,6 +160,11 @@ function synchronousGptAdapter() {
           .filter(([, registered]) => registered.size > 0)
           .map(([eventType, registered]) => Object.freeze([eventType, registered.size] as const))
       ),
+    publisherRefresh: (call: Readonly<GoogletagPublisherRefreshCall>) => {
+      const observer = publisherObserver;
+      if (!observer?.refresh) throw new Error('Publisher observer is unavailable');
+      return observer.refresh(call);
+    },
     refresh,
   };
 }
@@ -167,6 +184,8 @@ function synchronousPrebidAdapter() {
     admitted = prepared;
     return 'admitted' as const;
   });
+  const requestBids = vi.fn();
+  const setTargetingForGpt = vi.fn();
   const facade = Object.freeze({
     addAdUnits: vi.fn(),
     highestBids: vi.fn(() => Object.freeze([])),
@@ -181,8 +200,8 @@ function synchronousPrebidAdapter() {
       }
     ),
     renderAd: vi.fn(),
-    requestBids: vi.fn(),
-    setTargetingForGpt: vi.fn(),
+    requestBids,
+    setTargetingForGpt,
     subscribe: vi.fn(
       (
         eventType: string,
@@ -229,6 +248,8 @@ function synchronousPrebidAdapter() {
         Object.freeze({ highestBids: () => highest })
       );
     },
+    requestBids,
+    setTargetingForGpt,
   };
 }
 
@@ -998,6 +1019,136 @@ describe('browser composition', () => {
       resetGuardState();
     }
     expect(isGuardInstalled()).toBe(false);
+  });
+
+  it('composes the configured Prebid refresh policy through the owned GPT boundary', async () => {
+    const releaseId = 'a'.repeat(64);
+    const target: Record<string, unknown> = {};
+    const gpt = synchronousGptAdapter();
+    const prebid = synchronousPrebidAdapter();
+    const prebidConfig = Object.freeze({
+      clientSideBidders: Object.freeze(['client']),
+      excludedGamAdUnitPathSuffixes: Object.freeze<string[]>([]),
+    });
+    let request:
+      | Readonly<{
+          adUnits: readonly object[];
+          bidsBackHandler: () => void;
+          timeout: number;
+        }>
+      | undefined;
+    prebid.requestBids.mockImplementation((candidate: unknown) => {
+      request = candidate as typeof request;
+      request?.bidsBackHandler();
+    });
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target,
+        releaseId,
+        manifest: {
+          version: 1,
+          releaseId,
+          integrations: [
+            { id: 'gpt', required: true },
+            { id: 'prebid', required: true },
+          ],
+        },
+        knownIntegrationIds: Object.freeze(['gpt', 'prebid']),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: { version: 1, auctionId: 'initial', results: [] },
+            bids: [],
+          },
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        getBindings: (id) => ({
+          config: id === 'prebid' ? prebidConfig : Object.freeze({}),
+          interfaces: Object.freeze({}),
+        }),
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag: gpt.adapter,
+          messaging: fakeMessagingAdapter(),
+          prebid: prebid.adapter,
+        },
+        coreActivations: { correctnessGptListeners: vi.fn() },
+      }
+    );
+
+    expect(composition.runtime.start()).toBe(true);
+    expect(
+      composition.runtime.registerIntegration(createGptIntegrationRegistration(releaseId))
+    ).toBe(true);
+    expect(
+      composition.runtime.registerIntegration(createPrebidIntegrationRegistration(releaseId))
+    ).toBe(true);
+    await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+
+    const api = target as {
+      addAdUnits(unit: unknown): Readonly<{ registered: readonly string[] }>;
+    };
+    expect(
+      api.addAdUnits({
+        code: 'refresh-slot',
+        mediaTypes: { banner: { sizes: [[300, 250]] } },
+        bids: [
+          { bidder: 'server', params: { placement: 7 } },
+          { bidder: 'client', params: { placement: 'browser' } },
+        ],
+      })
+    ).toEqual({ registered: ['refresh-slot'] });
+    const navigation = composition.runtimeSessionForTest()?.currentNavigation;
+    const slots = composition.slotServiceForTest();
+    const physicalSlot = Object.freeze({ getAdUnitPath: () => '/network/refresh-slot' });
+    if (!navigation || !slots) throw new Error('Expected the active refresh composition');
+    expect(
+      slots.adoptGptSlot(navigation.generation, 'refresh-slot', {
+        definition: {
+          adUnitPath: '/network/refresh-slot',
+          elementId: 'refresh-slot',
+          sizes: Object.freeze([[300, 250]]),
+        },
+        ownership: 'publisher',
+        slot: physicalSlot,
+      })
+    ).toEqual({ ok: true });
+
+    const refreshOptions = Object.freeze({ changeCorrelator: false });
+    const decision = gpt.publisherRefresh(
+      Object.freeze({
+        requestedSlots: Object.freeze([physicalSlot]),
+        slots: Object.freeze([physicalSlot]),
+        options: refreshOptions,
+      })
+    );
+    expect(decision).toMatchObject({
+      action: 'defer',
+      slots: [physicalSlot],
+      completion: expect.any(Promise),
+    });
+    if (decision?.action !== 'defer') throw new Error('Expected the composed refresh policy');
+    await decision.completion;
+
+    expect(request?.timeout).toBe(1_500);
+    expect(request?.adUnits).toEqual([
+      {
+        code: 'refresh-slot',
+        mediaTypes: { banner: { sizes: [[300, 250]] } },
+        bids: [
+          {
+            bidder: 'trustedServer',
+            params: { bidderParams: { server: { placement: 7 } } },
+          },
+          { bidder: 'client', params: { placement: 'browser' } },
+        ],
+      },
+    ]);
+    expect(prebid.setTargetingForGpt).toHaveBeenCalledExactlyOnceWith(['refresh-slot']);
+    composition.runtime.dispose();
   });
 
   it('owns every remaining integration in one maximal composed transaction', async () => {
