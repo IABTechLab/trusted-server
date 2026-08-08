@@ -299,52 +299,49 @@ describe('creative/click.ts', () => {
     }
   });
 
-  it('navigates an over-long rebuild through a form POST instead of a GET URL', async () => {
-    // Fastly rejects request URLs over 8192 bytes before the handler runs, and
-    // a signed click with many tracking params exceeds that once nested in
-    // another query string. A form body has no such bound, and a submission is
-    // a navigation — so it is not blocked by CORS from the opaque origin.
+  it('does not reuse an opaque rebuild from a disposed guard generation', async () => {
     vi.useFakeTimers();
-
+    const nextClick =
+      '/first-party/click?tsurl=https%3A%2F%2Fexample.com%2Fnext&wave=2&tstoken=nexttoken';
     const originDescriptor = Object.getOwnPropertyDescriptor(window, 'origin');
     Object.defineProperty(window, 'origin', { value: 'null', configurable: true });
     global.fetch = undefined as unknown as typeof fetch;
-
-    const submits: HTMLFormElement[] = [];
-    const originalSubmit = HTMLFormElement.prototype.submit;
-    HTMLFormElement.prototype.submit = function patched(this: HTMLFormElement) {
-      submits.push(this);
-    };
+    const openMock = vi.fn();
+    const originalOpen = window.open;
+    window.open = openMock as unknown as typeof window.open;
+    let firstGeneration: { dispose(): void; scan(): void } | undefined;
+    let secondGeneration: { dispose(): void; scan(): void } | undefined;
 
     try {
-      // A signed click long enough that the nested rebuild URL crosses the cap.
-      const filler = 'a'.repeat(6800);
-      const longClick = `/first-party/click?tsurl=https%3A%2F%2Fexample.com%2Flanding&foo=1&pad=${filler}&tstoken=token123`;
       const anchor = document.createElement('a');
-      anchor.setAttribute('data-tsclick', longClick);
-      anchor.setAttribute('href', longClick);
+      anchor.setAttribute('data-tsclick', FIRST_PARTY_CLICK);
+      anchor.setAttribute('href', MUTATED_CLICK);
+      anchor.setAttribute('target', '_blank');
       document.body.appendChild(anchor);
+      const { installClickGuard } = await import('../../../src/integrations/creative/click');
 
-      await importCreativeModule();
-
-      anchor.setAttribute('href', `https://example.com/landing?pad=${filler}&bar=2`);
+      firstGeneration = installClickGuard(false);
+      firstGeneration.scan();
       await Promise.resolve();
       await vi.runAllTimersAsync();
+      const firstFallback = anchor.getAttribute('href') ?? '';
+      expect(firstFallback.startsWith(REBUILD_PREFIX)).toBe(true);
 
+      firstGeneration.dispose();
+      anchor.setAttribute('data-tsclick', nextClick);
+      expect(anchor.getAttribute('href')).toBe(firstFallback);
+
+      secondGeneration = installClickGuard(false);
       anchor.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
       await Promise.resolve();
       await vi.runAllTimersAsync();
 
-      expect(submits.length).toBeGreaterThan(0);
-      const form = submits[0];
-      expect(form.method.toLowerCase()).toBe('post');
-      expect(form.action).toContain('/first-party/proxy-rebuild');
-      const tsclick = form.querySelector('input[name="tsclick"]') as HTMLInputElement | null;
-      expect(tsclick?.value).toBe(longClick);
-      const add = form.querySelector('input[name="add"]') as HTMLInputElement | null;
-      expect(add?.value).toContain('bar');
+      expect(openMock).toHaveBeenCalledWith(absolute(nextClick), '_blank', 'noopener,noreferrer');
+      expect(openMock).not.toHaveBeenCalledWith(firstFallback, '_blank', 'noopener,noreferrer');
     } finally {
-      HTMLFormElement.prototype.submit = originalSubmit;
+      secondGeneration?.dispose();
+      firstGeneration?.dispose();
+      window.open = originalOpen;
       if (originDescriptor) {
         Object.defineProperty(window, 'origin', originDescriptor);
       } else {

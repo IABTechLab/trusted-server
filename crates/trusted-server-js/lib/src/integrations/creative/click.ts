@@ -10,15 +10,7 @@ import type { CreativeGuardHandle } from './startup';
 type AnchorLike = HTMLAnchorElement | HTMLAreaElement;
 type Canon = { base: string; params: Record<string, string> };
 type Diff = { add: Record<string, string>; del: string[] };
-
-// Rebuild URLs already written to an anchor's href by an earlier repair pass
-// (the opaque-origin GET fallback). They are not `/first-party/click` URLs, so
-// they cannot be canonicalized and deliberately never replace the canonical
-// `data-tsclick`. Without remembering them, a later click would canonicalize
-// the fallback against the original signed click, fail the base comparison, and
-// navigate the pre-mutation URL — silently dropping the mutation the fallback
-// exists to carry.
-const pendingRebuilds = new WeakMap<AnchorLike, string>();
+type PendingRebuilds = WeakMap<AnchorLike, string>;
 
 // Allow query/localStorage flag to crank logging when debugging creatives.
 function enableDebugFromEnv(): void {
@@ -169,6 +161,7 @@ async function rebuildClick(
   a: AnchorLike,
   tsClickStr: string,
   diff: Diff,
+  pendingRebuilds: PendingRebuilds,
   isActive: () => boolean
 ): Promise<string> {
   const addKeys = Object.keys(diff.add);
@@ -216,7 +209,7 @@ async function rebuildClick(
     if (!isActive()) return tsClickStr;
     const href = data && typeof data.href === 'string' ? data.href : null;
     if (href) {
-      persistRebuiltClick(a, href);
+      persistRebuiltClick(a, href, pendingRebuilds);
       log.info('tsjs-creative:click: rebuilt click', {
         added: addKeys,
         removed: delKeys,
@@ -242,6 +235,7 @@ async function rebuildClick(
 async function computeFinalUrl(
   a: AnchorLike,
   tsClickStr: string,
+  pendingRebuilds: PendingRebuilds,
   isActive: () => boolean
 ): Promise<string> {
   const orig = canonFromFirstPartyClick(tsClickStr);
@@ -280,7 +274,7 @@ async function computeFinalUrl(
     del: diff.del,
   });
 
-  return rebuildClick(a, tsClickStr, diff, isActive);
+  return rebuildClick(a, tsClickStr, diff, pendingRebuilds, isActive);
 }
 
 // Resolve a click URL against the pinned trusted base and require an http(s)
@@ -381,20 +375,11 @@ function navigate(a: AnchorLike, url: string, isMiddle: boolean): void {
 // compare against — is only updated when the value is itself a signed
 // /first-party/click URL. Writing the GET proxy-rebuild fallback there would
 // make every later canonicalization fail and lose subsequent mutations.
-// Root-relative form of a first-party URL — the shape the server-side rewriter
-// emits and the shape `data-tsclick` must keep. `href` is absolutized so it
-// resolves inside the srcdoc frame, but the canonical attribute has to stay in
-// the server's format: it is echoed back as the rebuild payload's `tsclick`.
-function canonicalClickValue(resolved: string): string {
-  try {
-    const url = new URL(resolved, TRUSTED_BASE_URL);
-    return `${url.pathname}${url.search}`;
-  } catch {
-    return resolved;
-  }
-}
-
-function persistRebuiltClick(anchor: AnchorLike, finalUrl: string): void {
+function persistRebuiltClick(
+  anchor: AnchorLike,
+  finalUrl: string,
+  pendingRebuilds: PendingRebuilds
+): void {
   // Persist the validated, absolutized URL — never the raw input. Beyond
   // enforcing the http(s) allowlist, an absolute URL keeps the anchor's
   // default navigation working inside the srcdoc iframe, where a relative
@@ -426,14 +411,15 @@ function persistRebuiltClick(anchor: AnchorLike, finalUrl: string): void {
 async function rebuildIfNeeded(
   anchor: AnchorLike,
   tsClickStr: string,
+  pendingRebuilds: PendingRebuilds,
   isActive: () => boolean
 ): Promise<string> {
-  let finalUrl = await computeFinalUrl(anchor, tsClickStr, isActive);
+  let finalUrl = await computeFinalUrl(anchor, tsClickStr, pendingRebuilds, isActive);
   if (!isActive()) return tsClickStr;
   if (finalUrl === tsClickStr) {
     await delay();
     if (!isActive()) return tsClickStr;
-    finalUrl = await computeFinalUrl(anchor, tsClickStr, isActive);
+    finalUrl = await computeFinalUrl(anchor, tsClickStr, pendingRebuilds, isActive);
   }
   return finalUrl;
 }
@@ -443,18 +429,24 @@ async function guardNavigation(
   anchor: AnchorLike,
   tsClickStr: string,
   isMiddle: boolean,
+  pendingRebuilds: PendingRebuilds,
   isActive: () => boolean
 ): Promise<void> {
-  const finalUrl = await rebuildIfNeeded(anchor, tsClickStr, isActive);
+  const finalUrl = await rebuildIfNeeded(anchor, tsClickStr, pendingRebuilds, isActive);
   if (!isActive()) return;
   if (finalUrl && finalUrl !== tsClickStr) {
-    persistRebuiltClick(anchor, finalUrl);
+    persistRebuiltClick(anchor, finalUrl, pendingRebuilds);
   }
   navigate(anchor, finalUrl || tsClickStr, isMiddle);
 }
 
 // Entry point for click/auxclick handlers: prevent default and queue guarded nav.
-function handleGuardedClick(ev: Event, isMiddle: boolean, isActive: () => boolean): void {
+function handleGuardedClick(
+  ev: Event,
+  isMiddle: boolean,
+  pendingRebuilds: PendingRebuilds,
+  isActive: () => boolean
+): void {
   const anchor = closestAnchor(ev.target);
   if (!anchor) return;
 
@@ -465,7 +457,7 @@ function handleGuardedClick(ev: Event, isMiddle: boolean, isActive: () => boolea
 
   const runNavigation = () => {
     if (!isActive()) return;
-    void guardNavigation(anchor, tsClickStr, isMiddle, isActive).catch((err) => {
+    void guardNavigation(anchor, tsClickStr, isMiddle, pendingRebuilds, isActive).catch((err) => {
       if (!isActive()) return;
       log.warn('tsjs-creative:click: failed to compute final URL', err);
       navigate(anchor, tsClickStr, isMiddle);
@@ -476,7 +468,10 @@ function handleGuardedClick(ev: Event, isMiddle: boolean, isActive: () => boolea
 }
 
 // Observe href/data-tsclick mutations and repair anchors that third parties touch.
-function monitorAnchorMutations(isActive: () => boolean): CreativeGuardHandle {
+function monitorAnchorMutations(
+  pendingRebuilds: PendingRebuilds,
+  isActive: () => boolean
+): CreativeGuardHandle {
   if (typeof document === 'undefined' || typeof MutationObserver === 'undefined') {
     return Object.freeze({ dispose: () => undefined, scan: () => undefined });
   }
@@ -485,11 +480,11 @@ function monitorAnchorMutations(isActive: () => boolean): CreativeGuardHandle {
     if (!isActive()) return;
     const tsClickStr = anchor.getAttribute('data-tsclick') || '';
     if (!tsClickStr) return;
-    void rebuildIfNeeded(anchor, tsClickStr, isActive)
+    void rebuildIfNeeded(anchor, tsClickStr, pendingRebuilds, isActive)
       .then((finalUrl) => {
         if (!isActive()) return;
         if (finalUrl && finalUrl !== tsClickStr) {
-          persistRebuiltClick(anchor, finalUrl);
+          persistRebuiltClick(anchor, finalUrl, pendingRebuilds);
         }
       })
       .catch((err) => {
@@ -540,17 +535,20 @@ export function installClickGuard(scanInitially = true): CreativeGuardHandle {
   enableDebugFromEnv();
   log.info('tsjs-creative:click: installing click guard');
 
+  // Opaque rebuild recognition belongs to this exact guard generation. A new
+  // installation must never inherit a disposed generation's anchor state.
+  const pendingRebuilds: PendingRebuilds = new WeakMap();
   let active = true;
   const isActive = (): boolean => active;
   const onClick = (ev: Event) => {
     if (!active) return;
-    handleGuardedClick(ev, false, isActive);
+    handleGuardedClick(ev, false, pendingRebuilds, isActive);
   };
 
   const onAuxClick = (ev: MouseEvent) => {
     if (!active) return;
     if (ev.button !== 1) return;
-    handleGuardedClick(ev, true, isActive);
+    handleGuardedClick(ev, true, pendingRebuilds, isActive);
   };
 
   document.addEventListener('click', onClick, true);
@@ -565,7 +563,7 @@ export function installClickGuard(scanInitially = true): CreativeGuardHandle {
     mutations?.dispose();
   };
   try {
-    mutations = monitorAnchorMutations(isActive);
+    mutations = monitorAnchorMutations(pendingRebuilds, isActive);
     const handle = Object.freeze({
       dispose,
       scan: (): void => mutations?.scan(),

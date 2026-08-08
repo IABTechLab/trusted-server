@@ -92,7 +92,15 @@ export function createCreativeStartup(options: CreativeStartupOptions): Creative
           options.document.addEventListener('DOMContentLoaded', readyListener, { once: true });
         }
       } catch (error) {
-        disposeHandles();
+        const listener = readyListener;
+        readyListener = undefined;
+        try {
+          if (listener) options.document.removeEventListener('DOMContentLoaded', listener);
+        } catch {
+          // Preserve the activation failure while completing owned guard rollback.
+        } finally {
+          disposeHandles();
+        }
         throw error;
       }
       return (): void => {
