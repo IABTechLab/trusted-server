@@ -8,6 +8,7 @@ import {
   type GoogletagFacade,
 } from '../../src/adapters/googletag';
 import {
+  createBrowserMessagingAdapter,
   createNoopMessagingAdapter,
   type CaptureMessageListener,
   type MessagingAdapter,
@@ -16,6 +17,10 @@ import {
   createNoopPrebidAdapter,
   type PrebidAdapter,
   type PrebidBindingStatus,
+  type PrebidEventFacade,
+  type PrebidFacade,
+  type PrebidTrustedServerAuctionV1,
+  type PreparedTrustedBidV1,
 } from '../../src/adapters/prebid';
 import {
   createBrowserComposition,
@@ -114,6 +119,79 @@ function fakePrebidAdapter(
   bindingStatus: () => PrebidBindingStatus = () => 'pending'
 ): PrebidAdapter {
   return Object.freeze({ ...createNoopPrebidAdapter(), bindingStatus });
+}
+
+function synchronousPrebidAdapter() {
+  let auctionListener: ((auction: Readonly<PrebidTrustedServerAuctionV1>) => void) | undefined;
+  let auctionEndListener:
+    ((event: unknown, prebid: Readonly<PrebidEventFacade>) => void) | undefined;
+  let admitted: Readonly<PreparedTrustedBidV1> | undefined;
+  const admitTrustedBid = vi.fn((prepared: Readonly<PreparedTrustedBidV1>) => {
+    admitted = prepared;
+    return 'admitted' as const;
+  });
+  const facade = Object.freeze({
+    addAdUnits: vi.fn(),
+    highestBids: vi.fn(() => Object.freeze([])),
+    processQueue: vi.fn(),
+    registerBidAdapter: vi.fn(),
+    registerTrustedServerBidder: vi.fn(
+      (listener: (auction: Readonly<PrebidTrustedServerAuctionV1>) => void) => {
+        auctionListener = listener;
+        return () => {
+          auctionListener = undefined;
+        };
+      }
+    ),
+    renderAd: vi.fn(),
+    requestBids: vi.fn(),
+    subscribe: vi.fn(
+      (
+        eventType: string,
+        listener: (event: unknown, prebid: Readonly<PrebidEventFacade>) => void
+      ) => {
+        if (eventType === 'auctionEnd') auctionEndListener = listener;
+        return () => {
+          if (auctionEndListener === listener) auctionEndListener = undefined;
+        };
+      }
+    ),
+  }) satisfies PrebidFacade;
+  const adapter = Object.freeze({
+    ...createNoopPrebidAdapter(),
+    admitTrustedBid,
+    bindingStatus: () => 'present' as const,
+    run: <Value>(command: (prebid: Readonly<PrebidFacade>) => Value) => {
+      let result: Promise<Value>;
+      try {
+        result = Promise.resolve(command(facade));
+      } catch (error) {
+        result = Promise.reject(error);
+      }
+      return Object.freeze({ status: 'present' as const, result, dispose: vi.fn() });
+    },
+  }) satisfies PrebidAdapter;
+  return {
+    adapter,
+    admitTrustedBid,
+    auction: (auction: Readonly<PrebidTrustedServerAuctionV1>): void => auctionListener?.(auction),
+    auctionEnd: (auctionId: string): void => {
+      const prepared = admitted;
+      const highest = prepared
+        ? Object.freeze([
+            Object.freeze({
+              ...prepared.bid,
+              adUnitCode: prepared.adUnitCode,
+              auctionId: prepared.auctionId,
+            }),
+          ])
+        : Object.freeze([]);
+      auctionEndListener?.(
+        Object.freeze({ auctionId }),
+        Object.freeze({ highestBids: () => highest })
+      );
+    },
+  };
 }
 
 function fakeMessagingAdapter(
@@ -672,6 +750,150 @@ describe('browser composition', () => {
       resetGuardState();
     }
     expect(isGuardInstalled()).toBe(false);
+  });
+
+  it('publishes and promotes one exact Prebid winner through runtime-owned PUC state', async () => {
+    const releaseId = 'a'.repeat(64);
+    const prebid = synchronousPrebidAdapter();
+    const reservationId = `r1_${'p'.repeat(22)}`;
+    let captureListener: CaptureMessageListener | undefined;
+    const messagingTarget = {
+      addEventListener: vi.fn(
+        (_type: 'message', listener: CaptureMessageListener, _capture: true) => {
+          captureListener = listener;
+        }
+      ),
+      removeEventListener: vi.fn(),
+    };
+    const messaging = createBrowserMessagingAdapter(messagingTarget);
+    const bid = Object.freeze({
+      candidateId: 'AAAAAAAAAAAA',
+      slot: 'slot-one',
+      provider: 'trusted',
+      upstreamBidId: 'upstream-one',
+      cpm: 1.25,
+      currency: 'USD' as const,
+      targeting: Object.freeze({ hb_bidder: 'trustedServer' }),
+      rendererReservationId: reservationId,
+      renderSource: Object.freeze({
+        type: 'adm' as const,
+        version: 1 as const,
+        adm: '<main>private creative</main>',
+        width: 300,
+        height: 250,
+      }),
+    });
+    const projection = Object.freeze({
+      version: 1,
+      auction: Object.freeze({
+        version: 1,
+        auctionId: 'auction-one',
+        results: Object.freeze([
+          Object.freeze({
+            slot: bid.slot,
+            outcome: 'winner' as const,
+            candidateId: bid.candidateId,
+          }),
+        ]),
+      }),
+      bids: Object.freeze([bid]),
+    });
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target: {},
+        releaseId,
+        manifest: {
+          version: 1,
+          releaseId,
+          integrations: [{ id: 'prebid', required: true }],
+        },
+        knownIntegrationIds: Object.freeze(['prebid']),
+        boot: {
+          auctionProjection: projection,
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        getBindings: () => ({ config: Object.freeze({}), interfaces: Object.freeze({}) }),
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag: fakeGoogletagAdapter(),
+          messaging,
+          prebid: prebid.adapter,
+        },
+        coreActivations: { correctnessGptListeners: vi.fn() },
+        createIdentityIssuerForTest: () =>
+          createTestNavigationIdentityIssuer({
+            getRandomValues: (target) => {
+              target.fill(9);
+              return target;
+            },
+          }),
+      }
+    );
+
+    try {
+      expect(composition.runtime.start()).toBe(true);
+      expect(
+        composition.runtime.registerIntegration(createPrebidIntegrationRegistration(releaseId))
+      ).toBe(true);
+      await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+      const complete = vi.fn();
+      prebid.auction(
+        Object.freeze({
+          auctionId: 'auction-one',
+          bids: Object.freeze([Object.freeze({ adUnitCode: bid.slot, requestId: 'request-one' })]),
+          complete,
+        })
+      );
+
+      expect(complete).toHaveBeenCalledTimes(1);
+      expect(prebid.admitTrustedBid).toHaveBeenCalledTimes(1);
+      expect(prebid.admitTrustedBid.mock.calls[0]?.[0]).toMatchObject({
+        auctionId: 'auction-one',
+        adUnitCode: bid.slot,
+        bid: { adId: reservationId, requestId: 'request-one' },
+      });
+      expect(composition.reservationServiceForTest()?.recognize(reservationId)).toMatchObject({
+        state: 'awaiting_prebid_selection',
+      });
+
+      prebid.auctionEnd('auction-one');
+      expect(composition.reservationServiceForTest()?.recognize(reservationId)).toMatchObject({
+        state: 'renderable',
+      });
+      expect(composition.pucBridgeForTest()?.snapshotInventoryForTest()).toMatchObject({
+        attempts: 1,
+      });
+
+      const claimPort = {
+        addEventListener: vi.fn(),
+        close: vi.fn(),
+        postMessage: vi.fn(),
+        removeEventListener: vi.fn(),
+        start: vi.fn(),
+      };
+      captureListener?.({
+        data: JSON.stringify({
+          message: 'Prebid Request',
+          adId: reservationId,
+          adServerDomain: 'ads.example.com',
+        }),
+        ports: [claimPort],
+        source: Object.freeze({ frame: 'selected-creative' }),
+        stopImmediatePropagation: vi.fn(),
+      } as unknown as MessageEvent);
+      expect(composition.pucBridgeForTest()?.snapshotInventoryForTest()).toMatchObject({
+        attempts: 1,
+        liveTickets: 0,
+        pendingClaims: 1,
+      });
+      expect(claimPort.postMessage).not.toHaveBeenCalled();
+      expect(claimPort.close).not.toHaveBeenCalled();
+    } finally {
+      composition.runtime.dispose();
+    }
   });
 
   it('hands late publisher GPT calls through the adapter into runtime-owned slot state', async () => {
