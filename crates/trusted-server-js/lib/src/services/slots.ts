@@ -1628,6 +1628,10 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       void destroyOperation.result.then(
         (result) => {
           if (result.status === 'destroyed') {
+            if (window.terminal || record.reconciliation !== window) {
+              detachDestroyedReconciliationPhysical(physical);
+              return;
+            }
             finishFailedReconciliation(record, window, reason, true);
             return;
           }
@@ -1640,6 +1644,10 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
             replacementError?.oldSlotDestroyed === true &&
             replacementError.preserveOldQuarantine !== true &&
             !reusedOldIdentity;
+          if (destroyed && (window.terminal || record.reconciliation !== window)) {
+            detachDestroyedReconciliationPhysical(physical);
+            return;
+          }
           finishFailedReconciliation(record, window, 'gpt_request_failed', destroyed);
         }
       );
