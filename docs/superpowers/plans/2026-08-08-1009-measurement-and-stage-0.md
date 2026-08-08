@@ -162,16 +162,37 @@ class: TS forwards client cookies to origin unchanged, so any cookie-personalize
 (logged-in state, paywall meter, publisher-side A/B assignment) becomes cross-servable
 once the cache is on.
 
+**Do not compare body hashes.** Verified on the live origin: this page regenerates
+~170 ad-slot container IDs as fresh 32-hex UUIDs on every request, so three requests give
+three different hashes with byte-identical lengths, cookie or not. A hash comparison
+reports a false FAIL every time.
+
+Normalize per-request identifiers, establish the no-cookie baseline drift first, then ask
+whether the cookie arm differs by _more_ than that baseline:
+
 ```bash
-# Same URL, with and without a session cookie. Compare Content-Length and body hash.
-for C in '' 'Cookie: <a-real-session-cookie>'; do
-  echo "--- ${C:-no-cookie}"
-  curl -sS -D /dev/stderr -o - "https://<origin-host>/<an-article-path>" \
-    -H 'Sec-Fetch-Dest: document' -H 'Accept: text/html' ${C:+-H "$C"} \
-    2> >(grep -iE '^(vary|cache-control|set-cookie|content-length):' >&2) \
-    | shasum
+ORIGIN="https://<origin-host>"; HOSTH="Host: <origin_host_header_override>"
+norm() { sed -E 's/[0-9a-f]{32}/UUID/g' "$1"; }
+
+for n in a b; do
+  curl -sS "$ORIGIN/<path>" -H "$HOSTH" \
+    -H 'Sec-Fetch-Dest: document' -H 'Accept: text/html' > "nc_$n.html"
 done
+curl -sS "$ORIGIN/<path>" -H "$HOSTH" \
+  -H 'Sec-Fetch-Dest: document' -H 'Accept: text/html' \
+  -H 'Cookie: <a-real-session-cookie>' > ck.html
+
+echo "baseline drift:  $(diff <(norm nc_a.html) <(norm nc_b.html) | grep -c '^[<>]')"
+echo "with cookie:     $(diff <(norm nc_a.html) <(norm ck.html)   | grep -c '^[<>]')"
+diff <(norm nc_a.html) <(norm ck.html) | head -20
 ```
+
+Send the `Host` override — the origin is a shared vhost and will not return the right
+document without it. Read it from `publisher.origin_host_header_override`.
+
+**Step A has already been run and passed.** See
+[the findings](./2026-08-08-1009-measurement-findings.md). Re-run only if the origin
+changes.
 
 Three failure shapes, any of which blocks Stage 0 independently of the `Vary` verdict:
 
