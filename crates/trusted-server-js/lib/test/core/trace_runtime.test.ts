@@ -5,6 +5,7 @@ import {
   DiagnosticsSubscriberLimitError,
   TRACE_BADGE_CLASS,
   TRACE_PANEL_ID,
+  type RenderTraceGptFactV1,
 } from '../../src/core/trace';
 
 function harness() {
@@ -256,7 +257,7 @@ describe('render trace diagnostics runtime', () => {
         path: 'ssat',
         rendered: true,
         injected: true,
-        gamEmpty: true,
+        gamEmpty: false,
         servedFrom: 'pbs-cache',
       })
     );
@@ -268,10 +269,13 @@ describe('render trace diagnostics runtime', () => {
     const secondToken = Object.freeze(Object.create(null) as object);
     const resolve = () => Object.freeze({ slotId: 'visible-slot', visible: false });
     const fact = (
-      kind: string,
+      kind: RenderTraceGptFactV1['kind'],
       token: object,
-      fields: Readonly<Record<string, unknown>> = Object.freeze({})
-    ) => Object.freeze({ kind, observedAtMs: 1, slot: Object.freeze({ token }), ...fields });
+      fields: Readonly<Pick<RenderTraceGptFactV1, 'isEmpty' | 'inViewPercentage'>> = Object.freeze(
+        {}
+      )
+    ): Readonly<RenderTraceGptFactV1> =>
+      Object.freeze({ kind, observedAtMs: 1, slot: Object.freeze({ token }), ...fields });
 
     owner.observeGptFact(fact('slotRequested', firstToken), resolve);
     owner.observeGptFact(fact('slotResponseReceived', firstToken), resolve);
@@ -286,11 +290,14 @@ describe('render trace diagnostics runtime', () => {
     expect(owner.diagnostics.current()['visible-slot']?.visible).toBe(false);
 
     owner.observeGptFact(fact('slotRequested', secondToken), resolve);
+    owner.observeGptFact(fact('slotRenderEnded', firstToken, { isEmpty: true }), resolve);
+    owner.observeGptFact(fact('impressionViewable', firstToken), resolve);
     owner.observeGptFact(fact('impressionViewable', secondToken), resolve);
     expect(
       owner.diagnostics.current()['visible-slot']?.visible,
       'a pre-render callback for a replacement physical request must not enrich the old impression'
     ).toBe(false);
+    expect(owner.diagnostics.history()).toHaveLength(1);
   });
 
   it('drops the oldest of 201 pending records and cancels work on disposal', () => {
