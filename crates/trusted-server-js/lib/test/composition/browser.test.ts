@@ -29,6 +29,7 @@ import {
   createTestBrowserRuntimeComposition,
 } from '../../src/composition/browser';
 import { log as localLog } from '../../src/core/log';
+import { TRACE_PANEL_ID } from '../../src/core/trace';
 import type { BrowserAuctionBidV1 } from '../../src/core/types';
 import { createCreativeIntegrationRegistration } from '../../src/integrations/creative/module';
 import { createDataDomeIntegrationRegistration } from '../../src/integrations/datadome/module';
@@ -181,6 +182,7 @@ function synchronousPrebidAdapter() {
     ),
     renderAd: vi.fn(),
     requestBids: vi.fn(),
+    setTargetingForGpt: vi.fn(),
     subscribe: vi.fn(
       (
         eventType: string,
@@ -2212,7 +2214,7 @@ describe('browser composition', () => {
             bids: [],
           },
           creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
-          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+          diagnostics: { version: 1, renderTraceOverlay: true, gpt: { active: false } },
         },
         kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
       },
@@ -2305,12 +2307,18 @@ describe('browser composition', () => {
         slotId: 'programmatic-slot',
         path: 'auction',
         rendered: true,
+        injected: true,
+        elementId: 'programmatic-slot',
         servedFrom: 'inline',
         count: 1,
       })
     );
     expect(renderTrace?.history()).toHaveLength(1);
     expect(Object.isFrozen(renderTrace?.history()[0])).toBe(true);
+    const programmaticSlot = document.getElementById('programmatic-slot');
+    expect(programmaticSlot?.getAttribute('data-ts-rendered')).toBe('true');
+    expect(programmaticSlot?.getAttribute('data-ts-injected')).toBe('true');
+    expect(document.getElementById(TRACE_PANEL_ID)?.textContent).toContain('programmatic-slot');
     expect(target).not.toHaveProperty('renders');
     expect(target).not.toHaveProperty('renderLog');
     expect(target).not.toHaveProperty('renderSeq');
@@ -2388,6 +2396,10 @@ describe('browser composition', () => {
     expect(document.querySelectorAll('[id="ambiguous-slot"] iframe')).toHaveLength(0);
     expect(contextContributor).toHaveBeenCalledTimes(4);
     expect(auctionFetcher).toHaveBeenCalledTimes(4);
+
+    session?.currentNavigation?.dispose();
+    expect(renderTrace?.current()).toEqual({});
+    expect(programmaticSlot?.hasAttribute('data-ts-rendered')).toBe(false);
 
     composition.runtime.dispose();
     expect(() => api.addAdUnits(programmatic)).toThrowError(

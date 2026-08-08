@@ -26,7 +26,11 @@ import type {
   CreativeBootV1,
   DiagnosticsBootV1,
 } from '../core/types';
-import { createRenderTrace, type RenderTraceRuntimeOwner } from '../core/trace';
+import {
+  createRenderTrace,
+  isEffectivelyVisible,
+  type RenderTraceRuntimeOwner,
+} from '../core/trace';
 import {
   parseBidRenderSourceV1,
   parseBrowserAuctionProjectionV1,
@@ -354,7 +358,8 @@ export function createTestBrowserRuntimeComposition(
       observation['kind'] !== 'render_attempt' ||
       typeof observation['slotId'] !== 'string' ||
       (observation['path'] !== 'auction' && observation['path'] !== 'ssat') ||
-      typeof observation['rendered'] !== 'boolean'
+      typeof observation['rendered'] !== 'boolean' ||
+      typeof observation['injected'] !== 'boolean'
     ) {
       return;
     }
@@ -373,10 +378,37 @@ export function createTestBrowserRuntimeComposition(
     const servedFrom = observation['servedFrom'];
     if (servedFrom !== undefined && servedFrom !== 'inline' && servedFrom !== 'pbs-cache') return;
     try {
+      const slotId = observation['slotId'];
+      const slot = browserServices?.slots.resolveRegisteredSlot(slotId);
+      const identifiers = slot
+        ? new Set([slot.registeredSlotId, ...slot.domAliases])
+        : new Set([slotId]);
+      const elements = new Set<HTMLElement>();
+      if (typeof document !== 'undefined') {
+        for (const identifier of identifiers) {
+          const element = document.getElementById(identifier);
+          if (element instanceof HTMLElement) elements.add(element);
+        }
+      }
+      const element = elements.size === 1 ? [...elements][0] : undefined;
+      const optionalString = (name: 'adId' | 'bidId' | 'creativeId'): string | undefined => {
+        const value = observation[name];
+        return typeof value === 'string' && value !== '' ? value : undefined;
+      };
+      const adId = optionalString('adId');
+      const bidId = optionalString('bidId');
+      const creativeId = optionalString('creativeId');
       renderTrace?.record({
-        slotId: observation['slotId'],
+        slotId,
         path: observation['path'],
         rendered: observation['rendered'],
+        injected: observation['injected'],
+        ...(element === undefined
+          ? {}
+          : { elementId: element.id, visible: isEffectivelyVisible(element) }),
+        ...(adId === undefined ? {} : { adId }),
+        ...(bidId === undefined ? {} : { bidId }),
+        ...(creativeId === undefined ? {} : { creativeId }),
         ...(servedFrom === undefined ? {} : { servedFrom }),
       });
     } catch {
@@ -742,7 +774,9 @@ export function createTestBrowserRuntimeComposition(
       );
       if (!initialProjection) throw new Error('Accepted boot projection is unavailable');
       const preparedRenderTrace = createRenderTrace({
+        ...(typeof document === 'undefined' ? {} : { document }),
         onSubscriberError: (error) => log.warn('render diagnostics: subscriber failed', error),
+        overlayEnabled: boot.diagnostics.renderTraceOverlay,
       });
       const preparedDiagnosticsBus = createDiagnosticsBus({
         manifest: boot.manifest,

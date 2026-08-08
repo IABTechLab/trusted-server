@@ -68,6 +68,7 @@ function createReadyPrebid(
     },
     renderAd: vi.fn(),
     requestBids: vi.fn(),
+    setTargetingForGPTAsync: vi.fn(),
   };
   const stamp = options.stamp ?? createStamp();
   Object.defineProperty(pbjs, '__trustedServerArtifactV1', {
@@ -93,6 +94,7 @@ describe('browser Prebid adapter readiness', () => {
       prebid.addAdUnits([{ code: 'slot-a' }]);
       prebid.registerBidAdapter(undefined, 'trustedServer', { code: 'trustedServer' });
       prebid.requestBids({ adUnitCodes: ['slot-a'] });
+      prebid.setTargetingForGpt(['slot-a']);
       prebid.renderAd({}, 'bid-a');
       return prebid.highestBids('slot-a');
     });
@@ -104,6 +106,7 @@ describe('browser Prebid adapter readiness', () => {
       code: 'trustedServer',
     });
     expect(ready.pbjs.requestBids).toHaveBeenCalledTimes(1);
+    expect(ready.pbjs.setTargetingForGPTAsync).toHaveBeenCalledExactlyOnceWith(['slot-a']);
     expect(ready.pbjs.renderAd).toHaveBeenCalledWith({}, 'bid-a');
   });
 
@@ -619,6 +622,7 @@ describe('browser Prebid adapter readiness', () => {
       'registerBidAdapter',
       'renderAd',
       'requestBids',
+      'setTargetingForGPTAsync',
     ] as const) {
       const ready = createReadyPrebid();
       Object.defineProperty(ready.pbjs, method, { value: undefined });

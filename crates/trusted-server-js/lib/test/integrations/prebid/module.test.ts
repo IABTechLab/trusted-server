@@ -1,8 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { PrebidAdmissionContractError } from '../../../src/adapters/prebid';
+import type { GoogletagAdapter } from '../../../src/adapters/googletag';
 import {
+  PrebidAdmissionContractError,
+  type PrebidAdapter,
+  type PrebidFacade,
+} from '../../../src/adapters/prebid';
+import {
+  createPrebidRefreshPolicy,
   createPrebidSelectionCoordinator,
+  createPrebidSyntheticRefreshRunner,
   createPrebidIntegrationRegistration,
   publishPrebidBid,
   type PrebidBidPublicationInput,
@@ -252,6 +259,368 @@ describe('transactional Prebid integration module', () => {
     });
     expect(start).toHaveBeenCalledTimes(1);
     expect(runtimeFailures).toEqual([{ id: 'prebid', phase: 'after_commit' }]);
+  });
+});
+
+describe('RCJ-PREBID-04 prospective refresh policy', () => {
+  function refreshHarness(
+    excludedGamAdUnitPathSuffixes: readonly string[] | (() => readonly string[])
+  ) {
+    const runtime = createRuntimeSession({
+      createIdentityIssuer: () =>
+        createTestNavigationIdentityIssuer({
+          getRandomValues: (target) => {
+            target.fill(3);
+            return target;
+          },
+        }),
+    });
+    const navigationResult = runtime.startInitialNavigation();
+    if (!navigationResult.ok) throw new Error('Expected navigation');
+    const navigation = navigationResult.value;
+    const clearCalls: Array<readonly [object, string]> = [];
+    const operationDisposals: Array<ReturnType<typeof vi.fn>> = [];
+    const googletag = {
+      run: vi.fn((command: (gpt: object) => unknown) => {
+        const dispose = vi.fn();
+        operationDisposals.push(dispose);
+        const facade = Object.freeze({
+          adUnitPath: (slot: object) => {
+            const getter = Reflect.get(slot, 'getAdUnitPath');
+            if (typeof getter !== 'function') return undefined;
+            return Reflect.apply(getter, slot, []);
+          },
+          clearTargeting: (slot: object, key: string) => {
+            clearCalls.push([slot, key]);
+            const clear = Reflect.get(slot, 'clearTargeting');
+            if (typeof clear === 'function') return Reflect.apply(clear, slot, [key]);
+            return undefined;
+          },
+        });
+        return Object.freeze({
+          status: 'present' as const,
+          result: Promise.resolve(command(facade)),
+          dispose,
+        });
+      }),
+    };
+    const auctionDisposals: Array<ReturnType<typeof vi.fn>> = [];
+    const runSyntheticAuction = vi.fn((_slots: readonly object[]) => {
+      const dispose = vi.fn();
+      auctionDisposals.push(dispose);
+      return Object.freeze({ completion: Promise.resolve(), dispose });
+    });
+    const policy = createPrebidRefreshPolicy({
+      currentNavigation: () => navigation,
+      excludedGamAdUnitPathSuffixes,
+      googletag: googletag as unknown as Pick<GoogletagAdapter, 'run'>,
+      runSyntheticAuction,
+    });
+    return {
+      auctionDisposals,
+      clearCalls,
+      navigation,
+      operationDisposals,
+      policy,
+      runSyntheticAuction,
+      runtime,
+    };
+  }
+
+  it('clears every target then filters only literal case-sensitive suffix matches', async () => {
+    const harness = refreshHarness(['/tracking']);
+    const excluded = {
+      clearTargeting: vi.fn(),
+      getAdUnitPath: vi.fn(() => '/network/tracking'),
+    };
+    const caseMismatch = {
+      clearTargeting: vi.fn(),
+      getAdUnitPath: vi.fn(() => '/network/Tracking'),
+    };
+    const trailingSlash = {
+      clearTargeting: vi.fn(),
+      getAdUnitPath: vi.fn(() => '/network/tracking/'),
+    };
+    const missing = { clearTargeting: vi.fn() };
+    const nonString = {
+      clearTargeting: vi.fn(),
+      getAdUnitPath: vi.fn(() => 42),
+    };
+    const throwing = {
+      clearTargeting: vi.fn(),
+      getAdUnitPath: vi.fn(() => {
+        throw new Error('path unavailable');
+      }),
+    };
+    const clearFailure = {
+      clearTargeting: vi.fn((key: string) => {
+        if (key === 'hb_adid') throw new Error('clear unavailable');
+      }),
+      getAdUnitPath: vi.fn(() => '/network/tracking'),
+    };
+    const slots = Object.freeze([
+      excluded,
+      caseMismatch,
+      trailingSlash,
+      missing,
+      nonString,
+      throwing,
+      clearFailure,
+    ]);
+
+    await harness.policy.prepare(
+      Object.freeze({ requestedSlots: slots, slots, options: Object.freeze({ exact: true }) })
+    );
+
+    const expectedKeys = [
+      'ts_initial',
+      'hb_pb',
+      'hb_bidder',
+      'hb_adid',
+      'hb_cache_host',
+      'hb_cache_path',
+    ];
+    for (const slot of slots) {
+      expect(
+        harness.clearCalls.filter(([target]) => target === slot).map(([, key]) => key)
+      ).toEqual(expectedKeys);
+    }
+    expect(harness.runSyntheticAuction).toHaveBeenCalledExactlyOnceWith(
+      [caseMismatch, trailingSlash, missing, nonString, throwing, clearFailure],
+      harness.navigation
+    );
+    harness.policy.dispose();
+    harness.runtime.dispose();
+  });
+
+  it('skips the synthetic auction when all targets are excluded', async () => {
+    const harness = refreshHarness(['/skip']);
+    const slots = Object.freeze([
+      { getAdUnitPath: () => '/one/skip' },
+      { getAdUnitPath: () => '/two/skip' },
+    ]);
+
+    await harness.policy.prepare(
+      Object.freeze({ requestedSlots: undefined, slots, options: undefined })
+    );
+
+    expect(harness.runSyntheticAuction).not.toHaveBeenCalled();
+    expect(harness.clearCalls).toHaveLength(slots.length * 6);
+    harness.policy.dispose();
+    harness.runtime.dispose();
+  });
+
+  it('reads the configured exclusion snapshot only when the activated policy prepares', async () => {
+    let configuredSuffixes: readonly string[] = Object.freeze([]);
+    const harness = refreshHarness(() => configuredSuffixes);
+    configuredSuffixes = Object.freeze(['/configured-after-activation']);
+    const slot = Object.freeze({ getAdUnitPath: () => '/network/configured-after-activation' });
+
+    await harness.policy.prepare(
+      Object.freeze({ requestedSlots: Object.freeze([slot]), slots: Object.freeze([slot]) })
+    );
+
+    expect(harness.runSyntheticAuction).not.toHaveBeenCalled();
+    expect(harness.clearCalls).toHaveLength(6);
+    harness.policy.dispose();
+    harness.runtime.dispose();
+  });
+
+  it('settles pending work on navigation abort and ignores a late auction completion', async () => {
+    const harness = refreshHarness([]);
+    let finishAuction!: () => void;
+    const auction = new Promise<void>((resolve) => {
+      finishAuction = resolve;
+    });
+    const auctionDispose = vi.fn();
+    harness.runSyntheticAuction.mockReturnValue(
+      Object.freeze({ completion: auction, dispose: auctionDispose })
+    );
+    const slot = Object.freeze({ getAdUnitPath: () => '/eligible' });
+    const completion = harness.policy.prepare(
+      Object.freeze({
+        requestedSlots: Object.freeze([slot]),
+        slots: Object.freeze([slot]),
+        options: undefined,
+      })
+    );
+    await vi.waitFor(() => expect(harness.runSyntheticAuction).toHaveBeenCalledOnce());
+
+    harness.runtime.replaceNavigation();
+    await expect(completion).resolves.toBeUndefined();
+    expect(harness.operationDisposals[0]).toHaveBeenCalledOnce();
+    expect(auctionDispose).toHaveBeenCalledOnce();
+    finishAuction();
+    await auction;
+    await Promise.resolve();
+    expect(harness.runSyntheticAuction).toHaveBeenCalledOnce();
+    harness.policy.dispose();
+  });
+
+  it('settles pending work when the refresh policy is disposed', async () => {
+    const harness = refreshHarness([]);
+    let finishAuction!: () => void;
+    const auction = new Promise<void>((resolve) => {
+      finishAuction = resolve;
+    });
+    const auctionDispose = vi.fn();
+    harness.runSyntheticAuction.mockReturnValue(
+      Object.freeze({ completion: auction, dispose: auctionDispose })
+    );
+    const slot = Object.freeze({ getAdUnitPath: () => '/eligible' });
+    const completion = harness.policy.prepare(
+      Object.freeze({ requestedSlots: Object.freeze([slot]), slots: Object.freeze([slot]) })
+    );
+    await vi.waitFor(() => expect(harness.runSyntheticAuction).toHaveBeenCalledOnce());
+
+    harness.policy.dispose();
+    harness.policy.dispose();
+    await expect(completion).resolves.toBeUndefined();
+    expect(harness.operationDisposals[0]).toHaveBeenCalledOnce();
+    expect(auctionDispose).toHaveBeenCalledOnce();
+    finishAuction();
+    await auction;
+    harness.runtime.dispose();
+  });
+});
+
+describe('RCJ-PREBID-04 adapter-backed synthetic refresh runner', () => {
+  function runnerHarness(options: Readonly<{ requestThrows?: boolean }> = {}) {
+    const runtime = createRuntimeSession({
+      createIdentityIssuer: () =>
+        createTestNavigationIdentityIssuer({
+          getRandomValues: (target) => {
+            target.fill(4);
+            return target;
+          },
+        }),
+    });
+    const navigationResult = runtime.startInitialNavigation();
+    if (!navigationResult.ok) throw new Error('Expected navigation');
+    const navigation = navigationResult.value;
+    const order: string[] = [];
+    let requestOptions:
+      | Readonly<{
+          adUnits: readonly object[];
+          bidsBackHandler: () => void;
+          timeout: number;
+        }>
+      | undefined;
+    const facade = Object.freeze({
+      requestBids: vi.fn((received: unknown) => {
+        order.push('request');
+        if (options.requestThrows) throw new Error('request unavailable');
+        requestOptions = received as typeof requestOptions;
+      }),
+      setTargetingForGpt: vi.fn((codes: readonly string[]) => {
+        order.push(`target:${codes.join(',')}`);
+      }),
+    }) as unknown as Readonly<PrebidFacade>;
+    const adapterDispose = vi.fn();
+    const prebid = Object.freeze({
+      run: vi.fn((command: (prebid: Readonly<PrebidFacade>) => unknown) =>
+        Object.freeze({
+          status: 'present' as const,
+          result: Promise.resolve(command(facade)),
+          dispose: adapterDispose,
+        })
+      ),
+    }) as unknown as Pick<PrebidAdapter, 'run'>;
+    let deadline: (() => void) | undefined;
+    const timerHandle = Object.freeze({});
+    const clear = vi.fn();
+    const slot = Object.freeze({ id: 'slot-a' });
+    const adUnit = Object.freeze({ code: 'slot-a', bids: Object.freeze([]) });
+    const prepareAuction = vi.fn(() =>
+      Object.freeze({
+        adUnitCodes: Object.freeze(['slot-a']),
+        adUnits: Object.freeze([adUnit]),
+      })
+    );
+    const runner = createPrebidSyntheticRefreshRunner({
+      prebid,
+      prepareAuction,
+      scheduler: Object.freeze({
+        clear,
+        set: (callback: () => void, milliseconds: number) => {
+          expect(milliseconds).toBe(1_500);
+          deadline = callback;
+          return timerHandle;
+        },
+      }),
+    });
+    return {
+      adapterDispose,
+      clear,
+      deadline: () => deadline,
+      facade,
+      navigation,
+      order,
+      prepareAuction,
+      requestOptions: () => requestOptions,
+      runner,
+      runtime,
+      slot,
+      timerHandle,
+    };
+  }
+
+  it('requests eligible ad units then applies only their scoped targeting before completion', async () => {
+    const harness = runnerHarness();
+    const operation = harness.runner(Object.freeze([harness.slot]), harness.navigation);
+
+    expect(harness.order).toEqual(['request']);
+    expect(harness.prepareAuction).toHaveBeenCalledExactlyOnceWith(
+      [harness.slot],
+      harness.navigation
+    );
+    expect(harness.requestOptions()).toMatchObject({
+      adUnits: [{ code: 'slot-a', bids: [] }],
+      timeout: 1_500,
+    });
+    harness.requestOptions()?.bidsBackHandler();
+    await expect(operation.completion).resolves.toBeUndefined();
+
+    expect(harness.order).toEqual(['request', 'target:slot-a']);
+    expect(harness.clear).toHaveBeenCalledExactlyOnceWith(harness.timerHandle);
+    expect(harness.adapterDispose).toHaveBeenCalledOnce();
+    harness.runtime.dispose();
+  });
+
+  it('uses one targeting/settlement latch for timeout, disposal, and late callbacks', async () => {
+    const timedOut = runnerHarness();
+    const timedOutOperation = timedOut.runner(Object.freeze([timedOut.slot]), timedOut.navigation);
+    const lateTimeoutCallback = timedOut.requestOptions()?.bidsBackHandler;
+    timedOut.deadline()?.();
+    await expect(timedOutOperation.completion).resolves.toBeUndefined();
+    lateTimeoutCallback?.();
+    expect(timedOut.order).toEqual(['request', 'target:slot-a']);
+    expect(timedOut.adapterDispose).toHaveBeenCalledOnce();
+    timedOut.runtime.dispose();
+
+    const disposed = runnerHarness();
+    const disposedOperation = disposed.runner(Object.freeze([disposed.slot]), disposed.navigation);
+    const lateDisposedCallback = disposed.requestOptions()?.bidsBackHandler;
+    disposedOperation.dispose();
+    disposedOperation.dispose();
+    await expect(disposedOperation.completion).resolves.toBeUndefined();
+    lateDisposedCallback?.();
+    disposed.deadline()?.();
+    expect(disposed.order).toEqual(['request']);
+    expect(disposed.adapterDispose).toHaveBeenCalledOnce();
+    disposed.runtime.dispose();
+  });
+
+  it('forwards completion without targeting when requestBids throws', async () => {
+    const harness = runnerHarness({ requestThrows: true });
+    const operation = harness.runner(Object.freeze([harness.slot]), harness.navigation);
+
+    await expect(operation.completion).resolves.toBeUndefined();
+    expect(harness.order).toEqual(['request']);
+    expect(harness.facade.setTargetingForGpt).not.toHaveBeenCalled();
+    expect(harness.adapterDispose).toHaveBeenCalledOnce();
+    expect(harness.deadline()).toBeUndefined();
+    harness.runtime.dispose();
   });
 });
 
@@ -768,6 +1137,61 @@ describe('Prebid selection coordination', () => {
       state: 'aborted',
     });
     expect(disposed.timers).toHaveLength(0);
+  });
+
+  it('aborts every ad unit in one exact auction and releases each short lease at expiry', () => {
+    const harness = prepareSelection();
+    const first = harness.admitted('j', 'slot-one');
+    const second = harness.admitted('k', 'slot-two');
+
+    harness.coordinator.abort(harness.navigation, 'auction-one');
+
+    expect(harness.reservations.recognize(first.bid.adId)).toMatchObject({ state: 'aborted' });
+    expect(harness.reservations.recognize(second.bid.adId)).toMatchObject({ state: 'aborted' });
+    expect(harness.timers).toHaveLength(0);
+    expect(harness.navigation.snapshotInventoryForTest().batches).toBe(0);
+
+    harness.setNow(10_000);
+    expect(harness.reservations.recognize(first.bid.adId)).toEqual({ recognized: false });
+    expect(harness.reservations.recognize(second.bid.adId)).toEqual({ recognized: false });
+    expect(harness.reservations.snapshotInventoryForTest().size).toBe(0);
+    harness.runtime.dispose();
+  });
+
+  it('selects independently across multiple ad units without promoting either group loser', () => {
+    const harness = prepareSelection();
+    const first = harness.admitted('l', 'slot-one');
+    const firstLoser = harness.admitted('m', 'slot-one');
+    const second = harness.admitted('n', 'slot-two');
+    const secondLoser = harness.admitted('o', 'slot-two');
+
+    harness.coordinator.auctionEnded(
+      Object.freeze({ auctionId: 'auction-one' }),
+      Object.freeze({
+        highestBids: (adUnitCode?: string) => {
+          const selected = adUnitCode === 'slot-one' ? first : second;
+          return Object.freeze([
+            Object.freeze({
+              ...selected.bid,
+              adUnitCode: selected.adUnitCode,
+              auctionId: selected.auctionId,
+            }),
+          ]);
+        },
+      })
+    );
+
+    expect(harness.reservations.recognize(first.bid.adId)).toMatchObject({ state: 'renderable' });
+    expect(harness.reservations.recognize(second.bid.adId)).toMatchObject({ state: 'renderable' });
+    expect(harness.reservations.recognize(firstLoser.bid.adId)).toMatchObject({
+      state: 'unselected',
+    });
+    expect(harness.reservations.recognize(secondLoser.bid.adId)).toMatchObject({
+      state: 'unselected',
+    });
+    expect(harness.attempts).toHaveLength(2);
+    expect(harness.timers).toHaveLength(0);
+    harness.runtime.dispose();
   });
 
   it('rolls back a scheduler that invokes the deadline before timer publication returns', () => {
