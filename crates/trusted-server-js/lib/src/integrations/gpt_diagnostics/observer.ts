@@ -6,12 +6,20 @@ import type { GptDiagnosticsSlotLike, GptRenderFacts } from './store';
 
 export interface GptDiagnosticsObserverStore {
   markGptObserved(): void;
-  recordSlotRequested(slot: GptDiagnosticsSlotLike): void;
-  recordSlotResponseReceived(slot: GptDiagnosticsSlotLike): void;
-  recordSlotRenderEnded(slot: GptDiagnosticsSlotLike, facts: GptRenderFacts): void;
-  recordSlotOnload(slot: GptDiagnosticsSlotLike): void;
-  recordImpressionViewable(slot: GptDiagnosticsSlotLike): void;
-  recordSlotVisibilityChanged(slot: GptDiagnosticsSlotLike, percentage: number): void;
+  recordSlotRequested(slot: GptDiagnosticsSlotLike, timestampMs?: number): void;
+  recordSlotResponseReceived(slot: GptDiagnosticsSlotLike, timestampMs?: number): void;
+  recordSlotRenderEnded(
+    slot: GptDiagnosticsSlotLike,
+    facts: GptRenderFacts,
+    timestampMs?: number
+  ): void;
+  recordSlotOnload(slot: GptDiagnosticsSlotLike, timestampMs?: number): void;
+  recordImpressionViewable(slot: GptDiagnosticsSlotLike, timestampMs?: number): void;
+  recordSlotVisibilityChanged(
+    slot: GptDiagnosticsSlotLike,
+    percentage: number,
+    timestampMs?: number
+  ): void;
 }
 
 interface ObserverLogger {
@@ -27,6 +35,7 @@ export class GptDiagnosticsObserver {
   private readonly store: GptDiagnosticsObserverStore;
   private readonly logger: ObserverLogger;
   private started = false;
+  private observed = false;
 
   constructor(store: GptDiagnosticsObserverStore, options: ObserverOptions = {}) {
     this.store = store;
@@ -36,47 +45,87 @@ export class GptDiagnosticsObserver {
   start(): void {
     if (this.started) return;
     this.started = true;
-    this.handle('activation', () => this.store.markGptObserved());
   }
 
   consume(fact: Readonly<GoogletagDiagnosticsFact>): void {
     this.start();
+    if (!this.observed) {
+      this.observed = true;
+      this.handle('observation', () => this.store.markGptObserved());
+    }
     const slot = fact.slot as GptDiagnosticsSlotLike;
+    const observedAtMs =
+      typeof fact.observedAtMs === 'number' && Number.isFinite(fact.observedAtMs)
+        ? fact.observedAtMs
+        : undefined;
     switch (fact.kind) {
       case 'slotRequested':
-        this.handle(fact.kind, () => this.store.recordSlotRequested(slot));
+        this.handle(fact.kind, () =>
+          observedAtMs === undefined
+            ? this.store.recordSlotRequested(slot)
+            : this.store.recordSlotRequested(slot, observedAtMs)
+        );
         return;
       case 'slotResponseReceived':
-        this.handle(fact.kind, () => this.store.recordSlotResponseReceived(slot));
+        this.handle(fact.kind, () =>
+          observedAtMs === undefined
+            ? this.store.recordSlotResponseReceived(slot)
+            : this.store.recordSlotResponseReceived(slot, observedAtMs)
+        );
         return;
       case 'slotRenderEnded':
         this.handle(fact.kind, () =>
-          this.store.recordSlotRenderEnded(slot, {
-            isEmpty: fact.isEmpty,
-            size: fact.size ? ([...fact.size] as Size) : undefined,
-            isBackfill: fact.isBackfill,
-            slotContentChanged: fact.slotContentChanged,
-          })
+          observedAtMs === undefined
+            ? this.store.recordSlotRenderEnded(slot, {
+                isEmpty: fact.isEmpty,
+                size: fact.size ? ([...fact.size] as Size) : undefined,
+                isBackfill: fact.isBackfill,
+                slotContentChanged: fact.slotContentChanged,
+              })
+            : this.store.recordSlotRenderEnded(
+                slot,
+                {
+                  isEmpty: fact.isEmpty,
+                  size: fact.size ? ([...fact.size] as Size) : undefined,
+                  isBackfill: fact.isBackfill,
+                  slotContentChanged: fact.slotContentChanged,
+                },
+                observedAtMs
+              )
         );
         return;
       case 'slotOnload':
-        this.handle(fact.kind, () => this.store.recordSlotOnload(slot));
+        this.handle(fact.kind, () =>
+          observedAtMs === undefined
+            ? this.store.recordSlotOnload(slot)
+            : this.store.recordSlotOnload(slot, observedAtMs)
+        );
         return;
       case 'impressionViewable':
-        this.handle(fact.kind, () => this.store.recordImpressionViewable(slot));
+        this.handle(fact.kind, () =>
+          observedAtMs === undefined
+            ? this.store.recordImpressionViewable(slot)
+            : this.store.recordImpressionViewable(slot, observedAtMs)
+        );
         return;
       case 'slotVisibilityChanged':
         this.handle(fact.kind, () =>
-          this.store.recordSlotVisibilityChanged(
-            slot,
-            typeof fact.inViewPercentage === 'number' ? fact.inViewPercentage : Number.NaN
-          )
+          observedAtMs === undefined
+            ? this.store.recordSlotVisibilityChanged(
+                slot,
+                typeof fact.inViewPercentage === 'number' ? fact.inViewPercentage : Number.NaN
+              )
+            : this.store.recordSlotVisibilityChanged(
+                slot,
+                typeof fact.inViewPercentage === 'number' ? fact.inViewPercentage : Number.NaN,
+                observedAtMs
+              )
         );
     }
   }
 
   private handle(
-    kind: GoogletagDiagnosticsFact['kind'] | 'activation',
+    kind: GoogletagDiagnosticsFact['kind'] | 'observation',
     callback: () => void
   ): void {
     try {

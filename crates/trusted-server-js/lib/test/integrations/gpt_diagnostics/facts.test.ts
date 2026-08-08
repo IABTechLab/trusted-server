@@ -12,7 +12,14 @@ import {
 } from '../../../src/integrations/gpt_diagnostics/facts';
 
 function fact(index: number): Readonly<GoogletagDiagnosticsFact> {
-  return Object.freeze({ kind: 'slotRequested', slot: Object.freeze({ index }) });
+  return Object.freeze({
+    kind: 'slotRequested',
+    observedAtMs: index,
+    slot: Object.freeze({
+      token: Object.freeze(Object.create(null) as object),
+      elementId: `slot-${index}`,
+    }),
+  });
 }
 
 describe('GPT diagnostics fact transport', () => {
@@ -28,7 +35,7 @@ describe('GPT diagnostics fact transport', () => {
     const received: number[] = [];
 
     const release = buffer.activate((item) => {
-      received.push((item.slot as { index: number }).index);
+      received.push(Number(item.slot.elementId?.slice('slot-'.length)));
     });
 
     expect(received).toHaveLength(512);

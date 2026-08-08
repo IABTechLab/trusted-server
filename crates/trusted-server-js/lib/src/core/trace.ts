@@ -932,6 +932,7 @@ export function createRenderTraceDiagnostics(
   options: RenderTraceRuntimeOptions = {}
 ): RenderTraceRuntimeOwner {
   const current = new Map<string, Readonly<RenderTraceRecord>>();
+  const counts = new Map<string, number>();
   const history: Array<Readonly<RenderTraceRecord>> = [];
   const recordsBySequence = new Map<number, Readonly<RenderTraceRecord>>();
   const subscribers = new Map<number, RenderTraceSubscription>();
@@ -1037,9 +1038,16 @@ export function createRenderTraceDiagnostics(
     } catch {
       at = Date.now();
     }
+    const previousCount = counts.get(input.slotId) ?? 0;
+    if (!counts.has(input.slotId) && counts.size >= MAX_RENDER_TRACE_SLOTS) {
+      const oldestCount = counts.keys().next().value as string | undefined;
+      if (oldestCount !== undefined) counts.delete(oldestCount);
+    }
+    counts.delete(input.slotId);
+    counts.set(input.slotId, previousCount + 1);
     const committed = copyRenderTraceRecord({
       ...input,
-      count: (previous?.count ?? 0) + 1,
+      count: previousCount + 1,
       seq: (sequence += 1),
       at,
     });
@@ -1166,6 +1174,7 @@ export function createRenderTraceDiagnostics(
     current.clear();
     history.length = 0;
     recordsBySequence.clear();
+    counts.clear();
     presentation.dispose();
   };
 

@@ -82,6 +82,22 @@ describe('GptDiagnosticsStore', () => {
     assertCoverageEquation(store);
   });
 
+  it('uses adapter callback times even when buffered delivery occurs much later', () => {
+    const store = new GptDiagnosticsStore({ now: () => 9_999 });
+    const slot = fakeSlot('buffered-slot');
+
+    store.recordSlotRequested(slot, 10);
+    store.recordSlotResponseReceived(slot, 25);
+    store.recordSlotRenderEnded(slot, { isEmpty: false }, 30);
+
+    expect(store.snapshot().slots[0]?.requests[0]).toMatchObject({
+      requestedAtMs: 10,
+      responseAtMs: 25,
+      renderAtMs: 30,
+      durations: { requestToResponseMs: 15, responseToRenderMs: 5, requestToRenderMs: 20 },
+    });
+  });
+
   it('matches load and viewability after a render with unknown fill state', () => {
     let now = 1;
     const store = new GptDiagnosticsStore({ now: () => now });

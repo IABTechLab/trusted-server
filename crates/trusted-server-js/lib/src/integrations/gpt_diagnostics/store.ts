@@ -22,6 +22,9 @@ const CALLBACK_KINDS: GptDiagnosticsCallbackKind[] = [
 ];
 
 export interface GptDiagnosticsSlotLike {
+  readonly token?: object | undefined;
+  readonly elementId?: string | undefined;
+  readonly adUnitPath?: string | undefined;
   getSlotElementId?: (() => string) | undefined;
   getAdUnitPath?: (() => string) | undefined;
 }
@@ -165,8 +168,8 @@ export class GptDiagnosticsStore {
     return () => this.listeners.delete(listener);
   }
 
-  recordSlotRequested(slot: GptDiagnosticsSlotLike): void {
-    const timestampMs = this.timestamp();
+  recordSlotRequested(slot: GptDiagnosticsSlotLike, observedAtMs?: number): void {
+    const timestampMs = this.timestamp(observedAtMs);
     const record = this.prepareCallback('slotRequested', slot, timestampMs);
     if (!record) return;
 
@@ -175,8 +178,9 @@ export class GptDiagnosticsStore {
       this.metadata.evictedRequestCycles += 1;
     }
 
-    const requestNumber = (this.requestNumbers.get(slot) ?? 0) + 1;
-    this.requestNumbers.set(slot, requestNumber);
+    const identity = slot.token ?? slot;
+    const requestNumber = (this.requestNumbers.get(identity) ?? 0) + 1;
+    this.requestNumbers.set(identity, requestNumber);
     record.requests.push({
       requestNumber,
       requestedAtMs: timestampMs,
@@ -187,8 +191,8 @@ export class GptDiagnosticsStore {
     this.notify();
   }
 
-  recordSlotResponseReceived(slot: GptDiagnosticsSlotLike): void {
-    const timestampMs = this.timestamp();
+  recordSlotResponseReceived(slot: GptDiagnosticsSlotLike, observedAtMs?: number): void {
+    const timestampMs = this.timestamp(observedAtMs);
     this.matchCycle(
       'slotResponseReceived',
       slot,
@@ -213,8 +217,12 @@ export class GptDiagnosticsStore {
     );
   }
 
-  recordSlotRenderEnded(slot: GptDiagnosticsSlotLike, facts: GptRenderFacts): void {
-    const timestampMs = this.timestamp();
+  recordSlotRenderEnded(
+    slot: GptDiagnosticsSlotLike,
+    facts: GptRenderFacts,
+    observedAtMs?: number
+  ): void {
+    const timestampMs = this.timestamp(observedAtMs);
     this.matchCycle(
       'slotRenderEnded',
       slot,
@@ -244,8 +252,8 @@ export class GptDiagnosticsStore {
     );
   }
 
-  recordSlotOnload(slot: GptDiagnosticsSlotLike): void {
-    const timestampMs = this.timestamp();
+  recordSlotOnload(slot: GptDiagnosticsSlotLike, observedAtMs?: number): void {
+    const timestampMs = this.timestamp(observedAtMs);
     this.matchCycle(
       'slotOnload',
       slot,
@@ -262,8 +270,8 @@ export class GptDiagnosticsStore {
     );
   }
 
-  recordImpressionViewable(slot: GptDiagnosticsSlotLike): void {
-    const timestampMs = this.timestamp();
+  recordImpressionViewable(slot: GptDiagnosticsSlotLike, observedAtMs?: number): void {
+    const timestampMs = this.timestamp(observedAtMs);
     this.matchCycle(
       'impressionViewable',
       slot,
@@ -288,8 +296,12 @@ export class GptDiagnosticsStore {
     );
   }
 
-  recordSlotVisibilityChanged(slot: GptDiagnosticsSlotLike, percentage: number): void {
-    const timestampMs = this.timestamp();
+  recordSlotVisibilityChanged(
+    slot: GptDiagnosticsSlotLike,
+    percentage: number,
+    observedAtMs?: number
+  ): void {
+    const timestampMs = this.timestamp(observedAtMs);
     const record = this.prepareCallback('slotVisibilityChanged', slot, timestampMs);
     if (!record) return;
 
@@ -354,9 +366,11 @@ export class GptDiagnosticsStore {
     };
   }
 
-  private timestamp(): number {
+  private timestamp(observedAtMs?: number): number {
     this.gptObserved = true;
-    return this.now();
+    return typeof observedAtMs === 'number' && Number.isFinite(observedAtMs)
+      ? observedAtMs
+      : this.now();
   }
 
   private prepareCallback(
@@ -365,7 +379,8 @@ export class GptDiagnosticsStore {
     timestampMs: number
   ): MutableSlotRecord | undefined {
     this.coverage[kind].observed += 1;
-    const existingNumber = this.slotNumbers.get(slot);
+    const identity = slot.token ?? slot;
+    const existingNumber = this.slotNumbers.get(identity);
     if (existingNumber !== undefined) {
       const existingRecord = this.slots.get(existingNumber);
       if (existingRecord) {
@@ -404,7 +419,7 @@ export class GptDiagnosticsStore {
       runtimeSlotNumber,
       requests: [],
     };
-    this.slotNumbers.set(slot, runtimeSlotNumber);
+    this.slotNumbers.set(identity, runtimeSlotNumber);
     this.refreshSlotMetadata(record, slot);
     this.slots.set(runtimeSlotNumber, record);
     this.slotOrder.push(runtimeSlotNumber);
@@ -413,10 +428,16 @@ export class GptDiagnosticsStore {
   }
 
   private refreshSlotMetadata(record: MutableSlotRecord, slot: GptDiagnosticsSlotLike): void {
-    record.slotElementId ??= optionalNonEmptyString(
+    record.slotElementId ??=
+      (typeof slot.elementId === 'string' && slot.elementId.length > 0
+        ? slot.elementId
+        : undefined) ?? optionalNonEmptyString(
       typeof slot.getSlotElementId === 'function' ? slot.getSlotElementId.bind(slot) : undefined
     );
-    record.adUnitPath ??= optionalNonEmptyString(
+    record.adUnitPath ??=
+      (typeof slot.adUnitPath === 'string' && slot.adUnitPath.length > 0
+        ? slot.adUnitPath
+        : undefined) ?? optionalNonEmptyString(
       typeof slot.getAdUnitPath === 'function' ? slot.getAdUnitPath.bind(slot) : undefined
     );
   }

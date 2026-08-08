@@ -1,11 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import type { GoogletagDiagnosticsFact } from '../../../src/adapters/googletag';
+import type {
+  GoogletagDiagnosticsFact,
+  GoogletagDiagnosticsSlotSnapshot,
+} from '../../../src/adapters/googletag';
 import {
   GptDiagnosticsObserver,
   type GptDiagnosticsObserverStore,
 } from '../../../src/integrations/gpt_diagnostics/observer';
-import type { GptDiagnosticsSlotLike } from '../../../src/integrations/gpt_diagnostics/store';
 
 function fakeStore(): GptDiagnosticsObserverStore {
   return {
@@ -19,30 +21,31 @@ function fakeStore(): GptDiagnosticsObserverStore {
   };
 }
 
-function fakeSlot(): GptDiagnosticsSlotLike {
+function fakeSlot(): GoogletagDiagnosticsSlotSnapshot {
   return Object.freeze({
-    getSlotElementId: () => 'ad-slot-example',
-    getAdUnitPath: () => '/example/site/banner',
+    token: Object.freeze(Object.create(null) as object),
+    elementId: 'ad-slot-example',
+    adUnitPath: '/example/site/banner',
   });
 }
 
 function fact(
   kind: GoogletagDiagnosticsFact['kind'],
-  slot: object,
+  slot: GoogletagDiagnosticsFact['slot'],
   fields: Partial<GoogletagDiagnosticsFact> = {}
 ): Readonly<GoogletagDiagnosticsFact> {
-  return Object.freeze({ kind, slot, ...fields });
+  return Object.freeze({ kind, observedAtMs: 1, slot, ...fields });
 }
 
 describe('GptDiagnosticsObserver', () => {
-  it('starts exactly once without reading or mutating any browser global', () => {
+  it('does not claim GPT observation merely because the diagnostics module activated', () => {
     const store = fakeStore();
     const observer = new GptDiagnosticsObserver(store);
 
     observer.start();
     observer.start();
 
-    expect(store.markGptObserved).toHaveBeenCalledOnce();
+    expect(store.markGptObserved).not.toHaveBeenCalled();
   });
 
   it('consumes all six normalized adapter facts', () => {
@@ -65,17 +68,36 @@ describe('GptDiagnosticsObserver', () => {
     observer.consume(fact('slotVisibilityChanged', slot, { inViewPercentage: 42 }));
 
     expect(store.markGptObserved).toHaveBeenCalledOnce();
-    expect(store.recordSlotRequested).toHaveBeenCalledWith(slot);
-    expect(store.recordSlotResponseReceived).toHaveBeenCalledWith(slot);
-    expect(store.recordSlotRenderEnded).toHaveBeenCalledWith(slot, {
-      isEmpty: false,
-      size: [300, 250],
-      isBackfill: true,
-      slotContentChanged: false,
+    expect(store.recordSlotRequested).toHaveBeenCalledWith(slot, 1);
+    expect(store.recordSlotResponseReceived).toHaveBeenCalledWith(slot, 1);
+    expect(store.recordSlotRenderEnded).toHaveBeenCalledWith(
+      slot,
+      {
+        isEmpty: false,
+        size: [300, 250],
+        isBackfill: true,
+        slotContentChanged: false,
+      },
+      1
+    );
+    expect(store.recordSlotOnload).toHaveBeenCalledWith(slot, 1);
+    expect(store.recordImpressionViewable).toHaveBeenCalledWith(slot, 1);
+    expect(store.recordSlotVisibilityChanged).toHaveBeenCalledWith(slot, 42, 1);
+  });
+
+  it('passes the immutable adapter callback timestamp through to every store mutation', () => {
+    const store = fakeStore();
+    const observer = new GptDiagnosticsObserver(store);
+    const slot = fakeSlot();
+    const timestamped = Object.freeze({
+      kind: 'slotRequested' as const,
+      slot,
+      observedAtMs: 123.5,
     });
-    expect(store.recordSlotOnload).toHaveBeenCalledWith(slot);
-    expect(store.recordImpressionViewable).toHaveBeenCalledWith(slot);
-    expect(store.recordSlotVisibilityChanged).toHaveBeenCalledWith(slot, 42);
+
+    observer.consume(timestamped as Readonly<GoogletagDiagnosticsFact>);
+
+    expect(store.recordSlotRequested).toHaveBeenCalledWith(slot, 123.5);
   });
 
   it('records a malformed visibility fact as unmatched instead of dropping its coverage', () => {
@@ -84,7 +106,7 @@ describe('GptDiagnosticsObserver', () => {
 
     observer.consume(fact('slotVisibilityChanged', fakeSlot()));
 
-    expect(store.recordSlotVisibilityChanged).toHaveBeenCalledWith(expect.any(Object), NaN);
+    expect(store.recordSlotVisibilityChanged).toHaveBeenCalledWith(expect.any(Object), NaN, 1);
   });
 
   it('contains store and logger failures without interrupting later facts', () => {
@@ -104,6 +126,6 @@ describe('GptDiagnosticsObserver', () => {
     expect(() => observer.consume(fact('slotOnload', slot))).not.toThrow();
 
     expect(logger.warn).toHaveBeenCalledOnce();
-    expect(store.recordSlotOnload).toHaveBeenCalledWith(slot);
+    expect(store.recordSlotOnload).toHaveBeenCalledWith(slot, 1);
   });
 });
