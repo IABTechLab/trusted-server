@@ -1388,6 +1388,126 @@ describe('browser composition', () => {
     expect(release).toHaveBeenCalledTimes(1);
   });
 
+  it('commits enabled creative with both guards false without creative effects', async () => {
+    const releaseId = 'a'.repeat(64);
+    const activateCreative = vi.fn();
+    const startCreative = vi.fn();
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target: {},
+        releaseId,
+        manifest: {
+          version: 1,
+          releaseId,
+          integrations: [{ id: 'creative', required: true }],
+        },
+        knownIntegrationIds: Object.freeze(['creative']),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: { version: 1, auctionId: 'initial', results: [] },
+            bids: [],
+          },
+          creative: { version: 1, enabled: true, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag: fakeGoogletagAdapter(),
+          messaging: fakeMessagingAdapter(),
+          prebid: fakePrebidAdapter(),
+        },
+        coreActivations: { correctnessGptListeners: vi.fn() },
+        creativeActivationForTest: activateCreative,
+        creativeStartupForTest: startCreative,
+      }
+    );
+
+    expect(composition.runtime.start()).toBe(true);
+    expect(
+      composition.runtime.registerIntegration(createCreativeIntegrationRegistration(releaseId))
+    ).toBe(true);
+    await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+    expect(activateCreative).not.toHaveBeenCalled();
+    expect(startCreative).not.toHaveBeenCalled();
+
+    composition.runtime.dispose();
+  });
+
+  it.each([
+    [
+      'disabled click guard bit',
+      { version: 1, enabled: false, clickGuard: true, renderGuard: false },
+      [],
+    ],
+    [
+      'disabled render guard bit',
+      { version: 1, enabled: false, clickGuard: false, renderGuard: true },
+      [],
+    ],
+    [
+      'disabled creative manifest member',
+      { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+      ['creative'],
+    ],
+    [
+      'missing enabled creative manifest member',
+      { version: 1, enabled: true, clickGuard: false, renderGuard: false },
+      [],
+    ],
+  ] as const)('rejects creative ABI mismatch: %s', async (_caseName, creative, manifestIds) => {
+    const releaseId = 'a'.repeat(64);
+    const activateCreative = vi.fn();
+    const startCreative = vi.fn();
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target: {},
+        releaseId,
+        manifest: {
+          version: 1,
+          releaseId,
+          integrations: manifestIds.map((id) => ({ id, required: true })),
+        },
+        knownIntegrationIds: Object.freeze(['creative']),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: { version: 1, auctionId: 'initial', results: [] },
+            bids: [],
+          },
+          creative,
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag: fakeGoogletagAdapter(),
+          messaging: fakeMessagingAdapter(),
+          prebid: fakePrebidAdapter(),
+        },
+        coreActivations: { correctnessGptListeners: vi.fn() },
+        creativeActivationForTest: activateCreative,
+        creativeStartupForTest: startCreative,
+      }
+    );
+
+    expect(composition.runtime.start()).toBe(true);
+    if (manifestIds.length === 1) {
+      expect(
+        composition.runtime.registerIntegration(createCreativeIntegrationRegistration(releaseId))
+      ).toBe(true);
+    }
+    await expect(composition.runtime.install()).resolves.toEqual({
+      state: 'fallback',
+      reason: 'abi_mismatch',
+    });
+    expect(activateCreative).not.toHaveBeenCalled();
+    expect(startCreative).not.toHaveBeenCalled();
+  });
+
   it('owns the real creative click guard through the composition lifecycle', async () => {
     const releaseId = 'a'.repeat(64);
     const addEventListener = vi.spyOn(document, 'addEventListener');
