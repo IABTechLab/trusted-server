@@ -83,6 +83,12 @@ export interface GoogletagTargetingObserver {
   readonly beforePublisherMutation: (slot: object, key?: string) => void;
 }
 
+/** Callable targeting observation release with an exact wrapper-identity latch. */
+export interface GoogletagTargetingObservation {
+  (): void;
+  readonly isCurrent: () => boolean;
+}
+
 /** One publisher-originated GPT call observed outside Trusted Server operations. */
 export interface GoogletagPublisherCallObserver {
   readonly defineSlot?: (
@@ -131,7 +137,10 @@ export interface GoogletagFacade {
   clearTargeting(slot: object, key?: string): unknown;
   display(slot: string | object): unknown;
   getTargeting(slot: object, key: string): readonly string[];
-  observeTargeting(slot: object, observer: GoogletagTargetingObserver): () => void;
+  observeTargeting(
+    slot: object,
+    observer: GoogletagTargetingObserver
+  ): GoogletagTargetingObservation;
   refresh(slots?: readonly object[], options?: Readonly<{ changeCorrelator: boolean }>): unknown;
   serviceState(): Readonly<{
     apiReady: boolean;
@@ -227,6 +236,7 @@ interface SharedInitialLoadTracker {
 }
 
 interface TargetingObservation {
+  readonly isCurrent: () => boolean;
   readonly observers: Set<GoogletagTargetingObserver>;
   readonly restore: () => void;
 }
@@ -427,7 +437,7 @@ function createFacade(
     slot: object,
     key: 'clearTargeting' | 'setTargeting',
     observer: GoogletagTargetingObserver
-  ): (() => void) | undefined => {
+  ): Readonly<{ isCurrent: () => boolean; restore: () => void }> | undefined => {
     if (!isOperationCurrent()) return undefined;
     const original = member(slot, key);
     let descriptor: PropertyDescriptor | undefined;
@@ -455,6 +465,15 @@ function createFacade(
         // Publisher replacement wins once the installed method no longer matches.
       }
     };
+    const wrapperIsCurrent = (): boolean => {
+      try {
+        if (!defineAttempted) return false;
+        const current = Object.getOwnPropertyDescriptor(slot, key);
+        return current !== undefined && current.value === wrapper;
+      } catch {
+        return false;
+      }
+    };
     try {
       descriptor = Object.getOwnPropertyDescriptor(slot, key);
       if (
@@ -479,7 +498,7 @@ function createFacade(
         restore();
         return undefined;
       }
-      return restore;
+      return Object.freeze({ isCurrent: wrapperIsCurrent, restore });
     } catch {
       restore();
       return undefined;
@@ -506,7 +525,10 @@ function createFacade(
       if (!isOperationCurrent()) throw new GoogletagAdapterError('external_artifact_incompatible');
       return Object.freeze([...targeting]);
     },
-    observeTargeting: (slot: object, observer: GoogletagTargetingObserver): (() => void) => {
+    observeTargeting: (
+      slot: object,
+      observer: GoogletagTargetingObserver
+    ): GoogletagTargetingObservation => {
       if (
         typeof observer !== 'object' ||
         observer === null ||
@@ -535,19 +557,20 @@ function createFacade(
         if (!restoreSet) throw new GoogletagAdapterError('external_artifact_incompatible');
         const restoreClear = replaceObservedMethod(slot, 'clearTargeting', dispatcher);
         if (!restoreClear) {
-          restoreSet();
+          restoreSet.restore();
           throw new GoogletagAdapterError('external_artifact_incompatible');
         }
         let restored = false;
         observation = {
+          isCurrent: (): boolean => restoreSet.isCurrent() && restoreClear.isCurrent(),
           observers,
           restore: (): void => {
             if (restored) return;
             restored = true;
             try {
-              restoreClear();
+              restoreClear.restore();
             } finally {
-              restoreSet();
+              restoreSet.restore();
             }
           },
         };
@@ -570,7 +593,7 @@ function createFacade(
         throw error;
       }
       let active = true;
-      return registerEffect(() => {
+      const releaseEffect = registerEffect(() => {
         if (!active) return;
         active = false;
         deleteSetValue(observation!.observers, observer);
@@ -581,6 +604,20 @@ function createFacade(
           observation!.restore();
         }
       });
+      const release = (() => releaseEffect()) as GoogletagTargetingObservation;
+      Object.defineProperty(release, 'isCurrent', {
+        configurable: false,
+        enumerable: true,
+        value: (): boolean => {
+          try {
+            return active && observation?.isCurrent() === true;
+          } catch {
+            return false;
+          }
+        },
+        writable: false,
+      });
+      return Object.freeze(release);
     },
     refresh: (
       slots?: readonly object[],

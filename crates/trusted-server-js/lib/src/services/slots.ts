@@ -10,6 +10,7 @@ import type {
   GoogletagReplacementResult,
 } from '../adapters/googletag';
 import {
+  GoogletagAdapterError,
   GoogletagReplacementCandidateCollisionError,
   GoogletagReplacementError,
 } from '../adapters/googletag';
@@ -84,6 +85,8 @@ export type GptSlotAdoptionResult = Readonly<
 
 export type SlotRequestFailure =
   | 'cycle_unattributable'
+  | 'external_queue_full'
+  | 'external_ready_timeout'
   | 'gpt_completion_timeout'
   | 'gpt_request_failed'
   | 'gpt_request_timeout'
@@ -130,7 +133,7 @@ export interface SlotServiceInventory {
 
 /** Runtime-owned slot registry and physical-cycle boundary. */
 export interface SlotService {
-  readonly activate: () => GoogletagOperation<void>;
+  readonly activate: () => void;
   readonly adoptGptSlot: (
     navigationGeneration: object,
     registeredSlotId: string,
@@ -170,6 +173,7 @@ export interface SlotService {
   readonly request: (input: SlotRequestInput) => SlotRequestHandle;
   readonly requestBatch: (inputs: readonly SlotBatchRequestInput[]) => readonly SlotRequestHandle[];
   readonly snapshotRegisteredSlots: (owner: NavigationSession) => readonly SlotRecord[] | undefined;
+  readonly start: () => GoogletagOperation<void>;
   readonly resolveAdUnitCode: (adUnitCode: string) => SlotRecord | undefined;
   readonly resolveDomAlias: (alias: string) => SlotRecord | undefined;
   readonly resolveRegisteredSlot: (registeredSlotId: string) => SlotRecord | undefined;
@@ -184,6 +188,10 @@ export interface SlotServiceOptions {
   readonly googletag: GoogletagAdapter;
   readonly now?: () => number;
   readonly reconciliation?: SlotReconciliationBoundary;
+  readonly warnPublisherHandoffMismatch?: (
+    message: string,
+    details: Readonly<{ formatsMismatch: boolean; pathMismatch: boolean }>
+  ) => void;
 }
 
 export type SlotReconciliationResolution =
@@ -250,6 +258,7 @@ interface ReconciliationWindow {
   firstPassFinished: boolean;
   operation: GoogletagOperation<GoogletagReplacementResult> | undefined;
   readonly orphan: PhysicalSlot;
+  pendingFailureReason: SlotRequestFailure | undefined;
   terminal: boolean;
 }
 
@@ -568,6 +577,15 @@ const failed = (reason: SlotRequestFailure): SlotRequestOutcome =>
   Object.freeze({ status: 'failed' as const, reason });
 const cancelled = (reason: 'navigation_disposed' | 'superseded'): SlotRequestOutcome =>
   Object.freeze({ status: 'cancelled' as const, reason });
+
+function externalInvocationFailure(error: unknown): SlotRequestFailure {
+  if (error instanceof GoogletagAdapterError) {
+    if (error.code === 'external_queue_full' || error.code === 'external_ready_timeout') {
+      return error.code;
+    }
+  }
+  return 'gpt_request_failed';
+}
 
 function placementKeysFor(
   registeredSlotId: string,
@@ -1104,6 +1122,10 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
 
   const cancelIntent = (intent: RequestIntent): void => {
     if (intent.terminal) return;
+    if (intent.record.reconciliation?.pendingFailureReason !== undefined) {
+      settle(intent, cancelled('superseded'));
+      return;
+    }
     const wasInvoked = intent.requestStartedAt !== undefined;
     const physical = intent.record.physical;
     if (intent.state === 'cycle' && physical?.activeCycle?.intent === intent) {
@@ -1168,18 +1190,24 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     intent.requestTimer = setTimeout(() => onRequestTimeout(intent), GPT_REQUEST_START_TIMEOUT_MS);
   };
 
-  const failExternalInvocation = (record: InternalSlotRecord, intent: RequestIntent): void => {
+  const failExternalInvocation = (
+    record: InternalSlotRecord,
+    intent: RequestIntent,
+    error: unknown
+  ): void => {
     if (intent.terminal) return;
+    if (record.reconciliation?.pendingFailureReason !== undefined) return;
+    const reason = externalInvocationFailure(error);
     const physical = record.physical;
     if (physical?.activeCycle?.intent === intent) {
       physical.activeCycle.intent = undefined;
       physical.state = 'quarantined';
       physical.quarantineReason = 'completion';
-      settle(intent, failed('gpt_request_failed'));
+      settle(intent, failed(reason));
       return;
     }
     const wasInvoked = intent.requestStartedAt !== undefined;
-    settle(intent, failed('gpt_request_failed'));
+    settle(intent, failed(reason));
     if (wasInvoked && physical) recoverRequestTimeout(record, physical);
     else advanceQueued(record);
   };
@@ -1243,6 +1271,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     intent: RequestIntent,
     expectedBindingToken: object
   ): void {
+    if (record.reconciliation?.pendingFailureReason !== undefined) return;
     if (
       intent.terminal ||
       record.activeIntent !== intent ||
@@ -1296,12 +1325,12 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       if (intent.terminal) operation.dispose();
       void operation.result.then(
         () => undefined,
-        () => {
-          failExternalInvocation(record, intent);
+        (error: unknown) => {
+          failExternalInvocation(record, intent, error);
         }
       );
-    } catch {
-      failExternalInvocation(record, intent);
+    } catch (error) {
+      failExternalInvocation(record, intent, error);
     }
   }
 
@@ -1314,9 +1343,9 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         provisionalSubscriptions = ensureBindingSubscriptions(gpt);
         return provisionalSubscriptions;
       });
-    } catch {
+    } catch (error) {
       if (provisionalSubscriptions?.installed) provisionalSubscriptions.ownership.release();
-      failExternalInvocation(record, intent);
+      failExternalInvocation(record, intent, error);
       return;
     }
     intent.invocation = operation;
@@ -1325,12 +1354,13 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         if (intent.invocation === operation) intent.invocation = undefined;
         retireHistoricalSubscriptions(subscriptions.ownership);
         if (intent.terminal) return;
+        if (record.reconciliation?.pendingFailureReason !== undefined) return;
         invokeExternalIntent(record, intent, subscriptions.ownership.token);
       },
-      () => {
+      (error: unknown) => {
         if (intent.invocation === operation) intent.invocation = undefined;
         if (provisionalSubscriptions?.installed) provisionalSubscriptions.ownership.release();
-        failExternalInvocation(record, intent);
+        failExternalInvocation(record, intent, error);
       }
     );
   }
@@ -1509,25 +1539,33 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     physical.activeCycle = undefined;
   };
 
-  const retireFailedReconciliation = (
+  const pauseReconciliationIntent = (intent: RequestIntent | undefined): void => {
+    if (!intent || intent.terminal) return;
+    if (intent.requestTimer !== undefined) clearTimeout(intent.requestTimer);
+    if (intent.completionTimer !== undefined) clearTimeout(intent.completionTimer);
+    intent.requestTimer = undefined;
+    intent.completionTimer = undefined;
+    intent.requestDeadlineAt = undefined;
+    intent.completionDeadlineAt = undefined;
+  };
+
+  const finishFailedReconciliation = (
     record: InternalSlotRecord,
     window: ReconciliationWindow,
     reason: SlotRequestFailure,
-    transactionStarted: boolean,
     oldSlotDestroyed: boolean
   ): void => {
-    if (window.terminal) return;
+    if (window.terminal || record.reconciliation !== window) return;
     window.terminal = true;
     clearReconciliationTimers(window);
     window.operation?.dispose();
     window.operation = undefined;
-    if (record.reconciliation === window) record.reconciliation = undefined;
+    record.reconciliation = undefined;
     const physical = window.orphan;
-    if (record.physical !== physical || physical.ownership !== 'trusted_server') return;
 
     settleReconciliationWork(record, physical, reason);
     retireCommittedArtifact(record, physical);
-    record.physical = undefined;
+    if (record.physical === physical) record.physical = undefined;
     physical.record = undefined;
     physical.state = 'retired';
     physical.quarantineReason = 'request';
@@ -1538,9 +1576,43 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       return;
     }
     quarantinePhysicalPlacement(physical);
-    if (transactionStarted) return;
+  };
 
-    let destroyOperation: GoogletagOperation<unknown> | undefined;
+  const retireFailedReconciliation = (
+    record: InternalSlotRecord,
+    window: ReconciliationWindow,
+    reason: SlotRequestFailure,
+    transactionStarted: boolean,
+    oldSlotDestroyed: boolean
+  ): void => {
+    if (window.terminal || record.reconciliation !== window) return;
+    if (window.pendingFailureReason !== undefined) return;
+    if (transactionStarted || oldSlotDestroyed) {
+      finishFailedReconciliation(record, window, reason, oldSlotDestroyed);
+      return;
+    }
+    const physical = window.orphan;
+    if (record.physical !== physical || physical.ownership !== 'trusted_server') {
+      cancelReconciliation(record);
+      return;
+    }
+
+    window.pendingFailureReason = reason;
+    clearReconciliationTimers(window);
+    window.operation?.dispose();
+    window.operation = undefined;
+    pauseReconciliationIntent(physical.activeCycle?.intent);
+    pauseReconciliationIntent(record.activeIntent);
+    pauseReconciliationIntent(record.queuedIntent);
+    physical.activeCycle = undefined;
+    retireCommittedArtifact(record, physical);
+    physical.state = 'retired';
+    physical.quarantineReason = 'request';
+    physical.destroyAttempted = true;
+    quarantinePhysicalPlacement(physical);
+    deleteSetValue(physicalSlots, physical);
+
+    let destroyOperation: GoogletagOperation<GoogletagReplacementResult> | undefined;
     try {
       destroyOperation = options.googletag.run((gpt) =>
         gpt.transactionalReplace(
@@ -1552,12 +1624,28 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
           }
         )
       );
+      window.operation = destroyOperation;
       void destroyOperation.result.then(
-        () => detachDestroyedReconciliationPhysical(physical),
-        () => undefined
+        (result) => {
+          if (result.status === 'destroyed') {
+            finishFailedReconciliation(record, window, reason, true);
+            return;
+          }
+          finishFailedReconciliation(record, window, 'gpt_request_failed', true);
+        },
+        (error: unknown) => {
+          const replacementError = error instanceof GoogletagReplacementError ? error : undefined;
+          const reusedOldIdentity = replacementError?.orphanedSlot === physical.slot;
+          const destroyed =
+            replacementError?.oldSlotDestroyed === true &&
+            replacementError.preserveOldQuarantine !== true &&
+            !reusedOldIdentity;
+          finishFailedReconciliation(record, window, 'gpt_request_failed', destroyed);
+        }
       );
     } catch {
       destroyOperation?.dispose();
+      finishFailedReconciliation(record, window, 'gpt_request_failed', false);
     }
   };
 
@@ -1745,6 +1833,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         firstPassFinished: true,
         operation: undefined,
         orphan: physical,
+        pendingFailureReason: undefined,
         terminal: false,
       };
       record.reconciliation = instant;
@@ -1760,6 +1849,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       firstPassFinished: false,
       operation: undefined,
       orphan: physical,
+      pendingFailureReason: undefined,
       terminal: false,
     };
     record.reconciliation = window;
@@ -2491,10 +2581,10 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
                   }
                   gpt.refresh(slots, Object.freeze({ changeCorrelator: false }));
                 });
-              } catch {
+              } catch (error) {
                 for (let index = 0; index < intents.length; index += 1) {
                   const intent = intents[index];
-                  if (intent) failExternalInvocation(intent.record, intent);
+                  if (intent) failExternalInvocation(intent.record, intent, error);
                 }
                 return;
               }
@@ -2521,27 +2611,27 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
               if (remaining === 0) operation.dispose();
               void operation.result.then(
                 () => undefined,
-                () => {
+                (error: unknown) => {
                   for (let index = 0; index < intents.length; index += 1) {
                     const intent = intents[index];
-                    if (intent) failExternalInvocation(intent.record, intent);
+                    if (intent) failExternalInvocation(intent.record, intent, error);
                   }
                 }
               );
             },
-            () => {
+            (error: unknown) => {
               if (provisionalSubscriptions?.installed) provisionalSubscriptions.ownership.release();
               for (let index = 0; index < intents.length; index += 1) {
                 const intent = intents[index];
-                if (intent) failExternalInvocation(intent.record, intent);
+                if (intent) failExternalInvocation(intent.record, intent, error);
               }
             }
           );
-        } catch {
+        } catch (error) {
           if (provisionalSubscriptions?.installed) provisionalSubscriptions.ownership.release();
           for (let index = 0; index < intents.length; index += 1) {
             const intent = intents[index];
-            if (intent) failExternalInvocation(intent.record, intent);
+            if (intent) failExternalInvocation(intent.record, intent, error);
           }
         }
       }
@@ -2681,6 +2771,22 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     if (!physical || !record || !record.state.owner.isCurrent()) {
       return Object.freeze({ action: 'forward' });
     }
+    if (exact.length === 1) {
+      const definition = physical.definition;
+      const formatsMismatch =
+        definition !== undefined && !replacementSizesEqual(sizes, definition.sizes);
+      const pathMismatch = definition !== undefined && adUnitPath !== definition.adUnitPath;
+      if (formatsMismatch || pathMismatch) {
+        try {
+          options.warnPublisherHandoffMismatch?.(
+            'GPT publisher handoff metadata mismatch',
+            Object.freeze({ formatsMismatch, pathMismatch })
+          );
+        } catch {
+          // Diagnostics cannot block an exact publisher ownership handoff.
+        }
+      }
+    }
     const definitionElementId = physical.definition?.elementId;
     const aliases =
       definitionElementId === undefined || definitionElementId === elementId
@@ -2756,30 +2862,31 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
   };
 
   const service: SlotService = Object.freeze({
-    activate: (): GoogletagOperation<void> => {
-      if (activation) return activation;
-      if (!reconciliationActive) {
-        const states = mapValueSnapshot(navigationStates);
-        const installed: NavigationState[] = [];
-        for (let index = 0; index < states.length; index += 1) {
-          const state = states[index];
-          if (!state || !installNavigationObserver(state)) {
-            for (let releaseIndex = installed.length - 1; releaseIndex >= 0; releaseIndex -= 1) {
-              const installedState = installed[releaseIndex];
-              const release = installedState?.observerRelease;
-              if (installedState) installedState.observerRelease = undefined;
-              try {
-                release?.();
-              } catch {
-                // Failed activation retains no observer ownership.
-              }
+    activate: (): void => {
+      if (reconciliationActive) return;
+      const states = mapValueSnapshot(navigationStates);
+      const installed: NavigationState[] = [];
+      for (let index = 0; index < states.length; index += 1) {
+        const state = states[index];
+        if (!state || !installNavigationObserver(state)) {
+          for (let releaseIndex = installed.length - 1; releaseIndex >= 0; releaseIndex -= 1) {
+            const installedState = installed[releaseIndex];
+            const release = installedState?.observerRelease;
+            if (installedState) installedState.observerRelease = undefined;
+            try {
+              release?.();
+            } catch {
+              // Failed activation retains no observer ownership.
             }
-            throw new Error('reconciliation observer failed');
           }
-          if (state.observerRelease) installed[installed.length] = state;
+          throw new Error('reconciliation observer failed');
         }
-        reconciliationActive = true;
+        if (state.observerRelease) installed[installed.length] = state;
       }
+      reconciliationActive = true;
+    },
+    start: (): GoogletagOperation<void> => {
+      if (activation) return activation;
       let subscriptions: BindingSubscriptionAdmission | undefined;
       const operation = options.googletag.run<void>((gpt) => {
         if (disposed) return;

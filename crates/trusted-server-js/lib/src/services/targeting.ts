@@ -49,6 +49,7 @@ interface TargetingFrame {
   readonly installed: string;
   readonly key: string;
   readonly ownerId: string;
+  readonly observation: GoogletagTargetingObservation | undefined;
   readonly slot: object;
 }
 
@@ -137,6 +138,7 @@ function copyValues(values: readonly string[]): readonly string[] {
 /** Construct the runtime-owned GPT targeting restoration journal. */
 export function createTargetingService(): TargetingService {
   const chainsBySlot = new WeakMap<object, Map<string, TargetingChain>>();
+  const observationsBySlot = new WeakMap<object, GoogletagTargetingObservation>();
   const liveFrames = new Set<TargetingFrame>();
   const observationReleases = new Set<() => void>();
   const setAddIntrinsic = Set.prototype.add;
@@ -233,6 +235,14 @@ export function createTargetingService(): TargetingService {
     }
   };
 
+  const observationIsCurrent = (observation: GoogletagTargetingObservation): boolean => {
+    try {
+      return observation.isCurrent() === true;
+    } catch {
+      return false;
+    }
+  };
+
   const release = (frame: TargetingFrame): boolean => {
     if (!frame.alive) return true;
     const slotChains = weakMapValue(chainsBySlot, frame.slot);
@@ -254,6 +264,11 @@ export function createTargetingService(): TargetingService {
       frame.alive = false;
       frameCount -= 1;
       deleteLiveFrame(frame);
+      return true;
+    }
+
+    if (frame.observation && !observationIsCurrent(frame.observation)) {
+      invalidateChain(frame.slot, slotChains, frame.key, chain);
       return true;
     }
 
@@ -358,6 +373,11 @@ export function createTargetingService(): TargetingService {
     }
 
     const actual = copyValues(targeting.getTargeting(key));
+    const observation = weakMapValue(observationsBySlot, slot);
+    if (observation && !observationIsCurrent(observation)) {
+      invalidatePublisherMutation(slot);
+      return undefined;
+    }
     let slotChains = weakMapValue(chainsBySlot, slot);
     let chain = slotChains ? mapValue(slotChains, key) : undefined;
     const top = chain?.frames[chain.frames.length - 1];
@@ -381,6 +401,7 @@ export function createTargetingService(): TargetingService {
       boundary: targeting,
       installed: value,
       key,
+      observation,
       ownerId,
       slot,
     };
@@ -476,7 +497,7 @@ export function createTargetingService(): TargetingService {
       let ownedRelease = (): void => undefined;
       const operation = adapter.run<void>((gpt) => {
         if (disposed) return;
-        let release = gpt.observeTargeting(
+        const release = gpt.observeTargeting(
           slot,
           Object.freeze({
             beforePublisherMutation: (mutatedSlot: object, key?: string) => {
@@ -489,11 +510,14 @@ export function createTargetingService(): TargetingService {
           if (!active) return;
           active = false;
           deleteObservationRelease(ownedRelease);
+          if (weakMapValue(observationsBySlot, slot) === release) {
+            deleteWeakMapValue(observationsBySlot, slot);
+          }
           const current = release;
-          release = (): void => undefined;
           current();
         };
         try {
+          setWeakMapValue(observationsBySlot, slot, release);
           addObservationRelease(ownedRelease);
         } catch (error) {
           ownedRelease();
@@ -519,4 +543,8 @@ export function createTargetingService(): TargetingService {
     snapshotForTest: () => Object.freeze({ frames: frameCount, slots: slotCount }),
   });
 }
-import type { GoogletagAdapter, GoogletagOperation } from '../adapters/googletag';
+import type {
+  GoogletagAdapter,
+  GoogletagOperation,
+  GoogletagTargetingObservation,
+} from '../adapters/googletag';
