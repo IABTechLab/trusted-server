@@ -18,6 +18,7 @@ import {
 } from '../../src/adapters/messaging';
 import {
   createNoopPrebidAdapter,
+  PrebidAdmissionContractError,
   type PrebidAdapter,
   type PrebidBindingStatus,
   type PrebidEventFacade,
@@ -175,14 +176,18 @@ function fakePrebidAdapter(
   return Object.freeze({ ...createNoopPrebidAdapter(), bindingStatus });
 }
 
-function synchronousPrebidAdapter() {
+function synchronousPrebidAdapter(
+  admission: (prepared: Readonly<PreparedTrustedBidV1>) => 'admitted' | 'not_admitted' = () =>
+    'admitted'
+) {
   let auctionListener: ((auction: Readonly<PrebidTrustedServerAuctionV1>) => void) | undefined;
   let auctionEndListener:
     ((event: unknown, prebid: Readonly<PrebidEventFacade>) => void) | undefined;
   let admitted: Readonly<PreparedTrustedBidV1> | undefined;
   const admitTrustedBid = vi.fn((prepared: Readonly<PreparedTrustedBidV1>) => {
-    admitted = prepared;
-    return 'admitted' as const;
+    const result = admission(prepared);
+    if (result === 'admitted') admitted = prepared;
+    return result;
   });
   const requestBids = vi.fn();
   const setTargetingForGpt = vi.fn();
@@ -1490,6 +1495,161 @@ describe('browser composition', () => {
       composition.runtime.dispose();
     }
   });
+
+  const prebidPublicationFailureCases: readonly (readonly [
+    string,
+    (prepared: Readonly<PreparedTrustedBidV1>) => 'admitted' | 'not_admitted',
+    'prebid_admission_failed' | 'prebid_contract_violation',
+  ])[] = [
+    ['not admitted', () => 'not_admitted', 'prebid_admission_failed'],
+    [
+      'partial publication',
+      () => {
+        throw new PrebidAdmissionContractError();
+      },
+      'prebid_contract_violation',
+    ],
+  ];
+  it.each(prebidPublicationFailureCases)(
+    'settles a %s Prebid publication as an exact slot lifecycle failure',
+    async (_case, admission, reason) => {
+      const releaseId = 'a'.repeat(64);
+      const prebid = synchronousPrebidAdapter(admission);
+      const reservationId = `r1_${'q'.repeat(22)}`;
+      const observations: Readonly<Record<string, unknown>>[] = [];
+      const bid = Object.freeze({
+        candidateId: 'BBBBBBBBBBBB',
+        slot: 'failed-slot',
+        provider: 'trusted',
+        upstreamBidId: 'failed-upstream',
+        cpm: 2.5,
+        currency: 'USD' as const,
+        targeting: Object.freeze({ hb_bidder: 'trustedServer' }),
+        rendererReservationId: reservationId,
+        renderSource: Object.freeze({
+          type: 'adm' as const,
+          version: 1 as const,
+          adm: '<main>must not render</main>',
+          width: 300,
+          height: 250,
+        }),
+      });
+      const projection = Object.freeze({
+        version: 1,
+        auction: Object.freeze({
+          version: 1,
+          auctionId: 'failed-auction',
+          results: Object.freeze([
+            Object.freeze({
+              slot: bid.slot,
+              outcome: 'winner' as const,
+              candidateId: bid.candidateId,
+            }),
+          ]),
+        }),
+        bids: Object.freeze([bid]),
+      });
+      const composition = createTestBrowserRuntimeComposition(
+        {
+          target: {},
+          releaseId,
+          manifest: {
+            version: 1,
+            releaseId,
+            integrations: [
+              { id: 'prebid', required: true },
+              { id: 'lifecycle_probe', required: true },
+            ],
+          },
+          knownIntegrationIds: Object.freeze(['prebid', 'lifecycle_probe']),
+          boot: {
+            auctionProjection: projection,
+            creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+            diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+          },
+          getBindings: () => ({ config: Object.freeze({}), interfaces: Object.freeze({}) }),
+          kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+        },
+        {
+          adapters: {
+            googletag: fakeGoogletagAdapter(),
+            messaging: fakeMessagingAdapter(),
+            prebid: prebid.adapter,
+          },
+          coreActivations: { correctnessGptListeners: vi.fn() },
+        }
+      );
+
+      try {
+        expect(composition.runtime.start()).toBe(true);
+        expect(
+          composition.runtime.registerIntegration(createPrebidIntegrationRegistration(releaseId))
+        ).toBe(true);
+        expect(
+          composition.runtime.registerIntegration({
+            id: 'lifecycle_probe',
+            release: releaseId,
+            prepare: ({
+              interfaces,
+              onDispose,
+            }: {
+              interfaces: Readonly<Record<string, unknown>>;
+              onDispose(callback: () => void): void;
+            }) => {
+              const diagnostics = interfaces['diagnostics'] as {
+                subscribe(
+                  id: string,
+                  listener: (observation: Readonly<Record<string, unknown>>) => void
+                ): (() => void) | undefined;
+              };
+              const release = diagnostics.subscribe('lifecycle_probe', (observation) =>
+                observations.push(observation)
+              );
+              if (!release) throw new Error('Expected the lifecycle diagnostics subscription');
+              onDispose(release);
+              return { activate: vi.fn() };
+            },
+          })
+        ).toBe(true);
+        await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+        const complete = vi.fn();
+
+        prebid.auction(
+          Object.freeze({
+            auctionId: 'failed-auction',
+            bids: Object.freeze([
+              Object.freeze({ adUnitCode: bid.slot, requestId: 'failed-request' }),
+            ]),
+            complete,
+          })
+        );
+
+        expect(complete).toHaveBeenCalledOnce();
+        expect(composition.reservationServiceForTest()?.recognize(reservationId)).toMatchObject({
+          recognized: true,
+          state: reason,
+        });
+        await vi.waitFor(() =>
+          expect(observations).toContainEqual(
+            expect.objectContaining({
+              kind: 'render_attempt',
+              slotId: bid.slot,
+              state: 'failed',
+              outcome: { outcome: 'failed', reason },
+            })
+          )
+        );
+        expect(
+          composition.runtimeSessionForTest()?.currentNavigation?.snapshotInventoryForTest()
+        ).toMatchObject({
+          attempts: 0,
+          batches: 0,
+        });
+      } finally {
+        composition.runtime.dispose();
+      }
+    }
+  );
 
   it('hands late publisher GPT calls through the adapter into runtime-owned slot state', async () => {
     const releaseId = 'a'.repeat(64);

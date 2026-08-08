@@ -748,6 +748,11 @@ export type PrebidBidPublicationResult =
   | Readonly<{ ok: true; bid: Readonly<PreparedTrustedBidV1> }>
   | Readonly<{ ok: false; reason: PrebidBidPublicationFailureReason }>;
 
+export type PrebidPublicationLifecycleFailureReason = Extract<
+  PrebidBidPublicationFailureReason,
+  'prebid_admission_failed' | 'prebid_contract_violation'
+>;
+
 type PrebidPublicationNavigation = NavigationSession;
 
 export interface PrebidBidPublicationInput {
@@ -969,6 +974,12 @@ export interface PrebidSelectionCoordinator {
     navigation: NavigationSession
   ) => boolean;
   readonly auctionEnded: (event: unknown, prebid: Readonly<PrebidEventFacade>) => void;
+  readonly settlePublicationFailure: (
+    navigation: NavigationSession,
+    auctionId: string,
+    adUnitCode: string,
+    reason: PrebidPublicationLifecycleFailureReason
+  ) => boolean;
   readonly abort: (navigation: NavigationSession, auctionId: string) => void;
   readonly dispose: () => void;
 }
@@ -1182,6 +1193,51 @@ export function createPrebidSelectionCoordinator(
     }
   };
 
+  const settlePublicationFailure = (
+    navigation: NavigationSession,
+    auctionId: string,
+    adUnitCode: string,
+    reason: PrebidPublicationLifecycleFailureReason
+  ): boolean => {
+    let ephemeralBatch: AuctionBatchScope | undefined;
+    try {
+      if (
+        disposed ||
+        !navigation.isCurrent() ||
+        !validBoundedString(auctionId, 128) ||
+        !validBoundedString(adUnitCode, 256)
+      ) {
+        return false;
+      }
+      const tracked = findAuction(navigation, auctionId);
+      const batch = tracked?.batch ?? navigation.createAuctionBatch(`prebid:${auctionId}`);
+      if (!batch) return false;
+      if (!tracked) ephemeralBatch = batch;
+      const owner = batch.createRenderAttempt(adUnitCode);
+      if (!owner.ok) return false;
+      let created: RenderAttemptCreationResult;
+      try {
+        created = options.createAttempt(owner.value);
+      } catch {
+        owner.value.dispose();
+        return false;
+      }
+      if (!created.ok) {
+        owner.value.dispose();
+        return false;
+      }
+      return created.value.fail(reason);
+    } catch {
+      return false;
+    } finally {
+      try {
+        ephemeralBatch?.dispose();
+      } catch {
+        // The failed attempt is already terminal; navigation remains the final owner.
+      }
+    }
+  };
+
   const auctionEnded = (event: unknown, prebid: Readonly<PrebidEventFacade>): void => {
     if (disposed) return;
     const record = ownDataObject(event);
@@ -1302,6 +1358,7 @@ export function createPrebidSelectionCoordinator(
   return Object.freeze({
     track,
     auctionEnded,
+    settlePublicationFailure,
     abort,
     dispose: (): void => {
       if (disposed) return;
