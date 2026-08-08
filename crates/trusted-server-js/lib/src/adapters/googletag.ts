@@ -113,6 +113,12 @@ export interface GoogletagPublisherCallObserver {
         slots: readonly object[];
         admission?: GoogletagPublisherCallAdmission;
       }>
+    | Readonly<{
+        action: 'defer';
+        slots: readonly object[];
+        completion: PromiseLike<unknown>;
+        admission?: GoogletagPublisherCallAdmission;
+      }>
     | Readonly<{ action: 'suppress' }>;
 }
 
@@ -139,10 +145,12 @@ export interface GoogletagPublisherDisplayCall {
 export interface GoogletagPublisherRefreshCall {
   readonly requestedSlots: readonly object[] | undefined;
   readonly slots: readonly object[];
+  readonly options?: unknown;
 }
 
 /** The small GPT surface exposed to an accepted operation. */
 export interface GoogletagFacade {
+  adUnitPath?(slot: object): unknown;
   bindingToken(): object;
   clearTargeting(slot: object, key?: string): unknown;
   display(slot: string | object): unknown;
@@ -533,6 +541,7 @@ function createFacade(
     }
   };
   return Object.freeze({
+    adUnitPath: (slot: object): unknown => call(slot, 'getAdUnitPath', []),
     bindingToken: (): object => bindingToken,
     clearTargeting: (slot: object, key?: string): unknown =>
       call(slot, 'clearTargeting', key === undefined ? [] : [key]),
@@ -2105,6 +2114,7 @@ export function createBrowserGoogletagAdapter(
         return undefined;
       }
     };
+    const deferredRefreshes = new Set<() => void>();
     const restorers: Array<() => void> = [];
     const install = (
       external: object,
@@ -2188,7 +2198,11 @@ export function createBrowserGoogletagAdapter(
             let decision: ReturnType<NonNullable<GoogletagPublisherCallObserver['refresh']>>;
             try {
               decision = refreshObserver(
-                Object.freeze({ requestedSlots: requested, slots: effective })
+                Object.freeze({
+                  requestedSlots: requested,
+                  slots: effective,
+                  options: arguments_[1],
+                })
               );
             } catch {
               // Observer failure must leave the publisher call native.
@@ -2211,6 +2225,51 @@ export function createBrowserGoogletagAdapter(
               }
               rollbackAdmission(admission);
               return Reflect.apply(original, receiver, arguments_);
+            }
+            if (decision?.action === 'defer') {
+              const replacement = objectSlots(decision.slots);
+              const completion = safeMember(decision, 'completion');
+              const then =
+                (typeof completion === 'object' && completion !== null) ||
+                typeof completion === 'function'
+                  ? safeMember(completion as object, 'then')
+                  : undefined;
+              if (!replacement || typeof then !== 'function') {
+                rollbackAdmission(admission);
+                return Reflect.apply(original, receiver, arguments_);
+              }
+              let forwarded = false;
+              const forward = (): void => {
+                if (forwarded) return;
+                forwarded = true;
+                try {
+                  deleteSetValue(deferredRefreshes, forward);
+                } catch {
+                  // The exact-once latch remains authoritative under hostile bookkeeping.
+                }
+                try {
+                  callWithAdmission(original, receiver, [replacement, arguments_[1]], admission);
+                } catch {
+                  // A deferred native throw has no synchronous publisher frame to receive it.
+                }
+              };
+              try {
+                addSetValue(deferredRefreshes, forward);
+                Promise.resolve(completion).then(forward, forward);
+              } catch {
+                try {
+                  deleteSetValue(deferredRefreshes, forward);
+                } catch {
+                  // Synchronous fail-open still owns the only native forward.
+                }
+                return callWithAdmission(
+                  original,
+                  receiver,
+                  [replacement, arguments_[1]],
+                  admission
+                );
+              }
+              return undefined;
             }
             return callWithAdmission(original, receiver, arguments_, admission);
           }
@@ -2247,6 +2306,8 @@ export function createBrowserGoogletagAdapter(
       } catch {
         // Exact wrapper restoration still runs when bookkeeping is hostile.
       }
+      const deferred = setValueSnapshot(deferredRefreshes);
+      for (let index = 0; index < deferred.length; index += 1) deferred[index]?.();
       for (let index = restorers.length - 1; index >= 0; index -= 1) restorers[index]?.();
     };
     registerAdapterEffect(release);

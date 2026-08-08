@@ -154,7 +154,9 @@ describe('external bundle + served shim evaluated together', () => {
       bidderAliases: artifactManifest.bidderAliases,
       userIdModules: artifactManifest.userIdModules,
     };
-    pageWindow.eval('window.pbjs = { que: [], cmd: [] };');
+    pageWindow.eval(
+      `window.__conflictingRequestBids=function conflictingRequestBids(){};window.pbjs={que:[],cmd:[]};["addAdUnits","getBidResponsesForAdUnitCode","getHighestCpmBids","offEvent","onEvent","processQueue","registerBidAdapter","renderAd","requestBids","setTargetingForGPTAsync"].forEach(function(name){window.pbjs[name]=name==="requestBids"?window.__conflictingRequestBids:function(){};});`
+    );
     pageWindow.eval(
       `window.__conflictingStamp=(function freeze(value){if(value&&typeof value==='object'){Object.getOwnPropertyNames(value).forEach(function(key){freeze(value[key]);});Object.freeze(value);}return value;})(${JSON.stringify(conflictingStamp)});`
     );
@@ -170,9 +172,129 @@ describe('external bundle + served shim evaluated together', () => {
 
     expect(() => pageWindow.eval(bundleCode)).not.toThrow();
     expect(pageWindow.pbjs).toBe(binding);
-    expect(pageWindow.pbjs.requestBids).toBeUndefined();
+    expect(pageWindow.pbjs.requestBids).toBe(pageWindow.__conflictingRequestBids);
     expect(pageWindow.pbjs.__trustedServerArtifactV1).toBe(pageWindow.__conflictingStamp);
     expect(warn).toHaveBeenCalledTimes(1);
+    dom.window.close();
+  });
+
+  it('does not mistake an exact stamp on a Prebid stub for an initialized duplicate', () => {
+    const dom = new JSDOM('<!doctype html><html></html>', {
+      url: 'https://pub.example.com/article',
+      runScripts: 'outside-only',
+    });
+    const pageWindow = dom.window;
+    pageWindow.fetch = vi.fn(async () => new Response('{}'));
+    pageWindow.Request = Request;
+    pageWindow.Headers = Headers;
+    pageWindow.Response = Response;
+    pageWindow.AbortController = AbortController;
+    if (!('isSecureContext' in pageWindow)) pageWindow.isSecureContext = true;
+    pageWindow.eval('window.pbjs = { que: [], cmd: [] };');
+    pageWindow.eval(
+      `window.__exactStamp=(function freeze(value){if(value&&typeof value==='object'){Object.getOwnPropertyNames(value).forEach(function(key){freeze(value[key]);});Object.freeze(value);}return value;})(${JSON.stringify(
+        {
+          abi: artifactManifest.abi,
+          artifactReleaseId: artifactManifest.artifactReleaseId,
+          prebidVersion: artifactManifest.prebidVersion,
+          moduleStems: artifactManifest.moduleStems,
+          bidderCodes: artifactManifest.bidderCodes,
+          bidderAliases: artifactManifest.bidderAliases,
+          userIdModules: artifactManifest.userIdModules,
+        }
+      )});`
+    );
+    pageWindow.Object.defineProperty(pageWindow.pbjs, '__trustedServerArtifactV1', {
+      value: pageWindow.__exactStamp,
+      enumerable: false,
+      writable: false,
+      configurable: false,
+    });
+
+    expect(() => pageWindow.eval(bundleCode)).not.toThrow();
+    expect(typeof pageWindow.pbjs.requestBids).toBe('function');
+    expect(pageWindow.pbjs.__trustedServerArtifactV1).toBe(pageWindow.__exactStamp);
+    dom.window.close();
+  });
+
+  it('accepts an exact 128-byte non-ASCII artifact name on a real stamped binding', () => {
+    const dom = new JSDOM('<!doctype html><html></html>', {
+      url: 'https://pub.example.com/article',
+      runScripts: 'outside-only',
+    });
+    const pageWindow = dom.window;
+    const boundaryName = 'é'.repeat(64);
+    const boundaryStamp = {
+      abi: artifactManifest.abi,
+      artifactReleaseId: 'e'.repeat(64),
+      prebidVersion: artifactManifest.prebidVersion,
+      moduleStems: [...artifactManifest.moduleStems, boundaryName].sort(),
+      bidderCodes: artifactManifest.bidderCodes,
+      bidderAliases: artifactManifest.bidderAliases,
+      userIdModules: artifactManifest.userIdModules,
+    };
+    pageWindow.eval(
+      `window.__fakeRequestBids=function fakeRequestBids(){};window.pbjs={que:[],cmd:[]};["addAdUnits","getBidResponsesForAdUnitCode","getHighestCpmBids","offEvent","onEvent","processQueue","registerBidAdapter","renderAd","requestBids","setTargetingForGPTAsync"].forEach(function(name){window.pbjs[name]=name==="requestBids"?window.__fakeRequestBids:function(){};});`
+    );
+    pageWindow.eval(
+      `window.__boundaryStamp=(function freeze(value){if(value&&typeof value==='object'){Object.getOwnPropertyNames(value).forEach(function(key){freeze(value[key]);});Object.freeze(value);}return value;})(${JSON.stringify(
+        boundaryStamp
+      )});`
+    );
+    pageWindow.Object.defineProperty(pageWindow.pbjs, '__trustedServerArtifactV1', {
+      value: pageWindow.__boundaryStamp,
+      enumerable: false,
+      writable: false,
+      configurable: false,
+    });
+
+    expect(() => pageWindow.eval(bundleCode)).not.toThrow();
+    expect(pageWindow.pbjs.requestBids).toBe(pageWindow.__fakeRequestBids);
+    expect(pageWindow.pbjs.__trustedServerArtifactV1).toBe(pageWindow.__boundaryStamp);
+    dom.window.close();
+  });
+
+  it('does not accept a UTF-8-overlong artifact name on a real stamped binding', () => {
+    const dom = new JSDOM('<!doctype html><html></html>', {
+      url: 'https://pub.example.com/article',
+      runScripts: 'outside-only',
+    });
+    const pageWindow = dom.window;
+    pageWindow.fetch = vi.fn(async () => new Response('{}'));
+    pageWindow.Request = Request;
+    pageWindow.Headers = Headers;
+    pageWindow.Response = Response;
+    pageWindow.AbortController = AbortController;
+    if (!('isSecureContext' in pageWindow)) pageWindow.isSecureContext = true;
+    const overlongName = `${'é'.repeat(64)}a`;
+    const malformedStamp = {
+      abi: artifactManifest.abi,
+      artifactReleaseId: 'f'.repeat(64),
+      prebidVersion: artifactManifest.prebidVersion,
+      moduleStems: [...artifactManifest.moduleStems, overlongName].sort(),
+      bidderCodes: artifactManifest.bidderCodes,
+      bidderAliases: artifactManifest.bidderAliases,
+      userIdModules: artifactManifest.userIdModules,
+    };
+    pageWindow.eval(
+      `window.__fakeRequestBids=function fakeRequestBids(){};window.pbjs={que:[],cmd:[]};["addAdUnits","getBidResponsesForAdUnitCode","getHighestCpmBids","offEvent","onEvent","processQueue","registerBidAdapter","renderAd","requestBids","setTargetingForGPTAsync"].forEach(function(name){window.pbjs[name]=name==="requestBids"?window.__fakeRequestBids:function(){};});`
+    );
+    pageWindow.eval(
+      `window.__malformedStamp=(function freeze(value){if(value&&typeof value==='object'){Object.getOwnPropertyNames(value).forEach(function(key){freeze(value[key]);});Object.freeze(value);}return value;})(${JSON.stringify(
+        malformedStamp
+      )});`
+    );
+    pageWindow.Object.defineProperty(pageWindow.pbjs, '__trustedServerArtifactV1', {
+      value: pageWindow.__malformedStamp,
+      enumerable: false,
+      writable: false,
+      configurable: false,
+    });
+
+    expect(() => pageWindow.eval(bundleCode)).not.toThrow();
+    expect(typeof pageWindow.pbjs.requestBids).toBe('function');
+    expect(pageWindow.pbjs.requestBids).not.toBe(pageWindow.__fakeRequestBids);
+    expect(pageWindow.pbjs.__trustedServerArtifactV1).toBe(pageWindow.__malformedStamp);
     dom.window.close();
   });
 

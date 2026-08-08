@@ -132,6 +132,7 @@ export interface PrebidFacade {
   ): () => void;
   renderAd(targetDocument: object, adId: string): unknown;
   requestBids(options: object): unknown;
+  setTargetingForGpt(adUnitCodes: readonly string[]): unknown;
   subscribe(
     eventType: string,
     listener: (event: unknown, prebid: Readonly<PrebidEventFacade>) => void
@@ -537,6 +538,7 @@ const REQUIRED_API_METHODS = [
   'registerBidAdapter',
   'renderAd',
   'requestBids',
+  'setTargetingForGPTAsync',
 ] as const;
 
 function commandQueue(binding: object): CommandQueue | undefined {
@@ -1083,6 +1085,8 @@ export function createBrowserPrebidAdapter(
         callBound(binding, 'renderAd', [targetDocument, adId], isOperationCurrent),
       requestBids: (options: object): unknown =>
         callBound(binding, 'requestBids', [options], isOperationCurrent),
+      setTargetingForGpt: (adUnitCodes: readonly string[]): unknown =>
+        callBound(binding, 'setTargetingForGPTAsync', [[...adUnitCodes]], isOperationCurrent),
       subscribe: (
         eventType: string,
         listener: (event: unknown, prebid: Readonly<PrebidEventFacade>) => void

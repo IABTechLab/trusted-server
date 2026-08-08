@@ -1950,6 +1950,7 @@ describe('browser googletag adapter readiness', () => {
         if (key === undefined) targeting.clear();
         else targeting.delete(key);
       }),
+      getAdUnitPath: vi.fn(() => '/publisher/example'),
       getTargeting: vi.fn((key: string) => targeting.get(key) ?? []),
       setTargeting: vi.fn((key: string, value: string | readonly string[]) => {
         targeting.set(key, typeof value === 'string' ? [value] : [...value]);
@@ -1964,6 +1965,7 @@ describe('browser googletag adapter readiness', () => {
       const unsubscribe = gpt.subscribe('slotRequested', listener);
       gpt.setTargeting(slot, 'hb_adid', 'reservation');
       expect(gpt.getTargeting(slot, 'hb_adid')).toEqual(['reservation']);
+      expect(gpt.adUnitPath?.(slot)).toBe('/publisher/example');
       gpt.refresh([slot], { changeCorrelator: false });
       expect(gpt.slots()).toEqual([slot]);
       expect(Object.isFrozen(gpt.slots())).toBe(true);
@@ -2098,6 +2100,7 @@ describe('browser googletag adapter readiness', () => {
 
     expect(observer.display).not.toHaveBeenCalled();
     expect(observer.refresh).toHaveBeenCalledExactlyOnceWith({
+      options: { changeCorrelator: true },
       requestedSlots: [slot],
       slots: [slot],
     });
@@ -2179,6 +2182,77 @@ describe('browser googletag adapter readiness', () => {
     expect(order).toEqual(['native:display', 'commit:display', 'native:refresh', 'commit:refresh']);
     expect(displayAdmission.rollback).not.toHaveBeenCalled();
     expect(refreshAdmission.rollback).not.toHaveBeenCalled();
+  });
+
+  it('defers one explicit refresh and forwards the complete snapshot with exact options once', async () => {
+    const ready = createReadyGoogletag();
+    const first = Object.freeze({ id: 'first' });
+    const second = Object.freeze({ id: 'second' });
+    const options = Object.freeze({ changeCorrelator: false, publisher: 'exact-options' });
+    const originalSlots = [first, second];
+    let complete!: () => void;
+    const completion = new Promise<void>((resolve) => {
+      complete = resolve;
+    });
+    const admission = Object.freeze({ commit: vi.fn(), rollback: vi.fn() });
+    const nativeRefresh = vi.fn();
+    ready.pubads.refresh = nativeRefresh;
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+    adapter.observePublisherCalls({
+      refresh: () =>
+        Object.freeze({
+          action: 'defer' as const,
+          admission,
+          completion,
+          slots: Object.freeze([first, second]),
+        }),
+    });
+
+    expect(ready.pubads.refresh(originalSlots, options)).toBeUndefined();
+    originalSlots.length = 0;
+    expect(nativeRefresh).not.toHaveBeenCalled();
+
+    complete();
+    await completion;
+    await Promise.resolve();
+    expect(nativeRefresh).toHaveBeenCalledExactlyOnceWith([first, second], options);
+    expect(admission.commit).toHaveBeenCalledOnce();
+    expect(admission.rollback).not.toHaveBeenCalled();
+    await Promise.resolve();
+    expect(nativeRefresh).toHaveBeenCalledOnce();
+  });
+
+  it('forwards a deferred global refresh exactly once when its observer is released', async () => {
+    const ready = createReadyGoogletag();
+    const first = Object.freeze({ id: 'first' });
+    const second = Object.freeze({ id: 'second' });
+    const options = Object.freeze({ changeCorrelator: true });
+    ready.pubads.getSlots.mockReturnValue([first, second]);
+    let complete!: () => void;
+    const completion = new Promise<void>((resolve) => {
+      complete = resolve;
+    });
+    const nativeRefresh = vi.fn();
+    ready.pubads.refresh = nativeRefresh;
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+    const release = adapter.observePublisherCalls({
+      refresh: () =>
+        Object.freeze({
+          action: 'defer' as const,
+          completion,
+          slots: Object.freeze([first, second]),
+        }),
+    });
+
+    ready.pubads.refresh(undefined, options);
+    expect(nativeRefresh).not.toHaveBeenCalled();
+    release();
+    expect(nativeRefresh).toHaveBeenCalledExactlyOnceWith([first, second], options);
+
+    complete();
+    await completion;
+    await Promise.resolve();
+    expect(nativeRefresh).toHaveBeenCalledOnce();
   });
 
   it('rolls back each unconsumed publisher admission on native throw and rethrows the exact error', () => {

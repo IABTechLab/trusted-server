@@ -3,6 +3,13 @@ import type {
   PrebidEventFacade,
   PrebidTrustedServerAuctionV1,
 } from '../../adapters/prebid';
+import type { GoogletagPublisherRefreshCall } from '../../adapters/googletag';
+
+interface RefreshPolicyCapability {
+  readonly prepare: (
+    call: Readonly<GoogletagPublisherRefreshCall>
+  ) => PromiseLike<unknown> | undefined;
+}
 
 export interface PrebidStartup {
   readonly activate: () => () => void;
@@ -14,6 +21,11 @@ export interface PrebidStartupOptions {
   readonly onAuction: (auction: Readonly<PrebidTrustedServerAuctionV1>) => void;
   readonly onAuctionEnd: (event: unknown, prebid: Readonly<PrebidEventFacade>) => void;
   readonly prebid: Pick<PrebidAdapter, 'notifyReady' | 'run'>;
+  readonly refresh?: Readonly<{
+    readonly configure?: (config: unknown) => void;
+    readonly install: (policy: RefreshPolicyCapability) => (() => void) | undefined;
+    readonly policy: RefreshPolicyCapability & Readonly<{ dispose: () => void }>;
+  }>;
   readonly start?: (config: unknown) => void;
 }
 
@@ -26,6 +38,7 @@ export function createPrebidStartup(options: PrebidStartupOptions): PrebidStartu
   let activationEffects: (() => void) | undefined;
   let bidderOperation: ReturnType<PrebidStartupOptions['prebid']['run']> | undefined;
   let bidderEffects: (() => void) | undefined;
+  let refreshPolicyRelease: (() => void) | undefined;
 
   const retainEffects = (
     result: Promise<unknown>,
@@ -63,6 +76,25 @@ export function createPrebidStartup(options: PrebidStartupOptions): PrebidStartu
       retainEffects(activationOperation.result, (release) => {
         activationEffects = release;
       });
+      const refresh = options.refresh;
+      if (refresh) {
+        try {
+          refreshPolicyRelease = refresh.install(refresh.policy);
+          if (!refreshPolicyRelease) throw new Error('Prebid refresh policy is unavailable');
+        } catch (error) {
+          released = true;
+          try {
+            disposeOwnedOperation(activationOperation, activationEffects);
+          } finally {
+            try {
+              refresh.policy.dispose();
+            } finally {
+              options.dispose();
+            }
+          }
+          throw error;
+        }
+      }
       return (): void => {
         if (released) return;
         released = true;
@@ -72,7 +104,15 @@ export function createPrebidStartup(options: PrebidStartupOptions): PrebidStartu
           try {
             disposeOwnedOperation(activationOperation, activationEffects);
           } finally {
-            options.dispose();
+            try {
+              options.refresh?.policy.dispose();
+            } finally {
+              try {
+                refreshPolicyRelease?.();
+              } finally {
+                options.dispose();
+              }
+            }
           }
         }
       };
@@ -80,13 +120,14 @@ export function createPrebidStartup(options: PrebidStartupOptions): PrebidStartu
     start: (config: unknown): void => {
       if (!activated || released || started) throw new Error('Prebid startup is unavailable');
       started = true;
-      bidderOperation = options.prebid.run((prebid) =>
-        prebid.registerTrustedServerBidder(options.onAuction)
-      );
-      retainEffects(bidderOperation.result, (release) => {
-        bidderEffects = release;
-      });
       try {
+        options.refresh?.configure?.(config);
+        bidderOperation = options.prebid.run((prebid) =>
+          prebid.registerTrustedServerBidder(options.onAuction)
+        );
+        retainEffects(bidderOperation.result, (release) => {
+          bidderEffects = release;
+        });
         options.start?.(config);
       } finally {
         options.prebid.notifyReady();
