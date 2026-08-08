@@ -2,6 +2,7 @@ import type {
   GoogletagAdapter,
   GoogletagFacade,
   GoogletagOperation,
+  GoogletagPublisherCallAdmission,
   GoogletagPublisherDefineSlotCall,
   GoogletagPublisherDisplayCall,
   GoogletagPublisherRefreshCall,
@@ -155,12 +156,16 @@ export interface SlotService {
   ) => Readonly<{ action: 'forward' }> | Readonly<{ action: 'handoff'; slot: object }>;
   readonly preparePublisherDisplay: (
     call: GoogletagPublisherDisplayCall
-  ) => Readonly<{ action: 'forward' }> | Readonly<{ action: 'suppress' }>;
-  readonly preparePublisherRefresh: (
-    call: GoogletagPublisherRefreshCall
   ) =>
-    | Readonly<{ action: 'forward' }>
-    | Readonly<{ action: 'replace'; slots: readonly object[] }>
+    | Readonly<{ action: 'forward'; admission?: GoogletagPublisherCallAdmission }>
+    | Readonly<{ action: 'suppress' }>;
+  readonly preparePublisherRefresh: (call: GoogletagPublisherRefreshCall) =>
+    | Readonly<{ action: 'forward'; admission?: GoogletagPublisherCallAdmission }>
+    | Readonly<{
+        action: 'replace';
+        slots: readonly object[];
+        admission?: GoogletagPublisherCallAdmission;
+      }>
     | Readonly<{ action: 'suppress' }>;
   readonly projectionRegistry: (owner: NavigationSession) => ProjectionSlotRegistry;
   readonly recordPublisherDestruction: (slot: object) => boolean;
@@ -239,7 +244,7 @@ interface PhysicalSlot {
   lastResponseIdentifier: string | undefined;
   ownership: GptSlotOwnership;
   placementKeys: readonly string[];
-  publisherIntentCount: number;
+  readonly publisherAdmissions: PublisherIntentAdmissionState[];
   publisherElementIds: readonly string[];
   suppressPublisherDisplay: boolean;
   suppressPublisherRefresh: boolean;
@@ -249,6 +254,14 @@ interface PhysicalSlot {
   readonly slot: object;
   state: PhysicalSlotState;
   destroyAttempted: boolean;
+}
+
+interface PublisherIntentAdmissionState {
+  enqueued: boolean;
+  phase: 'committed' | 'consumed' | 'pending' | 'rolled_back';
+  readonly generation: object | undefined;
+  readonly physical: PhysicalSlot;
+  readonly record: InternalSlotRecord | undefined;
 }
 
 interface ReconciliationWindow {
@@ -956,7 +969,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       lastResponseIdentifier: undefined,
       ownership: 'trusted_server',
       placementKeys: oldPhysical.placementKeys,
-      publisherIntentCount: 0,
+      publisherAdmissions: [],
       publisherElementIds: Object.freeze([]),
       quarantineReason: undefined,
       record,
@@ -1021,7 +1034,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       lastResponseIdentifier: undefined,
       ownership: 'trusted_server',
       placementKeys: source.placementKeys,
-      publisherIntentCount: 0,
+      publisherAdmissions: [],
       publisherElementIds: Object.freeze([]),
       quarantineReason: 'request',
       record: undefined,
@@ -1372,15 +1385,20 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     if (!physical) return;
 
     if (type === 'slotRequested') {
+      const publisherAdmission = physical.publisherAdmissions[0];
+      if (publisherAdmission) {
+        const phase = publisherAdmission.phase;
+        removePublisherAdmission(publisherAdmission);
+        publisherAdmission.phase = 'consumed';
+        if (phase === 'pending') applyPublisherIntent(physical);
+        if (!physical.activeCycle && physical.state === 'live') {
+          physical.activeCycle = { intent: undefined, kind: 'publisher' };
+        }
+        return;
+      }
       if (physical.state !== 'live' || physical.activeCycle) return;
       const record = physical.record;
       const intent = record?.activeIntent;
-      if (physical.publisherIntentCount > 0) {
-        physical.publisherIntentCount -= 1;
-        if (intent && !intent.terminal) settle(intent, failed('cycle_unattributable'));
-        physical.activeCycle = { intent: undefined, kind: 'publisher' };
-        return;
-      }
       if (
         intent &&
         !intent.terminal &&
@@ -1457,6 +1475,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
   const retirePhysicalForNavigation = (physical: PhysicalSlot): void => {
     const record = physical.record;
     if (record) retireCommittedArtifact(record, physical);
+    invalidatePublisherAdmissions(physical);
     physical.record = undefined;
     if (physical.ownership === 'publisher') {
       if (physical.activeCycle) {
@@ -1887,7 +1906,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       if (
         physical.ownership !== 'trusted_server' ||
         physical.state !== 'live' ||
-        physical.publisherIntentCount > 0 ||
+        physical.publisherAdmissions.length > 0 ||
         !physical.definition
       ) {
         cancelReconciliation(record);
@@ -2250,7 +2269,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       lastResponseIdentifier: undefined,
       ownership,
       placementKeys: bindingPlacementKeys,
-      publisherIntentCount: 0,
+      publisherAdmissions: [],
       publisherElementIds:
         ownership === 'publisher' && definition
           ? Object.freeze([definition.elementId])
@@ -2332,7 +2351,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       settle(intent, failed('gpt_request_failed'));
       return handle;
     }
-    if (physical.publisherIntentCount > 0) {
+    if (physical.publisherAdmissions.length > 0) {
       settle(intent, failed('cycle_unattributable'));
       return handle;
     }
@@ -2462,7 +2481,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
           physical.record !== record ||
           physical.state !== 'live' ||
           physical.activeCycle ||
-          physical.publisherIntentCount > 0 ||
+          physical.publisherAdmissions.length > 0 ||
           setHasValue(admittedRecords, record) ||
           setHasValue(admittedPhysicalSlots, physical.slot)
         ) {
@@ -2660,7 +2679,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     if (record?.physical === physical) record.physical = undefined;
     physical.record = undefined;
     physical.activeCycle = undefined;
-    physical.publisherIntentCount = 0;
+    invalidatePublisherAdmissions(physical);
     physical.publisherElementIds = Object.freeze([]);
     physical.suppressPublisherDisplay = false;
     physical.suppressPublisherRefresh = false;
@@ -2673,34 +2692,171 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     return true;
   };
 
-  const recordPublisherIntent = (slot: object): boolean => {
-    const physical = weakMapValue(physicalByObject, slot);
-    if (!physical || (physical.state !== 'live' && !physical.activeCycle)) return false;
-    if (physical.publisherIntentCount >= MAX_PENDING_PUBLISHER_INTENTS) {
-      physical.state = 'quarantined';
-      physical.quarantineReason = 'request';
-      quarantinePhysicalPlacement(physical);
-      if (physical.record?.activeIntent) {
-        settle(physical.record.activeIntent, failed('cycle_unattributable'));
+  const publisherAdmissionIndex = (state: PublisherIntentAdmissionState): number => {
+    const admissions = state.physical.publisherAdmissions;
+    for (let index = 0; index < admissions.length; index += 1) {
+      if (admissions[index] === state) return index;
+    }
+    return -1;
+  };
+
+  const invalidatePublisherAdmissions = (physical: PhysicalSlot): void => {
+    for (let index = 0; index < physical.publisherAdmissions.length; index += 1) {
+      const admission = physical.publisherAdmissions[index];
+      if (!admission) continue;
+      admission.enqueued = false;
+      if (admission.phase === 'pending' || admission.phase === 'committed') {
+        admission.phase = 'rolled_back';
       }
-      if (physical.record?.queuedIntent) {
-        settle(physical.record.queuedIntent, failed('cycle_unattributable'));
-      }
+    }
+    physical.publisherAdmissions.length = 0;
+  };
+
+  const removePublisherAdmission = (state: PublisherIntentAdmissionState): boolean => {
+    if (!state.enqueued) return false;
+    const physical = state.physical;
+    const admissions = physical.publisherAdmissions;
+    const admissionIndex = publisherAdmissionIndex(state);
+    state.enqueued = false;
+    if (admissionIndex < 0) return false;
+    for (let index = admissionIndex; index < admissions.length - 1; index += 1) {
+      const next = admissions[index + 1];
+      if (next) admissions[index] = next;
+    }
+    admissions.length -= 1;
+    return true;
+  };
+
+  const publisherAdmissionIsCurrent = (state: PublisherIntentAdmissionState): boolean => {
+    const physical = state.physical;
+    if (
+      !state.enqueued ||
+      publisherAdmissionIndex(state) < 0 ||
+      weakMapValue(physicalByObject, physical.slot) !== physical ||
+      physical.record !== state.record ||
+      (physical.state !== 'live' && !physical.activeCycle)
+    ) {
       return false;
     }
+    const record = state.record;
+    return (
+      !record ||
+      (!record.state.disposed &&
+        record.state.owner.isCurrent() &&
+        record.state.owner.generation === state.generation)
+    );
+  };
+
+  const failPublisherIntentOverflow = (physical: PhysicalSlot): void => {
+    if (physical.state === 'retired') return;
+    physical.state = 'quarantined';
+    physical.quarantineReason = 'request';
+    quarantinePhysicalPlacement(physical);
     if (physical.record?.activeIntent) {
       settle(physical.record.activeIntent, failed('cycle_unattributable'));
     }
     if (physical.record?.queuedIntent) {
       settle(physical.record.queuedIntent, failed('cycle_unattributable'));
     }
-    physical.publisherIntentCount += 1;
+  };
+
+  const applyPublisherIntent = (physical: PhysicalSlot): void => {
+    if (physical.record?.activeIntent) {
+      settle(physical.record.activeIntent, failed('cycle_unattributable'));
+    }
+    if (physical.record?.queuedIntent) {
+      settle(physical.record.queuedIntent, failed('cycle_unattributable'));
+    }
     if (physical.activeCycle?.kind === 'trusted_server') {
       physical.activeCycle = { intent: undefined, kind: 'publisher' };
       physical.state = 'quarantined';
       physical.quarantineReason = 'completion';
     }
+  };
+
+  const rollbackPublisherAdmission = (state: PublisherIntentAdmissionState): void => {
+    if (state.phase !== 'pending') return;
+    removePublisherAdmission(state);
+    state.phase = 'rolled_back';
+  };
+
+  const commitPublisherAdmission = (state: PublisherIntentAdmissionState): boolean => {
+    if (state.phase === 'committed' || state.phase === 'consumed') return true;
+    if (state.phase !== 'pending') return false;
+    if (!publisherAdmissionIsCurrent(state)) {
+      rollbackPublisherAdmission(state);
+      return false;
+    }
+    const physical = state.physical;
+    if (physical.publisherAdmissions.length > MAX_PENDING_PUBLISHER_INTENTS) {
+      removePublisherAdmission(state);
+      state.phase = 'rolled_back';
+      failPublisherIntentOverflow(physical);
+      return false;
+    }
+    state.phase = 'committed';
+    applyPublisherIntent(physical);
     return true;
+  };
+
+  const preparePublisherIntent = (
+    slot: object
+  ):
+    | Readonly<{
+        readonly admission: GoogletagPublisherCallAdmission;
+        readonly commit: () => boolean;
+      }>
+    | undefined => {
+    const physical = weakMapValue(physicalByObject, slot);
+    if (
+      !physical ||
+      (physical.state !== 'live' && !physical.activeCycle) ||
+      physical.publisherAdmissions.length > MAX_PENDING_PUBLISHER_INTENTS
+    ) {
+      return undefined;
+    }
+    const record = physical.record;
+    const state: PublisherIntentAdmissionState = {
+      enqueued: true,
+      generation: record?.state.owner.generation,
+      phase: 'pending',
+      physical,
+      record,
+    };
+    physical.publisherAdmissions[physical.publisherAdmissions.length] = state;
+    const admission: GoogletagPublisherCallAdmission = Object.freeze({
+      commit: (): void => {
+        commitPublisherAdmission(state);
+      },
+      rollback: (): void => {
+        rollbackPublisherAdmission(state);
+      },
+    });
+    return Object.freeze({ admission, commit: () => commitPublisherAdmission(state) });
+  };
+
+  const compositePublisherAdmission = (
+    admissions: readonly GoogletagPublisherCallAdmission[]
+  ): GoogletagPublisherCallAdmission | undefined => {
+    if (admissions.length === 0) return undefined;
+    return Object.freeze({
+      commit: (): void => {
+        for (let index = 0; index < admissions.length; index += 1) {
+          admissions[index]?.commit();
+        }
+      },
+      rollback: (): void => {
+        for (let index = admissions.length - 1; index >= 0; index -= 1) {
+          admissions[index]?.rollback();
+        }
+      },
+    });
+  };
+
+  const recordPublisherIntent = (slot: object): boolean => {
+    const prepared = preparePublisherIntent(slot);
+    if (!prepared) return false;
+    return prepared.commit();
   };
 
   const publisherPhysicalForTarget = (target: unknown): PhysicalSlot | undefined => {
@@ -2818,7 +2974,9 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
 
   const preparePublisherDisplay = (
     call: GoogletagPublisherDisplayCall
-  ): Readonly<{ action: 'forward' }> | Readonly<{ action: 'suppress' }> => {
+  ):
+    | Readonly<{ action: 'forward'; admission?: GoogletagPublisherCallAdmission }>
+    | Readonly<{ action: 'suppress' }> => {
     let target: unknown;
     let initialLoadDisabled: unknown;
     try {
@@ -2833,15 +2991,22 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       physical.suppressPublisherDisplay = false;
       return Object.freeze({ action: 'suppress' });
     }
-    if (initialLoadDisabled !== true) recordPublisherIntent(physical.slot);
-    return Object.freeze({ action: 'forward' });
+    const prepared =
+      initialLoadDisabled === true ? undefined : preparePublisherIntent(physical.slot);
+    return prepared
+      ? Object.freeze({ action: 'forward', admission: prepared.admission })
+      : Object.freeze({ action: 'forward' });
   };
 
   const preparePublisherRefresh = (
     call: GoogletagPublisherRefreshCall
   ):
-    | Readonly<{ action: 'forward' }>
-    | Readonly<{ action: 'replace'; slots: readonly object[] }>
+    | Readonly<{ action: 'forward'; admission?: GoogletagPublisherCallAdmission }>
+    | Readonly<{
+        action: 'replace';
+        slots: readonly object[];
+        admission?: GoogletagPublisherCallAdmission;
+      }>
     | Readonly<{ action: 'suppress' }> => {
     let slots: readonly object[];
     try {
@@ -2852,6 +3017,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     if (!Array.isArray(slots)) return Object.freeze({ action: 'forward' });
     let suppressed = false;
     const forwarded: object[] = [];
+    const admissions: GoogletagPublisherCallAdmission[] = [];
     for (let index = 0; index < slots.length; index += 1) {
       const slot = slots[index];
       if (!slot) continue;
@@ -2862,11 +3028,21 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         continue;
       }
       forwarded[forwarded.length] = slot;
-      if (physical?.ownership === 'publisher') recordPublisherIntent(slot);
+      if (physical?.ownership === 'publisher') {
+        const prepared = preparePublisherIntent(slot);
+        if (prepared) admissions[admissions.length] = prepared.admission;
+      }
     }
-    if (!suppressed) return Object.freeze({ action: 'forward' });
+    const admission = compositePublisherAdmission(admissions);
+    if (!suppressed) {
+      return admission
+        ? Object.freeze({ action: 'forward', admission })
+        : Object.freeze({ action: 'forward' });
+    }
     if (forwarded.length === 0) return Object.freeze({ action: 'suppress' });
-    return Object.freeze({ action: 'replace', slots: Object.freeze(forwarded) });
+    return admission
+      ? Object.freeze({ action: 'replace', admission, slots: Object.freeze(forwarded) })
+      : Object.freeze({ action: 'replace', slots: Object.freeze(forwarded) });
   };
 
   const service: SlotService = Object.freeze({
