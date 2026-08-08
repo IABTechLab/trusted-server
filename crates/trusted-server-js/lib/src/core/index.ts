@@ -1,7 +1,6 @@
 // Sole production bootstrap for the resilient TSJS runtime.
 export type {
   AddAdUnitsResult,
-  AdUnit,
   GptDiagnosticsApi,
   GptDiagnosticsExportV1,
   GptDiagnosticsRequestCycle,

@@ -1,8 +1,6 @@
-// Programmatic ad-unit validation plus the legacy registry retained until Task 19.
-import type { AdUnit, AddAdUnitsResult, ProgrammaticAdUnit, Size } from './types';
+// Programmatic ad-unit validation for the hard-cutover runtime.
+import type { AddAdUnitsResult, ProgrammaticAdUnit } from './types';
 import { validBoundedString } from './contracts/auction_projection';
-import { log } from './log';
-import { toArray } from './util';
 
 const MAX_AUCTION_BODY_BYTES = 256 * 1024;
 const MAX_PROGRAMMATIC_UNITS = 256;
@@ -666,30 +664,4 @@ export function serializeAuctionRequestBody(
   } catch {
     return undefined;
   }
-}
-
-// The mutable merge registry remains connected only to the pre-cutover core entry.
-const legacyRegistry = new Map<string, AdUnit>();
-
-export function addAdUnits(units: AdUnit | AdUnit[]): void {
-  const normalized = toArray(units);
-  for (let index = 0; index < normalized.length; index += 1) {
-    const unit = normalized[index];
-    if (!unit?.code) continue;
-    legacyRegistry.set(unit.code, { ...legacyRegistry.get(unit.code), ...unit });
-  }
-  log.info('addAdUnits:', { count: toArray(units).length });
-}
-
-export function firstSize(unit: AdUnit): Size | null {
-  const sizes = unit.mediaTypes?.banner?.sizes;
-  return sizes && sizes.length ? sizes[0]! : null;
-}
-
-export function getAllUnits(): AdUnit[] {
-  return Array.from(legacyRegistry.values());
-}
-
-export function getUnit(code: string): AdUnit | undefined {
-  return legacyRegistry.get(code);
 }

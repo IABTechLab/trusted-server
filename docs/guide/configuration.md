@@ -868,11 +868,9 @@ fetches never carry Basic credentials, so every visitor gets `401` — on
 `/_ts/page-bids` that means no ads after any client-side navigation. Match the
 admin routes specifically (`^/_ts/admin`) instead.
 
-Upgrading from a release before `/_ts/page-bids` existed: if any handler
-pattern covers it, narrow the pattern. The Trusted Server JS bundle falls back
-to the deprecated `/__ts/page-bids` alias in the meantime, but that alias is
-scheduled for removal
-([#970](https://github.com/IABTechLab/trusted-server/issues/970)).
+If an older deployment used a different SPA auction path, update its handler
+rules at the same time as the TSJS cutover. `/_ts/page-bids` is the only SPA
+auction endpoint; older path spellings are unknown routes.
 
 :::
 

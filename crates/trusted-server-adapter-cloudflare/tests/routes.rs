@@ -149,7 +149,9 @@ async fn aps_cutover_renderer_and_family_failures_are_local() {
         ("TRACE", "/integrations/aps/renderer/v1", 405),
         ("CONNECT", "/integrations/aps/renderer/v1", 405),
         ("PROPFIND", "/integrations/aps/renderer/v1", 405),
+        ("GET", "/integrations/aps/renderer", 404),
         ("GET", "/integrations/aps/renderer/v2", 404),
+        ("GET", "/integrations/aps/runner/v1.js", 404),
         ("GET", "/integrations/aps", 404),
     ] {
         let request = request_builder()
@@ -355,11 +357,9 @@ fn all_explicit_routes_are_registered() {
     for (method, path) in expected {
         assert_route_registered(method, path);
     }
-    let routes = registered_routes();
-    assert!(
-        routes.iter().all(|(_, path)| path != "/__ts/page-bids"),
-        "hard cutover must not retain the deprecated page-bids alias: {routes:?}"
-    );
+    for method in LEGACY_ADMIN_DENY_METHODS {
+        assert_route_registered(method, "/__ts/page-bids");
+    }
 
     for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
         for method in LEGACY_ADMIN_DENY_METHODS {

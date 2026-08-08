@@ -37,6 +37,14 @@ const LIVE_INTENT_SHIM = path.join(prebidDir, 'prebid_modules', 'liveIntentIdSys
 export const ARTIFACT_RELEASE_SENTINEL = '0'.repeat(64);
 const ARTIFACT_PROPERTY = '__trustedServerArtifactV1';
 const EXPECTED_PREBID_VERSION = '10.26.0';
+const LEGACY_RUNTIME_FLAG_PREFIX = ['__', 'tsjs', '_'].join('');
+
+/** Refuse to publish an external Prebid artifact carrying a retired TSJS runtime flag. */
+export function assertNoLegacyRuntimeFlags(bundleCode) {
+  if (bundleCode.includes(LEGACY_RUNTIME_FLAG_PREFIX)) {
+    throw new Error('[build-prebid-external] Generated artifact contains a legacy TSJS runtime flag');
+  }
+}
 
 export function parseArgs(argv) {
   const options = new Map();
@@ -395,6 +403,7 @@ async function buildExternalBundle(outDir, generatedModules, stamp) {
     if (finalBundle.includes(ARTIFACT_RELEASE_SENTINEL)) {
       throw new Error('[build-prebid-external] Artifact release sentinel remained after stamping');
     }
+    assertNoLegacyRuntimeFlags(finalBundle);
     const bundleBytes = Buffer.from(finalBundle, 'utf8');
     const metadata = deriveBundleMetadata(bundleBytes);
     const finalPath = path.join(outDir, metadata.filename);

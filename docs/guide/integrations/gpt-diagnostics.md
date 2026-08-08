@@ -390,7 +390,7 @@ use live on a separate internal channel (`window.tsjs.gptDiagnosticsRecorder`) t
 is not part of this contract and is not supported for operator use.
 
 ```js
-const diagnostics = window.tsjs.gptDiagnostics
+const diagnostics = window.tsjs.diagnostics.gpt
 
 diagnostics.snapshot()
 diagnostics.export()

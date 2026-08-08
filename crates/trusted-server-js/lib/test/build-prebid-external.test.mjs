@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   ARTIFACT_RELEASE_SENTINEL,
+  assertNoLegacyRuntimeFlags,
   deriveBundleMetadata,
   main,
   parseArgs,
@@ -18,6 +19,13 @@ import {
 } from '../build-prebid-external.mjs';
 
 describe('build-prebid-external metadata', () => {
+  it('rejects any legacy TSJS runtime flag before publishing an artifact', () => {
+    expect(() => assertNoLegacyRuntimeFlags('window.' + '__' + 'tsjs_prebid = {};')).toThrow(
+      /legacy TSJS runtime flag/
+    );
+    expect(() => assertNoLegacyRuntimeFlags('window.pbjs = { que: [] };')).not.toThrow();
+  });
+
   it('derives filename, sha256, and SRI from exact bundle bytes', () => {
     const bundleBytes = Buffer.from('console.log("trusted prebid");\n', 'utf8');
     const sha256 = crypto.createHash('sha256').update(bundleBytes).digest('hex');
@@ -103,8 +111,7 @@ describe('build-prebid-external metadata', () => {
       expect(bundle).toContain('getBidResponsesForAdUnitCode');
       expect(bundle).toContain(manifest.artifactReleaseId);
       expect(bundle).not.toContain(ARTIFACT_RELEASE_SENTINEL);
-      expect(bundle).not.toContain('__tsjs_prebid_bundle');
-      expect(bundle).not.toContain('__tsjsPrebidShimInstalled');
+      expect(bundle).not.toContain('__' + 'tsjs_');
       expect(manifest.bidderCodes).toEqual(['rubicon']);
       expect(bundle.split(manifest.artifactReleaseId)).toHaveLength(2);
       const normalized = bundle.replace(manifest.artifactReleaseId, ARTIFACT_RELEASE_SENTINEL);

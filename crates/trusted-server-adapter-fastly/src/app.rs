@@ -1208,6 +1208,13 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         primary_methods: &[Method::GET, Method::OPTIONS],
         handler: NamedRouteHandler::PageBids,
     },
+    // A removed route must be denied here, before the publisher fallback, so
+    // its response is always a local unknown-route result rather than an alias.
+    NamedRoute {
+        path: "/__ts/page-bids",
+        primary_methods: LEGACY_ADMIN_DENY_METHODS,
+        handler: NamedRouteHandler::LegacyAdminDenied,
+    },
     NamedRoute {
         path: "/first-party/proxy",
         primary_methods: &[Method::GET],
@@ -1614,7 +1621,17 @@ mod tests {
             ),
             (
                 Method::GET,
+                "/integrations/aps/renderer",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::GET,
                 "/integrations/aps/renderer/v2",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::GET,
+                "/integrations/aps/runner/v1.js",
                 StatusCode::NOT_FOUND,
             ),
             (Method::GET, "/integrations/aps", StatusCode::NOT_FOUND),
@@ -1955,10 +1972,10 @@ mod tests {
     }
 
     #[test]
-    fn page_bids_serves_only_the_canonical_path() {
-        // The hard cutover exposes only the canonical single-underscore path.
-        // Pin the literal the client fetches and reject accidental reintroduction
-        // of the former compatibility alias.
+    fn page_bids_keeps_the_canonical_handler_and_denies_the_removed_alias_locally() {
+        // The hard cutover exposes only the canonical single-underscore page-bids
+        // handler. The removed path is an explicit local 404, never an alias or
+        // publisher-fallback route.
         assert_eq!(
             PAGE_BIDS_PATH, "/_ts/page-bids",
             "canonical page-bids path must match the path tsjs fetches"
@@ -1969,12 +1986,15 @@ mod tests {
             .expect("canonical page-bids path should be registered");
         assert!(matches!(route.handler, NamedRouteHandler::PageBids));
         assert_eq!(route.primary_methods, &[Method::GET, Method::OPTIONS]);
-        assert!(
-            NAMED_ROUTES
-                .iter()
-                .all(|route| route.path != "/__ts/page-bids"),
-            "hard cutover must not retain the deprecated page-bids alias"
-        );
+        let removed = NAMED_ROUTES
+            .iter()
+            .find(|route| route.path == "/__ts/page-bids")
+            .expect("removed page-bids path should be denied locally");
+        assert!(matches!(
+            removed.handler,
+            NamedRouteHandler::LegacyAdminDenied
+        ));
+        assert_eq!(removed.primary_methods, super::LEGACY_ADMIN_DENY_METHODS);
     }
 
     #[test]

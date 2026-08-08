@@ -386,7 +386,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 13] {
+fn named_routes() -> [NamedRoute; 14] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -458,6 +458,13 @@ fn named_routes() -> [NamedRoute; 13] {
             path: PAGE_BIDS_PATH,
             primary_methods: &[Method::GET, Method::OPTIONS],
             handler: NamedRouteHandler::PageBids,
+        },
+        // This removed route must never reach the publisher fallback, which
+        // would make the hard cutover depend on the origin response.
+        NamedRoute {
+            path: "/__ts/page-bids",
+            primary_methods: LEGACY_ADMIN_DENY_METHODS,
+            handler: NamedRouteHandler::LegacyAdminDenied,
         },
         NamedRoute {
             path: "/first-party/proxy",

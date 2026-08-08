@@ -4,7 +4,7 @@ import {
   disposeSourcepointConsentMirror,
   initializeSourcepointConsentMirror,
   mirrorSourcepointConsent,
-} from '../../../src/integrations/sourcepoint';
+} from '../../../src/integrations/sourcepoint/consent_mirror';
 import { createSourcepointRuntime } from '../../../src/integrations/sourcepoint/module';
 
 describe('Sourcepoint integration initialization', () => {

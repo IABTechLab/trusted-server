@@ -262,7 +262,7 @@ export function parseTrustedServerAuctionResponseV1(
 /**
  * Build an {@link AdRequest} from an array of ad-unit-like objects.
  *
- * Accepts both plain tsjs `AdUnit` objects and Prebid-style `BidRequest`
+ * Accepts direct-auction programmatic units and Prebid-style `BidRequest`
  * objects (which carry `adUnitCode` instead of `code`).
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

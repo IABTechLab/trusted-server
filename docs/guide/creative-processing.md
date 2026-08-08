@@ -108,8 +108,9 @@ separately constrained asset capability is tracked in
 
 The second is **dynamic** resource signing,
 which rewrites URLs on elements a creative inserts at runtime. It is installed
-only when `renderGuard` is enabled in `tsCreativeConfig`, and that is `false`
-by default — deployments using the default configuration are unaffected. Where
+only when `renderGuard` is enabled in the immutable
+`window.tsjs.boot.creative` configuration, and that is `false` by default —
+deployments using the default configuration are unaffected. Where
 it is enabled, runtime-inserted `<img>`/`<iframe>` URLs cannot be signed from an
 opaque origin (the signing request is blocked by CORS), so they load directly
 from third parties; the sandbox still isolates them from the publisher origin,
@@ -753,29 +754,33 @@ impl IntegrationScriptRewriter for NextJsIntegration {
 
 ### Head Injectors
 
-Integrations can inject HTML snippets at the start of `<head>`, immediately after the unified TSJS bundle:
+Integrations can inject HTML snippets at the start of `<head>`, before the unified TSJS bundle:
 
-**Example**: An integration injects configuration that runs after the TSJS API is available
+**Example**: An integration emits release-bound configuration through the one transient pre-core transport
 
 ```rust
 impl IntegrationHeadInjector for MyIntegration {
     fn integration_id(&self) -> &'static str { "my_integration" }
 
     fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        vec![format!(
-            r#"<script>tsjs.setConfig({{ host: "{}" }});</script>"#,
-            ctx.request_host
-        )]
+        let config_json = serde_json::to_string(&serde_json::json!({
+            "host": ctx.request_host,
+        }))
+        .expect("should serialize integration config")
+        .replace("</", "<\\/");
+        vec![super::integration_config_script("my_integration", &config_json)]
     }
 }
 ```
 
 **Behavior**:
 
-- Snippets are prepended into `<head>` after the TSJS bundle tag
+- Snippets are prepended into `<head>` before the TSJS bundle tags
 - Called once per HTML response
 - Multiple integrations can each contribute snippets
 - If no snippets are returned, no extra markup is added
+
+The core snapshots and freezes each manifest integration's configuration, deletes the transient transport, and exposes only the final immutable `window.tsjs.boot` and `TsjsApi` surfaces.
 
 See [Integration Guide](/guide/integration-guide) for creating custom rewriters.
 

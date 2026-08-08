@@ -103,7 +103,9 @@ async fn aps_cutover_renderer_and_family_failures_are_local() {
         ("TRACE", "/integrations/aps/renderer/v1", 405),
         ("CONNECT", "/integrations/aps/renderer/v1", 405),
         ("PROPFIND", "/integrations/aps/renderer/v1", 405),
+        ("GET", "/integrations/aps/renderer", 404),
         ("GET", "/integrations/aps/renderer/v2", 404),
+        ("GET", "/integrations/aps/runner/v1.js", 404),
         ("GET", "/integrations/aps", 404),
     ] {
         let request = request_builder()
@@ -601,8 +603,8 @@ async fn auction_is_routed() {
     assert_ne!(resp.status().as_u16(), 404, "/auction must be routed");
 }
 
-/// The canonical SPA re-auction path reaches page-bids, while the hard cutover
-/// leaves the former double-underscore alias to the publisher fallback.
+/// The canonical SPA re-auction path reaches page-bids, while the removed
+/// double-underscore alias is denied locally with 404.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn page_bids_get_is_routed_only_on_the_canonical_path() {
     let canonical = request_builder()
@@ -624,13 +626,7 @@ async fn page_bids_get_is_routed_only_on_the_canonical_path() {
         .body(edgezero_core::body::Body::empty())
         .expect("should build request");
     let former_alias = route(test_router(), former_alias).await;
-    let alias_body =
-        String::from_utf8_lossy(&former_alias.into_body().into_bytes().unwrap_or_default())
-            .into_owned();
-    assert!(
-        !alias_body.contains("Creative opportunities not configured"),
-        "former compatibility alias must not reach page-bids"
-    );
+    assert_eq!(former_alias.status().as_u16(), 404);
 }
 
 // ---------------------------------------------------------------------------
