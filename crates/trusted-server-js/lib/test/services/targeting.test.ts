@@ -205,6 +205,67 @@ describe('owner-aware targeting journal', () => {
     clearAll?.release();
     expect(values.size).toBe(0);
   });
+
+  it.each(['same_set', 'different_set', 'per_key_clear', 'clear_all'] as const)(
+    'invalidates after publisher wrapper replacement for %s without calling that replacement on release',
+    async (mutation) => {
+      const values = new Map<string, readonly string[]>([
+        ['key', ['publisher']],
+        ['sibling', ['publisher-sibling']],
+      ]);
+      const slot = {
+        clearTargeting: vi.fn((key?: string) => {
+          if (key === undefined) values.clear();
+          else values.delete(key);
+        }),
+        getTargeting: vi.fn((key: string) => Object.freeze([...(values.get(key) ?? [])])),
+        setTargeting: vi.fn((key: string, value: string | readonly string[]) => {
+          values.set(key, Object.freeze(typeof value === 'string' ? [value] : [...value]));
+        }),
+      };
+      const adapter = adapterForTargetingSlot(slot);
+      const service = createTargetingService();
+      await expect(
+        service.observePublisherMutations(slot, adapter).result
+      ).resolves.toBeUndefined();
+      const frame = await adapter.run((gpt) =>
+        service.own(slot, 'key', 'trusted', 'owner', {
+          clearTargeting: (key) => gpt.clearTargeting(slot, key),
+          getTargeting: (key) => gpt.getTargeting(slot, key),
+          setTargeting: (key, value) => gpt.setTargeting(slot, key, value),
+        })
+      ).result;
+
+      const publisherSet = vi.fn((key: string, value: string | readonly string[]) => {
+        values.set(key, Object.freeze(typeof value === 'string' ? [value] : [...value]));
+      });
+      const publisherClear = vi.fn((key?: string) => {
+        if (key === undefined) values.clear();
+        else values.delete(key);
+      });
+      if (mutation === 'same_set' || mutation === 'different_set') {
+        slot.setTargeting = publisherSet;
+        slot.setTargeting('key', mutation === 'same_set' ? 'trusted' : 'publisher-new');
+      } else {
+        slot.clearTargeting = publisherClear;
+        slot.clearTargeting(mutation === 'per_key_clear' ? 'key' : undefined);
+      }
+
+      frame?.release();
+
+      expect(publisherSet).toHaveBeenCalledTimes(
+        mutation === 'same_set' || mutation === 'different_set' ? 1 : 0
+      );
+      expect(publisherClear).toHaveBeenCalledTimes(
+        mutation === 'per_key_clear' || mutation === 'clear_all' ? 1 : 0
+      );
+      if (mutation === 'same_set') expect(values.get('key')).toEqual(['trusted']);
+      else if (mutation === 'different_set') expect(values.get('key')).toEqual(['publisher-new']);
+      else expect(values.get('key')).toBeUndefined();
+      if (mutation === 'clear_all') expect(values.size).toBe(0);
+      expect(service.snapshotForTest()).toEqual({ frames: 0, slots: 0 });
+    }
+  );
 });
 
 function adapterForTargetingSlot(slot: object) {
@@ -289,6 +350,43 @@ describe('adapter-owned targeting interception', () => {
     expect(slot.clearTargeting).toBe(originalClear);
     slot.setTargeting('native', 'value');
     expect(second).toHaveBeenCalledTimes(2);
+  });
+
+  it('reports wrapper replacement fail-closed and never overwrites a publisher replacement', async () => {
+    const originalSet = vi.fn();
+    const originalClear = vi.fn();
+    const replacementSet = vi.fn();
+    const target = {
+      clearTargeting: originalClear,
+      getTargeting: () => [],
+      setTargeting: originalSet,
+    };
+    let trapDescriptors = false;
+    const slot = new Proxy(target, {
+      getOwnPropertyDescriptor: (current, key) => {
+        if (trapDescriptors) throw new Error('publisher descriptor trap');
+        return Reflect.getOwnPropertyDescriptor(current, key);
+      },
+    });
+    const adapter = adapterForTargetingSlot(slot);
+    const observation = await adapter.run((gpt) =>
+      gpt.observeTargeting(slot, { beforePublisherMutation: vi.fn() })
+    ).result;
+
+    expect(observation.isCurrent()).toBe(true);
+    target.setTargeting = replacementSet;
+    expect(observation.isCurrent()).toBe(false);
+    observation();
+    expect(target.setTargeting).toBe(replacementSet);
+    expect(target.clearTargeting).toBe(originalClear);
+
+    const trapped = await adapter.run((gpt) =>
+      gpt.observeTargeting(slot, { beforePublisherMutation: vi.fn() })
+    ).result;
+    trapDescriptors = true;
+    expect(() => trapped.isCurrent()).not.toThrow();
+    expect(trapped.isCurrent()).toBe(false);
+    expect(() => trapped()).not.toThrow();
   });
 
   it('rolls back the first method when transactional observer installation cannot wrap the second', async () => {

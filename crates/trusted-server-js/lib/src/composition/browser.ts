@@ -578,6 +578,7 @@ export function createTestBrowserRuntimeComposition(
         },
         googletag: composition.adapters.googletag,
         ...(reconciliation ? { reconciliation } : {}),
+        warnPublisherHandoffMismatch: (message, details) => log.warn(message, details),
       });
       const targetingService = createTargetingService();
       const reservationService = createReservationService({

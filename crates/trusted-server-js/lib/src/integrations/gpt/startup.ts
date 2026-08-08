@@ -14,6 +14,7 @@ type GptPublisherSlotBoundary = Pick<
   | 'preparePublisherDisplay'
   | 'preparePublisherRefresh'
   | 'recordPublisherDestruction'
+  | 'start'
 >;
 
 export interface GptStartup {
@@ -48,6 +49,9 @@ export function createGptStartup(options: GptStartupOptions): GptStartup {
       });
       return options.googletag.observePublisherCalls(observer);
     },
-    start: (config: unknown): void => options.start?.(config),
+    start: (config: unknown): void => {
+      options.slots().start();
+      options.start?.(config);
+    },
   });
 }

@@ -68,7 +68,7 @@ function createGptHarness(
     clearTargeting: vi.fn(),
     display,
     getTargeting: vi.fn(() => []),
-    observeTargeting: () => vi.fn(),
+    observeTargeting: () => Object.assign(vi.fn(), { isCurrent: () => true }),
     refresh: options.missingRefresh
       ? (undefined as unknown as GoogletagFacade['refresh'])
       : refresh,
@@ -486,7 +486,13 @@ describe('slot registry', () => {
 
   it('hands an exact late publisher definition the TS slot and consumes only duplicate requests', async () => {
     const gpt = createGptHarness({ initialLoadDisabled: true });
-    const service = createSlotService({ googletag: gpt.adapter });
+    const warnPublisherHandoffMismatch = vi.fn(() => {
+      throw new Error('fictional local logger failure');
+    });
+    const service = createSlotService({
+      googletag: gpt.adapter,
+      warnPublisherHandoffMismatch,
+    });
     const { navigation, runtime } = createRuntimeWithNavigation();
     const slot = bindTrustedSlot(service, navigation);
 
@@ -498,6 +504,13 @@ describe('slot registry', () => {
         sizes: Object.freeze([[728, 90]]),
       })
     ).toEqual({ action: 'handoff', slot });
+    expect(warnPublisherHandoffMismatch).toHaveBeenCalledExactlyOnceWith(
+      'GPT publisher handoff metadata mismatch',
+      Object.freeze({ formatsMismatch: true, pathMismatch: true })
+    );
+    expect(JSON.stringify(warnPublisherHandoffMismatch.mock.calls[0]).length).toBeLessThanOrEqual(
+      128
+    );
     expect(
       service.preparePublisherDisplay({ initialLoadDisabled: true, target: 'slot-div' })
     ).toEqual({ action: 'suppress' });
@@ -535,15 +548,37 @@ describe('slot registry', () => {
     expect(gpt.destroySlots).not.toHaveBeenCalled();
   });
 
+  it('does not warn when an exact publisher handoff matches path and formats', () => {
+    const warnPublisherHandoffMismatch = vi.fn();
+    const service = createSlotService({
+      googletag: createGptHarness().adapter,
+      warnPublisherHandoffMismatch,
+    });
+    const navigation = createNavigation();
+    const slot = bindTrustedSlot(service, navigation);
+
+    expect(
+      service.claimPublisherGptSlot({
+        adUnitPath: '/network/slot',
+        elementId: 'slot-div',
+        initialLoadDisabled: false,
+        sizes: Object.freeze([[300, 250]]),
+      })
+    ).toEqual({ action: 'handoff', slot });
+    expect(warnPublisherHandoffMismatch).not.toHaveBeenCalled();
+  });
+
   it('hydrates only one disconnected TS fallback with the configured prefix, path, and sizes', () => {
     const dom = createReconciliationBoundary();
     const firstElement = {};
     const secondElement = {};
     dom.put('slot-first', firstElement);
     dom.put('slot-second', secondElement);
+    const warnPublisherHandoffMismatch = vi.fn();
     const service = createSlotService({
       googletag: createGptHarness().adapter,
       reconciliation: dom.boundary,
+      warnPublisherHandoffMismatch,
     });
     const navigation = createNavigation();
     expect(
@@ -585,6 +620,7 @@ describe('slot registry', () => {
       action: 'forward',
     });
     expect(service.claimPublisherGptSlot(hydration)).toEqual({ action: 'handoff', slot: first });
+    expect(warnPublisherHandoffMismatch).not.toHaveBeenCalled();
   });
 
   it('suppresses the exact first explicit refresh after a disabled-load handoff', () => {
@@ -877,6 +913,130 @@ describe('navigation-owned DOM reconciliation', () => {
       expect.objectContaining({ id: 'slot' }),
     ]);
     expect(gpt.defineSlot).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['unresolved', 'destroy_false'],
+    ['unresolved', 'destroy_throw'],
+    ['ambiguous', 'destroy_false'],
+    ['ambiguous', 'destroy_throw'],
+  ] as const)('settles final %s cleanup %s as gpt_request_failed', async (resolution, failure) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const gpt = createGptHarness();
+    if (failure === 'destroy_false') gpt.destroySlots.mockReturnValue(false);
+    else {
+      gpt.destroySlots.mockImplementation(() => {
+        throw new Error('fictional destroy failure');
+      });
+    }
+    const dom = createReconciliationBoundary();
+    dom.put('slot-div', {});
+    const service = createSlotService({
+      googletag: gpt.adapter,
+      now: () => Date.now(),
+      reconciliation: dom.boundary,
+    });
+    const navigation = createNavigation();
+    bindTrustedSlot(service, navigation);
+    service.activate();
+    if (resolution === 'ambiguous') dom.replaceAmbiguously('slot-div', [{}, {}]);
+    else dom.disconnect('slot-div');
+    await vi.advanceTimersByTimeAsync(4_999);
+    const request = service.request({
+      intentId: `${resolution}-${failure}`,
+      navigationGeneration: navigation.generation,
+      operation: 'display',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+
+    await vi.advanceTimersByTimeAsync(1);
+
+    await expect(request.result).resolves.toEqual({
+      status: 'failed',
+      reason: 'gpt_request_failed',
+    });
+    expect(gpt.destroySlots).toHaveBeenCalledExactlyOnceWith([
+      expect.objectContaining({ id: 'slot' }),
+    ]);
+  });
+
+  it('keeps final cleanup pending and lets navigation cancellation beat its late result', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const gpt = createGptHarness();
+    const dom = createReconciliationBoundary();
+    dom.put('slot-div', {});
+    const service = createSlotService({
+      googletag: gpt.adapter,
+      now: () => Date.now(),
+      reconciliation: dom.boundary,
+    });
+    const { navigation, runtime } = createRuntimeWithNavigation();
+    bindTrustedSlot(service, navigation);
+    service.activate();
+    dom.disconnect('slot-div');
+    await vi.advanceTimersByTimeAsync(4_999);
+    const request = service.request({
+      intentId: 'navigation-wins-late-cleanup',
+      navigationGeneration: navigation.generation,
+      operation: 'display',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+
+    vi.advanceTimersByTime(1);
+    expect(request.status).toBe('active');
+    expect(gpt.destroySlots).toHaveBeenCalledTimes(1);
+    expect(runtime.replaceNavigation().ok).toBe(true);
+    await expect(request.result).resolves.toEqual({
+      status: 'cancelled',
+      reason: 'navigation_disposed',
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(request.status).toBe('terminal');
+    expect(gpt.destroySlots).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets request supersession win while final cleanup completes later', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const gpt = createGptHarness({ synchronousRun: false });
+    const dom = createReconciliationBoundary();
+    dom.put('slot-div', {});
+    const service = createSlotService({
+      googletag: gpt.adapter,
+      now: () => Date.now(),
+      reconciliation: dom.boundary,
+    });
+    const navigation = createNavigation();
+    bindTrustedSlot(service, navigation);
+    service.activate();
+    dom.disconnect('slot-div');
+    await vi.advanceTimersByTimeAsync(4_999);
+    const request = service.request({
+      intentId: 'supersession-wins-late-cleanup',
+      navigationGeneration: navigation.generation,
+      operation: 'display',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+
+    vi.advanceTimersByTime(1);
+    expect(request.status).toBe('active');
+    request.dispose();
+    await expect(request.result).resolves.toEqual({
+      status: 'cancelled',
+      reason: 'superseded',
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(request.status).toBe('terminal');
+    expect(gpt.destroySlots).toHaveBeenCalledTimes(1);
   });
 
   it('releases the exact committed artifact before retiring a failed reconciliation', async () => {
@@ -1641,19 +1801,23 @@ function readyListenerBinding() {
 }
 
 describe('binding-aware GPT listener activation', () => {
-  it('retries after readiness timeout and never duplicates listeners on the recovered binding', async () => {
+  it('installs observation without timers and starts readiness only after commit', async () => {
     vi.useFakeTimers();
     const target: { googletag?: unknown } = {};
     const adapter = createBrowserGoogletagAdapter(target);
     const service = createSlotService({ googletag: adapter });
-    const missing = service.activate();
+    service.activate();
+    expect(vi.getTimerCount()).toBe(0);
+
+    const missing = service.start();
+    expect(vi.getTimerCount()).toBe(1);
     await vi.advanceTimersByTimeAsync(10_000);
     await expect(missing.result).rejects.toMatchObject({ code: 'external_ready_timeout' });
 
     const ready = readyListenerBinding();
     target.googletag = ready.binding;
-    await expect(service.activate().result).resolves.toBeUndefined();
-    await expect(service.activate().result).resolves.toBeUndefined();
+    await expect(service.start().result).resolves.toBeUndefined();
+    await expect(service.start().result).resolves.toBeUndefined();
 
     expect(ready.addEventListener.mock.calls.map(([type]) => type)).toEqual([
       'slotRequested',
@@ -1667,10 +1831,11 @@ describe('binding-aware GPT listener activation', () => {
     const target: { googletag?: unknown } = { googletag: first.binding };
     const adapter = createBrowserGoogletagAdapter(target);
     const service = createSlotService({ googletag: adapter });
-    await expect(service.activate().result).resolves.toBeUndefined();
+    service.activate();
+    await expect(service.start().result).resolves.toBeUndefined();
     target.googletag = second.binding;
-    await expect(service.activate().result).resolves.toBeUndefined();
-    await expect(service.activate().result).resolves.toBeUndefined();
+    await expect(service.start().result).resolves.toBeUndefined();
+    await expect(service.start().result).resolves.toBeUndefined();
 
     expect(first.addEventListener).toHaveBeenCalledTimes(2);
     expect(second.addEventListener).toHaveBeenCalledTimes(2);
@@ -1683,6 +1848,59 @@ describe('binding-aware GPT listener activation', () => {
 
 describe('physical GPT cycles', () => {
   afterEach(() => vi.useRealTimers());
+
+  it('preserves external_queue_full when GPT readiness admission is saturated', async () => {
+    vi.useFakeTimers();
+    const target: { googletag?: unknown } = {};
+    const adapter = createBrowserGoogletagAdapter(target);
+    const service = createSlotService({ googletag: adapter });
+    const navigation = createNavigation();
+    bindTrustedSlot(service, navigation);
+    for (let index = 0; index < 64; index += 1) {
+      const queued = adapter.run(() => undefined);
+      void queued.result.catch(() => undefined);
+    }
+
+    const request = service.request({
+      intentId: 'queue-capacity',
+      navigationGeneration: navigation.generation,
+      operation: 'display',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+
+    await expect(request.result).resolves.toEqual({
+      status: 'failed',
+      reason: 'external_queue_full',
+    });
+    service.dispose();
+    adapter.dispose();
+  });
+
+  it('preserves external_ready_timeout when GPT never becomes ready', async () => {
+    vi.useFakeTimers();
+    const target: { googletag?: unknown } = {};
+    const adapter = createBrowserGoogletagAdapter(target);
+    const service = createSlotService({ googletag: adapter });
+    const navigation = createNavigation();
+    bindTrustedSlot(service, navigation);
+    const request = service.request({
+      intentId: 'readiness-deadline',
+      navigationGeneration: navigation.generation,
+      operation: 'display',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    await expect(request.result).resolves.toEqual({
+      status: 'failed',
+      reason: 'external_ready_timeout',
+    });
+    service.dispose();
+    adapter.dispose();
+  });
 
   it('records intent before a synchronous slotRequested event and supports SRA per slot', async () => {
     vi.useFakeTimers();

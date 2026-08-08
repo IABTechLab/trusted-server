@@ -474,6 +474,8 @@ describe('transactional GPT integration module', () => {
     [{ status: 'failed', reason: 'slot_quarantined' }, 'slot_quarantined'],
     [{ status: 'failed', reason: 'gpt_request_timeout' }, 'gpt_request_timeout'],
     [{ status: 'failed', reason: 'gpt_completion_timeout' }, 'gpt_completion_timeout'],
+    [{ status: 'failed', reason: 'external_queue_full' }, 'external_queue_full'],
+    [{ status: 'failed', reason: 'external_ready_timeout' }, 'external_ready_timeout'],
     [{ status: 'cancelled', reason: 'navigation_disposed' }, 'navigation_disposed'],
   ] as const)(
     'does not start fallback for non-empty terminal cycle outcome %s',
@@ -569,7 +571,7 @@ describe('ordered GPT winner publication', () => {
       getTargeting: (target: object, key: string) => (target as typeof slot).getTargeting(key),
       observeTargeting: () => {
         order.push('observe');
-        return vi.fn();
+        return Object.assign(vi.fn(), { isCurrent: () => true });
       },
       refresh: vi.fn(),
       serviceState: () =>
