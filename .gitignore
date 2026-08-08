@@ -48,6 +48,7 @@ src/*.html
 
 /guest-profiles
 /benchmark-results/**
+/rust-review-reports/
 
 # Playwright browser tests
 /crates/trusted-server-integration-tests/browser/node_modules/
