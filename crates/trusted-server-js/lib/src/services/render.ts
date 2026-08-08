@@ -733,7 +733,6 @@ export interface CacheAdmResolutionOptions {
   readonly cachePolicy: Readonly<CacheFetchPolicy>;
   readonly fetcher: CacheFetcher;
   readonly onResolved: (source: Readonly<CacheAdmSource>) => boolean;
-  readonly publisherOrigin: string;
 }
 
 export interface DirectCacheAttemptOptions extends DirectAdmAttemptOptions {
@@ -2508,13 +2507,11 @@ export function resolveCacheAdmAttempt(options: CacheAdmResolutionOptions): bool
   let cachePolicy: CacheAdmResolutionOptions['cachePolicy'];
   let fetchCache: CacheAdmResolutionOptions['fetcher'];
   let onResolved: CacheAdmResolutionOptions['onResolved'];
-  let publisherOrigin: string;
   try {
     attempt = options.attempt;
     cachePolicy = options.cachePolicy;
     fetchCache = options.fetcher;
     onResolved = options.onResolved;
-    publisherOrigin = options.publisherOrigin;
   } catch {
     return false;
   }
@@ -2531,15 +2528,7 @@ export function resolveCacheAdmAttempt(options: CacheAdmResolutionOptions): bool
   const source = readDirectCacheSource(attempt.renderSource, cachePolicy);
   const winnerContext = attempt.winnerContext;
   const selectedCpm = readSelectedCpm(winnerContext);
-  let cacheOrigin: string | undefined;
-  try {
-    cacheOrigin = source
-      ? urlPart(Reflect.construct(urlIntrinsic, [source.fetchUrl]) as URL, 'origin')
-      : undefined;
-  } catch {
-    cacheOrigin = undefined;
-  }
-  if (!source || selectedCpm === undefined || cacheOrigin === undefined) {
+  if (!source || selectedCpm === undefined) {
     attempt.fail('descriptor_invalid');
     return false;
   }
@@ -2674,8 +2663,7 @@ export function resolveCacheAdmAttempt(options: CacheAdmResolutionOptions): bool
       failCache('cache_network_error');
       return;
     }
-    const expectedResponseType = cacheOrigin === publisherOrigin ? 'basic' : 'cors';
-    if (responseType !== expectedResponseType) {
+    if (responseType !== 'cors') {
       failCache('cache_network_error');
       return;
     }
@@ -2784,7 +2772,6 @@ export function renderDirectCacheAttempt(options: DirectCacheAttemptOptions): bo
     fetcher,
     onResolved: (source) =>
       renderAdmAttempt({ attempt, container, prepareIframe, publisherOrigin }, source),
-    publisherOrigin,
   });
 }
 

@@ -2157,7 +2157,7 @@ describe('direct cache attempt rendering', () => {
   });
 
   it.each(['basic', 'default', undefined] as const)(
-    'rejects a cross-origin response with non-CORS type %s',
+    'rejects every response with non-CORS type %s',
     async (responseType) => {
       document.body.innerHTML = '<div id="fictional-slot"></div>';
       const render = attempt();
@@ -2188,7 +2188,7 @@ describe('direct cache attempt rendering', () => {
     }
   );
 
-  it('accepts a basic response only when the cache and publisher origins match', async () => {
+  it('rejects a basic response even when the cache and publisher origins match', async () => {
     const render = attempt();
     expect(render.admitDirectWinner(CACHE_SOURCE, WINNER_CONTEXT)).toBe(true);
     const response = new Response(JSON.stringify({ adm: '<div>same origin</div>' }));
@@ -2201,16 +2201,18 @@ describe('direct cache attempt rendering', () => {
         cachePolicy: CACHE_POLICY,
         fetcher: async () => response,
         onResolved,
-        publisherOrigin: new URL(CACHE_SOURCE.fetchUrl).origin,
       })
     ).toBe(true);
-    await vi.waitFor(() => expect(onResolved).toHaveBeenCalledOnce());
-    expect(onResolved.mock.calls[0]?.[0]).toMatchObject({ adm: '<div>same origin</div>' });
-    expect(render.snapshot()).toMatchObject({ outcome: undefined, state: 'rendering_direct' });
-    expect(render.cancel('caller_aborted')).toBe(true);
+    await vi.waitFor(() =>
+      expect(render.snapshot().outcome).toEqual({
+        outcome: 'failed',
+        reason: 'cache_network_error',
+      })
+    );
+    expect(onResolved).not.toHaveBeenCalled();
   });
 
-  it('rejects a CORS response when the cache and publisher origins match', async () => {
+  it('accepts a CORS response when the cache and publisher origins match', async () => {
     const render = attempt();
     expect(render.admitDirectWinner(CACHE_SOURCE, WINNER_CONTEXT)).toBe(true);
     const onResolved = vi.fn<(source: CacheAdmSource) => boolean>(() => true);
@@ -2221,16 +2223,12 @@ describe('direct cache attempt rendering', () => {
         cachePolicy: CACHE_POLICY,
         fetcher: async () => corsResponse(JSON.stringify({ adm: '<div>wrong type</div>' })),
         onResolved,
-        publisherOrigin: new URL(CACHE_SOURCE.fetchUrl).origin,
       })
     ).toBe(true);
-    await vi.waitFor(() =>
-      expect(render.snapshot().outcome).toEqual({
-        outcome: 'failed',
-        reason: 'cache_network_error',
-      })
-    );
-    expect(onResolved).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(onResolved).toHaveBeenCalledOnce());
+    expect(onResolved.mock.calls[0]?.[0]).toMatchObject({ adm: '<div>wrong type</div>' });
+    expect(render.snapshot()).toMatchObject({ outcome: undefined, state: 'rendering_direct' });
+    expect(render.cancel('caller_aborted')).toBe(true);
   });
 
   it('terminally rejects a foreign direct-cache container before fetching or mutating DOM', () => {
@@ -2450,7 +2448,6 @@ describe('direct cache attempt rendering', () => {
         cachePolicy: CACHE_POLICY,
         fetcher: fetchCache,
         onResolved,
-        publisherOrigin: window.location.origin,
       })
     ).toBe(true);
     expect(render.snapshot()).toMatchObject({
@@ -2508,7 +2505,6 @@ describe('direct cache attempt rendering', () => {
           cachePolicy: CACHE_POLICY,
           fetcher,
           onResolved,
-          publisherOrigin: window.location.origin,
         })
       ).toBe(true);
       await vi.advanceTimersByTimeAsync(4_999);
@@ -2606,7 +2602,6 @@ describe('direct cache attempt rendering', () => {
         cachePolicy: CACHE_POLICY,
         fetcher,
         onResolved,
-        publisherOrigin: window.location.origin,
       })
     ).toBe(true);
     await vi.waitFor(() => expect(onResolved).toHaveBeenCalledOnce());
