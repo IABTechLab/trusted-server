@@ -19,7 +19,16 @@ export const PROXY_RESPONSE =
 
 import type { TsCreativeConfig } from '../../../src/shared/globals';
 
+let disposeLastImportedCreative: (() => void) | undefined;
+
+export function disposeImportedCreativeModule(): void {
+  const dispose = disposeLastImportedCreative;
+  disposeLastImportedCreative = undefined;
+  dispose?.();
+}
+
 export async function importCreativeModule(config?: TsCreativeConfig): Promise<void> {
+  disposeImportedCreativeModule();
   const globalRef = globalThis as {
     __ts_creative_installed?: boolean;
     tsCreativeConfig?: TsCreativeConfig;
@@ -28,7 +37,8 @@ export async function importCreativeModule(config?: TsCreativeConfig): Promise<v
   if (config) {
     globalRef.tsCreativeConfig = config;
   }
-  await import('../../../src/integrations/creative/index');
+  const creative = await import('../../../src/integrations/creative/index');
+  disposeLastImportedCreative = creative.disposeGuards;
   if (config) {
     delete globalRef.tsCreativeConfig;
   }

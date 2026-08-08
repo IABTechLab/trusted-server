@@ -5,6 +5,8 @@ import { delay, queueTask } from '../../shared/async';
 import { hasOpaqueOrigin, TRUSTED_BASE_URL } from '../../shared/origin';
 import { createMutationScheduler } from '../../shared/scheduler';
 
+import type { CreativeGuardHandle } from './startup';
+
 type AnchorLike = HTMLAnchorElement | HTMLAreaElement;
 type Canon = { base: string; params: Record<string, string> };
 type Diff = { add: Record<string, string>; del: string[] };
@@ -416,9 +418,11 @@ async function rebuildIfNeeded(anchor: AnchorLike, tsClickStr: string): Promise<
 async function guardNavigation(
   anchor: AnchorLike,
   tsClickStr: string,
-  isMiddle: boolean
+  isMiddle: boolean,
+  isActive: () => boolean
 ): Promise<void> {
   const finalUrl = await rebuildIfNeeded(anchor, tsClickStr);
+  if (!isActive()) return;
   if (finalUrl && finalUrl !== tsClickStr) {
     persistRebuiltClick(anchor, finalUrl);
   }
@@ -426,7 +430,7 @@ async function guardNavigation(
 }
 
 // Entry point for click/auxclick handlers: prevent default and queue guarded nav.
-function handleGuardedClick(ev: Event, isMiddle: boolean): void {
+function handleGuardedClick(ev: Event, isMiddle: boolean, isActive: () => boolean): void {
   const anchor = closestAnchor(ev.target);
   if (!anchor) return;
 
@@ -436,7 +440,9 @@ function handleGuardedClick(ev: Event, isMiddle: boolean): void {
   ev.preventDefault();
 
   const runNavigation = () => {
-    void guardNavigation(anchor, tsClickStr, isMiddle).catch((err) => {
+    if (!isActive()) return;
+    void guardNavigation(anchor, tsClickStr, isMiddle, isActive).catch((err) => {
+      if (!isActive()) return;
       log.warn('tsjs-creative:click: failed to compute final URL', err);
       navigate(anchor, tsClickStr, isMiddle);
     });
@@ -446,14 +452,18 @@ function handleGuardedClick(ev: Event, isMiddle: boolean): void {
 }
 
 // Observe href/data-tsclick mutations and repair anchors that third parties touch.
-function monitorAnchorMutations(): void {
-  if (typeof document === 'undefined' || typeof MutationObserver === 'undefined') return;
+function monitorAnchorMutations(isActive: () => boolean): CreativeGuardHandle {
+  if (typeof document === 'undefined' || typeof MutationObserver === 'undefined') {
+    return Object.freeze({ dispose: () => undefined, scan: () => undefined });
+  }
 
   const schedule = createMutationScheduler<AnchorLike>((anchor) => {
+    if (!isActive()) return;
     const tsClickStr = anchor.getAttribute('data-tsclick') || '';
     if (!tsClickStr) return;
     void rebuildIfNeeded(anchor, tsClickStr)
       .then((finalUrl) => {
+        if (!isActive()) return;
         if (finalUrl && finalUrl !== tsClickStr) {
           persistRebuiltClick(anchor, finalUrl);
         }
@@ -463,14 +473,14 @@ function monitorAnchorMutations(): void {
       });
   });
 
-  const scan = () => {
+  const scan = (): void => {
+    if (!isActive()) return;
     const anchors = document.querySelectorAll<AnchorLike>('a[data-tsclick], area[data-tsclick]');
     anchors.forEach((anchor) => schedule(anchor));
   };
 
-  scan();
-
   const observer = new MutationObserver((records) => {
+    if (!isActive()) return;
     for (const record of records) {
       if (record.type !== 'attributes') continue;
       const target = record.target;
@@ -485,27 +495,61 @@ function monitorAnchorMutations(): void {
     attributes: true,
     attributeFilter: ['href', 'data-tsclick'],
   });
+
+  let disposed = false;
+  return Object.freeze({
+    dispose: (): void => {
+      if (disposed) return;
+      disposed = true;
+      observer.disconnect();
+      schedule.dispose();
+    },
+    scan,
+  });
 }
 
 // Wire up capture-phase click handlers + mutation observers to protect clicks.
-export function installClickGuard(): void {
+export function installClickGuard(scanInitially = true): CreativeGuardHandle {
   if (log.getLevel && log.getLevel() === 'warn') {
     log.setLevel('info');
   }
   enableDebugFromEnv();
   log.info('tsjs-creative:click: installing click guard');
 
+  let active = true;
+  const isActive = (): boolean => active;
   const onClick = (ev: Event) => {
-    handleGuardedClick(ev, false);
+    if (!active) return;
+    handleGuardedClick(ev, false, isActive);
   };
 
   const onAuxClick = (ev: MouseEvent) => {
+    if (!active) return;
     if (ev.button !== 1) return;
-    handleGuardedClick(ev, true);
+    handleGuardedClick(ev, true, isActive);
   };
 
   document.addEventListener('click', onClick, true);
   document.addEventListener('auxclick', onAuxClick as EventListener, true);
 
-  monitorAnchorMutations();
+  let mutations: CreativeGuardHandle | undefined;
+  const dispose = (): void => {
+    if (!active) return;
+    active = false;
+    document.removeEventListener('click', onClick, true);
+    document.removeEventListener('auxclick', onAuxClick as EventListener, true);
+    mutations?.dispose();
+  };
+  try {
+    mutations = monitorAnchorMutations(isActive);
+    const handle = Object.freeze({
+      dispose,
+      scan: (): void => mutations?.scan(),
+    });
+    if (scanInitially) handle.scan();
+    return handle;
+  } catch (error) {
+    dispose();
+    throw error;
+  }
 }

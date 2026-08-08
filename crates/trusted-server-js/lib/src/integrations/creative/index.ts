@@ -6,6 +6,7 @@ import { creativeGlobal, resolveWindow } from '../../shared/globals';
 import { installClickGuard } from './click';
 import { installDynamicImageProxy } from './image';
 import { installDynamicIframeProxy } from './iframe';
+import type { CreativeGuardHandle } from './startup';
 
 export { installDynamicImageProxy } from './image';
 export { installDynamicIframeProxy } from './iframe';
@@ -19,17 +20,38 @@ let currentConfig: Required<TsCreativeConfig> = { ...DEFAULT_CONFIG };
 let guardsInstallTriggered = false;
 let clickGuardInstalled = false;
 let renderGuardInstalled = false;
+let clickGuardHandle: CreativeGuardHandle | undefined;
+let imageGuardHandle: CreativeGuardHandle | undefined;
+let iframeGuardHandle: CreativeGuardHandle | undefined;
 
 function applyConfig(): void {
   if (currentConfig.clickGuard && !clickGuardInstalled) {
-    installClickGuard();
+    clickGuardHandle = installClickGuard();
     clickGuardInstalled = true;
   }
 
   if (currentConfig.renderGuard && !renderGuardInstalled) {
-    installDynamicImageProxy();
-    installDynamicIframeProxy();
+    imageGuardHandle = installDynamicImageProxy();
+    iframeGuardHandle = installDynamicIframeProxy();
     renderGuardInstalled = true;
+  }
+}
+
+/** Release only the wrappers, listeners, observers, and queued work installed by this module. */
+export function disposeGuards(): void {
+  const handles = [iframeGuardHandle, imageGuardHandle, clickGuardHandle];
+  iframeGuardHandle = undefined;
+  imageGuardHandle = undefined;
+  clickGuardHandle = undefined;
+  renderGuardInstalled = false;
+  clickGuardInstalled = false;
+  guardsInstallTriggered = false;
+  for (let index = 0; index < handles.length; index += 1) {
+    try {
+      handles[index]?.dispose();
+    } catch {
+      // One hostile cleanup cannot retain another guard's owned state.
+    }
   }
 }
 

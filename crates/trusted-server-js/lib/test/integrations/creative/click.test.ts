@@ -1,6 +1,12 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
-import { FIRST_PARTY_CLICK, MUTATED_CLICK, PROXY_RESPONSE, importCreativeModule } from './helpers';
+import {
+  FIRST_PARTY_CLICK,
+  MUTATED_CLICK,
+  PROXY_RESPONSE,
+  disposeImportedCreativeModule,
+  importCreativeModule,
+} from './helpers';
 
 const ORIGINAL_FETCH = global.fetch;
 
@@ -11,13 +17,45 @@ const REBUILD_PREFIX = absolute('/first-party/proxy-rebuild?');
 
 describe('creative/click.ts', () => {
   beforeEach(() => {
+    disposeImportedCreativeModule();
     vi.resetModules();
     document.body.innerHTML = '';
   });
 
   afterEach(() => {
+    disposeImportedCreativeModule();
     global.fetch = ORIGINAL_FETCH;
     vi.useRealTimers();
+  });
+
+  it('owns click listeners and defers the baseline scan until requested', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ href: PROXY_RESPONSE }),
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const anchor = document.createElement('a');
+    anchor.setAttribute('data-tsclick', FIRST_PARTY_CLICK);
+    anchor.setAttribute('href', MUTATED_CLICK);
+    document.body.appendChild(anchor);
+    const removeEventListener = vi.spyOn(document, 'removeEventListener');
+    const { installClickGuard } = await import('../../../src/integrations/creative/click');
+
+    const handle = installClickGuard(false);
+    await Promise.resolve();
+    await vi.runAllTimersAsync();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    handle.scan();
+    await Promise.resolve();
+    await vi.runAllTimersAsync();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    handle.dispose();
+    handle.dispose();
+    expect(removeEventListener.mock.calls.filter(([type]) => type === 'click')).toHaveLength(1);
+    expect(removeEventListener.mock.calls.filter(([type]) => type === 'auxclick')).toHaveLength(1);
   });
 
   it('repairs anchors via proxy rebuild fallback when fetch is unavailable', async () => {
