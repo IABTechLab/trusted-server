@@ -206,6 +206,39 @@ describe('owner-aware targeting journal', () => {
     expect(values.size).toBe(0);
   });
 
+  it('invalidates a TS journal when its captured native setter reenters a same-value publisher set', async () => {
+    const values = new Map<string, readonly string[]>([['key', ['publisher']]]);
+    let reentered = false;
+    const slot = {
+      clearTargeting: vi.fn((key?: string) => {
+        if (key === undefined) values.clear();
+        else values.delete(key);
+      }),
+      getTargeting: vi.fn((key: string) => Object.freeze([...(values.get(key) ?? [])])),
+      setTargeting: vi.fn((key: string, value: string | readonly string[]) => {
+        values.set(key, Object.freeze(typeof value === 'string' ? [value] : [...value]));
+        if (reentered) return;
+        reentered = true;
+        slot.setTargeting(key, value);
+      }),
+    };
+    const adapter = adapterForTargetingSlot(slot);
+    const service = createTargetingService();
+    await expect(service.observePublisherMutations(slot, adapter).result).resolves.toBeUndefined();
+
+    const frame = await adapter.run((gpt) =>
+      service.own(slot, 'key', 'trusted', 'owner', {
+        clearTargeting: (key) => gpt.clearTargeting(slot, key),
+        getTargeting: (key) => gpt.getTargeting(slot, key),
+        setTargeting: (key, value) => gpt.setTargeting(slot, key, value),
+      })
+    ).result;
+    frame?.release();
+
+    expect(values.get('key')).toEqual(['trusted']);
+    expect(service.snapshotForTest()).toEqual({ frames: 0, slots: 0 });
+  });
+
   it.each(['same_set', 'different_set', 'per_key_clear', 'clear_all'] as const)(
     'invalidates after publisher wrapper replacement for %s without calling that replacement on release',
     async (mutation) => {

@@ -89,6 +89,12 @@ export interface GoogletagTargetingObservation {
   readonly isCurrent: () => boolean;
 }
 
+/** Reversible bookkeeping prepared before one publisher GPT call. */
+export interface GoogletagPublisherCallAdmission {
+  readonly commit: () => void;
+  readonly rollback: () => void;
+}
+
 /** One publisher-originated GPT call observed outside Trusted Server operations. */
 export interface GoogletagPublisherCallObserver {
   readonly defineSlot?: (
@@ -97,12 +103,16 @@ export interface GoogletagPublisherCallObserver {
   readonly destroySlots?: (call: Readonly<GoogletagPublisherDestroySlotsCall>) => void;
   readonly display?: (
     call: Readonly<GoogletagPublisherDisplayCall>
-  ) => Readonly<{ action: 'forward' }> | Readonly<{ action: 'suppress' }>;
-  readonly refresh?: (
-    call: Readonly<GoogletagPublisherRefreshCall>
   ) =>
-    | Readonly<{ action: 'forward' }>
-    | Readonly<{ action: 'replace'; slots: readonly object[] }>
+    | Readonly<{ action: 'forward'; admission?: GoogletagPublisherCallAdmission }>
+    | Readonly<{ action: 'suppress' }>;
+  readonly refresh?: (call: Readonly<GoogletagPublisherRefreshCall>) =>
+    | Readonly<{ action: 'forward'; admission?: GoogletagPublisherCallAdmission }>
+    | Readonly<{
+        action: 'replace';
+        slots: readonly object[];
+        admission?: GoogletagPublisherCallAdmission;
+      }>
     | Readonly<{ action: 'suppress' }>;
 }
 
@@ -394,10 +404,15 @@ function createFacade(
   isOperationCurrent: () => boolean,
   isBindingCurrent: () => boolean,
   initialLoadDisabled: (service: object) => boolean,
-  targetingWrites: WeakMap<object, number>,
   targetingObservations: WeakMap<object, TargetingObservation>,
   bindingToken: object,
-  markFirstDisplay: () => void
+  markFirstDisplay: () => void,
+  invokeFacadeCall: (
+    callable: (...arguments_: unknown[]) => unknown,
+    receiver: unknown,
+    arguments_: readonly unknown[]
+  ) => unknown,
+  consumeFacadeCall: (callable: (...arguments_: unknown[]) => unknown) => boolean
 ): Readonly<GoogletagFacade> {
   const member = (external: object, key: PropertyKey): ((...args: unknown[]) => unknown) => {
     if (!isOperationCurrent()) throw new GoogletagAdapterError('external_artifact_incompatible');
@@ -412,7 +427,7 @@ function createFacade(
   const call = (external: object, key: PropertyKey, argumentsList: readonly unknown[]): unknown => {
     const callable = member(external, key);
     if (!isOperationCurrent()) throw new GoogletagAdapterError('external_artifact_incompatible');
-    const result = Reflect.apply(callable, external, argumentsList);
+    const result = invokeFacadeCall(callable, external, argumentsList);
     if (!isOperationCurrent()) throw new GoogletagAdapterError('external_artifact_incompatible');
     return result;
   };
@@ -423,16 +438,6 @@ function createFacade(
     return result;
   };
   const service = (): object => asObject(call(binding.binding, 'pubads', []));
-  const withTargetingWrite = (slot: object, callback: () => unknown): unknown => {
-    const depth = weakMapValue(targetingWrites, slot) ?? 0;
-    setWeakMapValue(targetingWrites, slot, depth + 1);
-    try {
-      return callback();
-    } finally {
-      if (depth === 0) deleteWeakMapValue(targetingWrites, slot);
-      else setWeakMapValue(targetingWrites, slot, depth);
-    }
-  };
   const replaceObservedMethod = (
     slot: object,
     key: 'clearTargeting' | 'setTargeting',
@@ -443,13 +448,14 @@ function createFacade(
     let descriptor: PropertyDescriptor | undefined;
     let defineAttempted = false;
     const wrapper = function (this: unknown, ...arguments_: unknown[]): unknown {
-      if ((weakMapValue(targetingWrites, slot) ?? 0) === 0) {
-        try {
-          const mutationKey = typeof arguments_[0] === 'string' ? arguments_[0] : undefined;
-          observer.beforePublisherMutation(slot, mutationKey);
-        } catch {
-          // Bookkeeping must not change publisher call arguments, order, return, or throw.
-        }
+      if (consumeFacadeCall(wrapper)) {
+        return Reflect.apply(original, this, arguments_);
+      }
+      try {
+        const mutationKey = typeof arguments_[0] === 'string' ? arguments_[0] : undefined;
+        observer.beforePublisherMutation(slot, mutationKey);
+      } catch {
+        // Bookkeeping must not change publisher call arguments, order, return, or throw.
       }
       return Reflect.apply(original, this, arguments_);
     };
@@ -507,13 +513,13 @@ function createFacade(
   return Object.freeze({
     bindingToken: (): object => bindingToken,
     clearTargeting: (slot: object, key?: string): unknown =>
-      withTargetingWrite(slot, () => call(slot, 'clearTargeting', key === undefined ? [] : [key])),
+      call(slot, 'clearTargeting', key === undefined ? [] : [key]),
     display: (slot: string | object): unknown => {
       const display = member(binding.binding, 'display');
       if (!isOperationCurrent()) throw new GoogletagAdapterError('external_artifact_incompatible');
       markFirstDisplay();
       if (!isOperationCurrent()) throw new GoogletagAdapterError('external_artifact_incompatible');
-      const result = Reflect.apply(display, binding.binding, [slot]);
+      const result = invokeFacadeCall(display, binding.binding, [slot]);
       if (!isOperationCurrent()) throw new GoogletagAdapterError('external_artifact_incompatible');
       return result;
     },
@@ -645,9 +651,7 @@ function createFacade(
       });
     },
     setTargeting: (slot: object, key: string, value: string | readonly string[]): unknown =>
-      withTargetingWrite(slot, () =>
-        call(slot, 'setTargeting', [key, Array.isArray(value) ? [...value] : value])
-      ),
+      call(slot, 'setTargeting', [key, Array.isArray(value) ? [...value] : value]),
     slots: (): readonly object[] => {
       const currentSlots = call(service(), 'getSlots', []);
       if (
@@ -822,15 +826,36 @@ export function createBrowserGoogletagAdapter(
   const live = new Set<PendingOperation<unknown>>();
   const effects = new Set<() => void>();
   let armedBindings = new WeakSet<object>();
-  const targetingWrites = new WeakMap<object, number>();
   const targetingObservations = new WeakMap<object, TargetingObservation>();
+  const facadeCalls = new WeakMap<(...arguments_: unknown[]) => unknown, number>();
   const bindingTokens = new WeakMap<object, object>();
   const initialLoadReleases = new Map<object, () => void>();
   const initialLoadOwner = Object.freeze({});
   let pendingReservations = 0;
   let disposed = false;
   let firstDisplayObserved = false;
-  let trustedCallDepth = 0;
+
+  const invokeFacadeCall = (
+    callable: (...arguments_: unknown[]) => unknown,
+    receiver: unknown,
+    arguments_: readonly unknown[]
+  ): unknown => {
+    const depth = weakMapValue(facadeCalls, callable) ?? 0;
+    setWeakMapValue(facadeCalls, callable, depth + 1);
+    try {
+      return Reflect.apply(callable, receiver, arguments_);
+    } finally {
+      if (depth === 0) deleteWeakMapValue(facadeCalls, callable);
+      else setWeakMapValue(facadeCalls, callable, depth);
+    }
+  };
+  const consumeFacadeCall = (callable: (...arguments_: unknown[]) => unknown): boolean => {
+    const depth = weakMapValue(facadeCalls, callable) ?? 0;
+    if (depth === 0) return false;
+    if (depth === 1) deleteWeakMapValue(facadeCalls, callable);
+    else setWeakMapValue(facadeCalls, callable, depth - 1);
+    return true;
+  };
 
   const markFirstDisplay = (): void => {
     if (firstDisplayObserved) return;
@@ -1519,10 +1544,11 @@ export function createBrowserGoogletagAdapter(
         const tracker = ensureInitialLoadTracking(binding, service);
         return tracker?.disabled === true;
       },
-      targetingWrites,
       targetingObservations,
       bindingToken,
-      markFirstDisplay
+      markFirstDisplay,
+      invokeFacadeCall,
+      consumeFacadeCall
     );
     try {
       if (disposed) {
@@ -1562,13 +1588,7 @@ export function createBrowserGoogletagAdapter(
             return;
           }
           try {
-            trustedCallDepth += 1;
-            let value: unknown;
-            try {
-              value = operation.command(facade);
-            } finally {
-              trustedCallDepth -= 1;
-            }
+            const value = operation.command(facade);
             if (operation.settled) return;
             if (disposed) {
               fail(operation, 'operation_disposed');
@@ -1908,6 +1928,66 @@ export function createBrowserGoogletagAdapter(
       !disposed &&
       readTarget(target) === currentBindingObject &&
       Reflect.apply(current.value.pubads, currentBindingObject, []) === serviceObject;
+    const safelyCurrent = (): boolean => {
+      try {
+        return stillCurrent();
+      } catch {
+        return false;
+      }
+    };
+    const publisherAdmission = (decision: unknown): GoogletagPublisherCallAdmission | undefined => {
+      if ((typeof decision !== 'object' || decision === null) && typeof decision !== 'function') {
+        return undefined;
+      }
+      const candidate = safeMember(decision as object, 'admission');
+      if (
+        (typeof candidate !== 'object' || candidate === null) &&
+        typeof candidate !== 'function'
+      ) {
+        return undefined;
+      }
+      const commit = safeMember(candidate as object, 'commit');
+      const rollback = safeMember(candidate as object, 'rollback');
+      if (typeof commit !== 'function' || typeof rollback !== 'function') return undefined;
+      return Object.freeze({
+        commit: (): void => {
+          Reflect.apply(commit, candidate, []);
+        },
+        rollback: (): void => {
+          Reflect.apply(rollback, candidate, []);
+        },
+      });
+    };
+    const commitAdmission = (admission: GoogletagPublisherCallAdmission | undefined): void => {
+      try {
+        admission?.commit();
+      } catch {
+        // Post-native bookkeeping cannot alter the publisher return value.
+      }
+    };
+    const rollbackAdmission = (admission: GoogletagPublisherCallAdmission | undefined): void => {
+      try {
+        admission?.rollback();
+      } catch {
+        // Rollback cannot replace the exact publisher-native failure.
+      }
+    };
+    const callWithAdmission = (
+      original: (...arguments_: unknown[]) => unknown,
+      receiver: unknown,
+      arguments_: readonly unknown[],
+      admission: GoogletagPublisherCallAdmission | undefined
+    ): unknown => {
+      let result: unknown;
+      try {
+        result = Reflect.apply(original, receiver, arguments_);
+      } catch (error) {
+        rollbackAdmission(admission);
+        throw error;
+      }
+      commitAdmission(admission);
+      return result;
+    };
     const objectSlots = (candidate: unknown): readonly object[] | undefined => {
       if (
         !Array.isArray(candidate) ||
@@ -1942,7 +2022,10 @@ export function createBrowserGoogletagAdapter(
       if (typeof original !== 'function') return;
       const callable = original as (...arguments_: unknown[]) => unknown;
       const wrapper = function (this: unknown, ...arguments_: unknown[]): unknown {
-        if (trustedCallDepth > 0 || !stillCurrent()) {
+        if (consumeFacadeCall(wrapper)) {
+          return Reflect.apply(callable, this, arguments_);
+        }
+        if (!safelyCurrent()) {
           return Reflect.apply(callable, this, arguments_);
         }
         return mediate(callable, this, arguments_);
@@ -1979,17 +2062,24 @@ export function createBrowserGoogletagAdapter(
       });
       install(currentBindingObject, 'display', (original, receiver, arguments_) => {
         if (displayObserver && arguments_.length === 1) {
+          let decision: ReturnType<NonNullable<GoogletagPublisherCallObserver['display']>>;
           try {
-            const decision = displayObserver(
+            decision = displayObserver(
               Object.freeze({
                 target: arguments_[0],
                 initialLoadDisabled: tracker?.disabled === true,
               })
             );
-            if (decision?.action === 'suppress') return undefined;
           } catch {
             // Observer failure must leave the publisher call native.
+            return Reflect.apply(original, receiver, arguments_);
           }
+          const admission = publisherAdmission(decision);
+          if (decision?.action === 'suppress') {
+            rollbackAdmission(admission);
+            return undefined;
+          }
+          return callWithAdmission(original, receiver, arguments_, admission);
         }
         return Reflect.apply(original, receiver, arguments_);
       });
@@ -1998,20 +2088,34 @@ export function createBrowserGoogletagAdapter(
           const requested = arguments_[0] === undefined ? undefined : objectSlots(arguments_[0]);
           const effective = requested ?? (arguments_[0] === undefined ? allSlots() : undefined);
           if (effective) {
+            let decision: ReturnType<NonNullable<GoogletagPublisherCallObserver['refresh']>>;
             try {
-              const decision = refreshObserver(
+              decision = refreshObserver(
                 Object.freeze({ requestedSlots: requested, slots: effective })
               );
-              if (decision?.action === 'suppress') return undefined;
-              if (decision?.action === 'replace') {
-                const replacement = objectSlots(decision.slots);
-                if (replacement) {
-                  return Reflect.apply(original, receiver, [replacement, ...arguments_.slice(1)]);
-                }
-              }
             } catch {
               // Observer failure must leave the publisher call native.
+              return Reflect.apply(original, receiver, arguments_);
             }
+            const admission = publisherAdmission(decision);
+            if (decision?.action === 'suppress') {
+              rollbackAdmission(admission);
+              return undefined;
+            }
+            if (decision?.action === 'replace') {
+              const replacement = objectSlots(decision.slots);
+              if (replacement) {
+                return callWithAdmission(
+                  original,
+                  receiver,
+                  [replacement, ...arguments_.slice(1)],
+                  admission
+                );
+              }
+              rollbackAdmission(admission);
+              return Reflect.apply(original, receiver, arguments_);
+            }
+            return callWithAdmission(original, receiver, arguments_, admission);
           }
         }
         return Reflect.apply(original, receiver, arguments_);
