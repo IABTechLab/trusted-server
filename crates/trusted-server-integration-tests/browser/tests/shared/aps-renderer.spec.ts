@@ -4,6 +4,9 @@ import { expect, test } from "@playwright/test";
 import { runtimeUrl } from "../../helpers/state.js";
 
 const IFRAME_CREATIVE_URL = "https://creative.example/iframe";
+const APS_TEST_ORIGIN = "https://aps-renderer.test";
+const APS_TEST_RENDERER_URL = `${APS_TEST_ORIGIN}/integrations/aps/renderer/v1`;
+const APS_TEST_RUNNER_URL = `${APS_TEST_ORIGIN}/integrations/aps/runner.js`;
 const SANDBOX =
   "allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation";
 const FICTIONAL_APS_RUNNER = readFileSync(
@@ -68,32 +71,47 @@ test.describe("APS renderer v1 protocol", () => {
     expect(csp).toBe(
       "default-src 'none'; sandbox allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline' 'self' https:; connect-src https:; frame-src https: data: blob:; img-src https: data: blob:; media-src https: data: blob:; style-src 'unsafe-inline' https:; font-src https: data:; worker-src https: blob:; form-action https:;",
     );
+    const rendererDocument = await rendererResponse.text();
+
+    // WebKit correctly treats `self` inside the sandbox as the iframe's opaque
+    // origin. Fulfil the exact served document at an HTTPS test origin so all
+    // engines exercise the production `https:` runner allowance; no CSP or
+    // sandbox relaxation is needed for the local HTTP transport.
+    await page.route(APS_TEST_RENDERER_URL, (route) =>
+      route.fulfill({
+        status: 200,
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "content-security-policy": csp!,
+          "x-content-type-options": "nosniff",
+          "referrer-policy": "no-referrer",
+        },
+        body: rendererDocument,
+      }),
+    );
 
     let runnerRequests = 0;
-    await page.route(
-      runtimeUrl("/integrations/aps/runner.js"),
-      async (route) => {
-        runnerRequests += 1;
-        await route.fulfill({
-          status: 200,
-          headers: {
-            "content-type": "application/javascript; charset=utf-8",
-            "access-control-allow-origin": "*",
-            "cross-origin-resource-policy": "cross-origin",
-            "x-content-type-options": "nosniff",
-            "referrer-policy": "no-referrer",
-          },
-          body: FICTIONAL_APS_RUNNER,
-        });
-      },
-    );
+    await page.route(APS_TEST_RUNNER_URL, async (route) => {
+      runnerRequests += 1;
+      await route.fulfill({
+        status: 200,
+        headers: {
+          "content-type": "application/javascript; charset=utf-8",
+          "access-control-allow-origin": "*",
+          "cross-origin-resource-policy": "cross-origin",
+          "x-content-type-options": "nosniff",
+          "referrer-policy": "no-referrer",
+        },
+        body: FICTIONAL_APS_RUNNER,
+      });
+    });
     await page.route(runtimeUrl("/aps-v1-protocol-test"), (route) =>
       route.fulfill({
         status: 200,
         contentType: "text/html",
         headers: {
           "content-security-policy":
-            "default-src 'none'; script-src 'unsafe-inline'; frame-src 'self'",
+            "default-src 'none'; script-src 'unsafe-inline'; frame-src https:",
         },
         body: `<!doctype html><meta charset="utf-8"><div id="slots"></div><script>
 window.apsV1Records = Object.create(null);
@@ -104,7 +122,7 @@ window.startApsV1 = function(options) {
   document.getElementById('slots').appendChild(slot);
   var frame = document.createElement('iframe');
   frame.setAttribute('sandbox', ${JSON.stringify(SANDBOX)});
-  frame.src = ${JSON.stringify(runtimeUrl("/integrations/aps/renderer/v1"))} + '#tsaps=' + options.nonce;
+  frame.src = ${JSON.stringify(APS_TEST_RENDERER_URL)} + '#tsaps=' + options.nonce;
   frame.style.display = 'none';
   var channel = new MessageChannel();
   var record = {messages: [], frame: frame, channel: channel};
@@ -245,10 +263,8 @@ window.startApsV1 = function(options) {
       );
     expect(runnerRequests).toBe(requestsBeforeInvalid);
 
-    await page.unroute(runtimeUrl("/integrations/aps/runner.js"));
-    await page.route(runtimeUrl("/integrations/aps/runner.js"), (route) =>
-      route.abort(),
-    );
+    await page.unroute(APS_TEST_RUNNER_URL);
+    await page.route(APS_TEST_RUNNER_URL, (route) => route.abort());
     await start("load-failure-case", "load-failure-case-bid");
     await expect
       .poll(async () => await messages("load-failure-case"))

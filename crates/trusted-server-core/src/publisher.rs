@@ -13039,7 +13039,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_publisher_body_treats_mixed_case_html_as_html() {
+    fn stream_publisher_body_treats_mixed_case_html_as_hard_cutover_html() {
         let settings = create_test_settings();
         let registry = IntegrationRegistry::with_plan(
             &settings,
@@ -13089,12 +13089,12 @@ mod tests {
 
         let html = String::from_utf8(output).expect("should be valid UTF-8");
         assert!(
-            html.contains(".adSlots=JSON.parse"),
-            "mixed-case HTML must use the HTML processor and inject ad slots. Got: {html}"
+            html.contains(r#""auctionId":"initial","results":[]},"slots":[],"bids":[]"#),
+            "mixed-case HTML must use the HTML processor and inject the canonical boot projection. Got: {html}"
         );
         assert!(
-            html.contains(".bids=JSON.parse"),
-            "mixed-case HTML must use the HTML processor and inject bids. Got: {html}"
+            !html.contains(".adSlots=JSON.parse") && !html.contains(".bids=JSON.parse"),
+            "mixed-case HTML must not restore legacy TSJS data globals. Got: {html}"
         );
     }
 

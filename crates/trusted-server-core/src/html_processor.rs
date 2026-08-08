@@ -19,8 +19,7 @@ use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
 use crate::tsjs;
 
-const EMPTY_AUCTION_PROJECTION_JSON: &str =
-    r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"bids":[]}"#;
+const EMPTY_AUCTION_PROJECTION_JSON: &str = r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"slots":[],"bids":[]}"#;
 
 /// Wraps [`HtmlRewriterAdapter`] with optional post-processing.
 ///
@@ -2077,7 +2076,7 @@ mod tests {
             .expect("should process");
         let html = std::str::from_utf8(&output).expect("should be utf8");
         assert!(
-            html.contains(r#""auctionId":"initial","results":[]},"bids":[]"#),
+            html.contains(r#""auctionId":"initial","results":[]},"slots":[],"bids":[]"#),
             "should inject the exact safe empty initial projection"
         );
         assert!(!html.contains(".bids="));

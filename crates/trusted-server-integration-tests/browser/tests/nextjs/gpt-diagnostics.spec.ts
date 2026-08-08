@@ -3,6 +3,8 @@ import { installGptStub } from "../../helpers/gpt-stub.js";
 import { readState, runtimeUrl } from "../../helpers/state.js";
 
 const HOST_ID = "trusted-server-gpt-diagnostics";
+const GPT_DIAGNOSTICS_MODULE =
+    /tsjs=tsjs-gpt_diagnostics(?:\.min)?\.js(?:[?#]|$)/i;
 const EVENT_NAMES = [
     "slotRequested",
     "slotResponseReceived",
@@ -19,9 +21,32 @@ test.beforeEach(async ({ page }, testInfo) => {
 });
 
 async function waitForApi(page: Page): Promise<void> {
-    await page.waitForFunction(() =>
-        Boolean((window as any).tsjs?.diagnostics?.gpt),
-    );
+    try {
+        await page.waitForFunction(
+            () => Boolean((window as any).tsjs?.diagnostics?.gpt),
+            undefined,
+            { timeout: 10_000 },
+        );
+    } catch (error) {
+        const state = await page.evaluate(() => {
+            const api = (window as any).tsjs;
+            return {
+                internal: api?._internal,
+                names: Object.getOwnPropertyNames(api ?? {}).sort(),
+                diagnostics: Object.getOwnPropertyNames(
+                    api?.diagnostics ?? {},
+                ).sort(),
+                bootGptActive: api?.boot?.diagnostics?.gpt?.active,
+                listeners: (
+                    window as any
+                ).__gptDiagnosticsStub.listenerCounts(),
+            };
+        });
+        throw new Error(
+            `GPT diagnostics API did not activate: ${JSON.stringify(state)}`,
+            { cause: error },
+        );
+    }
 }
 
 async function emit(
@@ -49,7 +74,7 @@ test.describe("GPT runtime diagnostics", () => {
         const diagnosticNetworkRequests: string[] = [];
         const diagnosticModuleRequests: string[] = [];
         page.on("request", (request) => {
-            if (/tsjs-gpt_diagnostics/i.test(request.url())) {
+            if (GPT_DIAGNOSTICS_MODULE.test(request.url())) {
                 diagnosticModuleRequests.push(request.url());
             }
             if (
@@ -86,13 +111,14 @@ test.describe("GPT runtime diagnostics", () => {
         expect(diagnosticModuleRequests).toEqual([]);
     });
 
-    test("activates, cleans the URL, persists in the browser session, and deactivates", async ({
+    test("activates, cleans the URL, enforces the session contract, and deactivates", async ({
         browser,
+        browserName,
         page,
     }) => {
         const moduleRequests: string[] = [];
         page.on("request", (request) => {
-            if (/tsjs-gpt_diagnostics/i.test(request.url())) {
+            if (GPT_DIAGNOSTICS_MODULE.test(request.url())) {
                 moduleRequests.push(request.url());
             }
         });
@@ -111,7 +137,26 @@ test.describe("GPT runtime diagnostics", () => {
         const activationCookie = (await page.context().cookies()).find(
             (cookie) => cookie.name === "__Host-ts-console",
         );
-        expect(activationCookie).toMatchObject({ value: "1", httpOnly: true });
+        // WebKit does not persist Secure cookies delivered by the suite's local
+        // HTTP transport. The response contract is still asserted above, while
+        // Chromium and Firefox exercise the browser-managed session lifecycle.
+        const supportsHarnessSecureCookie =
+            browserName !== "webkit" ||
+            new URL(page.url()).protocol === "https:";
+        if (supportsHarnessSecureCookie) {
+            expect(activationCookie).toMatchObject({
+                value: "1",
+                path: "/",
+                secure: true,
+                httpOnly: true,
+                sameSite: "Lax",
+            });
+        } else {
+            expect(activationCookie).toBeUndefined();
+            expect(activationResponse?.headers()["set-cookie"]).toContain(
+                "__Host-ts-console=1; Path=/; Secure; HttpOnly; SameSite=Lax",
+            );
+        }
         expect(new URL(page.url()).search).toBe("?unrelated=kept");
         expect(new URL(page.url()).hash).toBe("#fixture");
         const listenerCounts = await page.evaluate(() =>
@@ -120,44 +165,51 @@ test.describe("GPT runtime diagnostics", () => {
         for (const eventName of EVENT_NAMES)
             expect(listenerCounts[eventName]).toBe(1);
 
-        await page
-            .getByRole("navigation", { name: "Fixture navigation" })
-            .getByRole("link", { name: "Home" })
-            .click();
-        await page.waitForURL("**/");
-        expect(
-            await page.evaluate(() =>
-                Boolean((window as any).tsjs?.diagnostics?.gpt),
-            ),
-        ).toBe(true);
-        await page.goBack();
-        await page.waitForURL("**/gpt-diagnostics?unrelated=kept#fixture");
-        await waitForApi(page);
+        if (supportsHarnessSecureCookie) {
+            await page
+                .getByRole("navigation", { name: "Fixture navigation" })
+                .getByRole("link", { name: "Home" })
+                .click();
+            await page.waitForURL("**/");
+            expect(
+                await page.evaluate(() =>
+                    Boolean((window as any).tsjs?.diagnostics?.gpt),
+                ),
+            ).toBe(true);
+            await page.goBack();
+            await page.waitForURL("**/gpt-diagnostics?unrelated=kept#fixture");
+            await waitForApi(page);
 
-        const sameSessionPage = await page.context().newPage();
-        await installGptStub(sameSessionPage);
-        await sameSessionPage.goto(runtimeUrl("/gpt-diagnostics"), {
-            waitUntil: "load",
-        });
-        await waitForApi(sameSessionPage);
-        await sameSessionPage.close();
-
-        await page.goto(
-            runtimeUrl("/gpt-diagnostics?unrelated=second#persisted"),
-            {
+            const sameSessionPage = await page.context().newPage();
+            await installGptStub(sameSessionPage);
+            await sameSessionPage.goto(runtimeUrl("/gpt-diagnostics"), {
                 waitUntil: "load",
-            },
-        );
-        await waitForApi(page);
-        expect(new URL(page.url()).search).toBe("?unrelated=second");
-        expect(new URL(page.url()).hash).toBe("#persisted");
+            });
+            await waitForApi(sameSessionPage);
+            await sameSessionPage.close();
 
-        await page.goto(
+            await page.goto(
+                runtimeUrl("/gpt-diagnostics?unrelated=second#persisted"),
+                {
+                    waitUntil: "load",
+                },
+            );
+            await waitForApi(page);
+            expect(new URL(page.url()).search).toBe("?unrelated=second");
+            expect(new URL(page.url()).hash).toBe("#persisted");
+        }
+
+        const deactivationResponse = await page.goto(
             runtimeUrl(
                 "/gpt-diagnostics?unrelated=kept&ts_console=false#disabled",
             ),
             { waitUntil: "load" },
         );
+        if (!supportsHarnessSecureCookie) {
+            expect(deactivationResponse?.headers()["set-cookie"]).toContain(
+                "__Host-ts-console=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0",
+            );
+        }
         expect(new URL(page.url()).search).toBe("?unrelated=kept");
         expect(new URL(page.url()).hash).toBe("#disabled");
         expect(

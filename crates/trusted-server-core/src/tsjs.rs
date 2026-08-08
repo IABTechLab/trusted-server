@@ -312,7 +312,7 @@ mod tests {
         let script = tsjs_boot_script_v1(TsjsBootScriptConfigV1 {
             module_ids: &["creative", "gpt", "gpt_diagnostics"],
             auction_projection_json:
-                r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"bids":[]}"#,
+                r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"slots":[],"bids":[]}"#,
             creative: CreativeBootConfigV1 {
                 enabled: true,
                 click_guard: true,
@@ -325,7 +325,7 @@ mod tests {
 
         assert!(script.starts_with("<script>(function(){var t=window.tsjs=window.tsjs||{};"));
         assert!(script.contains(&format!(
-            r#"t.boot={{"abi":1,"releaseId":"{}","manifest":{{"version":1,"releaseId":"{}","integrations":[{{"id":"creative","required":true}},{{"id":"gpt","required":true}},{{"id":"gpt_diagnostics","required":true}}]}},"auctionProjection":{{"version":1,"auction":{{"version":1,"auctionId":"initial","results":[]}},"bids":[]}},"creative":{{"version":1,"enabled":true,"clickGuard":true,"renderGuard":false}},"diagnostics":{{"version":1,"renderTraceOverlay":true,"gpt":{{"active":true}}}}}};"#,
+            r#"t.boot={{"abi":1,"releaseId":"{}","manifest":{{"version":1,"releaseId":"{}","integrations":[{{"id":"creative","required":true}},{{"id":"gpt","required":true}},{{"id":"gpt_diagnostics","required":true}}]}},"auctionProjection":{{"version":1,"auction":{{"version":1,"auctionId":"initial","results":[]}},"slots":[],"bids":[]}},"creative":{{"version":1,"enabled":true,"clickGuard":true,"renderGuard":false}},"diagnostics":{{"version":1,"renderTraceOverlay":true,"gpt":{{"active":true}}}}}};"#,
             release_id(),
             release_id()
         )));
@@ -338,7 +338,7 @@ mod tests {
     fn boot_script_rejects_manifest_diagnostics_mismatch_and_escapes_projection_markup() {
         let mismatched = tsjs_boot_script_v1(TsjsBootScriptConfigV1 {
             module_ids: &["creative"],
-            auction_projection_json: r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"bids":[]}"#,
+            auction_projection_json: r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"slots":[],"bids":[]}"#,
             creative: CreativeBootConfigV1 {
                 enabled: true,
                 click_guard: true,
@@ -355,7 +355,7 @@ mod tests {
         let script = tsjs_boot_script_v1(TsjsBootScriptConfigV1 {
             module_ids: &["creative"],
             auction_projection_json:
-                r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"bids":[],"probe":"</ScRiPt><script>&\u2028"}"#,
+                r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"slots":[],"bids":[],"probe":"</ScRiPt><script>&\u2028"}"#,
             creative: CreativeBootConfigV1 {
                 enabled: true,
                 click_guard: true,

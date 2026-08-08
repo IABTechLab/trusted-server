@@ -99,6 +99,7 @@ import type {
   RuntimeSession,
 } from '../kernel/sessions';
 import { createRuntimeSession } from '../kernel/sessions';
+import { trustedDocumentHttpOrigin } from '../shared/origin';
 import type { CoreActivationContext } from '../kernel/integration_registry';
 import { createRuntime, type Runtime, type RuntimeOptions } from '../kernel/runtime';
 import {
@@ -1419,7 +1420,11 @@ export function createBrowserRuntimeComposition(
         prepareRenderSource: (candidate) => parseBidRenderSourceV1(candidate, cachePolicy),
       });
       const rendererNonces = createRendererNonceRegistry();
-      const publisherOrigin = window.location.origin;
+      // A real document origin is authoritative. Only an opaque srcdoc may
+      // fall back to the server-stamped base; publisher script must not be able
+      // to redirect the APS endpoint by predefining that creative-only stamp.
+      const publisherOrigin = trustedDocumentHttpOrigin(window.location.origin);
+      if (!publisherOrigin) throw new Error('Trusted publisher origin is unavailable');
       const fetchCache = globalThis.fetch;
       const rendererUrl = new URL(APS_RENDERER_V1_PATH, publisherOrigin).href;
       const renderDirectAdm = Object.freeze(

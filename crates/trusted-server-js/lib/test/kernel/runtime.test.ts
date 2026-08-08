@@ -355,6 +355,7 @@ describe('Runtime bootstrap owner', () => {
     ['invalid manifest', { version: 2 }, 'abi_mismatch'],
     ['missing bundle', manifest(['gpt']), 'bundle_partial'],
   ] as const)('commits terminal fallback for %s', async (_name, candidateManifest, reason) => {
+    vi.useFakeTimers();
     const queued = vi.fn();
     const activateCore = vi.fn();
     const target = { que: [queued], boot: boot() };
@@ -373,7 +374,9 @@ describe('Runtime bootstrap owner', () => {
     });
 
     runtime.start();
-    await expect(runtime.install()).resolves.toEqual({ state: 'fallback', reason });
+    const installed = runtime.install();
+    if (reason === 'bundle_partial') await vi.advanceTimersByTimeAsync(10_000);
+    await expect(installed).resolves.toEqual({ state: 'fallback', reason });
 
     expect(runtime.state).toBe('fallback');
     expect(activateCore).not.toHaveBeenCalled();

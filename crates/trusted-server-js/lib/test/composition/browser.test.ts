@@ -3259,7 +3259,9 @@ describe('browser composition', () => {
     );
 
     expect(composition.runtime.start()).toBe(true);
-    await expect(composition.runtime.install()).resolves.toEqual({
+    const installed = composition.runtime.install();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(installed).resolves.toEqual({
       state: 'fallback',
       reason: 'bundle_partial',
     });
