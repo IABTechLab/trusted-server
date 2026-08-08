@@ -20,7 +20,7 @@ import {
 } from '../adapters/prebid';
 import { parseCacheFetchPolicyV1 } from '../core/config';
 import { parseTrustedServerAuctionResponseV1 } from '../core/auction';
-import type { BrowserAuctionProjectionV1 } from '../core/types';
+import type { BrowserAuctionProjectionV1, CreativeBootV1 } from '../core/types';
 import {
   parseBidRenderSourceV1,
   parseBrowserAuctionProjectionV1,
@@ -36,6 +36,10 @@ import {
 } from '../core/registry';
 import { prepareAdmIframe } from '../core/render';
 import { APS_RENDERER_V1_PATH, renderDirectApsAttempt } from '../integrations/aps/render';
+import { installClickGuard } from '../integrations/creative/click';
+import { installDynamicIframeProxy } from '../integrations/creative/iframe';
+import { installDynamicImageProxy } from '../integrations/creative/image';
+import { createCreativeStartup } from '../integrations/creative/startup';
 import {
   publishGptWinner,
   startGptSlotOperation,
@@ -169,6 +173,8 @@ export interface BrowserCoreActivations {
 export interface TestBrowserRuntimeCompositionOptions extends BrowserCompositionOptions {
   readonly auctionFetcherForTest?: AuctionBatchFetcher;
   readonly coreActivations: BrowserCoreActivations;
+  readonly creativeActivationForTest?: (config: Readonly<CreativeBootV1>) => () => void;
+  readonly creativeStartupForTest?: (config: Readonly<CreativeBootV1>) => void;
   readonly createIdentityIssuerForTest?: NavigationIdentityIssuerFactory;
   readonly admittedProgrammaticSlotsForTest?: readonly string[];
   readonly gptStartupForTest?: (config: unknown) => void;
@@ -179,6 +185,7 @@ export interface TestBrowserRuntimeCompositionOptions extends BrowserComposition
 interface AcceptedBrowserBoot {
   readonly auctionProjection: object;
   readonly cachePolicy?: unknown;
+  readonly creative: Readonly<CreativeBootV1>;
   readonly manifest: {
     readonly integrations: readonly { readonly id: string }[];
   };
@@ -269,6 +276,23 @@ export function createTestBrowserRuntimeComposition(
   const composition = createBrowserComposition(compositionOptions);
   const providedBindings = runtimeOptions.getBindings;
   let browserServices: Readonly<BrowserServices> | undefined;
+  let creativeBoot: Readonly<CreativeBootV1> | undefined;
+  const defaultCreativeRuntime =
+    typeof document === 'undefined'
+      ? Object.freeze({
+          activate: (_config: Readonly<CreativeBootV1>) => () => undefined,
+          start: (_config: Readonly<CreativeBootV1>) => undefined,
+        })
+      : createCreativeStartup({
+          document,
+          installClickGuard: () => installClickGuard(false),
+          installDynamicIframeProxy: () => installDynamicIframeProxy(false),
+          installDynamicImageProxy: () => installDynamicImageProxy(false),
+        });
+  const creativeRuntime = Object.freeze({
+    activate: compositionOptions.creativeActivationForTest ?? defaultCreativeRuntime.activate,
+    start: compositionOptions.creativeStartupForTest ?? defaultCreativeRuntime.start,
+  });
   const startGpt = compositionOptions.gptStartupForTest ?? (() => undefined);
   const gptRuntime = createGptStartup({
     googletag: composition.adapters.googletag,
@@ -358,6 +382,7 @@ export function createTestBrowserRuntimeComposition(
       if (!descriptor || !('value' in descriptor)) return provided;
       config = descriptor.value;
     }
+    if (id === 'creative' && config === undefined) config = creativeBoot;
     const interfaces = runtimeSession?.interfaces;
     if (!interfaces) throw new Error(`Integration interfaces are unavailable for ${id}`);
     return Object.freeze({
@@ -555,6 +580,7 @@ export function createTestBrowserRuntimeComposition(
     },
     prepareOwner: (context) => {
       const boot = context.boot as unknown as AcceptedBrowserBoot;
+      creativeBoot = boot.creative;
       const cachePolicy =
         boot.cachePolicy === undefined ? undefined : parseCacheFetchPolicyV1(boot.cachePolicy);
       const parseProjection = (candidate: unknown): object | undefined =>
@@ -758,6 +784,7 @@ export function createTestBrowserRuntimeComposition(
           compositionOptions.createIdentityIssuerForTest ?? createBrowserNavigationIdentityIssuer,
         interfaces: Object.freeze({
           adapters: composition.adapters,
+          creative: creativeRuntime,
           gpt: gptRuntime,
           prebid: prebidRuntime,
           ...services,
@@ -782,6 +809,7 @@ export function createTestBrowserRuntimeComposition(
           auctionBatchService = undefined;
           auctionContextRegistry = undefined;
           projectionParser = undefined;
+          creativeBoot = undefined;
         }
       });
       const navigation = session.startInitialNavigation(initialProjection);
