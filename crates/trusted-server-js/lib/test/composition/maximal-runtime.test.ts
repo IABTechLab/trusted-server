@@ -241,6 +241,7 @@ function createMaximalHarness(options: MaximalHarnessOptions = {}) {
         auctionProjection: {
           version: 1,
           auction: { version: 1, auctionId: 'initial', results: [] },
+          slots: [],
           bids: [],
         },
         creative: { version: 1, enabled: true, clickGuard: true, renderGuard: false },
@@ -390,6 +391,7 @@ describe('generated maximal browser runtime transaction', () => {
           auctionProjection: {
             version: 1,
             auction: { version: 1, auctionId: 'initial', results: [] },
+            slots: [],
             bids: [],
           },
           creative: { version: 1, enabled: true, clickGuard: true, renderGuard: false },

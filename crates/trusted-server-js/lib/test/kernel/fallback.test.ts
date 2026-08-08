@@ -17,6 +17,7 @@ function boot(creative: unknown) {
     auctionProjection: {
       version: 1,
       auction: { version: 1, auctionId: 'initial', results: [] },
+      slots: [],
       bids: [],
     },
     creative,

@@ -809,14 +809,12 @@ impl IntegrationRegistry {
         plan: Arc<AuctionPlan>,
     ) -> Result<Self, Report<TrustedServerError>> {
         let mut inner = IntegrationRegistryInner::default();
-        let mut registrations = Vec::new();
-        if let Some(registration) = crate::integrations::prebid::register_for_plan(settings, &plan)?
-        {
-            registrations.push(registration);
-        }
-        if let Some(registration) = crate::integrations::aps::register_for_plan(settings, &plan)? {
-            registrations.push(registration);
-        }
+        let aps_proxy: Arc<dyn IntegrationProxy> =
+            Arc::new(super::aps::ApsV1Integration::from_settings(settings)?);
+        inner
+            .reserved_proxies
+            .push(("/integrations/aps", aps_proxy));
+
         for builder in crate::integrations::builders() {
             if let Some(registration) = (builder.build)(settings)? {
                 debug_assert_eq!(registration.integration_id, builder.id);
@@ -899,31 +897,6 @@ impl IntegrationRegistry {
         })
     }
 
-    /// Build the coordinated-cutover APS surface for hermetic tests only.
-    ///
-    /// Ordinary production construction deliberately has no reserved APS
-    /// dispatcher until the hard cutover task activates it.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when ordinary registry construction or APS
-    /// configuration validation fails.
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn new_with_aps_v1_for_tests(
-        settings: &Settings,
-    ) -> Result<Self, Report<TrustedServerError>> {
-        let mut registry = Self::new(settings)?;
-        let proxy: Arc<dyn IntegrationProxy> =
-            Arc::new(super::aps::ApsV1Integration::from_settings(settings)?);
-        let inner = Arc::get_mut(&mut registry.inner).ok_or_else(|| {
-            Report::new(TrustedServerError::Configuration {
-                message: "APS test registry became shared during construction".to_string(),
-            })
-        })?;
-        inner.reserved_proxies.push(("/integrations/aps", proxy));
-        Ok(registry)
-    }
-
     fn reserved_proxy(&self, path: &str) -> Option<&Arc<dyn IntegrationProxy>> {
         self.inner
             .reserved_proxies
@@ -937,13 +910,13 @@ impl IntegrationRegistry {
             .map(|(_, proxy)| proxy)
     }
 
-    /// Return true when a coordinated-cutover family owns this path.
+    /// Return true when a hard-cutover family owns this path.
     #[must_use]
     pub fn has_reserved_path(&self, path: &str) -> bool {
         self.reserved_proxy(path).is_some()
     }
 
-    /// Dispatch a coordinated-cutover family before auth, EC, filters, and fallback.
+    /// Dispatch a hard-cutover family before auth, EC, filters, and fallback.
     #[must_use]
     pub async fn handle_reserved_proxy(
         &self,
@@ -1688,19 +1661,15 @@ mod tests {
     }
 
     #[test]
-    fn aps_coordinated_cutover_family_exists_only_in_explicit_test_registry() {
+    fn production_registry_always_reserves_the_aps_family() {
         let settings = create_test_settings();
-        let ordinary = IntegrationRegistry::new(&settings).expect("ordinary registry should build");
-        assert!(!ordinary.has_reserved_path("/integrations/aps"));
-        assert!(!ordinary.has_reserved_path("/integrations/aps/runner.js"));
-
-        let cutover = IntegrationRegistry::new_with_aps_v1_for_tests(&settings)
-            .expect("coordinated-cutover registry should build");
-        assert!(cutover.has_reserved_path("/integrations/aps"));
-        assert!(cutover.has_reserved_path("/integrations/aps/runner.js"));
-        assert!(cutover.has_reserved_path("/integrations/aps/malformed/path"));
-        assert!(!cutover.has_reserved_path("/integrations/apsx/runner.js"));
-        assert!(!cutover.has_reserved_path("/integrations/aps-legacy"));
+        let registry =
+            IntegrationRegistry::new(&settings).expect("production registry should build");
+        assert!(registry.has_reserved_path("/integrations/aps"));
+        assert!(registry.has_reserved_path("/integrations/aps/runner.js"));
+        assert!(registry.has_reserved_path("/integrations/aps/malformed/path"));
+        assert!(!registry.has_reserved_path("/integrations/apsx/runner.js"));
+        assert!(!registry.has_reserved_path("/integrations/aps-legacy"));
 
         let request = Request::builder()
             .method(Method::GET)
@@ -1708,7 +1677,7 @@ mod tests {
             .header(HEADER_X_TS_EC.clone(), "caller-controlled")
             .body(EdgeBody::empty())
             .expect("should build reserved APS request");
-        let response = futures::executor::block_on(cutover.handle_reserved_proxy(
+        let response = futures::executor::block_on(registry.handle_reserved_proxy(
             &settings,
             &noop_services(),
             request,

@@ -920,6 +920,13 @@ interface AuctionDecisionSetV1 {
 interface BrowserAuctionProjectionV1 {
   version: 1
   auction: AuctionDecisionSetV1
+  slots: Array<{
+    slot: string
+    gamUnitPath: string
+    divId: string
+    formats: Array<readonly [number, number]>
+    targeting: Record<string, string>
+  }>
   bids: Array<{
     candidateId: string
     slot: string
@@ -936,11 +943,11 @@ interface BrowserAuctionProjectionV1 {
 
 `BrowserAuctionProjectionV1` is exact, deny-unknown, and bounded before any slot,
 reservation, targeting, or bid mutation. Its canonical UTF-8 JSON is at most
-`MAX_BROWSER_AUCTION_PROJECTION_BYTES = 8 * 1024 * 1024`; `auction.results` and
-`bids` each contain at most 256 entries; and all objects are plain own-data objects
+`MAX_BROWSER_AUCTION_PROJECTION_BYTES = 8 * 1024 * 1024`; `auction.results`, `slots`,
+and `bids` each contain at most 256 entries; and all objects are plain own-data objects
 with no accessors. Canonical serialization uses the interface field order shown,
-request order for results, matching result order for bids, lexically sorted targeting
-keys, and no insignificant whitespace. `auctionId` matches
+request order for results, the same order for slots, matching result order for bids,
+lexically sorted targeting keys, and no insignificant whitespace. `auctionId` matches
 `^[A-Za-z0-9._:-]{1,128}$`; candidate ids use
 the exact 12-character base64url form from §3.4 and are unique; result slots are
 unique, follow the §2.2 bound, and contain no NUL or ASCII control; every winner has
@@ -949,6 +956,23 @@ exactly one bid with the same slot/candidate and non-winners have none;
 `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`; and upstream bid ids are 1–64 UTF-8 bytes with
 no NUL or ASCII control. CPM is a finite nonnegative number and currency is exactly
 `USD`.
+
+For initial HTML and `/_ts/page-bids`, `slots.length` equals
+`auction.results.length` exactly. Entry `slots[i].slot` equals
+`auction.results[i].slot`; slot ids are unique; and the entire projection is rejected
+if any placement is missing, duplicated, extra, or out of order. `gamUnitPath` and
+`divId` are nonempty, contain no NUL or ASCII control, and are each at most 256 UTF-8
+bytes. `formats` contains 1–64 exact two-number tuples and every width and height is
+an integer in 1–4096. Placement `targeting` uses the same exact key/value grammar and
+32-entry cap as bid targeting and cannot contain `hb_adid`.
+
+The direct `/auction` response does not expose this browser projection shape. Its
+internal use of the canonical decision/bid serializer supplies `slots:[]` because
+there is no server-rendered GAM placement to bind; the wire response remains the
+exact OpenRTB response plus decision extension. Rust canonicalization therefore
+accepts either full ordered placement coverage or the direct-only empty placement
+vector, while the browser boot/page-bids parser accepts only full ordered coverage.
+No browser consumer interprets an empty placement vector for a nonempty decision set.
 
 Each bid's `targeting` member is a plain own-data object with at most 32 entries. A key
 matches `^[A-Za-z0-9_]{1,20}$`, is unique and case-sensitive, and cannot be
@@ -965,7 +989,8 @@ the existing no-bid/failed results in request order. For `/auction`, the corresp
 TS winner bids are likewise absent from `seatbid`; no unmatched decision or bid is
 emitted. The reduced projection is guaranteed to fit from the 256-result/id bounds.
 Initial HTML, page-bids, and direct response production use this same all-winners
-rule, never a completion-order or first-fit subset. Boot rejects any independently
+rule, never a completion-order or first-fit subset. The aggregate measurement includes
+the complete ordered placement vector for browser projections. Boot rejects any independently
 malformed or oversized value as `abi_mismatch`; page-bids and direct response
 admission reject it transactionally as `invalid_response` with no partial slot,
 reservation, targeting, or bid state.
@@ -1084,6 +1109,10 @@ stores the document-generation input at
 value; an SPA page-bids response replaces only the new session's internal projection
 through the transaction in §2.5. It never mutates `tsjs.boot`. A winner decision
 must join exactly one projected bid and a no-bid/failed decision must join none.
+Every decision also joins its exact ordered `slots` placement. Static placement
+targeting is applied first, bid targeting overrides a duplicate static key, and the
+runtime alone synthesizes `hb_adid` from `rendererReservationId`; neither server
+targeting object may provide that key.
 Targeting applies one identity rule from §2.2 and never truncates a value to fit GAM.
 If the chosen value cannot satisfy the 40-character targeting limit, the bid is
 rejected before targeting with an explicit local reason.
@@ -1123,6 +1152,19 @@ For SSAT/page-bids, only after successful insertion may it expose that same id a
 GAM `hb_adid`, publish other targeting, record GPT intent, and invoke a
 request-capable GPT operation—in that order. Any failure before request invocation
 tombstones the reservation, compare-restores targeting, and settles the attempt.
+
+The composition resolves each projected `divId` to the exact element first, then to
+one unambiguous responsive/hydrated prefix match; container-shell aliases are not
+treated as creative roots and ambiguity fails `slot_unresolved`. If GPT already owns
+exactly one live slot for the resolved element, the slot service adopts that publisher
+object and publishes with `refresh`. Otherwise the sole GPT adapter performs a
+transactional `defineSlot`/`addService`/adoption and publishes with `display`.
+Staleness destroys the unadopted candidate, and no path may leave a second physical
+slot. Initial boot and every successfully committed page-bids replacement use this
+same publisher. `pushState`, `replaceState`, and `popstate` share pathname-plus-query
+identity; identical routes are suppressed, a current failed/rejected response rolls
+back to the last committed path so the same route can retry, and an older response
+cannot roll back or publish over a newer navigation generation.
 
 For the Trusted Server Prebid adapter, the supported artifact is the content-addressed
 external bundle built from exactly lockfile-resolved Prebid.js 10.26.0. The external
@@ -1987,9 +2029,10 @@ timer, listener, port, or iframe. It never exposes a compatibility API.
 
 The safe fallback boot uses the embedded release and
 `manifest:{version:1,releaseId,integrations:[]}`, independently retains the server
-auction projection only when that projection passes its exact shape/256-slot bounds,
+auction projection only when that projection passes its exact shape, full ordered
+placement coverage, 256-slot bounds,
 field grammars, render limits, and 8 MiB aggregate cap from §§3.1–3.2, and otherwise substitutes exactly
-`{version:1,auction:{version:1,auctionId:'fallback',results:[]},bids:[]}`. It
+`{version:1,auction:{version:1,auctionId:'fallback',results:[]},slots:[],bids:[]}`. It
 retains a valid cache policy or omits it, and substitutes the creative/diagnostics
 disabled safe defaults from §§5.4/5.8 because no integration module commits. It never copies an accessor or
 unknown property. Fallback batch membership comes only from exact server slot ids in
@@ -2012,23 +2055,23 @@ and late bundles; no valid call remains pending.
 
 There are no compatibility aliases:
 
-| Baseline surface                         | Final surface                                                                   |
-| ---------------------------------------- | ------------------------------------------------------------------------------- |
-| scattered `window.__tsjs_*` flags/config | `tsjs.boot.*`                                                                   |
-| `tsjs.adSlots`/`tsjs.bids`               | initial `tsjs.boot.auctionProjection`; internal navigation projection after SPA |
-| `tsjs.version === '0.1.0'`               | `tsjs.version === '1.0.0'` plus `tsjs.releaseId`                                |
-| `globalThis.tscreative`                  | no callable equivalent; automatic creative module                               |
-| `globalThis.tsCreativeConfig`            | `tsjs.boot.creative`                                                            |
-| void/callback `requestAds`               | `tsjs.requestAds(options): Promise<RequestAdsResult>`                           |
-| placeholder `renderAdUnit`               | `tsjs.requestAds({slots:[id]})`                                                 |
-| placeholder `renderAllAdUnits`           | `tsjs.requestAds()`                                                             |
-| generic mutable `setConfig`/`getConfig`  | immutable `tsjs.boot.*` plus typed integration config                           |
-| `tsjs.renders`/`renderLog`/`renderSeq`   | `tsjs.diagnostics.renderTrace`                                                  |
-| `window` event `tsjs:adRendered`         | `tsjs.diagnostics.renderTrace.subscribe(listener)`                              |
-| `tsjs.gptDiagnostics`                    | `tsjs.diagnostics.gpt`                                                          |
-| `window.__tsjs_prebid_bundle`            | exact own `pbjs.__trustedServerArtifactV1` stamp                                |
-| integration install/patch sentinels      | kernel integration registry/`WeakSet`                                           |
-| GPT slot expandos                        | `SlotRecord`                                                                    |
+| Baseline surface                         | Final surface                                                                                                      |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| scattered `window.__tsjs_*` flags/config | `tsjs.boot.*`                                                                                                      |
+| `tsjs.adSlots`/`tsjs.bids`               | initial `tsjs.boot.auctionProjection` including exact ordered placements; internal navigation projection after SPA |
+| `tsjs.version === '0.1.0'`               | `tsjs.version === '1.0.0'` plus `tsjs.releaseId`                                                                   |
+| `globalThis.tscreative`                  | no callable equivalent; automatic creative module                                                                  |
+| `globalThis.tsCreativeConfig`            | `tsjs.boot.creative`                                                                                               |
+| void/callback `requestAds`               | `tsjs.requestAds(options): Promise<RequestAdsResult>`                                                              |
+| placeholder `renderAdUnit`               | `tsjs.requestAds({slots:[id]})`                                                                                    |
+| placeholder `renderAllAdUnits`           | `tsjs.requestAds()`                                                                                                |
+| generic mutable `setConfig`/`getConfig`  | immutable `tsjs.boot.*` plus typed integration config                                                              |
+| `tsjs.renders`/`renderLog`/`renderSeq`   | `tsjs.diagnostics.renderTrace`                                                                                     |
+| `window` event `tsjs:adRendered`         | `tsjs.diagnostics.renderTrace.subscribe(listener)`                                                                 |
+| `tsjs.gptDiagnostics`                    | `tsjs.diagnostics.gpt`                                                                                             |
+| `window.__tsjs_prebid_bundle`            | exact own `pbjs.__trustedServerArtifactV1` stamp                                                                   |
+| integration install/patch sentinels      | kernel integration registry/`WeakSet`                                                                              |
+| GPT slot expandos                        | `SlotRecord`                                                                                                       |
 
 `window.tsjs.que` remains the pre-load command queue because it is the bootstrap
 transport, not a legacy behavior alias.
@@ -2506,11 +2549,7 @@ subscription methods. The final schema is:
 ```ts
 type RenderTracePathV1 = 'auction' | 'ssat' | 'gam-refresh'
 type RenderTraceServedFromV1 =
-  | 'inline'
-  | 'gam'
-  | 'debug-adm'
-  | 'pbs-cache'
-  | 'prebid'
+  'inline' | 'gam' | 'debug-adm' | 'pbs-cache' | 'prebid'
 
 interface RenderTraceRecord {
   readonly slotId: string

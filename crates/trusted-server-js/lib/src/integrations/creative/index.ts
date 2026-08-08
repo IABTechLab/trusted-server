@@ -1,12 +1,14 @@
-// Entry point for the creative runtime: wires up click + image + iframe guards globally.
-import { log } from '../../core/log';
-import type { TsCreativeConfig, CreativeWindow, TsCreativeApi } from '../../shared/globals';
-import { creativeGlobal, resolveWindow } from '../../shared/globals';
+// Legacy callable helpers remain exported until Task 22; production performs
+// only the release-bound integration registration below.
+import { EMBEDDED_RELEASE_ID } from '../../core/release';
+import type { TsCreativeConfig, TsCreativeApi } from '../../shared/globals';
+import { creativeGlobal } from '../../shared/globals';
 
 import { installClickGuard } from './click';
 import { installDynamicImageProxy } from './image';
 import { installDynamicIframeProxy } from './iframe';
 import type { CreativeGuardHandle } from './startup';
+import { createCreativeIntegrationRegistration } from './module';
 
 export { installDynamicImageProxy } from './image';
 export { installDynamicIframeProxy } from './iframe';
@@ -88,32 +90,14 @@ export const tsCreative: TsCreativeApi = {
   getConfig: getCreativeConfig,
 };
 
-try {
-  creativeGlobal.tscreative = tsCreative;
-} catch (err) {
-  log.debug('tsjs-creative: failed to expose global tscreative', err);
-}
-
 export default tsCreative;
 
-(function auto() {
-  // Auto-install on load so publishers just reference the bundle.
-  const maybeWindow = resolveWindow();
-  if (!maybeWindow || typeof document === 'undefined') return;
-
-  const win = maybeWindow as CreativeWindow;
-  const initialConfig = creativeGlobal.tsCreativeConfig ?? win.tsCreativeConfig;
-  if (initialConfig) {
-    mergeConfig(initialConfig);
-  } else {
-    creativeGlobal.tsCreativeConfig = { ...currentConfig };
+if (typeof window !== 'undefined') {
+  const register = (window.tsjs as unknown as { _registerIntegration?: unknown } | undefined)
+    ?._registerIntegration;
+  if (typeof register === 'function') {
+    Reflect.apply(register, window.tsjs, [
+      createCreativeIntegrationRegistration(EMBEDDED_RELEASE_ID),
+    ]);
   }
-  if (win.__ts_creative_installed) return;
-  win.__ts_creative_installed = true;
-
-  installGuards();
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => installGuards());
-  }
-})();
+}

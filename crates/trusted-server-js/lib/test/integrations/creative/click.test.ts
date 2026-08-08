@@ -4,8 +4,8 @@ import {
   FIRST_PARTY_CLICK,
   MUTATED_CLICK,
   PROXY_RESPONSE,
+  activateCreativeRuntime,
   disposeImportedCreativeModule,
-  importCreativeModule,
 } from './helpers';
 
 const ORIGINAL_FETCH = global.fetch;
@@ -67,7 +67,7 @@ describe('creative/click.ts', () => {
     anchor.setAttribute('href', FIRST_PARTY_CLICK);
     document.body.appendChild(anchor);
 
-    await importCreativeModule();
+    await activateCreativeRuntime();
 
     anchor.setAttribute('href', MUTATED_CLICK);
 
@@ -94,7 +94,7 @@ describe('creative/click.ts', () => {
     anchor.setAttribute('href', FIRST_PARTY_CLICK);
     document.body.appendChild(anchor);
 
-    await importCreativeModule();
+    await activateCreativeRuntime();
 
     anchor.setAttribute('href', MUTATED_CLICK);
 
@@ -180,7 +180,7 @@ describe('creative/click.ts', () => {
       anchor.setAttribute('href', FIRST_PARTY_CLICK);
       document.body.appendChild(anchor);
 
-      await importCreativeModule();
+      await activateCreativeRuntime();
 
       anchor.setAttribute('href', MUTATED_CLICK);
 
@@ -220,7 +220,7 @@ describe('creative/click.ts', () => {
       anchor.setAttribute('href', FIRST_PARTY_CLICK);
       document.body.appendChild(anchor);
 
-      await importCreativeModule();
+      await activateCreativeRuntime();
 
       anchor.setAttribute('href', MUTATED_CLICK);
       await Promise.resolve();
@@ -269,7 +269,7 @@ describe('creative/click.ts', () => {
       anchor.setAttribute('target', '_blank');
       document.body.appendChild(anchor);
 
-      await importCreativeModule();
+      await activateCreativeRuntime();
 
       // Wave 1: creative mutates the link, observer repairs it.
       anchor.setAttribute('href', MUTATED_CLICK);
@@ -361,7 +361,7 @@ describe('creative/click.ts', () => {
     anchor.setAttribute('href', 'javascript:evil()');
     document.body.appendChild(anchor);
 
-    await importCreativeModule();
+    await activateCreativeRuntime();
 
     anchor.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
     await Promise.resolve();
@@ -389,7 +389,7 @@ describe('creative/click.ts', () => {
     document.body.appendChild(anchor);
 
     try {
-      await importCreativeModule();
+      await activateCreativeRuntime();
       anchor.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
       await Promise.resolve();
       await vi.runAllTimersAsync();
@@ -416,7 +416,7 @@ describe('creative/click.ts', () => {
     document.body.appendChild(anchor);
 
     try {
-      await importCreativeModule();
+      await activateCreativeRuntime();
       anchor.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
       await Promise.resolve();
       await vi.runAllTimersAsync();

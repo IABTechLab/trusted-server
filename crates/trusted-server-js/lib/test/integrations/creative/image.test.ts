@@ -1,6 +1,6 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
-import { disposeImportedCreativeModule, importCreativeModule, waitForExpect } from './helpers';
+import { activateCreativeRuntime, disposeImportedCreativeModule, waitForExpect } from './helpers';
 
 const ORIGINAL_FETCH = global.fetch;
 
@@ -25,7 +25,7 @@ describe('creative/image.ts', () => {
     });
     global.fetch = fetchMock as unknown as typeof fetch;
 
-    await importCreativeModule({ renderGuard: true });
+    await activateCreativeRuntime({ renderGuard: true });
 
     const img = new Image();
     img.src = 'https://img.example/pixel.gif?cb=1';
@@ -44,7 +44,7 @@ describe('creative/image.ts', () => {
     const fetchMock = vi.fn().mockRejectedValue(new Error('network'));
     global.fetch = fetchMock as unknown as typeof fetch;
 
-    await importCreativeModule({ renderGuard: true });
+    await activateCreativeRuntime({ renderGuard: true });
 
     const img = new Image();
     img.src = 'https://img.example/fallback.png';

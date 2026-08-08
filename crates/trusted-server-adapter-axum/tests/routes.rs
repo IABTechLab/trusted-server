@@ -54,7 +54,6 @@ fn test_router() -> edgezero_core::router::RouterService {
         .expect("should build router from test settings")
 }
 
-#[cfg(feature = "aps-runner-proxy-integration-test")]
 async fn route_reserved(request: Request<AxumBody>) -> axum::http::Response<AxumBody> {
     let request = edgezero_adapter_axum::request::into_core_request(request)
         .await
@@ -141,16 +140,9 @@ fn all_explicit_routes_are_registered() {
         ("POST", "/admin/keys/rotate"),
         ("POST", "/admin/keys/deactivate"),
         ("POST", "/auction"),
-        // SPA re-auction endpoint, plus its deprecated `/__ts/` alias. Both
-        // paths are spelled out as literals rather than referencing
-        // `PAGE_BIDS_PATH` / `PAGE_BIDS_LEGACY_PATH` so this test pins the
-        // actual URL the tsjs client fetches — asserting a const against itself
-        // would still pass if the const's value changed out from under the
-        // client.
+        // Pin the canonical literal fetched by the hard-cutover client.
         ("GET", "/_ts/page-bids"),
         ("OPTIONS", "/_ts/page-bids"),
-        ("GET", "/__ts/page-bids"),
-        ("OPTIONS", "/__ts/page-bids"),
         ("GET", "/first-party/proxy"),
         ("GET", "/first-party/click"),
         ("GET", "/first-party/sign"),
@@ -162,6 +154,11 @@ fn all_explicit_routes_are_registered() {
     for (method, path) in expected {
         assert_route_registered(method, path);
     }
+    let routes = registered_routes();
+    assert!(
+        routes.iter().all(|(_, path)| path != "/__ts/page-bids"),
+        "hard cutover must not retain the deprecated page-bids alias: {routes:?}"
+    );
 }
 
 /// Verify the legacy non-`/_ts` admin aliases ARE registered — to the local
@@ -272,7 +269,6 @@ async fn tsjs_route_prefix_is_handled_not_5xx() {
     );
 }
 
-#[cfg(feature = "aps-runner-proxy-integration-test")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn aps_cutover_renderer_and_family_failures_are_local() {
     let renderer = Request::builder()

@@ -37,7 +37,7 @@ use crate::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationHeadInjector,
     IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, collect_body_bounded,
-    collect_response_bounded, ensure_integration_backend,
+    collect_response_bounded, ensure_integration_backend, integration_config_script,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -1019,66 +1019,10 @@ impl IntegrationHeadInjector for SourcepointIntegration {
     }
 
     fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        let mut inserts = vec![format!(
-            "<script>window.__tsjs_sourcepoint={{\"rewriteSdk\":{}}};</script>",
-            self.config.rewrite_sdk
-        )];
-
-        if !self.config.rewrite_sdk {
-            return inserts;
-        }
-
-        // Install a property trap on `window._sp_` so that when the
-        // publisher's code (typically a Next.js hydration chunk) sets the
-        // Sourcepoint config object, we intercept it and rewrite any
-        // `cdn.privacy-mgmt.com` URLs to the first-party proxy prefix.
-        //
-        // The trap is transparent: the getter returns the (patched) value and
-        // the setter accepts any shape the SDK expects.  We also handle the
-        // case where `window._sp_` is already set before our script runs.
-        //
-        // Limitations:
-        // - Only intercepts top-level assignment (`window._sp_ = …`).  Nested
-        //   mutation like `window._sp_.config.baseEndpoint = "…"` after the
-        //   initial assignment is not caught.  The JS body regex rewriter
-        //   covers that case for string literals in bundled code.
-        // - `s.replace()` replaces only the first occurrence per call, which
-        //   is fine for the current set of scalar URL config fields.
-        inserts.push(format!(
-            concat!(
-                "<script>",
-                "(function(){{try{{",
-                "var C=\"{cdn_host}\";",
-                "var P=\"{cdn_prefix}\";",
-                "function r(s){{",
-                "if(typeof s!==\"string\")return s;",
-                "return s.replace(\"https://\"+C,P).replace(\"http://\"+C,P).replace(\"//\"+C,P)",
-                "}}",
-                "function p(o){{",
-                "if(!o||typeof o!==\"object\")return o;",
-                "if(o.config){{",
-                "if(typeof o.config.baseEndpoint===\"string\")o.config.baseEndpoint=r(o.config.baseEndpoint);",
-                "if(typeof o.config.mmsDomain===\"string\")o.config.mmsDomain=r(o.config.mmsDomain);",
-                "if(typeof o.config.wrapperAPIOrigin===\"string\")o.config.wrapperAPIOrigin=r(o.config.wrapperAPIOrigin);",
-                "if(typeof o.config.cmpOrigin===\"string\")o.config.cmpOrigin=r(o.config.cmpOrigin);",
-                "}}",
-                "if(typeof o.metricUrl===\"string\")o.metricUrl=r(o.metricUrl);",
-                "return o",
-                "}}",
-                "var v=window._sp_?p(window._sp_):undefined;",
-                "Object.defineProperty(window,\"_sp_\",{{",
-                "configurable:true,",
-                "get:function(){{return v}},",
-                "set:function(n){{v=p(n)}}",
-                "}});",
-                "}}catch(e){{if(window.console&&console.warn)console.warn(\"Sourcepoint: failed to install runtime config rewrite trap\",e)}}}})();",
-                "</script>",
-            ),
-            cdn_host = SOURCEPOINT_CDN_HOST,
-            cdn_prefix = SOURCEPOINT_CDN_PREFIX,
-        ));
-
-        inserts
+        vec![integration_config_script(
+            SOURCEPOINT_INTEGRATION_ID,
+            &format!("{{\"rewriteSdk\":{}}}", self.config.rewrite_sdk),
+        )]
     }
 }
 
@@ -1451,7 +1395,7 @@ mod tests {
     }
 
     #[test]
-    fn head_injector_emits_config_script_plus_trap_when_enabled() {
+    fn head_injector_emits_only_transient_config_when_enabled() {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
         let document_state = IntegrationDocumentState::default();
         let ctx = IntegrationHtmlContext {
@@ -1462,53 +1406,15 @@ mod tests {
         };
 
         let inserts = integration.head_inserts(&ctx);
-        assert_eq!(
-            inserts.len(),
-            2,
-            "should emit config plus trap script when enabled"
-        );
+        assert_eq!(inserts.len(), 1, "the TS module owns the Sourcepoint guard");
 
         let config_script = &inserts[0];
         assert!(
-            config_script.contains("window.__tsjs_sourcepoint={\"rewriteSdk\":true}"),
+            config_script.contains("c.sourcepoint={\"rewriteSdk\":true}"),
             "should emit rewrite SDK config script: {config_script}"
         );
-
-        let trap_script = &inserts[1];
-        assert!(
-            trap_script.starts_with("<script>") && trap_script.ends_with("</script>"),
-            "should be wrapped in script tags: {trap_script}",
-        );
-        assert!(
-            trap_script.contains("cdn.privacy-mgmt.com"),
-            "should reference the CDN host to rewrite: {trap_script}",
-        );
-        assert!(
-            trap_script.contains("/integrations/sourcepoint/cdn"),
-            "should contain the first-party CDN prefix: {trap_script}",
-        );
-        assert!(
-            trap_script.contains("try{") && trap_script.contains("catch(e)"),
-            "should guard best-effort trap installation: {trap_script}",
-        );
-        assert!(
-            trap_script.contains("console.warn"),
-            "should log trap installation failures for observability: {trap_script}",
-        );
-        assert!(
-            trap_script.contains("Object.defineProperty"),
-            "should install a property trap on window._sp_: {trap_script}",
-        );
-        for config_field in ["baseEndpoint", "mmsDomain", "wrapperAPIOrigin", "cmpOrigin"] {
-            assert!(
-                trap_script.contains(&format!("o.config.{config_field}")),
-                "should patch config field {config_field}: {trap_script}",
-            );
-        }
-        assert!(
-            trap_script.contains("o.metricUrl"),
-            "should patch top-level metricUrl: {trap_script}",
-        );
+        assert!(!config_script.contains("window.__tsjs_sourcepoint"));
+        assert!(!config_script.contains("Object.defineProperty"));
     }
 
     #[test]
@@ -1531,7 +1437,7 @@ mod tests {
             "should emit only config script when rewrite_sdk is false"
         );
         assert!(
-            inserts[0].contains("window.__tsjs_sourcepoint={\"rewriteSdk\":false}"),
+            inserts[0].contains("c.sourcepoint={\"rewriteSdk\":false}"),
             "should flag rewriteSdk false"
         );
         assert!(

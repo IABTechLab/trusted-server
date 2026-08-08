@@ -1,6 +1,6 @@
 //! HTTP endpoint handlers for auction requests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
@@ -20,20 +20,21 @@ use crate::ec::log_id;
 use crate::ec::prebid_eids::parse_prebid_eids_cookie;
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
+use crate::http_util::RequestInfo;
 use crate::openrtb::{Eid, Uid};
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
 use super::AuctionOrchestrator;
-use super::formats::{
-    convert_to_openrtb_response, convert_to_openrtb_response_with_report,
-    convert_tsjs_to_auction_request,
-};
+use super::formats::{attach_auction_response_headers, convert_tsjs_to_auction_request};
 use super::telemetry::{
     AuctionObservationContext, AuctionSource, AuctionTerminalOutcome, build_auction_events,
     emit_auction_events_best_effort_lazy,
 };
-use super::types::{AuctionContext, AuctionDecisionSetV1, AuctionSlotFailureReason};
+use super::types::{
+    AuctionContext, AuctionDecisionSetV1, AuctionRequest, AuctionSlotFailureReason,
+    SlotAuctionDecisionV1, SystemAuctionIdentityGenerator,
+};
 
 const MAX_CLIENT_EID_SOURCES: usize = 64;
 const MAX_CLIENT_UIDS_PER_SOURCE: usize = 32;
@@ -44,6 +45,66 @@ const MAX_CLIENT_EID_SOURCE_BYTES: usize = 255;
 /// with EID arrays) while preventing an authenticated client from consuming
 /// arbitrary WASM linear memory.
 const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
+
+struct ExactAuctionResponseV1 {
+    response: Response<EdgeBody>,
+    delivered_winner_slots: HashSet<String>,
+    dropped_winner_count: usize,
+}
+
+fn exact_auction_response_v1(
+    result: &OrchestrationResult,
+    settings: &Settings,
+    auction_request: &AuctionRequest,
+    request_origin: &str,
+    ec_allowed: bool,
+) -> Result<ExactAuctionResponseV1, Report<TrustedServerError>> {
+    let price_granularity = settings
+        .creative_opportunities
+        .as_ref()
+        .map(|config| config.price_granularity)
+        .unwrap_or_default();
+    let canonical = crate::publisher::coordinated_cutover_v1::build_browser_auction_projection_v1(
+        result,
+        price_granularity,
+        settings,
+        request_origin,
+        None,
+        &SystemAuctionIdentityGenerator,
+    )?;
+    let body = crate::auction::formats::coordinated_cutover_v1::serialize_trusted_server_auction_response_v1(
+        &canonical,
+    )?;
+    let delivered_winner_slots: HashSet<String> = canonical
+        .projection
+        .auction
+        .results
+        .iter()
+        .filter_map(|decision| match decision {
+            SlotAuctionDecisionV1::Winner { slot, .. } => Some(slot.clone()),
+            _ => None,
+        })
+        .collect();
+    let projected_winner_count = result
+        .decision_set
+        .results
+        .iter()
+        .filter(|decision| matches!(decision, SlotAuctionDecisionV1::Winner { .. }))
+        .count();
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(EdgeBody::from(body))
+        .change_context(TrustedServerError::Auction {
+            message: "Failed to build exact auction response".to_string(),
+        })?;
+    attach_auction_response_headers(&mut response, auction_request, ec_allowed)?;
+    Ok(ExactAuctionResponseV1 {
+        response,
+        dropped_winner_count: projected_winner_count.saturating_sub(delivered_winner_slots.len()),
+        delivered_winner_slots,
+    })
+}
 
 /// Handle auction request from `POST /auction`.
 ///
@@ -168,6 +229,22 @@ pub async fn handle_auction(
     );
 
     let http_req = Request::from_parts(parts, EdgeBody::empty());
+    let request_info = RequestInfo::from_request(&http_req, services.client_info());
+    let request_scheme = if request_info.scheme.is_empty() {
+        http_req.uri().scheme_str().unwrap_or("https")
+    } else {
+        &request_info.scheme
+    };
+    let request_host = if request_info.host.is_empty() {
+        http_req
+            .uri()
+            .authority()
+            .map(http::uri::Authority::as_str)
+            .unwrap_or(&settings.publisher.domain)
+    } else {
+        &request_info.host
+    };
+    let request_origin = format!("{request_scheme}://{request_host}");
 
     // Story 5 middleware contract: auction is a read-only EC route.
     // It must not generate EC IDs; it only consumes pre-routed context.
@@ -254,12 +331,14 @@ pub async fn handle_auction(
             total_time_ms: 0,
             metadata: HashMap::new(),
         };
-        return convert_to_openrtb_response(
+        return Ok(exact_auction_response_v1(
             &empty_result,
             settings,
             &auction_request,
+            &request_origin,
             ec_context.ec_allowed(),
-        );
+        )?
+        .response);
     }
 
     // Parse client-provided EIDs from the current request body. When the
@@ -357,10 +436,11 @@ pub async fn handle_auction(
         }
     };
 
-    let conversion = match convert_to_openrtb_response_with_report(
+    let conversion = match exact_auction_response_v1(
         &result,
         settings,
         &auction_request,
+        &request_origin,
         ec_context.ec_allowed(),
     ) {
         Ok(conversion) => conversion,
@@ -388,7 +468,7 @@ pub async fn handle_auction(
             AuctionTerminalOutcome::Completed {
                 request: &auction_request,
                 result: &result,
-                delivered_winner_slots: Some(&conversion.delivery.delivered_winner_slots),
+                delivered_winner_slots: Some(&conversion.delivered_winner_slots),
             },
         )
     })
@@ -397,8 +477,8 @@ pub async fn handle_auction(
     log::info!(
         "Auction completed: {} providers, {} delivered winning bids, {} dropped winners, {}ms total",
         result.provider_responses.len(),
-        conversion.delivery.delivered_winner_slots.len(),
-        conversion.delivery.dropped_winner_count,
+        conversion.delivered_winner_slots.len(),
+        conversion.dropped_winner_count,
         result.total_time_ms
     );
 
@@ -876,6 +956,20 @@ mod tests {
         assert!(
             seatbid_empty,
             "gated auction must return no bids, got: {parsed}"
+        );
+        assert_eq!(parsed["cur"], "USD");
+        assert_eq!(
+            parsed["ext"]["trusted_server"]["slot_results"]["results"][0],
+            json!({
+                "slot": "div-gpt-ad-1",
+                "outcome": "failed",
+                "reason": "consent_denied"
+            }),
+            "the production endpoint must emit the exact decision-set extension"
+        );
+        assert!(
+            parsed["ext"].get("orchestrator").is_none(),
+            "the removed legacy response extension must not survive the hard cutover"
         );
 
         let batches = telemetry_sink

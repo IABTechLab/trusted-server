@@ -76,6 +76,72 @@ describe('browser googletag adapter readiness', () => {
     expect(ready.display).toHaveBeenCalledWith('slot-a');
   });
 
+  it('defines and adopts one GPT slot as a synchronous rollback-capable transaction', async () => {
+    const ready = createReadyGoogletag();
+    const slot = { addService: vi.fn() };
+    ready.googletag.defineSlot.mockReturnValue(slot);
+    ready.googletag.destroySlots.mockReturnValue(true);
+    const commit = vi.fn(() => true);
+    const rollback = vi.fn();
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+
+    const operation = adapter.run((gpt) =>
+      gpt.transactionalDefine(
+        {
+          adUnitPath: '/123/slot-a',
+          elementId: 'slot-a',
+          sizes: [[300, 250]],
+        },
+        () => true,
+        (candidate) => {
+          expect(candidate).toBe(slot);
+          return Object.freeze({ commit, rollback });
+        }
+      )
+    );
+
+    await expect(operation.result).resolves.toEqual({ status: 'defined', slot });
+    expect(ready.googletag.defineSlot).toHaveBeenCalledExactlyOnceWith(
+      '/123/slot-a',
+      [[300, 250]],
+      'slot-a'
+    );
+    expect(slot.addService).toHaveBeenCalledExactlyOnceWith(ready.pubads);
+    expect(commit).toHaveBeenCalledOnce();
+    expect(rollback).not.toHaveBeenCalled();
+    expect(ready.googletag.destroySlots).not.toHaveBeenCalled();
+    expect(slot.addService.mock.invocationCallOrder[0]).toBeLessThan(
+      commit.mock.invocationCallOrder[0]!
+    );
+  });
+
+  it('destroys a newly defined GPT slot when its navigation becomes stale before adoption', async () => {
+    const ready = createReadyGoogletag();
+    const slot = { addService: vi.fn() };
+    ready.googletag.defineSlot.mockReturnValue(slot);
+    ready.googletag.destroySlots.mockReturnValue(true);
+    const isGenerationCurrent = vi.fn().mockReturnValueOnce(true).mockReturnValue(false);
+    const prepareCommit = vi.fn();
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+
+    const operation = adapter.run((gpt) =>
+      gpt.transactionalDefine(
+        {
+          adUnitPath: '/123/slot-a',
+          elementId: 'slot-a',
+          sizes: [[300, 250]],
+        },
+        isGenerationCurrent,
+        prepareCommit
+      )
+    );
+
+    await expect(operation.result).resolves.toEqual({ status: 'discarded' });
+    expect(prepareCommit).not.toHaveBeenCalled();
+    expect(slot.addService).not.toHaveBeenCalled();
+    expect(ready.googletag.destroySlots).toHaveBeenCalledExactlyOnceWith([slot]);
+  });
+
   it('marks and measures only the first TS-authoritative display', async () => {
     const ready = createReadyGoogletag();
     const performance = {

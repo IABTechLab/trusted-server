@@ -41,10 +41,8 @@ use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
     IntegrationRegistration, UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
-};
-#[cfg(test)]
-use crate::integrations::{
-    ensure_integration_backend_with_timeout, predict_integration_backend_name,
+    ensure_integration_backend_with_timeout, integration_config_script,
+    predict_integration_backend_name,
 };
 #[cfg(test)]
 use crate::openrtb::{
@@ -1398,8 +1396,18 @@ impl IntegrationHeadInjector for PrebidIntegration {
             excluded_gam_ad_unit_path_suffixes: &self.config.excluded_gam_ad_unit_path_suffixes,
         };
 
-        let config_json = serialize_injected_prebid_config(&payload);
-        let mut inserts = vec![injected_prebid_config_script(&config_json)];
+        // Escape `</` to prevent breaking out of the script tag.
+        let config_json = serde_json::to_string(&payload)
+            .unwrap_or_else(|e| {
+                log::warn!("Prebid: failed to serialize client config: {e}");
+                "{}".to_string()
+            })
+            .replace("</", "<\\/");
+
+        let mut inserts = vec![integration_config_script(
+            PREBID_INTEGRATION_ID,
+            &config_json,
+        )];
 
         inserts.push(self.external_bundle_script_tag());
 
@@ -4803,6 +4811,9 @@ external_bundle_sri = "sha384-AAAA"
             "should omit empty refresh-auction exclusions: {}",
             script
         );
+        assert!(script.contains("c.prebid="));
+        assert!(!script.contains("window.__tsjs_prebid"));
+        assert!(!script.contains("window.pbjs"));
     }
 
     #[test]

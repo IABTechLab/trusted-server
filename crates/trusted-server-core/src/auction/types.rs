@@ -510,6 +510,22 @@ pub struct BrowserAuctionBidV1 {
     pub render_source: BidRenderSourceV1,
 }
 
+/// Exact GAM placement metadata required to publish one server-projected slot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowserAuctionSlotV1 {
+    /// Exact server slot identity joined to one auction decision.
+    pub slot: String,
+    /// Fully rendered GAM ad-unit path for this navigation.
+    pub gam_unit_path: String,
+    /// Stable configured DOM id/prefix for responsive resolution.
+    pub div_id: String,
+    /// Accepted banner dimensions in configured order.
+    pub formats: Vec<[u32; 2]>,
+    /// Static publisher targeting applied before winner targeting.
+    pub targeting: BTreeMap<String, String>,
+}
+
 /// Complete browser-facing version-1 auction projection.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BrowserAuctionProjectionV1 {
@@ -517,6 +533,8 @@ pub struct BrowserAuctionProjectionV1 {
     pub version: u8,
     /// Ordered decision set for every requested slot.
     pub auction: AuctionDecisionSetV1,
+    /// Ordered GAM placement definitions; empty only for direct `/auction` serialization.
+    pub slots: Vec<BrowserAuctionSlotV1>,
     /// Winner bids in matching decision order.
     pub bids: Vec<BrowserAuctionBidV1>,
 }

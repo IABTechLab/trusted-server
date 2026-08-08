@@ -21,6 +21,7 @@ import {
   releasePublisherFirstImpressionAuction,
 } from '../../core/first_impression';
 import { log } from '../../core/log';
+import { EMBEDDED_RELEASE_ID } from '../../core/release';
 import { isEffectivelyVisible, recordRender, stampCreativeTrace } from '../../core/trace';
 import {
   buildAdRequest,
@@ -32,6 +33,7 @@ import type { AuctionBid, AuctionEid } from '../../core/auction';
 import type { AuctionSlot, BrowserAuctionBidV1, RenderRecord } from '../../core/types';
 
 import { PREBID_USER_ID_MODULE_REGISTRY } from './user_id_modules';
+import { createPrebidIntegrationRegistration } from './module';
 
 /**
  * Prebid.js public API surface (type-only; erased at build time).
@@ -1815,29 +1817,91 @@ function syncPrebidEidsCookie(): void {
   }
 }
 
-// Self-initialize when loaded in a browser (same pattern as other integrations).
+// ---------------------------------------------------------------------------
+// Render trace (client-side /auction path)
+// ---------------------------------------------------------------------------
+
+interface PrebidRenderedBid {
+  adUnitCode?: string;
+  bidderCode?: string;
+  bidder?: string;
+  creativeId?: string;
+  meta?: {
+    tsAuctionId?: unknown;
+    tsBidId?: unknown;
+    tsAdmHash?: unknown;
+    [key: string]: unknown;
+  };
+}
+
+interface PrebidRenderEvent {
+  bid?: PrebidRenderedBid;
+  adId?: string;
+  reason?: string;
+  message?: string;
+}
+
+function findAuctionSlotElement(adUnitCode: string): HTMLElement | null {
+  if (typeof document === 'undefined') return null;
+  return (document.getElementById(adUnitCode) ??
+    document.getElementById(`${adUnitCode}-container`)) as HTMLElement | null;
+}
+
+export function recordPrebidAdRender(
+  bid: PrebidRenderedBid | undefined,
+  outcome: 'succeeded' | 'failed'
+): RenderRecord | undefined {
+  if (!bid || typeof bid.adUnitCode !== 'string' || bid.adUnitCode === '') return undefined;
+  const meta = bid.meta ?? {};
+  if (typeof meta.tsAuctionId !== 'string') return undefined;
+  const succeeded = outcome === 'succeeded';
+  const el = findAuctionSlotElement(bid.adUnitCode);
+  const record = recordRender({
+    slotId: bid.adUnitCode,
+    path: 'auction',
+    rendered: succeeded,
+    injected: succeeded,
+    visible: succeeded ? isEffectivelyVisible(el) : false,
+    elementId: el?.id,
+    auctionId: meta.tsAuctionId,
+    bidId: typeof meta.tsBidId === 'string' ? meta.tsBidId : undefined,
+    admHash: typeof meta.tsAdmHash === 'string' ? meta.tsAdmHash : undefined,
+    bidder: bid.bidderCode ?? bid.bidder,
+    creativeId: bid.creativeId,
+    servedFrom: 'prebid',
+  });
+  if (el) stampCreativeTrace(el, record);
+  return record;
+}
+
+export function installPrebidRenderTrace(): void {
+  if (typeof window === 'undefined') return;
+  const p = pbjs as unknown as {
+    onEvent?: (event: string, handler: (event: PrebidRenderEvent) => void) => void;
+    __tsRenderTraceInstalled?: boolean;
+  };
+  if (typeof p.onEvent !== 'function' || p.__tsRenderTraceInstalled) return;
+  p.__tsRenderTraceInstalled = true;
+  const listen = (name: string, outcome: 'succeeded' | 'failed'): void => {
+    p.onEvent!(name, (event) => {
+      try {
+        recordPrebidAdRender(event?.bid, outcome);
+      } catch (err) {
+        log.warn(`[tsjs-prebid] render-trace ${name} failed`, err);
+      }
+    });
+  };
+  listen('adRenderSucceeded', 'succeeded');
+  listen('adRenderFailed', 'failed');
+}
+
 if (typeof window !== 'undefined') {
-  installPrebidNpm();
-  // When the external bundle failed to load, installPrebidNpm bailed out and
-  // pbjs.requestBids is undefined. Installing the refresh handler anyway
-  // would clear TS-applied GPT targeting on every publisher refresh and then
-  // fail to run the replacement auction — leave GPT untouched instead.
-  if (hasPrebidJsApi()) {
-    installRefreshHandler();
-    // The slim-Prebid lazy loader appends this bundle from a window.load
-    // handler, so `load` may already have fired by the time this code runs —
-    // waiting for it again would skip user ID setup entirely on that path.
-    if (document.readyState === 'complete') {
-      installUserIdModules();
-    } else {
-      window.addEventListener(
-        'load',
-        () => {
-          installUserIdModules();
-        },
-        { once: true }
-      );
-    }
+  const register = (window.tsjs as unknown as { _registerIntegration?: unknown } | undefined)
+    ?._registerIntegration;
+  if (typeof register === 'function') {
+    Reflect.apply(register, window.tsjs, [
+      createPrebidIntegrationRegistration(EMBEDDED_RELEASE_ID),
+    ]);
   }
 }
 

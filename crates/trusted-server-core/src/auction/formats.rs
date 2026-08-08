@@ -31,7 +31,7 @@ use super::orchestrator::OrchestrationResult;
 use super::types::{
     AdFormat, AdSlot, AuctionDecisionSetV1, AuctionDropReason, AuctionDropReasons, AuctionRequest,
     AuctionSlotFailureReason, BidRenderSourceV1, BrowserAuctionBidV1, BrowserAuctionProjectionV1,
-    CacheFetchPolicyV1, DeviceInfo, MAX_BROWSER_AUCTION_PROJECTION_BYTES,
+    BrowserAuctionSlotV1, CacheFetchPolicyV1, DeviceInfo, MAX_BROWSER_AUCTION_PROJECTION_BYTES,
     MAX_BROWSER_AUCTION_RESULTS, MAX_BROWSER_AUCTION_TARGETING_ENTRIES, MediaType, OrchestratorExt,
     ProviderSummary, PublisherInfo, RENDER_DIMENSION_MAX, RENDER_DIMENSION_MIN, SiteInfo,
     SlotAuctionDecisionV1, UserInfo, classify_aps_renderer_v1, record_auction_drop,
@@ -311,6 +311,35 @@ pub(crate) struct OpenRtbResponseConversion {
     pub delivery: AuctionDeliveryReport,
 }
 
+/// Attach the consent/EID headers shared by every `/auction` response wire.
+pub(crate) fn attach_auction_response_headers(
+    response: &mut Response<EdgeBody>,
+    auction_request: &AuctionRequest,
+    ec_allowed: bool,
+) -> Result<(), Report<TrustedServerError>> {
+    if ec_allowed {
+        response
+            .headers_mut()
+            .insert(HEADER_X_TS_EC_CONSENT, HeaderValue::from_static("ok"));
+    }
+
+    if let Some(ref eids) = auction_request.user.eids {
+        let (encoded, truncated) = encode_eids_header(eids)?;
+        let header_val =
+            HeaderValue::from_str(&encoded).change_context(TrustedServerError::Auction {
+                message: "Failed to encode EIDs header value".to_string(),
+            })?;
+        response.headers_mut().insert(HEADER_X_TS_EIDS, header_val);
+        if truncated {
+            response
+                .headers_mut()
+                .insert(HEADER_X_TS_EIDS_TRUNCATED, HeaderValue::from_static("true"));
+        }
+    }
+
+    Ok(())
+}
+
 #[allow(
     dead_code,
     reason = "pure coordinated-cutover contract is exercised directly until Task 19 wires endpoints"
@@ -517,6 +546,18 @@ pub(crate) mod coordinated_cutover_v1 {
             && valid_render_source(&bid.render_source, publisher_origin)
     }
 
+    fn valid_browser_slot(slot: &BrowserAuctionSlotV1) -> bool {
+        valid_bounded_text(&slot.slot, 256)
+            && valid_bounded_text(&slot.gam_unit_path, 256)
+            && valid_bounded_text(&slot.div_id, 256)
+            && !slot.formats.is_empty()
+            && slot.formats.len() <= 64
+            && slot.formats.iter().all(|[width, height]| {
+                valid_render_dimension(*width) && valid_render_dimension(*height)
+            })
+            && valid_targeting(&slot.targeting)
+    }
+
     fn validate_decision_set(
         decision_set: &AuctionDecisionSetV1,
     ) -> Result<(), Report<TrustedServerError>> {
@@ -566,6 +607,29 @@ pub(crate) mod coordinated_cutover_v1 {
             projection_contract_error("Browser auction projection version must be 1")
         );
         validate_decision_set(&input.auction)?;
+        ensure!(
+            input.slots.len() <= MAX_BROWSER_AUCTION_RESULTS,
+            projection_contract_error("Browser auction slot count exceeds 256")
+        );
+        if !input.slots.is_empty() {
+            ensure!(
+                input.slots.len() == input.auction.results.len(),
+                projection_contract_error(
+                    "Browser auction slots must cover every decision or be empty for direct serialization"
+                )
+            );
+            let mut slot_ids = HashSet::with_capacity(input.slots.len());
+            for (index, slot) in input.slots.iter().enumerate() {
+                ensure!(
+                    valid_browser_slot(slot)
+                        && slot_ids.insert(slot.slot.as_str())
+                        && input.auction.results[index].slot() == slot.slot,
+                    projection_contract_error(
+                        "Browser auction slots must be valid, unique, and follow decision order"
+                    )
+                );
+            }
+        }
         ensure!(
             input.bids.len() <= MAX_BROWSER_AUCTION_RESULTS,
             projection_contract_error("Browser auction bid count exceeds 256")
@@ -623,6 +687,7 @@ pub(crate) mod coordinated_cutover_v1 {
                 auction_id: input.auction.auction_id,
                 results: canonical_results,
             },
+            slots: input.slots,
             bids: canonical_bids,
         };
         let mut json =
@@ -975,27 +1040,7 @@ pub(crate) fn convert_to_openrtb_response_with_report(
             message: "Failed to build auction response".to_string(),
         })?;
 
-    // Signal consent status independently of whether EIDs were resolved.
-    if ec_allowed {
-        response
-            .headers_mut()
-            .insert(HEADER_X_TS_EC_CONSENT, HeaderValue::from_static("ok"));
-    }
-
-    // Attach EID response headers when consent-gated EIDs are available.
-    if let Some(ref eids) = auction_request.user.eids {
-        let (encoded, truncated) = encode_eids_header(eids)?;
-        let header_val =
-            HeaderValue::from_str(&encoded).change_context(TrustedServerError::Auction {
-                message: "Failed to encode EIDs header value".to_string(),
-            })?;
-        response.headers_mut().insert(HEADER_X_TS_EIDS, header_val);
-        if truncated {
-            response
-                .headers_mut()
-                .insert(HEADER_X_TS_EIDS_TRUNCATED, HeaderValue::from_static("true"));
-        }
-    }
+    attach_auction_response_headers(&mut response, auction_request, ec_allowed)?;
 
     Ok(OpenRtbResponseConversion { response, delivery })
 }
@@ -2627,6 +2672,7 @@ mod convert_tests {
                 auction_id: "auction-1".to_string(),
                 results,
             },
+            slots: Vec::new(),
             bids,
         }
     }
@@ -2821,6 +2867,7 @@ mod convert_tests {
                         reason: crate::auction::types::AuctionSlotFailureReason::IdentityGenerationFailed,
                     }],
                 },
+                slots: Vec::new(),
                 bids: Vec::new(),
             },
             "https://publisher.example",

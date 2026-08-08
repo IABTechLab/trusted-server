@@ -74,7 +74,6 @@ pub use template_cache::{
     VaryHeaderValues, VarySpec,
 };
 pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
-#[cfg(any(test, feature = "test-utils"))]
 pub use types::ExactResponseHeadersV1;
 pub use types::{
     ClientInfo, GeoInfo, PlatformBackendSpec, RuntimeServices, RuntimeServicesBuilder, StoreId,

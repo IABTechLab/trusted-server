@@ -4,7 +4,14 @@ export {
   mirrorOsanoConsent,
 } from './consent_mirror';
 
-import { initializeOsanoConsentMirror } from './consent_mirror';
+import { EMBEDDED_RELEASE_ID } from '../../core/release';
 
-// Legacy entry point retained until the coordinated Task 19 wiring cutover.
-initializeOsanoConsentMirror();
+import { createOsanoIntegrationRegistration } from './module';
+
+if (typeof window !== 'undefined') {
+  const register = (window.tsjs as unknown as { _registerIntegration?: unknown } | undefined)
+    ?._registerIntegration;
+  if (typeof register === 'function') {
+    Reflect.apply(register, window.tsjs, [createOsanoIntegrationRegistration(EMBEDDED_RELEASE_ID)]);
+  }
+}

@@ -74,6 +74,7 @@ function createGptHarness(
   const facade: GoogletagFacade = Object.freeze({
     bindingToken: () => bindingToken,
     clearTargeting: vi.fn(),
+    transactionalDefine: () => Object.freeze({ status: 'discarded' as const }),
     display,
     getTargeting: vi.fn(() => []),
     observeTargeting: () => Object.assign(vi.fn(), { isCurrent: () => true }),
@@ -87,6 +88,7 @@ function createGptHarness(
         pubadsReady: true,
       }),
     setTargeting: vi.fn(),
+    slotElementId: () => undefined,
     slots: () => Object.freeze([...slots]),
     subscribe: (eventType: string, listener: (event: unknown) => void) => {
       const registered = listeners.get(eventType) ?? new Set();

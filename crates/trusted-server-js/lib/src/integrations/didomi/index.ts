@@ -1,4 +1,7 @@
 import { log } from '../../core/log';
+import { EMBEDDED_RELEASE_ID } from '../../core/release';
+
+import { createDidomiIntegrationRegistration } from './module';
 
 const DEFAULT_CONSENT_PROXY_PATH = '/integrations/didomi/consent/';
 
@@ -47,7 +50,11 @@ export function installDidomiSdkProxy(): boolean {
 }
 
 if (typeof window !== 'undefined') {
-  installDidomiSdkProxy();
+  const register = (window.tsjs as unknown as { _registerIntegration?: unknown } | undefined)
+    ?._registerIntegration;
+  if (typeof register === 'function') {
+    Reflect.apply(register, window.tsjs, [createDidomiIntegrationRegistration(EMBEDDED_RELEASE_ID)]);
+  }
 }
 
 export default installDidomiSdkProxy;

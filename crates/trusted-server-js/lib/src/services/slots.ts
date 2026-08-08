@@ -17,7 +17,11 @@ import {
 } from '../adapters/googletag';
 import type { NavigationSession } from '../kernel/sessions';
 
-import type { PreparedProjectionSlots, ProjectionSlotRegistry } from './projections';
+import type {
+  PreparedProjectionSlots,
+  ProjectionSlotRegistration,
+  ProjectionSlotRegistry,
+} from './projections';
 
 /** Shared maximum across server-projected and programmatically admitted slots. */
 export const MAX_ACTIVE_SLOT_RECORDS = 256;
@@ -149,7 +153,7 @@ export interface SlotService {
   ) => boolean;
   readonly prepareProjectionSlots: (
     owner: NavigationSession,
-    slots: readonly string[]
+    slots: readonly ProjectionSlotRegistration[]
   ) => PreparedProjectionSlots | undefined;
   readonly claimPublisherGptSlot: (
     call: GoogletagPublisherDefineSlotCall
@@ -3133,19 +3137,27 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     },
     prepareProjectionSlots: (
       owner: NavigationSession,
-      slots: readonly string[]
+      slots: readonly ProjectionSlotRegistration[]
     ): PreparedProjectionSlots | undefined => {
       if (!owner.isCurrent() || !Array.isArray(slots)) return undefined;
-      const copied = Object.freeze([...slots]);
+      let copied: readonly SlotRegistration[];
+      try {
+        copied = Object.freeze(
+          slots.map((slot) => ({
+            registeredSlotId: slot.registeredSlotId,
+            domAliases: Object.freeze([...slot.domAliases]),
+            source: 'server' as const,
+          }))
+        );
+      } catch {
+        return undefined;
+      }
       let committedRecords: readonly SlotRecord[] | undefined;
       return Object.freeze({
         ownerGeneration: owner.generation,
         commit: (): boolean => {
           if (committedRecords) return false;
-          const result = register(
-            owner,
-            copied.map((registeredSlotId) => ({ registeredSlotId, source: 'server' as const }))
-          );
+          const result = register(owner, copied);
           if (!result.ok) return false;
           committedRecords = result.records;
           return true;
@@ -3171,7 +3183,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       Object.freeze({
         prepareProjectionSlots: (
           ownerGeneration: object,
-          slots: readonly string[],
+          slots: readonly ProjectionSlotRegistration[],
           maximumActiveSlots: number
         ) => {
           if (
