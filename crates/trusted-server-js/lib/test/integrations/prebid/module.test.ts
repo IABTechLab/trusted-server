@@ -11,6 +11,7 @@ import {
   createPrebidSelectionCoordinator,
   createPrebidSyntheticRefreshRunner,
   createPrebidIntegrationRegistration,
+  preparePrebidRegisteredRefreshAuction,
   publishPrebidBid,
   type PrebidBidPublicationInput,
   type PreparedTrustedBidV1,
@@ -485,6 +486,75 @@ describe('RCJ-PREBID-04 prospective refresh policy', () => {
 });
 
 describe('RCJ-PREBID-04 adapter-backed synthetic refresh runner', () => {
+  it('routes detached server and client bids without consulting publisher Prebid state', () => {
+    const slot = Object.freeze({ id: 'slot-a' });
+    const serverParams = Object.freeze({ placement: 'current' });
+    const unit = Object.freeze({
+      code: 'slot-a',
+      mediaTypes: Object.freeze({
+        banner: Object.freeze({ sizes: Object.freeze([Object.freeze([300, 250])]) }),
+      }),
+      bids: Object.freeze([
+        Object.freeze({
+          bidder: 'trustedServer',
+          params: Object.freeze({
+            bidderParams: Object.freeze({
+              client: Object.freeze({ stale: true }),
+              preserved: Object.freeze({ placement: 'folded' }),
+              server: Object.freeze({ placement: 'stale' }),
+            }),
+            zone: 'news',
+          }),
+        }),
+        Object.freeze({ bidder: 'server', params: serverParams }),
+        Object.freeze({ bidder: 'client', params: Object.freeze({ placement: 'browser' }) }),
+      ]),
+    });
+
+    const prepared = preparePrebidRegisteredRefreshAuction({
+      clientSideBidders: Object.freeze(['client']),
+      resolveAdUnit: (candidate) => (candidate === slot ? unit : undefined),
+      slots: Object.freeze([slot]),
+    });
+
+    expect(prepared).toEqual({
+      adUnitCodes: ['slot-a'],
+      adUnits: [
+        {
+          code: 'slot-a',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          bids: [
+            {
+              bidder: 'trustedServer',
+              params: {
+                bidderParams: {
+                  preserved: { placement: 'folded' },
+                  server: { placement: 'current' },
+                },
+                zone: 'news',
+              },
+            },
+            { bidder: 'client', params: { placement: 'browser' } },
+          ],
+        },
+      ],
+    });
+    expect(Object.isFrozen(prepared?.adUnits)).toBe(true);
+    expect(Object.isFrozen(prepared?.adUnits[0])).toBe(true);
+  });
+
+  it('fails closed when a physical slot has no detached registered ad unit', () => {
+    const slot = Object.freeze({ id: 'unregistered' });
+
+    expect(
+      preparePrebidRegisteredRefreshAuction({
+        clientSideBidders: Object.freeze([]),
+        resolveAdUnit: () => undefined,
+        slots: Object.freeze([slot]),
+      })
+    ).toBeUndefined();
+  });
+
   function runnerHarness(options: Readonly<{ requestThrows?: boolean }> = {}) {
     const runtime = createRuntimeSession({
       createIdentityIssuer: () =>
