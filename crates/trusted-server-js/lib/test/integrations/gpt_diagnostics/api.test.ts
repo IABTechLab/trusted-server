@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { GptDiagnosticsBinding } from '../../../src/core/types';
+import { DiagnosticsSubscriberLimitError } from '../../../src/core/trace';
 import { GptDiagnosticsApiController } from '../../../src/integrations/gpt_diagnostics/api';
 import { GptDiagnosticsStore } from '../../../src/integrations/gpt_diagnostics/store';
 
@@ -35,6 +36,16 @@ function readBlob(blob: Blob): Promise<string> {
     reader.addEventListener('error', () => reject(reader.error));
     reader.readAsText(blob);
   });
+}
+
+function scheduleInto(tasks: Array<() => void>): (callback: () => void) => () => void {
+  return (callback) => {
+    tasks.push(callback);
+    return () => {
+      const index = tasks.indexOf(callback);
+      if (index >= 0) tasks.splice(index, 1);
+    };
+  };
 }
 
 beforeEach(() => {
@@ -98,6 +109,11 @@ describe('GptDiagnosticsApiController', () => {
     const second = controller.api.snapshot();
     expect(second).not.toBe(snapshot);
     expect(second.slots).not.toBe(snapshot.slots);
+    expect(Object.isFrozen(snapshot)).toBe(true);
+    expect(Object.isFrozen(snapshot.page)).toBe(true);
+    expect(Object.isFrozen(snapshot.slots)).toBe(true);
+    expect(Object.isFrozen(snapshot.slots[0]?.requests)).toBe(true);
+    expect(Object.isFrozen(snapshot.slots[0]?.requests[0]?.durations)).toBe(true);
   });
 
   it('coalesces store and binding updates and isolates subscribers', () => {
@@ -113,7 +129,7 @@ describe('GptDiagnosticsApiController', () => {
       { show: vi.fn(), hide: vi.fn() },
       {
         now: () => new Date('2026-07-28T00:00:00.000Z'),
-        schedule: (callback) => scheduled.push(callback),
+        schedule: scheduleInto(scheduled),
       }
     );
     controller.api.subscribe(() => {
@@ -136,6 +152,66 @@ describe('GptDiagnosticsApiController', () => {
     store.recordSlotVisibilityChanged(slot, 30);
     scheduled.shift()!();
     expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it('captures subscriber membership per commit and coalesces to the latest snapshot', () => {
+    const scheduled: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({ now: () => 1, schedule: (callback) => callback() });
+    const bindings = new FakeBindings();
+    const controller = new GptDiagnosticsApiController(
+      store,
+      bindings,
+      { show: vi.fn(), hide: vi.fn() },
+      {
+        now: () => new Date('2026-07-28T00:00:00.000Z'),
+        schedule: scheduleInto(scheduled),
+      }
+    );
+    const first = vi.fn();
+    const second = vi.fn();
+    const releaseFirst = controller.api.subscribe(first);
+    const observedSlot = fakeSlot();
+
+    store.recordSlotRequested(observedSlot);
+    controller.api.subscribe(second);
+    releaseFirst();
+    expect(scheduled).toHaveLength(1);
+    scheduled.shift()?.();
+    expect(first).not.toHaveBeenCalled();
+    expect(second).not.toHaveBeenCalled();
+
+    store.recordSlotVisibilityChanged(observedSlot, 10);
+    store.recordSlotVisibilityChanged(observedSlot, 20);
+    expect(scheduled).toHaveLength(1);
+    scheduled.shift()?.();
+    expect(second).toHaveBeenCalledOnce();
+    expect(second.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({
+        slots: [expect.objectContaining({ currentVisibilityPercentage: 20 })],
+      })
+    );
+  });
+
+  it('validates callability before enforcing the shared 32-subscriber cap', () => {
+    const controller = new GptDiagnosticsApiController(
+      new GptDiagnosticsStore({ now: () => 1 }),
+      new FakeBindings(),
+      { show: vi.fn(), hide: vi.fn() }
+    );
+    const releases = Array.from({ length: 32 }, () =>
+      controller.api.subscribe(() => undefined)
+    );
+
+    expect(() => controller.api.subscribe(null as never)).toThrow(TypeError);
+    expect(() => controller.api.subscribe(() => undefined)).toThrow(
+      DiagnosticsSubscriberLimitError
+    );
+    expect(() => controller.api.subscribe(() => undefined)).toThrow(
+      expect.objectContaining({ code: 'subscriber_capacity', surface: 'gpt' })
+    );
+    releases[0]?.();
+    releases[0]?.();
+    expect(controller.api.subscribe(() => undefined)).toEqual(expect.any(Function));
   });
 
   it('delegates show and hide without mutating diagnostics data', () => {
@@ -206,13 +282,17 @@ describe('GptDiagnosticsApiController', () => {
       store,
       bindings,
       { show: vi.fn(), hide: vi.fn() },
-      { schedule: (callback) => scheduled.push(callback) }
+      { schedule: scheduleInto(scheduled) }
     );
     const listener = vi.fn();
     controller.api.subscribe(listener);
 
-    controller.destroy();
     store.recordSlotRequested(fakeSlot());
+    expect(scheduled).toHaveLength(1);
+
+    controller.destroy();
+    while (scheduled.length > 0) scheduled.shift()?.();
+    store.recordSlotVisibilityChanged(fakeSlot(), 10);
     bindings.emit();
 
     expect(scheduled).toEqual([]);

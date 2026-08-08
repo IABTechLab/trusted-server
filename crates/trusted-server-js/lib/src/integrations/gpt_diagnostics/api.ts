@@ -1,4 +1,5 @@
 import type { GptDiagnosticsApi, GptDiagnosticsExportV1 } from '../../core/types';
+import { DiagnosticsSubscriberLimitError } from '../../core/trace';
 
 import type { GptDiagnosticsBindingManager } from './binding';
 import type { GptDiagnosticsStoreSnapshot } from './store';
@@ -27,10 +28,21 @@ interface ApiOptions {
   window?: ApiWindow | undefined;
   document?: Document | undefined;
   now?: (() => Date) | undefined;
-  schedule?: ((callback: () => void) => void) | undefined;
+  schedule?: ((callback: () => void) => () => void) | undefined;
 }
 
 type ApiListener = (snapshot: GptDiagnosticsExportV1) => void;
+const MAX_API_SUBSCRIBERS = 32;
+
+interface PendingNotification {
+  readonly snapshot: GptDiagnosticsExportV1;
+  readonly subscriberIds: readonly number[];
+}
+
+function scheduleTask(callback: () => void): () => void {
+  const handle = globalThis.setTimeout(callback, 0);
+  return () => globalThis.clearTimeout(handle);
+}
 
 /** Owns the public read-only diagnostics API and its source subscriptions. */
 export class GptDiagnosticsApiController {
@@ -42,11 +54,13 @@ export class GptDiagnosticsApiController {
   private readonly window: ApiWindow;
   private readonly document: Document;
   private readonly now: () => Date;
-  private readonly schedule: (callback: () => void) => void;
-  private readonly listeners = new Set<ApiListener>();
+  private readonly schedule: (callback: () => void) => () => void;
+  private readonly listeners = new Map<number, ApiListener>();
   private readonly unsubscribeStore: () => void;
   private readonly unsubscribeBindings: () => void;
-  private notificationScheduled = false;
+  private pending: PendingNotification | undefined;
+  private cancelScheduled: (() => void) | undefined;
+  private nextSubscriberId = 0;
   private destroyed = false;
 
   constructor(
@@ -61,47 +75,65 @@ export class GptDiagnosticsApiController {
     this.window = options.window ?? (window as unknown as ApiWindow);
     this.document = options.document ?? document;
     this.now = options.now ?? (() => new Date());
-    this.schedule = options.schedule ?? ((callback) => queueMicrotask(callback));
+    this.schedule = options.schedule ?? scheduleTask;
     this.unsubscribeStore = this.store.subscribe(() => this.scheduleNotification());
     this.unsubscribeBindings = this.bindings.subscribe(() => this.scheduleNotification());
 
-    this.api = {
+    this.api = Object.freeze({
       snapshot: () => this.snapshot(),
       export: () => this.download(),
-      subscribe: (listener) => this.subscribe(listener),
+      subscribe: (listener: ApiListener) => this.subscribe(listener),
       show: () => this.presentation.show(),
       hide: () => this.presentation.hide(),
-    };
+    });
   }
 
   snapshot(): GptDiagnosticsExportV1 {
     const store = this.store.snapshot();
-    return {
+    const slots = Object.freeze(
+      store.slots.map((slot) =>
+        Object.freeze({
+          runtimeSlotNumber: slot.runtimeSlotNumber,
+          slotElementId: slot.slotElementId,
+          adUnitPath: slot.adUnitPath,
+          binding: Object.freeze({ ...this.bindings.exportBinding(slot.runtimeSlotNumber) }),
+          currentVisibilityPercentage: slot.currentVisibilityPercentage,
+          maximumVisibilityPercentage: slot.maximumVisibilityPercentage,
+          requests: Object.freeze(
+            slot.requests.map((cycle) =>
+              Object.freeze({
+                ...cycle,
+                durations: Object.freeze({ ...cycle.durations }),
+                size: cycle.size ? Object.freeze([...cycle.size]) : undefined,
+              })
+            )
+          ),
+        })
+      )
+    );
+    const callbackIssues = Object.freeze(
+      store.callbackIssues.map((issue) => Object.freeze({ ...issue }))
+    );
+    const coverage = Object.freeze(
+      Object.fromEntries(
+        Object.entries(store.coverage).map(([kind, counters]) => [
+          kind,
+          Object.freeze({ ...counters }),
+        ])
+      )
+    ) as GptDiagnosticsExportV1['coverage'];
+    return Object.freeze({
       version: 1,
       capturedAt: this.now().toISOString(),
-      page: {
+      page: Object.freeze({
         origin: this.window.location.origin,
         pathname: this.window.location.pathname,
-      },
-      slots: store.slots.map((slot) => ({
-        runtimeSlotNumber: slot.runtimeSlotNumber,
-        slotElementId: slot.slotElementId,
-        adUnitPath: slot.adUnitPath,
-        binding: this.bindings.exportBinding(slot.runtimeSlotNumber),
-        currentVisibilityPercentage: slot.currentVisibilityPercentage,
-        maximumVisibilityPercentage: slot.maximumVisibilityPercentage,
-        requests: slot.requests.map((cycle) => ({
-          ...cycle,
-          durations: { ...cycle.durations },
-          size: cycle.size ? [...cycle.size] : undefined,
-        })),
-      })),
-      callbackIssues: store.callbackIssues.map((issue) => ({ ...issue })),
-      coverage: Object.fromEntries(
-        Object.entries(store.coverage).map(([kind, counters]) => [kind, { ...counters }])
-      ) as GptDiagnosticsExportV1['coverage'],
-      metadata: { ...store.metadata },
-    };
+      }),
+      slots,
+      callbackIssues,
+      coverage,
+      metadata: Object.freeze({ ...store.metadata }),
+    }) as GptDiagnosticsExportV1;
   }
 
   destroy(): void {
@@ -109,13 +141,30 @@ export class GptDiagnosticsApiController {
     this.destroyed = true;
     this.unsubscribeStore();
     this.unsubscribeBindings();
+    try {
+      this.cancelScheduled?.();
+    } catch {
+      // The destroyed latch suppresses a hostile late scheduler callback.
+    }
+    this.cancelScheduled = undefined;
+    this.pending = undefined;
     this.listeners.clear();
   }
 
   private subscribe(listener: ApiListener): () => void {
+    if (typeof listener !== 'function') throw new TypeError('Diagnostics listener must be callable');
     if (this.destroyed) return () => undefined;
-    this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
+    if (this.listeners.size >= MAX_API_SUBSCRIBERS) {
+      throw new DiagnosticsSubscriberLimitError('gpt');
+    }
+    const id = (this.nextSubscriberId += 1);
+    this.listeners.set(id, listener);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.listeners.delete(id);
+    };
   }
 
   private download(): void {
@@ -139,19 +188,34 @@ export class GptDiagnosticsApiController {
   }
 
   private scheduleNotification(): void {
-    if (this.destroyed || this.notificationScheduled) return;
-    this.notificationScheduled = true;
-    this.schedule(() => {
-      this.notificationScheduled = false;
-      if (this.destroyed) return;
-
-      for (const listener of this.listeners) {
-        try {
-          listener(this.snapshot());
-        } catch {
-          // One API subscriber must not block the rest.
-        }
-      }
+    if (this.destroyed || this.listeners.size === 0) return;
+    const pending = Object.freeze({
+      snapshot: this.snapshot(),
+      subscriberIds: Object.freeze([...this.listeners.keys()]),
     });
+    this.pending = pending;
+    if (this.cancelScheduled) return;
+    try {
+      const cancel = this.schedule(() => {
+        this.cancelScheduled = undefined;
+        const notification = this.pending;
+        this.pending = undefined;
+        if (this.destroyed || !notification) return;
+        for (const id of notification.subscriberIds) {
+          const listener = this.listeners.get(id);
+          if (!listener) continue;
+          try {
+            listener(notification.snapshot);
+          } catch {
+            // One API subscriber must not block the rest.
+          }
+        }
+      });
+      if (typeof cancel !== 'function') throw new TypeError('Invalid diagnostics scheduler');
+      if (!this.destroyed && this.pending) this.cancelScheduled = cancel;
+    } catch {
+      this.cancelScheduled = undefined;
+      this.pending = undefined;
+    }
   }
 }
