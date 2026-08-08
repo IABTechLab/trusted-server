@@ -178,7 +178,17 @@ else
 fi
 CARGO_TEST_PID="$!"
 
-CHILD_PGID="$(ps -o pgid= -p "$CARGO_TEST_PID" 2>/dev/null | tr -d '[:space:]' || true)"
+CHILD_PGID=""
+# The background child can be observed between fork and `setsid(2)`, especially
+# when `setsid` is provided by a shim on BSD/macOS. Give it a bounded moment to
+# enter its dedicated process group before enforcing the cleanup invariant.
+for ((attempt = 0; attempt < 50; attempt += 1)); do
+  CHILD_PGID="$(ps -o pgid= -p "$CARGO_TEST_PID" 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ "$CHILD_PGID" =~ ^[1-9][0-9]*$ ]] && [ "$CHILD_PGID" != "$SHELL_PGID" ]; then
+    break
+  fi
+  sleep 0.01
+done
 if [[ "$CHILD_PGID" =~ ^[1-9][0-9]*$ ]] && [ "$CHILD_PGID" != "$SHELL_PGID" ]; then
   CARGO_TEST_PGID="$CHILD_PGID"
 else

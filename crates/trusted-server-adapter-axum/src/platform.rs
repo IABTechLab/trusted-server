@@ -482,9 +482,12 @@ impl AxumPlatformHttpClient {
         }
 
         tokio::time::timeout(policy.total_timeout, async move {
-            let mut response = builder
-                .send()
+            let mut response = tokio::time::timeout(policy.first_byte_timeout, builder.send())
                 .await
+                .map_err(|_| {
+                    Report::new(PlatformError::HttpClient)
+                        .attach("raw proxy first-byte deadline exceeded")
+                })?
                 .change_context(PlatformError::HttpClient)?;
             let evidence = ProxyResponseEvidenceV1 {
                 status: response.status().as_u16(),
@@ -509,11 +512,15 @@ impl AxumPlatformHttpClient {
             }
 
             let mut body = Vec::new();
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .change_context(PlatformError::HttpClient)?
-            {
+            loop {
+                let chunk = tokio::time::timeout(policy.blocking_read_timeout, response.chunk())
+                    .await
+                    .map_err(|_| {
+                        Report::new(PlatformError::HttpClient)
+                            .attach("raw proxy blocking-read deadline exceeded")
+                    })?
+                    .change_context(PlatformError::HttpClient)?;
+                let Some(chunk) = chunk else { break };
                 let next_len = body.len().checked_add(chunk.len()).ok_or_else(|| {
                     Report::new(PlatformError::HttpClient).attach("raw proxy body length overflow")
                 })?;
@@ -1046,6 +1053,89 @@ mod tests {
             )
             .await;
         assert!(deadline.is_err(), "total deadline must cover first byte");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_proxy_enforces_first_byte_and_blocking_read_deadlines() {
+        let first_byte_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind first-byte deadline server");
+        let first_byte_addr = first_byte_listener
+            .local_addr()
+            .expect("should read first-byte server address");
+        tokio::spawn(async move {
+            let (mut stream, _) = first_byte_listener
+                .accept()
+                .await
+                .expect("should accept first-byte request");
+            let mut request = [0; 1024];
+            let _ = stream
+                .read(&mut request)
+                .await
+                .expect("should read first-byte request");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: 2\r\n\r\nok",
+                )
+                .await;
+        });
+        let first_byte = AxumPlatformHttpClient::new()
+            .send_raw_proxy_v1(
+                raw_proxy_request(&format!("http://{first_byte_addr}/")),
+                RawProxyPolicyV1 {
+                    total_timeout: Duration::from_secs(1),
+                    first_byte_timeout: Duration::from_millis(20),
+                    blocking_read_timeout: Duration::from_secs(1),
+                    max_response_bytes: 2,
+                },
+            )
+            .await;
+        assert!(
+            first_byte.is_err(),
+            "response headers after the first-byte deadline must fail"
+        );
+
+        let body_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind blocking-read deadline server");
+        let body_addr = body_listener
+            .local_addr()
+            .expect("should read blocking-read server address");
+        tokio::spawn(async move {
+            let (mut stream, _) = body_listener
+                .accept()
+                .await
+                .expect("should accept blocking-read request");
+            let mut request = [0; 1024];
+            let _ = stream
+                .read(&mut request)
+                .await
+                .expect("should read blocking-read request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nTransfer-Encoding: chunked\r\n\r\n1\r\no\r\n",
+                )
+                .await
+                .expect("should write first body chunk");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = stream.write_all(b"1\r\nk\r\n0\r\n\r\n").await;
+        });
+        let blocking_read = AxumPlatformHttpClient::new()
+            .send_raw_proxy_v1(
+                raw_proxy_request(&format!("http://{body_addr}/")),
+                RawProxyPolicyV1 {
+                    total_timeout: Duration::from_secs(1),
+                    first_byte_timeout: Duration::from_secs(1),
+                    blocking_read_timeout: Duration::from_millis(20),
+                    max_response_bytes: 2,
+                },
+            )
+            .await;
+        assert!(
+            blocking_read.is_err(),
+            "a body read blocked past its deadline must fail"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
