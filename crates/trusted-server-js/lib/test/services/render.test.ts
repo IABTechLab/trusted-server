@@ -4575,6 +4575,9 @@ describe('RenderAttempt diagnostics producer', () => {
       kind: 'render_attempt',
       attemptId: renderAttempt.id,
       slotId: renderAttempt.slot,
+      path: 'auction',
+      rendered: true,
+      servedFrom: 'inline',
       state: 'accepted',
       outcome: { outcome: 'accepted' },
     });

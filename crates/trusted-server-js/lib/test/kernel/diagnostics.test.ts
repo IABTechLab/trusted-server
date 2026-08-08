@@ -151,4 +151,23 @@ describe('kernel diagnostics bus', () => {
     expect(read).not.toHaveBeenCalled();
     bus.dispose();
   });
+
+  it('commits to the private core observer before asynchronous module delivery', () => {
+    vi.useFakeTimers();
+    const order: string[] = [];
+    const bus = createDiagnosticsBus({
+      manifest: manifest(['observer']),
+      onObservation: () => {
+        order.push('core');
+        throw new Error('fictional core observer failure');
+      },
+    });
+    bus.subscribe('observer', () => order.push('module'));
+
+    expect(bus.publish(observation(1))).toBe(true);
+    expect(order).toEqual(['core']);
+    vi.runOnlyPendingTimers();
+    expect(order).toEqual(['core', 'module']);
+    bus.dispose();
+  });
 });

@@ -83,6 +83,8 @@ export interface RuntimeOptions {
   readonly boot?: unknown;
   readonly now?: () => number;
   readonly getBindings?: (id: string) => IntegrationBindings;
+  /** Resolve the complete frozen namespace after every diagnostics module activates. */
+  readonly getDiagnosticsForPublish?: () => Readonly<object>;
   readonly prepareOwner?: (context: RuntimeOwnerPreparationContext) => void;
   readonly activateOwner?: (context: RuntimeOwnerActivationContext) => void;
   readonly activateCore?: (context: CoreActivationContext) => void;
@@ -284,6 +286,15 @@ class RuntimeOwner implements Runtime {
   }
 
   private kernelFields(): Readonly<Record<string, unknown>> {
+    const diagnostics =
+      this.options.getDiagnosticsForPublish?.() ?? this.options.kernel.diagnostics;
+    if (
+      (typeof diagnostics !== 'object' && typeof diagnostics !== 'function') ||
+      diagnostics === null ||
+      !Object.isFrozen(diagnostics)
+    ) {
+      throw new Error('Published diagnostics namespace must be frozen');
+    }
     const fields: Record<string, unknown> = {};
     Object.defineProperties(fields, {
       version: { enumerable: true, value: '1.0.0' },
@@ -296,7 +307,7 @@ class RuntimeOwner implements Runtime {
       _registerIntegration: { enumerable: true, value: () => false },
       addAdUnits: { enumerable: true, value: this.options.kernel.addAdUnits },
       requestAds: { enumerable: true, value: this.options.kernel.requestAds },
-      diagnostics: { enumerable: true, value: this.options.kernel.diagnostics },
+      diagnostics: { enumerable: true, value: diagnostics },
       _internal: {
         enumerable: false,
         value: Object.freeze({ state: 'kernel', releaseId: EMBEDDED_RELEASE_ID }),

@@ -126,6 +126,37 @@ describe('Runtime bootstrap owner', () => {
     ).toBe(false);
   });
 
+  it('resolves the frozen diagnostics namespace only after core and module activation', async () => {
+    const target: Record<string, unknown> = {};
+    const diagnostics = Object.freeze({ renderTrace: Object.freeze({}) });
+    let activated = false;
+    const getDiagnosticsForPublish = vi.fn(() => {
+      expect(activated).toBe(true);
+      return diagnostics;
+    });
+    const runtime = createRuntime({
+      target,
+      releaseId: RELEASE,
+      manifest: manifest([]),
+      knownIntegrationIds: Object.freeze([]),
+      boot: boot(),
+      activateCore: () => {
+        activated = true;
+      },
+      getDiagnosticsForPublish,
+      kernel: {
+        addAdUnits: vi.fn(),
+        diagnostics: Object.freeze({ premature: true }),
+        requestAds: vi.fn(),
+      },
+    });
+
+    expect(runtime.start()).toBe(true);
+    await expect(runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+    expect(getDiagnosticsForPublish).toHaveBeenCalledOnce();
+    expect(target['diagnostics']).toBe(diagnostics);
+  });
+
   it('prepares inert owner interfaces before module preparation and activates afterward', async () => {
     const order: string[] = [];
     let prepared = false;
