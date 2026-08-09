@@ -1,6 +1,6 @@
 # APS Render Fix and TSJS Resilience Architecture — Design
 
-- **Status:** revision 31 — hard-cutover contract with phase-aware TSJS loading
+- **Status:** revision 32 — hard-cutover contract with phase-aware TSJS loading
   and complete `rc/july` TSJS adoption
 - **Date:** 2026-08-04
 - **Baseline:** `origin/rc/july` @ `905984e62` ("Prevent APS renderer document
@@ -63,10 +63,11 @@
 
 Existing local render tracing, GPT diagnostics, logging, counters, debug output,
 and telemetry integrations remain functional through the cutover. They may move
-behind the runtime event bus or the final diagnostics namespace, but their
-observable concepts and non-interference guarantees are in scope. Correctness must
-not depend on a new event reaching an external sink. Any new analytics contract
-requires a separate design.
+behind the core-owned diagnostics ingress, the GPT-owned fact stream, the trace
+owner's private presentation capability, or the final diagnostics namespace, but
+their observable concepts and non-interference guarantees are in scope. Correctness
+must not depend on a new observation reaching presentation code or an external sink.
+Any new analytics contract requires a separate design.
 
 ### 0.3 Architectural rules
 
@@ -123,7 +124,7 @@ or that explicit supersession proof.
 | `RCJ-CORE-01`     | Core config/context, callback queue, auction parsing, direct request/rendering, SPA generation checks, and shared helpers continue to serve every enabled integration.                                        | **Rebuild:** kernel, services, and composition root; exact behavioral corpus runs before and after the switch.                                                                                                                                                                   |
 | `RCJ-CORE-02`     | Programmatic ad-unit registration can drive direct `/auction`; core also exposes version/queue, placeholder render helpers, mutable generic config, and the local logger.                                     | **Preserve/supersede:** §5.4 defines the exact final API; typed registration/request APIs and immutable config replace placeholders/mutable config; logger methods/default remain, while invalid levels now throw without mutation instead of being retained with warn fallback. |
 | `RCJ-BOOT-01`     | The edge-injected `gpt_bootstrap.js` duplicates initial-load tracking, slot handoff, hydration scheduling, GPT definition/targeting/display/refresh, and can render initial ads without the main TSJS bundle. | **Rebuild/supersede:** the committed runtime owns all normal GPT behavior. Missing/partial bundles intentionally settle through the terminal non-rendering fallback in §5.3; no bootstrap may construct a degraded GPT runtime.                                                  |
-| `RCJ-TRACE-01`    | Render tracing records one honest impression timeline, bounded history, current-slot state, DOM stamps/badges, local overlay, no stale auction attribution, and emits `tsjs:adRendered`.                      | **Rebuild/supersede:** lifecycle diagnostics subscriber and `tsjs.diagnostics.renderTrace`; its subscription replaces the mutable globals and CustomEvent, and no integration writes trace state directly.                                                                       |
+| `RCJ-TRACE-01`    | Render tracing records one honest impression timeline, bounded history, current-slot state, DOM stamps/badges, local overlay, no stale auction attribution, and emits `tsjs:adRendered`.                      | **Rebuild/supersede:** the core trace reducer, `tsjs.diagnostics.renderTrace`, and the separately authorized deferred presentation attachment; the public data subscription replaces the mutable globals and CustomEvent, and no integration writes trace state directly.        |
 | `RCJ-GPT-01`      | A TS fallback and a later publisher `defineSlot` share one physical GPT slot and one initial request; ownership transfer prevents later TS destruction.                                                       | **Rebuild:** GPT adapter plus slot service handoff record; no integration-owned function sentinels or duplicate wrappers.                                                                                                                                                        |
 | `RCJ-GPT-02`      | Responsive/hydrated slot resolution chooses the unique active placement, recovers DOM replacement, and never silently chooses an ambiguous sibling.                                                           | **Rebuild:** navigation-scoped aliases plus runtime-owned DOM binding/reconciliation.                                                                                                                                                                                            |
 | `RCJ-GPT-03`      | Native publisher GPT calls, service state, SRA, disabled initial load, refresh options, targeting cleanup, and publisher-owned slots retain their native semantics.                                           | **Preserve/Rebuild:** the sole GPT adapter owns interception and event fan-out; publisher activity never becomes TS-owned work.                                                                                                                                                  |
@@ -564,6 +565,8 @@ The implementation keeps these identities distinct:
 | attempt id              | in-page lifecycle ownership      | `a1_` plus 22 base64url characters; navigation-unique          |
 | lifecycle ticket        | cross-window capability          | `t1_` plus 22 base64url characters; one-use and attempt-bound  |
 | renderer nonce          | renderer-document capability     | `n1_` plus 22 base64url characters; one-use and attempt-bound  |
+| GPT trace slot token    | diagnostic physical-object join  | adapter-minted canonical `gt1_` form; runtime-local, nonreused |
+| GPT trace cycle ordinal | diagnostic impression join       | 1..2^32-1 per physical object; valid only with its slot token  |
 
 Every TS-owned PUC source introduced by this design—APS or inline ADM—receives a renderer reservation
 id, and that id is copied exactly to GAM `hb_adid`. For the Trusted Server Prebid
@@ -2045,28 +2048,28 @@ keys shown; `—` means none. The inclusion predicate is server-owned and
 deny-unknown. A module id, phase, trigger, predicate, provider/consumer list, or
 obligation absent from this table is not a production module:
 
-| Order | Module id                  | Product     | Phase / trigger                    | Include iff                      | Provides                                                                      | Consumes                                                                           | Critical obligation or deferred scope                                                                                    |
-| ----: | -------------------------- | ----------- | ---------------------------------- | -------------------------------- | ----------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------ | --------------------------------------------------------------- |
-|     1 | `render_runtime`           | runtime     | critical                           | always                           | `slots.v1`, `auction.v1`, `render.v1`, `messages.v1`, `trace.v1`, `direct.v1` | `runtime.v1`                                                                       | Public direct first display, projection, one lifecycle/dispatcher/trace owner                                            |
-|     2 | `aps`                      | APS         | critical                           | APS integration enabled          | `aps.v1`                                                                      | `runtime.v1`, `slots.v1`, `render.v1`, `messages.v1`, `trace.v1`                   | Any initial APS winner and PUC claim must render                                                                         |
-|     3 | `creative`                 | creative    | critical                           | `creative.enabled && (clickGuard |                                                                               | renderGuard)`                                                                      | —                                                                                                                        | `runtime.v1`                                           | Guards must observe parser-time DOM/constructor activity        |
-|     4 | `datadome`                 | DataDome    | critical                           | DataDome enabled                 | —                                                                             | `runtime.v1`                                                                       | Script/preload rewriting must precede publisher SDK insertion                                                            |
-|     5 | `didomi`                   | Didomi      | critical                           | Didomi enabled                   | —                                                                             | `runtime.v1`                                                                       | `didomiConfig.sdkPath` must exist before SDK evaluation                                                                  |
-|     6 | `google_tag_manager`       | GTM/GA      | critical                           | Google Tag Manager enabled       | —                                                                             | `runtime.v1`                                                                       | Script/preload/beacon/fetch guards must precede matching traffic                                                         |
-|     7 | `gpt`                      | GPT         | critical                           | GPT integration enabled          | `gpt.v1`, `gpt.events.v1`, `pbs_cache.baseline.v1`                            | `runtime.v1`, `slots.v1`, `auction.v1`, `render.v1`, `messages.v1`, `trace.v1`     | Sole GPT adapter/listeners plus every initial handoff/hydration/reconciliation path                                      |
-|     8 | `gpt_diagnostics`          | diagnostics | critical                           | `diagnostics.gpt.active`         | `gpt_diag.v1`                                                                 | `runtime.v1`, `gpt.events.v1`, `trace.v1`                                          | Capture earliest raw GPT fact and commit final public API                                                                |
-|     9 | `lockr`                    | Lockr       | critical                           | Lockr enabled                    | —                                                                             | `runtime.v1`                                                                       | Script guard/readiness/API-host rewrite may precede first display                                                        |
-|    10 | `osano_consent`            | Osano       | critical                           | Osano enabled                    | `osano_consent.v1`                                                            | `runtime.v1`                                                                       | Initial USP/GPP/TCF mirror must precede consent-dependent auction work                                                   |
-|    11 | `permutive_context`        | Permutive   | critical                           | Permutive enabled                | `permutive_context.v1`                                                        | `runtime.v1`                                                                       | Guard/readiness and initial normalized segments feed first auction context                                               |
-|    12 | `sourcepoint_consent`      | Sourcepoint | critical                           | Sourcepoint enabled              | `sourcepoint_consent.v1`                                                      | `runtime.v1`                                                                       | Initial GPP/localStorage mirror and optional SDK guard precede consent use                                               |
-|    13 | `prebid`                   | Prebid      | critical                           | Prebid integration enabled       | `prebid.v1`                                                                   | `runtime.v1`, `slots.v1`, `render.v1`, `messages.v1`, and `aps.v1` iff APS enabled | External-artifact readiness, bidder aliases, user-ID/EIDs, publisher queue, initial auction, and TS bidder/PUC admission |
-|    14 | `testlight`                | Testlight   | critical                           | Testlight enabled                | —                                                                             | `runtime.v1`                                                                       | Preexisting callbacks must bridge before publisher code can replace/drain them                                           |
-|    15 | `diagnostics_presentation` | diagnostics | deferred / `first_display_or_idle` | `renderTraceOverlay              |                                                                               | diagnostics.gpt.active`                                                            | —                                                                                                                        | `runtime.v1`, `trace.v1`, and `gpt_diag.v1` iff active | DOM overlay, badges, formatting, clipboard/download interaction |
-|    16 | `gpt_later`                | GPT         | deferred / `first_display_or_idle` | GPT enabled                      | —                                                                             | `runtime.v1`, `slots.v1`, `auction.v1`, `render.v1`, `gpt.v1`, `trace.v1`          | Post-first-display refresh, SPA navigation, and later reconciliation only                                                |
-|    17 | `osano_lifecycle`          | Osano       | deferred / `first_display_or_idle` | Osano enabled                    | —                                                                             | `runtime.v1`, `osano_consent.v1`                                                   | Later retry/event/focus/visibility/clear maintenance                                                                     |
-|    18 | `permutive_lifecycle`      | Permutive   | deferred / `first_display_or_idle` | Permutive enabled                | —                                                                             | `runtime.v1`, `permutive_context.v1`                                               | Later SDK/segment refresh maintenance                                                                                    |
-|    19 | `prebid_later`             | Prebid      | deferred / `first_display_or_idle` | Prebid and GPT enabled           | —                                                                             | `runtime.v1`, `slots.v1`, `gpt.v1`, `prebid.v1`                                    | Synthetic refresh and GAM-path exclusion; never initial admission                                                        |
-|    20 | `sourcepoint_lifecycle`    | Sourcepoint | deferred / `first_display_or_idle` | Sourcepoint enabled              | —                                                                             | `runtime.v1`, `sourcepoint_consent.v1`                                             | Later retry/visibility/focus/update/safe-clear maintenance                                                               |
+| Order | Module id                  | Product     | Phase / trigger                    | Include iff                                         | Provides                                                                                               | Consumes                                                                           | Critical obligation or deferred scope                                                                                    |
+| ----: | -------------------------- | ----------- | ---------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+|     1 | `render_runtime`           | runtime     | critical                           | always                                              | `slots.v1`, `auction.v1`, `render.v1`, `messages.v1`, `trace.v1`, `trace.presentation.v1`, `direct.v1` | `runtime.v1`                                                                       | Public direct first display, projection, one lifecycle/dispatcher/trace owner                                            |
+|     2 | `aps`                      | APS         | critical                           | APS integration enabled                             | `aps.v1`                                                                                               | `runtime.v1`, `slots.v1`, `render.v1`, `messages.v1`, `trace.v1`                   | Any initial APS winner and PUC claim must render                                                                         |
+|     3 | `creative`                 | creative    | critical                           | `creative.enabled && (clickGuard \|\| renderGuard)` | —                                                                                                      | `runtime.v1`                                                                       | Guards must observe parser-time DOM/constructor activity                                                                 |
+|     4 | `datadome`                 | DataDome    | critical                           | DataDome enabled                                    | —                                                                                                      | `runtime.v1`                                                                       | Script/preload rewriting must precede publisher SDK insertion                                                            |
+|     5 | `didomi`                   | Didomi      | critical                           | Didomi enabled                                      | —                                                                                                      | `runtime.v1`                                                                       | `didomiConfig.sdkPath` must exist before SDK evaluation                                                                  |
+|     6 | `google_tag_manager`       | GTM/GA      | critical                           | Google Tag Manager enabled                          | —                                                                                                      | `runtime.v1`                                                                       | Script/preload/beacon/fetch guards must precede matching traffic                                                         |
+|     7 | `gpt`                      | GPT         | critical                           | GPT integration enabled                             | `gpt.v1`, `gpt.events.v1`, `pbs_cache.baseline.v1`                                                     | `runtime.v1`, `slots.v1`, `auction.v1`, `render.v1`, `messages.v1`, `trace.v1`     | Sole GPT adapter/listeners plus every initial handoff/hydration/reconciliation path                                      |
+|     8 | `gpt_diagnostics`          | diagnostics | critical                           | `diagnostics.gpt.active`                            | `gpt_diag.v1`                                                                                          | `runtime.v1`, `gpt.events.v1`                                                      | Consume the GPT-owned bounded fact stream and commit the final data-only public API                                      |
+|     9 | `lockr`                    | Lockr       | critical                           | Lockr enabled                                       | —                                                                                                      | `runtime.v1`                                                                       | Script guard/readiness/API-host rewrite may precede first display                                                        |
+|    10 | `osano_consent`            | Osano       | critical                           | Osano enabled                                       | `osano_consent.v1`                                                                                     | `runtime.v1`                                                                       | Initial USP/GPP/TCF mirror must precede consent-dependent auction work                                                   |
+|    11 | `permutive_context`        | Permutive   | critical                           | Permutive enabled                                   | `permutive_context.v1`                                                                                 | `runtime.v1`                                                                       | Guard/readiness and initial normalized segments feed first auction context                                               |
+|    12 | `sourcepoint_consent`      | Sourcepoint | critical                           | Sourcepoint enabled                                 | `sourcepoint_consent.v1`                                                                               | `runtime.v1`                                                                       | Initial GPP/localStorage mirror and optional SDK guard precede consent use                                               |
+|    13 | `prebid`                   | Prebid      | critical                           | Prebid integration enabled                          | `prebid.v1`                                                                                            | `runtime.v1`, `slots.v1`, `render.v1`, `messages.v1`, and `aps.v1` iff APS enabled | External-artifact readiness, bidder aliases, user-ID/EIDs, publisher queue, initial auction, and TS bidder/PUC admission |
+|    14 | `testlight`                | Testlight   | critical                           | Testlight enabled                                   | —                                                                                                      | `runtime.v1`                                                                       | Preexisting callbacks must bridge before publisher code can replace/drain them                                           |
+|    15 | `diagnostics_presentation` | diagnostics | deferred / `first_display_or_idle` | `renderTraceOverlay \|\| diagnostics.gpt.active`    | —                                                                                                      | `runtime.v1`, `trace.presentation.v1`, and `gpt_diag.v1` iff active                | DOM overlay, badges, formatting, clipboard/download interaction                                                          |
+|    16 | `gpt_later`                | GPT         | deferred / `first_display_or_idle` | GPT enabled                                         | —                                                                                                      | `runtime.v1`, `slots.v1`, `auction.v1`, `render.v1`, `gpt.v1`, `trace.v1`          | Post-first-display refresh, SPA navigation, and later reconciliation only                                                |
+|    17 | `osano_lifecycle`          | Osano       | deferred / `first_display_or_idle` | Osano enabled                                       | —                                                                                                      | `runtime.v1`, `osano_consent.v1`                                                   | Later retry/event/focus/visibility/clear maintenance                                                                     |
+|    18 | `permutive_lifecycle`      | Permutive   | deferred / `first_display_or_idle` | Permutive enabled                                   | —                                                                                                      | `runtime.v1`, `permutive_context.v1`                                               | Later SDK/segment refresh maintenance                                                                                    |
+|    19 | `prebid_later`             | Prebid      | deferred / `first_display_or_idle` | Prebid and GPT enabled                              | —                                                                                                      | `runtime.v1`, `slots.v1`, `gpt.v1`, `prebid.v1`                                    | Synthetic refresh and GAM-path exclusion; never initial admission                                                        |
+|    20 | `sourcepoint_lifecycle`    | Sourcepoint | deferred / `first_display_or_idle` | Sourcepoint enabled                                 | —                                                                                                      | `runtime.v1`, `sourcepoint_consent.v1`                                             | Later retry/visibility/focus/update/safe-clear maintenance                                                               |
 
 `runtime.v1` is the kernel's only built-in capability: generation, disposal,
 clock/scheduler, queue, logger, validated boot data, capability access, and phase
@@ -2076,10 +2079,13 @@ silently substituted. The maximal manifest therefore has 14 critical plus six
 deferred entries: `MAX_CRITICAL_MODULES = 14` and `MAX_MANIFEST_MODULES = 20`.
 The serializer, parser, registry, callback staging, tests, and fuzz/capacity fixtures
 derive 13/14/15 and 19/20/21 boundaries from this table rather than retaining a
-hand-written 16. Exactly the two catalog consumers of internal
-observation streams (`gpt_diagnostics` and `diagnostics_presentation`) determine
-`MAX_INTERNAL_DIAGNOSTICS_SUBSCRIPTIONS = 2`; public subscriber limits remain
-separate.
+hand-written 16. The kernel diagnostics ingress has no integration-module
+subscription surface or subscription-capacity constant. GPT diagnostics consumes
+the separately bounded `gpt.events.v1` capability, while deferred diagnostics
+presentation alone consumes `trace.presentation.v1`. `attachPresentation` is absent
+from `trace.v1`, so APS, GPT, and `gpt_later` cannot obtain presentation authority
+even though they publish or consume trace facts. Public diagnostic subscriber limits
+remain separate.
 
 The release catalog records, for every module id, its product integration, phase,
 trigger, provided/consumed capability keys, and whether parser-time activation is a
@@ -2883,13 +2889,215 @@ release id.
 
 ### 5.8 Local diagnostics
 
-The kernel owns a bounded, failure-isolated diagnostics bus. Render attempts and the
-GPT adapter publish immutable observations after their correctness transition; a
-diagnostics subscriber can never delay, reject, retry, or mutate the source
-operation. Subscriber throws are logged locally and isolated from later subscribers.
-The internal bus admits exactly the catalog-derived maximum of two
-integration-module subscriptions; publisher code cannot register on that internal
-bus.
+The kernel owns one bounded, failure-isolated diagnostics ingress. Render attempts
+and the GPT adapter call its closure-bound `publish(candidate: unknown): boolean`
+only after their correctness transition. An active ingress accepts only a data tree
+whose root is an ordinary or null-prototype record and whose descendants are null,
+booleans, finite numbers, strings, dense arrays, or ordinary/null-prototype records.
+Records must contain only own enumerable string data properties. Arrays must contain
+only their exact own `length` plus dense own data elements `0..length-1`; extra
+properties are invalid. Symbols, accessors, functions, `undefined`, bigint,
+non-finite numbers, sparse arrays, custom prototypes, cycles, repeated object
+references, and any proxy/trap failure are invalid. Runtime-local GPT slot identity
+therefore crosses this boundary as a bounded string token, never as retained object
+identity.
+
+The executable ingress limits are:
+
+```ts
+const MAX_DIAGNOSTICS_OBSERVATION_DEPTH = 16
+const MAX_DIAGNOSTICS_OBSERVATION_NODES = 512
+const MAX_DIAGNOSTICS_PROPERTY_NAME_BYTES = 128
+const MAX_DIAGNOSTICS_STRING_BYTES = 4096
+```
+
+The root has depth zero. Every encountered root, property value, or array element,
+including a primitive, consumes one node, so a flat record with 511 scalar values is
+the widest accepted record and one with 512 is rejected. Property-name and string
+limits count UTF-8 bytes independently. At or below every limit, ingress builds a
+fresh tree from own data descriptors, uses null-prototype objects for copied records,
+deep-freezes the copy, and retains no producer-owned array or record. A limit,
+descriptor, copy, encoding, or freeze failure returns `false` without invoking the
+reducer and never throws into the source operation.
+
+After a successful snapshot, ingress invokes the closure-private core trace reducer
+exactly once, synchronously. Reducer or local error-reporter failure is caught and
+cannot alter the source transition; because transport acceptance already succeeded,
+`publish` returns `true`. The ingress has no integration-module or publisher
+subscription API, listener identity, pending-delivery queue, scheduler/timer,
+overflow callback, or subscription-capacity constant. Its exact returned facade is
+frozen and contains only `publish` and `dispose`. `dispose` is idempotent, clears
+retained owner callbacks, and makes the bound `publish` return `false`; a retained
+facade from a disposed/replaced runtime epoch is likewise inert. Navigation-scoped
+producers must pass their owner-generation check before publication, and the reducer
+also ignores a semantically stale fact without treating diagnostics as authority.
+
+The core-ingress representation of one physical GPT slot is the exact branded data
+token `GptSlotTokenV1`. The sole GPT adapter owns its mint and no publisher input can
+select it:
+
+```ts
+type GptSlotTokenV1 = string & { readonly __brand: 'GptSlotTokenV1' }
+type GptTraceCycleOrdinalV1 = number & {
+  readonly __brand: 'GptTraceCycleOrdinalV1'
+}
+const MAX_GPT_SLOT_TOKEN_ORDINAL = 4_294_967_295
+const MAX_GPT_SLOT_TOKEN_BYTES = 11
+const MAX_GPT_TRACE_CYCLE_ORDINAL = 4_294_967_295
+const MAX_GPT_TRACE_CYCLES_PER_SLOT = 10
+// Exact wire grammar: /^gt1_(?:[1-9a-z][0-9a-z]{0,6})$/ plus decoded value <= 0xffffffff.
+```
+
+The adapter starts a runtime-local unsigned ordinal at one and emits `gt1_` plus its
+lower-case canonical base-36 form, with no leading zero. It increments only after a
+successful mint, stores the string beside the adapter's private opaque identity in
+the `WeakMap` entry for that exact GPT slot object, and copies it into any runtime
+`SlotRecord` that adopts that object as its exact optional own-data field
+`readonly traceToken?: GptSlotTokenV1`. Re-observing or handing off the same physical
+object returns the same string. A newly defined/replacement object receives a new
+ordinal even when it has the same element id, ad-unit path, registered slot id, or
+publisher owner. Ordinals are never reused within one runtime; physical destruction,
+retirement, navigation disposal, map pruning, and garbage collection do not rewind
+the counter. Runtime disposal clears the weak/map state and makes every old publisher
+inert before a later runtime may begin again at one.
+
+The adapter's `gpt.events.v1` facts retain their separate frozen opaque object token
+because that direct bounded stream never crosses the generic ingress and critical
+GPT diagnostics needs same-object identity. Before publishing a GPT fact to
+`trace.v1`, the GPT integration creates a data-only projection that replaces the
+opaque token with the exact own-data field
+`slot:{token:GptSlotTokenV1,cycleOrdinal:GptTraceCycleOrdinalV1,elementId?:string}`;
+no object-valued identity enters the snapshot. Neither identity is public or render
+authority.
+
+The adapter owns a separate unsigned trace-cycle ordinal in each physical object's
+`WeakMap` state. The first unambiguous `slotRequested` for that object mints one and
+each later unambiguous physical request cycle increments it. It starts at one,
+increments only after the sole lifecycle adapter has opened that exact cycle, never
+wraps or reuses a value for the object, and survives publisher handoff. Every
+projected value must be an integer from 1 through 4,294,967,295; the reducer rejects
+zero, fractions, non-finite values, and larger values. A duplicate or overlapping
+`slotRequested` that the §2.4 lifecycle owner cannot attribute opens no trace cycle
+and emits no trace projection. Exhaustion at 4,294,967,296 latches new trace-cycle
+projection unavailable for only that physical object; its GPT lifecycle and
+`gpt.events.v1` stream continue unchanged.
+
+The adapter retains at most ten trace-cycle records per physical object, keyed by
+the ordinal, with request state, optional `responseIdentifier`, and per-event seen
+state. At most one cycle is open. Before opening another, it prunes the oldest
+completed/retired record only when the ten-record cap is full; it never evicts an
+open record. Pruning sets a permanent `unknownPriorCycle` latch for that physical
+object; the latch retains no old id but participates in future ambiguity checks and
+is cleared only when that object/runtime is disposed.
+
+A non-request GPT fact receives a cycle ordinal only from the §2.4 lifecycle owner's
+exact already-attributed cycle handle, or when response identity and retained
+per-event state leave exactly one eligible record and `unknownPriorCycle` cannot be
+the source. It is never assigned to the newest cycle by timing, element id, or slot
+token alone. A late `slotResponseReceived`, `slotRenderEnded`, `slotOnload`,
+`impressionViewable`, or `slotVisibilityChanged` that could belong to both a prior
+cycle and a newer started/completed cycle is ambiguous and produces no core-ingress
+projection. A uniquely matched old fact keeps the old ordinal even after a newer
+cycle starts. Eviction makes an otherwise unmatched later fact a diagnostics-only
+drop rather than a candidate for the current cycle; no callback can recreate an
+evicted ordinal. Destroy, redefine, and navigation disposal retire all retained
+cycles for the affected physical object, while runtime disposal clears the weak
+state.
+
+If the slot-token ordinal is exhausted, token/cycle construction or validation
+fails, or an injected test mint collides, the adapter emits no affected core-ingress
+projection and continues the GPT operation plus `gpt.events.v1` delivery unchanged.
+Already minted slot tokens and unambiguous cycles on other objects remain usable.
+The failure is reported at most once per failure class through the local logger and
+cannot fail a display, handoff, destroy, refresh, or diagnostics callback.
+
+On the first accepted `slotRequested` projection, the core trace reducer resolves
+the projection's bounded element id to exactly one current registered slot and keys
+its 256-entry diagnostics-only physical-impression map by the exact pair
+`{token,cycleOrdinal}`. The binding is
+`{slotId,navigationGeneration,baselineSeq?,historySeq?,state}` where `state` is
+`open`, `completed`, or `retired`. An unresolved, ambiguous, duplicate-active,
+stale-generation, or over-capacity binding is dropped without evicting an open entry.
+Later facts join only by the exact pair; token alone, element id, ad-unit path, and
+registered slot id are never substitutes. `slotRenderEnded` stores the exact created
+or enriched `historySeq` and completes the binding. Handoff of the same physical
+object keeps its token but each refresh receives a distinct cycle binding;
+redefine/replacement changes both the physical token and its per-object cycle
+sequence. Destroy or navigation disposal retires affected bindings. A late fact for
+a uniquely retained retired pair may enrich only its already-recorded, still-retained
+old `historySeq`; it cannot create a row, rebind to a new cycle/generation, or mutate
+new `current` state. Completed/retired bindings are pruned oldest-first before
+admitting a new binding, open bindings are never evicted, and runtime disposal clears
+the map. Exhaustion, collision, stability, handoff, repeated refresh, replacement,
+retirement, late-event, and navigation behavior remain diagnostics-only and never
+participate in GPT lifecycle authority.
+
+The critical `gpt_diagnostics` module does not subscribe to that ingress. It consumes
+only the separately bounded GPT-owned `gpt.events.v1` fact stream. The broker values
+for `trace.v1` and `trace.presentation.v1` are different frozen exact interfaces:
+`trace.v1` contains correctness fact operations and ingress publication but no
+presentation attachment, while `trace.presentation.v1` contains only
+`attachPresentation`. The release catalog grants the latter only to deferred
+`diagnostics_presentation`; APS, GPT, `gpt_later`, publishers, and the public API
+cannot obtain it.
+
+The private capability has this complete interface; no other own key is permitted:
+
+```ts
+interface RenderTracePresentationSourceV1 {
+  current(): Readonly<Record<string, Readonly<RenderTraceRecord>>>
+  history(): readonly Readonly<RenderTraceRecord>[]
+  subscribe(listener: () => void): () => void
+}
+
+interface RenderTracePresentationControlsV1 {
+  dispose(): void
+}
+
+type RenderTracePresentationFactoryV1 = (
+  source: Readonly<RenderTracePresentationSourceV1>
+) => Readonly<RenderTracePresentationControlsV1>
+
+interface TracePresentationCapabilityV1 {
+  attachPresentation(factory: RenderTracePresentationFactoryV1): () => void
+}
+```
+
+`attachPresentation(factory)` is synchronous and admits at most one live attachment.
+A non-callable factory, a reentrant/duplicate call, or a call after trace-owner
+disposal throws `TypeError` without disturbing an existing attachment. Callability
+is checked before attachment state, so a non-callable duplicate still leaves the
+first attachment untouched. The callable receives one exact frozen source with only
+`current`, `history`, and `subscribe`. While attached, `current()` and `history()`
+return the same frozen copies as the public trace API. After detach/owner disposal,
+retained source methods are inert: `current()` returns a frozen null-prototype empty
+record, `history()` returns a frozen empty array, and no runtime state is retained.
+
+`source.subscribe` checks listener callability first and throws `TypeError` for a
+non-callable listener. It then requires the attachment to be attaching or live and
+requires that no private listener is already live; either failure throws `TypeError`
+without replacing or unsubscribing the first listener. Success returns an idempotent
+zero-argument unsubscribe function that removes only that exact listener. A later
+subscribe may succeed after it unsubscribes while the attachment remains live; a
+retained subscribe call after detach/owner disposal throws `TypeError`, and a retained
+unsubscribe is a no-op. The factory must end its synchronous call with one live
+listener, perform its initial snapshot render in the attaching task, and return an
+exact frozen own-data `{dispose}` controls object. No presentation callback runs
+during attachment, so that initial snapshot precedes all live delivery.
+
+If the factory throws, returns malformed controls, or returns without a live
+listener, attachment rolls back the candidate listener and scheduled work, invokes
+an own callable candidate `dispose` once when safely available, reports any cleanup
+failure locally, and rethrows so only the deferred module transaction fails. The
+attachment slot is then reusable. Once attached, every trace commit updates the
+data store first and coalesces presentation notification into at most one owned
+zero-delay task. The callback's return value is ignored; a throw is isolated and
+reported, and the next commit can schedule again. The returned detach function is
+idempotent: it invalidates the attachment generation, cancels pending work, clears
+the private listener, and invokes controls `dispose` exactly once. Trace-owner
+disposal performs the same sequence. Late scheduler callbacks and retained source,
+unsubscribe, detach, or controls references are inert. This private attachment is
+not counted against the 32 live subscribers per public diagnostics surface.
 
 `tsjs.diagnostics.renderTrace` replaces the mutable `tsjs.renders`, `renderLog`, and
 `renderSeq` globals and the `tsjs:adRendered` CustomEvent with read-only snapshot and
@@ -2898,11 +3106,7 @@ subscription methods. The final schema is:
 ```ts
 type RenderTracePathV1 = 'auction' | 'ssat' | 'gam-refresh'
 type RenderTraceServedFromV1 =
-  | 'inline'
-  | 'gam'
-  | 'debug-adm'
-  | 'pbs-cache'
-  | 'prebid'
+  'inline' | 'gam' | 'debug-adm' | 'pbs-cache' | 'prebid'
 
 interface RenderTraceRecord {
   readonly slotId: string
@@ -3165,9 +3369,10 @@ by line count:
 | `prebid/later.ts`                    | deferred synthetic refresh and GAM-path exclusion only; it owns no initial admission, artifact-readiness, bidder, user-ID, EID, or publisher-queue behavior                           |
 | `core/request.ts`                    | public validation, immutable selection, and thin `AuctionBatch` coordination; path implementations live behind injected capabilities                                                  |
 | `core/render.ts`                     | only minimum path-independent first-display DOM/lifecycle helpers; APS/ADM live with their owner, while cache stays the baseline GPT-integration implementation                       |
-| `core/trace.ts`                      | bounded correctness-fact store, snapshots/subscriptions, and stable facade; DOM overlay, badges, formatting, and clipboard/download UI are deferred                                   |
+| `kernel/diagnostics.ts`              | bounded data-tree snapshot ingress and one closure-private reducer callback; no integration subscriptions, pending queue, scheduler, timer, or presentation authority                 |
+| `core/trace.ts`                      | bounded correctness-fact reducer/store, public snapshots/subscriptions, and separately attenuated `trace.presentation.v1`; no DOM presentation code                                   |
 | APS maps in globals                  | runtime-owned bounded reservation capability supplied by the APS integration module                                                                                                   |
-| diagnostics overlay/UI               | deferred presentation subscriber; never imported by production core or correctness producers                                                                                          |
+| diagnostics overlay/UI               | deferred owner of the sole private `trace.presentation.v1` attachment; never imported by production core or correctness producers                                                     |
 | duplicated `script_guard.ts`         | small per-integration factory compiled into the owning module; no central production root imports every matcher                                                                       |
 | optional integration implementations | remain in their integration IIFEs and register inert factories; they are absent from core bytes                                                                                       |
 
@@ -3438,6 +3643,9 @@ Tests must cover at least:
   consumption of a deferred provider, phase overrides, unknown/missing/multiply
   counted production artifacts, deferred/test source pulled into core, and a module
   classified critical without its named parser-time or first-display obligation;
+  exact per-consumer capability projection proves `attachPresentation` is absent
+  from `trace.v1` and denied to APS, GPT, and `gpt_later`, while only
+  `diagnostics_presentation` can consume `trace.presentation.v1`;
 - exactly one critical network request and manifest-order registration; critical
   module missing/wrong-release/duplicate/prepare throw/reject/abort/activation throw
   at each checkpoint, late critical continuation after fallback, and critical
@@ -3510,14 +3718,52 @@ Tests must cover at least:
   missing/throwing console methods;
 - direct and PUC ADM initial `about:blank`, pre-assignment, intended `srcdoc`, error,
   removal, replacement, duplicate load, supersession, disposal, stale-generation,
-  and deadline orderings, proving only the current intended navigation accepts; and
+  and deadline orderings, proving only the current intended navigation accepts;
+- core diagnostics ingress has the exact frozen `{publish,dispose}` surface and no
+  `subscribe`, listener id, capacity, queue, scheduler, or timer; valid ordinary and
+  null-prototype records, dense arrays, and UTF-8 multibyte data pass at total-node
+  511/512, depth 15/16, 127/128-byte property names, and 4,095/4,096-byte strings,
+  while total-node 513, depth 17, 129-byte names, 4,097-byte strings, sparse/extra-
+  property arrays, accessors, symbols, custom prototypes, functions, `undefined`,
+  bigint, non-finite numbers, cycles, aliases, hostile traps, and copy/freeze failure
+  return `false` without reducer entry; accepted snapshots share no producer record
+  or array, reducer/reporting throws are isolated with `true` returned, disposal is
+  idempotent, and retained stale-runtime publishers remain `false` and inert;
+- GPT trace tokens have canonical ordinals 1/35/36/4,294,967,295, exact lower-case
+  base-36 grammar and 11-byte maximum, reject zero/leading-zero/upper-case/decoded-
+  overflow/collision inputs, and latch only new trace-token minting on ordinal
+  4,294,967,296; repeated facts and publisher handoff for one physical slot retain
+  one token, distinct/replacement objects sharing every publisher identifier receive
+  distinct tokens, and token failure leaves object-identity-bearing `gpt.events.v1`
+  delivery and GPT behavior live; per-object trace-cycle ordinal 0/1/4,294,967,295/
+  4,294,967,296, fractional/non-finite rejection, 9/10/11 retained-cycle pruning,
+  and per-object rather than global exhaustion; compound `{token,cycleOrdinal}` core
+  binding covers unresolved/ambiguous/duplicate active facts, live-map totals
+  255/256/257, completed/retired oldest-first pruning, destroy/redefine, handoff,
+  navigation retirement, no old-pair rebinding or new-current mutation, history-only
+  late enrichment, and full runtime disposal; two consecutive refresh cycles on the
+  same physical object produce two rows, with prior-cycle `slotResponseReceived`,
+  `slotRenderEnded`, `slotOnload`, `impressionViewable`, and visibility callbacks at
+  each side of the next cycle's start and completion joining only when uniquely
+  attributable and otherwise producing no trace projection or current-row mutation;
+  the same ambiguity remains fail-closed after the eleventh cycle prunes an old
+  record and sets `unknownPriorCycle`;
 - render-trace record/update reordering, one-impression enrichment, weaker-signal
   non-regression, 200-entry pruning, stale attribution/DOM-field/badge removal,
   navigation pruning of `current`, 32/33 subscriber boundaries and capacity reuse,
   199/200/201 pending notification bounds, same-sequence coalescing, post-commit
   asynchronous frozen subscription detail/timing, subscribe/unsubscribe races,
   slow/throwing listeners, absence of `tsjs:adRendered`,
-  hidden/gam-only/ok truth, overlay/export failure, and cross-IIFE sequence order;
+  hidden/gam-only/ok truth, and cross-IIFE sequence order; private presentation
+  non-callable/reentrant/duplicate attachment, failed factory/malformed-controls/
+  missing-listener rollback and later retry, same-task initial snapshot before live
+  delivery, non-callable source listener before state checks, second-subscribe failure
+  preserving the first listener, unsubscribe/resubscribe and idempotent unsubscribe,
+  commit-during-next-task ordering, update coalescing, ignored return and thrown
+  callback, detach/owner-dispose exactly once, late scheduled callbacks, retained
+  empty `current`/`history`, rejected retained subscribe and inert unsubscribe/detach/
+  controls references, public 32-subscriber capacity unaffected, and overlay/export
+  failure that leaves the trace store and public subscribers live;
 - GPT diagnostics activation before/after early buffered callbacks, exact raw-event
   replay, exact `tsjs.boot.diagnostics` schema, query/session enable-disable and
   fail-closed inputs, accessor/prototype/unknown/missing/version rejection and
@@ -3671,33 +3917,33 @@ adding a hidden analytics subsystem here.
 
 ## 10. Risks and mitigations
 
-| Risk                                                                 | Mitigation                                                                                                                                                                                                                      |
-| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| PUC behavior differs from the local contract harness                 | keep the harness limited to the public message/helper contract, exercise `h.sendMessage`, and gate the actual externally hosted PUC release on real GAM; do not vendor PUC bytes                                                |
-| Same-realm publisher code can interfere                              | explicitly trust TS-authored owner code; capability checks defend unrelated frames, replays, and stale work, not arbitrary same-realm compromise                                                                                |
-| A module activation never returns                                    | activation is generated first-party code with boundary tests; elapsed returning calls fail through monotonic checks, but JavaScript cannot preempt a nonreturning same-thread function                                          |
-| Strict parsing rejects a future APS field                            | descriptor is versioned; outer transport remains tolerant; add a reviewed version/corpus update rather than silently accepting new semantics                                                                                    |
-| CSP blocks a legitimate APS creative                                 | three-browser real-GAM suite; script creatives remain opt-in; CSP changes are explicit security work                                                                                                                            |
-| Hard cutover breaks stale pages                                      | accepted compatibility stance; a stale hash fails locally and reload is required; retain the prior deployable binary for whole-release rollback, not N/N-1 routes in the active binary                                          |
-| Kernel extraction changes unrelated integrations                     | per-integration pre/post behavior corpus, adapter fakes, current full suites, behavioral maximal-bundle test, and exact disposal assertions                                                                                     |
-| Optional code drifts back into the critical artifact                 | release-catalog phase/dependency validation, production metafile deny paths, semantic critical-set budgets, and reviewable named parser-time obligations                                                                        |
-| A deferred feature is called before its module is ready              | caller deadlines start at original enqueue and may expire while gated; after the paint gate, live waiters share one independently bounded module load with no duplicate/fallback/runtime                                        |
-| First display never occurs, so deferred work starves                 | the owned 10-second post-kernel no-display guard becomes the trigger, followed by bounded idle scheduling or the owned timer fallback                                                                                           |
-| A page waits past 10 seconds before its first display                | accepted explicit boundary: correctness still uses critical owners, but the post-window display may contend with already released later work and is excluded from the protected-load claim                                      |
-| A forged/replaced script registers into the runtime                  | exact same-origin catalog URL, release/id/phase match, core-created element identity, `document.currentScript`, single terminal registration, and generation checks                                                             |
-| Publisher CSP or Trusted Types blocks a deferred module              | preserve the publisher policy; copy only the authenticated critical nonce, use one exact-manifest Trusted Types policy when allowed, validate default-policy output, and isolate `policy_blocked` without a second sink/runtime |
-| Phase splitting duplicates product ownership                         | one broker provider per capability, immutable interfaces, critical-before-deferred dependency rule, identity/disposal tests, and no public service locator                                                                      |
-| Deferred loading reduces critical bytes but grows total release size | independent immutable maximal-total raw/gzip/Brotli budget and complete release inventory; splitting alone cannot make the gate pass                                                                                            |
-| One deferred module stalls unrelated later behavior                  | start every independent deferred transaction after the common gate without awaiting siblings; separate deadlines and no deferred-to-deferred capability edges prevent head-of-line blocking                                     |
-| `rc/july` moves after the design is approved                         | pin `905984e62`; stop before code changes, diff all inventoried TSJS/bootstrap/browser paths, and update the ledger/tests explicitly                                                                                            |
-| Diagnostics change ad behavior or overclaim a render                 | one-way observation bus, bounded early-event replay, isolated subscribers, honest `gam-only`/`ok` rules, inactive zero-side-effect tests, and no correctness dependency                                                         |
-| Bounded registries refuse traffic under extreme churn                | explicit reservation `registry_full` and slot `registry_capacity`, lifecycle pruning, capacity stress tests; never trade correctness for eviction                                                                               |
-| GPT event attribution remains ambiguous                              | fail the TS attempt deterministically and never trigger fallback from ambiguous/publisher-owned activity                                                                                                                        |
-| Late async work mutates new SPA state                                | generation checks, owned disposers, terminal latch, and adversarial reversed-order tests                                                                                                                                        |
-| Browser tests report iframe load but not APS success                 | require the bound APS render-completion callback and inspect network/DOM evidence                                                                                                                                               |
-| APS runner becomes unavailable or stops the callback                 | load/rejection/silence fail the attempt; real-browser conformance blocks release and APS disablement is the emergency containment path                                                                                          |
-| APS runner reports completion incorrectly                            | accepted external trust risk; protected conformance checks DOM/network behavior, but cannot prove future mutable bytes; suspect behavior disables APS                                                                           |
-| Existing operational signals are weak                                | do not invent telemetry in this spec; hold deployment or write a separate observability design                                                                                                                                  |
+| Risk                                                                 | Mitigation                                                                                                                                                                                                                                                                                                                                                    |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| PUC behavior differs from the local contract harness                 | keep the harness limited to the public message/helper contract, exercise `h.sendMessage`, and gate the actual externally hosted PUC release on real GAM; do not vendor PUC bytes                                                                                                                                                                              |
+| Same-realm publisher code can interfere                              | explicitly trust TS-authored owner code; capability checks defend unrelated frames, replays, and stale work, not arbitrary same-realm compromise                                                                                                                                                                                                              |
+| A module activation never returns                                    | activation is generated first-party code with boundary tests; elapsed returning calls fail through monotonic checks, but JavaScript cannot preempt a nonreturning same-thread function                                                                                                                                                                        |
+| Strict parsing rejects a future APS field                            | descriptor is versioned; outer transport remains tolerant; add a reviewed version/corpus update rather than silently accepting new semantics                                                                                                                                                                                                                  |
+| CSP blocks a legitimate APS creative                                 | three-browser real-GAM suite; script creatives remain opt-in; CSP changes are explicit security work                                                                                                                                                                                                                                                          |
+| Hard cutover breaks stale pages                                      | accepted compatibility stance; a stale hash fails locally and reload is required; retain the prior deployable binary for whole-release rollback, not N/N-1 routes in the active binary                                                                                                                                                                        |
+| Kernel extraction changes unrelated integrations                     | per-integration pre/post behavior corpus, adapter fakes, current full suites, behavioral maximal-bundle test, and exact disposal assertions                                                                                                                                                                                                                   |
+| Optional code drifts back into the critical artifact                 | release-catalog phase/dependency validation, production metafile deny paths, semantic critical-set budgets, and reviewable named parser-time obligations                                                                                                                                                                                                      |
+| A deferred feature is called before its module is ready              | caller deadlines start at original enqueue and may expire while gated; after the paint gate, live waiters share one independently bounded module load with no duplicate/fallback/runtime                                                                                                                                                                      |
+| First display never occurs, so deferred work starves                 | the owned 10-second post-kernel no-display guard becomes the trigger, followed by bounded idle scheduling or the owned timer fallback                                                                                                                                                                                                                         |
+| A page waits past 10 seconds before its first display                | accepted explicit boundary: correctness still uses critical owners, but the post-window display may contend with already released later work and is excluded from the protected-load claim                                                                                                                                                                    |
+| A forged/replaced script registers into the runtime                  | exact same-origin catalog URL, release/id/phase match, core-created element identity, `document.currentScript`, single terminal registration, and generation checks                                                                                                                                                                                           |
+| Publisher CSP or Trusted Types blocks a deferred module              | preserve the publisher policy; copy only the authenticated critical nonce, use one exact-manifest Trusted Types policy when allowed, validate default-policy output, and isolate `policy_blocked` without a second sink/runtime                                                                                                                               |
+| Phase splitting duplicates product ownership                         | one broker provider per capability, immutable interfaces, critical-before-deferred dependency rule, identity/disposal tests, and no public service locator                                                                                                                                                                                                    |
+| Deferred loading reduces critical bytes but grows total release size | independent immutable maximal-total raw/gzip/Brotli budget and complete release inventory; splitting alone cannot make the gate pass                                                                                                                                                                                                                          |
+| One deferred module stalls unrelated later behavior                  | start every independent deferred transaction after the common gate without awaiting siblings; separate deadlines and no deferred-to-deferred capability edges prevent head-of-line blocking                                                                                                                                                                   |
+| `rc/july` moves after the design is approved                         | pin `905984e62`; stop before code changes, diff all inventoried TSJS/bootstrap/browser paths, and update the ledger/tests explicitly                                                                                                                                                                                                                          |
+| Diagnostics change ad behavior or overclaim a render                 | bounded core-only snapshot ingress, separately bounded GPT fact replay, consumer-specific private presentation capability, isolated public subscribers, honest `gam-only`/`ok` rules, inactive zero-side-effect tests, and no correctness dependency                                                                                                          |
+| Bounded registries refuse traffic under extreme churn                | explicit reservation `registry_full` and slot `registry_capacity`, lifecycle pruning, capacity stress tests; never trade correctness for eviction                                                                                                                                                                                                             |
+| GPT event attribution remains ambiguous                              | adapter-minted non-reused physical-slot plus per-object cycle identity joins diagnostics only after exact current-slot and unique-cycle resolution; unresolved, stale, or multi-cycle-ambiguous facts are dropped, while lifecycle authority still fails the TS attempt deterministically and never triggers fallback from ambiguous/publisher-owned activity |
+| Late async work mutates new SPA state                                | generation checks, owned disposers, terminal latch, and adversarial reversed-order tests                                                                                                                                                                                                                                                                      |
+| Browser tests report iframe load but not APS success                 | require the bound APS render-completion callback and inspect network/DOM evidence                                                                                                                                                                                                                                                                             |
+| APS runner becomes unavailable or stops the callback                 | load/rejection/silence fail the attempt; real-browser conformance blocks release and APS disablement is the emergency containment path                                                                                                                                                                                                                        |
+| APS runner reports completion incorrectly                            | accepted external trust risk; protected conformance checks DOM/network behavior, but cannot prove future mutable bytes; suspect behavior disables APS                                                                                                                                                                                                         |
+| Existing operational signals are weak                                | do not invent telemetry in this spec; hold deployment or write a separate observability design                                                                                                                                                                                                                                                                |
 
 ## 11. Success criteria
 
@@ -3794,6 +4040,23 @@ The design is complete when all of the following are true:
     generated pure external Prebid artifact remains isolated under its §5.6 contract
     and contains no TSJS behavior; Trusted Server's runtime bundles retain only owned
     adapters, proxy/loading contracts, and lifecycle wrappers.
+28. The core diagnostics ingress admits and snapshots only the exact bounded data
+    tree, exposes no module subscription machinery, and becomes inert on owner
+    disposal. `trace.presentation.v1` is a separate consumer-specific capability
+    available only to deferred diagnostics presentation; attachment activation,
+    replay/live ordering, failure rollback, coalescing, detach, owner disposal, and
+    late callbacks cannot affect trace correctness or the 32-live-subscriber public
+    limits.
+29. Each physical GPT object receives one adapter-minted canonical trace token that
+    remains stable through handoff, is never reused within the runtime, and differs
+    across redefine/replacement even when publisher identifiers match. Each
+    unambiguous physical request admitted to trace projection receives a distinct
+    nonreused per-object cycle ordinal, and trace facts join only through that
+    compound identity; ambiguous requests are omitted fail-closed. Token/cycle mint,
+    ambiguity, collision, map capacity, retirement, late events, navigation, or
+    disposal failure can drop only diagnostic projection; it cannot conflate old/new
+    impressions or affect GPT behavior and the independently bounded object-identity
+    `gpt.events.v1` stream.
 
 ## 12. Open implementation decisions
 
