@@ -4027,12 +4027,13 @@ pub async fn handle_page_bids(
     };
 
     let bid_map = prebuilt_bid_map.unwrap_or_else(|| {
-        build_bid_map(
+        build_bid_map_with_auction_id(
             &winning_bids,
             co_config.price_granularity,
             settings,
             &page_bids_request_origin,
             settings.debug.inject_adm_for_testing,
+            None,
         )
     });
 
