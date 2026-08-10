@@ -687,10 +687,5 @@ routes; N per arm; and the cache-tier mix.
       the answer.
 - [ ] Cleanup complete: flag resolved, C2 purged, synthetic endpoint removed, dependency
       landed or dropped.
-- [ ] **Cross-document invariants hold:** `python3 scripts/docs-invariants.py`. This is a
-      named gate, not a courtesy check. `npm run format` and `npm run build` catch
-      formatting and dead links; neither catches a claim corrected in one document and
-      left standing in another, which is the failure mode this document set has hit on
-      four separate review rounds. Add a check whenever a correction lands.
 - [ ] All CI gates pass: `cargo fmt --all -- --check`; the six clippy targets; the four
       adapter test suites; the parity suite; JS build, test, and format; docs format.

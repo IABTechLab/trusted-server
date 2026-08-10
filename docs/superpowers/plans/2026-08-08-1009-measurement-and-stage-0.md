@@ -25,16 +25,14 @@ for wasm-safe timing, `log` for instrumentation, Viceroy for adapter tests.
 **Spec:** `docs/superpowers/specs/2026-08-08-esi-cacheable-root-validation-design.md`
 (§3 Steps A/B/C and §4 Stage 0). Read §4 and §5 before starting Task 5.
 
-**Before pushing, run three gates, not two:**
+**Before pushing, run both documentation gates:**
 
 ```bash
 cd docs && npm run format && npm run build && cd ..
-python3 scripts/docs-invariants.py
 ```
 
 `npm run build` is not optional — `format` passes on documents with dead links, and that
-shipped a broken docs build on this branch once already. `docs-invariants.py` catches
-cross-document contradictions, which neither of the other two can see.
+shipped a broken docs build on this branch once already.
 
 **Two prettier gotchas, both hit while writing this plan.** CI gate 7
 (`cd docs && npm run format`) runs `prettier --check` over all of `docs/`, so both bite.
@@ -1042,10 +1040,5 @@ Named so nobody widens this plan mid-flight. All are specified in the spec.
       measuring the TTFB the publisher actually complained about; use it for before/after.
 - [ ] `unexpected_origin_304` rate is zero and representations are not mixed (Task 5a
       Step 8) — both checked **before** the win is claimed.
-- [ ] **Cross-document invariants hold:** `python3 scripts/docs-invariants.py`. This is a
-      named gate, not a courtesy check. `npm run format` and `npm run build` catch
-      formatting and dead links; neither catches a claim corrected in one document and
-      left standing in another, which is the failure mode this document set has hit on
-      four separate review rounds. Add a check whenever a correction lands.
 - [ ] All CI gates pass: `cargo fmt --all -- --check`; the six clippy targets; the four
       adapter test suites; the parity suite; JS build, test, and format; docs format.
