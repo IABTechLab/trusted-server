@@ -360,11 +360,12 @@ describe('installTsAdInit', () => {
       getSlotElementId: vi.fn().mockReturnValue('div-new-slot'),
       getTargeting: vi.fn().mockReturnValue([]),
     };
+    const refresh = vi.fn();
     const mockPubads = {
       enableSingleRequest: vi.fn(),
       getSlots: vi.fn().mockReturnValue([existingSlot]),
       addEventListener: vi.fn(),
-      refresh: vi.fn(),
+      refresh,
     };
     const display = vi.fn();
     (window as TestWindow).googletag = {
@@ -422,7 +423,7 @@ describe('installTsAdInit', () => {
     expect(existingSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '1.00');
     expect(definedSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '2.00');
     expect(display).toHaveBeenCalledWith('div-new-slot');
-    expect(mockPubads.refresh).toHaveBeenCalledWith([existingSlot]);
+    expect(refresh).toHaveBeenCalledWith([existingSlot]);
   });
 
   it('reads window.tsjs.bids synchronously and applies bid targeting before refresh', async () => {
