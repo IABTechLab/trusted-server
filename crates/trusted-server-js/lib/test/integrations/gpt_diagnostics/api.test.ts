@@ -408,6 +408,89 @@ describe('GptDiagnosticsApiController', () => {
     expect(listener).toHaveBeenCalledTimes(1);
   });
 
+  it('gives subscribers isolated copies of one captured snapshot', () => {
+    const scheduled: Array<() => void> = [];
+    const sourceListeners = new Set<() => void>();
+    const store = fakeApiStore();
+    store.subscribe.mockImplementation((listener) => {
+      sourceListeners.add(listener);
+      return () => sourceListeners.delete(listener);
+    });
+    store.snapshot.mockReturnValue({
+      gptObserved: true,
+      slots: [
+        {
+          runtimeSlotNumber: 1,
+          slotElementId: 'ad-slot-example',
+          adUnitPath: '/example/site/banner',
+          requests: [
+            {
+              requestNumber: 1,
+              durations: { requestToResponseMs: 10 },
+              incompleteSequence: false,
+              adManager: { yieldGroupIds: [10], companyIds: [20] },
+              trustedServerCreativeFailures: ['cache_fetch_failed' as const],
+            },
+          ],
+        },
+      ],
+      callbackIssues: [],
+      attributionIssues: [
+        {
+          reason: 'creative_attempt_expired' as const,
+          timestampMs: 30,
+        },
+      ],
+      coverage: emptyCoverage(),
+      metadata: {
+        droppedCallbacks: 0,
+        droppedAttributionIssues: 0,
+        evictedSlots: 0,
+        evictedRequestCycles: 0,
+      },
+    });
+    const controller = new GptDiagnosticsApiController(
+      store,
+      new FakeBindings(),
+      { show: vi.fn(), hide: vi.fn() },
+      {
+        now: () => new Date('2026-08-10T00:00:00.000Z'),
+        schedule: (callback) => scheduled.push(callback),
+      }
+    );
+    let observedSnapshot: ReturnType<typeof controller.api.snapshot> | undefined;
+
+    controller.api.subscribe((snapshot) => {
+      const cycle = snapshot.slots[0]!.requests[0]!;
+      cycle.durations.requestToResponseMs = 999;
+      cycle.adManager!.yieldGroupIds!.push(99);
+      cycle.trustedServerCreativeFailures!.push('response_post_failed');
+      snapshot.attributionIssues?.push({
+        reason: 'creative_attempt_unknown',
+        timestampMs: 40,
+      });
+      snapshot.coverage.slotRequested.observed = 99;
+      snapshot.metadata.droppedCallbacks = 99;
+    });
+    controller.api.subscribe((snapshot) => {
+      observedSnapshot = snapshot;
+    });
+
+    for (const listener of sourceListeners) listener();
+    expect(scheduled).toHaveLength(1);
+    scheduled.shift()!();
+
+    expect(store.snapshot).toHaveBeenCalledTimes(1);
+    expect(observedSnapshot?.capturedAt).toBe('2026-08-10T00:00:00.000Z');
+    const observedCycle = observedSnapshot?.slots[0]?.requests[0];
+    expect(observedCycle?.durations.requestToResponseMs).toBe(10);
+    expect(observedCycle?.adManager?.yieldGroupIds).toEqual([10]);
+    expect(observedCycle?.trustedServerCreativeFailures).toEqual(['cache_fetch_failed']);
+    expect(observedSnapshot?.attributionIssues).toHaveLength(1);
+    expect(observedSnapshot?.coverage.slotRequested.observed).toBe(0);
+    expect(observedSnapshot?.metadata.droppedCallbacks).toBe(0);
+  });
+
   it('delegates show and hide without mutating diagnostics data', () => {
     const store = new GptDiagnosticsStore({ now: () => 1 });
     const presentation = { show: vi.fn(), hide: vi.fn() };

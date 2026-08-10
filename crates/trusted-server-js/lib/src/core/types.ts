@@ -257,11 +257,11 @@ export interface GptDiagnosticsExportV1 {
   };
   slots: GptDiagnosticsSlotExport[];
   callbackIssues: GptDiagnosticsCallbackIssue[];
-  attributionIssues: GptDiagnosticsAttributionIssue[];
+  attributionIssues?: GptDiagnosticsAttributionIssue[];
   coverage: Record<GptDiagnosticsCallbackKind, GptDiagnosticsCoverageCounters>;
   metadata: {
     droppedCallbacks: number;
-    droppedAttributionIssues: number;
+    droppedAttributionIssues?: number;
     evictedSlots: number;
     evictedRequestCycles: number;
   };

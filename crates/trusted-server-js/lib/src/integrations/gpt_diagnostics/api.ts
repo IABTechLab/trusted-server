@@ -52,6 +52,43 @@ interface ApiOptions {
 
 type ApiListener = (snapshot: GptDiagnosticsExportV1) => void;
 
+function cloneExportSnapshot(snapshot: GptDiagnosticsExportV1): GptDiagnosticsExportV1 {
+  return {
+    version: snapshot.version,
+    capturedAt: snapshot.capturedAt,
+    page: { ...snapshot.page },
+    slots: snapshot.slots.map((slot) => ({
+      ...slot,
+      binding: { ...slot.binding },
+      requests: slot.requests.map((cycle) => ({
+        ...cycle,
+        durations: { ...cycle.durations },
+        size: cycle.size ? [...cycle.size] : undefined,
+        adManager: cycle.adManager
+          ? {
+              ...cycle.adManager,
+              yieldGroupIds: cycle.adManager.yieldGroupIds
+                ? [...cycle.adManager.yieldGroupIds]
+                : undefined,
+              companyIds: cycle.adManager.companyIds ? [...cycle.adManager.companyIds] : undefined,
+            }
+          : undefined,
+        trustedServerCreativeFailures: cycle.trustedServerCreativeFailures
+          ? [...cycle.trustedServerCreativeFailures]
+          : undefined,
+      })),
+    })),
+    callbackIssues: snapshot.callbackIssues.map((issue) => ({ ...issue })),
+    ...(snapshot.attributionIssues === undefined
+      ? {}
+      : { attributionIssues: snapshot.attributionIssues.map((issue) => ({ ...issue })) }),
+    coverage: Object.fromEntries(
+      Object.entries(snapshot.coverage).map(([kind, counters]) => [kind, { ...counters }])
+    ) as GptDiagnosticsExportV1['coverage'],
+    metadata: { ...snapshot.metadata },
+  };
+}
+
 function safelyRecord(action: () => void): void {
   try {
     action();
@@ -234,7 +271,7 @@ export class GptDiagnosticsApiController {
 
       for (const listener of this.listeners) {
         try {
-          listener(snapshot);
+          listener(cloneExportSnapshot(snapshot));
         } catch {
           // One API subscriber must not block the rest.
         }
