@@ -147,6 +147,12 @@ surrogate keys the _origin_ supplies on its responses, or the HTTP cache's own
 request/candidate surrogate-key surface. Confirm which is available before relying on it —
 an earlier revision of this document conflated the two.
 
+**C2's purge is locally testable; C1's is not.** Verified 2026-08-10: Viceroy 0.17
+implements `purge_surrogate_key` against the same in-process cache it serves reads from
+(`viceroy-lib-0.17.0/src/wiggle_abi/fastly_purge_impl.rs:10-32`), soft purge included. So
+the purge-based rollback for the C2 template cache the spike builds can be exercised end
+to end without a Fastly service. That does nothing for Stage 0, whose exposure is C1.
+
 Rollback is therefore: flip the flag, **then** purge C1 by whichever mechanism is actually
 available (or roll a versioned key namespace), **then** observe past the origin TTL before
 declaring the incident closed. With no C1 purge path wired, the tail is the TTL itself —

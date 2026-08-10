@@ -468,16 +468,114 @@ built from — and decide explicitly whether the stored template is compressed.
 Per-user signals must never appear in the key. If a signal cannot be excluded from the
 template, it does not belong in C2 at all.
 
-**Design choice to make explicitly before writing code.** Two viable shapes:
+### Design decided 2026-08-10: `cache::core`. Do not revisit read-through.
 
-1. **Read-through with `after_send` + `set_body_transform`** — keeps HTTP semantics,
-   revalidation, and stale handling for free; less control over the key.
-2. **`cache::core` as above** — full control; you own metadata, revalidation, and the
-   stale state machine.
+An earlier revision left this open between `cache::core` and read-through caching with
+`after_send` + `set_body_transform`. Investigated and verified against the pinned SDK and
+Viceroy 0.17 source. **Read-through is not viable here** — not on preference, on three
+hard blockers:
 
-This plan assumes (2). If (1) is chosen, Step 4 is rewritten and the metadata envelope
-disappears. Either way, the platform boundary must sit **before** the origin request, or
-a C2 HIT cannot actually skip the fetch — which is the entire point.
+1. **Viceroy stubs the entire HTTP Cache ABI**, and the SDK converts that into a _send
+   error_ rather than a fallback. `is_request_cacheable` returns
+   `Err(NotAvailable("HTTP Cache API primitives"))`
+   (`viceroy-lib-0.17.0/src/wiggle_abi/http_cache.rs:108-114`; 26 such stubs in that
+   file), which makes `must_use_host_caching()` true, which with a send hook set returns
+   `Err(SendErrorCause::HttpCacheApiUnsupported)`
+   (`fastly-0.12.1/src/http/request.rs:626-632`). **Setting `after_send` makes every
+   publisher origin fetch fail** under `fastly compute serve`, `cargo test-fastly`, and
+   the parity suite. The whole local loop dies.
+2. **`with_cache_bypass` makes the hook silently dead.** `get_caching_mode` checks
+   `cache_override.is_pass()` **first** (`request.rs:612-615`) and returns host caching, so
+   `after_send` is never invoked and no error is raised. On exactly the requests in scope,
+   today, the hook would do nothing quietly.
+3. **The closure bounds are incompatible with this codebase.** `with_after_send` requires
+   `Fn + Send + Sync + 'static` (`request.rs:545-550`). Everything the rewriter needs is
+   `!Send` by construction — `edgezero_core::body::Body` wraps a `LocalBoxStream`
+   deliberately, which is why the platform layer is `#[async_trait(?Send)]` throughout.
+   And `set_body_transform` is synchronous, so it could never await the auction collect.
+
+Read-through's appeal was real — `CandidateResponse::apply_and_stream_back` is
+`execute_and_stream_back` with HTTP semantics attached, and TTL/SWR/vary/surrogate keys
+derived from origin headers for free. It is simply unreachable from here.
+
+**Also settled: core cannot reach it at all.** `PlatformHttpRequest`
+(`platform/http.rs:16-37`) is a plain data struct with no callback slot, and carrying one
+would name `fastly::http::CandidateResponse` in portable core, breaking the other three
+adapters.
+
+### Follow the existing null-object pattern
+
+`cache::core` fits the shape the repo already uses four times for a Fastly-only capability
+behind a portable trait: `UnavailableHttpClient` (`platform/http.rs:216-243`),
+`UnavailableKvStore` (`platform/kv.rs:14-17`), and the `RuntimeServices.kv_store`
+field/accessor/builder (`platform/types.rs:170,222,269,330`). Add
+`PlatformTemplateCache` the same way, and follow
+`crates/trusted-server-adapter-fastly/src/ec_kv.rs` — 140 lines, the repo's only real
+edge-storage read/write — rather than inventing a shape.
+
+**Return `EdgeBody`, not `Vec<u8>`.** `EdgeBody::Stream` exists,
+`fastly_body_to_edge_stream` (`adapter-fastly/src/platform.rs:503`) already converts, and
+`PublisherResponse::Buffered` tolerates a live stream (`publisher.rs:1019-1022`).
+
+### Exact insertion point
+
+**Immediately before `let mut platform_request = PlatformHttpRequest::new(...)`** — the
+last line before `req` is consumed, and a few lines before the origin send. Everything
+needed is in scope there: `settings`, `services`, the final URI and Host, `backend_name`,
+`request_path`, `matched_slots`, `should_run_ad_stack`, `request_had_authorization`,
+`request_host`, `request_scheme`.
+
+**One required move:** `assembly_mode` is currently computed _after_ the send, for the
+logging call site. It depends only on `settings`, so hoist it above the insertion point.
+
+**Tee-ing is not needed.** With any post-processor registered — and the Next.js
+integration always registers one — `HtmlWithPostProcessing` emits nothing until the final
+chunk and then returns the whole transformed document as one contiguous buffer
+(`html_processor.rs:92-97,148`). Two `write_all` calls on the same slice; no tee
+abstraction, no extra copy. Still use `execute_and_stream_back`, but for transaction
+correctness and request collapsing rather than for memory. On a hit the processor is never
+built at all.
+
+- [ ] **Step 4b: close the risks the design investigation surfaced**
+
+Four, all specific to this codebase rather than to `cache::core` in general.
+
+**`Vary` is in the key list but nothing consumes it.** `c2_bypass_reason` checks
+`Set-Cookie`, `Cache-Control`, `Authorization`, status and content type — **not `Vary`**.
+Viceroy supports `WriteOptions.vary_rule`, so the mechanism exists; the gate has to use
+it. Until then the key is missing a signal the origin explicitly declares, and Step A's
+verdict is a `PROVISIONAL PASS`, not a release gate.
+
+**Store bytes plus a metadata envelope; rebuild every header on a hit.** The publisher
+path forces `private, no-store` and strips `ETag`/`Last-Modified`/CDN headers _after_ the
+send. Replaying stored origin headers would fight that. Store only the transformed body
+and a small `user_metadata` envelope — content encoding, content type, schema version,
+tsjs hash — and construct every response header from scratch on a hit. Then no origin
+header is ever replayed and the `Set-Cookie` privacy net is trivially safe.
+`get_user_metadata` is implemented in Viceroy.
+
+**Content-Encoding belongs in the key.** The streaming pipeline pairs input encoding to
+the same output encoding, so the transformed bytes inherit whatever the origin negotiated
+from the client's `Accept-Encoding` — still gzip, deflate, br or identity after
+`restrict_accept_encoding` narrows it. Either key on the negotiated encoding or normalize
+to identity in the cache and re-encode on read. Getting this wrong serves brotli bytes to
+a client that asked for gzip.
+
+**Host and scheme belong in the key.** The post-processed output is host-dependent by
+construction: `request_host` and `request_scheme` reach `IntegrationHtmlContext`.
+
+- [ ] **Step 4c: file the wasted-dispatch follow-up**
+
+The auction is dispatched _before_ the insertion point. Under `Esi` and `ClientFill` the
+root injects nothing, so that dispatch is already pure waste on this branch — and on a C2
+hit it is waste that must be cleaned up via `emit_abandoned_auction` or it leaks
+telemetry.
+
+Keeping the lookup at the insertion point above is right for the spike: minimal diff, and
+lookup latency overlaps the in-flight auction. Moving it earlier would eliminate the
+wasted dispatch but serialize the lookup ahead of dispatch. **File it; do not fix it
+here.** Suppressing root-level dispatch under the shared modes is Task 4's job, where it
+also has to be reconciled with the exactly-one-auction gate.
 
 - [ ] **Step 5: Unit tests, then the target suite**
 
