@@ -949,6 +949,24 @@ struct HtmlStreamProcessorParams<'a> {
     gpt_diagnostics: Option<crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
 }
 
+/// Whether a root-level auction has any consumer under this assembly mode.
+///
+/// Only [`AssemblyMode::Inline`] injects the auction result into the root document.
+/// Under the shared-template modes both seams emit nothing, so a dispatched root
+/// auction would bill the SSPs, hold the response for the full budget, and have its
+/// result discarded with no error and no log.
+///
+/// This is the guard for the failure mode described in §5 of
+/// `docs/superpowers/specs/2026-08-08-esi-cacheable-root-validation-design.md`,
+/// reached here by an incomplete feature flag rather than by removing the hold.
+pub(crate) fn root_auction_is_useful(mode: AssemblyMode) -> bool {
+    match mode {
+        AssemblyMode::Inline => true,
+        // The fragment path runs its own auction; see the spike plan's Task 4.
+        AssemblyMode::ClientFill | AssemblyMode::Esi => false,
+    }
+}
+
 /// What the `</body>` seam should inject, given the assembly mode.
 ///
 /// Explicit rather than inferred. The previous shape read
@@ -2742,8 +2760,26 @@ pub async fn handle_publisher_request(
     // dispatch_auction returns — DispatchedAuction holds no lifetime — so req
     // can be mutated and sent to origin immediately after.
     let mut auction_observation: Option<AuctionObservationContext> = None;
+    let assembly_mode = settings
+        .creative_opportunities
+        .as_ref()
+        .map(CreativeOpportunitiesConfig::assembly_mode)
+        .unwrap_or_default();
+
     let mut auction_request_for_telemetry: Option<AuctionRequest> = None;
     let mut dispatched_auction = if matched_slots.is_empty() {
+        None
+    } else if !root_auction_is_useful(assembly_mode) {
+        // Shared-template modes inject nothing at the root: `template_ad_slots_script`
+        // and `body_close_injection` both return `None`. Dispatching here would send
+        // real SSP requests, hold the response for the full auction budget, and then
+        // discard the result with no error and no log — the silent-waste signature
+        // §5 of the design doc is entirely about. The fragment path runs its own
+        // auction; this one has no consumer.
+        log::debug!(
+            "skipping root auction dispatch: assembly mode {assembly_mode:?} injects \
+             nothing at the root"
+        );
         None
     } else {
         // Telemetry attribution must use the same publisher identity as the
@@ -2879,6 +2915,7 @@ pub async fn handle_publisher_request(
     // below needs it, and an authorized response must never become a shared
     // template.
     let request_had_authorization = req.headers().contains_key(header::AUTHORIZATION);
+    let request_had_cookie = req.headers().contains_key(header::COOKIE);
 
     if should_run_ad_stack {
         req.headers_mut().remove(header::IF_NONE_MATCH);
@@ -2968,11 +3005,6 @@ pub async fn handle_publisher_request(
 
     crate::integrations::gpt_diagnostics::finalize_response(&gpt_diagnostics, &mut response);
 
-    let assembly_mode = settings
-        .creative_opportunities
-        .as_ref()
-        .map(CreativeOpportunitiesConfig::assembly_mode)
-        .unwrap_or_default();
     let ad_slots_script = template_ad_slots_script(
         assembly_mode,
         should_run_ad_stack,
@@ -3035,6 +3067,7 @@ pub async fn handle_publisher_request(
         match c2_bypass_reason(
             assembly_mode,
             request_had_authorization,
+            request_had_cookie,
             status,
             &content_type,
             response.headers(),
@@ -3661,6 +3694,15 @@ pub(crate) enum C2BypassReason {
     /// Not HTML, so there is no template to transform.
     #[display("content type is not text/html")]
     NotHtml,
+    /// The request carried a `Cookie`, which TS forwards to origin unchanged — there
+    /// is no `Cookie` strip on the publisher path. Cookie-personalized HTML is
+    /// therefore cross-servable unless the origin declares `Vary: Cookie` or marks
+    /// those responses private, and a response can be personalized without carrying
+    /// `Set-Cookie` itself when the session was established earlier. Named in §4 of
+    /// the design doc; disqualifying until the origin's `Vary` is verified to cover
+    /// it.
+    #[display("request carried Cookie and the origin's Vary does not cover it")]
+    CookieForwarded,
 }
 
 /// Whether a response may be written to the shared transformed-template cache.
@@ -3675,6 +3717,7 @@ pub(crate) enum C2BypassReason {
 pub(crate) fn c2_bypass_reason(
     mode: AssemblyMode,
     request_had_authorization: bool,
+    request_had_cookie: bool,
     status: StatusCode,
     content_type: &str,
     response_headers: &edgezero_core::http::HeaderMap,
@@ -3685,21 +3728,24 @@ pub(crate) fn c2_bypass_reason(
     if request_had_authorization {
         return Some(C2BypassReason::AuthorizedRequest);
     }
+    if request_had_cookie {
+        return Some(C2BypassReason::CookieForwarded);
+    }
     if response_headers.contains_key(header::SET_COOKIE) {
         return Some(C2BypassReason::OriginSetCookie);
     }
-    // Reuse the cookie-privacy net's predicate rather than a third copy of it.
-    // That covers `private` and `no-store`; `no-cache` needs its own check
-    // because it means "revalidate before reuse", not "do not store" — a
-    // distinction that is correct for HTTP caches but too permissive for a
-    // spike-owned template cache, so treat it as disqualifying here.
-    let cache_control = response_headers
+    // One pass over the header. `private` and `no-store` match the cookie-privacy
+    // net's reading; `no-cache` is added because it means "revalidate before reuse"
+    // rather than "do not store" — correct for an HTTP cache, too permissive for a
+    // spike-owned one.
+    let non_shareable = response_headers
         .get(header::CACHE_CONTROL)
         .and_then(|value| value.to_str().ok())
-        .map(str::to_ascii_lowercase);
-    if crate::response_privacy::is_uncacheable_by_cache_control(response_headers)
-        || cache_control.is_some_and(|value| value.contains("no-cache"))
-    {
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|value| {
+            value.contains("private") || value.contains("no-store") || value.contains("no-cache")
+        });
+    if non_shareable {
         return Some(C2BypassReason::OriginNotShareable);
     }
     if status != StatusCode::OK {
@@ -4733,6 +4779,50 @@ mod tests {
         .expect("should proxy publisher request")
     }
 
+    mod root_auction_gate_tests {
+        //! Guards the silent-waste failure mode: dispatching an auction whose result
+        //! nothing will consume. Under the shared modes both injection seams emit
+        //! nothing, so a dispatched root auction bills the SSPs, holds the response
+        //! for the full budget, and discards the result with no error and no log.
+
+        use super::*;
+        use crate::creative_opportunities::AssemblyMode;
+
+        #[test]
+        fn only_inline_has_a_consumer_for_a_root_auction() {
+            assert!(
+                root_auction_is_useful(AssemblyMode::Inline),
+                "inline injects the auction result at `</body>`"
+            );
+            for mode in [AssemblyMode::ClientFill, AssemblyMode::Esi] {
+                assert!(
+                    !root_auction_is_useful(mode),
+                    "{mode:?}: neither seam injects, so a root auction has no consumer"
+                );
+            }
+        }
+
+        #[test]
+        fn the_gate_agrees_with_the_injection_decisions() {
+            // The real invariant: a root auction is useful exactly when something
+            // will read it. Deriving that from the two seam decisions rather than
+            // asserting it per-variant means a new mode cannot make these disagree.
+            for mode in [
+                AssemblyMode::Inline,
+                AssemblyMode::ClientFill,
+                AssemblyMode::Esi,
+            ] {
+                let something_consumes_it =
+                    body_close_injection(mode, true) != BodyCloseInjection::None;
+                assert_eq!(
+                    root_auction_is_useful(mode),
+                    something_consumes_it,
+                    "{mode:?}: dispatch usefulness must track whether a seam consumes the result"
+                );
+            }
+        }
+    }
+
     mod body_close_decision_tests {
         //! The `</body>` decision must not be inferred from the `<head>` script.
         //!
@@ -4825,7 +4915,14 @@ mod tests {
         fn a_plain_shareable_html_200_is_cacheable() {
             for mode in [AssemblyMode::ClientFill, AssemblyMode::Esi] {
                 assert_eq!(
-                    c2_bypass_reason(mode, false, StatusCode::OK, "text/html", &shareable()),
+                    c2_bypass_reason(
+                        mode,
+                        false,
+                        false,
+                        StatusCode::OK,
+                        "text/html",
+                        &shareable()
+                    ),
                     None,
                     "{mode:?}: a shareable HTML 200 should be eligible"
                 );
@@ -4837,6 +4934,7 @@ mod tests {
             assert_eq!(
                 c2_bypass_reason(
                     AssemblyMode::Inline,
+                    false,
                     false,
                     StatusCode::OK,
                     "text/html",
@@ -4853,12 +4951,34 @@ mod tests {
                 c2_bypass_reason(
                     AssemblyMode::Esi,
                     true,
+                    false,
                     StatusCode::OK,
                     "text/html",
                     &shareable()
                 ),
                 Some(C2BypassReason::AuthorizedRequest),
                 "an authenticated response must not enter a shared cache"
+            );
+        }
+
+        #[test]
+        fn a_forwarded_request_cookie_disqualifies_even_without_set_cookie() {
+            // The dangerous case: session established on an earlier request, so this
+            // response carries no Set-Cookie, has no Cache-Control at all, is a 200,
+            // and is HTML — yet is personalized because TS forwarded the Cookie to
+            // origin unchanged. Every other condition reports it cacheable.
+            let no_cache_control = edgezero_core::http::HeaderMap::new();
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    true,
+                    StatusCode::OK,
+                    "text/html",
+                    &no_cache_control
+                ),
+                Some(C2BypassReason::CookieForwarded),
+                "cookie-personalized HTML must not become a shared template"
             );
         }
 
@@ -4871,6 +4991,7 @@ mod tests {
             assert_eq!(
                 c2_bypass_reason(
                     AssemblyMode::Esi,
+                    false,
                     false,
                     StatusCode::OK,
                     "text/html",
@@ -4893,7 +5014,14 @@ mod tests {
             ] {
                 let map = headers(&[(header::CACHE_CONTROL, directive)]);
                 assert_eq!(
-                    c2_bypass_reason(AssemblyMode::Esi, false, StatusCode::OK, "text/html", &map),
+                    c2_bypass_reason(
+                        AssemblyMode::Esi,
+                        false,
+                        false,
+                        StatusCode::OK,
+                        "text/html",
+                        &map
+                    ),
                     Some(C2BypassReason::OriginNotShareable),
                     "`{directive}` should disqualify the response"
                 );
@@ -4908,6 +5036,7 @@ mod tests {
             assert_eq!(
                 c2_bypass_reason(
                     AssemblyMode::Esi,
+                    false,
                     false,
                     StatusCode::FORBIDDEN,
                     "text/html",
@@ -4924,6 +5053,7 @@ mod tests {
                 assert_eq!(
                     c2_bypass_reason(
                         AssemblyMode::Esi,
+                        false,
                         false,
                         StatusCode::OK,
                         content_type,
@@ -4948,6 +5078,7 @@ mod tests {
                 c2_bypass_reason(
                     AssemblyMode::Esi,
                     true,
+                    false,
                     StatusCode::FORBIDDEN,
                     "application/json",
                     &map
