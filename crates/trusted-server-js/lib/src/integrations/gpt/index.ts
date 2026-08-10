@@ -1091,8 +1091,9 @@ export function installTsAdInit(): void {
         } catch {
           // Diagnostics must not alter ad delivery.
         }
-        // Map the resolved inner div to the slot ID so slotRenderEnded and ADM
-        // injection address the same, single GPT slot.
+        // Map both inner div and container div → slot ID so slotRenderEnded
+        // (which reports the GPT slot's div, i.e. slotDivId/container) can look up
+        // the slot, while adm injection (which targets the inner div) also works.
         divToSlotId[actualDivId] = slot.id;
         if (slotDivId2 !== actualDivId) divToSlotId[slotDivId2] = slot.id;
         const slotTargetingKeys = Object.keys(slot.targeting ?? {});

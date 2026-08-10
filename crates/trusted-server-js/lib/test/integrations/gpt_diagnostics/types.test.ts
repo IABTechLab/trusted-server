@@ -4,10 +4,12 @@ import type {
   GptDiagnosticsApi,
   GptDiagnosticsAttributionIssue,
   GptDiagnosticsAttributionIssueReason,
+  GptDiagnosticsDelivery,
   GptDiagnosticsExportV1,
   GptDiagnosticsRecorder,
   GptDiagnosticsRequestCycle,
   GptDiagnosticsRequestPath,
+  GptDiagnosticsResponseClass,
   GptDiagnosticsSlotExport,
   TsjsApi,
 } from '../../../src/core/types';
@@ -161,7 +163,26 @@ describe('GPT diagnostics public types', () => {
       | 'creative_attempt_expired'
       | 'creative_attempt_evicted'
     >();
-    expectTypeOf(snapshot).toEqualTypeOf<GptDiagnosticsExportV1>();
+    // Keep additions synchronized with the exhaustive presentation switches.
+    expectTypeOf<GptDiagnosticsDelivery>().toEqualTypeOf<
+      | 'trusted_server_response_sent'
+      | 'trusted_server_selected'
+      | 'candidate_unconfirmed'
+      | 'no_candidate'
+      | 'unknown'
+      | 'pending'
+      | 'not_applicable'
+    >();
+    expectTypeOf<GptDiagnosticsRequestPath>().toEqualTypeOf<
+      | 'trusted_server_direct'
+      | 'prebid_refresh'
+      | 'publisher_refresh'
+      | 'competing'
+      | 'unattributed'
+    >();
+    expectTypeOf<GptDiagnosticsResponseClass>().toEqualTypeOf<
+      'empty' | 'backfill' | 'reservation' | 'unclassified_non_empty'
+    >();    expectTypeOf(snapshot).toEqualTypeOf<GptDiagnosticsExportV1>();
     expectTypeOf<GptDiagnosticsSlotExport>().not.toHaveProperty('bidder');
     expectTypeOf<GptDiagnosticsSlotExport>().not.toHaveProperty('targeting');
     expectTypeOf<GptDiagnosticsRequestCycle>().not.toHaveProperty('price');

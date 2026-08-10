@@ -378,6 +378,219 @@ describe('installTsAdInit', () => {
     expect(refresh).toHaveBeenCalledWith([existingSlot]);
   });
 
+  function configureOpportunityDiagnostics(
+    bid: AuctionBidData | undefined,
+    recordTrustedServerOpportunity: ReturnType<typeof vi.fn>
+  ) {
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([mockSlot]),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+    };
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: bid ? { atf_sidebar_ad: bid } : {},
+      gptDiagnosticsRecorder: {
+        recordTrustedServerOpportunity,
+      } as unknown as TsjsApi['gptDiagnosticsRecorder'],
+    };
+
+    return { mockPubads, mockSlot };
+  }
+
+  it.each([
+    [
+      'inline markup',
+      { hb_pb: '1.00', hb_adid: 'abc-uuid', adm: '<div>Creative</div>' },
+      'renderable_candidate',
+    ],
+    [
+      'complete cache coordinates',
+      {
+        hb_bidder: 'example-bidder',
+        hb_adid: 'abc-uuid',
+        hb_cache_host: 'cache.example.com',
+        hb_cache_path: '/cache',
+      },
+      'renderable_candidate',
+    ],
+    [
+      'an ad ID without a render source',
+      { hb_pb: '1.00', hb_adid: 'abc-uuid' },
+      'unrenderable_candidate',
+    ],
+    [
+      'a render source without an ad ID',
+      { hb_pb: '1.00', adm: '<div>Creative</div>' },
+      'unrenderable_candidate',
+    ],
+    [
+      'no non-empty Trusted Server bid targeting',
+      { hb_pb: '', hb_bidder: '', hb_adid: '', adm: '<div>Creative</div>' },
+      'no_candidate',
+    ],
+  ] as const)(
+    'records exactly one %s opportunity for every resolved GPT slot',
+    async (_description, bid, expectedOpportunity) => {
+      const recordTrustedServerOpportunity = vi.fn();
+      const { mockSlot } = configureOpportunityDiagnostics(
+        bid as AuctionBidData,
+        recordTrustedServerOpportunity
+      );
+
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+      (window as TestWindow).tsjs!.adInit!();
+
+      expect(recordTrustedServerOpportunity).toHaveBeenCalledTimes(1);
+      expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+        mockSlot,
+        'atf_sidebar_ad',
+        expectedOpportunity
+      );
+    }
+  );
+
+  it('forwards winning bid auction metadata to diagnostics only when present', async () => {
+    const recordTrustedServerOpportunity = vi.fn();
+    const { mockSlot } = configureOpportunityDiagnostics(
+      {
+        hb_pb: '1.00',
+        hb_bidder: 'example',
+        hb_adid: 'creative-1',
+        hb_auction_id: 'auction-123',
+      },
+      recordTrustedServerOpportunity
+    );
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      mockSlot,
+      'atf_sidebar_ad',
+      'unrenderable_candidate',
+      'auction-123'
+    );
+  });
+
+  it('records no_candidate when the resolved slot has no bid', async () => {
+    const recordTrustedServerOpportunity = vi.fn();
+    const { mockSlot } = configureOpportunityDiagnostics(undefined, recordTrustedServerOpportunity);
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledTimes(1);
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      mockSlot,
+      'atf_sidebar_ad',
+      'no_candidate'
+    );
+  });
+
+  it('keeps targeting, display, and refresh running when opportunity diagnostics throws', async () => {
+    const existingSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const definedSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-new-slot'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const originalRefresh = vi.fn();
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([existingSlot]),
+      addEventListener: vi.fn(),
+      refresh: originalRefresh,
+    };
+    const display = vi.fn();
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(definedSlot),
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+      display,
+    };
+    const newSlotDiv = document.createElement('div');
+    newSlotDiv.id = 'div-new-slot';
+    document.body.appendChild(newSlotDiv);
+    const recordTrustedServerOpportunity = vi.fn(() => {
+      throw new Error('diagnostics unavailable');
+    });
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+        {
+          id: 'new_slot_ad',
+          gam_unit_path: '/123/new',
+          div_id: 'div-new-slot',
+          formats: [[728, 90]],
+          targeting: {},
+        },
+      ],
+      bids: {
+        atf_sidebar_ad: {
+          hb_pb: '1.00',
+          hb_adid: 'existing-id',
+          adm: '<div>Existing</div>',
+        },
+        new_slot_ad: {
+          hb_pb: '2.00',
+          hb_adid: 'new-id',
+          adm: '<div>New</div>',
+        },
+      },
+      gptDiagnosticsRecorder: {
+        recordTrustedServerOpportunity,
+      } as unknown as TsjsApi['gptDiagnosticsRecorder'],
+    };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    expect(() => (window as TestWindow).tsjs!.adInit!()).not.toThrow();
+
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledTimes(2);
+    expect(existingSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '1.00');
+    expect(definedSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '2.00');
+    expect(display).toHaveBeenCalledWith('div-new-slot');
+    expect(originalRefresh).toHaveBeenCalledWith([existingSlot]);
+  });
+
   it('reads window.tsjs.bids synchronously and applies bid targeting before refresh', async () => {
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),

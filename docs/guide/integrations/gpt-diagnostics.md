@@ -100,11 +100,6 @@ step. When `slotRenderEnded` omits `isEmpty`, the result stays Rendered (fill un
 and `responseClass` remains absent. `unclassified_non_empty` requires an explicit
 `isEmpty === false` observation.
 
-A filled render without a load callback remains Filled with **Load not observed**;
-missing viewability is not classified as a failure. When GPT emits load or viewability
-after a completed render but omits a boolean `isEmpty`, diagnostics retain those
-observed facts without inferring Filled; known-empty renders never accept them.
-
 ## Request Paths
 
 Request-path labels describe integration paths observed immediately before one GPT

@@ -89,7 +89,7 @@ export interface AuctionBidData {
   hb_cache_path?: string;
   /** Trace-only OpenRTB bid identifier. */
   hb_bid_id?: string;
-  /** Trace-only server-side auction identifier. */
+  /** Opaque server-auction correlation ID used only by GPT diagnostics. */
   hb_auction_id?: string;
   /** Trace-only OpenRTB creative identifier. */
   hb_crid?: string;
