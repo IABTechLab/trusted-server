@@ -8,11 +8,17 @@
 ESI and client-fill against it, and produce a decision record that either adopts ESI,
 adopts client-fill, or rejects both — with the Fastly-only maintenance cost priced in.
 
-**Architecture:** `origin → lol_html transform → fastly::cache::core → assemble → finalize`.
-The transform emits `esi:include` markers at the two existing injection seams instead of
-inlining per-user data. The cached object is a shared template with no per-user bytes.
-Assembly is either the `esi` crate (edge) or a client fetch of `/_ts/page-bids` (browser),
-selected per request by config so both can be measured on one build.
+**Architecture:**
+`origin → lol_html transform → fastly::cache::core → finalize headers → stream assembly`.
+
+Headers finalize **before** assembly, not after — streaming responses on this adapter
+commit headers first and then pipe chunks, so nothing can be set once assembly starts.
+
+The transform emits **one unconditional marker at the body-close seam**. Not two: the
+head seam is not a template hole, because `tsjs.adSlots` presence is request-gated
+(Task 3 Step 2). The cached object is a shared template with no per-user bytes and no
+request-dependent decisions. Assembly is either the `esi` crate (edge) or a client fetch
+(browser), selected per request by the arm allocator so both are measured on one build.
 
 **Tech Stack:** Rust 2024, `wasm32-wasip1`, `fastly` 0.12.1 (`cache::core`, `http::purge`),
 `esi` 0.7, `lol_html`, a real Fastly test service for cache behaviour.

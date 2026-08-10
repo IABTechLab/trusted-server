@@ -118,9 +118,12 @@ supply it: they compare cached fetches against each other, not against an origin
 
 Three checks, ordered cheapest-first. Each needs a named owner before starting.
 
-**Step A — origin `Vary` check (minutes).** `curl` the origin with and without `RSC`,
-`Next-Router-*`, and the experiment header; inspect the `Vary` response header.
-**Gates Stage 0**, the only build item recommended now. Do this first because it is the
+**Step A — origin `Vary` and cookie check (minutes for the first pass).** `curl` the
+origin with and without `RSC`, `Next-Router-*`, and the experiment header; inspect `Vary`,
+`Cache-Control`, and `Set-Cookie`. **This first pass yields a `PROVISIONAL PASS` only** —
+it is not what gates the flip. A `FINAL PASS` additionally requires a real authenticated
+session, Basic Auth through TS, the experiment variant, representative routes, and
+cached-hit render attribution. Do the cheap pass first because it is the
 cheapest thing that unblocks anything.
 
 **Step B — what consumes TS's own response headers (under a day).** Request a TS-served
@@ -264,7 +267,8 @@ three are a larger class than the RSC split:
 So Step A must capture `Cache-Control` and `Set-Cookie` too, and repeat each request with
 and without a session cookie. Same minutes of work; closes the bigger hole.
 
-**Two effort branches, and Step A decides which:**
+**Two effort branches, and Step A's `Vary` result decides which** — note this selects the
+_shape_ of Stage 0, while the `FINAL PASS` conditions decide _whether it ships at all_:
 
 | Step A result          | Stage 0 is…                                   | Effort |
 | ---------------------- | --------------------------------------------- | ------ |
@@ -418,11 +422,13 @@ That is backwards. `lol_html` is what \_emits* the `esi:include` tags; ESI canno
 tags that do not exist yet. The correct order:
 
 ```
-origin  →  lol_html transform          →  fastly::cache::core  →  esi assemble  →  finalize  →  client
-           (one unconditional marker      (shared template,       (per request,     headers are
-            at the body-close seam,         surrogate-keyed,        fetch the         finalized
-            no per-user data and no         TS-chosen TTL)          fragment)         BEFORE the
-            request-dependent decisions)                                              body streams
+origin  →  lol_html transform         →  fastly::cache::core  →  finalize headers  →  stream esi assembly  →  client
+           (one unconditional marker     (shared template,       (EC cookie, geo,      (per request,
+            at the body-close seam;       surrogate-keyed,        unconditional          fetch the
+            the head seam is NOT a        TS-chosen TTL)          private/no-store)      fragment)
+            hole — adSlots presence
+            is request-gated, §6.7)                              nothing may change
+                                                                 after this point
 ```
 
 The push/pull mismatch that the earlier revision treated as a blocker is real but
@@ -545,9 +551,10 @@ until a topology change.
 
 **Stage 4 — purge wiring.** Not sized. Prerequisite for a TS-owned cache. TS today emits
 no `Surrogate-Key` and holds a management token scoped without purge — but that token is
-the wrong surface: `InsertBuilder::surrogate_keys` and
-`fastly::http::purge::purge_surrogate_key` are both in the pinned SDK and purge runs
-inside Compute ([§6.6](#66-the-esi-pipeline-corrected)). This is **missing wiring, not a
+the wrong surface: `InsertBuilder::surrogate_keys` is the Core Cache API and
+`fastly::http::purge::purge_surrogate_key` runs inside Compute, both in the pinned SDK
+([§6.6](#66-the-esi-pipeline-corrected)). Note those key **C2**, the TS-owned template
+cache — not the HTTP read-through cache C1. This is **missing wiring, not a
 platform limit.** Until it exists,
 any TS-owned cache is TTL-only and a config push takes up to one TTL to take effect.
 
@@ -590,8 +597,10 @@ comment that it is _"rejected until an access-log emitter is wired"_). That is a
 follow-on, not part of this work.
 
 **Stage 0 next**, shipped as the operator flag in §4 rather than a deletion. Gated on a
-`curl`, reverses an origin-load cost the prior design explicitly accepted, and rolls back
-with a config push. Closer to a defect fix than an optimization — TS opted out of a cache
+`FINAL PASS` — a `curl` alone yields only a `PROVISIONAL PASS`. It reverses an origin-load
+cost the prior design explicitly accepted; the read path reverts with a config push, but
+full rollback also needs a C1 purge path or waiting out the origin TTL. Closer to a defect
+fix than an optimization — TS opted out of a cache
 it did not need to opt out of.
 
 **Stages 1–2 queue behind the correctness defects.** Their failure mode is silent
