@@ -213,7 +213,18 @@ STALE / BYPASS from the transaction outcome. Record the serving POP alongside. A
 that mixes cold-MISS and warm-HIT requests is meaningless, and arms cannot be compared
 unless the mix is known — per tier.
 
-- [ ] **Step 4: Define the sample plan before collecting anything**
+- [ ] **Step 4: Build a request-scoped arm allocator**
+
+`AssemblyMode` as specified in Task 3 is a **global** setting, but the sample plan below
+requires randomized, non-sequential allocation. A global flip gives sequential blocks
+instead, which confounds arm with time of day, cache warmth, and traffic mix.
+
+Allocate per request: hash the lineage ID into buckets, or key off the tester cookie.
+The global setting stays as the kill switch and as the way to force a single arm; the
+allocator is what the experiment actually uses. Record the assigned arm on every log line
+and every telemetry row.
+
+- [ ] **Step 5: Define the sample plan before collecting anything**
 
 Write all of this into the findings document **before** the first measurement, and treat
 it as fixed:
@@ -337,27 +348,48 @@ use fastly::cache::core::{Transaction, CacheKey};
 
 let tx = Transaction::lookup(CacheKey::from(key_bytes)).execute()?;
 
-let template: Body = if let Some(found) = tx.found() {
-    found.to_body()                       // C2 HIT — skip origin fetch and transform
-} else if tx.must_insert_or_update() {
-    // C2 MISS. Fetch origin, transform, insert, and read our own bytes back in one
-    // pass: execute_and_stream_back gives both the write handle and a readable Found.
-    let (mut writer, found) = tx
-        .insert(template_ttl)
-        .surrogate_keys(["ts-template", &url_surrogate_key])   // chained, not discarded
-        .user_metadata(metadata_envelope)                       // see below
-        .execute_and_stream_back()?;
-    stream_lol_html_output_into(&mut writer)?;
-    writer.finish()?;                                           // REQUIRED
-    found.to_body()
+// Order matters: a STALE entry sets BOTH found() and must_insert_or_update().
+// Testing found() first would serve the stale bytes and silently never fulfil the
+// update obligation, leaving every concurrent waiter blocked until timeout.
+let template: Body = if tx.must_insert_or_update() {
+    match transform_origin_into(&tx) {
+        Ok((writer, found)) => {
+            writer.finish()?;              // REQUIRED — without it the object never completes
+            found.to_stream()?             // fallible; there is no `to_body()`
+        }
+        Err(e) => {
+            // Do NOT finish() a partial template — it would be served to everyone
+            // until it expires. Abandon the writer, release the obligation so another
+            // client can try, and fall back to the untransformed path for this request.
+            writer.abandon();
+            tx.cancel_insert_or_update()?;
+            return fallback_uncached(e);
+        }
+    }
+} else if let Some(found) = tx.found() {
+    // Fresh hit. `is_usable()` and `is_stale()` are available if a stale-serve
+    // policy is wanted; the spike should start by treating stale as a miss.
+    found.to_stream()?                     // C2 HIT — skip origin fetch and transform
 } else {
-    unreachable!("transaction must either find or be obliged to insert")
+    unreachable!("a transaction is either obliged to insert or has found an item")
 };
 ```
 
-`finish()` is not optional — without it the object never completes and its length stays
-unknown. On any transform error, **cancel rather than finish**, or a partial template is
-inserted and served to everyone until it expires.
+Inside `transform_origin_into`, `execute_and_stream_back()` yields both handles at once:
+
+```rust
+let (mut writer, found) = tx
+    .insert(template_ttl)
+    .surrogate_keys(["ts-template", &url_surrogate_key])   // chained, not discarded
+    .user_metadata(metadata_envelope)
+    .execute_and_stream_back()?;
+```
+
+**Decide the stale policy explicitly.** `Found::is_stale()` and `is_usable()` exist, and
+`stale_while_revalidate` can be set at insert. Serving stale while revalidating is a real
+option — but it is a state machine, and `cache::core` implements none of it for you. The
+spike should start by treating stale as a miss and only add stale-serve if the numbers
+justify it.
 
 **`cache::core` carries no HTTP semantics.** Status, headers, content encoding, and
 revalidation are all yours. Serialize what you need into `user_metadata` — at minimum the
@@ -434,9 +466,23 @@ for the silent-empty-bids trap, which applies in full.
 themselves, which takes ownership away from the finalize / `ec_finalize` / apply-effects
 ordering. `process_stream(&mut self, src: impl BufRead, out: &mut impl Write, …)` keeps it.
 
-Source is the C2 body. Sink is the response body on the way to the client — so EC cookie,
-geo, and the privacy net still run **after** assembly. Confirm that ordering explicitly;
-it is the difference between a correct response and a leaked one.
+Source is the C2 body. Sink is the client response body.
+
+**The ordering an earlier draft described is impossible.** It said EC cookie, geo, and the
+privacy net run _after_ assembly. They cannot: streaming responses on this adapter
+**commit headers first and then pipe chunks**
+(`adapter-fastly/src/main.rs`, `send_edgezero_response`). Once ESI starts writing, no
+header can change.
+
+The correct invariant:
+
+> **Finalize every header before a single body byte is written** — EC `Set-Cookie`, geo
+> suppression, and an unconditional `Cache-Control: private, no-store` — **then** stream
+> the assembly with no further header mutation.
+
+That means `private, no-store` is set unconditionally up front rather than derived from
+what the assembly turns out to contain. Deriving it after the fact is not available, and
+assuming it was is how a per-user response ends up shared-cacheable.
 
 - [ ] **Step 2: Disable DCA explicitly and allowlist the dispatcher**
 
@@ -566,8 +612,11 @@ Not a phase. Every one of these is a hard fail, independent of any performance r
 **Adopt ESI only if all three hold:**
 
 1. Every Task 6 gate passes on A3.
-2. A3 beats A2 on TTFB by a margin the reviewers ratify **before** collection — not
-   chosen after seeing the numbers.
+2. A3 beats A2 on **bids-ready time, `adInit` fire time, and first TS-attributed creative
+   paint** — by a margin the reviewers ratify **before** collection, not chosen after
+   seeing the numbers. **Not root TTFB:** A2 and A3 serve the same C2 template, so their
+   root timings are near-identical by construction and a difference there would be noise.
+   Root TTFB is a non-regression guard only.
 3. Render outcomes on A3 are non-inferior to A0.
 
 **Otherwise adopt A2 (client-fill)** if its gates pass and it beats A1. It is portable

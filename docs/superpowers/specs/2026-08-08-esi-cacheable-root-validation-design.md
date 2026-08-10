@@ -306,14 +306,14 @@ fill cannot be the canary — see [§7](#7-deferred-work-specified-not-scheduled
 
 ### 6.1 Corrections to #1009's premises
 
-| #   | #1009 states                           | Verified against `cfb98f4`                                                                                                                                                                                                                                                             |
-| --- | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | Two per-user injection seams           | `tsjs.adSlots` is per-URL — `build_slot_json` emits config- and path-derived fields only. **One per-user hole.**                                                                                                                                                                       |
-| 2   | Identity off-inline is a prerequisite  | Privacy net is cookie-gated and returning navs set no cookie (`ec/finalize.rs:86-94`). **First-visit only** — but note the corollary: because returning navigations set no cookie, that net never fires for them and is **not** a backstop against shared-caching a per-user response. |
-| 3   | Stamp at `:2882-2888`                  | `:2945-2963`, `private, no-store`, also removing `ETag`/`Last-Modified`/four CDN headers. **Seven headers.**                                                                                                                                                                           |
-| 4   | Three cacheability killers             | Two more: `bypass_cache` and the `304→502 guard`. **The bypass is the cost.**                                                                                                                                                                                                          |
-| 5   | Two `!Send` pipelines is the hard part | `?Send` already pervasive. **Not the obstacle.**                                                                                                                                                                                                                                       |
-| 6   | Goal: root as a shared Fastly HIT      | Nothing caches TS's own response on Compute; the A/B's `x-cache` is the **backend readthrough** cache. **Reframes the goal.**                                                                                                                                                          |
+| #   | #1009 states                           | Verified against `cfb98f4`                                                                                                                                                                                                                                                                   |
+| --- | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Two per-user injection seams           | Partly. `tsjs.adSlots` **content** is per-URL — `build_slot_json` emits config- and path-derived fields only. But its **presence** is gated on `should_run_ad_stack` (consent, bot, prefetch, kill switch), so it is request-dependent and **must not live in a shared template**. See §6.7. |
+| 2   | Identity off-inline is a prerequisite  | Privacy net is cookie-gated and returning navs set no cookie (`ec/finalize.rs:86-94`). **First-visit only** — but note the corollary: because returning navigations set no cookie, that net never fires for them and is **not** a backstop against shared-caching a per-user response.       |
+| 3   | Stamp at `:2882-2888`                  | `:2945-2963`, `private, no-store`, also removing `ETag`/`Last-Modified`/four CDN headers. **Seven headers.**                                                                                                                                                                                 |
+| 4   | Three cacheability killers             | Two more: `bypass_cache` and the `304→502 guard`. **The bypass is the cost.**                                                                                                                                                                                                                |
+| 5   | Two `!Send` pipelines is the hard part | `?Send` already pervasive. **Not the obstacle.**                                                                                                                                                                                                                                             |
+| 6   | Goal: root as a shared Fastly HIT      | Nothing caches TS's own response on Compute; the A/B's `x-cache` is the **backend readthrough** cache. **Reframes the goal.**                                                                                                                                                                |
 
 Rows on #1009's `esi` compatibility check (holds), its drifted line numbers, and its
 two broken `#1`/`#3` cross-references are in [Appendix A](#appendix-a--full-1009-correction-table).
@@ -416,9 +416,10 @@ tags that do not exist yet. The correct order:
 
 ```
 origin  →  lol_html transform          →  fastly::cache::core  →  esi assemble  →  finalize  →  client
-           (emit esi:include at the        (shared template,       (per request,     (EC cookie,
-            head + body-close seams,        surrogate-keyed,        fetch the         geo, privacy
-            no per-user data)               TS-chosen TTL)          bids fragment)    net)
+           (one unconditional marker      (shared template,       (per request,     headers are
+            at the body-close seam,         surrogate-keyed,        fetch the         finalized
+            no per-user data and no         TS-chosen TTL)          fragment)         BEFORE the
+            request-dependent decisions)                                              body streams
 ```
 
 The push/pull mismatch that the earlier revision treated as a blocker is real but
@@ -452,6 +453,39 @@ end to end. Unit tests can cover the transform and the security properties; MISS
 stale / shielding behaviour must run against a real Fastly test service.
 
 ---
+
+### 6.7 What may and may not live in a shared template
+
+A correction to §6.1 row 1, and the constraint that governs any shared-template design.
+
+The original framing — "`adSlots` is per-URL, so there is one per-user hole, not two" —
+is half right and dangerously so. `build_slot_json` really does emit only config- and
+path-derived fields. But whether the script is emitted **at all** is gated on
+`should_run_ad_stack` (`publisher.rs:2920-2927`), which is
+`is_get && is_navigation && !is_prefetch && !is_bot && has_matched_slots &&
+consent_allows_auction && auction_enabled`.
+
+So the _content_ is per-URL and the _presence_ is per-request. A shared object filled by
+the first request would freeze that request's consent decision, bot classification,
+prefetch status, and kill-switch state for every later reader. A consent-denied fill
+serves a no-ads template to consenting users; a consenting fill serves ad markup to
+someone who refused.
+
+**The rule for anything cached and shared:**
+
+| May live in the template                | Must live in the per-request fragment          |
+| --------------------------------------- | ---------------------------------------------- |
+| tsjs bundle script tag (content-hashed) | `tsjs.adSlots` — presence is request-gated     |
+| URL rewrites (per-host, in the key)     | `tsjs.bids`                                    |
+|                                         | GPT diagnostics bootstrap (cookie/query-gated) |
+|                                         | Integration head-inserts (request-scoped)      |
+
+The test that catches this class is **byte-identity of the template across requests
+differing in consent, bot classification, and prefetch status** — not an absence-of-
+per-user-values scan, which the broken design would have passed.
+
+This applies to any shared-template work, ESI or client-fill alike. The
+[spike plan](../plans/2026-08-10-1009-esi-validation-spike.md) implements it.
 
 ---
 
@@ -600,7 +634,7 @@ Rows 1–6 are in [§6.1](#61-corrections-to-1009s-premises). The remainder:
 | `2832-2836`     | strip `If-None-Match`, `If-Modified-Since`, `Range`, `If-Range` | **keep** — needed for any injection                                                  |
 | `2866`          | `with_cache_bypass()`                                           | **make operator-controlled** — [§4](#4-stage-0--the-only-build-item-recommended-now) |
 | `2894`          | 304 → 502 guard                                                 | keep as safety net                                                                   |
-| `2920`          | build `adSlots`                                                 | keep — per-URL                                                                       |
+| `2920`          | build `adSlots`                                                 | keep, but see §6.7 — presence is request-dependent                                   |
 | `2945`          | strip cacheability                                              | **replace** — Stage 3a                                                               |
 
 **Cache tiers.** T1 backend readthrough (already available; TS opts out). T2 TS-owned
@@ -744,35 +778,35 @@ queued before it loads (#1009 Part 1) — not filed, should be.
 
 All pinned to `cfb98f4`.
 
-| Concern                                      | Location                                                                        |
-| -------------------------------------------- | ------------------------------------------------------------------------------- |
-| Eligibility decision                         | `publisher.rs:2651`, `:2660`                                                    |
-| `is_navigation_request`                      | `http_util.rs:73-98`                                                            |
-| Auction dispatch (pre-origin, non-blocking)  | `publisher.rs:2698-2760`                                                        |
-| Auction overlap intent                       | `auction/orchestrator.rs:950-952`                                               |
-| Auction timeout resolution                   | `publisher.rs:2680-2684` (creative_opportunities, else auction.timeout_ms)      |
-| Conditional/range header strip               | `publisher.rs:2832-2836`                                                        |
-| Origin cache bypass                          | `publisher.rs:2866-2868`                                                        |
-| Origin 304 → 502 guard                       | `publisher.rs:2894-2916`                                                        |
-| `adSlots` build (per-URL)                    | `publisher.rs:2920`, `:3558-3577`, `:3501-3525`                                 |
-| Uncacheable stamp                            | `publisher.rs:2945-2963`                                                        |
-| `</body>` hold — sync / async / Fastly lazy  | `publisher.rs:2235` / `:2109` / `:1318-1390`                                    |
-| Hold buffer                                  | `publisher.rs:2177-2218`                                                        |
-| Auction collect (HTML / non-HTML)            | `publisher.rs:2431` (emits `:2456`) / `:2388` (emits `:2410`)                   |
-| Abandonment emitter                          | `publisher.rs:2360`                                                             |
-| Bids script build                            | `publisher.rs:3438-3491`                                                        |
-| `/_ts/page-bids`                             | `publisher.rs:3611`, handler `:3723`, auction `:3903`                           |
-| Injection seams (head / body-close)          | `html_processor.rs:310-363` / `:381-395`                                        |
-| Post-processor buffering                     | `html_processor.rs:62-94`                                                       |
-| Next.js post-processor registration          | `integrations/nextjs/mod.rs:107`                                                |
-| Max buffered body (16 MB)                    | `settings.rs:77-79`                                                             |
-| EC cookie issuance policy                    | `ec/finalize.rs:86-107`                                                         |
-| Cookie-privacy net                           | `response_privacy.rs:20-61`                                                     |
-| Geo response headers                         | `adapter-fastly/src/middleware.rs:194-200`                                      |
-| Cacheable-header precedent                   | `http_util.rs:294-311`                                                          |
-| Management token lacks purge (wrong surface) | `adapter-fastly/src/management_api.rs:12`                                       |
-| In-process purge / surrogate keys            | `fastly` 0.12.1 `cache::core`, `http::purge::purge_surrogate_key`               |
-| Client initial-ad gate                       | `js/lib/src/integrations/gpt/index.ts:536-555`                                  |
-| `adInit` bid application                     | `js/lib/src/integrations/gpt/index.ts:566`, `:652`, `:657-661`                  |
-| Client SPA auction hook                      | `js/lib/src/integrations/gpt/index.ts:806`, `:859`, `:892-949`                  |
-| Prior design that introduced the killers     | `docs/superpowers/specs/2026-07-22-ssat-root-document-304-prevention-design.md` |
+| Concern                                                   | Location                                                                        |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| Eligibility decision                                      | `publisher.rs:2651`, `:2660`                                                    |
+| `is_navigation_request`                                   | `http_util.rs:73-98`                                                            |
+| Auction dispatch (pre-origin, non-blocking)               | `publisher.rs:2698-2760`                                                        |
+| Auction overlap intent                                    | `auction/orchestrator.rs:950-952`                                               |
+| Auction timeout resolution                                | `publisher.rs:2680-2684` (creative_opportunities, else auction.timeout_ms)      |
+| Conditional/range header strip                            | `publisher.rs:2832-2836`                                                        |
+| Origin cache bypass                                       | `publisher.rs:2866-2868`                                                        |
+| Origin 304 → 502 guard                                    | `publisher.rs:2894-2916`                                                        |
+| `adSlots` build (content per-URL, presence request-gated) | `publisher.rs:2920`, `:3558-3577`, `:3501-3525`                                 |
+| Uncacheable stamp                                         | `publisher.rs:2945-2963`                                                        |
+| `</body>` hold — sync / async / Fastly lazy               | `publisher.rs:2235` / `:2109` / `:1318-1390`                                    |
+| Hold buffer                                               | `publisher.rs:2177-2218`                                                        |
+| Auction collect (HTML / non-HTML)                         | `publisher.rs:2431` (emits `:2456`) / `:2388` (emits `:2410`)                   |
+| Abandonment emitter                                       | `publisher.rs:2360`                                                             |
+| Bids script build                                         | `publisher.rs:3438-3491`                                                        |
+| `/_ts/page-bids`                                          | `publisher.rs:3611`, handler `:3723`, auction `:3903`                           |
+| Injection seams (head / body-close)                       | `html_processor.rs:310-363` / `:381-395`                                        |
+| Post-processor buffering                                  | `html_processor.rs:62-94`                                                       |
+| Next.js post-processor registration                       | `integrations/nextjs/mod.rs:107`                                                |
+| Max buffered body (16 MB)                                 | `settings.rs:77-79`                                                             |
+| EC cookie issuance policy                                 | `ec/finalize.rs:86-107`                                                         |
+| Cookie-privacy net                                        | `response_privacy.rs:20-61`                                                     |
+| Geo response headers                                      | `adapter-fastly/src/middleware.rs:194-200`                                      |
+| Cacheable-header precedent                                | `http_util.rs:294-311`                                                          |
+| Management token lacks purge (wrong surface)              | `adapter-fastly/src/management_api.rs:12`                                       |
+| In-process purge / surrogate keys                         | `fastly` 0.12.1 `cache::core`, `http::purge::purge_surrogate_key`               |
+| Client initial-ad gate                                    | `js/lib/src/integrations/gpt/index.ts:536-555`                                  |
+| `adInit` bid application                                  | `js/lib/src/integrations/gpt/index.ts:566`, `:652`, `:657-661`                  |
+| Client SPA auction hook                                   | `js/lib/src/integrations/gpt/index.ts:806`, `:859`, `:892-949`                  |
+| Prior design that introduced the killers                  | `docs/superpowers/specs/2026-07-22-ssat-root-document-304-prevention-design.md` |

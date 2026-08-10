@@ -237,15 +237,22 @@ Create `docs/superpowers/plans/2026-08-08-1009-measurement-findings.md`:
 **Cookie / auth exposure:** bodies differ by cookie? `Vary: Cookie` present? origin
 `Set-Cookie` on a shared-cacheable response? `Authorization`-gated responses cacheable?
 
-**Verdict:** PASS / FAIL
+**Verdict:** FINAL PASS / PROVISIONAL PASS / FAIL
 
-PASS = `Vary` names every request header the origin varies on (`RSC`, any `Next-Router-*`
-or experiment header whose value changed the body, **and `Cookie` if bodies differ by
-cookie**), and no `Set-Cookie` rides a shared-cacheable response.
-FAIL = any of the above is unmet.
+`FINAL PASS` = `Vary` names every request header the origin varies on (`RSC`, any
+`Next-Router-*` or experiment header whose value changed the body, **and `Cookie` if
+bodies differ by cookie**), no `Set-Cookie` rides a shared-cacheable response, **and** all
+five conditions in Task 5's gate are recorded — a real authenticated session cookie, Basic
+Auth through TS, the experiment variant, representative routes, and cached-hit
+slot/render attribution.
 
-**Consequence:** PASS → Task 5a (flip the flag). FAIL → Task 5b (cache-key
-discriminator). See spec §4.
+`PROVISIONAL PASS` = the `Vary` and cookie checks hold, but one or more of those five is
+untested. **Not a release gate.** A first pass lands here.
+
+`FAIL` = any `Vary` or `Set-Cookie` criterion is unmet.
+
+**Consequence:** `FINAL PASS` → Task 5a (flip the flag). `PROVISIONAL PASS` → close the
+gaps before Task 5 starts. `FAIL` → Task 5b (cache-key discriminator). See spec §4.
 
 **A FAIL is also a live production defect, not only a Stage 0 blocker.** RSC fetches are
 not navigations, so they never set the bypass and **already transit the read-through
@@ -778,7 +785,7 @@ already-deployed build**. No second release, and rollback is another config push
 than a revert. That matters here specifically: the failure mode this gates on is cache
 poisoning, where minutes of exposure are worse than a slow rollout.
 
-### Task 5a: flip the flag (Task 1 verdict = PASS)
+### Task 5a: flip the flag (Task 1 verdict = `FINAL PASS`)
 
 **Files:**
 
@@ -896,11 +903,18 @@ expire. The origin's `max-age=60` bounds that, but does not remove it.
 Full rollback:
 
 1. Push `bypass_origin_cache = true`.
-2. Purge. `fastly::http::purge::purge_surrogate_key` runs inside Compute, with keys
-   attached at insert via `InsertBuilder::surrogate_keys`; alternatively roll a versioned
-   cache-key namespace. **Neither is wired today** — if the flip ships before one exists,
-   the rollback story is "wait out the TTL," and that must be an accepted risk rather
-   than an unnoticed one.
+2. Purge — **and note this is C1, not C2.** `InsertBuilder::surrogate_keys` belongs to
+   the Core Cache API and applies to the transformed-template cache the ESI spike builds.
+   It has no effect on the HTTP read-through cache that Stage 0 turns on. Purging C1
+   requires either surrogate keys the **origin** supplies on its responses, or the HTTP
+   cache's own request/candidate surrogate-key surface. Confirm which is available before
+   relying on it.
+
+   **Neither is wired today.** If the flip ships before one exists, the rollback story is
+   "wait out the origin TTL" — roughly a minute, per the Step A findings. That is
+   survivable, but it must be an accepted risk recorded before the flip rather than a
+   discovery during an incident.
+
 3. Observe past the origin TTL before declaring the incident closed.
 
 - [ ] **Step 5: Run the full suite across every adapter**
