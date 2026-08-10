@@ -1,17 +1,45 @@
 # ESI and the Cacheable Root
 
-**Issue:** IABTechLab/trusted-server#1009 · **Date:** 2026-08-08
-**Baseline:** citations verified at `cfb98f4`; unchanged as of `b0ce56c3` (the two
-commits between touch only CI workflows and Cargo aliases).
+**Issue:** IABTechLab/trusted-server#1009 · **Date:** 2026-08-08 ·
+**Revised:** 2026-08-10
+**Baseline:** citations verified at `cfb98f4`; unchanged as of `b0ce56c3`.
 
-**Decision requested:** approve the four items below. Three are "yes/no"; one funds
-about three days of measurement.
+> ## ⚠️ Correction, 2026-08-10 — this document's original ESI verdict was wrong
+>
+> The first revision concluded that ESI was **structurally blocked**: that it
+> presupposed a TS-owned template cache which did not exist, and that such a cache was
+> in turn blocked on purge capability the platform did not offer. **Both claims are
+> false**, and an external review was right to reject them.
+>
+> Verified against the pinned `fastly` 0.12.1:
+>
+> - **The cache boundary is native.** `fastly::cache::core` provides
+>   `insert(key, max_age).execute() -> StreamingBody` for arbitrary bytes, `lookup()` /
+>   `found()` to read them back, and `Transaction` with `must_insert()` for request
+>   collapsing. The two-stage design needs no separate KV or template service.
+> - **Purge exists in-process.** `InsertBuilder::surrogate_keys([...])` attaches keys at
+>   insert; `fastly::http::purge::purge_surrogate_key` purges from inside Compute. The
+>   management-API token scope cited in the original is irrelevant to it.
+> - **The original pipeline ordering was backwards.** It said "order esi → lol*html,
+>   never the reverse." `lol_html` \_emits* the `esi:include` tags, so ESI must run after
+>   it. Correct order is in [§6.6](#66-the-esi-pipeline-corrected).
+>
+> The error was inspecting what this repository does and reporting it as what the
+> platform permits — the same mistake this document criticises #1009 for making in the
+> other direction.
+>
+> **ESI is therefore feasible and unvalidated, not rejected.** Validating it is
+> [a separate plan](../plans/2026-08-10-1009-esi-validation-spike.md). What survives
+> here is the latency re-diagnosis and the Stage 0 optimisation, which are worth doing
+> and are **not** an answer to #1009.
+
+**Decision requested:** approve the four items in §1.
 
 > **Orientation.** #1009 asks whether Edge Side Includes (ESI) can cache page fragments
 > so that cacheable publisher HTML is separated from per-user ad state, recovering a
 > TTFB regression that Trusted Server (TS) adds to navigations on a Next.js App Router
-> publisher running on Fastly Compute. The answer is no to ESI, and the regression has a
-> cheaper cause than the issue assumes.
+> publisher running on Fastly Compute. ESI can do this; whether it should is not settled
+> here. Separately, the regression has a cheaper cause than the issue assumes.
 >
 > **This document deliberately carries no performance measurements.** Every conclusion
 > below is derived from code at the pinned baseline, so it can be checked by reading the
@@ -19,22 +47,24 @@ about three days of measurement.
 > it is named as unknown and [§3](#3-monday-morning) says how to obtain it.
 >
 > Terms used throughout: **the hold** = TS holding the HTTP response open at `</body>`
-> until the server-side auction (SSAT) resolves. **#418** = a React hydration-mismatch
-> defect caused by `adInit()` mutating ad-slot subtrees during hydration; it is why bid
-> application is deferred to `window.load`. **The SSAT price defect** = a live
-> mispricing bug named in #1009 (prices reading 100× high) — cited from #1009 and prior
-> investigation, not re-verified here.
+> until the server-side auction (SSAT) resolves. **React #418** = the React
+> hydration-mismatch error raised when `adInit()` mutates ad-slot subtrees during
+> hydration; it is why bid application is deferred to `window.load`. It is a React error
+> number, **not** a repository issue — the tracker is
+> [#938](https://github.com/IABTechLab/trusted-server/issues/938). **The SSAT price
+> defect** = a live mispricing bug named in #1009 (prices reading 100× high) — cited
+> from #1009 and prior investigation, not re-verified here.
 
 ---
 
 ## 1. Decision requested
 
-| #   | Decision                                                                                                                         | Owner needed  |
-| --- | -------------------------------------------------------------------------------------------------------------------------------- | ------------- |
-| D1  | **ESI is deferred.** Revival condition: #418 resolved _and_ the `window.load` gate removed. Not a rejection — a dated condition. | Eng + product |
-| D2  | **Fund ~3 days of measurement** (§3). No dependencies. Can start immediately.                                                    | Eng           |
-| D3  | **Approve Stage 0** — an operator flag disabling the origin cache bypass, subject to the `Vary` check in §3.                     | Eng           |
-| D4  | **Stages 1–2 queue behind the SSAT price defect and #418.** Stages 3b–5 unscheduled.                                             | Product       |
+| #   | Decision                                                                                                                                      | Owner needed  |
+| --- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
+| D1  | **ESI is feasible and unvalidated.** Validate it via [the spike plan](../plans/2026-08-10-1009-esi-validation-spike.md), not by deferring it. | Eng + product |
+| D2  | **Fund ~3 days of measurement** (§3). No dependencies. Can start immediately.                                                                 | Eng           |
+| D3  | **Approve Stage 0** — an operator flag disabling the origin cache bypass, subject to the `Vary` check in §3.                                  | Eng           |
+| D4  | **Stages 1–2 queue behind the SSAT price defect and #938.** Stages 3b–5 unscheduled.                                                          | Product       |
 
 Rationale for D4 in [§8](#8-priority). Everything this document recommends _against_
 doing is in [§7](#7-deferred-work-specified-not-scheduled), at deliberately lower
@@ -44,17 +74,20 @@ detail than the work it recommends.
 
 ## 2. Why — the three findings
 
-**ESI does not work here, for a structural reason #1009 misses.** ESI's input is pull
-(`BufRead`); `lol_html`'s is push (`HtmlRewriter::write`). ESI cannot sit downstream of
-the rewriter without an intermediate buffer, and in the two-stage design the cache
-boundary _is_ that buffer. **ESI presupposes a TS-owned template cache** rather than
-being independent of one — and that cache is blocked on purge capability TS does not
-have (no `Surrogate-Key` anywhere; the Fastly management token is scoped without purge
-permission). ESI is also Fastly-only at every API level. Its one advantage over a
-client fetch — no round trip — is worth nothing while bids are not consumed until
-`window.load`. Separately, enabling ESI's Dynamic Content Assembly would be an SSRF
-vector: bid payloads carry partner-controlled creative markup, so an SSP could embed
-`<esi:include src="…">` and make the edge fetch an arbitrary URL. Details in
+**ESI is buildable on the pinned SDK, and unvalidated.** `lol_html` emits
+`esi:include` tags into a shared template; `fastly::cache::core` stores that template;
+the `esi` crate assembles per request on the way out. Everything that requires is
+already a dependency. The real open questions are empirical, not architectural: does it
+beat a plain client fetch by enough to justify a Fastly-only rendering path, and can
+per-user leakage be excluded under cold MISS, warm HIT, stale revalidation, and fragment
+failure. [The spike plan](../plans/2026-08-10-1009-esi-validation-spike.md) answers
+those; [§6.6](#66-the-esi-pipeline-corrected) gives the pipeline.
+
+Two constraints stay true regardless. ESI is **Fastly-only at every API level**, so it
+is a per-platform accelerator rather than the architecture, and its maintenance cost
+belongs in the decision. And its Dynamic Content Assembly must be **explicitly disabled**
+— bid payloads carry partner-controlled creative markup, so under `DcaMode::Esi` an SSP
+could embed `<esi:include src="…">` and make the edge fetch an arbitrary URL. Details in
 [Appendix E](#appendix-e--esi-notes-condensed).
 
 **The auction is already out of band; the hold is ~free.** It is dispatched _before_
@@ -361,7 +394,7 @@ no post-processor takes the streaming path and would see a lower floor.
 ### 6.5 Confidence
 
 **High on the structural claims.** §6.2's argument, the bypass forcing a cache miss, the
-ESI push/pull mismatch, the silent-empty-bids failure mode, the geo and purge blockers,
+the silent-empty-bids failure mode, the geo and `Vary` blockers,
 and the fill-canary blindness are all read directly out of the code at `cfb98f4`. Anyone
 can check them without running anything.
 
@@ -372,6 +405,51 @@ Worth stating plainly: #1009 reached the opposite causal conclusion from a small
 That is a caution about small samples generally, not only about that one — which is why
 §3 Step C specifies the measurement rather than this document supplying a substitute
 for it.
+
+### 6.6 The ESI pipeline, corrected
+
+An earlier revision of this document said "order esi → lol*html, never the reverse."
+That is backwards. `lol_html` is what \_emits* the `esi:include` tags; ESI cannot process
+tags that do not exist yet. The correct order:
+
+```
+origin  →  lol_html transform          →  fastly::cache::core  →  esi assemble  →  finalize  →  client
+           (emit esi:include at the        (shared template,       (per request,     (EC cookie,
+            head + body-close seams,        surrogate-keyed,        fetch the         geo, privacy
+            no per-user data)               TS-chosen TTL)          bids fragment)    net)
+```
+
+The push/pull mismatch that the earlier revision treated as a blocker is real but
+irrelevant: `lol_html` pushes, `esi` pulls, and **the cache is the buffer between them**.
+That is not an obstacle to the two-stage design — it _is_ the two-stage design, which is
+what #1009 proposed in the first place.
+
+Mechanism, all present in the pinned `fastly` 0.12.1:
+
+| Need                    | API                                                                                 |
+| ----------------------- | ----------------------------------------------------------------------------------- |
+| Store the template      | `cache::core::insert(key, max_age).execute() -> StreamingBody`                      |
+| Read it back            | `cache::core::lookup(key)` → `found()`                                              |
+| Avoid a thundering herd | `cache::core::Transaction` — `must_insert()` / `must_insert_or_update()`            |
+| Invalidate              | `InsertBuilder::surrogate_keys([...])` + `fastly::http::purge::purge_surrogate_key` |
+
+Purge runs **inside Compute**. The management-API token scope cited under
+[Stage 4](#7-deferred-work-specified-not-scheduled) governs a different surface and does
+not gate this.
+
+**Three caches, kept distinct.** Conflating them is what produced the original error:
+
+1. **Origin read-through** — raw origin bytes. What Stage 0 turns back on.
+2. **Shared transformed template** — post-`lol_html`, pre-ESI, no per-user data. The ESI
+   target, and new.
+3. **Assembled-response delivery cache** — the final per-user output. **Must never
+   exist.** Nothing in this document or the spike proposes one.
+
+**Validation constraint.** Viceroy 0.17 cannot exercise the customized read-through hooks
+end to end. Unit tests can cover the transform and the security properties; MISS / HIT /
+stale / shielding behaviour must run against a real Fastly test service.
+
+---
 
 ---
 
@@ -425,12 +503,19 @@ and can never be shared-cached ([Appendix C](#appendix-c--vary-signals-condensed
 **Also gated on Step B**: if nothing consumes TS's response headers, this tier is inert
 until a topology change.
 
-**Stage 4 — purge capability.** Not sized. Prerequisite for anything beyond the backend
-readthrough cache. TS today has no `Surrogate-Key` emission and no purge permission, so
+**Stage 4 — purge wiring.** Not sized. Prerequisite for a TS-owned cache. TS today emits
+no `Surrogate-Key` and holds a management token scoped without purge — but that token is
+the wrong surface: `InsertBuilder::surrogate_keys` and
+`fastly::http::purge::purge_surrogate_key` are both in the pinned SDK and purge runs
+inside Compute ([§6.6](#66-the-esi-pipeline-corrected)). This is **missing wiring, not a
+platform limit.** Until it exists,
 any TS-owned cache is TTL-only and a config push takes up to one TTL to take effect.
 
-**Stage 5 — TS-owned template cache, then ESI.** Not sized, and gated on D1's revival
-condition.
+**Stage 5 — ESI.** Superseded. ESI no longer waits on a "revival condition"; it is
+feasible on the pinned SDK and is validated by
+[its own spike plan](../plans/2026-08-10-1009-esi-validation-spike.md), which does not
+queue behind Stages 1–4. The shared template cache it needs is
+`fastly::cache::core` ([§6.6](#66-the-esi-pipeline-corrected)), not a new service.
 
 **Identity needs no work.** A new visitor's first navigation sets the EC cookie and the
 privacy net downgrades that one response; every later navigation sets no cookie and is
@@ -443,10 +528,10 @@ server-side (`rsc_flight.rs` plus `integrations/nextjs/`, ~4,100 lines) by rewri
 hydration's _input_; a shim would be a second source of truth producing the exact
 mismatch both exist to prevent. Late-bid rendering has no foothold and the obvious
 interception point is measured-unsafe: a controlled capture found the `__next_f` gate
-reproducing #418 on every run and destroying the creative on half of them — it patches
+reproducing React #418 on every run and destroying the creative on half of them — it patches
 `__next_f.push` shortly after React's first commit, while hydration continues for
 thousands more. Two retractions to carry forward: that gate is
-measured-unsafe rather than merely unproven, and "#418 at ~5% and not impression-costing"
+measured-unsafe rather than merely unproven, and "React #418 at ~5% and not impression-costing"
 is retracted — it came from pages whose slots are not React-owned. Note
 `docs/superpowers/specs/2026-07-24-adinit-hydration-gate-design.md` exists only on the
 unmerged branch `958-adinit-hydration-chunk-gate`, so `publisher.rs:3461-3464` points at
@@ -472,10 +557,11 @@ it did not need to opt out of.
 **Stages 1–2 queue behind the correctness defects.** Their failure mode is silent
 revenue loss, against a publisher whose ads currently fill reliably. The SSAT price
 defect misprices live auctions, and **a slow correct auction loses less money than a
-fast wrong one**. #418 sits ahead too: Stage 1's join gate must be reconciled with
+fast wrong one**. React #418 sits ahead too: Stage 1's join gate must be reconciled with
 whatever hydration gate lands, and doing that twice is waste.
 
-**Stages 3b–5 are not competitive** on current evidence and should not be scheduled.
+**Stages 3b–4 are not competitive** on current evidence and should not be scheduled.
+**ESI is no longer in this queue** — it is validated separately and on its own evidence.
 
 ---
 
@@ -518,7 +604,8 @@ Rows 1–6 are in [§6.1](#61-corrections-to-1009s-premises). The remainder:
 **Cache tiers.** T1 backend readthrough (already available; TS opts out). T2 TS-owned
 template cache (adds KV latency, eventual consistency, a full invalidation design).
 T3 delivery cache of TS output (Fastly topology change; **ESI cannot run**, since
-Compute is not invoked on a HIT). T2 and T3 both introduce a cache TS cannot purge.
+Compute is not invoked on a HIT). T2 and T3 both introduce a cache TS does not yet purge —
+wiring that is available but unbuilt.
 
 ---
 
@@ -607,22 +694,25 @@ exists.
 
 ## Appendix E — ESI notes (condensed)
 
-For if and when [D1](#1-decision-requested)'s revival condition is met. Expand then;
-recording only what would otherwise be re-derived:
+Input to [the ESI validation spike](../plans/2026-08-10-1009-esi-validation-spike.md).
+Recording only what would otherwise be re-derived:
 
 - Pin `esi = "0.7"`. Pre-1.0, irregular cadence, two yanked betas in the 0.7 line.
 - **Use `process_stream`, not the wrappers.** `process_response` and
   `process_response_streaming` consume `self` _and_ send the response themselves, taking
   ownership away from the finalize / `ec_finalize` ordering.
-- **Order esi → lol_html**, never the reverse, via a newtype implementing `io::Write`.
-  Mind the `StreamingBody`-is-a-`BufWriter` hazard: esi flushes per parse batch, so any
-  adapter in between must propagate `flush()`.
+- **Order lol_html → cache → esi.** `lol_html` emits the tags; ESI consumes them on the
+  way out. An earlier revision had this backwards — see
+  [§6.6](#66-the-esi-pipeline-corrected). Mind the `StreamingBody`-is-a-`BufWriter`
+  hazard on the way to the client: esi flushes per parse batch, so anything between esi
+  and the `StreamingBody` must propagate `flush()`.
 - **Always supply a custom fragment dispatcher.** The built-in one builds a dynamic
   backend per URL host and panics on a hostless URL; dynamic backends are also the known
   Viceroy local-dev failure mode here.
-- **DCA off, asserted explicitly** — not merely left at its default. Rationale is the SSRF
-  vector in [§2](#2-why--the-three-findings): partner-controlled creative markup would
-  become ESI-executable at the edge.
+- **DCA off, asserted explicitly** — not merely left at its default. Rationale is the
+  SSRF vector in [§2](#2-why--the-three-findings): partner-controlled creative markup
+  would become ESI-executable at the edge. Pair it with an **exact-path allowlist
+  dispatcher**, so a fragment URL that is not the bids endpoint cannot be fetched at all.
 - **`<esi:try>` runs _all_ attempts and concatenates every non-failed output** — not
   first-success-wins, so primary/fallback pairs render both. Least obvious behaviour in
   the crate.
@@ -649,34 +739,35 @@ queued before it loads (#1009 Part 1) — not filed, should be.
 
 All pinned to `cfb98f4`.
 
-| Concern                                     | Location                                                                        |
-| ------------------------------------------- | ------------------------------------------------------------------------------- |
-| Eligibility decision                        | `publisher.rs:2651`, `:2660`                                                    |
-| `is_navigation_request`                     | `http_util.rs:73-98`                                                            |
-| Auction dispatch (pre-origin, non-blocking) | `publisher.rs:2698-2760`                                                        |
-| Auction overlap intent                      | `auction/orchestrator.rs:950-952`                                               |
-| Auction timeout resolution                  | `publisher.rs:2680-2684` (creative_opportunities, else auction.timeout_ms)      |
-| Conditional/range header strip              | `publisher.rs:2832-2836`                                                        |
-| Origin cache bypass                         | `publisher.rs:2866-2868`                                                        |
-| Origin 304 → 502 guard                      | `publisher.rs:2894-2916`                                                        |
-| `adSlots` build (per-URL)                   | `publisher.rs:2920`, `:3558-3577`, `:3501-3525`                                 |
-| Uncacheable stamp                           | `publisher.rs:2945-2963`                                                        |
-| `</body>` hold — sync / async / Fastly lazy | `publisher.rs:2235` / `:2109` / `:1318-1390`                                    |
-| Hold buffer                                 | `publisher.rs:2177-2218`                                                        |
-| Auction collect (HTML / non-HTML)           | `publisher.rs:2431` (emits `:2456`) / `:2388` (emits `:2410`)                   |
-| Abandonment emitter                         | `publisher.rs:2360`                                                             |
-| Bids script build                           | `publisher.rs:3438-3491`                                                        |
-| `/_ts/page-bids`                            | `publisher.rs:3611`, handler `:3723`, auction `:3903`                           |
-| Injection seams (head / body-close)         | `html_processor.rs:310-363` / `:381-395`                                        |
-| Post-processor buffering                    | `html_processor.rs:62-94`                                                       |
-| Next.js post-processor registration         | `integrations/nextjs/mod.rs:107`                                                |
-| Max buffered body (16 MB)                   | `settings.rs:77-79`                                                             |
-| EC cookie issuance policy                   | `ec/finalize.rs:86-107`                                                         |
-| Cookie-privacy net                          | `response_privacy.rs:20-61`                                                     |
-| Geo response headers                        | `adapter-fastly/src/middleware.rs:194-200`                                      |
-| Cacheable-header precedent                  | `http_util.rs:294-311`                                                          |
-| No purge permission                         | `adapter-fastly/src/management_api.rs:12`                                       |
-| Client initial-ad gate                      | `js/lib/src/integrations/gpt/index.ts:536-555`                                  |
-| `adInit` bid application                    | `js/lib/src/integrations/gpt/index.ts:566`, `:652`, `:657-661`                  |
-| Client SPA auction hook                     | `js/lib/src/integrations/gpt/index.ts:806`, `:859`, `:892-949`                  |
-| Prior design that introduced the killers    | `docs/superpowers/specs/2026-07-22-ssat-root-document-304-prevention-design.md` |
+| Concern                                      | Location                                                                        |
+| -------------------------------------------- | ------------------------------------------------------------------------------- |
+| Eligibility decision                         | `publisher.rs:2651`, `:2660`                                                    |
+| `is_navigation_request`                      | `http_util.rs:73-98`                                                            |
+| Auction dispatch (pre-origin, non-blocking)  | `publisher.rs:2698-2760`                                                        |
+| Auction overlap intent                       | `auction/orchestrator.rs:950-952`                                               |
+| Auction timeout resolution                   | `publisher.rs:2680-2684` (creative_opportunities, else auction.timeout_ms)      |
+| Conditional/range header strip               | `publisher.rs:2832-2836`                                                        |
+| Origin cache bypass                          | `publisher.rs:2866-2868`                                                        |
+| Origin 304 → 502 guard                       | `publisher.rs:2894-2916`                                                        |
+| `adSlots` build (per-URL)                    | `publisher.rs:2920`, `:3558-3577`, `:3501-3525`                                 |
+| Uncacheable stamp                            | `publisher.rs:2945-2963`                                                        |
+| `</body>` hold — sync / async / Fastly lazy  | `publisher.rs:2235` / `:2109` / `:1318-1390`                                    |
+| Hold buffer                                  | `publisher.rs:2177-2218`                                                        |
+| Auction collect (HTML / non-HTML)            | `publisher.rs:2431` (emits `:2456`) / `:2388` (emits `:2410`)                   |
+| Abandonment emitter                          | `publisher.rs:2360`                                                             |
+| Bids script build                            | `publisher.rs:3438-3491`                                                        |
+| `/_ts/page-bids`                             | `publisher.rs:3611`, handler `:3723`, auction `:3903`                           |
+| Injection seams (head / body-close)          | `html_processor.rs:310-363` / `:381-395`                                        |
+| Post-processor buffering                     | `html_processor.rs:62-94`                                                       |
+| Next.js post-processor registration          | `integrations/nextjs/mod.rs:107`                                                |
+| Max buffered body (16 MB)                    | `settings.rs:77-79`                                                             |
+| EC cookie issuance policy                    | `ec/finalize.rs:86-107`                                                         |
+| Cookie-privacy net                           | `response_privacy.rs:20-61`                                                     |
+| Geo response headers                         | `adapter-fastly/src/middleware.rs:194-200`                                      |
+| Cacheable-header precedent                   | `http_util.rs:294-311`                                                          |
+| Management token lacks purge (wrong surface) | `adapter-fastly/src/management_api.rs:12`                                       |
+| In-process purge / surrogate keys            | `fastly` 0.12.1 `cache::core`, `http::purge::purge_surrogate_key`               |
+| Client initial-ad gate                       | `js/lib/src/integrations/gpt/index.ts:536-555`                                  |
+| `adInit` bid application                     | `js/lib/src/integrations/gpt/index.ts:566`, `:652`, `:657-661`                  |
+| Client SPA auction hook                      | `js/lib/src/integrations/gpt/index.ts:806`, `:859`, `:892-949`                  |
+| Prior design that introduced the killers     | `docs/superpowers/specs/2026-07-22-ssat-root-document-304-prevention-design.md` |

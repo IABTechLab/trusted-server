@@ -43,17 +43,32 @@ cookie changes nothing.** Byte lengths were identical across all three responses
 
 Cookie sent: `ts-tester=true; sessionid=abc123; ts-ec=probe`.
 
-### Verdict: **PASS**
+### Verdict: **PROVISIONAL PASS** — not sufficient to gate a production flip
+
+Downgraded 2026-08-10 after external review. Everything below held under the conditions
+tested; the conditions tested are narrower than the gate requires.
+
+What passed:
 
 - `Vary` names every request header the origin varies on. ✅
-- Bodies do not differ by cookie, so `Vary: Cookie` is not required. ✅
+- Bodies did not differ by the cookie sent, so `Vary: Cookie` was not required **for
+  that cookie**. ✅
 - No `Set-Cookie` on a shared-cacheable response. ✅
-- Origin returns 200 without credentials, so no `Authorization` exposure at this layer.
-  (#1009's basic-auth gate is on the Trusted Server side, not the origin.) ✅
+- Origin returns 200 without credentials at this layer. ✅
 
-**Consequence:** Stage 0 takes the simple path — the operator flag plus a config flip,
-not the cache-key discriminator. No live production defect: the origin's `Vary` covers
-the RSC variants that already transit the read-through cache today.
+**What was not tested, and each of these can flip the verdict:**
+
+| Gap                                      | Why it matters                                                                                                                                                    |
+| ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sessionid=abc123` is not a real session | A synthetic value proves nothing about a state-bearing publisher session. An authenticated or paywall-metered session is exactly the case that would personalize. |
+| One route (homepage) only                | Article, section, and search routes may personalize differently.                                                                                                  |
+| Experiment variant never exercised       | #1009 says the origin varies on one. It is absent from `Vary` — see Residual uncertainty below.                                                                   |
+| Basic Auth through TS untested           | #1009 describes a gated deployment. Only the origin was probed directly.                                                                                          |
+| Cached-hit slot resolution untested      | The randomized div IDs below are an unverified interaction, not a cleared one.                                                                                    |
+
+**Consequence:** Stage 0 still takes the operator-flag path rather than the cache-key
+discriminator, and no live cross-serving defect is indicated. But this is **not** a
+release gate. Close the table above before flipping the flag in production.
 
 ## Two findings the checks were not looking for
 
@@ -84,8 +99,8 @@ every visitor within a 60-second window receives the same IDs.**
 This is very likely fine — `tsjs.adSlots` is built from configured slot definitions, not
 scraped from origin markup, and injection is a prefix match on the configured `div_id`.
 But it is an untested interaction between Stage 0 and the slot-matching path, and it was
-not in anyone's risk list. **Verify slot matching still resolves against a cached
-document before flipping the flag**, and watch TS-attributed renders across the flip
+not in anyone's risk list. **This is a release gate, not a note.** Verify slot matching resolves against a cached
+document before flipping the flag, and watch TS-attributed renders across the flip
 rather than only `origin_fetch_ms`.
 
 ## Method note — a defect in the plan's Step A probe
@@ -111,6 +126,23 @@ client-side; or they key on a cookie value this probe did not supply. The `Vary`
 declaration is authoritative for cache correctness and it is thorough enough to name four
 Next-specific headers, so this is unlikely to be a cache-safety gap. Worth one question
 to whoever wrote that line in #1009 rather than further probing.
+
+## Rollback caveat, added 2026-08-10
+
+The plan described flipping the flag back as a seconds-long rollback. That is
+incomplete. Re-enabling the bypass stops **HTML navigations** reading from cache; it
+evicts nothing. Objects already cached — including those RSC and other request classes
+continue to read — persist until they expire.
+
+Two mitigations, both real:
+
+- The origin's `max-age=60` bounds read-through exposure to roughly a minute.
+- Purge is available in-process: `fastly::http::purge::purge_surrogate_key`, with keys
+  attached at insert via `InsertBuilder::surrogate_keys`. An earlier claim that TS had no
+  purge capability was wrong — it has no _wiring_, which is buildable.
+
+Rollback is therefore: flip the flag, **then** purge or roll a versioned cache-key
+namespace, **then** observe past the origin TTL before declaring the incident closed.
 
 ## Step B — consumers of TS's own response headers
 

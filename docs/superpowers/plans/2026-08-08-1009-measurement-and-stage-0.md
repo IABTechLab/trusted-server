@@ -2,9 +2,16 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Obtain the checks that gate the #1009 work, then turn off the redundant origin
-cache bypass that the spec identifies as the actual TTFB cost — behind an operator flag,
-so it rolls back with a config push rather than a release.
+**Goal:** Turn off the redundant origin cache bypass that the spec identifies as the
+actual TTFB cost, behind an operator flag, and establish the measurement baseline that
+later work is compared against.
+
+> **This plan does not close #1009.** It contains no ESI arm and no client-fill arm, so
+> completing it cannot answer whether ESI separates cacheable content from per-user
+> state. It is a **supporting optimisation and the experimental control** for
+> [the ESI validation spike](./2026-08-10-1009-esi-validation-spike.md), which is where
+> #1009 is actually decided. Scoped and framed this way after external review on
+> 2026-08-10.
 
 **Architecture:** Two investigation tasks that produce recorded findings and no code; one
 code task that adds a config-gated timing log and makes the cache bypass operator-
@@ -864,8 +871,20 @@ Note from prior operational experience in this repo: the environment-variable ov
 scalar-only **and** only overrides keys that already exist in the TOML. Adding the key to
 the operator's file is required; setting only an env var will be silently dropped.
 
-**Roll back by pushing `true` again.** No release required. That is the whole reason this
-is a flag.
+**Rollback is a config push plus an eviction — not a config push alone.** Pushing `true`
+again stops HTML navigations reading from cache, but evicts nothing: objects already
+cached, including those RSC and other request classes keep reading, persist until they
+expire. The origin's `max-age=60` bounds that, but does not remove it.
+
+Full rollback:
+
+1. Push `bypass_origin_cache = true`.
+2. Purge. `fastly::http::purge::purge_surrogate_key` runs inside Compute, with keys
+   attached at insert via `InsertBuilder::surrogate_keys`; alternatively roll a versioned
+   cache-key namespace. **Neither is wired today** — if the flip ships before one exists,
+   the rollback story is "wait out the TTL," and that must be an accepted risk rather
+   than an unnoticed one.
+3. Observe past the origin TTL before declaring the incident closed.
 
 - [ ] **Step 5: Run the full suite across every adapter**
 
