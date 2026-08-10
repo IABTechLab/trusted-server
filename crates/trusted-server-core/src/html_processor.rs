@@ -155,6 +155,30 @@ impl StreamProcessor for HtmlWithPostProcessing {
     fn reset(&mut self) {}
 }
 
+/// What the `</body>` seam injects.
+///
+/// This is a decision, not a side effect of whether the `<head>` script exists.
+/// An earlier shape gated body-close injection on `ad_slots_script.is_some()`,
+/// which coupled two independent choices: once a shared-template mode stopped
+/// emitting the head script, body-close injection silently stopped too.
+///
+/// See `docs/superpowers/specs/2026-08-08-esi-cacheable-root-validation-design.md`
+/// §6.7.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum BodyCloseInjection {
+    /// Emit nothing. Either no slots matched under the inline path, or a
+    /// client-fill mode where the browser fetches the fragment unprompted.
+    #[default]
+    None,
+    /// Read the auction result from `ad_bids_state` and inject it, falling back to
+    /// an empty payload. Today's shipped behaviour.
+    InlineBids,
+    /// Emit this markup verbatim — an `<esi:include>` for the edge to assemble.
+    /// Must be identical for every request that reaches the transform, or the
+    /// cached template is not shared-safe.
+    Marker(String),
+}
+
 /// Configuration for HTML processing
 #[derive(Clone)]
 pub struct HtmlProcessorConfig {
@@ -175,6 +199,9 @@ pub struct HtmlProcessorConfig {
     pub max_buffered_body_bytes: usize,
     /// Request-scoped conditional diagnostics delivery decision.
     pub gpt_diagnostics: Option<GptDiagnosticsRequestDecision>,
+    /// What the `</body>` seam injects. Decided by the caller rather than inferred
+    /// from [`Self::ad_slots_script`].
+    pub body_close: BodyCloseInjection,
 }
 
 impl HtmlProcessorConfig {
@@ -196,6 +223,7 @@ impl HtmlProcessorConfig {
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: settings.publisher.max_buffered_body_bytes,
             gpt_diagnostics: None,
+            body_close: BodyCloseInjection::None,
         }
     }
 
@@ -214,6 +242,17 @@ impl HtmlProcessorConfig {
     ) -> Self {
         self.ad_slots_script = ad_slots_script;
         self.ad_bids_state = ad_bids_state;
+        self
+    }
+
+    /// Set what the `</body>` seam injects.
+    ///
+    /// Separate from [`with_ad_state`](Self::with_ad_state) because the two are
+    /// independent decisions: a shared-template mode emits no head script and
+    /// still needs a body-close marker.
+    #[must_use]
+    pub fn with_body_close(mut self, body_close: BodyCloseInjection) -> Self {
+        self.body_close = body_close;
         self
     }
 
@@ -304,6 +343,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let integration_registry = config.integrations.clone();
     let script_rewriters = integration_registry.script_rewriters();
     let ad_slots_script = config.ad_slots_script.clone();
+    let body_close = config.body_close.clone();
     let ad_bids_state = config.ad_bids_state.clone();
     let gpt_diagnostics = config.gpt_diagnostics.clone();
 
@@ -371,25 +411,38 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         element!("body", {
             let state = ad_bids_state.clone();
             let injected_bids = injected_bids.clone();
-            let has_slots = ad_slots_script.is_some();
+            let body_close = body_close.clone();
             move |el| {
-                if !has_slots {
+                if matches!(body_close, BodyCloseInjection::None) {
                     return Ok(());
                 }
                 let state = state.clone();
                 let injected_bids = injected_bids.clone();
+                let body_close = body_close.clone();
                 if let Some(handlers) = el.end_tag_handlers() {
                     let handler: EndTagHandler<'static> =
                         Box::new(move |end_tag: &mut EndTag<'_>| {
                             if injected_bids.swap(true, Ordering::SeqCst) {
                                 return Ok(());
                             }
-                            let script_guard = state.lock().expect("should lock bid state");
-                            let bids_script = match &*script_guard {
-                                Some(s) => s.clone(),
-                                None => build_empty_bids_script(),
+                            let markup = match &body_close {
+                                // Verbatim, and identical on every request that
+                                // reaches the transform — that is what makes the
+                                // cached template shared-safe.
+                                BodyCloseInjection::Marker(marker) => marker.clone(),
+                                BodyCloseInjection::InlineBids => {
+                                    let script_guard = state.lock().expect("should lock bid state");
+                                    match &*script_guard {
+                                        Some(s) => s.clone(),
+                                        None => build_empty_bids_script(),
+                                    }
+                                }
+                                // Unreachable: the element handler returned early
+                                // above. Kept exhaustive rather than using `_` so a
+                                // new variant is a compile error here.
+                                BodyCloseInjection::None => return Ok(()),
                             };
-                            end_tag.before(&bids_script, ContentType::Html);
+                            end_tag.before(&markup, ContentType::Html);
                             Ok(())
                         });
                     handlers.push(handler);
@@ -684,6 +737,7 @@ mod tests {
 
     fn create_test_config() -> HtmlProcessorConfig {
         HtmlProcessorConfig {
+            body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_owned(),
             request_host: "test.example.com".to_owned(),
             request_scheme: "https".to_owned(),
@@ -1528,6 +1582,7 @@ mod tests {
     #[test]
     fn injects_ad_slots_at_head_open() {
         let config = HtmlProcessorConfig {
+            body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
@@ -1603,6 +1658,7 @@ mod tests {
         let bids_script = r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
         let config = HtmlProcessorConfig {
+            body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
@@ -1639,6 +1695,7 @@ mod tests {
         let bids_script = r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
         let config = HtmlProcessorConfig {
+            body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
@@ -1676,6 +1733,7 @@ mod tests {
 
         let request_host = "proxy.test-publisher.example.com";
         let config = HtmlProcessorConfig {
+            body_close: BodyCloseInjection::None,
             origin_host: "origin.test-publisher.example.com".to_string(),
             request_host: request_host.to_string(),
             request_scheme: "https".to_string(),
@@ -1727,6 +1785,7 @@ mod tests {
         // (state is None) — e.g. auction timed out with zero bids. Fallback to {}.
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
+            body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
@@ -1756,6 +1815,7 @@ mod tests {
         // unmodified (spec §8: "Existing client-side Prebid/GPT flow runs unmodified").
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
+            body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),

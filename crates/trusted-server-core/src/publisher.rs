@@ -55,6 +55,7 @@ use crate::ec::EcContext;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
+use crate::html_processor::BodyCloseInjection;
 use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
 use crate::integrations::IntegrationRegistry;
 use crate::platform::{GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
@@ -948,6 +949,39 @@ struct HtmlStreamProcessorParams<'a> {
     gpt_diagnostics: Option<crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
 }
 
+/// What the `</body>` seam should inject, given the assembly mode.
+///
+/// Explicit rather than inferred. The previous shape read
+/// `ad_slots_script.is_some()` inside the element handler, which silently coupled
+/// two independent decisions: once [`template_ad_slots_script`] stopped emitting a
+/// head script under a shared mode, body-close injection stopped with it.
+///
+/// `Esi` returns [`BodyCloseInjection::None`] for now rather than a placeholder
+/// marker. The marker must point at a dedicated fragment endpoint returning an
+/// executable script — `/_ts/page-bids` returns JSON, and ESI splices fragment
+/// bytes verbatim, so aiming at it would put raw JSON where a script belongs.
+/// That endpoint does not exist yet, and emitting a marker with nothing behind it
+/// would be worse than emitting nothing.
+pub(crate) fn body_close_injection(
+    mode: AssemblyMode,
+    head_script_present: bool,
+) -> BodyCloseInjection {
+    match mode {
+        // Per-navigation and never shared, so gating on slot presence is correct.
+        AssemblyMode::Inline => {
+            if head_script_present {
+                BodyCloseInjection::InlineBids
+            } else {
+                BodyCloseInjection::None
+            }
+        }
+        // The browser fetches the fragment unprompted; nothing to emit.
+        AssemblyMode::ClientFill => BodyCloseInjection::None,
+        // Pending the fragment endpoint. See the note above.
+        AssemblyMode::Esi => BodyCloseInjection::None,
+    }
+}
+
 fn create_html_stream_processor(
     params: HtmlStreamProcessorParams<'_>,
 ) -> Result<impl StreamProcessor + use<>, Report<TrustedServerError>> {
@@ -959,9 +993,20 @@ fn create_html_stream_processor(
         params.origin_host,
         params.request_host,
         params.request_scheme,
-    )
-    .with_ad_state(params.ad_slots_script, params.ad_bids_state)
-    .with_gpt_diagnostics(params.gpt_diagnostics);
+    );
+
+    let assembly_mode = params
+        .settings
+        .creative_opportunities
+        .as_ref()
+        .map(CreativeOpportunitiesConfig::assembly_mode)
+        .unwrap_or_default();
+    let body_close = body_close_injection(assembly_mode, params.ad_slots_script.is_some());
+
+    let config = config
+        .with_ad_state(params.ad_slots_script, params.ad_bids_state)
+        .with_gpt_diagnostics(params.gpt_diagnostics)
+        .with_body_close(body_close);
 
     Ok(create_html_processor(config))
 }
@@ -4686,6 +4731,70 @@ mod tests {
         )
         .await
         .expect("should proxy publisher request")
+    }
+
+    mod body_close_decision_tests {
+        //! The `</body>` decision must not be inferred from the `<head>` script.
+        //!
+        //! Coupling them is a live defect, not a hypothetical: gating the head seam
+        //! on template neutrality made `ad_slots_script` `None` under shared modes,
+        //! which silently disabled body-close injection too. These tests pin the two
+        //! decisions apart.
+
+        use super::*;
+        use crate::creative_opportunities::AssemblyMode;
+
+        #[test]
+        fn inline_injects_bids_only_when_the_head_script_is_present() {
+            assert_eq!(
+                body_close_injection(AssemblyMode::Inline, true),
+                BodyCloseInjection::InlineBids,
+                "inline with matched slots should inject the auction result"
+            );
+            assert_eq!(
+                body_close_injection(AssemblyMode::Inline, false),
+                BodyCloseInjection::None,
+                "inline without matched slots should leave the publisher's flow alone"
+            );
+        }
+
+        #[test]
+        fn shared_modes_do_not_depend_on_the_head_script() {
+            // The decision must be the same either way. Under a shared mode the head
+            // script is always absent, so a decision that read it would be
+            // accidentally correct here and wrong the moment that changes.
+            for mode in [AssemblyMode::ClientFill, AssemblyMode::Esi] {
+                assert_eq!(
+                    body_close_injection(mode, true),
+                    body_close_injection(mode, false),
+                    "{mode:?}: body-close must not vary with head-script presence"
+                );
+            }
+        }
+
+        #[test]
+        fn client_fill_emits_nothing_because_the_browser_fetches_unprompted() {
+            assert_eq!(
+                body_close_injection(AssemblyMode::ClientFill, false),
+                BodyCloseInjection::None
+            );
+        }
+
+        #[test]
+        fn esi_emits_nothing_until_the_fragment_endpoint_exists() {
+            // Deliberately not a placeholder marker. `/_ts/page-bids` returns JSON
+            // and ESI splices fragment bytes verbatim, so pointing at it would put
+            // raw JSON where an executable script belongs. Emitting a marker with
+            // nothing behind it is worse than emitting nothing.
+            //
+            // This test is expected to change when that endpoint lands — it exists
+            // to make that a deliberate edit rather than a silent one.
+            assert_eq!(
+                body_close_injection(AssemblyMode::Esi, false),
+                BodyCloseInjection::None,
+                "Esi should emit nothing until a script-returning fragment endpoint exists"
+            );
+        }
     }
 
     mod c2_gate_tests {

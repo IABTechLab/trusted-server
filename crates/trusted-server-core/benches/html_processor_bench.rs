@@ -1,5 +1,7 @@
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use trusted_server_core::html_processor::{HtmlProcessorConfig, create_html_processor};
+use trusted_server_core::html_processor::{
+    BodyCloseInjection, HtmlProcessorConfig, create_html_processor,
+};
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::streaming_processor::StreamProcessor as _;
 
@@ -13,6 +15,10 @@ fn make_config() -> HtmlProcessorConfig {
         ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
         max_buffered_body_bytes: 16 * 1024 * 1024,
         gpt_diagnostics: None,
+        // The benchmark measures URL rewriting, not ad injection, and
+        // `ad_slots_script` is `None` here — matching the previous behaviour,
+        // which inferred no body-close work from that.
+        body_close: BodyCloseInjection::None,
     }
 }
 
