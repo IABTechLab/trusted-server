@@ -251,7 +251,7 @@ The core of the spike. Behind a flag, default off.
 
 **Files:**
 
-- `crates/trusted-server-core/src/publisher.rs` — emit markers at the two seams
+- `crates/trusted-server-core/src/publisher.rs` — emit **one** unconditional marker at the body-close seam (see Step 2; the head seam is not a template hole)
 - `crates/trusted-server-core/src/settings.rs` — the mode flag
 - `crates/trusted-server-adapter-fastly/src/` — the `cache::core` read/write
 
@@ -352,38 +352,48 @@ let tx = Transaction::lookup(CacheKey::from(key_bytes)).execute()?;
 // Testing found() first would serve the stale bytes and silently never fulfil the
 // update obligation, leaving every concurrent waiter blocked until timeout.
 let template: Body = if tx.must_insert_or_update() {
-    match transform_origin_into(&tx) {
-        Ok((writer, found)) => {
-            writer.finish()?;              // REQUIRED — without it the object never completes
-            found.to_stream()?             // fallible; there is no `to_body()`
+    // Fetch and prepare BEFORE consuming `tx`. After `insert()` the transaction is
+    // gone and `cancel_insert_or_update()` is unreachable, so anything that can fail
+    // and does not need the writer belongs here.
+    let origin = match fetch_and_prepare_origin() {
+        Ok(origin) => origin,
+        Err(e) => {
+            tx.cancel_insert_or_update()?;   // releases the obligation to a waiter
+            return fallback_uncached(e);
+        }
+    };
+
+    // `Transaction::insert(self)` consumes `tx` from this line on.
+    let (mut writer, found) = tx
+        .insert(template_ttl)
+        .surrogate_keys(["ts-template", &url_surrogate_key])   // chained, not discarded
+        .user_metadata(metadata_envelope)
+        .execute_and_stream_back()?;
+
+    match stream_lol_html_output(origin, &mut writer) {
+        Ok(()) => {
+            writer.finish()?;        // REQUIRED, and consumes `writer`
+            found.to_stream()?       // fallible; there is no `to_body()`
         }
         Err(e) => {
-            // Do NOT finish() a partial template — it would be served to everyone
-            // until it expires. Abandon the writer, release the obligation so another
-            // client can try, and fall back to the untransformed path for this request.
-            writer.abandon();
-            tx.cancel_insert_or_update()?;
+            // Also consumes `writer`, marking an unsuccessful end so no partial
+            // template is served. (A `StreamingBody` dropped without `finish()` is
+            // aborted anyway, but say it explicitly.)
+            writer.abandon()?;
             return fallback_uncached(e);
         }
     }
 } else if let Some(found) = tx.found() {
-    // Fresh hit. `is_usable()` and `is_stale()` are available if a stale-serve
-    // policy is wanted; the spike should start by treating stale as a miss.
-    found.to_stream()?                     // C2 HIT — skip origin fetch and transform
+    found.to_stream()?               // C2 HIT — skip origin fetch and transform
 } else {
     unreachable!("a transaction is either obliged to insert or has found an item")
 };
 ```
 
-Inside `transform_origin_into`, `execute_and_stream_back()` yields both handles at once:
-
-```rust
-let (mut writer, found) = tx
-    .insert(template_ttl)
-    .surrogate_keys(["ts-template", &url_surrogate_key])   // chained, not discarded
-    .user_metadata(metadata_envelope)
-    .execute_and_stream_back()?;
-```
+Two ownership rules this shape exists to respect, both of which an earlier draft broke:
+`Transaction::insert(self)` **consumes** the transaction, so a helper taking `&tx` cannot
+call it and `cancel_insert_or_update` is unreachable afterwards; and `finish`/`abandon`
+each consume the writer, so neither can be referenced from an arm that did not bind it.
 
 **Decide the stale policy explicitly.** `Found::is_stale()` and `is_usable()` exist, and
 `stale_while_revalidate` can be set at insert. Serving stale while revalidating is a real
@@ -582,9 +592,12 @@ Not a phase. Every one of these is a hard fail, independent of any performance r
 - [ ] **Request collapsing** works: concurrent cold requests transform once.
 - [ ] **DCA disabled**, verified by the injection test in Task 5 Step 2.
 - [ ] **Exactly one auction per pageview**, from `auction_events_raw`.
-- [ ] **Cookie and privacy finalization still run** after assembly — EC `Set-Cookie` on
-      first visit, and the privacy net downgrading it. This is the ordering that ESI's
-      streaming mode makes easy to get wrong, since it drops `$add_header`.
+- [ ] **Cookie and privacy finalization ran BEFORE assembly**, not after — EC
+      `Set-Cookie` on first visit, geo suppression, and an unconditional
+      `Cache-Control: private, no-store`. Headers commit before the body streams on this
+      adapter, so "finalize after assembly" is not available; asserting it that way is how
+      a per-user response ends up shared-cacheable. ESI's streaming mode dropping
+      `$add_header` is a consequence of the same constraint, not a separate hazard.
 - [ ] **Slot and bid attribution unchanged.** Same slots matched, same bids applied, same
       renders attributed. Use TS-attributed renders — the SSAT line item, non-empty
       `ts.bids`, `hb_adid` presence — **never slot fill**, which is blind to empty bids
@@ -668,5 +681,10 @@ routes; N per arm; and the cache-tier mix.
       the answer.
 - [ ] Cleanup complete: flag resolved, C2 purged, synthetic endpoint removed, dependency
       landed or dropped.
+- [ ] **Cross-document invariants hold:** `python3 scripts/docs-invariants.py`. This is a
+      named gate, not a courtesy check. `npm run format` and `npm run build` catch
+      formatting and dead links; neither catches a claim corrected in one document and
+      left standing in another, which is the failure mode this document set has hit on
+      four separate review rounds. Add a check whenever a correction lands.
 - [ ] All CI gates pass: `cargo fmt --all -- --check`; the six clippy targets; the four
       adapter test suites; the parity suite; JS build, test, and format; docs format.

@@ -17,9 +17,12 @@
 >   `insert(key, max_age).execute() -> StreamingBody` for arbitrary bytes, `lookup()` /
 >   `found()` to read them back, and `Transaction` with `must_insert()` for request
 >   collapsing. The two-stage design needs no separate KV or template service.
-> - **Purge exists in-process.** `InsertBuilder::surrogate_keys([...])` attaches keys at
->   insert; `fastly::http::purge::purge_surrogate_key` purges from inside Compute. The
->   management-API token scope cited in the original is irrelevant to it.
+> - **Purge exists in-process.** `fastly::http::purge::purge_surrogate_key` purges from
+>   inside Compute; the management-API token scope cited in the original is irrelevant to
+>   it. Note which cache, though: `InsertBuilder::surrogate_keys([...])` is the **Core
+>   Cache** API and keys the transformed-template cache (C2). It does **not** key the HTTP
+>   read-through cache (C1) that Stage 0 turns on — purging that needs origin-supplied
+>   keys or the HTTP cache's own surrogate-key surface.
 > - **The original pipeline ordering was backwards.** It said "order esi → lol*html,
 >   never the reverse." `lol_html` \_emits* the `esi:include` tags, so ESI must run after
 >   it. Correct order is in [§6.6](#66-the-esi-pipeline-corrected).
@@ -59,12 +62,12 @@
 
 ## 1. Decision requested
 
-| #   | Decision                                                                                                                                      | Owner needed  |
-| --- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
-| D1  | **ESI is feasible and unvalidated.** Validate it via [the spike plan](../plans/2026-08-10-1009-esi-validation-spike.md), not by deferring it. | Eng + product |
-| D2  | **Fund ~3 days of measurement** (§3). No dependencies. Can start immediately.                                                                 | Eng           |
-| D3  | **Approve Stage 0** — an operator flag disabling the origin cache bypass, subject to the `Vary` check in §3.                                  | Eng           |
-| D4  | **Stages 1–2 queue behind the SSAT price defect and #938.** Stages 3b–5 unscheduled.                                                          | Product       |
+| #   | Decision                                                                                                                                                                                                                                    | Owner needed  |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
+| D1  | **ESI is feasible and unvalidated.** Validate it via [the spike plan](../plans/2026-08-10-1009-esi-validation-spike.md), not by deferring it.                                                                                               | Eng + product |
+| D2  | **Fund ~3 days of measurement** (§3). No dependencies. Can start immediately.                                                                                                                                                               | Eng           |
+| D3  | **Approve Stage 0** — an operator flag disabling the origin cache bypass, subject to a **`FINAL PASS`** in §3. A `Vary` check alone is a `PROVISIONAL PASS` and is not a release gate. Rollback needs a purge path, not only a config push. | Eng           |
+| D4  | **Stages 1–2 queue behind the SSAT price defect and #938.** Stages 3b–5 unscheduled.                                                                                                                                                        | Product       |
 
 Rationale for D4 in [§8](#8-priority). Everything this document recommends _against_
 doing is in [§7](#7-deferred-work-specified-not-scheduled), at deliberately lower
@@ -429,12 +432,13 @@ what #1009 proposed in the first place.
 
 Mechanism, all present in the pinned `fastly` 0.12.1:
 
-| Need                    | API                                                                                 |
-| ----------------------- | ----------------------------------------------------------------------------------- |
-| Store the template      | `cache::core::insert(key, max_age).execute() -> StreamingBody`                      |
-| Read it back            | `cache::core::lookup(key)` → `found()`                                              |
-| Avoid a thundering herd | `cache::core::Transaction` — `must_insert()` / `must_insert_or_update()`            |
-| Invalidate              | `InsertBuilder::surrogate_keys([...])` + `fastly::http::purge::purge_surrogate_key` |
+| Need                    | API                                                                                                                                        |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Store the template      | `cache::core::insert(key, max_age).execute() -> StreamingBody`                                                                             |
+| Read it back            | `cache::core::lookup(key)` → `found()`                                                                                                     |
+| Avoid a thundering herd | `cache::core::Transaction` — `must_insert()` / `must_insert_or_update()`                                                                   |
+| Invalidate **C2 only**  | `InsertBuilder::surrogate_keys([...])` (Core Cache) + `fastly::http::purge::purge_surrogate_key`. Does **not** key C1 — see the row below. |
+| Invalidate C1           | Origin-supplied surrogate keys, or the HTTP cache's own surrogate-key surface. Not the Core Cache API.                                     |
 
 Purge runs **inside Compute**. The management-API token scope cited under
 [Stage 4](#7-deferred-work-specified-not-scheduled) governs a different surface and does

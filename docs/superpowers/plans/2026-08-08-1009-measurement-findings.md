@@ -137,12 +137,20 @@ continue to read — persist until they expire.
 Two mitigations, both real:
 
 - The origin's `max-age=60` bounds read-through exposure to roughly a minute.
-- Purge is available in-process: `fastly::http::purge::purge_surrogate_key`, with keys
-  attached at insert via `InsertBuilder::surrogate_keys`. An earlier claim that TS had no
-  purge capability was wrong — it has no _wiring_, which is buildable.
+- Purge exists in-process — `fastly::http::purge::purge_surrogate_key`. An earlier claim
+  that TS had no purge capability was wrong; it has no _wiring_, which is buildable.
 
-Rollback is therefore: flip the flag, **then** purge or roll a versioned cache-key
-namespace, **then** observe past the origin TTL before declaring the incident closed.
+**But note which cache.** `InsertBuilder::surrogate_keys` belongs to the **Core Cache**
+API and applies to the transformed-template cache the ESI spike would build (C2). It has
+**no effect on the HTTP read-through cache** that Stage 0 turns on (C1). Purging C1 needs
+surrogate keys the _origin_ supplies on its responses, or the HTTP cache's own
+request/candidate surrogate-key surface. Confirm which is available before relying on it —
+an earlier revision of this document conflated the two.
+
+Rollback is therefore: flip the flag, **then** purge C1 by whichever mechanism is actually
+available (or roll a versioned key namespace), **then** observe past the origin TTL before
+declaring the incident closed. With no C1 purge path wired, the tail is the TTL itself —
+roughly a minute here, and a recorded risk rather than a surprise.
 
 ## Step B — consumers of TS's own response headers
 
