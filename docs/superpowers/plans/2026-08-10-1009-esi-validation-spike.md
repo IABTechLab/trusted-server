@@ -137,21 +137,35 @@ cargo check-fastly
 Expected: clean. The crate declares edition 2021 with no `rust-version`, and pulls recent
 `rand` and `nom`, so this is a genuine question on Rust 1.95.0 / `wasm32-wasip1`.
 
-- [ ] **Step 3: Check the lockfiles have not desynced**
+- [ ] **Step 3: Check no shared dependency was forced to move**
 
 ```bash
 git diff --stat Cargo.lock
-cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity
+cargo check --manifest-path crates/trusted-server-integration-tests/Cargo.toml --tests \
+  --target "$(rustc -vV | sed -n 's/^host: //p')"
 ```
 
-CI requires shared direct deps to match between the root and integration-tests lockfiles.
-`regex`, `bytes`, and `log` overlap. If they desync, fix with targeted
-`cargo update -p <crate> --precise <version>` — **never a full update**.
+**Correction, verified 2026-08-10:** an earlier revision of this step warned about a
+desync between the root `Cargo.lock` and `crates/trusted-server-integration-tests/Cargo.lock`.
+**That second lockfile does not exist** — the crate is a workspace member (root
+`Cargo.toml:10`) and shares the root lockfile. The hazard cannot arise in that form.
+
+What does matter is whether adding `esi` forces an **existing** shared dependency to a new
+version, since `regex`, `bytes`, and `log` are used across the workspace. Adding a new
+major that coexists is harmless; moving an existing one is not. If one moves, fix with a
+targeted `cargo update -p <crate> --precise <version>` — **never a full update**.
+
+**Already run and recorded** in [the findings](./2026-08-08-1009-measurement-findings.md):
+no existing shared dependency moved.
 
 - [ ] **Step 4: Record and commit, or stop**
 
-If Step 2 fails, this plan stops here and #1009 is answered "not on this toolchain."
-Record that in the findings document and escalate rather than fighting the build.
+**Task 1 is complete — verdict PASS, recorded 2026-08-10.** `esi` 0.7.1 compiles clean on
+Rust 1.95.0 / `wasm32-wasip1`, all six clippy targets pass, and no existing shared
+dependency moved. See [the findings](./2026-08-08-1009-measurement-findings.md).
+
+Had Step 2 failed, this plan would have stopped here with #1009 answered "not on this
+toolchain." It did not.
 
 ```bash
 git add crates/trusted-server-adapter-fastly/Cargo.toml Cargo.lock

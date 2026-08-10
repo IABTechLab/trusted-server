@@ -152,6 +152,43 @@ available (or roll a versioned key namespace), **then** observe past the origin 
 declaring the incident closed. With no C1 purge path wired, the tail is the TTL itself —
 roughly a minute here, and a recorded risk rather than a surprise.
 
+## ESI spike Task 1 — does `esi` 0.7 build on this toolchain?
+
+**Date:** 2026-08-10 · **Verdict: PASS.** The cheapest falsifier for the ESI question
+clears. #1009 is not closed by a toolchain limit.
+
+| Check                                                                                      | Result               |
+| ------------------------------------------------------------------------------------------ | -------------------- |
+| `cargo add esi@0.7 --package trusted-server-adapter-fastly`                                | resolved `esi 0.7.1` |
+| `cargo check-fastly` (Rust 1.95.0 / `wasm32-wasip1`)                                       | clean                |
+| `cargo fmt --all -- --check`                                                               | clean                |
+| All six clippy targets (fastly, axum, cloudflare, cloudflare-wasm, spin-native, spin-wasm) | clean                |
+| `cargo check --manifest-path crates/trusted-server-integration-tests/Cargo.toml --tests`   | clean                |
+
+**Nine new transitive dependencies:** `esi 0.7.1`, `nom 8.0.0`, `rand 0.10.2`,
+`rand_core 0.10.1`, `chacha20 0.10.1`, `cpufeatures 0.3.0`, `atoi 2.0.0`,
+`html-escape 0.2.15`, `md5 0.8.1`.
+
+**No existing shared dependency moved.** `regex` stays 1.12.4, `bytes` 1.12.0, `log`
+0.4.33. `nom` and `rand` gain new majors that coexist with the existing 7.1.3 / 0.8.6 /
+0.9.4 rather than replacing them — the best available outcome, since a forced bump on a
+shared dep is what would have made this expensive.
+
+### A claim in the spike plan was wrong
+
+Task 1 Step 3 told the implementer to check for a desync between the root `Cargo.lock` and
+`crates/trusted-server-integration-tests/Cargo.lock`. **That second lockfile does not
+exist.** The integration-tests crate is a workspace member (root `Cargo.toml:10`) and
+shares the root lockfile, so the desync hazard cannot arise in that form. The plan has
+been corrected. The dual-lockfile constraint was real at some earlier point; it is not the
+current layout.
+
+### Not yet verified
+
+Compiling is not working. Nothing here exercises `cache::core`, ESI assembly, or any
+runtime behaviour — Tasks 2 onward remain untouched, and the `esi` dependency is added but
+unused.
+
 ## Step B — consumers of TS's own response headers
 
 Not yet run.
