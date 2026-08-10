@@ -3420,7 +3420,7 @@ pub(crate) fn build_bid_map_with_auction_id(
                 // Sanitize dangerous markup first, then optionally rewrite URLs
                 // to first-party proxies. The inline processor emits absolute URLs
                 // and omits the tsjs bundle injection because GAM owns the frame.
-                if let Some(ref renderer) = bid.renderer {
+                let has_renderer = if let Some(ref renderer) = bid.renderer {
                     let renderer = match serde_json::to_value(renderer) {
                         Ok(renderer) => renderer,
                         Err(error) => {
@@ -3432,7 +3432,10 @@ pub(crate) fn build_bid_map_with_auction_id(
                         }
                     };
                     obj.insert("renderer".to_string(), renderer);
-                }
+                    true
+                } else {
+                    false
+                };
                 if let Some(ref raw_creative) = bid.creative {
                     // Resolve ${AUCTION_PRICE} from the exact winning CPM BEFORE
                     // sanitizing, rewriting, and signing — URL rewriting would
@@ -3444,7 +3447,15 @@ pub(crate) fn build_bid_map_with_auction_id(
                         &base_origin,
                         &priced,
                     );
-                    if !adm.is_empty() {
+                    if adm.trim().is_empty() {
+                        if !has_renderer {
+                            log::warn!(
+                                "Skipping winning bid for slot '{}' because creative processing rejected its only render source",
+                                slot_id
+                            );
+                            return None;
+                        }
+                    } else {
                         obj.insert("adm".to_string(), serde_json::Value::String(adm));
                     }
                 }
@@ -8781,9 +8792,8 @@ mod tests {
         #[test]
         fn build_bid_map_omits_oversized_adm() {
             // Creatives larger than the sanitize pass's 1 MiB cap are rejected
-            // (empty result), so the inline `adm` is omitted and the pbRender
-            // bridge falls back to the PBS Cache coordinates instead of shipping
-            // an unbounded creative to the client.
+            // (empty result), so the bid is omitted rather than recording a blank
+            // winner or shipping an unbounded creative to the client.
             let mut winning_bids = HashMap::new();
             let mut bid = make_bid(
                 "atf_sidebar_ad",
@@ -8803,13 +8813,9 @@ mod tests {
                 "",
                 false,
             );
-            let obj = map
-                .get("atf_sidebar_ad")
-                .and_then(|v| v.as_object())
-                .expect("should have a bid entry");
             assert!(
-                obj.get("adm").is_none(),
-                "should omit the inline adm when the creative exceeds the 1 MiB cap"
+                !map.contains_key("atf_sidebar_ad"),
+                "should omit the bid when the creative exceeds the 1 MiB cap"
             );
         }
 
@@ -9210,6 +9216,7 @@ mod tests {
         fn bid_map_exposes_aps_renderer_and_selected_bid_id() {
             let mut bid = make_bid("atf_sidebar_ad", 1.50, "aps", "fallback-ad", "", "");
             bid.bid_id = Some("selected-bid".to_string());
+            bid.creative = Some("<script>reject()</script>".to_string());
             bid.nurl = None;
             bid.burl = None;
             bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
@@ -9245,6 +9252,26 @@ mod tests {
             let script = build_bids_script(&map);
             assert!(!script.contains("</script></script>"));
             assert!(script.contains("\\u003C/script\\u003E"));
+        }
+
+        #[test]
+        fn bid_map_omits_creative_rejected_by_processing_without_renderer() {
+            let mut bid = make_bid("atf_sidebar_ad", 1.50, "kargo", "fallback-ad", "", "");
+            bid.creative = Some("<script>reject()</script>".to_string());
+            let winning_bids = HashMap::from([("atf_sidebar_ad".to_string(), bid)]);
+
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+            );
+
+            assert!(
+                !map.contains_key("atf_sidebar_ad"),
+                "should omit a bid whose only creative was rejected"
+            );
         }
 
         #[test]
@@ -9615,11 +9642,11 @@ mod tests {
         use super::super::*;
         use super::build_services_with_http_client;
         use crate::auction::AuctionOrchestrator;
-        use crate::auction::provider::AuctionProvider;
+        use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
         use crate::auction::types::{AuctionRequest, AuctionResponse, Bid};
         use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
         use crate::platform::test_support::{StubHttpClient, noop_services};
-        use crate::platform::{PlatformHttpRequest, PlatformPendingRequest, PlatformResponse};
+        use crate::platform::{PlatformHttpRequest, PlatformResponse};
         use crate::test_support::tests::crate_test_settings_str;
         use error_stack::{Report, ResultExt};
         use http::Method;
@@ -9643,7 +9670,7 @@ mod tests {
                 &self,
                 request: &AuctionRequest,
                 context: &AuctionContext<'_>,
-            ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+            ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
                 *self
                     .captured_request
                     .lock()
@@ -9664,6 +9691,7 @@ mod tests {
                     .change_context(TrustedServerError::Auction {
                         message: "test bidder launch failed".to_string(),
                     })
+                    .map(ProviderRequestOutcome::pending)
             }
 
             async fn parse_response(
@@ -9684,6 +9712,8 @@ mod tests {
                         nurl: None,
                         burl: None,
                         bid_id: None,
+                        creative_id: None,
+                        renderer: None,
                         ad_id: Some("winner-123".to_string()),
                         cache_id: None,
                         cache_host: None,

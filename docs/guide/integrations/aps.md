@@ -203,7 +203,7 @@ This release is a direct protocol cutover:
 
 1. Replace the legacy `/e/dtb/bid` endpoint with `/e/pb/bid`.
 2. Rename `pub_id` to `account_id`.
-3. Remove APS-specific slot ID configuration and remove `aps` from Prebid Server bidder lists. Trusted Server also filters APS from PBS requests for this path. An ad unit containing only `aps` intentionally does not fall back to its PBS stored request; add a non-APS PBS bidder when that fallback is required.
+3. Remove APS-specific slot ID configuration and remove `aps` from Prebid Server bidder lists. Trusted Server also filters APS from PBS requests for this path.
 4. Prepare GAM line items and Universal Creative for `hb_bidder=aps` and the selected APS `hb_adid`.
 5. Disable publisher-native APS demand for the Trusted Server test cohort.
 
