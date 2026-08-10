@@ -83,8 +83,9 @@ Interpretation:
   a different domain than navigation rows for the same site. Neither current
   table panel displays `publisher_domain`.
 
-The reconciliation endpoint in this addendum makes this class of failure
-self-announcing regardless of cause.
+The reconciliation health checks in this addendum make two failure classes
+self-announcing: orphan provider events in raw data and raw-to-rollup count
+divergence. They do not provide billing or business reconciliation.
 
 ## Decision summary
 
@@ -102,8 +103,8 @@ self-announcing regardless of cause.
    emitted; the privacy posture of the parent design is unchanged.
 4. Add `currency` to the bid rollups and endpoints. CPM quantiles are always
    computed and displayed per currency.
-5. Replace the quarantine stub with the workspace quarantine source and add a
-   raw-data reconciliation endpoint.
+5. Replace the quarantine stub with the workspace quarantine source and add an
+   event-completeness and raw-to-rollup parity health endpoint.
 6. Ship the Grafana dashboard as provisioned JSON in the repo, with a panel
    specification (below) that every future change is reviewed against.
 7. Rename or relabel misleading measures: `win_rate` becomes
@@ -268,13 +269,30 @@ merge.
   contract (datasource, quarantined_rows, checked_at, status) is unchanged, so
   the panel does not care which source backs it. Deployment smoke tests must
   assert `status != 'unconfigured'`.
-- **Reconciliation.** New endpoint `event_reconciliation` over raw, last 24
-  hours, per `auction_source`: `uniqExact(auction_id)` where
-  `event_kind = 'summary'`, the same where `event_kind = 'provider_call'`, and
-  their difference. Healthy is a difference of zero (allowing best-effort
-  slack); the dashboard alerts visually when provider-call auctions exceed
-  summary auctions by more than 2%. This turns the class of bug found in the
-  2026-07-30 review into a red panel instead of a support escalation.
+- **Reconciliation.** New endpoint `event_reconciliation` reports two
+  independent health checks, over the last 24 hours and per
+  `auction_source`.
+  - **Raw event completeness:** return `summary_auctions` as the unique
+    summary IDs with a non-null `terminal_status`,
+    `attempted_summary_auctions` as the unique summary IDs whose status is not
+    `skipped`, `provider_call_auctions` as the unique provider-call IDs, and
+    `provider_orphan_auctions` as provider-call IDs without a matching
+    attempted summary. Skipped summaries, and attempted outcomes with no
+    provider call, are valid and do not make the check unhealthy. The
+    dashboard alerts when orphan provider auctions exceed 2% of attempted
+    summaries, or when provider events exist without any attempted summaries.
+  - **Raw-to-rollup parity:** for summaries, provider calls, and bids, compare
+    eligible raw row counts with the corresponding `countMerge` values from
+    the per-minute rollup targets. The raw eligibility predicates mirror the
+    MV `WHERE` clauses, but deliberately exclude no measure-null rows. Query
+    only events older than the documented materialization-lag tolerance. The
+    endpoint returns raw rows, rollup rows, delta, and status so a missing MV
+    deployment or backfill is visible even when raw event completeness is
+    healthy.
+
+  This turns the class of bug found in the 2026-07-30 review into a red panel
+  instead of a support escalation without treating the directional dataset as
+  a financial ledger.
 
 ## F. Grafana: dashboard as code
 
@@ -318,8 +336,9 @@ to collection (includes origin race)"; no panel title uses the bare phrase
   error, abandoned), null `price_cpm` bids including a null-price win, and a
   non-USD currency. `tb test` cases assert these rows are counted, excluded
   from quantiles, and split by currency.
-- A reconciliation fixture where provider-call auctions exceed summaries
-  asserts the endpoint reports the delta.
+- Reconciliation fixtures cover a skipped summary with no provider call
+  (healthy), an orphan provider auction (unhealthy), and a raw-to-rollup count
+  mismatch (unhealthy).
 - Privacy tests extend to the two new fields: values must be members of the
   closed sets, never UA substrings.
 - Deployment smoke test asserts quarantine endpoint is configured and rollup
