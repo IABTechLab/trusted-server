@@ -1794,18 +1794,20 @@ pub(crate) fn write_bids_to_state(
     settings: &Settings,
     request_origin: &str,
     include_debug_bid: bool,
+    auction_id: Option<&str>,
 ) {
     log::debug!(
         "write_bids_to_state: {} winning bid(s): [{}]",
         winning_bids.len(),
         winning_bids.keys().cloned().collect::<Vec<_>>().join(", ")
     );
-    let bid_map = build_bid_map(
+    let bid_map = build_bid_map_with_auction_id(
         winning_bids,
         price_granularity,
         settings,
         request_origin,
         include_debug_bid,
+        auction_id,
     );
     let bids_script = build_bids_script(&bid_map);
     *ad_bids_state.lock().expect("should lock bid state") = Some(bids_script);
@@ -2393,6 +2395,10 @@ async fn collect_non_html_auction(
     services: &RuntimeServices,
     settings: &Settings,
 ) {
+    let auction_id = telemetry
+        .auction_request
+        .as_ref()
+        .and_then(|_| diagnostics_auction_id(settings));
     let placeholder = mediator_placeholder_request();
     let result = orchestrator
         .collect_dispatched_auction(
@@ -2422,6 +2428,7 @@ async fn collect_non_html_auction(
         settings,
         &request_origin(&params.request_scheme, &params.request_host),
         settings.debug.inject_adm_for_testing,
+        auction_id.as_deref(),
     );
 }
 
@@ -2441,6 +2448,10 @@ async fn collect_stream_auction(
         settings,
         request_origin,
     } = deps;
+    let auction_id = telemetry
+        .auction_request
+        .as_ref()
+        .and_then(|_| diagnostics_auction_id(settings));
     log::info!("body_close_hold_loop: collecting dispatched auction before held body tail");
     let placeholder = mediator_placeholder_request();
     let collect_ctx = make_collect_context(settings, services, &placeholder);
@@ -2472,6 +2483,7 @@ async fn collect_stream_auction(
         settings,
         request_origin,
         settings.debug.inject_adm_for_testing,
+        auction_id.as_deref(),
     );
 
     if settings.debug.auction_html_comment {
@@ -3203,6 +3215,21 @@ pub(crate) fn build_auction_request(
     }
 }
 
+/// Mint the browser-visible auction correlation token for GPT diagnostics.
+///
+/// The token is freshly generated per auction and carries no user identity.
+/// [`AuctionRequest::id`] must never be used here: for a consented visitor it is
+/// `ts-{ec_id}`, so publishing it in `window.tsjs.bids` would hand the `HttpOnly`
+/// EC identifier to any script on the page, and — being stable per visitor — it
+/// could not distinguish one auction from the next either.
+///
+/// Returns `None` unless the GPT diagnostics integration is enabled, since
+/// nothing else consumes the value.
+fn diagnostics_auction_id(settings: &Settings) -> Option<String> {
+    crate::integrations::gpt_diagnostics::is_enabled(settings)
+        .then(|| format!("ts-auc-{}", uuid::Uuid::new_v4().simple()))
+}
+
 /// Escape a JSON string so it is safe to embed inside a JS double-quoted string literal
 /// inside an HTML `<script>` block.
 ///
@@ -3250,12 +3277,31 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 ///
 /// Returns a JSON object map of slot ID → bid metadata including the bucketed
 /// CPM (`hb_pb`), bidder (`hb_bidder`), and optional ad ID, nurl, and burl.
+#[cfg(test)]
 pub(crate) fn build_bid_map(
     winning_bids: &std::collections::HashMap<String, Bid>,
     granularity: crate::price_bucket::PriceGranularity,
     settings: &Settings,
     request_origin: &str,
     include_debug_bid: bool,
+) -> serde_json::Map<String, serde_json::Value> {
+    build_bid_map_with_auction_id(
+        winning_bids,
+        granularity,
+        settings,
+        request_origin,
+        include_debug_bid,
+        None,
+    )
+}
+
+pub(crate) fn build_bid_map_with_auction_id(
+    winning_bids: &std::collections::HashMap<String, Bid>,
+    granularity: crate::price_bucket::PriceGranularity,
+    settings: &Settings,
+    request_origin: &str,
+    include_debug_bid: bool,
+    auction_id: Option<&str>,
 ) -> serde_json::Map<String, serde_json::Value> {
     // Inline creatives render in a foreign origin (PUC's srcdoc under GAM), so
     // their proxy/click URLs must be absolute against the origin the visitor is
@@ -3278,6 +3324,12 @@ pub(crate) fn build_bid_map(
                     "hb_bidder".to_string(),
                     serde_json::Value::String(bid.bidder.clone()),
                 );
+                if let Some(auction_id) = auction_id {
+                    obj.insert(
+                        "hb_auction_id".to_string(),
+                        serde_json::Value::String(auction_id.to_owned()),
+                    );
+                }
                 // Winning creative dimensions — the bridge sizes the inline
                 // render from these, falling back to the first configured slot
                 // format only when absent, which mis-sizes a multi-size slot.
@@ -3849,8 +3901,8 @@ pub async fn handle_page_bids(
     // skip the live auction, matching the existing bot/prefetch behaviour.
     let ad_stack_enabled = auction_enabled && consent_allows_auction;
 
-    let winning_bids = if matched_slots.is_empty() {
-        std::collections::HashMap::new()
+    let (winning_bids, auction_id) = if matched_slots.is_empty() {
+        (std::collections::HashMap::new(), None)
     } else {
         // Same publisher identity as the outbound bid request — see the
         // matching note on the initial-navigation observation above.
@@ -3916,7 +3968,7 @@ pub async fn handle_page_bids(
                         )
                     })
                     .await;
-                    winning_bids
+                    (winning_bids, diagnostics_auction_id(settings))
                 }
                 Err(e) => {
                     log::warn!("page-bids auction failed: {e:?}");
@@ -3933,7 +3985,7 @@ pub async fn handle_page_bids(
                         )
                     })
                     .await;
-                    std::collections::HashMap::new()
+                    (std::collections::HashMap::new(), None)
                 }
             }
         } else {
@@ -3959,16 +4011,17 @@ pub async fn handle_page_bids(
                 )
             })
             .await;
-            std::collections::HashMap::new()
+            (std::collections::HashMap::new(), None)
         }
     };
 
-    let bid_map = build_bid_map(
+    let bid_map = build_bid_map_with_auction_id(
         &winning_bids,
         co_config.price_granularity,
         settings,
         &page_bids_request_origin,
         settings.debug.inject_adm_for_testing,
+        auction_id.as_deref(),
     );
 
     // Gate slots on the ad-stack kill switch / consent: when disabled, return no
@@ -8101,7 +8154,7 @@ mod tests {
     mod creative_opportunities_tests {
         use super::super::{
             MatchedSlotsContext, build_ad_slots_script, build_auction_request, build_bid_map,
-            build_bids_script, html_escape_for_script,
+            build_bids_script, diagnostics_auction_id, html_escape_for_script, write_bids_to_state,
         };
         use crate::auction::types::{Bid, MediaType};
         use crate::consent::ConsentContext;
@@ -8345,6 +8398,139 @@ mod tests {
                 obj.get("burl").and_then(|v| v.as_str()),
                 Some("https://ssp/bill"),
                 "should include burl"
+            );
+        }
+
+        /// Guards the browser-visible token every auction path shares: it must
+        /// be fresh per auction and absent unless diagnostics can consume it.
+        #[test]
+        fn diagnostics_auction_id_is_fresh_and_gated() {
+            let mut settings = test_settings();
+            assert_eq!(
+                diagnostics_auction_id(&settings),
+                None,
+                "no token should be minted without the diagnostics integration"
+            );
+
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+                .expect("should enable diagnostics");
+            let first =
+                diagnostics_auction_id(&settings).expect("enabled diagnostics should mint a token");
+            let second =
+                diagnostics_auction_id(&settings).expect("enabled diagnostics should mint a token");
+
+            assert!(
+                first.starts_with("ts-auc-"),
+                "token should use the diagnostics prefix, got `{first}`"
+            );
+            assert_ne!(first, second, "each auction should mint its own token");
+        }
+
+        #[test]
+        fn initial_document_bids_script_includes_auction_id_only_for_winning_bids() {
+            let slot = make_slot();
+            let slots = [slot];
+            let slots_ctx = MatchedSlotsContext {
+                matched_slots: &slots,
+                request_path: "/2024/01/my-article/",
+            };
+            let request_info = RequestInfo {
+                host: "publisher.example.com".to_string(),
+                scheme: "https".to_string(),
+            };
+            let mut auction_request = build_auction_request(
+                &slots_ctx,
+                None,
+                &ConsentContext::default(),
+                &request_info,
+                "publisher.example.com",
+                Some("Mozilla/5.0"),
+            );
+            auction_request.id = "initial-auction-example-123".to_string();
+            let mut winning_bids = HashMap::new();
+            winning_bids.insert(
+                "atf_sidebar_ad".to_string(),
+                make_bid(
+                    "atf_sidebar_ad",
+                    1.50,
+                    "example_bidder",
+                    "abc123",
+                    "https://example.com/win",
+                    "https://example.com/bill",
+                ),
+            );
+
+            let state = std::sync::Arc::new(std::sync::Mutex::new(None));
+            write_bids_to_state(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &state,
+                &test_settings(),
+                "",
+                false,
+                Some(&auction_request.id),
+            );
+            let script = state
+                .lock()
+                .expect("should lock initial bid state")
+                .clone()
+                .expect("should generate initial-document bids script");
+            let bid_json = script
+                .strip_prefix(
+                    "<script>(function(){var t=window.tsjs=window.tsjs||{};var b=JSON.parse(\"",
+                )
+                .and_then(|script| {
+                    script.strip_suffix(
+                        "\");var s=t.scheduleInitialAdInit;if(typeof s===\"function\")s(b);else t.bids=b;})();</script>",
+                    )
+                })
+                .expect("should emit the initial-document tsjs.bids script shape");
+            let bid_json: String = serde_json::from_str(&format!("\"{bid_json}\""))
+                .expect("should decode initial-document JSON.parse input");
+            let bids: serde_json::Value = serde_json::from_str(&bid_json)
+                .expect("should serialize initial-document bids as JSON");
+
+            assert_eq!(
+                bids["atf_sidebar_ad"]["hb_auction_id"], auction_request.id,
+                "initial-document bids should expose the current request ID only on the winner"
+            );
+
+            write_bids_to_state(
+                &HashMap::new(),
+                PriceGranularity::Dense,
+                &state,
+                &test_settings(),
+                "",
+                false,
+                Some(&auction_request.id),
+            );
+            let empty_script = state
+                .lock()
+                .expect("should lock empty initial bid state")
+                .clone()
+                .expect("should generate empty initial-document bids script");
+            let empty_bid_json = empty_script
+                .strip_prefix(
+                    "<script>(function(){var t=window.tsjs=window.tsjs||{};var b=JSON.parse(\"",
+                )
+                .and_then(|script| {
+                    script.strip_suffix(
+                        "\");var s=t.scheduleInitialAdInit;if(typeof s===\"function\")s(b);else t.bids=b;})();</script>",
+                    )
+                })
+                .expect("should emit the empty initial-document tsjs.bids script shape");
+            let empty_bid_json: String = serde_json::from_str(&format!("\"{empty_bid_json}\""))
+                .expect("should decode empty initial-document JSON.parse input");
+            let empty_bids: serde_json::Value = serde_json::from_str(&empty_bid_json)
+                .expect("should serialize empty initial-document bids as JSON");
+            assert!(
+                empty_bids
+                    .as_object()
+                    .expect("initial-document bids should be an object")
+                    .is_empty(),
+                "initial-document bids should not fabricate metadata without a winner"
             );
         }
 
@@ -9519,11 +9705,105 @@ mod tests {
 
     mod page_bids_no_match_tests {
         use super::super::*;
+        use super::build_services_with_http_client;
         use crate::auction::AuctionOrchestrator;
+        use crate::auction::provider::AuctionProvider;
+        use crate::auction::types::{AuctionRequest, AuctionResponse, Bid};
         use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
-        use crate::platform::test_support::noop_services;
+        use crate::platform::test_support::{StubHttpClient, noop_services};
+        use crate::platform::{PlatformHttpRequest, PlatformPendingRequest, PlatformResponse};
         use crate::test_support::tests::crate_test_settings_str;
+        use error_stack::{Report, ResultExt};
         use http::Method;
+        use std::sync::{Arc, Mutex};
+
+        const AUCTION_ID_TEST_PROVIDER: &str = "auction_id_test_provider";
+        const AUCTION_ID_TEST_BACKEND: &str = "auction-id-test-backend";
+
+        struct AuctionIdTestProvider {
+            captured_request: Arc<Mutex<Option<AuctionRequest>>>,
+            winning_bid: bool,
+        }
+
+        #[async_trait::async_trait(?Send)]
+        impl AuctionProvider for AuctionIdTestProvider {
+            fn provider_name(&self) -> &'static str {
+                AUCTION_ID_TEST_PROVIDER
+            }
+
+            async fn request_bids(
+                &self,
+                request: &AuctionRequest,
+                context: &AuctionContext<'_>,
+            ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+                *self
+                    .captured_request
+                    .lock()
+                    .expect("should lock captured auction request") = Some(request.clone());
+                let request = PlatformHttpRequest::new(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("https://bidder.example.test/bids")
+                        .body(EdgeBody::empty())
+                        .expect("should build test bidder request"),
+                    AUCTION_ID_TEST_BACKEND,
+                );
+                context
+                    .services
+                    .http_client()
+                    .send_async(request)
+                    .await
+                    .change_context(TrustedServerError::Auction {
+                        message: "test bidder launch failed".to_string(),
+                    })
+            }
+
+            async fn parse_response(
+                &self,
+                _response: PlatformResponse,
+                response_time_ms: u64,
+            ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+                let bids = if self.winning_bid {
+                    vec![Bid {
+                        slot_id: "atf".to_string(),
+                        price: Some(1.50),
+                        currency: "USD".to_string(),
+                        creative: None,
+                        adomain: None,
+                        bidder: AUCTION_ID_TEST_PROVIDER.to_string(),
+                        width: 300,
+                        height: 250,
+                        nurl: None,
+                        burl: None,
+                        bid_id: None,
+                        ad_id: Some("winner-123".to_string()),
+                        cache_id: None,
+                        cache_host: None,
+                        cache_path: None,
+                        metadata: Default::default(),
+                    }]
+                } else {
+                    Vec::new()
+                };
+                Ok(AuctionResponse::success(
+                    AUCTION_ID_TEST_PROVIDER,
+                    bids,
+                    response_time_ms,
+                ))
+            }
+
+            fn timeout_ms(&self) -> u32 {
+                100
+            }
+
+            fn backend_name(
+                &self,
+                _services: &RuntimeServices,
+                _timeout_ms: u32,
+            ) -> Option<String> {
+                Some(AUCTION_ID_TEST_BACKEND.to_string())
+            }
+        }
 
         fn settings_with_co() -> Settings {
             let toml = format!(
@@ -9666,6 +9946,206 @@ mod tests {
             )
             .await
             .expect("should return ok response")
+        }
+
+        fn auction_id_test_orchestrator(
+            settings: &Settings,
+            captured_request: Arc<Mutex<Option<AuctionRequest>>>,
+            winning_bid: bool,
+        ) -> AuctionOrchestrator {
+            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            orchestrator.register_provider(Arc::new(AuctionIdTestProvider {
+                captured_request,
+                winning_bid,
+            }));
+            orchestrator
+        }
+
+        #[tokio::test]
+        async fn page_bids_response_includes_auction_id_only_for_winning_bids() {
+            let mut settings = settings_with_co();
+            settings.auction.providers = vec![AUCTION_ID_TEST_PROVIDER.to_string()];
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+                .expect("should enable diagnostics");
+            let slots = article_slot();
+            let winning_stub = Arc::new(StubHttpClient::new());
+            winning_stub.push_response(200, b"winner".to_vec());
+            let winning_services = build_services_with_http_client(
+                Arc::clone(&winning_stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let winning_request = Arc::new(Mutex::new(None));
+            let winning_orchestrator =
+                auction_id_test_orchestrator(&settings, Arc::clone(&winning_request), true);
+            let ec_context = EcContext::new_for_test(
+                Some("page-auction-example-123".to_string()),
+                crate::consent::ConsentContext {
+                    jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                    ..Default::default()
+                },
+            );
+
+            let winning_response = handle_page_bids(
+                &settings,
+                &winning_services,
+                None,
+                AuctionDispatch {
+                    orchestrator: &winning_orchestrator,
+                    slots: &slots,
+                    registry: None,
+                },
+                &ec_context,
+                make_page_bids_request("/2024/01/my-article/"),
+            )
+            .await
+            .expect("should return winning page-bids response");
+            let winning_body: serde_json::Value = serde_json::from_slice(
+                &winning_response
+                    .into_body()
+                    .into_bytes()
+                    .expect("should read winning page-bids response body"),
+            )
+            .expect("should serialize winning page-bids response as JSON");
+            let auction_request = winning_request
+                .lock()
+                .expect("should lock captured winning request")
+                .clone()
+                .expect("should dispatch a winning auction request");
+
+            assert_eq!(
+                auction_request.id, "ts-page-auction-example-123",
+                "test EC ID should produce a deterministic auction request ID"
+            );
+            let winning_auction_id = winning_body["bids"]["atf"]["hb_auction_id"]
+                .as_str()
+                .expect("page-bids should expose an auction ID on the winner")
+                .to_string();
+            assert!(
+                winning_auction_id.starts_with("ts-auc-"),
+                "page-bids should expose a freshly minted diagnostics token, got `{winning_auction_id}`"
+            );
+            assert_ne!(
+                winning_auction_id, auction_request.id,
+                "browser-visible auction ID must not be the EC-derived request ID"
+            );
+            assert!(
+                !winning_auction_id.contains("page-auction-example-123"),
+                "browser-visible auction ID must not embed the EC ID"
+            );
+
+            let no_winner_stub = Arc::new(StubHttpClient::new());
+            no_winner_stub.push_response(200, b"no-bid".to_vec());
+            let no_winner_services = build_services_with_http_client(
+                Arc::clone(&no_winner_stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let no_winner_orchestrator =
+                auction_id_test_orchestrator(&settings, Arc::new(Mutex::new(None)), false);
+            let no_winner_response = handle_page_bids(
+                &settings,
+                &no_winner_services,
+                None,
+                AuctionDispatch {
+                    orchestrator: &no_winner_orchestrator,
+                    slots: &slots,
+                    registry: None,
+                },
+                &ec_context,
+                make_page_bids_request("/2024/01/my-article/"),
+            )
+            .await
+            .expect("should return no-winner page-bids response");
+            let no_winner_body: serde_json::Value = serde_json::from_slice(
+                &no_winner_response
+                    .into_body()
+                    .into_bytes()
+                    .expect("should read no-winner page-bids response body"),
+            )
+            .expect("should serialize no-winner page-bids response as JSON");
+
+            assert!(
+                no_winner_body["bids"]
+                    .as_object()
+                    .expect("page-bids should return a bids object")
+                    .is_empty(),
+                "page-bids should not fabricate auction metadata without a winner"
+            );
+        }
+
+        /// The browser-visible auction ID is minted per auction and only for
+        /// deployments that run the diagnostics integration, so it can neither
+        /// carry EC identity across auctions nor reach pages that ignore it.
+        #[tokio::test]
+        async fn page_bids_auction_id_is_per_auction_and_gated_on_diagnostics() {
+            async fn winning_auction_id(settings: &Settings) -> Option<String> {
+                let slots = article_slot();
+                let stub = Arc::new(StubHttpClient::new());
+                stub.push_response(200, b"winner".to_vec());
+                let services = build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                );
+                let orchestrator =
+                    auction_id_test_orchestrator(settings, Arc::new(Mutex::new(None)), true);
+                let ec_context = EcContext::new_for_test(
+                    Some("page-auction-example-123".to_string()),
+                    crate::consent::ConsentContext {
+                        jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                        ..Default::default()
+                    },
+                );
+                let response = handle_page_bids(
+                    settings,
+                    &services,
+                    None,
+                    AuctionDispatch {
+                        orchestrator: &orchestrator,
+                        slots: &slots,
+                        registry: None,
+                    },
+                    &ec_context,
+                    make_page_bids_request("/2024/01/my-article/"),
+                )
+                .await
+                .expect("should return page-bids response");
+                let body: serde_json::Value = serde_json::from_slice(
+                    &response
+                        .into_body()
+                        .into_bytes()
+                        .expect("should read page-bids response body"),
+                )
+                .expect("should serialize page-bids response as JSON");
+                body["bids"]["atf"]["hb_auction_id"]
+                    .as_str()
+                    .map(str::to_string)
+            }
+
+            let mut settings = settings_with_co();
+            settings.auction.providers = vec![AUCTION_ID_TEST_PROVIDER.to_string()];
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+                .expect("should enable diagnostics");
+
+            let first = winning_auction_id(&settings)
+                .await
+                .expect("first auction should expose a diagnostics token");
+            let second = winning_auction_id(&settings)
+                .await
+                .expect("second auction should expose a diagnostics token");
+            assert_ne!(
+                first, second,
+                "each auction for the same visitor should mint its own token"
+            );
+
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": false }))
+                .expect("should disable diagnostics");
+            assert_eq!(
+                winning_auction_id(&settings).await,
+                None,
+                "no auction metadata should reach the page without the diagnostics integration"
+            );
         }
 
         /// The deprecated `/__ts/page-bids` alias must be handled identically to
