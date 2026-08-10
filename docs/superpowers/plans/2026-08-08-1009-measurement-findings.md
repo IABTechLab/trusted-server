@@ -183,11 +183,39 @@ shares the root lockfile, so the desync hazard cannot arise in that form. The pl
 been corrected. The dual-lockfile constraint was real at some earlier point; it is not the
 current layout.
 
+### Viceroy 0.17 supports the whole Core Cache surface this spike needs
+
+**Date:** 2026-08-10 · **Verdict: PASS.** Probed directly under
+`cargo test -p trusted-server-adapter-fastly --target wasm32-wasip1`, then removed:
+
+| API                                                                      | Result |
+| ------------------------------------------------------------------------ | ------ |
+| `cache::core::insert(key, ttl).execute()` → write → `finish()`           | works  |
+| `cache::core::lookup(key).execute()` → `Found::to_stream()`              | works  |
+| `Transaction::lookup(key).execute()` → `must_insert_or_update()`         | works  |
+| `Transaction::insert(ttl).surrogate_keys([…]).execute_and_stream_back()` | works  |
+| Second transactional lookup reports a hit, no obligation                 | works  |
+
+That is the entire API surface the spike's Task 3 Step 4 specifies, including the
+transaction and stream-back shapes.
+
+**Consequence: provisioning a Fastly service is not a prerequisite.** An earlier revision
+of the spike plan made it Task 2 and a blocker on everything downstream. Almost all of the
+correctness and safety work — the C2 cache logic, the transform, template byte-identity,
+ESI assembly, DCA and dispatcher refusal, fragment-failure degradation, header ordering,
+and the leakage gates — runs locally. The plan is re-sequenced accordingly.
+
+**What still needs a real service:** shielding behaviour, POP-level cache tiering,
+request collapsing under genuine concurrency (Viceroy is a single instance, so a passing
+`Transaction` test proves the API works and not that collapsing is correct under load),
+stale revalidation timing, and **every performance number in the decision rule**. Local
+timings are meaningless for the decision.
+
 ### Not yet verified
 
-Compiling is not working. Nothing here exercises `cache::core`, ESI assembly, or any
-runtime behaviour — Tasks 2 onward remain untouched, and the `esi` dependency is added but
-unused.
+Compiling and a cache round-trip are not an implementation. Nothing yet exercises the
+`lol_html` transform into C2, ESI assembly, or any runtime behaviour on the publisher path,
+and the `esi` dependency is added but unused.
 
 ## Step B — consumers of TS's own response headers
 

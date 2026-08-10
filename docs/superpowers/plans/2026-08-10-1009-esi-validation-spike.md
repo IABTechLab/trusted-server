@@ -97,19 +97,19 @@ not its implementation.
 ## Task order and dependencies
 
 ```
-Stage 0 plan (flag + timing instrumentation)  ──┐
-                                                ├──> Task 3 (C2 template cache)
-Task 1 (esi crate compiles)  ───────────────────┤
-Task 2 (test service + harness) ────────────────┘         │
-                                                          ├──> Task 4 (A2 client-fill)
-                                                          ├──> Task 5 (A3 ESI)
-                                                          └──> Task 6 (safety gates)
-                                                                     │
-                                                                     └──> Task 7 (decision record)
+Task 1 (esi compiles) ── DONE, PASS ──┐
+                                      ├──> Task 3 (C2 cache)  ─┬──> Task 4 (A2 client-fill)
+Stage 0 plan (flag + instrumentation) ┘                        ├──> Task 5 (A3 ESI)
+                                                               └──> Task 6 (safety gates)
+                                                                          │
+                        Task 2 (real service) ─────────────────────────────┴──> Task 7 (decision)
 ```
 
-Tasks 1 and 2 are independent and should run first — both can invalidate the plan
-cheaply. Task 6 runs against every arm, not once at the end.
+**Task 2 is not a blocker on Tasks 3–6.** Everything those tasks need is exercisable under
+Viceroy 0.17 — verified, see Task 2. The real service is required only for the
+measurements Task 7 decides on, so provision it once there is something worth measuring.
+
+Task 6 runs against every arm, not once at the end.
 
 ---
 
@@ -174,19 +174,47 @@ git commit -m "Add the esi crate to the Fastly adapter for the #1009 validation 
 
 ---
 
-## Task 2: Stand up the test service and the harness
+## Task 2: Local validation first, real service only for what needs it
 
-**Viceroy 0.17 does support `cache::core` locally** — an earlier draft of this plan said
-otherwise and was wrong. What it does **not** support is the customized HTTP
-read-through hooks (`after_send` / `set_body_transform`), which matters only if the
-alternative design in Task 3 Step 4 is chosen.
+**Verified 2026-08-10 under Viceroy 0.17: the entire Core Cache surface this spike uses
+works locally.** A probe exercised `cache::core::insert`, `lookup`, `finish`, `to_stream`,
+and — the shape Task 3 Step 4 actually specifies — `Transaction::lookup`,
+`must_insert_or_update`, `insert(...).surrogate_keys(...).execute_and_stream_back()`, and
+hit-after-insert semantics. All passed. Recorded in
+[the findings](./2026-08-08-1009-measurement-findings.md).
 
-So: C2 insert/lookup/transaction logic, the transform, and the security properties are all
-testable locally. **Shielding, request collapsing under real concurrency, POP behaviour,
-and stale revalidation are not** — those need a real Fastly service. Establish one before
-Tasks 3–6, and be clear which findings came from which environment.
+That reorders this plan. An earlier revision made provisioning a Fastly service Task 2 and
+a blocker on everything after it. It is not a blocker: **almost all of the correctness and
+safety work is local**, and only the numbers and the cache topology need real
+infrastructure.
 
-- [ ] **Step 1: Provision a dedicated test service**
+| Work                                                         | Where        |
+| ------------------------------------------------------------ | ------------ |
+| C2 insert / lookup / transaction logic (Task 3)              | **Local**    |
+| The `lol_html` transform and template byte-identity (Task 3) | **Local**    |
+| ESI assembly — the crate is pure Rust over `BufRead`/`Write` | **Local**    |
+| DCA off, dispatcher allowlist, injection refusal (Task 5)    | **Local**    |
+| Fragment-failure degradation (Task 5)                        | **Local**    |
+| Header-finalization ordering, no-C3 assertions (Task 6)      | **Local**    |
+| Cross-user leakage / request-neutrality gates (Task 6)       | **Local**    |
+| Shielding behaviour                                          | Real service |
+| POP-level cache tiering (`x-cache`, `hit-state`, `age`)      | Real service |
+| Request collapsing under genuine concurrency                 | Real service |
+| Stale revalidation timing at the edge                        | Real service |
+| **Every performance number in Task 7's decision rule**       | Real service |
+
+**So: build and prove correctness locally through Tasks 3, 5, and 6 before provisioning
+anything.** If the design is wrong or leaks, that surfaces locally for free, and the
+service is only needed once there is something worth measuring.
+
+Two caveats on the local scope. Viceroy is a single instance, so a passing `Transaction`
+test proves the API works, **not** that collapsing behaves correctly under load. And local
+timings are meaningless for the decision — do not let a fast local run substitute for
+Task 7 evidence.
+
+### When the real service is needed
+
+- [ ] **Step 1: Provision it — after local correctness passes, not before**
 
 Separate from production. Confirm and record: whether the publisher backend is
 **shielded**, and whether any Delivery service fronts the Compute service. Both change
