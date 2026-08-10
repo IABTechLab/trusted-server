@@ -91,9 +91,9 @@ could embed `<esi:include src="…">` and make the edge fetch an arbitrary URL. 
 [Appendix E](#appendix-e--esi-notes-condensed).
 
 **The auction is already out of band; the hold is ~free.** It is dispatched _before_
-the origin fetch and does not block — dispatched at [publisher.rs:2751-2755](../../../crates/trusted-server-core/src/publisher.rs#L2751-L2755), sent at [:2870](../../../crates/trusted-server-core/src/publisher.rs#L2870) —
+the origin fetch and does not block — dispatched at `publisher.rs:2751-2755`, sent at `:2870` —
 with a 500 ms budget. The actual cost is `with_cache_bypass`
-([publisher.rs:2867](../../../crates/trusted-server-core/src/publisher.rs#L2867)),
+(`publisher.rs:2867`),
 which forces every ad-eligible navigation to miss the Fastly readthrough cache.
 
 **The two fixes are multiplicative.** Removing the bypass alone lets the previously
@@ -122,14 +122,14 @@ cheapest thing that unblocks anything.
 
 **Step B — what consumes TS's own response headers (under a day).** Request a TS-served
 path that already emits `public, s-maxage`
-([http_util.rs:294-311](../../../crates/trusted-server-core/src/http_util.rs#L294-L311))
+(`http_util.rs:294-311`)
 twice and look for `x-cache`/`age` on TS's _own_ response. **Gates the Stage 3a/3b
 split** — see [§7](#7-deferred-work-specified-not-scheduled).
 
 **Step C — measure the hold directly (1 day + a measurement window).**
 
 The hold's cost is literally the duration of one `.await`: `collect_stream_auction` at
-[publisher.rs:793](../../../crates/trusted-server-core/src/publisher.rs#L793), plus the
+`publisher.rs:793`, plus the
 two EOF variants in `hold_finish_ready_segments` and `hold_finish_tail_segments`. Two
 `Instant`s around it yield **`hold_wait_ms`** — the number this entire document is
 arguing about, measured rather than modelled.
@@ -182,7 +182,7 @@ browser harness when Stage 1 is actually scheduled.
 ## 4. Stage 0 — the only build item recommended now
 
 Stop bypassing the read-through cache on ad-eligible navigations
-([publisher.rs:2867](../../../crates/trusted-server-core/src/publisher.rs#L2867)).
+(`publisher.rs:2867`).
 
 **Ship it as an operator flag, not a deletion.** Add
 `publisher.bypass_origin_cache`, defaulting to today's behaviour, in the same release as
@@ -191,7 +191,9 @@ the Step C instrumentation. Then turn it off with `ts config push`.
 The diff is slightly larger than deleting a line, and that is the point. The risk being
 gated here is **cache poisoning** — serving one representation in response to a request
 for another. For that class of failure, rollback speed dominates diff size: a config push
-reverts in seconds, a release does not. The flag also buys an A/B on a byte-identical
+reverts the read path in seconds where a release does not — but a config push **evicts
+nothing**, so full rollback is flip, then purge or roll a versioned key namespace, then
+observe past the origin TTL. The flag also buys an A/B on a byte-identical
 build, removing build difference as a confound in the very measurement this depends on,
 and allows flipping for a tester-cookie population before all traffic.
 
@@ -203,7 +205,7 @@ its branch. A temporary flag left in place becomes permanent configuration surfa
 Two regression signals, both checked before the win is:
 
 - **`unexpected_origin_304` abandonment rate.** That reason
-  ([publisher.rs:2894-2916](../../../crates/trusted-server-core/src/publisher.rs#L2894-L2916),
+  (`publisher.rs:2894-2916`,
   emitted via `emit_abandoned_auction` at `:2360`) exists precisely because the ad-stack
   path refuses cached and conditional origin responses. Re-enabling the cache is what
   could revive it. **Any non-zero rate is a rollback signal** — it means a 304 is reaching
@@ -214,7 +216,7 @@ Two regression signals, both checked before the win is:
   performance regression.
 
 **Why it is safe in principle.** The conditional-header strip runs 34 lines earlier
-under the same gate ([publisher.rs:2832-2836](../../../crates/trusted-server-core/src/publisher.rs#L2832),
+under the same gate (`publisher.rs:2832-2836`,
 which also strips `Range`/`If-Range`), so the request already reaches the cache
 unconditional and a HIT returns a full body. [The 304-prevention design](./2026-07-22-ssat-root-document-304-prevention-design.md)
 added the bypass as belt-and-braces and listed the TTFB cost under its own Risks. The
@@ -222,7 +224,7 @@ strip alone satisfies its invariant.
 
 **But it carries a risk that design never considered — and this is the blocking
 precondition.** RSC fetches are not navigations
-([is_navigation_request](../../../crates/trusted-server-core/src/http_util.rs#L73-L98)
+(`is_navigation_request`
 requires `Sec-Fetch-Dest: document`), so they never set the bypass and **already flow
 through the readthrough cache**, while HTML navigations are `PASS`. Removing the bypass
 puts both representations under one cache key. #1009 states the origin varies on
@@ -233,7 +235,7 @@ cache can serve a flight payload to an HTML navigation.
 The classification is also not airtight: `is_navigation_request` falls back to the
 `Accept` header when Fetch Metadata is absent, and its own comment warns _"this path is
 weaker — `fetch()` can set Accept: text/html"_
-([http_util.rs:84-88](../../../crates/trusted-server-core/src/http_util.rs#L84)).
+(`http_util.rs:84-88`).
 
 **A FAIL is not merely a Stage 0 blocker — it is a live production defect.** RSC fetches
 already transit the read-through cache today, because they never set the bypass. If the
@@ -285,13 +287,13 @@ The hold is load-bearing for something other than latency. The invariant is:
 
 > `ad_bids_state` must be `Some(..)` when `lol_html` processes the `<body>` end tag.
 
-The end-tag handler ([html_processor.rs:381-395](../../../crates/trusted-server-core/src/html_processor.rs#L381-L395))
+The end-tag handler (`html_processor.rs:381-395`)
 locks that mutex once and falls back to `build_empty_bids_script()` on `None`.
 
 **Removing the hold without relocating collection renders a normal page with
 `tsjs.bids = {}` and no server-side ads** — no error, no non-2xx, no ERROR log. On
 Axum, Cloudflare, and Spin the loss is fully silent:
-[publisher.rs:2248](../../../crates/trusted-server-core/src/publisher.rs#L2248) holds a
+`publisher.rs:2248` holds a
 bare `Option<DispatchedAuction>` with no guard, so not even a drop warning fires. **The
 SSPs are billed regardless.**
 
@@ -304,14 +306,14 @@ fill cannot be the canary — see [§7](#7-deferred-work-specified-not-scheduled
 
 ### 6.1 Corrections to #1009's premises
 
-| #   | #1009 states                           | Verified against `cfb98f4`                                                                                                                                                         |
-| --- | -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | Two per-user injection seams           | `tsjs.adSlots` is per-URL — [build_slot_json](../../../crates/trusted-server-core/src/publisher.rs#L3501-L3525) emits config- and path-derived fields only. **One per-user hole.** |
-| 2   | Identity off-inline is a prerequisite  | Privacy net is cookie-gated and returning navs set no cookie ([ec/finalize.rs:86-94](../../../crates/trusted-server-core/src/ec/finalize.rs#L86-L94)). **First-visit only.**       |
-| 3   | Stamp at `:2882-2888`                  | [`:2945-2963`](../../../crates/trusted-server-core/src/publisher.rs#L2945-L2963), `private, no-store`, also removing `ETag`/`Last-Modified`/four CDN headers. **Seven headers.**   |
-| 4   | Three cacheability killers             | Two more: `bypass_cache` and the [304→502 guard](../../../crates/trusted-server-core/src/publisher.rs#L2894-L2916). **The bypass is the cost.**                                    |
-| 5   | Two `!Send` pipelines is the hard part | `?Send` already pervasive. **Not the obstacle.**                                                                                                                                   |
-| 6   | Goal: root as a shared Fastly HIT      | Nothing caches TS's own response on Compute; the A/B's `x-cache` is the **backend readthrough** cache. **Reframes the goal.**                                                      |
+| #   | #1009 states                           | Verified against `cfb98f4`                                                                                                                                                                                                                                                             |
+| --- | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Two per-user injection seams           | `tsjs.adSlots` is per-URL — `build_slot_json` emits config- and path-derived fields only. **One per-user hole.**                                                                                                                                                                       |
+| 2   | Identity off-inline is a prerequisite  | Privacy net is cookie-gated and returning navs set no cookie (`ec/finalize.rs:86-94`). **First-visit only** — but note the corollary: because returning navigations set no cookie, that net never fires for them and is **not** a backstop against shared-caching a per-user response. |
+| 3   | Stamp at `:2882-2888`                  | `:2945-2963`, `private, no-store`, also removing `ETag`/`Last-Modified`/four CDN headers. **Seven headers.**                                                                                                                                                                           |
+| 4   | Three cacheability killers             | Two more: `bypass_cache` and the `304→502 guard`. **The bypass is the cost.**                                                                                                                                                                                                          |
+| 5   | Two `!Send` pipelines is the hard part | `?Send` already pervasive. **Not the obstacle.**                                                                                                                                                                                                                                       |
+| 6   | Goal: root as a shared Fastly HIT      | Nothing caches TS's own response on Compute; the A/B's `x-cache` is the **backend readthrough** cache. **Reframes the goal.**                                                                                                                                                          |
 
 Rows on #1009's `esi` compatibility check (holds), its drifted line numbers, and its
 two broken `#1`/`#3` cross-references are in [Appendix A](#appendix-a--full-1009-correction-table).
@@ -327,9 +329,9 @@ argument for client-fill, which the issue then declines in favour of ESI.
 It was wrong, and the correction matters.**
 
 The hold does not key off `lol_html` at all. `BodyCloseHoldBuffer::push`
-([publisher.rs:2190-2202](../../../crates/trusted-server-core/src/publisher.rs#L2190))
+(`publisher.rs:2190-2202`)
 scans the **decoded origin input** for `</body`, and `hold_collect_close_tail` awaits
-`collect_stream_auction` ([publisher.rs:793](../../../crates/trusted-server-core/src/publisher.rs#L793))
+`collect_stream_auction` (`publisher.rs:793`)
 the moment that byte sequence appears — with `is_last = false`, before post-processing
 runs. Post-processor buffering is irrelevant to when the hold fires, so the argument
 applies identically to every publisher or to none.
@@ -342,7 +344,7 @@ What is true, and all that is true:
 
 `A` is bounded by `auction_timeout_ms`, resolved as
 `creative_opportunities.auction_timeout_ms` falling back to `auction.timeout_ms`
-([publisher.rs:2680-2684](../../../crates/trusted-server-core/src/publisher.rs#L2680-L2684))
+(`publisher.rs:2680-2684`)
 — check the resolution order against your own config rather than trusting a number; the
 shipped example sets different values at each level.
 
@@ -351,7 +353,7 @@ cost directly rather than inferring it.
 
 A finding that does survive, and belongs with [the ceiling](#64-the-ceiling): because
 `HtmlWithPostProcessing` withholds all output until the final chunk, the streaming-prefix
-design at [publisher.rs:1343-1348](../../../crates/trusted-server-core/src/publisher.rs#L1343-L1348)
+design at `publisher.rs:1343-1348`
 — whose comment promises "the client receives the document up to `</body>` while the
 auction rides alongside transfer" — is **inert on a Next.js publisher**. Every
 `step.ready` yields empty bytes. That comment is misleading on exactly the publisher
@@ -481,7 +483,7 @@ Secondary wins: removes the duplicated per-codec decoder/encoder wiring, six com
 imports, and the non-parser-context `</body` byte-scan false positive (#850).
 
 **Regression gate — do not use slot fill.** `adInit` calls `defineSlot` and
-`addService` regardless of bids ([gpt/index.ts:652](../../../crates/trusted-server-js/lib/src/integrations/gpt/index.ts#L652),
+`addService` regardless of bids (`gpt/index.ts:652`,
 `const bid = bids[slot.id] ?? {}`), so GAM still requests and fills from its own demand.
 #1009 measured identical fill on both arms, confirming fill is not TS-attributable. Use
 SSAT reservation line-item renders, non-empty `ts.bids`, and `hb_adid` presence
@@ -495,7 +497,7 @@ body the document is no longer per-user. Record it as a deliberate decision.
 
 **Stage 3b — shared cacheability.** 5–10 d, and **blocked on two things**. First, geo:
 `apply_finalize_headers` writes IP-derived `x-geo-*` on every response
-([fastly/middleware.rs:194-200](../../../crates/trusted-server-adapter-fastly/src/middleware.rs#L194-L200)),
+(`fastly/middleware.rs:194-200`),
 which shared-cached replays one visitor's geo to the next; geo is not a request header
 so suppression is the only option. Second, `Vary`: the publisher path emits none, and at
 least eleven request signals change the rewritten bytes for one URL — five are per-user
@@ -592,17 +594,20 @@ Rows 1–6 are in [§6.1](#61-corrections-to-1009s-premises). The remainder:
 
 **`should_run_ad_stack` carries four meanings across six sites:**
 
-| Line                                                                        | Meaning                                                         | Disposition                                                                          |
-| --------------------------------------------------------------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| [2651](../../../crates/trusted-server-core/src/publisher.rs#L2651), `:2660` | eligibility and auction gate                                    | keep                                                                                 |
-| [2832-2836](../../../crates/trusted-server-core/src/publisher.rs#L2832)     | strip `If-None-Match`, `If-Modified-Since`, `Range`, `If-Range` | **keep** — needed for any injection                                                  |
-| [2866](../../../crates/trusted-server-core/src/publisher.rs#L2866)          | `with_cache_bypass()`                                           | **make operator-controlled** — [§4](#4-stage-0--the-only-build-item-recommended-now) |
-| [2894](../../../crates/trusted-server-core/src/publisher.rs#L2894)          | 304 → 502 guard                                                 | keep as safety net                                                                   |
-| [2920](../../../crates/trusted-server-core/src/publisher.rs#L2920)          | build `adSlots`                                                 | keep — per-URL                                                                       |
-| [2945](../../../crates/trusted-server-core/src/publisher.rs#L2945)          | strip cacheability                                              | **replace** — Stage 3a                                                               |
+| Line            | Meaning                                                         | Disposition                                                                          |
+| --------------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `2651`, `:2660` | eligibility and auction gate                                    | keep                                                                                 |
+| `2832-2836`     | strip `If-None-Match`, `If-Modified-Since`, `Range`, `If-Range` | **keep** — needed for any injection                                                  |
+| `2866`          | `with_cache_bypass()`                                           | **make operator-controlled** — [§4](#4-stage-0--the-only-build-item-recommended-now) |
+| `2894`          | 304 → 502 guard                                                 | keep as safety net                                                                   |
+| `2920`          | build `adSlots`                                                 | keep — per-URL                                                                       |
+| `2945`          | strip cacheability                                              | **replace** — Stage 3a                                                               |
 
 **Cache tiers.** T1 backend readthrough (already available; TS opts out). T2 TS-owned
-template cache (adds KV latency, eventual consistency, a full invalidation design).
+template cache. An earlier revision assumed this meant a KV store, and priced in KV
+latency and eventual consistency. It does not — it is `fastly::cache::core`
+(§6.6), which is a cache, not a KV store. What it does add is metadata and
+revalidation handling that `cache::core` does not provide for you.
 T3 delivery cache of TS output (Fastly topology change; **ESI cannot run**, since
 Compute is not invoked on a HIT). T2 and T3 both introduce a cache TS does not yet purge —
 wiring that is available but unbuilt.

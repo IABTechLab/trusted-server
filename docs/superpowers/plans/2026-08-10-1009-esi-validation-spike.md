@@ -76,6 +76,12 @@ A0→A1 measures the bypass. A1→A2 measures the template split. A2→A3 measur
 client assembly — **that difference is the entire case for ESI**, and it is the number
 this plan exists to produce.
 
+**Do not compare A2 and A3 on root TTFB.** They serve the same C2 template, so their root
+timings should be near-identical by construction; a null result there proves nothing.
+ESI's claimed advantage is that bids arrive without a client round-trip, so measure:
+**bids-ready time**, **`adInit` fire time**, and **first TS-attributed creative paint**.
+Root TTFB stays as a guard that the template path did not regress, not as the comparison.
+
 REF is included because #1009 anchors on it, and excluded from pass/fail because TS-off
 does no auction and no injection. Comparing against it measures the feature's existence,
 not its implementation.
@@ -150,9 +156,15 @@ git commit -m "Add the esi crate to the Fastly adapter for the #1009 validation 
 
 ## Task 2: Stand up the test service and the harness
 
-**Viceroy 0.17 cannot exercise the `cache::core` hooks end to end.** Unit tests cover the
-transform and the security properties; MISS / HIT / stale / shielding must run on a real
-Fastly service. Establish that before building, or Tasks 3–6 have nowhere to run.
+**Viceroy 0.17 does support `cache::core` locally** — an earlier draft of this plan said
+otherwise and was wrong. What it does **not** support is the customized HTTP
+read-through hooks (`after_send` / `set_body_transform`), which matters only if the
+alternative design in Task 3 Step 4 is chosen.
+
+So: C2 insert/lookup/transaction logic, the transform, and the security properties are all
+testable locally. **Shielding, request collapsing under real concurrency, POP behaviour,
+and stale revalidation are not** — those need a real Fastly service. Establish one before
+Tasks 3–6, and be clear which findings came from which environment.
 
 - [ ] **Step 1: Provision a dedicated test service**
 
@@ -169,30 +181,56 @@ The shielding answer also settles an open question from the Stage 0 findings: #1
 off-TS win came from a shield HIT, so whether the test service has one determines whether
 its numbers transfer to production at all.
 
-- [ ] **Step 2: Extend the harness for correlation**
+- [ ] **Step 2: Extend the harness for lineage, not just correlation**
 
-The existing tester-cookie A/B has no way to join server timings to browser timings. Add
-a per-request correlation ID — generated at TS entry, echoed in an `x-ts-request-id`
-response header, and included in every timing log line.
+The existing tester-cookie A/B has no way to join server timings to browser timings. A
+root-only request ID is not enough either: under A3 the auction happens in a **fragment
+subrequest**, so a root ID never reaches the auction telemetry.
 
-Without it, the experiment cannot join hold time, origin time, auction telemetry, browser
-TTFB, and render outcome for the same request. **That is the difference between an
+Propagate a **lineage ID plus the experiment arm** through the whole chain:
+
+```
+root request → C2 lookup → fragment subrequest → auction telemetry → browser render event
+```
+
+Generated at TS entry, forwarded into the fragment request, attached to the
+`auction_events_raw` row, echoed as `x-ts-request-id`, and exposed to the browser harness
+so render events carry it. Every timing log line includes both fields.
+
+Without this the experiment cannot join hold time, origin time, auction telemetry, browser
+TTFB, and render outcome for the same pageview. **That is the difference between an
 experiment and a pile of numbers.**
 
-- [ ] **Step 3: Capture cache tier and status per request**
+- [ ] **Step 3: Capture C1 and C2 status separately**
 
-Record `x-cache`, `hit-state`, `age`, and the serving POP alongside each measurement. A
-median that mixes cold-MISS and warm-HIT requests is meaningless, and arms cannot be
-compared unless the mix is known.
+`x-cache`, `hit-state`, and `age` describe the **HTTP read-through cache (C1)**. They say
+nothing about the **transformed-template cache (C2)**, which is a `cache::core` object
+with no HTTP semantics. Recording only the former and calling it "cache status" would
+attribute C2 hits and misses to the wrong tier.
+
+Emit both: the C1 headers as-is, plus an explicit `x-ts-c2` field carrying HIT / MISS /
+STALE / BYPASS from the transaction outcome. Record the serving POP alongside. A median
+that mixes cold-MISS and warm-HIT requests is meaningless, and arms cannot be compared
+unless the mix is known — per tier.
 
 - [ ] **Step 4: Define the sample plan before collecting anything**
 
-State, in the findings document, ahead of time: requests per arm per route, how cold MISS
-is forced, how warm HIT is confirmed, and the confidence interval to be reported.
+Write all of this into the findings document **before** the first measurement, and treat
+it as fixed:
+
+| Element              | What to state                                                                                                              |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| Allocation           | Requests per arm per route, and how arms are assigned                                                                      |
+| Randomization        | Randomized or blocked by route and cache state — not sequential runs                                                       |
+| Pilot variance       | A small pilot to estimate variance, before sizing the real run                                                             |
+| MDE and power        | The smallest difference worth detecting, and the N that detects it                                                         |
+| CI method            | Which interval, computed how                                                                                               |
+| Warmup and carryover | How cold MISS is forced, how warm HIT is confirmed, and how one arm's cache state is prevented from contaminating the next |
 
 Rationale: this whole effort exists because #1009 drew a causal conclusion from N=4 that
-did not survive contact with the code. Repeating that with more arms would be worse, not
-better.
+did not survive contact with the code. Repeating that with more arms and no power
+calculation would be worse, not better — it would look rigorous while being equally
+unfalsifiable.
 
 ---
 
@@ -229,51 +267,127 @@ already documents: `Settings` carries `#[serde(deny_unknown_fields)]`, `ts confi
 typed, and `Publisher` has a hand-written `Default` plus eight exhaustive test literals
 and a live doctest.
 
-- [ ] **Step 2: Emit markers instead of inlining, under `ClientFill`/`Esi`**
+- [ ] **Step 2: Make the template strictly request-neutral**
 
-The two seams are already isolated — that is #1009's correct observation. At head-open,
-`tsjs.adSlots` is **per-URL and stays in the template** (config- and path-derived only,
-`publisher.rs:3501-3525`). At body-close, emit a marker instead of the bids script.
+**The obvious design is wrong and would leak.** An earlier draft kept `tsjs.adSlots` in
+the shared template on the grounds that it is per-URL. Its _content_ is per-URL; its
+_presence_ is not. It is gated on `should_run_ad_stack` (`publisher.rs:2920-2927`), which
+is `is_get && is_navigation && !is_prefetch && !is_bot && has_matched_slots &&
+consent_allows_auction && auction_enabled`.
 
-Under `Esi`: `<esi:include src="/_ts/page-bids?path=…" />`.
-Under `ClientFill`: nothing at all — **not an empty bids script.** The Stage 0 plan
-explains why: an empty script calls `scheduleInitialAdInit({})` and assigns
-`ts.bids = {}` synchronously, racing the client fetch.
+So the first request to fill C2 would freeze **its own** consent decision, bot
+classification, prefetch status, and kill-switch state into an object every later visitor
+reads. A consent-denied first fill serves a no-ads template to consenting users; a
+consenting first fill serves ad markup to a user who refused.
 
-**Assert the template carries no per-user bytes.** A unit test over the transform output
-must fail on any of: a bid value, an EC ID, a consent string, a geo value, or a
-`Set-Cookie`. This is the test that makes C2 safe, and it is cheaper to write now than to
-retrofit.
+**Rule: the template contains an unconditional inert placeholder and nothing else.**
 
-- [ ] **Step 3: Write the template into C2**
+| Element                   | Where it lives                                     |
+| ------------------------- | -------------------------------------------------- |
+| tsjs bundle script tag    | Template — content-hashed, genuinely per-URL       |
+| URL rewrites              | Template — per-host, in the cache key              |
+| `tsjs.adSlots`            | **Fragment** — its presence is request-dependent   |
+| `tsjs.bids`               | **Fragment**                                       |
+| GPT diagnostics bootstrap | **Fragment** — gated on a per-request cookie/query |
+
+Emit **one** unconditional marker at the body-close seam, identical on every request that
+reaches the transform. Under `Esi` it is an `<esi:include>`; under `ClientFill` it is
+nothing at all, with the client fetching unprompted.
+
+- [ ] **Step 3: Bypass C2 for anything that must not be shared**
+
+`cache::core` is not an HTTP cache — it will happily store whatever you hand it. Nothing
+rejects private or authenticated responses for you. Refuse to insert when **any** holds:
+
+- The origin response carries `Set-Cookie`.
+- The origin response is `private`, `no-store`, or `no-cache`.
+- The request carried `Authorization`.
+- The response is not 200 with an HTML content type.
+- DataDome's request filter replaced the document.
+
+Audit every request-dependent rewrite before declaring the template neutral — the
+integration head-inserts and the GPT-diagnostics bootstrap are both request-scoped and
+must not reach C2.
+
+**Assert it, do not assume it.** A unit test over the transform output must fail on any
+of: a bid value, an EC ID, a consent string, a geo value, a diagnostics bootstrap, or a
+`Set-Cookie`. Then a second test must assert the template is **byte-identical** for two
+requests differing in consent, bot classification, and prefetch status. That second test
+is the one that catches this class of bug; the first would have passed on the broken
+design.
+
+- [ ] **Step 4: Write and read C2 — with the real API**
+
+The builder is move-based and the insert and read handles are different objects. Naïve
+code does not compile:
 
 ```rust
-// Fastly adapter. Key on the same signals the origin varies on, plus TS's own
-// variant inputs. Surrogate-key it so rollback can purge rather than wait.
-let mut insert = fastly::cache::core::insert(cache_key, template_ttl);
-insert.surrogate_keys([&surrogate_key_for_url, "ts-template"]);
-let mut body = insert.execute()?;
-// stream the lol_html output into `body`
+// WRONG — surrogate_keys consumes the builder and returns it; this discards the
+// return value and then uses a moved binding. And execute() gives a WRITE stream,
+// so there is nothing to read back from it.
+let mut insert = cache::core::insert(key, ttl);
+insert.surrogate_keys(["ts-template"]);
+let body = insert.execute()?;
 ```
 
-Use `cache::core::Transaction` with `must_insert()` for the lookup, so a cold cache under
-load transforms once rather than per concurrent request.
+Correct shape, using a transaction so a cold cache under load transforms once:
 
-**Cache key must include** everything the origin's `Vary` names — `rsc`,
+```rust
+use fastly::cache::core::{Transaction, CacheKey};
+
+let tx = Transaction::lookup(CacheKey::from(key_bytes)).execute()?;
+
+let template: Body = if let Some(found) = tx.found() {
+    found.to_body()                       // C2 HIT — skip origin fetch and transform
+} else if tx.must_insert_or_update() {
+    // C2 MISS. Fetch origin, transform, insert, and read our own bytes back in one
+    // pass: execute_and_stream_back gives both the write handle and a readable Found.
+    let (mut writer, found) = tx
+        .insert(template_ttl)
+        .surrogate_keys(["ts-template", &url_surrogate_key])   // chained, not discarded
+        .user_metadata(metadata_envelope)                       // see below
+        .execute_and_stream_back()?;
+    stream_lol_html_output_into(&mut writer)?;
+    writer.finish()?;                                           // REQUIRED
+    found.to_body()
+} else {
+    unreachable!("transaction must either find or be obliged to insert")
+};
+```
+
+`finish()` is not optional — without it the object never completes and its length stays
+unknown. On any transform error, **cancel rather than finish**, or a partial template is
+inserted and served to everyone until it expires.
+
+**`cache::core` carries no HTTP semantics.** Status, headers, content encoding, and
+revalidation are all yours. Serialize what you need into `user_metadata` — at minimum the
+content encoding, the transform schema version, and the origin `Vary` values the key was
+built from — and decide explicitly whether the stored template is compressed.
+
+**Cache key must include**, beyond the origin's declared `Vary` (`rsc`,
 `next-router-state-tree`, `next-router-prefetch`, `next-router-segment-prefetch`,
-`Accept-Encoding` (measured, see the Stage 0 findings) — **plus** TS's own per-variant
-inputs: request host and scheme, the enabled-integration set, and the tsjs content hash.
-Per-user signals must never appear in the key; they must be absent from the template
-instead. If a signal cannot be excluded from the template, it does not belong in C2.
+`Accept-Encoding` — measured, see the Stage 0 findings):
 
-Set `template_ttl` deliberately short for the spike. A short TTL bounds every failure mode
-here and costs only hit rate.
+- The full URL, explicitly. Do not rely on an ambient request key.
+- **The assembly mode.** A2 and A3 emit different template bytes and would otherwise
+  poison each other's entries.
+- **A template schema version**, bumped whenever the transform changes, so a deploy does
+  not read yesterday's shape.
+- Request host and scheme, the enabled-integration set, and the tsjs content hash.
 
-- [ ] **Step 4: Read it back and assemble**
+Per-user signals must never appear in the key. If a signal cannot be excluded from the
+template, it does not belong in C2 at all.
 
-On `found()`, skip the origin fetch and the transform entirely; hand the cached body to
-the assembler. On miss, transform and insert as above, then assemble from what was
-inserted.
+**Design choice to make explicitly before writing code.** Two viable shapes:
+
+1. **Read-through with `after_send` + `set_body_transform`** — keeps HTTP semantics,
+   revalidation, and stale handling for free; less control over the key.
+2. **`cache::core` as above** — full control; you own metadata, revalidation, and the
+   stale state machine.
+
+This plan assumes (2). If (1) is chosen, Step 4 is rewritten and the metadata envelope
+disappears. Either way, the platform boundary must sit **before** the origin request, or
+a C2 HIT cannot actually skip the fetch — which is the entire point.
 
 - [ ] **Step 5: Unit tests, then the target suite**
 
@@ -328,11 +442,18 @@ it is the difference between a correct response and a leaked one.
 
 ```rust
 let config = esi::Configuration::default()
-    .with_escaped(false);
-// default_dca and inherit_parent_dca stay at DcaMode::None / false — set them
-// explicitly rather than relying on defaults; this is a pre-1.0 crate and the
-// setting fails open.
+    .with_escaped(false)
+    .with_default_dca(esi::DcaMode::None)   // call the setter; do not rely on the default
+    .with_inherit_parent_dca(false);
 ```
+
+Comments are not configuration. An earlier draft said DCA "stays at its default" — on a
+pre-1.0 crate whose default could move in a patch release, and where this setting fails
+**open**, that is not good enough. Call the setters.
+
+Also disable **fragment caching** explicitly, or mark the include `no-store="on"`. A
+cached auction fragment is a per-user object in a shared cache — the C3 failure mode by
+another route.
 
 The dispatcher must be **exact-path allowlisted**: a fragment URL that is not the bids
 endpoint is refused, not fetched. The built-in dispatcher builds a dynamic backend per URL
@@ -343,20 +464,57 @@ recursive parse would let an SSP make the edge fetch an arbitrary URL. **Add a u
 that feeds `<esi:include src="http://attacker.example/">` through a creative payload and
 asserts no fetch is attempted.**
 
-- [ ] **Step 3: Deterministic synthetic fragment first**
+- [ ] **Step 3: The fragment must be a script, not the JSON endpoint**
 
-Before the real auction, point the include at a fixed-content endpoint. This separates
-"does the pipeline assemble correctly" from "does the auction behave," and the two fail
-very differently. Only once assembly is proven does the include move to
-`/_ts/page-bids`.
+**`/_ts/page-bids` cannot be the ESI target.** It returns
+`serde_json::json!({"slots":…, "bids":…})` (`publisher.rs:3987`), and ESI splices fragment
+bytes in literally — the page would contain raw JSON where an executable script belongs.
+Nothing would call `scheduleInitialAdInit`.
 
-- [ ] **Step 4: Handle the flush hazard**
+Add a **dedicated fragment endpoint** returning the executable script — the same shape
+`build_bids_script` produces today, plus the `adSlots` assignment that moved out of the
+template in Task 3 Step 2. Either that, or use the `esi` crate's fragment-response
+processor to wrap the JSON; the dedicated endpoint is simpler and easier to assert on.
+
+Three more things the naïve marker gets wrong:
+
+- **The same-origin gate will reject it.** `page_bids_request_allowed`
+  (`publisher.rs:3644`) requires `Sec-Fetch-Site: same-origin` or the `X-TSJS-Page-Bids`
+  header. An internal ESI subrequest carries neither. Give the fragment endpoint an
+  internal contract and a fixed backend rather than weakening that gate — it exists to
+  stop third parties burning SSP quota.
+- **Parent context does not propagate.** EC identity, consent state, client IP, geo, User
+  Agent, and the correlation ID all live on the parent request. Forward an **explicitly
+  approved allowlist** of them into the fragment request. Forwarding everything is how a
+  fragment ends up more privileged than the parent.
+- **Root dispatch must be suppressed.** The navigation path already dispatches an
+  auction. If A3 does not suppress it, every pageview runs two — doubling SSP and APS
+  spend. This applies to **A2 and A3 alike**.
+
+- [ ] **Step 4: Validate the whole URL, not the path**
+
+An exact-path allowlist alone permits `https://attacker.example/_ts/page-bids`. Validate
+**scheme, authority, method, path, and query** — or better, ignore the marker's URL
+entirely and dispatch to a fixed internal backend, treating the `esi:include` as a signal
+rather than an address.
+
+Add a test that feeds `<esi:include src="https://attacker.example/_ts/page-bids" />`
+through a creative payload and asserts no outbound fetch is attempted.
+
+- [ ] **Step 5: Deterministic synthetic fragment first**
+
+Before wiring the real auction, point the include at a fixed-content endpoint. This
+separates "does the pipeline assemble correctly" from "does the auction behave," and the
+two fail very differently. Only once assembly is proven does the fragment become the real
+one.
+
+- [ ] **Step 6: Handle the flush hazard**
 
 `esi` flushes its output writer after each parse batch. Fastly's `StreamingBody` is a
 `BufWriter`, so anything between esi and it must propagate `flush()` or nothing leaves the
 Wasm heap.
 
-- [ ] **Step 5: Fragment failure must degrade, not break**
+- [ ] **Step 7: Fragment failure must degrade, not break**
 
 Assert that a fragment timeout or non-2xx yields a page with empty bids rather than a 5xx
 or a truncated document. Note the crate's non-obvious semantics: `alt` is attempted before
@@ -385,9 +543,14 @@ Not a phase. Every one of these is a hard fail, independent of any performance r
       renders attributed. Use TS-attributed renders — the SSAT line item, non-empty
       `ts.bids`, `hb_adid` presence — **never slot fill**, which is blind to empty bids
       because `adInit` defines slots regardless.
-- [ ] **No C3.** Assert the final assembled response is never shared-cacheable: no
-      `public`, no `s-maxage`, no `Surrogate-Control` on a response carrying per-user
-      state.
+- [ ] **No C3 — assert positively, not by absence.** Forbidding `public`, `s-maxage`, and
+      `Surrogate-Control` is **not sufficient**: a bare `Cache-Control: max-age=60` passes
+      that check and is still shared-cacheable, and that is exactly what the measured
+      origin sends. Require instead that every assembled response carries
+      `Cache-Control: private, no-store` and that `Expires`, `ETag`, `Last-Modified`, and
+      all four CDN cache directives are stripped. Test it for **returning** users
+      specifically — they set no EC cookie, so the cookie privacy net never fires and is
+      not a backstop here.
 
 ---
 

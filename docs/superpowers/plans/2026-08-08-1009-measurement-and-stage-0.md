@@ -197,9 +197,9 @@ diff <(norm nc_a.html) <(norm ck.html) | head -20
 Send the `Host` override — the origin is a shared vhost and will not return the right
 document without it. Read it from `publisher.origin_host_header_override`.
 
-**Step A has already been run and passed.** See
-[the findings](./2026-08-08-1009-measurement-findings.md). Re-run only if the origin
-changes.
+**Step A has been run once and returned a PROVISIONAL PASS**, which is **not** sufficient
+to flip the flag. See [the findings](./2026-08-08-1009-measurement-findings.md) for the
+five untested conditions. Complete them and record a `FINAL PASS` before Task 5.
 
 Three failure shapes, any of which blocks Stage 0 independently of the `Vary` verdict:
 
@@ -750,11 +750,28 @@ git commit -m "Record server-side latency breakdown for #1009"
 
 ## Task 5: Stage 0 — turn the origin cache bypass off
 
-**Gate:** do not flip the flag until Task 1 has a recorded verdict.
+**Gate:** do not flip the flag until Task 1 has recorded a **`FINAL PASS`**. There are
+three verdicts, not two.
 
-- **PASS** → Task 5a (config flip).
-- **FAIL** → Task 5b. Do **not** flip on a FAIL; it can serve an RSC payload to an HTML
+- **`FINAL PASS`** → Task 5a (config flip).
+- **`PROVISIONAL PASS`** → **stop.** Not a release gate. This is the current state. It
+  means the representation split is declared correctly under the conditions tested, and
+  that those conditions were too narrow to flip production on.
+- **`FAIL`** → Task 5b. Do **not** flip; it can serve an RSC payload to an HTML
   navigation.
+
+**`FINAL PASS` requires all five, each recorded in the findings document:**
+
+| Condition                                                | Why the provisional run is insufficient              |
+| -------------------------------------------------------- | ---------------------------------------------------- |
+| A real authenticated or state-bearing session cookie     | `sessionid=abc123` is synthetic and proves nothing   |
+| Basic Auth exercised **through TS**, not just the origin | #1009 describes a gated deployment                   |
+| The experiment variant named in #1009                    | Absent from the origin's `Vary`; unexplained         |
+| Representative routes — article, section, search         | Only the homepage was probed                         |
+| Cached-hit slot and render attribution                   | The randomized div IDs are an unverified interaction |
+
+Any one of these unrecorded means the verdict stays `PROVISIONAL PASS` and Task 5 does
+not start.
 
 Because Task 3 made the bypass config-driven, Stage 0 ships as a **config change on an
 already-deployed build**. No second release, and rollback is another config push rather
@@ -982,8 +999,12 @@ Named so nobody widens this plan mid-flight. All are specified in the spec.
       N where applicable, and the consequence spelled out.
 - [ ] `publisher_timing` and `publisher_hold` lines are emitted in production and
       readable, and `hold_wait_ms` has a recorded median.
+- [ ] Task 1 recorded a **`FINAL PASS`** — all five conditions in Task 5's gate closed,
+      not merely the provisional run.
 - [ ] Either Task 5a is shipped, or Task 1 returned FAIL and both a production defect and
       a follow-up plan for 5b exist.
+- [ ] A purge path or versioned cache-key namespace exists **before** the flip, or the
+      "wait out the TTL" rollback is explicitly accepted and recorded as a risk.
 - [ ] **The win is measured client-side, not from `origin_fetch_ms`.** That figure is
       origin TTFB and excludes body download, rewrite, and post-processing — it is
       attribution, not the outcome. #1009 already has a working tester-cookie browser A/B
