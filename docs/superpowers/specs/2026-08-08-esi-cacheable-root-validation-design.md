@@ -1,4 +1,7 @@
-# ESI and the Cacheable Root
+# The Cacheable Root: Latency Diagnosis and Stage 0 Design
+
+_Filename retains its original `esi-` prefix; the commit history and every
+cross-reference point at it. The subject moved, the path did not._
 
 **Issue:** IABTechLab/trusted-server#1009 · **Date:** 2026-08-08 ·
 **Revised:** 2026-08-10
@@ -36,6 +39,22 @@
 > here is the latency re-diagnosis and the Stage 0 optimisation, which are worth doing
 > and are **not** an answer to #1009.
 
+## Document map — read this first
+
+#1009 is answered across three documents, not one. This is the only place that says
+which owns what.
+
+| Document                                                                 | Owns                                                                                                |
+| ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| **This spec**                                                            | Why the TTFB regression happens, what Stage 0 is and why, and the corrected ESI feasibility verdict |
+| [Stage 0 plan](../plans/2026-08-08-1009-measurement-and-stage-0.md)      | Implementing the measurement and the cache-bypass flag. **Does not close #1009.**                   |
+| [ESI validation spike](../plans/2026-08-10-1009-esi-validation-spike.md) | **Where #1009 is actually decided.** Four arms, safety gates, decision rule.                        |
+| [Findings](../plans/2026-08-08-1009-measurement-findings.md)             | Recorded results. Currently: Step A only, at `PROVISIONAL PASS`.                                    |
+
+**If you want the ESI answer**, it is [§2](#2-why--the-three-findings) for the verdict,
+[§6.6](#66-the-esi-pipeline-corrected) for the pipeline, and the spike plan for how it
+gets validated. Everything else here is Stage 0 and the latency analysis behind it.
+
 **Decision requested:** approve the four items in §1.
 
 > **Orientation.** #1009 asks whether Edge Side Includes (ESI) can cache page fragments
@@ -67,7 +86,7 @@
 | D1  | **ESI is feasible and unvalidated.** Validate it via [the spike plan](../plans/2026-08-10-1009-esi-validation-spike.md), not by deferring it.                                                                                               | Eng + product |
 | D2  | **Fund ~3 days of measurement** (§3). No dependencies. Can start immediately.                                                                                                                                                               | Eng           |
 | D3  | **Approve Stage 0** — an operator flag disabling the origin cache bypass, subject to a **`FINAL PASS`** in §3. A `Vary` check alone is a `PROVISIONAL PASS` and is not a release gate. Rollback needs a purge path, not only a config push. | Eng           |
-| D4  | **Stages 1–2 queue behind the SSAT price defect and #938.** Stages 3b–5 unscheduled.                                                                                                                                                        | Product       |
+| D4  | **Stages 1–2 queue behind the SSAT price defect and #938.** Stages 3b–4 unscheduled. ESI is not in this queue — see §7.                                                                                                                     | Product       |
 
 Rationale for D4 in [§8](#8-priority). Everything this document recommends _against_
 doing is in [§7](#7-deferred-work-specified-not-scheduled), at deliberately lower
@@ -501,7 +520,25 @@ This applies to any shared-template work, ESI or client-fill alike. The
 
 ## 7. Deferred work, specified not scheduled
 
-Lower detail is deliberate. Full specifications are in the appendices.
+**The full sequence, in one place.** Stage 0 is specified in [§4](#4-stage-0--the-only-build-item-recommended-now)
+rather than repeated here; everything below it is deferred.
+
+| Stage | What                                            | Status                                         |
+| ----- | ----------------------------------------------- | ---------------------------------------------- |
+| **0** | Operator flag disabling the origin cache bypass | Recommended now. Gated on a `FINAL PASS`. §4.  |
+| 1     | Bid delivery off the response body              | Deferred behind the correctness defects        |
+| 2     | Delete the `</body>` hold                       | Deferred; one-way, needs a Stage 1 soak        |
+| 3a    | Browser caching (`private, max-age` + `ETag`)   | Specified, low risk, unscheduled               |
+| 3b    | Shared cacheability                             | Blocked on geo suppression, `Vary`, and Step B |
+| 4     | Purge wiring                                    | Prerequisite for any TS-owned cache            |
+
+**ESI is not a stage here.** It was Stage 5 in an earlier revision, queued behind the
+rest. It no longer queues: it is feasible on the pinned SDK and is decided by
+[its own spike plan](../plans/2026-08-10-1009-esi-validation-spike.md), which runs
+independently of Stages 1–4. The shared template cache it needs is `fastly::cache::core`
+([§6.6](#66-the-esi-pipeline-corrected)), not a new service.
+
+Lower detail below is deliberate. Full specifications are in the appendices.
 
 **Stage 1 — bid delivery off the response body.** The client fetches `/_ts/page-bids` at
 navigation generation 0. Endpoint, same-origin gate, wire shape, and client consumer
@@ -557,12 +594,6 @@ the wrong surface: `InsertBuilder::surrogate_keys` is the Core Cache API and
 cache — not the HTTP read-through cache C1. This is **missing wiring, not a
 platform limit.** Until it exists,
 any TS-owned cache is TTL-only and a config push takes up to one TTL to take effect.
-
-**Stage 5 — ESI.** Superseded. ESI no longer waits on a "revival condition"; it is
-feasible on the pinned SDK and is validated by
-[its own spike plan](../plans/2026-08-10-1009-esi-validation-spike.md), which does not
-queue behind Stages 1–4. The shared template cache it needs is
-`fastly::cache::core` ([§6.6](#66-the-esi-pipeline-corrected)), not a new service.
 
 **Identity needs no work.** A new visitor's first navigation sets the EC cookie and the
 privacy net downgrades that one response; every later navigation sets no cookie and is
