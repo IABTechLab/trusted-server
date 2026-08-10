@@ -217,6 +217,66 @@ Compiling and a cache round-trip are not an implementation. Nothing yet exercise
 `lol_html` transform into C2, ESI assembly, or any runtime behaviour on the publisher path,
 and the `esi` dependency is added but unused.
 
+## ESI spike Task 3 — implementation progress
+
+**Date:** 2026-08-10. All of it behaviour-neutral under the default
+`AssemblyMode::Inline`; nothing here changes a shipped code path.
+
+| Step                             | State                                                               |
+| -------------------------------- | ------------------------------------------------------------------- |
+| 1 — `AssemblyMode` setting       | **Done.** `Option<AssemblyMode>` on `CreativeOpportunitiesConfig`.  |
+| 2 — head-seam neutrality gate    | **Done.** `template_ad_slots_script`, three byte-identity tests.    |
+| 2b — body-close decoupling       | **Done.** `BodyCloseInjection`, `body_close_injection`.             |
+| 2c — emit the marker under `Esi` | **Not done.** Blocked on the fragment endpoint; see below.          |
+| 3 — C2 eligibility gate          | **Done.** `c2_bypass_reason`, eight tests. Logs only, no cache I/O. |
+| 4 — C2 cache read/write          | **Not started.** Design choice open; see below.                     |
+
+### What is deliberately absent
+
+**No marker is emitted under `Esi`.** The marker must point at a fragment endpoint
+returning an **executable script**. `/_ts/page-bids` returns JSON
+(`publisher.rs`, `handle_page_bids`) and ESI splices fragment bytes verbatim, so aiming
+at it would put raw JSON where a script belongs. That endpoint does not exist, and a
+marker with nothing behind it is worse than no marker. A test pins the current answer so
+it changes deliberately.
+
+**No cache read or write.** `c2_bypass_reason` has a real call site that logs its verdict,
+which makes the decision observable during the spike without mutating anything. Task 3
+Step 4 is blocked on choosing between read-through-with-body-transform and explicit
+`cache::core` — the plan names that as a decision to make before writing code, and it is
+under investigation rather than assumed.
+
+### A defect this work introduced and then caught
+
+Gating the head seam on neutrality made `ad_slots_script` `None` under the shared modes.
+The body-close element handler read exactly that value to decide whether to inject at all,
+so shared modes silently stopped injecting anything at `</body>` — a side effect of a
+`<head>` change. Safe, since emitting nothing cannot leak, but wrong in the way the spec
+warns about: the gate has to be "did this response carry bids", not "does this page have
+slots".
+
+Found by reading the handler while starting the next step, not by a failing test. Fixed by
+replacing the inference with a named decision. The test that now guards it asserts
+body-close is identical whether or not the head script is present — a decision that read
+the head script would be _accidentally_ correct today, because that script is always
+absent under shared modes, and wrong the moment that changes.
+
+Worth recording because it is the same shape as the bug the whole task exists to prevent:
+something that looks correct and quietly does nothing.
+
+### Coverage and its limits
+
+Fourteen new tests. `fmt`, all six clippy targets, and all four adapter suites pass, with
+1850 core tests under Viceroy. `clippy --all-targets` caught a benchmark construction site
+that all four test suites missed — the suites are not the whole gate.
+
+**The neutrality guarantee is narrower than it looks.** The tests prove `tsjs.adSlots` is
+neutral. They say nothing about the other things injected at the same seam — integration
+`head_inserts`, the gpt-diagnostics bootstrap, the RSC placeholder rewriter — which the
+spec flags as needing an audit and which that audit has not yet covered. Until it does,
+treat request-neutrality as asserted for one element rather than established for the
+template.
+
 ## Step B — consumers of TS's own response headers
 
 Not yet run.
