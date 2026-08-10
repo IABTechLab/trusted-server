@@ -4,7 +4,7 @@ import path from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 
 import envelope from '../../fixtures/aps-renderer-v1.json';
-import type { TsjsApi } from '../../../src/core/types';
+import type { AuctionBidData, TsjsApi } from '../../../src/core/types';
 
 function apsRenderer() {
   const bid = envelope.seatbid[0].bid[0];
@@ -22,7 +22,6 @@ function apsRenderer() {
   };
 }
 
-import type { AuctionBidData, TsjsApi } from '../../../src/core/types';
 // Track every 'message' EventListener added to window across the entire test
 // file.  This lets the installTsRenderBridge suite remove all accumulated
 // handlers (registered by each vi.resetModules() + module re-import in the
