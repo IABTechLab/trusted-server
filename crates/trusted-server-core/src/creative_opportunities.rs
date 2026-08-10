@@ -183,6 +183,36 @@ fn derive_section(path: &str, section_root: &str, section_segment: usize) -> Str
     }
 }
 
+/// How per-user ad state reaches the page.
+///
+/// `Inline` is the shipped behaviour: the auction result is injected before
+/// `</body>` and the root document is therefore uncacheable. The other two serve
+/// a request-neutral shared template and fill the per-user holes afterwards —
+/// `ClientFill` from the browser, `Esi` at the edge.
+///
+/// Spike-only, for the #1009 ESI validation. Remove with the spike.
+///
+/// # Why the template must be request-neutral
+///
+/// Under `ClientFill` and `Esi` the template is shared across visitors, so
+/// nothing whose *presence* depends on the request may appear in it — not merely
+/// nothing whose *value* does. `tsjs.adSlots` is the trap: its content is derived
+/// from config and path, but whether it is emitted at all is gated on consent,
+/// bot classification, prefetch status and the auction kill switch. A template
+/// filled by the first request would freeze that request's decision for every
+/// later reader.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssemblyMode {
+    /// Inject bids inline before `</body>`. Root uncacheable. Shipped behaviour.
+    #[default]
+    Inline,
+    /// Serve a shared template; the browser fetches the per-user fragment.
+    ClientFill,
+    /// Serve a shared template; assemble the fragment at the edge with ESI.
+    Esi,
+}
+
 /// Top-level configuration for the creative opportunities system.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -244,9 +274,28 @@ pub struct CreativeOpportunitiesConfig {
     /// [`section_root`](Self::section_root) are omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section_segment: Option<usize>,
+    /// How per-user ad state reaches the page. Absent means
+    /// [`AssemblyMode::Inline`], the shipped behaviour.
+    ///
+    /// `Option` rather than a bare enum, and `skip_serializing_if`, deliberately:
+    /// these structs use `deny_unknown_fields`, so a pushed key makes an older
+    /// binary fail configuration load. Keeping it absent when unset means a
+    /// deployment that never sets it stays rollback-compatible.
+    ///
+    /// Spike-only. See [`AssemblyMode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assembly_mode: Option<AssemblyMode>,
     /// Slot templates. Empty vec = feature disabled (no auction fired, no globals injected).
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub slot: Vec<CreativeOpportunitySlot>,
+}
+
+impl CreativeOpportunitiesConfig {
+    /// Resolved assembly mode, defaulting to [`AssemblyMode::Inline`] when unset.
+    #[must_use]
+    pub fn assembly_mode(&self) -> AssemblyMode {
+        self.assembly_mode.unwrap_or_default()
+    }
 }
 
 impl CreativeOpportunitiesConfig {
@@ -1149,6 +1198,7 @@ mod tests {
             auction_timeout_ms: None,
             price_granularity: PriceGranularity::default(),
             section_root: section_root.map(str::to_string),
+            assembly_mode: None,
             section_segment: None,
             slot: vec![slot],
         }
@@ -1546,6 +1596,7 @@ mod tests {
             auction_timeout_ms: None,
             price_granularity: PriceGranularity::default(),
             section_root: None,
+            assembly_mode: None,
             section_segment: None,
             slot: Vec::new(),
         };
@@ -1821,6 +1872,68 @@ mod tests {
         assert!(
             serde_json::from_value::<ApsSlotParams>(aps_typo).is_err(),
             "unknown APS key should be rejected"
+        );
+    }
+
+    #[test]
+    fn assembly_mode_defaults_to_inline_when_absent() {
+        // Arrange: the minimal config an existing deployment would have.
+        let toml = r#"
+            gam_network_id = "99999"
+        "#;
+
+        // Act
+        let config: CreativeOpportunitiesConfig =
+            toml::from_str(toml).expect("should deserialize without assembly_mode");
+
+        // Assert
+        assert_eq!(
+            config.assembly_mode, None,
+            "an absent key should stay absent rather than materializing a value"
+        );
+        assert_eq!(
+            config.assembly_mode(),
+            AssemblyMode::Inline,
+            "should resolve to the shipped inline behaviour"
+        );
+    }
+
+    #[test]
+    fn assembly_mode_deserializes_each_variant() {
+        for (raw, expected) in [
+            ("inline", AssemblyMode::Inline),
+            ("client_fill", AssemblyMode::ClientFill),
+            ("esi", AssemblyMode::Esi),
+        ] {
+            let toml = format!(
+                r#"
+                    gam_network_id = "99999"
+                    assembly_mode = "{raw}"
+                "#
+            );
+            let config: CreativeOpportunitiesConfig =
+                toml::from_str(&toml).unwrap_or_else(|e| panic!("should parse {raw}: {e}"));
+            assert_eq!(
+                config.assembly_mode(),
+                expected,
+                "should resolve `{raw}` to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unset_assembly_mode_is_omitted_from_serialized_config() {
+        // `deny_unknown_fields` means a pushed key breaks config load on an older
+        // binary. A deployment that never sets this must not gain the key just by
+        // round-tripping through a newer one.
+        let config: CreativeOpportunitiesConfig =
+            toml::from_str("gam_network_id = \"99999\"").expect("should deserialize");
+
+        let serialized = toml::to_string(&config).expect("should serialize");
+
+        assert!(
+            !serialized.contains("assembly_mode"),
+            "unset assembly_mode must not be serialized, got:\n{serialized}"
         );
     }
 

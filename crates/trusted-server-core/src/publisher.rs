@@ -50,6 +50,7 @@ use crate::auction::types::{
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
+use crate::creative_opportunities::{AssemblyMode, CreativeOpportunitiesConfig};
 use crate::ec::EcContext;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::registry::PartnerRegistry;
@@ -2917,14 +2918,18 @@ pub async fn handle_publisher_request(
 
     crate::integrations::gpt_diagnostics::finalize_response(&gpt_diagnostics, &mut response);
 
-    let ad_slots_script = if should_run_ad_stack {
-        settings
-            .creative_opportunities
-            .as_ref()
-            .map(|co_config| build_ad_slots_script(&matched_slots, co_config, &request_path))
-    } else {
-        None
-    };
+    let assembly_mode = settings
+        .creative_opportunities
+        .as_ref()
+        .map(CreativeOpportunitiesConfig::assembly_mode)
+        .unwrap_or_default();
+    let ad_slots_script = template_ad_slots_script(
+        assembly_mode,
+        should_run_ad_stack,
+        settings,
+        &matched_slots,
+        &request_path,
+    );
 
     // §4.7: HTML with synthesized per-navigation auction state must not be
     // stored or validated as an origin representation. Strip both browser and
@@ -3555,6 +3560,45 @@ fn match_renderable_slots(
 ///
 /// Property names match what the client-side TSJS bundle expects:
 /// `gam_unit_path`, `div_id`, `formats`, and `targeting`.
+/// What the `<head>` seam injects, given the assembly mode.
+///
+/// Under [`AssemblyMode::Inline`] the response is per-navigation and not shared,
+/// so emitting `tsjs.adSlots` only when the ad stack runs is correct.
+///
+/// Under [`AssemblyMode::ClientFill`] and [`AssemblyMode::Esi`] the document is a
+/// **shared template**, and `should_run_ad_stack` is request-dependent — it folds
+/// in consent, bot classification, prefetch status and the auction kill switch.
+/// Emitting conditionally there would freeze the first-filling request's decision
+/// for every later reader of the cached object: a consent-denied fill would serve
+/// a no-ads template to consenting users, and a consenting fill would serve ad
+/// markup to someone who refused.
+///
+/// So those modes return [`None`] **unconditionally**, and `adSlots` moves to the
+/// per-request fragment alongside the bids. The head seam is not a template hole.
+///
+/// See `docs/superpowers/specs/2026-08-08-esi-cacheable-root-validation-design.md`
+/// §6.7.
+pub(crate) fn template_ad_slots_script(
+    mode: AssemblyMode,
+    should_run_ad_stack: bool,
+    settings: &Settings,
+    matched_slots: &[crate::creative_opportunities::CreativeOpportunitySlot],
+    request_path: &str,
+) -> Option<String> {
+    match mode {
+        AssemblyMode::ClientFill | AssemblyMode::Esi => None,
+        AssemblyMode::Inline => {
+            if !should_run_ad_stack {
+                return None;
+            }
+            settings
+                .creative_opportunities
+                .as_ref()
+                .map(|co_config| build_ad_slots_script(matched_slots, co_config, request_path))
+        }
+    }
+}
+
 pub(crate) fn build_ad_slots_script(
     matched_slots: &[crate::creative_opportunities::CreativeOpportunitySlot],
     co_config: &crate::creative_opportunities::CreativeOpportunitiesConfig,
@@ -4536,6 +4580,121 @@ mod tests {
         )
         .await
         .expect("should proxy publisher request")
+    }
+
+    mod template_neutrality_tests {
+        //! The gate for #1009's shared-template design.
+        //!
+        //! An "absence of per-user values" scan is not sufficient here: the bug
+        //! that nearly shipped was a *conditionally present* element whose own
+        //! content was per-URL. These tests assert byte-identity across requests
+        //! that differ only in the gating decision.
+
+        use super::*;
+        use crate::creative_opportunities::{
+            AssemblyMode, CreativeOpportunityFormat, CreativeOpportunitySlot,
+        };
+
+        fn slot() -> CreativeOpportunitySlot {
+            CreativeOpportunitySlot {
+                id: "atf".to_string(),
+                gam_unit_path: Some("/99999/example/home".to_string()),
+                div_id: Some("ad-atf".to_string()),
+                page_patterns: vec!["/**".to_string()],
+                formats: vec![CreativeOpportunityFormat {
+                    width: 300,
+                    height: 250,
+                    media_type: MediaType::Banner,
+                }],
+                floor_price: None,
+                targeting: Default::default(),
+                providers: Default::default(),
+                compiled_patterns: Vec::new(),
+                compiled_unit: None,
+            }
+        }
+
+        fn settings_with_slots() -> Settings {
+            let mut settings = crate::test_support::tests::create_test_settings();
+            // Construct the section rather than mutating it if present: the shared
+            // fixture does not carry `[creative_opportunities]`, and an `if let
+            // Some(..)` here would silently no-op and make the inline assertion
+            // below vacuous.
+            settings.creative_opportunities = Some(CreativeOpportunitiesConfig {
+                gam_network_id: "99999".to_string(),
+                auction_timeout_ms: Some(500),
+                price_granularity: Default::default(),
+                section_root: None,
+                assembly_mode: None,
+                section_segment: None,
+                slot: vec![slot()],
+            });
+            settings
+        }
+
+        #[test]
+        fn shared_modes_emit_no_head_script_regardless_of_the_gating_decision() {
+            let settings = settings_with_slots();
+            let slots = [slot()];
+
+            for mode in [AssemblyMode::ClientFill, AssemblyMode::Esi] {
+                let ran = template_ad_slots_script(mode, true, &settings, &slots, "/");
+                let did_not_run = template_ad_slots_script(mode, false, &settings, &slots, "/");
+
+                assert_eq!(
+                    ran, did_not_run,
+                    "{mode:?}: the template must be byte-identical whether or not the ad \
+                     stack ran; a cached object cannot carry one request's consent, bot, \
+                     prefetch or kill-switch decision"
+                );
+                assert_eq!(
+                    ran, None,
+                    "{mode:?}: adSlots belongs in the per-request fragment, not the template"
+                );
+            }
+        }
+
+        #[test]
+        fn inline_mode_keeps_its_request_dependent_behaviour() {
+            // Inline responses are per-navigation and never shared, so gating is
+            // correct there. This guards against "fixing" the shared-mode bug by
+            // breaking the shipped path.
+            let settings = settings_with_slots();
+            let slots = [slot()];
+
+            assert!(
+                template_ad_slots_script(AssemblyMode::Inline, true, &settings, &slots, "/")
+                    .is_some(),
+                "inline should emit adSlots when the ad stack runs"
+            );
+            assert_eq!(
+                template_ad_slots_script(AssemblyMode::Inline, false, &settings, &slots, "/"),
+                None,
+                "inline should emit nothing when the ad stack does not run"
+            );
+        }
+
+        #[test]
+        fn shared_modes_are_neutral_across_differing_slot_matches() {
+            // Slot matching folds in the request path. Under a shared mode even
+            // that must not reach the template.
+            let settings = settings_with_slots();
+
+            let matched = template_ad_slots_script(
+                AssemblyMode::Esi,
+                true,
+                &settings,
+                &[slot()],
+                "/news/article",
+            );
+            let unmatched =
+                template_ad_slots_script(AssemblyMode::Esi, true, &settings, &[], "/other");
+
+            assert_eq!(
+                matched, unmatched,
+                "the template must not vary with slot matching under a shared mode"
+            );
+        }
     }
 
     mod ssat_cache_policy_tests {
@@ -8127,6 +8286,7 @@ mod tests {
                 auction_timeout_ms: Some(500),
                 price_granularity: PriceGranularity::Dense,
                 section_root: None,
+                assembly_mode: None,
                 section_segment: None,
                 slot: Vec::new(),
             }
