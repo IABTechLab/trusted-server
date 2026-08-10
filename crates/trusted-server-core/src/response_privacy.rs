@@ -9,7 +9,7 @@
 //! cache such as Cloudflare would otherwise serve an operator/origin
 //! `Cache-Control: public` on a cookie-bearing response as-is.
 
-use edgezero_core::http::{HeaderName, HeaderValue, Response, header};
+use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Response, header};
 
 use crate::settings::Settings;
 
@@ -23,6 +23,25 @@ pub const CDN_CACHE_HEADERS: &[&str] = &[
     "cdn-cache-control",
     "cloudflare-cdn-cache-control",
 ];
+
+/// Whether `Cache-Control` already forbids shared caching.
+///
+/// Extracted because this predicate is needed in three places now: both arms of
+/// the cookie-privacy net below, and the shared-template cache gate in
+/// `publisher::c2_bypass_reason`.
+///
+/// Directives are case-insensitive (RFC 9111 §5.2), so `No-Store` and `Private`
+/// count. `no-cache` deliberately does **not**: it requires revalidation before
+/// reuse, not a refusal to store, so a `no-cache` response is still shareable.
+/// Callers needing the stricter reading must check it themselves.
+#[must_use]
+pub(crate) fn is_uncacheable_by_cache_control(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|v| v.contains("private") || v.contains("no-store"))
+}
 
 /// Forces cookie-bearing responses to stay private to shared caches.
 ///
@@ -44,14 +63,7 @@ pub fn enforce_set_cookie_cache_privacy(response: &mut Response) {
     for name in CDN_CACHE_HEADERS {
         response.headers_mut().remove(*name);
     }
-    // Cache-Control directives are case-insensitive (RFC 9111 §5.2), so match
-    // against a lowercased copy — `No-Store` / `Private` must count.
-    let already_uncacheable = response
-        .headers()
-        .get(header::CACHE_CONTROL)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|v| v.contains("private") || v.contains("no-store"));
+    let already_uncacheable = is_uncacheable_by_cache_control(response.headers());
     if !already_uncacheable {
         response.headers_mut().insert(
             header::CACHE_CONTROL,
@@ -77,12 +89,7 @@ pub fn enforce_set_cookie_cache_privacy(response: &mut Response) {
 pub fn apply_response_headers_with_cache_privacy(settings: &Settings, response: &mut Response) {
     enforce_set_cookie_cache_privacy(response);
 
-    let response_is_uncacheable = response
-        .headers()
-        .get(header::CACHE_CONTROL)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|v| v.contains("private") || v.contains("no-store"));
+    let response_is_uncacheable = is_uncacheable_by_cache_control(response.headers());
 
     for (key, value) in &settings.response_headers {
         if response_is_uncacheable

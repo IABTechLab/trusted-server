@@ -2830,6 +2830,11 @@ pub async fn handle_publisher_request(
         }
     );
 
+    // Recorded before the request is consumed by the origin send: the C2 gate
+    // below needs it, and an authorized response must never become a shared
+    // template.
+    let request_had_authorization = req.headers().contains_key(header::AUTHORIZATION);
+
     if should_run_ad_stack {
         req.headers_mut().remove(header::IF_NONE_MATCH);
         req.headers_mut().remove(header::IF_MODIFIED_SINCE);
@@ -2975,6 +2980,25 @@ pub async fn handle_publisher_request(
         .to_string();
 
     let status = response.status();
+
+    // Evaluate the shared-template cache gate and log it. No behaviour change yet:
+    // the C2 read/write lands in Task 3 Step 4, and under the default `Inline`
+    // mode this reports `InlineMode` and logs nothing. Wiring it now gives the
+    // gate a real call site and makes the decision observable during the spike
+    // rather than only at the point it starts mutating requests.
+    if !matches!(assembly_mode, AssemblyMode::Inline) {
+        match c2_bypass_reason(
+            assembly_mode,
+            request_had_authorization,
+            status,
+            &content_type,
+            response.headers(),
+        ) {
+            Some(reason) => log::debug!("c2_template_cache bypass: {reason}"),
+            None => log::debug!("c2_template_cache eligible"),
+        }
+    }
+
     let content_encoding = response
         .headers()
         .get(header::CONTENT_ENCODING)
@@ -3560,6 +3584,88 @@ fn match_renderable_slots(
 ///
 /// Property names match what the client-side TSJS bundle expects:
 /// `gam_unit_path`, `div_id`, `formats`, and `targeting`.
+/// Why a response must not enter the shared transformed-template cache (C2).
+///
+/// `cache::core` is not an HTTP cache: it stores whatever bytes it is handed and
+/// rejects nothing on its own. Every safety condition is the caller's to enforce,
+/// so they are enumerated here rather than left implicit.
+///
+/// Spike-only, for the #1009 ESI validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
+pub(crate) enum C2BypassReason {
+    /// Not a shared-template mode; there is no C2 object to write.
+    #[display("assembly mode is inline")]
+    InlineMode,
+    /// The origin set a cookie. Caching this would replay one visitor's cookie
+    /// to the next — and the cookie-privacy net downgrades *our* response, which
+    /// happens after the cache has already stored the origin's.
+    #[display("origin response carries Set-Cookie")]
+    OriginSetCookie,
+    /// The origin declared the response non-shareable.
+    #[display("origin marked the response private, no-store or no-cache")]
+    OriginNotShareable,
+    /// The request was authenticated. #1009 describes a Basic-Auth-gated
+    /// deployment, so an authorized response entering a shared cache is a live
+    /// concern rather than a hypothetical one.
+    #[display("request carried Authorization")]
+    AuthorizedRequest,
+    /// Not a 200. This is also what covers a `DataDome` block, which replaces the
+    /// document with a `403` (`integrations/datadome/protection.rs:778`).
+    #[display("status was not 200 OK")]
+    NonOkStatus,
+    /// Not HTML, so there is no template to transform.
+    #[display("content type is not text/html")]
+    NotHtml,
+}
+
+/// Whether a response may be written to the shared transformed-template cache.
+///
+/// Returns [`None`] when it is safe to cache, or the first disqualifying reason.
+/// Leak vectors are checked before mere ineligibility so the reported reason is
+/// the most serious one that applies.
+///
+/// See `docs/superpowers/specs/2026-08-08-esi-cacheable-root-validation-design.md`
+/// §6.6 for why C1, C2 and a final assembled-response cache are distinct, and why
+/// the third must never exist.
+pub(crate) fn c2_bypass_reason(
+    mode: AssemblyMode,
+    request_had_authorization: bool,
+    status: StatusCode,
+    content_type: &str,
+    response_headers: &edgezero_core::http::HeaderMap,
+) -> Option<C2BypassReason> {
+    if matches!(mode, AssemblyMode::Inline) {
+        return Some(C2BypassReason::InlineMode);
+    }
+    if request_had_authorization {
+        return Some(C2BypassReason::AuthorizedRequest);
+    }
+    if response_headers.contains_key(header::SET_COOKIE) {
+        return Some(C2BypassReason::OriginSetCookie);
+    }
+    // Reuse the cookie-privacy net's predicate rather than a third copy of it.
+    // That covers `private` and `no-store`; `no-cache` needs its own check
+    // because it means "revalidate before reuse", not "do not store" — a
+    // distinction that is correct for HTTP caches but too permissive for a
+    // spike-owned template cache, so treat it as disqualifying here.
+    let cache_control = response_headers
+        .get(header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_ascii_lowercase);
+    if crate::response_privacy::is_uncacheable_by_cache_control(response_headers)
+        || cache_control.is_some_and(|value| value.contains("no-cache"))
+    {
+        return Some(C2BypassReason::OriginNotShareable);
+    }
+    if status != StatusCode::OK {
+        return Some(C2BypassReason::NonOkStatus);
+    }
+    if !is_html_content_type(content_type) {
+        return Some(C2BypassReason::NotHtml);
+    }
+    None
+}
+
 /// What the `<head>` seam injects, given the assembly mode.
 ///
 /// Under [`AssemblyMode::Inline`] the response is per-navigation and not shared,
@@ -4580,6 +4686,167 @@ mod tests {
         )
         .await
         .expect("should proxy publisher request")
+    }
+
+    mod c2_gate_tests {
+        //! `cache::core` stores whatever it is handed and rejects nothing, so every
+        //! one of these conditions is the caller's to enforce. Each is a leak vector
+        //! or an eligibility rule, not a preference.
+
+        use super::*;
+        use crate::creative_opportunities::AssemblyMode;
+        use edgezero_core::http::HeaderName;
+
+        fn headers(pairs: &[(HeaderName, &str)]) -> edgezero_core::http::HeaderMap {
+            let mut map = edgezero_core::http::HeaderMap::new();
+            for (name, value) in pairs {
+                map.insert(
+                    name.clone(),
+                    HeaderValue::from_str(value).expect("should build header value"),
+                );
+            }
+            map
+        }
+
+        fn shareable() -> edgezero_core::http::HeaderMap {
+            headers(&[(header::CACHE_CONTROL, "max-age=60")])
+        }
+
+        #[test]
+        fn a_plain_shareable_html_200_is_cacheable() {
+            for mode in [AssemblyMode::ClientFill, AssemblyMode::Esi] {
+                assert_eq!(
+                    c2_bypass_reason(mode, false, StatusCode::OK, "text/html", &shareable()),
+                    None,
+                    "{mode:?}: a shareable HTML 200 should be eligible"
+                );
+            }
+        }
+
+        #[test]
+        fn inline_mode_never_writes_a_template() {
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Inline,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &shareable()
+                ),
+                Some(C2BypassReason::InlineMode),
+                "inline has no shared template to write"
+            );
+        }
+
+        #[test]
+        fn an_authorized_request_is_never_cached() {
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    true,
+                    StatusCode::OK,
+                    "text/html",
+                    &shareable()
+                ),
+                Some(C2BypassReason::AuthorizedRequest),
+                "an authenticated response must not enter a shared cache"
+            );
+        }
+
+        #[test]
+        fn an_origin_set_cookie_is_never_cached() {
+            let with_cookie = headers(&[
+                (header::CACHE_CONTROL, "max-age=60"),
+                (header::SET_COOKIE, "sid=abc; Path=/"),
+            ]);
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &with_cookie
+                ),
+                Some(C2BypassReason::OriginSetCookie),
+                "caching this would replay one visitor's cookie to the next"
+            );
+        }
+
+        #[test]
+        fn non_shareable_cache_control_is_refused_case_insensitively() {
+            for directive in [
+                "private",
+                "no-store",
+                "no-cache",
+                "Private, max-age=60",
+                "NO-STORE",
+                "public, No-Cache",
+            ] {
+                let map = headers(&[(header::CACHE_CONTROL, directive)]);
+                assert_eq!(
+                    c2_bypass_reason(AssemblyMode::Esi, false, StatusCode::OK, "text/html", &map),
+                    Some(C2BypassReason::OriginNotShareable),
+                    "`{directive}` should disqualify the response"
+                );
+            }
+        }
+
+        #[test]
+        fn a_datadome_block_is_refused_by_the_status_check() {
+            // DataDome replaces the document with a 403
+            // (`integrations/datadome/protection.rs:778`). There is no separate
+            // marker to detect, and none is needed.
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    StatusCode::FORBIDDEN,
+                    "text/html",
+                    &shareable()
+                ),
+                Some(C2BypassReason::NonOkStatus),
+                "a blocked document must not become the shared template"
+            );
+        }
+
+        #[test]
+        fn non_html_is_refused() {
+            for content_type in ["text/x-component", "application/json", ""] {
+                assert_eq!(
+                    c2_bypass_reason(
+                        AssemblyMode::Esi,
+                        false,
+                        StatusCode::OK,
+                        content_type,
+                        &shareable()
+                    ),
+                    Some(C2BypassReason::NotHtml),
+                    "`{content_type}` has no HTML template to transform"
+                );
+            }
+        }
+
+        #[test]
+        fn leak_vectors_are_reported_before_mere_ineligibility() {
+            // A response that fails several conditions should name the most serious
+            // one, so an operator reading the log sees the security reason rather
+            // than a content-type quibble.
+            let map = headers(&[
+                (header::CACHE_CONTROL, "private"),
+                (header::SET_COOKIE, "sid=abc"),
+            ]);
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    true,
+                    StatusCode::FORBIDDEN,
+                    "application/json",
+                    &map
+                ),
+                Some(C2BypassReason::AuthorizedRequest),
+                "authorization is the most serious disqualifier and should win"
+            );
+        }
     }
 
     mod template_neutrality_tests {
