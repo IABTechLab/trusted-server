@@ -6068,6 +6068,70 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_transform_that_overruns_its_buffer_stores_nothing() {
+            // The 16 MB cap in production, shrunk here. A partial template in C2 is the
+            // worst outcome available: it would be served to every subsequent visitor as
+            // a truncated document, indefinitely, with no error after the first request.
+            //
+            // Safe by construction — the cap error propagates before the store runs — but
+            // "by construction" is exactly the kind of claim that stops being true after
+            // an unrelated refactor moves one line.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let mut raw = settings_with_mode("esi");
+            raw.publisher.max_buffered_body_bytes = 8;
+            let settings = Arc::new(raw);
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+
+            let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let consent = crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            };
+            let mut ec_context = EcContext::new_for_test(None, consent);
+            let publisher_response = handle_publisher_request(
+                &settings,
+                &services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &[article_slot()],
+                    registry: None,
+                },
+                navigation_request(),
+            )
+            .await
+            .expect("the request itself should succeed; the cap trips during streaming");
+
+            let result = publisher_response_into_streaming_response(
+                publisher_response,
+                &Method::GET,
+                Arc::clone(&settings),
+                &registry,
+                orchestrator,
+                services.clone(),
+            )
+            .await;
+
+            assert!(
+                result.is_err(),
+                "overrunning the buffer must fail rather than truncate"
+            );
+            assert!(
+                cache
+                    .entries
+                    .lock()
+                    .expect("should lock entries")
+                    .is_empty(),
+                "a failed transform must leave nothing in the shared cache"
+            );
+        }
+
+        #[tokio::test]
         async fn a_cache_hit_is_never_shared_cacheable() {
             // Asserted positively, because the obvious negative check does not work.
             // Forbidding `public`, `s-maxage` and `Surrogate-Control` passes trivially
@@ -6131,6 +6195,147 @@ mod tests {
                 header_of(&warm, header::CACHE_CONTROL),
                 Some("private, no-store")
             );
+        }
+
+        /// Geo that reports a fixed, recognizable location.
+        ///
+        /// A distinct value per synthetic user, so a geo leak into the template shows up
+        /// as a substring rather than requiring inference.
+        struct StubGeo(&'static str);
+
+        impl crate::platform::PlatformGeo for StubGeo {
+            fn lookup(
+                &self,
+                _client_ip: Option<std::net::IpAddr>,
+            ) -> Result<Option<GeoInfo>, Report<crate::platform::PlatformError>> {
+                Ok(Some(GeoInfo {
+                    city: self.0.to_string(),
+                    country: self.0.to_string(),
+                    continent: self.0.to_string(),
+                    latitude: 1.0,
+                    longitude: 2.0,
+                    metro_code: 3,
+                    region: Some(self.0.to_string()),
+                    asn: Some(4),
+                }))
+            }
+        }
+
+        /// One synthetic user: an identity, a consent posture, and a location.
+        struct SyntheticUser {
+            ec_id: &'static str,
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction,
+            geo_marker: &'static str,
+        }
+
+        /// Runs one synthetic user against a fresh cache and returns the stored template.
+        ///
+        /// Fresh cache per user deliberately: the point is to compare what each *would*
+        /// store, so sharing a cache would let the first user's entry answer for the
+        /// second and the comparison would prove nothing.
+        async fn stored_template_for(user: &SyntheticUser) -> Vec<u8> {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = RuntimeServices::builder()
+                .config_store(Arc::new(NoopConfigStore))
+                .secret_store(Arc::new(NoopSecretStore))
+                .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+                .backend(Arc::new(StubBackend))
+                .http_client(Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>)
+                .geo(Arc::new(StubGeo(user.geo_marker)))
+                .client_info(ClientInfo::default())
+                .template_cache(
+                    Arc::clone(&cache) as Arc<dyn crate::platform::PlatformTemplateCache>
+                )
+                .template_assembler(Arc::new(SubstitutingAssembler))
+                .build();
+            queue_shareable_html(&stub);
+
+            let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let consent = crate::consent::ConsentContext {
+                jurisdiction: user.jurisdiction.clone(),
+                ..Default::default()
+            };
+            let mut ec_context = EcContext::new_for_test(Some(user.ec_id.to_string()), consent);
+            let publisher_response = handle_publisher_request(
+                &settings,
+                &services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &[article_slot()],
+                    registry: None,
+                },
+                navigation_request(),
+            )
+            .await
+            .expect("should proxy publisher request");
+            let _ = publisher_response_into_streaming_response(
+                publisher_response,
+                &Method::GET,
+                Arc::clone(&settings),
+                &registry,
+                orchestrator,
+                services.clone(),
+            )
+            .await
+            .expect("should finalize publisher response");
+
+            let entries = cache.entries.lock().expect("should lock entries");
+            entries
+                .values()
+                .next()
+                .expect("a template should have been stored")
+                .body
+                .clone()
+        }
+
+        #[tokio::test]
+        async fn two_users_differing_in_identity_consent_and_geo_store_the_same_template() {
+            // The gate the whole design rests on. The template is shared between
+            // visitors, so anything request-scoped that reaches it is one visitor's data
+            // served to the next. Byte-identity is the assertion because it does not
+            // depend on guessing which field might leak.
+            let alice = SyntheticUser {
+                ec_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.alice1",
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                geo_marker: "AliceCity",
+            };
+            let bob = SyntheticUser {
+                ec_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.bobbb1",
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::Gdpr,
+                geo_marker: "BobCity",
+            };
+
+            let alice_template = stored_template_for(&alice).await;
+            let bob_template = stored_template_for(&bob).await;
+
+            assert_eq!(
+                alice_template, bob_template,
+                "two users differing in identity, consent and geo must produce the same \
+                 shared template"
+            );
+
+            // Belt and braces: byte-identity would also hold if *both* templates leaked
+            // the same wrong thing, so name the values that must be absent.
+            let template = String::from_utf8(alice_template).expect("template should be utf-8");
+            for forbidden in [
+                alice.ec_id,
+                bob.ec_id,
+                alice.geo_marker,
+                bob.geo_marker,
+                "adSlots",
+                "window.tsjs",
+            ] {
+                assert!(
+                    !template.contains(forbidden),
+                    "`{forbidden}` must not appear in a shared template: {template}"
+                );
+            }
         }
 
         #[tokio::test]

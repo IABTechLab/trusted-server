@@ -270,6 +270,34 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_but_present_entry_reads_as_a_miss_rather_than_being_served() {
+        // Stale-while-revalidate is a real option and deliberately not taken: it is a
+        // state machine `cache::core` does not implement for you, and serving stale here
+        // means serving a template built by an older transform or an older JS bundle.
+        //
+        // The entry has to be *present and stale*, not merely expired. A zero TTL with no
+        // `stale_while_revalidate` window is simply absent, so a test written that way
+        // passes without ever reaching `is_stale()` — verified: reverting the staleness
+        // check left that version green. The revalidate window is what keeps the object
+        // readable while stale, so this actually exercises the branch.
+        let key = key("https://example.com/stale");
+        let body = b"stale-template".to_vec();
+        let metadata = metadata_for(&body);
+        let cache_key = CacheKey::from(key.to_cache_key().into_bytes());
+
+        let mut writer = fastly::cache::core::insert(cache_key, Duration::from_secs(0))
+            .stale_while_revalidate(Duration::from_secs(60))
+            .user_metadata(metadata.encode().into())
+            .execute()
+            .expect("should begin insert");
+        writer.write_all(&body).expect("should write body");
+        writer.finish().expect("should finish insert");
+
+        let miss = run(cache().get(&key)).expect_err("a stale template must not be served");
+        assert_eq!(miss, TemplateCacheMiss::NotFound);
+    }
+
+    #[test]
     fn purge_all_clears_stored_templates() {
         // The rollback lever. Without this, backing out a bad template means waiting
         // for the TTL.
