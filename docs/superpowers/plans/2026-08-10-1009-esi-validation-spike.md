@@ -546,6 +546,32 @@ Viceroy supports `WriteOptions.vary_rule`, so the mechanism exists; the gate has
 it. Until then the key is missing a signal the origin explicitly declares, and Step A's
 verdict is a `PROVISIONAL PASS`, not a release gate.
 
+**Resolved — `VarySpec`, commit `b688d667`.** Building the key exposed a problem this
+plan states but does not solve: the key must cover everything the origin varies on, but
+**a lookup happens before the fetch**, so on a cold key the origin's `Vary` is not yet
+known. Three ways out — configure the list; two-phase lookup against a URL-keyed record
+holding the last-seen `Vary`; or store the list alongside and re-key on mismatch. The
+latter two are correct and double the lookups on every request.
+
+Configured is taken, **as a spike-grade choice rather than a production one**: Step A
+already measured the origin's actual `Vary`, and a 60s TTL bounds drift to a minute
+rather than indefinitely.
+
+The drift is guarded rather than merely accepted. `VarySpec::uncovered_by` runs _after_
+the origin responds, when its `Vary` is finally known, and names which headers the
+configured spec missed. A template built under a key that did not cover something the
+origin varies on **must not be stored** — a request differing only in that header would
+read it. Naming the specific headers makes a stale config identifiable instead of
+producing a generic refusal.
+
+Two decisions worth their tests. An absent header and a present-but-empty one key the
+same, because the origin sees no difference between them. And `Vary: *` is not reported
+as a named gap — it means uncacheable, which the eligibility gate handles, and reporting
+it would produce a nonsense instruction to configure a header called `*`.
+
+Still open: wiring `uncovered_by` into `c2_bypass_reason` as a bypass reason, which
+happens with the store call site.
+
 **Store bytes plus a metadata envelope; rebuild every header on a hit.** The publisher
 path forces `private, no-store` and strips `ETag`/`Last-Modified`/CDN headers _after_ the
 send. Replaying stored origin headers would fight that. Store only the transformed body

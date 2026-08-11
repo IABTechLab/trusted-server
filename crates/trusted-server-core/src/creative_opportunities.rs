@@ -285,6 +285,21 @@ pub struct CreativeOpportunitiesConfig {
     /// Spike-only. See [`AssemblyMode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assembly_mode: Option<AssemblyMode>,
+    /// Request headers the origin varies on, which the shared-template cache key must
+    /// cover.
+    ///
+    /// Operator-stated because a cache **lookup happens before the fetch**, so on a cold
+    /// key the origin's `Vary` is not yet known. See `VarySpec` for why the alternatives
+    /// (two-phase lookup, or storing the list and re-keying) were not taken.
+    ///
+    /// **Unset or empty means nothing is covered, so any origin `Vary` disqualifies the
+    /// response and no template is ever cached.** That is the intended default: a
+    /// deployment that has not stated what its origin varies on must not get a shared
+    /// cache by omission.
+    ///
+    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_cache_vary: Option<Vec<String>>,
     /// Slot templates. Empty vec = feature disabled (no auction fired, no globals injected).
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub slot: Vec<CreativeOpportunitySlot>,
@@ -295,6 +310,16 @@ impl CreativeOpportunitiesConfig {
     #[must_use]
     pub fn assembly_mode(&self) -> AssemblyMode {
         self.assembly_mode.unwrap_or_default()
+    }
+
+    /// Headers the cache key covers, per operator config.
+    ///
+    /// Unset yields an empty spec, which covers nothing — so any origin `Vary` reads as
+    /// a gap and the response is never cached. Failing closed is deliberate: an
+    /// unconfigured deployment should not acquire a shared cache silently.
+    #[must_use]
+    pub fn template_cache_vary(&self) -> crate::platform::VarySpec {
+        crate::platform::VarySpec::new(self.template_cache_vary.clone().unwrap_or_default())
     }
 }
 
@@ -1199,6 +1224,7 @@ mod tests {
             price_granularity: PriceGranularity::default(),
             section_root: section_root.map(str::to_string),
             assembly_mode: None,
+            template_cache_vary: None,
             section_segment: None,
             slot: vec![slot],
         }
@@ -1597,6 +1623,7 @@ mod tests {
             price_granularity: PriceGranularity::default(),
             section_root: None,
             assembly_mode: None,
+            template_cache_vary: None,
             section_segment: None,
             slot: Vec::new(),
         };

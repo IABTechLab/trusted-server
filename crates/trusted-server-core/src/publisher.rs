@@ -58,7 +58,9 @@ use crate::error::TrustedServerError;
 use crate::html_processor::BodyCloseInjection;
 use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
 use crate::integrations::IntegrationRegistry;
-use crate::platform::{GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
+use crate::platform::{
+    GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices, VarySpec,
+};
 use crate::price_bucket::{PriceGranularity, price_bucket};
 use crate::response_privacy::CDN_CACHE_HEADERS;
 use crate::rsc_flight::RscFlightUrlRewriter;
@@ -3096,6 +3098,11 @@ pub async fn handle_publisher_request(
             status,
             &content_type,
             response.headers(),
+            &settings
+                .creative_opportunities
+                .as_ref()
+                .map(CreativeOpportunitiesConfig::template_cache_vary)
+                .unwrap_or_else(|| VarySpec::new([])),
         ) {
             Some(reason) => log::debug!("c2_template_cache bypass: {reason}"),
             None => log::debug!("c2_template_cache eligible"),
@@ -3694,7 +3701,7 @@ fn match_renderable_slots(
 /// so they are enumerated here rather than left implicit.
 ///
 /// Spike-only, for the #1009 ESI validation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
+#[derive(Debug, Clone, PartialEq, Eq, derive_more::Display)]
 pub(crate) enum C2BypassReason {
     /// Not a shared-template mode; there is no C2 object to write.
     #[display("assembly mode is inline")]
@@ -3728,6 +3735,32 @@ pub(crate) enum C2BypassReason {
     /// it.
     #[display("request carried Cookie and the origin's Vary does not cover it")]
     CookieForwarded,
+    /// The origin varies on a header the cache key does not cover.
+    ///
+    /// The key is built *before* the fetch from a configured [`VarySpec`], because a
+    /// lookup cannot know what the origin varies on until it has responded. That makes
+    /// the configured list capable of going stale. This is the guard: once the origin's
+    /// `Vary` is finally known, a template whose key missed one of its headers must not
+    /// be stored, because a request differing only in that header would read it.
+    ///
+    /// Carries the uncovered header names rather than a bare flag, so a stale config is
+    /// identifiable from the log line instead of requiring a bisect.
+    #[display("origin varies on {_0}, which the cache key does not cover")]
+    VaryNotCovered(VaryGap),
+}
+
+/// The header names an origin's `Vary` named that the cache key did not cover.
+///
+/// A newtype rather than a bare `Vec<String>` so [`C2BypassReason`] stays `Display`-able
+/// as one line, and so the empty case is unrepresentable at the call site — an empty gap
+/// is not a bypass, it is a pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VaryGap(Vec<String>);
+
+impl core::fmt::Display for VaryGap {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0.join(", "))
+    }
 }
 
 /// Whether a response may be written to the shared transformed-template cache.
@@ -3746,6 +3779,7 @@ pub(crate) fn c2_bypass_reason(
     status: StatusCode,
     content_type: &str,
     response_headers: &edgezero_core::http::HeaderMap,
+    key_vary: &VarySpec,
 ) -> Option<C2BypassReason> {
     if matches!(mode, AssemblyMode::Inline) {
         return Some(C2BypassReason::InlineMode);
@@ -3758,6 +3792,18 @@ pub(crate) fn c2_bypass_reason(
     }
     if response_headers.contains_key(header::SET_COOKIE) {
         return Some(C2BypassReason::OriginSetCookie);
+    }
+    // Checked here, among the leak vectors, because storing under a key that does not
+    // cover the origin's Vary is cross-serving rather than mere ineligibility: a request
+    // differing only in the uncovered header would read this template.
+    let uncovered = key_vary.uncovered_by(
+        response_headers
+            .get_all(header::VARY)
+            .iter()
+            .filter_map(|value| value.to_str().ok()),
+    );
+    if !uncovered.is_empty() {
+        return Some(C2BypassReason::VaryNotCovered(VaryGap(uncovered)));
     }
     // One pass over the header. `private` and `no-store` match the cookie-privacy
     // net's reading; `no-cache` is added because it means "revalidate before reuse"
@@ -5106,6 +5152,114 @@ mod tests {
             headers(&[(header::CACHE_CONTROL, "max-age=60")])
         }
 
+        /// The shipped default: no operator has stated what the origin varies on, so the
+        /// key covers nothing. Responses without a `Vary` are unaffected; any `Vary` at
+        /// all disqualifies.
+        fn nothing_covered() -> VarySpec {
+            VarySpec::new([])
+        }
+
+        #[test]
+        fn an_unconfigured_deployment_never_caches_a_varying_response() {
+            // The fail-closed default. An operator who has not stated the origin's Vary
+            // must not acquire a shared cache by omission — and a real origin varies on
+            // something, so this is the common path, not an edge case.
+            let mut varying = shareable();
+            varying.insert(header::VARY, HeaderValue::from_static("accept-encoding"));
+
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &varying,
+                    &nothing_covered(),
+                ),
+                Some(C2BypassReason::VaryNotCovered(VaryGap(vec![
+                    "accept-encoding".to_string()
+                ]))),
+                "an unstated Vary must disqualify rather than silently under-key"
+            );
+        }
+
+        #[test]
+        fn a_fully_covered_vary_is_cacheable() {
+            let mut varying = shareable();
+            varying.insert(
+                header::VARY,
+                HeaderValue::from_static("rsc, Accept-Encoding"),
+            );
+
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &varying,
+                    &VarySpec::new(["rsc".to_string(), "accept-encoding".to_string()]),
+                ),
+                None,
+                "a key covering everything the origin varies on is safe to store"
+            );
+        }
+
+        #[test]
+        fn config_drift_names_the_missing_header() {
+            // The failure this guards: the origin adds a header to its Vary, nobody
+            // updates config, and requests differing only in that header start sharing a
+            // template. The reason must name it, or diagnosing means a bisect.
+            let mut varying = shareable();
+            varying.insert(
+                header::VARY,
+                HeaderValue::from_static("rsc, next-router-prefetch"),
+            );
+
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &varying,
+                    &VarySpec::new(["rsc".to_string()]),
+                ),
+                Some(C2BypassReason::VaryNotCovered(VaryGap(vec![
+                    "next-router-prefetch".to_string()
+                ]))),
+                "the uncovered header must be named"
+            );
+        }
+
+        #[test]
+        fn a_vary_split_across_repeated_headers_is_still_checked() {
+            // Vary is a list header, so an origin may send it once or many times. Reading
+            // only the first would let the rest through unkeyed.
+            let mut varying = shareable();
+            varying.append(header::VARY, HeaderValue::from_static("rsc"));
+            varying.append(header::VARY, HeaderValue::from_static("cookie"));
+
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &varying,
+                    &VarySpec::new(["rsc".to_string()]),
+                ),
+                Some(C2BypassReason::VaryNotCovered(VaryGap(vec![
+                    "cookie".to_string()
+                ]))),
+                "a repeated Vary header must not hide names behind the first value"
+            );
+        }
+
         #[test]
         fn a_plain_shareable_html_200_is_cacheable() {
             for mode in [AssemblyMode::ClientFill, AssemblyMode::Esi] {
@@ -5116,7 +5270,8 @@ mod tests {
                         false,
                         StatusCode::OK,
                         "text/html",
-                        &shareable()
+                        &shareable(),
+                        &nothing_covered(),
                     ),
                     None,
                     "{mode:?}: a shareable HTML 200 should be eligible"
@@ -5133,7 +5288,8 @@ mod tests {
                     false,
                     StatusCode::OK,
                     "text/html",
-                    &shareable()
+                    &shareable(),
+                    &nothing_covered(),
                 ),
                 Some(C2BypassReason::InlineMode),
                 "inline has no shared template to write"
@@ -5149,7 +5305,8 @@ mod tests {
                     false,
                     StatusCode::OK,
                     "text/html",
-                    &shareable()
+                    &shareable(),
+                    &nothing_covered(),
                 ),
                 Some(C2BypassReason::AuthorizedRequest),
                 "an authenticated response must not enter a shared cache"
@@ -5170,7 +5327,8 @@ mod tests {
                     true,
                     StatusCode::OK,
                     "text/html",
-                    &no_cache_control
+                    &no_cache_control,
+                    &nothing_covered(),
                 ),
                 Some(C2BypassReason::CookieForwarded),
                 "cookie-personalized HTML must not become a shared template"
@@ -5190,7 +5348,8 @@ mod tests {
                     false,
                     StatusCode::OK,
                     "text/html",
-                    &with_cookie
+                    &with_cookie,
+                    &nothing_covered(),
                 ),
                 Some(C2BypassReason::OriginSetCookie),
                 "caching this would replay one visitor's cookie to the next"
@@ -5215,7 +5374,8 @@ mod tests {
                         false,
                         StatusCode::OK,
                         "text/html",
-                        &map
+                        &map,
+                        &nothing_covered(),
                     ),
                     Some(C2BypassReason::OriginNotShareable),
                     "`{directive}` should disqualify the response"
@@ -5235,7 +5395,8 @@ mod tests {
                     false,
                     StatusCode::FORBIDDEN,
                     "text/html",
-                    &shareable()
+                    &shareable(),
+                    &nothing_covered(),
                 ),
                 Some(C2BypassReason::NonOkStatus),
                 "a blocked document must not become the shared template"
@@ -5252,7 +5413,8 @@ mod tests {
                         false,
                         StatusCode::OK,
                         content_type,
-                        &shareable()
+                        &shareable(),
+                        &nothing_covered(),
                     ),
                     Some(C2BypassReason::NotHtml),
                     "`{content_type}` has no HTML template to transform"
@@ -5276,7 +5438,8 @@ mod tests {
                     false,
                     StatusCode::FORBIDDEN,
                     "application/json",
-                    &map
+                    &map,
+                    &nothing_covered(),
                 ),
                 Some(C2BypassReason::AuthorizedRequest),
                 "authorization is the most serious disqualifier and should win"
@@ -5328,6 +5491,7 @@ mod tests {
                 price_granularity: Default::default(),
                 section_root: None,
                 assembly_mode: None,
+                template_cache_vary: None,
                 section_segment: None,
                 slot: vec![slot()],
             });
@@ -8989,6 +9153,7 @@ mod tests {
                 price_granularity: PriceGranularity::Dense,
                 section_root: None,
                 assembly_mode: None,
+                template_cache_vary: None,
                 section_segment: None,
                 slot: Vec::new(),
             }
