@@ -193,6 +193,7 @@ mod tests {
 
     fn metadata_for(body: &[u8]) -> TemplateMetadata {
         TemplateMetadata {
+            policy_headers: Vec::new(),
             content_encoding: "identity".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
             schema_version: TEMPLATE_SCHEMA_VERSION,

@@ -143,6 +143,23 @@ fn surrogate_safe(url: &str) -> String {
         .collect()
 }
 
+/// Origin response headers safe to store with a shared template and replay on a hit.
+///
+/// Every one is a per-URL policy statement, identical for every reader. Nothing
+/// per-reader (`Set-Cookie`) and nothing cache-controlling (`Cache-Control`, `ETag`,
+/// `Surrogate-Control`) appears here, and it is an allowlist so a new origin header is
+/// excluded until someone decides otherwise.
+pub const REPLAYABLE_POLICY_HEADERS: &[&str] = &[
+    "content-security-policy",
+    "content-security-policy-report-only",
+    "permissions-policy",
+    "referrer-policy",
+    "x-frame-options",
+    "x-content-type-options",
+    "content-language",
+    "x-robots-tag",
+];
+
 /// Headers the key covers by construction, whatever the operator configured.
 ///
 /// `Accept-Encoding` has a dedicated key field ([`TemplateCacheKey::accept_encoding`]),
@@ -265,6 +282,16 @@ pub struct TemplateMetadata {
     /// checking it on read makes a truncated entry a miss instead of a silently
     /// short template that would assemble into a broken page.
     pub body_len: u64,
+    /// Origin response headers that are policy, not per-reader state.
+    ///
+    /// Reconstructing headers from scratch on a hit keeps origin `Set-Cookie` and caching
+    /// directives out of a shared cache — but it also dropped `Content-Security-Policy`,
+    /// framing protection and `Content-Language`, weakening the page. These are
+    /// per-URL and identical for every reader, so they belong with the template.
+    ///
+    /// Deliberately an allowlist: anything per-reader or cache-controlling is excluded by
+    /// construction rather than by remembering to strip it.
+    pub policy_headers: Vec<(String, String)>,
 }
 
 impl TemplateMetadata {
@@ -273,11 +300,16 @@ impl TemplateMetadata {
     /// unambiguous.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        format!(
+        let mut out = format!(
             "v={}\nce={}\nct={}\nlen={}",
             self.schema_version, self.content_encoding, self.content_type, self.body_len
-        )
-        .into_bytes()
+        );
+        for (name, value) in &self.policy_headers {
+            // Header values cannot contain newlines (the HTTP parser rejects them), so a
+            // newline-delimited encoding cannot be broken by a header value.
+            out.push_str(&format!("\nh={name}:{value}"));
+        }
+        out.into_bytes()
     }
 
     /// Parse `user_metadata`. Returns `None` on anything unexpected, which callers
@@ -286,6 +318,7 @@ impl TemplateMetadata {
     pub fn decode(raw: &[u8]) -> Option<Self> {
         let text = core::str::from_utf8(raw).ok()?;
         let mut schema_version = None;
+        let mut policy_headers = Vec::new();
         let mut content_encoding = None;
         let mut content_type = None;
         let mut body_len = None;
@@ -294,6 +327,11 @@ impl TemplateMetadata {
             match key {
                 "v" => schema_version = Some(value.parse().ok()?),
                 "ce" => content_encoding = Some(value.to_string()),
+                "h" => {
+                    if let Some((name, header_value)) = value.split_once(':') {
+                        policy_headers.push((name.to_string(), header_value.to_string()));
+                    }
+                }
                 "ct" => content_type = Some(value.to_string()),
                 "len" => body_len = Some(value.parse().ok()?),
                 _ => return None,
@@ -301,6 +339,7 @@ impl TemplateMetadata {
         }
         Some(Self {
             schema_version: schema_version?,
+            policy_headers,
             content_encoding: content_encoding?,
             content_type: content_type?,
             body_len: body_len?,
@@ -633,6 +672,7 @@ mod tests {
     fn metadata_round_trips() {
         let metadata = TemplateMetadata {
             content_encoding: "gzip".to_string(),
+            policy_headers: Vec::new(),
             content_type: "text/html; charset=utf-8".to_string(),
             schema_version: TEMPLATE_SCHEMA_VERSION,
             body_len: 42,
@@ -674,6 +714,7 @@ mod tests {
                     &key(),
                     &TemplateMetadata {
                         content_encoding: "identity".to_string(),
+                        policy_headers: Vec::new(),
                         content_type: "text/html".to_string(),
                         schema_version: TEMPLATE_SCHEMA_VERSION,
                         body_len: 0,

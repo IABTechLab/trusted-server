@@ -241,6 +241,13 @@ else
     "$(grep -c 'esi:include' "$WORK/r2.html" || true)" "0"
   check "a bids script is present" \
     "$(grep -c 'window.tsjs' "$WORK/r2.html" || true)" "1"
+  # `window.tsjs` alone passes while initial ads are dead: shared modes suppress the head
+  # slot script, so if the seam does not carry slots, `adSlots` stays `[]` and `adInit`
+  # defines nothing. This harness passed green through exactly that bug.
+  check "the seam carries slot definitions, not just bids" \
+    "$(grep -c 'adSlots=JSON.parse' "$WORK/r2.html" || true)" "1"
+  check "the slot definitions are populated, not an empty array" \
+    "$(grep -c 'adSlots=JSON.parse("\[\]")' "$WORK/r2.html" || true)" "0"
 
   HDRS=$(curl -s -D- -o /dev/null -H "Host: ts.example.com" \
     -H "Accept-Encoding: gzip" \

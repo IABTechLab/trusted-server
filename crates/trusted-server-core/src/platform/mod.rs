@@ -57,6 +57,7 @@ pub use kv::UnavailableKvStore;
 pub use template_assembly::{
     PlatformTemplateAssembler, TemplateAssemblyError, UnavailableTemplateAssembler,
 };
+pub use template_cache::REPLAYABLE_POLICY_HEADERS;
 pub use template_cache::{
     PlatformTemplateCache, TEMPLATE_SCHEMA_VERSION, TemplateCacheError, TemplateCacheKey,
     TemplateCacheMiss, TemplateEntry, TemplateMetadata, UnavailableTemplateCache, VarySpec,

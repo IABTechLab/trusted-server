@@ -1244,6 +1244,12 @@ pub struct OwnedProcessResponseParams {
     ///
     /// Spike-only, for the #1009 ESI validation.
     pub(crate) template_cache_key: Option<crate::platform::TemplateCacheKey>,
+    /// Slot definitions for the `</body>` seam under a shared mode, as JSON.
+    ///
+    /// Request-scoped, so it travels with the request rather than into the template.
+    pub(crate) seam_ad_slots: Option<String>,
+    /// Origin policy headers to store with the template and replay on a hit.
+    pub(crate) policy_headers: Vec<(String, String)>,
     pub(crate) content_encoding: String,
     pub(crate) origin_host: String,
     pub(crate) origin_url: String,
@@ -1378,8 +1384,12 @@ pub async fn buffer_publisher_response_async(
             // Store first, assemble second — never the reverse. The stored bytes are
             // shared between visitors; the assembled ones carry this visitor's bids.
             // Swapping these two lines is the C3 leak.
+            // Read before the store: `store_template_if_authorized` *takes* the key so a
+            // request cannot store twice, which would leave nothing for assembly to gate
+            // on.
+            let was_authorized = params.template_cache_key.is_some();
             store_template_if_authorized(services, &mut params, &bytes).await;
-            let bytes = assemble_if_shared(services, settings, &params, bytes)?;
+            let bytes = assemble_if_shared(was_authorized, settings, &params, bytes)?;
             response.headers_mut().insert(
                 http::header::CONTENT_LENGTH,
                 http::HeaderValue::from(bytes.len() as u64),
@@ -1415,16 +1425,18 @@ pub async fn buffer_publisher_response_async(
                 )
                 .await;
             }
-            let (head, tail) = split_template_at_seam(&template);
-            let bids = params
-                .ad_bids_state
-                .lock()
-                .expect("should lock bid state")
-                .clone()
-                .unwrap_or_else(build_empty_bids_script);
-            let mut assembled = Vec::with_capacity(head.len() + bids.len() + tail.len());
+            let (head, tail) = split_template_at_seam(&template).change_context_lazy(|| {
+                crate::error::TrustedServerError::Proxy {
+                    message: "cached template has no usable seam marker".to_string(),
+                }
+            })?;
+            let seam = build_seam_script(
+                params.seam_ad_slots.as_deref().unwrap_or("[]"),
+                &current_bid_map(&params.ad_bids_state),
+            );
+            let mut assembled = Vec::with_capacity(head.len() + seam.len() + tail.len());
             assembled.extend_from_slice(head);
-            assembled.extend_from_slice(bids.as_bytes());
+            assembled.extend_from_slice(seam.as_bytes());
             assembled.extend_from_slice(tail);
             response.headers_mut().insert(
                 http::header::CONTENT_LENGTH,
@@ -1472,55 +1484,91 @@ fn decode_transformed_body(
     Ok(out)
 }
 
-/// Resolves the `</body>` marker into this visitor's bids, if the mode assembles.
+/// Splices this visitor's slots and bids into the seam, if the mode assembles.
 ///
-/// Called *after* [`store_template_if_authorized`], never before: what is stored must
-/// be the template every visitor shares, and what is returned must be this visitor's
-/// document. Two call sites rather than one so that ordering is visible rather than
-/// implied.
+/// Uses the same byte split as the hit path, and deliberately **not** the `esi` crate.
+/// That crate loses content inside any element larger than its 16 KB `chunk_size`: it
+/// empties its buffer before parsing and never restores those bytes when the parser
+/// returns `Incomplete`. Next.js streams its RSC payload as a few enormous
+/// `self.__next_f.push(...)` scripts, so a real 1.4 MB page came back at 697 KB and the
+/// browser showed an error boundary. Raising `chunk_size` moves the threshold rather
+/// than removing it.
+///
+/// Called *after* [`store_template_if_authorized`], never before: what is stored must be
+/// the template every visitor shares.
 ///
 /// # Errors
 ///
-/// Returns an error if the adapter has no assembler or if assembly fails. Deliberately
-/// fatal rather than falling back to the unassembled template: that template contains a
-/// literal `esi:include`, so serving it would render no ads, report no error, and look
-/// to every monitor like a page that worked.
+/// Returns an error if the seam marker is missing or repeated.
 fn assemble_if_shared(
-    services: &RuntimeServices,
+    was_authorized: bool,
     settings: &Settings,
     params: &OwnedProcessResponseParams,
     bytes: Vec<u8>,
 ) -> Result<Vec<u8>, Report<crate::error::TrustedServerError>> {
-    let assembly_mode = settings
+    // Gated on the *authorization*, not on the configured mode. A bypassed response fell
+    // back to inline and therefore carries no marker; splitting it would fail and turn
+    // an ordinary bypass — the common case against a real origin — into a 500.
+    // Both conditions, and neither alone: only `Esi` emits a marker, and only an
+    // authorized response has one to find. `ClientFill` is authorized but marker-free.
+    let emits_a_marker = settings
         .creative_opportunities
         .as_ref()
         .map(CreativeOpportunitiesConfig::assembly_mode)
-        .unwrap_or_default();
-    if !matches!(assembly_mode, AssemblyMode::Esi) {
+        .is_some_and(|mode| matches!(mode, AssemblyMode::Esi));
+    if !was_authorized || !emits_a_marker {
         return Ok(bytes);
     }
 
-    let template = String::from_utf8(bytes).change_context(TrustedServerError::Proxy {
-        message: "shared template is not valid UTF-8, so it cannot be assembled".to_string(),
+    let (head, tail) = split_template_at_seam(&bytes).change_context_lazy(|| {
+        crate::error::TrustedServerError::Proxy {
+            message: "shared template has no usable seam marker".to_string(),
+        }
     })?;
+    // `None` means the ad stack did not run — bot, prefetch, consent-denied, kill switch.
+    // Emitting an empty-slot seam would still call `scheduleInitialAdInit`, scheduling
+    // `adInit` for exactly the traffic that opted out. Emit nothing instead.
+    let seam = params
+        .seam_ad_slots
+        .as_deref()
+        .map(|slots| build_seam_script(slots, &current_bid_map(&params.ad_bids_state)))
+        .unwrap_or_default();
 
-    // The auction already in flight is the fragment. `body_close_injection` emitted a
-    // constant marker into the template precisely so this substitution — not a
-    // subrequest — is what fills it.
-    let fragment = params
-        .ad_bids_state
-        .lock()
-        .expect("should lock bid state")
-        .clone()
-        .unwrap_or_else(build_empty_bids_script);
+    let mut out = Vec::with_capacity(head.len() + seam.len() + tail.len());
+    out.extend_from_slice(head);
+    out.extend_from_slice(seam.as_bytes());
+    out.extend_from_slice(tail);
+    Ok(out)
+}
 
-    services
-        .template_assembler()
-        .assemble(&template, &fragment)
-        .map(String::into_bytes)
-        .change_context(TrustedServerError::Proxy {
-            message: "failed to assemble the shared template".to_string(),
-        })
+/// The bids for this request, recovered from the rendered bids script.
+///
+/// # Known defect
+///
+/// `ad_bids_state` holds a *JS-escaped* `<script>`, and this reverses only the two
+/// escapes `html_escape_for_script` applies to angle brackets. Any bid whose JSON
+/// contains another escaped character is lost. Every fixture here has empty bids, so
+/// nothing catches it.
+///
+/// The correct fix is to carry the bid map alongside the rendered script from
+/// `write_bids_to_state` rather than reconstructing it, which is a change in the auction
+/// collection path and is not made here.
+fn current_bid_map(
+    ad_bids_state: &Arc<Mutex<Option<String>>>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let guard = ad_bids_state.lock().expect("should lock bid state");
+    let Some(script) = guard.as_deref() else {
+        return serde_json::Map::new();
+    };
+    let Some(start) = script.find("JSON.parse(\"") else {
+        return serde_json::Map::new();
+    };
+    let rest = &script[start + "JSON.parse(\"".len()..];
+    let Some(end) = rest.find("\")") else {
+        return serde_json::Map::new();
+    };
+    serde_json::from_str(&rest[..end].replace("\\u003c", "<").replace("\\u003e", ">"))
+        .unwrap_or_default()
 }
 
 /// Builds the injection state a cached template needs on the way out.
@@ -1536,8 +1584,10 @@ fn build_template_assembly_params(
     ad_bids_state: Arc<Mutex<Option<String>>>,
 ) -> OwnedProcessResponseParams {
     OwnedProcessResponseParams {
-        // Already stored, and storing again on a hit would be pointless work.
+        // Already stored; storing again on a hit would be pointless work.
         template_cache_key: None,
+        seam_ad_slots: None,
+        policy_headers: Vec::new(),
         content_encoding: entry.metadata.content_encoding.clone(),
         origin_host: String::new(),
         origin_url: settings.publisher.origin_url.clone(),
@@ -1559,16 +1609,35 @@ fn build_template_assembly_params(
 ///
 /// # Errors
 ///
-/// Returns the template unchanged as the head, with no tail, if the marker is absent —
-/// callers check for it before reaching here, so that is a defensive path rather than an
-/// expected one.
-fn split_template_at_seam(template: &[u8]) -> (&[u8], &[u8]) {
+/// Returns [`SeamError`] when the marker is absent or appears more than once. Both mean
+/// the template is not one this arm produced, and assembling it anyway would serve a page
+/// with either no bids or a visible marker in it.
+fn split_template_at_seam(template: &[u8]) -> Result<(&[u8], &[u8]), SeamError> {
     let marker = ESI_BIDS_INCLUDE.as_bytes();
-    match template.windows(marker.len()).position(|w| w == marker) {
-        Some(at) => (&template[..at], &template[at + marker.len()..]),
-        None => (template, &[]),
+    let mut found = template
+        .windows(marker.len())
+        .enumerate()
+        .filter(|(_, w)| *w == marker)
+        .map(|(at, _)| at);
+    let at = found.next().ok_or(SeamError::Missing)?;
+    if found.next().is_some() {
+        return Err(SeamError::Repeated);
     }
+    Ok((&template[..at], &template[at + marker.len()..]))
 }
+
+/// Why a template could not be split at its seam.
+#[derive(Debug, derive_more::Display)]
+pub(crate) enum SeamError {
+    /// No marker: the template predates the current transform, or was never templatized.
+    #[display("template contains no seam marker")]
+    Missing,
+    /// More than one marker, which the seam is never supposed to emit.
+    #[display("template contains more than one seam marker")]
+    Repeated,
+}
+
+impl core::error::Error for SeamError {}
 
 /// Builds the response served from a C2 hit.
 ///
@@ -1624,6 +1693,18 @@ fn build_cached_template_response(
     // this adapter headers commit before the first body byte — so a length guessed here
     // could not be corrected later.
     response.headers_mut().remove(header::CONTENT_LENGTH);
+
+    // Policy headers are replayed; per-reader and cache-controlling ones are not, which
+    // is what the allowlist encodes. Without this a hit silently dropped the origin's
+    // Content-Security-Policy and framing protection — a weaker page, served faster.
+    for (name, value) in &entry.metadata.policy_headers {
+        if let (Ok(name), Ok(value)) = (
+            header::HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            response.headers_mut().insert(name, value);
+        }
+    }
     Ok(response)
 }
 
@@ -1653,6 +1734,7 @@ async fn store_template_if_authorized(
         // would make a cache hit declare `Content-Encoding: gzip` over plaintext bytes,
         // which is the same undecodable response one layer along.
         content_encoding: "identity".to_string(),
+        policy_headers: params.policy_headers.clone(),
         content_type: params.content_type.clone(),
         schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
         body_len: bytes.len() as u64,
@@ -1765,7 +1847,8 @@ pub async fn publisher_response_into_streaming_response(
             // only wait is at the seam, at the very end of the document. Assembling
             // eagerly instead measured ~100x worse TTFB than doing nothing.
             let stream = async_stream::try_stream! {
-                let (head, tail) = split_template_at_seam(&template);
+                let (head, tail) = split_template_at_seam(&template)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                 yield bytes::Bytes::copy_from_slice(head);
 
                 if let Some(dispatched) = params.dispatched_auction.take() {
@@ -1790,13 +1873,11 @@ pub async fn publisher_response_into_streaming_response(
                     .await;
                 }
 
-                let bids = params
-                    .ad_bids_state
-                    .lock()
-                    .expect("should lock bid state")
-                    .clone()
-                    .unwrap_or_else(build_empty_bids_script);
-                yield bytes::Bytes::from(bids);
+                let seam = build_seam_script(
+                    params.seam_ad_slots.as_deref().unwrap_or("[]"),
+                    &current_bid_map(&params.ad_bids_state),
+                );
+                yield bytes::Bytes::from(seam);
                 yield bytes::Bytes::copy_from_slice(tail);
             };
             *response.body_mut() = EdgeBody::from_stream::<_, std::io::Error>(stream);
@@ -3527,6 +3608,16 @@ pub async fn handle_publisher_request(
         })?,
     );
 
+    // The slots the head seam deliberately withheld, routed to the `</body>` seam so they
+    // travel per request instead of into a template shared between readers.
+    let seam_ad_slots = seam_ad_slots_json(
+        assembly_mode,
+        should_run_ad_stack,
+        settings,
+        &matched_slots,
+        &request_path,
+    );
+
     // C2 lookup, before the origin fetch — the whole point is to skip it.
     //
     // The gate that authorized the store was response-derived, so it cannot re-run
@@ -3573,6 +3664,7 @@ pub async fn handle_publisher_request(
                         price_granularity,
                         Arc::clone(&ad_bids_state),
                     );
+                    params.seam_ad_slots = seam_ad_slots.clone();
                     params.dispatched_auction = dispatched_auction.take();
                     params.auction_observation = auction_observation.take();
                     params.auction_request = auction_request_for_telemetry.clone();
@@ -3728,7 +3820,26 @@ pub async fn handle_publisher_request(
         .get(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .unwrap_or_default();
-    if should_run_ad_stack && is_html_content_type(origin_content_type) {
+    // `template_cache_key` is `Some` only for a response the gate authorized, which is
+    // exactly a response that will be assembled. Those must be private regardless of
+    // `should_run_ad_stack`: a bot, prefetch, kill-switched or consent-denied request can
+    // assemble an empty-bids document and would otherwise keep the origin's public
+    // caching directives, letting a downstream cache serve it to a later eligible reader.
+    let policy_headers: Vec<(String, String)> = crate::platform::REPLAYABLE_POLICY_HEADERS
+        .iter()
+        .filter_map(|name| {
+            response
+                .headers()
+                .get(*name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| ((*name).to_string(), value.to_string()))
+        })
+        .collect();
+
+    let assembled_response_must_be_private = template_cache_key.is_some();
+    if (should_run_ad_stack || assembled_response_must_be_private)
+        && is_html_content_type(origin_content_type)
+    {
         response.headers_mut().insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("private, no-store"),
@@ -3846,6 +3957,8 @@ pub async fn handle_publisher_request(
                 body,
                 params: Box::new(OwnedProcessResponseParams {
                     template_cache_key,
+                    seam_ad_slots,
+                    policy_headers,
                     content_encoding,
                     origin_host,
                     origin_url: settings.publisher.origin_url.clone(),
@@ -4270,6 +4383,64 @@ else t.bids=b;\
     )
 }
 
+/// Build the `</body>` seam script for a shared-template mode.
+///
+/// Carries **both** request-scoped pieces: the slot definitions and the bids. Under a
+/// shared mode the head seam emits no `tsjs.adSlots`, because slot *presence* is
+/// request-gated and baking it into a template shared between readers would decide for
+/// all of them. Sending only bids — which is what this did — left `tsjs.adSlots` at its
+/// `[]` default, so `adInit` defined no slots and the page rendered correctly with **no
+/// TS ads at all**. A review caught it; nothing here or in the harness would have.
+///
+/// Slots are assigned before the scheduler is invoked, because `scheduleInitialAdInit`
+/// may fire `adInit` and `adInit` reads `ts.adSlots`.
+pub(crate) fn build_seam_script(
+    slots_json: &str,
+    bid_map: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let bids = serde_json::to_string(bid_map)
+        .expect("serde_json::to_string of Map<String,Value> should be infallible");
+    format!(
+        "<script>(function(){{\
+var t=window.tsjs=window.tsjs||{{}};\
+t.adSlots=JSON.parse(\"{}\");\
+var b=JSON.parse(\"{}\");\
+var s=t.scheduleInitialAdInit;\
+if(typeof s===\"function\")s(b);\
+else t.bids=b;\
+}})();</script>",
+        html_escape_for_script(slots_json),
+        html_escape_for_script(&bids)
+    )
+}
+
+/// The slot definitions a shared-mode seam must carry, as JSON.
+///
+/// Mirrors [`template_ad_slots_script`]'s gating: same `should_run_ad_stack` condition,
+/// same slot set. The difference is only *where* it is delivered — the seam, per
+/// request, rather than the head, into a shared template.
+pub(crate) fn seam_ad_slots_json(
+    mode: AssemblyMode,
+    should_run_ad_stack: bool,
+    settings: &Settings,
+    matched_slots: &[crate::creative_opportunities::CreativeOpportunitySlot],
+    request_path: &str,
+) -> Option<String> {
+    if matches!(mode, AssemblyMode::Inline) || !should_run_ad_stack {
+        return None;
+    }
+    let co_config = settings.creative_opportunities.as_ref()?;
+    let section = co_config.section_for_path(request_path);
+    let slots: Vec<serde_json::Value> = matched_slots
+        .iter()
+        .filter_map(|slot| build_slot_json(slot, co_config, &section))
+        .collect();
+    Some(
+        serde_json::to_string(&slots)
+            .expect("serde_json::to_string of Vec<Value> should be infallible"),
+    )
+}
+
 /// Build the empty-bids `<script>` tag used when no bids were returned.
 ///
 /// Shares the same shape as [`build_bids_script`] so any change to the script
@@ -4396,6 +4567,13 @@ pub(crate) enum C2BypassReason {
     /// identifiable from the log line instead of requiring a bisect.
     #[display("origin varies on {_0}, which the cache key does not cover")]
     VaryNotCovered(VaryGap),
+    /// `Vary: *` — the origin says no request key can select this representation.
+    ///
+    /// `VarySpec::uncovered_by` filters the wildcard out on the grounds that "the
+    /// eligibility gate handles it". It did not: nothing rejected it, so a `Vary: *`
+    /// response was shareable. A review found the gap between the comment and the code.
+    #[display("origin sent Vary: *, so no request key can select this response")]
+    VaryWildcard,
 }
 
 /// The header names an origin's `Vary` named that the cache key did not cover.
@@ -4445,6 +4623,15 @@ pub(crate) fn c2_bypass_reason(
     // Checked here, among the leak vectors, because storing under a key that does not
     // cover the origin's Vary is cross-serving rather than mere ineligibility: a request
     // differing only in the uncovered header would read this template.
+    if response_headers
+        .get_all(header::VARY)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|name| name.trim() == "*")
+    {
+        return Some(C2BypassReason::VaryWildcard);
+    }
     let uncovered = key_vary.uncovered_by(
         response_headers
             .get_all(header::VARY)
@@ -5032,10 +5219,17 @@ pub async fn handle_page_bids(
         // spike measures the difference between two script shapes instead of between
         // two delivery mechanisms.
         //
-        // Slots are not part of the fragment: under a shared mode the head seam emits
-        // no `tsjs.adSlots`, and the template already carries the slot markup. The
-        // fragment supplies only what could not be shared.
-        PageBidsFormat::Fragment => (build_bids_script(&bid_map), "text/html; charset=utf-8"),
+        // Slots *and* bids. An earlier version sent only bids, on the reasoning that
+        // "the template already carries the slot markup" — conflating the publisher's
+        // `<div>` with `tsjs.adSlots`, which is TS's own slot configuration and is what
+        // `adInit` iterates. Without it the page rendered correctly and served no ads.
+        PageBidsFormat::Fragment => (
+            build_seam_script(
+                &serde_json::to_string(&slots_json).unwrap_or_else(|_| "[]".to_string()),
+                &bid_map,
+            ),
+            "text/html; charset=utf-8",
+        ),
     };
 
     let mut response = Response::new(EdgeBody::from(body));
@@ -5366,6 +5560,8 @@ mod tests {
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
             template_cache_key: None,
+            seam_ad_slots: None,
+            policy_headers: Vec::new(),
             content_encoding: content_encoding.to_owned(),
             origin_host: settings.publisher.origin_host(),
             origin_url: settings.publisher.origin_url.clone(),
@@ -6944,6 +7140,109 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn the_seam_carries_slot_definitions_or_the_page_serves_no_ads() {
+            // Shared modes suppress the head slot script, so the seam is the only place
+            // `tsjs.adSlots` can come from. Sending only bids left it at its `[]` default,
+            // `adInit` defined nothing, and the page rendered perfectly with zero TS ads —
+            // green tests, healthy-looking page, no revenue.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+
+            let miss = body_of(run(&settings, &services, navigation_request()).await).await;
+            let hit = body_of(run(&settings, &services, navigation_request()).await).await;
+
+            for (label, body) in [("miss", miss), ("hit", hit)] {
+                let text = String::from_utf8(body).expect("utf-8");
+                assert!(
+                    text.contains("adSlots=JSON.parse"),
+                    "{label}: the seam must carry slot definitions"
+                );
+                assert!(
+                    text.contains("test-slot"),
+                    "{label}: the slot definitions must be populated, not `[]`"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn an_assembled_response_is_private_even_when_the_ad_stack_is_off() {
+            // The private stamp was gated on `should_run_ad_stack`. A bot, prefetch,
+            // kill-switched or consent-denied request can still assemble an empty-bids
+            // document, and would have kept the origin's public caching directives — so a
+            // downstream cache could serve that to a later eligible reader.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+
+            let bot = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://ts.example.com/article")
+                .header(header::HOST, "ts.example.com")
+                .header("sec-fetch-dest", "document")
+                .header("sec-fetch-mode", "navigate")
+                .header(
+                    header::USER_AGENT,
+                    "Googlebot/2.1 (+http://www.google.com/bot.html)",
+                )
+                .body(EdgeBody::empty())
+                .expect("should build bot request");
+            let response = run(&settings, &services, bot).await;
+
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("private, no-store"),
+                "an assembled response must be private whatever the ad stack decided"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_cache_hit_keeps_the_origin_security_headers() {
+            // Reconstructing headers keeps origin `Set-Cookie` and caching directives out
+            // of a shared cache, and also silently dropped Content-Security-Policy —
+            // a weaker page, served faster. Policy headers are per-URL, so they belong
+            // with the template.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            stub.push_response_with_headers(
+                200,
+                b"<html><head></head><body>origin</body></html>".to_vec(),
+                vec![
+                    ("content-type", "text/html; charset=utf-8"),
+                    ("cache-control", "public, max-age=300"),
+                    ("content-security-policy", "default-src 'self'"),
+                    ("x-frame-options", "SAMEORIGIN"),
+                ],
+            );
+
+            let _ = run(&settings, &services, navigation_request()).await;
+            let warm = run(&settings, &services, navigation_request()).await;
+
+            assert_eq!(
+                warm.headers()
+                    .get(header::CONTENT_SECURITY_POLICY)
+                    .and_then(|v| v.to_str().ok()),
+                Some("default-src 'self'"),
+                "a hit must not drop the origin's CSP"
+            );
+            assert_eq!(
+                warm.headers()
+                    .get("x-frame-options")
+                    .and_then(|v| v.to_str().ok()),
+                Some("SAMEORIGIN")
+            );
+        }
+
+        #[tokio::test]
         async fn a_post_is_never_answered_from_a_cached_get() {
             // `handle_publisher_request` is the `*`-method fallback route, so a publisher
             // path that renders a page on GET and accepts a form or webhook on POST reaches
@@ -7123,6 +7422,28 @@ mod tests {
                     "cookie".to_string()
                 ]))),
                 "the origin's own declaration must override the operator's assertion"
+            );
+        }
+
+        #[test]
+        fn a_wildcard_vary_is_refused() {
+            // `VarySpec::uncovered_by` filters `*` out, with a comment saying the
+            // eligibility gate handles it. It did not — nothing rejected the wildcard, so
+            // a response the origin said no key can select was shareable.
+            let mut varying = shareable();
+            varying.insert(header::VARY, HeaderValue::from_static("*"));
+
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &varying,
+                    &nothing_covered(),
+                ),
+                Some(C2BypassReason::VaryWildcard)
             );
         }
 
@@ -9243,6 +9564,8 @@ mod tests {
         let body = EdgeBody::from(compressed);
         let params = OwnedProcessResponseParams {
             template_cache_key: None,
+            seam_ad_slots: None,
+            policy_headers: Vec::new(),
             content_encoding: "gzip".to_string(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
@@ -9292,6 +9615,8 @@ mod tests {
 
         let params = OwnedProcessResponseParams {
             template_cache_key: None,
+            seam_ad_slots: None,
+            policy_headers: Vec::new(),
             content_encoding: String::new(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
@@ -9330,6 +9655,8 @@ mod tests {
             IntegrationRegistry::new(&settings).expect("should create integration registry");
         let params = OwnedProcessResponseParams {
             template_cache_key: None,
+            seam_ad_slots: None,
+            policy_headers: Vec::new(),
             content_encoding: String::new(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
@@ -9446,6 +9773,8 @@ mod tests {
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 template_cache_key: None,
+                seam_ad_slots: None,
+                policy_headers: Vec::new(),
                 content_encoding: String::new(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
@@ -9500,6 +9829,8 @@ mod tests {
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 template_cache_key: None,
+                seam_ad_slots: None,
+                policy_headers: Vec::new(),
                 content_encoding: "gzip".to_string(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
@@ -9557,6 +9888,8 @@ mod tests {
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 template_cache_key: None,
+                seam_ad_slots: None,
+                policy_headers: Vec::new(),
                 content_encoding: "deflate".to_string(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
@@ -9614,6 +9947,8 @@ mod tests {
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 template_cache_key: None,
+                seam_ad_slots: None,
+                policy_headers: Vec::new(),
                 content_encoding: "br".to_string(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
@@ -9671,6 +10006,8 @@ mod tests {
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 template_cache_key: None,
+                seam_ad_slots: None,
+                policy_headers: Vec::new(),
                 content_encoding: "br".to_string(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
@@ -9716,6 +10053,8 @@ mod tests {
     fn non_html_stream_params(content_encoding: &str) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
             template_cache_key: None,
+            seam_ad_slots: None,
+            policy_headers: Vec::new(),
             content_encoding: content_encoding.to_string(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
@@ -9905,6 +10244,8 @@ mod tests {
             let state = Arc::new(Mutex::new(None));
             let mut params = OwnedProcessResponseParams {
                 template_cache_key: None,
+                seam_ad_slots: None,
+                policy_headers: Vec::new(),
                 content_encoding: String::new(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
@@ -9970,6 +10311,8 @@ mod tests {
             let state = Arc::new(Mutex::new(None));
             let mut params = OwnedProcessResponseParams {
                 template_cache_key: None,
+                seam_ad_slots: None,
+                policy_headers: Vec::new(),
                 content_encoding: "gzip".to_string(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
@@ -10037,6 +10380,8 @@ mod tests {
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
                 template_cache_key: None,
+                seam_ad_slots: None,
+                policy_headers: Vec::new(),
                 content_encoding: String::new(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
@@ -10097,6 +10442,8 @@ mod tests {
             .expect("should build response");
         let params = OwnedProcessResponseParams {
             template_cache_key: None,
+            seam_ad_slots: None,
+            policy_headers: Vec::new(),
             content_encoding: content_encoding.to_string(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
@@ -10231,6 +10578,8 @@ mod tests {
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
             template_cache_key: None,
+            seam_ad_slots: None,
+            policy_headers: Vec::new(),
             content_encoding: content_encoding.to_string(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
@@ -10577,6 +10926,8 @@ mod tests {
                 EcContext::new_for_test(None, crate::consent::types::ConsentContext::default());
             OwnedProcessResponseParams {
                 template_cache_key: None,
+                seam_ad_slots: None,
+                policy_headers: Vec::new(),
                 content_encoding: String::new(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
@@ -10760,6 +11111,8 @@ mod tests {
             .collect();
         let params = OwnedProcessResponseParams {
             template_cache_key: None,
+            seam_ad_slots: None,
+            policy_headers: Vec::new(),
             content_encoding: "gzip".to_string(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
@@ -10831,6 +11184,8 @@ mod tests {
         let state = Arc::new(Mutex::new(Some(bids_script.to_string())));
         let params = OwnedProcessResponseParams {
             template_cache_key: None,
+            seam_ad_slots: None,
+            policy_headers: Vec::new(),
             content_encoding: String::new(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
@@ -10885,6 +11240,8 @@ mod tests {
         // error as soon as it tries to read the gzip header.
         let params = OwnedProcessResponseParams {
             template_cache_key: None,
+            seam_ad_slots: None,
+            policy_headers: Vec::new(),
             content_encoding: "gzip".to_string(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
@@ -10994,6 +11351,8 @@ mod tests {
 
         let params = OwnedProcessResponseParams {
             template_cache_key: None,
+            seam_ad_slots: None,
+            policy_headers: Vec::new(),
             content_encoding: String::new(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
@@ -11052,6 +11411,8 @@ mod tests {
         let html = br#"<html><body><script>self.__next_f.push([1,"1:{\"link\":\"https://origin.example.com/page\"}"])</script></body></html>"#;
         let params = OwnedProcessResponseParams {
             template_cache_key: None,
+            seam_ad_slots: None,
+            policy_headers: Vec::new(),
             content_encoding: String::new(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),

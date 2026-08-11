@@ -306,6 +306,140 @@ mod tests {
     }
 
     #[test]
+    fn a_large_realistic_document_survives_byte_identically() {
+        // The real document is ~690KB of publisher HTML. Every other test here uses a
+        // handful of lines, and `Configuration` has a `chunk_size` — so a parser that is
+        // faithful on a small input can still corrupt one that spans many chunks.
+        //
+        // Observed on a real deployment: the cache-miss path, which runs this parser over
+        // the whole document, produced a broken page, while the cache-hit path, which
+        // does a plain byte split, produced a working one. This is that difference under
+        // test.
+        let mut document = String::from("<!doctype html><html><head><title>t</title></head><body>");
+        for i in 0..6000 {
+            document.push_str(&format!(
+                "<div class=\"c{i}\" data-x=\"a&amp;b\"><!--$--><p>copy {i} &lt;tag&gt;</p>\
+                 <!--/$--></div><script>self.__next_f.push([1,\"{i}:a\\u003eb\"]);</script>"
+            ));
+        }
+        document.push_str(&format!("{ESI_BIDS_INCLUDE}</body></html>"));
+        assert!(
+            document.len() > 600_000,
+            "fixture must be realistically large, got {}",
+            document.len()
+        );
+
+        let assembled = assemble(&document, FRAGMENT).expect("should assemble");
+
+        assert_eq!(
+            assembled.len(),
+            document.len() - ESI_BIDS_INCLUDE.len() + FRAGMENT.len(),
+            "assembled length must differ from the source by exactly the seam swap"
+        );
+        assert_eq!(
+            assembled,
+            document.replace(ESI_BIDS_INCLUDE, FRAGMENT),
+            "a large document must survive byte-identically apart from the seam"
+        );
+    }
+
+    #[test]
+    fn a_document_larger_than_the_real_page_is_not_truncated() {
+        // The real page is ~1.4MB decoded. A deployment served 691704 bytes of it and
+        // the browser showed an error boundary — the document was cut roughly in half.
+        // The cache-hit path, which does a plain byte split, served the same page
+        // correctly, so the loss is in this parser and only shows up above some size the
+        // 600KB test does not reach.
+        let mut document = String::from("<!doctype html><html><head><title>t</title></head><body>");
+        for i in 0..14000 {
+            document.push_str(&format!(
+                "<div class=\"c{i}\" data-x=\"a&amp;b\"><!--$--><p>copy {i} &lt;tag&gt;</p>\
+                 <!--/$--></div><script>self.__next_f.push([1,\"{i}:a\\u003eb\"]);</script>"
+            ));
+        }
+        document.push_str(&format!("{ESI_BIDS_INCLUDE}</body></html>"));
+        assert!(
+            document.len() > 1_400_000,
+            "fixture must exceed the real page size, got {}",
+            document.len()
+        );
+
+        let assembled = assemble(&document, FRAGMENT).expect("should assemble");
+        let expected = document.replace(ESI_BIDS_INCLUDE, FRAGMENT);
+
+        assert_eq!(
+            assembled.len(),
+            expected.len(),
+            "assembly dropped {} bytes of a {}-byte document",
+            expected.len() as i64 - assembled.len() as i64,
+            document.len()
+        );
+        assert!(
+            assembled.ends_with("</body></html>"),
+            "the document must not be cut short; it ends with: {:?}",
+            &assembled[assembled.len().saturating_sub(80)..]
+        );
+    }
+
+    #[test]
+    fn dollar_signs_in_the_document_are_not_treated_as_esi_variables() {
+        // ESI interpolates `$(VAR)`, and a React Server Components payload is full of
+        // dollar signs: `[\"$\",\"$L1b\",null,…]` is how RSC encodes element references.
+        //
+        // A real page lost ~750KB through this parser while the byte-split path served it
+        // intact, and the two diverged exactly at `self.__next_f.push([1,"15:[\"$\",…`.
+        // Every fixture here until now was dollar-free.
+        let payload = r#"<script>self.__next_f.push([1,"15:["$","$L1b",null,{"a":1}]"])</script>"#;
+        let document = format!(
+            "<!doctype html><html><body><p>before</p>{payload}<p>after</p>{ESI_BIDS_INCLUDE}</body></html>"
+        );
+
+        let assembled = assemble(&document, FRAGMENT).expect("should assemble");
+
+        assert!(
+            assembled.contains("after"),
+            "content after a dollar sign must survive: {assembled}"
+        );
+        assert_eq!(
+            assembled,
+            document.replace(ESI_BIDS_INCLUDE, FRAGMENT),
+            "a document containing `$` must survive byte-identically apart from the seam"
+        );
+    }
+
+    #[test]
+    fn the_crate_truncates_a_script_larger_than_its_chunk_size() {
+        // Asserts the *defect*, deliberately. This is why the render path no longer uses
+        // this crate: `esi` 0.7.1 empties its buffer before parsing and never restores
+        // those bytes when the parser returns `Incomplete`, so any element larger than
+        // its 16KB `chunk_size` loses content. Next.js streams its RSC payload as a few
+        // enormous `self.__next_f.push(...)` scripts, so a real 1.4MB page came back at
+        // 697KB and the browser showed an error boundary.
+        //
+        // Total size is not the trigger — a 1.4MB document of small scripts is fine, and
+        // that is why every fixture here passed for weeks. The size of one element is.
+        // Raising `chunk_size` moves the threshold rather than removing it.
+        //
+        // If this ever starts failing, the crate has been fixed and edge assembly could
+        // be reconsidered on its merits rather than ruled out on this one.
+        let payload = "x".repeat(120_000);
+        let document = format!(
+            "<!doctype html><html><body><p>before</p>\
+             <script>self.__next_f.push([1,\"{payload}\"])</script>\
+             <p id=\"after-the-big-script\">after</p>{ESI_BIDS_INCLUDE}</body></html>"
+        );
+
+        let assembled = assemble(&document, FRAGMENT).expect("should assemble");
+        let expected = document.replace(ESI_BIDS_INCLUDE, FRAGMENT);
+
+        assert!(
+            assembled.len() < expected.len(),
+            "the crate is expected to drop bytes here; if it no longer does, this test \
+             and the decision it justifies both need revisiting"
+        );
+    }
+
+    #[test]
     fn script_bearing_fragments_are_spliced_verbatim() {
         // ESI substitutes bytes without escaping, which is exactly why the fragment
         // endpoint must return markup rather than JSON. This pins that behaviour, since
