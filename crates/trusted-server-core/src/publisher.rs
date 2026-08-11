@@ -1021,9 +1021,22 @@ fn create_html_stream_processor(
         .unwrap_or_default();
     let body_close = body_close_injection(assembly_mode, params.ad_slots_script.is_some());
 
+    // Diagnostics is request-scoped — activated by a cookie or query parameter — so
+    // it must not reach a shared template. It does not leak today, but only by
+    // coincidence: `requires_private_no_store()` is a strict superset of the
+    // conditions under which a script is emitted, and the resulting `private,
+    // no-store` stamp lands before the C2 gate reads response headers, so the gate
+    // refuses. That is two independent conditions happening to align. Gate it here
+    // instead, so the guarantee does not depend on a relationship nothing enforces.
+    // `gpt_diagnostics_superset_of_injection` locks the coincidence as a backstop.
+    let gpt_diagnostics = match assembly_mode {
+        AssemblyMode::Inline => params.gpt_diagnostics,
+        AssemblyMode::ClientFill | AssemblyMode::Esi => None,
+    };
+
     let config = config
         .with_ad_state(params.ad_slots_script, params.ad_bids_state)
-        .with_gpt_diagnostics(params.gpt_diagnostics)
+        .with_gpt_diagnostics(gpt_diagnostics)
         .with_body_close(body_close);
 
     Ok(create_html_processor(config))
