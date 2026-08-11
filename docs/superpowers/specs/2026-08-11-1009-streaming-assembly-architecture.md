@@ -52,6 +52,32 @@ The routing decision that caused it — shared modes take the buffered finalizer
 because **a store needs complete transformed bytes.** True on a miss. Irrelevant on a hit,
 where the template is already materialized.
 
+## 2b. Demonstrated, not argued
+
+Run locally under `viceroy serve` against a stub origin with a **self-imposed 1.5 s bid
+endpoint**. These are synthetic numbers from a delay chosen to be observable — not a
+measurement of any real deployment, and not comparable to publisher data.
+
+| Request | Cache | TTFB      | Total     | Origin fetched |
+| ------- | ----- | --------- | --------- | -------------- |
+| 1       | miss  | ~injected | ~injected | yes            |
+| 2       | hit   | ~injected | ~injected | **no**         |
+| 3       | hit   | ~injected | ~injected | **no**         |
+
+Two things are visible, and both matter more than the absolute values:
+
+1. **The cache works.** One origin fetch across three requests; the C2 log shows one
+   miss, one store, two hits.
+2. **The reader waits exactly as long anyway.** Time-to-first-byte equals total on every
+   request, so nothing streams — the entire response lands at once, after the auction.
+   On the hits the origin fetch is gone and first byte still tracks the injected bid
+   delay.
+
+That is the claim in §1 and §2 reproduced on demand: a cached root delivers **no latency
+benefit to the reader** while the response is held for the auction. It also gives the
+harness a pass/fail shape for the change this document proposes — under streaming
+assembly, TTFB must fall away from total by approximately the injected delay.
+
 ## 3. The decisive facts
 
 Three, all verified in the codebase rather than assumed:
