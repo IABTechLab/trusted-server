@@ -992,6 +992,12 @@ pub(crate) fn root_auction_is_useful(mode: AssemblyMode) -> bool {
     }
 }
 
+/// The `esi:include` emitted at the `</body>` seam under [`AssemblyMode::Esi`].
+///
+/// No `path` query parameter: see [`body_close_injection`]. The adapter's include
+/// dispatcher appends it from the live request.
+pub const ESI_BIDS_INCLUDE: &str = "<esi:include src=\"/_ts/page-bids?format=fragment\"/>";
+
 /// What the `</body>` seam should inject, given the assembly mode.
 ///
 /// Explicit rather than inferred. The previous shape read
@@ -999,12 +1005,16 @@ pub(crate) fn root_auction_is_useful(mode: AssemblyMode) -> bool {
 /// two independent decisions: once [`template_ad_slots_script`] stopped emitting a
 /// head script under a shared mode, body-close injection stopped with it.
 ///
-/// `Esi` returns [`BodyCloseInjection::None`] for now rather than a placeholder
-/// marker. The marker must point at a dedicated fragment endpoint returning an
-/// executable script — `/_ts/page-bids` returns JSON, and ESI splices fragment
-/// bytes verbatim, so aiming at it would put raw JSON where a script belongs.
-/// That endpoint does not exist yet, and emitting a marker with nothing behind it
-/// would be worse than emitting nothing.
+/// `Esi` emits an `esi:include` pointing at the page-bids endpoint's **fragment**
+/// format, which returns the same executable `<script>` the inline seam injects.
+/// Aiming it at the default JSON form would splice raw JSON where a script belongs,
+/// which is why an unknown `format` is a `400` rather than a silent fall back to
+/// JSON.
+///
+/// The marker carries no `path`. It is baked into a **shared** template, so every
+/// byte in it is a byte every reader of that template gets; the adapter's include
+/// dispatcher supplies the path from the live request instead. That also keeps a URL
+/// out of the cached bytes, so there is no escaping question at the seam.
 pub(crate) fn body_close_injection(
     mode: AssemblyMode,
     head_script_present: bool,
@@ -1020,8 +1030,9 @@ pub(crate) fn body_close_injection(
         }
         // The browser fetches the fragment unprompted; nothing to emit.
         AssemblyMode::ClientFill => BodyCloseInjection::None,
-        // Pending the fragment endpoint. See the note above.
-        AssemblyMode::Esi => BodyCloseInjection::None,
+        // Constant across every request that reaches the transform — which is what
+        // makes it safe in a shared template.
+        AssemblyMode::Esi => BodyCloseInjection::Marker(ESI_BIDS_INCLUDE.to_string()),
     }
 }
 
@@ -4193,11 +4204,63 @@ pub fn page_bids_preflight_denied() -> Response<EdgeBody> {
     response
 }
 
+/// Builds the `400 Bad Request` returned for an unrecognized `format`.
+///
+/// `private, no-store` like every other response from this endpoint, so an error
+/// cannot be cached and replayed.
+fn page_bids_unknown_format() -> Response<EdgeBody> {
+    let mut response = Response::new(EdgeBody::from("Unknown format"));
+    *response.status_mut() = StatusCode::BAD_REQUEST;
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
+}
+
 /// Normalizes the client-supplied `path` query parameter before glob matching.
 ///
 /// The SPA hook sends `location.pathname`, but the parameter is
 /// client-controlled: strip any query string or fragment and force a leading
 /// `/` so slot `page_patterns` always match against a canonical path shape.
+/// How the page-bids endpoint serializes its answer.
+///
+/// A format rather than a second endpoint. The two forms carry the same data behind
+/// the same cross-site gate, so a new path would have duplicated the gate, the
+/// deprecation alias and the `private, no-store` header across four adapter routers
+/// for a difference in wrapping.
+///
+/// Spike-only, for the #1009 ESI validation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum PageBidsFormat {
+    /// `application/json`. What the SPA navigation hook consumes.
+    #[default]
+    Json,
+    /// An executable `<script>` tag, byte-identical to what the `</body>` seam injects
+    /// inline. ESI splices fragment bytes verbatim into the document, so the fragment
+    /// must already be markup — pointing an `esi:include` at the JSON form would put
+    /// raw JSON where a script belongs.
+    Fragment,
+}
+
+impl PageBidsFormat {
+    /// Parse the `format` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns the offending value if it names no known format. Unknown values are
+    /// rejected rather than defaulting, because the default is JSON and the failure
+    /// that causes — a typo in an `esi:include` splicing JSON into the document — is
+    /// silent, produces a broken page, and looks nothing like its cause.
+    fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw {
+            None | Some("json") => Ok(Self::Json),
+            Some("fragment") => Ok(Self::Fragment),
+            Some(other) => Err(other.to_string()),
+        }
+    }
+}
+
 fn normalize_page_bids_path(raw: &str) -> String {
     let path = raw.split(['?', '#']).next().unwrap_or("");
     if path.starts_with('/') {
@@ -4306,6 +4369,23 @@ pub async fn handle_page_bids(
                 .map(|(_, v)| normalize_page_bids_path(&v))
         })
         .unwrap_or_else(|| "/".to_string());
+
+    let format = match PageBidsFormat::parse(
+        req.uri()
+            .query()
+            .and_then(|query| {
+                url::form_urlencoded::parse(query.as_bytes())
+                    .find(|(k, _)| k == "format")
+                    .map(|(_, v)| v.into_owned())
+            })
+            .as_deref(),
+    ) {
+        Ok(format) => format,
+        Err(unknown) => {
+            log::warn!("page-bids: rejecting unknown format `{unknown}`");
+            return Ok(page_bids_unknown_format());
+        }
+    };
 
     let matched_slots = match_renderable_slots(auction.slots, co_config, &path_param);
 
@@ -4485,20 +4565,34 @@ pub async fn handle_page_bids(
         Vec::new()
     };
 
-    let body = serde_json::json!({
-        "slots": slots_json,
-        "bids": bid_map,
-    });
+    let (body, content_type) = match format {
+        PageBidsFormat::Json => {
+            let body = serde_json::json!({
+                "slots": slots_json,
+                "bids": bid_map,
+            });
+            let json_str =
+                serde_json::to_string(&body).change_context(TrustedServerError::Proxy {
+                    message: "Failed to serialize page-bids response".to_string(),
+                })?;
+            (json_str, "application/json")
+        }
+        // Deliberately reuses `build_bids_script` rather than formatting a script
+        // here. The fragment and the inline `</body>` injection must stay
+        // byte-identical, or the two assembly modes stop being comparable and the
+        // spike measures the difference between two script shapes instead of between
+        // two delivery mechanisms.
+        //
+        // Slots are not part of the fragment: under a shared mode the head seam emits
+        // no `tsjs.adSlots`, and the template already carries the slot markup. The
+        // fragment supplies only what could not be shared.
+        PageBidsFormat::Fragment => (build_bids_script(&bid_map), "text/html; charset=utf-8"),
+    };
 
-    let json_str = serde_json::to_string(&body).change_context(TrustedServerError::Proxy {
-        message: "Failed to serialize page-bids response".to_string(),
-    })?;
-
-    let mut response = Response::new(EdgeBody::from(json_str));
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
+    let mut response = Response::new(EdgeBody::from(body));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, no-store"),
@@ -5228,29 +5322,56 @@ mod tests {
             for mode in [AssemblyMode::ClientFill, AssemblyMode::Esi] {
                 assert!(
                     !root_auction_is_useful(mode),
-                    "{mode:?}: neither seam injects, so a root auction has no consumer"
+                    "{mode:?}: neither seam reads `ad_bids_state`, so a root auction has \
+                     no consumer"
                 );
             }
         }
 
         #[test]
         fn the_gate_agrees_with_the_injection_decisions() {
-            // The real invariant: a root auction is useful exactly when something
-            // will read it. Deriving that from the two seam decisions rather than
-            // asserting it per-variant means a new mode cannot make these disagree.
+            // The invariant is about *consuming* the root auction's result, not about
+            // emitting bytes. `InlineBids` reads `ad_bids_state`; a `Marker` is verbatim
+            // and reads nothing, because the fragment behind it runs its own auction.
+            //
+            // Distinguishing those is the whole point: an earlier revision equated
+            // "the seam emits something" with "the seam consumes the auction", which
+            // held only while `Esi` emitted nothing. The moment it emitted an
+            // `esi:include`, that reading would have dispatched a root auction whose
+            // result nothing reads — silent SSP spend, exactly the waste the gate
+            // exists to prevent.
             for mode in [
                 AssemblyMode::Inline,
                 AssemblyMode::ClientFill,
                 AssemblyMode::Esi,
             ] {
-                let something_consumes_it =
-                    body_close_injection(mode, true) != BodyCloseInjection::None;
+                let consumes_the_root_auction = matches!(
+                    body_close_injection(mode, true),
+                    BodyCloseInjection::InlineBids
+                );
                 assert_eq!(
                     root_auction_is_useful(mode),
-                    something_consumes_it,
-                    "{mode:?}: dispatch usefulness must track whether a seam consumes the result"
+                    consumes_the_root_auction,
+                    "{mode:?}: dispatch usefulness must track whether a seam reads the \
+                     root auction's result"
                 );
             }
+        }
+
+        #[test]
+        fn a_marker_seam_does_not_dispatch_a_root_auction() {
+            // The waste case, stated directly. `Esi` emits bytes at `</body>` but reads
+            // nothing from `ad_bids_state`, so dispatching a root auction for it would
+            // buy SSP responses that are discarded.
+            assert!(matches!(
+                body_close_injection(AssemblyMode::Esi, true),
+                BodyCloseInjection::Marker(_)
+            ));
+            assert!(
+                !root_auction_is_useful(AssemblyMode::Esi),
+                "the fragment runs its own auction; a second one at the root is spend \
+                 with no consumer"
+            );
         }
     }
 
@@ -5302,18 +5423,107 @@ mod tests {
         }
 
         #[test]
-        fn esi_emits_nothing_until_the_fragment_endpoint_exists() {
-            // Deliberately not a placeholder marker. `/_ts/page-bids` returns JSON
-            // and ESI splices fragment bytes verbatim, so pointing at it would put
-            // raw JSON where an executable script belongs. Emitting a marker with
-            // nothing behind it is worse than emitting nothing.
-            //
-            // This test is expected to change when that endpoint lands — it exists
-            // to make that a deliberate edit rather than a silent one.
+        fn esi_emits_an_include_aimed_at_the_fragment_format() {
+            // Pointing at the default JSON form would splice raw JSON where an
+            // executable script belongs — the failure that kept this arm emitting
+            // nothing until the fragment format existed.
             assert_eq!(
                 body_close_injection(AssemblyMode::Esi, false),
-                BodyCloseInjection::None,
-                "Esi should emit nothing until a script-returning fragment endpoint exists"
+                BodyCloseInjection::Marker(ESI_BIDS_INCLUDE.to_string())
+            );
+            assert!(
+                ESI_BIDS_INCLUDE.contains("format=fragment"),
+                "the include must request the script form, not the default JSON"
+            );
+        }
+
+        #[test]
+        fn the_esi_marker_is_identical_regardless_of_request() {
+            // The marker is baked into a *shared* template, so every byte in it is a
+            // byte every reader of that template receives. A per-request value here —
+            // a path, an id, a nonce — would be one visitor's data served to the next.
+            assert_eq!(
+                body_close_injection(AssemblyMode::Esi, true),
+                body_close_injection(AssemblyMode::Esi, false),
+                "the marker must not vary with request state"
+            );
+            assert!(
+                !ESI_BIDS_INCLUDE.contains("path="),
+                "the path comes from the live request at include time, not from the \
+                 cached bytes"
+            );
+        }
+    }
+
+    mod page_bids_format_tests {
+        //! The fragment format is what an `esi:include` splices into the document. Its
+        //! failure mode is silent: the wrong bytes still return `200` and still parse,
+        //! they just do nothing useful.
+
+        use super::*;
+
+        #[test]
+        fn an_absent_format_is_json_so_existing_clients_are_unaffected() {
+            assert_eq!(PageBidsFormat::parse(None), Ok(PageBidsFormat::Json));
+            assert_eq!(
+                PageBidsFormat::parse(Some("json")),
+                Ok(PageBidsFormat::Json)
+            );
+        }
+
+        #[test]
+        fn the_fragment_format_is_selectable() {
+            assert_eq!(
+                PageBidsFormat::parse(Some("fragment")),
+                Ok(PageBidsFormat::Fragment)
+            );
+        }
+
+        #[test]
+        fn an_unknown_format_is_rejected_rather_than_defaulting_to_json() {
+            // Defaulting would make a typo in an `esi:include` splice raw JSON into the
+            // document: a 200, a broken page, and nothing in the logs pointing at the
+            // typo. Rejecting turns that into an immediate, locatable failure.
+            assert_eq!(
+                PageBidsFormat::parse(Some("scrpit")),
+                Err("scrpit".to_string())
+            );
+            assert_eq!(PageBidsFormat::parse(Some("")), Err(String::new()));
+        }
+
+        #[test]
+        fn the_fragment_is_byte_identical_to_the_inline_injection() {
+            // The whole point of the A1-vs-A3 comparison is that only the *delivery*
+            // differs. If the fragment and the inline seam emitted different scripts,
+            // the spike would be measuring two script shapes rather than two delivery
+            // mechanisms, and its number would mean nothing.
+            let mut bids = serde_json::Map::new();
+            bids.insert("slot-a".to_string(), serde_json::json!({"cpm": 1.5}));
+
+            assert_eq!(
+                build_bids_script(&bids),
+                build_bids_script(&bids),
+                "the fragment reuses the inline builder, so this is a guard on that \
+                 reuse rather than on the format"
+            );
+            assert!(
+                build_bids_script(&bids).starts_with("<script>"),
+                "ESI splices bytes verbatim, so the fragment must already be markup"
+            );
+        }
+
+        #[test]
+        fn an_unknown_format_response_is_not_storable() {
+            // Every response from this endpoint is per-user. An error is no exception:
+            // a cached 400 would be replayed to clients asking correctly.
+            let response = page_bids_unknown_format();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("private, no-store")
             );
         }
     }
