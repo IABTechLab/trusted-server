@@ -3212,36 +3212,51 @@ pub async fn handle_publisher_request(
     //
     // Headers are read as forwarded, after `restrict_accept_encoding` — keying on what
     // the client originally sent would key on a value the origin never saw.
-    let template_cache_key = (!matches!(assembly_mode, AssemblyMode::Inline)).then(|| {
-        crate::platform::TemplateCacheKey {
-            url: target_uri.to_string(),
-            request_host: request_host.to_string(),
-            request_scheme: request_scheme.to_string(),
-            assembly_mode,
-            vary_values: settings
-                .creative_opportunities
-                .as_ref()
-                .map(CreativeOpportunitiesConfig::template_cache_vary)
-                .unwrap_or_else(|| VarySpec::new([]))
-                .values_from(|name| {
-                    req.headers()
-                        .get(name)
-                        .and_then(|value| value.to_str().ok())
-                }),
-            accept_encoding: req
-                .headers()
-                .get(header::ACCEPT_ENCODING)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default()
-                .to_string(),
-            // Changes whenever any JS module changes, so a bundle deploy invalidates
-            // stored templates without needing a purge.
-            integration_fingerprint: trusted_server_js::concatenated_hash(
-                &trusted_server_js::all_module_ids(),
-            ),
-            schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
-        }
-    });
+    // GET only, and this is the single point that enforces it: the key governs both the
+    // lookup and the store, so a `None` here excludes non-GET from each.
+    //
+    // Without it, `handle_publisher_request` — the `*`-method fallback route — answers a
+    // POST to a path whose GET is cached with the cached page, and the origin never sees
+    // the mutating request. No error, no log, the action silently swallowed. A POST is
+    // not entitled to a GET's representation.
+    let method_is_cacheable = req.method() == Method::GET;
+    if !method_is_cacheable && !matches!(assembly_mode, AssemblyMode::Inline) {
+        log::debug!(
+            "c2_template_cache bypass: method {} is not eligible for a shared template",
+            req.method()
+        );
+    }
+    let template_cache_key =
+        (method_is_cacheable && !matches!(assembly_mode, AssemblyMode::Inline)).then(|| {
+            crate::platform::TemplateCacheKey {
+                url: target_uri.to_string(),
+                request_host: request_host.to_string(),
+                request_scheme: request_scheme.to_string(),
+                assembly_mode,
+                vary_values: settings
+                    .creative_opportunities
+                    .as_ref()
+                    .map(CreativeOpportunitiesConfig::template_cache_vary)
+                    .unwrap_or_else(|| VarySpec::new([]))
+                    .values_from(|name| {
+                        req.headers()
+                            .get(name)
+                            .and_then(|value| value.to_str().ok())
+                    }),
+                accept_encoding: req
+                    .headers()
+                    .get(header::ACCEPT_ENCODING)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string(),
+                // Changes whenever any JS module changes, so a bundle deploy invalidates
+                // stored templates without needing a purge.
+                integration_fingerprint: trusted_server_js::concatenated_hash(
+                    &trusted_server_js::all_module_ids(),
+                ),
+                schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
+            }
+        });
     *req.uri_mut() = target_uri;
     req.headers_mut().insert(
         header::HOST,
@@ -5882,6 +5897,17 @@ mod tests {
                 .expect("should build navigation request")
         }
 
+        /// A navigation carrying an **active** diagnostics decision, the way the real one
+        /// arrives: in the request extensions, set from a per-reader cookie or query
+        /// parameter.
+        fn diagnostics_navigation_request() -> Request<EdgeBody> {
+            let mut request = navigation_request();
+            request.extensions_mut().insert(
+                crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision::active_for_tests(),
+            );
+            request
+        }
+
         /// A slot matching `/article`.
         ///
         /// Passed through `AuctionDispatch`, not read from settings — and that is the
@@ -6234,9 +6260,13 @@ mod tests {
         /// store, so sharing a cache would let the first user's entry answer for the
         /// second and the comparison would prove nothing.
         async fn stored_template_for(user: &SyntheticUser) -> Vec<u8> {
+            stored_template_for_mode("esi", user).await
+        }
+
+        async fn stored_template_for_mode(mode: &str, user: &SyntheticUser) -> Vec<u8> {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
-            let settings = Arc::new(settings_with_mode("esi"));
+            let settings = Arc::new(settings_with_mode(mode));
             let services = RuntimeServices::builder()
                 .config_store(Arc::new(NoopConfigStore))
                 .secret_store(Arc::new(NoopSecretStore))
@@ -6364,6 +6394,123 @@ mod tests {
                     .expect("should lock entries")
                     .is_empty(),
                 "inline must never write a shared template"
+            );
+        }
+
+        #[tokio::test]
+        async fn client_fill_shares_a_template_across_readers_too() {
+            // `ClientFill` had no end-to-end coverage at all: every test in this module
+            // ran `esi` or `inline`, and the neutrality tests recompose the processor's
+            // inputs by hand instead of calling `create_html_stream_processor`. A leak
+            // reintroduced in the real wiring, scoped to this mode, passed the entire
+            // suite.
+            //
+            // Running the same two synthetic users through the real pipeline under
+            // `client_fill` closes that: the mode is now exercised where it is actually
+            // composed, not only where its decision functions are called directly.
+            let alice = SyntheticUser {
+                ec_id: "cccccccccccccccccccccccccccccccc.alice2",
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                geo_marker: "AliceTown",
+            };
+            let bob = SyntheticUser {
+                ec_id: "dddddddddddddddddddddddddddddddd.bobbb2",
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::Gdpr,
+                geo_marker: "BobTown",
+            };
+
+            let alice_template = stored_template_for_mode("client_fill", &alice).await;
+            let bob_template = stored_template_for_mode("client_fill", &bob).await;
+
+            assert_eq!(
+                alice_template, bob_template,
+                "client-fill templates must be shareable across readers"
+            );
+
+            let template = String::from_utf8(alice_template).expect("template should be utf-8");
+            for forbidden in [
+                alice.ec_id,
+                bob.ec_id,
+                alice.geo_marker,
+                bob.geo_marker,
+                "adSlots",
+                "window.tsjs",
+                // The mode injects nothing at `</body>`, so not even a marker belongs.
+                "esi:include",
+            ] {
+                assert!(
+                    !template.contains(forbidden),
+                    "`{forbidden}` must not appear in a client-fill template: {template}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn an_active_diagnostics_request_never_stores_a_template() {
+            // An independent review reintroduced a diagnostics leak scoped to
+            // `ClientFill` and the whole suite stayed green. Investigating showed the
+            // mutation is not actually exploitable: `requires_private_no_store()` is a
+            // strict superset of the condition under which diagnostics markup is
+            // emitted, and that stamp lands *before* the C2 gate reads response headers,
+            // so such a request never stores a template at all.
+            //
+            // That is a coincidence between two independent conditions, and the whole
+            // protection rests on it. This pins the consequence directly, so the
+            // relationship is checked rather than merely reasoned about.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+
+            let _ = run(&settings, &services, diagnostics_navigation_request()).await;
+
+            assert!(
+                cache
+                    .entries
+                    .lock()
+                    .expect("should lock entries")
+                    .is_empty(),
+                "a reader running diagnostics must not contribute to a shared cache"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_post_is_never_answered_from_a_cached_get() {
+            // `handle_publisher_request` is the `*`-method fallback route, so a publisher
+            // path that renders a page on GET and accepts a form or webhook on POST reaches
+            // here for both. Serving the cached GET to the POST swallows the mutating
+            // request entirely: the origin never sees it, the caller gets 200 and a page,
+            // and nothing anywhere reports a problem.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+            queue_shareable_html(&stub);
+
+            // Warm the cache with a GET.
+            let _ = run(&settings, &services, navigation_request()).await;
+            assert_eq!(stub.recorded_request_uris().len(), 1);
+
+            let post = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("https://ts.example.com/article")
+                .header(header::HOST, "ts.example.com")
+                .body(EdgeBody::from("field=value"))
+                .expect("should build post request");
+            let _ = run(&settings, &services, post).await;
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "the POST must reach the origin rather than being answered from the \
+                 cached GET"
+            );
+            assert_eq!(
+                cache.entries.lock().expect("should lock entries").len(),
+                1,
+                "and it must not store a template of its own"
             );
         }
 
