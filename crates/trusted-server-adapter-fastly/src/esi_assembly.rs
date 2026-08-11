@@ -15,16 +15,11 @@
 //!
 //! Spike-only. Remove with the spike.
 
-// Not yet reachable from the request path: resolving the fragment means running the
-// auction, which is the next step (the spike plan's Task 5). The tests below do
-// exercise it, so `expect` is wrong here — it would be unfulfilled under `cfg(test)`
-// and satisfied in the binary, and no single attribute can be both.
-#![allow(dead_code)]
-
 use esi::{CacheConfig, Configuration, DcaMode, PendingFragmentContent, Processor};
 use fastly::Response;
 use fastly::http::StatusCode;
 use std::io::Cursor;
+use trusted_server_core::platform::{PlatformTemplateAssembler, TemplateAssemblyError};
 
 /// The processor configuration, with every safety-relevant field stated.
 ///
@@ -129,6 +124,17 @@ pub fn assemble(template: &str, fragment: &str) -> Result<String, EsiAssemblyErr
         })?;
 
     String::from_utf8(output).map_err(|_| EsiAssemblyError::NotUtf8)
+}
+
+/// Fastly's implementation of the core assembler seam.
+pub struct FastlyTemplateAssembler;
+
+impl PlatformTemplateAssembler for FastlyTemplateAssembler {
+    fn assemble(&self, template: &str, fragment: &str) -> Result<String, TemplateAssemblyError> {
+        assemble(template, fragment).map_err(|e| TemplateAssemblyError::Failed {
+            message: e.to_string(),
+        })
+    }
 }
 
 #[cfg(test)]

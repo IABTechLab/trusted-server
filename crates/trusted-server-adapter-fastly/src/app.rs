@@ -259,6 +259,7 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         // Spike-only (#1009). Constructed unconditionally, but only read when the
         // assembly mode is a shared-template one — which defaults to Inline, so this
         // is inert until an operator opts in.
+        .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
         .template_cache(Arc::new(crate::template_cache::FastlyTemplateCache::new(
             crate::template_cache::TEMPLATE_CACHE_TTL,
         )))
