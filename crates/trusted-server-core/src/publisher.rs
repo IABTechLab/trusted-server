@@ -1530,7 +1530,20 @@ async fn store_template_if_authorized(
         .put(&key, &metadata, bytes.to_vec())
         .await
     {
-        Ok(()) => log::debug!("c2_template_cache stored {} bytes", bytes.len()),
+        Ok(()) => {
+            // Reports whether the seam marker made it into the stored bytes. The marker
+            // is deliberately invisible from the outside — assembly replaces it before
+            // the response is sent, on both the miss and hit paths — so this log line is
+            // the only way to confirm the template really has a hole in it rather than
+            // per-reader bids baked in.
+            log::debug!(
+                "c2_template_cache stored {} bytes (seam marker present: {})",
+                bytes.len(),
+                bytes
+                    .windows(ESI_BIDS_INCLUDE.len())
+                    .any(|w| w == ESI_BIDS_INCLUDE.as_bytes())
+            );
+        }
         Err(err) => log::warn!("c2_template_cache store failed: {err}"),
     }
 }

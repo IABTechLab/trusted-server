@@ -244,6 +244,23 @@ else
     "$(( $(grep -c "POST /article" "$WORK/origin.log" || true) - POSTS_BEFORE ))" "1"
 fi
 
+if [ "$MODE" != "inline" ]; then
+  info "Where the marker actually lives"
+  echo "  The cached template (the shared copy — has a hole where bids go):"
+  grep -oE "c2_template_cache stored [0-9]+ bytes \(seam marker present: [a-z]+\)" \
+    "$WORK/viceroy.log" | sort -u | sed 's/^/    /'
+  echo
+  echo "  What the reader receives (hole filled, no marker):"
+  grep -oE "esi:include|window\.tsjs" "$WORK/r2.html" | sort | uniq -c | sed 's/^/    /'
+  cat <<'EOF'
+
+  The marker is never visible in page source, in any mode. It exists only inside
+  the cache; assembly replaces it before the response is sent, on both the miss
+  and hit paths. `seam marker present: true` above is the evidence that the
+  stored copy is genuinely reader-agnostic rather than carrying someone's bids.
+EOF
+fi
+
 info "Timing (bid endpoint delays $BID_DELAY s)"
 printf '  request 1  ttfb=%ss  total=%ss\n' "$TTFB1" "$TOTAL1"
 printf '  request 2  ttfb=%ss  total=%ss\n' "$TTFB2" "$TOTAL2"
