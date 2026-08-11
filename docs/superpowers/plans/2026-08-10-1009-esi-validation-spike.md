@@ -830,14 +830,32 @@ non-failed output — it is not first-success-wins.
 
 Not a phase. Every one of these is a hard fail, independent of any performance result.
 
-- [ ] **Zero cross-user leakage.** Request the same URL as two synthetic users differing
-      in consent state, EC identity, and geo. Assert the C2 template is byte-identical
-      and that no bid, EC ID, consent string, or geo value appears in it.
-- [ ] **Cold MISS, warm HIT, stale revalidation** each produce a correct page.
-- [ ] **Transform failure** (the 16 MB buffer cap, a malformed body) does not insert a
-      partial template into C2 and does not serve one.
+- [x] **Zero cross-user leakage.** DONE — `76df2469`. Two synthetic users differing in EC
+      identity, consent jurisdiction and geo store a byte-identical template, each against
+      a fresh cache so the first cannot answer for the second. Forbidden-substring checks
+      are the second layer, since byte-identity also holds if both leak the same thing.
+      Mutation-verified: leaking `adSlots` through the head seam fails it.
+- [x] **Cold MISS, warm HIT, stale revalidation** DONE — `76df2469`, and end to end under
+      `viceroy serve` (below). Stale reads as a miss; serving stale would mean serving a
+      template built by an older transform or bundle.
+
+      The first stale test passed for the wrong reason and had to be rewritten: a zero TTL
+      produces an *absent* entry, not a stale one, so `is_stale()` was never reached —
+      confirmed by reverting the check and watching it stay green. Only a
+      `stale_while_revalidate` window makes an entry present-and-stale.
+
+- [x] **Transform failure** DONE — `76df2469`. A partial template in C2 is the worst
+      outcome available: a truncated document served to every later visitor, indefinitely,
+      with no error after the first request. Mutation-verified by storing before the cap
+      check.
 - [ ] **Request collapsing** works: concurrent cold requests transform once.
-- [ ] **DCA disabled**, verified by the injection test in Task 5 Step 2.
+- [x] **DCA disabled** DONE — `0597f54e`. Config asserted _and_ behaviour: a fragment
+      carrying its own `esi:include` is spliced as text rather than dispatched.
+
+- [ ] **Request collapsing** — not tested, and not testable here. Viceroy is
+      single-threaded, so the concurrent cold-request case cannot be produced. The racing
+      _writer_ path is covered (`a_second_put_on_a_fresh_entry_is_a_no_op`), which is the
+      correctness half; the collapsing half needs real concurrency.
 - [ ] **Exactly one auction per pageview**, from `auction_events_raw`.
 - [ ] **Cookie and privacy finalization ran BEFORE assembly**, not after — EC
       `Set-Cookie` on first visit, geo suppression, and an unconditional
@@ -849,7 +867,15 @@ Not a phase. Every one of these is a hard fail, independent of any performance r
       renders attributed. Use TS-attributed renders — the SSAT line item, non-empty
       `ts.bids`, `hb_adid` presence — **never slot fill**, which is blind to empty bids
       because `adInit` defines slots regardless.
-- [ ] **No C3 — assert positively, not by absence.** Forbidding `public`, `s-maxage`, and
+- [x] **No C3 — assert positively, not by absence.** DONE — `0adb578e`, and this gate's
+      wording caught a live bug. A C2 hit returns before the point where the publisher path
+      stamps `private, no-store`, so it served HTML with **no `Cache-Control` at all** —
+      heuristically cacheable, and therefore a shared cache of an assembled per-user
+      response. Checking for the _absence_ of `public`/`s-maxage`/`Surrogate-Control` would
+      have reported it as safe, because there was nothing present to forbid. Covered for
+      returning visitors specifically, where the cookie-privacy net never fires.
+
+      Original wording, retained because it is what made the difference: Forbidding `public`, `s-maxage`, and
       `Surrogate-Control` is **not sufficient**: a bare `Cache-Control: max-age=60` passes
       that check and is still shared-cacheable, and that is exactly what the measured
       origin sends. Require instead that every assembled response carries

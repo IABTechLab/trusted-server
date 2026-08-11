@@ -383,6 +383,64 @@ themselves mutation-checked.
 **Still not deployable.** `ClientFill` and `Esi` render a template with a hole and
 nothing filling it — Task 4 and Task 5. A cache that works is necessary, not sufficient.
 
+## Local end-to-end run — the Esi arm renders
+
+`viceroy serve` against a stub origin, config pushed into a scratchpad `fastly.toml` so
+nothing tracked was modified. Served document:
+
+```html
+<h1>Stub article</h1>
+<div id="ts-slot-header"></div>
+<p>Body copy.</p>
+<script>
+  ;(function () {
+    var t = (window.tsjs = window.tsjs || {})
+    var b = JSON.parse('{}')
+    var s = t.scheduleInitialAdInit
+    if (typeof s === 'function') s(b)
+    else t.bids = b
+  })()
+</script>
+```
+
+No `esi:include`. One origin fetch for two requests. `private, no-store` on the hit.
+Cached template 353 bytes against 467 served, so the cache holds the pre-assembly
+template. All three fragment formats behave: script, JSON, and `400` on a typo. `Inline`
+unaffected — two fetches for two requests, no C2 activity, no markers.
+
+### The bug only a running server could find
+
+With the auction **enabled**, C2 never engaged: two origin fetches, marker unresolved.
+
+TS stamps its own `private, no-store` when `should_run_ad_stack` is true. The C2 gate ran
+after that stamp, read it as the origin's declaration, concluded `OriginNotShareable`, and
+refused — **on every page that serves ads**, which is every page that matters.
+
+The more important half is why no test caught it. The fixture left the auction disabled
+and passed `slots: &[]`, so `should_run_ad_stack` was false in every test, the stamp never
+fired, and the ordering was unobservable. Every C2 assertion had been made against the one
+configuration where C2's hardest condition does not apply.
+
+Demonstrated both ways: with the old fixture, reintroducing the bug passes all seven
+tests; with the corrected fixture it fails six.
+
+### Pattern across this branch
+
+Five bugs now share one shape — compiled, passed every existing test, and were wrong:
+
+1. The head-seam gate silently disabled body-close injection (`d9e05973`).
+2. The key held the encoding the origin _chose_, so the cache could never hit (`2a2e6c6a`).
+3. A C2 hit served with no `Cache-Control` at all (`0adb578e`).
+4. A C2 hit dropped its in-flight auction, billing SSPs for nothing (`b3ac59a6`).
+5. The gate read TS's own header as the origin's (`4c557347`).
+
+Three were found by writing the test the plan asked for. One needed a running server. None
+were found by review — including my own, twice over on the same gate.
+
+The stale-cache test is the same failure in miniature: it passed while never reaching
+`is_stale()`, and only mutation testing exposed that. A test that passes for the wrong
+reason is worse than no test, because it is counted as coverage.
+
 ## Step B — consumers of TS's own response headers
 
 Not yet run.
