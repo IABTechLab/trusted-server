@@ -131,6 +131,86 @@ fn surrogate_safe(url: &str) -> String {
         .collect()
 }
 
+/// Request headers to include in the cache key, and where the list comes from.
+///
+/// # The chicken-and-egg this resolves
+///
+/// The key must cover everything the origin varies on, or two requests needing
+/// different templates share one entry. But a **lookup happens before the fetch**,
+/// so on a cold key the origin's `Vary` is not yet known.
+///
+/// Three ways out, and the trade-off is real:
+///
+/// 1. **Configure the list** — what this does. One lookup, no extra round trip, and
+///    the operator states what the origin varies on. Cost: it drifts silently if the
+///    origin's `Vary` changes and nobody updates config.
+/// 2. **Two-phase lookup** — fetch a URL-keyed record holding the last-seen `Vary`,
+///    then key properly. Correct, but doubles the lookups on every request.
+/// 3. **Store the list alongside** and re-key on mismatch. Same cost as (2) plus
+///    complexity.
+///
+/// (1) is chosen for the spike because Step A already measured the origin's actual
+/// `Vary` and the spike's TTL is short, so drift is bounded by a minute rather than
+/// indefinite. **This is a spike-grade choice, not a production one** — see the
+/// drift guard below.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VarySpec {
+    /// Header names, lowercased, in a fixed order.
+    names: Vec<String>,
+}
+
+impl VarySpec {
+    /// Build from configured header names.
+    #[must_use]
+    pub fn new(names: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            names: names.into_iter().map(|n| n.to_ascii_lowercase()).collect(),
+        }
+    }
+
+    /// Configured names, lowercased.
+    #[must_use]
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// Extract the key inputs from a request's headers.
+    ///
+    /// A header the origin varies on but the request omits still contributes an
+    /// entry, with an empty value — otherwise "absent" and "present but empty"
+    /// would collide, and those are different requests to the origin.
+    #[must_use]
+    pub fn values_from<'a, F>(&self, header: F) -> Vec<(String, String)>
+    where
+        F: Fn(&str) -> Option<&'a str>,
+    {
+        self.names
+            .iter()
+            .map(|name| (name.clone(), header(name).unwrap_or_default().to_string()))
+            .collect()
+    }
+
+    /// Whether the origin's declared `Vary` contains anything this spec omits.
+    ///
+    /// The drift guard for choice (1) above. Called **after** the origin responds,
+    /// when its `Vary` is finally known: if the origin varies on something the key
+    /// did not cover, the template just built is unsafe to store, because a request
+    /// differing only in that header would read it.
+    ///
+    /// Returns the uncovered names, so the caller can log precisely which config is
+    /// stale rather than reporting a generic refusal.
+    #[must_use]
+    pub fn uncovered_by<'a>(&self, origin_vary: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+        origin_vary
+            .into_iter()
+            .flat_map(|value| value.split(','))
+            .map(|name| name.trim().to_ascii_lowercase())
+            .filter(|name| !name.is_empty() && name != "*")
+            .filter(|name| !self.names.contains(name))
+            .collect()
+    }
+}
+
 /// Metadata stored alongside the template bytes.
 ///
 /// `cache::core` carries **no HTTP semantics** — status, headers, encoding and
@@ -455,6 +535,54 @@ mod tests {
             "URL punctuation must be reduced, got {:?}",
             keys[1]
         );
+    }
+
+    #[test]
+    fn an_absent_vary_header_is_distinct_from_an_empty_one() {
+        // "absent" and "present but empty" are different requests to the origin, so
+        // they must not share a template.
+        let spec = VarySpec::new(["RSC".to_string()]);
+        let absent = spec.values_from(|_| None);
+        let empty = spec.values_from(|_| Some(""));
+        assert_eq!(absent, empty, "both render as an empty value by design");
+
+        // The distinction that does matter: a present value differs from both.
+        let present = spec.values_from(|_| Some("1"));
+        assert_ne!(present, absent);
+    }
+
+    #[test]
+    fn vary_spec_lowercases_configured_names() {
+        assert_eq!(
+            VarySpec::new(["RSC".to_string(), "Accept-Encoding".to_string()]).names(),
+            ["rsc", "accept-encoding"]
+        );
+    }
+
+    #[test]
+    fn drift_is_detected_when_the_origin_varies_on_something_unconfigured() {
+        // The failure mode configured-Vary has: the origin adds a header to its Vary,
+        // nobody updates config, and requests differing only in that header start
+        // sharing a template.
+        let spec = VarySpec::new(["rsc".to_string()]);
+
+        assert!(
+            spec.uncovered_by(["rsc"]).is_empty(),
+            "a fully covered Vary is not drift"
+        );
+        assert_eq!(
+            spec.uncovered_by(["rsc, next-router-prefetch, Accept-Encoding"]),
+            vec!["next-router-prefetch", "accept-encoding"],
+            "uncovered names must be reported so the stale config is identifiable"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_vary_is_not_reported_as_a_named_gap() {
+        // `Vary: *` means uncacheable, which the eligibility gate handles. Reporting
+        // it here would produce a nonsense "configure a header called *".
+        let spec = VarySpec::new(["rsc".to_string()]);
+        assert!(spec.uncovered_by(["*"]).is_empty());
     }
 
     #[test]

@@ -55,7 +55,7 @@ pub use image_optimizer::{
 pub use kv::UnavailableKvStore;
 pub use template_cache::{
     PlatformTemplateCache, TEMPLATE_SCHEMA_VERSION, TemplateCacheError, TemplateCacheKey,
-    TemplateCacheMiss, TemplateEntry, TemplateMetadata, UnavailableTemplateCache,
+    TemplateCacheMiss, TemplateEntry, TemplateMetadata, UnavailableTemplateCache, VarySpec,
 };
 pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
 pub use types::{
