@@ -193,25 +193,48 @@ function candidateSlotRoots(elementId: string): HTMLElement[] {
   return roots;
 }
 
+function candidateSlotRootsForConfiguredDivId(divId: string): HTMLElement[] {
+  const roots = candidateSlotRoots(divId);
+  const dynamicElements = Array.from(document.querySelectorAll<HTMLElement>('[id]')).filter(
+    (element) => element.id.startsWith(divId) && !element.id.endsWith('-container')
+  );
+  for (const element of dynamicElements) {
+    if (!roots.includes(element)) roots.push(element);
+    const container = document.getElementById(`${element.id}-container`);
+    if (container && !roots.includes(container)) roots.push(container);
+  }
+  return roots;
+}
+
+function sourceIsInSlotRoots(source: MessageEventSource, roots: HTMLElement[]): boolean {
+  return roots.some((root) =>
+    Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
+  );
+}
+
 function slotIdForMessageSource(source: MessageEventSource | null): string | undefined {
   if (!source) return undefined;
 
   const divToSlotId = window.tsjs?.divToSlotId ?? {};
-  return Object.entries(divToSlotId).find(([elementId]) =>
-    candidateSlotRoots(elementId).some((root) =>
-      Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
-    )
+  const resolvedSlotId = Object.entries(divToSlotId).find(([elementId]) =>
+    sourceIsInSlotRoots(source, candidateSlotRoots(elementId))
   )?.[1];
+  if (resolvedSlotId) return resolvedSlotId;
+
+  const slots = window.tsjs?.adSlots ?? [];
+  return [...slots]
+    .sort((left, right) => right.div_id.length - left.div_id.length)
+    .find((slot) => sourceIsInSlotRoots(source, candidateSlotRootsForConfiguredDivId(slot.div_id)))
+    ?.id;
 }
 
 function messageSourceBelongsToAdUnit(
   source: MessageEventSource | null,
   adUnitCode: string
 ): boolean {
-  if (!source) return false;
-  return candidateSlotRoots(adUnitCode).some((root) =>
-    Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
-  );
+  return source
+    ? sourceIsInSlotRoots(source, candidateSlotRootsForConfiguredDivId(adUnitCode))
+    : false;
 }
 
 function clearTargetingKeys(slot: GoogleTagSlot, keys: Iterable<string>): void {
