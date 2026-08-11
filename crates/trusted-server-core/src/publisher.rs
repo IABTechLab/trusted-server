@@ -1284,6 +1284,49 @@ pub async fn buffer_publisher_response_async(
     }
 }
 
+/// Builds the response served from a C2 hit.
+///
+/// Every header is constructed here rather than replayed from the stored entry. The
+/// publisher path rewrites `Cache-Control` and strips validators after the send, so a
+/// replayed origin header would fight it; constructing them also means no origin header
+/// can reach a second visitor through the cache, which makes the `Set-Cookie` privacy
+/// net trivially safe rather than safe-by-audit.
+///
+/// # Errors
+///
+/// Returns an error if the stored metadata cannot be rendered as header values, which
+/// would mean a corrupt entry.
+///
+/// Spike-only, for the #1009 ESI validation.
+fn build_cached_template_response(
+    entry: &crate::platform::TemplateEntry,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let invalid = |what: &str| TrustedServerError::Proxy {
+        message: format!("cached template has an unusable {what}"),
+    };
+    let mut response = Response::new(EdgeBody::from(entry.body.clone()));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&entry.metadata.content_type)
+            .change_context_lazy(|| invalid("content type"))?,
+    );
+    // The encoding the origin actually chose, not the one keyed on. See
+    // `TemplateCacheKey::accept_encoding` for why those differ.
+    if !entry.metadata.content_encoding.is_empty() && entry.metadata.content_encoding != "identity"
+    {
+        response.headers_mut().insert(
+            header::CONTENT_ENCODING,
+            HeaderValue::from_str(&entry.metadata.content_encoding)
+                .change_context_lazy(|| invalid("content encoding"))?,
+        );
+    }
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from(entry.body.len() as u64),
+    );
+    Ok(response)
+}
+
 /// Writes the transformed template to the shared cache, if the gate authorized it.
 ///
 /// The key's presence is the authorization: it is `Some` only when
@@ -3032,23 +3075,44 @@ pub async fn handle_publisher_request(
     // legacy path never sets it. Either way it is an internal edge signal that
     // must not leak to publisher backends.
     req.headers_mut().remove("fastly-ssl");
-    // Captured before the request is consumed: the C2 key identifies the origin
-    // document plus the request headers the origin varies on, and this is the last
-    // point where both are still in hand.
+    // The C2 key is built here, before the request is consumed, because every field
+    // is request-derived and this is the last point where the request is in hand.
     //
-    // Read from the request as forwarded, after `restrict_accept_encoding` — keying on
-    // what the client originally sent would key on a value the origin never saw.
-    let template_cache_url = target_uri.to_string();
-    let template_cache_vary_values = settings
-        .creative_opportunities
-        .as_ref()
-        .map(CreativeOpportunitiesConfig::template_cache_vary)
-        .unwrap_or_else(|| VarySpec::new([]))
-        .values_from(|name| {
-            req.headers()
-                .get(name)
+    // Building it pre-fetch is what makes a lookup possible at all: a key that needed
+    // the origin's response could only ever authorize a store, never satisfy a read.
+    //
+    // Headers are read as forwarded, after `restrict_accept_encoding` — keying on what
+    // the client originally sent would key on a value the origin never saw.
+    let template_cache_key = (!matches!(assembly_mode, AssemblyMode::Inline)).then(|| {
+        crate::platform::TemplateCacheKey {
+            url: target_uri.to_string(),
+            request_host: request_host.to_string(),
+            request_scheme: request_scheme.to_string(),
+            assembly_mode,
+            vary_values: settings
+                .creative_opportunities
+                .as_ref()
+                .map(CreativeOpportunitiesConfig::template_cache_vary)
+                .unwrap_or_else(|| VarySpec::new([]))
+                .values_from(|name| {
+                    req.headers()
+                        .get(name)
+                        .and_then(|value| value.to_str().ok())
+                }),
+            accept_encoding: req
+                .headers()
+                .get(header::ACCEPT_ENCODING)
                 .and_then(|value| value.to_str().ok())
-        });
+                .unwrap_or_default()
+                .to_string(),
+            // Changes whenever any JS module changes, so a bundle deploy invalidates
+            // stored templates without needing a purge.
+            integration_fingerprint: trusted_server_js::concatenated_hash(
+                &trusted_server_js::all_module_ids(),
+            ),
+            schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
+        }
+    });
     *req.uri_mut() = target_uri;
     req.headers_mut().insert(
         header::HOST,
@@ -3056,6 +3120,32 @@ pub async fn handle_publisher_request(
             message: "invalid publisher origin host header".to_string(),
         })?,
     );
+
+    // C2 lookup, before the origin fetch — the whole point is to skip it.
+    //
+    // The gate that authorized the store was response-derived, so it cannot re-run
+    // here and does not need to: a template in the cache already passed it. What must
+    // re-run are the *request*-derived disqualifications, because they are properties
+    // of this request rather than of the stored bytes. An authenticated request must
+    // not be served a shared template even if that template is perfectly cacheable.
+    if let Some(key) = template_cache_key
+        .as_ref()
+        .filter(|_| !request_had_authorization && !request_had_cookie)
+    {
+        match services.template_cache().get(key).await {
+            Ok(entry) => {
+                log::debug!("c2_template_cache hit: {} bytes", entry.body.len());
+                // Headers are constructed rather than replayed. The publisher path
+                // rewrites `Cache-Control` and strips validators *after* the send, so
+                // replaying stored origin headers would fight that — and constructing
+                // them means no origin header can leak through the cache.
+                return Ok(PublisherResponse::Buffered(build_cached_template_response(
+                    &entry,
+                )?));
+            }
+            Err(miss) => log::debug!("c2_template_cache miss: {miss}"),
+        }
+    }
 
     // SSP requests are already racing through the platform HTTP client, so
     // origin TTFB tracks origin latency rather than the auction timeout.
@@ -3183,21 +3273,14 @@ pub async fn handle_publisher_request(
         .to_lowercase();
     let route = classify_response_route(status, &content_type, &content_encoding, request_host);
 
-    // The shared-template cache gate. Evaluated here rather than earlier because the
-    // negotiated content encoding is part of the key: the pipeline pairs input encoding
-    // to output encoding, so a template stored as brotli must never be handed to a
-    // client that asked for gzip.
+    // The shared-template cache gate: it does not build the key, it authorizes storing
+    // the one built pre-fetch. Everything it checks is response-derived, which is
+    // exactly why it cannot run at lookup time — and why it does not need to. Anything
+    // already in the cache passed this gate on the way in.
     //
-    // A `Some` key is the store authorization. Under the default `Inline` mode the gate
-    // reports `InlineMode` and nothing is ever stored.
-    let template_cache_key = if matches!(assembly_mode, AssemblyMode::Inline) {
-        None
-    } else {
-        let key_vary = settings
-            .creative_opportunities
-            .as_ref()
-            .map(CreativeOpportunitiesConfig::template_cache_vary)
-            .unwrap_or_else(|| VarySpec::new([]));
+    // A surviving key is the store authorization. Under `Inline` there is no key to
+    // survive.
+    let template_cache_key = template_cache_key.filter(|_| {
         match c2_bypass_reason(
             assembly_mode,
             request_had_authorization,
@@ -3205,31 +3288,22 @@ pub async fn handle_publisher_request(
             status,
             &content_type,
             response.headers(),
-            &key_vary,
+            &settings
+                .creative_opportunities
+                .as_ref()
+                .map(CreativeOpportunitiesConfig::template_cache_vary)
+                .unwrap_or_else(|| VarySpec::new([])),
         ) {
             Some(reason) => {
                 log::debug!("c2_template_cache bypass: {reason}");
-                None
+                false
             }
             None => {
                 log::debug!("c2_template_cache eligible");
-                Some(crate::platform::TemplateCacheKey {
-                    url: template_cache_url,
-                    request_host: request_host.to_string(),
-                    request_scheme: request_scheme.to_string(),
-                    assembly_mode,
-                    vary_values: template_cache_vary_values,
-                    content_encoding: content_encoding.clone(),
-                    // Changes whenever any JS module changes, so a bundle deploy
-                    // invalidates stored templates without needing a purge.
-                    integration_fingerprint: trusted_server_js::concatenated_hash(
-                        &trusted_server_js::all_module_ids(),
-                    ),
-                    schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
-                })
+                true
             }
         }
-    };
+    });
 
     match route {
         ResponseRoute::PassThrough => {
@@ -5306,7 +5380,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 assembly_mode: AssemblyMode::Esi,
                 vary_values: vec![],
-                content_encoding: "identity".to_string(),
+                accept_encoding: "identity".to_string(),
                 integration_fingerprint: "fp".to_string(),
                 schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
             }
@@ -5383,6 +5457,288 @@ mod tests {
                 cache.recorded().len(),
                 1,
                 "authorization must be single-use"
+            );
+        }
+    }
+
+    mod c2_end_to_end_tests {
+        //! The chain, end to end: a second request for the same URL must be served from
+        //! the cache without touching the origin. Everything else in this file tests a
+        //! link; this tests that they connect.
+
+        use super::*;
+        use crate::platform::ClientInfo;
+        use crate::platform::test_support::{
+            NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend, StubHttpClient,
+        };
+        use crate::test_support::tests::crate_test_settings_str;
+        use std::collections::HashMap;
+
+        /// A working cache, unlike the recorder above — this one has to actually return
+        /// what it stored, or a hit proves nothing.
+        #[derive(Default)]
+        struct MemoryTemplateCache {
+            entries: Mutex<HashMap<String, crate::platform::TemplateEntry>>,
+        }
+
+        #[async_trait::async_trait(?Send)]
+        impl crate::platform::PlatformTemplateCache for MemoryTemplateCache {
+            async fn get(
+                &self,
+                key: &crate::platform::TemplateCacheKey,
+            ) -> Result<crate::platform::TemplateEntry, crate::platform::TemplateCacheMiss>
+            {
+                self.entries
+                    .lock()
+                    .expect("should lock entries")
+                    .get(&key.to_cache_key())
+                    .cloned()
+                    .ok_or(crate::platform::TemplateCacheMiss::NotFound)
+            }
+
+            async fn put(
+                &self,
+                key: &crate::platform::TemplateCacheKey,
+                metadata: &crate::platform::TemplateMetadata,
+                body: Vec<u8>,
+            ) -> Result<(), crate::platform::TemplateCacheError> {
+                self.entries.lock().expect("should lock entries").insert(
+                    key.to_cache_key(),
+                    crate::platform::TemplateEntry {
+                        metadata: metadata.clone(),
+                        body,
+                    },
+                );
+                Ok(())
+            }
+
+            async fn purge_all(&self) -> Result<(), crate::platform::TemplateCacheError> {
+                self.entries.lock().expect("should lock entries").clear();
+                Ok(())
+            }
+        }
+
+        fn settings_with_mode(mode: &str) -> Settings {
+            let toml = format!(
+                "{}\n[creative_opportunities]\ngam_network_id = \"99999\"\n\
+                 assembly_mode = \"{mode}\"\n",
+                crate_test_settings_str()
+            );
+            let mut settings =
+                Settings::from_toml(&toml).expect("should parse settings with an assembly mode");
+            // Mirrors `create_test_settings`; the integration registry refuses to build
+            // without it.
+            settings.proxy.allowed_domains =
+                vec!["*.example".to_string(), "*.example.com".to_string()];
+            settings
+        }
+
+        fn services(
+            http_client: Arc<StubHttpClient>,
+            cache: Arc<MemoryTemplateCache>,
+        ) -> RuntimeServices {
+            RuntimeServices::builder()
+                .config_store(Arc::new(NoopConfigStore))
+                .secret_store(Arc::new(NoopSecretStore))
+                .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+                .backend(Arc::new(StubBackend))
+                .http_client(http_client)
+                .geo(Arc::new(NoopGeo))
+                .client_info(ClientInfo::default())
+                .template_cache(cache)
+                .build()
+        }
+
+        /// Shareable HTML: no `Set-Cookie`, no `Vary`, a public `Cache-Control`. Every
+        /// condition the gate checks is satisfied, so a bypass here would be a bug in
+        /// the wiring rather than in the fixture.
+        fn queue_shareable_html(stub: &StubHttpClient) {
+            stub.push_response_with_headers(
+                200,
+                b"<html><head></head><body>origin</body></html>".to_vec(),
+                vec![
+                    ("content-type", "text/html; charset=utf-8"),
+                    ("cache-control", "public, max-age=300"),
+                ],
+            );
+        }
+
+        fn navigation_request() -> Request<EdgeBody> {
+            HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://ts.example.com/article")
+                .header(header::HOST, "ts.example.com")
+                .header("sec-fetch-dest", "document")
+                .body(EdgeBody::empty())
+                .expect("should build navigation request")
+        }
+
+        /// Runs the full request, **including the finalizer**.
+        ///
+        /// The finalizer is not optional here: the store happens once the transform has
+        /// produced every byte, so a test that stopped at `handle_publisher_request`
+        /// would never populate the cache and a hit could not be proven.
+        async fn run(
+            settings: &Arc<Settings>,
+            services: &RuntimeServices,
+            request: Request<EdgeBody>,
+        ) -> Response<EdgeBody> {
+            let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+            let registry =
+                IntegrationRegistry::new(settings).expect("should create integration registry");
+            let consent = crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            };
+            let mut ec_context = EcContext::new_for_test(None, consent);
+            let publisher_response = handle_publisher_request(
+                settings,
+                services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &[],
+                    registry: None,
+                },
+                request,
+            )
+            .await
+            .expect("should proxy publisher request");
+
+            publisher_response_into_streaming_response(
+                publisher_response,
+                &Method::GET,
+                Arc::clone(settings),
+                &registry,
+                orchestrator,
+                services.clone(),
+            )
+            .await
+            .expect("should finalize publisher response")
+        }
+
+        fn body_of(response: Response<EdgeBody>) -> Vec<u8> {
+            response
+                .into_body()
+                .into_bytes()
+                .expect("a shared-mode response is buffered, so its bytes are in hand")
+                .to_vec()
+        }
+
+        #[tokio::test]
+        async fn a_second_request_is_served_from_the_cache_without_touching_the_origin() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+
+            // Only one origin response is queued. If the second request reached the
+            // origin it would find the queue empty, so this fixture is itself part of
+            // the assertion.
+            queue_shareable_html(&stub);
+
+            let first = body_of(run(&settings, &services, navigation_request()).await);
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "the cold request must fetch the origin"
+            );
+
+            let second = body_of(run(&settings, &services, navigation_request()).await);
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "the warm request must not fetch the origin — that saving is the point"
+            );
+            assert_eq!(
+                second, first,
+                "the cached template must be byte-identical to what was stored"
+            );
+        }
+
+        #[tokio::test]
+        async fn inline_mode_never_reads_or_writes_the_cache() {
+            // The shipped path. If this ever cached, per-user ad state would be shared
+            // between visitors — the exact failure the whole design exists to avoid.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("inline"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+            queue_shareable_html(&stub);
+
+            let _ = run(&settings, &services, navigation_request()).await;
+            let _ = run(&settings, &services, navigation_request()).await;
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "inline must fetch the origin every time"
+            );
+            assert!(
+                cache
+                    .entries
+                    .lock()
+                    .expect("should lock entries")
+                    .is_empty(),
+                "inline must never write a shared template"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_authenticated_request_is_not_served_a_shared_template() {
+            // The stored template is perfectly cacheable; this request is not entitled
+            // to it. The store gate cannot express that, because it is a property of
+            // the reader rather than of the bytes — which is why the lookup re-checks.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+            queue_shareable_html(&stub);
+
+            let _ = run(&settings, &services, navigation_request()).await;
+            assert_eq!(
+                cache.entries.lock().expect("should lock entries").len(),
+                1,
+                "the cold request should have populated the cache"
+            );
+
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let consent = crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            };
+            let mut ec_context = EcContext::new_for_test(None, consent);
+            let authenticated = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://ts.example.com/article")
+                .header(header::HOST, "ts.example.com")
+                .header("sec-fetch-dest", "document")
+                .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+                .body(EdgeBody::empty())
+                .expect("should build authenticated request");
+            let _ = handle_publisher_request(
+                &settings,
+                &services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &[],
+                    registry: None,
+                },
+                authenticated,
+            )
+            .await
+            .expect("should proxy publisher request");
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "an authenticated request must reach the origin rather than read a \
+                 shared template"
             );
         }
     }

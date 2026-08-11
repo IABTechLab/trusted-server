@@ -53,13 +53,25 @@ pub struct TemplateCacheKey {
     /// order the origin listed them. Not a fixed list: the origin is authoritative,
     /// and hard-coding one here would silently drift when the origin's changes.
     pub vary_values: Vec<(String, String)>,
-    /// The negotiated content encoding of the stored bytes.
+    /// The `Accept-Encoding` sent to the origin, **not** the encoding the origin
+    /// chose.
     ///
-    /// The streaming pipeline pairs input encoding to the same output encoding, so
-    /// the transformed bytes inherit whatever the origin chose from the client's
-    /// `Accept-Encoding`. Serving brotli bytes to a client that asked for gzip is a
-    /// broken response, so this is part of the key rather than of the payload.
-    pub content_encoding: String,
+    /// The distinction is forced by ordering. The pipeline pairs input encoding to the
+    /// same output encoding, so the transformed bytes inherit whatever the origin
+    /// negotiated — and serving brotli bytes to a client that asked for gzip is a
+    /// broken response, so encoding must be keyed. But **a lookup happens before the
+    /// origin has chosen**, so the chosen value is unavailable at exactly the moment
+    /// the key is needed. Keying on it would mean storing under `br` and looking up
+    /// under `gzip, br`: a cache that never hits.
+    ///
+    /// Keying on the request side is sound because origin negotiation is a function of
+    /// what it was offered, so identical offers yield identical choices. The encoding
+    /// actually chosen is recorded in [`TemplateMetadata::content_encoding`] and is
+    /// what the served response declares.
+    ///
+    /// Read as forwarded, after `restrict_accept_encoding` narrows it — the value the
+    /// client sent is not necessarily the value the origin saw.
+    pub accept_encoding: String,
     /// Identifies the enabled integration set and the tsjs bundle. Both change the
     /// injected markup for the same URL.
     pub integration_fingerprint: String,
@@ -89,7 +101,7 @@ impl TemplateCacheKey {
         push(&self.request_scheme);
         push(&self.request_host);
         push(&self.url);
-        push(&self.content_encoding);
+        push(&self.accept_encoding);
         push(&self.integration_fingerprint);
 
         push(&self.vary_values.len().to_string());
@@ -407,7 +419,7 @@ mod tests {
             request_scheme: "https".to_string(),
             assembly_mode: AssemblyMode::Esi,
             vary_values: vec![("rsc".to_string(), "1".to_string())],
-            content_encoding: "gzip".to_string(),
+            accept_encoding: "gzip".to_string(),
             integration_fingerprint: "abc123".to_string(),
             schema_version: TEMPLATE_SCHEMA_VERSION,
         }
@@ -440,11 +452,11 @@ mod tests {
         assert_ne!(scheme.to_cache_key(), base, "scheme must change the key");
 
         let mut encoding = key();
-        encoding.content_encoding = "br".to_string();
+        encoding.accept_encoding = "br".to_string();
         assert_ne!(
             encoding.to_cache_key(),
             base,
-            "content encoding must change the key; serving brotli to a gzip client \
+            "accept encoding must change the key; serving brotli to a gzip client \
              is a broken response"
         );
 

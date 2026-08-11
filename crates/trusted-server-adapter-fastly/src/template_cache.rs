@@ -185,7 +185,7 @@ mod tests {
             request_scheme: "https".to_string(),
             assembly_mode: AssemblyMode::Esi,
             vary_values: vec![("rsc".to_string(), "1".to_string())],
-            content_encoding: "identity".to_string(),
+            accept_encoding: "identity".to_string(),
             integration_fingerprint: "fp".to_string(),
             schema_version: TEMPLATE_SCHEMA_VERSION,
         }
