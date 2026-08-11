@@ -283,6 +283,73 @@ spec flags as needing an audit and which that audit has not yet covered. Until i
 treat request-neutrality as asserted for one element rather than established for the
 template.
 
+## Code review of the Task 3 commits — three HIGH findings, all closed
+
+**Date:** 2026-08-11. An independent review of the four implementation commits found
+three HIGH issues. The default `Inline` path was verified unchanged byte-for-byte, so
+none was a live regression — but all three were invariants this branch exists to
+establish and none was enforced or tested.
+
+### 1. The auction dispatched under shared modes with nothing to consume it
+
+`assembly_mode` was computed _after_ the dispatch decision, so flipping to `client_fill`
+or `esi` would still have sent real SSP bid requests, held the response for the full
+auction budget, and discarded the result — because both injection seams now return
+nothing — with no error, no warning and no log.
+
+Exactly the silent-waste signature §5 of the design doc is about, reached by an
+incomplete feature flag rather than by removing the hold. Fixed by hoisting
+`assembly_mode` above the dispatch and gating on `root_auction_is_useful`.
+
+The test derives the invariant rather than asserting per-variant: a root auction is
+useful exactly when a seam will consume its result. A new mode cannot make the dispatch
+gate and the injection decisions disagree without failing it.
+
+### 2. The C2 gate ignored the forwarded client `Cookie`
+
+TS forwards client cookies to origin unchanged — there is no `Cookie` strip on the
+publisher path. So a response can be cookie-personalized while carrying no `Set-Cookie`
+itself (session established earlier), no `Cache-Control` at all, status 200, HTML — and
+every condition in the gate reported it cacheable.
+
+§4 of the design doc names this. The plan's own Task 3 Step 3 checklist missed it, so
+the implementation matching the checklist exactly still had the hole. Now disqualifying
+until an origin `Vary` covering `Cookie` is verified.
+
+### 3. Request-neutrality was asserted for one element, not the seam
+
+The head seam still injected integration `head_inserts` and the GPT-diagnostics
+bootstrap unconditionally.
+
+Audited both. **`head_inserts` is clean** — all three implementations (datadome, didomi,
+gpt) take the context parameter unused, so output depends on configuration, not the
+request. **GPT diagnostics is not** — cookie- or query-activated, and documented as an
+immutable request-scoped decision.
+
+It did not leak, but only by coincidence: `requires_private_no_store()` is a strict
+superset of the conditions under which either script is emitted, and that stamp lands
+before the C2 gate reads response headers, so the gate refused. Two independent
+conditions that happened to align, with nothing enforcing the relationship.
+
+Fixed on both sides — the processor receives no diagnostics decision under shared modes,
+**and** a test enumerates every combination of the decision's three fields asserting that
+anything which injects also requires the stamp. The gate is the guarantee; the invariant
+test is the backstop if the gate is ever removed.
+
+### What this says about the tests that existed
+
+All three findings were in code the existing tests covered — and passed. The tests
+exercised the pure decision functions with hand-built inputs and never the rendered
+`<head>`/`</body>` bytes. That is still true: **no test renders a full document through
+`create_html_processor` and compares two requests byte-for-byte.** The plan's Task 3
+Step 2 requires exactly that, and it remains the most valuable missing test.
+
+### Reviewer's gate, adopted
+
+Do not proceed to Task 3 Step 4 (actual C2 read/write) or expose `AssemblyMode` to any
+test or staging traffic until the full-document byte-identity test exists. The three
+fixes above close the known holes; that test is what would catch the next one.
+
 ## Step B — consumers of TS's own response headers
 
 Not yet run.
