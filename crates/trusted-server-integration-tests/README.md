@@ -142,6 +142,7 @@ Playwright directly.
 |---|---|
 | `script-injection` | `script#trustedserver-js` present in live DOM, no console errors |
 | `script-bundle` | JS bundle loads with 200, no parse/runtime errors, correct content type |
+| `aps-renderer` | Static route nonce gating, restrictive CSP, replay rejection, and opaque iframe/script isolation |
 
 ### Browser-level — Next.js
 

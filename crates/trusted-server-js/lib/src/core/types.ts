@@ -41,11 +41,41 @@ export interface AuctionDebugBidData {
   height?: number;
   nurl?: string | null;
   burl?: string | null;
+  bid_id?: string | null;
   ad_id?: string | null;
+  creative_id?: string | null;
   cache_id?: string | null;
   cache_host?: string | null;
   cache_path?: string | null;
   metadata?: Record<string, unknown>;
+}
+
+export type ApsTagType = 'iframe' | 'script';
+
+/** Version 1 Trusted Server APS renderer descriptor. */
+export interface ApsRendererV1 {
+  type: 'aps';
+  version: 1;
+  accountId: string;
+  bidId: string;
+  creativeId?: string;
+  tagType: ApsTagType;
+  creativeUrl: string;
+  aaxResponse: string;
+  width: number;
+  height: number;
+}
+
+export type AuctionBidRenderer = ApsRendererV1;
+
+/** A client-side Prebid bid's generated ad ID bound to its APS render capability. */
+export interface ApsPrebidRendererEntry {
+  adUnitCode: string;
+  renderer: ApsRendererV1;
+  registeredAt: number;
+  expiresAt: number;
+  /** Mark the bid as won and rendered after replying to Universal Creative. */
+  markUsed(): void;
 }
 
 /** Bid targeting data from the server-side auction, injected into `window.tsjs.bids`. */
@@ -63,21 +93,18 @@ export interface AuctionBidData {
   h?: number;
   nurl?: string;
   burl?: string;
+  /** Typed winning-bid renderer capability. */
+  renderer?: AuctionBidRenderer;
+  /** Winning creative width used by the inline render bridge. */
+  w?: number;
+  /** Winning creative height used by the inline render bridge. */
+  h?: number;
   /**
-   * Sanitized winning creative markup for local rendering through the pbRender
-   * bridge. Present whenever the winning bid carried a creative that passed the
-   * server-side sanitize/rewrite boundary; absent when there was no creative or
-   * it was rejected (e.g. over the 1 MiB cap), in which case the bridge falls
-   * back to the PBS Cache coordinates. This is NOT gated by
-   * `inject_adm_for_testing`.
+   * Sanitized winning creative markup for the inline render bridge. Present
+   * when the server retained a non-empty creative; not gated by debug mode.
    */
   adm?: string;
-  /**
-   * Verbose per-bid debug blob (carries the raw, un-sanitized creative among
-   * other fields). Only present when `[debug] inject_adm_for_testing = true`;
-   * its presence is also the client-side gate for the testing-only direct
-   * GAM-replace path.
-   */
+  /** Debug-only bid field mirror. Only present when `[debug] inject_adm_for_testing = true`. */
   debug_bid?: AuctionDebugBidData;
 }
 
@@ -338,6 +365,11 @@ export interface TsjsApi {
   adSlots?: AuctionSlot[];
   /** Winning bid targeting data injected before </body>. */
   bids?: Record<string, AuctionBidData>;
+  /**
+   * Bounded client-side Prebid APS renderer capabilities keyed by Prebid's generated
+   * `hb_adid`. The Universal Creative bridge consumes each entry at most once.
+   */
+  apsPrebidRenderers?: Record<string, ApsPrebidRendererEntry>;
   /** Initialises GPT slots with server-side bid targeting and calls refresh(). */
   adInit?: () => void;
   /** GPT slot objects TS defined — used to destroy stale slots on SPA navigation. */

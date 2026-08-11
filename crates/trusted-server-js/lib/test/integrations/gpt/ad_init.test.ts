@@ -3,7 +3,24 @@ import path from 'node:path';
 
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 
+import envelope from '../../fixtures/aps-renderer-v1.json';
 import type { AuctionBidData, TsjsApi } from '../../../src/core/types';
+
+function apsRenderer() {
+  const bid = envelope.seatbid[0].bid[0];
+  return {
+    type: 'aps' as const,
+    version: 1 as const,
+    accountId: 'example-account-id',
+    bidId: bid.id,
+    creativeId: 'fictional-creative-id',
+    tagType: 'iframe' as const,
+    creativeUrl: bid.ext.creativeurl,
+    aaxResponse: btoa(JSON.stringify(envelope)),
+    width: bid.w,
+    height: bid.h,
+  };
+}
 
 // Track every 'message' EventListener added to window across the entire test
 // file.  This lets the installTsRenderBridge suite remove all accumulated
@@ -168,6 +185,15 @@ describe('installTsAdInit', () => {
         hb_adid: 'abc-uuid',
         hb_cache_host: 'cache.example.com',
         hb_cache_path: '/cache',
+      },
+      'renderable_candidate',
+    ],
+    [
+      'typed renderer',
+      {
+        hb_pb: '1.00',
+        hb_adid: apsRenderer().bidId,
+        renderer: apsRenderer(),
       },
       'renderable_candidate',
     ],
@@ -1281,7 +1307,7 @@ describe('installTsAdInit', () => {
     beaconSpy.mockRestore();
   });
 
-  it('calls apstag.setDisplayBids when hb_bidder is aps', async () => {
+  it('does not call native apstag for a Trusted Server APS renderer winner', async () => {
     const setDisplayBidsSpy = vi.fn();
     (window as TestWindow).apstag = { setDisplayBids: setDisplayBidsSpy };
 
@@ -1314,7 +1340,12 @@ describe('installTsAdInit', () => {
         },
       ],
       bids: {
-        atf_sidebar_ad: { hb_pb: '1.50', hb_bidder: 'aps', nurl: '', burl: '' },
+        atf_sidebar_ad: {
+          hb_pb: '1.50',
+          hb_bidder: 'aps',
+          hb_adid: envelope.seatbid[0].bid[0].id,
+          renderer: apsRenderer(),
+        },
       },
     };
 
@@ -1322,7 +1353,8 @@ describe('installTsAdInit', () => {
     installTsAdInit();
     (window as TestWindow).tsjs!.adInit!();
 
-    expect(setDisplayBidsSpy).toHaveBeenCalled();
+    expect(setDisplayBidsSpy).not.toHaveBeenCalled();
+    expect((window as TestWindow).apstag).toEqual({ setDisplayBids: setDisplayBidsSpy });
 
     delete (window as TestWindow).apstag;
   });
@@ -1549,9 +1581,9 @@ describe('installTsRenderBridge', () => {
     delete (window as TestWindow).tsjs;
   });
 
-  function createTrustedSlotIframe(): Window {
+  function createTrustedSlotIframe(divId = 'div-header'): Window {
     const slot = document.createElement('div');
-    slot.id = 'div-header';
+    slot.id = divId;
     const iframe = document.createElement('iframe');
     slot.appendChild(iframe);
     document.body.appendChild(slot);
@@ -1754,6 +1786,600 @@ describe('installTsRenderBridge', () => {
     expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
     expect(beaconSpy).not.toHaveBeenCalled();
     beaconSpy.mockRestore();
+  });
+
+  it('serves a server APS renderer once and rejects a repeated request', async () => {
+    const renderer = apsRenderer();
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: renderer.bidId,
+      hb_bidder: 'aps',
+      hb_pb: '1.23',
+      renderer,
+      // These must not be used even if unexpected legacy fields coexist.
+      nurl: 'https://notify.example/win',
+      burl: 'https://notify.example/bill',
+      hb_cache_host: 'cache.example.com',
+      hb_cache_path: '/cache',
+    };
+    const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(47);
+    const recordTrustedServerCreativeResponse = vi.fn();
+    const recordTrustedServerCreativeFailure = vi.fn();
+    (window as TestWindow).tsjs.gptDiagnosticsRecorder = {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } as unknown as TsjsApi['gptDiagnosticsRecorder'];
+
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    const fakePort = { postMessage: (message: string) => portMessages.push(message) };
+    const event = Object.assign(new Event('message'), {
+      data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
+      ports: [fakePort],
+      source,
+      stopImmediatePropagation: stopSpy,
+    }) as unknown as MessageEvent;
+
+    bridgeListener(event);
+    bridgeListener(event);
+
+    expect(stopSpy).toHaveBeenCalledTimes(2);
+    expect(fetchStub).not.toHaveBeenCalled();
+    expect(beaconSpy).not.toHaveBeenCalled();
+    expect(recordTrustedServerCreativeRequest).toHaveBeenCalledOnce();
+    expect(recordTrustedServerCreativeRequest).toHaveBeenCalledWith('homepage_header');
+    expect(recordTrustedServerCreativeResponse).toHaveBeenCalledWith(47);
+    expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
+    // Server-rendered APS capabilities are one-shot per slot and ad ID. A
+    // repeated Universal Creative request is claimed but receives no payload.
+    expect(portMessages).toHaveLength(1);
+    const response = JSON.parse(portMessages[0]) as Record<string, unknown>;
+    expect(Object.keys(response).sort()).toEqual(
+      [
+        'adId',
+        'apsRenderer',
+        'height',
+        'message',
+        'renderer',
+        'rendererUrl',
+        'rendererVersion',
+        'width',
+      ].sort()
+    );
+    expect(response).toEqual({
+      message: 'Prebid Response',
+      adId: renderer.bidId,
+      renderer: expect.stringContaining('window.render=function'),
+      rendererVersion: 4,
+      rendererUrl: new URL('/integrations/aps/renderer', window.location.origin).href,
+      apsRenderer: renderer,
+      width: 300,
+      height: 250,
+    });
+    expect(String(response.renderer)).not.toContain(renderer.accountId);
+    expect(String(response.renderer)).not.toContain(renderer.aaxResponse);
+
+    // Universal Creative's dynamic-renderer path evaluates the returned static
+    // source and calls window.render(response, helper, targetWindow). Consume
+    // the exact bridge response through that deployed protocol shape.
+    const dynamicWindow = window as unknown as {
+      render?: (data: Record<string, unknown>, helper: unknown, target: Window) => Promise<void>;
+    };
+    window.eval(String(response.renderer));
+    try {
+      const rendered = dynamicWindow.render!(response, undefined, window);
+      const outerFrame = document.querySelector<HTMLIFrameElement>(
+        'iframe[src*="/integrations/aps/renderer#tsaps="]'
+      )!;
+      expect(outerFrame).not.toBeNull();
+      expect(outerFrame.getAttribute('sandbox')).not.toContain('allow-same-origin');
+
+      const rendererPost = vi.spyOn(outerFrame.contentWindow!, 'postMessage');
+      outerFrame.dispatchEvent(new Event('load'));
+      const sent = rendererPost.mock.calls[0][0] as { nonce: string };
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          data: { message: 'trusted-server/aps/renderer-ready', nonce: sent.nonce },
+          source: outerFrame.contentWindow,
+        })
+      );
+      await expect(rendered).resolves.toBeUndefined();
+      outerFrame.remove();
+    } finally {
+      delete dynamicWindow.render;
+    }
+    beaconSpy.mockRestore();
+  });
+
+  it('serves a registered Prebid APS renderer when its generated ad ID differs from the APS bid ID', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'prebid-generated-ad-id';
+    const markUsed = vi.fn();
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markUsed,
+      },
+    };
+    const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(48);
+    const recordTrustedServerCreativeResponse = vi.fn();
+    const recordTrustedServerCreativeFailure = vi.fn();
+    (window as TestWindow).tsjs.gptDiagnosticsRecorder = {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } as unknown as TsjsApi['gptDiagnosticsRecorder'];
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    const event = Object.assign(new Event('message'), {
+      data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+      ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+      source,
+      stopImmediatePropagation: stopSpy,
+    }) as unknown as MessageEvent;
+
+    bridgeListener(event);
+    const foreignIframe = document.createElement('iframe');
+    document.body.appendChild(foreignIframe);
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source: foreignIframe.contentWindow,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+
+    expect(stopSpy).toHaveBeenCalledTimes(2);
+    expect(portMessages).toHaveLength(1);
+    expect(markUsed).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(portMessages[0])).toEqual(
+      expect.objectContaining({
+        message: 'Prebid Response',
+        adId: prebidAdId,
+        apsRenderer: renderer,
+        width: renderer.width,
+        height: renderer.height,
+      })
+    );
+    expect(renderer.bidId).not.toBe(prebidAdId);
+    expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
+    expect(fetchStub).not.toHaveBeenCalled();
+    expect(recordTrustedServerCreativeRequest).toHaveBeenCalledOnce();
+    expect(recordTrustedServerCreativeRequest).toHaveBeenCalledWith('homepage_header');
+    expect(recordTrustedServerCreativeResponse).toHaveBeenCalledWith(48);
+    expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
+    foreignIframe.remove();
+  });
+
+  it.each(['server', 'Prebid'] as const)(
+    'records response_post_failed when posting a %s APS renderer throws',
+    async (sourceKind) => {
+      const renderer = apsRenderer();
+      const adId = sourceKind === 'server' ? renderer.bidId : 'prebid-post-failure-ad-id';
+      const markUsed = vi.fn();
+      if (sourceKind === 'server') {
+        (window as TestWindow).tsjs.bids.homepage_header = {
+          hb_adid: adId,
+          hb_bidder: 'aps',
+          renderer,
+        };
+      } else {
+        (window as TestWindow).tsjs.apsPrebidRenderers = {
+          [adId]: {
+            adUnitCode: 'div-header',
+            renderer,
+            registeredAt: Date.now(),
+            expiresAt: Date.now() + 60_000,
+            markUsed,
+          },
+        };
+      }
+
+      const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(50);
+      const recordTrustedServerCreativeResponse = vi.fn();
+      const recordTrustedServerCreativeFailure = vi.fn();
+      (window as TestWindow).tsjs.gptDiagnosticsRecorder = {
+        recordTrustedServerCreativeRequest,
+        recordTrustedServerCreativeResponse,
+        recordTrustedServerCreativeFailure,
+      } as unknown as TsjsApi['gptDiagnosticsRecorder'];
+
+      const bridgeListener = await captureBridgeListener();
+      const source = createTrustedSlotIframe();
+      expect(() =>
+        bridgeListener(
+          Object.assign(new Event('message'), {
+            data: JSON.stringify({ message: 'Prebid Request', adId }),
+            ports: [
+              {
+                postMessage: vi.fn(() => {
+                  throw new Error('port closed');
+                }),
+              },
+            ],
+            source,
+            stopImmediatePropagation: vi.fn(),
+          }) as unknown as MessageEvent
+        )
+      ).not.toThrow();
+
+      expect(recordTrustedServerCreativeRequest).toHaveBeenCalledWith('homepage_header');
+      expect(recordTrustedServerCreativeFailure).toHaveBeenCalledWith(50, 'response_post_failed');
+      expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
+      expect(markUsed).not.toHaveBeenCalled();
+    }
+  );
+
+  it('still serves the APS renderer when markUsed throws', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'throwing-mark-used-ad-id';
+    const markUsed = vi.fn(() => {
+      throw new Error('fictional markUsed failure');
+    });
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markUsed,
+      },
+    };
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const portMessages: string[] = [];
+
+    expect(() =>
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+          ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      )
+    ).not.toThrow();
+
+    expect(portMessages).toHaveLength(1);
+    expect(JSON.parse(portMessages[0])).toEqual(
+      expect.objectContaining({
+        message: 'Prebid Response',
+        adId: prebidAdId,
+        apsRenderer: renderer,
+      })
+    );
+    expect(markUsed).toHaveBeenCalledTimes(1);
+  });
+
+  it('prunes expired consumed APS renderer IDs', async () => {
+    vi.useFakeTimers();
+    try {
+      const renderer = apsRenderer();
+      const prebidAdId = 'expiring-consumed-ad-id';
+      const start = Date.now();
+      const firstMarkUsed = vi.fn();
+      const secondMarkUsed = vi.fn();
+      (window as TestWindow).tsjs.apsPrebidRenderers = {
+        [prebidAdId]: {
+          adUnitCode: 'div-header',
+          renderer,
+          registeredAt: start,
+          expiresAt: start + 60_000,
+          markUsed: firstMarkUsed,
+        },
+      };
+
+      const bridgeListener = await captureBridgeListener();
+      const source = createTrustedSlotIframe();
+      const stopImmediatePropagation = vi.fn();
+      const portMessages: string[] = [];
+      const sendRequest = (): void => {
+        bridgeListener(
+          Object.assign(new Event('message'), {
+            data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+            ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+            source,
+            stopImmediatePropagation,
+          }) as unknown as MessageEvent
+        );
+      };
+
+      sendRequest();
+      vi.advanceTimersByTime(60_001);
+      (window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId] = {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markUsed: secondMarkUsed,
+      };
+      sendRequest();
+
+      expect(portMessages).toHaveLength(2);
+      expect(stopImmediatePropagation).toHaveBeenCalledTimes(2);
+      expect(firstMarkUsed).toHaveBeenCalledTimes(1);
+      expect(secondMarkUsed).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('fails closed when consumed APS renderer tombstones reach capacity', async () => {
+    const renderer = apsRenderer();
+    const capacity = 256;
+    const callbacks = Array.from({ length: capacity + 1 }, () => ({
+      markUsed: vi.fn(),
+    }));
+    const entries = Object.fromEntries(
+      callbacks.map((lifecycle, index) => [
+        `capacity-ad-${index}`,
+        {
+          adUnitCode: 'div-header',
+          renderer,
+          registeredAt: Date.now(),
+          expiresAt: Date.now() + 60_000,
+          ...lifecycle,
+        },
+      ])
+    );
+    (window as TestWindow).tsjs.apsPrebidRenderers = entries;
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const stopImmediatePropagation = vi.fn();
+    const portMessages: string[] = [];
+    const sendRequest = (adId: string): void => {
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId }),
+          ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+          source,
+          stopImmediatePropagation,
+        }) as unknown as MessageEvent
+      );
+    };
+
+    for (let index = 0; index < capacity; index += 1) {
+      sendRequest(`capacity-ad-${index}`);
+    }
+    sendRequest(`capacity-ad-${capacity}`);
+    sendRequest('capacity-ad-0');
+
+    expect(portMessages).toHaveLength(capacity);
+    expect(callbacks[capacity].markUsed).not.toHaveBeenCalled();
+    expect(entries[`capacity-ad-${capacity}`]).toBeDefined();
+    expect(callbacks[0].markUsed).toHaveBeenCalledTimes(1);
+    expect(stopImmediatePropagation).toHaveBeenCalledTimes(capacity + 2);
+  });
+
+  it('does not expose a registered Prebid APS renderer to another slot iframe', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'prebid-generated-ad-id';
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markUsed: vi.fn(),
+      },
+    };
+
+    const footer = document.createElement('div');
+    footer.id = 'div-footer';
+    const foreignIframe = document.createElement('iframe');
+    footer.appendChild(foreignIframe);
+    document.body.appendChild(footer);
+
+    const bridgeListener = await captureBridgeListener();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source: foreignIframe.contentWindow,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+
+    expect(stopSpy).toHaveBeenCalledTimes(1);
+    expect(portMessages).toEqual([]);
+    expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeDefined();
+    footer.remove();
+  });
+
+  it('drops an expired Prebid APS renderer without claiming the creative request', async () => {
+    const prebidAdId = 'expired-prebid-ad-id';
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer: apsRenderer(),
+        registeredAt: Date.now() - 61_000,
+        expiresAt: Date.now() - 1_000,
+        markUsed: vi.fn(),
+      },
+    };
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+
+    expect(stopSpy).not.toHaveBeenCalled();
+    expect(portMessages).toEqual([]);
+    expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
+  });
+
+  it.each(['server', 'Prebid'] as const)(
+    'claims a TS-owned request before rejecting invalid %s APS data',
+    async (sourceKind) => {
+      const renderer = { ...apsRenderer(), aaxResponse: 'invalid' };
+      const adId = sourceKind === 'server' ? renderer.bidId : 'prebid-invalid-renderer-ad-id';
+      const markUsed = vi.fn();
+      if (sourceKind === 'server') {
+        (window as TestWindow).tsjs.bids.homepage_header = {
+          hb_adid: adId,
+          hb_bidder: 'aps',
+          renderer,
+        };
+      } else {
+        (window as TestWindow).tsjs.apsPrebidRenderers = {
+          [adId]: {
+            adUnitCode: 'div-header',
+            renderer,
+            registeredAt: Date.now(),
+            expiresAt: Date.now() + 60_000,
+            markUsed,
+          },
+        };
+      }
+
+      const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(49);
+      const recordTrustedServerCreativeResponse = vi.fn();
+      const recordTrustedServerCreativeFailure = vi.fn();
+      (window as TestWindow).tsjs.gptDiagnosticsRecorder = {
+        recordTrustedServerCreativeRequest,
+        recordTrustedServerCreativeResponse,
+        recordTrustedServerCreativeFailure,
+      } as unknown as TsjsApi['gptDiagnosticsRecorder'];
+
+      const bridgeListener = await captureBridgeListener();
+      const source = createTrustedSlotIframe();
+      const stopSpy = vi.fn();
+      const portMessages: string[] = [];
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId }),
+          ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+          source,
+          stopImmediatePropagation: stopSpy,
+        }) as unknown as MessageEvent
+      );
+
+      expect(stopSpy).toHaveBeenCalledOnce();
+      expect(portMessages).toEqual([]);
+      expect(fetchStub).not.toHaveBeenCalled();
+      expect(recordTrustedServerCreativeRequest).toHaveBeenCalledWith('homepage_header');
+      expect(recordTrustedServerCreativeFailure).toHaveBeenCalledWith(49, 'missing_render_source');
+      expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
+      expect(markUsed).not.toHaveBeenCalled();
+    }
+  );
+
+  it('accepts an APS request from a dynamic slot root resolved from its configured prefix', async () => {
+    const renderer = apsRenderer();
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: renderer.bidId,
+      hb_bidder: 'aps',
+      renderer,
+    };
+    (window as TestWindow).tsjs.adSlots[0].div_id = 'div-header-';
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe('div-header-dynamic');
+    const portMessages: string[] = [];
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent
+    );
+
+    expect(portMessages).toHaveLength(1);
+    document.getElementById('div-header-dynamic')?.remove();
+  });
+
+  it('does not let an overlapping slot prefix claim another slot iframe', async () => {
+    const renderer = apsRenderer();
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: renderer.bidId,
+      hb_bidder: 'aps',
+      renderer,
+    };
+    (window as TestWindow).tsjs.adSlots.push({
+      id: 'homepage_header_mobile',
+      formats: [[320, 50]],
+      gam_unit_path: '/a/b/mobile',
+      div_id: 'div-header-mobile',
+      targeting: {},
+    });
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe('div-header-mobile');
+    const portMessages: string[] = [];
+    const stopSpy = vi.fn();
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+
+    expect(stopSpy).not.toHaveBeenCalled();
+    expect(portMessages).toEqual([]);
+    document.getElementById('div-header-mobile')?.remove();
+  });
+
+  it('ignores an APS ad ID requested by another configured slot', async () => {
+    const renderer = apsRenderer();
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: renderer.bidId,
+      hb_bidder: 'aps',
+      renderer,
+    };
+    (window as TestWindow).tsjs.adSlots.push({
+      id: 'homepage_footer',
+      formats: [[300, 250]],
+      gam_unit_path: '/a/b/footer',
+      div_id: 'div-footer',
+      targeting: {},
+    });
+    const footer = document.createElement('div');
+    footer.id = 'div-footer';
+    const foreignIframe = document.createElement('iframe');
+    footer.appendChild(foreignIframe);
+    document.body.appendChild(footer);
+
+    const bridgeListener = await captureBridgeListener();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source: foreignIframe.contentWindow,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+
+    expect(stopSpy).not.toHaveBeenCalled();
+    expect(portMessages).toEqual([]);
+    expect(fetchStub).not.toHaveBeenCalled();
+    footer.remove();
   });
 
   it('calls stopImmediatePropagation and fetches PBS Cache for a TS bid', async () => {
@@ -2733,7 +3359,7 @@ describe('installTsRenderBridge', () => {
     window.dispatchEvent(
       new MessageEvent('message', {
         data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
-        ports: [fakePort as MessagePort],
+        ports: [fakePort as unknown as MessagePort],
         source: foreignIframe.contentWindow,
       })
     );
@@ -2789,7 +3415,7 @@ describe('installTsRenderBridge', () => {
       new MessageEvent('message', {
         // adId belongs to slot B (homepage_footer), not slot A's iframe.
         data: JSON.stringify({ message: 'Prebid Request', adId: 'footer-uuid' }),
-        ports: [fakePort as MessagePort],
+        ports: [fakePort as unknown as MessagePort],
         source,
       })
     );

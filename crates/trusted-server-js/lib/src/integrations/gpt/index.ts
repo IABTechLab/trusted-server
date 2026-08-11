@@ -6,6 +6,14 @@ import type {
   GptDiagnosticsTrustedServerOpportunity,
   TsjsApi,
 } from '../../core/types';
+import {
+  APS_UNIVERSAL_CREATIVE_RENDERER,
+  APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+  apsRendererUrl,
+  consumeApsPrebidRenderer,
+  getApsPrebidRenderer,
+  validateApsRenderer,
+} from '../aps/render';
 
 import { installGptGuard } from './script_guard';
 
@@ -51,8 +59,11 @@ function trustedServerOpportunity(bid: AuctionBidData): GptDiagnosticsTrustedSer
   const hasAdId = isNonEmptyString(bid.hb_adid);
   const hasInline = isNonEmptyString(bid.adm);
   const hasCache = isNonEmptyString(bid.hb_cache_host) && isNonEmptyString(bid.hb_cache_path);
+  const hasRenderer = bid.renderer !== undefined;
 
-  return hasAdId && (hasInline || hasCache) ? 'renderable_candidate' : 'unrenderable_candidate';
+  return hasAdId && (hasInline || hasCache || hasRenderer)
+    ? 'renderable_candidate'
+    : 'unrenderable_candidate';
 }
 
 // ------------------------------------------------------------------
@@ -105,11 +116,27 @@ function slotIdForMessageSource(source: MessageEventSource | null): string | und
   if (!source) return undefined;
 
   const slots = window.tsjs?.adSlots ?? [];
-  return slots.find((slot) =>
-    candidateSlotRoots(slot.div_id).some((root) =>
-      Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
-    )
-  )?.id;
+  // Prefer the most-specific configured prefix so an earlier broad prefix
+  // cannot claim an iframe owned by a later, more-specific slot.
+  return [...slots]
+    .sort((left, right) => right.div_id.length - left.div_id.length)
+    .find((slot) =>
+      candidateSlotRoots(slot.div_id).some((root) =>
+        Array.from(root.querySelectorAll('iframe')).some(
+          (iframe) => iframe.contentWindow === source
+        )
+      )
+    )?.id;
+}
+
+function messageSourceBelongsToAdUnit(
+  source: MessageEventSource | null,
+  adUnitCode: string
+): boolean {
+  if (!source) return false;
+  return candidateSlotRoots(adUnitCode).some((root) =>
+    Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
+  );
 }
 
 function clearTargetingKeys(slot: GoogleTagSlot, keys: Iterable<string>): void {
@@ -718,13 +745,8 @@ export function installTsAdInit(): void {
           slotsToRefresh.push(gptSlot);
         }
 
-        // APS: signal to apstag that bids are ready so Amazon's GAM creative
-        // can render.  apstag must already be initialised on the page (which it
-        // is on production publisher pages).  Safe no-op if apstag is absent.
-        if (bid.hb_bidder === 'aps' || bid.hb_bidder === 'amazon-aps') {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (window as any).apstag?.setDisplayBids?.();
-        }
+        // Trusted Server APS winners carry their own typed renderer and never
+        // enter the publisher-owned native apstag rendering path.
       });
 
       ts.prevGptSlots = newSlots as unknown[];
@@ -953,9 +975,7 @@ export function installSpaAuctionHook(): void {
 
   let inflight: AbortController | null = null;
   // Last path an auction was run for. popstate fires for hash-only and
-  // same-pathname back/forward (scroll restoration), and pushState/replaceState
-  // can be called with the current URL, so guard every entry point against
-  // re-requesting impressions for a path we already loaded.
+  // same-pathname changes, so guard against re-requesting loaded impressions.
   let currentPath = location.pathname;
   // Last path whose slots/bids were actually applied — the initial SSR page
   // counts. A failed navigation rolls `currentPath` back to this rather than to
@@ -1037,7 +1057,8 @@ export function installSpaAuctionHook(): void {
     const original = history[method].bind(history);
     history[method] = function (state: unknown, unused: string, url?: string | URL | null): void {
       original(state, unused, url);
-      const newPath = url ? new URL(String(url), location.href).pathname : location.pathname;
+      const locationUrl = url ? new URL(String(url), location.href) : location;
+      const newPath = locationUrl.pathname;
       // onNavigate no-ops when newPath equals the last loaded path.
       void onNavigate(newPath);
     };
@@ -1184,6 +1205,36 @@ function safelyRecordCreativeFailure(
   }
 }
 
+/** Maximum number of consumed APS Prebid IDs retained as security tombstones. */
+const MAX_CONSUMED_PREBID_APS_IDS = 256;
+
+function pruneConsumedPrebidApsIds(
+  consumedIds: Map<string, { expiresAt: number }>,
+  now: number
+): void {
+  for (const [adId, consumed] of consumedIds) {
+    if (consumed.expiresAt <= now) consumedIds.delete(adId);
+  }
+}
+
+function hasConsumedPrebidApsIdCapacity(
+  consumedIds: Map<string, { expiresAt: number }>,
+  adId: string
+): boolean {
+  if (consumedIds.has(adId) || consumedIds.size < MAX_CONSUMED_PREBID_APS_IDS) return true;
+
+  log.warn(`[tsjs-gpt] APS Prebid renderer tombstone capacity reached; declining '${adId}'`);
+  return false;
+}
+
+function recordConsumedPrebidApsId(
+  consumedIds: Map<string, { expiresAt: number }>,
+  adId: string,
+  expiresAt: number
+): void {
+  consumedIds.set(adId, { expiresAt });
+}
+
 /**
  * Install the TS → pbRender bridge.
  *
@@ -1215,6 +1266,10 @@ export function installTsRenderBridge(): void {
   // is scoped to the slot, not the bare adId: hb_adid is not unique per bid, so
   // keying on it alone would let one slot block a distinct slot's render.
   const renderingKeys = new Set<string>();
+  const consumedPrebidApsIds = new Map<string, { expiresAt: number }>();
+  // One consumed APS ad ID per slot is sufficient: a newer bid replaces the
+  // slot's old ad ID in `window.tsjs.bids`, so the ownership guard rejects it.
+  const consumedServerApsBySlot = new Map<string, string>();
 
   window.addEventListener('message', (e: MessageEvent) => {
     let data: Record<string, unknown>;
@@ -1233,7 +1288,66 @@ export function installTsRenderBridge(): void {
 
     const port = e.ports?.[0];
     if (!port) return;
+
+    const now = Date.now();
+    pruneConsumedPrebidApsIds(consumedPrebidApsIds, now);
+    const consumedPrebidAps = consumedPrebidApsIds.get(adId);
+    if (consumedPrebidAps) {
+      // Once TS claims an APS capability, keep the ad ID unavailable to every
+      // other iframe. Letting Prebid's global handler answer a foreign source
+      // would expose the creative despite the slot-bound capability check.
+      e.stopImmediatePropagation();
+      return;
+    }
+
     const sourceSlotId = slotIdForMessageSource(e.source);
+    const prebidRendererEntry = getApsPrebidRenderer(adId);
+    if (prebidRendererEntry) {
+      // Fail closed for a TS-owned APS ad ID before checking its source. Native
+      // Prebid handles ad IDs globally and would otherwise answer a request from
+      // an unrelated iframe when this slot-bound capability rejects it.
+      e.stopImmediatePropagation();
+      if (!messageSourceBelongsToAdUnit(e.source, prebidRendererEntry.adUnitCode)) return;
+      const renderer = validateApsRenderer(prebidRendererEntry.renderer);
+      const rendererUrl = apsRendererUrl();
+      if (!renderer || !rendererUrl) {
+        const attemptId = sourceSlotId ? safelyRecordCreativeRequest(sourceSlotId) : undefined;
+        safelyRecordCreativeFailure(attemptId, 'missing_render_source');
+        return;
+      }
+      if (!hasConsumedPrebidApsIdCapacity(consumedPrebidApsIds, adId)) return;
+      if (!consumeApsPrebidRenderer(adId, prebidRendererEntry)) return;
+      recordConsumedPrebidApsId(consumedPrebidApsIds, adId, prebidRendererEntry.expiresAt);
+
+      const attemptId = sourceSlotId ? safelyRecordCreativeRequest(sourceSlotId) : undefined;
+      try {
+        port.postMessage(
+          JSON.stringify({
+            message: 'Prebid Response',
+            adId,
+            renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+            rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+            rendererUrl,
+            apsRenderer: renderer,
+            width: renderer.width,
+            height: renderer.height,
+          })
+        );
+      } catch (err) {
+        safelyRecordCreativeFailure(attemptId, 'response_post_failed');
+        log.warn(`[tsjs-gpt] APS Prebid response post failed for '${adId}'`, err);
+        return;
+      }
+      safelyRecordCreativeResponse(attemptId);
+
+      try {
+        prebidRendererEntry.markUsed();
+      } catch (err) {
+        log.warn(`[tsjs-gpt] APS Prebid markUsed callback threw for '${adId}'`, err);
+      }
+      return;
+    }
+
     if (!sourceSlotId) return;
 
     // Resolve the bid by the requesting slot, not by the first bid whose hb_adid
@@ -1250,6 +1364,43 @@ export function installTsRenderBridge(): void {
     // Prebid.js handle it. The adId guard also prevents an iframe under slot A from
     // pulling slot B's creative and firing slot B's win/billing beacons.
     if (!matchedBid || matchedBid.hb_adid !== adId) return;
+
+    if (matchedBid.renderer !== undefined) {
+      // This slot and ad ID belong to TS, so fail closed before validating the
+      // descriptor and never let native Prebid answer a rejected or replayed request.
+      e.stopImmediatePropagation();
+      if (consumedServerApsBySlot.get(slotId) === adId) return;
+      const renderer = validateApsRenderer(matchedBid.renderer);
+      const rendererUrl = apsRendererUrl();
+      if (!renderer || !rendererUrl) {
+        const attemptId = safelyRecordCreativeRequest(slotId);
+        safelyRecordCreativeFailure(attemptId, 'missing_render_source');
+        return;
+      }
+      consumedServerApsBySlot.set(slotId, adId);
+
+      const attemptId = safelyRecordCreativeRequest(slotId);
+      try {
+        port.postMessage(
+          JSON.stringify({
+            message: 'Prebid Response',
+            adId,
+            renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+            rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+            rendererUrl,
+            apsRenderer: renderer,
+            width: renderer.width,
+            height: renderer.height,
+          })
+        );
+      } catch (err) {
+        safelyRecordCreativeFailure(attemptId, 'response_post_failed');
+        log.warn(`[tsjs-gpt] APS server response post failed for '${slotId}'`, err);
+        return;
+      }
+      safelyRecordCreativeResponse(attemptId);
+      return;
+    }
 
     const attemptId = safelyRecordCreativeRequest(slotId);
 

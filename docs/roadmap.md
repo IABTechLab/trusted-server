@@ -75,6 +75,12 @@ Our development is focused on three key areas:
 - Real-time cohort updates
 - Secure Signals integration
 
+**Amazon Publisher Services (APS) OpenRTB Integration**
+
+- Banner OpenRTB bidding with decoded-price competition
+- Opaque sandboxed rendering for direct and GAM/Universal Creative paths
+- Controlled rollout pending APS account-team confirmation for edge-originated traffic
+
 ### Planned for 2026
 
 **Full Google Ad Manager (GAM) Support**
@@ -83,12 +89,6 @@ Our development is focused on three key areas:
 - Dynamic ad slot management
 - Programmatic guaranteed support
 - First-party GAM reporting
-
-**Amazon Publisher Services (APS) Integration**
-
-- Transparent Ad Marketplace (TAM) support
-- A9 bidding integration
-- First-party APS header bidding
 
 **Kargo SSP Integration**
 

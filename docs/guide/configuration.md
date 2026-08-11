@@ -1066,6 +1066,12 @@ apply when the integration section exists in `trusted-server.toml`.
 | `client_side_bidders`      | Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side (see [Prebid docs](/guide/integrations/prebid#client-side-bidders)) |
 | `script_patterns`          | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                           |
 
+APS is configured exclusively under `[integrations.aps]`. `aps` entries in
+`bidders` or `client_side_bidders` are logged and removed case-insensitively so
+an upgrade does not prevent Trusted Server from starting. Remove those entries
+from operator configuration; this guard prevents APS demand from reaching
+Prebid Server or the client-side Prebid bundle.
+
 **Example**:
 
 ```toml
@@ -1283,8 +1289,12 @@ timeout_ms = 2000
 
 [integrations.aps]
 enabled = true
-pub_id = "example-publisher"
-endpoint = "https://aps.example.com/e/dtb/bid"
+account_id = "example-account"
+debug = false
+# Optional pair for deployments hosted away from APS-authorized inventory.
+# inventory_domain = "publisher.example"
+# inventory_page_origin = "https://www.publisher.example"
+allow_script_creatives = false
 
 [integrations.prebid]
 enabled = true
@@ -1302,6 +1312,7 @@ TRUSTED_SERVER__AUCTION__PROVIDERS__1=prebid
 TRUSTED_SERVER__AUCTION__MEDIATOR=adserver_mock
 TRUSTED_SERVER__AUCTION__TIMEOUT_MS=2000
 TRUSTED_SERVER__AUCTION__CREATIVE_STORE=creative_store
+TRUSTED_SERVER__INTEGRATIONS__APS__DEBUG=false
 ```
 
 ## Creative Opportunities Configuration
