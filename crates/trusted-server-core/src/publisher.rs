@@ -1297,11 +1297,19 @@ pub async fn buffer_publisher_response_async(
 
 /// Builds the response served from a C2 hit.
 ///
-/// Every header is constructed here rather than replayed from the stored entry. The
-/// publisher path rewrites `Cache-Control` and strips validators after the send, so a
-/// replayed origin header would fight it; constructing them also means no origin header
-/// can reach a second visitor through the cache, which makes the `Set-Cookie` privacy
-/// net trivially safe rather than safe-by-audit.
+/// Every header is constructed here rather than replayed from the stored entry, so no
+/// origin header can reach a second visitor through the cache.
+///
+/// # Why this sets `private, no-store` itself
+///
+/// A C2 hit returns **before** the origin fetch, and therefore before the point where
+/// the publisher path stamps `private, no-store` and strips validators. Omitting it
+/// here does not fall back to a safe default — it emits HTML with no `Cache-Control` at
+/// all, which is heuristically cacheable by browsers and intermediaries. That is a
+/// shared cache of an assembled per-user response: the C3 the design forbids outright.
+///
+/// Asserting the absence of `public`/`s-maxage`/`Surrogate-Control` would not have
+/// caught it. Nothing was present to forbid.
 ///
 /// # Errors
 ///
@@ -1316,6 +1324,12 @@ fn build_cached_template_response(
         message: format!("cached template has an unusable {what}"),
     };
     let mut response = Response::new(EdgeBody::from(entry.body.clone()));
+    // First, not last: see the note above. The assembled response is per-user even
+    // though the template it was built from is not.
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_str(&entry.metadata.content_type)
@@ -5864,6 +5878,76 @@ mod tests {
             assert_eq!(
                 second, first,
                 "the cached template must be byte-identical to what was stored"
+            );
+        }
+
+        fn header_of(response: &Response<EdgeBody>, name: header::HeaderName) -> Option<&str> {
+            response.headers().get(name).and_then(|v| v.to_str().ok())
+        }
+
+        #[tokio::test]
+        async fn a_cache_hit_is_never_shared_cacheable() {
+            // Asserted positively, because the obvious negative check does not work.
+            // Forbidding `public`, `s-maxage` and `Surrogate-Control` passes trivially
+            // on a response that carries no `Cache-Control` at all — and *that* is the
+            // real failure mode here, since a C2 hit returns before the point where the
+            // publisher path stamps the response private. HTML with no `Cache-Control`
+            // is heuristically cacheable, so "nothing to forbid" is not safety.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+
+            let _cold = run(&settings, &services, navigation_request()).await;
+            let warm = run(&settings, &services, navigation_request()).await;
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "the second request must be a hit, or this asserts nothing"
+            );
+            assert_eq!(
+                header_of(&warm, header::CACHE_CONTROL),
+                Some("private, no-store"),
+                "an assembled response is per-user even when its template is not"
+            );
+
+            // Validators would let a client revalidate into a shared copy, and the CDN
+            // directives would instruct an intermediary to store one outright. The
+            // origin fixture sends a `public, max-age=300` that must not survive.
+            for stripped in [header::ETAG, header::LAST_MODIFIED, header::EXPIRES] {
+                assert_eq!(
+                    header_of(&warm, stripped.clone()),
+                    None,
+                    "{stripped} must not survive onto an assembled response"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_returning_visitor_gets_the_same_privacy_headers() {
+            // The case with no backstop. A first-visit response sets an EC cookie, so
+            // the adapter's cookie-privacy net force-privatizes it regardless of what
+            // this path does. A returning visitor sets no cookie, so that net never
+            // fires and this path is the only thing standing between an assembled
+            // per-user document and a shared cache.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+
+            let _cold = run(&settings, &services, navigation_request()).await;
+            let warm = run(&settings, &services, navigation_request()).await;
+
+            assert!(
+                header_of(&warm, header::SET_COOKIE).is_none(),
+                "no cookie here means no privacy net, which is the point of this test"
+            );
+            assert_eq!(
+                header_of(&warm, header::CACHE_CONTROL),
+                Some("private, no-store")
             );
         }
 
