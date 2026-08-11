@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   GptDiagnosticsObserver,
   type GptDiagnosticsObserverStore,
+  type GptObserverWindow,
 } from '../../../src/integrations/gpt_diagnostics/observer';
 import type { GptDiagnosticsSlotLike } from '../../../src/integrations/gpt_diagnostics/store';
 
@@ -27,6 +28,7 @@ function fakeStore(): GptDiagnosticsObserverStore {
     recordSlotOnload: vi.fn(),
     recordImpressionViewable: vi.fn(),
     recordSlotVisibilityChanged: vi.fn(),
+    recordPublisherRefresh: vi.fn(),
   };
 }
 
@@ -102,6 +104,103 @@ describe('GptDiagnosticsObserver', () => {
 
     expect(gpt.pubads.addEventListener).toHaveBeenCalledTimes(EVENT_NAMES.length);
     expect(store.markGptObserved).toHaveBeenCalledTimes(1);
+  });
+
+  it('observes publisher refresh slots without changing the delegated call', () => {
+    const store = fakeStore();
+    const gpt = controlledGpt();
+    const slot = fakeSlot();
+    const receiver = { refresh: gpt.pubads.refresh };
+    const originalRefresh = vi.fn(function (this: unknown, ...args: unknown[]) {
+      return { receiver: this, args };
+    });
+    gpt.pubads.refresh = originalRefresh;
+    const observer = new GptDiagnosticsObserver(store, { window: gpt.window });
+    observer.install();
+    gpt.googletag.cmd[0]();
+
+    const result = Reflect.apply(gpt.pubads.refresh, receiver, [
+      [slot],
+      { changeCorrelator: false },
+    ]);
+
+    expect(store.recordPublisherRefresh).toHaveBeenCalledWith([slot]);
+    expect(originalRefresh).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ receiver, args: [[slot], { changeCorrelator: false }] });
+  });
+
+  it('preserves bare, explicit-undefined, malformed, throwing, and nested refresh behavior', () => {
+    const store = fakeStore();
+    const gpt = controlledGpt();
+    const slot = fakeSlot();
+    const secondSlot = fakeSlot();
+    const originalRefresh = vi.fn(function (this: unknown, ...args: unknown[]) {
+      if (args[0] === 'throw') throw new Error('refresh failure');
+      return { receiver: this, args };
+    });
+    const getSlots = vi.fn(() => [slot, null, secondSlot]);
+    gpt.pubads.refresh = originalRefresh;
+    Object.assign(gpt.pubads, { getSlots });
+    const runtime = { tsjs: {} };
+    const observer = new GptDiagnosticsObserver(store, { window: { ...gpt.window, ...runtime } });
+    observer.install();
+    gpt.googletag.cmd[0]();
+    observer.install();
+
+    expect(gpt.pubads.refresh()).toEqual({ receiver: gpt.pubads, args: [] });
+    expect(store.recordPublisherRefresh).toHaveBeenLastCalledWith([slot, secondSlot]);
+
+    // GPT treats an omitted, undefined, or null slot list as "refresh all", and
+    // `refresh(null, opts)` is the documented way to pass options while doing so.
+    expect(gpt.pubads.refresh(undefined)).toEqual({ receiver: gpt.pubads, args: [undefined] });
+    expect(gpt.pubads.refresh(null, { changeCorrelator: false })).toEqual({
+      receiver: gpt.pubads,
+      args: [null, { changeCorrelator: false }],
+    });
+    expect(store.recordPublisherRefresh).toHaveBeenCalledTimes(3);
+    expect(store.recordPublisherRefresh).toHaveBeenLastCalledWith([slot, secondSlot]);
+
+    getSlots.mockImplementationOnce(() => {
+      throw new Error('getSlots failure');
+    });
+    expect(gpt.pubads.refresh()).toEqual({ receiver: gpt.pubads, args: [] });
+    expect(() => gpt.pubads.refresh('throw')).toThrow('refresh failure');
+    expect(
+      store.recordPublisherRefresh,
+      'a failed slot lookup records nothing'
+    ).toHaveBeenCalledTimes(3);
+
+    (
+      observer as unknown as { window: { tsjs: { prebidRefreshDispatchInProgress?: boolean } } }
+    ).window.tsjs.prebidRefreshDispatchInProgress = true;
+    gpt.pubads.refresh([slot]);
+    expect(
+      store.recordPublisherRefresh,
+      'a Prebid-delegated refresh is not publisher intent'
+    ).toHaveBeenCalledTimes(3);
+    expect(originalRefresh).toHaveBeenCalledTimes(6);
+  });
+
+  it('delegates when the shared diagnostics context accessor throws', () => {
+    const store = fakeStore();
+    const gpt = controlledGpt();
+    const slot = fakeSlot();
+    const originalRefresh = vi.fn(() => 'delegated');
+    gpt.pubads.refresh = originalRefresh;
+    Object.assign(gpt.pubads, { getSlots: () => [slot] });
+    const target = { googletag: gpt.googletag } as unknown as GptObserverWindow;
+    Object.defineProperty(target, 'tsjs', {
+      get: () => {
+        throw new Error('context unavailable');
+      },
+    });
+    const observer = new GptDiagnosticsObserver(store, { window: target });
+    observer.install();
+    gpt.googletag.cmd[0]();
+
+    expect(gpt.pubads.refresh()).toBe('delegated');
+    expect(originalRefresh).toHaveBeenCalledTimes(1);
+    expect(store.recordPublisherRefresh).not.toHaveBeenCalled();
   });
 
   it('creates a command queue and waits when GPT is absent', () => {
@@ -183,6 +282,65 @@ describe('GptDiagnosticsObserver', () => {
     expect(store.recordSlotVisibilityChanged).toHaveBeenCalledWith(slot, 42);
   });
 
+  it('forwards the Ad Manager identifiers GPT reports for the delivered ad', () => {
+    const store = fakeStore();
+    const gpt = controlledGpt();
+    const slot = fakeSlot();
+    const observer = new GptDiagnosticsObserver(store, { window: gpt.window });
+    observer.install();
+    gpt.googletag.cmd[0]();
+
+    gpt.emit('slotRenderEnded', {
+      slot,
+      isEmpty: false,
+      lineItemId: 6543210987,
+      creativeId: 1234567890,
+      campaignId: 2345678901,
+      advertiserId: 3456789012,
+      sourceAgnosticLineItemId: 6543210987,
+      yieldGroupIds: [11, 12],
+      companyIds: [],
+    });
+
+    expect(store.recordSlotRenderEnded).toHaveBeenCalledWith(
+      slot,
+      expect.objectContaining({
+        adManager: {
+          lineItemId: 6543210987,
+          creativeId: 1234567890,
+          campaignId: 2345678901,
+          advertiserId: 3456789012,
+          sourceAgnosticLineItemId: 6543210987,
+          yieldGroupIds: [11, 12],
+        },
+      })
+    );
+  });
+
+  it('drops malformed Ad Manager identifiers instead of reporting them', () => {
+    const store = fakeStore();
+    const gpt = controlledGpt();
+    const slot = fakeSlot();
+    const observer = new GptDiagnosticsObserver(store, { window: gpt.window });
+    observer.install();
+    gpt.googletag.cmd[0]();
+
+    gpt.emit('slotRenderEnded', {
+      slot,
+      isEmpty: false,
+      lineItemId: null,
+      creativeId: '1234567890',
+      campaignId: 0,
+      advertiserId: 1.5,
+      yieldGroupIds: 'not-a-list',
+    });
+
+    expect(store.recordSlotRenderEnded).toHaveBeenCalledWith(
+      slot,
+      expect.objectContaining({ adManager: undefined })
+    );
+  });
+
   it('drops unsupported or invalid rendered sizes', () => {
     const store = fakeStore();
     const gpt = controlledGpt();
@@ -252,7 +410,7 @@ describe('GptDiagnosticsObserver', () => {
     expect(logger.warn).toHaveBeenCalledTimes(2);
   });
 
-  it('does not patch GPT or browser methods', () => {
+  it('wraps only PubAds refresh and leaves unrelated GPT and browser methods intact', () => {
     const store = fakeStore();
     const gpt = controlledGpt();
     const observer = new GptDiagnosticsObserver(store, { window: gpt.window });
@@ -271,7 +429,7 @@ describe('GptDiagnosticsObserver', () => {
 
     expect(gpt.googletag.display).toBe(references.display);
     expect(gpt.googletag.defineSlot).toBe(references.defineSlot);
-    expect(gpt.pubads.refresh).toBe(references.refresh);
+    expect(gpt.pubads.refresh).not.toBe(references.refresh);
     expect(window.fetch).toBe(references.fetch);
     expect(window.XMLHttpRequest).toBe(references.XMLHttpRequest);
     expect(window.history.pushState).toBe(references.pushState);
