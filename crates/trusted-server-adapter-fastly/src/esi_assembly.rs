@@ -267,6 +267,45 @@ mod tests {
     }
 
     #[test]
+    fn react_suspense_markers_and_inline_scripts_survive() {
+        // The document this runs over is the publisher's entire page, not an ESI
+        // template. React marks Suspense boundaries with HTML comments — `<!--$-->`,
+        // `<!--/$-->`, `<!--$?-->`, `<!--$!-->` — and hydration fails if they are altered
+        // or dropped. Next.js also embeds inline scripts full of escaped JSON.
+        //
+        // Nothing previously checked that assembly is byte-faithful to any of it. Every
+        // test used a five-line fixture.
+        let document = format!(
+            "<!doctype html><html><head>\
+             <script>self.__next_s.push([0,{{\"children\":\"a\\u003eb &amp; c\"}}]);</script>\
+             </head><body>\
+             <div hidden=\"\"><!--$--><!--/$--></div>\
+             <div hidden=\"\"><!--$?--><!--$!--></div>\
+             <p>copy</p>{ESI_BIDS_INCLUDE}</body></html>"
+        );
+
+        let assembled = assemble(&document, FRAGMENT).expect("should assemble");
+
+        for marker in ["<!--$-->", "<!--/$-->", "<!--$?-->", "<!--$!-->"] {
+            assert!(
+                assembled.contains(marker),
+                "React Suspense marker {marker} must survive assembly, or hydration \
+                 fails: {assembled}"
+            );
+        }
+        assert!(
+            assembled.contains("a\\u003eb &amp; c"),
+            "inline script content must be byte-faithful: {assembled}"
+        );
+        // Everything except the marker substitution must be untouched.
+        assert_eq!(
+            assembled,
+            document.replace(ESI_BIDS_INCLUDE, FRAGMENT),
+            "assembly must change nothing but the seam"
+        );
+    }
+
+    #[test]
     fn script_bearing_fragments_are_spliced_verbatim() {
         // ESI substitutes bytes without escaping, which is exactly why the fragment
         // endpoint must return markup rather than JSON. This pins that behaviour, since

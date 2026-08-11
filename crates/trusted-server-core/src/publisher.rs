@@ -1356,6 +1356,25 @@ pub async fn buffer_publisher_response_async(
             )
             .await?;
             let bytes = output.into_inner();
+            // Decode before either storing or splicing. Both are textual operations and
+            // the transform's output follows the origin's encoding.
+            //
+            // Only shared modes pay this. Under `Inline` the bytes go out exactly as the
+            // encoder produced them, still compressed, which is what the encoder is for.
+            let bytes = if params.template_cache_key.is_some() {
+                let decoded = decode_transformed_body(
+                    bytes,
+                    &params.content_encoding,
+                    settings.publisher.max_buffered_body_bytes,
+                )?;
+                // The response now carries plaintext, so it must stop claiming otherwise.
+                response
+                    .headers_mut()
+                    .remove(http::header::CONTENT_ENCODING);
+                decoded
+            } else {
+                bytes
+            };
             // Store first, assemble second — never the reverse. The stored bytes are
             // shared between visitors; the assembled ones carry this visitor's bids.
             // Swapping these two lines is the C3 leak.
@@ -1419,6 +1438,38 @@ pub async fn buffer_publisher_response_async(
             Ok(response)
         }
     }
+}
+
+/// Decodes transformed body bytes so they can be stored and spliced as text.
+///
+/// The pipeline pairs input encoding to output encoding, so a compressed origin yields a
+/// compressed transform. Everything the shared-template path does afterwards is textual:
+/// finding the seam marker, splitting on it, inserting a script. None of that works on
+/// compressed bytes — the marker is not present to find, `from_utf8` fails, and a spliced
+/// gzip stream is undecodable in the browser.
+///
+/// An earlier attempt forced `Accept-Encoding: identity` on the *origin request* instead.
+/// That worked and cost far too much: the origin then sent ~674 KB uncompressed where it
+/// would have sent ~100 KB, adding seconds to the fetch. The fetch should stay
+/// compressed; only the assembled response needs to be text.
+///
+/// # Errors
+///
+/// Returns an error if the bytes do not decode, which would mean the encoder and the
+/// declared `Content-Encoding` disagree.
+fn decode_transformed_body(
+    bytes: Vec<u8>,
+    content_encoding: &str,
+    max_decoded_bytes: usize,
+) -> Result<Vec<u8>, Report<TrustedServerError>> {
+    let compression = Compression::from_content_encoding(content_encoding);
+    if matches!(compression, Compression::None) {
+        return Ok(bytes);
+    }
+    let mut decoder = BodyStreamDecoder::new(compression, max_decoded_bytes);
+    let mut out = decoder.decode_chunk(bytes::Bytes::from(bytes))?.to_vec();
+    out.extend_from_slice(&decoder.finish()?);
+    Ok(out)
 }
 
 /// Resolves the `</body>` marker into this visitor's bids, if the mode assembles.
@@ -1597,7 +1648,11 @@ async fn store_template_if_authorized(
         return;
     };
     let metadata = crate::platform::TemplateMetadata {
-        content_encoding: params.content_encoding.clone(),
+        // `identity`, not the origin's encoding. The caller decoded before storing,
+        // because the seam split is textual — so recording the origin's encoding here
+        // would make a cache hit declare `Content-Encoding: gzip` over plaintext bytes,
+        // which is the same undecodable response one layer along.
+        content_encoding: "identity".to_string(),
         content_type: params.content_type.clone(),
         schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
         body_len: bytes.len() as u64,
@@ -3411,26 +3466,6 @@ pub async fn handle_publisher_request(
     // legacy path never sets it. Either way it is an internal edge signal that
     // must not leak to publisher backends.
     req.headers_mut().remove("fastly-ssl");
-    // Shared modes ask the origin for identity, and this is not an optimization —
-    // without it the feature is broken end to end.
-    //
-    // The pipeline pairs input encoding to output encoding, so a gzip origin produces a
-    // gzip template. Every step after that assumes text: the seam marker cannot be found
-    // in compressed bytes, `String::from_utf8` on them fails outright, and splicing a
-    // plaintext bids script into the middle of a gzip stream yields
-    // `ERR_CONTENT_DECODING_FAILED` in the browser. Observed as a 502 on a real origin.
-    //
-    // The cost is real and accepted for the spike: a cache hit is served uncompressed,
-    // so it moves more bytes. Fixing that properly means storing decoded and re-encoding
-    // at serve time through a streaming encoder, which is a larger change than this
-    // spike needs to answer its question.
-    if !matches!(assembly_mode, AssemblyMode::Inline) {
-        req.headers_mut().insert(
-            header::ACCEPT_ENCODING,
-            HeaderValue::from_static("identity"),
-        );
-    }
-
     // The C2 key is built here, before the request is consumed, because every field
     // is request-derived and this is the last point where the request is in hand.
     //

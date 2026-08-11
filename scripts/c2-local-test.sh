@@ -113,9 +113,11 @@ class H(BaseHTTPRequestHandler):
         # browser ERR_CONTENT_DECODING_FAILED.
         base = [("Cache-Control", "public, max-age=300"), ("Vary", "Accept-Encoding")]
         if "gzip" in (self.headers.get("Accept-Encoding") or ""):
+            print("origin: served COMPRESSED", flush=True)
             self._send(gzip.compress(PAGE), "text/html; charset=utf-8",
                        base + [("Content-Encoding", "gzip")])
         else:
+            print("origin: served PLAINTEXT", flush=True)
             self._send(PAGE, "text/html; charset=utf-8", base)
 
     def do_POST(self):
@@ -241,6 +243,7 @@ else
     "$(grep -c 'window.tsjs' "$WORK/r2.html" || true)" "1"
 
   HDRS=$(curl -s -D- -o /dev/null -H "Host: ts.example.com" \
+    -H "Accept-Encoding: gzip" \
     -H "sec-fetch-dest: document" -H "sec-fetch-mode: navigate" \
     "http://127.0.0.1:$TS_PORT/article")
   check "cache hit is not shared-cacheable" \
@@ -248,6 +251,7 @@ else
 
   POSTS_BEFORE=$(grep -c "POST /article" "$WORK/origin.log" || true)
   curl -s -o /dev/null -X POST -d 'x=1' -H "Host: ts.example.com" \
+    -H "Accept-Encoding: gzip" \
     "http://127.0.0.1:$TS_PORT/article"
   check "a POST still reaches the origin" \
     "$(( $(grep -c "POST /article" "$WORK/origin.log" || true) - POSTS_BEFORE ))" "1"
@@ -343,6 +347,12 @@ else
   # The property the unit tests cannot reach: in-process there is no bid provider, so
   # there is no auction to wait on and reordering the stream is unobservable. Here the
   # bid endpoint really sleeps, so the first body byte either beats it or does not.
+  # Guards a regression: an earlier fix forced Accept-Encoding: identity on the origin
+  # request, which made the origin send ~674KB where it would have sent ~100KB and added
+  # seconds to the fetch. Only the assembled response needs to be text; the fetch must
+  # stay compressed.
+  check "the origin fetch stays compressed" \
+    "$(grep -c 'served PLAINTEXT' "$WORK/origin.log" || true)" "0"
   check "cache hit streams: the article is delivered before the auction resolves" \
     "$(awk -v f="$FIRST_BODY" -v c="$COMPLETE" 'BEGIN { print (f < c / 3) ? "yes" : "no" }')" \
     "yes"
