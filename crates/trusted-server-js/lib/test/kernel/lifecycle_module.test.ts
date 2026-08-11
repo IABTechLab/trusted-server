@@ -7,6 +7,8 @@ import {
 import { createLifecycleIntegrationRegistration } from '../../src/kernel/lifecycle_module';
 
 const RELEASE_ID = 'a'.repeat(64);
+const CRITICAL_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
+const TEST_INTEGRATION_ID = 'datadome';
 
 function callbacks(order: string[]): IntegrationInstallCallbacks {
   return {
@@ -21,15 +23,16 @@ function registry(config: unknown, runtime: unknown) {
     manifest: {
       version: 1,
       releaseId: RELEASE_ID,
-      integrations: [{ id: 'example', required: true }],
+      criticalSrc: CRITICAL_SRC,
+      integrations: [{ id: TEST_INTEGRATION_ID, phase: 'critical' }],
     },
     releaseId: RELEASE_ID,
-    knownIntegrationIds: Object.freeze(['example']),
+    knownIntegrationIds: Object.freeze([TEST_INTEGRATION_ID]),
     startedAtMs: 0,
     now: () => 0,
     getBindings: () => ({
       config,
-      interfaces: Object.freeze({ example: runtime }),
+      interfaces: Object.freeze({ [TEST_INTEGRATION_ID]: runtime }),
     }),
   });
 }
@@ -50,7 +53,7 @@ describe('shared integration lifecycle module', () => {
     });
     const runtime = Object.freeze({ activate, start });
     const owner = registry(config, runtime);
-    owner.register(createLifecycleIntegrationRegistration('example', RELEASE_ID));
+    owner.register(createLifecycleIntegrationRegistration(TEST_INTEGRATION_ID, RELEASE_ID));
 
     const result = await owner.install(callbacks(order));
 
@@ -68,7 +71,7 @@ describe('shared integration lifecycle module', () => {
   ])('rejects %s configuration before activation', async (_name, config) => {
     const activate = vi.fn(() => vi.fn());
     const owner = registry(config, Object.freeze({ activate, start: vi.fn() }));
-    owner.register(createLifecycleIntegrationRegistration('example', RELEASE_ID));
+    owner.register(createLifecycleIntegrationRegistration(TEST_INTEGRATION_ID, RELEASE_ID));
 
     await expect(owner.install(callbacks([]))).resolves.toMatchObject({
       state: 'fallback',
@@ -83,7 +86,7 @@ describe('shared integration lifecycle module', () => {
       Object.freeze({}),
       Object.freeze({ activate, start: vi.fn(), publish: vi.fn() })
     );
-    owner.register(createLifecycleIntegrationRegistration('example', RELEASE_ID));
+    owner.register(createLifecycleIntegrationRegistration(TEST_INTEGRATION_ID, RELEASE_ID));
 
     await expect(owner.install(callbacks([]))).resolves.toMatchObject({
       state: 'fallback',

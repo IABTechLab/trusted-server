@@ -876,11 +876,17 @@ describe('AuctionContextRegistry', () => {
     ]);
   });
 
-  it('fails closed for a manifest beyond the integration bound', () => {
-    const ids = Object.freeze(Array.from({ length: 17 }, (_, index) => `integration-${index}`));
+  it.each([
+    ['just below', 19, true],
+    ['at', 20, true],
+    ['above', 21, false],
+  ] as const)('%s the canonical manifest capacity accepts=%s', (_name, count, accepted) => {
+    const ids = Object.freeze(Array.from({ length: count }, (_, index) => `integration-${index}`));
+    const construct = (): void => {
+      createAuctionContextRegistry({ manifestIntegrationIds: ids, runtimeOwner: owner() });
+    };
 
-    expect(() =>
-      createAuctionContextRegistry({ manifestIntegrationIds: ids, runtimeOwner: owner() })
-    ).toThrow(TypeError);
+    if (accepted) expect(construct).not.toThrow();
+    else expect(construct).toThrow(TypeError);
   });
 });

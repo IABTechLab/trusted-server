@@ -14,6 +14,7 @@ import {
 } from '../../src/kernel/integration_registry';
 
 const RELEASE_ID = 'a'.repeat(64);
+const CRITICAL_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
 const registrations: ReadonlyArray<
   readonly [string, (release: string) => IntegrationRegistration]
 > = Object.freeze([
@@ -21,14 +22,14 @@ const registrations: ReadonlyArray<
   ['didomi', createDidomiIntegrationRegistration] as const,
   ['google_tag_manager', createGoogleTagManagerIntegrationRegistration] as const,
   ['lockr', createLockrIntegrationRegistration] as const,
-  ['osano', createOsanoIntegrationRegistration] as const,
-  ['permutive', createPermutiveIntegrationRegistration] as const,
-  ['sourcepoint', createSourcepointIntegrationRegistration] as const,
+  ['osano_consent', createOsanoIntegrationRegistration] as const,
+  ['permutive_context', createPermutiveIntegrationRegistration] as const,
+  ['sourcepoint_consent', createSourcepointIntegrationRegistration] as const,
   ['testlight', createTestlightIntegrationRegistration] as const,
 ]);
 const configFor = (id: string): unknown => {
   if (id === 'didomi') return Object.freeze({ proxyPath: '/integrations/didomi/sdk' });
-  if (id === 'sourcepoint') return Object.freeze({ rewriteSdk: true });
+  if (id === 'sourcepoint_consent') return Object.freeze({ rewriteSdk: true });
   return undefined;
 };
 
@@ -55,7 +56,8 @@ describe('remaining integration lifecycle modules', () => {
       manifest: {
         version: 1,
         releaseId: RELEASE_ID,
-        integrations: ids.map((id) => ({ id, required: true })),
+        criticalSrc: CRITICAL_SRC,
+        integrations: ids.map((id) => ({ id, phase: 'critical' as const })),
       },
       releaseId: RELEASE_ID,
       knownIntegrationIds: ids,
@@ -94,7 +96,8 @@ describe('remaining integration lifecycle modules', () => {
         manifest: {
           version: 1,
           releaseId: RELEASE_ID,
-          integrations: [{ id, required: true }],
+          criticalSrc: CRITICAL_SRC,
+          integrations: [{ id, phase: 'critical' }],
         },
         releaseId: RELEASE_ID,
         knownIntegrationIds: Object.freeze([id]),

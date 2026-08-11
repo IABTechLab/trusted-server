@@ -7,6 +7,8 @@ import {
 import { createIntegrationRegistry } from '../../../src/kernel/integration_registry';
 
 const RELEASE_ID = 'a'.repeat(64);
+const CRITICAL_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
+const SOURCEPOINT_INTEGRATION_ID = 'sourcepoint_consent';
 
 describe('transactional Sourcepoint integration module', () => {
   it.each([true, false])(
@@ -45,16 +47,17 @@ describe('transactional Sourcepoint integration module', () => {
       manifest: {
         version: 1,
         releaseId: RELEASE_ID,
-        integrations: [{ id: 'sourcepoint', required: true }],
+        criticalSrc: CRITICAL_SRC,
+        integrations: [{ id: SOURCEPOINT_INTEGRATION_ID, phase: 'critical' }],
       },
       releaseId: RELEASE_ID,
-      knownIntegrationIds: Object.freeze(['sourcepoint']),
+      knownIntegrationIds: Object.freeze([SOURCEPOINT_INTEGRATION_ID]),
       startedAtMs: 0,
       now: () => 0,
       getBindings: () => ({
         config,
         interfaces: Object.freeze({
-          sourcepoint: Object.freeze({ activate, start: vi.fn() }),
+          [SOURCEPOINT_INTEGRATION_ID]: Object.freeze({ activate, start: vi.fn() }),
         }),
       }),
     });

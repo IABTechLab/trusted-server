@@ -1,5 +1,3 @@
-import path from 'node:path';
-
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -8,7 +6,7 @@ import {
 } from '../../src/adapters/googletag';
 import { createNoopMessagingAdapter } from '../../src/adapters/messaging';
 import { createNoopPrebidAdapter } from '../../src/adapters/prebid';
-import { createTestBrowserRuntimeComposition } from '../../src/composition/browser';
+import { createTestBrowserRuntimeComposition } from '../../src/composition/browser_test';
 import { createCreativeIntegrationRegistration } from '../../src/integrations/creative/module';
 import { createDataDomeIntegrationRegistration } from '../../src/integrations/datadome/module';
 import { createDidomiIntegrationRegistration } from '../../src/integrations/didomi/module';
@@ -19,20 +17,52 @@ import { createLockrIntegrationRegistration } from '../../src/integrations/lockr
 import { createOsanoIntegrationRegistration } from '../../src/integrations/osano/module';
 import { createPermutiveIntegrationRegistration } from '../../src/integrations/permutive/module';
 import { createPrebidIntegrationRegistration } from '../../src/integrations/prebid/module';
+import { createRenderRuntimeIntegrationRegistration } from '../../src/integrations/render_runtime/module';
 import { createSourcepointIntegrationRegistration } from '../../src/integrations/sourcepoint/module';
 import { createTestlightIntegrationRegistration } from '../../src/integrations/testlight/module';
+import type { BootManifestV1 } from '../../src/core/types';
 import type {
   IntegrationActivationContext,
+  IntegrationCatalogEntry,
   IntegrationPrepareContext,
   IntegrationRegistration,
+  PreparedIntegration,
 } from '../../src/kernel/integration_registry';
-import { discoverIntegrationModules } from '../../scripts/integration-inventory-v1.mjs';
+import {
+  MAX_CRITICAL_MODULES,
+  MAX_MANIFEST_MODULES,
+  RELEASE_CATALOG,
+} from '../../src/kernel/release_catalog';
 
 const TEST_RELEASE_ID = 'a'.repeat(64);
+const EXPECTED_MAXIMAL_INTEGRATION_IDS = Object.freeze([
+  'render_runtime',
+  'aps',
+  'creative',
+  'datadome',
+  'didomi',
+  'google_tag_manager',
+  'gpt',
+  'gpt_diagnostics',
+  'lockr',
+  'osano_consent',
+  'permutive_context',
+  'sourcepoint_consent',
+  'prebid',
+  'testlight',
+  'diagnostics_presentation',
+  'gpt_later',
+  'osano_lifecycle',
+  'permutive_lifecycle',
+  'prebid_later',
+  'sourcepoint_lifecycle',
+]);
+const CRITICAL_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
 
 type RegistrationFactory = (release: string) => IntegrationRegistration;
 
 const REGISTRATION_FACTORIES = new Map<string, RegistrationFactory>([
+  ['render_runtime', createRenderRuntimeIntegrationRegistration],
   ['creative', createCreativeIntegrationRegistration],
   ['datadome', createDataDomeIntegrationRegistration],
   ['didomi', createDidomiIntegrationRegistration],
@@ -40,15 +70,45 @@ const REGISTRATION_FACTORIES = new Map<string, RegistrationFactory>([
   ['gpt', createGptIntegrationRegistration],
   ['gpt_diagnostics', createGptDiagnosticsIntegrationRegistration],
   ['lockr', createLockrIntegrationRegistration],
-  ['osano', createOsanoIntegrationRegistration],
-  ['permutive', createPermutiveIntegrationRegistration],
+  ['osano_consent', createOsanoIntegrationRegistration],
+  ['permutive_context', createPermutiveIntegrationRegistration],
   ['prebid', createPrebidIntegrationRegistration],
-  ['sourcepoint', createSourcepointIntegrationRegistration],
+  ['sourcepoint_consent', createSourcepointIntegrationRegistration],
   ['testlight', createTestlightIntegrationRegistration],
 ]);
 
-function generatedIntegrationIds(): readonly string[] {
-  return Object.freeze(discoverIntegrationModules(path.resolve(process.cwd(), 'src/integrations')));
+function maximalIntegrationIds(): readonly string[] {
+  return Object.freeze(RELEASE_CATALOG.map(({ id }) => id));
+}
+
+function maximalManifest(): Readonly<BootManifestV1> {
+  return Object.freeze({
+    version: 1,
+    releaseId: TEST_RELEASE_ID,
+    criticalSrc: CRITICAL_SRC,
+    integrations: Object.freeze(
+      RELEASE_CATALOG.map(({ id, phase, trigger }) => {
+        if (phase === 'critical') return Object.freeze({ id, phase });
+        if (trigger !== 'first_display_or_idle') {
+          throw new TypeError(`Deferred fixture ${id} is missing its canonical trigger`);
+        }
+        return Object.freeze({
+          id,
+          phase,
+          trigger,
+          src: `/static/tsjs=tsjs-${id}.min.js?v=${'d'.repeat(64)}`,
+        });
+      })
+    ),
+  });
+}
+
+function maximalRegistryCatalog(): readonly IntegrationCatalogEntry[] {
+  return Object.freeze(
+    RELEASE_CATALOG.map(({ id, phase, trigger, consumes, provides }) =>
+      Object.freeze({ id, phase, trigger, consumes, provides })
+    )
+  );
 }
 
 function tracedRegistration(
@@ -57,12 +117,14 @@ function tracedRegistration(
   failAfterActivation?: string
 ): IntegrationRegistration {
   return Object.freeze({
+    abi: registration.abi,
     id: registration.id,
-    release: registration.release,
+    phase: registration.phase,
+    releaseId: registration.releaseId,
     prepare: async (context: IntegrationPrepareContext) => {
       events.push(`prepare:${registration.id}`);
       const prepared = await registration.prepare(context);
-      return Object.freeze({
+      const traced: PreparedIntegration = {
         activate: (activationContext: IntegrationActivationContext): void => {
           events.push(`activate:${registration.id}`);
           activationContext.onDispose(() => events.push(`dispose:${registration.id}`));
@@ -71,7 +133,12 @@ function tracedRegistration(
             throw new Error(`injected ${registration.id} activation failure`);
           }
         },
-      });
+      };
+      const interfacesDescriptor = Object.getOwnPropertyDescriptor(prepared, 'interfaces');
+      if (interfacesDescriptor) {
+        Object.defineProperty(traced, 'interfaces', interfacesDescriptor);
+      }
+      return Object.freeze(traced);
     },
   });
 }
@@ -85,7 +152,7 @@ function integrationConfig(id: string): unknown {
       excludedGamAdUnitPathSuffixes: Object.freeze([]),
     });
   }
-  if (id === 'sourcepoint') return Object.freeze({ rewriteSdk: true });
+  if (id === 'sourcepoint_consent') return Object.freeze({ rewriteSdk: true });
   return undefined;
 }
 
@@ -106,7 +173,7 @@ function captureOption(options?: boolean | AddEventListenerOptions): boolean {
 }
 
 function createMaximalHarness(options: MaximalHarnessOptions = {}) {
-  const integrationIds = generatedIntegrationIds();
+  const integrationIds = maximalIntegrationIds();
   const events: string[] = [];
   const registrations = integrationIds.map((id) => {
     const factory = REGISTRATION_FACTORIES.get(id);
@@ -231,12 +298,9 @@ function createMaximalHarness(options: MaximalHarnessOptions = {}) {
     {
       target,
       releaseId: TEST_RELEASE_ID,
-      manifest: {
-        version: 1,
-        releaseId: TEST_RELEASE_ID,
-        integrations: integrationIds.map((id) => ({ id, required: true })),
-      },
+      manifest: maximalManifest(),
       knownIntegrationIds: integrationIds,
+      catalog: maximalRegistryCatalog(),
       boot: {
         auctionProjection: {
           version: 1,
@@ -336,9 +400,86 @@ describe('generated maximal browser runtime transaction', () => {
     vi.unstubAllGlobals();
   });
 
+  it('derives the complete maximal fixture in canonical release order', () => {
+    const integrationIds = maximalIntegrationIds();
+    const manifest = maximalManifest();
+
+    expect(integrationIds).toEqual(EXPECTED_MAXIMAL_INTEGRATION_IDS);
+    expect(integrationIds).toHaveLength(MAX_MANIFEST_MODULES);
+    expect(manifest).toMatchObject({
+      version: 1,
+      releaseId: TEST_RELEASE_ID,
+      criticalSrc: CRITICAL_SRC,
+    });
+    expect(manifest.integrations.map(({ id }) => id)).toEqual(integrationIds);
+    expect(
+      manifest.integrations
+        .slice(0, MAX_CRITICAL_MODULES)
+        .every(({ phase }) => phase === 'critical')
+    ).toBe(true);
+    expect(
+      manifest.integrations.slice(MAX_CRITICAL_MODULES).every(({ phase }) => phase === 'deferred')
+    ).toBe(true);
+    for (const entry of manifest.integrations) {
+      expect(Object.isFrozen(entry)).toBe(true);
+      if (entry.phase === 'critical') {
+        expect(Reflect.ownKeys(entry).sort()).toEqual(['id', 'phase']);
+      } else {
+        expect(Reflect.ownKeys(entry).sort()).toEqual(['id', 'phase', 'src', 'trigger']);
+        expect(entry.trigger).toBe('first_display_or_idle');
+        expect(entry.src).toBe(`/static/tsjs=tsjs-${entry.id}.min.js?v=${'d'.repeat(64)}`);
+      }
+    }
+    expect(Object.isFrozen(manifest)).toBe(true);
+    expect(Object.isFrozen(manifest.integrations)).toBe(true);
+  });
+
+  it.each([
+    ['provider', true],
+    ['non-provider', false],
+  ] as const)(
+    'preserves exact prepared interfaces for a %s registration',
+    async (_name, provider) => {
+      const capability = Object.freeze({ invoke: vi.fn() });
+      const providerInterfaces = Object.freeze({ 'fixture.v1': capability });
+      const activate = vi.fn();
+      const registration: IntegrationRegistration = Object.freeze({
+        abi: 1,
+        id: 'fixture',
+        phase: 'critical',
+        releaseId: TEST_RELEASE_ID,
+        prepare: async () =>
+          provider
+            ? Object.freeze({ activate, interfaces: providerInterfaces })
+            : Object.freeze({ activate }),
+      });
+      const prepared = await tracedRegistration(registration, []).prepare({
+        config: undefined,
+        interfaces: Object.freeze({}),
+        signal: new AbortController().signal,
+        onDispose: vi.fn(),
+      });
+
+      expect(Object.isFrozen(prepared)).toBe(true);
+      expect(Reflect.ownKeys(prepared).sort()).toEqual(
+        provider ? ['activate', 'interfaces'] : ['activate']
+      );
+      if (provider) {
+        expect(Object.getOwnPropertyDescriptor(prepared, 'interfaces')).toMatchObject({
+          enumerable: true,
+          value: providerInterfaces,
+        });
+        expect(prepared.interfaces).toBe(providerInterfaces);
+        expect(prepared.interfaces?.['fixture.v1']).toBe(capability);
+      } else {
+        expect(Object.prototype.hasOwnProperty.call(prepared, 'interfaces')).toBe(false);
+      }
+    }
+  );
+
   it('owns all server bundles once and disposes them in exact reverse generated order', async () => {
     vi.useFakeTimers();
-    const integrationIds = generatedIntegrationIds();
+    const integrationIds = maximalIntegrationIds();
     const events: string[] = [];
     const registrations = integrationIds.map((id) => {
       const factory = REGISTRATION_FACTORIES.get(id);
@@ -381,12 +522,9 @@ describe('generated maximal browser runtime transaction', () => {
       {
         target,
         releaseId: TEST_RELEASE_ID,
-        manifest: {
-          version: 1,
-          releaseId: TEST_RELEASE_ID,
-          integrations: integrationIds.map((id) => ({ id, required: true })),
-        },
+        manifest: maximalManifest(),
         knownIntegrationIds: integrationIds,
+        catalog: maximalRegistryCatalog(),
         boot: {
           auctionProjection: {
             version: 1,
@@ -425,7 +563,7 @@ describe('generated maximal browser runtime transaction', () => {
     expect(composition.runtime.start()).toBe(true);
     expect(composition.runtime.start()).toBe(false);
     for (const registration of registrations) {
-      expect(registration.release).toBe(TEST_RELEASE_ID);
+      expect(registration.releaseId).toBe(TEST_RELEASE_ID);
       expect(composition.runtime.registerIntegration(registration)).toBe(true);
       events.push(`register:${registration.id}`);
     }
@@ -456,7 +594,7 @@ describe('generated maximal browser runtime transaction', () => {
     );
     expect(composition.auctionContextRegistryForTest()?.snapshotInventoryForTest()).toEqual({
       disposed: false,
-      registrations: ['permutive'],
+      registrations: ['permutive_context'],
     });
     expect(activeObservers.size).toBe(1);
     expect(activeMutationObservers.size).toBeGreaterThan(0);
@@ -486,12 +624,12 @@ describe('generated maximal browser runtime transaction', () => {
   it.each([
     {
       name: 'a real activation fails after acquiring its composed effects',
-      failureId: 'permutive',
+      failureId: 'permutive_context',
       phase: 'activate' as const,
     },
     {
       name: 'one real registration receives malformed frozen config',
-      failureId: 'sourcepoint',
+      failureId: 'sourcepoint_consent',
       phase: 'prepare' as const,
     },
   ])('fails closed when $name', async ({ failureId, phase }) => {
@@ -589,7 +727,7 @@ describe('generated maximal browser runtime transaction', () => {
     try {
       const installed = await harness.composition.runtime.install();
       const expectedRuntimeFailures =
-        kind === 'storage' ? [{ id: 'sourcepoint', phase: 'after_commit' }] : [];
+        kind === 'storage' ? [{ id: 'sourcepoint_consent', phase: 'after_commit' }] : [];
 
       expect(installed).toEqual({
         state: 'kernel',
@@ -605,7 +743,7 @@ describe('generated maximal browser runtime transaction', () => {
       );
       expect(
         harness.composition.auctionContextRegistryForTest()?.snapshotInventoryForTest()
-      ).toEqual({ disposed: false, registrations: ['permutive'] });
+      ).toEqual({ disposed: false, registrations: ['permutive_context'] });
       expect(harness.resourceCounts()).toMatchObject({
         captureListeners: 1,
         listeners: expect.any(Number),
@@ -630,7 +768,8 @@ describe('generated maximal browser runtime transaction', () => {
       }
 
       falsePositiveScript?.remove();
-      const disposedBeforeRuntimeRelease = kind === 'storage' ? ['dispose:sourcepoint'] : [];
+      const disposedBeforeRuntimeRelease =
+        kind === 'storage' ? ['dispose:sourcepoint_consent'] : [];
       expect(harness.events.filter((event) => event.startsWith('dispose:'))).toEqual(
         disposedBeforeRuntimeRelease
       );
@@ -639,8 +778,10 @@ describe('generated maximal browser runtime transaction', () => {
       const expectedDisposals =
         kind === 'storage'
           ? [
-              'dispose:sourcepoint',
-              ...reverseIds.filter((id) => id !== 'sourcepoint').map((id) => `dispose:${id}`),
+              'dispose:sourcepoint_consent',
+              ...reverseIds
+                .filter((id) => id !== 'sourcepoint_consent')
+                .map((id) => `dispose:${id}`),
             ]
           : reverseIds.map((id) => `dispose:${id}`);
       expect(harness.events.filter((event) => event.startsWith('dispose:'))).toEqual(
