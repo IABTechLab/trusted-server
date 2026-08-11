@@ -3375,6 +3375,52 @@ pub async fn handle_publisher_request(
     // stored or validated as an origin representation. Strip both browser and
     // surrogate validators/cache directives before returning it.
     //
+    // The shared-template cache gate: it does not build the key, it authorizes storing
+    // the one built pre-fetch. Everything it checks is response-derived, which is
+    // exactly why it cannot run at lookup time — and why it does not need to. Anything
+    // already in the cache passed this gate on the way in.
+    //
+    // A surviving key is the store authorization. Under `Inline` there is no key to
+    // survive.
+    //
+    // **Evaluated before TS stamps its own `private, no-store` below, and that ordering
+    // is load-bearing.** The gate asks whether the *origin* declared the response
+    // shareable. Run it after the stamp and it reads TS's own header instead, concludes
+    // `OriginNotShareable`, and refuses to cache — on every page where the ad stack
+    // runs, which is every page that matters. Local testing caught exactly that; no unit
+    // test did, because their fixtures leave the auction disabled and never reach the
+    // stamp.
+    let gate_content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let template_cache_key = template_cache_key.filter(|_| {
+        match c2_bypass_reason(
+            assembly_mode,
+            request_had_authorization,
+            request_had_cookie,
+            response.status(),
+            &gate_content_type,
+            response.headers(),
+            &settings
+                .creative_opportunities
+                .as_ref()
+                .map(CreativeOpportunitiesConfig::template_cache_vary)
+                .unwrap_or_else(|| VarySpec::new([])),
+        ) {
+            Some(reason) => {
+                log::debug!("c2_template_cache bypass: {reason}");
+                false
+            }
+            None => {
+                log::debug!("c2_template_cache eligible");
+                true
+            }
+        }
+    });
+
     // Gate on `should_run_ad_stack` rather than content-type alone: when no slot
     // matched, the feature is disabled, or this is not an ad-eligible navigation,
     // no per-user `tsjs.adSlots`/`tsjs.bids` are injected, so forcing private
@@ -3423,38 +3469,6 @@ pub async fn handle_publisher_request(
         .unwrap_or_default()
         .to_lowercase();
     let route = classify_response_route(status, &content_type, &content_encoding, request_host);
-
-    // The shared-template cache gate: it does not build the key, it authorizes storing
-    // the one built pre-fetch. Everything it checks is response-derived, which is
-    // exactly why it cannot run at lookup time — and why it does not need to. Anything
-    // already in the cache passed this gate on the way in.
-    //
-    // A surviving key is the store authorization. Under `Inline` there is no key to
-    // survive.
-    let template_cache_key = template_cache_key.filter(|_| {
-        match c2_bypass_reason(
-            assembly_mode,
-            request_had_authorization,
-            request_had_cookie,
-            status,
-            &content_type,
-            response.headers(),
-            &settings
-                .creative_opportunities
-                .as_ref()
-                .map(CreativeOpportunitiesConfig::template_cache_vary)
-                .unwrap_or_else(|| VarySpec::new([])),
-        ) {
-            Some(reason) => {
-                log::debug!("c2_template_cache bypass: {reason}");
-                false
-            }
-            None => {
-                log::debug!("c2_template_cache eligible");
-                true
-            }
-        }
-    });
 
     match route {
         ResponseRoute::PassThrough => {
@@ -5780,10 +5794,23 @@ mod tests {
             }
         }
 
+        /// Settings with the ad stack **live**, not merely configured.
+        ///
+        /// `[auction] enabled = true` and a slot matching the request path are both
+        /// required, because `should_run_ad_stack` folds them together and half this
+        /// path only executes when it is true. An earlier version of this helper left
+        /// the auction disabled, which made every test here exercise the branch where
+        /// TS never stamps its own `private, no-store` — and so missed that the C2 gate
+        /// was reading that stamp and refusing to cache every page that runs ads.
         fn settings_with_mode(mode: &str) -> Settings {
             let toml = format!(
-                "{}\n[creative_opportunities]\ngam_network_id = \"99999\"\n\
-                 assembly_mode = \"{mode}\"\n",
+                "{}\n[auction]\nenabled = true\n\n\
+                 [creative_opportunities]\ngam_network_id = \"99999\"\n\
+                 assembly_mode = \"{mode}\"\n\n\
+                 [[creative_opportunities.slot]]\n\
+                 id = \"test-slot\"\n\
+                 page_patterns = [\"/article\"]\n\
+                 formats = [{{ width = 728, height = 90 }}]\n",
                 crate_test_settings_str()
             );
             let mut settings =
@@ -5850,8 +5877,34 @@ mod tests {
                 .uri("https://ts.example.com/article")
                 .header(header::HOST, "ts.example.com")
                 .header("sec-fetch-dest", "document")
+                .header("sec-fetch-mode", "navigate")
                 .body(EdgeBody::empty())
                 .expect("should build navigation request")
+        }
+
+        /// A slot matching `/article`.
+        ///
+        /// Passed through `AuctionDispatch`, not read from settings — and that is the
+        /// distinction that matters. `should_run_ad_stack` requires a *matched* slot, so
+        /// a config slot with no dispatch slot leaves the ad stack off and skips every
+        /// branch that only runs when it is on.
+        fn article_slot() -> crate::creative_opportunities::CreativeOpportunitySlot {
+            crate::creative_opportunities::CreativeOpportunitySlot {
+                id: "test-slot".to_string(),
+                gam_unit_path: None,
+                div_id: Some("test-slot".to_string()),
+                page_patterns: vec!["/article".to_string()],
+                formats: vec![crate::creative_opportunities::CreativeOpportunityFormat {
+                    width: 728,
+                    height: 90,
+                    media_type: MediaType::Banner,
+                }],
+                floor_price: None,
+                targeting: Default::default(),
+                providers: Default::default(),
+                compiled_patterns: Vec::new(),
+                compiled_unit: None,
+            }
         }
 
         /// Runs the full request, **including the finalizer**.
@@ -5879,7 +5932,7 @@ mod tests {
                 &mut ec_context,
                 AuctionDispatch {
                     orchestrator: &orchestrator,
-                    slots: &[],
+                    slots: &[article_slot()],
                     registry: None,
                 },
                 request,
@@ -6149,7 +6202,7 @@ mod tests {
                 &mut ec_context,
                 AuctionDispatch {
                     orchestrator: &orchestrator,
-                    slots: &[],
+                    slots: &[article_slot()],
                     registry: None,
                 },
                 authenticated,
