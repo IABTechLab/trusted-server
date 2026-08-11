@@ -686,6 +686,37 @@ for the silent-empty-bids trap, which applies in full.
 
 ## Task 5: Arm A3 — ESI at the edge
 
+- [x] **Step 0: the mechanism works — DONE.** `9539061e`, hardened in `0597f54e`.
+
+Verified under Viceroy with the real `esi` 0.7 crate rather than argued from docs: a
+template carrying the `</body>` seam's own `esi:include` comes back with the fragment
+spliced in its place and no unresolved tag left.
+
+**The async/sync obstacle is dissolved, not worked around.** `esi`'s fragment dispatcher
+is synchronous and this codebase's fragment producer is `async`; calling one from the
+other means a nested executor, which panics.
+`PendingFragmentContent::CompletedRequest` lets the dispatcher hand back an
+already-built response, so the caller resolves the fragment in the normal async flow and
+the dispatcher performs **no I/O at all** — no subrequest, no backend, no self-call,
+nothing for Viceroy to stub. That also removes the need for a self-referencing backend
+this plan would otherwise have required.
+
+**Step 2's instruction was right, and reading the crate showed why.**
+`CacheConfig::is_includes_cacheable` defaults to **`true`**. A fragment carries one
+visitor's bids, so the default caches per-user data and serves it to the next visitor —
+silently, on a hit. `includes_force_ttl` is worse where set: it caches everything,
+ignoring `private`, `no-store` and `Set-Cookie` alike. Both now stated explicitly, along
+with `default_dca`/`inherit_parent_dca` (fragment bytes are data, never re-parsed as
+ESI), `max_include_depth = 1`, and rendered caching / `edge_control` off because the
+publisher path owns those headers.
+
+Nine tests. Four assert the configuration; the rest assert behaviour, including that a
+fragment containing its own `esi:include` is spliced as text rather than dispatched, so
+auction data cannot drive fragment requests.
+
+**What remains is the call site**, below. Emitting the include and resolving it are both
+proven; connecting them is not done.
+
 - [ ] **Step 1: Wire `process_stream`, not the wrappers**
 
 `process_response` and `process_response_streaming` consume `self` _and_ send the response
