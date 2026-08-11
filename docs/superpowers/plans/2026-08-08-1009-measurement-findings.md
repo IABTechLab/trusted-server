@@ -441,6 +441,53 @@ The stale-cache test is the same failure in miniature: it passed while never rea
 `is_stale()`, and only mutation testing exposed that. A test that passes for the wrong
 reason is worse than no test, because it is counted as coverage.
 
+## Independent review — two blockers, and two reasons the cache would have measured nothing
+
+An independent reviewer read `main...HEAD` and, importantly, **demonstrated** findings by
+running code rather than inferring them. Four things it found that review-by-reading had
+not.
+
+**A POST was answered from a cached GET.** `handle_publisher_request` is the `*`-method
+fallback route, so a publisher path that renders on GET and accepts a form or webhook on
+POST reaches it for both. The origin never saw the mutating request; the caller got `200`
+and a page. Fixed at key construction, since the key governs lookup and store alike.
+
+**`Vary: Accept-Encoding` disqualified everything.** The key has a dedicated
+`accept_encoding` field, so such an origin is already keyed correctly — but the coverage
+check consulted only the operator-configured list and reported a gap. Every compressing
+origin sends that header, so **C2 would have stored nothing against any real origin**.
+This is worse than a plain bug: the spike would have measured a hit rate near zero and
+reported it as a result.
+
+**Cookies excluded essentially every repeat visitor.** Any cookie disqualified in both
+directions, and TS sets its own identity cookie. The population that could ever see a warm
+hit was roughly first-ever page views and cookie-less clients. The design notes called
+this the "first-nav exception"; it is the common case, not the exception. Now opt-in via
+`origin_is_cookie_independent`, with the `Vary: Cookie` drift guard overriding a wrong
+assertion.
+
+**`ClientFill` had no end-to-end coverage.** The reviewer reintroduced a diagnostics leak
+scoped to that mode and all 1889 tests passed. Investigation showed that specific mutation
+is unreachable — `requires_private_no_store()` is a strict superset of the injection
+condition and stamps before the gate reads headers — but only by a coincidence between two
+independent conditions. Both the coverage gap and the coincidence are now pinned by tests.
+
+### What the review says about the review process
+
+The reviewer's confirmed findings all came from **running** something. Its clean bills —
+no leak in the template itself, no `Inline` regression — came with positive evidence:
+tracing that integration context types carry no per-reader field at all, and separately
+proving the leakage test has teeth by breaking the store/assemble order and watching it
+fail.
+
+Two of my own comments were wrong, and it caught both by checking rather than reading:
+one claimed three call sites where there are two, the other described a dispatcher
+mechanism that stopped existing when assembly moved to `CompletedRequest`.
+
+Verified afterwards against a running server with the origin advertising
+`Vary: Accept-Encoding`: a cookie-bearing repeat visitor now costs one origin fetch across
+two requests, and a POST still reaches the origin.
+
 ## Step B — consumers of TS's own response headers
 
 Not yet run.
