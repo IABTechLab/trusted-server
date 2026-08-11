@@ -50,7 +50,10 @@ import { createLegacyGptRegistrationForTest as createGptIntegrationRegistration 
 import { isGuardInstalled, resetGuardState } from '../../src/integrations/gpt/script_guard';
 import { createGptDiagnosticsIntegrationRegistration } from '../../src/integrations/gpt_diagnostics/module';
 import { createLockrIntegrationRegistration } from '../../src/integrations/lockr/module';
+import { createOsanoIntegrationRegistration } from '../../src/integrations/osano/module';
+import { createPermutiveIntegrationRegistration } from '../../src/integrations/permutive/module';
 import { createPrebidIntegrationRegistration } from '../../src/integrations/prebid/module';
+import { createSourcepointIntegrationRegistration } from '../../src/integrations/sourcepoint/module';
 import { createTestlightIntegrationRegistration } from '../../src/integrations/testlight/module';
 import { publicLog } from '../../src/kernel/fallback';
 import { createTestNavigationIdentityIssuer } from '../../src/kernel/identity';
@@ -2060,9 +2063,9 @@ describe('browser composition', () => {
       ['didomi', createDidomiIntegrationRegistration] as const,
       ['google_tag_manager', createGoogleTagManagerIntegrationRegistration] as const,
       ['lockr', createLockrIntegrationRegistration] as const,
-      ['osano_consent', noConfigLifecycle('osano_consent')] as const,
-      ['permutive_context', noConfigLifecycle('permutive_context')] as const,
-      ['sourcepoint_consent', sourcepointLifecycle('sourcepoint_consent')] as const,
+      ['osano_consent', createOsanoIntegrationRegistration] as const,
+      ['permutive_context', createPermutiveIntegrationRegistration] as const,
+      ['sourcepoint_consent', createSourcepointIntegrationRegistration] as const,
       ['testlight', createTestlightIntegrationRegistration] as const,
     ]);
     const deferredMembers = Object.freeze([

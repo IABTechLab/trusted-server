@@ -10,6 +10,7 @@ import {
 } from '../../../src/kernel/integration_registry';
 
 const RELEASE_ID = 'a'.repeat(64);
+const CRITICAL_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
 
 function callbacks(order: string[]): IntegrationInstallCallbacks {
   return {
@@ -33,7 +34,8 @@ describe('transactional Google Tag Manager integration module', () => {
       manifest: {
         version: 1,
         releaseId: RELEASE_ID,
-        integrations: [{ id: 'google_tag_manager', required: true }],
+        criticalSrc: CRITICAL_SRC,
+        integrations: [{ id: 'google_tag_manager', phase: 'critical' }],
       },
       releaseId: RELEASE_ID,
       knownIntegrationIds: Object.freeze(['google_tag_manager']),

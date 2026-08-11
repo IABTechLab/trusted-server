@@ -10,7 +10,7 @@ import {
 } from './consent_mirror';
 import { installSourcepointGuard, resetGuardState } from './script_guard';
 
-export const SOURCEPOINT_INTEGRATION_ID = 'sourcepoint' as const;
+export const SOURCEPOINT_INTEGRATION_ID = 'sourcepoint_consent' as const;
 
 interface SourcepointBootConfig {
   readonly rewriteSdk: boolean;

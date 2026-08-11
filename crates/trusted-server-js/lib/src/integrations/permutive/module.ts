@@ -8,7 +8,7 @@ import { log } from '../../core/log';
 import { installPermutiveGuard, resetGuardState } from './script_guard';
 import { getPermutiveSegments } from './segments';
 
-export const PERMUTIVE_INTEGRATION_ID = 'permutive' as const;
+export const PERMUTIVE_INTEGRATION_ID = 'permutive_context' as const;
 
 const PERMUTIVE_CONFIG_FIELDS = [
   'apiHost',

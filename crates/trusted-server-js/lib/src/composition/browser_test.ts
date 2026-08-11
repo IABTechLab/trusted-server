@@ -274,9 +274,7 @@ interface AcceptedBrowserBoot {
   readonly cachePolicy?: unknown;
   readonly creative: Readonly<CreativeBootV1>;
   readonly diagnostics: Readonly<DiagnosticsBootV1>;
-  readonly didomi?: unknown;
   readonly manifest: Readonly<BootManifestV1>;
-  readonly sourcepoint?: unknown;
 }
 
 interface PreparedBrowserServices {
@@ -712,7 +710,6 @@ export function createTestBrowserRuntimeComposition(
   let gptDiagnosticsFacts: GptDiagnosticsFactBuffer | undefined;
   let renderTrace: RenderTraceRuntimeOwner | undefined;
   const renderTraceSlotsByNavigation = new Map<object, Set<string>>();
-  let acceptedBrowserBoot: AcceptedBrowserBoot | undefined;
   const consumeCoreObservation = (observation: DiagnosticsObservation): void => {
     if (
       observation['kind'] === 'slotRequested' ||
@@ -1008,8 +1005,6 @@ export function createTestBrowserRuntimeComposition(
     }
     if (id === 'creative' && config === undefined) config = creativeBoot;
     if (id === 'gpt_diagnostics' && config === undefined) config = diagnosticsBoot?.gpt;
-    if (id === 'didomi' && config === undefined) config = acceptedBrowserBoot?.didomi;
-    if (id === 'sourcepoint' && config === undefined) config = acceptedBrowserBoot?.sourcepoint;
     const interfaces = runtimeSession?.interfaces;
     if (!interfaces) throw new Error(`Integration interfaces are unavailable for ${id}`);
     return Object.freeze({
@@ -1400,7 +1395,6 @@ export function createTestBrowserRuntimeComposition(
     },
     prepareOwner: (context) => {
       const boot = context.boot as unknown as AcceptedBrowserBoot;
-      acceptedBrowserBoot = boot;
       creativeBoot = boot.creative;
       diagnosticsBoot = boot.diagnostics;
       const cachePolicy =
@@ -1701,7 +1695,6 @@ export function createTestBrowserRuntimeComposition(
           auctionBatchService = undefined;
           auctionContextRegistry = undefined;
           projectionParser = undefined;
-          acceptedBrowserBoot = undefined;
           creativeBoot = undefined;
           diagnosticsBoot = undefined;
           renderTraceSlotsByNavigation.clear();

@@ -6,7 +6,7 @@ import {
 
 import { disposeOsanoConsentMirror, initializeOsanoConsentMirror } from './consent_mirror';
 
-export const OSANO_INTEGRATION_ID = 'osano' as const;
+export const OSANO_INTEGRATION_ID = 'osano_consent' as const;
 
 export interface OsanoRuntimeDependencies {
   readonly initialize: () => void;

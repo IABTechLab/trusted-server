@@ -1,6 +1,6 @@
 import type { DisposeCallback } from '../kernel/disposable';
+import { MAX_MANIFEST_MODULES } from '../kernel/release_catalog';
 
-const MAX_MANIFEST_INTEGRATIONS = 16;
 const INTEGRATION_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 // Context shares the existing /auction request-body ceiling. The structural
 // bound follows from the smallest repeated JSON unit (`0,`), and the key bound
@@ -120,7 +120,7 @@ interface TraversalFrame {
 }
 
 function snapshotManifest(candidate: readonly string[]): readonly string[] {
-  if (!Object.isFrozen(candidate) || candidate.length > MAX_MANIFEST_INTEGRATIONS) {
+  if (!Object.isFrozen(candidate) || candidate.length > MAX_MANIFEST_MODULES) {
     throw new TypeError('Auction context manifest must be frozen and bounded');
   }
   const seen = new Set<string>();
