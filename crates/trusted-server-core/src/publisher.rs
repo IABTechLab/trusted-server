@@ -1154,6 +1154,14 @@ pub(crate) fn classify_response_route(
 /// Owned version of [`ProcessResponseParams`] for returning from
 /// [`handle_publisher_request`] without lifetime issues.
 pub struct OwnedProcessResponseParams {
+    /// Where to store the transformed template, or [`None`] to store nothing.
+    ///
+    /// `Some` only when [`c2_bypass_reason`] cleared the response, so the key's
+    /// presence *is* the decision — there is no second place that could disagree with
+    /// the gate, and no way to reach the store without having passed it.
+    ///
+    /// Spike-only, for the #1009 ESI validation.
+    pub(crate) template_cache_key: Option<crate::platform::TemplateCacheKey>,
     pub(crate) content_encoding: String,
     pub(crate) origin_host: String,
     pub(crate) origin_url: String,
@@ -1261,6 +1269,7 @@ pub async fn buffer_publisher_response_async(
             )
             .await?;
             let bytes = output.into_inner();
+            store_template_if_authorized(services, &mut params, &bytes).await;
             response.headers_mut().insert(
                 http::header::CONTENT_LENGTH,
                 http::HeaderValue::from(bytes.len() as u64),
@@ -1272,6 +1281,42 @@ pub async fn buffer_publisher_response_async(
             *response.body_mut() = body;
             Ok(response)
         }
+    }
+}
+
+/// Writes the transformed template to the shared cache, if the gate authorized it.
+///
+/// The key's presence is the authorization: it is `Some` only when
+/// [`c2_bypass_reason`] cleared the response, so this cannot store something the gate
+/// rejected. Takes the key rather than borrowing it, so a second call for the same
+/// request stores nothing.
+///
+/// Failures are logged and swallowed. A cache that cannot be written is a slower
+/// service, not a broken one, and the whole point of C2 is that the response is
+/// reproducible without it.
+///
+/// Spike-only, for the #1009 ESI validation.
+async fn store_template_if_authorized(
+    services: &RuntimeServices,
+    params: &mut OwnedProcessResponseParams,
+    bytes: &[u8],
+) {
+    let Some(key) = params.template_cache_key.take() else {
+        return;
+    };
+    let metadata = crate::platform::TemplateMetadata {
+        content_encoding: params.content_encoding.clone(),
+        content_type: params.content_type.clone(),
+        schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
+        body_len: bytes.len() as u64,
+    };
+    match services
+        .template_cache()
+        .put(&key, &metadata, bytes.to_vec())
+        .await
+    {
+        Ok(()) => log::debug!("c2_template_cache stored {} bytes", bytes.len()),
+        Err(err) => log::warn!("c2_template_cache store failed: {err}"),
     }
 }
 
@@ -1295,6 +1340,34 @@ pub async fn publisher_response_into_streaming_response(
     orchestrator: Arc<AuctionOrchestrator>,
     services: RuntimeServices,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    // A template can only be stored once the transform has produced every byte, and
+    // streaming hands bytes to the client as they are produced rather than collecting
+    // them. Shared modes therefore take the buffered finalizer, which already
+    // materializes the transformed body.
+    //
+    // Deliberately keyed on the store authorization rather than on the assembly mode:
+    // a shared-mode response the gate rejected has nothing to store, so it keeps
+    // streaming. `Inline` — the shipped path — never reaches this branch at all, which
+    // is the point. The spike cannot regress production latency by construction.
+    //
+    // The cost is that a C2 *miss* buffers. That is the right trade: misses are already
+    // paying an origin fetch and a full transform, and what the spike measures is the
+    // hit, where there is no origin fetch to stream from in the first place.
+    if matches!(
+        &publisher_response,
+        PublisherResponse::Stream { params, .. } if params.template_cache_key.is_some()
+    ) {
+        return buffer_publisher_response_async(
+            publisher_response,
+            method,
+            &settings,
+            integration_registry,
+            &orchestrator,
+            &services,
+        )
+        .await;
+    }
+
     match publisher_response {
         PublisherResponse::Buffered(mut response) => {
             // Fastly requests the origin body as a stream before the response is
@@ -2959,6 +3032,23 @@ pub async fn handle_publisher_request(
     // legacy path never sets it. Either way it is an internal edge signal that
     // must not leak to publisher backends.
     req.headers_mut().remove("fastly-ssl");
+    // Captured before the request is consumed: the C2 key identifies the origin
+    // document plus the request headers the origin varies on, and this is the last
+    // point where both are still in hand.
+    //
+    // Read from the request as forwarded, after `restrict_accept_encoding` — keying on
+    // what the client originally sent would key on a value the origin never saw.
+    let template_cache_url = target_uri.to_string();
+    let template_cache_vary_values = settings
+        .creative_opportunities
+        .as_ref()
+        .map(CreativeOpportunitiesConfig::template_cache_vary)
+        .unwrap_or_else(|| VarySpec::new([]))
+        .values_from(|name| {
+            req.headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+        });
     *req.uri_mut() = target_uri;
     req.headers_mut().insert(
         header::HOST,
@@ -3085,30 +3175,6 @@ pub async fn handle_publisher_request(
 
     let status = response.status();
 
-    // Evaluate the shared-template cache gate and log it. No behaviour change yet:
-    // the C2 read/write lands in Task 3 Step 4, and under the default `Inline`
-    // mode this reports `InlineMode` and logs nothing. Wiring it now gives the
-    // gate a real call site and makes the decision observable during the spike
-    // rather than only at the point it starts mutating requests.
-    if !matches!(assembly_mode, AssemblyMode::Inline) {
-        match c2_bypass_reason(
-            assembly_mode,
-            request_had_authorization,
-            request_had_cookie,
-            status,
-            &content_type,
-            response.headers(),
-            &settings
-                .creative_opportunities
-                .as_ref()
-                .map(CreativeOpportunitiesConfig::template_cache_vary)
-                .unwrap_or_else(|| VarySpec::new([])),
-        ) {
-            Some(reason) => log::debug!("c2_template_cache bypass: {reason}"),
-            None => log::debug!("c2_template_cache eligible"),
-        }
-    }
-
     let content_encoding = response
         .headers()
         .get(header::CONTENT_ENCODING)
@@ -3116,6 +3182,54 @@ pub async fn handle_publisher_request(
         .unwrap_or_default()
         .to_lowercase();
     let route = classify_response_route(status, &content_type, &content_encoding, request_host);
+
+    // The shared-template cache gate. Evaluated here rather than earlier because the
+    // negotiated content encoding is part of the key: the pipeline pairs input encoding
+    // to output encoding, so a template stored as brotli must never be handed to a
+    // client that asked for gzip.
+    //
+    // A `Some` key is the store authorization. Under the default `Inline` mode the gate
+    // reports `InlineMode` and nothing is ever stored.
+    let template_cache_key = if matches!(assembly_mode, AssemblyMode::Inline) {
+        None
+    } else {
+        let key_vary = settings
+            .creative_opportunities
+            .as_ref()
+            .map(CreativeOpportunitiesConfig::template_cache_vary)
+            .unwrap_or_else(|| VarySpec::new([]));
+        match c2_bypass_reason(
+            assembly_mode,
+            request_had_authorization,
+            request_had_cookie,
+            status,
+            &content_type,
+            response.headers(),
+            &key_vary,
+        ) {
+            Some(reason) => {
+                log::debug!("c2_template_cache bypass: {reason}");
+                None
+            }
+            None => {
+                log::debug!("c2_template_cache eligible");
+                Some(crate::platform::TemplateCacheKey {
+                    url: template_cache_url,
+                    request_host: request_host.to_string(),
+                    request_scheme: request_scheme.to_string(),
+                    assembly_mode,
+                    vary_values: template_cache_vary_values,
+                    content_encoding: content_encoding.clone(),
+                    // Changes whenever any JS module changes, so a bundle deploy
+                    // invalidates stored templates without needing a purge.
+                    integration_fingerprint: trusted_server_js::concatenated_hash(
+                        &trusted_server_js::all_module_ids(),
+                    ),
+                    schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
+                })
+            }
+        }
+    };
 
     match route {
         ResponseRoute::PassThrough => {
@@ -3197,6 +3311,7 @@ pub async fn handle_publisher_request(
                 response,
                 body,
                 params: Box::new(OwnedProcessResponseParams {
+                    template_cache_key,
                     content_encoding,
                     origin_host,
                     origin_url: settings.publisher.origin_url.clone(),
@@ -4633,6 +4748,7 @@ mod tests {
         content_encoding: &str,
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            template_cache_key: None,
             content_encoding: content_encoding.to_owned(),
             origin_host: settings.publisher.origin_host(),
             origin_url: settings.publisher.origin_url.clone(),
@@ -5124,6 +5240,149 @@ mod tests {
                 body_close_injection(AssemblyMode::Esi, false),
                 BodyCloseInjection::None,
                 "Esi should emit nothing until a script-returning fragment endpoint exists"
+            );
+        }
+    }
+
+    mod c2_store_authorization_tests {
+        //! The store is authorized by the key's presence and nothing else. These cover
+        //! the two ways that could silently break: storing without authorization, and
+        //! storing twice for one request.
+
+        use super::*;
+        use crate::platform::ClientInfo;
+        use crate::platform::test_support::{
+            NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend,
+        };
+
+        /// Records what was stored, so the assertions are about behaviour rather than
+        /// about a call not returning an error.
+        #[derive(Default)]
+        struct RecordingCache {
+            stored: Mutex<Vec<(String, usize)>>,
+        }
+
+        #[async_trait::async_trait(?Send)]
+        impl crate::platform::PlatformTemplateCache for RecordingCache {
+            async fn get(
+                &self,
+                _key: &crate::platform::TemplateCacheKey,
+            ) -> Result<crate::platform::TemplateEntry, crate::platform::TemplateCacheMiss>
+            {
+                Err(crate::platform::TemplateCacheMiss::NotFound)
+            }
+
+            async fn put(
+                &self,
+                key: &crate::platform::TemplateCacheKey,
+                _metadata: &crate::platform::TemplateMetadata,
+                body: Vec<u8>,
+            ) -> Result<(), crate::platform::TemplateCacheError> {
+                self.stored
+                    .lock()
+                    .expect("should lock recorded stores")
+                    .push((key.url.clone(), body.len()));
+                Ok(())
+            }
+
+            async fn purge_all(&self) -> Result<(), crate::platform::TemplateCacheError> {
+                Ok(())
+            }
+        }
+
+        impl RecordingCache {
+            fn recorded(&self) -> Vec<(String, usize)> {
+                self.stored
+                    .lock()
+                    .expect("should lock recorded stores")
+                    .clone()
+            }
+        }
+
+        fn key() -> crate::platform::TemplateCacheKey {
+            crate::platform::TemplateCacheKey {
+                url: "https://example.com/page".to_string(),
+                request_host: "example.com".to_string(),
+                request_scheme: "https".to_string(),
+                assembly_mode: AssemblyMode::Esi,
+                vary_values: vec![],
+                content_encoding: "identity".to_string(),
+                integration_fingerprint: "fp".to_string(),
+                schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
+            }
+        }
+
+        fn services_with(cache: Arc<RecordingCache>) -> RuntimeServices {
+            RuntimeServices::builder()
+                .config_store(Arc::new(NoopConfigStore))
+                .secret_store(Arc::new(NoopSecretStore))
+                .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+                .backend(Arc::new(StubBackend))
+                .geo(Arc::new(NoopGeo))
+                .http_client(Arc::new(StubHttpClient::new()))
+                .client_info(ClientInfo::default())
+                .template_cache(cache)
+                .build()
+        }
+
+        #[tokio::test]
+        async fn an_unauthorized_response_stores_nothing() {
+            // `None` is what the gate leaves behind on every bypass, and it is also the
+            // default for Inline. If this ever stored, every bypass reason would be
+            // decorative.
+            let cache = Arc::new(RecordingCache::default());
+            let settings = create_test_settings();
+            let mut params = make_stream_params(&settings, "identity");
+            params.template_cache_key = None;
+
+            store_template_if_authorized(&services_with(Arc::clone(&cache)), &mut params, b"body")
+                .await;
+
+            assert!(
+                cache.recorded().is_empty(),
+                "a response the gate rejected must not reach the cache"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_authorized_response_stores_the_transformed_bytes() {
+            let cache = Arc::new(RecordingCache::default());
+            let settings = create_test_settings();
+            let mut params = make_stream_params(&settings, "identity");
+            params.template_cache_key = Some(key());
+
+            store_template_if_authorized(
+                &services_with(Arc::clone(&cache)),
+                &mut params,
+                b"<html>transformed</html>",
+            )
+            .await;
+
+            assert_eq!(
+                cache.recorded(),
+                vec![("https://example.com/page".to_string(), 24)],
+                "the authorized response should store its transformed bytes"
+            );
+        }
+
+        #[tokio::test]
+        async fn authorization_is_consumed_so_one_request_stores_once() {
+            // The finalizers are layered, and a future change could plausibly call this
+            // from both. Taking the key makes a double store impossible rather than
+            // merely unlikely.
+            let cache = Arc::new(RecordingCache::default());
+            let settings = create_test_settings();
+            let mut params = make_stream_params(&settings, "identity");
+            params.template_cache_key = Some(key());
+            let services = services_with(Arc::clone(&cache));
+
+            store_template_if_authorized(&services, &mut params, b"first").await;
+            store_template_if_authorized(&services, &mut params, b"second").await;
+
+            assert_eq!(
+                cache.recorded().len(),
+                1,
+                "authorization must be single-use"
             );
         }
     }
@@ -7293,6 +7552,7 @@ mod tests {
 
         let body = EdgeBody::from(compressed);
         let params = OwnedProcessResponseParams {
+            template_cache_key: None,
             content_encoding: "gzip".to_string(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
@@ -7341,6 +7601,7 @@ mod tests {
             IntegrationRegistry::new(&settings).expect("should create integration registry");
 
         let params = OwnedProcessResponseParams {
+            template_cache_key: None,
             content_encoding: String::new(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
@@ -7378,6 +7639,7 @@ mod tests {
         let registry =
             IntegrationRegistry::new(&settings).expect("should create integration registry");
         let params = OwnedProcessResponseParams {
+            template_cache_key: None,
             content_encoding: String::new(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
@@ -7493,6 +7755,7 @@ mod tests {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                template_cache_key: None,
                 content_encoding: String::new(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
@@ -7546,6 +7809,7 @@ mod tests {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                template_cache_key: None,
                 content_encoding: "gzip".to_string(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
@@ -7602,6 +7866,7 @@ mod tests {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                template_cache_key: None,
                 content_encoding: "deflate".to_string(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
@@ -7658,6 +7923,7 @@ mod tests {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                template_cache_key: None,
                 content_encoding: "br".to_string(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
@@ -7714,6 +7980,7 @@ mod tests {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                template_cache_key: None,
                 content_encoding: "br".to_string(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
@@ -7758,6 +8025,7 @@ mod tests {
 
     fn non_html_stream_params(content_encoding: &str) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            template_cache_key: None,
             content_encoding: content_encoding.to_string(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
@@ -7946,6 +8214,7 @@ mod tests {
             let services = noop_services();
             let state = Arc::new(Mutex::new(None));
             let mut params = OwnedProcessResponseParams {
+                template_cache_key: None,
                 content_encoding: String::new(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
@@ -8010,6 +8279,7 @@ mod tests {
             let services = noop_services();
             let state = Arc::new(Mutex::new(None));
             let mut params = OwnedProcessResponseParams {
+                template_cache_key: None,
                 content_encoding: "gzip".to_string(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
@@ -8076,6 +8346,7 @@ mod tests {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                template_cache_key: None,
                 content_encoding: String::new(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
@@ -8135,6 +8406,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build response");
         let params = OwnedProcessResponseParams {
+            template_cache_key: None,
             content_encoding: content_encoding.to_string(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
@@ -8268,6 +8540,7 @@ mod tests {
         dispatched_auction: Option<DispatchedAuction>,
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            template_cache_key: None,
             content_encoding: content_encoding.to_string(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
@@ -8613,6 +8886,7 @@ mod tests {
             let ec_context =
                 EcContext::new_for_test(None, crate::consent::types::ConsentContext::default());
             OwnedProcessResponseParams {
+                template_cache_key: None,
                 content_encoding: String::new(),
                 origin_host: "origin.example.com".to_string(),
                 origin_url: "https://origin.example.com".to_string(),
@@ -8795,6 +9069,7 @@ mod tests {
             .map(bytes::Bytes::copy_from_slice)
             .collect();
         let params = OwnedProcessResponseParams {
+            template_cache_key: None,
             content_encoding: "gzip".to_string(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
@@ -8865,6 +9140,7 @@ mod tests {
             r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{}");</script>"#;
         let state = Arc::new(Mutex::new(Some(bids_script.to_string())));
         let params = OwnedProcessResponseParams {
+            template_cache_key: None,
             content_encoding: String::new(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
@@ -8918,6 +9194,7 @@ mod tests {
         // Claim gzip encoding but feed non-gzip bytes. The GzDecoder will
         // error as soon as it tries to read the gzip header.
         let params = OwnedProcessResponseParams {
+            template_cache_key: None,
             content_encoding: "gzip".to_string(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
@@ -9026,6 +9303,7 @@ mod tests {
         let body = EdgeBody::from(html.to_vec());
 
         let params = OwnedProcessResponseParams {
+            template_cache_key: None,
             content_encoding: String::new(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
@@ -9083,6 +9361,7 @@ mod tests {
         // Small, single-fragment RSC script — placeholder path (not fallback).
         let html = br#"<html><body><script>self.__next_f.push([1,"1:{\"link\":\"https://origin.example.com/page\"}"])</script></body></html>"#;
         let params = OwnedProcessResponseParams {
+            template_cache_key: None,
             content_encoding: String::new(),
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
