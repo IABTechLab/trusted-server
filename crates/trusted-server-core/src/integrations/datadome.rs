@@ -68,6 +68,7 @@ use serde_json::Value as JsonValue;
 use url::Url;
 use validator::Validate;
 
+use crate::constants::ENV_FASTLY_IS_STAGING;
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
@@ -467,6 +468,17 @@ impl DataDomeIntegration {
         config: DataDomeConfig,
     ) -> Result<(), Report<TrustedServerError>> {
         Self::try_new(config).map(|_| ())
+    }
+
+    fn active_protection_test_bypass(&self) -> Option<&ProtectionTestBypassConfig> {
+        if std::env::var(ENV_FASTLY_IS_STAGING).as_deref() != Ok("1") {
+            return None;
+        }
+
+        self.config
+            .protection_test_bypass
+            .as_ref()
+            .filter(|bypass| bypass.enabled)
     }
 
     fn validate_protection_test_bypass(
@@ -926,18 +938,26 @@ fn build(
     };
 
     let integration = DataDomeIntegration::try_new(config)?;
-    let protection_test_bypass = integration
+    let protection_test_bypass_configured = integration
         .config
         .protection_test_bypass
         .as_ref()
         .is_some_and(|bypass| bypass.enabled);
+    let protection_test_bypass_active = integration.active_protection_test_bypass().is_some();
+    if protection_test_bypass_configured && !protection_test_bypass_active {
+        log::warn!(
+            "[datadome] DataDome test bypass is configured but inactive because FASTLY_IS_STAGING is not 1"
+        );
+    }
     log::info!(
         "[datadome] Registering integration (sdk_origin: {}, rewrite_sdk: {}, enable_protection: {}, protection_test_bypass: {})",
         integration.config.sdk_origin,
         integration.config.rewrite_sdk,
         integration.config.enable_protection,
-        if protection_test_bypass {
-            "enabled"
+        if protection_test_bypass_active {
+            "active"
+        } else if protection_test_bypass_configured {
+            "configured-inactive"
         } else {
             "disabled"
         },

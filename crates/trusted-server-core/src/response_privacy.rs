@@ -22,7 +22,6 @@ pub const CDN_CACHE_HEADERS: &[&str] = &[
     "fastly-surrogate-control",
     "cdn-cache-control",
     "cloudflare-cdn-cache-control",
-    "cdn-cache-control",
 ];
 
 /// Forces cookie-bearing responses to stay private to shared caches.

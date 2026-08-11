@@ -169,7 +169,7 @@ A request is protected when all of the following are true:
 5. The client IP does not match `protection_excluded_ip_cidrs` or any Config Store-backed CIDR source.
 6. The client ASN is not listed in `protection_excluded_asns`.
 7. No `protection_exclusion_rules` match.
-8. The request does not contain a matching enabled `protection_test_bypass` credential.
+8. The request does not contain a matching enabled `protection_test_bypass` credential while `FASTLY_IS_STAGING=1`.
 
 Static assets are excluded by default using a case-insensitive file-extension regex. Trusted Server internal routes such as `/static/tsjs=`, `/integrations/`, `/first-party/`, admin routes, discovery routes, and signature-verification routes are also excluded by default.
 
@@ -182,6 +182,7 @@ can configure a static header credential that skips only the server-side
 Protection API:
 
 ```toml
+# Runtime activation also requires FASTLY_IS_STAGING=1.
 [integrations.datadome.protection_test_bypass]
 enabled = true
 credential_secret_store = "ts_secrets"
@@ -189,14 +190,17 @@ credential_secret_name = "datadome_test_bypass"
 ```
 
 `protection_test_bypass` requires `enable_protection = true`; it is disabled
-when omitted. Store the temporary credential in the configured Secret Store,
-configure this section only while needed, protect the site with an outer access
-control such as Basic Auth, and remove the section when testing finishes. Do not
-enable it in production.
+when omitted and is runtime-active only when `FASTLY_IS_STAGING=1`. A retained
+section cannot bypass protection in a production or other non-staging runtime.
+Store the temporary credential in the configured Secret Store, configure this
+section only while needed, protect the site with an outer access control such
+as Basic Auth, and remove the section when testing finishes.
 
-The fixed `x-ts-datadome-bypass` header is compared in constant time, removed
-before the request can reach DataDome or the publisher origin, and never
-logged. Scope the header to the staging origin; do not attach it to every
+Whenever the enabled DataDome request filter runs, the fixed
+`x-ts-datadome-bypass` header is removed before configuration or credential
+checks. It therefore cannot reach DataDome or the publisher origin when the
+bypass is absent, disabled, inactive, or invalid. Active credentials are
+compared in constant time and never logged. Scope the header to the staging origin; do not attach it to every
 request in a browser context because that can disclose the credential to
 third-party origins. With Playwright:
 
@@ -223,7 +227,7 @@ This behavior applies to:
 - `protection_excluded_ip_cidr_sources`;
 - structured `ip_cidr` rules;
 - structured `ip_cidr_source` rules; and
-- a matching enabled `protection_test_bypass` credential.
+- a matching enabled `protection_test_bypass` credential in a staging runtime.
 
 ASN, method, path, query-parameter, static-asset, and internal-route
 exclusions do not automatically suppress the client-side tag. DataDome tags

@@ -165,15 +165,11 @@ impl DataDomeIntegration {
         req: &mut Request<EdgeBody>,
         services: &RuntimeServices,
     ) -> bool {
-        let Some(bypass) = self
-            .config
-            .protection_test_bypass
-            .as_ref()
-            .filter(|bypass| bypass.enabled)
-        else {
+        let value = req.headers_mut().remove(super::HEADER_DATADOME_TEST_BYPASS);
+        let Some(bypass) = self.active_protection_test_bypass() else {
             return false;
         };
-        let Some(value) = req.headers_mut().remove(super::HEADER_DATADOME_TEST_BYPASS) else {
+        let Some(value) = value else {
             return false;
         };
 
@@ -806,6 +802,23 @@ mod tests {
             .expect("should build filter request")
     }
 
+    fn filter_with_staging(
+        integration: &DataDomeIntegration,
+        settings: &Settings,
+        services: &RuntimeServices,
+        request: &mut Request<EdgeBody>,
+    ) -> RequestFilterDecision {
+        temp_env::with_var(crate::constants::ENV_FASTLY_IS_STAGING, Some("1"), || {
+            futures::executor::block_on(integration.filter_protection_request(RequestFilterInput {
+                settings,
+                services,
+                request,
+                geo_info: None,
+                is_integration_route: false,
+            }))
+        })
+    }
+
     fn filter_marks_request(
         config: DataDomeConfig,
         services: &RuntimeServices,
@@ -875,15 +888,7 @@ mod tests {
             edgezero_core::http::HeaderValue::from_static("temporary-test-credential"),
         );
 
-        let decision = futures::executor::block_on(integration.filter_protection_request(
-            RequestFilterInput {
-                settings: &settings,
-                services: &services,
-                request: &mut request,
-                geo_info: None,
-                is_integration_route: false,
-            },
-        ));
+        let decision = filter_with_staging(&integration, &settings, &services, &mut request);
 
         assert!(
             matches!(decision, RequestFilterDecision::Continue(_)),
@@ -903,6 +908,148 @@ mod tests {
         assert!(
             http_client.recorded_backend_names().is_empty(),
             "a matching test credential must not call the Protection API"
+        );
+    }
+
+    #[test]
+    fn protection_test_bypass_header_is_stripped_when_unconfigured_or_disabled() {
+        for protection_test_bypass in [
+            None,
+            Some(ProtectionTestBypassConfig {
+                enabled: false,
+                credential_secret_store: "ts_secrets".to_string(),
+                credential_secret_name: "datadome_test_bypass".to_string(),
+            }),
+        ] {
+            let config = DataDomeConfig {
+                enabled: true,
+                enable_protection: true,
+                protection_test_bypass,
+                ..DataDomeConfig::default()
+            };
+            let integration =
+                DataDomeIntegration::try_new(config).expect("should create integration");
+            let mut secrets = HashMap::new();
+            secrets.insert(
+                "datadome_server_side_key".to_string(),
+                b"server-side-key".to_vec(),
+            );
+            let http_client = Arc::new(StubHttpClient::new());
+            http_client.push_response_with_headers(
+                200,
+                Vec::new(),
+                vec![(HEADER_DATADOME_RESPONSE, "200")],
+            );
+            let services = build_services_with_secret_and_http_client(
+                HashMapSecretStore::new(secrets),
+                http_client.clone(),
+            );
+            let settings = Settings::default();
+            let mut request = request_for_filter();
+            request.headers_mut().insert(
+                super::super::HEADER_DATADOME_TEST_BYPASS,
+                edgezero_core::http::HeaderValue::from_static("stale-test-credential"),
+            );
+
+            let decision = filter_with_staging(&integration, &settings, &services, &mut request);
+
+            assert!(
+                matches!(decision, RequestFilterDecision::Continue(_)),
+                "an allowed Protection API response should continue"
+            );
+            assert!(
+                request
+                    .headers()
+                    .get(super::super::HEADER_DATADOME_TEST_BYPASS)
+                    .is_none(),
+                "the bypass header must be stripped when the bypass is unconfigured or disabled"
+            );
+            assert!(
+                !has_client_tag_suppression_marker(&request),
+                "an inactive bypass must not suppress the DataDome client tag"
+            );
+            assert_eq!(
+                http_client.recorded_backend_names().len(),
+                1,
+                "an inactive bypass must still call the Protection API"
+            );
+        }
+    }
+
+    #[test]
+    fn protection_test_bypass_is_inactive_outside_staging() {
+        let config = DataDomeConfig {
+            enabled: true,
+            enable_protection: true,
+            protection_test_bypass: Some(ProtectionTestBypassConfig {
+                enabled: true,
+                credential_secret_store: "ts_secrets".to_string(),
+                credential_secret_name: "datadome_test_bypass".to_string(),
+            }),
+            ..DataDomeConfig::default()
+        };
+        let integration = DataDomeIntegration::try_new(config).expect("should create integration");
+        let mut secrets = HashMap::new();
+        secrets.insert(
+            "datadome_server_side_key".to_string(),
+            b"server-side-key".to_vec(),
+        );
+        secrets.insert(
+            "datadome_test_bypass".to_string(),
+            b"temporary-test-credential".to_vec(),
+        );
+        let http_client = Arc::new(StubHttpClient::new());
+        http_client.push_response_with_headers(
+            200,
+            Vec::new(),
+            vec![(HEADER_DATADOME_RESPONSE, "200")],
+        );
+        let services = build_services_with_secret_and_http_client(
+            HashMapSecretStore::new(secrets),
+            http_client.clone(),
+        );
+        let settings = Settings::default();
+        let mut request = request_for_filter();
+        request.headers_mut().insert(
+            super::super::HEADER_DATADOME_TEST_BYPASS,
+            edgezero_core::http::HeaderValue::from_static("temporary-test-credential"),
+        );
+
+        let decision = temp_env::with_var(
+            crate::constants::ENV_FASTLY_IS_STAGING,
+            None::<&str>,
+            || {
+                futures::executor::block_on(integration.filter_protection_request(
+                    RequestFilterInput {
+                        settings: &settings,
+                        services: &services,
+                        request: &mut request,
+                        geo_info: None,
+                        is_integration_route: false,
+                    },
+                ))
+            },
+        );
+
+        assert!(
+            matches!(decision, RequestFilterDecision::Continue(_)),
+            "an allowed Protection API response should continue"
+        );
+        assert!(
+            request
+                .headers()
+                .get(super::super::HEADER_DATADOME_TEST_BYPASS)
+                .is_none(),
+            "the bypass credential must be stripped outside staging"
+        );
+        assert!(
+            !has_client_tag_suppression_marker(&request),
+            "the bypass must not suppress the DataDome client tag outside staging"
+        );
+        assert_eq!(
+            http_client.recorded_backend_names().len(),
+            1,
+            "the bypass must still call the Protection API outside staging"
         );
     }
 
@@ -944,15 +1091,7 @@ mod tests {
             edgezero_core::http::HeaderValue::from_static("temporary-test-credential"),
         );
 
-        let decision = futures::executor::block_on(integration.filter_protection_request(
-            RequestFilterInput {
-                settings: &settings,
-                services: &services,
-                request: &mut request,
-                geo_info: None,
-                is_integration_route: false,
-            },
-        ));
+        let decision = filter_with_staging(&integration, &settings, &services, &mut request);
 
         assert!(
             matches!(decision, RequestFilterDecision::Continue(_)),
@@ -1007,15 +1146,7 @@ mod tests {
             edgezero_core::http::HeaderValue::from_static("wrong-credential"),
         );
 
-        let decision = futures::executor::block_on(integration.filter_protection_request(
-            RequestFilterInput {
-                settings: &settings,
-                services: &services,
-                request: &mut request,
-                geo_info: None,
-                is_integration_route: false,
-            },
-        ));
+        let decision = filter_with_staging(&integration, &settings, &services, &mut request);
 
         assert!(
             matches!(decision, RequestFilterDecision::Continue(_)),

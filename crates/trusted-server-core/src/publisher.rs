@@ -1423,6 +1423,14 @@ pub async fn publisher_response_into_streaming_response(
     }
 }
 
+/// Removes request headers that can produce a bodyless or partial origin response.
+fn strip_conditional_and_range_headers(req: &mut Request<EdgeBody>) {
+    req.headers_mut().remove(header::IF_NONE_MATCH);
+    req.headers_mut().remove(header::IF_MODIFIED_SINCE);
+    req.headers_mut().remove(header::RANGE);
+    req.headers_mut().remove(header::IF_RANGE);
+}
+
 /// Returns `true` when a buffered publisher response should carry a body and a
 /// recomputed `Content-Length`.
 ///
@@ -1464,6 +1472,8 @@ fn apply_datadome_client_tag_cache_privacy(
             HeaderValue::from_static("private, max-age=0"),
         );
     }
+    response.headers_mut().remove(header::ETAG);
+    response.headers_mut().remove(header::LAST_MODIFIED);
     for header_name in CDN_CACHE_HEADERS {
         response.headers_mut().remove(*header_name);
     }
@@ -2881,11 +2891,15 @@ pub async fn handle_publisher_request(
         }
     );
 
-    if should_run_ad_stack {
-        req.headers_mut().remove(header::IF_NONE_MATCH);
-        req.headers_mut().remove(header::IF_MODIFIED_SINCE);
-        req.headers_mut().remove(header::RANGE);
-        req.headers_mut().remove(header::IF_RANGE);
+    let suppress_datadome_client_side_tag = req
+        .extensions()
+        .get::<crate::integrations::datadome::DataDomeClientTagSuppressed>()
+        .is_some();
+    if should_run_ad_stack || suppress_datadome_client_side_tag {
+        // The origin content type is not known yet, so request hints cannot safely
+        // narrow this to HTML without allowing 304 or 206 responses to bypass a
+        // response mutation that becomes necessary after the fetch.
+        strip_conditional_and_range_headers(&mut req);
     }
 
     // Only advertise encodings the rewrite pipeline can decode and re-encode.
@@ -2912,14 +2926,6 @@ pub async fn handle_publisher_request(
     // without streaming support may reject the flag outright rather than
     // silently buffering, which would fail every publisher fetch.
     let request_method = req.method().clone();
-    let suppress_datadome_client_side_tag = req
-        .extensions()
-        .get::<crate::integrations::datadome::DataDomeClientTagSuppressed>()
-        .is_some();
-    if suppress_datadome_client_side_tag {
-        req.headers_mut().remove(header::IF_NONE_MATCH);
-        req.headers_mut().remove(header::IF_MODIFIED_SINCE);
-    }
     let mut platform_request = PlatformHttpRequest::new(req, backend_name);
     if services.http_client().supports_streaming_responses() {
         platform_request = platform_request.with_stream_response();
@@ -5339,6 +5345,8 @@ mod tests {
             .header(header::HOST, "publisher.example")
             .header(header::IF_NONE_MATCH, "\"cached-page\"")
             .header(header::IF_MODIFIED_SINCE, "Wed, 21 Oct 2015 07:28:00 GMT")
+            .header(header::RANGE, "bytes=0-18")
+            .header(header::IF_RANGE, "\"cached-page\"")
             .body(EdgeBody::empty())
             .expect("should build conditional request");
         req.extensions_mut()
@@ -5351,18 +5359,19 @@ mod tests {
             .into_iter()
             .next()
             .expect("should record one outbound request");
-        assert!(
-            headers
-                .iter()
-                .all(|(name, _)| !name.eq_ignore_ascii_case(header::IF_NONE_MATCH.as_str())),
-            "suppressed requests must not forward If-None-Match"
-        );
-        assert!(
-            headers
-                .iter()
-                .all(|(name, _)| !name.eq_ignore_ascii_case(header::IF_MODIFIED_SINCE.as_str())),
-            "suppressed requests must not forward If-Modified-Since"
-        );
+        for header_name in [
+            header::IF_NONE_MATCH,
+            header::IF_MODIFIED_SINCE,
+            header::RANGE,
+            header::IF_RANGE,
+        ] {
+            assert!(
+                headers
+                    .iter()
+                    .all(|(name, _)| !name.eq_ignore_ascii_case(header_name.as_str())),
+                "suppressed requests must not forward {header_name}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5529,6 +5538,8 @@ mod tests {
             .header("fastly-surrogate-control", "max-age=600")
             .header("cloudflare-cdn-cache-control", "max-age=600")
             .header("cdn-cache-control", "max-age=600")
+            .header(header::ETAG, "\"origin-tag\"")
+            .header(header::LAST_MODIFIED, "Wed, 21 Oct 2015 07:28:00 GMT")
             .body(EdgeBody::empty())
             .expect("should build cacheable HTML response");
 
@@ -5566,6 +5577,12 @@ mod tests {
             response.headers().get("cdn-cache-control").is_none(),
             "suppressed HTML should not retain CDN-Cache-Control"
         );
+        for header_name in [header::ETAG, header::LAST_MODIFIED] {
+            assert!(
+                !response.headers().contains_key(&header_name),
+                "suppressed HTML should not retain {header_name}"
+            );
+        }
 
         let mut no_store_response = Response::builder()
             .status(StatusCode::OK)

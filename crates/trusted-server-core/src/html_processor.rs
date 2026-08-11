@@ -966,7 +966,7 @@ mod tests {
     }
 
     #[test]
-    fn suppressed_datadome_tag_is_not_injected_into_processed_html() {
+    fn suppressed_datadome_tag_preserves_and_rewrites_publisher_tag() {
         let mut settings = create_test_settings();
         settings
             .integrations
@@ -991,7 +991,10 @@ mod tests {
         let mut processor = create_html_processor(config);
 
         let output = processor
-            .process_chunk(b"<html><head></head><body>content</body></html>", true)
+            .process_chunk(
+                br#"<html><head><script id="publisher-datadome" src="https://js.datadome.co/tags.js"></script></head><body>content</body></html>"#,
+                true,
+            )
             .expect("should process HTML");
         let html = String::from_utf8(output).expect("should produce UTF-8 HTML");
 
@@ -1000,8 +1003,21 @@ mod tests {
             "should omit the DataDome client configuration"
         );
         assert!(
-            !html.contains("/integrations/datadome/tags.js"),
-            "should omit the DataDome client tag URL"
+            html.contains("id=\"publisher-datadome\""),
+            "should preserve the publisher-originated DataDome tag"
+        );
+        assert!(
+            html.contains("src=\"/integrations/datadome/tags.js\""),
+            "should rewrite the publisher-originated DataDome tag"
+        );
+        assert!(
+            !html.contains("https://js.datadome.co/tags.js"),
+            "should remove the original third-party DataDome URL"
+        );
+        assert_eq!(
+            html.matches("/integrations/datadome/tags.js").count(),
+            1,
+            "should leave exactly one publisher-originated DataDome tag"
         );
     }
 
