@@ -82,7 +82,7 @@ cat > "$WORK/origin.py" <<PYEOF
 The page is as shareable as HTML gets — no Set-Cookie, a public Cache-Control, and a
 Vary the cache key covers — so a bypass means a real bug rather than a fixture problem.
 """
-import json, time
+import gzip, json, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PAGE = b"""<!doctype html>
@@ -107,8 +107,16 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        self._send(PAGE, "text/html; charset=utf-8",
-                   [("Cache-Control", "public, max-age=300"), ("Vary", "Accept-Encoding")])
+        # Compresses when asked, because a real origin does and because a plaintext-only
+        # stub hid a bug that broke the feature end to end: a gzip template has no
+        # findable seam marker, and splicing plaintext bids into a gzip stream gives the
+        # browser ERR_CONTENT_DECODING_FAILED.
+        base = [("Cache-Control", "public, max-age=300"), ("Vary", "Accept-Encoding")]
+        if "gzip" in (self.headers.get("Accept-Encoding") or ""):
+            self._send(gzip.compress(PAGE), "text/html; charset=utf-8",
+                       base + [("Content-Encoding", "gzip")])
+        else:
+            self._send(PAGE, "text/html; charset=utf-8", base)
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -201,6 +209,7 @@ req() { # req <output-file> [extra curl args...]
   local out="$1"; shift
   curl -s -o "$out" -w '%{time_starttransfer} %{time_total} %{http_code}' \
     -H "Host: ts.example.com" \
+    -H "Accept-Encoding: gzip" \
     -H "sec-fetch-dest: document" -H "sec-fetch-mode: navigate" \
     "$@" "http://127.0.0.1:$TS_PORT/article"
 }
@@ -276,6 +285,7 @@ extra = sys.argv[4] if len(sys.argv) > 4 else ""
 req = (
     f"GET {path} HTTP/1.1\r\nHost: ts.example.com\r\n"
     "sec-fetch-dest: document\r\nsec-fetch-mode: navigate\r\n"
+    "accept-encoding: gzip\r\n"
     f"{extra}Connection: close\r\n\r\n"
 ).encode()
 

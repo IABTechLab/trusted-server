@@ -3411,6 +3411,26 @@ pub async fn handle_publisher_request(
     // legacy path never sets it. Either way it is an internal edge signal that
     // must not leak to publisher backends.
     req.headers_mut().remove("fastly-ssl");
+    // Shared modes ask the origin for identity, and this is not an optimization —
+    // without it the feature is broken end to end.
+    //
+    // The pipeline pairs input encoding to output encoding, so a gzip origin produces a
+    // gzip template. Every step after that assumes text: the seam marker cannot be found
+    // in compressed bytes, `String::from_utf8` on them fails outright, and splicing a
+    // plaintext bids script into the middle of a gzip stream yields
+    // `ERR_CONTENT_DECODING_FAILED` in the browser. Observed as a 502 on a real origin.
+    //
+    // The cost is real and accepted for the spike: a cache hit is served uncompressed,
+    // so it moves more bytes. Fixing that properly means storing decoded and re-encoding
+    // at serve time through a streaming encoder, which is a larger change than this
+    // spike needs to answer its question.
+    if !matches!(assembly_mode, AssemblyMode::Inline) {
+        req.headers_mut().insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+    }
+
     // The C2 key is built here, before the request is consumed, because every field
     // is request-derived and this is the last point where the request is in hand.
     //
