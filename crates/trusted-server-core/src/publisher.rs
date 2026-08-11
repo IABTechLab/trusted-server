@@ -363,6 +363,8 @@ struct ProcessResponseParams<'a> {
     ad_bids_state: &'a Arc<Mutex<Option<String>>>,
     gpt_diagnostics:
         Option<&'a crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
+    /// See [`HtmlStreamProcessorParams::shared_template_authorized`].
+    shared_template_authorized: bool,
 }
 
 struct PublisherBodyProcessor {
@@ -388,6 +390,7 @@ impl PublisherBodyProcessor {
                 ad_slots_script: params.ad_slots_script.as_deref().map(str::to_string),
                 ad_bids_state: Arc::clone(&params.ad_bids_state),
                 gpt_diagnostics: params.gpt_diagnostics.clone(),
+                shared_template_authorized: params.template_cache_key.is_some(),
             })?)
         } else if is_rsc_flight {
             Box::new(RscFlightUrlRewriter::new(
@@ -465,6 +468,7 @@ fn process_response_streaming<W: Write>(
             ad_slots_script: params.ad_slots_script.map(str::to_string),
             ad_bids_state: params.ad_bids_state.clone(),
             gpt_diagnostics: params.gpt_diagnostics.cloned(),
+            shared_template_authorized: params.shared_template_authorized,
         })?;
         StreamingPipeline::new(config, processor)
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
@@ -949,6 +953,11 @@ struct HtmlStreamProcessorParams<'a> {
     ad_slots_script: Option<String>,
     ad_bids_state: Arc<Mutex<Option<String>>>,
     gpt_diagnostics: Option<crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
+    /// Whether a shared template was authorized for this response.
+    ///
+    /// Carried rather than re-derived so both seams see the same answer. See
+    /// [`effective_assembly_mode`].
+    shared_template_authorized: bool,
 }
 
 /// The diagnostics decision the template may carry.
@@ -1007,6 +1016,38 @@ pub(crate) fn root_auction_is_useful(mode: AssemblyMode) -> bool {
 /// dispatcher appends it from the live request.
 pub const ESI_BIDS_INCLUDE: &str = "<esi:include src=\"/_ts/page-bids?format=fragment\"/>";
 
+/// The assembly mode this response will actually be delivered under.
+///
+/// The configured mode says what the operator wants; the cache key says whether it is
+/// available. A shared mode with no key means the gate refused this response — the
+/// origin set a cookie, declared a `Vary` the key does not cover, returned a non-200,
+/// and so on — so there is no shared template to build and nothing downstream will
+/// assemble one.
+///
+/// When that happens the request falls back to [`AssemblyMode::Inline`] **entirely**,
+/// at every seam. Falling back at one seam and not another is what produced the failure
+/// this function exists to prevent: the `</body>` seam emitted an `esi:include` because
+/// the mode was `Esi`, while assembly was skipped because there was no key, so the
+/// reader received a document with a raw `<esi:include>` in it and no bids at all.
+///
+/// Bypassing is the *normal* case against a real origin, not an edge case, so this path
+/// runs far more often than the shared one.
+fn effective_assembly_mode(settings: &Settings, shared_template_authorized: bool) -> AssemblyMode {
+    let configured = settings
+        .creative_opportunities
+        .as_ref()
+        .map(CreativeOpportunitiesConfig::assembly_mode)
+        .unwrap_or_default();
+    if matches!(configured, AssemblyMode::Inline) || shared_template_authorized {
+        return configured;
+    }
+    log::debug!(
+        "assembly mode {configured:?} is unavailable for this response (no shared template \
+         was authorized); falling back to inline"
+    );
+    AssemblyMode::Inline
+}
+
 /// What the `</body>` seam should inject, given the assembly mode.
 ///
 /// Explicit rather than inferred. The previous shape read
@@ -1063,12 +1104,7 @@ fn create_html_stream_processor(
         params.request_scheme,
     );
 
-    let assembly_mode = params
-        .settings
-        .creative_opportunities
-        .as_ref()
-        .map(CreativeOpportunitiesConfig::assembly_mode)
-        .unwrap_or_default();
+    let assembly_mode = effective_assembly_mode(params.settings, params.shared_template_authorized);
     let body_close = body_close_injection(assembly_mode, params.ad_slots_script.is_some());
 
     let gpt_diagnostics = template_gpt_diagnostics(assembly_mode, params.gpt_diagnostics);
@@ -1891,6 +1927,7 @@ pub fn stream_publisher_body<W: Write>(
         ad_slots_script: params.ad_slots_script.as_deref(),
         ad_bids_state: &params.ad_bids_state,
         gpt_diagnostics: params.gpt_diagnostics.as_ref(),
+        shared_template_authorized: params.template_cache_key.is_some(),
     };
     process_response_streaming(body, output, &borrowed)
 }
@@ -1984,6 +2021,7 @@ pub async fn stream_publisher_body_async<W: Write>(
         ad_slots_script: params.ad_slots_script.as_deref().map(str::to_string),
         ad_bids_state: params.ad_bids_state.clone(),
         gpt_diagnostics: params.gpt_diagnostics.clone(),
+        shared_template_authorized: params.template_cache_key.is_some(),
     }) {
         Ok(processor) => processor,
         Err(err) => {
@@ -3396,33 +3434,6 @@ pub async fn handle_publisher_request(
 
     crate::integrations::gpt_diagnostics::finalize_response(&gpt_diagnostics, &mut response);
 
-    let ad_slots_script = template_ad_slots_script(
-        assembly_mode,
-        should_run_ad_stack,
-        settings,
-        &matched_slots,
-        &request_path,
-    );
-
-    // §4.7: HTML with synthesized per-navigation auction state must not be
-    // stored or validated as an origin representation. Strip both browser and
-    // surrogate validators/cache directives before returning it.
-    //
-    // The shared-template cache gate: it does not build the key, it authorizes storing
-    // the one built pre-fetch. Everything it checks is response-derived, which is
-    // exactly why it cannot run at lookup time — and why it does not need to. Anything
-    // already in the cache passed this gate on the way in.
-    //
-    // A surviving key is the store authorization. Under `Inline` there is no key to
-    // survive.
-    //
-    // **Evaluated before TS stamps its own `private, no-store` below, and that ordering
-    // is load-bearing.** The gate asks whether the *origin* declared the response
-    // shareable. Run it after the stamp and it reads TS's own header instead, concludes
-    // `OriginNotShareable`, and refuses to cache — on every page where the ad stack
-    // runs, which is every page that matters. Local testing caught exactly that; no unit
-    // test did, because their fixtures leave the auction disabled and never reach the
-    // stamp.
     let gate_content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -3454,6 +3465,39 @@ pub async fn handle_publisher_request(
         }
     });
 
+    // Both seams resolve the mode the same way, from the gate's verdict rather than
+    // from configuration. Deciding them independently is what produced a document with
+    // a raw `<esi:include>` and no bids: the body seam saw `Esi` and emitted a marker,
+    // the head seam emitted no `adSlots`, and nothing assembled either.
+    let assembly_mode = effective_assembly_mode(settings, template_cache_key.is_some());
+
+    let ad_slots_script = template_ad_slots_script(
+        assembly_mode,
+        should_run_ad_stack,
+        settings,
+        &matched_slots,
+        &request_path,
+    );
+
+    // §4.7: HTML with synthesized per-navigation auction state must not be
+    // stored or validated as an origin representation. Strip both browser and
+    // surrogate validators/cache directives before returning it.
+    //
+    // The shared-template cache gate: it does not build the key, it authorizes storing
+    // the one built pre-fetch. Everything it checks is response-derived, which is
+    // exactly why it cannot run at lookup time — and why it does not need to. Anything
+    // already in the cache passed this gate on the way in.
+    //
+    // A surviving key is the store authorization. Under `Inline` there is no key to
+    // survive.
+    //
+    // **Evaluated before TS stamps its own `private, no-store` below, and that ordering
+    // is load-bearing.** The gate asks whether the *origin* declared the response
+    // shareable. Run it after the stamp and it reads TS's own header instead, concludes
+    // `OriginNotShareable`, and refuses to cache — on every page where the ad stack
+    // runs, which is every page that matters. Local testing caught exactly that; no unit
+    // test did, because their fixtures leave the auction disabled and never reach the
+    // stamp.
     // Gate on `should_run_ad_stack` rather than content-type alone: when no slot
     // matched, the feature is disabled, or this is not an ad-eligible navigation,
     // no per-user `tsjs.adSlots`/`tsjs.bids` are injected, so forcing private
@@ -5996,12 +6040,25 @@ mod tests {
             .expect("should finalize publisher response")
         }
 
-        fn body_of(response: Response<EdgeBody>) -> Vec<u8> {
-            response
-                .into_body()
-                .into_bytes()
-                .expect("a shared-mode response is buffered, so its bytes are in hand")
-                .to_vec()
+        /// Collects a response body whether it was buffered or streamed.
+        ///
+        /// Both occur here by design: a response the gate authorized is buffered so it
+        /// can be stored, and one it refused keeps streaming exactly like `inline`. A
+        /// helper that assumed either would silently only ever test one of them.
+        async fn body_of(response: Response<EdgeBody>) -> Vec<u8> {
+            match response.into_body() {
+                EdgeBody::Stream(mut stream) => {
+                    let mut out = Vec::new();
+                    while let Some(chunk) = stream.next().await {
+                        out.extend_from_slice(&chunk.expect("stream chunk should read"));
+                    }
+                    out
+                }
+                other => other
+                    .into_bytes()
+                    .expect("a non-stream body has its bytes in hand")
+                    .to_vec(),
+            }
         }
 
         #[tokio::test]
@@ -6016,14 +6073,14 @@ mod tests {
             // the assertion.
             queue_shareable_html(&stub);
 
-            let first = body_of(run(&settings, &services, navigation_request()).await);
+            let first = body_of(run(&settings, &services, navigation_request()).await).await;
             assert_eq!(
                 stub.recorded_request_uris().len(),
                 1,
                 "the cold request must fetch the origin"
             );
 
-            let second = body_of(run(&settings, &services, navigation_request()).await);
+            let second = body_of(run(&settings, &services, navigation_request()).await).await;
             assert_eq!(
                 stub.recorded_request_uris().len(),
                 1,
@@ -6054,13 +6111,13 @@ mod tests {
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
             queue_shareable_html(&stub);
 
-            let cold = String::from_utf8(body_of(
-                run(&settings, &services, navigation_request()).await,
-            ))
+            let cold = String::from_utf8(
+                body_of(run(&settings, &services, navigation_request()).await).await,
+            )
             .expect("cold response should be utf-8");
-            let warm = String::from_utf8(body_of(
-                run(&settings, &services, navigation_request()).await,
-            ))
+            let warm = String::from_utf8(
+                body_of(run(&settings, &services, navigation_request()).await).await,
+            )
             .expect("warm response should be utf-8");
 
             assert_eq!(
@@ -6558,6 +6615,55 @@ mod tests {
                     .expect("should lock entries")
                     .is_empty(),
                 "a reader running diagnostics must not contribute to a shared cache"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_bypassed_response_falls_back_to_inline_at_every_seam() {
+            // Observed against a real origin: a page arrived with a raw
+            // `<esi:include>` in it and no bids at all. The `</body>` seam emitted the
+            // marker because the mode was `Esi`, while assembly was skipped because the
+            // gate had refused a key — a fallback at one seam and not the other.
+            //
+            // Bypassing is the *normal* case against a real origin, so this path runs
+            // far more often than the shared one. It has to produce a working page.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+
+            // A `Set-Cookie` from the origin disqualifies the response, exactly as a
+            // real origin does.
+            stub.push_response_with_headers(
+                200,
+                b"<html><head></head><body>origin</body></html>".to_vec(),
+                vec![
+                    ("content-type", "text/html; charset=utf-8"),
+                    ("cache-control", "public, max-age=300"),
+                    ("set-cookie", "sess=1"),
+                ],
+            );
+
+            let document = String::from_utf8(
+                body_of(run(&settings, &services, navigation_request()).await).await,
+            )
+            .expect("response should be utf-8");
+
+            assert!(
+                cache
+                    .entries
+                    .lock()
+                    .expect("should lock entries")
+                    .is_empty(),
+                "the gate refused, so nothing may be stored"
+            );
+            assert!(
+                !document.contains("esi:include"),
+                "a marker must never be emitted when nothing will resolve it: {document}"
+            );
+            assert!(
+                document.contains("window.tsjs"),
+                "and the reader must still get their bids: {document}"
             );
         }
 
