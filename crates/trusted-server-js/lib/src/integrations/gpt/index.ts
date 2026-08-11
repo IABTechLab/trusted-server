@@ -1,5 +1,11 @@
 import { log } from '../../core/log';
-import type { AuctionSlot, AuctionBidData, TsjsApi } from '../../core/types';
+import type {
+  AuctionSlot,
+  AuctionBidData,
+  GptDiagnosticsCreativeFailure,
+  GptDiagnosticsTrustedServerOpportunity,
+  TsjsApi,
+} from '../../core/types';
 import {
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
@@ -41,6 +47,21 @@ const TS_BID_TARGETING_KEYS = [
   'hb_cache_path',
 ] as const;
 const TS_BASE_TARGETING_KEYS = [...TS_BID_TARGETING_KEYS, TS_INITIAL_TARGETING_KEY] as const;
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function trustedServerOpportunity(bid: AuctionBidData): GptDiagnosticsTrustedServerOpportunity {
+  const hasBidTargeting = TS_BID_TARGETING_KEYS.some((key) => isNonEmptyString(bid[key]));
+  if (!hasBidTargeting) return 'no_candidate';
+
+  const hasAdId = isNonEmptyString(bid.hb_adid);
+  const hasInline = isNonEmptyString(bid.adm);
+  const hasCache = isNonEmptyString(bid.hb_cache_host) && isNonEmptyString(bid.hb_cache_path);
+
+  return hasAdId && (hasInline || hasCache) ? 'renderable_candidate' : 'unrenderable_candidate';
+}
 
 // ------------------------------------------------------------------
 // googletag type stubs (minimal surface needed by the shim)
@@ -92,18 +113,17 @@ function slotIdForMessageSource(source: MessageEventSource | null): string | und
   if (!source) return undefined;
 
   const slots = window.tsjs?.adSlots ?? [];
-  const ownsSource = (roots: HTMLElement[]): boolean =>
-    roots.some((root) =>
-      Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
-    );
-  // Prefer exact configured IDs before prefix/container fallbacks so a nested
-  // dynamic slot cannot be claimed by an overlapping parent slot.
-  return (
-    slots.find((slot) => {
-      const root = document.getElementById(slot.div_id);
-      return root !== null && ownsSource([root]);
-    }) ?? slots.find((slot) => ownsSource(candidateSlotRoots(slot.div_id)))
-  )?.id;
+  // Prefer the most-specific configured prefix so an earlier broad prefix
+  // cannot claim an iframe owned by a later, more-specific slot.
+  return [...slots]
+    .sort((left, right) => right.div_id.length - left.div_id.length)
+    .find((slot) =>
+      candidateSlotRoots(slot.div_id).some((root) =>
+        Array.from(root.querySelectorAll('iframe')).some(
+          (iframe) => iframe.contentWindow === source
+        )
+      )
+    )?.id;
 }
 
 function messageSourceBelongsToAdUnit(
@@ -439,8 +459,10 @@ function queueWinBillingBeacon(url: string): boolean {
  * Reads `window.tsjs.adSlots` (injected at head-open) and `window.tsjs.bids`
  * (injected before </body>) synchronously — no fetch, no Promise. Applies bid
  * targeting to GPT slots, sets the `ts_initial` sentinel, then calls refresh().
- * Win/billing beacons fire from the TS render bridge, where a matching Prebid
- * Universal Creative request proves the TS creative actually rendered.
+ * Win/billing beacons fire from the TS render bridge after a matching Prebid
+ * Universal Creative request selects the TS bid and markup is successfully posted
+ * to its MessagePort. Neither observation proves that PUC consumed the response or
+ * that the creative rendered pixels.
  *
  * Idempotent: destroys previously created TS-managed slots before redefining them,
  * so it is safe to call again after SPA navigation updates `tsjs.adSlots`/`tsjs.bids`.
@@ -684,6 +706,27 @@ export function installTsAdInit(): void {
           if (bid[key]) gptSlot.setTargeting(key, String(bid[key]!));
         });
         gptSlot.setTargeting(TS_INITIAL_TARGETING_KEY, '1');
+        // Diagnostics are observational only. A missing or malformed debug
+        // implementation must never interrupt slot mapping or delivery.
+        try {
+          const opportunity = trustedServerOpportunity(bid);
+          if (bid.hb_auction_id !== undefined) {
+            ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
+              gptSlot,
+              slot.id,
+              opportunity,
+              bid.hb_auction_id
+            );
+          } else {
+            ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
+              gptSlot,
+              slot.id,
+              opportunity
+            );
+          }
+        } catch {
+          // Diagnostics must not alter ad delivery.
+        }
         // Map both inner div and container div → slot ID so slotRenderEnded
         // (which reports the GPT slot's div, i.e. slotDivId/container) can look up
         // the slot, while adm injection (which targets the inner div) also works.
@@ -699,16 +742,8 @@ export function installTsAdInit(): void {
           slotsToRefresh.push(gptSlot);
         }
 
-        // APS: signal to apstag that bids are ready so Amazon's GAM creative
-        // can render.  apstag must already be initialised on the page (which it
-        // is on production publisher pages).  Safe no-op if apstag is absent.
-        if (
-          (bid.hb_bidder === 'aps' || bid.hb_bidder === 'amazon-aps') &&
-          bid.renderer === undefined
-        ) {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (window as any).apstag?.setDisplayBids?.();
-        }
+        // Trusted Server APS winners carry their own typed renderer and never
+        // enter the publisher-owned native apstag rendering path.
       });
 
       ts.prevGptSlots = newSlots as unknown[];
@@ -937,9 +972,7 @@ export function installSpaAuctionHook(): void {
 
   let inflight: AbortController | null = null;
   // Last path an auction was run for. popstate fires for hash-only and
-  // same-pathname back/forward (scroll restoration), and pushState/replaceState
-  // can be called with the current URL, so guard every entry point against
-  // re-requesting impressions for a path we already loaded.
+  // same-pathname changes, so guard against re-requesting loaded impressions.
   let currentPath = location.pathname;
   // Last path whose slots/bids were actually applied — the initial SSR page
   // counts. A failed navigation rolls `currentPath` back to this rather than to
@@ -1021,7 +1054,8 @@ export function installSpaAuctionHook(): void {
     const original = history[method].bind(history);
     history[method] = function (state: unknown, unused: string, url?: string | URL | null): void {
       original(state, unused, url);
-      const newPath = url ? new URL(String(url), location.href).pathname : location.pathname;
+      const locationUrl = url ? new URL(String(url), location.href) : location;
+      const newPath = locationUrl.pathname;
       // onNavigate no-ops when newPath equals the last loaded path.
       void onNavigate(newPath);
     };
@@ -1135,6 +1169,39 @@ export function parseCachedBid(body: string): CachedBid | undefined {
   };
 }
 
+function safelyRecordCreativeRequest(slotId: string): number | undefined {
+  try {
+    const attemptId =
+      window.tsjs?.gptDiagnosticsRecorder?.recordTrustedServerCreativeRequest(slotId);
+    return typeof attemptId === 'number' && Number.isFinite(attemptId) ? attemptId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function safelyRecordCreativeResponse(attemptId: number | undefined): void {
+  if (attemptId === undefined) return;
+
+  try {
+    window.tsjs?.gptDiagnosticsRecorder?.recordTrustedServerCreativeResponse(attemptId);
+  } catch {
+    // Diagnostics must not alter creative delivery.
+  }
+}
+
+function safelyRecordCreativeFailure(
+  attemptId: number | undefined,
+  reason: GptDiagnosticsCreativeFailure
+): void {
+  if (attemptId === undefined) return;
+
+  try {
+    window.tsjs?.gptDiagnosticsRecorder?.recordTrustedServerCreativeFailure(attemptId, reason);
+  } catch {
+    // Diagnostics must not alter creative delivery.
+  }
+}
+
 /** Maximum number of consumed APS Prebid IDs retained as security tombstones. */
 const MAX_CONSUMED_PREBID_APS_IDS = 256;
 
@@ -1169,8 +1236,9 @@ function recordConsumedPrebidApsId(
  * Install the TS → pbRender bridge.
  *
  * Must be installed synchronously at module init — before `adInit()` fires
- * `refresh()`, which triggers GAM to serve the Prebid creative. Installing
- * post-load would miss first-impression `"Prebid Request"` messages.
+ * `refresh()`, which initiates the GAM request that may select the Prebid
+ * creative. Installing post-load would miss first-impression `"Prebid Request"`
+ * messages.
  *
  * When `adId` matches a TS server-side bid in `window.tsjs.bids` AND the bid
  * has renderable markup, the bridge:
@@ -1196,6 +1264,9 @@ export function installTsRenderBridge(): void {
   // keying on it alone would let one slot block a distinct slot's render.
   const renderingKeys = new Set<string>();
   const consumedPrebidApsIds = new Map<string, { expiresAt: number }>();
+  // One consumed APS ad ID per slot is sufficient: a newer bid replaces the
+  // slot's old ad ID in `window.tsjs.bids`, so the ownership guard rejects it.
+  const consumedServerApsBySlot = new Map<string, string>();
 
   window.addEventListener('message', (e: MessageEvent) => {
     let data: Record<string, unknown>;
@@ -1265,9 +1336,11 @@ export function installTsRenderBridge(): void {
     if (!sourceSlotId) return;
 
     // Resolve the bid by the requesting slot, not by the first bid whose hb_adid
-    // matches. hb_adid is not unique per bid: absent PBS Cache, it falls back to a
-    // creative id a bidder may reuse across slots. A first-match-by-adId lookup
-    // would resolve every duplicate to one slot, so all but that slot render blank.
+    // matches. hb_adid is not unique per bid: absent PBS Cache it falls back to a
+    // creative id a bidder may reuse across slots, and only absent that too does it
+    // fall back to the OpenRTB bid id, which is unique per bid instance. A
+    // first-match-by-adId lookup would resolve every duplicate to one slot, so all
+    // but that slot render blank.
     const bids = window.tsjs?.bids ?? {};
     const slotId = sourceSlotId;
     const matchedBid = bids[slotId];
@@ -1278,10 +1351,14 @@ export function installTsRenderBridge(): void {
     if (!matchedBid || matchedBid.hb_adid !== adId) return;
 
     if (matchedBid.renderer !== undefined) {
+      // This slot and ad ID belong to TS, so fail closed before validating the
+      // descriptor and never let native Prebid answer a rejected or replayed request.
+      e.stopImmediatePropagation();
+      if (consumedServerApsBySlot.get(slotId) === adId) return;
       const renderer = validateApsRenderer(matchedBid.renderer);
       const rendererUrl = apsRendererUrl();
       if (!renderer || !rendererUrl) return;
-      e.stopImmediatePropagation();
+      consumedServerApsBySlot.set(slotId, adId);
       port.postMessage(
         JSON.stringify({
           message: 'Prebid Response',
@@ -1297,6 +1374,8 @@ export function installTsRenderBridge(): void {
       return;
     }
 
+    const attemptId = safelyRecordCreativeRequest(slotId);
+
     const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
     // Prefer the winning creative's own dimensions; the first configured slot
     // format is only a fallback and mis-sizes a multi-size slot whose winner is
@@ -1304,26 +1383,43 @@ export function installTsRenderBridge(): void {
     const [fallbackWidth, fallbackHeight] = slot?.formats?.[0] ?? [728, 90];
     const width = matchedBid.w ?? fallbackWidth;
     const height = matchedBid.h ?? fallbackHeight;
+    const inlineAdm = isNonEmptyString(matchedBid.adm) ? matchedBid.adm : undefined;
+    const cacheHost = isNonEmptyString(matchedBid.hb_cache_host)
+      ? matchedBid.hb_cache_host
+      : undefined;
+    const cachePath = isNonEmptyString(matchedBid.hb_cache_path)
+      ? matchedBid.hb_cache_path
+      : undefined;
 
-    if (matchedBid.adm) {
+    if (inlineAdm) {
       e.stopImmediatePropagation();
-      port.postMessage(
-        JSON.stringify({
-          message: 'Prebid Response',
-          adId,
-          ad: matchedBid.adm,
-          renderer: TS_DISPLAY_RENDERER,
-          width,
-          height,
-        })
-      );
+      try {
+        port.postMessage(
+          JSON.stringify({
+            message: 'Prebid Response',
+            adId,
+            ad: inlineAdm,
+            renderer: TS_DISPLAY_RENDERER,
+            width,
+            height,
+          })
+        );
+      } catch (err) {
+        safelyRecordCreativeFailure(attemptId, 'response_post_failed');
+        log.warn(`[tsjs-gpt] pbRender bridge: response post failed for '${slotId}'`, err);
+        return;
+      }
+      safelyRecordCreativeResponse(attemptId);
       fireWinBillingBeacons(slotId, matchedBid);
       log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from inline adm`);
       return;
     }
 
     // No TS render source — let Prebid.js handle it.
-    if (!matchedBid.hb_cache_host || !matchedBid.hb_cache_path) return;
+    if (!cacheHost || !cachePath) {
+      safelyRecordCreativeFailure(attemptId, 'missing_render_source');
+      return;
+    }
 
     // TS owns this adId — stop Prebid from also processing it.
     e.stopImmediatePropagation();
@@ -1334,48 +1430,73 @@ export function installTsRenderBridge(): void {
     if (renderingKeys.has(renderingKey)) return;
     renderingKeys.add(renderingKey);
 
-    const cacheUrl = `https://${matchedBid.hb_cache_host}${matchedBid.hb_cache_path}?uuid=${encodeURIComponent(adId)}`;
+    const cacheUrl = `https://${cacheHost}${cachePath}?uuid=${encodeURIComponent(adId)}`;
 
-    fetch(cacheUrl, { mode: 'cors' })
-      .then((res) => (res.ok ? res.text() : Promise.reject(res.status)))
-      .then((body) => {
-        // PBS Cache returns the cached bid as a JSON object; decode its creative
-        // and render metadata the same way the Prebid Universal Creative does.
-        const cached = parseCachedBid(body);
-        if (!cached) {
-          // No renderable creative in the cache payload — decline rather than
-          // ship a serialized bid document to PUC. Beacons stay unfired.
-          log.warn(
-            `[tsjs-gpt] pbRender bridge: PBS Cache response for '${slotId}' had no renderable adm`
-          );
-          return;
+    const cachedBody = fetch(cacheUrl, { mode: 'cors' }).then((res) =>
+      res.ok ? res.text() : Promise.reject(res.status)
+    );
+
+    cachedBody
+      .then(
+        (body) => {
+          // PBS Cache returns the cached bid as a JSON object; decode its creative
+          // and render metadata the same way the Prebid Universal Creative does.
+          const cached = parseCachedBid(body);
+          if (!cached) {
+            // No renderable creative in the cache payload — decline rather than
+            // ship a serialized bid document to PUC. Beacons stay unfired.
+            safelyRecordCreativeFailure(attemptId, 'invalid_cache_payload');
+            log.warn(
+              `[tsjs-gpt] pbRender bridge: PBS Cache response for '${slotId}' had no renderable adm`
+            );
+            return;
+          }
+          // Resolve the auction-price macro from the cached clearing price, and
+          // size from the cached bid's own dimensions, falling back to the slot
+          // format only when the cache omits them.
+          const ad =
+            cached.price !== undefined
+              ? expandAuctionPriceMacro(cached.adm, cached.price)
+              : cached.adm;
+          try {
+            port.postMessage(
+              JSON.stringify({
+                message: 'Prebid Response',
+                adId,
+                ad,
+                renderer: TS_DISPLAY_RENDERER,
+                width: cached.width ?? width,
+                height: cached.height ?? height,
+              })
+            );
+          } catch (err) {
+            safelyRecordCreativeFailure(attemptId, 'response_post_failed');
+            log.warn(`[tsjs-gpt] pbRender bridge: response post failed for '${slotId}'`, err);
+            return;
+          }
+          safelyRecordCreativeResponse(attemptId);
+          // Beacons carry the server-expanded ${AUCTION_PRICE} from the auction's
+          // clearing price, not `cached.price` — the auction result is the
+          // authoritative clearing price, and the cached copy is only the render
+          // source. Do not re-expand them here.
+          fireWinBillingBeacons(slotId, matchedBid);
+          log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from PBS Cache`);
+        },
+        (err) => {
+          safelyRecordCreativeFailure(attemptId, 'cache_fetch_failed');
+          log.warn(`[tsjs-gpt] pbRender bridge: PBS Cache fetch failed for '${slotId}'`, err);
         }
-        // Resolve the auction-price macro from the cached clearing price, and
-        // size from the cached bid's own dimensions, falling back to the slot
-        // format only when the cache omits them.
-        const ad =
-          cached.price !== undefined
-            ? expandAuctionPriceMacro(cached.adm, cached.price)
-            : cached.adm;
-        port.postMessage(
-          JSON.stringify({
-            message: 'Prebid Response',
-            adId,
-            ad,
-            renderer: TS_DISPLAY_RENDERER,
-            width: cached.width ?? width,
-            height: cached.height ?? height,
-          })
-        );
-        // Beacons carry the server-expanded ${AUCTION_PRICE} from the auction's
-        // clearing price, not `cached.price` — the auction result is the
-        // authoritative clearing price, and the cached copy is only the render
-        // source. Do not re-expand them here.
-        fireWinBillingBeacons(slotId, matchedBid);
-        log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from PBS Cache`);
-      })
+      )
       .catch((err) => {
-        log.warn(`[tsjs-gpt] pbRender bridge: PBS Cache fetch failed for '${slotId}'`, err);
+        // Errors reaching this stage were thrown after the cache body promise
+        // settled, so parsing, posting follow-up work, beacons, success logging,
+        // or failure reporting must not create new cache-failure evidence. Keep
+        // the fire-and-forget bridge promise handled without changing evidence.
+        try {
+          log.warn(`[tsjs-gpt] pbRender bridge: response processing failed for '${slotId}'`, err);
+        } catch {
+          // Logging must not create an unhandled bridge rejection.
+        }
       })
       .finally(() => {
         renderingKeys.delete(renderingKey);

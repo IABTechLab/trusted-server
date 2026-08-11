@@ -319,7 +319,17 @@ impl AdServerMockProvider {
                     }),
                     nurl: original.and_then(|b| b.nurl.clone()),
                     burl: original.and_then(|b| b.burl.clone()),
-                    bid_id: original.and_then(|bid| bid.bid_id.clone()),
+                    // The mediation response is itself `OpenRTB`, so the mediated
+                    // bid's own `id` is this bid's identifier. Fall back to the
+                    // original SSP bid's id when the mediator omits one. Without
+                    // either, a mediated bid whose only `hb_adid` source is the bid
+                    // id would lose it and never render — including APS bids, which
+                    // carry no `ad_id` or `cache_id` for the restore to recover.
+                    bid_id: bid["id"]
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .map(String::from)
+                        .or_else(|| original.and_then(|bid| bid.bid_id.clone())),
                     ad_id: original.and_then(|bid| bid.ad_id.clone()),
                     creative_id: original.and_then(|bid| bid.creative_id.clone()),
                     renderer: original.and_then(|bid| bid.renderer.clone()),
@@ -868,7 +878,11 @@ mod tests {
             Some("https://ssp.example/bill"),
             "should restore burl"
         );
-        assert_eq!(bid.bid_id.as_deref(), Some("source-bid-id"));
+        assert_eq!(
+            bid.bid_id.as_deref(),
+            Some("mediated-bid-001"),
+            "should carry the mediated OpenRTB bid id so hb_adid always has a source"
+        );
         assert_eq!(
             bid.ad_id.as_deref(),
             Some("bid-impression-id"),
@@ -890,6 +904,65 @@ mod tests {
             bid.cache_path.as_deref(),
             Some("/cache"),
             "should restore PBS cache path"
+        );
+    }
+
+    #[test]
+    fn parse_mediation_response_falls_back_to_original_bid_id() {
+        // A mediator that omits the per-bid `id` must not strand a pass-through
+        // bid whose only hb_adid source is its OpenRTB bid id.
+        let provider = AdServerMockProvider::new(AdServerMockConfig::default());
+        let mediation_response = json!({
+            "id": "test-auction-123",
+            "seatbid": [{
+                "seat": "prebid",
+                "bid": [{
+                    "impid": "header-banner",
+                    "price": 0.20,
+                    "adm": "<div>Mediated Ad</div>",
+                    "w": 728,
+                    "h": 90,
+                    "crid": "example-bidder-creative"
+                }]
+            }],
+            "cur": "USD"
+        });
+        let mut bid_index = BidIndex::new();
+        bid_index.insert(
+            (
+                "prebid".to_string(),
+                "header-banner".to_string(),
+                "example-bidder".to_string(),
+            ),
+            Bid {
+                slot_id: "header-banner".to_string(),
+                price: Some(0.20),
+                currency: "USD".to_string(),
+                creative: Some("<div>Original Ad</div>".to_string()),
+                adomain: None,
+                bidder: "example-bidder".to_string(),
+                width: 728,
+                height: 90,
+                nurl: None,
+                burl: None,
+                bid_id: Some("019f7e2a-b45b-70b0-a2d1-b651c430700b".to_string()),
+                ad_id: None,
+                creative_id: None,
+                renderer: None,
+                cache_id: None,
+                cache_host: None,
+                cache_path: None,
+                metadata: HashMap::new(),
+            },
+        );
+
+        let auction_response =
+            provider.parse_mediation_response(&mediation_response, 42, &bid_index);
+
+        assert_eq!(
+            auction_response.bids[0].bid_id.as_deref(),
+            Some("019f7e2a-b45b-70b0-a2d1-b651c430700b"),
+            "should restore the original SSP bid id when the mediator omits one"
         );
     }
 

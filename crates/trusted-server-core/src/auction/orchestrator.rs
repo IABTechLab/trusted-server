@@ -528,6 +528,8 @@ impl AuctionOrchestrator {
                 .backend()
                 .canonicalize_transport_timeout_ms(remaining_ms, provider.timeout_ms());
 
+            // The deadline gate intentionally precedes `request_bids`: zero
+            // budget skips every provider, including one that might respond immediately.
             if effective_timeout == 0 {
                 log::warn!("Auction timeout exhausted before launching provider request; skipping");
                 continue;
@@ -642,6 +644,9 @@ impl AuctionOrchestrator {
         }
 
         if pending_requests.is_empty() {
+            // An immediate response (for example, an APS-only Prebid no-bid) is
+            // a completed provider outcome. Launch failures alone remain a
+            // terminal auction error rather than being converted to a 200 no-bid.
             if immediate_response_count > 0 {
                 return Ok(responses);
             }
@@ -988,6 +993,8 @@ impl AuctionOrchestrator {
                 .backend()
                 .canonicalize_transport_timeout_ms(remaining_ms, provider.timeout_ms());
 
+            // Match the synchronous path's strict deadline semantics: do not
+            // invoke even an immediate provider after the budget reaches zero.
             if effective_timeout == 0 {
                 log::warn!(
                     "Auction timeout ({}ms) exhausted before launching '{}' — skipping",
@@ -1503,13 +1510,17 @@ mod tests {
     };
     use crate::error::TrustedServerError;
     use crate::platform::test_support::{
-        StubHttpClient, build_services_with_http_client, noop_services,
+        StubHttpClient, build_services_with_backend_and_http_client,
+        build_services_with_http_client, noop_services,
     };
-    use crate::platform::{PlatformHttpRequest, PlatformResponse, RuntimeServices};
+    use crate::platform::{
+        PlatformBackend, PlatformBackendSpec, PlatformError, PlatformHttpRequest, PlatformResponse,
+        RuntimeServices,
+    };
     use crate::test_support::tests::crate_test_settings_str;
     use error_stack::{Report, ResultExt};
     use std::collections::{HashMap, HashSet};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use super::AuctionOrchestrator;
 
@@ -1589,6 +1600,172 @@ mod tests {
 
         fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
             Some(self.backend.to_string())
+        }
+    }
+
+    struct RecordingTimeoutProvider {
+        name: &'static str,
+        backend: &'static str,
+        configured_timeout_ms: u32,
+        predicted: Arc<Mutex<Vec<u32>>>,
+        requested: Arc<Mutex<Vec<u32>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for RecordingTimeoutProvider {
+        fn provider_name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn request_bids(
+            &self,
+            _request: &AuctionRequest,
+            context: &AuctionContext<'_>,
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+            self.requested
+                .lock()
+                .expect("should lock requested timeouts")
+                .push(context.timeout_ms);
+            let request = PlatformHttpRequest::new(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("https://example.com/bid")
+                    .body(edgezero_core::body::Body::empty())
+                    .expect("should build recording request"),
+                self.backend,
+            );
+            context
+                .services
+                .http_client()
+                .send_async(request)
+                .await
+                .change_context(TrustedServerError::Auction {
+                    message: "recording launch failed".to_string(),
+                })
+                .map(ProviderRequestOutcome::pending)
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            Ok(AuctionResponse::success(
+                self.name,
+                vec![],
+                response_time_ms,
+            ))
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            self.configured_timeout_ms
+        }
+
+        fn backend_name(&self, _services: &RuntimeServices, timeout_ms: u32) -> Option<String> {
+            self.predicted
+                .lock()
+                .expect("should lock predicted timeouts")
+                .push(timeout_ms);
+            Some(self.backend.to_string())
+        }
+    }
+
+    struct DivergentBackendProvider {
+        name: &'static str,
+        predicted: &'static str,
+        resolved: &'static str,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for DivergentBackendProvider {
+        fn provider_name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn request_bids(
+            &self,
+            _request: &AuctionRequest,
+            context: &AuctionContext<'_>,
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+            let request = PlatformHttpRequest::new(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("https://example.com/bid")
+                    .body(edgezero_core::body::Body::empty())
+                    .expect("should build divergent request"),
+                self.resolved,
+            );
+            context
+                .services
+                .http_client()
+                .send_async(request)
+                .await
+                .change_context(TrustedServerError::Auction {
+                    message: "divergent launch failed".to_string(),
+                })
+                .map(ProviderRequestOutcome::pending)
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            Ok(AuctionResponse::success(
+                self.name,
+                vec![],
+                response_time_ms,
+            ))
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            2000
+        }
+
+        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
+            Some(self.predicted.to_string())
+        }
+    }
+
+    struct CanonicalTimeoutBackend {
+        canonical_ms: u32,
+        calls: Arc<Mutex<Vec<(u32, u32)>>>,
+    }
+
+    impl PlatformBackend for CanonicalTimeoutBackend {
+        fn predict_name(
+            &self,
+            _spec: &PlatformBackendSpec,
+        ) -> Result<String, Report<PlatformError>> {
+            Ok("stub-backend".to_string())
+        }
+
+        fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+            Ok("stub-backend".to_string())
+        }
+
+        fn canonicalize_transport_timeout_ms(&self, remaining_ms: u32, configured_ms: u32) -> u32 {
+            self.calls
+                .lock()
+                .expect("should lock canonicalization calls")
+                .push((remaining_ms, configured_ms));
+            self.canonical_ms
+        }
+    }
+
+    fn recording_provider(
+        name: &'static str,
+        backend: &'static str,
+        configured_timeout_ms: u32,
+        predicted: &Arc<Mutex<Vec<u32>>>,
+        requested: &Arc<Mutex<Vec<u32>>>,
+    ) -> RecordingTimeoutProvider {
+        RecordingTimeoutProvider {
+            name,
+            backend,
+            configured_timeout_ms,
+            predicted: Arc::clone(predicted),
+            requested: Arc::clone(requested),
         }
     }
 
@@ -2348,11 +2525,14 @@ mod tests {
                 .expect("should build request");
             let context = create_test_auction_context(&settings, &req, 2000);
 
-            let result = orchestrator.run_auction(&request, &context).await;
+            let error = orchestrator
+                .run_auction(&request, &context)
+                .await
+                .expect_err("should fail when every provider launch fails");
 
-            let err = result.expect_err("should fail when every provider launch fails");
             assert!(
-                err.to_string()
+                error
+                    .to_string()
                     .contains("All 1 configured provider(s) skipped or failed to launch"),
                 "should explain that no configured provider request launched"
             );
@@ -2489,6 +2669,297 @@ mod tests {
             result > 1900,
             "should still have most of the budget, got {result}"
         );
+    }
+
+    #[test]
+    fn parallel_launch_applies_canonical_timeout_to_name_and_request() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"{}".to_vec());
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let services = build_services_with_backend_and_http_client(
+                Arc::new(CanonicalTimeoutBackend {
+                    canonical_ms: 750,
+                    calls: Arc::clone(&calls),
+                }),
+                stub,
+            );
+            let predicted = Arc::new(Mutex::new(Vec::new()));
+            let requested = Arc::new(Mutex::new(Vec::new()));
+            let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+                enabled: true,
+                providers: vec!["bidder".to_string()],
+                timeout_ms: 2000,
+                ..Default::default()
+            });
+            orchestrator.register_provider(Arc::new(recording_provider(
+                "bidder",
+                "bidder-backend",
+                1000,
+                &predicted,
+                &requested,
+            )));
+            let settings = create_test_settings();
+            let downstream = http::Request::new(edgezero_core::body::Body::empty());
+            let context = immediate_test_context(&settings, &downstream, &services);
+
+            orchestrator
+                .run_auction(&create_test_auction_request(), &context)
+                .await
+                .expect("should complete auction");
+
+            assert_eq!(*predicted.lock().expect("should lock predicted"), vec![750]);
+            assert_eq!(*requested.lock().expect("should lock requested"), vec![750]);
+            let calls = calls.lock().expect("should lock calls");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].1, 1000);
+            assert!(calls[0].0 > 0 && calls[0].0 <= 2000);
+        });
+    }
+
+    #[test]
+    fn zero_canonical_timeout_skips_parallel_launch() {
+        futures::executor::block_on(async {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let services = build_services_with_backend_and_http_client(
+                Arc::new(CanonicalTimeoutBackend {
+                    canonical_ms: 0,
+                    calls,
+                }),
+                Arc::new(StubHttpClient::new()),
+            );
+            let predicted = Arc::new(Mutex::new(Vec::new()));
+            let requested = Arc::new(Mutex::new(Vec::new()));
+            let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+                enabled: true,
+                providers: vec!["bidder".to_string()],
+                timeout_ms: 2000,
+                ..Default::default()
+            });
+            orchestrator.register_provider(Arc::new(recording_provider(
+                "bidder",
+                "bidder-backend",
+                1000,
+                &predicted,
+                &requested,
+            )));
+            let settings = create_test_settings();
+            let downstream = http::Request::new(edgezero_core::body::Body::empty());
+            let context = immediate_test_context(&settings, &downstream, &services);
+
+            let result = orchestrator
+                .run_auction(&create_test_auction_request(), &context)
+                .await;
+
+            assert!(result.is_err(), "zero budget should skip every provider");
+            assert!(predicted.lock().expect("should lock predicted").is_empty());
+            assert!(requested.lock().expect("should lock requested").is_empty());
+        });
+    }
+
+    #[test]
+    fn synchronous_mediation_applies_canonical_timeout_to_mediator() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"{}".to_vec());
+            stub.push_response(200, b"{}".to_vec());
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let services = build_services_with_backend_and_http_client(
+                Arc::new(CanonicalTimeoutBackend {
+                    canonical_ms: 500,
+                    calls,
+                }),
+                stub,
+            );
+            let predicted = Arc::new(Mutex::new(Vec::new()));
+            let requested = Arc::new(Mutex::new(Vec::new()));
+            let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+                enabled: true,
+                providers: vec!["bidder".to_string()],
+                mediator: Some("mediator".to_string()),
+                timeout_ms: 2000,
+                ..Default::default()
+            });
+            orchestrator.register_provider(Arc::new(StubAuctionProvider {
+                name: "bidder",
+                backend: "bidder-backend",
+            }));
+            orchestrator.register_provider(Arc::new(recording_provider(
+                "mediator",
+                "mediator-backend",
+                2000,
+                &predicted,
+                &requested,
+            )));
+            let settings = create_test_settings();
+            let downstream = http::Request::new(edgezero_core::body::Body::empty());
+            let context = immediate_test_context(&settings, &downstream, &services);
+
+            orchestrator
+                .run_auction(&create_test_auction_request(), &context)
+                .await
+                .expect("should complete mediated auction");
+
+            assert!(predicted.lock().expect("should lock predicted").is_empty());
+            assert_eq!(*requested.lock().expect("should lock requested"), vec![500]);
+        });
+    }
+
+    #[test]
+    fn dispatched_collect_applies_canonical_timeout_to_both_paths() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"{}".to_vec());
+            stub.push_response(200, b"{}".to_vec());
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let services = build_services_with_backend_and_http_client(
+                Arc::new(CanonicalTimeoutBackend {
+                    canonical_ms: 500,
+                    calls,
+                }),
+                stub,
+            );
+            let bidder_predicted = Arc::new(Mutex::new(Vec::new()));
+            let bidder_requested = Arc::new(Mutex::new(Vec::new()));
+            let mediator_predicted = Arc::new(Mutex::new(Vec::new()));
+            let mediator_requested = Arc::new(Mutex::new(Vec::new()));
+            let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+                enabled: true,
+                providers: vec!["bidder".to_string()],
+                mediator: Some("mediator".to_string()),
+                timeout_ms: 2000,
+                ..Default::default()
+            });
+            orchestrator.register_provider(Arc::new(recording_provider(
+                "bidder",
+                "bidder-backend",
+                2000,
+                &bidder_predicted,
+                &bidder_requested,
+            )));
+            orchestrator.register_provider(Arc::new(recording_provider(
+                "mediator",
+                "mediator-backend",
+                2000,
+                &mediator_predicted,
+                &mediator_requested,
+            )));
+            let settings = create_test_settings();
+            let downstream = http::Request::new(edgezero_core::body::Body::empty());
+            let context = immediate_test_context(&settings, &downstream, &services);
+            let request = create_test_auction_request();
+
+            let DispatchAuctionOutcome::Dispatched(dispatched) =
+                orchestrator.dispatch_auction(&request, &context).await
+            else {
+                panic!("should dispatch bidder request");
+            };
+            orchestrator
+                .collect_dispatched_auction(dispatched, &services, &context)
+                .await;
+
+            assert_eq!(
+                *bidder_predicted.lock().expect("should lock predicted"),
+                vec![500]
+            );
+            assert_eq!(
+                *bidder_requested.lock().expect("should lock requested"),
+                vec![500]
+            );
+            assert!(
+                mediator_predicted
+                    .lock()
+                    .expect("should lock predicted")
+                    .is_empty()
+            );
+            assert_eq!(
+                *mediator_requested.lock().expect("should lock requested"),
+                vec![500]
+            );
+        });
+    }
+
+    #[test]
+    fn dispatched_resolved_backend_name_diverging_from_prediction_still_correlates() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"{}".to_vec());
+            let services = build_services_with_http_client(stub);
+            let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+                enabled: true,
+                providers: vec!["provider-a".to_string()],
+                timeout_ms: 2000,
+                ..Default::default()
+            });
+            orchestrator.register_provider(Arc::new(DivergentBackendProvider {
+                name: "provider-a",
+                predicted: "predicted-backend",
+                resolved: "resolved-backend",
+            }));
+            let settings = create_test_settings();
+            let downstream = http::Request::new(edgezero_core::body::Body::empty());
+            let context = immediate_test_context(&settings, &downstream, &services);
+            let request = create_test_auction_request();
+
+            let DispatchAuctionOutcome::Dispatched(dispatched) =
+                orchestrator.dispatch_auction(&request, &context).await
+            else {
+                panic!("should dispatch provider");
+            };
+            let result = orchestrator
+                .collect_dispatched_auction(dispatched, &services, &context)
+                .await;
+
+            assert!(result.provider_responses.iter().any(|response| {
+                response.provider == "provider-a" && response.status == BidStatus::Success
+            }));
+        });
+    }
+
+    #[test]
+    fn dispatched_post_launch_resolved_name_collision_fails_second_provider_attributably() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"{}".to_vec());
+            stub.push_response(200, b"{}".to_vec());
+            let services = build_services_with_http_client(stub);
+            let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+                enabled: true,
+                providers: vec!["provider-a".to_string(), "provider-b".to_string()],
+                timeout_ms: 2000,
+                ..Default::default()
+            });
+            orchestrator.register_provider(Arc::new(DivergentBackendProvider {
+                name: "provider-a",
+                predicted: "predicted-a",
+                resolved: "shared-resolved",
+            }));
+            orchestrator.register_provider(Arc::new(DivergentBackendProvider {
+                name: "provider-b",
+                predicted: "predicted-b",
+                resolved: "shared-resolved",
+            }));
+            let settings = create_test_settings();
+            let downstream = http::Request::new(edgezero_core::body::Body::empty());
+            let context = immediate_test_context(&settings, &downstream, &services);
+            let request = create_test_auction_request();
+
+            let DispatchAuctionOutcome::Dispatched(dispatched) =
+                orchestrator.dispatch_auction(&request, &context).await
+            else {
+                panic!("should dispatch first provider");
+            };
+            let result = orchestrator
+                .collect_dispatched_auction(dispatched, &services, &context)
+                .await;
+
+            assert!(result.provider_responses.iter().any(|response| {
+                response.provider == "provider-a" && response.status == BidStatus::Success
+            }));
+            assert!(result.provider_responses.iter().any(|response| {
+                response.provider == "provider-b" && response.status == BidStatus::Error
+            }));
+        });
     }
 
     #[test]

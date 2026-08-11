@@ -217,9 +217,8 @@ At request level emit:
   falls back to the configured publisher origin.
 - A candidate URL must use HTTP(S), have no userinfo, be length-bounded, and match the
   configured publisher host before it can become `site.page`.
-- `site.ref` is emitted only when a valid HTTP(S) downstream `Referer` differs from the
-  normalized current page. If the endpoint request's `Referer` is simply the current
-  page, omit `site.ref` rather than mislabeling it as the document's prior referrer.
+- APS OpenRTB omits `site.ref`. This does not change the existing Prebid Server path,
+  which continues to forward the browser `Referer` as `site.ref`.
 - Do not add an unrestricted client-provided URL or copy arbitrary headers.
 
 ### 7.4 Privacy rules

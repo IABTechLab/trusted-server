@@ -29,8 +29,8 @@ use crate::settings::Settings;
 
 use super::orchestrator::OrchestrationResult;
 use super::types::{
-    AdFormat, AdSlot, AuctionRequest, DeviceInfo, MediaType, OrchestratorExt, ProviderSummary,
-    PublisherInfo, SiteInfo, UserInfo,
+    AdFormat, AdSlot, AuctionRequest, BidRenderer, DeviceInfo, MediaType, OrchestratorExt,
+    ProviderSummary, PublisherInfo, SiteInfo, UserInfo,
 };
 
 /// Request body for `POST /auction` (tsjs / Prebid.js wire format).
@@ -365,6 +365,12 @@ pub(crate) fn convert_to_openrtb_response_with_report(
 
         // Ordinary markup remains on the mandatory sanitize/rewrite path. A
         // typed renderer is serialized separately and never enters the HTML sanitizer.
+        let serialize_renderer = |renderer: &BidRenderer| {
+            (BidExt {
+                trusted_server: BidTrustedServerExt { renderer },
+            })
+            .to_ext()
+        };
         let (adm, ext) = if let Some(raw_creative) = bid
             .creative
             .as_deref()
@@ -372,7 +378,7 @@ pub(crate) fn convert_to_openrtb_response_with_report(
         {
             if bid.renderer.is_some() {
                 log::warn!(
-                    "Auction {}: winning bid for slot '{}' from '{}' has both creative markup and a renderer; using creative markup",
+                    "Auction {}: winning bid for slot '{}' from '{}' has both creative markup and a renderer; using creative markup when it remains renderable",
                     auction_request.id,
                     slot_id,
                     bid.bidder
@@ -390,12 +396,33 @@ pub(crate) fn convert_to_openrtb_response_with_report(
                 processed.len()
             );
 
-            (Some(processed), None)
+            if processed.trim().is_empty() {
+                let Some(renderer) = bid.renderer.as_ref() else {
+                    log::warn!(
+                        "Auction {}: skipping winning bid for slot '{}' from '{}' because creative processing rejected its only render source",
+                        auction_request.id,
+                        slot_id,
+                        bid.bidder
+                    );
+                    delivery.record_drop("creative_processing_rejected");
+                    continue;
+                };
+                let Some(ext) = serialize_renderer(renderer) else {
+                    log::warn!(
+                        "Auction {}: skipping winning bid for slot '{}' from '{}' because its renderer extension could not be serialized",
+                        auction_request.id,
+                        slot_id,
+                        bid.bidder
+                    );
+                    delivery.record_drop("renderer_extension_serialization_failed");
+                    continue;
+                };
+                (None, Some(ext))
+            } else {
+                (Some(processed), None)
+            }
         } else if let Some(renderer) = bid.renderer.as_ref() {
-            let Some(ext) = (BidExt {
-                trusted_server: BidTrustedServerExt { renderer },
-            })
-            .to_ext() else {
+            let Some(ext) = serialize_renderer(renderer) else {
                 log::warn!(
                     "Auction {}: skipping winning bid for slot '{}' from '{}' because its renderer extension could not be serialized",
                     auction_request.id,
@@ -1328,10 +1355,12 @@ mod tests {
         missing.creative = None;
         let mut whitespace = make_bid("whitespace", "invalid", Some(2.9));
         whitespace.creative = Some(" \n\t ".to_string());
+        let mut rejected = make_bid("rejected", "invalid", Some(2.8));
+        rejected.creative = Some("<script>reject()</script>".to_string());
         let unpriced = make_bid("unpriced", "invalid", None);
         let ordinary = make_bid("ordinary", "appnexus", Some(2.75));
         let mut renderer = make_bid("renderer", "aps", Some(2.5));
-        renderer.creative = Some("  ".to_string());
+        renderer.creative = Some("<script>reject()</script>".to_string());
         renderer.bid_id = Some("upstream-renderer-bid".to_string());
         renderer.creative_id = None;
         renderer.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
@@ -1351,6 +1380,7 @@ mod tests {
             winning_bids: HashMap::from([
                 (missing.slot_id.clone(), missing),
                 (whitespace.slot_id.clone(), whitespace),
+                (rejected.slot_id.clone(), rejected),
                 (unpriced.slot_id.clone(), unpriced),
                 (ordinary.slot_id.clone(), ordinary),
                 (renderer.slot_id.clone(), renderer),
@@ -1367,13 +1397,17 @@ mod tests {
             HashSet::from(["ordinary".to_string(), "renderer".to_string()]),
             "should report only serialized winners as delivered"
         );
-        assert_eq!(conversion.delivery.dropped_winner_count, 3);
+        assert_eq!(conversion.delivery.dropped_winner_count, 4);
         assert_eq!(
             conversion.delivery.dropped_winner_reasons["no_render_source"],
             2
         );
         assert_eq!(
             conversion.delivery.dropped_winner_reasons["no_decoded_price"],
+            1
+        );
+        assert_eq!(
+            conversion.delivery.dropped_winner_reasons["creative_processing_rejected"],
             1
         );
         let json = response_json(conversion.response);
@@ -1385,13 +1419,17 @@ mod tests {
             .collect();
 
         assert_eq!(bids.len(), 2, "should omit only invalid winners");
-        assert_eq!(json["ext"]["orchestrator"]["dropped_winner_count"], 3);
+        assert_eq!(json["ext"]["orchestrator"]["dropped_winner_count"], 4);
         assert_eq!(
             json["ext"]["orchestrator"]["dropped_winner_reasons"]["no_render_source"],
             2
         );
         assert_eq!(
             json["ext"]["orchestrator"]["dropped_winner_reasons"]["no_decoded_price"],
+            1
+        );
+        assert_eq!(
+            json["ext"]["orchestrator"]["dropped_winner_reasons"]["creative_processing_rejected"],
             1
         );
         let ordinary = bids
