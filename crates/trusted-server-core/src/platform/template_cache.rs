@@ -143,6 +143,17 @@ fn surrogate_safe(url: &str) -> String {
         .collect()
 }
 
+/// Headers the key covers by construction, whatever the operator configured.
+///
+/// `Accept-Encoding` has a dedicated key field ([`TemplateCacheKey::accept_encoding`]),
+/// so an origin declaring `Vary: Accept-Encoding` is already keyed correctly. Without
+/// this, that extremely ordinary declaration — any compressing origin sends it — reads
+/// as an uncovered gap and disqualifies the response, so **C2 would never cache anything
+/// against a real origin** unless the operator redundantly listed a header the key
+/// already covers. Found by review before it could make the spike measure a hit rate of
+/// approximately zero and read that as a result.
+const STRUCTURALLY_COVERED: &[&str] = &["accept-encoding"];
+
 /// Request headers to include in the cache key, and where the list comes from.
 ///
 /// # The chicken-and-egg this resolves
@@ -218,6 +229,7 @@ impl VarySpec {
             .flat_map(|value| value.split(','))
             .map(|name| name.trim().to_ascii_lowercase())
             .filter(|name| !name.is_empty() && name != "*")
+            .filter(|name| !STRUCTURALLY_COVERED.contains(&name.as_str()))
             .filter(|name| !self.names.contains(name))
             .collect()
     }
@@ -584,8 +596,28 @@ mod tests {
         );
         assert_eq!(
             spec.uncovered_by(["rsc, next-router-prefetch, Accept-Encoding"]),
-            vec!["next-router-prefetch", "accept-encoding"],
-            "uncovered names must be reported so the stale config is identifiable"
+            vec!["next-router-prefetch"],
+            "uncovered names must be reported so the stale config is identifiable; \
+             accept-encoding is excluded because the key covers it structurally"
+        );
+    }
+
+    #[test]
+    fn a_key_field_counts_as_coverage_without_being_configured() {
+        // The failure this prevents is silent and total: every compressing origin sends
+        // `Vary: Accept-Encoding`, so treating it as a gap means the cache never stores
+        // anything, and a spike measuring hit rate would report ~0 and look like a
+        // finding rather than a bug.
+        let spec = VarySpec::new([]);
+
+        assert!(
+            spec.uncovered_by(["Accept-Encoding"]).is_empty(),
+            "the key has a dedicated accept_encoding field, so this is already covered"
+        );
+        assert_eq!(
+            spec.uncovered_by(["accept-encoding, rsc"]),
+            vec!["rsc"],
+            "only the genuinely uncovered name should be reported"
         );
     }
 

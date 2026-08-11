@@ -300,6 +300,23 @@ pub struct CreativeOpportunitiesConfig {
     /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_cache_vary: Option<Vec<String>>,
+    /// Operator assertion that the origin's HTML does not depend on request cookies.
+    ///
+    /// Unset or `false` disqualifies **every cookie-bearing request** from the shared
+    /// template cache, in both directions. That is safe and it is also very nearly a
+    /// disable switch: Trusted Server sets its own identity cookie, so essentially every
+    /// repeat visitor carries one. Left at the default, the cache can only ever serve
+    /// first-ever page views and cookie-less clients.
+    ///
+    /// Setting `true` asserts the origin serves the same HTML with or without cookies.
+    /// It is not taken on trust alone — if the origin ever declares `Vary: Cookie`, the
+    /// drift guard reports an uncovered header and the response is refused regardless of
+    /// this flag. So a wrong assertion is caught whenever the origin is honest about it,
+    /// and this only widens the window where the origin personalizes *silently*.
+    ///
+    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_is_cookie_independent: Option<bool>,
     /// Slot templates. Empty vec = feature disabled (no auction fired, no globals injected).
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub slot: Vec<CreativeOpportunitySlot>,
@@ -317,6 +334,16 @@ impl CreativeOpportunitiesConfig {
     /// Unset yields an empty spec, which covers nothing — so any origin `Vary` reads as
     /// a gap and the response is never cached. Failing closed is deliberate: an
     /// unconfigured deployment should not acquire a shared cache silently.
+    /// Whether a cookie-bearing request may participate in the shared cache.
+    ///
+    /// Defaults to `false`, which is the conservative reading and also the one that
+    /// makes the cache almost inert on real traffic. See
+    /// [`Self::origin_is_cookie_independent`].
+    #[must_use]
+    pub fn origin_is_cookie_independent(&self) -> bool {
+        self.origin_is_cookie_independent.unwrap_or(false)
+    }
+
     #[must_use]
     pub fn template_cache_vary(&self) -> crate::platform::VarySpec {
         crate::platform::VarySpec::new(self.template_cache_vary.clone().unwrap_or_default())
@@ -1225,6 +1252,7 @@ mod tests {
             section_root: section_root.map(str::to_string),
             assembly_mode: None,
             template_cache_vary: None,
+            origin_is_cookie_independent: None,
             section_segment: None,
             slot: vec![slot],
         }
@@ -1624,6 +1652,7 @@ mod tests {
             section_root: None,
             assembly_mode: None,
             template_cache_vary: None,
+            origin_is_cookie_independent: None,
             section_segment: None,
             slot: Vec::new(),
         };

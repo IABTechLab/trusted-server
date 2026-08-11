@@ -1020,10 +1020,15 @@ pub const ESI_BIDS_INCLUDE: &str = "<esi:include src=\"/_ts/page-bids?format=fra
 /// which is why an unknown `format` is a `400` rather than a silent fall back to
 /// JSON.
 ///
-/// The marker carries no `path`. It is baked into a **shared** template, so every
-/// byte in it is a byte every reader of that template gets; the adapter's include
-/// dispatcher supplies the path from the live request instead. That also keeps a URL
-/// out of the cached bytes, so there is no escaping question at the seam.
+/// The marker carries no `path`, because it is baked into a **shared** template and
+/// every byte in it is a byte every reader of that template receives. Keeping a URL out
+/// of the cached bytes also removes any escaping question at the seam.
+///
+/// Nothing reads the `src` attribute. Once assembly moved to
+/// `PendingFragmentContent::CompletedRequest`, the dispatcher stopped performing I/O and
+/// now substitutes the already-resolved fragment for any include regardless of its URL.
+/// The attribute is retained because a bare `esi:include` is not valid ESI and because a
+/// real-subrequest variant would need it.
 pub(crate) fn body_close_injection(
     mode: AssemblyMode,
     head_script_present: bool,
@@ -3188,6 +3193,19 @@ pub async fn handle_publisher_request(
     // template.
     let request_had_authorization = req.headers().contains_key(header::AUTHORIZATION);
     let request_had_cookie = req.headers().contains_key(header::COOKIE);
+    // Whether carrying a cookie is itself disqualifying. Computed once and used for both
+    // the lookup and the store, so the two cannot drift apart.
+    //
+    // The conservative default disqualifies every cookie-bearing request, which is very
+    // nearly a disable switch — TS sets its own identity cookie, so essentially every
+    // repeat visitor carries one. An operator who knows their origin ignores cookies can
+    // say so; the `Vary: Cookie` drift guard still refuses the response if the origin
+    // ever contradicts them.
+    let cookie_disqualifies = request_had_cookie
+        && !settings
+            .creative_opportunities
+            .as_ref()
+            .is_some_and(CreativeOpportunitiesConfig::origin_is_cookie_independent);
 
     if should_run_ad_stack {
         req.headers_mut().remove(header::IF_NONE_MATCH);
@@ -3274,7 +3292,7 @@ pub async fn handle_publisher_request(
     // not be served a shared template even if that template is perfectly cacheable.
     if let Some(key) = template_cache_key
         .as_ref()
-        .filter(|_| !request_had_authorization && !request_had_cookie)
+        .filter(|_| !request_had_authorization && !cookie_disqualifies)
     {
         match services.template_cache().get(key).await {
             Ok(entry) => {
@@ -3415,7 +3433,7 @@ pub async fn handle_publisher_request(
         match c2_bypass_reason(
             assembly_mode,
             request_had_authorization,
-            request_had_cookie,
+            cookie_disqualifies,
             response.status(),
             &gate_content_type,
             response.headers(),
@@ -4144,7 +4162,7 @@ impl core::fmt::Display for VaryGap {
 pub(crate) fn c2_bypass_reason(
     mode: AssemblyMode,
     request_had_authorization: bool,
-    request_had_cookie: bool,
+    cookie_disqualifies: bool,
     status: StatusCode,
     content_type: &str,
     response_headers: &edgezero_core::http::HeaderMap,
@@ -4156,7 +4174,7 @@ pub(crate) fn c2_bypass_reason(
     if request_had_authorization {
         return Some(C2BypassReason::AuthorizedRequest);
     }
-    if request_had_cookie {
+    if cookie_disqualifies {
         return Some(C2BypassReason::CookieForwarded);
     }
     if response_headers.contains_key(header::SET_COOKIE) {
@@ -6445,6 +6463,74 @@ mod tests {
             }
         }
 
+        fn cookie_navigation_request() -> Request<EdgeBody> {
+            HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://ts.example.com/article")
+                .header(header::HOST, "ts.example.com")
+                .header("sec-fetch-dest", "document")
+                .header("sec-fetch-mode", "navigate")
+                .header(header::COOKIE, "ts-ec=abc123")
+                .body(EdgeBody::empty())
+                .expect("should build cookie-bearing request")
+        }
+
+        #[tokio::test]
+        async fn by_default_a_cookie_bearing_request_uses_no_shared_cache() {
+            // The shipped default, and the reason the cache is nearly inert on real
+            // traffic: TS sets its own identity cookie, so essentially every repeat
+            // visitor arrives carrying one and is excluded in both directions.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+            queue_shareable_html(&stub);
+
+            let _ = run(&settings, &services, cookie_navigation_request()).await;
+            let _ = run(&settings, &services, cookie_navigation_request()).await;
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "both requests must reach the origin"
+            );
+            assert!(
+                cache
+                    .entries
+                    .lock()
+                    .expect("should lock entries")
+                    .is_empty(),
+                "and neither may store a template"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_declared_cookie_independent_origin_lets_repeat_visitors_share() {
+            // The opt-in. Without it the spike can only ever measure first-ever page
+            // views, which is not the population the issue cares about.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let mut raw = settings_with_mode("esi");
+            raw.creative_opportunities
+                .as_mut()
+                .expect("fixture configures creative opportunities")
+                .origin_is_cookie_independent = Some(true);
+            let settings = Arc::new(raw);
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+            queue_shareable_html(&stub);
+
+            let _ = run(&settings, &services, cookie_navigation_request()).await;
+            let _ = run(&settings, &services, cookie_navigation_request()).await;
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "the second cookie-bearing request should be served from the cache"
+            );
+        }
+
         #[tokio::test]
         async fn an_active_diagnostics_request_never_stores_a_template() {
             // An independent review reintroduced a diagnostics leak scoped to
@@ -6607,8 +6693,11 @@ mod tests {
             // The fail-closed default. An operator who has not stated the origin's Vary
             // must not acquire a shared cache by omission — and a real origin varies on
             // something, so this is the common path, not an edge case.
+            // Deliberately not `Accept-Encoding`: the key has a dedicated field for that
+            // one, so it is covered whatever the operator configured. Using it here
+            // would test the structural-coverage carve-out rather than the drift guard.
             let mut varying = shareable();
-            varying.insert(header::VARY, HeaderValue::from_static("accept-encoding"));
+            varying.insert(header::VARY, HeaderValue::from_static("rsc"));
 
             assert_eq!(
                 c2_bypass_reason(
@@ -6621,9 +6710,37 @@ mod tests {
                     &nothing_covered(),
                 ),
                 Some(C2BypassReason::VaryNotCovered(VaryGap(vec![
-                    "accept-encoding".to_string()
+                    "rsc".to_string()
                 ]))),
                 "an unstated Vary must disqualify rather than silently under-key"
+            );
+        }
+
+        #[test]
+        fn an_origin_that_varies_on_cookie_is_refused_even_when_declared_independent() {
+            // The backstop that makes `origin_is_cookie_independent` safe to offer. The
+            // operator asserts their origin ignores cookies; if the origin then says
+            // otherwise, the assertion loses. Without this, a wrong assertion would
+            // silently cross-serve personalized HTML.
+            let mut varying = shareable();
+            varying.insert(header::VARY, HeaderValue::from_static("Cookie"));
+
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    // The operator's assertion has already been applied here: this is
+                    // `false` precisely because they declared independence.
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &varying,
+                    &nothing_covered(),
+                ),
+                Some(C2BypassReason::VaryNotCovered(VaryGap(vec![
+                    "cookie".to_string()
+                ]))),
+                "the origin's own declaration must override the operator's assertion"
             );
         }
 
@@ -6935,6 +7052,7 @@ mod tests {
                 section_root: None,
                 assembly_mode: None,
                 template_cache_vary: None,
+                origin_is_cookie_independent: None,
                 section_segment: None,
                 slot: vec![slot()],
             });
@@ -10617,6 +10735,7 @@ mod tests {
                 section_root: None,
                 assembly_mode: None,
                 template_cache_vary: None,
+                origin_is_cookie_independent: None,
                 section_segment: None,
                 slot: Vec::new(),
             }

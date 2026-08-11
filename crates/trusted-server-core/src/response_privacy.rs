@@ -26,9 +26,13 @@ pub const CDN_CACHE_HEADERS: &[&str] = &[
 
 /// Whether `Cache-Control` already forbids shared caching.
 ///
-/// Extracted because this predicate is needed in three places now: both arms of
-/// the cookie-privacy net below, and the shared-template cache gate in
-/// `publisher::c2_bypass_reason`.
+/// Extracted because both arms of the cookie-privacy net below need it.
+///
+/// `publisher::c2_bypass_reason` deliberately does **not** call this and keeps its own
+/// copy: it additionally treats `no-cache` as non-shareable, because "revalidate before
+/// reuse" is correct for an HTTP cache and too permissive for a spike-owned one. The
+/// duplicate is the stricter of the two, so consolidating them would loosen the shared-
+/// template gate rather than tidy it.
 ///
 /// Directives are case-insensitive (RFC 9111 §5.2), so `No-Store` and `Private`
 /// count. `no-cache` deliberately does **not**: it requires revalidation before
