@@ -614,6 +614,50 @@ cargo fmt --all -- --check && cargo clippy-fastly
 `ClientFill` must work on all four adapters. `Esi` is Fastly-only and must not break the
 others' compilation.
 
+- [x] **Step 6: the call site — DONE.** `2db10639` (store), `2a2e6c6a` (lookup).
+
+The cache now engages end to end: a second request for the same URL is served without
+touching the origin, and is byte-identical to what was stored. Verified by mutation —
+disabling the lookup fails the hit test, so the hit is the cache answering rather than
+the fixture answering twice.
+
+**Wiring the lookup corrected the key.** It carried the content encoding the _origin_
+chose, which does not exist at lookup time. That meant storing under `br` and looking up
+under `gzip, br` — a cache that never hits. The field is now the `Accept-Encoding` sent
+to the origin. Sound because negotiation is a function of what the origin was offered,
+so identical offers yield identical choices; the chosen encoding stays in the metadata
+and is what the served response declares.
+
+That made every key field request-derived, so **the key is built before the fetch** and
+the response gate only authorizes storing it. A key that needed the response could only
+ever authorize a store, never satisfy a read.
+
+**The lookup re-checks the request-derived disqualifications, and only those.** The
+store gate is response-derived and cannot re-run, but need not: anything in the cache
+passed it on the way in. What must re-run are properties of the _reader_ rather than of
+the bytes — an authenticated request must not be served a shared template even when that
+template is perfectly cacheable.
+
+**Shared modes take the buffered finalizer.** Storing needs every transformed byte and
+streaming does not collect them. The branch keys on the store authorization rather than
+on the assembly mode, so `Inline` never reaches it and the spike cannot regress the
+shipped path by construction. A C2 _miss_ therefore buffers — the right trade, since a
+miss is already paying an origin fetch and a full transform, and what the spike measures
+is the hit, where there is no origin fetch to stream from at all.
+
+Every response header on a hit is constructed, never replayed, so no origin header can
+reach a second visitor through the cache.
+
+The publisher tests use an in-memory cache double, so they prove the wiring rather than
+the backing. The join they leave untested is the one `app.rs` makes: the publisher
+reaches the cache as a `dyn PlatformTemplateCache` behind `RuntimeServices`, never as
+the concrete type the Fastly tests exercise. That join is now executed under Viceroy
+against the real Core Cache rather than only type-checked.
+
+**What this does not establish.** `ClientFill` and `Esi` still render a template with a
+hole and nothing filling it. Task 4 and Task 5 remain the blockers on anything
+deployable — a cache that works is necessary, not sufficient.
+
 ---
 
 ## Task 4: Arm A2 — client-fill

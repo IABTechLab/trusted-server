@@ -308,6 +308,25 @@ mod tests {
     }
 
     #[test]
+    fn the_cache_round_trips_through_the_platform_trait_object() {
+        // Every other test here calls `FastlyTemplateCache` concretely. The publisher
+        // never does — it reaches the cache as a `dyn PlatformTemplateCache` behind
+        // `RuntimeServices`. That join is what `app.rs` wires, and until this test it
+        // was only type-checked, never executed.
+        let cache: std::sync::Arc<dyn PlatformTemplateCache> = std::sync::Arc::new(cache());
+        let key = key("https://example.com/via-trait-object");
+        let body = b"<html><body>template</body></html>".to_vec();
+
+        run(cache.put(&key, &metadata_for(&body), body.clone())).expect("should store");
+
+        assert_eq!(
+            run(cache.get(&key)).expect("should read back").body,
+            body,
+            "the trait object must reach the same Core Cache the concrete type does"
+        );
+    }
+
+    #[test]
     fn a_length_mismatch_is_refused_at_write_rather_than_stored() {
         // Storing metadata whose length disagrees with the body would make every
         // subsequent read a truncation miss — a cache that silently never hits.

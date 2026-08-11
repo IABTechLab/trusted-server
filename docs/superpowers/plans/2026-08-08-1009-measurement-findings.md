@@ -350,6 +350,39 @@ Do not proceed to Task 3 Step 4 (actual C2 read/write) or expose `AssemblyMode` 
 test or staging traffic until the full-document byte-identity test exists. The three
 fixes above close the known holes; that test is what would catch the next one.
 
+## Task 3 complete — the C2 cache engages end to end
+
+`2db10639` (store), `2a2e6c6a` (lookup), plus `b688d667`/`577eb85a` for the `Vary`
+handling. A second request for the same URL is now served without touching the origin,
+byte-identical to what was stored.
+
+**Three problems only appeared once the code had to run**, none of them visible in the
+plan or in review:
+
+1. **The key needed the origin's `Vary`, but a lookup precedes the fetch.** Resolved with
+   an operator-stated list plus a post-response drift guard that refuses to store under a
+   key that missed something. Spike-grade: a two-phase lookup is the correct answer and
+   doubles the lookups.
+2. **The key carried the encoding the _origin_ chose**, which also does not exist at
+   lookup time — storing under `br`, looking up under `gzip, br`, a cache that never hits.
+   Now keyed on what was sent to the origin.
+3. **Storing needs every transformed byte; streaming does not collect them.** Shared modes
+   take the buffered finalizer, branching on the store authorization rather than the
+   assembly mode, so `Inline` cannot reach it.
+
+Each was a case where the design read as complete and the implementation had a hole in
+it. That is the same pattern as the three review findings above, arriving one layer down.
+
+**Verified by mutation, not just by green tests.** Disabling the lookup fails the hit
+test, so the hit is the cache answering rather than the fixture answering twice; dropping
+the `Authorization` re-check fails the authenticated test; reading only the first `Vary`
+header value, and disabling the drift guard, each fail their own tests. The reviewer's
+gate above was satisfied first: the byte-identity tests it demanded exist and were
+themselves mutation-checked.
+
+**Still not deployable.** `ClientFill` and `Esi` render a template with a hole and
+nothing filling it — Task 4 and Task 5. A cache that works is necessary, not sufficient.
+
 ## Step B — consumers of TS's own response headers
 
 Not yet run.
