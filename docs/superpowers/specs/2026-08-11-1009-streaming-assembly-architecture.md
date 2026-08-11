@@ -78,6 +78,48 @@ benefit to the reader** while the response is held for the auction. It also give
 harness a pass/fail shape for the change this document proposes — under streaming
 assembly, TTFB must fall away from total by approximately the injected delay.
 
+## 2c. Measured against the shipped path — a ~100x TTFB regression
+
+`scripts/c2-local-test.sh` runs both modes against the same stub, with a self-imposed
+1.5 s bid endpoint. Synthetic numbers, not a measurement of any deployment.
+
+| Mode                      | TTFB              | Total   |
+| ------------------------- | ----------------- | ------- |
+| `inline` (shipped)        | **0.010–0.019 s** | ~1.51 s |
+| `esi` (buffered assembly) | **1.524–1.532 s** | ~1.53 s |
+
+**The shipped path already streams correctly.** First byte in ~10 ms; the article paints
+while the auction runs; only `</body>` waits. Buffered assembly turns that into a wait
+for the whole auction before the first byte — roughly **100x worse TTFB than doing
+nothing**.
+
+This corrects §1 and §2, which framed buffered assembly as capturing the origin-fetch
+saving and merely failing to add the streaming benefit. It is worse than that: it
+**removes** a benefit today's code already delivers. The origin-fetch saving is
+irrelevant beside losing the stream.
+
+It also sharpens where production's latency actually goes. Locally the stub origin
+answers in ~2 ms, so `inline` TTFB is ~10 ms. In production the origin fetch is slow and
+uncached, and TS cannot send a first byte until the origin sends one — so production TTFB
+is the **origin fetch**, with the auction hidden behind the remainder of the body plus the
+`</body>` hold. The fix is therefore a fast origin _while keeping the stream_: exactly
+Design C, and exactly what buffered assembly gives up.
+
+**Consequence for the plan:** `esi` mode must not be exposed to any traffic in its current
+form. It is not a smaller win than hoped, it is a regression.
+
+### A harness bug worth recording
+
+The first version of this comparison reported `inline` fetching the origin zero times —
+nonsense that still printed four passes. Viceroy was launched inside a subshell, so `$!`
+was the subshell rather than the server; cleanup killed the wrapper and orphaned viceroy.
+The next run then failed to bind and **silently answered from the previous run's process**,
+carrying that run's config and warm cache.
+
+A harness that answers from the wrong server is worse than one that crashes, because its
+output looks like data. Fixed with no subshell, a pre-flight port check, and a startup
+wait that fails loudly. The regression above was invisible until the control worked.
+
 ## 3. The decisive facts
 
 Three, all verified in the codebase rather than assumed:
