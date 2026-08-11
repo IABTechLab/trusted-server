@@ -36,6 +36,7 @@ mod error;
 mod http;
 mod image_optimizer;
 mod kv;
+pub mod template_cache;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod traits;
@@ -52,6 +53,10 @@ pub use image_optimizer::{
     PlatformImageOptimizerParams, PlatformImageOptimizerRegion,
 };
 pub use kv::UnavailableKvStore;
+pub use template_cache::{
+    PlatformTemplateCache, TEMPLATE_SCHEMA_VERSION, TemplateCacheError, TemplateCacheKey,
+    TemplateCacheMiss, TemplateEntry, TemplateMetadata, UnavailableTemplateCache,
+};
 pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
 pub use types::{
     ClientInfo, GeoInfo, PlatformBackendSpec, RuntimeServices, RuntimeServicesBuilder, StoreId,
