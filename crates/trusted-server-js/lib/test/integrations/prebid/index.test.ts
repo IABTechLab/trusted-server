@@ -546,7 +546,7 @@ describe('prebid/installPrebidNpm', () => {
     };
     bidResponseListener!(delivered);
 
-    const entry = (window as any).tsjs.apsPrebidRenderers['stripped-field-ad-id'];
+    const entry = testWindow.tsjs?.apsPrebidRenderers?.['stripped-field-ad-id'];
     expect(entry).toEqual(
       expect.objectContaining({ adUnitCode: 'div-aps', renderer, markUsed: expect.any(Function) })
     );
@@ -596,11 +596,11 @@ describe('prebid/installPrebidNpm', () => {
       });
     }
 
-    const registry = (window as any).tsjs.apsPrebidRenderers;
-    expect(registry['shared-imp-ad-id-0']).toEqual(
+    const registry = testWindow.tsjs?.apsPrebidRenderers;
+    expect(registry?.['shared-imp-ad-id-0']).toEqual(
       expect.objectContaining({ renderer: firstRenderer })
     );
-    expect(registry['shared-imp-ad-id-1']).toEqual(
+    expect(registry?.['shared-imp-ad-id-1']).toEqual(
       expect.objectContaining({ renderer: secondRenderer })
     );
   });
@@ -623,7 +623,7 @@ describe('prebid/installPrebidNpm', () => {
       requestId: 'req-reused',
       trustedServerRenderer: apsRenderer(),
     });
-    expect((window as any).tsjs.apsPrebidRenderers['surviving-field-ad-id']).toBeDefined();
+    expect(testWindow.tsjs?.apsPrebidRenderers?.['surviving-field-ad-id']).toBeDefined();
 
     // A later field-stripped bid reusing the same requestId has no descriptor of its
     // own, so no stale renderer may be registered for it.
@@ -636,7 +636,7 @@ describe('prebid/installPrebidNpm', () => {
       requestId: 'req-reused',
       meta: { advertiserDomains: [] },
     });
-    expect((window as any).tsjs.apsPrebidRenderers['reused-request-ad-id']).toBeUndefined();
+    expect(testWindow.tsjs?.apsPrebidRenderers?.['reused-request-ad-id']).toBeUndefined();
   });
 
   it('registers and scrubs on bidAccepted before later events can observe the descriptor', () => {
@@ -680,7 +680,7 @@ describe('prebid/installPrebidNpm', () => {
     };
     bidAcceptedListener!(accepted);
 
-    expect((window as any).tsjs.apsPrebidRenderers['accepted-ad-id']).toEqual(
+    expect(testWindow.tsjs?.apsPrebidRenderers?.['accepted-ad-id']).toEqual(
       expect.objectContaining({ adUnitCode: 'div-aps', renderer })
     );
     expect(accepted).not.toHaveProperty('trustedServerRenderer');
@@ -689,7 +689,7 @@ describe('prebid/installPrebidNpm', () => {
     // The later bidResponse pass sees the already-scrubbed object and no-ops.
     const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
     bidResponseListener!(accepted);
-    expect((window as any).tsjs.apsPrebidRenderers['accepted-ad-id']).toEqual(
+    expect(testWindow.tsjs?.apsPrebidRenderers?.['accepted-ad-id']).toEqual(
       expect.objectContaining({ renderer })
     );
     expect(warnSpy).not.toHaveBeenCalled();
@@ -713,7 +713,7 @@ describe('prebid/installPrebidNpm', () => {
       ttl: 300,
       meta: 'corrupted',
     });
-    expect((window as any).tsjs?.apsPrebidRenderers?.['corrupt-meta-ad-id']).toBeUndefined();
+    expect(testWindow.tsjs?.apsPrebidRenderers?.['corrupt-meta-ad-id']).toBeUndefined();
 
     // With a surviving top-level field the corrupt meta must not block registration.
     bidResponseListener!({
@@ -725,7 +725,7 @@ describe('prebid/installPrebidNpm', () => {
       meta: 'corrupted',
       trustedServerRenderer: apsRenderer(),
     });
-    expect((window as any).tsjs.apsPrebidRenderers['corrupt-meta-with-field-ad-id']).toBeDefined();
+    expect(testWindow.tsjs?.apsPrebidRenderers?.['corrupt-meta-with-field-ad-id']).toBeDefined();
   });
 
   it('does not register malformed or non-trusted APS renderer capabilities', () => {
@@ -2477,7 +2477,8 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
   }
 
   function refreshAdUnitFromLastRequest():
-    (Record<string, unknown> & { code?: string; bids?: TestBid[] }) | undefined {
+    | (Record<string, unknown> & { code?: string; bids?: TestBid[] })
+    | undefined {
     const lastCall = mockRequestBids.mock.calls[mockRequestBids.mock.calls.length - 1];
     return lastCall?.[0]?.adUnits?.[0];
   }
