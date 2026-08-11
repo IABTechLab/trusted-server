@@ -560,7 +560,8 @@ markup with its inner content. `rewrite_creatives` (default `true`) runs an
 HTML rewriter (`lol_html`) that converts eligible external resource and click
 URLs to signed first-party paths, adds `data-tsclick`, rewrites inline CSS
 `url(...)` values, removes bidder-supplied `<base>` elements, and injects the
-unified creative TSJS runtime when a `<body>` exists. In every mode, a creative
+unified creative TSJS runtime exactly once, whether or not the bidder supplied a
+`<body>` element. In every mode, a creative
 larger than the 1 MiB per-creative cap is rejected and its `adm` is dropped.
 
 ```toml

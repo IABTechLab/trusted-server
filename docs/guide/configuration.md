@@ -1258,8 +1258,9 @@ context that shares the publisher's origin. With `rewrite_creatives = true`
 not excluded by rewrite configuration are converted to signed first-party
 endpoints, and any bidder-supplied `<base>` element is removed. The
 `POST /auction` path emits root-relative endpoints and injects the creative TSJS
-runtime when a `<body>` exists; the foreign-origin SSAT renderer emits absolute
-endpoints and does not inject that bundle. With both disabled, `adm` ships
+runtime exactly once — whether or not the bidder supplied a `<body>`, since bare
+fragments are the common `adm` shape; the foreign-origin SSAT renderer emits
+absolute endpoints and does not inject that bundle. With both disabled, `adm` ships
 exactly as the bidder returned it — except that a creative larger than the
 1 MiB per-creative cap is rejected in every mode and its `adm` is dropped.
 Accepted external URLs are not host allowlisted by the sanitizer. Neither

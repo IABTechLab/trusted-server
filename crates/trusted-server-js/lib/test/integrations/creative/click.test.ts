@@ -261,6 +261,60 @@ describe('creative/click.ts', () => {
     }
   });
 
+  it('navigates an over-long rebuild through a form POST instead of a GET URL', async () => {
+    // Fastly rejects request URLs over 8192 bytes before the handler runs, and
+    // a signed click with many tracking params exceeds that once nested in
+    // another query string. A form body has no such bound, and a submission is
+    // a navigation — so it is not blocked by CORS from the opaque origin.
+    vi.useFakeTimers();
+
+    const originDescriptor = Object.getOwnPropertyDescriptor(window, 'origin');
+    Object.defineProperty(window, 'origin', { value: 'null', configurable: true });
+    global.fetch = undefined as unknown as typeof fetch;
+
+    const submits: HTMLFormElement[] = [];
+    const originalSubmit = HTMLFormElement.prototype.submit;
+    HTMLFormElement.prototype.submit = function patched(this: HTMLFormElement) {
+      submits.push(this);
+    };
+
+    try {
+      // A signed click long enough that the nested rebuild URL crosses the cap.
+      const filler = 'a'.repeat(6800);
+      const longClick = `/first-party/click?tsurl=https%3A%2F%2Fexample.com%2Flanding&foo=1&pad=${filler}&tstoken=token123`;
+      const anchor = document.createElement('a');
+      anchor.setAttribute('data-tsclick', longClick);
+      anchor.setAttribute('href', longClick);
+      document.body.appendChild(anchor);
+
+      await importCreativeModule();
+
+      anchor.setAttribute('href', `https://example.com/landing?pad=${filler}&bar=2`);
+      await Promise.resolve();
+      await vi.runAllTimersAsync();
+
+      anchor.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+      await vi.runAllTimersAsync();
+
+      expect(submits.length).toBeGreaterThan(0);
+      const form = submits[0];
+      expect(form.method.toLowerCase()).toBe('post');
+      expect(form.action).toContain('/first-party/proxy-rebuild');
+      const tsclick = form.querySelector('input[name="tsclick"]') as HTMLInputElement | null;
+      expect(tsclick?.value).toBe(longClick);
+      const add = form.querySelector('input[name="add"]') as HTMLInputElement | null;
+      expect(add?.value).toContain('bar');
+    } finally {
+      HTMLFormElement.prototype.submit = originalSubmit;
+      if (originDescriptor) {
+        Object.defineProperty(window, 'origin', originDescriptor);
+      } else {
+        delete (window as { origin?: string }).origin;
+      }
+    }
+  });
+
   it('refuses to navigate to or persist non-http(s) URLs', async () => {
     // The guard reads creative-controlled attributes; a javascript: value must
     // never reach location.href or an href write.

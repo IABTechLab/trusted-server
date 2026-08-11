@@ -406,6 +406,8 @@ Navigation form of the same recovery, for creatives rendered in a sandboxed ifra
 
 Validation is identical to the POST form.
 
+**Form-encoded POST (navigation, no URL length limit):** when the GET recovery URL would exceed the platform's request-URL limit (Fastly Compute rejects request URLs over 8192 bytes before the handler runs), the click guard submits a form instead. A `POST` carrying `Content-Type: application/x-www-form-urlencoded` with the same `tsclick`/`add`/`del` fields is treated as a navigation and answered with the same `302`, not the JSON body.
+
 ---
 
 ## Request Signing Endpoints

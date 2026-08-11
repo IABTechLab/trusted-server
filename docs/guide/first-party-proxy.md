@@ -241,9 +241,16 @@ Responds `302` with the rebuilt click in `Location` (plus
 `Cache-Control: no-store, private`), so the browser continues to
 `/first-party/click`, which then redirects to the advertiser.
 
+**Form-encoded POST (navigation, no URL length limit)**: a `POST` carrying
+`Content-Type: application/x-www-form-urlencoded` with the same fields is also
+treated as a navigation and answered with the `302`. The click guard uses it
+when the GET URL would exceed the platform's request-URL limit (Fastly Compute
+rejects request URLs over 8192 bytes before the handler runs), which a long
+signed click can do once nested inside another query string.
+
 Creative iframes are sandboxed without `allow-same-origin`, giving them an
 opaque origin whose `fetch` to this endpoint is cross-origin (`Origin: null`)
-and blocked by CORS. The GET form exists for that case: navigations are not
+and blocked by CORS. The navigation forms exist for that case: navigations are not
 subject to CORS, so the click guard navigates instead of fetching. Both forms
 apply identical validation.
 

@@ -285,6 +285,52 @@ function resolveSafeNavigationUrl(url: string): string | null {
   return null;
 }
 
+// Longest rebuild URL we will navigate to. Fastly Compute rejects request URLs
+// over 8192 bytes before the handler runs, and a signed click with many
+// tracking parameters can exceed that once nested inside another query string.
+// The margin covers percent-encoding growth and the request line's own overhead.
+const MAX_REBUILD_URL_LENGTH = 7000;
+
+const REBUILD_PATH = '/first-party/proxy-rebuild';
+
+// Navigate the rebuild as a form POST rather than a GET URL.
+//
+// The click is too long to nest in a query string, but a request body has no
+// such bound, and a form submission is a navigation — so it is not subject to
+// the CORS rules that rule out `fetch` from an opaque origin. The sandbox grants
+// `allow-forms`, and the endpoint answers a form-encoded POST with the same 302
+// it gives a GET. Only ever called from a click handler: submitting outside a
+// user gesture would navigate the frame on its own.
+function submitRebuildNavigation(anchor: AnchorLike, rebuildUrl: string): boolean {
+  try {
+    if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
+      return false;
+    }
+    const parsed = new URL(rebuildUrl, TRUSTED_BASE_URL);
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = parsed.origin + parsed.pathname;
+    form.target = anchor.getAttribute('target') || '_self';
+    form.style.display = 'none';
+    for (const field of ['tsclick', 'add', 'del']) {
+      const value = parsed.searchParams.get(field);
+      if (value === null) continue;
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = field;
+      input.value = value;
+      form.appendChild(input);
+    }
+    if (!form.querySelector('input[name="tsclick"]')) return false;
+    (document.body ?? document.documentElement).appendChild(form);
+    form.submit();
+    return true;
+  } catch (err) {
+    log.warn('tsjs-creative:click: rebuild form navigation failed', err);
+    return false;
+  }
+}
+
 // Send the user to the resolved URL while respecting middle clicks and targets.
 // Root-relative URLs are absolutized against the pinned trusted base first: in
 // the sandboxed srcdoc iframe there is no usable document URL for the
@@ -292,6 +338,16 @@ function resolveSafeNavigationUrl(url: string): string | null {
 function navigate(a: AnchorLike, url: string, isMiddle: boolean): void {
   const resolved = resolveSafeNavigationUrl(url);
   if (!resolved) return;
+  // An over-long recovery URL would be rejected by the platform before the
+  // handler runs, losing the click entirely. Carry it in a form body instead.
+  if (
+    !isMiddle &&
+    resolved.length > MAX_REBUILD_URL_LENGTH &&
+    resolved.includes(REBUILD_PATH) &&
+    submitRebuildNavigation(a, resolved)
+  ) {
+    return;
+  }
   const target = a.getAttribute('target') || (isMiddle ? '_blank' : '_self');
   if (target === '_blank' || isMiddle) {
     window.open(resolved, target, 'noopener,noreferrer');

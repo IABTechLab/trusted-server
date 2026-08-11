@@ -127,7 +127,11 @@ rewrite_creatives = true
 # Strip executable markup (script/object/embed/form/...) from winning-bid adm,
 # removing those elements together with their inner content.
 #
-# Defaults to false: creatives are delivered exactly as the bidder returned them.
+# Defaults to false: executable markup is preserved rather than stripped. Note
+# this is not "untouched" — with the default `rewrite_creatives = true` above,
+# eligible URLs are still rewritten to first-party endpoints, bidder `<base>`
+# elements are removed, and the creative TSJS runtime is injected.
+#
 # Enable whenever creatives can render in a context that shares the publisher's
 # origin — it is the primary defence there.
 #
