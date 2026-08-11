@@ -114,6 +114,23 @@ impl GptDiagnosticsRequestDecision {
     }
 }
 
+impl GptDiagnosticsRequestDecision {
+    /// An active decision, for tests in other modules that need one.
+    ///
+    /// The fields are private and built by `prepare_request` from a cookie or query
+    /// parameter; there is no other way to obtain an active decision across a module
+    /// boundary.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn active_for_tests() -> Self {
+        Self {
+            active: true,
+            clean_browser_path_and_query: None,
+            cookie_action: GptDiagnosticsCookieAction::None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod head_seam_invariant_tests {
     use super::*;

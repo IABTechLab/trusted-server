@@ -949,6 +949,29 @@ struct HtmlStreamProcessorParams<'a> {
     gpt_diagnostics: Option<crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
 }
 
+/// The diagnostics decision the template may carry.
+///
+/// Diagnostics is request-scoped — activated by a cookie or query parameter, and
+/// documented as an immutable per-request decision — so it must not reach a shared
+/// template.
+///
+/// It does not leak today even without this gate, but only by coincidence:
+/// `requires_private_no_store()` is a strict superset of the conditions under which
+/// a script is emitted, and that stamp lands before the C2 gate reads response
+/// headers, so the gate refuses. Two independent conditions that happen to align,
+/// with nothing enforcing the relationship. This makes the guarantee explicit;
+/// `requires_private_no_store_is_a_superset_of_injection` keeps the coincidence as a
+/// backstop if this gate is ever removed.
+pub(crate) fn template_gpt_diagnostics(
+    mode: AssemblyMode,
+    decision: Option<crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
+) -> Option<crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision> {
+    match mode {
+        AssemblyMode::Inline => decision,
+        AssemblyMode::ClientFill | AssemblyMode::Esi => None,
+    }
+}
+
 /// Whether a root-level auction has any consumer under this assembly mode.
 ///
 /// Only [`AssemblyMode::Inline`] injects the auction result into the root document.
@@ -1021,18 +1044,7 @@ fn create_html_stream_processor(
         .unwrap_or_default();
     let body_close = body_close_injection(assembly_mode, params.ad_slots_script.is_some());
 
-    // Diagnostics is request-scoped — activated by a cookie or query parameter — so
-    // it must not reach a shared template. It does not leak today, but only by
-    // coincidence: `requires_private_no_store()` is a strict superset of the
-    // conditions under which a script is emitted, and the resulting `private,
-    // no-store` stamp lands before the C2 gate reads response headers, so the gate
-    // refuses. That is two independent conditions happening to align. Gate it here
-    // instead, so the guarantee does not depend on a relationship nothing enforces.
-    // `gpt_diagnostics_superset_of_injection` locks the coincidence as a backstop.
-    let gpt_diagnostics = match assembly_mode {
-        AssemblyMode::Inline => params.gpt_diagnostics,
-        AssemblyMode::ClientFill | AssemblyMode::Esi => None,
-    };
+    let gpt_diagnostics = template_gpt_diagnostics(assembly_mode, params.gpt_diagnostics);
 
     let config = config
         .with_ad_state(params.ad_slots_script, params.ad_bids_state)
@@ -4792,6 +4804,176 @@ mod tests {
         .expect("should proxy publisher request")
     }
 
+    mod rendered_template_identity_tests {
+        //! The gate the plan's Task 3 Step 2 actually asks for.
+        //!
+        //! Every other test in this area exercises the decision functions with
+        //! hand-built inputs. That is how three HIGH review findings sat in covered,
+        //! passing code: the decisions were right and nothing checked what the
+        //! composition of them *renders*.
+        //!
+        //! These tests render whole documents through `create_html_processor`,
+        //! composing the same three decisions `create_html_stream_processor` uses,
+        //! and compare bytes. A future request-dependent injection added at either
+        //! seam fails here even if every decision function is left untouched.
+
+        use super::template_neutrality_tests::{settings_with_slots, slot};
+        use super::*;
+        use crate::creative_opportunities::AssemblyMode;
+        use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
+        use crate::integrations::IntegrationRegistry;
+        use crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision;
+
+        const DOCUMENT: &[u8] =
+            b"<html><head><title>t</title></head><body><p>content</p></body></html>";
+
+        /// One request's worth of variation. Everything here is request-scoped and
+        /// must not reach a shared template.
+        #[derive(Debug, Clone, Copy)]
+        struct RequestShape {
+            /// Folds in consent, bot classification, prefetch and the kill switch.
+            ad_stack_ran: bool,
+            /// Cookie- or query-activated.
+            diagnostics_active: bool,
+            /// A resolved auction, present only when one was dispatched.
+            bids_available: bool,
+        }
+
+        /// Build the config exactly as `create_html_stream_processor` does, so a
+        /// drift between a decision and its use is caught rather than hidden.
+        fn render(mode: AssemblyMode, shape: RequestShape) -> String {
+            let settings = settings_with_slots();
+            let slots = [slot()];
+
+            let ad_slots_script =
+                template_ad_slots_script(mode, shape.ad_stack_ran, &settings, &slots, "/");
+            let body_close = body_close_injection(mode, ad_slots_script.is_some());
+            let gpt_diagnostics = template_gpt_diagnostics(
+                mode,
+                shape
+                    .diagnostics_active
+                    .then(GptDiagnosticsRequestDecision::active_for_tests),
+            );
+
+            let ad_bids_state =
+                std::sync::Arc::new(std::sync::Mutex::new(shape.bids_available.then(|| {
+                    r#"<script>(window.tsjs=window.tsjs||{}).bids={"atf":1};</script>"#.to_string()
+                })));
+
+            let config = HtmlProcessorConfig {
+                origin_host: "origin.example.com".to_string(),
+                request_host: "example.com".to_string(),
+                request_scheme: "https".to_string(),
+                integrations: IntegrationRegistry::empty_for_tests(),
+                ad_slots_script,
+                ad_bids_state,
+                max_buffered_body_bytes: 16 * 1024 * 1024,
+                gpt_diagnostics,
+                body_close,
+            };
+
+            let mut processor = create_html_processor(config);
+            let out = processor
+                .process_chunk(DOCUMENT, true)
+                .expect("should process the document");
+            String::from_utf8(out).expect("output should be utf8")
+        }
+
+        fn every_shape() -> Vec<RequestShape> {
+            let mut shapes = Vec::new();
+            for ad_stack_ran in [false, true] {
+                for diagnostics_active in [false, true] {
+                    for bids_available in [false, true] {
+                        shapes.push(RequestShape {
+                            ad_stack_ran,
+                            diagnostics_active,
+                            bids_available,
+                        });
+                    }
+                }
+            }
+            shapes
+        }
+
+        #[test]
+        fn shared_modes_render_byte_identical_documents_for_every_request_shape() {
+            for mode in [AssemblyMode::ClientFill, AssemblyMode::Esi] {
+                let shapes = every_shape();
+                let baseline = render(mode, shapes[0]);
+
+                for shape in &shapes[1..] {
+                    let rendered = render(mode, *shape);
+                    assert_eq!(
+                        rendered, baseline,
+                        "{mode:?}: rendered template differs for {shape:?}. A shared \
+                         template that varies by request freezes the first-filling \
+                         request's decision for every later reader."
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn shared_mode_templates_contain_no_request_scoped_markers() {
+            // Byte-identity alone would be satisfied by rendering the same wrong
+            // thing every time, so also assert the specific things that must be
+            // absent.
+            for mode in [AssemblyMode::ClientFill, AssemblyMode::Esi] {
+                let rendered = render(
+                    mode,
+                    RequestShape {
+                        ad_stack_ran: true,
+                        diagnostics_active: true,
+                        bids_available: true,
+                    },
+                );
+                for forbidden in [
+                    ".adSlots",
+                    ".bids=",
+                    "__tsjs_gpt_diagnostics_active",
+                    "history.replaceState",
+                ] {
+                    assert!(
+                        !rendered.contains(forbidden),
+                        "{mode:?}: template contains request-scoped `{forbidden}`:\n{rendered}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn inline_still_varies_by_request_as_it_must() {
+            // The shared-mode assertions would also pass if rendering were broken
+            // everywhere. Inline responses are per-navigation and never shared, so
+            // they *should* differ — this proves the test can tell the difference.
+            let with_ads = render(
+                AssemblyMode::Inline,
+                RequestShape {
+                    ad_stack_ran: true,
+                    diagnostics_active: false,
+                    bids_available: true,
+                },
+            );
+            let without = render(
+                AssemblyMode::Inline,
+                RequestShape {
+                    ad_stack_ran: false,
+                    diagnostics_active: false,
+                    bids_available: false,
+                },
+            );
+            assert_ne!(
+                with_ads, without,
+                "inline must still vary by request; if it does not, this harness is \
+                 not rendering what it claims to"
+            );
+            assert!(
+                with_ads.contains(".adSlots"),
+                "inline with a matched slot should carry adSlots"
+            );
+        }
+    }
+
     mod root_auction_gate_tests {
         //! Guards the silent-waste failure mode: dispatching an auction whose result
         //! nothing will consume. Under the shared modes both injection seams emit
@@ -5115,7 +5297,7 @@ mod tests {
             AssemblyMode, CreativeOpportunityFormat, CreativeOpportunitySlot,
         };
 
-        fn slot() -> CreativeOpportunitySlot {
+        pub(super) fn slot() -> CreativeOpportunitySlot {
             CreativeOpportunitySlot {
                 id: "atf".to_string(),
                 gam_unit_path: Some("/99999/example/home".to_string()),
@@ -5134,7 +5316,7 @@ mod tests {
             }
         }
 
-        fn settings_with_slots() -> Settings {
+        pub(super) fn settings_with_slots() -> Settings {
             let mut settings = crate::test_support::tests::create_test_settings();
             // Construct the section rather than mutating it if present: the shared
             // fixture does not carry `[creative_opportunities]`, and an `if let
