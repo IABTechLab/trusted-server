@@ -118,6 +118,35 @@ describe('GptDiagnosticsBindingManager', () => {
     });
   });
 
+  it('fails closed when the supplied realm has a hostile HTMLElement constructor', () => {
+    const element = document.createElement('div');
+    element.id = 'hostile-realm-slot';
+    document.body.append(element);
+    const store = createStore();
+    store.recordSlotRequested(fakeSlot(element.id));
+    const hostileWindow = {
+      CSS: window.CSS,
+      MutationObserver: undefined,
+      addEventListener: window.addEventListener.bind(window),
+      get HTMLElement(): never {
+        throw new Error('hostile HTMLElement constructor');
+      },
+      innerHeight: window.innerHeight,
+      innerWidth: window.innerWidth,
+      removeEventListener: window.removeEventListener.bind(window),
+    };
+
+    const manager = new GptDiagnosticsBindingManager(store, {
+      window: hostileWindow as never,
+    });
+    managers.push(manager);
+
+    expect(manager.get(1)).toMatchObject({
+      binding: { status: 'unbound', reason: 'missing_element' },
+      visible: false,
+    });
+  });
+
   it('reports an empty GPT element ID as unbound without a synthetic DOM ID', () => {
     const store = createStore();
     store.recordSlotRequested(fakeSlot());

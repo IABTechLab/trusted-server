@@ -1,12 +1,16 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
-  createGptIntegrationRegistration,
   publishGptWinner,
+  publishInitialGptProjection,
   startGptSlotOperation,
   type GptWinnerPublicationInput,
   type GptSlotOperationInput,
 } from '../../../src/integrations/gpt/module';
+import { createLegacyGptRegistrationForTest as createGptIntegrationRegistration } from '../../helpers/legacy_gpt_registration';
+import { createGptIntegrationRegistration as createProductionGptRegistration } from '../../../src/integrations/gpt/module';
+import { createRenderRuntimeIntegrationRegistration } from '../../../src/integrations/render_runtime/module';
+import type { RuntimeCapabilityV1 } from '../../../src/kernel/runtime';
 import { createNoopGoogletagAdapter, type GoogletagFacade } from '../../../src/adapters/googletag';
 import { isGuardInstalled, resetGuardState } from '../../../src/integrations/gpt/script_guard';
 import { createTestNavigationIdentityIssuer } from '../../../src/kernel/identity';
@@ -112,7 +116,8 @@ function manifest(ids: readonly string[]) {
   return {
     version: 1,
     releaseId: RELEASE_ID,
-    integrations: ids.map((id) => ({ id, required: true })),
+    criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
+    integrations: ids.map((id) => ({ id, phase: 'critical' as const })),
   };
 }
 
@@ -120,7 +125,7 @@ function registration(
   id: string,
   prepare: IntegrationRegistration['prepare']
 ): IntegrationRegistration {
-  return Object.freeze({ id, release: RELEASE_ID, prepare });
+  return Object.freeze({ abi: 1, id, phase: 'critical', releaseId: RELEASE_ID, prepare });
 }
 
 function callbacks(order: string[]): IntegrationInstallCallbacks {
@@ -132,7 +137,342 @@ function callbacks(order: string[]): IntegrationInstallCallbacks {
 }
 
 describe('transactional GPT integration module', () => {
-  afterEach(() => resetGuardState());
+  afterEach(() => {
+    resetGuardState();
+    delete (window as Window & { googletag?: unknown }).googletag;
+  });
+
+  it.each([false, true])(
+    'uses only catalog capabilities and conditions diagnostics-only GPT listeners (active=%s)',
+    async (diagnosticsActive) => {
+      const listenerTypes: string[] = [];
+      const removedTypes: string[] = [];
+      const pubads = {
+        addEventListener: vi.fn((type: string, _listener: (event: unknown) => void) => {
+          listenerTypes.push(type);
+        }),
+        disableInitialLoad: vi.fn(),
+        getSlots: vi.fn(() => []),
+        refresh: vi.fn(),
+        removeEventListener: vi.fn((type: string, _listener: (event: unknown) => void) => {
+          removedTypes.push(type);
+        }),
+      };
+      (window as Window & { googletag?: unknown }).googletag = {
+        apiReady: true,
+        pubadsReady: true,
+        cmd: { push: (command: () => void) => (command(), 0) },
+        defineSlot: vi.fn(),
+        destroySlots: vi.fn(() => true),
+        display: vi.fn(),
+        getConfig: vi.fn(() => ({ disableInitialLoad: false })),
+        pubads: () => pubads,
+        setConfig: vi.fn(),
+      };
+      const providerFacades = new Map<string, Readonly<Record<string, unknown>>>();
+      const protect = vi.fn(() => true);
+      const bootManifest = Object.freeze({
+        version: 1 as const,
+        releaseId: RELEASE_ID,
+        criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
+        integrations: Object.freeze([
+          Object.freeze({ id: 'render_runtime', phase: 'critical' as const }),
+          Object.freeze({ id: 'gpt', phase: 'critical' as const }),
+        ]),
+      });
+      const runtime = Object.freeze({
+        boot: () =>
+          Object.freeze({
+            auctionProjection: Object.freeze({
+              version: 1,
+              auction: Object.freeze({
+                version: 1,
+                auctionId: 'initial',
+                results: Object.freeze([]),
+              }),
+              slots: Object.freeze([]),
+              bids: Object.freeze([]),
+            }),
+            diagnostics: Object.freeze({
+              version: 1,
+              renderTraceOverlay: false,
+              gpt: Object.freeze({ active: diagnosticsActive }),
+            }),
+            manifest: bootManifest,
+          }),
+        document,
+        generation: Object.freeze({}),
+        protectFirstDisplayAttemptBatch: protect,
+      } satisfies RuntimeCapabilityV1);
+      const registry = createIntegrationRegistry({
+        manifest: bootManifest,
+        releaseId: RELEASE_ID,
+        knownIntegrationIds: Object.freeze(['render_runtime', 'gpt']),
+        catalog: Object.freeze([
+          Object.freeze({
+            id: 'render_runtime',
+            phase: 'critical' as const,
+            trigger: null,
+            consumes: Object.freeze(['runtime.v1']),
+            provides: Object.freeze([
+              'slots.v1',
+              'auction.v1',
+              'render.v1',
+              'messages.v1',
+              'trace.v1',
+              'trace.presentation.v1',
+              'direct.v1',
+            ]),
+          }),
+          Object.freeze({
+            id: 'gpt',
+            phase: 'critical' as const,
+            trigger: null,
+            consumes: Object.freeze([
+              'runtime.v1',
+              'slots.v1',
+              'auction.v1',
+              'render.v1',
+              'messages.v1',
+              'trace.v1',
+            ]),
+            provides: Object.freeze(['gpt.v1', 'gpt.events.v1', 'pbs_cache.baseline.v1']),
+          }),
+        ]),
+        runtimeCapability: runtime,
+        getBindings: (id) =>
+          Object.freeze({
+            config: id === 'gpt' ? Object.freeze({}) : undefined,
+            interfaces: Object.freeze({}),
+          }),
+        onCapabilityStaged: (key, facade) => {
+          providerFacades.set(key, facade);
+          return () => {
+            if (providerFacades.get(key) === facade) providerFacades.delete(key);
+          };
+        },
+        startedAtMs: 0,
+        now: () => 0,
+      });
+      expect(registry.register(createRenderRuntimeIntegrationRegistration(RELEASE_ID))).toBe(true);
+      expect(registry.register(createProductionGptRegistration(RELEASE_ID))).toBe(true);
+
+      const result = await registry.install(callbacks([]));
+      expect(result.state).toBe('kernel');
+      expect([...providerFacades.keys()]).toEqual([
+        'slots.v1',
+        'auction.v1',
+        'render.v1',
+        'messages.v1',
+        'trace.v1',
+        'trace.presentation.v1',
+        'direct.v1',
+        'gpt.v1',
+        'gpt.events.v1',
+        'pbs_cache.baseline.v1',
+      ]);
+      expect(Reflect.ownKeys(providerFacades.get('pbs_cache.baseline.v1') ?? {})).toEqual([
+        'render',
+      ]);
+      const render = providerFacades.get('render.v1') as {
+        registerRenderer: (type: 'cache', renderer: () => boolean) => () => void;
+      };
+      expect(() => render.registerRenderer('cache', () => false)).toThrow('duplicated');
+      expect(protect).not.toHaveBeenCalled();
+      expect([...listenerTypes].sort()).toEqual(
+        (diagnosticsActive
+          ? [
+              'slotRequested',
+              'slotRenderEnded',
+              'slotResponseReceived',
+              'slotOnload',
+              'impressionViewable',
+              'slotVisibilityChanged',
+            ]
+          : ['slotRequested', 'slotRenderEnded']
+        ).sort()
+      );
+      expect(listenerTypes.slice(0, 2)).toEqual(['slotRequested', 'slotRenderEnded']);
+
+      if (result.state === 'kernel') result.dispose();
+      expect(removedTypes.sort()).toEqual([...listenerTypes].sort());
+      expect(providerFacades.size).toBe(0);
+      expect(() => render.registerRenderer('cache', () => false)).toThrow('inactive');
+    }
+  );
+
+  it('protects the complete immutable initial winner batch before starting either GPT request', async () => {
+    const candidateIds = ['candidate001', 'candidate002'] as const;
+    const projection = Object.freeze({
+      version: 1 as const,
+      auction: Object.freeze({
+        version: 1 as const,
+        auctionId: 'initial-winners',
+        results: Object.freeze(
+          candidateIds.map((candidateId, index) =>
+            Object.freeze({
+              slot: `slot-${index + 1}`,
+              outcome: 'winner' as const,
+              candidateId,
+            })
+          )
+        ),
+      }),
+      slots: Object.freeze(
+        candidateIds.map((_candidateId, index) =>
+          Object.freeze({
+            slot: `slot-${index + 1}`,
+            gamUnitPath: `/123/slot-${index + 1}`,
+            divId: `slot-${index + 1}`,
+            formats: Object.freeze([Object.freeze([300, 250] as const)]),
+            targeting: Object.freeze({}),
+          })
+        )
+      ),
+      bids: Object.freeze(
+        candidateIds.map((candidateId, index) =>
+          Object.freeze({
+            candidateId,
+            slot: `slot-${index + 1}`,
+            provider: 'fictional',
+            upstreamBidId: `upstream-${index + 1}`,
+            cpm: index + 1,
+            currency: 'USD' as const,
+            targeting: Object.freeze({}),
+            rendererReservationId: `r1_${String(index + 1).repeat(22)}`,
+            renderSource: Object.freeze({
+              type: 'adm' as const,
+              version: 1 as const,
+              adm: `<p>${index + 1}</p>`,
+              width: 300,
+              height: 250,
+            }),
+          })
+        )
+      ),
+    });
+    for (const placement of projection.slots) {
+      const element = document.createElement('div');
+      element.id = placement.divId;
+      document.body.appendChild(element);
+    }
+    const runtime = createRuntimeSession({
+      createIdentityIssuer: () =>
+        createTestNavigationIdentityIssuer({
+          getRandomValues: (target) => {
+            target.fill(7);
+            return target;
+          },
+        }),
+    });
+    const navigationResult = runtime.startInitialNavigation(projection);
+    if (!navigationResult.ok) throw new Error(navigationResult.reason);
+    const navigation = navigationResult.value;
+    const artifacts = createCommittedArtifactStore();
+    const reservations = createReservationService({
+      prepareRenderSource: (candidate) =>
+        typeof candidate === 'object' && candidate !== null && Object.isFrozen(candidate)
+          ? (candidate as never)
+          : undefined,
+    });
+    const physical = new Map<string, object>();
+    const request = vi.fn(() =>
+      Object.freeze({
+        status: 'active' as const,
+        result: Promise.resolve(
+          Object.freeze({ status: 'failed' as const, reason: 'gpt_request_failed' as const })
+        ),
+        dispose: vi.fn(),
+      })
+    );
+    const slots = Object.freeze({
+      adoptGptSlot: (
+        _generation: object,
+        registeredSlotId: string,
+        binding: Readonly<{ slot: object }>
+      ) => {
+        physical.set(registeredSlotId, binding.slot);
+        return Object.freeze({ ok: true as const });
+      },
+      isBoundGptSlot: (_generation: object, registeredSlotId: string, slot: object) =>
+        physical.get(registeredSlotId) === slot,
+      recordPublisherDestruction: vi.fn(() => true),
+      request,
+    });
+    const targeting = Object.freeze({
+      observePublisherMutations: () =>
+        Object.freeze({ status: 'completed', result: Promise.resolve(), dispose: vi.fn() }),
+      own: (_slot: object, _key: string, _value: string, ownerId: string) =>
+        Object.freeze({ ownerId, release: vi.fn() }),
+    });
+    const facade = Object.freeze({
+      slots: () => Object.freeze([]),
+      slotElementId: () => undefined,
+      transactionalDefine: (
+        definition: Readonly<{ elementId: string }>,
+        _current: () => boolean,
+        prepare: (slot: object) => Readonly<{ commit: () => boolean }>
+      ) => {
+        const slot = Object.freeze({ elementId: definition.elementId });
+        if (!prepare(slot).commit()) return Object.freeze({ status: 'failed' as const });
+        return Object.freeze({ status: 'defined' as const, slot });
+      },
+      clearTargeting: vi.fn(),
+      getTargeting: vi.fn(() => Object.freeze([])),
+      setTargeting: vi.fn(),
+    });
+    const googletag = Object.freeze({
+      run: (command: (gpt: typeof facade) => unknown) =>
+        Object.freeze({
+          status: 'completed',
+          result: Promise.resolve(command(facade)),
+          dispose: vi.fn(),
+        }),
+    });
+    let protectedLatches: readonly PromiseLike<unknown>[] | undefined;
+    const protect = vi.fn((latches: readonly PromiseLike<unknown>[]) => {
+      expect(Object.isFrozen(latches)).toBe(true);
+      expect(latches).toHaveLength(2);
+      expect(request).not.toHaveBeenCalled();
+      protectedLatches = latches;
+      return true;
+    });
+
+    await publishInitialGptProjection(document, {
+      googletag: googletag as never,
+      navigation,
+      projection: projection as never,
+      protect,
+      pucBridge: Object.freeze({
+        registerGamAttempt: vi.fn(() => true),
+        recordNonemptyGam: vi.fn(() => true),
+      }),
+      render: Object.freeze({
+        artifacts,
+        createAttempt: (owner: Parameters<typeof createRenderAttempt>[0]['owner']) =>
+          createRenderAttempt({
+            artifacts,
+            owner,
+            prepareRenderSource: (candidate) => candidate as never,
+            reservations,
+          }),
+        publisherOrigin: window.location.origin,
+        registerRenderer: vi.fn(),
+        rendererNonces: Object.freeze({}),
+        renderWinner: vi.fn(() => false),
+        reservations,
+      }) as never,
+      slots: slots as never,
+      targeting: targeting as never,
+    });
+
+    expect(protect).toHaveBeenCalledOnce();
+    expect(request).toHaveBeenCalledTimes(2);
+    await Promise.allSettled([...(protectedLatches ?? [])]);
+    artifacts.dispose();
+    reservations.dispose();
+    runtime.dispose();
+  });
 
   it('prepares inertly, activates the reversible guard, and starts only after commit', async () => {
     const config = Object.freeze({ scriptUrl: '/integrations/gpt/script' });

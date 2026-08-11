@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   createBrowserGoogletagAdapter,
+  createGoogletagTraceCycleHandle,
   type GoogletagDiagnosticsFact,
 } from '../../src/adapters/googletag';
 
@@ -1191,7 +1192,7 @@ describe('browser googletag adapter readiness', () => {
         order.push('correctness');
       })
     ).result;
-    expect(ready.pubads.addEventListener).toHaveBeenCalledTimes(1);
+    expect(ready.pubads.addEventListener).toHaveBeenCalledOnce();
     const slot = Object.freeze({
       getSlotElementId: () => 'fictional-slot',
       getAdUnitPath: () => '/example/fictional-slot',
@@ -1217,6 +1218,7 @@ describe('browser googletag adapter readiness', () => {
         observedAtMs: 42.25,
         slot: {
           token: expect.any(Object),
+          traceToken: 'gt1_1',
           elementId: 'fictional-slot',
           adUnitPath: '/example/fictional-slot',
         },
@@ -1231,13 +1233,265 @@ describe('browser googletag adapter readiness', () => {
     const safeSlot = (facts[0] as { slot: Record<string, unknown> }).slot;
     expect(Object.isFrozen(safeSlot)).toBe(true);
     expect(Object.isFrozen(safeSlot['token'])).toBe(true);
-    expect(Reflect.ownKeys(safeSlot).sort()).toEqual(['adUnitPath', 'elementId', 'token']);
+    expect(Reflect.ownKeys(safeSlot).sort()).toEqual([
+      'adUnitPath',
+      'elementId',
+      'token',
+      'traceToken',
+    ]);
     expect(Object.values(safeSlot).some((value) => typeof value === 'function')).toBe(false);
     expect(safeSlot).not.toBe(slot);
 
     releaseDiagnostics?.();
     emit({ slot, isEmpty: true });
     expect(facts).toHaveLength(1);
+  });
+
+  it.each([false, true])(
+    'publishes correctness facts from the sole listeners and conditions four diagnostics-only listeners (active=%s)',
+    async (diagnosticsActive) => {
+      const ready = createReadyGoogletag();
+      const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+      const facts: GoogletagDiagnosticsFact[] = [];
+      const accepted = createGoogletagTraceCycleHandle(() => false);
+      adapter.observeDiagnostics?.((fact) => facts.push(fact));
+      await adapter.run((gpt) => {
+        gpt.subscribe('slotRequested', () => accepted);
+        gpt.subscribe('slotRenderEnded', () => accepted);
+        if (diagnosticsActive) {
+          for (const eventType of [
+            'slotResponseReceived',
+            'slotOnload',
+            'impressionViewable',
+            'slotVisibilityChanged',
+          ]) {
+            gpt.subscribe(eventType, () => undefined, true);
+          }
+        }
+      }).result;
+      const slot = { getSlotElementId: () => 'sole-listener-slot' };
+      const emit = (eventType: string, fields: Readonly<Record<string, unknown>> = {}): void => {
+        const event = { slot, ...fields };
+        for (const listener of ready.listeners.get(eventType) ?? []) listener(event);
+      };
+
+      emit('slotRequested');
+      if (diagnosticsActive) emit('slotResponseReceived');
+      emit('slotRenderEnded', { isEmpty: false });
+      if (diagnosticsActive) {
+        emit('slotOnload');
+        emit('impressionViewable');
+        emit('slotVisibilityChanged', { inViewPercentage: 75 });
+      }
+
+      expect(ready.pubads.addEventListener).toHaveBeenCalledTimes(diagnosticsActive ? 6 : 2);
+      expect(facts.map(({ kind }) => kind)).toEqual(
+        diagnosticsActive
+          ? [
+              'slotRequested',
+              'slotResponseReceived',
+              'slotRenderEnded',
+              'slotOnload',
+              'impressionViewable',
+              'slotVisibilityChanged',
+            ]
+          : ['slotRequested', 'slotRenderEnded']
+      );
+      expect(facts.every(({ slot: snapshot }) => snapshot.cycleOrdinal === 1)).toBe(true);
+    }
+  );
+
+  it('opens trace cycles only from accepted lifecycle handles and publishes each raw event once', async () => {
+    const ready = createReadyGoogletag();
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+    const facts: GoogletagDiagnosticsFact[] = [];
+    const lifecycle = { retired: false };
+    const accepted = createGoogletagTraceCycleHandle(() => lifecycle.retired);
+    adapter.observeDiagnostics?.((fact) => facts.push(fact));
+    await adapter.run((gpt) => {
+      gpt.subscribe('slotRequested', () => accepted);
+      gpt.subscribe('slotRenderEnded', () => accepted);
+    }).result;
+    const slot = { getSlotElementId: () => 'accepted-cycle-slot' };
+    const emit = (eventType: string, fields: Readonly<Record<string, unknown>> = {}): void => {
+      const event = { slot, ...fields };
+      for (const listener of ready.listeners.get(eventType) ?? []) listener(event);
+    };
+
+    emit('slotRequested');
+    emit('slotRenderEnded', { isEmpty: false, responseIdentifier: 'accepted-response' });
+    lifecycle.retired = true;
+    emit('slotRequested');
+
+    expect(facts.map(({ kind, slot: snapshot }) => [kind, snapshot.cycleOrdinal])).toEqual([
+      ['slotRequested', 1],
+      ['slotRenderEnded', 1],
+      ['slotRequested', undefined],
+    ]);
+  });
+
+  it('publishes a correctness fact only after lifecycle attribution completes', async () => {
+    const ready = createReadyGoogletag();
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+    const facts: GoogletagDiagnosticsFact[] = [];
+    const order: string[] = [];
+    const accepted = createGoogletagTraceCycleHandle(() => false);
+    adapter.observeDiagnostics?.((fact) => {
+      order.push('diagnostics');
+      facts.push(fact);
+    });
+    await adapter.run((gpt) => {
+      gpt.subscribe('slotRequested', () => {
+        order.push('correctness');
+        return accepted;
+      });
+    }).result;
+    const slot = { getSlotElementId: () => 'attributed-cycle-slot' };
+
+    const event = { slot };
+    for (const listener of ready.listeners.get('slotRequested') ?? []) listener(event);
+
+    expect(facts).toHaveLength(1);
+    expect(facts[0]?.slot.cycleOrdinal).toBe(1);
+    expect(order).toEqual(['correctness', 'diagnostics']);
+  });
+
+  it('reports duplicate, reused, and already-open cycle handles once while preserving raw facts', async () => {
+    const ready = createReadyGoogletag();
+    const reports = vi.fn();
+    const adapter = createBrowserGoogletagAdapter(
+      { googletag: ready.googletag },
+      { reportDiagnosticsFailure: reports }
+    );
+    const facts: GoogletagDiagnosticsFact[] = [];
+    const first = createGoogletagTraceCycleHandle(() => false);
+    const second = createGoogletagTraceCycleHandle(() => false);
+    let selected = first;
+    adapter.observeDiagnostics?.((fact) => facts.push(fact));
+    await adapter.run((gpt) => {
+      gpt.subscribe('slotRequested', () => selected);
+    }).result;
+    const firstSlot = { getSlotElementId: () => 'cycle-collision-one' };
+    const secondSlot = { getSlotElementId: () => 'cycle-collision-two' };
+    const emit = (slot: object): void => {
+      const event = { slot };
+      for (const listener of ready.listeners.get('slotRequested') ?? []) listener(event);
+    };
+
+    emit(firstSlot);
+    emit(firstSlot);
+    selected = second;
+    emit(firstSlot);
+    selected = first;
+    emit(secondSlot);
+
+    expect(facts).toHaveLength(4);
+    expect(facts.map(({ slot }) => slot.cycleOrdinal)).toEqual([
+      1,
+      undefined,
+      undefined,
+      undefined,
+    ]);
+    expect(reports).toHaveBeenCalledOnce();
+    expect(reports).toHaveBeenCalledWith('trace_cycle_collision');
+  });
+
+  it('reports nonunique callbacks once without suppressing raw facts', async () => {
+    const ready = createReadyGoogletag();
+    const reports = vi.fn();
+    const adapter = createBrowserGoogletagAdapter(
+      { googletag: ready.googletag },
+      { reportDiagnosticsFailure: reports }
+    );
+    const facts: GoogletagDiagnosticsFact[] = [];
+    const first = createGoogletagTraceCycleHandle(() => false);
+    const second = createGoogletagTraceCycleHandle(() => false);
+    adapter.observeDiagnostics?.((fact) => facts.push(fact));
+    const slot = { getSlotElementId: () => 'cycle-ambiguity' };
+    const emit = (eventType: string, fields: Readonly<Record<string, unknown>> = {}): void => {
+      const event = { slot, ...fields };
+      for (const listener of ready.listeners.get(eventType) ?? []) listener(event);
+    };
+
+    await adapter.run((gpt) => {
+      gpt.subscribe('slotRequested', (event) =>
+        (event as { cycle: number }).cycle === 1 ? first : second
+      );
+      gpt.subscribe('slotRenderEnded', (event) =>
+        (event as { cycle: number }).cycle === 1 ? first : second
+      );
+      gpt.subscribe('slotOnload', () => undefined, true);
+    }).result;
+    emit('slotRequested', { cycle: 1 });
+    emit('slotRenderEnded', { cycle: 1, isEmpty: false });
+    emit('slotRequested', { cycle: 2 });
+    emit('slotRenderEnded', { cycle: 2, isEmpty: false });
+    emit('slotOnload');
+
+    expect(facts).toHaveLength(5);
+    expect(facts.map(({ slot: snapshot }) => snapshot.cycleOrdinal)).toEqual([
+      1,
+      1,
+      2,
+      2,
+      undefined,
+    ]);
+    expect(reports).toHaveBeenCalledOnce();
+    expect(reports).toHaveBeenCalledWith('trace_cycle_ambiguity');
+  });
+
+  it('never transfers a trace handle from a non-owner into a diagnostics-only fact', async () => {
+    const ready = createReadyGoogletag();
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+    const facts: GoogletagDiagnosticsFact[] = [];
+    const first = createGoogletagTraceCycleHandle(() => false);
+    const second = createGoogletagTraceCycleHandle(() => false);
+    let selected = first;
+    adapter.observeDiagnostics?.((fact) => facts.push(fact));
+    await adapter.run((gpt) => {
+      gpt.subscribe('slotRequested', () => selected);
+      gpt.subscribe('slotRenderEnded', () => selected);
+      gpt.subscribe('slotOnload', () => selected);
+      gpt.subscribe('slotOnload', () => undefined, true);
+    }).result;
+    const slot = { getSlotElementId: () => 'diagnostics-only-attribution-slot' };
+    const emit = (eventType: string, fields: Readonly<Record<string, unknown>> = {}): void => {
+      const event = { slot, ...fields };
+      for (const listener of ready.listeners.get(eventType) ?? []) listener(event);
+    };
+
+    emit('slotRequested');
+    emit('slotRenderEnded', { isEmpty: false });
+    selected = second;
+    emit('slotRequested');
+    emit('slotRenderEnded', { isEmpty: false });
+    selected = first;
+    emit('slotOnload');
+
+    expect(facts.map(({ kind, slot: snapshot }) => [kind, snapshot.cycleOrdinal])).toEqual([
+      ['slotRequested', 1],
+      ['slotRenderEnded', 1],
+      ['slotRequested', 2],
+      ['slotRenderEnded', 2],
+      ['slotOnload', undefined],
+    ]);
+  });
+
+  it('accepts correctness attribution only from an adapter-branded trace handle', async () => {
+    const ready = createReadyGoogletag();
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+    const facts: GoogletagDiagnosticsFact[] = [];
+    const forged = Object.freeze({ isRetired: () => false });
+    adapter.observeDiagnostics?.((fact) => facts.push(fact));
+    await adapter.run((gpt) => {
+      gpt.subscribe('slotRequested', () => forged as never);
+    }).result;
+    const slot = { getSlotElementId: () => 'forged-attribution-slot' };
+
+    for (const listener of ready.listeners.get('slotRequested') ?? []) listener({ slot });
+
+    expect(facts).toHaveLength(1);
+    expect(facts[0]?.slot.cycleOrdinal).toBeUndefined();
   });
 
   it('admits only one diagnostics observer without adding GPT listeners', () => {
@@ -1252,7 +1506,7 @@ describe('browser googletag adapter readiness', () => {
     expect(ready.pubads.addEventListener).not.toHaveBeenCalled();
   });
 
-  it('keeps one non-capability token per physical Slot and never freezes publisher authority', async () => {
+  it('keeps distinct opaque and canonical trace tokens per physical Slot', async () => {
     const ready = createReadyGoogletag();
     const adapter = createBrowserGoogletagAdapter({
       googletag: ready.googletag,
@@ -1282,14 +1536,337 @@ describe('browser googletag adapter readiness', () => {
     expect(facts).toHaveLength(3);
     expect(facts[0]?.slot.token).toBe(facts[1]?.slot.token);
     expect(facts[2]?.slot.token).not.toBe(facts[0]?.slot.token);
+    expect(facts[0]?.slot.traceToken).toBe('gt1_1');
+    expect(facts[1]?.slot.traceToken).toBe('gt1_1');
+    expect(facts[2]?.slot.traceToken).toBe('gt1_2');
+    expect(facts[0]?.slot.cycleOrdinal).toBeUndefined();
+    expect(facts[1]?.slot.cycleOrdinal).toBeUndefined();
+    expect(facts[2]?.slot.cycleOrdinal).toBeUndefined();
+    expect(facts[0]?.slot.token).not.toBe(facts[0]?.slot.traceToken);
     expect(Object.isFrozen(first)).toBe(false);
     expect(Object.isFrozen(replacement)).toBe(false);
     expect(Reflect.ownKeys(facts[0]?.slot ?? {}).sort()).toEqual([
       'adUnitPath',
       'elementId',
       'token',
+      'traceToken',
     ]);
   });
+
+  it('mints canonical trace identity before events and keeps it stable for handoff', () => {
+    const adapter = createBrowserGoogletagAdapter({});
+    const first = {};
+    const replacement = {};
+
+    expect(adapter.traceToken(first)).toBe('gt1_1');
+    expect(adapter.traceToken(first)).toBe('gt1_1');
+    expect(adapter.traceToken(replacement)).toBe('gt1_2');
+    expect(adapter.traceToken(first)).toMatch(/^gt1_[1-9a-z][0-9a-z]{0,6}$/);
+    adapter.dispose();
+    expect(adapter.traceToken(first)).toBeUndefined();
+  });
+
+  it('does not retain default canonical tokens in a collision ledger', () => {
+    const disposalClearCalls = (() => {
+      const clear = vi.spyOn(Set.prototype, 'clear');
+      try {
+        const adapter = createBrowserGoogletagAdapter({});
+        for (let ordinal = 1; ordinal <= 1_024; ordinal += 1) {
+          expect(adapter.traceToken({})).toBe(`gt1_${ordinal.toString(36)}`);
+        }
+        const callsBeforeDispose = clear.mock.calls.length;
+
+        adapter.dispose();
+        return clear.mock.calls.length - callsBeforeDispose;
+      } finally {
+        clear.mockRestore();
+      }
+    })();
+
+    expect(disposalClearCalls).toBe(0);
+  });
+
+  it('clears the custom minted trace-token collision ledger once on adapter disposal', () => {
+    const disposalClearCalls = (() => {
+      const clear = vi.spyOn(Set.prototype, 'clear');
+      try {
+        const adapter = createBrowserGoogletagAdapter(
+          {},
+          { mintTraceToken: (ordinal) => `gt1_${ordinal.toString(36)}` }
+        );
+        expect(adapter.traceToken({})).toBe('gt1_1');
+        expect(adapter.traceToken({})).toBe('gt1_2');
+        const callsBeforeDispose = clear.mock.calls.length;
+
+        adapter.dispose();
+        adapter.dispose();
+        return clear.mock.calls.length - callsBeforeDispose;
+      } finally {
+        clear.mockRestore();
+      }
+    })();
+
+    expect(disposalClearCalls).toBe(1);
+  });
+
+  it('mints trace-token boundary ordinals and reports exhaustion once without affecting older tokens', () => {
+    const boundaries = createBrowserGoogletagAdapter({}, { initialTraceTokenOrdinal: 35 });
+    expect(boundaries.traceToken({})).toBe('gt1_z');
+    expect(boundaries.traceToken({})).toBe('gt1_10');
+
+    const reports = vi.fn();
+    const exhausted = createBrowserGoogletagAdapter(
+      {},
+      { initialTraceTokenOrdinal: 4_294_967_295, reportDiagnosticsFailure: reports }
+    );
+    const retained = {};
+    expect(exhausted.traceToken(retained)).toBe('gt1_1z141z3');
+    expect(exhausted.traceToken({})).toBeUndefined();
+    expect(exhausted.traceToken({})).toBeUndefined();
+    expect(exhausted.traceToken(retained)).toBe('gt1_1z141z3');
+    expect(reports).toHaveBeenCalledTimes(1);
+    expect(reports).toHaveBeenCalledWith('trace_token_exhausted');
+  });
+
+  it('contains one injected token collision and lets the next physical object reuse the unspent ordinal', () => {
+    const reports = vi.fn(() => {
+      throw new Error('fictional diagnostics reporter failure');
+    });
+    let calls = 0;
+    const adapter = createBrowserGoogletagAdapter(
+      {},
+      {
+        mintTraceToken: (ordinal) => {
+          calls += 1;
+          return calls === 2 ? 'gt1_1' : `gt1_${ordinal.toString(36)}`;
+        },
+        reportDiagnosticsFailure: reports,
+      }
+    );
+
+    expect(adapter.traceToken({})).toBe('gt1_1');
+    expect(() => adapter.traceToken({})).not.toThrow();
+    expect(adapter.traceToken({})).toBe('gt1_2');
+    expect(reports).toHaveBeenCalledOnce();
+    expect(reports).toHaveBeenCalledWith('trace_token_collision');
+  });
+
+  it('contains per-object cycle exhaustion while preserving raw diagnostics delivery', async () => {
+    const ready = createReadyGoogletag();
+    const reports = vi.fn();
+    const adapter = createBrowserGoogletagAdapter(
+      { googletag: ready.googletag },
+      { initialTraceCycleOrdinal: 4_294_967_295, reportDiagnosticsFailure: reports }
+    );
+    const facts: GoogletagDiagnosticsFact[] = [];
+    let lifecycle = { retired: true };
+    let accepted: ReturnType<typeof createGoogletagTraceCycleHandle> | undefined;
+    adapter.observeDiagnostics?.((fact) => facts.push(fact));
+    await adapter.run((gpt) => {
+      gpt.subscribe('slotRequested', () => {
+        lifecycle.retired = true;
+        const current = { retired: false };
+        lifecycle = current;
+        accepted = createGoogletagTraceCycleHandle(() => current.retired);
+        return accepted;
+      });
+      gpt.subscribe('slotRenderEnded', () => accepted);
+    }).result;
+    const slot = { getSlotElementId: () => 'cycle-exhaustion-slot' };
+    const emit = (eventType: string, fields: Readonly<Record<string, unknown>> = {}): void => {
+      const event = { slot, ...fields };
+      for (const listener of ready.listeners.get(eventType) ?? []) listener(event);
+    };
+
+    emit('slotRequested');
+    emit('slotRenderEnded', { isEmpty: false });
+    emit('slotRequested');
+
+    expect(facts.map((fact) => fact.slot.cycleOrdinal)).toEqual([
+      4_294_967_295,
+      4_294_967_295,
+      undefined,
+    ]);
+    expect(reports).toHaveBeenCalledOnce();
+    expect(reports).toHaveBeenCalledWith('trace_cycle_exhausted');
+  });
+
+  it('assigns exact per-object cycle ordinals and omits ambiguous callbacks', async () => {
+    const ready = createReadyGoogletag();
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+    const facts: GoogletagDiagnosticsFact[] = [];
+    let lifecycle = { retired: true };
+    let accepted: ReturnType<typeof createGoogletagTraceCycleHandle> | undefined;
+    adapter.observeDiagnostics?.((fact) => facts.push(fact));
+    await adapter.run((gpt) => {
+      gpt.subscribe('slotRequested', () => {
+        lifecycle.retired = true;
+        const current = { retired: false };
+        lifecycle = current;
+        accepted = createGoogletagTraceCycleHandle(() => current.retired);
+        return accepted;
+      });
+      gpt.subscribe('slotRenderEnded', () => accepted);
+      for (const eventType of ['slotResponseReceived', 'impressionViewable']) {
+        gpt.subscribe(eventType, () => undefined, true);
+      }
+    }).result;
+    const slot = {
+      getSlotElementId: () => 'cycle-slot',
+      getAdUnitPath: () => '/example/cycle-slot',
+    };
+    const emit = (eventType: string, fields: Readonly<Record<string, unknown>> = {}): void => {
+      const event = { slot, ...fields };
+      for (const listener of ready.listeners.get(eventType) ?? []) listener(event);
+    };
+
+    emit('slotRequested');
+    emit('slotResponseReceived', { responseIdentifier: 'response-1' });
+    emit('slotRenderEnded', { isEmpty: false, responseIdentifier: 'response-1' });
+    emit('slotRequested');
+    emit('impressionViewable');
+    emit('slotRenderEnded', { isEmpty: false, responseIdentifier: 'response-2' });
+
+    expect(facts.map(({ kind, slot: snapshot }) => [kind, snapshot.cycleOrdinal])).toEqual([
+      ['slotRequested', 1],
+      ['slotResponseReceived', 1],
+      ['slotRenderEnded', 1],
+      ['slotRequested', 2],
+      ['impressionViewable', undefined],
+      ['slotRenderEnded', 2],
+    ]);
+    expect(facts[1]?.responseIdentifier).toBe('response-1');
+    expect(facts[2]?.responseIdentifier).toBe('response-1');
+    expect(facts[5]?.responseIdentifier).toBe('response-2');
+  });
+
+  it.each([
+    [9, 1],
+    [10, 1],
+    [11, undefined],
+  ] as const)(
+    'retains bounded cycle identity after %i completed requests',
+    async (cycleCount, expectedOldOrdinal) => {
+      const ready = createReadyGoogletag();
+      const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+      const facts: GoogletagDiagnosticsFact[] = [];
+      let lifecycle = { retired: true };
+      let accepted: ReturnType<typeof createGoogletagTraceCycleHandle> | undefined;
+      adapter.observeDiagnostics?.((fact) => facts.push(fact));
+      await adapter.run((gpt) => {
+        gpt.subscribe('slotRequested', () => {
+          lifecycle.retired = true;
+          const current = { retired: false };
+          lifecycle = current;
+          accepted = createGoogletagTraceCycleHandle(() => current.retired);
+          return accepted;
+        });
+        gpt.subscribe('slotRenderEnded', () => accepted);
+        gpt.subscribe('slotOnload', () => undefined, true);
+      }).result;
+      const slot = { getSlotElementId: () => 'ledger-slot' };
+      const emit = (eventType: string, fields: Readonly<Record<string, unknown>> = {}): void => {
+        const event = { slot, ...fields };
+        for (const listener of ready.listeners.get(eventType) ?? []) listener(event);
+      };
+
+      for (let ordinal = 1; ordinal <= cycleCount; ordinal += 1) {
+        emit('slotRequested');
+        emit('slotRenderEnded', {
+          isEmpty: false,
+          responseIdentifier: `response-${ordinal}`,
+        });
+      }
+      emit('slotOnload', { responseIdentifier: 'response-1' });
+
+      const requested = facts.filter(({ kind }) => kind === 'slotRequested');
+      expect(requested.map(({ slot: snapshot }) => snapshot.cycleOrdinal)).toEqual(
+        Array.from({ length: cycleCount }, (_, index) => index + 1)
+      );
+      expect(facts[facts.length - 1]?.kind).toBe('slotOnload');
+      expect(facts[facts.length - 1]?.slot.cycleOrdinal).toBe(expectedOldOrdinal);
+    }
+  );
+
+  it.each(
+    [
+      'slotResponseReceived',
+      'slotRenderEnded',
+      'slotOnload',
+      'impressionViewable',
+      'slotVisibilityChanged',
+    ].flatMap((eventType) =>
+      ['before-next-start', 'after-next-start', 'after-next-completion'].map(
+        (position) => [eventType, position] as const
+      )
+    )
+  )(
+    'attributes an old %s callback %s only from exact retained evidence',
+    async (eventType, position) => {
+      const ready = createReadyGoogletag();
+      const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+      const facts: GoogletagDiagnosticsFact[] = [];
+      const firstState = { retired: false };
+      const secondState = { retired: false };
+      const first = createGoogletagTraceCycleHandle(() => firstState.retired);
+      const second = createGoogletagTraceCycleHandle(() => secondState.retired);
+      adapter.observeDiagnostics?.((fact) => facts.push(fact));
+      await adapter.run((gpt) => {
+        gpt.subscribe('slotRequested', (event) =>
+          (event as { cycle: number }).cycle === 1 ? first : second
+        );
+        gpt.subscribe('slotRenderEnded', (event) =>
+          (event as { cycle: number }).cycle === 1 ? first : second
+        );
+        for (const type of [
+          'slotResponseReceived',
+          'slotOnload',
+          'impressionViewable',
+          'slotVisibilityChanged',
+        ]) {
+          gpt.subscribe(type, () => undefined, true);
+        }
+      }).result;
+      const slot = { getSlotElementId: () => 'callback-order-slot' };
+      let emitted = 0;
+      const emit = (type: string, fields: Readonly<Record<string, unknown>>): void => {
+        emitted += 1;
+        const event = { slot, ...fields };
+        for (const listener of ready.listeners.get(type) ?? []) listener(event);
+      };
+      const oldFields = {
+        cycle: 1,
+        responseIdentifier: 'response-1',
+        ...(eventType === 'slotRenderEnded' ? { isEmpty: false } : {}),
+        ...(eventType === 'slotVisibilityChanged' ? { inViewPercentage: 25 } : {}),
+      };
+
+      emit('slotRequested', { cycle: 1 });
+      if (position !== 'before-next-start') {
+        emit('slotRenderEnded', {
+          cycle: 1,
+          isEmpty: false,
+          responseIdentifier: 'response-1',
+        });
+        firstState.retired = true;
+        emit('slotRequested', { cycle: 2 });
+        if (position === 'after-next-completion') {
+          emit('slotRenderEnded', {
+            cycle: 2,
+            isEmpty: false,
+            responseIdentifier: 'response-2',
+          });
+        }
+      }
+      emit(eventType, oldFields);
+
+      expect(facts).toHaveLength(emitted);
+      expect(facts[facts.length - 1]?.kind).toBe(eventType);
+      expect(facts[facts.length - 1]?.slot.cycleOrdinal).toBe(
+        eventType === 'slotRenderEnded' && position !== 'before-next-start' ? undefined : 1
+      );
+    }
+  );
 
   it('rolls back an exact GPT listener when installation replaces the binding', async () => {
     const first = createReadyGoogletag();

@@ -11,7 +11,6 @@ const DIAGNOSTICS_ONLY_EVENTS = Object.freeze([
   'impressionViewable',
   'slotVisibilityChanged',
 ] as const);
-
 export interface GptDiagnosticsFactBufferOptions {
   readonly onConsumerError?: (error: unknown) => void;
   readonly onOverflow?: (droppedFacts: number) => void;
@@ -21,6 +20,48 @@ export interface GptDiagnosticsFactBuffer {
   readonly publish: (fact: Readonly<GoogletagDiagnosticsFact>) => boolean;
   readonly activate: (consumer: GoogletagDiagnosticsObserver) => (() => void) | undefined;
   readonly dispose: () => void;
+}
+
+/** Project the direct opaque GPT fact into the bounded data-only core trace shape. */
+export function projectGptTraceFact(
+  fact: Readonly<GoogletagDiagnosticsFact>
+): Readonly<Record<string, unknown>> | undefined {
+  try {
+    const traceToken = fact.slot.traceToken;
+    const cycleOrdinal = fact.slot.cycleOrdinal;
+    if (
+      typeof traceToken !== 'string' ||
+      !/^gt1_[1-9a-z][0-9a-z]{0,6}$/.test(traceToken) ||
+      traceToken.length > 11 ||
+      Number.parseInt(traceToken.slice(4), 36) > 4_294_967_295 ||
+      !Number.isInteger(cycleOrdinal) ||
+      (cycleOrdinal ?? 0) < 1 ||
+      (cycleOrdinal ?? 0) > 4_294_967_295
+    ) {
+      return undefined;
+    }
+    const slot = Object.freeze({
+      token: traceToken,
+      cycleOrdinal,
+      ...(typeof fact.slot.elementId === 'string' && fact.slot.elementId !== ''
+        ? { elementId: fact.slot.elementId }
+        : {}),
+    });
+    return Object.freeze({
+      kind: fact.kind,
+      observedAtMs: fact.observedAtMs,
+      slot,
+      ...(typeof fact.isEmpty === 'boolean' ? { isEmpty: fact.isEmpty } : {}),
+      ...(typeof fact.inViewPercentage === 'number' && Number.isFinite(fact.inViewPercentage)
+        ? { inViewPercentage: fact.inViewPercentage }
+        : {}),
+      ...(typeof fact.responseIdentifier === 'string' && fact.responseIdentifier !== ''
+        ? { responseIdentifier: fact.responseIdentifier }
+        : {}),
+    });
+  } catch {
+    return undefined;
+  }
 }
 
 function validFact(fact: unknown): fact is Readonly<GoogletagDiagnosticsFact> {
@@ -39,7 +80,7 @@ function validFact(fact: unknown): fact is Readonly<GoogletagDiagnosticsFact> {
   );
 }
 
-/** Own the bounded handoff between early GPT callbacks and the diagnostics module. */
+/** Own the GPT-side bounded handoff between early callbacks and diagnostics consumers. */
 export function createGptDiagnosticsFactBuffer(
   options: GptDiagnosticsFactBufferOptions = {}
 ): GptDiagnosticsFactBuffer {
@@ -118,23 +159,12 @@ export function createGptDiagnosticsFactBuffer(
   });
 }
 
-/** Connect the sole GPT adapter stream and only the four diagnostics-only listeners. */
-export function activateGptDiagnosticsFactCapture(
-  adapter: Pick<GoogletagAdapter, 'observeDiagnostics' | 'run'>,
-  buffer: Pick<GptDiagnosticsFactBuffer, 'publish'>
+function activateEventListeners(
+  adapter: Pick<GoogletagAdapter, 'run'>,
+  onFailure: () => void = () => undefined
 ): (() => void) | undefined {
   let disposed = false;
   let releases: readonly (() => void)[] = Object.freeze([]);
-  const observeDiagnostics = adapter.observeDiagnostics;
-  const releaseObserver = observeDiagnostics((fact) => {
-    try {
-      buffer.publish(fact);
-    } catch {
-      // Fact buffering cannot alter the already-completed GPT callback.
-    }
-  });
-  if (!releaseObserver) return undefined;
-
   let operation: ReturnType<GoogletagAdapter['run']> | undefined;
   try {
     operation = adapter.run((gpt) => {
@@ -143,7 +173,7 @@ export function activateGptDiagnosticsFactCapture(
         for (let index = 0; index < DIAGNOSTICS_ONLY_EVENTS.length; index += 1) {
           const eventType = DIAGNOSTICS_ONLY_EVENTS[index];
           if (!eventType) continue;
-          installed[installed.length] = gpt.subscribe(eventType, () => undefined);
+          installed[installed.length] = gpt.subscribe(eventType, () => undefined, true);
         }
         return Object.freeze(installed);
       } catch (error) {
@@ -172,14 +202,14 @@ export function activateGptDiagnosticsFactCapture(
       },
       () => {
         try {
-          releaseObserver();
+          onFailure();
         } catch {
-          // Failed activation retains no observer ownership.
+          // Failure notification cannot retain listener ownership.
         }
       }
     );
   } catch {
-    releaseObserver();
+    onFailure();
     return undefined;
   }
 
@@ -199,10 +229,48 @@ export function activateGptDiagnosticsFactCapture(
       }
     }
     releases = Object.freeze([]);
+  };
+}
+
+/** Install only the four GPT listeners that exist while diagnostics is active. */
+export function activateGptDiagnosticsEventListeners(
+  adapter: Pick<GoogletagAdapter, 'run'>
+): (() => void) | undefined {
+  return activateEventListeners(adapter);
+}
+
+/** Connect the sole GPT adapter stream and only the four diagnostics-only listeners. */
+export function activateGptDiagnosticsFactCapture(
+  adapter: Pick<GoogletagAdapter, 'observeDiagnostics' | 'run'>,
+  buffer: Pick<GptDiagnosticsFactBuffer, 'publish'>
+): (() => void) | undefined {
+  let disposed = false;
+  const observerRelease = adapter.observeDiagnostics((fact) => {
     try {
-      releaseObserver();
+      buffer.publish(fact);
     } catch {
-      // The adapter's disposed latch remains authoritative.
+      // Fact buffering cannot alter the already-completed GPT callback.
+    }
+  });
+  if (!observerRelease) return undefined;
+  let observerActive = true;
+  const releaseObserver = (): void => {
+    if (!observerActive) return;
+    observerActive = false;
+    observerRelease();
+  };
+  const releaseListeners = activateEventListeners(adapter, releaseObserver);
+  if (!releaseListeners) {
+    releaseObserver();
+    return undefined;
+  }
+  return (): void => {
+    if (disposed) return;
+    disposed = true;
+    try {
+      releaseListeners();
+    } finally {
+      releaseObserver();
     }
   };
 }

@@ -1,0 +1,495 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import type {
+  IntegrationActivationContext,
+  IntegrationPrepareContext,
+  PreparedIntegration,
+} from '../../../src/kernel/integration_registry';
+import type { RuntimeCapabilityV1 } from '../../../src/kernel/runtime';
+import { createRenderRuntimeIntegrationRegistration } from '../../../src/integrations/render_runtime/module';
+import { log } from '../../../src/core/log';
+import type { RenderAttempt } from '../../../src/services/render';
+
+const RELEASE_ID = 'a'.repeat(64);
+
+afterEach(() => {
+  document.body.replaceChildren();
+});
+
+describe('render_runtime provider', () => {
+  it('rolls back prepared resources without unbound disposer failures', () => {
+    const release: Array<() => void> = [];
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+    const runtime = Object.freeze({
+      boot: () =>
+        Object.freeze({
+          auctionProjection: Object.freeze({
+            version: 1,
+            auction: Object.freeze({
+              version: 1,
+              auctionId: 'initial',
+              results: Object.freeze([]),
+            }),
+            slots: Object.freeze([]),
+            bids: Object.freeze([]),
+          }),
+          diagnostics: Object.freeze({
+            version: 1,
+            renderTraceOverlay: false,
+            gpt: Object.freeze({ active: false }),
+          }),
+          manifest: Object.freeze({
+            version: 1,
+            releaseId: RELEASE_ID,
+            criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'b'.repeat(64)}`,
+            integrations: Object.freeze([
+              Object.freeze({ id: 'render_runtime', phase: 'critical' as const }),
+            ]),
+          }),
+        }),
+      document,
+      generation: Object.freeze({}),
+      protectFirstDisplayAttemptBatch: vi.fn(() => true),
+    } satisfies RuntimeCapabilityV1);
+
+    createRenderRuntimeIntegrationRegistration(RELEASE_ID).prepare(
+      Object.freeze({
+        config: undefined,
+        interfaces: Object.freeze({ 'runtime.v1': runtime }),
+        signal: new AbortController().signal,
+        onDispose: (callback: () => void) => release.push(callback),
+      } satisfies IntegrationPrepareContext)
+    );
+    release.reverse().forEach((callback) => callback());
+
+    expect(warn).not.toHaveBeenCalledWith('render_runtime disposal failed', expect.anything());
+    warn.mockRestore();
+  });
+
+  it('stages the seven real capabilities inertly and activates direct registration once', () => {
+    const release: Array<() => void> = [];
+    const activationRelease: Array<() => void> = [];
+    const protect = vi.fn(() => true);
+    const runtime = Object.freeze({
+      boot: () =>
+        Object.freeze({
+          auctionProjection: Object.freeze({
+            version: 1,
+            auction: Object.freeze({
+              version: 1,
+              auctionId: 'initial',
+              results: Object.freeze([]),
+            }),
+            slots: Object.freeze([]),
+            bids: Object.freeze([]),
+          }),
+          diagnostics: Object.freeze({
+            version: 1,
+            renderTraceOverlay: false,
+            gpt: Object.freeze({ active: false }),
+          }),
+          manifest: Object.freeze({
+            version: 1,
+            releaseId: RELEASE_ID,
+            criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'b'.repeat(64)}`,
+            integrations: Object.freeze([
+              Object.freeze({ id: 'render_runtime', phase: 'critical' as const }),
+            ]),
+          }),
+        }),
+      document,
+      generation: Object.freeze({}),
+      protectFirstDisplayAttemptBatch: protect,
+    } satisfies RuntimeCapabilityV1);
+    const registration = createRenderRuntimeIntegrationRegistration(RELEASE_ID);
+    const prepared = registration.prepare(
+      Object.freeze({
+        config: undefined,
+        interfaces: Object.freeze({ 'runtime.v1': runtime }),
+        signal: new AbortController().signal,
+        onDispose: (callback: () => void) => release.push(callback),
+      } satisfies IntegrationPrepareContext)
+    );
+    if ('then' in Object(prepared)) throw new Error('render_runtime preparation must be sync');
+    const exactPrepared = prepared as PreparedIntegration;
+    const interfaces = exactPrepared.interfaces;
+    expect(Reflect.ownKeys(interfaces ?? {})).toEqual([
+      'slots.v1',
+      'auction.v1',
+      'render.v1',
+      'messages.v1',
+      'trace.v1',
+      'trace.presentation.v1',
+      'direct.v1',
+    ]);
+    const direct = interfaces?.['direct.v1'] as {
+      addAdUnits: (candidate: unknown) => unknown;
+    };
+    const slotCapability = interfaces?.['slots.v1'] as {
+      attachPhysicalService: (service: object) => () => void;
+      snapshot: () => readonly Readonly<{ registeredSlotId: string }>[];
+    };
+    expect(() =>
+      direct.addAdUnits({
+        code: 'programmatic',
+        mediaTypes: { banner: { sizes: [[300, 250]] } },
+        bids: [{ bidder: 'fictional', params: {} }],
+      })
+    ).toThrow();
+
+    exactPrepared.activate(
+      Object.freeze({
+        signal: new AbortController().signal,
+        onDispose: (callback: () => void) => activationRelease.push(callback),
+        afterCommit: vi.fn(),
+      } satisfies IntegrationActivationContext)
+    );
+    expect(
+      direct.addAdUnits({
+        code: 'programmatic',
+        mediaTypes: { banner: { sizes: [[300, 250]] } },
+        bids: [{ bidder: 'fictional', params: {} }],
+      })
+    ).toEqual({ registered: ['programmatic'] });
+    const physicalRecords: Array<Readonly<Record<string, unknown>>> = [];
+    const physicalService = Object.freeze({
+      register: vi.fn(
+        (_owner: object, registrations: readonly Readonly<Record<string, unknown>>[]) => {
+          physicalRecords.push(
+            ...registrations.map((registration) =>
+              Object.freeze({
+                ...registration,
+                navigationGeneration: Object.freeze({}),
+                domAliases: registration['domAliases'] ?? Object.freeze([]),
+              })
+            )
+          );
+          return Object.freeze({ ok: true as const, records: Object.freeze([...physicalRecords]) });
+        }
+      ),
+      snapshotRegisteredSlots: vi.fn(() => Object.freeze([...physicalRecords])),
+    });
+    const releasePhysical = slotCapability.attachPhysicalService(physicalService);
+    expect(physicalService.register).toHaveBeenCalledOnce();
+    expect(slotCapability.snapshot().map(({ registeredSlotId }) => registeredSlotId)).toEqual([
+      'programmatic',
+    ]);
+    releasePhysical();
+    expect(slotCapability.snapshot().map(({ registeredSlotId }) => registeredSlotId)).toEqual([
+      'programmatic',
+    ]);
+
+    activationRelease.reverse().forEach((callback) => callback());
+    release.reverse().forEach((callback) => callback());
+    expect(() =>
+      direct.addAdUnits({
+        code: 'late',
+        mediaTypes: { banner: { sizes: [[300, 250]] } },
+      })
+    ).toThrow();
+  });
+
+  it('rejects renderer and APS-message registration until activation and removes exact registrations', () => {
+    const release: Array<() => void> = [];
+    const activationRelease: Array<() => void> = [];
+    const runtime = Object.freeze({
+      boot: () =>
+        Object.freeze({
+          auctionProjection: Object.freeze({
+            version: 1,
+            auction: Object.freeze({
+              version: 1,
+              auctionId: 'initial',
+              results: Object.freeze([]),
+            }),
+            slots: Object.freeze([]),
+            bids: Object.freeze([]),
+          }),
+          diagnostics: Object.freeze({
+            version: 1,
+            renderTraceOverlay: false,
+            gpt: Object.freeze({ active: false }),
+          }),
+          manifest: Object.freeze({
+            version: 1,
+            releaseId: RELEASE_ID,
+            criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'b'.repeat(64)}`,
+            integrations: Object.freeze([
+              Object.freeze({ id: 'render_runtime', phase: 'critical' as const }),
+            ]),
+          }),
+        }),
+      document,
+      generation: Object.freeze({}),
+      protectFirstDisplayAttemptBatch: vi.fn(() => true),
+    } satisfies RuntimeCapabilityV1);
+    const prepared = createRenderRuntimeIntegrationRegistration(RELEASE_ID).prepare(
+      Object.freeze({
+        config: undefined,
+        interfaces: Object.freeze({ 'runtime.v1': runtime }),
+        signal: new AbortController().signal,
+        onDispose: (callback: () => void) => release.push(callback),
+      } satisfies IntegrationPrepareContext)
+    ) as PreparedIntegration;
+    const render = prepared.interfaces?.['render.v1'] as {
+      registerRenderer: (
+        type: 'aps',
+        renderer: (attempt: RenderAttempt, container: HTMLElement) => boolean
+      ) => () => void;
+    };
+    const messages = prepared.interfaces?.['messages.v1'] as {
+      messaging: {
+        parseProtocolMessage: (kind: 'apsEnvelope', candidate: unknown) => object | undefined;
+      };
+      registerApsValidation: (validation: Readonly<Record<string, unknown>>) => () => void;
+    };
+    const renderer = vi.fn(() => true);
+    const origin = window.location.origin;
+    const rendererUrl = new URL('/integrations/aps/renderer/v1', origin).href;
+    const validation = Object.freeze({
+      expectedPublisherOrigin: origin,
+      expectedRendererUrl: rendererUrl,
+      validateApsRenderer: vi.fn(() => true),
+    });
+    const envelope = Object.freeze({
+      version: 1,
+      nonce: `n1_${'a'.repeat(22)}`,
+      publisherOrigin: origin,
+      renderer: Object.freeze({
+        type: 'aps',
+        version: 1,
+        accountId: 'account',
+        bidId: 'bid',
+        tagType: 'iframe',
+        creativeUrl: 'https://example.test/creative',
+        width: 300,
+        height: 250,
+        aaxResponse: 'response',
+      }),
+    });
+
+    expect(() => render.registerRenderer('aps', renderer)).toThrow('inactive');
+    expect(() => messages.registerApsValidation(validation)).toThrow('inactive');
+    expect(messages.messaging.parseProtocolMessage('apsEnvelope', envelope)).toBeUndefined();
+
+    prepared.activate(
+      Object.freeze({
+        signal: new AbortController().signal,
+        onDispose: (callback: () => void) => activationRelease.push(callback),
+        afterCommit: vi.fn(),
+      } satisfies IntegrationActivationContext)
+    );
+    const hostileCause = new Error('publisher-owned validation trap');
+    const hostileValidation = new Proxy(Object.freeze({}), {
+      getPrototypeOf: () => {
+        throw hostileCause;
+      },
+    });
+    let validationError: unknown;
+    try {
+      messages.registerApsValidation(hostileValidation);
+    } catch (error) {
+      validationError = error;
+    }
+    expect(validationError).toBeInstanceOf(TypeError);
+    expect(validationError).toMatchObject({
+      message: 'APS message validation is malformed',
+      cause: hostileCause,
+    });
+    expect(Object.keys(validationError as object)).not.toContain('cause');
+    const releaseRenderer = render.registerRenderer('aps', renderer);
+    const releaseValidation = messages.registerApsValidation(validation);
+    expect(messages.messaging.parseProtocolMessage('apsEnvelope', envelope)).toEqual(envelope);
+    expect(() => render.registerRenderer('aps', vi.fn())).toThrow('duplicated');
+    expect(() => messages.registerApsValidation(validation)).toThrow('duplicated');
+
+    releaseRenderer();
+    releaseValidation();
+    const replacementRenderer = vi.fn(() => false);
+    const releaseReplacement = render.registerRenderer('aps', replacementRenderer);
+    const releaseReplacementValidation = messages.registerApsValidation(validation);
+    releaseRenderer();
+    releaseValidation();
+    expect(() => render.registerRenderer('aps', vi.fn())).toThrow('duplicated');
+    expect(() => messages.registerApsValidation(validation)).toThrow('duplicated');
+
+    activationRelease.reverse().forEach((callback) => callback());
+    expect(() => render.registerRenderer('aps', vi.fn())).toThrow('inactive');
+    expect(() => messages.registerApsValidation(validation)).toThrow('inactive');
+    expect(messages.messaging.parseProtocolMessage('apsEnvelope', envelope)).toBeUndefined();
+    releaseReplacement();
+    releaseReplacementValidation();
+    release.reverse().forEach((callback) => callback());
+  });
+
+  it('publishes the data-only render trace through the private capability and public diagnostics', () => {
+    const release: Array<() => void> = [];
+    const activationRelease: Array<() => void> = [];
+    const runtime = Object.freeze({
+      boot: () =>
+        Object.freeze({
+          auctionProjection: Object.freeze({
+            version: 1,
+            auction: Object.freeze({
+              version: 1,
+              auctionId: 'initial',
+              results: Object.freeze([
+                Object.freeze({ slot: 'slot-one', outcome: 'no_bid' as const }),
+              ]),
+            }),
+            slots: Object.freeze([
+              Object.freeze({
+                slot: 'slot-one',
+                gamUnitPath: '/123/slot-one',
+                divId: 'slot-one',
+                formats: Object.freeze([Object.freeze([300, 250])]),
+                targeting: Object.freeze({}),
+              }),
+            ]),
+            bids: Object.freeze([]),
+          }),
+          diagnostics: Object.freeze({
+            version: 1,
+            renderTraceOverlay: true,
+            gpt: Object.freeze({ active: false }),
+          }),
+          manifest: Object.freeze({
+            version: 1,
+            releaseId: RELEASE_ID,
+            criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'b'.repeat(64)}`,
+            integrations: Object.freeze([
+              Object.freeze({ id: 'render_runtime', phase: 'critical' as const }),
+            ]),
+          }),
+        }),
+      document,
+      generation: Object.freeze({}),
+      protectFirstDisplayAttemptBatch: vi.fn(() => true),
+    } satisfies RuntimeCapabilityV1);
+    const prepared = createRenderRuntimeIntegrationRegistration(RELEASE_ID).prepare(
+      Object.freeze({
+        config: undefined,
+        interfaces: Object.freeze({ 'runtime.v1': runtime }),
+        signal: new AbortController().signal,
+        onDispose: (callback: () => void) => release.push(callback),
+      } satisfies IntegrationPrepareContext)
+    ) as PreparedIntegration;
+    const trace = prepared.interfaces?.['trace.v1'] as {
+      diagnostics: {
+        current: () => Readonly<Record<string, Readonly<Record<string, unknown>>>>;
+      };
+      observations: { publish: (observation: Readonly<Record<string, unknown>>) => boolean };
+      record: (record: Readonly<Record<string, unknown>>) => Readonly<Record<string, unknown>>;
+    };
+    const tracePresentation = prepared.interfaces?.['trace.presentation.v1'] as {
+      attachPresentation: (factory: (source: object) => object) => () => void;
+    };
+    const direct = prepared.interfaces?.['direct.v1'] as {
+      diagnostics: { renderTrace: object };
+    };
+    const slots = prepared.interfaces?.['slots.v1'] as {
+      attachPhysicalService: (service: object) => () => void;
+    };
+    prepared.activate(
+      Object.freeze({
+        signal: new AbortController().signal,
+        onDispose: (callback: () => void) => activationRelease.push(callback),
+        afterCommit: vi.fn(),
+      } satisfies IntegrationActivationContext)
+    );
+    let physicalRecords: readonly Readonly<Record<string, unknown>>[] = Object.freeze([]);
+    const physicalService = Object.freeze({
+      register: (
+        owner: { generation: object },
+        registrations: readonly Readonly<Record<string, unknown>>[]
+      ) => {
+        physicalRecords = Object.freeze(
+          registrations.map((registration) =>
+            Object.freeze({
+              ...registration,
+              domAliases: registration['domAliases'] ?? Object.freeze([]),
+              navigationGeneration: owner.generation,
+              traceToken: 'gt1_1',
+            })
+          )
+        );
+        return Object.freeze({ ok: true as const, records: physicalRecords });
+      },
+      resolveDomAlias: (alias: string) =>
+        physicalRecords.find((record) =>
+          (record['domAliases'] as readonly string[]).includes(alias)
+        ),
+      resolveRegisteredSlot: (slotId: string) =>
+        physicalRecords.find((record) => record['registeredSlotId'] === slotId),
+      snapshotRegisteredSlots: () => physicalRecords,
+    });
+    const releasePhysicalService = slots.attachPhysicalService(physicalService);
+
+    expect(Reflect.ownKeys(trace)).toEqual([
+      'record',
+      'enrich',
+      'prune',
+      'diagnostics',
+      'observations',
+    ]);
+    expect(Object.isFrozen(trace)).toBe(true);
+    expect(Reflect.ownKeys(trace.observations)).toEqual(['publish']);
+    expect('attachPresentation' in trace).toBe(false);
+    expect(Reflect.ownKeys(tracePresentation)).toEqual(['attachPresentation']);
+    expect(Object.isFrozen(tracePresentation)).toBe(true);
+    expect(tracePresentation.attachPresentation).toBeTypeOf('function');
+    expect(direct.diagnostics.renderTrace).toBe(trace.diagnostics);
+    expect(document.getElementById('ts-render-trace-panel')).toBeNull();
+    expect(
+      trace.observations.publish(
+        Object.freeze({
+          kind: 'render_attempt',
+          attemptId: 'attempt-one',
+          slotId: 'slot-one',
+          path: 'auction',
+          rendered: true,
+          injected: true,
+          servedFrom: 'inline',
+          state: 'accepted',
+          outcome: Object.freeze({ outcome: 'accepted' }),
+        })
+      )
+    ).toBe(true);
+    expect(trace.diagnostics.current()['slot-one']).toMatchObject({
+      slotId: 'slot-one',
+      path: 'auction',
+      rendered: true,
+      injected: true,
+      servedFrom: 'inline',
+    });
+    expect(
+      trace.observations.publish(
+        Object.freeze({
+          kind: 'slotRequested',
+          slot: Object.freeze({ token: 'gt1_1', cycleOrdinal: 1, elementId: 'slot-one' }),
+        })
+      )
+    ).toBe(true);
+    expect(
+      trace.observations.publish(
+        Object.freeze({
+          kind: 'slotRenderEnded',
+          slot: Object.freeze({ token: 'gt1_1', cycleOrdinal: 1, elementId: 'slot-one' }),
+          isEmpty: false,
+        })
+      )
+    ).toBe(true);
+    expect(trace.diagnostics.current()['slot-one']).toMatchObject({
+      count: 2,
+      path: 'gam-refresh',
+      rendered: true,
+      servedFrom: 'gam',
+    });
+    expect(document.getElementById('ts-render-trace-panel')).toBeNull();
+
+    activationRelease.reverse().forEach((callback) => callback());
+    releasePhysicalService();
+    release.reverse().forEach((callback) => callback());
+    expect(trace.diagnostics.current()).toEqual({});
+  });
+});

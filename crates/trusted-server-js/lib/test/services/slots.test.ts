@@ -8,6 +8,7 @@ import {
   type GoogletagPublisherCallAdmission,
   type GoogletagReplacementCommitAdmission,
   type GoogletagReplacementDefinition,
+  type GptSlotTokenV1,
 } from '../../src/adapters/googletag';
 import { createTestNavigationIdentityIssuer } from '../../src/kernel/identity';
 import { createRuntimeSession, type NavigationSession } from '../../src/kernel/sessions';
@@ -65,6 +66,8 @@ function createGptHarness(
   const addService = vi.fn();
   const operationDisposals: Array<ReturnType<typeof vi.fn>> = [];
   const bindingToken = Object.freeze({});
+  const traceTokens = new WeakMap<object, GptSlotTokenV1>();
+  let nextTraceToken = 1;
   let deferredDestroyedResolved = false;
   let resolveDeferredDestroyedPromise!: () => void;
   const deferredDestroyedPromise = new Promise<void>((resolve) => {
@@ -146,6 +149,15 @@ function createGptHarness(
     notifyReady: vi.fn(),
     observeDiagnostics: () => vi.fn(),
     observePublisherCalls: () => vi.fn(),
+    traceToken: (slot: object) => {
+      let token = traceTokens.get(slot);
+      if (!token) {
+        token = `gt1_${nextTraceToken.toString(36)}` as GptSlotTokenV1;
+        nextTraceToken += 1;
+        traceTokens.set(slot, token);
+      }
+      return token;
+    },
     run: <T>(command: (gpt: Readonly<GoogletagFacade>) => T) => {
       let disposed = false;
       const dispose = vi.fn(() => {
@@ -309,6 +321,27 @@ function createReconciliationBoundary() {
 
 describe('slot registry', () => {
   afterEach(() => vi.useRealTimers());
+
+  it('copies the adapter-owned canonical token into the adopted SlotRecord', () => {
+    const harness = createGptHarness();
+    const service = createSlotService({ googletag: harness.adapter });
+    const navigation = createNavigation();
+    const physical = {};
+    expect(service.register(navigation, [serverRegistration('token-slot')])).toMatchObject({
+      ok: true,
+    });
+
+    expect(
+      service.adoptGptSlot(navigation.generation, 'token-slot', {
+        ownership: 'publisher',
+        slot: physical,
+      })
+    ).toEqual({ ok: true });
+    const record = service.resolveRegisteredSlot('token-slot');
+    expect(record?.traceToken).toBe('gt1_1');
+    expect(Object.isFrozen(record)).toBe(true);
+    expect(harness.adapter.traceToken(physical)).toBe(record?.traceToken);
+  });
 
   it('accepts exact nonempty 256-byte ids and rejects empty, 257-byte, and ASCII controls', () => {
     const service = createSlotService({ googletag: createGptHarness().adapter });
@@ -3678,6 +3711,34 @@ describe('Task 11 adversarial ownership review', () => {
     expect(service.snapshotForTest().cycles).toBe(0);
   });
 
+  it('returns an exact accepted cycle handle and retires it on replacement and navigation', () => {
+    const service = createSlotService({ googletag: createGptHarness().adapter });
+    const navigation = createNavigation();
+    const slot = bindTrustedSlot(service, navigation);
+
+    const first = service.handleGptEvent('slotRequested', { slot });
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(Reflect.ownKeys(first ?? {})).toEqual(['isRetired']);
+    expect(first?.isRetired()).toBe(false);
+    expect(service.handleGptEvent('slotRequested', { slot })).toBeUndefined();
+    expect(
+      service.handleGptEvent('slotRenderEnded', {
+        isEmpty: false,
+        responseIdentifier: 'first-response',
+        slot,
+      })
+    ).toBe(first);
+    expect(first?.isRetired()).toBe(false);
+
+    const second = service.handleGptEvent('slotRequested', { slot });
+    expect(second).not.toBe(first);
+    expect(first?.isRetired()).toBe(true);
+    expect(second?.isRetired()).toBe(false);
+
+    navigation.dispose();
+    expect(second?.isRetired()).toBe(true);
+  });
+
   it('bounds publisher intent accounting and fails closed on overflow', async () => {
     const service = createSlotService({ googletag: createGptHarness().adapter });
     const navigation = createNavigation();
@@ -4302,6 +4363,7 @@ describe('Task 11 adversarial ownership review', () => {
         notifyReady: vi.fn(),
         observeDiagnostics: () => vi.fn(),
         observePublisherCalls: () => vi.fn(),
+        traceToken: () => undefined,
         run: <T>(command: (gpt: Readonly<GoogletagFacade>) => T) => {
           let value: T;
           try {

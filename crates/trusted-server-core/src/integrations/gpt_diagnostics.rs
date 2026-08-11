@@ -1,9 +1,9 @@
 //! Query-activated, browser-session GPT runtime diagnostics integration.
 //!
-//! Deployment configuration makes the standalone browser module available.
-//! Exact `ts_console` directives establish or clear a host-only session cookie;
-//! active documents load the module synchronously without adding diagnostics to
-//! the ordinary unified bundle.
+//! Exact `ts_console` directives establish or clear a host-only session cookie.
+//! Active documents select `gpt_diagnostics` as a critical member of the unified
+//! TSJS manifest, whose runtime owns diagnostics fact capture and delivery. No
+//! standalone diagnostics browser module or script tag is emitted.
 
 use error_stack::{Report, ResultExt};
 use http::{HeaderValue, Method, Request, Response, Uri, header, uri::PathAndQuery};
@@ -16,7 +16,6 @@ use crate::error::TrustedServerError;
 use crate::http_util::is_navigation_request;
 use crate::response_privacy::CDN_CACHE_HEADERS;
 use crate::settings::{IntegrationConfig, Settings};
-use crate::tsjs;
 
 use super::IntegrationRegistration;
 
@@ -26,9 +25,7 @@ pub const GPT_DIAGNOSTICS_INTEGRATION_ID: &str = "gpt_diagnostics";
 pub const GPT_DIAGNOSTICS_QUERY: &str = "ts_console";
 /// Host-only browser-session activation cookie.
 pub const GPT_DIAGNOSTICS_COOKIE: &str = "__Host-ts-console";
-/// Static filename for the request-scoped, non-authoritative URL cleanup asset.
-pub const GPT_DIAGNOSTICS_BOOTSTRAP_FILENAME: &str = "tsjs-gpt_diagnostics-bootstrap.min.js";
-/// Browser program served only as a public static asset and injected per request.
+/// Request-scoped browser program that removes the consumed directive from the visible URL.
 pub const GPT_DIAGNOSTICS_BOOTSTRAP_SOURCE: &str = include_str!("gpt_diagnostics_bootstrap.js");
 
 const SET_CONSOLE_COOKIE: &str = "__Host-ts-console=1; Path=/; Secure; HttpOnly; SameSite=Lax";
@@ -39,7 +36,7 @@ const CLEAR_CONSOLE_COOKIE: &str =
 #[derive(Debug, Clone, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct GptDiagnosticsConfig {
-    /// Whether the GPT diagnostics browser module is available.
+    /// Whether requests may activate the unified critical GPT diagnostics runtime.
     #[serde(default)]
     pub enabled: bool,
 }
@@ -96,26 +93,11 @@ impl GptDiagnosticsRequestDecision {
             || self.reserved_directive
     }
 
-    /// Build the synchronous standalone diagnostics module tag.
-    #[must_use]
-    pub fn module_script_tag(&self) -> Option<String> {
-        self.active.then(|| {
-            format!(
-                "<script src=\"{}\"></script>",
-                tsjs::tsjs_single_module_script_src(GPT_DIAGNOSTICS_INTEGRATION_ID)
-            )
-        })
-    }
-
-    /// Build the one-time external URL-cleanup tag after reserved input was consumed.
+    /// Build the one-time inline URL-cleanup tag after reserved input was consumed.
     #[must_use]
     pub fn url_cleanup_script_tag(&self) -> Option<String> {
-        self.cleanup_browser_url.then(|| {
-            format!(
-                "<script src=\"/static/tsjs={}\"></script>",
-                GPT_DIAGNOSTICS_BOOTSTRAP_FILENAME
-            )
-        })
+        self.cleanup_browser_url
+            .then(|| format!("<script>{GPT_DIAGNOSTICS_BOOTSTRAP_SOURCE}</script>"))
     }
 }
 
@@ -407,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn ts_console_register_excludes_diagnostics_from_unified_and_deferred_bundles() {
+    fn ts_console_register_defers_browser_delivery_to_the_unified_critical_catalog() {
         let registry = IntegrationRegistry::new(&settings(true)).expect("should build registry");
 
         assert!(registry.integration_enabled(GPT_DIAGNOSTICS_INTEGRATION_ID));
@@ -443,14 +425,13 @@ mod tests {
         );
         assert_eq!(request.headers()[header::COOKIE], "other=value");
         assert_eq!(decision.boot_config_json(), r#"{"active":true}"#);
-        assert_eq!(
-            decision.url_cleanup_script_tag(),
-            Some(
-                "<script src=\"/static/tsjs=tsjs-gpt_diagnostics-bootstrap.min.js\"></script>"
-                    .to_owned()
-            ),
-            "a server-consumed directive should authorize one external cleanup asset"
-        );
+        let cleanup = decision
+            .url_cleanup_script_tag()
+            .expect("a server-consumed directive should authorize inline cleanup");
+        assert!(cleanup.starts_with("<script>"));
+        assert!(cleanup.ends_with("</script>"));
+        assert!(cleanup.contains("history.replaceState"));
+        assert!(!cleanup.contains(" src="));
     }
 
     #[test]

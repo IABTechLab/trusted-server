@@ -192,7 +192,11 @@ export interface GoogletagFacade {
   setTargeting(slot: object, key: string, value: string | readonly string[]): unknown;
   slotElementId?(slot: object): unknown;
   slots(): readonly object[];
-  subscribe(eventType: string, listener: (event: unknown) => void): () => void;
+  subscribe(
+    eventType: string,
+    listener: (event: unknown) => Readonly<GoogletagTraceCycleHandle> | void,
+    diagnosticsOwner?: boolean
+  ): () => void;
   transactionalReplace(
     oldSlot: object,
     definition: GoogletagReplacementDefinition | undefined,
@@ -216,6 +220,7 @@ export interface GoogletagOperation<T> {
 /** Narrow GPT boundary consumed by kernel sessions and services. */
 export interface GoogletagAdapter {
   bindingStatus(): GoogletagBindingStatus;
+  traceToken(slot: object): GptSlotTokenV1 | undefined;
   observeDiagnostics(observer: GoogletagDiagnosticsObserver): (() => void) | undefined;
   observePublisherCalls(observer: GoogletagPublisherCallObserver): () => void;
   run<T>(
@@ -243,11 +248,45 @@ export interface GoogletagDiagnosticsFact {
   readonly isBackfill?: boolean;
   readonly slotContentChanged?: boolean;
   readonly inViewPercentage?: number;
+  readonly responseIdentifier?: string;
+}
+
+export type GptSlotTokenV1 = string & { readonly __brand: 'GptSlotTokenV1' };
+export type GptTraceCycleOrdinalV1 = number & {
+  readonly __brand: 'GptTraceCycleOrdinalV1';
+};
+
+/** Exact lifecycle-owned attribution accepted by the GPT diagnostics producer. */
+export interface GoogletagTraceCycleHandle {
+  readonly isRetired: () => boolean;
+}
+
+const googletagTraceCycleHandles = new WeakSet<object>();
+
+/** Create one opaque adapter-branded handle for an accepted physical request cycle. */
+export function createGoogletagTraceCycleHandle(
+  isRetired: () => boolean
+): Readonly<GoogletagTraceCycleHandle> {
+  if (typeof isRetired !== 'function') throw new TypeError('invalid GPT trace cycle retirement');
+  const handle = Object.freeze({ isRetired });
+  googletagTraceCycleHandles.add(handle);
+  return handle;
+}
+
+function acceptedTraceCycleHandle(value: unknown): value is Readonly<GoogletagTraceCycleHandle> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    Object.isFrozen(value) &&
+    googletagTraceCycleHandles.has(value)
+  );
 }
 
 /** Frozen, non-authoritative identity and metadata captured from one physical GPT slot. */
 export interface GoogletagDiagnosticsSlotSnapshot {
   readonly token: object;
+  readonly traceToken?: GptSlotTokenV1;
+  readonly cycleOrdinal?: GptTraceCycleOrdinalV1;
   readonly elementId?: string;
   readonly adUnitPath?: string;
 }
@@ -258,6 +297,23 @@ export type GoogletagDiagnosticsObserver = (fact: Readonly<GoogletagDiagnosticsF
 export interface GoogletagGlobalTarget {
   googletag?: unknown;
   performance?: unknown;
+}
+
+export type GoogletagDiagnosticsFailureCode =
+  | 'trace_cycle_ambiguity'
+  | 'trace_cycle_collision'
+  | 'trace_cycle_exhausted'
+  | 'trace_cycle_invalid'
+  | 'trace_token_collision'
+  | 'trace_token_exhausted'
+  | 'trace_token_invalid';
+
+/** Test seams and local reporting for diagnostics-only identity construction. */
+export interface GoogletagDiagnosticsIdentityOptions {
+  readonly initialTraceCycleOrdinal?: number;
+  readonly initialTraceTokenOrdinal?: number;
+  readonly mintTraceToken?: (ordinal: number) => unknown;
+  readonly reportDiagnosticsFailure?: (code: GoogletagDiagnosticsFailureCode) => void;
 }
 
 interface CommandQueue {
@@ -319,6 +375,7 @@ const mapGetIntrinsic = Map.prototype.get;
 const mapKeysIntrinsic = Map.prototype.keys;
 const setDeleteIntrinsic = Set.prototype.delete;
 const setAddIntrinsic = Set.prototype.add;
+const setHasIntrinsic = Set.prototype.has;
 const setSizeGetter = Object.getOwnPropertyDescriptor(Set.prototype, 'size')?.get as (
   this: Set<unknown>
 ) => number;
@@ -349,6 +406,10 @@ function deleteSetValue<T>(set: Set<T>, value: T): boolean {
 
 function addSetValue<T>(set: Set<T>, value: T): void {
   Reflect.apply(setAddIntrinsic, set, [value]);
+}
+
+function setHasValue<T>(set: Set<T>, value: T): boolean {
+  return Reflect.apply(setHasIntrinsic, set, [value]) as boolean;
 }
 
 function setValues<T>(set: Set<T>): IterableIterator<T> {
@@ -475,7 +536,11 @@ function createFacade(
     arguments_: readonly unknown[]
   ) => unknown,
   consumeFacadeCall: (callable: (...arguments_: unknown[]) => unknown) => boolean,
-  publishDiagnostics: (eventType: string, event: unknown) => void
+  publishDiagnostics: (
+    eventType: string,
+    event: unknown,
+    handle: Readonly<GoogletagTraceCycleHandle> | undefined
+  ) => void
 ): Readonly<GoogletagFacade> {
   const member = (external: object, key: PropertyKey): ((...args: unknown[]) => unknown) => {
     if (!isOperationCurrent()) throw new GoogletagAdapterError('external_artifact_incompatible');
@@ -814,18 +879,31 @@ function createFacade(
       if (!isOperationCurrent()) throw new GoogletagAdapterError('external_artifact_incompatible');
       return Object.freeze([...currentSlots]);
     },
-    subscribe: (eventType: string, listener: (event: unknown) => void): (() => void) => {
+    subscribe: (
+      eventType: string,
+      listener: (event: unknown) => Readonly<GoogletagTraceCycleHandle> | void,
+      diagnosticsOwner = false
+    ): (() => void) => {
       const currentService = service();
       const add = member(currentService, 'addEventListener');
       const remove = member(currentService, 'removeEventListener');
       const wrapped = (event: unknown): void => {
         if (!isBindingCurrent()) return;
+        let handle: Readonly<GoogletagTraceCycleHandle> | void = undefined;
         try {
-          listener(event);
+          handle = listener(event);
         } catch {
           // Publisher and service callbacks cannot escape the GPT boundary.
         }
-        publishDiagnostics(eventType, event);
+        if (diagnosticsOwner) {
+          publishDiagnostics(eventType, event, undefined);
+        } else if (eventType === 'slotRequested' || eventType === 'slotRenderEnded') {
+          publishDiagnostics(
+            eventType,
+            event,
+            acceptedTraceCycleHandle(handle) ? handle : undefined
+          );
+        }
       };
       let attempted = false;
       const rollback = (): void => {
@@ -972,7 +1050,8 @@ function createFacade(
 
 /** Create the sole production reader/writer boundary for `window.googletag`. */
 export function createBrowserGoogletagAdapter(
-  target: GoogletagGlobalTarget = window as unknown as GoogletagGlobalTarget
+  target: GoogletagGlobalTarget = window as unknown as GoogletagGlobalTarget,
+  diagnosticsOptions: GoogletagDiagnosticsIdentityOptions = {}
 ): GoogletagAdapter {
   const pending: PendingOperation<unknown>[] = [];
   const live = new Set<PendingOperation<unknown>>();
@@ -985,18 +1064,235 @@ export function createBrowserGoogletagAdapter(
     (...arguments_: unknown[]) => unknown
   >();
   const bindingTokens = new WeakMap<object, object>();
-  const diagnosticsSlots = new WeakMap<object, GoogletagDiagnosticsSlotSnapshot>();
+  interface TraceCycle {
+    readonly handle: Readonly<GoogletagTraceCycleHandle>;
+    readonly ordinal: GptTraceCycleOrdinalV1;
+    readonly seen: Set<GoogletagDiagnosticsEventName>;
+    responseIdentifier?: string;
+    state: 'open' | 'completed' | 'retired';
+  }
+  interface DiagnosticsSlotState {
+    readonly adUnitPath?: string;
+    readonly cycles: TraceCycle[];
+    readonly elementId?: string;
+    nextCycleOrdinal: number;
+    readonly token: object;
+    readonly traceToken?: GptSlotTokenV1;
+    unknownPriorCycle: boolean;
+  }
+  const diagnosticsSlots = new WeakMap<object, DiagnosticsSlotState>();
+  const traceCycleHandleOwners = new WeakMap<
+    Readonly<GoogletagTraceCycleHandle>,
+    DiagnosticsSlotState
+  >();
+  const mintTraceToken =
+    typeof diagnosticsOptions.mintTraceToken === 'function'
+      ? diagnosticsOptions.mintTraceToken
+      : undefined;
+  const mintedTraceTokens = mintTraceToken ? new Set<string>() : undefined;
+  const reportedDiagnosticsFailures = new Set<GoogletagDiagnosticsFailureCode>();
   const initialLoadReleases = new Map<object, () => void>();
   const initialLoadOwner = Object.freeze({});
   let diagnosticsObserver: GoogletagDiagnosticsObserver | undefined;
+  let nextTraceTokenOrdinal = diagnosticsOptions.initialTraceTokenOrdinal ?? 1;
   let pendingReservations = 0;
   let disposed = false;
   let firstDisplayObserved = false;
 
+  const reportDiagnosticsFailure = (code: GoogletagDiagnosticsFailureCode): void => {
+    try {
+      if (setHasValue(reportedDiagnosticsFailures, code)) return;
+      addSetValue(reportedDiagnosticsFailures, code);
+    } catch {
+      return;
+    }
+    try {
+      diagnosticsOptions.reportDiagnosticsFailure?.(code);
+    } catch {
+      // Local diagnostics reporting cannot affect GPT lifecycle behavior.
+    }
+  };
+
+  const createDiagnosticsSlotState = (physicalSlot: object): DiagnosticsSlotState => {
+    const optionalStringCall = (key: 'getSlotElementId' | 'getAdUnitPath'): string | undefined => {
+      const method = safeMember(physicalSlot, key);
+      if (typeof method !== 'function') return undefined;
+      try {
+        const value = Reflect.apply(method, physicalSlot, []);
+        return typeof value === 'string' && value.length > 0 ? value : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+    const ordinal = nextTraceTokenOrdinal;
+    let traceToken: GptSlotTokenV1 | undefined;
+    if (Number.isInteger(ordinal) && ordinal >= 1 && ordinal <= 4_294_967_295) {
+      let candidate: unknown;
+      try {
+        candidate = mintTraceToken ? mintTraceToken(ordinal) : `gt1_${ordinal.toString(36)}`;
+      } catch {
+        reportDiagnosticsFailure('trace_token_invalid');
+      }
+      if (
+        typeof candidate === 'string' &&
+        /^gt1_[1-9a-z][0-9a-z]{0,6}$/.test(candidate) &&
+        candidate.length <= 11 &&
+        Number.parseInt(candidate.slice(4), 36) <= 4_294_967_295
+      ) {
+        if (mintedTraceTokens && setHasValue(mintedTraceTokens, candidate)) {
+          reportDiagnosticsFailure('trace_token_collision');
+        } else {
+          try {
+            if (mintedTraceTokens) addSetValue(mintedTraceTokens, candidate);
+            traceToken = candidate as GptSlotTokenV1;
+            nextTraceTokenOrdinal += 1;
+          } catch {
+            if (mintedTraceTokens) deleteSetValue(mintedTraceTokens, candidate);
+            reportDiagnosticsFailure('trace_token_invalid');
+          }
+        }
+      } else if (candidate !== undefined) {
+        reportDiagnosticsFailure('trace_token_invalid');
+      }
+    } else {
+      reportDiagnosticsFailure(
+        Number.isInteger(ordinal) && ordinal > 4_294_967_295
+          ? 'trace_token_exhausted'
+          : 'trace_token_invalid'
+      );
+    }
+    const elementId = optionalStringCall('getSlotElementId');
+    const adUnitPath = optionalStringCall('getAdUnitPath');
+    return {
+      ...(adUnitPath === undefined ? {} : { adUnitPath }),
+      cycles: [],
+      ...(elementId === undefined ? {} : { elementId }),
+      nextCycleOrdinal: diagnosticsOptions.initialTraceCycleOrdinal ?? 1,
+      token: Object.freeze(Object.create(null) as object),
+      ...(traceToken === undefined ? {} : { traceToken }),
+      unknownPriorCycle: false,
+    };
+  };
+
+  const diagnosticsSlotState = (physicalSlot: object): DiagnosticsSlotState | undefined => {
+    if (disposed) return undefined;
+    try {
+      let state = weakMapValue(diagnosticsSlots, physicalSlot);
+      if (!state) {
+        state = createDiagnosticsSlotState(physicalSlot);
+        setWeakMapValue(diagnosticsSlots, physicalSlot, state);
+        if (weakMapValue(diagnosticsSlots, physicalSlot) !== state) return undefined;
+      }
+      return state;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const traceCycle = (
+    state: DiagnosticsSlotState,
+    eventType: GoogletagDiagnosticsEventName,
+    responseIdentifier: string | undefined,
+    acceptedHandle: Readonly<GoogletagTraceCycleHandle> | undefined
+  ): GptTraceCycleOrdinalV1 | undefined => {
+    if (!state.traceToken) return undefined;
+    const isRetired = (handle: Readonly<GoogletagTraceCycleHandle>): boolean => {
+      try {
+        return handle.isRetired() === true;
+      } catch {
+        return true;
+      }
+    };
+    for (let index = 0; index < state.cycles.length; index += 1) {
+      const cycle = state.cycles[index];
+      if (cycle && cycle.state !== 'retired' && isRetired(cycle.handle)) {
+        cycle.state = 'retired';
+      }
+    }
+    if (eventType === 'slotRequested') {
+      if (!acceptedHandle || isRetired(acceptedHandle)) return undefined;
+      if (
+        weakMapValue(traceCycleHandleOwners, acceptedHandle) !== undefined ||
+        state.cycles.some((cycle) => cycle.handle === acceptedHandle) ||
+        state.cycles.some((cycle) => cycle.state === 'open')
+      ) {
+        reportDiagnosticsFailure('trace_cycle_collision');
+        return undefined;
+      }
+      const ordinal = state.nextCycleOrdinal;
+      if (!Number.isInteger(ordinal) || ordinal < 1 || ordinal > 4_294_967_295) {
+        reportDiagnosticsFailure(
+          Number.isInteger(ordinal) && ordinal > 4_294_967_295
+            ? 'trace_cycle_exhausted'
+            : 'trace_cycle_invalid'
+        );
+        return undefined;
+      }
+      if (state.cycles.length >= 10) {
+        const pruneIndex = state.cycles.findIndex((cycle) => cycle.state !== 'open');
+        if (pruneIndex < 0) {
+          reportDiagnosticsFailure('trace_cycle_collision');
+          return undefined;
+        }
+        state.cycles.splice(pruneIndex, 1);
+        state.unknownPriorCycle = true;
+      }
+      const cycle: TraceCycle = {
+        handle: acceptedHandle,
+        ordinal: ordinal as GptTraceCycleOrdinalV1,
+        seen: new Set([eventType]),
+        state: 'open',
+      };
+      try {
+        setWeakMapValue(traceCycleHandleOwners, acceptedHandle, state);
+      } catch {
+        reportDiagnosticsFailure('trace_cycle_invalid');
+        return undefined;
+      }
+      state.cycles.push(cycle);
+      state.nextCycleOrdinal += 1;
+      return cycle.ordinal;
+    }
+
+    let candidates: TraceCycle[] = [];
+    if (acceptedHandle !== undefined) {
+      candidates = state.cycles.filter(
+        (cycle) => cycle.handle === acceptedHandle && !cycle.seen.has(eventType)
+      );
+    } else if (responseIdentifier !== undefined) {
+      candidates = state.cycles.filter(
+        (cycle) => cycle.responseIdentifier === responseIdentifier && !cycle.seen.has(eventType)
+      );
+      if (candidates.length === 0) {
+        const open = state.cycles.filter(
+          (cycle) =>
+            cycle.state === 'open' &&
+            cycle.responseIdentifier === undefined &&
+            !cycle.seen.has(eventType)
+        );
+        if (open.length === 1) candidates = open;
+      }
+    } else if (!state.unknownPriorCycle) {
+      candidates = state.cycles.filter((cycle) => !cycle.seen.has(eventType));
+    }
+    if (candidates.length !== 1) {
+      if (candidates.length > 1) reportDiagnosticsFailure('trace_cycle_ambiguity');
+      return undefined;
+    }
+    const cycle = candidates[0]!;
+    cycle.seen.add(eventType);
+    if (responseIdentifier !== undefined && cycle.responseIdentifier === undefined) {
+      cycle.responseIdentifier = responseIdentifier;
+    }
+    if (eventType === 'slotRenderEnded') cycle.state = 'completed';
+    return cycle.ordinal;
+  };
+
   const diagnosticFact = (
     eventType: string,
     event: unknown,
-    observedAtMs: number
+    observedAtMs: number,
+    acceptedHandle: Readonly<GoogletagTraceCycleHandle> | undefined
   ): Readonly<GoogletagDiagnosticsFact> | undefined => {
     try {
       if ((typeof event !== 'object' || event === null) && typeof event !== 'function') {
@@ -1007,31 +1303,28 @@ export function createBrowserGoogletagAdapter(
         return undefined;
       }
       const physicalSlot = slot as object;
-      let safeSlot = weakMapValue(diagnosticsSlots, physicalSlot);
-      if (!safeSlot) {
-        const optionalStringCall = (
-          key: 'getSlotElementId' | 'getAdUnitPath'
-        ): string | undefined => {
-          const method = safeMember(physicalSlot, key);
-          if (typeof method !== 'function') return undefined;
-          try {
-            const value = Reflect.apply(method, physicalSlot, []);
-            return typeof value === 'string' && value.length > 0 ? value : undefined;
-          } catch {
-            return undefined;
-          }
-        };
-        const token = Object.freeze(Object.create(null) as object);
-        const elementId = optionalStringCall('getSlotElementId');
-        const adUnitPath = optionalStringCall('getAdUnitPath');
-        safeSlot = Object.freeze({
-          token,
-          ...(elementId === undefined ? {} : { elementId }),
-          ...(adUnitPath === undefined ? {} : { adUnitPath }),
-        });
-        setWeakMapValue(diagnosticsSlots, physicalSlot, safeSlot);
-      }
-      const base = { kind: eventType, observedAtMs, slot: safeSlot };
+      const state = diagnosticsSlotState(physicalSlot);
+      if (!state) return undefined;
+      const responseIdentifierValue = safeMember(event as object, 'responseIdentifier');
+      const responseIdentifier =
+        typeof responseIdentifierValue === 'string' && responseIdentifierValue.length > 0
+          ? responseIdentifierValue
+          : undefined;
+      const kind = eventType as GoogletagDiagnosticsEventName;
+      const cycleOrdinal = traceCycle(state, kind, responseIdentifier, acceptedHandle);
+      const safeSlot = Object.freeze({
+        token: state.token,
+        ...(state.traceToken === undefined ? {} : { traceToken: state.traceToken }),
+        ...(cycleOrdinal === undefined ? {} : { cycleOrdinal }),
+        ...(state.elementId === undefined ? {} : { elementId: state.elementId }),
+        ...(state.adUnitPath === undefined ? {} : { adUnitPath: state.adUnitPath }),
+      });
+      const base = {
+        kind,
+        observedAtMs,
+        slot: safeSlot,
+        ...(responseIdentifier === undefined ? {} : { responseIdentifier }),
+      };
       switch (eventType) {
         case 'slotRequested':
         case 'slotResponseReceived':
@@ -1079,7 +1372,11 @@ export function createBrowserGoogletagAdapter(
     }
   };
 
-  const publishDiagnostics = (eventType: string, event: unknown): void => {
+  const publishDiagnostics = (
+    eventType: string,
+    event: unknown,
+    acceptedHandle: Readonly<GoogletagTraceCycleHandle> | undefined
+  ): void => {
     const observer = diagnosticsObserver;
     if (!observer || disposed) return;
     let observedAtMs = 0;
@@ -1098,7 +1395,7 @@ export function createBrowserGoogletagAdapter(
     } catch {
       // A missing or hostile clock cannot suppress the observed GPT fact.
     }
-    const fact = diagnosticFact(eventType, event, observedAtMs);
+    const fact = diagnosticFact(eventType, event, observedAtMs, acceptedHandle);
     if (!fact) return;
     try {
       observer(fact);
@@ -2536,6 +2833,8 @@ export function createBrowserGoogletagAdapter(
 
   return Object.freeze({
     bindingStatus: (): GoogletagBindingStatus => currentBinding().status,
+    traceToken: (slot: object): GptSlotTokenV1 | undefined =>
+      diagnosticsSlotState(slot)?.traceToken,
     observeDiagnostics,
     observePublisherCalls,
     run,
@@ -2543,6 +2842,11 @@ export function createBrowserGoogletagAdapter(
     dispose: (): void => {
       if (disposed) return;
       disposed = true;
+      try {
+        mintedTraceTokens?.clear();
+      } catch {
+        // Diagnostics identity cleanup cannot interrupt independent adapter disposal.
+      }
       for (const operation of [...live]) fail(operation, 'operation_disposed');
       try {
         releaseHistoricalInitialLoadBindings();

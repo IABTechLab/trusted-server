@@ -1,56 +1,16 @@
-// Closure-private render diagnostics and presentation for the hard-cutover runtime.
-import type { RenderTraceDiagnostics, RenderTraceRecord } from "./types";
+// Closure-private render diagnostics data for the hard-cutover runtime.
+import type { RenderTraceDiagnostics, RenderTraceRecord } from './types';
 
 const MAX_RENDER_LOG_ENTRIES = 200;
 
-/** DOM id of the diagnostics-owned floating trace panel. */
-export const TRACE_PANEL_ID = "ts-render-trace-panel";
-
-/** CSS class of the diagnostics-owned per-slot badge. */
-export const TRACE_BADGE_CLASS = "ts-render-badge";
-
-/** Whether an element and its ancestor chain are visibly presented. */
-export function isEffectivelyVisible(el: Element | null): boolean {
-  try {
-    if (!el || !(el instanceof HTMLElement) || !el.isConnected) return false;
-    const rect = el.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return false;
-    let node: HTMLElement | null = el;
-    while (node) {
-      const style = getComputedStyle(node);
-      if (
-        style.display === "none" ||
-        style.visibility === "hidden" ||
-        Number.parseFloat(style.opacity || "1") === 0
-      ) {
-        return false;
-      }
-      node = node.parentElement;
-    }
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-type PanelStatus = "ok" | "hidden" | "gam-only" | "empty";
-
-function panelStatus(record: Readonly<RenderTraceRecord>): PanelStatus {
-  if (!record.rendered || record.gamEmpty === true) return "empty";
-  if (record.visible !== true) return "hidden";
-  return record.injected === true ? "ok" : "gam-only";
-}
-
-const STATUS_STYLE: Record<PanelStatus, { color: string; mark: string; label: string }> = {
-  ok: { color: "#3fb950", mark: "✓", label: "ok" },
-  hidden: { color: "#d29922", mark: "⚠", label: "hidden" },
-  "gam-only": { color: "#58a6ff", mark: "◐", label: "gam-only" },
-  empty: { color: "#f85149", mark: "✗", label: "empty" },
-};
-
 const MAX_RENDER_TRACE_SLOTS = 256;
+const MAX_RENDER_TRACE_COUNTERS = 768;
 const MAX_RENDER_TRACE_SUBSCRIBERS = 32;
 const MAX_RENDER_TRACE_NOTIFICATIONS = 200;
+const EMPTY_RENDER_TRACE_CURRENT = Object.freeze(
+  Object.create(null) as Record<string, Readonly<RenderTraceRecord>>
+);
+const EMPTY_RENDER_TRACE_HISTORY = Object.freeze([]) as readonly Readonly<RenderTraceRecord>[];
 
 type RenderTraceInputV1 = Omit<RenderTraceRecord, 'at' | 'count' | 'seq'>;
 type RenderTraceUpdateV1 = Partial<Omit<RenderTraceRecord, 'at' | 'count' | 'seq' | 'slotId'>>;
@@ -64,7 +24,11 @@ export interface RenderTraceGptFactV1 extends Readonly<Record<string, unknown>> 
     | 'slotOnload'
     | 'impressionViewable'
     | 'slotVisibilityChanged';
-  readonly slot: Readonly<{ readonly token: object; readonly elementId?: string }>;
+  readonly slot: Readonly<{
+    readonly token: string;
+    readonly cycleOrdinal: number;
+    readonly elementId?: string;
+  }>;
   readonly isEmpty?: boolean;
   readonly inViewPercentage?: number;
 }
@@ -72,6 +36,8 @@ export interface RenderTraceGptFactV1 extends Readonly<Record<string, unknown>> 
 /** Current registered-slot identity and presentation state for one safe GPT fact. */
 export interface RenderTraceGptResolutionV1 {
   readonly slotId: string;
+  readonly navigationGeneration: object;
+  readonly traceToken: string;
   readonly elementId?: string;
   readonly visible?: boolean;
 }
@@ -82,30 +48,44 @@ export interface RenderTraceRuntimeScheduler {
 }
 
 export interface RenderTraceRuntimeOptions {
-  readonly document?: Document | undefined;
-  readonly exportRecord?: (record: Readonly<RenderTraceRecord>) => void;
   readonly now?: () => number;
   readonly onOverflow?: (droppedNotifications: number) => void;
   readonly onPresentationError?: (error: unknown) => void;
   readonly onSubscriberError?: (error: unknown) => void;
-  readonly overlayEnabled?: boolean;
   readonly schedule?: (callback: () => void) => () => void;
   readonly scheduler?: RenderTraceRuntimeScheduler;
 }
 
+/** Closure-private data channel made available only to the deferred presentation owner. */
+export interface RenderTracePresentationSource {
+  readonly current: RenderTraceDiagnostics['current'];
+  readonly history: RenderTraceDiagnostics['history'];
+  readonly subscribe: (listener: () => void) => () => void;
+}
+
+export interface RenderTracePresentationControls {
+  readonly dispose: () => void;
+}
+
+export type RenderTracePresentationFactory = (
+  source: RenderTracePresentationSource
+) => RenderTracePresentationControls;
+
 export interface RenderTraceRuntimeOwner {
   readonly api: RenderTraceDiagnostics;
   readonly diagnostics: RenderTraceDiagnostics;
-  readonly record: (input: RenderTraceInputV1) => Readonly<RenderTraceRecord>;
+  readonly record: (input: RenderTraceInputV1) => Readonly<RenderTraceRecord> | undefined;
   readonly enrich: (
     recordOrSequence: Readonly<RenderTraceRecord> | number,
     patch: RenderTraceUpdateV1
   ) => Readonly<RenderTraceRecord> | undefined;
   readonly prune: (slotId: string, sequence?: number) => boolean;
+  readonly pruneNavigation: (navigationGeneration: object) => number;
   readonly observeGptFact: (
     fact: Readonly<RenderTraceGptFactV1>,
     resolve: (elementId: string | undefined) => RenderTraceGptResolutionV1 | undefined
   ) => void;
+  readonly attachPresentation: (factory: RenderTracePresentationFactory) => () => void;
   readonly dispose: () => void;
 }
 
@@ -164,303 +144,21 @@ function scheduleRenderTraceTask(callback: () => void): () => void {
   return (): void => globalThis.clearTimeout(handle);
 }
 
-const RUNTIME_TRACE_ATTRIBUTES = [
-  'data-ts-slot-id',
-  'data-ts-render-path',
-  'data-ts-rendered',
-  'data-ts-auction-id',
-  'data-ts-bidder',
-  'data-ts-ad-id',
-  'data-ts-bid-id',
-  'data-ts-creative-id',
-  'data-ts-adm-hash',
-  'data-ts-served-from',
-  'data-ts-gam-empty',
-  'data-ts-injected',
-  'data-ts-visible',
-] as const;
-
-interface PresentedTraceSlot {
-  readonly element: HTMLElement;
-  readonly priorInlinePosition?: string;
-}
-
-interface RenderTracePresentation {
-  readonly present: (record: Readonly<RenderTraceRecord>) => void;
-  readonly prune: (slotId: string) => void;
-  readonly dispose: () => void;
-}
-
-function createRenderTracePresentation(
-  options: RenderTraceRuntimeOptions,
-  history: () => readonly Readonly<RenderTraceRecord>[]
-): RenderTracePresentation {
-  const targetDocument =
-    options.document ?? (typeof document === 'undefined' ? undefined : document);
-  const overlayEnabled = options.overlayEnabled === true;
-  const presented = new Map<string, PresentedTraceSlot>();
-  const panelRecords = new Map<number, Readonly<RenderTraceRecord>>();
-  const panelRows = new Map<number, HTMLButtonElement>();
-  let panel: HTMLElement | undefined;
-  let panelHeading: HTMLElement | undefined;
-  let panelRowsHost: HTMLElement | undefined;
-
-  const report = (error: unknown): void => {
-    try {
-      options.onPresentationError?.(error);
-    } catch {
-      // Presentation reporting is diagnostics-only.
-    }
-  };
-
-  const removeBadge = (element: HTMLElement): void => {
-    for (const badge of element.querySelectorAll(`:scope > .${TRACE_BADGE_CLASS}`)) badge.remove();
-  };
-
-  const clearElement = (presentedSlot: PresentedTraceSlot): void => {
-    const { element, priorInlinePosition } = presentedSlot;
-    for (const attribute of RUNTIME_TRACE_ATTRIBUTES) element.removeAttribute(attribute);
-    removeBadge(element);
-    if (priorInlinePosition !== undefined && element.style.position === 'relative') {
-      element.style.position = priorInlinePosition;
-    }
-  };
-
-  const createBadge = (
-    element: HTMLElement,
-    record: Readonly<RenderTraceRecord>
-  ): PresentedTraceSlot => {
-    let priorInlinePosition: string | undefined;
-    try {
-      const position = targetDocument?.defaultView?.getComputedStyle(element).position;
-      if (position === 'static' || position === '') {
-        priorInlinePosition = element.style.position;
-        element.style.position = 'relative';
-      }
-    } catch {
-      // A badge remains noninteractive even if its containing block is publisher-owned.
-    }
-    const status = panelStatus(record);
-    const style = STATUS_STYLE[status];
-    const badge = targetDocument?.createElement('div');
-    if (!badge) {
-      return {
-        element,
-        ...(priorInlinePosition === undefined ? {} : { priorInlinePosition }),
-      };
-    }
-    badge.className = TRACE_BADGE_CLASS;
-    badge.textContent =
-      `TS ${style.mark} #${record.seq}` +
-      `${record.bidder ? ` · ${record.bidder}` : ''}` +
-      `${style.label === 'ok' ? '' : ` · ${style.label}`}`;
-    badge.style.setProperty('position', 'absolute');
-    badge.style.setProperty('top', '4px');
-    badge.style.setProperty('left', '4px');
-    badge.style.setProperty('z-index', '2147483646');
-    badge.style.setProperty('pointer-events', 'none');
-    badge.style.setProperty('font', '10px/1.5 ui-monospace, Menlo, Consolas, monospace');
-    badge.style.setProperty('padding', '1px 5px');
-    badge.style.setProperty('color', '#fff');
-    badge.style.setProperty('background', style.color);
-    badge.style.setProperty('border-radius', '3px');
-    element.appendChild(badge);
-    return { element, ...(priorInlinePosition === undefined ? {} : { priorInlinePosition }) };
-  };
-
-  const exportRow = (record: Readonly<RenderTraceRecord>): void => {
-    const copied = copyRenderTraceRecord(record);
-    try {
-      if (options.exportRecord) {
-        options.exportRecord(copied);
-        return;
-      }
-      const clipboard = targetDocument?.defaultView?.navigator.clipboard;
-      const write = clipboard?.writeText;
-      if (typeof write !== 'function') return;
-      const pending = Reflect.apply(write, clipboard, [JSON.stringify(copied, null, 2)]) as
-        Promise<void> | undefined;
-      void pending?.catch(report);
-    } catch (error) {
-      report(error);
-    }
-  };
-
-  const renderPanel = (record?: Readonly<RenderTraceRecord>): void => {
-    if (!overlayEnabled || !targetDocument?.body) return;
-    if (!panel) {
-      const collision = targetDocument.getElementById(TRACE_PANEL_ID);
-      if (collision) return;
-      panel = targetDocument.createElement('div');
-      panel.id = TRACE_PANEL_ID;
-      panel.setAttribute('data-ts-render-trace-owner', '1');
-      panel.style.setProperty('position', 'fixed');
-      panel.style.setProperty('bottom', '12px');
-      panel.style.setProperty('right', '12px');
-      panel.style.setProperty('z-index', '2147483647');
-      panel.style.setProperty('max-width', '360px');
-      panel.style.setProperty('max-height', '45vh');
-      panel.style.setProperty('overflow', 'auto');
-      panel.style.setProperty('background', 'rgba(17,17,17,0.94)');
-      panel.style.setProperty('color', '#eee');
-      panel.style.setProperty('font', '11px/1.5 ui-monospace, Menlo, Consolas, monospace');
-      panel.style.setProperty('border', '1px solid #333');
-      panel.style.setProperty('border-radius', '6px');
-      panel.style.setProperty('box-shadow', '0 4px 16px rgba(0,0,0,0.4)');
-      panelHeading = targetDocument.createElement('div');
-      panelHeading.style.setProperty('padding', '6px 10px');
-      panelHeading.style.setProperty('font-weight', '700');
-      panelRowsHost = targetDocument.createElement('div');
-      panel.append(panelHeading, panelRowsHost);
-      targetDocument.body.appendChild(panel);
-    }
-    const retained = history();
-    panelHeading!.textContent = `TS Render Trace · ${retained.length} renders`;
-    const retainedSequences = new Set(retained.map(({ seq }) => seq));
-    for (const [sequence, row] of panelRows) {
-      if (retainedSequences.has(sequence)) continue;
-      row.remove();
-      panelRows.delete(sequence);
-      panelRecords.delete(sequence);
-    }
-    if (record && retainedSequences.has(record.seq)) {
-      panelRecords.set(record.seq, record);
-      let row = panelRows.get(record.seq);
-      if (!row) {
-        row = targetDocument.createElement('button');
-        row.type = 'button';
-        row.setAttribute('data-ts-trace-seq', String(record.seq));
-        row.style.setProperty('display', 'block');
-        row.style.setProperty('width', '100%');
-        row.style.setProperty('padding', '6px 10px');
-        row.style.setProperty('border', '0');
-        row.style.setProperty('border-top', '1px solid #2a2a2a');
-        row.style.setProperty('background', 'transparent');
-        row.style.setProperty('font', 'inherit');
-        row.style.setProperty('text-align', 'left');
-        row.style.setProperty('cursor', 'pointer');
-        row.addEventListener('click', () => {
-          const exported = panelRecords.get(record.seq);
-          if (exported) exportRow(exported);
-        });
-        panelRows.set(record.seq, row);
-        panelRowsHost!.prepend(row);
-      }
-      const status = panelStatus(record);
-      const style = STATUS_STYLE[status];
-      row.textContent = `#${record.seq} ${style.mark} ${record.slotId} · ${style.label} · ${record.path}`;
-      row.style.setProperty('border-left', `3px solid ${style.color}`);
-      row.style.setProperty('color', style.color);
-    }
-  };
-
-  const present = (record: Readonly<RenderTraceRecord>): void => {
-    try {
-      const prior = presented.get(record.slotId);
-      const elementId = record.elementId ?? record.slotId;
-      const candidate = targetDocument?.getElementById(elementId);
-      const element = candidate && candidate instanceof HTMLElement ? candidate : undefined;
-      if (prior && prior.element !== element) {
-        clearElement(prior);
-        presented.delete(record.slotId);
-      }
-      if (element) {
-        const retainedPosition = prior?.element === element ? prior.priorInlinePosition : undefined;
-        removeBadge(element);
-        const values: Readonly<
-          Record<(typeof RUNTIME_TRACE_ATTRIBUTES)[number], string | undefined>
-        > = {
-          'data-ts-slot-id': record.slotId,
-          'data-ts-render-path': record.path,
-          'data-ts-rendered': String(record.rendered),
-          'data-ts-auction-id': record.auctionId,
-          'data-ts-bidder': record.bidder,
-          'data-ts-ad-id': record.adId,
-          'data-ts-bid-id': record.bidId,
-          'data-ts-creative-id': record.creativeId,
-          'data-ts-adm-hash': record.admHash,
-          'data-ts-served-from': record.servedFrom,
-          'data-ts-gam-empty': record.gamEmpty === undefined ? undefined : String(record.gamEmpty),
-          'data-ts-injected': record.injected === undefined ? undefined : String(record.injected),
-          'data-ts-visible': record.visible === undefined ? undefined : String(record.visible),
-        };
-        for (const attribute of RUNTIME_TRACE_ATTRIBUTES) {
-          const value = values[attribute];
-          if (value === undefined || value === '') element.removeAttribute(attribute);
-          else element.setAttribute(attribute, value);
-        }
-        const status = panelStatus(record);
-        if (
-          overlayEnabled &&
-          element.tagName !== 'IFRAME' &&
-          (status === 'ok' || status === 'gam-only')
-        ) {
-          const next = createBadge(element, record);
-          presented.set(record.slotId, {
-            element,
-            ...(retainedPosition === undefined
-              ? next.priorInlinePosition === undefined
-                ? {}
-                : { priorInlinePosition: next.priorInlinePosition }
-              : { priorInlinePosition: retainedPosition }),
-          });
-        } else {
-          if (retainedPosition !== undefined && element.style.position === 'relative') {
-            element.style.position = retainedPosition;
-          }
-          presented.set(record.slotId, { element });
-        }
-      }
-      renderPanel(record);
-    } catch (error) {
-      report(error);
-    }
-  };
-
-  const prune = (slotId: string): void => {
-    try {
-      const existing = presented.get(slotId);
-      if (existing) clearElement(existing);
-      presented.delete(slotId);
-      renderPanel();
-    } catch (error) {
-      report(error);
-    }
-  };
-
-  const dispose = (): void => {
-    for (const slotId of [...presented.keys()]) prune(slotId);
-    try {
-      panel?.remove();
-    } catch (error) {
-      report(error);
-    }
-    panel = undefined;
-    panelHeading = undefined;
-    panelRowsHost = undefined;
-    panelRecords.clear();
-    panelRows.clear();
-  };
-
-  return Object.freeze({ present, prune, dispose });
-}
-
-/** Create one document-runtime render trace without exposing its mutation authority. */
-export function createRenderTraceDiagnostics(
-  options: RenderTraceRuntimeOptions = {}
-): RenderTraceRuntimeOwner {
+function createRenderTraceOwner(options: RenderTraceRuntimeOptions): RenderTraceRuntimeOwner {
   const current = new Map<string, Readonly<RenderTraceRecord>>();
   const counts = new Map<string, number>();
   const history: Array<Readonly<RenderTraceRecord>> = [];
   const recordsBySequence = new Map<number, Readonly<RenderTraceRecord>>();
   const gptImpressions = new Map<
-    object,
+    string,
     {
       readonly baselineSequence: number | undefined;
+      historySequence?: number;
+      readonly navigationGeneration: object;
       reconciled?: boolean;
-      renderEnded?: boolean;
-      sequence?: number;
       readonly slotId: string;
+      state: 'open' | 'completed' | 'retired';
+      readonly token: string;
     }
   >();
   const subscribers = new Map<number, RenderTraceSubscription>();
@@ -471,8 +169,18 @@ export function createRenderTraceDiagnostics(
   let droppedNotifications = 0;
   let reportedDroppedNotifications = 0;
   let cancelScheduled: (() => void) | undefined;
+  let presentationSubscriber: Readonly<{ generation: number; listener: () => void }> | undefined;
+  let presentationGeneration = 0;
+  let presentationPending:
+    | Readonly<{
+        subscriber: Readonly<{ generation: number; listener: () => void }>;
+      }>
+    | undefined;
+  let cancelPresentationScheduled: (() => void) | undefined;
+  let presentationControls: RenderTracePresentationControls | undefined;
+  let invalidatePresentationSource: (() => void) | undefined;
+  let presentationAttaching = false;
   let disposed = false;
-  const presentation = createRenderTracePresentation(options, () => history);
 
   const schedule = (callback: () => void): (() => void) => {
     if (options.schedule) return options.schedule(callback);
@@ -488,6 +196,54 @@ export function createRenderTraceDiagnostics(
       options.onSubscriberError?.(error);
     } catch {
       // Diagnostics error reporting cannot affect correctness work.
+    }
+  };
+
+  const reportPresentationError = (error: unknown): void => {
+    try {
+      options.onPresentationError?.(error);
+    } catch {
+      // Deferred presentation reporting cannot affect trace data ownership.
+    }
+  };
+
+  const cancelPresentationTask = (): void => {
+    const cancel = cancelPresentationScheduled;
+    cancelPresentationScheduled = undefined;
+    presentationPending = undefined;
+    if (!cancel) return;
+    try {
+      cancel();
+    } catch (error) {
+      reportPresentationError(error);
+    }
+  };
+
+  const notifyPresentation = (): void => {
+    const subscriber = presentationSubscriber;
+    if (disposed || !subscriber || presentationPending) return;
+    const pending = Object.freeze({ subscriber });
+    presentationPending = pending;
+    try {
+      const cancel = schedule(() => {
+        if (presentationPending !== pending) return;
+        cancelPresentationScheduled = undefined;
+        presentationPending = undefined;
+        if (disposed || presentationSubscriber !== subscriber) return;
+        try {
+          subscriber.listener();
+        } catch (error) {
+          reportPresentationError(error);
+        }
+      });
+      if (typeof cancel !== 'function') throw new TypeError('invalid presentation scheduler');
+      if (presentationPending === pending && presentationSubscriber === subscriber) {
+        cancelPresentationScheduled = cancel;
+      }
+    } catch (error) {
+      if (presentationPending === pending) presentationPending = undefined;
+      cancelPresentationScheduled = undefined;
+      reportPresentationError(error);
     }
   };
 
@@ -558,19 +314,38 @@ export function createRenderTraceDiagnostics(
     current.get(record.slotId)?.seq === record.seq ||
     history.some((candidate) => candidate.seq === record.seq);
 
-  const record = (input: RenderTraceInputV1): Readonly<RenderTraceRecord> => {
-    if (!disposed && input.path !== 'gam-refresh') {
+  const trimCounters = (): void => {
+    if (counts.size <= MAX_RENDER_TRACE_COUNTERS) return;
+    const protectedSlotIds = new Set<string>();
+    for (const slotId of current.keys()) protectedSlotIds.add(slotId);
+    for (const traceRecord of history) protectedSlotIds.add(traceRecord.slotId);
+    for (const impression of gptImpressions.values()) protectedSlotIds.add(impression.slotId);
+    while (counts.size > MAX_RENDER_TRACE_COUNTERS) {
+      let evicted = false;
+      for (const slotId of counts.keys()) {
+        if (protectedSlotIds.has(slotId)) continue;
+        counts.delete(slotId);
+        evicted = true;
+        break;
+      }
+      if (!evicted) break;
+    }
+  };
+
+  const record = (input: RenderTraceInputV1): Readonly<RenderTraceRecord> | undefined => {
+    if (disposed) return undefined;
+    if (input.path !== 'gam-refresh') {
       for (const impression of gptImpressions.values()) {
         if (
           impression.slotId !== input.slotId ||
-          impression.renderEnded !== true ||
+          impression.state !== 'completed' ||
           impression.reconciled === true ||
-          impression.sequence === undefined ||
-          current.get(input.slotId)?.seq !== impression.sequence
+          impression.historySequence === undefined ||
+          current.get(input.slotId)?.seq !== impression.historySequence
         ) {
           continue;
         }
-        const reconciled = enrich(impression.sequence, input);
+        const reconciled = enrich(impression.historySequence, input);
         if (reconciled) {
           impression.reconciled = true;
           return reconciled;
@@ -589,17 +364,7 @@ export function createRenderTraceDiagnostics(
       at = Date.now();
     }
     const previousCount = counts.get(input.slotId) ?? 0;
-    if (!counts.has(input.slotId) && counts.size >= MAX_RENDER_TRACE_SLOTS) {
-      let evictedCounter: string | undefined;
-      for (const candidate of counts.keys()) {
-        if (!current.has(candidate)) {
-          evictedCounter = candidate;
-          break;
-        }
-      }
-      evictedCounter ??= evictedCurrentSlot;
-      if (evictedCounter !== undefined) counts.delete(evictedCounter);
-    }
+    if (previousCount > 0) counts.delete(input.slotId);
     counts.set(input.slotId, previousCount + 1);
     const committed = copyRenderTraceRecord({
       ...input,
@@ -607,10 +372,8 @@ export function createRenderTraceDiagnostics(
       seq: (sequence += 1),
       at,
     });
-    if (disposed) return committed;
     if (evictedCurrentSlot !== undefined) {
       current.delete(evictedCurrentSlot);
-      presentation.prune(evictedCurrentSlot);
     }
     current.set(committed.slotId, committed);
     recordsBySequence.set(committed.seq, committed);
@@ -620,8 +383,9 @@ export function createRenderTraceDiagnostics(
       if (evicted && !retained(evicted)) recordsBySequence.delete(evicted.seq);
     }
     if (previous && !retained(previous)) recordsBySequence.delete(previous.seq);
+    trimCounters();
     enqueue(committed);
-    presentation.present(committed);
+    notifyPresentation();
     return committed;
   };
 
@@ -662,20 +426,58 @@ export function createRenderTraceDiagnostics(
     const historyIndex = history.findIndex(({ seq }) => seq === targetSequence);
     if (historyIndex >= 0) history[historyIndex] = committed;
     enqueue(committed);
-    presentation.present(committed);
+    notifyPresentation();
     return committed;
   };
 
   const prune = (slotId: string, expectedSequence?: number): boolean => {
     if (disposed || typeof slotId !== 'string') return false;
+    let retired = false;
+    for (const impression of gptImpressions.values()) {
+      if (
+        impression.slotId === slotId &&
+        (expectedSequence === undefined ||
+          impression.historySequence === expectedSequence ||
+          impression.baselineSequence === expectedSequence)
+      ) {
+        impression.state = 'retired';
+        retired = true;
+      }
+    }
     const existing = current.get(slotId);
     if (!existing || (expectedSequence !== undefined && existing.seq !== expectedSequence)) {
-      return false;
+      return retired;
     }
     current.delete(slotId);
     if (!retained(existing)) recordsBySequence.delete(existing.seq);
-    presentation.prune(slotId);
+    notifyPresentation();
     return true;
+  };
+
+  const pruneNavigation = (navigationGeneration: object): number => {
+    if (disposed || typeof navigationGeneration !== 'object' || navigationGeneration === null) {
+      return 0;
+    }
+    let retired = 0;
+    let currentChanged = false;
+    for (const impression of gptImpressions.values()) {
+      if (
+        impression.navigationGeneration !== navigationGeneration ||
+        impression.state === 'retired'
+      ) {
+        continue;
+      }
+      impression.state = 'retired';
+      retired += 1;
+      const sequence = impression.historySequence ?? impression.baselineSequence;
+      const existing = current.get(impression.slotId);
+      if (sequence === undefined || existing?.seq !== sequence) continue;
+      current.delete(impression.slotId);
+      if (!retained(existing)) recordsBySequence.delete(existing.seq);
+      currentChanged = true;
+    }
+    if (currentChanged) notifyPresentation();
+    return retired;
   };
 
   const observeGptFact = (
@@ -685,32 +487,82 @@ export function createRenderTraceDiagnostics(
     if (disposed || typeof resolve !== 'function') return;
     try {
       const token = fact.slot.token;
-      if (typeof token !== 'object' || token === null || !Object.isFrozen(token)) return;
-      const resolution = resolve(fact.slot.elementId);
-      if (!resolution || typeof resolution.slotId !== 'string' || resolution.slotId === '') return;
+      const cycleOrdinal = fact.slot.cycleOrdinal;
+      if (
+        typeof token !== 'string' ||
+        !/^gt1_[1-9a-z][0-9a-z]{0,6}$/.test(token) ||
+        token.length > 11 ||
+        Number.parseInt(token.slice(4), 36) > 4_294_967_295 ||
+        !Number.isInteger(cycleOrdinal) ||
+        cycleOrdinal < 1 ||
+        cycleOrdinal > 4_294_967_295
+      ) {
+        return;
+      }
+      const key = `${token}:${cycleOrdinal}`;
 
       if (fact.kind === 'slotRequested') {
-        for (const [candidateToken, impression] of gptImpressions) {
-          if (impression.slotId === resolution.slotId) gptImpressions.delete(candidateToken);
+        if (gptImpressions.has(key)) return;
+        const resolution = resolve(fact.slot.elementId);
+        if (
+          !resolution ||
+          typeof resolution.slotId !== 'string' ||
+          resolution.slotId === '' ||
+          typeof resolution.navigationGeneration !== 'object' ||
+          resolution.navigationGeneration === null ||
+          resolution.traceToken !== token
+        ) {
+          return;
+        }
+        for (const impression of gptImpressions.values()) {
+          if (impression.token === token && impression.state === 'open') return;
         }
         if (gptImpressions.size >= MAX_RENDER_TRACE_SLOTS) {
-          const oldestToken = gptImpressions.keys().next().value as object | undefined;
-          if (oldestToken) gptImpressions.delete(oldestToken);
+          let prunable: string | undefined;
+          for (const [candidateKey, impression] of gptImpressions) {
+            if (impression.state !== 'open') {
+              prunable = candidateKey;
+              break;
+            }
+          }
+          if (prunable === undefined) return;
+          gptImpressions.delete(prunable);
         }
-        gptImpressions.set(token, {
+        for (const impression of gptImpressions.values()) {
+          if (
+            impression.slotId === resolution.slotId &&
+            (impression.state === 'completed' ||
+              impression.navigationGeneration !== resolution.navigationGeneration ||
+              impression.token !== token)
+          ) {
+            impression.state = 'retired';
+          }
+        }
+        gptImpressions.set(key, {
           baselineSequence: current.get(resolution.slotId)?.seq,
+          navigationGeneration: resolution.navigationGeneration,
           slotId: resolution.slotId,
+          state: 'open',
+          token,
         });
         return;
       }
 
-      const impression = gptImpressions.get(token);
-      if (!impression || impression.slotId !== resolution.slotId) return;
+      const impression = gptImpressions.get(key);
+      if (!impression) return;
       if (fact.kind === 'slotResponseReceived') return;
       if (fact.kind === 'slotRenderEnded') {
-        if (typeof fact.isEmpty !== 'boolean') return;
-        if (impression.renderEnded) return;
-        impression.renderEnded = true;
+        if (typeof fact.isEmpty !== 'boolean' || impression.state !== 'open') return;
+        const resolution = resolve(fact.slot.elementId);
+        if (
+          !resolution ||
+          resolution.slotId !== impression.slotId ||
+          resolution.navigationGeneration !== impression.navigationGeneration ||
+          resolution.traceToken !== token
+        ) {
+          impression.state = 'retired';
+          return;
+        }
         const latest = current.get(impression.slotId);
         const target =
           latest && latest.seq !== impression.baselineSequence
@@ -721,40 +573,58 @@ export function createRenderTraceDiagnostics(
                 rendered: !fact.isEmpty,
                 gamEmpty: fact.isEmpty,
                 injected: false,
-                ...(resolution.elementId === undefined ? {} : { elementId: resolution.elementId }),
-                ...(resolution.visible === undefined
+                ...(resolution?.elementId === undefined ? {} : { elementId: resolution.elementId }),
+                ...(resolution?.visible === undefined
                   ? {}
                   : { visible: !fact.isEmpty && resolution.visible }),
                 servedFrom: 'gam',
               });
+        if (!target) return;
         const enriched = enrich(target, {
           rendered: !fact.isEmpty,
           gamEmpty: fact.isEmpty,
           injected: false,
           ...(target.servedFrom === undefined ? { servedFrom: 'gam' as const } : {}),
-          ...(resolution.elementId === undefined ? {} : { elementId: resolution.elementId }),
-          ...(resolution.visible === undefined
+          ...(resolution?.elementId === undefined ? {} : { elementId: resolution.elementId }),
+          ...(resolution?.visible === undefined
             ? {}
             : { visible: !fact.isEmpty && resolution.visible }),
         });
-        impression.sequence = enriched?.seq ?? target.seq;
+        impression.historySequence = enriched?.seq ?? target.seq;
+        impression.state = 'completed';
         return;
       }
 
-      const targetSequence = impression.sequence;
-      if (targetSequence === undefined || current.get(impression.slotId)?.seq !== targetSequence) {
-        return;
-      }
+      const targetSequence = impression.historySequence;
+      if (targetSequence === undefined) return;
+      const update = (patch: RenderTraceUpdateV1): void => {
+        if (impression.state !== 'retired') {
+          enrich(targetSequence, patch);
+          return;
+        }
+        const active = current.get(impression.slotId);
+        const enriched = enrich(targetSequence, patch);
+        if (active?.seq === targetSequence && enriched) current.set(impression.slotId, active);
+      };
       if (fact.kind === 'impressionViewable') {
-        enrich(targetSequence, { visible: true });
+        update({ visible: true });
       } else if (
         fact.kind === 'slotVisibilityChanged' &&
         typeof fact.inViewPercentage === 'number' &&
         Number.isFinite(fact.inViewPercentage)
       ) {
-        enrich(targetSequence, { visible: fact.inViewPercentage > 0 });
-      } else if (fact.kind === 'slotOnload' && resolution.visible !== undefined) {
-        enrich(targetSequence, { visible: resolution.visible });
+        update({ visible: fact.inViewPercentage > 0 });
+      } else if (fact.kind === 'slotOnload') {
+        const resolution = resolve(fact.slot.elementId);
+        if (
+          resolution &&
+          resolution.slotId === impression.slotId &&
+          resolution.navigationGeneration === impression.navigationGeneration &&
+          resolution.traceToken === impression.token &&
+          resolution.visible !== undefined
+        ) {
+          update({ visible: resolution.visible });
+        }
       }
     } catch {
       // GPT diagnostics cannot affect the committed render or adapter callback.
@@ -795,9 +665,130 @@ export function createRenderTraceDiagnostics(
     },
   });
 
+  const clearPresentationSubscriber = (): void => {
+    presentationSubscriber = undefined;
+    cancelPresentationTask();
+  };
+
+  const disposePresentationCandidate = (candidate: unknown): void => {
+    try {
+      if (typeof candidate !== 'object' || candidate === null) return;
+      const descriptor = Object.getOwnPropertyDescriptor(candidate, 'dispose');
+      if (descriptor && 'value' in descriptor && typeof descriptor.value === 'function') {
+        Reflect.apply(descriptor.value, candidate, []);
+      }
+    } catch (error) {
+      reportPresentationError(error);
+    }
+  };
+
+  const validPresentationControls = (
+    candidate: unknown
+  ): candidate is RenderTracePresentationControls => {
+    try {
+      if (typeof candidate !== 'object' || candidate === null || !Object.isFrozen(candidate)) {
+        return false;
+      }
+      const keys = Reflect.ownKeys(candidate);
+      if (keys.length !== 1 || keys[0] !== 'dispose') return false;
+      const descriptor = Object.getOwnPropertyDescriptor(candidate, 'dispose');
+      return Boolean(
+        descriptor?.enumerable && 'value' in descriptor && typeof descriptor.value === 'function'
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  const attachPresentation = (factory: RenderTracePresentationFactory): (() => void) => {
+    if (typeof factory !== 'function') {
+      throw new TypeError('render trace presentation factory must be callable');
+    }
+    if (disposed || presentationControls || presentationAttaching) {
+      throw new TypeError('render trace presentation is unavailable');
+    }
+    presentationAttaching = true;
+    let sourceLive = true;
+    const invalidateSource = (): void => {
+      sourceLive = false;
+    };
+    invalidatePresentationSource = invalidateSource;
+    const source = Object.freeze({
+      current: (): Readonly<Record<string, Readonly<RenderTraceRecord>>> =>
+        sourceLive && !disposed ? api.current() : EMPTY_RENDER_TRACE_CURRENT,
+      history: (): readonly Readonly<RenderTraceRecord>[] =>
+        sourceLive && !disposed ? api.history() : EMPTY_RENDER_TRACE_HISTORY,
+      subscribe: (listener: () => void): (() => void) => {
+        if (typeof listener !== 'function') {
+          throw new TypeError('render trace presentation listener must be callable');
+        }
+        if (
+          disposed ||
+          !sourceLive ||
+          presentationSubscriber ||
+          (!presentationAttaching && !presentationControls)
+        ) {
+          throw new TypeError('render trace presentation subscription is unavailable');
+        }
+        const subscription = Object.freeze({
+          generation: (presentationGeneration += 1),
+          listener,
+        });
+        presentationSubscriber = subscription;
+        let active = true;
+        return (): void => {
+          if (!active) return;
+          active = false;
+          if (presentationSubscriber === subscription) clearPresentationSubscriber();
+        };
+      },
+    }) satisfies RenderTracePresentationSource;
+    let candidate: unknown;
+    try {
+      candidate = factory(source);
+      if (!validPresentationControls(candidate)) {
+        throw new TypeError('render trace presentation controls are malformed');
+      }
+      if (!presentationSubscriber) {
+        throw new TypeError('render trace presentation subscription is unavailable');
+      }
+      const controls = candidate;
+      presentationControls = controls;
+      let active = true;
+      return (): void => {
+        if (!active) return;
+        active = false;
+        if (presentationControls !== controls) return;
+        presentationControls = undefined;
+        if (invalidatePresentationSource === invalidateSource) {
+          invalidatePresentationSource = undefined;
+        }
+        invalidateSource();
+        clearPresentationSubscriber();
+        disposePresentationCandidate(controls);
+      };
+    } catch (error) {
+      if (invalidatePresentationSource === invalidateSource) {
+        invalidatePresentationSource = undefined;
+      }
+      invalidateSource();
+      clearPresentationSubscriber();
+      disposePresentationCandidate(candidate);
+      throw error;
+    } finally {
+      presentationAttaching = false;
+    }
+  };
+
   const dispose = (): void => {
     if (disposed) return;
     disposed = true;
+    const controls = presentationControls;
+    presentationControls = undefined;
+    invalidatePresentationSource?.();
+    invalidatePresentationSource = undefined;
+    clearPresentationSubscriber();
+    if (controls) disposePresentationCandidate(controls);
     try {
       cancelScheduled?.();
     } catch {
@@ -812,7 +803,6 @@ export function createRenderTraceDiagnostics(
     recordsBySequence.clear();
     counts.clear();
     gptImpressions.clear();
-    presentation.dispose();
   };
 
   return Object.freeze({
@@ -821,10 +811,16 @@ export function createRenderTraceDiagnostics(
     record,
     enrich,
     prune,
+    pruneNavigation,
     observeGptFact,
+    attachPresentation,
     dispose,
   });
 }
 
-/** Short name used by the browser composition owner. */
-export const createRenderTrace = createRenderTraceDiagnostics;
+/** Data-only critical trace owner; contains no DOM presentation behavior. */
+export function createRenderTraceStore(
+  options: RenderTraceRuntimeOptions = {}
+): RenderTraceRuntimeOwner {
+  return createRenderTraceOwner(options);
+}
