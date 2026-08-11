@@ -34,6 +34,7 @@ mod management_api;
 mod middleware;
 mod platform;
 mod rate_limiter;
+mod template_cache;
 mod tinybird;
 
 use crate::app::{EcFinalizeState, TrustedServerApp, load_settings_from_config_store};

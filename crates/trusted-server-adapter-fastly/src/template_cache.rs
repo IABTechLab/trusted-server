@@ -1,0 +1,327 @@
+//! Fastly Core Cache backing for the shared transformed-template cache (C2).
+//!
+//! Only the Fastly adapter implements this; every other adapter uses
+//! `UnavailableTemplateCache`, so the shared assembly modes stay portable and only
+//! the caching is Fastly-only.
+//!
+//! **Why Core Cache and not read-through caching.** Read-through with `after_send` +
+//! `set_body_transform` looks like a better fit — it keeps HTTP semantics and derives
+//! TTL and surrogate keys from origin headers for free. It is unreachable here:
+//! Viceroy 0.17 stubs the entire HTTP Cache ABI and the SDK converts that into a
+//! *send error*, so setting `after_send` makes every publisher origin fetch fail
+//! under `fastly compute serve`, `cargo test-fastly` and the parity suite. It is also
+//! silently dead whenever the origin request is in pass mode, and its closure bounds
+//! (`Fn + Send + Sync`) are incompatible with a platform layer that is `!Send` by
+//! construction. Recorded in the spike plan's Task 3 Step 4 so nobody re-proposes it.
+//!
+//! Spike-only. Remove with the spike.
+
+use fastly::cache::core::{CacheKey, Transaction};
+use std::io::Write as _;
+use std::time::Duration;
+use trusted_server_core::platform::{
+    PlatformTemplateCache, TemplateCacheError, TemplateCacheKey, TemplateCacheMiss, TemplateEntry,
+    TemplateMetadata,
+};
+
+/// How long a cached template lives.
+///
+/// Deliberately short for the spike. A short TTL bounds every failure mode in this
+/// module — a poisoned template, a stale schema, a truncated write — and the only
+/// cost is hit rate, which is a measurement input rather than a correctness one.
+pub const TEMPLATE_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Surrogate key attached to every stored template, so a single purge clears them
+/// all. This is the rollback lever: without it, backing out a bad template means
+/// waiting for the TTL.
+const PURGE_ALL_SURROGATE_KEY: &str = "ts-template";
+
+/// Fastly Core Cache implementation of the C2 template cache.
+pub struct FastlyTemplateCache {
+    ttl: Duration,
+}
+
+impl FastlyTemplateCache {
+    /// Create a cache whose entries live for `ttl`.
+    ///
+    /// Keep this short for the spike. A short TTL bounds every failure mode in this
+    /// module — a poisoned template, a stale schema, a bad transform — and costs
+    /// only hit rate.
+    #[must_use]
+    pub fn new(ttl: Duration) -> Self {
+        Self { ttl }
+    }
+}
+
+fn backend_error(message: impl Into<String>) -> TemplateCacheError {
+    TemplateCacheError::Backend {
+        message: message.into(),
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl PlatformTemplateCache for FastlyTemplateCache {
+    async fn get(&self, key: &TemplateCacheKey) -> Result<TemplateEntry, TemplateCacheMiss> {
+        let cache_key = CacheKey::from(key.to_cache_key().into_bytes());
+
+        // A plain lookup, not a transaction: a read that does not intend to insert
+        // must not take an insert obligation it will never discharge, which would
+        // block every other client waiting on the same key until they time out.
+        let found = fastly::cache::core::lookup(cache_key)
+            .execute()
+            .map_err(|_| TemplateCacheMiss::NotFound)?
+            .ok_or(TemplateCacheMiss::NotFound)?;
+
+        // Stale entries are treated as a miss for the spike. Serving stale while
+        // revalidating is a real option, but it is a state machine `cache::core`
+        // does not implement for you, and it is not what this spike is measuring.
+        if found.is_stale() {
+            return Err(TemplateCacheMiss::NotFound);
+        }
+
+        let metadata = TemplateMetadata::decode(&found.user_metadata())
+            .ok_or(TemplateCacheMiss::UnreadableMetadata)?;
+
+        // A schema mismatch is a miss, not an error: rolling back to an older binary
+        // then degrades to re-transforming rather than assembling against a template
+        // shape it does not understand.
+        if metadata.schema_version != key.schema_version {
+            return Err(TemplateCacheMiss::SchemaMismatch);
+        }
+
+        let body = found
+            .to_stream()
+            .map_err(|_| TemplateCacheMiss::NotFound)?
+            .into_bytes();
+
+        // A write that failed part-way cannot cancel its own insert (see `put`), so
+        // a short entry is possible. Catch it here rather than assembling a
+        // truncated template into a broken page.
+        if body.len() as u64 != metadata.body_len {
+            return Err(TemplateCacheMiss::Truncated);
+        }
+
+        Ok(TemplateEntry { metadata, body })
+    }
+
+    async fn put(
+        &self,
+        key: &TemplateCacheKey,
+        metadata: &TemplateMetadata,
+        body: Vec<u8>,
+    ) -> Result<(), TemplateCacheError> {
+        if metadata.body_len != body.len() as u64 {
+            return Err(backend_error(format!(
+                "metadata body_len {} does not match the {} bytes supplied; storing \
+                 this would make every read a truncation miss",
+                metadata.body_len,
+                body.len()
+            )));
+        }
+
+        let cache_key = CacheKey::from(key.to_cache_key().into_bytes());
+
+        // Transactional insert so a cold key under load transforms once rather than
+        // once per concurrent request.
+        let tx = Transaction::lookup(cache_key)
+            .execute()
+            .map_err(|e| backend_error(format!("transactional lookup failed: {e:?}")))?;
+
+        // Order matters. A STALE entry sets *both* `found()` and
+        // `must_insert_or_update()`. Testing `found()` first would return early on
+        // the stale bytes and never discharge the obligation, leaving every
+        // concurrent waiter blocked until timeout.
+        if !tx.must_insert_or_update() {
+            // Someone else already inserted a fresh entry. Nothing to do, and
+            // nothing to discharge.
+            return Ok(());
+        }
+
+        // `Transaction::insert` takes `self`, so from here there is no handle left to
+        // cancel the insert with. A write that fails part-way therefore cannot be
+        // retracted — which is why `TemplateMetadata::body_len` exists and `get`
+        // checks it. The metadata is written before the body, so a truncated entry
+        // still carries the length it was supposed to have.
+        let surrogate_keys = key.surrogate_keys();
+        let mut writer = tx
+            .insert(self.ttl)
+            .surrogate_keys(surrogate_keys.iter().map(String::as_str))
+            .user_metadata(metadata.encode().into())
+            .execute()
+            .map_err(|e| backend_error(format!("cache insert failed: {e:?}")))?;
+
+        if let Err(e) = writer.write_all(&body) {
+            // Deliberately not calling `finish()`. An unfinished entry has no known
+            // length, and even if it is observable, `get`'s length check rejects it.
+            return Err(backend_error(format!("writing template body failed: {e}")));
+        }
+
+        // Required. Without it the object never completes and its length stays
+        // unknown, so readers see a partial or absent entry.
+        writer
+            .finish()
+            .map_err(|e| backend_error(format!("finishing the cached template failed: {e}")))?;
+
+        Ok(())
+    }
+
+    async fn purge_all(&self) -> Result<(), TemplateCacheError> {
+        fastly::http::purge::purge_surrogate_key(PURGE_ALL_SURROGATE_KEY)
+            .map_err(|e| backend_error(format!("purging templates failed: {e:?}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trusted_server_core::creative_opportunities::AssemblyMode;
+    use trusted_server_core::platform::TEMPLATE_SCHEMA_VERSION;
+
+    /// Distinct per test, so tests sharing the process cache cannot collide.
+    fn key(url: &str) -> TemplateCacheKey {
+        TemplateCacheKey {
+            url: url.to_string(),
+            request_host: "example.com".to_string(),
+            request_scheme: "https".to_string(),
+            assembly_mode: AssemblyMode::Esi,
+            vary_values: vec![("rsc".to_string(), "1".to_string())],
+            content_encoding: "identity".to_string(),
+            integration_fingerprint: "fp".to_string(),
+            schema_version: TEMPLATE_SCHEMA_VERSION,
+        }
+    }
+
+    fn metadata_for(body: &[u8]) -> TemplateMetadata {
+        TemplateMetadata {
+            content_encoding: "identity".to_string(),
+            content_type: "text/html; charset=utf-8".to_string(),
+            schema_version: TEMPLATE_SCHEMA_VERSION,
+            body_len: body.len() as u64,
+        }
+    }
+
+    /// The trait is `async_trait(?Send)` and this crate has no async test runtime,
+    /// so drive the futures directly.
+    fn run<T>(fut: impl core::future::Future<Output = T>) -> T {
+        futures::executor::block_on(fut)
+    }
+
+    fn cache() -> FastlyTemplateCache {
+        FastlyTemplateCache::new(Duration::from_secs(60))
+    }
+
+    #[test]
+    fn a_stored_template_reads_back_intact() {
+        let cache = cache();
+        let key = key("https://example.com/roundtrip");
+        let body = b"<html><body>template</body></html>".to_vec();
+        let metadata = metadata_for(&body);
+
+        run(cache.put(&key, &metadata, body.clone())).expect("should store");
+
+        let entry = run(cache.get(&key)).expect("should read back");
+        assert_eq!(entry.body, body, "bytes must survive the round trip");
+        assert_eq!(entry.metadata, metadata, "metadata must survive too");
+    }
+
+    #[test]
+    fn an_absent_key_is_a_miss_not_an_error() {
+        let miss =
+            run(cache().get(&key("https://example.com/never-stored"))).expect_err("should miss");
+        assert_eq!(miss, TemplateCacheMiss::NotFound);
+    }
+
+    #[test]
+    fn a_different_assembly_mode_does_not_read_the_same_entry() {
+        // The arms emit different bytes. If they shared an entry, one would serve
+        // the other's template.
+        let cache = cache();
+        let esi = key("https://example.com/mode-split");
+        let mut client_fill = esi.clone();
+        client_fill.assembly_mode = AssemblyMode::ClientFill;
+
+        let body = b"esi-template".to_vec();
+        run(cache.put(&esi, &metadata_for(&body), body)).expect("should store");
+
+        assert_eq!(
+            run(cache.get(&client_fill)).err(),
+            Some(TemplateCacheMiss::NotFound),
+            "client-fill must not read the ESI arm's template"
+        );
+    }
+
+    #[test]
+    fn a_schema_bump_reads_a_miss_rather_than_a_stale_shape() {
+        let cache = cache();
+        let key_v1 = key("https://example.com/schema");
+        let body = b"old-shape".to_vec();
+        run(cache.put(&key_v1, &metadata_for(&body), body)).expect("should store");
+
+        // A deploy that changes the transform bumps the constant. The old entry must
+        // not be assembled against.
+        let mut key_v2 = key_v1.clone();
+        key_v2.schema_version = TEMPLATE_SCHEMA_VERSION + 1;
+
+        assert_eq!(
+            run(cache.get(&key_v2)).err(),
+            Some(TemplateCacheMiss::NotFound),
+            "a bumped schema changes the key, so the old entry is simply not found"
+        );
+    }
+
+    #[test]
+    fn purge_all_clears_stored_templates() {
+        // The rollback lever. Without this, backing out a bad template means waiting
+        // for the TTL.
+        let cache = cache();
+        let key = key("https://example.com/purge");
+        let body = b"template".to_vec();
+        run(cache.put(&key, &metadata_for(&body), body)).expect("should store");
+        run(cache.get(&key)).expect("should be present before purge");
+
+        run(cache.purge_all()).expect("should purge");
+
+        assert!(
+            run(cache.get(&key)).is_err(),
+            "purge must clear the template, or rollback is TTL-bound"
+        );
+    }
+
+    #[test]
+    fn a_second_put_on_a_fresh_entry_is_a_no_op() {
+        // Exercises the `must_insert_or_update` early return: a concurrent writer
+        // that finds a fresh entry must neither error nor overwrite.
+        let cache = cache();
+        let key = key("https://example.com/second-put");
+        let first = b"first".to_vec();
+        run(cache.put(&key, &metadata_for(&first), first.clone())).expect("first put stores");
+
+        let second = b"second".to_vec();
+        run(cache.put(&key, &metadata_for(&second), second))
+            .expect("second put should be a no-op, not an error");
+
+        assert_eq!(
+            run(cache.get(&key)).expect("should read").body,
+            first,
+            "a fresh entry must not be overwritten by a racing writer"
+        );
+    }
+
+    #[test]
+    fn a_length_mismatch_is_refused_at_write_rather_than_stored() {
+        // Storing metadata whose length disagrees with the body would make every
+        // subsequent read a truncation miss — a cache that silently never hits.
+        // Catch it at the write instead.
+        let cache = cache();
+        let key = key("https://example.com/length-mismatch");
+        let mut metadata = metadata_for(b"12345");
+        metadata.body_len = 999;
+
+        let err = run(cache.put(&key, &metadata, b"12345".to_vec()))
+            .expect_err("a length mismatch must be refused");
+        assert!(
+            matches!(err, TemplateCacheError::Backend { .. }),
+            "expected a backend error, got {err:?}"
+        );
+    }
+}

@@ -153,6 +153,14 @@ pub struct TemplateMetadata {
     /// a miss, not an error, so a rollback to an older binary degrades to
     /// re-transforming rather than misassembling.
     pub schema_version: u32,
+    /// Length of the template bytes as written.
+    ///
+    /// Guards against a partially written entry. `Transaction::insert` consumes the
+    /// transaction, so a write that fails part-way cannot cancel the insert — there
+    /// is no handle left to cancel it with. Recording the intended length and
+    /// checking it on read makes a truncated entry a miss instead of a silently
+    /// short template that would assemble into a broken page.
+    pub body_len: u64,
 }
 
 impl TemplateMetadata {
@@ -162,8 +170,8 @@ impl TemplateMetadata {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         format!(
-            "v={}\nce={}\nct={}",
-            self.schema_version, self.content_encoding, self.content_type
+            "v={}\nce={}\nct={}\nlen={}",
+            self.schema_version, self.content_encoding, self.content_type, self.body_len
         )
         .into_bytes()
     }
@@ -176,12 +184,14 @@ impl TemplateMetadata {
         let mut schema_version = None;
         let mut content_encoding = None;
         let mut content_type = None;
+        let mut body_len = None;
         for line in text.lines() {
             let (key, value) = line.split_once('=')?;
             match key {
                 "v" => schema_version = Some(value.parse().ok()?),
                 "ce" => content_encoding = Some(value.to_string()),
                 "ct" => content_type = Some(value.to_string()),
+                "len" => body_len = Some(value.parse().ok()?),
                 _ => return None,
             }
         }
@@ -189,6 +199,7 @@ impl TemplateMetadata {
             schema_version: schema_version?,
             content_encoding: content_encoding?,
             content_type: content_type?,
+            body_len: body_len?,
         })
     }
 }
@@ -205,6 +216,10 @@ pub enum TemplateCacheMiss {
     /// Found, but its metadata could not be parsed.
     #[display("cached template metadata is unreadable")]
     UnreadableMetadata,
+    /// Found, but shorter than the metadata says it should be — a write that failed
+    /// part-way. See [`TemplateMetadata::body_len`].
+    #[display("cached template is truncated")]
+    Truncated,
     /// This platform has no template cache.
     #[display("no template cache on this platform")]
     Unsupported,
@@ -239,8 +254,12 @@ impl fmt::Debug for dyn PlatformTemplateCache {
 /// Only the Fastly adapter implements this; every other adapter uses
 /// [`UnavailableTemplateCache`], which reports [`TemplateCacheMiss::Unsupported`] so
 /// the caller transforms every time rather than failing.
+///
+/// `Send + Sync` on the trait, `?Send` on the futures: `RuntimeServices` is held in a
+/// `LazyLock` static, so the trait object must cross threads even though the futures
+/// themselves never do — the platform layer is `!Send` by construction.
 #[async_trait::async_trait(?Send)]
-pub trait PlatformTemplateCache {
+pub trait PlatformTemplateCache: Send + Sync {
     /// Read a template. `Err` is a miss, not a failure — every variant means
     /// "transform it yourself".
     async fn get(&self, key: &TemplateCacheKey) -> Result<TemplateEntry, TemplateCacheMiss>;
@@ -262,6 +281,7 @@ pub trait PlatformTemplateCache {
 }
 
 /// A template read from the cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateEntry {
     /// Metadata stored at insert.
     pub metadata: TemplateMetadata,
@@ -443,6 +463,7 @@ mod tests {
             content_encoding: "gzip".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
             schema_version: TEMPLATE_SCHEMA_VERSION,
+            body_len: 42,
         };
         let decoded =
             TemplateMetadata::decode(&metadata.encode()).expect("should decode what it encoded");
@@ -453,9 +474,9 @@ mod tests {
     fn unparseable_metadata_is_a_miss_not_a_panic() {
         for raw in [
             &b"not-key-value"[..],
-            &b"v=notanumber\nce=gzip\nct=text/html"[..],
-            &b"v=1\nce=gzip"[..],
-            &b"v=1\nce=gzip\nct=text/html\nunexpected=1"[..],
+            &b"v=notanumber\nce=gzip\nct=text/html\nlen=1"[..],
+            &b"v=1\nce=gzip\nct=text/html"[..],
+            &b"v=1\nce=gzip\nct=text/html\nlen=1\nunexpected=1"[..],
             &[0xff, 0xfe][..],
         ] {
             assert_eq!(
@@ -483,6 +504,7 @@ mod tests {
                         content_encoding: "identity".to_string(),
                         content_type: "text/html".to_string(),
                         schema_version: TEMPLATE_SCHEMA_VERSION,
+                        body_len: 0,
                     },
                     Vec::new()
                 )

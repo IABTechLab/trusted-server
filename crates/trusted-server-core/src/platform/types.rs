@@ -168,6 +168,11 @@ pub struct RuntimeServices {
     /// per-request basis by cloning [`RuntimeServices`] with
     /// [`RuntimeServices::with_kv_store`].
     pub(crate) kv_store: Arc<dyn PlatformKvStore>,
+    /// Shared transformed-template cache (C2). Defaults to
+    /// [`UnavailableTemplateCache`], so adapters without one degrade to transforming
+    /// per request rather than failing. Spike-only; see
+    /// [`crate::platform::template_cache`].
+    pub(crate) template_cache: Arc<dyn super::PlatformTemplateCache>,
     /// Dynamic backend registration and name prediction.
     pub(crate) backend: Arc<dyn PlatformBackend>,
     /// Outbound HTTP client abstraction.
@@ -223,6 +228,12 @@ impl RuntimeServices {
         &*self.kv_store
     }
 
+    /// The shared transformed-template cache. Spike-only.
+    #[must_use]
+    pub fn template_cache(&self) -> &dyn super::PlatformTemplateCache {
+        &*self.template_cache
+    }
+
     /// Returns the dynamic backend service.
     #[must_use]
     pub fn backend(&self) -> &dyn PlatformBackend {
@@ -272,6 +283,17 @@ impl RuntimeServices {
             ..self
         }
     }
+
+    /// Returns a clone of this instance with the template cache replaced.
+    ///
+    /// Spike-only (#1009).
+    #[must_use]
+    pub fn with_template_cache(self, cache: Arc<dyn super::PlatformTemplateCache>) -> Self {
+        Self {
+            template_cache: cache,
+            ..self
+        }
+    }
 }
 
 impl fmt::Debug for RuntimeServices {
@@ -290,6 +312,7 @@ pub struct RuntimeServicesBuilder {
     config_store: Option<Arc<dyn PlatformConfigStore>>,
     secret_store: Option<Arc<dyn PlatformSecretStore>>,
     kv_store: Option<Arc<dyn PlatformKvStore>>,
+    template_cache: Option<Arc<dyn super::PlatformTemplateCache>>,
     backend: Option<Arc<dyn PlatformBackend>>,
     http_client: Option<Arc<dyn PlatformHttpClient>>,
     geo: Option<Arc<dyn PlatformGeo>>,
@@ -303,6 +326,7 @@ impl RuntimeServicesBuilder {
             config_store: None,
             secret_store: None,
             kv_store: None,
+            template_cache: None,
             backend: None,
             http_client: None,
             geo: None,
@@ -322,6 +346,13 @@ impl RuntimeServicesBuilder {
     #[must_use]
     pub fn secret_store(mut self, secret_store: Arc<dyn PlatformSecretStore>) -> Self {
         self.secret_store = Some(secret_store);
+        self
+    }
+
+    /// Set the shared transformed-template cache. Spike-only.
+    #[must_use]
+    pub fn template_cache(mut self, cache: Arc<dyn super::PlatformTemplateCache>) -> Self {
+        self.template_cache = Some(cache);
         self
     }
 
@@ -387,6 +418,11 @@ impl RuntimeServicesBuilder {
             kv_store: self
                 .kv_store
                 .expect("should set kv_store before building RuntimeServices"),
+            // Defaulted rather than required: an adapter with no template cache
+            // should degrade to transforming per request, not fail to build.
+            template_cache: self
+                .template_cache
+                .unwrap_or_else(|| Arc::new(super::UnavailableTemplateCache)),
             backend: self
                 .backend
                 .expect("should set backend before building RuntimeServices"),
