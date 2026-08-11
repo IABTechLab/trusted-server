@@ -1,4 +1,11 @@
-import type { GptDiagnosticsApi, GptDiagnosticsExportV1 } from '../../core/types';
+import type {
+  GptDiagnosticsApi,
+  GptDiagnosticsCreativeFailure,
+  GptDiagnosticsExportV1,
+  GptDiagnosticsRecorder,
+  GptDiagnosticsSlotHandle,
+  GptDiagnosticsTrustedServerOpportunity,
+} from '../../core/types';
 
 import type { GptDiagnosticsBindingManager } from './binding';
 import type { GptDiagnosticsStoreSnapshot } from './store';
@@ -6,6 +13,19 @@ import type { GptDiagnosticsStoreSnapshot } from './store';
 interface ApiStore {
   snapshot(): GptDiagnosticsStoreSnapshot;
   subscribe(listener: () => void): () => void;
+  recordTrustedServerOpportunity(
+    slot: GptDiagnosticsSlotHandle,
+    auctionSlotId: string,
+    opportunity: GptDiagnosticsTrustedServerOpportunity,
+    trustedServerAuctionId?: string
+  ): void;
+  recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
+  recordTrustedServerCreativeRequest(auctionSlotId: string): number | undefined;
+  recordTrustedServerCreativeResponse(attemptId: number): void;
+  recordTrustedServerCreativeFailure(
+    attemptId: number,
+    reason: GptDiagnosticsCreativeFailure
+  ): void;
 }
 
 interface ApiBindingManager {
@@ -32,9 +52,64 @@ interface ApiOptions {
 
 type ApiListener = (snapshot: GptDiagnosticsExportV1) => void;
 
+function cloneExportSnapshot(snapshot: GptDiagnosticsExportV1): GptDiagnosticsExportV1 {
+  return {
+    version: snapshot.version,
+    capturedAt: snapshot.capturedAt,
+    page: { ...snapshot.page },
+    slots: snapshot.slots.map((slot) => ({
+      ...slot,
+      binding: { ...slot.binding },
+      requests: slot.requests.map((cycle) => ({
+        ...cycle,
+        durations: { ...cycle.durations },
+        size: cycle.size ? [...cycle.size] : undefined,
+        adManager: cycle.adManager
+          ? {
+              ...cycle.adManager,
+              yieldGroupIds: cycle.adManager.yieldGroupIds
+                ? [...cycle.adManager.yieldGroupIds]
+                : undefined,
+              companyIds: cycle.adManager.companyIds ? [...cycle.adManager.companyIds] : undefined,
+            }
+          : undefined,
+        trustedServerCreativeFailures: cycle.trustedServerCreativeFailures
+          ? [...cycle.trustedServerCreativeFailures]
+          : undefined,
+      })),
+    })),
+    callbackIssues: snapshot.callbackIssues.map((issue) => ({ ...issue })),
+    ...(snapshot.attributionIssues === undefined
+      ? {}
+      : { attributionIssues: snapshot.attributionIssues.map((issue) => ({ ...issue })) }),
+    coverage: Object.fromEntries(
+      Object.entries(snapshot.coverage).map(([kind, counters]) => [kind, { ...counters }])
+    ) as GptDiagnosticsExportV1['coverage'],
+    metadata: { ...snapshot.metadata },
+  };
+}
+
+function safelyRecord(action: () => void): void {
+  try {
+    action();
+  } catch {
+    // Diagnostics must not alter delivery.
+  }
+}
+
+function safelyCreateAttempt(action: () => number | undefined): number | undefined {
+  try {
+    return action();
+  } catch {
+    return undefined;
+  }
+}
+
 /** Owns the public read-only diagnostics API and its source subscriptions. */
 export class GptDiagnosticsApiController {
   readonly api: GptDiagnosticsApi;
+  /** Internal evidence channel for Trusted Server integration modules. */
+  readonly recorder: GptDiagnosticsRecorder;
 
   private readonly store: ApiStore;
   private readonly bindings: ApiBindingManager;
@@ -72,6 +147,29 @@ export class GptDiagnosticsApiController {
       show: () => this.presentation.show(),
       hide: () => this.presentation.hide(),
     };
+
+    this.recorder = {
+      recordTrustedServerOpportunity: (slot, auctionSlotId, opportunity, trustedServerAuctionId) =>
+        safelyRecord(() => {
+          if (trustedServerAuctionId === undefined) {
+            this.store.recordTrustedServerOpportunity(slot, auctionSlotId, opportunity);
+          } else {
+            this.store.recordTrustedServerOpportunity(
+              slot,
+              auctionSlotId,
+              opportunity,
+              trustedServerAuctionId
+            );
+          }
+        }),
+      recordPrebidRefresh: (slots) => safelyRecord(() => this.store.recordPrebidRefresh(slots)),
+      recordTrustedServerCreativeRequest: (auctionSlotId) =>
+        safelyCreateAttempt(() => this.store.recordTrustedServerCreativeRequest(auctionSlotId)),
+      recordTrustedServerCreativeResponse: (attemptId) =>
+        safelyRecord(() => this.store.recordTrustedServerCreativeResponse(attemptId)),
+      recordTrustedServerCreativeFailure: (attemptId, reason) =>
+        safelyRecord(() => this.store.recordTrustedServerCreativeFailure(attemptId, reason)),
+    };
   }
 
   snapshot(): GptDiagnosticsExportV1 {
@@ -94,9 +192,24 @@ export class GptDiagnosticsApiController {
           ...cycle,
           durations: { ...cycle.durations },
           size: cycle.size ? [...cycle.size] : undefined,
+          adManager: cycle.adManager
+            ? {
+                ...cycle.adManager,
+                yieldGroupIds: cycle.adManager.yieldGroupIds
+                  ? [...cycle.adManager.yieldGroupIds]
+                  : undefined,
+                companyIds: cycle.adManager.companyIds
+                  ? [...cycle.adManager.companyIds]
+                  : undefined,
+              }
+            : undefined,
+          trustedServerCreativeFailures: cycle.trustedServerCreativeFailures
+            ? [...cycle.trustedServerCreativeFailures]
+            : undefined,
         })),
       })),
       callbackIssues: store.callbackIssues.map((issue) => ({ ...issue })),
+      attributionIssues: store.attributionIssues.map((issue) => ({ ...issue })),
       coverage: Object.fromEntries(
         Object.entries(store.coverage).map(([kind, counters]) => [kind, { ...counters }])
       ) as GptDiagnosticsExportV1['coverage'],
@@ -145,9 +258,20 @@ export class GptDiagnosticsApiController {
       this.notificationScheduled = false;
       if (this.destroyed) return;
 
+      // One snapshot per notification: every subscriber must see the same
+      // `capturedAt` and the same derived delivery states, and deriving it once
+      // keeps the cost independent of the subscriber count.
+      let snapshot: GptDiagnosticsExportV1;
+      try {
+        snapshot = this.snapshot();
+      } catch {
+        // A snapshot failure must not escape the scheduled callback.
+        return;
+      }
+
       for (const listener of this.listeners) {
         try {
-          listener(this.snapshot());
+          listener(cloneExportSnapshot(snapshot));
         } catch {
           // One API subscriber must not block the rest.
         }

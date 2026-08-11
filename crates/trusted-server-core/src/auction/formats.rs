@@ -449,6 +449,7 @@ mod tests {
             height: 250,
             nurl: None,
             burl: None,
+            bid_id: None,
             ad_id: None,
             cache_id: None,
             cache_host: None,

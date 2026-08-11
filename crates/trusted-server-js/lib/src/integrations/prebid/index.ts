@@ -16,7 +16,7 @@ import type _pbjsDefault from 'prebid.js';
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
-import type { AuctionSlot } from '../../core/types';
+import type { AuctionSlot, TsjsApi } from '../../core/types';
 
 import { PREBID_USER_ID_MODULE_REGISTRY } from './user_id_modules';
 
@@ -129,6 +129,8 @@ interface InjectedPrebidConfig {
   bidders?: string[];
   /** Bidders that run client-side via native Prebid.js adapters. */
   clientSideBidders?: string[];
+  /** GAM ad-unit-path suffixes excluded from refresh auctions. */
+  excludedGamAdUnitPathSuffixes?: string[];
 }
 
 interface PrebidUserIdDiagnostics {
@@ -364,10 +366,56 @@ type PrebidUserIdEid = {
 
 type RefreshGptSlot = {
   getSlotElementId?: () => string;
+  getAdUnitPath?: () => string;
   getTargeting?: (key: string) => string[];
   clearTargeting?: (key?: string) => RefreshGptSlot;
   getSizes?: () => unknown[];
 };
+
+function recordPrebidRefreshForDiagnostics(slots: RefreshGptSlot[]): void {
+  try {
+    window.tsjs?.gptDiagnosticsRecorder?.recordPrebidRefresh(slots);
+  } catch {
+    // Diagnostics must not suppress the GAM request.
+  }
+}
+
+function dispatchPrebidRefresh<T>(
+  refresh: (slots?: unknown[], opts?: unknown) => T,
+  slots: unknown[] | undefined,
+  opts: unknown
+): T {
+  let tsjs: TsjsApi | undefined;
+  let hadOwnContext = false;
+  let previousContext: boolean | undefined;
+  let shouldRestoreContext = false;
+  try {
+    tsjs = window.tsjs;
+    if (tsjs) {
+      hadOwnContext = Object.prototype.hasOwnProperty.call(tsjs, 'prebidRefreshDispatchInProgress');
+      previousContext = tsjs.prebidRefreshDispatchInProgress;
+      shouldRestoreContext = true;
+      tsjs.prebidRefreshDispatchInProgress = true;
+    }
+  } catch {
+    // Diagnostics context must not affect refresh delegation.
+  }
+  try {
+    return refresh(slots, opts);
+  } finally {
+    if (shouldRestoreContext && tsjs) {
+      try {
+        if (hadOwnContext) {
+          tsjs.prebidRefreshDispatchInProgress = previousContext;
+        } else {
+          delete tsjs.prebidRefreshDispatchInProgress;
+        }
+      } catch {
+        // Diagnostics context restoration must not mask a refresh result or throw.
+      }
+    }
+  }
+}
 
 const DEFAULT_REFRESH_SIZES: BannerSize[] = [
   [728, 90],
@@ -688,6 +736,33 @@ function serverSideBidderParamsForRefresh(
 function publisherZoneForRefresh(candidateCodes: Array<string | undefined>): string | undefined {
   const match = findRefreshAdUnit(candidateCodes);
   return match ? match.mediaTypes?.banner?.name : findRefreshSnapshot(candidateCodes)?.zone;
+}
+
+function isUsableRefreshAuctionExclusionSuffix(suffix: unknown): suffix is string {
+  return typeof suffix === 'string' && suffix.startsWith('/') && suffix.length > 1;
+}
+
+function refreshAuctionExclusionSuffixes(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter(isUsableRefreshAuctionExclusionSuffix) : [];
+}
+
+function isExcludedFromRefreshAuction(
+  slot: RefreshGptSlot,
+  excludedGamAdUnitPathSuffixes: readonly string[]
+): boolean {
+  if (excludedGamAdUnitPathSuffixes.length === 0) return false;
+
+  try {
+    const adUnitPath = slot.getAdUnitPath?.();
+    return (
+      typeof adUnitPath === 'string' &&
+      excludedGamAdUnitPathSuffixes.some((suffix) => adUnitPath.endsWith(suffix))
+    );
+  } catch {
+    // GPT path metadata is optional for this optimization. If it is unavailable,
+    // preserve normal refresh-auction behavior rather than suppressing demand.
+    return false;
+  }
 }
 
 function clearRefreshTargeting(slot: RefreshGptSlot): void {
@@ -1226,12 +1301,25 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       const deliverySlots = publisherDeliverySlots(targetSlots);
       const independentSlots = targetSlots.filter((slot) => !deliverySlots.has(slot));
       if (independentSlots.length === 0) {
+        recordPrebidRefreshForDiagnostics(targetSlots);
+        return dispatchPrebidRefresh(originalRefresh, slots, opts);
+      }
+
+      // Clear stale Trusted Server/Prebid targeting from independent slots before
+      // filtering so excluded slots still receive a clean GAM refresh.
+      independentSlots.forEach(clearRefreshTargeting);
+
+      const excludedGamAdUnitPathSuffixes = refreshAuctionExclusionSuffixes(
+        getInjectedConfig()?.excludedGamAdUnitPathSuffixes
+      );
+      const auctionSlots = independentSlots.filter(
+        (slot) => !isExcludedFromRefreshAuction(slot, excludedGamAdUnitPathSuffixes)
+      );
+      if (!auctionSlots.length) {
         return originalRefresh(slots, opts);
       }
 
-      independentSlots.forEach(clearRefreshTargeting);
-
-      const adUnits = independentSlots.map((slot) => {
+      const adUnits = auctionSlots.map((slot) => {
         const injectedSlot = findInjectedSlotForRefresh(slot);
         const code = refreshSlotElementId(slot) ?? 'refresh-slot';
         // A TS-owned slot may be defined on `${div_id}-container`, so the GPT
@@ -1291,7 +1379,12 @@ export function installRefreshHandler(timeoutMs = 1500): void {
             log.error('[tsjs-prebid] refresh targeting failed', error);
           }
         }
-        originalRefresh(slots, opts);
+        recordPrebidRefreshForDiagnostics(targetSlots);
+        // Preserve the publisher's original refresh form. In particular, a bare
+        // GPT refresh remains bare so GPT resolves its registered slot set when
+        // the auction completes; the dispatch wrapper only scopes the shared
+        // diagnostics context around the delegated call.
+        dispatchPrebidRefresh(originalRefresh, slots, opts);
       }
 
       try {
