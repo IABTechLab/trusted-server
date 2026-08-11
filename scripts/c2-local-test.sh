@@ -261,16 +261,83 @@ if [ "$MODE" != "inline" ]; then
 EOF
 fi
 
-info "Timing (bid endpoint delays $BID_DELAY s)"
-printf '  request 1  ttfb=%ss  total=%ss\n' "$TTFB1" "$TOTAL1"
-printf '  request 2  ttfb=%ss  total=%ss\n' "$TTFB2" "$TOTAL2"
-cat <<EOF
+cat > "$WORK/probe.py" <<'PROBEEOF'
+"""Measures time to first *body* byte, which curl's time_starttransfer does not.
 
-  Read it like this: TTFB ~= total means the response is buffered — the reader
-  waits for the auction before receiving any byte. Streaming assembly is the
-  change that should pull TTFB away from total by roughly the bid delay. That
-  gap is the pass/fail for that work; today there is none.
+For a streaming response, headers commit long before any body byte, so
+time_starttransfer reports header-commit time and a stream that stalls before its
+first chunk looks identical to one that does not.
+"""
+import socket, sys, time
+
+host, port, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+extra = sys.argv[4] if len(sys.argv) > 4 else ""
+
+req = (
+    f"GET {path} HTTP/1.1\r\nHost: ts.example.com\r\n"
+    "sec-fetch-dest: document\r\nsec-fetch-mode: navigate\r\n"
+    f"{extra}Connection: close\r\n\r\n"
+).encode()
+
+s = socket.create_connection((host, port))
+t0 = time.time()
+s.sendall(req)
+
+buf = b""
+t_headers = t_body = None
+total = 0
+while True:
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    if t_headers is None:
+        t_headers = time.time()
+    buf += chunk
+    total += len(chunk)
+    # First byte past the header terminator is the first body byte.
+    if t_body is None and b"\r\n\r\n" in buf:
+        head_end = buf.index(b"\r\n\r\n") + 4
+        if len(buf) > head_end:
+            t_body = time.time()
+t_end = time.time()
+s.close()
+
+def ms(t):
+    return "n/a" if t is None else f"{(t - t0) * 1000:.0f}ms"
+
+print(f"headers={ms(t_headers)}  first_body_byte={ms(t_body)}  complete={ms(t_end)}  bytes={total}")
+PROBEEOF
+
+info "Delivery timing (bid endpoint delays $BID_DELAY s)"
+cat <<'EOF'
+  Measured with a socket probe, not curl. `time_starttransfer` reports the first byte
+  of the *response*, which for a streaming response is the headers — committed long
+  before any body byte. A stream that stalls before its first chunk looks identical to
+  one that does not.
 EOF
+echo
+probe_body_ms() { python3 "$WORK/probe.py" 127.0.0.1 "$TS_PORT" /article; }
+echo "  request A: $(probe_body_ms)"
+B_LINE="$(probe_body_ms)"
+echo "  request B: $B_LINE"
+echo
+
+FIRST_BODY=$(echo "$B_LINE" | sed -n 's/.*first_body_byte=\([0-9]*\)ms.*/\1/p')
+COMPLETE=$(echo "$B_LINE" | sed -n 's/.*complete=\([0-9]*\)ms.*/\1/p')
+
+if [ "$MODE" = "inline" ]; then
+  check "inline delivers the article before the auction resolves" \
+    "$(awk -v f="$FIRST_BODY" -v c="$COMPLETE" 'BEGIN { print (f < c / 3) ? "yes" : "no" }')" \
+    "yes"
+else
+  # The property the unit tests cannot reach: in-process there is no bid provider, so
+  # there is no auction to wait on and reordering the stream is unobservable. Here the
+  # bid endpoint really sleeps, so the first body byte either beats it or does not.
+  check "cache hit streams: the article is delivered before the auction resolves" \
+    "$(awk -v f="$FIRST_BODY" -v c="$COMPLETE" 'BEGIN { print (f < c / 3) ? "yes" : "no" }')" \
+    "yes"
+fi
+printf '    first body byte %sms, complete %sms\n\n' "$FIRST_BODY" "$COMPLETE"
 
 info "Result"
 printf '  %d passed, %d failed\n\n' "$PASS" "$FAIL"

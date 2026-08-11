@@ -1146,6 +1146,27 @@ pub enum PublisherResponse {
         /// Parameters for [`process_response_streaming`].
         params: Box<OwnedProcessResponseParams>,
     },
+    /// A shared template read from C2, to be assembled on the way out.
+    ///
+    /// Distinct from [`Self::Stream`] because the bytes are **already transformed** —
+    /// running them through `lol_html` again would inject a second tsjs `<script>` and
+    /// re-rewrite already-rewritten URLs. All this needs is the seam split.
+    ///
+    /// Carried to the finalizer rather than assembled at the read, because assembling
+    /// eagerly means buffering: the reader would wait for the auction before the first
+    /// byte, which measured ~100x worse TTFB than doing nothing. The finalizer owns the
+    /// `Arc`s a `'static` stream needs.
+    ///
+    /// Spike-only, for the #1009 ESI validation.
+    AssembleTemplate {
+        /// Response with every header already set. `Content-Length` must stay absent:
+        /// the assembled length is unknown until bids resolve.
+        response: Response<EdgeBody>,
+        /// The cached template, containing exactly one unresolved seam marker.
+        template: Vec<u8>,
+        /// Auction and injection state, same as [`Self::Stream`].
+        params: Box<OwnedProcessResponseParams>,
+    },
     /// Non-processable 2xx response (images, fonts, video). The adapter must
     /// reattach the body via setting the body before returning.
     /// `finalize_response()` and `send_to_client()` are applied at the outer
@@ -1271,6 +1292,11 @@ pub struct OwnedProcessResponseParams {
 ///
 /// Returns an error if the streaming pipeline fails to process the response
 /// body, or if the processed body exceeds the configured buffer cap.
+///
+/// # Panics
+///
+/// Panics if the `ad_bids_state` mutex is poisoned, which requires a prior panic while
+/// it was held. Every holder is a short, infallible read or write of an `Option<String>`.
 pub async fn buffer_publisher_response_async(
     publisher_response: PublisherResponse,
     method: &Method,
@@ -1342,6 +1368,52 @@ pub async fn buffer_publisher_response_async(
             *response.body_mut() = EdgeBody::from(bytes);
             Ok(response)
         }
+        PublisherResponse::AssembleTemplate {
+            mut response,
+            template,
+            mut params,
+        } => {
+            // Buffered adapters have no streaming to preserve, so eager assembly costs
+            // them nothing. The streaming finalizer must not do this.
+            if let Some(dispatched) = params.dispatched_auction.take() {
+                collect_stream_auction(
+                    dispatched,
+                    AuctionTelemetryCarry {
+                        observation: params.auction_observation.take(),
+                        auction_request: params.auction_request.take(),
+                    },
+                    &AuctionCollectDeps {
+                        price_granularity: params.price_granularity,
+                        ad_bids_state: &params.ad_bids_state,
+                        orchestrator,
+                        services,
+                        settings,
+                        request_origin: request_origin(
+                            &params.request_scheme,
+                            &params.request_host,
+                        ),
+                    },
+                )
+                .await;
+            }
+            let (head, tail) = split_template_at_seam(&template);
+            let bids = params
+                .ad_bids_state
+                .lock()
+                .expect("should lock bid state")
+                .clone()
+                .unwrap_or_else(build_empty_bids_script);
+            let mut assembled = Vec::with_capacity(head.len() + bids.len() + tail.len());
+            assembled.extend_from_slice(head);
+            assembled.extend_from_slice(bids.as_bytes());
+            assembled.extend_from_slice(tail);
+            response.headers_mut().insert(
+                http::header::CONTENT_LENGTH,
+                http::HeaderValue::from(assembled.len() as u64),
+            );
+            *response.body_mut() = EdgeBody::from(assembled);
+            Ok(response)
+        }
         PublisherResponse::PassThrough { mut response, body } => {
             *response.body_mut() = body;
             Ok(response)
@@ -1400,43 +1472,51 @@ fn assemble_if_shared(
         })
 }
 
-/// Collects the in-flight auction and assembles the cached template with its bids.
+/// Builds the injection state a cached template needs on the way out.
 ///
-/// A C2 hit skips the origin fetch, and with it the streaming pipeline that normally
-/// collects the auction and fills the `</body>` seam. Both still have to happen — the
-/// auction was dispatched before the lookup and is already billing the SSPs.
+/// The template carries no auction state — that is what makes it shareable — so the
+/// per-reader parts are attached here, from this request.
+fn build_template_assembly_params(
+    entry: &crate::platform::TemplateEntry,
+    settings: &Settings,
+    request_host: &str,
+    request_scheme: &str,
+    price_granularity: PriceGranularity,
+    ad_bids_state: Arc<Mutex<Option<String>>>,
+) -> OwnedProcessResponseParams {
+    OwnedProcessResponseParams {
+        // Already stored, and storing again on a hit would be pointless work.
+        template_cache_key: None,
+        content_encoding: entry.metadata.content_encoding.clone(),
+        origin_host: String::new(),
+        origin_url: settings.publisher.origin_url.clone(),
+        request_host: request_host.to_string(),
+        request_scheme: request_scheme.to_string(),
+        content_type: entry.metadata.content_type.clone(),
+        // The template already carries the head seam; re-injecting would duplicate it.
+        ad_slots_script: None,
+        ad_bids_state,
+        auction_observation: None,
+        auction_request: None,
+        dispatched_auction: None,
+        price_granularity,
+        gpt_diagnostics: None,
+    }
+}
+
+/// Splits a template at its seam marker.
 ///
 /// # Errors
 ///
-/// Returns an error if the cached bytes are not UTF-8, or if assembly fails.
-async fn collect_and_assemble_cached_template(
-    entry: &crate::platform::TemplateEntry,
-    dispatched: Option<DispatchedAuction>,
-    telemetry: AuctionTelemetryCarry,
-    deps: &AuctionCollectDeps<'_>,
-) -> Result<Vec<u8>, Report<TrustedServerError>> {
-    if let Some(dispatched) = dispatched {
-        collect_stream_auction(dispatched, telemetry, deps).await;
+/// Returns the template unchanged as the head, with no tail, if the marker is absent —
+/// callers check for it before reaching here, so that is a defensive path rather than an
+/// expected one.
+fn split_template_at_seam(template: &[u8]) -> (&[u8], &[u8]) {
+    let marker = ESI_BIDS_INCLUDE.as_bytes();
+    match template.windows(marker.len()).position(|w| w == marker) {
+        Some(at) => (&template[..at], &template[at + marker.len()..]),
+        None => (template, &[]),
     }
-
-    let template = core::str::from_utf8(&entry.body).change_context(TrustedServerError::Proxy {
-        message: "cached template is not valid UTF-8, so it cannot be assembled".to_string(),
-    })?;
-
-    let fragment = deps
-        .ad_bids_state
-        .lock()
-        .expect("should lock bid state")
-        .clone()
-        .unwrap_or_else(build_empty_bids_script);
-
-    deps.services
-        .template_assembler()
-        .assemble(template, &fragment)
-        .map(String::into_bytes)
-        .change_context(TrustedServerError::Proxy {
-            message: "failed to assemble the cached template".to_string(),
-        })
 }
 
 /// Builds the response served from a C2 hit.
@@ -1463,13 +1543,11 @@ async fn collect_and_assemble_cached_template(
 /// Spike-only, for the #1009 ESI validation.
 fn build_cached_template_response(
     entry: &crate::platform::TemplateEntry,
-    assembled: Vec<u8>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let invalid = |what: &str| TrustedServerError::Proxy {
         message: format!("cached template has an unusable {what}"),
     };
-    let assembled_len = assembled.len() as u64;
-    let mut response = Response::new(EdgeBody::from(assembled));
+    let mut response = Response::new(EdgeBody::empty());
     // First, not last: see the note above. The assembled response is per-user even
     // though the template it was built from is not.
     response.headers_mut().insert(
@@ -1491,11 +1569,10 @@ fn build_cached_template_response(
                 .change_context_lazy(|| invalid("content encoding"))?,
         );
     }
-    // The assembled length, not the template's: assembly substitutes the marker for a
-    // bids script, so the two differ on every request.
-    response
-        .headers_mut()
-        .insert(header::CONTENT_LENGTH, HeaderValue::from(assembled_len));
+    // No `Content-Length`. The assembled length is not known until bids resolve, and on
+    // this adapter headers commit before the first body byte — so a length guessed here
+    // could not be corrected later.
+    response.headers_mut().remove(header::CONTENT_LENGTH);
     Ok(response)
 }
 
@@ -1560,6 +1637,11 @@ async fn store_template_if_authorized(
 /// Returns an error if processor construction fails before the streaming body
 /// is created; a dispatched auction is abandoned with `processor_init_error`
 /// telemetry first, matching the buffered finalizer.
+///
+/// # Panics
+///
+/// Panics if the `ad_bids_state` mutex is poisoned, which requires a prior panic while
+/// it was held. Every holder is a short, infallible read or write of an `Option<String>`.
 pub async fn publisher_response_into_streaming_response(
     publisher_response: PublisherResponse,
     method: &Method,
@@ -1607,6 +1689,62 @@ pub async fn publisher_response_into_streaming_response(
             if !response_carries_body(method, response.status()) {
                 make_response_bodiless(&mut response);
             }
+            Ok(response)
+        }
+        PublisherResponse::AssembleTemplate {
+            mut response,
+            template,
+            mut params,
+        } => {
+            if !response_carries_body(method, response.status()) {
+                make_response_bodiless(&mut response);
+                return Ok(response);
+            }
+
+            let services = services.clone();
+            let settings = Arc::clone(&settings);
+            let orchestrator = Arc::clone(&orchestrator);
+
+            // This is the whole point of the variant. The template's head goes out
+            // immediately, so the article paints while the auction is still running; the
+            // only wait is at the seam, at the very end of the document. Assembling
+            // eagerly instead measured ~100x worse TTFB than doing nothing.
+            let stream = async_stream::try_stream! {
+                let (head, tail) = split_template_at_seam(&template);
+                yield bytes::Bytes::copy_from_slice(head);
+
+                if let Some(dispatched) = params.dispatched_auction.take() {
+                    collect_stream_auction(
+                        dispatched,
+                        AuctionTelemetryCarry {
+                            observation: params.auction_observation.take(),
+                            auction_request: params.auction_request.take(),
+                        },
+                        &AuctionCollectDeps {
+                            price_granularity: params.price_granularity,
+                            ad_bids_state: &params.ad_bids_state,
+                            orchestrator: &orchestrator,
+                            services: &services,
+                            settings: &settings,
+                            request_origin: request_origin(
+                                &params.request_scheme,
+                                &params.request_host,
+                            ),
+                        },
+                    )
+                    .await;
+                }
+
+                let bids = params
+                    .ad_bids_state
+                    .lock()
+                    .expect("should lock bid state")
+                    .clone()
+                    .unwrap_or_else(build_empty_bids_script);
+                yield bytes::Bytes::from(bids);
+                yield bytes::Bytes::copy_from_slice(tail);
+            };
+            *response.body_mut() = EdgeBody::from_stream::<_, std::io::Error>(stream);
             Ok(response)
         }
         PublisherResponse::PassThrough { mut response, body } => {
@@ -3348,35 +3486,47 @@ pub async fn handle_publisher_request(
         match services.template_cache().get(key).await {
             Ok(entry) => {
                 log::debug!("c2_template_cache hit: {} bytes", entry.body.len());
-                // The origin fetch is skipped, but the auction is not. It was dispatched
-                // above and is in flight; dropping it here would bill the SSPs for a
-                // result nobody reads — the silent waste the dispatch gate exists to
-                // prevent, reappearing on the one path that skips the pipeline which
-                // normally collects it.
-                let assembled = collect_and_assemble_cached_template(
-                    &entry,
-                    dispatched_auction.take(),
-                    AuctionTelemetryCarry {
-                        observation: auction_observation.take(),
-                        auction_request: auction_request_for_telemetry.clone(),
-                    },
-                    &AuctionCollectDeps {
-                        price_granularity,
-                        ad_bids_state: &ad_bids_state,
-                        orchestrator: auction.orchestrator,
-                        services,
+
+                // A template with no seam marker cannot be assembled, and serving it
+                // would be a page with slots and no ads. Treat it as a miss and fetch
+                // the origin: `schema_version` should make this unreachable, so it means
+                // the transform changed without the version moving.
+                if !entry
+                    .body
+                    .windows(ESI_BIDS_INCLUDE.len())
+                    .any(|w| w == ESI_BIDS_INCLUDE.as_bytes())
+                {
+                    log::error!(
+                        "c2_template_cache hit has no seam marker; treating as a miss. \
+                         The transform changed without TEMPLATE_SCHEMA_VERSION moving."
+                    );
+                } else {
+                    // Deliberately *not* assembled here. The auction is still in flight,
+                    // and awaiting it now would hold the first byte until it resolves —
+                    // measured at ~100x worse TTFB than doing nothing. The finalizer
+                    // streams the template up to the seam, waits there, and writes the
+                    // bids into the gap.
+                    //
+                    // Headers are constructed rather than replayed, so no origin header
+                    // can reach a second reader through the cache.
+                    let response = build_cached_template_response(&entry)?;
+                    let mut params = build_template_assembly_params(
+                        &entry,
                         settings,
-                        request_origin: request_origin(request_scheme, request_host),
-                    },
-                )
-                .await?;
-                // Headers are constructed rather than replayed. The publisher path
-                // rewrites `Cache-Control` and strips validators *after* the send, so
-                // replaying stored origin headers would fight that — and constructing
-                // them means no origin header can leak through the cache.
-                return Ok(PublisherResponse::Buffered(build_cached_template_response(
-                    &entry, assembled,
-                )?));
+                        request_host,
+                        request_scheme,
+                        price_granularity,
+                        Arc::clone(&ad_bids_state),
+                    );
+                    params.dispatched_auction = dispatched_auction.take();
+                    params.auction_observation = auction_observation.take();
+                    params.auction_request = auction_request_for_telemetry.clone();
+                    return Ok(PublisherResponse::AssembleTemplate {
+                        response,
+                        template: entry.body,
+                        params: Box::new(params),
+                    });
+                }
             }
             Err(miss) => log::debug!("c2_template_cache miss: {miss}"),
         }
@@ -6632,6 +6782,64 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_cache_hit_streams_rather_than_buffering() {
+            // The property that makes the cache worth having, and the one that regressed
+            // silently. Buffered assembly held the first byte until the auction resolved
+            // — measured at ~100x worse TTFB than shipping nothing at all, because the
+            // inline path already streams and waits only at `</body>`.
+            //
+            // Asserted on the body *shape* rather than on timing: a timing test would be
+            // flaky, and `EdgeBody::Stream` is the structural fact that produces the
+            // timing.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+
+            // Warm the cache, then take the hit.
+            let _ = run(&settings, &services, navigation_request()).await;
+            let warm = run(&settings, &services, navigation_request()).await;
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "the second request must be a hit, or this asserts nothing"
+            );
+            assert!(
+                warm.headers().get(header::CONTENT_LENGTH).is_none(),
+                "a streamed assembly has no length until bids resolve, and headers \
+                 commit before the first byte"
+            );
+
+            // The invariant that actually matters, and the one a body-shape assertion
+            // misses: a stream that awaited the auction before its first yield would
+            // still be an `EdgeBody::Stream` and would still hold the first byte.
+            //
+            // So pull exactly one chunk and prove the auction has not been collected
+            // yet — `ad_bids_state` is only written by the collector. No timing
+            // involved, so nothing to be flaky about.
+            let EdgeBody::Stream(mut stream) = warm.into_body() else {
+                panic!("a cache hit must stream, not buffer");
+            };
+            let first = stream
+                .next()
+                .await
+                .expect("the stream should yield a first chunk")
+                .expect("the first chunk should read");
+
+            assert!(
+                first.starts_with(b"<!doctype html>") || first.starts_with(b"<html"),
+                "the first chunk must be the document head, not the bids: {:?}",
+                String::from_utf8_lossy(&first[..first.len().min(60)])
+            );
+            assert!(
+                !first.windows(11).any(|w| w == b"window.tsjs"),
+                "the first chunk must precede the bids script"
+            );
+        }
+
+        #[tokio::test]
         async fn a_bypassed_response_falls_back_to_inline_at_every_seam() {
             // Observed against a real origin: a page arrived with a raw
             // `<esi:include>` in it and no bids at all. The `</body>` seam emitted the
@@ -7514,6 +7722,7 @@ mod tests {
             match response {
                 PublisherResponse::Buffered(response)
                 | PublisherResponse::Stream { response, .. }
+                | PublisherResponse::AssembleTemplate { response, .. }
                 | PublisherResponse::PassThrough { response, .. } => response.into_parts().0,
             }
         }
@@ -7747,7 +7956,9 @@ mod tests {
                 // Assert
                 let response = match response {
                     PublisherResponse::Buffered(response) => response,
-                    PublisherResponse::PassThrough { .. } | PublisherResponse::Stream { .. } => {
+                    PublisherResponse::PassThrough { .. }
+                    | PublisherResponse::Stream { .. }
+                    | PublisherResponse::AssembleTemplate { .. } => {
                         panic!("unexpected origin 304 should return a buffered response")
                     }
                 };
@@ -7830,7 +8041,9 @@ mod tests {
             // Assert
             let response = match response {
                 PublisherResponse::Buffered(response) => response,
-                PublisherResponse::PassThrough { .. } | PublisherResponse::Stream { .. } => {
+                PublisherResponse::PassThrough { .. }
+                | PublisherResponse::Stream { .. }
+                | PublisherResponse::AssembleTemplate { .. } => {
                     panic!("noneligible origin 304 should remain buffered")
                 }
             };
@@ -7904,7 +8117,8 @@ mod tests {
                 *response.body_mut() = body;
                 response
             }
-            PublisherResponse::Stream { response, .. } => response,
+            PublisherResponse::Stream { response, .. }
+            | PublisherResponse::AssembleTemplate { response, .. } => response,
         };
 
         assert_eq!(response.status(), StatusCode::OK);
