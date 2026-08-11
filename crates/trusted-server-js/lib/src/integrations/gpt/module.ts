@@ -2,8 +2,14 @@ import type {
   IntegrationActivationContext,
   IntegrationPrepareContext,
   IntegrationRegistration,
+  PreparedIntegration,
 } from '../../kernel/integration_registry';
-import type { GoogletagAdapter, GoogletagFacade } from '../../adapters/googletag';
+import {
+  createBrowserGoogletagAdapter,
+  type GoogletagAdapter,
+  type GoogletagFacade,
+} from '../../adapters/googletag';
+import type { MessagingAdapter } from '../../adapters/messaging';
 import {
   isAuctionCandidateIdV1,
   isRendererReservationIdV1,
@@ -12,26 +18,46 @@ import type {
   BrowserAuctionBidV1,
   BrowserAuctionProjectionV1,
   BrowserAuctionSlotV1,
+  CacheFetchPolicyV1,
 } from '../../core/types';
-import type { NavigationSession } from '../../kernel/sessions';
+import { log } from '../../core/log';
+import { prepareAdmIframe } from '../../core/render';
+import { DisposableStack } from '../../kernel/disposable';
+import type { RuntimeCapabilityV1 } from '../../kernel/runtime';
+import type { NavigationSession, RenderAttemptScope } from '../../kernel/sessions';
 import {
   createSlotOperation,
+  renderDirectCacheAttempt,
+  resolveCacheAdmAttempt,
   type CommittedRenderArtifact,
   type RenderAttempt,
+  type RenderAttemptCreationResult,
   type RenderFailureReason,
+  type RendererNonceRegistry,
   type SlotOperationCreationResult,
   type SlotOperationOptions,
 } from '../../services/render';
-import type { PucBridge, PucGamAttemptInput } from '../../services/puc_bridge';
+import {
+  createPucBridge,
+  type PucBridge,
+  type PucGamAttemptInput,
+} from '../../services/puc_bridge';
 import type { ReservationService } from '../../services/reservations';
-import type { SlotRequestOutcome, SlotService } from '../../services/slots';
+import { createSlotService, type SlotRequestOutcome, type SlotService } from '../../services/slots';
 import type {
   TargetingBoundary,
   TargetingOwnership,
   TargetingService,
 } from '../../services/targeting';
+import { createTargetingService } from '../../services/targeting';
 
+import {
+  activateGptDiagnosticsEventListeners,
+  createGptDiagnosticsFactBuffer,
+  projectGptTraceFact,
+} from './diagnostics_facts';
 import { installGptGuard, resetGuardState } from './script_guard';
+import { createGptStartup } from './startup';
 
 export const GPT_INTEGRATION_ID = 'gpt' as const;
 
@@ -48,9 +74,54 @@ const objectIsFrozenIntrinsic = Object.isFrozen;
 const promiseThenIntrinsic = Promise.prototype.then;
 const reflectApplyIntrinsic = Reflect.apply;
 
-interface GptIntegrationRuntime {
-  readonly activate: () => () => void;
-  readonly start: (config: unknown) => void;
+interface ProductionAuctionCapability {
+  readonly navigation: NavigationSession;
+  readonly projection: Readonly<BrowserAuctionProjectionV1>;
+}
+
+interface ProductionSlotsCapability {
+  readonly attachPhysicalService: (service: SlotService) => () => void;
+}
+
+interface ProductionRenderCapability {
+  readonly artifacts: Readonly<{
+    current: (slot: string) => CommittedRenderArtifact | undefined;
+    release: (artifact: CommittedRenderArtifact) => boolean;
+  }>;
+  readonly cachePolicy?: Readonly<CacheFetchPolicyV1>;
+  readonly createAttempt: (
+    owner: RenderAttemptScope,
+    parentAttemptId?: string
+  ) => RenderAttemptCreationResult;
+  readonly publisherOrigin: string;
+  readonly registerRenderer: (
+    type: 'cache',
+    renderer: (attempt: RenderAttempt, container: HTMLElement) => boolean
+  ) => () => void;
+  readonly rendererNonces: RendererNonceRegistry;
+  readonly renderWinner: (attempt: RenderAttempt) => boolean;
+  readonly reservations: ReservationService;
+}
+
+interface ProductionMessagesCapability {
+  readonly messaging: MessagingAdapter;
+}
+
+interface ProductionTraceCapability {
+  readonly observations: Readonly<{
+    publish: (observation: Readonly<Record<string, unknown>>) => boolean;
+  }>;
+}
+
+interface InitialProjectionServices {
+  readonly googletag: GoogletagAdapter;
+  readonly projection: Readonly<BrowserAuctionProjectionV1>;
+  readonly navigation: NavigationSession;
+  readonly protect: RuntimeCapabilityV1['protectFirstDisplayAttemptBatch'];
+  readonly pucBridge: Pick<PucBridge, 'recordNonemptyGam' | 'registerGamAttempt'>;
+  readonly render: ProductionRenderCapability;
+  readonly slots: SlotService;
+  readonly targeting: TargetingService;
 }
 
 export interface GptSlotOperationInput extends Omit<PucGamAttemptInput, 'attempt'> {
@@ -556,6 +627,238 @@ export function startGptSlotOperation(input: GptSlotOperationInput): SlotOperati
   return operation;
 }
 
+function exactCapability<Value extends object>(
+  interfaces: Readonly<Record<string, unknown>>,
+  key: string
+): Value | undefined {
+  const candidate = interfaces[key];
+  return typeof candidate === 'object' && candidate !== null && Object.isFrozen(candidate)
+    ? (candidate as Value)
+    : undefined;
+}
+
+function gptDiagnosticsActive(runtime: RuntimeCapabilityV1): boolean {
+  try {
+    const boot = runtime.boot();
+    if (!boot) return false;
+    const diagnostics = Object.getOwnPropertyDescriptor(boot, 'diagnostics');
+    if (!diagnostics || !('value' in diagnostics)) return false;
+    const gpt = Object.getOwnPropertyDescriptor(diagnostics.value, 'gpt');
+    if (!gpt || !('value' in gpt)) return false;
+    const active = Object.getOwnPropertyDescriptor(gpt.value, 'active');
+    return Boolean(active && 'value' in active && active.value === true);
+  } catch {
+    return false;
+  }
+}
+
+function resolveProjectedSlotElement(
+  document: Document,
+  placement: Readonly<BrowserAuctionSlotV1>
+): HTMLElement | undefined {
+  try {
+    const exact = document.getElementById(placement.divId);
+    if (exact instanceof HTMLElement) return exact;
+    const matches = [...document.querySelectorAll<HTMLElement>('[id]')].filter(
+      (element) => element.id.startsWith(placement.divId) && !element.id.endsWith('-container')
+    );
+    return matches.length === 1 ? matches[0] : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function terminalLatch(attempt: RenderAttempt): Promise<unknown> {
+  return new Promise((resolve) => {
+    if (!attempt.onSettled(resolve)) resolve(attempt.snapshot().outcome);
+  });
+}
+
+interface PreparedInitialGptWinner {
+  readonly attempt: RenderAttempt;
+  readonly bid: BrowserAuctionBidV1;
+  readonly binding: Readonly<{ operation: 'display' | 'refresh'; slot: object }> | undefined;
+  readonly decision: Readonly<{ slot: string; outcome: 'winner'; candidateId: string }>;
+  readonly owner: RenderAttemptScope;
+  readonly placement: BrowserAuctionSlotV1;
+  readonly terminal: Promise<unknown>;
+}
+
+/** Start one immutable initial GPT winner batch and protect every terminal latch together. */
+export async function publishInitialGptProjection(
+  document: Document,
+  input: InitialProjectionServices
+): Promise<void> {
+  const { googletag, navigation, projection, render, slots } = input;
+  if (!navigation.isCurrent() || projection.slots.length === 0) return;
+  const physicalBySlot = new Map<
+    string,
+    Readonly<{ operation: 'display' | 'refresh'; slot: object }>
+  >();
+  const operation = googletag.run(
+    (gpt) => {
+      for (let index = 0; index < projection.slots.length; index += 1) {
+        const placement = projection.slots[index];
+        if (!placement || !navigation.isCurrent()) break;
+        const element = resolveProjectedSlotElement(document, placement);
+        if (!element) continue;
+        const definition = Object.freeze({
+          adUnitPath: placement.gamUnitPath,
+          elementId: element.id,
+          sizes: placement.formats,
+        });
+        const existing = gpt.slots().filter((slot) => gpt.slotElementId?.(slot) === element.id);
+        if (existing.length > 1) continue;
+        const publisherSlot = existing[0];
+        if (publisherSlot) {
+          const adopted = slots.adoptGptSlot(navigation.generation, placement.slot, {
+            definition,
+            elementIdPrefix: placement.divId,
+            ownership: 'publisher',
+            slot: publisherSlot,
+          });
+          if (adopted.ok) {
+            physicalBySlot.set(
+              placement.slot,
+              Object.freeze({ operation: 'refresh', slot: publisherSlot })
+            );
+          }
+          continue;
+        }
+        const defined = gpt.transactionalDefine(
+          definition,
+          () => navigation.isCurrent(),
+          (candidate) => {
+            let committed = false;
+            return Object.freeze({
+              commit: (): boolean => {
+                const adopted = slots.adoptGptSlot(navigation.generation, placement.slot, {
+                  definition,
+                  elementIdPrefix: placement.divId,
+                  ownership: 'trusted_server',
+                  slot: candidate,
+                });
+                committed = adopted.ok;
+                return committed;
+              },
+              rollback: (): void => {
+                if (!committed) return;
+                committed = false;
+                slots.recordPublisherDestruction(candidate);
+              },
+            });
+          }
+        );
+        if (defined.status === 'defined') {
+          physicalBySlot.set(
+            placement.slot,
+            Object.freeze({ operation: 'display', slot: defined.slot })
+          );
+        }
+      }
+    },
+    { signal: navigation.signal }
+  );
+  try {
+    await operation.result;
+  } catch (error) {
+    if (navigation.isCurrent()) log.warn('GPT projection slot binding failed', error);
+  }
+  if (!navigation.isCurrent()) return;
+
+  const batch = navigation.createAuctionBatch(`gpt:${projection.auction.auctionId}`);
+  if (!batch) return;
+  const prepared: PreparedInitialGptWinner[] = [];
+  let winnerIndex = 0;
+  for (let index = 0; index < projection.auction.results.length; index += 1) {
+    const decision = projection.auction.results[index];
+    const placement = projection.slots[index];
+    if (!decision || !placement || decision.outcome !== 'winner') continue;
+    const bid = projection.bids[winnerIndex];
+    winnerIndex += 1;
+    if (!bid || !navigation.isCurrent()) continue;
+    const owner = batch.createRenderAttempt(decision.slot);
+    if (!owner.ok) continue;
+    const created = render.createAttempt(owner.value);
+    if (!created.ok) continue;
+    prepared.push(
+      Object.freeze({
+        attempt: created.value,
+        bid,
+        binding: physicalBySlot.get(decision.slot),
+        decision,
+        owner: owner.value,
+        placement,
+        terminal: terminalLatch(created.value),
+      })
+    );
+  }
+  if (prepared.length === 0) return;
+  input.protect(Object.freeze(prepared.map(({ terminal }) => terminal)));
+
+  await Promise.all(
+    prepared.map(async ({ attempt, bid, binding, decision, owner, placement }) => {
+      if (!binding) {
+        attempt.fail('slot_unresolved');
+        return;
+      }
+      const artifact = Object.freeze({
+        kind: 'puc' as const,
+        attemptId: attempt.id,
+        slot: attempt.slot,
+        navigationGeneration: attempt.navigationGeneration,
+        dispose: () => undefined,
+      });
+      const published = await publishGptWinner({
+        artifact,
+        attempt,
+        bid,
+        googletag,
+        navigation,
+        operation: binding.operation,
+        owner,
+        placement,
+        pucBridge: input.pucBridge,
+        requestClass: 'initial',
+        reservations: render.reservations,
+        slot: binding.slot,
+        slots,
+        targeting: input.targeting,
+        createFallback: (parentAttemptId) => {
+          const fallbackOwner = batch.createRenderAttempt(decision.slot);
+          if (!fallbackOwner.ok) {
+            return Object.freeze({
+              ok: false as const,
+              reason:
+                fallbackOwner.reason === 'identity_generation_failed'
+                  ? ('identity_generation_failed' as const)
+                  : fallbackOwner.reason === 'stale_owner'
+                    ? ('stale_owner' as const)
+                    : ('invalid_attempt' as const),
+            });
+          }
+          const fallback = render.createAttempt(fallbackOwner.value, parentAttemptId);
+          if (!fallback.ok) return fallback;
+          if (
+            !fallback.value.admitDirectWinner(
+              bid.renderSource,
+              Object.freeze({ selectedCpm: bid.cpm })
+            )
+          ) {
+            fallback.value.fail('winner_not_renderable');
+            return fallback;
+          }
+          if (!render.renderWinner(fallback.value)) fallback.value.fail('winner_not_renderable');
+          return fallback;
+        },
+      });
+      if (!published.ok && navigation.isCurrent()) {
+        log.warn('GPT projection winner publication failed', published.reason);
+      }
+    })
+  );
+}
+
 function validFrozenConfig(candidate: unknown): boolean {
   const seen = new Set<object>();
   let nodes = 0;
@@ -607,61 +910,216 @@ function validFrozenConfig(candidate: unknown): boolean {
   }
 }
 
-function readGptRuntime(
-  interfaces: Readonly<Record<string, unknown>>
-): GptIntegrationRuntime | undefined {
-  const descriptor = Object.getOwnPropertyDescriptor(interfaces, GPT_INTEGRATION_ID);
-  if (!descriptor || !('value' in descriptor)) return undefined;
-  const candidate = descriptor.value;
+function prepareProductionGpt(context: IntegrationPrepareContext): PreparedIntegration {
+  const runtime = exactCapability<RuntimeCapabilityV1>(context.interfaces, 'runtime.v1');
+  if (!runtime) throw new TypeError('GPT requires runtime.v1');
+  if (!validFrozenConfig(context.config)) throw new TypeError('GPT integration config is invalid');
+  const auction = exactCapability<ProductionAuctionCapability>(context.interfaces, 'auction.v1');
+  const slotCapability = exactCapability<ProductionSlotsCapability>(context.interfaces, 'slots.v1');
+  const render = exactCapability<ProductionRenderCapability>(context.interfaces, 'render.v1');
+  const messages = exactCapability<ProductionMessagesCapability>(context.interfaces, 'messages.v1');
+  const trace = exactCapability<ProductionTraceCapability>(context.interfaces, 'trace.v1');
+  const document = runtime.document;
   if (
-    typeof candidate !== 'object' ||
-    candidate === null ||
-    Array.isArray(candidate) ||
-    !Object.isFrozen(candidate) ||
-    Reflect.ownKeys(candidate).length !== 2
+    !auction ||
+    !slotCapability ||
+    !render ||
+    !messages ||
+    !trace ||
+    !document?.defaultView ||
+    typeof runtime.protectFirstDisplayAttemptBatch !== 'function' ||
+    typeof slotCapability.attachPhysicalService !== 'function' ||
+    typeof render.createAttempt !== 'function' ||
+    typeof render.registerRenderer !== 'function' ||
+    typeof render.renderWinner !== 'function' ||
+    typeof render.publisherOrigin !== 'string' ||
+    typeof trace.observations?.publish !== 'function'
   ) {
-    return undefined;
+    throw new TypeError('GPT capability graph is malformed');
   }
-  const activate = Object.getOwnPropertyDescriptor(candidate, 'activate');
-  const start = Object.getOwnPropertyDescriptor(candidate, 'start');
-  if (
-    !activate ||
-    !('value' in activate) ||
-    typeof activate.value !== 'function' ||
-    !start ||
-    !('value' in start) ||
-    typeof start.value !== 'function'
-  ) {
-    return undefined;
-  }
-  return candidate as GptIntegrationRuntime;
+
+  const scope = new DisposableStack((error) => log.warn('GPT preparation disposal failed', error));
+  context.onDispose(() => scope.dispose());
+  let active = false;
+  scope.onDispose(() => {
+    active = false;
+  });
+  const googletag = createBrowserGoogletagAdapter(
+    document.defaultView as unknown as Parameters<typeof createBrowserGoogletagAdapter>[0],
+    {
+      reportDiagnosticsFailure: (code) => log.warn('GPT diagnostics identity unavailable', code),
+    }
+  );
+  scope.onDispose(() => googletag.dispose());
+  const slots = createSlotService({
+    disposeCommittedArtifact: (navigationGeneration, registeredSlotId) => {
+      const artifact = render.artifacts.current(registeredSlotId);
+      if (artifact?.navigationGeneration === navigationGeneration)
+        render.artifacts.release(artifact);
+    },
+    googletag,
+  });
+  scope.onDispose(() => slots.dispose());
+  const targeting = createTargetingService();
+  scope.onDispose(() => targeting.dispose());
+  const fetchCache = globalThis.fetch;
+  const cacheRenderer = (attempt: RenderAttempt, container: HTMLElement): boolean => {
+    if (!active) return false;
+    const cachePolicy = render.cachePolicy;
+    if (!cachePolicy) {
+      attempt.fail('descriptor_invalid');
+      return false;
+    }
+    if (typeof fetchCache !== 'function') {
+      attempt.fail('cache_network_error');
+      return false;
+    }
+    return renderDirectCacheAttempt({
+      attempt,
+      cachePolicy,
+      container,
+      fetcher: (input, init) => fetchCache(input, init),
+      prepareIframe: prepareAdmIframe,
+      publisherOrigin: render.publisherOrigin,
+    });
+  };
+  const resolveCacheAdm = (
+    attempt: Parameters<NonNullable<Parameters<typeof createPucBridge>[0]['resolveCacheAdm']>>[0],
+    onResolved: Parameters<NonNullable<Parameters<typeof createPucBridge>[0]['resolveCacheAdm']>>[1]
+  ): boolean => {
+    const cachePolicy = render.cachePolicy;
+    if (!cachePolicy) {
+      attempt.fail('descriptor_invalid');
+      return false;
+    }
+    if (typeof fetchCache !== 'function') {
+      attempt.fail('cache_network_error');
+      return false;
+    }
+    return resolveCacheAdmAttempt({
+      attempt: attempt as RenderAttempt,
+      cachePolicy,
+      fetcher: (input, init) => fetchCache(input, init),
+      onResolved,
+    });
+  };
+  const rendererUrl = new URL('/integrations/aps/renderer/v1', render.publisherOrigin).href;
+  const startup = createGptStartup({ googletag, slots: () => slots });
+  const diagnosticsEnabled = gptDiagnosticsActive(runtime);
+  const diagnosticsFacts = diagnosticsEnabled
+    ? createGptDiagnosticsFactBuffer({
+        onOverflow: (droppedFacts) =>
+          log.warn('GPT diagnostics fact buffer overflow', droppedFacts),
+      })
+    : undefined;
+  if (diagnosticsFacts) scope.onDispose(diagnosticsFacts.dispose);
+  let pucBridge: PucBridge | undefined;
+  const gptCapability = Object.freeze({
+    adapter: googletag,
+    installRefreshPolicy: startup.installRefreshPolicy,
+    slots,
+  });
+  const eventsCapability = Object.freeze({
+    subscribe: (listener: (fact: Readonly<Record<string, unknown>>) => void): (() => void) => {
+      const release =
+        active && diagnosticsFacts
+          ? diagnosticsFacts.activate(listener as Parameters<typeof diagnosticsFacts.activate>[0])
+          : undefined;
+      if (!release) {
+        throw new TypeError('GPT event subscription is unavailable');
+      }
+      return release;
+    },
+  });
+  const cacheCapability = Object.freeze({ render: cacheRenderer });
+
+  return Object.freeze({
+    activate: ({ afterCommit, onDispose }: IntegrationActivationContext) => {
+      if (active) throw new Error('GPT already activated');
+      const cacheRelease: { current?: () => void } = {};
+      const diagnosticsEventRelease: { current?: () => void } = {};
+      const diagnosticsRelease: { current?: () => void } = {};
+      const publisherRelease: { current?: () => void } = {};
+      const slotServiceRelease: { current?: () => void } = {};
+      const bridgeRelease: { current?: () => void } = {};
+      onDispose(resetGuardState);
+      onDispose(() => cacheRelease.current?.());
+      onDispose(() => diagnosticsEventRelease.current?.());
+      onDispose(() => diagnosticsRelease.current?.());
+      onDispose(() => publisherRelease.current?.());
+      onDispose(() => slotServiceRelease.current?.());
+      onDispose(() => bridgeRelease.current?.());
+      onDispose(() => {
+        active = false;
+      });
+
+      slotServiceRelease.current = slotCapability.attachPhysicalService(slots);
+      slots.activate();
+      slots.start();
+      const bridge = createPucBridge({
+        messaging: messages.messaging,
+        publisherOrigin: render.publisherOrigin,
+        rendererNonces: render.rendererNonces,
+        rendererUrl,
+        reservations: render.reservations,
+        resolveCacheAdm,
+      });
+      pucBridge = bridge;
+      bridgeRelease.current = () => {
+        bridge.dispose();
+        if (pucBridge === bridge) pucBridge = undefined;
+      };
+      const releaseDiagnostics = googletag.observeDiagnostics((fact) => {
+        const observation = projectGptTraceFact(fact);
+        if (observation) trace.observations.publish(observation);
+        diagnosticsFacts?.publish(fact);
+      });
+      if (!releaseDiagnostics) throw new Error('GPT diagnostics event boundary is unavailable');
+      diagnosticsRelease.current = releaseDiagnostics;
+      if (diagnosticsFacts) {
+        const releaseDiagnosticEvents = activateGptDiagnosticsEventListeners(googletag);
+        if (!releaseDiagnosticEvents) {
+          throw new Error('GPT diagnostics-only event listeners are unavailable');
+        }
+        diagnosticsEventRelease.current = releaseDiagnosticEvents;
+      }
+      publisherRelease.current = startup.activate();
+      cacheRelease.current = render.registerRenderer('cache', cacheRenderer);
+      installGptGuard();
+      active = true;
+      afterCommit(() => {
+        startup.start(context.config);
+        const currentBridge = pucBridge;
+        if (!active || currentBridge !== bridge) return;
+        void publishInitialGptProjection(document, {
+          googletag,
+          navigation: auction.navigation,
+          projection: auction.projection,
+          protect: runtime.protectFirstDisplayAttemptBatch,
+          pucBridge: currentBridge,
+          render,
+          slots,
+          targeting,
+        }).catch((error) => {
+          if (auction.navigation.isCurrent()) log.warn('GPT initial projection failed', error);
+        });
+      });
+    },
+    interfaces: Object.freeze({
+      'gpt.v1': gptCapability,
+      'gpt.events.v1': eventsCapability,
+      'pbs_cache.baseline.v1': cacheCapability,
+    }),
+  });
 }
 
 /** Build the release-bound GPT module registered by the coordinated runtime. */
-export function createGptIntegrationRegistration(release: string): IntegrationRegistration {
+export function createGptIntegrationRegistration(releaseId: string): IntegrationRegistration {
   return Object.freeze({
+    abi: 1,
     id: GPT_INTEGRATION_ID,
-    release,
-    prepare: ({ config, interfaces }: IntegrationPrepareContext) => {
-      if (!validFrozenConfig(config)) throw new TypeError('GPT integration config is invalid');
-      const runtime = readGptRuntime(interfaces);
-      if (!runtime) throw new TypeError('GPT integration runtime is unavailable');
-
-      return Object.freeze({
-        activate: ({ afterCommit, onDispose }: IntegrationActivationContext) => {
-          // Register restoration before the first live browser mutation.
-          onDispose(resetGuardState);
-          const runtimeRelease: { value?: () => void } = {};
-          onDispose(() => runtimeRelease.value?.());
-          const release = runtime.activate();
-          if (typeof release !== 'function') {
-            throw new TypeError('GPT integration activation disposer is unavailable');
-          }
-          runtimeRelease.value = release;
-          installGptGuard();
-          afterCommit(() => runtime.start(config));
-        },
-      });
-    },
+    phase: 'critical',
+    releaseId,
+    prepare: (context: IntegrationPrepareContext) => prepareProductionGpt(context),
   });
 }

@@ -280,6 +280,14 @@ fn not_found_response() -> Response<EdgeBody> {
     response
 }
 
+fn tsjs_not_found_response() -> Response<EdgeBody> {
+    let mut response = not_found_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
 fn restrict_accept_encoding(req: &mut Request<EdgeBody>) {
     // If the client sent no Accept-Encoding, leave the request unchanged so the
     // origin responds without compression. Adding encodings here would cause the
@@ -362,165 +370,7 @@ fn accept_encoding_qvalue(header_value: &str, target: &str) -> Option<f32> {
     matched_qvalue
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReaderEncodingError {
-    Malformed,
-    NoAcceptableEncoding,
-}
-
-fn parse_quality_value(value: &str) -> Option<f32> {
-    let value = value.trim();
-    let (whole, fraction) = value
-        .split_once('.')
-        .map_or((value, None), |(whole, fraction)| (whole, Some(fraction)));
-    let fraction_is_valid = fraction.is_none_or(|fraction| {
-        fraction.len() <= 3 && fraction.bytes().all(|byte| byte.is_ascii_digit())
-    });
-    if !fraction_is_valid {
-        return None;
-    }
-    match whole {
-        "0" => value.parse().ok(),
-        "1" if fraction.is_none_or(|fraction| fraction.bytes().all(|byte| byte == b'0')) => {
-            Some(1.0)
-        }
-        _ => None,
-    }
-}
-
-fn negotiate_reader_compression(
-    headers: &edgezero_core::http::HeaderMap,
-) -> Result<Compression, ReaderEncodingError> {
-    if !headers.contains_key(header::ACCEPT_ENCODING) {
-        return Ok(Compression::None);
-    }
-
-    let mut qualities = Vec::<(String, f32)>::new();
-    for field in headers.get_all(header::ACCEPT_ENCODING) {
-        let field = field.to_str().map_err(|_| ReaderEncodingError::Malformed)?;
-        for item in field
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-        {
-            let mut parts = item.split(';');
-            let token = parts
-                .next()
-                .map(str::trim)
-                .filter(|token| !token.is_empty())
-                .ok_or(ReaderEncodingError::Malformed)?
-                .to_ascii_lowercase();
-            if token != "*" && http::HeaderName::from_bytes(token.as_bytes()).is_err() {
-                return Err(ReaderEncodingError::Malformed);
-            }
-            let mut quality = 1.0;
-            let mut saw_quality = false;
-            for parameter in parts {
-                let (name, value) = parameter
-                    .trim()
-                    .split_once('=')
-                    .ok_or(ReaderEncodingError::Malformed)?;
-                if !name.trim().eq_ignore_ascii_case("q") || saw_quality {
-                    return Err(ReaderEncodingError::Malformed);
-                }
-                quality = parse_quality_value(value).ok_or(ReaderEncodingError::Malformed)?;
-                saw_quality = true;
-            }
-            if qualities.iter().any(|(seen, _)| seen == &token) {
-                return Err(ReaderEncodingError::Malformed);
-            }
-            qualities.push((token, quality));
-        }
-    }
-
-    let explicit = |name: &str| {
-        qualities
-            .iter()
-            .find_map(|(candidate, quality)| (candidate == name).then_some(*quality))
-    };
-    let wildcard = explicit("*");
-    let quality_for = |name: &str| explicit(name).or(wildcard).unwrap_or(0.0);
-    // Identity is implicitly acceptable at q=1 unless explicitly excluded, or a
-    // wildcard q=0 excludes every unlisted coding.
-    let identity_quality =
-        explicit("identity").unwrap_or_else(|| if wildcard == Some(0.0) { 0.0 } else { 1.0 });
-
-    let candidates = [
-        (Compression::Brotli, quality_for("br")),
-        (Compression::Gzip, quality_for("gzip")),
-        (Compression::Deflate, quality_for("deflate")),
-        (Compression::None, identity_quality),
-    ];
-    let mut selected = None;
-    for (compression, quality) in candidates {
-        if quality > 0.0 && selected.is_none_or(|(_, best)| quality > best) {
-            selected = Some((compression, quality));
-        }
-    }
-    selected
-        .map(|(compression, _)| compression)
-        .ok_or(ReaderEncodingError::NoAcceptableEncoding)
-}
-
-fn set_response_compression(response: &mut Response<EdgeBody>, compression: Compression) {
-    let encoding = match compression {
-        Compression::None => None,
-        Compression::Gzip => Some("gzip"),
-        Compression::Deflate => Some("deflate"),
-        Compression::Brotli => Some("br"),
-    };
-    if let Some(encoding) = encoding {
-        response
-            .headers_mut()
-            .insert(header::CONTENT_ENCODING, HeaderValue::from_static(encoding));
-    } else {
-        response.headers_mut().remove(header::CONTENT_ENCODING);
-    }
-    let varies_on_encoding = response
-        .headers()
-        .get_all(header::VARY)
-        .iter()
-        .any(|value| {
-            value.to_str().is_ok_and(|value| {
-                value
-                    .split(',')
-                    .any(|name| name.trim().eq_ignore_ascii_case("accept-encoding"))
-            })
-        });
-    if !varies_on_encoding {
-        response
-            .headers_mut()
-            .append(header::VARY, HeaderValue::from_static("Accept-Encoding"));
-    }
-    response.headers_mut().remove(header::CONTENT_LENGTH);
-}
-
-fn response_compression(response: &Response<EdgeBody>) -> Compression {
-    response
-        .headers()
-        .get(header::CONTENT_ENCODING)
-        .and_then(|value| value.to_str().ok())
-        .map(Compression::from_content_encoding)
-        .unwrap_or(Compression::None)
-}
-
-fn encode_complete_body(
-    body: Vec<u8>,
-    compression: Compression,
-) -> Result<Vec<u8>, Report<TrustedServerError>> {
-    let mut encoder = BodyStreamEncoder::new(compression);
-    let mut encoded = encoder.encode_chunk(body)?;
-    encoded.extend_from_slice(&encoder.finish()?);
-    Ok(encoded)
-}
-
-/// Unified tsjs static serving: `/static/tsjs=<filename>`
-///
-/// Serves two types of bundles:
-/// - **Unified bundle** (`tsjs-unified.min.js`): core + immediate (non-deferred)
-///   integration modules.
-/// - **Deferred module** (`tsjs-{id}.min.js`): a single self-contained IIFE for
-///   modules loaded with `defer` (e.g., prebid).
+/// Exact content-addressed TSJS release transport.
 ///
 /// # Errors
 ///
@@ -531,86 +381,76 @@ pub fn handle_tsjs_dynamic(
     edge_header: EdgeCacheHeader,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     const PREFIX: &str = "/static/tsjs=";
-    const UNIFIED_FILENAMES: &[&str] = &["tsjs-unified.js", "tsjs-unified.min.js"];
 
     let path = req.uri().path();
-    if !path.starts_with(PREFIX) {
-        return Ok(not_found_response());
+    if req.method() != Method::GET || !path.starts_with(PREFIX) {
+        return Ok(tsjs_not_found_response());
     }
     let filename = &path[PREFIX.len()..];
-
-    if filename == crate::integrations::gpt_diagnostics::GPT_DIAGNOSTICS_BOOTSTRAP_FILENAME {
-        let mut response = serve_static_with_etag(
-            crate::integrations::gpt_diagnostics::GPT_DIAGNOSTICS_BOOTSTRAP_SOURCE,
-            req,
-            "application/javascript; charset=utf-8",
-        );
-        response
-            .headers_mut()
-            .insert(HEADER_X_COMPRESS_HINT, HeaderValue::from_static("on"));
-        return Ok(response);
+    let Some(requested_hash) = req.uri().query().and_then(|query| query.strip_prefix("v=")) else {
+        return Ok(tsjs_not_found_response());
+    };
+    if !valid_lowercase_sha256(requested_hash) {
+        return Ok(tsjs_not_found_response());
     }
 
-    if UNIFIED_FILENAMES.contains(&filename) {
-        // Serve core + immediate modules (excludes deferred like prebid).
-        let module_ids = integration_registry.js_module_ids_immediate();
+    if filename == "tsjs-unified.min.js" {
+        let module_ids = integration_registry
+            .tsjs_static_transport_selections(false)
+            .into_iter()
+            .map(|selection| integration_registry.tsjs_critical_module_ids(selection))
+            .find(|ids| trusted_server_js::concatenated_hash(ids) == requested_hash);
+        let Some(module_ids) = module_ids else {
+            return Ok(tsjs_not_found_response());
+        };
         let body = trusted_server_js::concatenate_modules(&module_ids);
-        let hash = trusted_server_js::concatenated_hash(&module_ids);
-        return Ok(serve_tsjs_static(req, &body, &hash, edge_header));
+        let mut resp = serve_static_with_etag(&body, req, "application/javascript; charset=utf-8");
+        apply_tsjs_success_headers(&mut resp);
+        return Ok(resp);
     }
 
     if let Some(module_id) = parse_single_module_filename(filename) {
-        // Deferred modules and the conditionally injected diagnostics module
-        // are served as content-addressed standalone assets. Delivery remains
-        // cookie-independent so the static response can stay publicly cached.
-        let deferred_ids = integration_registry.js_module_ids_deferred();
-        let diagnostics_standalone = module_id
-            == crate::integrations::gpt_diagnostics::GPT_DIAGNOSTICS_INTEGRATION_ID
-            && integration_registry.integration_enabled(module_id);
-        if !deferred_ids.contains(&module_id) && !diagnostics_standalone {
-            return Ok(not_found_response());
-        }
-        if let (Some(content), Some(hash)) = (
-            trusted_server_js::module_bundle(module_id),
-            trusted_server_js::single_module_hash(module_id),
-        ) {
-            return Ok(serve_tsjs_static(req, content, hash, edge_header));
+        let render_trace_overlay = crate::trace_cookie::render_trace_overlay_active(req);
+        let module_enabled = integration_registry
+            .tsjs_static_transport_selections(render_trace_overlay)
+            .into_iter()
+            .any(|selection| {
+                integration_registry
+                    .tsjs_deferred_module_ids(selection)
+                    .contains(&module_id)
+            });
+        if module_enabled
+            && trusted_server_js::single_module_hash(module_id).as_deref() == Some(requested_hash)
+            && let Some(content) = trusted_server_js::module_bundle(module_id)
+        {
+            let mut resp =
+                serve_static_with_etag(content, req, "application/javascript; charset=utf-8");
+            apply_tsjs_success_headers(&mut resp);
+            return Ok(resp);
         }
     }
 
-    Ok(not_found_response())
+    Ok(tsjs_not_found_response())
 }
 
-fn serve_tsjs_static(
-    req: &Request<EdgeBody>,
-    body: &str,
-    expected_hash: &str,
-    edge_header: EdgeCacheHeader,
-) -> Response<EdgeBody> {
-    let mut response = serve_static_with_etag(
-        body,
-        req,
-        "application/javascript; charset=utf-8",
-        edge_header,
-    );
-    if request_version_hash(req).is_some_and(|hash| hash == expected_hash) {
-        CachePolicy::public_immutable(Duration::from_secs(31_536_000))
-            .apply_to_headers(response.headers_mut(), edge_header);
-    }
+fn valid_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn apply_tsjs_success_headers(response: &mut Response<EdgeBody>) {
     response
         .headers_mut()
         .insert(HEADER_X_COMPRESS_HINT, HeaderValue::from_static("on"));
-    response
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
 }
 
-fn request_version_hash(req: &Request<EdgeBody>) -> Option<&str> {
-    req.uri().query()?.split('&').find_map(|pair| {
-        let (name, value) = pair.split_once('=')?;
-        (name == "v").then_some(value)
-    })
-}
-
-/// Extract a module ID from a deferred-module filename like `tsjs-sourcepoint.min.js`.
+/// Extract a catalogued deferred module ID from its only admitted filename.
 ///
 /// Returns `Some(&'static str)` if the filename matches a known JS module ID,
 /// `None` otherwise. The caller must additionally verify that the module is
@@ -619,11 +459,15 @@ fn request_version_hash(req: &Request<EdgeBody>) -> Option<&str> {
 fn parse_single_module_filename(filename: &str) -> Option<&'static str> {
     let stem = filename
         .strip_prefix("tsjs-")
-        .and_then(|s| s.strip_suffix(".min.js").or_else(|| s.strip_suffix(".js")))?;
+        .and_then(|s| s.strip_suffix(".min.js"))?;
 
-    trusted_server_js::all_module_ids()
+    trusted_server_js::all_integration_metadata()
         .into_iter()
-        .find(|&id| id == stem)
+        .find(|metadata| {
+            metadata.id == stem
+                && metadata.phase == Some(trusted_server_js::TsjsModulePhase::Deferred)
+        })
+        .map(|metadata| metadata.id)
 }
 
 /// Parameters for processing response streaming.
@@ -6091,14 +5935,12 @@ mod tests {
             .integrations
             .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
             .expect("should enable diagnostics");
-        let integration_registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create integration registry");
+        settings
+            .integrations
+            .insert_config("gpt", &serde_json::json!({}))
+            .expect("should enable the GPT event provider");
+        let integration_registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
         let mut request = HttpRequest::builder()
             .method(Method::GET)
             .uri("https://publisher.example/article?ts_console=1")
@@ -6128,9 +5970,12 @@ mod tests {
             "should not inject the removed activation flag"
         );
         assert!(
-            html.contains("tsjs-gpt_diagnostics.min.js"),
-            "should inject the standalone diagnostics module"
+            html.contains(r#""gpt":{"active":true}"#),
+            "should activate diagnostics through immutable boot data"
         );
+        assert!(html.contains("tsjs-unified.min.js?v="));
+        assert!(!html.contains("tsjs-gpt_diagnostics.min.js"));
+        assert_eq!(html.matches("history.replaceState").count(), 1);
     }
 
     #[test]
@@ -6284,6 +6129,10 @@ mod tests {
             .integrations
             .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
             .expect("should enable diagnostics");
+        settings
+            .integrations
+            .insert_config("gpt", &serde_json::json!({}))
+            .expect("should enable the GPT event provider");
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
             200,
@@ -7895,12 +7744,10 @@ mod tests {
                 "https://origin.test-publisher.com/article?keep=a%2Fb"
             );
             assert_eq!(result.outbound_cookie.as_deref(), Some("publisher=value"));
+            assert!(body.contains(r#""gpt":{"active":false}"#));
             assert!(!body.contains("tsjs-gpt_diagnostics.min.js"));
-            assert_eq!(
-                body.matches("tsjs-gpt_diagnostics-bootstrap.min.js")
-                    .count(),
-                1
-            );
+            assert!(!body.contains("tsjs-gpt_diagnostics-bootstrap.min.js"));
+            assert_eq!(body.matches("history.replaceState").count(), 1);
         }
     }
 
@@ -7915,8 +7762,11 @@ mod tests {
         .await;
         let active_body = response_body_string(active.response);
         assert_eq!(active.outbound_cookie.as_deref(), Some("publisher=value"));
-        assert!(active_body.contains("tsjs-gpt_diagnostics.min.js"));
+        assert!(active_body.contains(r#""gpt":{"active":true}"#));
+        assert!(active_body.contains("tsjs-unified.min.js?v="));
+        assert!(!active_body.contains("tsjs-gpt_diagnostics.min.js"));
         assert!(!active_body.contains("tsjs-gpt_diagnostics-bootstrap.min.js"));
+        assert!(!active_body.contains("history.replaceState"));
 
         let disabled = run_ts_console_pipeline(
             Method::GET,
@@ -7934,13 +7784,10 @@ mod tests {
             "https://origin.test-publisher.com/article?keep=%2F"
         );
         let disabled_body = response_body_string(disabled.response);
+        assert!(disabled_body.contains(r#""gpt":{"active":false}"#));
         assert!(!disabled_body.contains("tsjs-gpt_diagnostics.min.js"));
-        assert_eq!(
-            disabled_body
-                .matches("tsjs-gpt_diagnostics-bootstrap.min.js")
-                .count(),
-            1
-        );
+        assert!(!disabled_body.contains("tsjs-gpt_diagnostics-bootstrap.min.js"));
+        assert_eq!(disabled_body.matches("history.replaceState").count(), 1);
     }
 
     #[tokio::test]
@@ -7978,8 +7825,10 @@ mod tests {
             assert_eq!(result.outbound_cookie.as_deref(), Some("publisher=value"));
             assert!(!result.response.headers().contains_key(header::SET_COOKIE));
             let body = response_body_string(result.response);
+            assert!(body.contains(r#""gpt":{"active":false}"#));
             assert!(!body.contains("tsjs-gpt_diagnostics.min.js"));
             assert!(!body.contains("tsjs-gpt_diagnostics-bootstrap.min.js"));
+            assert!(!body.contains("history.replaceState"));
         }
     }
 
@@ -8980,26 +8829,131 @@ mod tests {
     #[test]
     fn tsjs_dynamic_serves_unified_bundle_for_known_filename() {
         let settings = create_test_settings();
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create integration registry");
-        let req = build_request(
-            Method::GET,
-            "https://publisher.example/static/tsjs=tsjs-unified.min.js",
-        );
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let selection = registry
+            .tsjs_static_transport_selections(false)
+            .pop()
+            .expect("should expose one transport selection");
+        let module_ids = registry.tsjs_critical_module_ids(selection);
+        let src = crate::tsjs::tsjs_script_src(&module_ids);
+        let req = build_request(Method::GET, &format!("https://publisher.example{src}"));
 
         let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)
             .expect("should handle tsjs request");
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static(
+                "application/javascript; charset=utf-8"
+            ))
+        );
+        assert_eq!(
+            response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
+        assert!(response.headers().contains_key(header::ETAG));
     }
 
     #[test]
-    fn tsjs_dynamic_serves_diagnostics_standalone_without_cookie_variance() {
+    fn tsjs_dynamic_preserves_strong_etag_conditional_304() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let selection = registry
+            .tsjs_static_transport_selections(false)
+            .pop()
+            .expect("should expose one transport selection");
+        let ids = registry.tsjs_critical_module_ids(selection);
+        let src = crate::tsjs::tsjs_script_src(&ids);
+        let first = build_request(Method::GET, &format!("https://publisher.example{src}"));
+        let first_response =
+            handle_tsjs_dynamic(&first, &registry).expect("should serve current release");
+        let etag = first_response
+            .headers()
+            .get(header::ETAG)
+            .cloned()
+            .expect("should emit an ETag");
+        let mut conditional =
+            build_request(Method::GET, &format!("https://publisher.example{src}"));
+        conditional
+            .headers_mut()
+            .insert(header::IF_NONE_MATCH, etag.clone());
+
+        let response = handle_tsjs_dynamic(&conditional, &registry)
+            .expect("should handle conditional request");
+
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers().get(header::ETAG), Some(&etag));
+        assert_eq!(
+            response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
+    }
+
+    #[test]
+    fn tsjs_dynamic_rejects_noncanonical_transport_locally_without_fallthrough() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let selection = registry
+            .tsjs_static_transport_selections(false)
+            .pop()
+            .expect("should expose one transport selection");
+        let ids = registry.tsjs_critical_module_ids(selection);
+        let hash = trusted_server_js::concatenated_hash(&ids);
+        let cases = [
+            (Method::HEAD, format!("tsjs-unified.min.js?v={hash}")),
+            (Method::OPTIONS, format!("tsjs-unified.min.js?v={hash}")),
+            (Method::POST, format!("tsjs-unified.min.js?v={hash}")),
+            (Method::GET, "tsjs-unified.min.js".to_owned()),
+            (Method::GET, format!("tsjs-unified.js?v={hash}")),
+            (Method::GET, format!("tsjs-unified.min.js?v={hash}&x=1")),
+            (Method::GET, format!("tsjs-unified.min.js?x=1&v={hash}")),
+            (Method::GET, "tsjs-unified.min.js?v=stale".to_owned()),
+            (
+                Method::GET,
+                format!("tsjs-unified.min.js?v={}", "0".repeat(64)),
+            ),
+            (
+                Method::GET,
+                format!("tsjs-unified.min.js?v={}", hash.to_uppercase()),
+            ),
+            (
+                Method::GET,
+                format!("tsjs-unknown.min.js?v={}", "0".repeat(64)),
+            ),
+            (
+                Method::GET,
+                format!(
+                    "tsjs-creative.min.js?v={}",
+                    trusted_server_js::single_module_hash("creative")
+                        .expect("should hash critical creative")
+                ),
+            ),
+        ];
+
+        for (method, suffix) in cases {
+            let req = build_request(
+                method,
+                &format!("https://publisher.example/static/tsjs={suffix}"),
+            );
+            let response = handle_tsjs_dynamic(&req, &registry).expect("should reject locally");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "case {suffix}");
+            assert_eq!(
+                response.headers().get(header::CACHE_CONTROL),
+                Some(&HeaderValue::from_static("no-store")),
+                "case {suffix}"
+            );
+            assert!(
+                !response.headers().contains_key(header::LOCATION),
+                "case {suffix}"
+            );
+        }
+    }
+
+    #[test]
+    fn tsjs_dynamic_rejects_critical_diagnostics_as_a_standalone_alias() {
         let mut settings = create_test_settings();
         settings
             .integrations
@@ -9015,7 +8969,11 @@ mod tests {
         .expect("should create integration registry");
         let mut req = build_request(
             Method::GET,
-            "https://publisher.example/static/tsjs=tsjs-gpt_diagnostics.min.js",
+            &format!(
+                "https://publisher.example/static/tsjs=tsjs-gpt_diagnostics.min.js?v={}",
+                trusted_server_js::single_module_hash("gpt_diagnostics")
+                    .expect("should hash diagnostics")
+            ),
         );
         req.headers_mut().insert(
             header::COOKIE,
@@ -9025,20 +8983,13 @@ mod tests {
         let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)
             .expect("should handle tsjs request");
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(!response.headers().contains_key(header::SET_COOKIE));
-        assert!(
-            !response
-                .headers()
-                .get(header::CACHE_CONTROL)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.contains("private") || value.contains("no-store")),
-            "standalone module should remain cookie-independent and publicly cacheable"
-        );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     }
 
     #[test]
-    fn ts_console_dynamic_serves_the_non_authoritative_cleanup_asset() {
+    fn ts_console_legacy_cleanup_asset_is_not_a_tsjs_release_route() {
         let settings = create_test_settings();
         let registry = IntegrationRegistry::new(&settings).expect("should build registry");
         let req = Request::builder()
@@ -9047,25 +8998,21 @@ mod tests {
             .expect("should build cleanup asset request");
 
         let response = handle_tsjs_dynamic(&req, &registry).expect("should serve cleanup asset");
-        let source = response_body_string(response);
-
-        assert!(source.contains("history.replaceState"));
-        assert!(source.contains("ts_console"));
-        assert!(!source.contains("sessionStorage"));
-        assert!(!source.contains("__tsjs_gpt_diagnostics_active"));
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     }
 
     #[test]
     fn parse_single_module_filename_extracts_known_id() {
         assert_eq!(
-            parse_single_module_filename("tsjs-sourcepoint.min.js"),
-            Some("sourcepoint"),
-            "should extract sourcepoint from minified filename"
+            parse_single_module_filename("tsjs-sourcepoint_lifecycle.min.js"),
+            Some("sourcepoint_lifecycle"),
+            "should extract a catalogued deferred module from the exact filename"
         );
         assert_eq!(
-            parse_single_module_filename("tsjs-sourcepoint.js"),
-            Some("sourcepoint"),
-            "should extract sourcepoint from unminified filename"
+            parse_single_module_filename("tsjs-sourcepoint_lifecycle.js"),
+            None,
+            "should reject unminified aliases"
         );
     }
 
@@ -9078,8 +9025,8 @@ mod tests {
         );
         assert_eq!(
             parse_single_module_filename("tsjs-core.min.js"),
-            Some("core"),
-            "should accept any known module ID (deferred check happens in caller)"
+            None,
+            "should reject reserved core as a standalone module"
         );
         assert_eq!(
             parse_single_module_filename("prebid.min.js"),
@@ -9094,27 +9041,33 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_dynamic_serves_prebid_shim_when_enabled() {
-        let settings = create_test_settings();
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create integration registry");
-        let req = build_request(
-            Method::GET,
-            "https://publisher.example/static/tsjs=tsjs-prebid.min.js",
-        );
+    fn tsjs_dynamic_serves_one_enabled_deferred_module_with_exact_hash() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config("osano", &serde_json::json!({ "enabled": true }))
+            .expect("should enable Osano lifecycle");
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let selection = registry
+            .tsjs_static_transport_selections(false)
+            .pop()
+            .expect("should expose one transport selection");
+        let deferred = registry.tsjs_deferred_module_ids(selection);
+        let module_id = deferred
+            .iter()
+            .find(|module_id| **module_id != "diagnostics_presentation")
+            .expect("should enable one non-diagnostics deferred module");
+        let src = crate::tsjs::tsjs_single_module_script_src(module_id)
+            .expect("should name enabled deferred module");
+        let req = build_request(Method::GET, &format!("https://publisher.example{src}"));
 
         let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)
             .expect("should handle tsjs request");
         assert_eq!(
             response.status(),
             StatusCode::OK,
-            "should serve the deferred prebid shim module when prebid is enabled"
+            "should serve an enabled deferred catalog module"
         );
     }
 

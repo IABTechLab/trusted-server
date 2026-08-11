@@ -1,6 +1,7 @@
 import type {
   GoogletagAdapter,
   GoogletagFacade,
+  GptSlotTokenV1,
   GoogletagOperation,
   GoogletagPublisherCallAdmission,
   GoogletagPublisherDefineSlotCall,
@@ -9,8 +10,10 @@ import type {
   GoogletagReplacementCommitAdmission,
   GoogletagReplacementDefinition,
   GoogletagReplacementResult,
+  GoogletagTraceCycleHandle,
 } from '../adapters/googletag';
 import {
+  createGoogletagTraceCycleHandle,
   GoogletagAdapterError,
   GoogletagReplacementCandidateCollisionError,
   GoogletagReplacementError,
@@ -57,6 +60,7 @@ export interface SlotRecord {
   readonly ordinal: number;
   readonly registeredSlotId: string;
   readonly source: SlotSource;
+  readonly traceToken?: GptSlotTokenV1;
 }
 
 export type SlotRegistrationFailure =
@@ -145,7 +149,10 @@ export interface SlotService {
     binding: GptSlotBinding
   ) => GptSlotAdoptionResult;
   readonly dispose: () => void;
-  readonly handleGptEvent: (type: GptEventType, event: unknown) => void;
+  readonly handleGptEvent: (
+    type: GptEventType,
+    event: unknown
+  ) => Readonly<GoogletagTraceCycleHandle> | undefined;
   readonly isBoundGptSlot: (
     navigationGeneration: object,
     registeredSlotId: string,
@@ -229,14 +236,16 @@ interface InternalSlotRecord {
   reconciliation: ReconciliationWindow | undefined;
   reconciliationSuccesses: number;
   readonly state: NavigationState;
-  readonly view: SlotRecord;
+  view: SlotRecord;
 }
 
 type PhysicalSlotState = 'live' | 'quarantined' | 'retired';
 
 interface PhysicalCycle {
   intent: RequestIntent | undefined;
-  readonly kind: 'publisher' | 'trusted_server';
+  kind: 'publisher' | 'trusted_server';
+  readonly traceHandle: Readonly<GoogletagTraceCycleHandle>;
+  readonly traceRetirement: { retired: boolean };
 }
 
 interface PhysicalSlot {
@@ -246,6 +255,7 @@ interface PhysicalSlot {
   domElement: object | undefined;
   elementIdPrefix: string | undefined;
   lastResponseIdentifier: string | undefined;
+  lastCycle: PhysicalCycle | undefined;
   ownership: GptSlotOwnership;
   placementKeys: readonly string[];
   readonly publisherAdmissions: PublisherIntentAdmissionState[];
@@ -722,6 +732,33 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
   let reconciliationObserve: SlotReconciliationBoundary['observe'] | undefined;
   let reconciliationIsConnected: SlotReconciliationBoundary['isConnected'] | undefined;
   let reconciliationResolve: SlotReconciliationBoundary['resolve'] | undefined;
+
+  const recordWithTraceToken = (
+    record: Readonly<SlotRecord>,
+    traceToken: GptSlotTokenV1 | undefined
+  ): SlotRecord =>
+    Object.freeze({
+      adUnitCode: record.adUnitCode,
+      ...(record.directAuctionUnit === undefined
+        ? {}
+        : { directAuctionUnit: record.directAuctionUnit }),
+      domAliases: record.domAliases,
+      navigationGeneration: record.navigationGeneration,
+      ordinal: record.ordinal,
+      registeredSlotId: record.registeredSlotId,
+      source: record.source,
+      ...(traceToken === undefined ? {} : { traceToken }),
+    });
+
+  const traceTokenFor = (slot: object): GptSlotTokenV1 | undefined => {
+    try {
+      return typeof options.googletag.traceToken === 'function'
+        ? options.googletag.traceToken(slot)
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  };
   try {
     const candidate = options.reconciliation;
     if (
@@ -747,6 +784,41 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
   let reconciliationActive = false;
   const subscriptionsByBinding = new WeakMap<object, BindingSubscriptions>();
   const bindingSubscriptions = new Set<BindingSubscriptions>();
+
+  const retirePhysicalCycle = (cycle: PhysicalCycle | undefined): void => {
+    if (cycle) cycle.traceRetirement.retired = true;
+  };
+
+  const retirePhysicalTraceCycles = (physical: PhysicalSlot): void => {
+    retirePhysicalCycle(physical.activeCycle);
+    if (physical.lastCycle !== physical.activeCycle) retirePhysicalCycle(physical.lastCycle);
+  };
+
+  const openPhysicalCycle = (
+    physical: PhysicalSlot,
+    intent: RequestIntent | undefined,
+    kind: PhysicalCycle['kind']
+  ): PhysicalCycle => {
+    retirePhysicalCycle(physical.lastCycle);
+    const traceRetirement = { retired: false };
+    const cycle: PhysicalCycle = {
+      intent,
+      kind,
+      traceHandle: createGoogletagTraceCycleHandle(
+        () => traceRetirement.retired || !setHasValue(physicalSlots, physical)
+      ),
+      traceRetirement,
+    };
+    physical.activeCycle = cycle;
+    physical.lastCycle = cycle;
+    return cycle;
+  };
+
+  const clearPhysicalCycle = (physical: PhysicalSlot, completed = false): void => {
+    const cycle = physical.activeCycle;
+    if (!completed) retirePhysicalCycle(cycle);
+    physical.activeCycle = undefined;
+  };
 
   const reconciliationElementIds = (
     record: InternalSlotRecord,
@@ -963,6 +1035,8 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     }
     const existing = weakMapValue(physicalByObject, replacement);
     if (existing) throw new GoogletagReplacementCandidateCollisionError(replacement);
+    const previousView = record.view;
+    const replacementTraceToken = traceTokenFor(replacement);
     const physical: PhysicalSlot = {
       activeCycle: undefined,
       artifactRetirementAttempted: false,
@@ -971,6 +1045,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       elementIdPrefix: oldPhysical.elementIdPrefix,
       destroyAttempted: false,
       lastResponseIdentifier: undefined,
+      lastCycle: undefined,
       ownership: 'trusted_server',
       placementKeys: oldPhysical.placementKeys,
       publisherAdmissions: [],
@@ -986,6 +1061,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     let committed = false;
     const rollback = (): void => {
       if (record.physical === physical) record.physical = oldPhysical;
+      if (record.physical === oldPhysical) record.view = previousView;
       if (oldPhysical.record === undefined && record.physical === oldPhysical) {
         oldPhysical.record = record;
       }
@@ -1014,6 +1090,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         retireCommittedArtifact(record, oldPhysical);
         if (record.state.disposed || !record.state.owner.isCurrent()) return false;
         record.physical = physical;
+        record.view = recordWithTraceToken(record.view, replacementTraceToken);
         oldPhysical.record = undefined;
         deleteSetValue(physicalSlots, oldPhysical);
         committed = true;
@@ -1036,6 +1113,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       elementIdPrefix: source.elementIdPrefix,
       destroyAttempted: true,
       lastResponseIdentifier: undefined,
+      lastCycle: undefined,
       ownership: 'trusted_server',
       placementKeys: source.placementKeys,
       publisherAdmissions: [],
@@ -1382,7 +1460,10 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     );
   }
 
-  const handleGptEvent = (type: GptEventType, event: unknown): void => {
+  const handleGptEvent = (
+    type: GptEventType,
+    event: unknown
+  ): Readonly<GoogletagTraceCycleHandle> | undefined => {
     const slot = ownData(event, 'slot');
     if ((typeof slot !== 'object' || slot === null) && typeof slot !== 'function') return;
     const physical = weakMapValue(physicalByObject, slot as object);
@@ -1396,9 +1477,9 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         publisherAdmission.phase = 'consumed';
         if (phase === 'pending') applyPublisherIntent(physical);
         if (!physical.activeCycle && physical.state === 'live') {
-          physical.activeCycle = { intent: undefined, kind: 'publisher' };
+          return openPhysicalCycle(physical, undefined, 'publisher').traceHandle;
         }
-        return;
+        return physical.activeCycle?.traceHandle;
       }
       if (physical.state !== 'live' || physical.activeCycle) return;
       const record = physical.record;
@@ -1416,16 +1497,15 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         if (intent.requestTimer !== undefined) clearTimeout(intent.requestTimer);
         intent.requestTimer = undefined;
         intent.state = 'cycle';
-        physical.activeCycle = { intent, kind: 'trusted_server' };
+        const cycle = openPhysicalCycle(physical, intent, 'trusted_server');
         intent.completionTimer = setTimeout(
           () => onCompletionTimeout(intent),
           Math.max(0, (intent.completionDeadlineAt ?? now()) - now())
         );
-        return;
+        return cycle.traceHandle;
       }
       if (intent && !intent.terminal) settle(intent, failed('cycle_unattributable'));
-      physical.activeCycle = { intent: undefined, kind: 'publisher' };
-      return;
+      return openPhysicalCycle(physical, undefined, 'publisher').traceHandle;
     }
 
     const responseIdentifierValue = ownData(event, 'responseIdentifier');
@@ -1450,7 +1530,8 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     const isEmptyValue = ownData(event, 'isEmpty');
     if (isEmptyValue !== true && isEmptyValue !== false) return;
     if (responseIdentifier !== undefined) physical.lastResponseIdentifier = responseIdentifier;
-    physical.activeCycle = undefined;
+    clearPhysicalCycle(physical, true);
+    const acceptedHandle = cycle.traceHandle;
     if (intent && !intent.terminal) {
       settle(
         intent,
@@ -1460,7 +1541,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         })
       );
       advanceQueued(intent.record);
-      return;
+      return acceptedHandle;
     }
     if (physical.quarantineReason === 'completion' || physical.quarantineReason === 'navigation') {
       const quarantineReason = physical.quarantineReason;
@@ -1474,9 +1555,11 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       if (physical.record && physical.state === 'live') advanceQueued(physical.record);
       else deleteSetValue(physicalSlots, physical);
     }
+    return acceptedHandle;
   };
 
   const retirePhysicalForNavigation = (physical: PhysicalSlot): void => {
+    retirePhysicalTraceCycles(physical);
     const record = physical.record;
     if (record) retireCommittedArtifact(record, physical);
     invalidatePublisherAdmissions(physical);
@@ -1559,7 +1642,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     if (cycleIntent && !cycleIntent.terminal) settle(cycleIntent, failed(reason));
     if (record.activeIntent) settle(record.activeIntent, failed(reason));
     if (record.queuedIntent) settle(record.queuedIntent, failed(reason));
-    physical.activeCycle = undefined;
+    clearPhysicalCycle(physical);
   };
 
   const pauseReconciliationIntent = (intent: RequestIntent | undefined): void => {
@@ -1627,7 +1710,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     pauseReconciliationIntent(physical.activeCycle?.intent);
     pauseReconciliationIntent(record.activeIntent);
     pauseReconciliationIntent(record.queuedIntent);
-    physical.activeCycle = undefined;
+    clearPhysicalCycle(physical);
     retireCommittedArtifact(record, physical);
     physical.state = 'retired';
     physical.quarantineReason = 'request';
@@ -1711,7 +1794,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     ) {
       settle(active, failed('gpt_request_failed'));
     }
-    window.orphan.activeCycle = undefined;
+    clearPhysicalCycle(window.orphan);
     detachDestroyedReconciliationPhysical(window.orphan);
     advanceQueued(record);
     return true;
@@ -2230,6 +2313,8 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       const previousElementIdPrefix = existing.elementIdPrefix;
       const previousPlacementKeys = existing.placementKeys;
       const previousPublisherElementIds = existing.publisherElementIds;
+      const previousView = record.view;
+      const traceToken = traceTokenFor(slotObject);
       try {
         if (!wasStrong) addSetValue(physicalSlots, existing);
         if (!setHasValue(physicalSlots, existing)) throw new Error('physical publication failed');
@@ -2245,6 +2330,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
             ? Object.freeze([definition.elementId])
             : Object.freeze([]);
         record.physical = existing;
+        record.view = recordWithTraceToken(record.view, traceToken);
         if (ownership === 'publisher') cancelReconciliation(record);
         return Object.freeze({ ok: true });
       } catch {
@@ -2256,6 +2342,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         existing.elementIdPrefix = previousElementIdPrefix;
         existing.placementKeys = previousPlacementKeys;
         existing.publisherElementIds = previousPublisherElementIds;
+        record.view = previousView;
         if (!wasStrong) deleteSetValue(physicalSlots, existing);
         return Object.freeze({ ok: false, reason: 'stale_owner' });
       }
@@ -2271,6 +2358,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       elementIdPrefix,
       destroyAttempted: false,
       lastResponseIdentifier: undefined,
+      lastCycle: undefined,
       ownership,
       placementKeys: bindingPlacementKeys,
       publisherAdmissions: [],
@@ -2286,13 +2374,17 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       suppressPublisherDisplay: false,
       suppressPublisherRefresh: false,
     };
+    const previousView = record.view;
+    const traceToken = traceTokenFor(slotObject);
     try {
       setWeakMapValue(physicalByObject, slotObject, physical);
       addSetValue(physicalSlots, physical);
       if (!state.owner.isCurrent() || state.disposed) throw new Error('stale owner');
       record.physical = physical;
+      record.view = recordWithTraceToken(record.view, traceToken);
       return Object.freeze({ ok: true });
     } catch {
+      record.view = previousView;
       deleteSetValue(physicalSlots, physical);
       if (weakMapValue(physicalByObject, slotObject) === physical) {
         deleteWeakMapValue(physicalByObject, slotObject);
@@ -2682,7 +2774,8 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     if (record) retireCommittedArtifact(record, physical);
     if (record?.physical === physical) record.physical = undefined;
     physical.record = undefined;
-    physical.activeCycle = undefined;
+    retirePhysicalTraceCycles(physical);
+    clearPhysicalCycle(physical);
     invalidatePublisherAdmissions(physical);
     physical.publisherElementIds = Object.freeze([]);
     physical.suppressPublisherDisplay = false;
@@ -2772,7 +2865,8 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       settle(physical.record.queuedIntent, failed('cycle_unattributable'));
     }
     if (physical.activeCycle?.kind === 'trusted_server') {
-      physical.activeCycle = { intent: undefined, kind: 'publisher' };
+      physical.activeCycle.intent = undefined;
+      physical.activeCycle.kind = 'publisher';
       physical.state = 'quarantined';
       physical.quarantineReason = 'completion';
     }

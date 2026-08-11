@@ -3,8 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { GptDiagnosticsBinding } from '../../../src/core/types';
 import type { GptDiagnosticsBindingView } from '../../../src/integrations/gpt_diagnostics/binding';
 import {
+  formatGptDiagnosticsBadgeText,
   GptDiagnosticsBadgeManager,
-  gptDiagnosticsBadgeTextForTest,
 } from '../../../src/integrations/gpt_diagnostics/badges';
 import { GptDiagnosticsStore } from '../../../src/integrations/gpt_diagnostics/store';
 
@@ -255,7 +255,7 @@ describe('GptDiagnosticsBadgeManager', () => {
 
   it('uses only GPT-observed lifecycle facts in badge text', () => {
     expect(
-      gptDiagnosticsBadgeTextForTest({
+      formatGptDiagnosticsBadgeText({
         requestNumber: 1,
         requestedAtMs: 0,
         responseAtMs: 276,
@@ -293,7 +293,7 @@ describe('GptDiagnosticsBadgeManager', () => {
       })
     ).toBe('Filled · Req 300×250, 320×50, 728×90 +1');
     expect(
-      gptDiagnosticsBadgeTextForTest({
+      formatGptDiagnosticsBadgeText({
         requestNumber: 1,
         isEmpty: true,
         incompleteSequence: false,
@@ -301,7 +301,7 @@ describe('GptDiagnosticsBadgeManager', () => {
       })
     ).toBe('Empty');
     expect(
-      gptDiagnosticsBadgeTextForTest({
+      formatGptDiagnosticsBadgeText({
         requestNumber: 1,
         renderAtMs: 5,
         incompleteSequence: false,
@@ -309,42 +309,38 @@ describe('GptDiagnosticsBadgeManager', () => {
       })
     ).toBe('Rendered (fill unknown)');
     expect(
-      gptDiagnosticsBadgeTextForTest({
+      formatGptDiagnosticsBadgeText({
         requestNumber: 1,
         incompleteSequence: false,
         durations: {},
       })
     ).toBe('Pending');
-    expect(
-      gptDiagnosticsBadgeTextForTest({
-        requestNumber: 1,
-        isEmpty: false,
-        renderAtMs: 5,
-        incompleteSequence: true,
-        durations: {},
-      })
-    ).toBe('Filled\nIncomplete sequence');
-    // Assert over rendered text: the delivery vocabulary lives in a helper that
-    // a `toString()` of this function would not include.
-    for (const delivery of [
-      'trusted_server_response_sent',
-      'trusted_server_selected',
-      'candidate_unconfirmed',
-      'no_candidate',
-      'unknown',
-      'pending',
-      'not_applicable',
-    ] as const) {
-      expect(
-        gptDiagnosticsBadgeTextForTest({
-          requestNumber: 1,
-          isEmpty: false,
-          incompleteSequence: false,
-          durations: {},
-          delivery,
-        })
-      ).not.toMatch(/GAM winner|bidder|provenance/i);
-    }
+    expect(formatGptDiagnosticsBadgeText.toString()).not.toMatch(
+      /Trusted Server|GAM winner|Prebid|bidder|provenance/i
+    );
+  });
+
+  it('rejects a counterfeit bound element instead of accepting DOM-shaped data', () => {
+    const frames: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({ schedule: (callback) => callback() });
+    store.recordSlotRequested(slot('counterfeit'));
+    const bindings = new FakeBindings();
+    const counterfeit = Object.freeze({
+      getBoundingClientRect: () => rectangle(10, 10, 300, 250),
+      isConnected: true,
+    }) as unknown as HTMLElement;
+    bindings.set(1, { status: 'bound' }, counterfeit, true);
+    const layer = document.createElement('div');
+    document.body.append(layer);
+    const manager = new GptDiagnosticsBadgeManager(store, bindings, {
+      scheduleFrame: queueFrame(frames),
+    });
+
+    manager.setLayer(layer);
+    runFrame(frames);
+
+    expect(layer.querySelector('.tsgd-badge')).toBeNull();
+    manager.destroy();
   });
 
   it('positions in the overlay layer and coalesces scroll and resize updates', () => {

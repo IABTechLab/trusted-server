@@ -1,4 +1,5 @@
 import type { GptDiagnosticsBinding, GptDiagnosticsSlotExport } from '../../core/types';
+import { realmOwnedElement, realmOwnedHtmlElement } from '../../shared/realm';
 
 import { scheduleFrame } from './presentation_helpers';
 import type { GptDiagnosticsBindingInput } from './store';
@@ -54,23 +55,33 @@ function isVisibleInViewport(element: HTMLElement, window: BindingWindow): boole
   );
 }
 
-function nodeIntersectsSlotIds(node: Node, slotElementIds: Set<string>): boolean {
-  if (!(node instanceof Element)) return false;
-  if (slotElementIds.has(node.id)) return true;
-  return Array.from(node.querySelectorAll('[id]')).some((element) =>
-    slotElementIds.has(element.id)
+function nodeIntersectsSlotIds(
+  node: Node,
+  slotElementIds: Set<string>,
+  targetWindow: BindingWindow
+): boolean {
+  const element = realmOwnedElement(node, targetWindow);
+  if (!element) return false;
+  if (slotElementIds.has(element.id)) return true;
+  return Array.from(element.querySelectorAll('[id]')).some((descendant) =>
+    slotElementIds.has(descendant.id)
   );
 }
 
-function mutationIntersectsSlotIds(record: MutationRecord, slotElementIds: Set<string>): boolean {
+function mutationIntersectsSlotIds(
+  record: MutationRecord,
+  slotElementIds: Set<string>,
+  targetWindow: BindingWindow
+): boolean {
+  const target = realmOwnedElement(record.target, targetWindow);
   if (record.type === 'attributes') {
-    if (!(record.target instanceof Element)) return false;
-    return slotElementIds.has(record.target.id) || slotElementIds.has(record.oldValue ?? '');
+    if (!target) return false;
+    return slotElementIds.has(target.id) || slotElementIds.has(record.oldValue ?? '');
   }
 
-  if (record.target instanceof Element && slotElementIds.has(record.target.id)) return true;
+  if (target && slotElementIds.has(target.id)) return true;
   return [...record.addedNodes, ...record.removedNodes].some((node) =>
-    nodeIntersectsSlotIds(node, slotElementIds)
+    nodeIntersectsSlotIds(node, slotElementIds, targetWindow)
   );
 }
 
@@ -104,9 +115,11 @@ export class GptDiagnosticsBindingManager {
   constructor(store: BindingStore, options: BindingOptions = {}) {
     this.store = store;
     this.document = options.document ?? document;
-    this.window = options.window ?? (window as unknown as BindingWindow);
-    this.scheduleFrame =
-      options.scheduleFrame ?? ((callback) => scheduleFrame(this.window, callback));
+    this.window =
+      options.window ??
+      (this.document.defaultView as unknown as BindingWindow | null) ??
+      (window as unknown as BindingWindow);
+    this.scheduleFrame = options.scheduleFrame ?? defaultScheduleFrame;
     this.unsubscribeStore = this.store.subscribe(() => this.scheduleRefresh());
 
     this.window.addEventListener('scroll', this.scheduleRefresh, { passive: true });
@@ -237,15 +250,14 @@ export class GptDiagnosticsBindingManager {
       };
     }
 
-    const candidate = this.document.getElementById(slotElementId);
-    if (!candidate || !(candidate instanceof this.window.HTMLElement) || !candidate.isConnected) {
+    const element = realmOwnedHtmlElement(this.document.getElementById(slotElementId), this.window);
+    if (!element || !element.isConnected) {
       return {
         binding: { status: 'unbound', reason: 'missing_element' },
         visible: false,
       };
     }
 
-    const element = candidate as HTMLElement;
     const escape = this.window.CSS?.escape;
     if (typeof escape !== 'function') {
       return {
@@ -283,7 +295,9 @@ export class GptDiagnosticsBindingManager {
     const observer = new Observer((records) => {
       if (
         this.slotElementIds.size > 0 &&
-        records.some((record) => mutationIntersectsSlotIds(record, this.slotElementIds))
+        records.some((record) =>
+          mutationIntersectsSlotIds(record, this.slotElementIds, this.window)
+        )
       ) {
         this.scheduleRefresh();
       }

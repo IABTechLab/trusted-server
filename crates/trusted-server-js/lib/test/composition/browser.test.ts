@@ -10,6 +10,8 @@ import {
   type GoogletagFacade,
   type GoogletagPublisherCallObserver,
   type GoogletagPublisherRefreshCall,
+  type GptSlotTokenV1,
+  type GptTraceCycleOrdinalV1,
 } from '../../src/adapters/googletag';
 import {
   createBrowserMessagingAdapter,
@@ -28,35 +30,102 @@ import {
   type PreparedTrustedBidV1,
 } from '../../src/adapters/prebid';
 import {
+  BROWSER_TEST_DIAGNOSTICS_PROVIDER_ID,
+  BROWSER_TEST_TRACE_PROVIDER_ID,
   createBrowserComposition,
-  createBrowserRuntimeComposition,
   createNoopBrowserComposition,
   createTestBrowserRuntimeComposition,
-} from '../../src/composition/browser';
+} from '../../src/composition/browser_test';
 import { log as localLog } from '../../src/core/log';
-import { TRACE_PANEL_ID } from '../../src/core/trace';
+import {
+  createDiagnosticsPresentationIntegrationRegistration,
+  TRACE_PANEL_ID,
+} from '../../src/integrations/gpt_diagnostics/presentation';
 import type { BrowserAuctionBidV1, BrowserAuctionProjectionV1 } from '../../src/core/types';
 import { createCreativeIntegrationRegistration } from '../../src/integrations/creative/module';
 import { createDataDomeIntegrationRegistration } from '../../src/integrations/datadome/module';
 import { createDidomiIntegrationRegistration } from '../../src/integrations/didomi/module';
 import { createGoogleTagManagerIntegrationRegistration } from '../../src/integrations/google_tag_manager/module';
-import { createGptIntegrationRegistration } from '../../src/integrations/gpt/module';
+import { createLegacyGptRegistrationForTest as createGptIntegrationRegistration } from '../helpers/legacy_gpt_registration';
 import { isGuardInstalled, resetGuardState } from '../../src/integrations/gpt/script_guard';
 import { createGptDiagnosticsIntegrationRegistration } from '../../src/integrations/gpt_diagnostics/module';
 import { createLockrIntegrationRegistration } from '../../src/integrations/lockr/module';
-import { createOsanoIntegrationRegistration } from '../../src/integrations/osano/module';
-import { createPermutiveIntegrationRegistration } from '../../src/integrations/permutive/module';
 import { createPrebidIntegrationRegistration } from '../../src/integrations/prebid/module';
-import { createSourcepointIntegrationRegistration } from '../../src/integrations/sourcepoint/module';
 import { createTestlightIntegrationRegistration } from '../../src/integrations/testlight/module';
 import { publicLog } from '../../src/kernel/fallback';
 import { createTestNavigationIdentityIssuer } from '../../src/kernel/identity';
 import type { IntegrationPrepareContext } from '../../src/kernel/integration_registry';
+import { createLifecycleIntegrationRegistration } from '../../src/kernel/lifecycle_module';
 import {
   createRenderAttempt,
   type CommittedRenderArtifact,
   type RenderAttempt,
 } from '../../src/services/render';
+
+const DEFERRED_INTEGRATION_IDS = new Set([
+  'diagnostics_presentation',
+  'gpt_later',
+  'osano_lifecycle',
+  'permutive_lifecycle',
+  'prebid_later',
+  'sourcepoint_lifecycle',
+]);
+
+const GPT_DIAGNOSTICS_TEST_IDS = Object.freeze([
+  BROWSER_TEST_DIAGNOSTICS_PROVIDER_ID,
+  'gpt_diagnostics',
+  'diagnostics_presentation',
+]);
+
+const BROWSER_TEST_OPTIONAL_GPT_DIAG_PROVIDER_ID = 'browser_test_optional_gpt_diag_provider';
+
+function runtimeManifest(releaseId: string, ids: readonly string[]) {
+  return {
+    version: 1 as const,
+    releaseId,
+    criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
+    integrations: ids.map((id) =>
+      DEFERRED_INTEGRATION_IDS.has(id)
+        ? {
+            id,
+            phase: 'deferred' as const,
+            trigger: 'first_display_or_idle' as const,
+            src: `/static/tsjs=tsjs-${id}.min.js?v=${'d'.repeat(64)}`,
+          }
+        : { id, phase: 'critical' as const }
+    ),
+  };
+}
+
+function runtimeCatalog(ids: readonly string[]) {
+  return Object.freeze(
+    ids.map((id) =>
+      Object.freeze({
+        id,
+        phase: DEFERRED_INTEGRATION_IDS.has(id) ? ('deferred' as const) : ('critical' as const),
+        trigger: DEFERRED_INTEGRATION_IDS.has(id) ? ('first_display_or_idle' as const) : null,
+        consumes: Object.freeze(
+          id === BROWSER_TEST_DIAGNOSTICS_PROVIDER_ID
+            ? ['runtime.v1']
+            : id === 'gpt_diagnostics'
+              ? ['runtime.v1', 'gpt.events.v1']
+              : id === 'diagnostics_presentation'
+                ? ['runtime.v1', 'trace.presentation.v1', 'gpt_diag.v1?gpt_diagnostics_active']
+                : []
+        ),
+        provides: Object.freeze(
+          id === BROWSER_TEST_DIAGNOSTICS_PROVIDER_ID
+            ? ['gpt.events.v1', 'trace.v1', 'trace.presentation.v1']
+            : id === BROWSER_TEST_TRACE_PROVIDER_ID
+              ? ['trace.v1', 'trace.presentation.v1']
+              : id === 'gpt_diagnostics' || id === BROWSER_TEST_OPTIONAL_GPT_DIAG_PROVIDER_ID
+                ? ['gpt_diag.v1']
+                : []
+        ),
+      })
+    )
+  );
+}
 
 function createTarget() {
   return {
@@ -86,15 +155,30 @@ function fakeGoogletagAdapter(
 }
 
 function synchronousGptAdapter(initialSlots: readonly object[] = []) {
-  const listeners = new Map<string, Set<(event: unknown) => void>>();
+  type Listener = Readonly<{
+    callback: Parameters<GoogletagFacade['subscribe']>[1];
+    diagnosticsOwner: boolean;
+  }>;
+  const listeners = new Map<string, Set<Listener>>();
   const physicalSlots: object[] = [...initialSlots];
   const targeting = new WeakMap<object, Map<string, readonly string[]>>();
   const bindingToken = Object.freeze({});
   const display = vi.fn();
   const refresh = vi.fn();
   const diagnosticsSlots = new WeakMap<object, GoogletagDiagnosticsFact['slot']>();
+  const diagnosticFacts: GoogletagDiagnosticsFact[] = [];
+  const traceTokens = new WeakMap<object, GptSlotTokenV1>();
+  const traceCycles = new WeakMap<object, GptTraceCycleOrdinalV1>();
+  let traceTokenSequence = 0;
   let diagnosticsObserver: GoogletagDiagnosticsObserver | undefined;
   let publisherObserver: GoogletagPublisherCallObserver | undefined;
+  const traceTokenFor = (slot: object): GptSlotTokenV1 => {
+    const existing = traceTokens.get(slot);
+    if (existing) return existing;
+    const token = `gt1_${(++traceTokenSequence).toString(36)}` as GptSlotTokenV1;
+    traceTokens.set(slot, token);
+    return token;
+  };
   const transactionalDefine: GoogletagFacade['transactionalDefine'] = (
     definition,
     isGenerationCurrent,
@@ -144,11 +228,16 @@ function synchronousGptAdapter(initialSlots: readonly object[] = []) {
         ? slot.getSlotElementId()
         : undefined,
     slots: () => Object.freeze([...physicalSlots]),
-    subscribe: (eventType: string, listener: (event: unknown) => void) => {
+    subscribe: (
+      eventType: string,
+      listener: Parameters<GoogletagFacade['subscribe']>[1],
+      diagnosticsOwner = false
+    ) => {
       const registered = listeners.get(eventType) ?? new Set();
-      registered.add(listener);
+      const entry = Object.freeze({ callback: listener, diagnosticsOwner });
+      registered.add(entry);
       listeners.set(eventType, registered);
-      return () => registered.delete(listener);
+      return () => registered.delete(entry);
     },
     transactionalReplace: () => Object.freeze({ status: 'destroyed' as const }),
   });
@@ -178,15 +267,16 @@ function synchronousGptAdapter(initialSlots: readonly object[] = []) {
       }
       return Object.freeze({ status: 'present' as const, result, dispose: vi.fn() });
     },
+    traceToken: traceTokenFor,
   });
   return {
     adapter,
     emit: (eventType: string, event: unknown): void => {
-      for (const listener of listeners.get(eventType) ?? []) {
-        listener(event);
-        if (typeof event !== 'object' || event === null || !('slot' in event)) continue;
+      let acceptedHandle: unknown;
+      const publishFact = (handle: unknown): void => {
+        if (typeof event !== 'object' || event === null || !('slot' in event)) return;
         const physicalSlot = event.slot;
-        if (typeof physicalSlot !== 'object' || physicalSlot === null) continue;
+        if (typeof physicalSlot !== 'object' || physicalSlot === null) return;
         let safeSlot = diagnosticsSlots.get(physicalSlot);
         if (!safeSlot) {
           const elementId =
@@ -198,30 +288,56 @@ function synchronousGptAdapter(initialSlots: readonly object[] = []) {
             'getAdUnitPath' in physicalSlot && typeof physicalSlot.getAdUnitPath === 'function'
               ? physicalSlot.getAdUnitPath()
               : undefined;
-          safeSlot = Object.freeze({
+          const createdSlot = Object.freeze({
             token: Object.freeze(Object.create(null) as object),
+            traceToken: traceTokenFor(physicalSlot),
             ...(typeof elementId === 'string' ? { elementId } : {}),
             ...(typeof adUnitPath === 'string' ? { adUnitPath } : {}),
           });
-          diagnosticsSlots.set(physicalSlot, safeSlot);
+          diagnosticsSlots.set(physicalSlot, createdSlot);
+          safeSlot = createdSlot;
         }
-        diagnosticsObserver?.(
-          Object.freeze({
-            ...event,
-            kind: eventType,
-            observedAtMs: 1,
-            slot: safeSlot,
-          }) as Parameters<GoogletagDiagnosticsObserver>[0]
-        );
+        if (eventType === 'slotRequested' && handle !== undefined) {
+          const next = ((traceCycles.get(physicalSlot) ?? 0) + 1) as GptTraceCycleOrdinalV1;
+          traceCycles.set(physicalSlot, next);
+        }
+        const cycleOrdinal = traceCycles.get(physicalSlot);
+        const fact = Object.freeze({
+          ...event,
+          kind: eventType,
+          observedAtMs: 1,
+          slot: Object.freeze({
+            ...safeSlot,
+            ...(cycleOrdinal === undefined ? {} : { cycleOrdinal }),
+          }),
+        }) as Parameters<GoogletagDiagnosticsObserver>[0];
+        diagnosticFacts.push(fact);
+        diagnosticsObserver?.(fact);
+      };
+      for (const listener of listeners.get(eventType) ?? []) {
+        const handle = listener.callback(event);
+        if (!listener.diagnosticsOwner) {
+          if (handle !== undefined) acceptedHandle = handle;
+          if (eventType === 'slotRequested' || eventType === 'slotRenderEnded') {
+            publishFact(handle);
+          }
+          continue;
+        }
+        publishFact(acceptedHandle);
       }
     },
     diagnosticsObserverActive: () => diagnosticsObserver !== undefined,
+    diagnosticFacts: () => Object.freeze([...diagnosticFacts]),
     display,
     listenerInventory: () =>
       Object.freeze(
         [...listeners.entries()]
           .filter(([, registered]) => registered.size > 0)
           .map(([eventType, registered]) => Object.freeze([eventType, registered.size] as const))
+      ),
+    listenerRoles: (eventType: string) =>
+      Object.freeze(
+        [...(listeners.get(eventType) ?? [])].map((listener) => listener.diagnosticsOwner)
       ),
     publisherRefresh: (call: Readonly<GoogletagPublisherRefreshCall>) => {
       const observer = publisherObserver;
@@ -329,7 +445,11 @@ function fakeMessagingAdapter(
 }
 
 describe('browser composition', () => {
-  afterEach(() => vi.useRealTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    document.head.querySelectorAll('script#trustedserver-js').forEach((script) => script.remove());
+    Object.defineProperty(document, 'currentScript', { configurable: true, value: null });
+  });
 
   it('constructs live adapters without changing production globals', () => {
     const target = createTarget();
@@ -432,7 +552,7 @@ describe('browser composition', () => {
       {
         target: {},
         releaseId: 'a'.repeat(64),
-        manifest: { version: 1, releaseId: 'a'.repeat(64), integrations: [] },
+        manifest: runtimeManifest('a'.repeat(64), []),
         knownIntegrationIds: Object.freeze([]),
         boot: {
           auctionProjection: projection,
@@ -615,7 +735,7 @@ describe('browser composition', () => {
       {
         target: {},
         releaseId,
-        manifest: { version: 1, releaseId, integrations: [{ id: 'gpt', required: true }] },
+        manifest: runtimeManifest(releaseId, ['gpt']),
         knownIntegrationIds: Object.freeze(['gpt']),
         boot: {
           auctionProjection: projection,
@@ -714,7 +834,7 @@ describe('browser composition', () => {
       {
         target: {},
         releaseId,
-        manifest: { version: 1, releaseId, integrations: [{ id: 'gpt', required: true }] },
+        manifest: runtimeManifest(releaseId, ['gpt']),
         knownIntegrationIds: Object.freeze(['gpt']),
         boot: {
           auctionProjection: {
@@ -851,22 +971,43 @@ describe('browser composition', () => {
     expect(listener).not.toHaveBeenCalled();
   });
 
+  it('classifies exactly the six deferred integration IDs without a suffix heuristic', () => {
+    const releaseId = 'a'.repeat(64);
+    const deferredIds = Object.freeze([
+      'diagnostics_presentation',
+      'gpt_later',
+      'osano_lifecycle',
+      'permutive_lifecycle',
+      'prebid_later',
+      'sourcepoint_lifecycle',
+    ]);
+    const rows = runtimeManifest(releaseId, [
+      'critical_lifecycle',
+      ...deferredIds,
+      'later_critical',
+    ]).integrations;
+
+    expect(rows.map(({ id, phase }) => [id, phase])).toEqual([
+      ['critical_lifecycle', 'critical'],
+      ...deferredIds.map((id) => [id, 'deferred']),
+      ['later_critical', 'critical'],
+    ]);
+  });
+
   it.each([false, true])(
     'installs only the active GPT diagnostics fact path when boot active is %s',
     async (active) => {
       const releaseId = 'a'.repeat(64);
       const target: Record<string, unknown> = {};
       const gpt = synchronousGptAdapter();
+      const integrationIds = active ? GPT_DIAGNOSTICS_TEST_IDS : Object.freeze([]);
       const composition = createTestBrowserRuntimeComposition(
         {
           target,
           releaseId,
-          manifest: {
-            version: 1,
-            releaseId,
-            integrations: active ? [{ id: 'gpt_diagnostics', required: true }] : [],
-          },
-          knownIntegrationIds: active ? Object.freeze(['gpt_diagnostics']) : Object.freeze([]),
+          manifest: runtimeManifest(releaseId, integrationIds),
+          knownIntegrationIds: integrationIds,
+          catalog: runtimeCatalog(integrationIds),
           boot: {
             auctionProjection: {
               version: 1,
@@ -891,6 +1032,11 @@ describe('browser composition', () => {
 
       expect(composition.runtime.start()).toBe(true);
       if (active) {
+        expect(
+          composition.runtime.registerIntegration(
+            composition.createDiagnosticsCapabilityProviderRegistrationForTest()
+          )
+        ).toBe(true);
         expect(
           composition.runtime.registerIntegration(
             createGptDiagnosticsIntegrationRegistration(releaseId)
@@ -918,6 +1064,9 @@ describe('browser composition', () => {
       expect(Reflect.ownKeys(diagnostics ?? {}).sort()).toEqual(
         active ? ['gpt', 'renderTrace'] : ['renderTrace']
       );
+      expect(target).not.toHaveProperty('gpt.events.v1');
+      expect(target).not.toHaveProperty('trace.v1');
+      expect(target).not.toHaveProperty('gpt_diag.v1');
 
       if (active) {
         const observedSlot = Object.freeze({
@@ -935,6 +1084,144 @@ describe('browser composition', () => {
     }
   );
 
+  it('composes the production GPT adapter lifecycle handle through SlotService and ingress into trace', async () => {
+    const releaseId = 'a'.repeat(64);
+    const listeners = new Map<string, Set<(event: unknown) => void>>();
+    const refresh = vi.fn();
+    const pubads = {
+      addEventListener: vi.fn((type: string, listener: (event: unknown) => void) => {
+        const registered = listeners.get(type) ?? new Set();
+        registered.add(listener);
+        listeners.set(type, registered);
+      }),
+      getSlots: vi.fn(() => [] as object[]),
+      refresh,
+      removeEventListener: vi.fn((type: string, listener: (event: unknown) => void) => {
+        listeners.get(type)?.delete(listener);
+      }),
+    };
+    const concreteAdapter = createBrowserGoogletagAdapter({
+      googletag: {
+        apiReady: true,
+        pubadsReady: true,
+        cmd: { push: (callback: () => void) => (callback(), 1) },
+        display: vi.fn(),
+        getConfig: vi.fn(() => ({ disableInitialLoad: false })),
+        pubads: vi.fn(() => pubads),
+        setConfig: vi.fn(),
+      },
+      performance: { now: () => 17 },
+    });
+    const integrationIds = GPT_DIAGNOSTICS_TEST_IDS;
+    const target: Record<string, unknown> = {};
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target,
+        releaseId,
+        manifest: runtimeManifest(releaseId, integrationIds),
+        knownIntegrationIds: integrationIds,
+        catalog: runtimeCatalog(integrationIds),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: {
+              version: 1,
+              auctionId: 'production-adapter-cycle',
+              results: [{ slot: 'production-adapter-slot', outcome: 'no_bid' }],
+            },
+            slots: [browserSlotPlacement('production-adapter-slot')],
+            bids: [],
+          },
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: true } },
+        },
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag: concreteAdapter,
+          messaging: fakeMessagingAdapter(),
+          prebid: fakePrebidAdapter(),
+        },
+        coreActivations: { correctnessGptListeners: vi.fn() },
+      }
+    );
+    const physicalSlot = Object.freeze({
+      clearTargeting: vi.fn(),
+      getAdUnitPath: () => '/123/production-adapter-slot',
+      getSlotElementId: () => 'production-adapter-slot',
+      getTargeting: vi.fn(() => []),
+      setTargeting: vi.fn(),
+    });
+    const emit = (type: string, fields: Readonly<Record<string, unknown>> = {}): void => {
+      const event = { slot: physicalSlot, ...fields };
+      for (const listener of listeners.get(type) ?? []) listener(event);
+    };
+
+    try {
+      expect(composition.runtime.start()).toBe(true);
+      expect(
+        composition.runtime.registerIntegration(
+          composition.createDiagnosticsCapabilityProviderRegistrationForTest()
+        )
+      ).toBe(true);
+      expect(
+        composition.runtime.registerIntegration(
+          createGptDiagnosticsIntegrationRegistration(releaseId)
+        )
+      ).toBe(true);
+      await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+      const navigation = composition.runtimeSessionForTest()?.currentNavigation;
+      const slots = composition.slotServiceForTest();
+      if (!navigation || !slots) throw new Error('Expected active production adapter composition');
+      expect(
+        slots.adoptGptSlot(navigation.generation, 'production-adapter-slot', {
+          definition: {
+            adUnitPath: '/123/production-adapter-slot',
+            elementId: 'production-adapter-slot',
+            sizes: Object.freeze([[300, 250]]),
+          },
+          ownership: 'trusted_server',
+          slot: physicalSlot,
+        })
+      ).toEqual({ ok: true });
+      const request = slots.request({
+        intentId: 'production-adapter-request',
+        navigationGeneration: navigation.generation,
+        operation: 'refresh',
+        registeredSlotId: 'production-adapter-slot',
+        requestClass: 'primary',
+      });
+      await vi.waitFor(() =>
+        expect(refresh).toHaveBeenCalledExactlyOnceWith(
+          [physicalSlot],
+          Object.freeze({ changeCorrelator: false })
+        )
+      );
+
+      emit('slotRequested');
+      emit('slotRenderEnded', { isEmpty: false, responseIdentifier: 'production-response' });
+      await expect(request.result).resolves.toEqual({
+        responseIdentifier: 'production-response',
+        status: 'rendered',
+      });
+      const diagnostics = target['diagnostics'] as {
+        readonly renderTrace: { current(): Readonly<Record<string, unknown>> };
+      };
+      expect(diagnostics.renderTrace.current()['production-adapter-slot']).toEqual(
+        expect.objectContaining({
+          gamEmpty: false,
+          path: 'gam-refresh',
+          rendered: true,
+        })
+      );
+      expect(listeners.get('slotRequested')).toHaveLength(1);
+      expect(listeners.get('slotRenderEnded')).toHaveLength(1);
+    } finally {
+      composition.runtime.dispose();
+    }
+  });
+
   it('activates reversible core effects in exact order and disposes them in reverse', async () => {
     const target = {};
     const order: string[] = [];
@@ -942,11 +1229,7 @@ describe('browser composition', () => {
       {
         target,
         releaseId: 'a'.repeat(64),
-        manifest: {
-          version: 1,
-          releaseId: 'a'.repeat(64),
-          integrations: [{ id: 'test', required: true }],
-        },
+        manifest: runtimeManifest('a'.repeat(64), ['test']),
         knownIntegrationIds: Object.freeze(['test']),
         boot: {
           auctionProjection: {
@@ -986,23 +1269,25 @@ describe('browser composition', () => {
     expect(composition.runtime.state).toBe('unclaimed');
     expect(composition.runtime.start()).toBe(true);
     expect(
-      composition.runtime.registerIntegration({
-        id: 'test',
-        release: 'a'.repeat(64),
-        prepare: ({
-          interfaces,
-          onDispose,
-        }: {
-          interfaces: Readonly<Record<string, unknown>>;
-          onDispose(callback: () => void): void;
-        }) => {
-          expect(Reflect.ownKeys(interfaces['diagnostics'] as object)).toEqual(['subscribe']);
-          expect(interfaces['diagnostics']).not.toHaveProperty('publish');
-          expect(interfaces['diagnostics']).not.toHaveProperty('dispose');
-          onDispose(() => order.push('dispose-module'));
-          return { activate: () => order.push('module') };
-        },
-      })
+      composition.runtime.registerIntegration(
+        Object.freeze({
+          abi: 1,
+          id: 'test',
+          phase: 'critical',
+          releaseId: 'a'.repeat(64),
+          prepare: ({
+            interfaces,
+            onDispose,
+          }: {
+            interfaces: Readonly<Record<string, unknown>>;
+            onDispose(callback: () => void): void;
+          }) => {
+            expect(interfaces).not.toHaveProperty('diagnostics');
+            onDispose(() => order.push('dispose-module'));
+            return Object.freeze({ activate: () => order.push('module') });
+          },
+        })
+      )
     ).toBe(true);
     await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
     expect(order).toEqual(['bridge', 'gpt', 'module']);
@@ -1067,6 +1352,7 @@ describe('browser composition', () => {
       notifyReady: vi.fn(),
       observeDiagnostics: () => vi.fn(),
       observePublisherCalls: () => vi.fn(),
+      traceToken: () => undefined,
       run: <T>(command: (gpt: Readonly<GoogletagFacade>) => T) => {
         const result = Promise.resolve(command(facade));
         return Object.freeze({ status: 'present' as const, result, dispose: vi.fn() });
@@ -1086,11 +1372,7 @@ describe('browser composition', () => {
       {
         target: {},
         releaseId,
-        manifest: {
-          version: 1,
-          releaseId,
-          integrations: [{ id: 'gpt', required: true }],
-        },
+        manifest: runtimeManifest(releaseId, ['gpt']),
         knownIntegrationIds: Object.freeze(['gpt']),
         boot: {
           auctionProjection: {
@@ -1140,12 +1422,9 @@ describe('browser composition', () => {
       {
         target,
         releaseId,
-        manifest: {
-          version: 1,
-          releaseId,
-          integrations: [{ id: 'gpt_diagnostics', required: true }],
-        },
-        knownIntegrationIds: Object.freeze(['gpt_diagnostics']),
+        manifest: runtimeManifest(releaseId, GPT_DIAGNOSTICS_TEST_IDS),
+        knownIntegrationIds: GPT_DIAGNOSTICS_TEST_IDS,
+        catalog: runtimeCatalog(GPT_DIAGNOSTICS_TEST_IDS),
         boot: {
           auctionProjection: {
             version: 1,
@@ -1169,6 +1448,11 @@ describe('browser composition', () => {
     );
 
     expect(composition.runtime.start()).toBe(true);
+    expect(
+      composition.runtime.registerIntegration(
+        composition.createDiagnosticsCapabilityProviderRegistrationForTest()
+      )
+    ).toBe(true);
     expect(
       composition.runtime.registerIntegration(
         createGptDiagnosticsIntegrationRegistration(releaseId)
@@ -1217,23 +1501,22 @@ describe('browser composition', () => {
     expect(gpt.listenerInventory()).toEqual([]);
   });
 
-  it('publishes committed GPT facts through the kernel diagnostics bus', async () => {
+  it('keeps the core diagnostics ingress private from integration modules', async () => {
     const releaseId = 'a'.repeat(64);
     const gpt = synchronousGptAdapter();
-    const observations: Readonly<Record<string, unknown>>[] = [];
+    const integrationIds = Object.freeze([
+      BROWSER_TEST_DIAGNOSTICS_PROVIDER_ID,
+      'diagnostics_probe',
+      'gpt_diagnostics',
+      'diagnostics_presentation',
+    ]);
     const composition = createTestBrowserRuntimeComposition(
       {
         target: {},
         releaseId,
-        manifest: {
-          version: 1,
-          releaseId,
-          integrations: [
-            { id: 'diagnostics_probe', required: true },
-            { id: 'gpt_diagnostics', required: true },
-          ],
-        },
-        knownIntegrationIds: Object.freeze(['diagnostics_probe', 'gpt_diagnostics']),
+        manifest: runtimeManifest(releaseId, integrationIds),
+        knownIntegrationIds: integrationIds,
+        catalog: runtimeCatalog(integrationIds),
         boot: {
           auctionProjection: {
             version: 1,
@@ -1259,24 +1542,29 @@ describe('browser composition', () => {
     try {
       expect(composition.runtime.start()).toBe(true);
       expect(
-        composition.runtime.registerIntegration({
-          id: 'diagnostics_probe',
-          release: releaseId,
-          prepare: ({ interfaces, onDispose }: IntegrationPrepareContext) => {
-            const diagnostics = interfaces['diagnostics'] as {
-              subscribe(
-                id: string,
-                listener: (observation: Readonly<Record<string, unknown>>) => void
-              ): (() => void) | undefined;
-            };
-            const release = diagnostics.subscribe('diagnostics_probe', (observation) =>
-              observations.push(observation)
-            );
-            if (!release) throw new Error('Expected the diagnostics bus subscription');
-            onDispose(release);
-            return { activate: vi.fn() };
-          },
-        })
+        composition.runtime.registerIntegration(
+          composition.createDiagnosticsCapabilityProviderRegistrationForTest()
+        )
+      ).toBe(true);
+      expect(
+        composition.runtime.registerIntegration(
+          Object.freeze({
+            abi: 1,
+            id: 'diagnostics_probe',
+            phase: 'critical',
+            releaseId,
+            prepare: ({ interfaces }: IntegrationPrepareContext) => {
+              expect(interfaces).not.toHaveProperty('diagnostics');
+              const trace = interfaces['trace.v1'] as Readonly<Record<string, unknown>>;
+              expect(Reflect.ownKeys(trace).sort()).toEqual(
+                ['diagnostics', 'enrich', 'observations', 'prune', 'record'].sort()
+              );
+              expect(Reflect.ownKeys(trace['observations'] as object)).toEqual(['publish']);
+              expect(trace).not.toHaveProperty('attachPresentation');
+              return Object.freeze({ activate: vi.fn() });
+            },
+          })
+        )
       ).toBe(true);
       expect(
         composition.runtime.registerIntegration(
@@ -1284,26 +1572,6 @@ describe('browser composition', () => {
         )
       ).toBe(true);
       await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
-
-      const observedSlot = Object.freeze({
-        getSlotElementId: () => 'bus-slot',
-        getAdUnitPath: () => '/example/bus-slot',
-      });
-      gpt.emit('slotRenderEnded', { slot: observedSlot, isEmpty: false });
-
-      await vi.waitFor(() =>
-        expect(observations).toContainEqual(
-          expect.objectContaining({
-            kind: 'slotRenderEnded',
-            slot: expect.objectContaining({
-              elementId: 'bus-slot',
-              adUnitPath: '/example/bus-slot',
-              token: expect.any(Object),
-            }),
-            isEmpty: false,
-          })
-        )
-      );
     } finally {
       composition.runtime.dispose();
     }
@@ -1313,16 +1581,13 @@ describe('browser composition', () => {
     const releaseId = 'a'.repeat(64);
     const target: Record<string, unknown> = {};
     const gpt = synchronousGptAdapter();
-    const composition = createBrowserRuntimeComposition(
+    const composition = createTestBrowserRuntimeComposition(
       {
         target,
         releaseId,
-        manifest: {
-          version: 1,
-          releaseId,
-          integrations: [{ id: 'gpt_diagnostics', required: true }],
-        },
-        knownIntegrationIds: Object.freeze(['gpt_diagnostics']),
+        manifest: runtimeManifest(releaseId, GPT_DIAGNOSTICS_TEST_IDS),
+        knownIntegrationIds: GPT_DIAGNOSTICS_TEST_IDS,
+        catalog: runtimeCatalog(GPT_DIAGNOSTICS_TEST_IDS),
         boot: {
           auctionProjection: {
             version: 1,
@@ -1347,6 +1612,11 @@ describe('browser composition', () => {
 
     try {
       expect(composition.runtime.start()).toBe(true);
+      expect(
+        composition.runtime.registerIntegration(
+          composition.createDiagnosticsCapabilityProviderRegistrationForTest()
+        )
+      ).toBe(true);
       expect(
         composition.runtime.registerIntegration(
           createGptDiagnosticsIntegrationRegistration(releaseId)
@@ -1362,10 +1632,25 @@ describe('browser composition', () => {
         getSlotElementId: () => 'gpt-trace-slot',
         getAdUnitPath: () => '/example/gpt-trace-slot',
       });
+      const navigation = composition.runtimeSessionForTest()?.currentNavigation;
+      if (!navigation) throw new Error('Expected active navigation');
+      expect(
+        composition.slotServiceForTest()?.adoptGptSlot(navigation.generation, 'gpt-trace-slot', {
+          ownership: 'publisher',
+          slot: physicalSlot,
+        })
+      ).toEqual({ ok: true });
+      expect(gpt.listenerRoles('slotRequested')).toEqual([false]);
 
       gpt.emit('slotRequested', { slot: physicalSlot });
+      expect(composition.slotServiceForTest()?.snapshotForTest().cycles).toBe(1);
       gpt.emit('slotRenderEnded', { slot: physicalSlot, isEmpty: false });
       gpt.emit('impressionViewable', { slot: physicalSlot });
+      expect(gpt.diagnosticFacts().map((fact) => [fact.kind, fact.slot.cycleOrdinal])).toEqual([
+        ['slotRequested', 1],
+        ['slotRenderEnded', 1],
+        ['impressionViewable', 1],
+      ]);
 
       const diagnostics = target['diagnostics'] as {
         renderTrace: {
@@ -1444,16 +1729,13 @@ describe('browser composition', () => {
         },
       }),
     }));
-    const composition = createBrowserRuntimeComposition(
+    const composition = createTestBrowserRuntimeComposition(
       {
         target,
         releaseId,
-        manifest: {
-          version: 1,
-          releaseId,
-          integrations: [{ id: 'gpt_diagnostics', required: true }],
-        },
-        knownIntegrationIds: Object.freeze(['gpt_diagnostics']),
+        manifest: runtimeManifest(releaseId, GPT_DIAGNOSTICS_TEST_IDS),
+        knownIntegrationIds: GPT_DIAGNOSTICS_TEST_IDS,
+        catalog: runtimeCatalog(GPT_DIAGNOSTICS_TEST_IDS),
         boot: {
           auctionProjection: {
             version: 1,
@@ -1481,6 +1763,11 @@ describe('browser composition', () => {
       expect(composition.runtime.start()).toBe(true);
       expect(
         composition.runtime.registerIntegration(
+          composition.createDiagnosticsCapabilityProviderRegistrationForTest()
+        )
+      ).toBe(true);
+      expect(
+        composition.runtime.registerIntegration(
           createGptDiagnosticsIntegrationRegistration(releaseId)
         )
       ).toBe(true);
@@ -1504,6 +1791,16 @@ describe('browser composition', () => {
         getSlotElementId: () => 'reverse-order-slot',
         getAdUnitPath: () => '/example/reverse-order-slot',
       });
+      const navigation = composition.runtimeSessionForTest()?.currentNavigation;
+      if (!navigation) throw new Error('Expected active navigation');
+      expect(
+        composition
+          .slotServiceForTest()
+          ?.adoptGptSlot(navigation.generation, 'reverse-order-slot', {
+            ownership: 'publisher',
+            slot: physicalSlot,
+          })
+      ).toEqual({ ok: true });
       gpt.emit('slotRequested', { slot: physicalSlot });
       gpt.emit('slotRenderEnded', { slot: physicalSlot, isEmpty: false });
       const provisional = api.diagnostics.renderTrace.current()['reverse-order-slot'];
@@ -1564,14 +1861,7 @@ describe('browser composition', () => {
       {
         target,
         releaseId,
-        manifest: {
-          version: 1,
-          releaseId,
-          integrations: [
-            { id: 'gpt', required: true },
-            { id: 'prebid', required: true },
-          ],
-        },
+        manifest: runtimeManifest(releaseId, ['gpt', 'prebid']),
         knownIntegrationIds: Object.freeze(['gpt', 'prebid']),
         boot: {
           auctionProjection: {
@@ -1648,14 +1938,7 @@ describe('browser composition', () => {
       {
         target,
         releaseId,
-        manifest: {
-          version: 1,
-          releaseId,
-          integrations: [
-            { id: 'gpt', required: true },
-            { id: 'prebid', required: true },
-          ],
-        },
+        manifest: runtimeManifest(releaseId, ['gpt', 'prebid']),
         knownIntegrationIds: Object.freeze(['gpt', 'prebid']),
         boot: {
           auctionProjection: {
@@ -1759,22 +2042,63 @@ describe('browser composition', () => {
     vi.useFakeTimers();
     const releaseId = 'a'.repeat(64);
     const target = {};
-    const members = Object.freeze([
+    const noConfigLifecycle = (id: string) => (release: string) =>
+      createLifecycleIntegrationRegistration(id, release, {
+        validateConfig: (candidate) => candidate === undefined,
+      });
+    const sourcepointLifecycle = (id: string) => (release: string) =>
+      createLifecycleIntegrationRegistration(id, release, {
+        validateConfig: (candidate) =>
+          typeof candidate === 'object' &&
+          candidate !== null &&
+          Object.isFrozen(candidate) &&
+          Reflect.ownKeys(candidate).length === 1 &&
+          typeof (candidate as Readonly<Record<string, unknown>>)['rewriteSdk'] === 'boolean',
+      });
+    const criticalMembers = Object.freeze([
       ['datadome', createDataDomeIntegrationRegistration] as const,
       ['didomi', createDidomiIntegrationRegistration] as const,
       ['google_tag_manager', createGoogleTagManagerIntegrationRegistration] as const,
       ['lockr', createLockrIntegrationRegistration] as const,
-      ['osano', createOsanoIntegrationRegistration] as const,
-      ['permutive', createPermutiveIntegrationRegistration] as const,
-      ['sourcepoint', createSourcepointIntegrationRegistration] as const,
+      ['osano_consent', noConfigLifecycle('osano_consent')] as const,
+      ['permutive_context', noConfigLifecycle('permutive_context')] as const,
+      ['sourcepoint_consent', sourcepointLifecycle('sourcepoint_consent')] as const,
       ['testlight', createTestlightIntegrationRegistration] as const,
     ]);
+    const deferredMembers = Object.freeze([
+      ['osano_lifecycle', noConfigLifecycle('osano_lifecycle')] as const,
+      ['permutive_lifecycle', noConfigLifecycle('permutive_lifecycle')] as const,
+      ['sourcepoint_lifecycle', sourcepointLifecycle('sourcepoint_lifecycle')] as const,
+    ]);
+    const members = Object.freeze([...criticalMembers, ...deferredMembers]);
     const ids = Object.freeze(members.map(([id]) => id));
     const configFor = (id: string): unknown => {
       if (id === 'didomi') return Object.freeze({ proxyPath: '/integrations/didomi/consent/' });
-      if (id === 'sourcepoint') return Object.freeze({ rewriteSdk: true });
+      if (id.startsWith('sourcepoint_')) return Object.freeze({ rewriteSdk: true });
       return undefined;
     };
+    const manifest = runtimeManifest(releaseId, ids);
+    expect(manifest.integrations.map(({ id, phase }) => [id, phase])).toEqual([
+      ['datadome', 'critical'],
+      ['didomi', 'critical'],
+      ['google_tag_manager', 'critical'],
+      ['lockr', 'critical'],
+      ['osano_consent', 'critical'],
+      ['permutive_context', 'critical'],
+      ['sourcepoint_consent', 'critical'],
+      ['testlight', 'critical'],
+      ['osano_lifecycle', 'deferred'],
+      ['permutive_lifecycle', 'deferred'],
+      ['sourcepoint_lifecycle', 'deferred'],
+    ]);
+    const criticalScript = document.createElement('script');
+    criticalScript.id = 'trustedserver-js';
+    criticalScript.src = new URL(manifest.criticalSrc, window.location.origin).href;
+    document.head.append(criticalScript);
+    let executingScript: HTMLScriptElement | null = criticalScript;
+    const currentScript = vi
+      .spyOn(document, 'currentScript', 'get')
+      .mockImplementation(() => executingScript);
     const appendChildBefore = Element.prototype.appendChild;
     const insertBeforeBefore = Element.prototype.insertBefore;
     const didomiBefore = Object.getOwnPropertyDescriptor(window, 'didomiConfig');
@@ -1783,12 +2107,9 @@ describe('browser composition', () => {
       {
         target,
         releaseId,
-        manifest: {
-          version: 1,
-          releaseId,
-          integrations: ids.map((id) => ({ id, required: true })),
-        },
+        manifest,
         knownIntegrationIds: ids,
+        catalog: runtimeCatalog(ids),
         boot: {
           auctionProjection: {
             version: 1,
@@ -1811,15 +2132,33 @@ describe('browser composition', () => {
         coreActivations: { correctnessGptListeners: vi.fn() },
       }
     );
+    const originalHeadAppend = document.head.append.bind(document.head);
+    const loadedDeferredIds: string[] = [];
+    const headAppend = vi.spyOn(document.head, 'append').mockImplementation((...nodes) => {
+      originalHeadAppend(...nodes);
+      for (const node of nodes) {
+        if (!(node instanceof HTMLScriptElement) || node === criticalScript) continue;
+        const member = deferredMembers.find(([id]) => node.src.includes(`tsjs-${id}.min.js`));
+        if (!member) continue;
+        executingScript = node;
+        loadedDeferredIds.push(member[0]);
+        expect(composition.runtime.registerIntegration(member[1](releaseId))).toBe(true);
+        node.onload?.(new Event('load'));
+        executingScript = criticalScript;
+      }
+    });
 
     expect(composition.runtime.start()).toBe(true);
-    for (const [, createRegistration] of members) {
+    for (const [, createRegistration] of criticalMembers) {
       expect(composition.runtime.registerIntegration(createRegistration(releaseId))).toBe(true);
     }
     await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+    expect(composition.runtime.protectFirstDisplayAttemptBatch([Promise.resolve()])).toBe(true);
+    await vi.advanceTimersByTimeAsync(2_500);
+    expect(loadedDeferredIds).toEqual(deferredMembers.map(([id]) => id));
     expect(composition.auctionContextRegistryForTest()?.snapshotInventoryForTest()).toEqual({
       disposed: false,
-      registrations: ['permutive'],
+      registrations: ['permutive_context'],
     });
     expect(composition.runtimeSessionForTest()?.interfaces).toMatchObject(
       Object.fromEntries(ids.map((id) => [id, expect.any(Object)]))
@@ -1833,6 +2172,9 @@ describe('browser composition', () => {
     expect(Element.prototype.insertBefore).toBe(insertBeforeBefore);
     expect(Object.getOwnPropertyDescriptor(window, 'didomiConfig')).toEqual(didomiBefore);
     expect(Object.getOwnPropertyDescriptor(window, 'testlight')).toEqual(testlightBefore);
+    headAppend.mockRestore();
+    currentScript.mockRestore();
+    criticalScript.remove();
   });
 
   it('injects the exact creative boot into reversible activation and post-commit startup', async () => {
@@ -1857,11 +2199,7 @@ describe('browser composition', () => {
       {
         target: {},
         releaseId,
-        manifest: {
-          version: 1,
-          releaseId,
-          integrations: [{ id: 'creative', required: true }],
-        },
+        manifest: runtimeManifest(releaseId, ['creative']),
         knownIntegrationIds: Object.freeze(['creative']),
         boot: {
           auctionProjection: {
@@ -1909,11 +2247,7 @@ describe('browser composition', () => {
       {
         target: {},
         releaseId,
-        manifest: {
-          version: 1,
-          releaseId,
-          integrations: [{ id: 'creative', required: true }],
-        },
+        manifest: runtimeManifest(releaseId, ['creative']),
         knownIntegrationIds: Object.freeze(['creative']),
         boot: {
           auctionProjection: {
@@ -1979,11 +2313,7 @@ describe('browser composition', () => {
       {
         target: {},
         releaseId,
-        manifest: {
-          version: 1,
-          releaseId,
-          integrations: manifestIds.map((id) => ({ id, required: true })),
-        },
+        manifest: runtimeManifest(releaseId, manifestIds),
         knownIntegrationIds: Object.freeze(['creative']),
         boot: {
           auctionProjection: {
@@ -2031,11 +2361,7 @@ describe('browser composition', () => {
       {
         target: {},
         releaseId,
-        manifest: {
-          version: 1,
-          releaseId,
-          integrations: [{ id: 'creative', required: true }],
-        },
+        manifest: runtimeManifest(releaseId, ['creative']),
         knownIntegrationIds: Object.freeze(['creative']),
         boot: {
           auctionProjection: {
@@ -2127,11 +2453,7 @@ describe('browser composition', () => {
       {
         target: {},
         releaseId,
-        manifest: {
-          version: 1,
-          releaseId,
-          integrations: [{ id: 'prebid', required: true }],
-        },
+        manifest: runtimeManifest(releaseId, ['prebid']),
         knownIntegrationIds: Object.freeze(['prebid']),
         boot: {
           auctionProjection: projection,
@@ -2241,7 +2563,6 @@ describe('browser composition', () => {
       const releaseId = 'a'.repeat(64);
       const prebid = synchronousPrebidAdapter(admission);
       const reservationId = `r1_${'q'.repeat(22)}`;
-      const observations: Readonly<Record<string, unknown>>[] = [];
       const bid = Object.freeze({
         candidateId: 'BBBBBBBBBBBB',
         slot: 'failed-slot',
@@ -2279,14 +2600,7 @@ describe('browser composition', () => {
         {
           target: {},
           releaseId,
-          manifest: {
-            version: 1,
-            releaseId,
-            integrations: [
-              { id: 'prebid', required: true },
-              { id: 'lifecycle_probe', required: true },
-            ],
-          },
+          manifest: runtimeManifest(releaseId, ['prebid', 'lifecycle_probe']),
           knownIntegrationIds: Object.freeze(['prebid', 'lifecycle_probe']),
           boot: {
             auctionProjection: projection,
@@ -2312,30 +2626,18 @@ describe('browser composition', () => {
           composition.runtime.registerIntegration(createPrebidIntegrationRegistration(releaseId))
         ).toBe(true);
         expect(
-          composition.runtime.registerIntegration({
-            id: 'lifecycle_probe',
-            release: releaseId,
-            prepare: ({
-              interfaces,
-              onDispose,
-            }: {
-              interfaces: Readonly<Record<string, unknown>>;
-              onDispose(callback: () => void): void;
-            }) => {
-              const diagnostics = interfaces['diagnostics'] as {
-                subscribe(
-                  id: string,
-                  listener: (observation: Readonly<Record<string, unknown>>) => void
-                ): (() => void) | undefined;
-              };
-              const release = diagnostics.subscribe('lifecycle_probe', (observation) =>
-                observations.push(observation)
-              );
-              if (!release) throw new Error('Expected the lifecycle diagnostics subscription');
-              onDispose(release);
-              return { activate: vi.fn() };
-            },
-          })
+          composition.runtime.registerIntegration(
+            Object.freeze({
+              abi: 1,
+              id: 'lifecycle_probe',
+              phase: 'critical',
+              releaseId,
+              prepare: ({ interfaces }: { interfaces: Readonly<Record<string, unknown>> }) => {
+                expect(interfaces).not.toHaveProperty('diagnostics');
+                return Object.freeze({ activate: vi.fn() });
+              },
+            })
+          )
         ).toBe(true);
         await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
         const complete = vi.fn();
@@ -2355,16 +2657,6 @@ describe('browser composition', () => {
           recognized: true,
           state: reason,
         });
-        await vi.waitFor(() =>
-          expect(observations).toContainEqual(
-            expect.objectContaining({
-              kind: 'render_attempt',
-              slotId: bid.slot,
-              state: 'failed',
-              outcome: { outcome: 'failed', reason },
-            })
-          )
-        );
         expect(
           composition.runtimeSessionForTest()?.currentNavigation?.snapshotInventoryForTest()
         ).toMatchObject({
@@ -2416,7 +2708,7 @@ describe('browser composition', () => {
       {
         target: {},
         releaseId,
-        manifest: { version: 1, releaseId, integrations: [{ id: 'gpt', required: true }] },
+        manifest: runtimeManifest(releaseId, ['gpt']),
         knownIntegrationIds: Object.freeze(['gpt']),
         boot: {
           auctionProjection: {
@@ -2512,7 +2804,7 @@ describe('browser composition', () => {
       {
         target: {},
         releaseId: 'a'.repeat(64),
-        manifest: { version: 1, releaseId: 'a'.repeat(64), integrations: [] },
+        manifest: runtimeManifest('a'.repeat(64), []),
         knownIntegrationIds: Object.freeze([]),
         boot: {
           auctionProjection: projection,
@@ -2693,7 +2985,7 @@ describe('browser composition', () => {
       {
         target,
         releaseId,
-        manifest: { version: 1, releaseId, integrations: [{ id: 'gpt', required: true }] },
+        manifest: runtimeManifest(releaseId, ['gpt']),
         knownIntegrationIds: Object.freeze(['gpt']),
         boot: {
           auctionProjection: initialProjection,
@@ -2819,7 +3111,7 @@ describe('browser composition', () => {
       {
         target: {},
         releaseId,
-        manifest: { version: 1, releaseId, integrations: [{ id: 'gpt', required: true }] },
+        manifest: runtimeManifest(releaseId, ['gpt']),
         knownIntegrationIds: Object.freeze(['gpt']),
         boot: {
           auctionProjection: {
@@ -2885,7 +3177,7 @@ describe('browser composition', () => {
       {
         target: {},
         releaseId: 'a'.repeat(64),
-        manifest: { version: 1, releaseId: 'a'.repeat(64), integrations: [] },
+        manifest: runtimeManifest('a'.repeat(64), []),
         knownIntegrationIds: Object.freeze([]),
         boot: {
           auctionProjection: {
@@ -2926,7 +3218,7 @@ describe('browser composition', () => {
       {
         target: {},
         releaseId: 'a'.repeat(64),
-        manifest: { version: 1, releaseId: 'a'.repeat(64), integrations: [] },
+        manifest: runtimeManifest('a'.repeat(64), []),
         knownIntegrationIds: Object.freeze([]),
         boot: {
           auctionProjection: {
@@ -2969,7 +3261,7 @@ describe('browser composition', () => {
       {
         target: {},
         releaseId: 'a'.repeat(64),
-        manifest: { version: 1, releaseId: 'a'.repeat(64), integrations: [] },
+        manifest: runtimeManifest('a'.repeat(64), []),
         knownIntegrationIds: Object.freeze([]),
         boot: {
           auctionProjection: {
@@ -3027,7 +3319,7 @@ describe('browser composition', () => {
       {
         target: {},
         releaseId: 'a'.repeat(64),
-        manifest: { version: 1, releaseId: 'a'.repeat(64), integrations: [] },
+        manifest: runtimeManifest('a'.repeat(64), []),
         knownIntegrationIds: Object.freeze([]),
         boot: {
           auctionProjection: {
@@ -3068,7 +3360,7 @@ describe('browser composition', () => {
         {
           target: {},
           releaseId: 'a'.repeat(64),
-          manifest: { version: 1, releaseId: 'a'.repeat(64), integrations: [] },
+          manifest: runtimeManifest('a'.repeat(64), []),
           knownIntegrationIds: Object.freeze([]),
           boot: {
             auctionProjection: {
@@ -3118,7 +3410,7 @@ describe('browser composition', () => {
       {
         target: {},
         releaseId: 'a'.repeat(64),
-        manifest: { version: 1, releaseId: 'a'.repeat(64), integrations: [] },
+        manifest: runtimeManifest('a'.repeat(64), []),
         knownIntegrationIds: Object.freeze([]),
         boot: {
           auctionProjection: {
@@ -3160,7 +3452,7 @@ describe('browser composition', () => {
       {
         target: {},
         releaseId: 'a'.repeat(64),
-        manifest: { version: 1, releaseId: 'a'.repeat(64), integrations: [] },
+        manifest: runtimeManifest('a'.repeat(64), []),
         knownIntegrationIds: Object.freeze([]),
         boot: {
           auctionProjection: {
@@ -3223,11 +3515,7 @@ describe('browser composition', () => {
       {
         target,
         releaseId: 'a'.repeat(64),
-        manifest: {
-          version: 1,
-          releaseId: 'a'.repeat(64),
-          integrations: [{ id: 'missing', required: true }],
-        },
+        manifest: runtimeManifest('a'.repeat(64), ['missing']),
         knownIntegrationIds: Object.freeze(['missing']),
         boot: {
           auctionProjection: {
@@ -3270,11 +3558,15 @@ describe('browser composition', () => {
     expect(vi.getTimerCount()).toBe(0);
 
     expect(
-      (target as { _registerIntegration(value: unknown): boolean })._registerIntegration({
-        id: 'missing',
-        release: 'a'.repeat(64),
-        prepare: latePreparation,
-      })
+      (target as { _registerIntegration(value: unknown): boolean })._registerIntegration(
+        Object.freeze({
+          abi: 1,
+          id: 'missing',
+          phase: 'critical',
+          releaseId: 'a'.repeat(64),
+          prepare: latePreparation,
+        })
+      )
     ).toBe(false);
     await vi.runAllTimersAsync();
 
@@ -3315,11 +3607,7 @@ describe('browser composition', () => {
       {
         target,
         releaseId,
-        manifest: {
-          version: 1,
-          releaseId,
-          integrations: [{ id: 'context_test', required: true }],
-        },
+        manifest: runtimeManifest(releaseId, ['context_test']),
         knownIntegrationIds: Object.freeze(['context_test']),
         boot: {
           auctionProjection: {
@@ -3351,11 +3639,15 @@ describe('browser composition', () => {
     try {
       expect(composition.runtime.start()).toBe(true);
       expect(
-        composition.runtime.registerIntegration({
-          id: 'context_test',
-          release: releaseId,
-          prepare: () => ({ activate: vi.fn() }),
-        })
+        composition.runtime.registerIntegration(
+          Object.freeze({
+            abi: 1,
+            id: 'context_test',
+            phase: 'critical',
+            releaseId,
+            prepare: () => Object.freeze({ activate: vi.fn() }),
+          })
+        )
       ).toBe(true);
       await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
       expect((target as { log?: unknown }).log).toBe(publicLog);
@@ -3397,7 +3689,35 @@ describe('browser composition', () => {
   });
 
   it('exercises transactional addAdUnits and invocation-time requestAds snapshots through the test kernel', async () => {
+    const releaseId = 'a'.repeat(64);
+    const integrationIds = Object.freeze([
+      BROWSER_TEST_TRACE_PROVIDER_ID,
+      'context_test',
+      'diagnostics_presentation',
+    ]);
+    const catalogIds = Object.freeze([
+      BROWSER_TEST_TRACE_PROVIDER_ID,
+      BROWSER_TEST_OPTIONAL_GPT_DIAG_PROVIDER_ID,
+      'context_test',
+      'diagnostics_presentation',
+    ]);
+    const manifest = runtimeManifest(releaseId, integrationIds);
+    const criticalScript = document.createElement('script');
+    criticalScript.id = 'trustedserver-js';
+    criticalScript.src = new URL(manifest.criticalSrc, window.location.origin).href;
+    document.head.append(criticalScript);
+    let executingScript: HTMLScriptElement | null = criticalScript;
+    const currentScript = vi
+      .spyOn(document, 'currentScript', 'get')
+      .mockImplementation(() => executingScript);
+    const frames: FrameRequestCallback[] = [];
+    const idle: Array<() => void> = [];
+    const presentationAnimationFrame = vi.fn();
+    vi.stubGlobal('requestAnimationFrame', presentationAnimationFrame);
     const target = {};
+    const preGateSlot = document.createElement('div');
+    preGateSlot.id = 'pre-gate-overlay-slot';
+    document.body.append(preGateSlot);
     const requestBodies: Array<{
       adUnits: Array<{ code: string }>;
       config: Readonly<Record<string, unknown>>;
@@ -3469,13 +3789,11 @@ describe('browser composition', () => {
     const composition = createTestBrowserRuntimeComposition(
       {
         target,
-        releaseId: 'a'.repeat(64),
-        manifest: {
-          version: 1,
-          releaseId: 'a'.repeat(64),
-          integrations: [{ id: 'context_test', required: true }],
-        },
-        knownIntegrationIds: Object.freeze(['context_test']),
+        releaseId,
+        document,
+        manifest,
+        knownIntegrationIds: catalogIds,
+        catalog: runtimeCatalog(catalogIds),
         boot: {
           auctionProjection: {
             version: 1,
@@ -3490,6 +3808,20 @@ describe('browser composition', () => {
           creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
           diagnostics: { version: 1, renderTraceOverlay: true, gpt: { active: false } },
         },
+        phaseScheduler: {
+          cancelAnimationFrame: vi.fn(),
+          cancelIdleCallback: vi.fn(),
+          clearTimeout,
+          requestAnimationFrame: (callback) => {
+            frames.push(callback);
+            return frames.length;
+          },
+          requestIdleCallback: (callback) => {
+            idle.push(callback);
+            return idle.length;
+          },
+          setTimeout,
+        },
         kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
       },
       {
@@ -3502,16 +3834,67 @@ describe('browser composition', () => {
         coreActivations: { correctnessGptListeners: vi.fn() },
       }
     );
+    const originalHeadAppend = document.head.append.bind(document.head);
+    const loadedPresentation = vi.fn();
+    const headAppend = vi.spyOn(document.head, 'append').mockImplementation((...nodes) => {
+      originalHeadAppend(...nodes);
+      for (const node of nodes) {
+        if (!(node instanceof HTMLScriptElement) || node === criticalScript) continue;
+        expect(node.src).toBe(
+          new URL(
+            manifest.integrations.find(({ id }) => id === 'diagnostics_presentation')!.src!,
+            window.location.origin
+          ).href
+        );
+        executingScript = node;
+        expect(
+          composition.runtime.registerIntegration(
+            createDiagnosticsPresentationIntegrationRegistration(releaseId)
+          )
+        ).toBe(true);
+        loadedPresentation();
+        node.onload?.(new Event('load'));
+        executingScript = criticalScript;
+      }
+    });
 
     expect(composition.runtime.start()).toBe(true);
     expect(
-      composition.runtime.registerIntegration({
-        id: 'context_test',
-        release: 'a'.repeat(64),
-        prepare: () => ({ activate: vi.fn() }),
-      })
+      composition.runtime.registerIntegration(
+        composition.createTraceCapabilityProviderRegistrationForTest()
+      )
+    ).toBe(true);
+    expect(
+      composition.runtime.registerIntegration(
+        Object.freeze({
+          abi: 1,
+          id: 'context_test',
+          phase: 'critical',
+          releaseId,
+          prepare: () => Object.freeze({ activate: vi.fn() }),
+        })
+      )
     ).toBe(true);
     await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+    expect(document.getElementById(TRACE_PANEL_ID)).toBeNull();
+    expect(presentationAnimationFrame).not.toHaveBeenCalled();
+    expect(frames).toEqual([]);
+    expect(idle).toEqual([]);
+    expect(loadedPresentation).not.toHaveBeenCalled();
+    expect(preGateSlot.getAttributeNames().filter((name) => name.startsWith('data-ts-'))).toEqual(
+      []
+    );
+    expect(composition.runtimeSessionForTest()?.interfaces).not.toHaveProperty('gpt.events.v1');
+    expect(composition.runtimeSessionForTest()?.interfaces).not.toHaveProperty('gpt_diag.v1');
+    expect(composition.runtime.protectFirstDisplayAttemptBatch([Promise.resolve()])).toBe(true);
+    await Promise.resolve();
+    await Promise.resolve();
+    frames.shift()?.(1);
+    frames.shift()?.(2);
+    idle.shift()?.();
+    await vi.waitFor(() => expect(loadedPresentation).toHaveBeenCalledOnce());
+    expect(document.getElementById(TRACE_PANEL_ID)).not.toBeNull();
+    expect(presentationAnimationFrame).not.toHaveBeenCalled();
     const contextContributor = vi.fn(() => ({ page: 'context' }));
     const session = composition.runtimeSessionForTest();
     expect(session).toBeDefined();
@@ -3552,7 +3935,10 @@ describe('browser composition', () => {
       ])
     ).toThrowError(expect.objectContaining({ code: 'slot_collision', unitIndex: 1 }));
     expect(composition.projectionSlotsForTest()).toEqual(['server-slot', 'programmatic-slot']);
-    document.body.innerHTML = '<div id="programmatic-slot"><span>placeholder</span></div>';
+    document.body.insertAdjacentHTML(
+      'beforeend',
+      '<div id="programmatic-slot"><span>placeholder</span></div>'
+    );
     const explicit = api.requestAds({ slots: ['unknown', 'programmatic-slot'] });
     await vi.waitFor(() =>
       expect(document.querySelector('#programmatic-slot iframe')).not.toBeNull()
@@ -3673,12 +4059,21 @@ describe('browser composition', () => {
 
     session?.currentNavigation?.dispose();
     expect(renderTrace?.current()).toEqual({});
-    expect(programmaticSlot?.hasAttribute('data-ts-rendered')).toBe(false);
+    await vi.waitFor(() => expect(programmaticSlot?.hasAttribute('data-ts-rendered')).toBe(false));
 
     composition.runtime.dispose();
+    expect(document.getElementById(TRACE_PANEL_ID)).toBeNull();
+    expect(preGateSlot.getAttributeNames().filter((name) => name.startsWith('data-ts-'))).toEqual(
+      []
+    );
     expect(() => api.addAdUnits(programmatic)).toThrowError(
       expect.objectContaining({ name: 'AdUnitRegistrationError', code: 'slot_collision' })
     );
     document.body.innerHTML = '';
+    headAppend.mockRestore();
+    currentScript.mockRestore();
+    criticalScript.remove();
+    preGateSlot.remove();
+    vi.unstubAllGlobals();
   });
 });

@@ -1,0 +1,730 @@
+import {
+  createBrowserMessagingAdapter,
+  type MessagingValidationOptions,
+} from '../../adapters/messaging';
+import { parseTrustedServerAuctionResponseV1 } from '../../core/auction';
+import {
+  parseBidRenderSourceV1,
+  parseBrowserAuctionProjectionV1,
+} from '../../core/contracts/auction_projection';
+import { validateRequestAdsOptions } from '../../core/contracts/request_ads';
+import { parseCacheFetchPolicyV1 } from '../../core/config';
+import { log } from '../../core/log';
+import { prepareAdmIframe } from '../../core/render';
+import { createRenderTraceStore } from '../../core/trace';
+import type { BootManifestV1, BrowserAuctionProjectionV1 } from '../../core/types';
+import { DisposableStack } from '../../kernel/disposable';
+import { createBrowserNavigationIdentityIssuer } from '../../kernel/identity';
+import type {
+  IntegrationActivationContext,
+  IntegrationPrepareContext,
+  IntegrationRegistration,
+} from '../../kernel/integration_registry';
+import type { RuntimeCapabilityV1 } from '../../kernel/runtime';
+import { createDiagnosticsIngress } from '../../kernel/diagnostics';
+import { createRuntimeSession } from '../../kernel/sessions';
+import {
+  AdUnitRegistrationError,
+  addAdUnitsResult,
+  prepareProgrammaticAdUnits,
+  serializeAuctionRequestBody,
+} from '../../core/registry';
+import { createAuctionBatchService } from '../../services/auction_batch';
+import { prepareInitialAuctionProjection } from '../../services/projections';
+import { createReservationService } from '../../services/reservations';
+import {
+  createCommittedArtifactStore,
+  createRenderAttempt,
+  createRendererNonceRegistry,
+  renderDirectAdmAttempt,
+  type RenderAttempt,
+} from '../../services/render';
+import type { SlotRecord, SlotService } from '../../services/slots';
+import { trustedDocumentHttpOrigin } from '../../shared/origin';
+
+interface AcceptedBoot {
+  readonly auctionProjection: unknown;
+  readonly cachePolicy?: unknown;
+  readonly diagnostics: Readonly<{
+    version: 1;
+    renderTraceOverlay: boolean;
+  }>;
+  readonly manifest: Readonly<BootManifestV1>;
+}
+
+export type RegisteredRenderSource = 'aps' | 'cache';
+export type RegisteredRenderer = (attempt: RenderAttempt, container: HTMLElement) => boolean;
+
+interface LocalSlotRecord {
+  readonly directAuctionUnit?: Readonly<object>;
+  readonly domAliases: readonly string[];
+  readonly navigationGeneration: object;
+  readonly registeredSlotId: string;
+  readonly source: 'programmatic' | 'server';
+}
+
+interface RuntimeSlotBroker {
+  readonly attach: (service: SlotService) => (() => void) | undefined;
+  readonly register: SlotService['register'];
+  readonly resolveDomAlias: SlotService['resolveDomAlias'];
+  readonly resolveRegisteredSlot: SlotService['resolveRegisteredSlot'];
+  readonly snapshotRegisteredSlots: SlotService['snapshotRegisteredSlots'];
+  readonly dispose: () => void;
+}
+
+interface ApsMessagingValidationRegistration {
+  readonly expectedPublisherOrigin: string;
+  readonly expectedRendererUrl: string;
+  readonly validateApsRenderer: (candidate: unknown) => boolean;
+}
+
+const APS_RENDERER_PATH = '/integrations/aps/renderer/v1';
+
+function exactRuntimeCapability(
+  interfaces: Readonly<Record<string, unknown>>
+): RuntimeCapabilityV1 {
+  const candidate = interfaces['runtime.v1'];
+  if (
+    typeof candidate !== 'object' ||
+    candidate === null ||
+    !Object.isFrozen(candidate) ||
+    typeof (candidate as RuntimeCapabilityV1).boot !== 'function' ||
+    typeof (candidate as RuntimeCapabilityV1).protectFirstDisplayAttemptBatch !== 'function'
+  ) {
+    throw new TypeError('render_runtime requires runtime.v1');
+  }
+  return candidate as RuntimeCapabilityV1;
+}
+
+function acceptedBoot(runtime: RuntimeCapabilityV1): AcceptedBoot {
+  const boot = runtime.boot();
+  if (typeof boot !== 'object' || boot === null || !Object.isFrozen(boot)) {
+    throw new TypeError('render_runtime boot is unavailable');
+  }
+  return boot as unknown as AcceptedBoot;
+}
+
+function slotResult(value: Record<string, unknown>): Readonly<Record<string, unknown>> {
+  return Object.freeze(value);
+}
+
+function createRuntimeSlotBroker(): RuntimeSlotBroker {
+  const local = new Map<string, LocalSlotRecord>();
+  let localOwner: Parameters<SlotService['register']>[0] | undefined;
+  let attached: SlotService | undefined;
+  let disposed = false;
+  const localSnapshot = (owner: Parameters<SlotService['snapshotRegisteredSlots']>[0]) =>
+    !disposed && owner.isCurrent()
+      ? (Object.freeze([...local.values()]) as unknown as readonly SlotRecord[])
+      : undefined;
+  return Object.freeze({
+    attach: (service: SlotService): (() => void) | undefined => {
+      if (disposed || attached || typeof service?.register !== 'function') return undefined;
+      const records = [...local.values()];
+      if (records.length > 0 && localOwner) {
+        const transferred = service.register(
+          localOwner,
+          records.map((record) =>
+            Object.freeze({
+              ...(record.directAuctionUnit === undefined
+                ? {}
+                : { directAuctionUnit: record.directAuctionUnit }),
+              domAliases: record.domAliases,
+              registeredSlotId: record.registeredSlotId,
+              source: record.source,
+            })
+          )
+        );
+        if (!transferred.ok) return undefined;
+      }
+      attached = service;
+      local.clear();
+      let released = false;
+      return (): void => {
+        if (released) return;
+        released = true;
+        if (attached !== service) return;
+        const restored = localOwner
+          ? (service.snapshotRegisteredSlots(localOwner) ??
+            (records as unknown as readonly SlotRecord[]))
+          : (records as unknown as readonly SlotRecord[]);
+        attached = undefined;
+        if (!disposed) {
+          local.clear();
+          for (const record of restored) {
+            local.set(
+              record.registeredSlotId,
+              Object.freeze({
+                ...(record.directAuctionUnit === undefined
+                  ? {}
+                  : { directAuctionUnit: record.directAuctionUnit }),
+                domAliases: Object.freeze([...record.domAliases]),
+                navigationGeneration: record.navigationGeneration,
+                registeredSlotId: record.registeredSlotId,
+                source: record.source,
+              })
+            );
+          }
+        }
+      };
+    },
+    register: (
+      owner: Parameters<SlotService['register']>[0],
+      registrations: Parameters<SlotService['register']>[1]
+    ) => {
+      if (attached) {
+        localOwner = owner;
+        return attached.register(owner, registrations);
+      }
+      if (disposed || !owner.isCurrent()) {
+        return Object.freeze({ ok: false as const, reason: 'stale_owner' as const });
+      }
+      if (localOwner && localOwner !== owner) {
+        return Object.freeze({ ok: false as const, reason: 'stale_owner' as const });
+      }
+      if (local.size + registrations.length > 256) {
+        return Object.freeze({ ok: false as const, reason: 'registry_capacity' as const });
+      }
+      const seen = new Set<string>();
+      for (const registration of registrations) {
+        if (
+          typeof registration.registeredSlotId !== 'string' ||
+          registration.registeredSlotId === '' ||
+          local.has(registration.registeredSlotId) ||
+          seen.has(registration.registeredSlotId)
+        ) {
+          return Object.freeze({ ok: false as const, reason: 'duplicate_slot' as const });
+        }
+        seen.add(registration.registeredSlotId);
+      }
+      const records = registrations.map((registration: (typeof registrations)[number]) =>
+        Object.freeze({
+          ...(registration.directAuctionUnit === undefined
+            ? {}
+            : { directAuctionUnit: registration.directAuctionUnit }),
+          domAliases: Object.freeze([...(registration.domAliases ?? [])]),
+          navigationGeneration: owner.generation,
+          registeredSlotId: registration.registeredSlotId,
+          source: registration.source,
+        })
+      );
+      localOwner = owner;
+      for (const record of records) local.set(record.registeredSlotId, record);
+      return Object.freeze({
+        ok: true as const,
+        records: records as unknown as readonly SlotRecord[],
+      });
+    },
+    resolveDomAlias: (alias: string) => {
+      if (attached) return attached.resolveDomAlias(alias);
+      let match: LocalSlotRecord | undefined;
+      for (const record of local.values()) {
+        if (!record.domAliases.includes(alias)) continue;
+        if (match) return undefined;
+        match = record;
+      }
+      return match as unknown as SlotRecord | undefined;
+    },
+    resolveRegisteredSlot: (id: string) =>
+      attached?.resolveRegisteredSlot(id) ?? (local.get(id) as unknown as SlotRecord | undefined),
+    snapshotRegisteredSlots: (owner: Parameters<SlotService['snapshotRegisteredSlots']>[0]) =>
+      attached?.snapshotRegisteredSlots(owner) ?? localSnapshot(owner),
+    dispose: () => {
+      if (disposed) return;
+      disposed = true;
+      attached = undefined;
+      localOwner = undefined;
+      local.clear();
+    },
+  });
+}
+
+function exactApsMessagingValidation(
+  candidate: unknown,
+  publisherOrigin: string
+): Readonly<ApsMessagingValidationRegistration> {
+  try {
+    if (
+      typeof candidate !== 'object' ||
+      candidate === null ||
+      !Object.isFrozen(candidate) ||
+      Object.getPrototypeOf(candidate) !== Object.prototype ||
+      Object.getOwnPropertySymbols(candidate).length !== 0 ||
+      Object.getOwnPropertyNames(candidate).sort().join(',') !==
+        'expectedPublisherOrigin,expectedRendererUrl,validateApsRenderer'
+    ) {
+      throw new TypeError('APS message validation is malformed');
+    }
+    const validation = candidate as ApsMessagingValidationRegistration;
+    const rendererUrl = new URL(validation.expectedRendererUrl);
+    if (
+      validation.expectedPublisherOrigin !== publisherOrigin ||
+      rendererUrl.origin !== publisherOrigin ||
+      rendererUrl.pathname !== APS_RENDERER_PATH ||
+      rendererUrl.search !== '' ||
+      rendererUrl.hash !== '' ||
+      rendererUrl.href !== validation.expectedRendererUrl ||
+      typeof validation.validateApsRenderer !== 'function'
+    ) {
+      throw new TypeError('APS message validation is malformed');
+    }
+    return Object.freeze({
+      expectedPublisherOrigin: validation.expectedPublisherOrigin,
+      expectedRendererUrl: validation.expectedRendererUrl,
+      validateApsRenderer: validation.validateApsRenderer,
+    });
+  } catch (error) {
+    if (error instanceof TypeError && error.message === 'APS message validation is malformed') {
+      throw error;
+    }
+    const malformed = new TypeError('APS message validation is malformed');
+    Object.defineProperty(malformed, 'cause', {
+      configurable: true,
+      value: error,
+      writable: true,
+    });
+    throw malformed;
+  }
+}
+
+/** Mandatory concrete provider for the shared browser runtime capabilities. */
+export function createRenderRuntimeIntegrationRegistration(
+  releaseId: string
+): IntegrationRegistration {
+  return Object.freeze({
+    abi: 1 as const,
+    id: 'render_runtime',
+    phase: 'critical' as const,
+    releaseId,
+    prepare: (context: IntegrationPrepareContext) => {
+      const runtime = exactRuntimeCapability(context.interfaces);
+      const boot = acceptedBoot(runtime);
+      const document = runtime.document;
+      const view = document?.defaultView;
+      if (!document || !view) throw new TypeError('render_runtime requires a browser document');
+      const origin = trustedDocumentHttpOrigin(view.location.origin);
+      if (!origin) throw new TypeError('render_runtime requires a trusted HTTP origin');
+      const cachePolicy =
+        boot.cachePolicy === undefined ? undefined : parseCacheFetchPolicyV1(boot.cachePolicy);
+      const projection = prepareInitialAuctionProjection(boot.auctionProjection, (candidate) =>
+        parseBrowserAuctionProjectionV1(candidate, boot.cachePolicy)
+      ) as Readonly<BrowserAuctionProjectionV1> | undefined;
+      if (!projection) throw new TypeError('render_runtime projection is invalid');
+
+      const scope = new DisposableStack((error) =>
+        log.warn('render_runtime disposal failed', error)
+      );
+      context.onDispose(() => scope.dispose());
+      let active = false;
+      scope.onDispose(() => {
+        active = false;
+      });
+
+      const artifacts = createCommittedArtifactStore();
+      scope.onDispose(() => artifacts.dispose());
+      const slots = createRuntimeSlotBroker();
+      scope.onDispose(() => slots.dispose());
+
+      const renderTrace = createRenderTraceStore({
+        onPresentationError: (error) => log.warn('render diagnostics presentation failed', error),
+        onSubscriberError: (error) => log.warn('render diagnostics subscriber failed', error),
+      });
+      scope.onDispose(() => renderTrace.dispose());
+      const consumeCoreObservation = (observation: Readonly<Record<string, unknown>>): void => {
+        if (
+          observation['kind'] === 'slotRequested' ||
+          observation['kind'] === 'slotResponseReceived' ||
+          observation['kind'] === 'slotRenderEnded' ||
+          observation['kind'] === 'slotOnload' ||
+          observation['kind'] === 'impressionViewable' ||
+          observation['kind'] === 'slotVisibilityChanged'
+        ) {
+          renderTrace.observeGptFact(observation as never, (elementId) => {
+            if (typeof elementId !== 'string' || elementId === '') return undefined;
+            const slot = slots.resolveDomAlias(elementId) ?? slots.resolveRegisteredSlot(elementId);
+            return slot?.traceToken
+              ? Object.freeze({
+                  slotId: slot.registeredSlotId,
+                  elementId,
+                  navigationGeneration: slot.navigationGeneration,
+                  traceToken: slot.traceToken,
+                })
+              : undefined;
+          });
+          return;
+        }
+        if (
+          observation['kind'] !== 'render_attempt' ||
+          typeof observation['slotId'] !== 'string' ||
+          (observation['path'] !== 'auction' && observation['path'] !== 'ssat') ||
+          typeof observation['rendered'] !== 'boolean' ||
+          typeof observation['injected'] !== 'boolean'
+        ) {
+          return;
+        }
+        const terminal = observation['outcome'];
+        const terminalRecord =
+          typeof terminal === 'object' && terminal !== null
+            ? (terminal as Readonly<Record<string, unknown>>)
+            : undefined;
+        const attributableEmpty =
+          observation['state'] === 'failed' &&
+          terminalRecord?.['outcome'] === 'failed' &&
+          terminalRecord['reason'] === 'gam_empty';
+        if (observation['state'] !== 'accepted' && !attributableEmpty) return;
+        if ((observation['state'] === 'accepted') !== observation['rendered']) return;
+        const servedFrom = observation['servedFrom'];
+        if (servedFrom !== undefined && servedFrom !== 'inline' && servedFrom !== 'pbs-cache') {
+          return;
+        }
+        const slotId = observation['slotId'];
+        const slot = slots.resolveRegisteredSlot(slotId);
+        const optionalString = (name: 'adId' | 'bidId' | 'creativeId'): string | undefined => {
+          const value = observation[name];
+          return typeof value === 'string' && value !== '' ? value : undefined;
+        };
+        const adId = optionalString('adId');
+        const bidId = optionalString('bidId');
+        const creativeId = optionalString('creativeId');
+        renderTrace.record({
+          slotId,
+          path: observation['path'],
+          rendered: observation['rendered'],
+          injected: observation['injected'],
+          ...(slot?.domAliases[0] === undefined ? {} : { elementId: slot.domAliases[0] }),
+          ...(adId === undefined ? {} : { adId }),
+          ...(bidId === undefined ? {} : { bidId }),
+          ...(creativeId === undefined ? {} : { creativeId }),
+          ...(servedFrom === undefined ? {} : { servedFrom }),
+        });
+      };
+      const diagnostics = createDiagnosticsIngress({
+        reduce: consumeCoreObservation,
+        reportError: (error) => log.warn('diagnostics reducer failed', error),
+      });
+      scope.onDispose(() => diagnostics.dispose());
+      let apsValidation: Readonly<ApsMessagingValidationRegistration> | undefined;
+      const messagingValidation: MessagingValidationOptions = Object.freeze({
+        get expectedPublisherOrigin(): string {
+          return apsValidation?.expectedPublisherOrigin ?? '';
+        },
+        get expectedRendererUrl(): string {
+          return apsValidation?.expectedRendererUrl ?? '';
+        },
+        validateApsRenderer: (candidate: unknown): boolean =>
+          apsValidation?.validateApsRenderer(candidate) === true,
+      });
+      const messaging = createBrowserMessagingAdapter(
+        view as unknown as Parameters<typeof createBrowserMessagingAdapter>[0],
+        messagingValidation
+      );
+      scope.onDispose(() => {
+        apsValidation = undefined;
+      });
+      const reservations = createReservationService({
+        prepareRenderSource: (candidate) => parseBidRenderSourceV1(candidate, cachePolicy),
+      });
+      scope.onDispose(() => reservations.dispose());
+      const rendererNonces = createRendererNonceRegistry();
+      scope.onDispose(() => rendererNonces.dispose());
+      const session = createRuntimeSession({
+        createIdentityIssuer: createBrowserNavigationIdentityIssuer,
+        interfaces: Object.freeze({}),
+        onNavigationDispose: (generation) => {
+          artifacts.disposeNavigation(generation);
+          renderTrace.pruneNavigation(generation);
+          for (const slotId of Object.keys(renderTrace.diagnostics.current())) {
+            renderTrace.prune(slotId);
+          }
+        },
+      });
+      scope.onDispose(() => session.dispose());
+      const navigationResult = session.startInitialNavigation(projection);
+      if (!navigationResult.ok) throw new TypeError(navigationResult.reason);
+      const navigation = navigationResult.value;
+      if (
+        !slots.register(
+          navigation,
+          projection.slots.map((placement) =>
+            Object.freeze({
+              domAliases: Object.freeze([placement.divId]),
+              registeredSlotId: placement.slot,
+              source: 'server' as const,
+            })
+          )
+        ).ok
+      ) {
+        throw new TypeError('render_runtime projection slots are invalid');
+      }
+      const registeredRenderers = new Map<RegisteredRenderSource, RegisteredRenderer>();
+      scope.onDispose(() => registeredRenderers.clear());
+      const createAttempt = (
+        owner: Parameters<typeof createRenderAttempt>[0]['owner'],
+        parentAttemptId?: string
+      ) =>
+        createRenderAttempt({
+          artifacts,
+          owner,
+          ...(parentAttemptId === undefined ? {} : { parentAttemptId }),
+          prepareRenderSource: (candidate) => parseBidRenderSourceV1(candidate, cachePolicy),
+          publishDiagnostics: diagnostics.publish,
+          reservations,
+        });
+      const resolveContainer = (slot: string): HTMLElement | undefined => {
+        const record = slots.resolveRegisteredSlot(slot);
+        if (!record) return undefined;
+        const identifiers =
+          record.source === 'programmatic'
+            ? new Set([record.registeredSlotId])
+            : new Set(record.domAliases);
+        const matches = [...document.querySelectorAll<HTMLElement>('[id]')].filter((element) =>
+          identifiers.has(element.id)
+        );
+        return matches.length === 1 ? matches[0] : undefined;
+      };
+      const renderWinner = (attempt: RenderAttempt): boolean => {
+        const container = resolveContainer(attempt.slot);
+        if (!container) {
+          attempt.fail('slot_unresolved');
+          return false;
+        }
+        if (attempt.renderSource?.type === 'adm') {
+          return renderDirectAdmAttempt({
+            attempt,
+            container,
+            prepareIframe: prepareAdmIframe,
+            publisherOrigin: origin,
+          });
+        }
+        if (attempt.renderSource?.type === 'aps' || attempt.renderSource?.type === 'cache') {
+          const renderer = registeredRenderers.get(attempt.renderSource.type);
+          if (renderer) return renderer(attempt, container);
+        }
+        attempt.fail('descriptor_invalid');
+        return false;
+      };
+      const batches = createAuctionBatchService({
+        ...(cachePolicy ? { cachePolicy } : {}),
+        createAttempt,
+        fetcher: (input, init) => globalThis.fetch(input, init),
+        parseResponse: parseTrustedServerAuctionResponseV1,
+        renderWinner,
+      });
+      scope.onDispose(() => batches.dispose());
+
+      const addAdUnits = (candidate: unknown): unknown => {
+        if (!active || !navigation.isCurrent()) throw new AdUnitRegistrationError('slot_collision');
+        const snapshot = slots.snapshotRegisteredSlots(navigation);
+        if (!snapshot) throw new AdUnitRegistrationError('slot_collision');
+        const prepared = prepareProgrammaticAdUnits(
+          candidate,
+          new Set(snapshot.map(({ registeredSlotId }) => registeredSlotId))
+        );
+        const registration = slots.register(
+          navigation,
+          prepared.map((unit) =>
+            Object.freeze({
+              directAuctionUnit: unit,
+              registeredSlotId: unit.code,
+              source: 'programmatic' as const,
+            })
+          )
+        );
+        if (!registration.ok) {
+          throw new AdUnitRegistrationError(
+            registration.reason === 'registry_capacity' ? 'registry_capacity' : 'slot_collision'
+          );
+        }
+        return addAdUnitsResult(prepared);
+      };
+
+      const requestAds = async (candidate?: unknown): Promise<unknown> => {
+        const validated = validateRequestAdsOptions(candidate);
+        const snapshot = slots.snapshotRegisteredSlots(navigation);
+        const requested = Object.freeze(
+          validated.slots
+            ? [...validated.slots]
+            : (snapshot ?? []).map(({ registeredSlotId }) => registeredSlotId)
+        );
+        if (!active || !navigation.isCurrent()) {
+          return Object.freeze({
+            slots: Object.freeze(
+              requested.map((slot) =>
+                slotResult({
+                  slot,
+                  path: 'primary',
+                  outcome: 'cancelled',
+                  reason: 'navigation_disposed',
+                })
+              )
+            ),
+          });
+        }
+        const recordsById = new Map(
+          (snapshot ?? []).map((record) => [record.registeredSlotId, record])
+        );
+        const admitted = requested
+          .map((slot) => recordsById.get(slot))
+          .filter((record): record is NonNullable<typeof record> => record !== undefined);
+        if (admitted.length === 0) {
+          return Object.freeze({
+            slots: Object.freeze(
+              requested.map((slot) =>
+                slotResult({
+                  slot,
+                  path: 'primary',
+                  outcome: 'failed',
+                  reason: 'slot_unresolved',
+                })
+              )
+            ),
+          });
+        }
+        const adUnits = admitted.map((record) => {
+          return (
+            record?.directAuctionUnit ??
+            Object.freeze({
+              code: record.registeredSlotId,
+              mediaTypes: Object.freeze({}),
+              bids: Object.freeze([]),
+            })
+          );
+        });
+        const requestBody = serializeAuctionRequestBody(adUnits, Object.freeze({}));
+        if (!requestBody) {
+          return Object.freeze({
+            slots: Object.freeze(
+              requested.map((slot) =>
+                slotResult({ slot, path: 'primary', outcome: 'failed', reason: 'internal_error' })
+              )
+            ),
+          });
+        }
+        const batch = batches.create({
+          navigation,
+          requestBody,
+          ...(validated.signal ? { signal: validated.signal } : {}),
+          slots: Object.freeze(admitted.map(({ registeredSlotId }) => registeredSlotId)),
+          timeoutMs: validated.timeoutMs,
+        });
+        runtime.protectFirstDisplayAttemptBatch([batch.result]);
+        const result = await batch.result;
+        const bySlot = new Map(result.slots.map((entry) => [entry.slot, entry]));
+        return Object.freeze({
+          slots: Object.freeze(
+            requested.map(
+              (slot) =>
+                bySlot.get(slot) ??
+                slotResult({
+                  slot,
+                  path: 'primary',
+                  outcome: 'failed',
+                  reason: 'slot_unresolved',
+                })
+            )
+          ),
+        });
+      };
+
+      const slotsCapability = Object.freeze({
+        attachPhysicalService: (candidate: unknown): (() => void) => {
+          if (!active) throw new TypeError('GPT slot service provider is inactive');
+          const service = candidate as SlotService;
+          if (
+            typeof service !== 'object' ||
+            service === null ||
+            !Object.isFrozen(service) ||
+            typeof service.register !== 'function'
+          ) {
+            throw new TypeError('GPT slot service provider is invalid');
+          }
+          const release = slots.attach(service);
+          if (!release) throw new TypeError('GPT slot service provider is duplicated');
+          return release;
+        },
+        resolve: (id: string) => slots.resolveRegisteredSlot(id),
+        snapshot: () => slots.snapshotRegisteredSlots(navigation) ?? Object.freeze([]),
+      });
+      const auctionCapability = Object.freeze({ batches, navigation, projection, session });
+      const renderCapability = Object.freeze({
+        artifacts,
+        cachePolicy,
+        createAttempt,
+        renderWinner,
+        rendererNonces,
+        reservations,
+        publisherOrigin: origin,
+        registerRenderer: (type: RegisteredRenderSource, renderer: RegisteredRenderer) => {
+          if (!active) throw new TypeError('render source provider is inactive');
+          if (
+            (type !== 'aps' && type !== 'cache') ||
+            typeof renderer !== 'function' ||
+            registeredRenderers.has(type)
+          ) {
+            throw new TypeError('render source provider is invalid or duplicated');
+          }
+          registeredRenderers.set(type, renderer);
+          let released = false;
+          return (): void => {
+            if (released) return;
+            released = true;
+            if (registeredRenderers.get(type) === renderer) registeredRenderers.delete(type);
+          };
+        },
+      });
+      const messagesCapability = Object.freeze({
+        messaging,
+        registerApsValidation: (candidate: unknown): (() => void) => {
+          if (!active) throw new TypeError('APS message validation provider is inactive');
+          if (apsValidation) throw new TypeError('APS message validation provider is duplicated');
+          const validation = exactApsMessagingValidation(candidate, origin);
+          apsValidation = validation;
+          let released = false;
+          return (): void => {
+            if (released) return;
+            released = true;
+            if (apsValidation === validation) apsValidation = undefined;
+          };
+        },
+      });
+      const traceCapability = Object.freeze({
+        record: renderTrace.record,
+        enrich: renderTrace.enrich,
+        prune: renderTrace.prune,
+        diagnostics: renderTrace.diagnostics,
+        observations: Object.freeze({
+          publish: diagnostics.publish,
+        }),
+      });
+      const tracePresentationCapability = Object.freeze({
+        attachPresentation: renderTrace.attachPresentation,
+      });
+      const directCapability = Object.freeze({
+        addAdUnits,
+        requestAds,
+        diagnostics: Object.freeze({ renderTrace: renderTrace.diagnostics }),
+      });
+
+      return Object.freeze({
+        activate: (activation: IntegrationActivationContext) => {
+          if (active) throw new Error('render_runtime already activated');
+          active = true;
+          activation.onDispose(() => {
+            active = false;
+            apsValidation = undefined;
+            registeredRenderers.clear();
+          });
+        },
+        interfaces: Object.freeze({
+          'slots.v1': slotsCapability,
+          'auction.v1': auctionCapability,
+          'render.v1': renderCapability,
+          'messages.v1': messagesCapability,
+          'trace.v1': traceCapability,
+          'trace.presentation.v1': tracePresentationCapability,
+          'direct.v1': directCapability,
+        }),
+      });
+    },
+  });
+}

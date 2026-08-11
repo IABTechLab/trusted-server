@@ -1,4 +1,5 @@
 import type { GptDiagnosticsRequestCycle } from '../../core/types';
+import { realmOwnedElement, realmOwnedHtmlElement } from '../../shared/realm';
 
 import type { GptDiagnosticsBindingManager } from './binding';
 import { unhandledCase } from './exhaustive';
@@ -60,22 +61,32 @@ function intersectsViewport(rectangle: DOMRect, window: Window): boolean {
   );
 }
 
-function nodeIntersectsSlotIds(node: Node, slotElementIds: Set<string>): boolean {
-  if (!(node instanceof Element)) return false;
-  if (slotElementIds.has(node.id)) return true;
-  return Array.from(node.querySelectorAll('[id]')).some((element) =>
-    slotElementIds.has(element.id)
+function nodeIntersectsSlotIds(
+  node: Node,
+  slotElementIds: Set<string>,
+  targetWindow: BadgeWindow
+): boolean {
+  const element = realmOwnedElement(node, targetWindow);
+  if (!element) return false;
+  if (slotElementIds.has(element.id)) return true;
+  return Array.from(element.querySelectorAll('[id]')).some((descendant) =>
+    slotElementIds.has(descendant.id)
   );
 }
 
-function mutationIntersectsSlotIds(record: MutationRecord, slotElementIds: Set<string>): boolean {
+function mutationIntersectsSlotIds(
+  record: MutationRecord,
+  slotElementIds: Set<string>,
+  targetWindow: BadgeWindow
+): boolean {
+  const target = realmOwnedElement(record.target, targetWindow);
   if (record.type === 'attributes') {
-    if (!(record.target instanceof Element)) return false;
-    return slotElementIds.has(record.target.id) || slotElementIds.has(record.oldValue ?? '');
+    if (!target) return false;
+    return slotElementIds.has(target.id) || slotElementIds.has(record.oldValue ?? '');
   }
-  if (record.target instanceof Element && slotElementIds.has(record.target.id)) return true;
+  if (target && slotElementIds.has(target.id)) return true;
   return [...record.addedNodes, ...record.removedNodes].some((node) =>
-    nodeIntersectsSlotIds(node, slotElementIds)
+    nodeIntersectsSlotIds(node, slotElementIds, targetWindow)
   );
 }
 
@@ -85,36 +96,8 @@ function formatMilliseconds(value: number | undefined): string | undefined {
   return `${Math.round(value)} ms`;
 }
 
-/**
- * Label the delivery state the store already derived.
- *
- * The badge must not re-derive precedence from raw timestamps: the store owns
- * that ladder, and a second copy of it can disagree — for instance by claiming
- * a Trusted Server response on a cycle GPT reported empty.
- */
-function deliveryLabel(cycle: GptDiagnosticsRequestCycle): string | undefined {
-  switch (cycle.delivery) {
-    case 'trusted_server_response_sent':
-      return 'TS response sent';
-    case 'trusted_server_selected':
-      return 'TS selected';
-    case 'pending':
-      return 'TS candidate (pending)';
-    case 'candidate_unconfirmed':
-      return 'TS unconfirmed';
-    case 'no_candidate':
-      return 'No TS candidate';
-    case 'unknown':
-      return 'Delivery unknown';
-    case 'not_applicable':
-    case undefined:
-      return undefined;
-    default:
-      return unhandledCase(cycle.delivery);
-  }
-}
-
-function badgeText(cycle: GptDiagnosticsRequestCycle): string {
+/** Format one observed GPT request cycle for both badge and accessible text surfaces. */
+export function formatGptDiagnosticsBadgeText(cycle: GptDiagnosticsRequestCycle): string {
   const firstLine: string[] = [];
   if (cycle.isEmpty === true) firstLine.push('Empty');
   else if (cycle.isEmpty === false) firstLine.push('Filled');
@@ -176,10 +159,12 @@ export class GptDiagnosticsBadgeManager {
   constructor(store: BadgeStore, bindings: BadgeBindings, options: BadgeOptions = {}) {
     this.store = store;
     this.bindings = bindings;
-    this.window = options.window ?? (window as unknown as BadgeWindow);
     this.document = options.document ?? document;
-    this.scheduleFrame =
-      options.scheduleFrame ?? ((callback) => scheduleFrame(this.window, callback));
+    this.window =
+      options.window ??
+      (this.document.defaultView as unknown as BadgeWindow | null) ??
+      (window as unknown as BadgeWindow);
+    this.scheduleFrame = options.scheduleFrame ?? defaultScheduleFrame;
     this.refreshSlotElementIds();
     this.unsubscribeStore = this.store.subscribe(() => {
       this.refreshSlotElementIds();
@@ -195,8 +180,8 @@ export class GptDiagnosticsBadgeManager {
 
   setLayer(layer: HTMLElement | undefined): void {
     if (this.destroyed) return;
-    this.layer = layer;
-    if (layer?.isConnected) this.refreshSlots();
+    this.layer = realmOwnedHtmlElement(layer, this.window);
+    if (this.layer?.isConnected) this.refreshSlots();
     this.scheduleUpdate();
   }
 
@@ -209,7 +194,7 @@ export class GptDiagnosticsBadgeManager {
       const cycle = latestCycle(slot);
       if (!cycle) continue;
       const binding = this.bindings.get(slot.runtimeSlotNumber);
-      const element = binding.element;
+      const element = realmOwnedHtmlElement(binding.element, this.window);
       if (binding.binding.status !== 'bound' || !element?.isConnected) continue;
 
       const rectangle = element.getBoundingClientRect();
@@ -219,7 +204,7 @@ export class GptDiagnosticsBadgeManager {
       const badge = this.document.createElement('div');
       badge.className = 'tsgd-badge';
       badge.dataset.runtimeSlot = String(slot.runtimeSlotNumber);
-      badge.textContent = badgeText(cycle);
+      badge.textContent = formatGptDiagnosticsBadgeText(cycle);
       badge.style.maxWidth = `${BADGE_MAX_WIDTH_PX}px`;
       badge.style.left = `${Math.max(
         BADGE_EDGE_GUTTER_PX,
@@ -318,7 +303,11 @@ export class GptDiagnosticsBadgeManager {
     if (typeof Observer !== 'function' || !this.document.documentElement) return;
     this.mutationObserver = new Observer((records) => {
       if (!this.layer?.isConnected || this.slotElementIds.size === 0) return;
-      if (records.some((record) => mutationIntersectsSlotIds(record, this.slotElementIds))) {
+      if (
+        records.some((record) =>
+          mutationIntersectsSlotIds(record, this.slotElementIds, this.window)
+        )
+      ) {
         this.scheduleUpdate();
       }
     });
@@ -337,5 +326,3 @@ export class GptDiagnosticsBadgeManager {
     this.resizeObserver = new Observer(this.scheduleUpdate);
   }
 }
-
-export const gptDiagnosticsBadgeTextForTest = badgeText;

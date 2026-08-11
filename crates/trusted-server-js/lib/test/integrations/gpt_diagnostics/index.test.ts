@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { GoogletagDiagnosticsFact } from '../../../src/adapters/googletag';
-import { createGptDiagnosticsFactBuffer } from '../../../src/integrations/gpt_diagnostics/facts';
-import { createGptDiagnosticsRuntime } from '../../../src/integrations/gpt_diagnostics';
+import { createGptDiagnosticsFactBuffer } from '../../../src/integrations/gpt/diagnostics_facts';
+import { createGptDiagnosticsRuntime } from '../../../src/composition/browser_test_gpt_diagnostics';
 import { GPT_DIAGNOSTICS_HOST_ID } from '../../../src/integrations/gpt_diagnostics/overlay';
 
 function slot(id: string): GoogletagDiagnosticsFact['slot'] {
