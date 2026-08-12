@@ -1,7 +1,7 @@
 # APS Render Fix and TSJS Resilience Architecture — Design
 
-- **Status:** revision 32 — hard-cutover contract with phase-aware TSJS loading
-  and complete `rc/july` TSJS adoption
+- **Status:** revision 33 — hard-cutover contract with phase-aware TSJS loading,
+  complete `rc/july` TSJS adoption, and role-correct transfer budgets
 - **Date:** 2026-08-04
 - **Baseline:** `origin/rc/july` @ `905984e62` ("Prevent APS renderer document
   clipping"), including `248fe9558` (PUC/MessageChannel and collapsed-shell
@@ -3403,9 +3403,22 @@ After that upgrade, the lockfile compiler is the authority. CI runs a checked-in
 the deferred loader uses only authenticated classic same-origin script elements as
 specified in §5.2.
 
-The checked-in pre-change fixture is immutable evidence, not a baseline that may be
-regenerated from the larger implementation. Its bundle roles survive intentional
-file splitting:
+The checked-in pre-change fixture is immutable historical evidence and is never
+regenerated or rewritten. Its original `bundles` values measured a different
+artifact model: minimal contained only the old core, reference omitted the now-
+mandatory render owner, and maximal contained thirteen unsplit files. Those values
+remain the report-only historical comparison for this cutover. They are not applied
+as byte ceilings to semantically different post-split membership: either mandatory
+`core` or mandatory `render_runtime` alone is larger than the old entire minimal
+ceiling, and even a one-pass deduplicated build of the required pair cannot fit it.
+
+Transfer regression gates therefore use a second, role-correct baseline stored in
+the same performance JSON without altering the historical fields. It is captured
+once from the exact clean, pushed parent commit after Task 18D is behaviorally green
+and conflicts with the current `main` and PR base are resolved, but before the
+coordinated Task 19 production-wiring switch. The capture records its own source
+ref/SHA, toolchain and compression identity, release inventory, per-artifact hashes,
+and these semantic sets:
 
 - **minimal critical** is the server-composed artifact for
   `[core, render_runtime]`; `render_runtime` is mandatory even when no product
@@ -3421,32 +3434,35 @@ file splitting:
 
 The build emits one canonical release inventory with each production bundle's id,
 role, phase, trigger, inputs, outputs, bytes, and hash. Budget membership is derived
-from that catalog rather than an obsolete exact filename list. The gate rejects an
-unclassified or multiply counted artifact, a missing production artifact, a test
-artifact, and a reference-critical artifact whose dependency graph reaches a
-deferred source. With the recorded compression settings, the hard 5% ceilings are:
-
-| Set                | Raw bytes | gzip bytes | Brotli bytes |
-| ------------------ | --------: | ---------: | -----------: |
-| minimal critical   |    24,482 |      9,121 |        8,070 |
-| reference critical |   119,443 |     36,921 |       27,353 |
-| maximal total      |   196,585 |     56,488 |       39,679 |
+from that catalog rather than an obsolete exact filename list. The role-correct
+capture stores the exact raw, gzip, and Brotli values for bootstrap, minimal,
+reference, and maximal. For each value, the blocking ceiling is
+`ceil(capturedBytes * 1.05)`; the comparator computes this formula from the frozen
+capture rather than accepting separately hand-entered numbers.
 
 The inline bootstrap-controller/fallback cannot be used to hide code outside those
-sets. It has its own immutable 5%-over-`rc/july@905984e62`
-`gpt_bootstrap.js` baseline of 19,101 raw, 5,468 gzip, and 4,632 Brotli bytes:
-the ceilings are 20,056 raw, 5,741 gzip, and 4,863 Brotli bytes. Its production
-metafile/import allowlist permits only boot-manifest/queue/
-fallback validation, generation/disposal, timing, and local logging primitives. The
-release inventory counts it exactly once under the `bootstrap` role and the release
-hash covers its final bytes; it is not counted again as a TSJS integration bundle.
+sets. It receives its own role-correct captured value and 5% ceiling, appears exactly
+once under the `bootstrap` role, and is not counted again in maximal TSJS total. Its
+production metafile/import allowlist permits only boot-manifest/queue/fallback
+validation, generation/disposal, timing, and local logging primitives.
 
-`npm run check:bundle` builds fresh metrics and runs this comparator in CI. Updating
-the fixture or raising a ceiling requires separate design approval; it is not an
-implementation escape hatch. The production-core metafile is also checked against
-the release catalog and explicit deny paths so a deferred service, integration,
-diagnostics presentation component, no-op adapter, fake scheduler, or `*ForTest`
-export cannot be pulled back into the critical artifact by a transitive import.
+`npm run check:bundle` builds fresh metrics and runs both parts in CI:
+
+1. the original pre-change values and their old 5% figures are printed as immutable
+   historical deltas, never as pass/fail comparisons across different membership;
+2. the role-correct bootstrap/minimal/reference/maximal values enforce the computed
+   5% transfer ceilings.
+
+The gate also rejects an unclassified or multiply counted artifact, a missing
+production artifact, a test artifact, a maximal inventory that omits any split
+module, critical reachability to a deferred source, a consumer that inlines a
+catalogued provider implementation, a second adapter/runtime/listener owner, and
+production reachability to fake/no-op/test or `*ForTest` sources. It reports the
+largest source contributions and repeated production attributions so later work
+cannot hide growth inside a passing aggregate. Changing historical evidence,
+recapturing the role-correct baseline, changing membership, or raising its 5%
+formula requires a separate reviewed design; it is not an implementation escape
+hatch.
 
 Boot-to-first-display uses real User Timing marks, not `__tsjsPerf` or a test-only
 placeholder. The bootstrap controller records `tsjs:bids-script` immediately before
@@ -3548,7 +3564,7 @@ failures are never waived by a performance pass.
 | Real-GAM test network | SSAT APS-PUC, Prebid-adapter APS-PUC, page-bids APS-PUC, direct APS, direct ADM plus baseline PBS Cache regression, fallback after attributable empty GAM, SRA, refresh, SPA, handoff, hydrated DOM replacement, and collapsed shell                                                                                                                           |
 | Adapter parity        | exact renderer sandbox/CSP/header bytes plus runner-proxy routing, five-second deadline, closed response parsing, bounded relay, header filtering, and failures match on all adapters                                                                                                                                                                          |
 | Regression            | non-APS Cache/ADM and notifications, pure external Prebid/native bids/EIDs/user IDs/refresh exclusions, publisher GPT/handoff/SRA/SPA, creative processing/click recovery, render trace/GPT diagnostics, and every remaining integration remain correct                                                                                                        |
-| Quality               | full-package TypeScript/lint including tests/scripts/build code, ESLint and release-catalog dependency boundaries, production-metafile/test-hook exclusions, format, clippy, Rust adapter suites, Vitest, artifact integration, Playwright, immutable bundle/performance/heap budgets, and complete maximal inventory                                          |
+| Quality               | full-package TypeScript/lint including tests/scripts/build code, ESLint and release-catalog dependency boundaries, production-metafile/test-hook exclusions, format, clippy, Rust adapter suites, Vitest, artifact integration, Playwright, immutable historical bundle reporting, role-correct transfer budgets, performance/heap budgets, and complete maximal inventory                     |
 
 ### 7.2 Mandatory race matrix
 
@@ -3839,8 +3855,11 @@ deployable artifact.
    and renderer route conform to the contract.
 4. **Critical-path extraction:** build the one server-composed critical artifact,
    move optional/later behavior out of its dependency graph, add authenticated
-   deferred loading into the same runtime, and make the immutable bundle, timing,
-   heap, inventory, and production-metafile gates green before production wiring.
+   deferred loading into the same runtime, and make inventory and production-
+   metafile gates green. After resolving current-base conflicts, capture the one
+   role-correct transfer baseline from that exact clean Task 18D parent commit;
+   historical bundle deltas remain report-only, and the new transfer, timing, and
+   heap gates must be green before production wiring.
 5. **Browser integrations:** migrate APS, GPT, Prebid, direct auction, fallback,
    local diagnostics, creative processing, every remaining TSJS integration, and
    bootstrap to the catalogued critical/deferred modules while their `RCJ-*` parity
@@ -4021,10 +4040,12 @@ The design is complete when all of the following are true:
     no-op/fake/test seams, or `*ForTest` accessors. Every production artifact appears
     exactly once in the release inventory, with the bootstrap role included once and
     every TSJS module included in maximal total.
-25. Bootstrap-controller, minimal-critical, reference-critical, maximal-total,
-    boot-to-first-display p90, and retained-heap results remain within their immutable
-    §5.12 ceilings without baseline regeneration, selective sample reruns, or
-    file-membership loopholes.
+25. Bootstrap-controller, minimal-critical, reference-critical, and maximal-total
+    remain within 5% of the one immutable role-correct §5.12 capture; the original
+    pre-change values remain unchanged and are reported as historical deltas.
+    Boot-to-first-display p90 and retained-heap results remain within their original
+    immutable ceilings without recapture, selective sample reruns, or membership
+    loopholes.
 26. A deferred module can register only from the exact current core-created local
     release script and can obtain only catalogued frozen capabilities from the one
     runtime. It cannot replace an adapter, slot registry, dispatcher, provider, or
