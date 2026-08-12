@@ -16,11 +16,12 @@
 //!
 //! Spike-only. Remove with the spike.
 
-use fastly::cache::core::{CacheKey, Transaction};
+use fastly::cache::core::{CacheKey, Found, Transaction};
 use std::io::Write as _;
 use std::time::Duration;
 use trusted_server_core::platform::{
-    PlatformTemplateCache, TemplateCacheError, TemplateCacheKey, TemplateCacheMiss, TemplateEntry,
+    PlatformTemplateCache, PlatformTemplateCacheReservation, TemplateCacheError, TemplateCacheKey,
+    TemplateCacheLookup, TemplateCacheMiss, TemplateCacheReservation, TemplateEntry,
     TemplateMetadata,
 };
 
@@ -59,8 +60,107 @@ fn backend_error(message: impl Into<String>) -> TemplateCacheError {
     }
 }
 
+fn read_found(found: Found, key: &TemplateCacheKey) -> Result<TemplateEntry, TemplateCacheMiss> {
+    if found.is_stale() {
+        return Err(TemplateCacheMiss::NotFound);
+    }
+
+    let metadata = TemplateMetadata::decode(&found.user_metadata())
+        .ok_or(TemplateCacheMiss::UnreadableMetadata)?;
+    if metadata.schema_version != key.schema_version {
+        return Err(TemplateCacheMiss::SchemaMismatch);
+    }
+    if found
+        .known_length()
+        .is_some_and(|length| length != metadata.body_len)
+    {
+        return Err(TemplateCacheMiss::Truncated);
+    }
+
+    let body = found
+        .to_stream()
+        .map_err(|_| TemplateCacheMiss::NotFound)?
+        .into_bytes();
+    if body.len() as u64 != metadata.body_len {
+        return Err(TemplateCacheMiss::Truncated);
+    }
+    Ok(TemplateEntry { metadata, body })
+}
+
+struct FastlyTemplateReservation {
+    transaction: Transaction,
+    surrogate_keys: Vec<String>,
+    ttl_cap: Duration,
+}
+
+impl PlatformTemplateCacheReservation for FastlyTemplateReservation {
+    fn insert(
+        self: Box<Self>,
+        metadata: &TemplateMetadata,
+        body: Vec<u8>,
+        max_age: Duration,
+    ) -> Result<(), TemplateCacheError> {
+        if metadata.body_len != body.len() as u64 {
+            return Err(backend_error(format!(
+                "metadata body_len {} does not match the {} bytes supplied",
+                metadata.body_len,
+                body.len()
+            )));
+        }
+
+        let mut writer = self
+            .transaction
+            .insert(max_age.min(self.ttl_cap))
+            .surrogate_keys(self.surrogate_keys.iter().map(String::as_str))
+            .known_length(body.len() as u64)
+            .user_metadata(metadata.encode().into())
+            .execute()
+            .map_err(|e| backend_error(format!("cache insert failed: {e:?}")))?;
+        writer
+            .write_all(&body)
+            .map_err(|e| backend_error(format!("writing template body failed: {e}")))?;
+        writer
+            .finish()
+            .map_err(|e| backend_error(format!("finishing the cached template failed: {e}")))?;
+        Ok(())
+    }
+
+    fn cancel(self: Box<Self>) -> Result<(), TemplateCacheError> {
+        self.transaction
+            .cancel_insert_or_update()
+            .map_err(|e| backend_error(format!("cancelling cache reservation failed: {e:?}")))
+    }
+}
+
 #[async_trait::async_trait(?Send)]
 impl PlatformTemplateCache for FastlyTemplateCache {
+    async fn lookup_or_reserve(
+        &self,
+        key: &TemplateCacheKey,
+    ) -> Result<TemplateCacheLookup, TemplateCacheError> {
+        let transaction = Transaction::lookup(CacheKey::from(key.to_cache_key().into_bytes()))
+            .execute()
+            .map_err(|e| backend_error(format!("transactional lookup failed: {e:?}")))?;
+
+        if transaction.must_insert_or_update() {
+            return Ok(TemplateCacheLookup::Reserved(
+                TemplateCacheReservation::new(Box::new(FastlyTemplateReservation {
+                    transaction,
+                    surrogate_keys: key.surrogate_keys(),
+                    ttl_cap: self.ttl,
+                })),
+            ));
+        }
+
+        let found = transaction.found().ok_or_else(|| {
+            backend_error("transaction returned neither a hit nor an insert obligation")
+        })?;
+        Ok(match read_found(found, key) {
+            Ok(entry) => TemplateCacheLookup::Hit(entry),
+            Err(miss) => TemplateCacheLookup::Invalid(miss),
+        })
+    }
+
     async fn get(&self, key: &TemplateCacheKey) -> Result<TemplateEntry, TemplateCacheMiss> {
         let cache_key = CacheKey::from(key.to_cache_key().into_bytes());
 
@@ -72,36 +172,7 @@ impl PlatformTemplateCache for FastlyTemplateCache {
             .map_err(|_| TemplateCacheMiss::NotFound)?
             .ok_or(TemplateCacheMiss::NotFound)?;
 
-        // Stale entries are treated as a miss for the spike. Serving stale while
-        // revalidating is a real option, but it is a state machine `cache::core`
-        // does not implement for you, and it is not what this spike is measuring.
-        if found.is_stale() {
-            return Err(TemplateCacheMiss::NotFound);
-        }
-
-        let metadata = TemplateMetadata::decode(&found.user_metadata())
-            .ok_or(TemplateCacheMiss::UnreadableMetadata)?;
-
-        // A schema mismatch is a miss, not an error: rolling back to an older binary
-        // then degrades to re-transforming rather than assembling against a template
-        // shape it does not understand.
-        if metadata.schema_version != key.schema_version {
-            return Err(TemplateCacheMiss::SchemaMismatch);
-        }
-
-        let body = found
-            .to_stream()
-            .map_err(|_| TemplateCacheMiss::NotFound)?
-            .into_bytes();
-
-        // A write that failed part-way cannot cancel its own insert (see `put`), so
-        // a short entry is possible. Catch it here rather than assembling a
-        // truncated template into a broken page.
-        if body.len() as u64 != metadata.body_len {
-            return Err(TemplateCacheMiss::Truncated);
-        }
-
-        Ok(TemplateEntry { metadata, body })
+        read_found(found, key)
     }
 
     async fn put(
@@ -109,6 +180,7 @@ impl PlatformTemplateCache for FastlyTemplateCache {
         key: &TemplateCacheKey,
         metadata: &TemplateMetadata,
         body: Vec<u8>,
+        max_age: Duration,
     ) -> Result<(), TemplateCacheError> {
         if metadata.body_len != body.len() as u64 {
             return Err(backend_error(format!(
@@ -144,7 +216,7 @@ impl PlatformTemplateCache for FastlyTemplateCache {
         // still carries the length it was supposed to have.
         let surrogate_keys = key.surrogate_keys();
         let mut writer = tx
-            .insert(self.ttl)
+            .insert(max_age.min(self.ttl))
             .surrogate_keys(surrogate_keys.iter().map(String::as_str))
             .user_metadata(metadata.encode().into())
             .execute()
@@ -163,6 +235,11 @@ impl PlatformTemplateCache for FastlyTemplateCache {
             .map_err(|e| backend_error(format!("finishing the cached template failed: {e}")))?;
 
         Ok(())
+    }
+
+    async fn purge_url(&self, key: &TemplateCacheKey) -> Result<(), TemplateCacheError> {
+        fastly::http::purge::purge_surrogate_key(&key.url_surrogate_key())
+            .map_err(|e| backend_error(format!("purging invalid template failed: {e:?}")))
     }
 
     async fn purge_all(&self) -> Result<(), TemplateCacheError> {
@@ -221,11 +298,32 @@ mod tests {
         let body = b"<html><body>template</body></html>".to_vec();
         let metadata = metadata_for(&body);
 
-        run(cache.put(&key, &metadata, body.clone())).expect("should store");
+        run(cache.put(&key, &metadata, body.clone(), TEMPLATE_CACHE_TTL)).expect("should store");
 
         let entry = run(cache.get(&key)).expect("should read back");
         assert_eq!(entry.body, body, "bytes must survive the round trip");
         assert_eq!(entry.metadata, metadata, "metadata must survive too");
+    }
+
+    #[test]
+    fn transactional_lookup_reserves_before_insert_then_hits() {
+        let cache = cache();
+        let key = key("https://example.com/pre-origin-reservation");
+        let body = b"<html><body>collapsed</body></html>".to_vec();
+        let metadata = metadata_for(&body);
+
+        let reservation = match run(cache.lookup_or_reserve(&key)).expect("lookup should work") {
+            TemplateCacheLookup::Reserved(reservation) => reservation,
+            _ => panic!("a cold transactional lookup must assign the insert obligation"),
+        };
+        reservation
+            .insert(&metadata, body.clone(), Duration::from_secs(17))
+            .expect("reservation should insert");
+
+        match run(cache.lookup_or_reserve(&key)).expect("warm lookup should work") {
+            TemplateCacheLookup::Hit(entry) => assert_eq!(entry.body, body),
+            _ => panic!("the next transactional lookup must see the inserted template"),
+        }
     }
 
     #[test]
@@ -245,7 +343,7 @@ mod tests {
         inline.assembly_mode = AssemblyMode::Inline;
 
         let body = b"esi-template".to_vec();
-        run(cache.put(&esi, &metadata_for(&body), body)).expect("should store");
+        run(cache.put(&esi, &metadata_for(&body), body, TEMPLATE_CACHE_TTL)).expect("should store");
 
         assert_eq!(
             run(cache.get(&inline)).err(),
@@ -259,7 +357,8 @@ mod tests {
         let cache = cache();
         let key_v1 = key("https://example.com/schema");
         let body = b"old-shape".to_vec();
-        run(cache.put(&key_v1, &metadata_for(&body), body)).expect("should store");
+        run(cache.put(&key_v1, &metadata_for(&body), body, TEMPLATE_CACHE_TTL))
+            .expect("should store");
 
         // A deploy that changes the transform bumps the constant. The old entry must
         // not be assembled against.
@@ -308,7 +407,7 @@ mod tests {
         let cache = cache();
         let key = key("https://example.com/purge");
         let body = b"template".to_vec();
-        run(cache.put(&key, &metadata_for(&body), body)).expect("should store");
+        run(cache.put(&key, &metadata_for(&body), body, TEMPLATE_CACHE_TTL)).expect("should store");
         run(cache.get(&key)).expect("should be present before purge");
 
         run(cache.purge_all()).expect("should purge");
@@ -326,10 +425,16 @@ mod tests {
         let cache = cache();
         let key = key("https://example.com/second-put");
         let first = b"first".to_vec();
-        run(cache.put(&key, &metadata_for(&first), first.clone())).expect("first put stores");
+        run(cache.put(
+            &key,
+            &metadata_for(&first),
+            first.clone(),
+            TEMPLATE_CACHE_TTL,
+        ))
+        .expect("first put stores");
 
         let second = b"second".to_vec();
-        run(cache.put(&key, &metadata_for(&second), second))
+        run(cache.put(&key, &metadata_for(&second), second, TEMPLATE_CACHE_TTL))
             .expect("second put should be a no-op, not an error");
 
         assert_eq!(
@@ -349,7 +454,8 @@ mod tests {
         let key = key("https://example.com/via-trait-object");
         let body = b"<html><body>template</body></html>".to_vec();
 
-        run(cache.put(&key, &metadata_for(&body), body.clone())).expect("should store");
+        run(cache.put(&key, &metadata_for(&body), body.clone(), TEMPLATE_CACHE_TTL))
+            .expect("should store");
 
         assert_eq!(
             run(cache.get(&key)).expect("should read back").body,
@@ -368,7 +474,7 @@ mod tests {
         let mut metadata = metadata_for(b"12345");
         metadata.body_len = 999;
 
-        let err = run(cache.put(&key, &metadata, b"12345".to_vec()))
+        let err = run(cache.put(&key, &metadata, b"12345".to_vec(), TEMPLATE_CACHE_TTL))
             .expect_err("a length mismatch must be refused");
         assert!(
             matches!(err, TemplateCacheError::Backend { .. }),

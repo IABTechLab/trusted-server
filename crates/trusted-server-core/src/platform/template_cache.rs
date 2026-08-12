@@ -127,10 +127,15 @@ impl TemplateCacheKey {
     /// for an incident, the narrow one for ordinary invalidation.
     #[must_use]
     pub fn surrogate_keys(&self) -> Vec<String> {
-        vec![
-            "ts-template".to_string(),
-            format!("ts-template-url-{}", digest_hex(self.url.as_bytes())),
-        ]
+        vec!["ts-template".to_string(), self.url_surrogate_key()]
+    }
+
+    /// Surrogate key for every variant of this publisher URL.
+    ///
+    /// Used to evict a malformed object without flushing unrelated article templates.
+    #[must_use]
+    pub fn url_surrogate_key(&self) -> String {
+        format!("ts-template-url-{}", digest_hex(self.url.as_bytes()))
     }
 }
 
@@ -227,6 +232,9 @@ impl VarySpec {
                 .map_err(|_| raw.clone())?
                 .as_str()
                 .to_string();
+            if STRUCTURALLY_COVERED.contains(&name.as_str()) {
+                continue;
+            }
             if seen.insert(name.clone()) {
                 normalized.push(name);
             }
@@ -423,6 +431,84 @@ pub enum TemplateCacheError {
 
 impl core::error::Error for TemplateCacheError {}
 
+/// Result of the pre-origin cache transaction.
+pub enum TemplateCacheLookup {
+    /// A fresh usable template.
+    Hit(TemplateEntry),
+    /// This request owns the obligation to provide or cancel the cold object.
+    Reserved(TemplateCacheReservation),
+    /// This adapter deliberately has no shared-template cache.
+    Unsupported,
+    /// A cache object existed but failed schema, metadata, or length validation.
+    Invalid(TemplateCacheMiss),
+}
+
+/// Platform-owned insert obligation. Dropping it cancels, making every early-return
+/// path safe without an async cleanup ladder in the publisher pipeline.
+pub struct TemplateCacheReservation {
+    inner: Option<Box<dyn PlatformTemplateCacheReservation>>,
+}
+
+impl core::fmt::Debug for TemplateCacheReservation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TemplateCacheReservation")
+            .finish_non_exhaustive()
+    }
+}
+
+impl TemplateCacheReservation {
+    /// Wrap a platform reservation.
+    #[must_use]
+    pub fn new(inner: Box<dyn PlatformTemplateCacheReservation>) -> Self {
+        Self { inner: Some(inner) }
+    }
+
+    /// Fulfil the reservation with a validated template.
+    pub fn insert(
+        mut self,
+        metadata: &TemplateMetadata,
+        body: Vec<u8>,
+        max_age: std::time::Duration,
+    ) -> Result<(), TemplateCacheError> {
+        self.inner
+            .take()
+            .expect("reservation should be consumed once")
+            .insert(metadata, body, max_age)
+    }
+
+    /// Explicitly give up the reservation. Drop performs the same operation as a net.
+    pub fn cancel(mut self) -> Result<(), TemplateCacheError> {
+        self.inner
+            .take()
+            .expect("reservation should be consumed once")
+            .cancel()
+    }
+}
+
+impl Drop for TemplateCacheReservation {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take()
+            && let Err(err) = inner.cancel()
+        {
+            log::warn!("c2_template_cache reservation cancellation failed: {err}");
+        }
+    }
+}
+
+/// Adapter-specific ownership token returned by a transactional lookup.
+pub trait PlatformTemplateCacheReservation: Send {
+    /// Insert and discharge the obligation.
+    fn insert(
+        self: Box<Self>,
+        metadata: &TemplateMetadata,
+        body: Vec<u8>,
+        max_age: std::time::Duration,
+    ) -> Result<(), TemplateCacheError>;
+
+    /// Cancel and allow a waiting request to take ownership.
+    fn cancel(self: Box<Self>) -> Result<(), TemplateCacheError>;
+}
+
 impl fmt::Debug for dyn PlatformTemplateCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("PlatformTemplateCache")
@@ -440,6 +526,20 @@ impl fmt::Debug for dyn PlatformTemplateCache {
 /// themselves never do — the platform layer is `!Send` by construction.
 #[async_trait::async_trait(?Send)]
 pub trait PlatformTemplateCache: Send + Sync {
+    /// Transactionally look up a template before origin work begins.
+    async fn lookup_or_reserve(
+        &self,
+        key: &TemplateCacheKey,
+    ) -> Result<TemplateCacheLookup, TemplateCacheError> {
+        Ok(match self.get(key).await {
+            Ok(entry) => TemplateCacheLookup::Hit(entry),
+            Err(TemplateCacheMiss::Unsupported | TemplateCacheMiss::NotFound) => {
+                TemplateCacheLookup::Unsupported
+            }
+            Err(miss) => TemplateCacheLookup::Invalid(miss),
+        })
+    }
+
     /// Read a template. `Err` is a miss, not a failure — every variant means
     /// "transform it yourself".
     async fn get(&self, key: &TemplateCacheKey) -> Result<TemplateEntry, TemplateCacheMiss>;
@@ -454,7 +554,11 @@ pub trait PlatformTemplateCache: Send + Sync {
         key: &TemplateCacheKey,
         metadata: &TemplateMetadata,
         body: Vec<u8>,
+        max_age: std::time::Duration,
     ) -> Result<(), TemplateCacheError>;
+
+    /// Purge every cached variant for one publisher URL.
+    async fn purge_url(&self, key: &TemplateCacheKey) -> Result<(), TemplateCacheError>;
 
     /// Purge every stored template. The rollback lever.
     async fn purge_all(&self) -> Result<(), TemplateCacheError>;
@@ -478,6 +582,13 @@ pub struct UnavailableTemplateCache;
 
 #[async_trait::async_trait(?Send)]
 impl PlatformTemplateCache for UnavailableTemplateCache {
+    async fn lookup_or_reserve(
+        &self,
+        _key: &TemplateCacheKey,
+    ) -> Result<TemplateCacheLookup, TemplateCacheError> {
+        Ok(TemplateCacheLookup::Unsupported)
+    }
+
     async fn get(&self, _key: &TemplateCacheKey) -> Result<TemplateEntry, TemplateCacheMiss> {
         Err(TemplateCacheMiss::Unsupported)
     }
@@ -487,7 +598,12 @@ impl PlatformTemplateCache for UnavailableTemplateCache {
         _key: &TemplateCacheKey,
         _metadata: &TemplateMetadata,
         _body: Vec<u8>,
+        _max_age: std::time::Duration,
     ) -> Result<(), TemplateCacheError> {
+        Err(TemplateCacheError::Unsupported)
+    }
+
+    async fn purge_url(&self, _key: &TemplateCacheKey) -> Result<(), TemplateCacheError> {
         Err(TemplateCacheError::Unsupported)
     }
 
@@ -499,6 +615,8 @@ impl PlatformTemplateCache for UnavailableTemplateCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn key() -> TemplateCacheKey {
         TemplateCacheKey {
@@ -514,6 +632,33 @@ mod tests {
             template_fingerprint: "abc123".to_string(),
             schema_version: TEMPLATE_SCHEMA_VERSION,
         }
+    }
+
+    struct CountingReservation(Arc<AtomicUsize>);
+
+    impl PlatformTemplateCacheReservation for CountingReservation {
+        fn insert(
+            self: Box<Self>,
+            _metadata: &TemplateMetadata,
+            _body: Vec<u8>,
+            _max_age: std::time::Duration,
+        ) -> Result<(), TemplateCacheError> {
+            Ok(())
+        }
+
+        fn cancel(self: Box<Self>) -> Result<(), TemplateCacheError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn dropping_an_unfulfilled_reservation_cancels_exactly_once() {
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        drop(TemplateCacheReservation::new(Box::new(
+            CountingReservation(Arc::clone(&cancellations)),
+        )));
+        assert_eq!(cancellations.load(Ordering::SeqCst), 1);
     }
 
     /// Every field must change the key. A field that does not is a cross-serving
@@ -719,7 +864,7 @@ mod tests {
     fn vary_spec_lowercases_configured_names() {
         assert_eq!(
             VarySpec::new(["RSC".to_string(), "Accept-Encoding".to_string()]).names(),
-            ["rsc", "accept-encoding"]
+            ["rsc"]
         );
     }
 
@@ -834,7 +979,8 @@ mod tests {
                         schema_version: TEMPLATE_SCHEMA_VERSION,
                         body_len: 0,
                     },
-                    Vec::new()
+                    Vec::new(),
+                    std::time::Duration::from_secs(1)
                 )
                 .await,
             Err(TemplateCacheError::Unsupported)

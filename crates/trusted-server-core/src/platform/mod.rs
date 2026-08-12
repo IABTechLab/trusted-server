@@ -55,9 +55,10 @@ pub use image_optimizer::{
 pub use kv::UnavailableKvStore;
 pub use template_cache::REPLAYABLE_POLICY_HEADERS;
 pub use template_cache::{
-    PlatformTemplateCache, TEMPLATE_SCHEMA_VERSION, TemplateCacheError, TemplateCacheKey,
-    TemplateCacheMiss, TemplateEntry, TemplateMetadata, UnavailableTemplateCache, VaryHeaderValues,
-    VarySpec,
+    PlatformTemplateCache, PlatformTemplateCacheReservation, TEMPLATE_SCHEMA_VERSION,
+    TemplateCacheError, TemplateCacheKey, TemplateCacheLookup, TemplateCacheMiss,
+    TemplateCacheReservation, TemplateEntry, TemplateMetadata, UnavailableTemplateCache,
+    VaryHeaderValues, VarySpec,
 };
 pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
 pub use types::{

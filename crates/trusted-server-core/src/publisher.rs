@@ -1238,7 +1238,7 @@ pub struct OwnedProcessResponseParams {
     /// the gate, and no way to reach the store without having passed it.
     ///
     /// Spike-only, for the #1009 ESI validation.
-    pub(crate) template_cache_key: Option<crate::platform::TemplateCacheKey>,
+    pub(crate) template_cache_key: Option<AuthorizedTemplateStore>,
     /// Slot definitions for the `</body>` seam under a shared mode, as JSON.
     ///
     /// Request-scoped, so it travels with the request rather than into the template.
@@ -1266,6 +1266,13 @@ pub struct OwnedProcessResponseParams {
     /// Request-scoped conditional diagnostics delivery decision.
     pub(crate) gpt_diagnostics:
         Option<crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
+}
+
+/// Response-authorized C2 insert inputs. The key is built before origin lookup; the
+/// lifetime is only known after the origin proves this representation is shareable.
+pub(crate) struct AuthorizedTemplateStore {
+    reservation: crate::platform::TemplateCacheReservation,
+    max_age: Duration,
 }
 
 /// Buffers a [`PublisherResponse`] into a single [`Response`], collecting the
@@ -1742,11 +1749,11 @@ fn build_cached_template_response(
 ///
 /// Spike-only, for the #1009 ESI validation.
 async fn store_template_if_authorized(
-    services: &RuntimeServices,
+    _services: &RuntimeServices,
     params: &mut OwnedProcessResponseParams,
     bytes: &[u8],
 ) {
-    let Some(key) = params.template_cache_key.take() else {
+    let Some(store) = params.template_cache_key.take() else {
         return;
     };
     let metadata = crate::platform::TemplateMetadata {
@@ -1760,10 +1767,9 @@ async fn store_template_if_authorized(
         schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
         body_len: bytes.len() as u64,
     };
-    match services
-        .template_cache()
-        .put(&key, &metadata, bytes.to_vec())
-        .await
+    match store
+        .reservation
+        .insert(&metadata, bytes.to_vec(), store.max_age)
     {
         Ok(()) => {
             // Reports whether the seam marker made it into the stored bytes. The marker
@@ -3618,6 +3624,8 @@ pub async fn handle_publisher_request(
             .creative_opportunities
             .as_ref()
             .is_some_and(CreativeOpportunitiesConfig::origin_is_cookie_independent);
+    let request_requires_origin =
+        request_bypasses_c2(req.headers()) || gpt_diagnostics.requires_private_no_store();
 
     if should_run_ad_stack {
         req.headers_mut().remove(header::IF_NONE_MATCH);
@@ -3626,7 +3634,16 @@ pub async fn handle_publisher_request(
         req.headers_mut().remove(header::IF_RANGE);
     }
 
-    // Only advertise encodings the rewrite pipeline can decode and re-encode.
+    let method_is_cacheable = req.method() == Method::GET;
+    let request_can_use_shared_template = method_is_cacheable
+        && matches!(assembly_mode, AssemblyMode::Esi)
+        && !request_had_authorization
+        && !cookie_disqualifies
+        && !request_requires_origin;
+
+    // Only advertise encodings the rewrite pipeline can decode and re-encode. A cold
+    // reservation switches this to the canonical shared offer after lookup; an
+    // unsupported/backend-failed cache keeps the reader-compatible offer for inline.
     restrict_accept_encoding(&mut req);
     // Strip the internal `fastly-ssl` scheme signal before forwarding to the
     // origin. On the EdgeZero path the entry point re-injects this header from
@@ -3649,30 +3666,33 @@ pub async fn handle_publisher_request(
     // POST to a path whose GET is cached with the cached page, and the origin never sees
     // the mutating request. No error, no log, the action silently swallowed. A POST is
     // not entitled to a GET's representation.
-    let method_is_cacheable = req.method() == Method::GET;
     if !method_is_cacheable && !matches!(assembly_mode, AssemblyMode::Inline) {
         log::debug!(
             "c2_template_cache bypass: method {} is not eligible for a shared template",
             req.method()
         );
     }
-    let template_cache_key = (method_is_cacheable
-        && !matches!(assembly_mode, AssemblyMode::Inline))
-    .then(|| crate::platform::TemplateCacheKey {
-        url: target_uri.to_string(),
-        request_host: request_host.to_string(),
-        request_scheme: request_scheme.to_string(),
-        origin_identity: format!("{}\0{}", settings.publisher.origin_url, origin_host_header),
-        assembly_mode,
-        vary_values: settings
-            .creative_opportunities
-            .as_ref()
-            .map(CreativeOpportunitiesConfig::template_cache_vary)
-            .unwrap_or_else(|| VarySpec::new([]))
-            .values_from(req.headers()),
-        template_fingerprint: template_fingerprint(settings),
-        schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
-    });
+    if request_requires_origin && matches!(assembly_mode, AssemblyMode::Esi) {
+        log::debug!(
+            "c2_template_cache bypass: request cache semantics or diagnostics require origin"
+        );
+    }
+    let template_cache_key =
+        request_can_use_shared_template.then(|| crate::platform::TemplateCacheKey {
+            url: target_uri.to_string(),
+            request_host: request_host.to_string(),
+            request_scheme: request_scheme.to_string(),
+            origin_identity: format!("{}\0{}", settings.publisher.origin_url, origin_host_header),
+            assembly_mode,
+            vary_values: settings
+                .creative_opportunities
+                .as_ref()
+                .map(CreativeOpportunitiesConfig::template_cache_vary)
+                .unwrap_or_else(|| VarySpec::new([]))
+                .values_from(req.headers()),
+            template_fingerprint: template_fingerprint(settings),
+            schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
+        });
     *req.uri_mut() = target_uri;
     req.headers_mut().insert(
         header::HOST,
@@ -3698,12 +3718,10 @@ pub async fn handle_publisher_request(
     // re-run are the *request*-derived disqualifications, because they are properties
     // of this request rather than of the stored bytes. An authenticated request must
     // not be served a shared template even if that template is perfectly cacheable.
-    if let Some(key) = template_cache_key
-        .as_ref()
-        .filter(|_| !request_had_authorization && !cookie_disqualifies)
-    {
-        match services.template_cache().get(key).await {
-            Ok(entry) => {
+    let mut template_cache_reservation = None;
+    if let Some(key) = template_cache_key.as_ref() {
+        match services.template_cache().lookup_or_reserve(key).await {
+            Ok(crate::platform::TemplateCacheLookup::Hit(entry)) => {
                 log::debug!("c2_template_cache hit: {} bytes", entry.body.len());
 
                 // The **strict** check — exactly one marker — and it runs here, before a
@@ -3729,6 +3747,11 @@ pub async fn handle_publisher_request(
                         "c2_template_cache hit is unusable ({err}); treating as a miss. \
                          The transform changed without TEMPLATE_SCHEMA_VERSION moving."
                     );
+                    if let Err(purge_err) = services.template_cache().purge_url(key).await {
+                        log::warn!(
+                            "c2_template_cache could not purge unusable URL variants: {purge_err}"
+                        );
+                    }
                 } else {
                     // Deliberately *not* assembled here. The auction is still in flight,
                     // and awaiting it now would hold the first byte until it resolves —
@@ -3758,8 +3781,36 @@ pub async fn handle_publisher_request(
                     });
                 }
             }
-            Err(miss) => log::debug!("c2_template_cache miss: {miss}"),
+            Ok(crate::platform::TemplateCacheLookup::Reserved(reservation)) => {
+                log::debug!("c2_template_cache cold miss: insert reservation acquired");
+                template_cache_reservation = Some(reservation);
+            }
+            Ok(crate::platform::TemplateCacheLookup::Unsupported) => {
+                log::debug!("c2_template_cache bypass: platform has no shared cache");
+            }
+            Ok(crate::platform::TemplateCacheLookup::Invalid(miss)) => {
+                log::warn!(
+                    "c2_template_cache invalid entry: {miss}; purging and falling back inline"
+                );
+                if let Err(purge_err) = services.template_cache().purge_url(key).await {
+                    log::warn!(
+                        "c2_template_cache could not purge invalid URL variants: {purge_err}"
+                    );
+                }
+            }
+            Err(err) => log::warn!("c2_template_cache backend failure: {err}; falling back inline"),
         }
+    }
+
+    // Every actual shared miss offers the same supported set upstream. The stored
+    // template is decoded to identity, so reader encoding neither changes nor
+    // partitions C2. Do this only after acquiring a reservation: adapters without C2
+    // fall back inline and must retain the reader-compatible offer above.
+    if template_cache_reservation.is_some() {
+        req.headers_mut().insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("br, gzip, deflate"),
+        );
     }
 
     // SSP requests are already racing through the platform HTTP client, so
@@ -3833,30 +3884,34 @@ pub async fn handle_publisher_request(
         .and_then(|h| h.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    let template_cache_key = template_cache_key.filter(|_| {
-        match c2_bypass_reason(
-            assembly_mode,
-            request_had_authorization,
-            cookie_disqualifies,
-            response.status(),
-            &gate_content_type,
-            response.headers(),
-            &settings
-                .creative_opportunities
-                .as_ref()
-                .map(CreativeOpportunitiesConfig::template_cache_vary)
-                .unwrap_or_else(|| VarySpec::new([])),
-        ) {
-            Some(reason) => {
-                log::debug!("c2_template_cache bypass: {reason}");
-                false
+    let template_cache_key =
+        template_cache_reservation.and_then(|reservation| {
+            match c2_cache_ttl(
+                assembly_mode,
+                request_had_authorization,
+                cookie_disqualifies,
+                response.status(),
+                &gate_content_type,
+                response.headers(),
+                &settings
+                    .creative_opportunities
+                    .as_ref()
+                    .map(CreativeOpportunitiesConfig::template_cache_vary)
+                    .unwrap_or_else(|| VarySpec::new([])),
+            ) {
+                Err(reason) => {
+                    log::debug!("c2_template_cache bypass: {reason}");
+                    None
+                }
+                Ok(ttl) => {
+                    log::debug!("c2_template_cache eligible for {}s", ttl.as_secs());
+                    Some(AuthorizedTemplateStore {
+                        reservation,
+                        max_age: ttl,
+                    })
+                }
             }
-            None => {
-                log::debug!("c2_template_cache eligible");
-                true
-            }
-        }
-    });
+        });
 
     // Both seams resolve the mode the same way, from the gate's verdict rather than
     // from configuration. Deciding them independently is what produced a document with
@@ -4702,6 +4757,14 @@ pub(crate) enum C2BypassReason {
     /// The origin declared the response non-shareable.
     #[display("origin marked the response private, no-store or no-cache")]
     OriginNotShareable,
+    /// Cache directives or HTTP dates were malformed. Failing closed prevents a
+    /// parser disagreement from extending a representation's lifetime.
+    #[display("origin cache policy is malformed")]
+    MalformedCachePolicy,
+    /// Core Cache has no HTTP heuristic freshness. C2 therefore requires an explicit,
+    /// still-positive origin lifetime rather than inventing one.
+    #[display("origin response has no positive shared freshness")]
+    NoPositiveFreshness,
     /// The request was authenticated. #1009 describes a Basic-Auth-gated
     /// deployment, so an authorized response entering a shared cache is a live
     /// concern rather than a hypothetical one.
@@ -4744,6 +4807,47 @@ pub(crate) enum C2BypassReason {
     VaryWildcard,
 }
 
+fn request_bypasses_c2(headers: &edgezero_core::http::HeaderMap) -> bool {
+    const CONDITIONAL_OR_PARTIAL: &[&str] = &[
+        "range",
+        "if-range",
+        "if-match",
+        "if-none-match",
+        "if-modified-since",
+        "if-unmodified-since",
+    ];
+    if CONDITIONAL_OR_PARTIAL
+        .iter()
+        .any(|name| headers.contains_key(*name))
+    {
+        return true;
+    }
+
+    for value in headers.get_all(header::CACHE_CONTROL) {
+        let Ok(value) = value.to_str() else {
+            return true;
+        };
+        for directive in value.split(',').map(str::trim) {
+            let (name, argument) = directive
+                .split_once('=')
+                .map_or((directive, None), |(name, value)| (name, Some(value)));
+            match name.trim().to_ascii_lowercase().as_str() {
+                "no-cache" | "no-store" => return true,
+                "max-age" if argument.is_some_and(|value| value.trim_matches('"') == "0") => {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    headers.get_all(header::PRAGMA).iter().any(|value| {
+        value
+            .to_str()
+            .map_or(true, |value| value.eq_ignore_ascii_case("no-cache"))
+    })
+}
+
 /// The header names an origin's `Vary` named that the cache key did not cover.
 ///
 /// A newtype rather than a bare `Vec<String>` so [`C2BypassReason`] stays `Display`-able
@@ -4767,6 +4871,7 @@ impl core::fmt::Display for VaryGap {
 /// See `docs/superpowers/specs/2026-08-08-esi-cacheable-root-validation-design.md`
 /// §6.6 for why C1, C2 and a final assembled-response cache are distinct, and why
 /// the third must never exist.
+#[cfg(test)]
 pub(crate) fn c2_bypass_reason(
     mode: AssemblyMode,
     request_had_authorization: bool,
@@ -4776,67 +4881,167 @@ pub(crate) fn c2_bypass_reason(
     response_headers: &edgezero_core::http::HeaderMap,
     key_vary: &VarySpec,
 ) -> Option<C2BypassReason> {
+    c2_cache_ttl(
+        mode,
+        request_had_authorization,
+        cookie_disqualifies,
+        status,
+        content_type,
+        response_headers,
+        key_vary,
+    )
+    .err()
+}
+
+/// Safety ceiling for a shared transformed template. The origin may authorize less,
+/// never more; its `Age` is deducted before this cap is applied.
+const MAX_TEMPLATE_CACHE_TTL: Duration = Duration::from_secs(60);
+
+fn single_header_value<'a>(
+    headers: &'a edgezero_core::http::HeaderMap,
+    name: header::HeaderName,
+) -> Result<Option<&'a str>, C2BypassReason> {
+    let mut values = headers.get_all(name).iter();
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(C2BypassReason::MalformedCachePolicy);
+    }
+    first
+        .to_str()
+        .map(Some)
+        .map_err(|_| C2BypassReason::MalformedCachePolicy)
+}
+
+fn parse_delta_seconds(value: &str) -> Result<u64, C2BypassReason> {
+    value
+        .trim()
+        .trim_matches('"')
+        .parse::<u64>()
+        .map_err(|_| C2BypassReason::MalformedCachePolicy)
+}
+
+fn origin_shared_ttl(headers: &edgezero_core::http::HeaderMap) -> Result<Duration, C2BypassReason> {
+    let mut max_age = None;
+    let mut shared_max_age = None;
+
+    for value in headers.get_all(header::CACHE_CONTROL) {
+        let value = value
+            .to_str()
+            .map_err(|_| C2BypassReason::MalformedCachePolicy)?;
+        for directive in value.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+            let (name, value) = directive
+                .split_once('=')
+                .map_or((directive, None), |(name, value)| (name, Some(value)));
+            match name.trim().to_ascii_lowercase().as_str() {
+                "private" | "no-store" | "no-cache" => {
+                    return Err(C2BypassReason::OriginNotShareable);
+                }
+                "max-age" => {
+                    let parsed =
+                        parse_delta_seconds(value.ok_or(C2BypassReason::MalformedCachePolicy)?)?;
+                    if max_age.replace(parsed).is_some() {
+                        return Err(C2BypassReason::MalformedCachePolicy);
+                    }
+                }
+                "s-maxage" => {
+                    let parsed =
+                        parse_delta_seconds(value.ok_or(C2BypassReason::MalformedCachePolicy)?)?;
+                    if shared_max_age.replace(parsed).is_some() {
+                        return Err(C2BypassReason::MalformedCachePolicy);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let freshness = match shared_max_age.or(max_age) {
+        Some(seconds) => seconds,
+        None => {
+            let expires = single_header_value(headers, header::EXPIRES)?
+                .ok_or(C2BypassReason::NoPositiveFreshness)
+                .and_then(|value| {
+                    httpdate::parse_http_date(value)
+                        .map_err(|_| C2BypassReason::MalformedCachePolicy)
+                })?;
+            let date = match single_header_value(headers, header::DATE)? {
+                Some(value) => httpdate::parse_http_date(value)
+                    .map_err(|_| C2BypassReason::MalformedCachePolicy)?,
+                None => std::time::SystemTime::now(),
+            };
+            expires
+                .duration_since(date)
+                .map_err(|_| C2BypassReason::NoPositiveFreshness)?
+                .as_secs()
+        }
+    };
+
+    let age = single_header_value(headers, header::AGE)?
+        .map(parse_delta_seconds)
+        .transpose()?
+        .unwrap_or(0);
+    let remaining = freshness
+        .checked_sub(age)
+        .filter(|seconds| *seconds > 0)
+        .ok_or(C2BypassReason::NoPositiveFreshness)?;
+    Ok(Duration::from_secs(remaining).min(MAX_TEMPLATE_CACHE_TTL))
+}
+
+pub(crate) fn c2_cache_ttl(
+    mode: AssemblyMode,
+    request_had_authorization: bool,
+    cookie_disqualifies: bool,
+    status: StatusCode,
+    content_type: &str,
+    response_headers: &edgezero_core::http::HeaderMap,
+    key_vary: &VarySpec,
+) -> Result<Duration, C2BypassReason> {
     if matches!(mode, AssemblyMode::Inline) {
-        return Some(C2BypassReason::InlineMode);
+        return Err(C2BypassReason::InlineMode);
     }
     if request_had_authorization {
-        return Some(C2BypassReason::AuthorizedRequest);
+        return Err(C2BypassReason::AuthorizedRequest);
     }
     if cookie_disqualifies {
-        return Some(C2BypassReason::CookieForwarded);
+        return Err(C2BypassReason::CookieForwarded);
     }
     if response_headers.contains_key(header::SET_COOKIE) {
-        return Some(C2BypassReason::OriginSetCookie);
+        return Err(C2BypassReason::OriginSetCookie);
     }
     // Checked here, among the leak vectors, because storing under a key that does not
     // cover the origin's Vary is cross-serving rather than mere ineligibility: a request
     // differing only in the uncovered header would read this template.
-    if response_headers
-        .get_all(header::VARY)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .any(|name| name.trim() == "*")
-    {
-        return Some(C2BypassReason::VaryWildcard);
+    let mut vary_values = Vec::new();
+    for value in response_headers.get_all(header::VARY) {
+        let value = value
+            .to_str()
+            .map_err(|_| C2BypassReason::MalformedCachePolicy)?;
+        for name in value
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            if name == "*" {
+                return Err(C2BypassReason::VaryWildcard);
+            }
+            header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| C2BypassReason::MalformedCachePolicy)?;
+        }
+        vary_values.push(value);
     }
-    let uncovered = key_vary.uncovered_by(
-        response_headers
-            .get_all(header::VARY)
-            .iter()
-            .filter_map(|value| value.to_str().ok()),
-    );
+    let uncovered = key_vary.uncovered_by(vary_values);
     if !uncovered.is_empty() {
-        return Some(C2BypassReason::VaryNotCovered(VaryGap(uncovered)));
-    }
-    // Every value, not the first. `Cache-Control` may arrive as repeated header lines —
-    // `Cache-Control: public, max-age=300` then `Cache-Control: private` — and HTTP
-    // treats that identically to one comma-joined line. `HeaderMap::get` returns only
-    // the first, so a `private` or `no-store` in a later line was invisible and the
-    // response was stored in a cache shared between readers. Same fail-open shape as the
-    // `Vary` reads above, which is why those already use `get_all`.
-    //
-    // `private` and `no-store` match the cookie-privacy net's reading; `no-cache` is
-    // added because it means "revalidate before reuse" rather than "do not store" —
-    // correct for an HTTP cache, too permissive for a spike-owned one.
-    let non_shareable = response_headers
-        .get_all(header::CACHE_CONTROL)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .map(str::to_ascii_lowercase)
-        .any(|value| {
-            value.contains("private") || value.contains("no-store") || value.contains("no-cache")
-        });
-    if non_shareable {
-        return Some(C2BypassReason::OriginNotShareable);
+        return Err(C2BypassReason::VaryNotCovered(VaryGap(uncovered)));
     }
     if status != StatusCode::OK {
-        return Some(C2BypassReason::NonOkStatus);
+        return Err(C2BypassReason::NonOkStatus);
     }
     if !is_html_content_type(content_type) {
-        return Some(C2BypassReason::NotHtml);
+        return Err(C2BypassReason::NotHtml);
     }
-    None
+    origin_shared_ttl(response_headers)
 }
 
 /// What the `<head>` seam injects, given the assembly mode.
@@ -6324,7 +6529,31 @@ mod tests {
         /// about a call not returning an error.
         #[derive(Default)]
         struct RecordingCache {
-            stored: Mutex<Vec<(String, usize)>>,
+            stored: Arc<Mutex<Vec<(String, usize)>>>,
+        }
+
+        struct RecordingReservation {
+            stored: Arc<Mutex<Vec<(String, usize)>>>,
+            url: String,
+        }
+
+        impl crate::platform::PlatformTemplateCacheReservation for RecordingReservation {
+            fn insert(
+                self: Box<Self>,
+                _metadata: &crate::platform::TemplateMetadata,
+                body: Vec<u8>,
+                _max_age: Duration,
+            ) -> Result<(), crate::platform::TemplateCacheError> {
+                self.stored
+                    .lock()
+                    .expect("should lock recorded stores")
+                    .push((self.url, body.len()));
+                Ok(())
+            }
+
+            fn cancel(self: Box<Self>) -> Result<(), crate::platform::TemplateCacheError> {
+                Ok(())
+            }
         }
 
         #[async_trait::async_trait(?Send)]
@@ -6342,11 +6571,19 @@ mod tests {
                 key: &crate::platform::TemplateCacheKey,
                 _metadata: &crate::platform::TemplateMetadata,
                 body: Vec<u8>,
+                _max_age: Duration,
             ) -> Result<(), crate::platform::TemplateCacheError> {
                 self.stored
                     .lock()
                     .expect("should lock recorded stores")
                     .push((key.url.clone(), body.len()));
+                Ok(())
+            }
+
+            async fn purge_url(
+                &self,
+                _key: &crate::platform::TemplateCacheKey,
+            ) -> Result<(), crate::platform::TemplateCacheError> {
                 Ok(())
             }
 
@@ -6374,6 +6611,18 @@ mod tests {
                 vary_values: vec![],
                 template_fingerprint: "fp".to_string(),
                 schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
+            }
+        }
+
+        fn authorization(cache: &RecordingCache) -> AuthorizedTemplateStore {
+            AuthorizedTemplateStore {
+                reservation: crate::platform::TemplateCacheReservation::new(Box::new(
+                    RecordingReservation {
+                        stored: Arc::clone(&cache.stored),
+                        url: key().url,
+                    },
+                )),
+                max_age: Duration::from_secs(30),
             }
         }
 
@@ -6414,7 +6663,7 @@ mod tests {
             let cache = Arc::new(RecordingCache::default());
             let settings = create_test_settings();
             let mut params = make_stream_params(&settings, "identity");
-            params.template_cache_key = Some(key());
+            params.template_cache_key = Some(authorization(&cache));
 
             store_template_if_authorized(
                 &services_with(Arc::clone(&cache)),
@@ -6438,7 +6687,7 @@ mod tests {
             let cache = Arc::new(RecordingCache::default());
             let settings = create_test_settings();
             let mut params = make_stream_params(&settings, "identity");
-            params.template_cache_key = Some(key());
+            params.template_cache_key = Some(authorization(&cache));
             let services = services_with(Arc::clone(&cache));
 
             store_template_if_authorized(&services, &mut params, b"first").await;
@@ -6469,19 +6718,80 @@ mod tests {
         /// what it stored, or a hit proves nothing.
         #[derive(Default)]
         struct MemoryTemplateCache {
-            entries: Mutex<HashMap<String, crate::platform::TemplateEntry>>,
+            entries: Arc<Mutex<HashMap<String, crate::platform::TemplateEntry>>>,
             /// Every key `get` was called with, so a test can assert what was *asked
             /// for* rather than only what came back. A lookup that names a schema
             /// version this binary cannot assemble is the bug; whether the entry
             /// happened to survive the later marker check is not the same question.
-            lookups: Mutex<Vec<crate::platform::TemplateCacheKey>>,
+            lookups: Arc<Mutex<Vec<crate::platform::TemplateCacheKey>>>,
             /// Every key `put` was called with, so a test can re-key an entry exactly
             /// instead of reconstructing what the request derived.
-            stored_keys: Mutex<Vec<crate::platform::TemplateCacheKey>>,
+            stored_keys: Arc<Mutex<Vec<crate::platform::TemplateCacheKey>>>,
+        }
+
+        struct MemoryTemplateReservation {
+            entries: Arc<Mutex<HashMap<String, crate::platform::TemplateEntry>>>,
+            stored_keys: Arc<Mutex<Vec<crate::platform::TemplateCacheKey>>>,
+            key: crate::platform::TemplateCacheKey,
+        }
+
+        impl crate::platform::PlatformTemplateCacheReservation for MemoryTemplateReservation {
+            fn insert(
+                self: Box<Self>,
+                metadata: &crate::platform::TemplateMetadata,
+                body: Vec<u8>,
+                _max_age: Duration,
+            ) -> Result<(), crate::platform::TemplateCacheError> {
+                self.stored_keys
+                    .lock()
+                    .expect("should lock stored keys")
+                    .push(self.key.clone());
+                self.entries.lock().expect("should lock entries").insert(
+                    self.key.to_cache_key(),
+                    crate::platform::TemplateEntry {
+                        metadata: metadata.clone(),
+                        body,
+                    },
+                );
+                Ok(())
+            }
+
+            fn cancel(self: Box<Self>) -> Result<(), crate::platform::TemplateCacheError> {
+                Ok(())
+            }
         }
 
         #[async_trait::async_trait(?Send)]
         impl crate::platform::PlatformTemplateCache for MemoryTemplateCache {
+            async fn lookup_or_reserve(
+                &self,
+                key: &crate::platform::TemplateCacheKey,
+            ) -> Result<crate::platform::TemplateCacheLookup, crate::platform::TemplateCacheError>
+            {
+                self.lookups
+                    .lock()
+                    .expect("should lock lookups")
+                    .push(key.clone());
+                if let Some(entry) = self
+                    .entries
+                    .lock()
+                    .expect("should lock entries")
+                    .get(&key.to_cache_key())
+                    .cloned()
+                {
+                    return Ok(crate::platform::TemplateCacheLookup::Hit(entry));
+                }
+                Ok(crate::platform::TemplateCacheLookup::Reserved(
+                    crate::platform::TemplateCacheReservation::new(Box::new(
+                        MemoryTemplateReservation {
+                            entries: Arc::clone(&self.entries),
+                            stored_keys: Arc::clone(&self.stored_keys),
+                            key: key.clone(),
+                        },
+                    )),
+                ))
+            }
+
             async fn get(
                 &self,
                 key: &crate::platform::TemplateCacheKey,
@@ -6504,6 +6814,7 @@ mod tests {
                 key: &crate::platform::TemplateCacheKey,
                 metadata: &crate::platform::TemplateMetadata,
                 body: Vec<u8>,
+                _max_age: Duration,
             ) -> Result<(), crate::platform::TemplateCacheError> {
                 self.stored_keys
                     .lock()
@@ -6516,6 +6827,17 @@ mod tests {
                         body,
                     },
                 );
+                Ok(())
+            }
+
+            async fn purge_url(
+                &self,
+                key: &crate::platform::TemplateCacheKey,
+            ) -> Result<(), crate::platform::TemplateCacheError> {
+                self.entries
+                    .lock()
+                    .expect("should lock entries")
+                    .remove(&key.to_cache_key());
                 Ok(())
             }
 
@@ -6965,6 +7287,36 @@ mod tests {
             );
         }
 
+        #[tokio::test]
+        async fn revalidation_partial_and_conditional_requests_bypass_a_warm_template() {
+            for (name, value) in [
+                (header::CACHE_CONTROL, "no-cache"),
+                (header::PRAGMA, "no-cache"),
+                (header::RANGE, "bytes=0-31"),
+                (header::IF_NONE_MATCH, "\"reader-validator\""),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let settings = Arc::new(settings_with_mode("esi"));
+                let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                queue_shareable_html(&stub);
+                queue_shareable_html(&stub);
+
+                let _ = body_of(run(&settings, &services, navigation_request()).await).await;
+                let mut revalidating = navigation_request();
+                revalidating
+                    .headers_mut()
+                    .insert(name.clone(), HeaderValue::from_static(value));
+                let _ = body_of(run(&settings, &services, revalidating).await).await;
+
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    2,
+                    "{name}: {value} must reach the origin even when C2 is warm"
+                );
+            }
+        }
+
         fn header_of(response: &Response<EdgeBody>, name: header::HeaderName) -> Option<&str> {
             response.headers().get(name).and_then(|v| v.to_str().ok())
         }
@@ -7101,6 +7453,15 @@ mod tests {
             assert!(
                 served.contains("window.tsjs"),
                 "and the fallback must still deliver the seam: {served}"
+            );
+            assert!(
+                cache
+                    .entries
+                    .lock()
+                    .expect("should lock entries")
+                    .is_empty(),
+                "an unusable fresh object must be purged instead of forcing inline fallback \
+                 until its TTL expires"
             );
         }
 
@@ -7903,6 +8264,37 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn active_diagnostics_bypass_an_already_warm_template() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+            queue_shareable_html(&stub);
+
+            let _ = body_of(run(&settings, &services, navigation_request()).await).await;
+            let response = run(&settings, &services, diagnostics_navigation_request()).await;
+            let document = String::from_utf8(body_of(response).await)
+                .expect("diagnostics document should be UTF-8");
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "request-private diagnostics must reach the origin even when an ordinary \
+                 shared template is warm"
+            );
+            assert_eq!(
+                cache.lookups.lock().expect("should lock lookups").len(),
+                1,
+                "the diagnostics request must not consult C2 at all"
+            );
+            assert!(
+                document.contains("__tsjs_gpt_diagnostics_active"),
+                "origin fallback must retain the request-private diagnostics bootstrap"
+            );
+        }
+
+        #[tokio::test]
         async fn a_cache_hit_streams_rather_than_buffering() {
             // The property that makes the cache worth having, and the one that regressed
             // silently. Buffered assembly held the first byte until the auction resolved
@@ -8375,6 +8767,113 @@ mod tests {
                 ),
                 None
             );
+        }
+
+        #[test]
+        fn origin_freshness_is_positive_age_adjusted_and_capped() {
+            let fresh_headers = headers(&[(header::CACHE_CONTROL, "public, max-age=300")]);
+            assert_eq!(
+                c2_cache_ttl(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &fresh_headers,
+                    &nothing_covered(),
+                ),
+                Ok(MAX_TEMPLATE_CACHE_TTL)
+            );
+
+            let aged = headers(&[
+                (header::CACHE_CONTROL, "s-maxage=50, max-age=300"),
+                (header::AGE, "35"),
+            ]);
+            assert_eq!(
+                c2_cache_ttl(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &aged,
+                    &nothing_covered(),
+                ),
+                Ok(Duration::from_secs(15))
+            );
+        }
+
+        #[test]
+        fn zero_exhausted_missing_and_malformed_freshness_are_refused() {
+            for (map, expected) in [
+                (
+                    headers(&[(header::CACHE_CONTROL, "max-age=0")]),
+                    C2BypassReason::NoPositiveFreshness,
+                ),
+                (
+                    headers(&[(header::CACHE_CONTROL, "max-age=60"), (header::AGE, "60")]),
+                    C2BypassReason::NoPositiveFreshness,
+                ),
+                (
+                    headers(&[(header::CACHE_CONTROL, "public")]),
+                    C2BypassReason::NoPositiveFreshness,
+                ),
+                (
+                    headers(&[(header::CACHE_CONTROL, "max-age=tomorrow")]),
+                    C2BypassReason::MalformedCachePolicy,
+                ),
+            ] {
+                assert_eq!(
+                    c2_bypass_reason(
+                        AssemblyMode::Esi,
+                        false,
+                        false,
+                        StatusCode::OK,
+                        "text/html",
+                        &map,
+                        &nothing_covered(),
+                    ),
+                    Some(expected)
+                );
+            }
+        }
+
+        #[test]
+        fn expires_can_authorize_but_never_extend_an_expired_response() {
+            let fresh = headers(&[
+                (header::DATE, "Wed, 12 Aug 2026 08:00:00 GMT"),
+                (header::EXPIRES, "Wed, 12 Aug 2026 08:00:30 GMT"),
+            ]);
+            assert_eq!(origin_shared_ttl(&fresh), Ok(Duration::from_secs(30)));
+
+            let expired = headers(&[
+                (header::DATE, "Wed, 12 Aug 2026 08:01:00 GMT"),
+                (header::EXPIRES, "Wed, 12 Aug 2026 08:00:30 GMT"),
+            ]);
+            assert_eq!(
+                origin_shared_ttl(&expired),
+                Err(C2BypassReason::NoPositiveFreshness)
+            );
+        }
+
+        #[test]
+        fn request_revalidation_partial_and_conditional_semantics_bypass_c2() {
+            for (name, value) in [
+                (header::CACHE_CONTROL, "no-cache"),
+                (header::CACHE_CONTROL, "max-age=0"),
+                (header::CACHE_CONTROL, "no-store"),
+                (header::PRAGMA, "no-cache"),
+                (header::RANGE, "bytes=0-99"),
+                (header::IF_NONE_MATCH, "\"etag\""),
+                (header::IF_MODIFIED_SINCE, "Wed, 12 Aug 2026 08:00:00 GMT"),
+            ] {
+                let map = headers(&[(name.clone(), value)]);
+                assert!(request_bypasses_c2(&map), "{name}: {value} must bypass");
+            }
+            assert!(!request_bypasses_c2(&headers(&[(
+                header::CACHE_CONTROL,
+                "max-age=30"
+            )])));
         }
 
         #[test]
