@@ -1094,6 +1094,27 @@ test('registered integration dispatch selects post-switch evidence without chang
   );
 });
 
+test('protected real-GAM evidence is dispatchable for an unmerged branch without duplicating the suite', () => {
+  const integrationWorkflow = fs.readFileSync(
+    path.join(repositoryRoot, '.github/workflows/integration-tests.yml'),
+    'utf8'
+  );
+  const realGamWorkflow = fs.readFileSync(
+    path.join(repositoryRoot, '.github/workflows/aps-real-gam.yml'),
+    'utf8'
+  );
+  assert.match(realGamWorkflow, /workflow_call:/);
+  assert.doesNotMatch(integrationWorkflow, /real_gam_evidence_id:/);
+  assert.match(
+    integrationWorkflow,
+    /real-gam-attestation:[\s\S]*?startsWith\(inputs\.evidence_id, 'aps-tsjs-cutover-'\)[\s\S]*?uses: \.\/\.github\/workflows\/aps-real-gam\.yml/
+  );
+  assert.match(
+    integrationWorkflow,
+    /real-gam-attestation:[\s\S]*?evidence_id: \$\{\{ inputs\.evidence_id \}\}/
+  );
+});
+
 test('cutover workflows bind exact release evidence and prior artifact provenance', () => {
   const qualityWorkflow = fs.readFileSync(
     path.join(repositoryRoot, '.github/workflows/test.yml'),
@@ -1105,6 +1126,20 @@ test('cutover workflows bind exact release evidence and prior artifact provenanc
   );
   const realGamWorkflow = fs.readFileSync(
     path.join(repositoryRoot, '.github/workflows/aps-real-gam.yml'),
+    'utf8'
+  );
+  const realGamNetwork = fs.readFileSync(
+    path.join(
+      repositoryRoot,
+      'crates/trusted-server-integration-tests/browser/helpers/gam-test-network.ts'
+    ),
+    'utf8'
+  );
+  const hardCutoverPolicy = fs.readFileSync(
+    path.join(
+      repositoryRoot,
+      'crates/trusted-server-js/lib/scripts/check-hard-cutover-absence.mjs'
+    ),
     'utf8'
   );
 
@@ -1137,6 +1172,8 @@ test('cutover workflows bind exact release evidence and prior artifact provenanc
   assert.match(integrationWorkflow, /Scrub all integration evidence before upload/);
   assert.match(realGamWorkflow, /aps-real-gam-\$\{\{ github\.run_id \}\}/);
   assert.match(realGamWorkflow, /capabilities\?/);
+  assert.match(realGamNetwork, /pucRelease\.value !== expectedPucRelease/);
+  assert.match(hardCutoverPolicy, /PUC package is vendored into the local harness/);
 });
 
 test('release id changes independently with id, role, phase, trigger, bytes, and order', () => {

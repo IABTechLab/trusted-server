@@ -15,11 +15,13 @@ type BrowserName = "chromium" | "firefox" | "webkit";
 
 const RELEASE_ID_PATTERN = /^[0-9a-f]{64}$/u;
 const APS_RENDERER_PATH = "/integrations/aps/renderer/v1";
-const APS_RUNNER_PATH = "/integrations/aps/runner/v1";
+const APS_RUNNER_PATH = "/integrations/aps/runner.js";
 const EVIDENCE_ROOT = resolve(__dirname, "../real-gam-evidence");
 const TERMINAL_STATE = "terminal";
 const WIDTH = 300;
 const HEIGHT = 250;
+
+export const REAL_GAM_PUC_RELEASE = "1.17.2";
 
 const PROTOCOL_MESSAGES = [
   "Prebid Request",
@@ -420,15 +422,19 @@ function hasRendererAncestor(frame: Frame): boolean {
   return false;
 }
 
-function classifyUrl(
+export function classifyRealGamNetworkUrl(
   rawUrl: string,
   pageOrigin: string,
   request?: Request,
 ): NetworkEvidence["kind"] {
   const url = parsedUrl(rawUrl);
   if (!url) return "third-party";
-  if (url.pathname === APS_RENDERER_PATH) return "renderer";
-  if (url.pathname === APS_RUNNER_PATH) return "runner-proxy";
+  if (url.origin === pageOrigin && url.pathname === APS_RENDERER_PATH) {
+    return "renderer";
+  }
+  if (url.origin === pageOrigin && url.pathname === APS_RUNNER_PATH) {
+    return "runner-proxy";
+  }
   if (
     (url.hostname === "securepubads.g.doubleclick.net" &&
       url.pathname === "/tag/js/gpt.js") ||
@@ -446,7 +452,7 @@ function classifyUrl(
   }
   if (url.origin === pageOrigin) {
     try {
-      if (request?.frame() === request?.frame().page().mainFrame()) {
+      if (request && request.frame() === request.frame().page().mainFrame()) {
         return "test-page";
       }
     } catch {
@@ -579,7 +585,11 @@ class EvidenceCollector {
       const record: NetworkEvidence = {
         sequence: this.#network.length + 1,
         atMs: elapsed(this.#startedAt),
-        kind: classifyUrl(request.url(), this.#pageOrigin, request),
+        kind: classifyRealGamNetworkUrl(
+          request.url(),
+          this.#pageOrigin,
+          request,
+        ),
         method: safeMethod(request.method()),
         resourceType: safeResourceType(request.resourceType()),
       };
@@ -619,7 +629,10 @@ class EvidenceCollector {
       textBytes: Buffer.byteLength(text, "utf8"),
       textSha256: sha256(text),
       argumentCount: message.args().length,
-      sourceKind: classifyUrl(message.location().url, this.#pageOrigin),
+      sourceKind: classifyRealGamNetworkUrl(
+        message.location().url,
+        this.#pageOrigin,
+      ),
     });
   }
 
@@ -762,7 +775,7 @@ function parseSnapshot(value: unknown): CaseSnapshot {
   return value as CaseSnapshot;
 }
 
-async function openProtectedPage(
+export async function openProtectedRealGamPage(
   page: Page,
   environment: RealGamEnvironment,
 ): Promise<void> {
@@ -772,7 +785,7 @@ async function openProtectedPage(
     throw new Error("the protected real-GAM page could not be opened");
   }
   const valid = await page.evaluate(
-    ({ expectedReleaseId, expectedCaseIds }) => {
+    ({ expectedReleaseId, expectedPucRelease, expectedCaseIds }) => {
       try {
         const descriptor = Object.getOwnPropertyDescriptor(
           window,
@@ -786,12 +799,15 @@ async function openProtectedPage(
           !Object.isFrozen(api) ||
           Object.getOwnPropertySymbols(api).length !== 0 ||
           Object.getOwnPropertyNames(api).sort().join("\n") !==
-            ["caseIds", "releaseId", "run", "version"].sort().join("\n")
+            ["caseIds", "pucRelease", "releaseId", "run", "version"]
+              .sort()
+              .join("\n")
         ) {
           return false;
         }
         const version = Object.getOwnPropertyDescriptor(api, "version");
         const releaseId = Object.getOwnPropertyDescriptor(api, "releaseId");
+        const pucRelease = Object.getOwnPropertyDescriptor(api, "pucRelease");
         const caseIds = Object.getOwnPropertyDescriptor(api, "caseIds");
         const run = Object.getOwnPropertyDescriptor(api, "run");
         if (
@@ -801,6 +817,9 @@ async function openProtectedPage(
           !releaseId ||
           !("value" in releaseId) ||
           releaseId.value !== expectedReleaseId ||
+          !pucRelease ||
+          !("value" in pucRelease) ||
+          pucRelease.value !== expectedPucRelease ||
           !caseIds ||
           !("value" in caseIds) ||
           !Array.isArray(caseIds.value) ||
@@ -824,6 +843,7 @@ async function openProtectedPage(
     },
     {
       expectedReleaseId: environment.expectedReleaseId,
+      expectedPucRelease: REAL_GAM_PUC_RELEASE,
       expectedCaseIds: REAL_GAM_CASES.map(({ caseId }) => caseId),
     },
   );
@@ -1444,7 +1464,7 @@ export async function runAttestedRealGamCase(options: {
   try {
     await installBrowserObservers(page);
     phase = "protected-page-contract";
-    await openProtectedPage(page, environment);
+    await openProtectedRealGamPage(page, environment);
     phase = "case-snapshot";
     const snapshot = await invokeCase(
       page,
