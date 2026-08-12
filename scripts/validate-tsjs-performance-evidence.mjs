@@ -9,7 +9,7 @@ const EXPECTED = Object.freeze({
   chromium: "145.0.7632.6",
   machineClass: "github-hosted:ubuntu-24.04",
   runnerImage: "ubuntu-24.04",
-  fixture: "tsjs-core-placeholder-v1",
+  fixture: "tsjs-generated-loopback-v1",
   controller: "generated-server-v1",
   node: "v24.12.0",
   npm: "11.6.2",
@@ -342,7 +342,7 @@ function validFixture() {
         controller: "generated-server-v1",
         machineClass: "github-hosted:ubuntu-24.04",
         runnerImage: "ubuntu-24.04",
-        fixture: "tsjs-core-placeholder-v1",
+        fixture: "tsjs-generated-loopback-v1",
         node: "v24.12.0",
         npm: "11.6.2",
         typescript: "6.0.3",
@@ -509,6 +509,18 @@ function runSelfTest() {
     new URL(".github/workflows/tsjs-performance-gate.yml", repositoryRoot),
     "utf8",
   );
+  const integrationWorkflow = readFileSync(
+    new URL(".github/workflows/integration-tests.yml", repositoryRoot),
+    "utf8",
+  );
+  const browserTestScript = readFileSync(
+    new URL("scripts/integration-tests-browser.sh", repositoryRoot),
+    "utf8",
+  );
+  const apsProxyScript = readFileSync(
+    new URL("scripts/integration-tests-aps-runner-proxy.sh", repositoryRoot),
+    "utf8",
+  );
   const generalTestWorkflow = readFileSync(
     new URL(".github/workflows/test.yml", repositoryRoot),
     "utf8",
@@ -527,6 +539,31 @@ function runSelfTest() {
     performanceTest,
     /__tsjsPerf/u,
     "the browser gate must read real performance entries, never the placeholder API",
+  );
+  assert.match(
+    performanceTest,
+    /from "node:http"/u,
+    "the browser gate must serve the fixture through node:http",
+  );
+  assert.match(
+    performanceTest,
+    /\.listen\(0, "127\.0\.0\.1"/u,
+    "the browser gate must listen on an ephemeral IPv4 loopback port",
+  );
+  assert.match(
+    performanceTest,
+    /FIXTURE_ID = "tsjs-generated-loopback-v1"/u,
+    "the browser gate must identify the generated loopback fixture",
+  );
+  assert.doesNotMatch(
+    performanceTest,
+    /\.route(?:FromHAR)?\(|\.fulfill\(/u,
+    "the browser gate must not intercept or fulfill measured requests through Playwright",
+  );
+  assert.match(
+    performanceTest,
+    /server\.closeAllConnections\(\)/u,
+    "the browser gate must force-close Chromium keepalive connections during cleanup",
   );
   assert.match(
     performanceTest,
@@ -562,6 +599,73 @@ function runSelfTest() {
     performanceWorkflow,
     /setup-integration-test-env|VICEROY|WASM_ARTIFACT|build-test-images/u,
     "the hermetic performance fixture must not build unused runtime infrastructure",
+  );
+  assert.match(
+    performanceWorkflow,
+    /node_version="\$\(awk '\$1 == "nodejs" \{ print \$2 \}' \.tool-versions\)"/u,
+    "the performance workflow must extract the pinned Node.js version with valid awk quoting",
+  );
+  assert.match(
+    performanceWorkflow,
+    /rust_version="\$\(awk '\$1 == "rust" \{ print \$2 \}' \.tool-versions\)"/u,
+    "the performance workflow must extract the pinned Rust version with valid awk quoting",
+  );
+  assert.match(
+    performanceWorkflow,
+    /test -n "\$node_version"[\s\S]*test -n "\$rust_version"/u,
+    "the performance workflow must reject empty toolchain pins",
+  );
+  assert.match(
+    performanceWorkflow,
+    /test "\$\(node --version\)" = "v24\.12\.0"[\s\S]*test "\$\(npm --version\)" = "11\.6\.2"[\s\S]*test "\$\(rustc --version \| awk '\{ print \$2 \}'\)" = "1\.95\.0"/u,
+    "the performance workflow must verify the installed Node.js, npm, and Rust versions",
+  );
+  assert.match(
+    integrationWorkflow,
+    /uses: fermyon\/actions\/spin\/setup@v1[\s\S]{0,100}version: "v4\.0\.2"/u,
+    "the integration workflow must retain Spin's required v-prefixed version",
+  );
+  for (const job of [
+    "prepare-artifacts",
+    "integration-tests",
+    "integration-tests-fastly-ec",
+    "aps-runner-proxy",
+    "browser-tests",
+    "browser-tests-aps-tsjs-conformance",
+  ]) {
+    assert.match(
+      integrationWorkflow,
+      new RegExp(
+        `^  ${job}:\\n(?:    .+\\n)*?    if: github\\.event_name == 'pull_request'$`,
+        "mu",
+      ),
+      `${job} must stay PR-only so manual evidence dispatches run the immutable performance job once`,
+    );
+  }
+  assert.deepEqual(
+    browserTestScript.match(/^cd .+$/gmu),
+    ['cd "$REPO_ROOT"'],
+    "the browser test launcher must remain at the repository root",
+  );
+  assert.equal(
+    browserTestScript.match(/Building TSJS browser fixtures/gu)?.length,
+    1,
+    "the browser test launcher must build TSJS fixtures exactly once",
+  );
+  assert.match(
+    browserTestScript,
+    /npm --prefix "\$BROWSER_DIR" exec --[\s\S]*--config "\$REPO_ROOT\/\$BROWSER_DIR\/playwright\.config\.ts"/u,
+    "the browser test launcher must pass Playwright an absolute config path",
+  );
+  assert.match(
+    apsProxyScript,
+    /ARTIFACTS_DIR="\$\{ARTIFACTS_DIR:-\$REPO_ROOT\/target\/integration-test-artifacts\}"/u,
+    "the APS proxy launcher must establish one effective artifacts directory",
+  );
+  assert.match(
+    apsProxyScript,
+    /VICEROY_CONFIG_PATH="\$ARTIFACTS_DIR\/configs\/viceroy\.toml"/u,
+    "the APS proxy launcher must use the generator's effective artifacts directory",
   );
   assert.doesNotMatch(
     generalTestWorkflow,

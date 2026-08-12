@@ -3693,9 +3693,32 @@ runtime/APS contracts file-by-file.
       first-display adapter through test-only prospective routes/composition; it may
       not switch any production emitter or use `window.__tsjsPerf`. On Chromium
       145.0.7632.6, `github-hosted:ubuntu-24.04`, and fixture
-      `tsjs-core-placeholder-v1`, use exactly five warmups and 50 samples, require the
+      `tsjs-generated-loopback-v1`, use exactly five warmups and 50 samples, require the
       real `tsjs:bids-script` and `tsjs:first-display` marks, and enforce p90 ≤28.6 ms
       without selective reruns.
+
+  **Corrected-instrument amendment (2026-08-12).** The earlier E7 run used
+  Playwright request interception and is invalid evidence: `page.route()` /
+  `route.fulfill()` did not measure a real browser-to-server transport. The corrected
+  instrument serves the exact generated controller document and exact built critical
+  and deferred bytes from one in-process `node:http` server bound to an ephemeral
+  `127.0.0.1` port for the Playwright test. Auction POST and page-bids use that same
+  loopback origin; delayed `gpt_later`, request counts, resource timing, mark timing,
+  manual heap lifecycle, and cleanup remain part of the instrument. Its fixture
+  provenance is `tsjs-generated-loopback-v1`; the unchanged generator remains
+  `generated-server-v1`.
+
+  This transport and provenance correction invalidates commit
+  `a7a9bab36c4eee6bc180e9206ca6c6879303d37a` as the frozen E7 instrument, along
+  with its run, evidence tuple, and any instrument tag. The workflow must extract
+  non-empty repository pins with valid quoting and verify Node.js `v24.12.0`, npm
+  `11.6.2`, and Rust `1.95.0` before measurement. Do not infer or raise a threshold
+  from a local run or another OS. The next single corrected capture on the exact
+  pinned `github-hosted:ubuntu-24.04` environment freezes the corrected instrument
+  and the reviewed threshold decision. The p90 ceiling remains 28.6 ms. Record and
+  review any capture-derived heap constant change before tagging; after that
+  checkpoint, both the corrected instrument bytes and its thresholds are immutable
+  and the normal pre-switch validation/tag sequence below applies.
 
   In one separate fresh Chromium context, run the real fixture once. At each heap
   checkpoint, send `HeapProfiler.collectGarbage` exactly once, immediately read the

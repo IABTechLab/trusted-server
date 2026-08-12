@@ -132,7 +132,7 @@ trap cleanup EXIT
 for framework in "${FRAMEWORKS[@]}"; do
     echo "==> Running Playwright tests for $framework..."
     TEST_FRAMEWORK="$framework" npm --prefix "$BROWSER_DIR" exec -- \
-        playwright test --config "$BROWSER_DIR/playwright.config.ts" "$@"
+        playwright test --config "$REPO_ROOT/$BROWSER_DIR/playwright.config.ts" "$@"
 done
 
 echo "==> All browser tests passed."

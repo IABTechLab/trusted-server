@@ -7,6 +7,11 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import {
+  createServer,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
@@ -15,7 +20,6 @@ import {
   type Browser,
   type BrowserContext,
   type Page,
-  type Route,
 } from "@playwright/test";
 
 const REPO_ROOT = execFileSync("git", ["rev-parse", "--show-toplevel"], {
@@ -31,7 +35,7 @@ const P90_CEILING_MS = 28.6;
 const EXPECTED_CHROMIUM = "145.0.7632.6";
 const MACHINE_CLASS = "github-hosted:ubuntu-24.04";
 const RUNNER_IMAGE = "ubuntu-24.04";
-const FIXTURE_ID = "tsjs-core-placeholder-v1";
+const FIXTURE_ID = "tsjs-generated-loopback-v1";
 const CONTROLLER_ID = "generated-server-v1";
 const CRITICAL_IDS = ["render_runtime", "gpt"] as const;
 const DEFERRED_IDS = ["diagnostics_presentation", "gpt_later"] as const;
@@ -74,6 +78,11 @@ interface FixtureRun {
   deferredRequests: string[];
   pageErrors: string[];
   consoleMessages: string[];
+  close(): Promise<void>;
+}
+
+interface FixtureServer {
+  origin: string;
   close(): Promise<void>;
 }
 
@@ -468,54 +477,80 @@ function noBidAuction(requestBody: unknown) {
   };
 }
 
-async function fulfillFixtureRoute(
-  route: Route,
+function sendResponse(
+  response: ServerResponse,
+  status: number,
+  contentType: string,
+  body: string,
+  script = false,
+): void {
+  response.writeHead(status, {
+    "Content-Type": contentType,
+    ...(script ? { "X-Content-Type-Options": "nosniff" } : {}),
+  });
+  response.end(body);
+}
+
+async function requestJson(request: IncomingMessage): Promise<unknown> {
+  request.setEncoding("utf8");
+  let body = "";
+  for await (const chunk of request) body += chunk;
+  return JSON.parse(body) as unknown;
+}
+
+async function serveFixtureRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
   resources: FixtureResources,
-  manualDisplay: boolean,
 ): Promise<void> {
-  const url = new URL(route.request().url());
+  const url = new URL(request.url ?? "/", "http://127.0.0.1");
   if (url.pathname === "/fixture") {
-    await route.fulfill({
-      status: 200,
-      contentType: "text/html; charset=utf-8",
-      body: fixtureDocument(resources, manualDisplay),
-    });
+    sendResponse(
+      response,
+      200,
+      "text/html; charset=utf-8",
+      fixtureDocument(resources, url.searchParams.get("manual") === "1"),
+    );
     return;
   }
   if (`${url.pathname}${url.search}` === resources.criticalSrc) {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/javascript; charset=utf-8",
-      headers: { "X-Content-Type-Options": "nosniff" },
-      body: resources.criticalBody,
-    });
+    sendResponse(
+      response,
+      200,
+      "application/javascript; charset=utf-8",
+      resources.criticalBody,
+      true,
+    );
     return;
   }
   for (const [id, artifact] of resources.deferred) {
     if (`${url.pathname}${url.search}` !== artifact.src) continue;
     if (id === "gpt_later")
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 200));
-    await route.fulfill({
-      status: 200,
-      contentType: "application/javascript; charset=utf-8",
-      headers: { "X-Content-Type-Options": "nosniff" },
-      body: artifact.body,
-    });
+    sendResponse(
+      response,
+      200,
+      "application/javascript; charset=utf-8",
+      artifact.body,
+      true,
+    );
     return;
   }
   if (url.pathname === "/_ts/auction") {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify(noBidAuction(route.request().postDataJSON())),
-    });
+    sendResponse(
+      response,
+      200,
+      "application/json",
+      JSON.stringify(noBidAuction(await requestJson(request))),
+    );
     return;
   }
   if (url.pathname === "/_ts/page-bids") {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({
+    sendResponse(
+      response,
+      200,
+      "application/json",
+      JSON.stringify({
         version: 1,
         auction: {
           version: 1,
@@ -533,15 +568,68 @@ async function fulfillFixtureRoute(
         ],
         bids: [],
       }),
-    });
+    );
     return;
   }
-  await route.fulfill({ status: 404, body: "not found" });
+  sendResponse(response, 404, "text/plain; charset=utf-8", "not found");
+}
+
+async function startFixtureServer(
+  resources: FixtureResources,
+): Promise<FixtureServer> {
+  const server = createServer((request, response) => {
+    void serveFixtureRequest(request, response, resources).catch((error) => {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      if (response.headersSent) {
+        response.destroy(failure);
+        return;
+      }
+      sendResponse(
+        response,
+        500,
+        "text/plain; charset=utf-8",
+        "fixture server failure",
+      );
+    });
+  });
+  await new Promise<void>((resolveListen, rejectListen) => {
+    const onError = (error: Error) => {
+      server.off("listening", onListening);
+      rejectListen(error);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      resolveListen();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(0, "127.0.0.1");
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    server.close();
+    throw new Error("fixture server address is unavailable");
+  }
+  let closed = false;
+  return {
+    origin: `http://127.0.0.1:${address.port}`,
+    close: async () => {
+      if (closed) return;
+      closed = true;
+      await new Promise<void>((resolveClose, rejectClose) => {
+        server.close((error) => {
+          if (error) rejectClose(error);
+          else resolveClose();
+        });
+        server.closeAllConnections();
+      });
+    },
+  };
 }
 
 async function openFixture(
   browser: Browser,
-  resources: FixtureResources,
+  fixtureServer: FixtureServer,
   manualDisplay = false,
 ): Promise<FixtureRun> {
   const context = await browser.newContext();
@@ -565,10 +653,8 @@ async function openFixture(
   page.on("console", (message) =>
     consoleMessages.push(`${message.type()}: ${message.text()}`),
   );
-  await page.route("https://performance.example/**", (route) =>
-    fulfillFixtureRoute(route, resources, manualDisplay),
-  );
-  await page.goto("https://performance.example/fixture", { waitUntil: "load" });
+  const fixtureUrl = `${fixtureServer.origin}/fixture${manualDisplay ? "?manual=1" : ""}`;
+  await page.goto(fixtureUrl, { waitUntil: "load" });
   return {
     context,
     page,
@@ -787,6 +873,12 @@ declare global {
 
 test.describe("TSJS first-display performance gate", () => {
   test.describe.configure({ retries: 0, mode: "serial" });
+  let activeFixtureServer: FixtureServer | undefined;
+
+  test.afterEach(async () => {
+    await activeFixtureServer?.close();
+    activeFixtureServer = undefined;
+  });
 
   test("records complete real timing, heap, and request-ordering evidence", async ({
     browser,
@@ -803,9 +895,11 @@ test.describe("TSJS first-display performance gate", () => {
     expect(process.env.TSJS_PERF_MACHINE_CLASS).toBe(MACHINE_CLASS);
     expect(process.env.TSJS_PERF_RUNNER_IMAGE).toBe(RUNNER_IMAGE);
     const resources = loadFixtureResources();
+    const fixtureServer = await startFixtureServer(resources);
+    activeFixtureServer = fixtureServer;
 
     for (let index = 0; index < WARMUPS; index += 1) {
-      const run = await openFixture(browser, resources);
+      const run = await openFixture(browser, fixtureServer);
       try {
         await observeFixture(run);
       } finally {
@@ -816,7 +910,7 @@ test.describe("TSJS first-display performance gate", () => {
     const samples: number[] = [];
     let representative: BrowserObservation | undefined;
     for (let index = 0; index < SAMPLES; index += 1) {
-      const run = await openFixture(browser, resources);
+      const run = await openFixture(browser, fixtureServer);
       try {
         representative = await observeFixture(run);
         samples.push(representative.timingMs);
@@ -829,7 +923,7 @@ test.describe("TSJS first-display performance gate", () => {
     const sampledP90 = p90(samples);
     expect(sampledP90).toBeLessThanOrEqual(P90_CEILING_MS);
 
-    const heapRun = await openFixture(browser, resources, true);
+    const heapRun = await openFixture(browser, fixtureServer, true);
     const retainedHeapBytes = {} as Record<HeapCheckpoint, number>;
     try {
       await expect

@@ -20,6 +20,7 @@ case "$RUNTIME" in
 esac
 
 ORIGIN_PORT="${INTEGRATION_ORIGIN_PORT:-8888}"
+export ARTIFACTS_DIR="${ARTIFACTS_DIR:-$REPO_ROOT/target/integration-test-artifacts}"
 HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
 if [ -z "$HOST_TARGET" ]; then
   echo "failed to detect the native Rust target" >&2
@@ -124,7 +125,7 @@ case "$RUNTIME" in
     INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT" \
       ./scripts/generate-integration-viceroy-configs.sh
     export WASM_BINARY_PATH="$REPO_ROOT/target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm"
-    export VICEROY_CONFIG_PATH="$REPO_ROOT/target/integration-test-artifacts/configs/viceroy.toml"
+    export VICEROY_CONFIG_PATH="$ARTIFACTS_DIR/configs/viceroy.toml"
     ;;
   cloudflare)
     bash crates/trusted-server-adapter-cloudflare/build.sh
