@@ -1,33 +1,20 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { expect, test, type Page } from "@playwright/test";
 import { installGptStub } from "../../helpers/gpt-stub.js";
+import {
+  criticalTsjsFixture,
+  loadCriticalTsjsFixture,
+} from "../../helpers/tsjs-fixture.js";
 
-const TSJS_CRATE = resolve(__dirname, "../../../../trusted-server-js");
-const CORE_BUNDLE = readFileSync(
-  resolve(TSJS_CRATE, "dist/tsjs-core.js"),
-  "utf8",
-);
-const GPT_BUNDLE = readFileSync(
-  resolve(TSJS_CRATE, "dist/tsjs-gpt.js"),
-  "utf8",
-);
-const RELEASE = JSON.parse(
-  readFileSync(resolve(TSJS_CRATE, "dist/tsjs-release-v1.json"), "utf8"),
-) as { releaseId: string };
+const GPT_FIXTURE = criticalTsjsFixture(["render_runtime", "gpt"]);
 
 const SLOT = "puc-lifecycle-slot";
 const RESERVATION_ID = "r1_AAAAAAAAAAAAAAAAAAAAAA";
 
-function boot(releaseId: string) {
+function boot() {
   return {
     abi: 1,
-    releaseId,
-    manifest: {
-      version: 1,
-      releaseId,
-      integrations: [{ id: "gpt", required: true }],
-    },
+    releaseId: GPT_FIXTURE.releaseId,
+    manifest: GPT_FIXTURE.manifest,
     auctionProjection: {
       version: 1,
       auction: {
@@ -113,11 +100,11 @@ async function openLifecyclePage(
       };
     },
     {
-      initialBoot: boot(RELEASE.releaseId),
+      initialBoot: boot(),
       completeOnDisplay: nonemptyCompletionOnDisplay,
     },
   );
-  await page.addScriptTag({ content: `${CORE_BUNDLE}\n;\n${GPT_BUNDLE}` });
+  await loadCriticalTsjsFixture(page, GPT_FIXTURE);
   await expect
     .poll(() =>
       page.evaluate(

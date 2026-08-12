@@ -386,7 +386,9 @@ pub fn tsjs_boot_script_v1(
     }
 
     let creative_in_manifest = config.module_ids.contains(&"creative");
-    if creative_in_manifest != config.creative.enabled
+    let creative_required =
+        config.creative.enabled && (config.creative.click_guard || config.creative.render_guard);
+    if creative_in_manifest != creative_required
         || (!config.creative.enabled
             && (config.creative.click_guard || config.creative.render_guard))
     {
@@ -455,6 +457,45 @@ pub fn tsjs_script_tag(module_ids: &[&str]) -> String {
         "<script src=\"{}\" id=\"trustedserver-js\"></script>",
         tsjs_script_src(module_ids)
     )
+}
+
+const CREATIVE_TSJS_MODULE_IDS: &[&str] = &["render_runtime", "creative"];
+const EMPTY_CREATIVE_AUCTION_PROJECTION_JSON: &str = r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"slots":[],"bids":[]}"#;
+
+/// Build the complete hard-cutover bootstrap for a rewritten creative document.
+///
+/// Rewritten creatives are independent documents, so they need their own exact
+/// boot transport and critical artifact. The inventory is intentionally limited
+/// to the always-on render runtime and creative integration; publisher-page
+/// integrations and deferred presentation code do not belong in creative HTML.
+///
+/// # Errors
+///
+/// Returns an error when the creative settings or exact boot manifest are invalid.
+pub(crate) fn creative_tsjs_bootstrap_v1(
+    settings: &Settings,
+) -> Result<Option<String>, Report<TrustedServerError>> {
+    let creative = creative_boot_config_v1(settings)?;
+    if !creative.enabled || (!creative.click_guard && !creative.render_guard) {
+        return Ok(None);
+    }
+    let controller = tsjs_boot_script_v1(TsjsBootScriptConfigV1 {
+        module_ids: CREATIVE_TSJS_MODULE_IDS,
+        auction_projection_json: EMPTY_CREATIVE_AUCTION_PROJECTION_JSON,
+        creative,
+        render_trace_overlay: false,
+        gpt_diagnostics_active: false,
+    })?;
+    Ok(Some(format!(
+        "{controller}{}",
+        tsjs_script_tag(CREATIVE_TSJS_MODULE_IDS)
+    )))
+}
+
+/// Return the exact critical module inventory admitted for rewritten creatives.
+#[must_use]
+pub(crate) const fn creative_tsjs_module_ids() -> &'static [&'static str] {
+    CREATIVE_TSJS_MODULE_IDS
 }
 
 /// `/static` URL for the unified bundle with a conservative cache-busting hash.
@@ -988,6 +1029,74 @@ mod tests {
             tsjs_script_tag(&module_ids),
             format!("<script src=\"{src}\" id=\"trustedserver-js\"></script>"),
             "should generate exactly one trusted server script tag"
+        );
+    }
+
+    #[test]
+    fn creative_bootstrap_uses_only_the_required_critical_modules() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let bootstrap = creative_tsjs_bootstrap_v1(&settings)
+            .expect("should build the creative bootstrap")
+            .expect("the default creative integration should be enabled");
+        let expected_src = tsjs_script_src(&["render_runtime", "creative"]);
+
+        assert!(bootstrap.contains("t.boot="), "{bootstrap}");
+        assert!(
+            bootstrap.contains(r#"{"id":"render_runtime","phase":"critical"}"#),
+            "{bootstrap}"
+        );
+        assert!(
+            bootstrap.contains(r#"{"id":"creative","phase":"critical"}"#),
+            "{bootstrap}"
+        );
+        assert!(
+            bootstrap.contains(&format!(r#"src="{expected_src}""#)),
+            "{bootstrap}"
+        );
+        assert_eq!(bootstrap.matches("id=\"trustedserver-js\"").count(), 1);
+        assert!(!bootstrap.contains(r#""id":"gpt""#), "{bootstrap}");
+        assert!(!bootstrap.contains(r#""phase":"deferred""#), "{bootstrap}");
+    }
+
+    #[test]
+    fn creative_bootstrap_is_absent_when_both_guards_are_disabled() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "creative",
+                &serde_json::json!({
+                    "enabled": true,
+                    "click_guard": false,
+                    "render_guard": false,
+                }),
+            )
+            .expect("should configure creative browser policy");
+
+        assert_eq!(
+            creative_tsjs_bootstrap_v1(&settings)
+                .expect("should resolve the creative bootstrap policy"),
+            None,
+            "zero browser work must not inject a runtime into creative HTML"
+        );
+    }
+
+    #[test]
+    fn boot_script_accepts_enabled_creative_with_no_guards_and_no_module() {
+        assert!(
+            tsjs_boot_script_v1(TsjsBootScriptConfigV1 {
+                module_ids: &["render_runtime"],
+                auction_projection_json: EMPTY_CREATIVE_AUCTION_PROJECTION_JSON,
+                creative: CreativeBootConfigV1 {
+                    enabled: true,
+                    click_guard: false,
+                    render_guard: false,
+                },
+                render_trace_overlay: false,
+                gpt_diagnostics_active: false,
+            })
+            .is_ok(),
+            "creative membership is required only when a guard has browser work"
         );
     }
 

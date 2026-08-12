@@ -1,9 +1,50 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildFallbackBoot, buildKernelBoot } from '../../src/kernel/fallback';
+import {
+  buildFallbackBoot,
+  buildKernelBoot,
+  trustedCriticalOrigin,
+} from '../../src/kernel/fallback';
 
 const RELEASE_ID = 'a'.repeat(64);
 const TRUSTED_CRITICAL_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'d'.repeat(64)}`;
+
+function opaqueDocument(stamp: PropertyDescriptor | undefined): Document {
+  const view = { location: { origin: 'null' } } as Record<string, unknown>;
+  if (stamp) Object.defineProperty(view, '__tsCreativeOrigin', stamp);
+  return { defaultView: view } as unknown as Document;
+}
+
+describe('critical artifact origin', () => {
+  it('accepts only the immutable own-data creative stamp for an opaque document', () => {
+    expect(
+      trustedCriticalOrigin(
+        opaqueDocument({
+          configurable: false,
+          enumerable: false,
+          value: 'https://publisher.example',
+          writable: false,
+        })
+      )
+    ).toBe('https://publisher.example');
+  });
+
+  it.each([
+    undefined,
+    { configurable: true, enumerable: false, value: 'https://publisher.example', writable: false },
+    { configurable: false, enumerable: false, value: 'https://publisher.example', writable: true },
+    { configurable: false, enumerable: true, value: 'https://publisher.example', writable: false },
+    { configurable: false, enumerable: false, get: () => 'https://publisher.example' },
+    {
+      configurable: false,
+      enumerable: false,
+      value: 'https://attacker.example/path',
+      writable: false,
+    },
+  ])('rejects an absent, mutable, accessor-backed, or non-origin creative stamp', (stamp) => {
+    expect(trustedCriticalOrigin(opaqueDocument(stamp))).toBeUndefined();
+  });
+});
 
 function manifest(ids: readonly string[]) {
   return {

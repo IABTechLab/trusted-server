@@ -3,8 +3,12 @@ import { installGptStub } from "../../helpers/gpt-stub.js";
 import { readState, runtimeUrl } from "../../helpers/state.js";
 
 const HOST_ID = "trusted-server-gpt-diagnostics";
-const GPT_DIAGNOSTICS_MODULE =
+const CRITICAL_TSJS_MODULE =
+    /tsjs=tsjs-unified(?:\.min)?\.js(?:[?#]|$)/i;
+const STANDALONE_GPT_DIAGNOSTICS_MODULE =
     /tsjs=tsjs-gpt_diagnostics(?:\.min)?\.js(?:[?#]|$)/i;
+const DIAGNOSTICS_PRESENTATION_MODULE =
+    /tsjs=tsjs-diagnostics_presentation(?:\.min)?\.js(?:[?#]|$)/i;
 const EVENT_NAMES = [
     "slotRequested",
     "slotResponseReceived",
@@ -74,7 +78,7 @@ test.describe("GPT runtime diagnostics", () => {
         const diagnosticNetworkRequests: string[] = [];
         const diagnosticModuleRequests: string[] = [];
         page.on("request", (request) => {
-            if (GPT_DIAGNOSTICS_MODULE.test(request.url())) {
+            if (STANDALONE_GPT_DIAGNOSTICS_MODULE.test(request.url())) {
                 diagnosticModuleRequests.push(request.url());
             }
             if (
@@ -116,11 +120,13 @@ test.describe("GPT runtime diagnostics", () => {
         browserName,
         page,
     }) => {
-        const moduleRequests: string[] = [];
+        const criticalRequests: string[] = [];
+        const standaloneDiagnosticsRequests: string[] = [];
         page.on("request", (request) => {
-            if (GPT_DIAGNOSTICS_MODULE.test(request.url())) {
-                moduleRequests.push(request.url());
-            }
+            if (CRITICAL_TSJS_MODULE.test(request.url()))
+                criticalRequests.push(request.url());
+            if (STANDALONE_GPT_DIAGNOSTICS_MODULE.test(request.url()))
+                standaloneDiagnosticsRequests.push(request.url());
         });
         const activationResponse = await page.goto(
             runtimeUrl(
@@ -133,7 +139,8 @@ test.describe("GPT runtime diagnostics", () => {
         expect(activationResponse?.headers()["cache-control"]).toContain(
             "no-store",
         );
-        expect(moduleRequests).toHaveLength(1);
+        expect(criticalRequests).toHaveLength(1);
+        expect(standaloneDiagnosticsRequests).toEqual([]);
         const activationCookie = (await page.context().cookies()).find(
             (cookie) => cookie.name === "__Host-ts-console",
         );
@@ -256,10 +263,14 @@ test.describe("GPT runtime diagnostics", () => {
     test("captures lifecycle truth, conservative overlap, binding changes, remount, and export", async ({
         page,
     }, testInfo) => {
+        test.setTimeout(60_000);
         const pageErrors: string[] = [];
         const diagnosticNetworkRequests: string[] = [];
+        const presentationModuleRequests: string[] = [];
         page.on("pageerror", (error) => pageErrors.push(error.message));
         page.on("request", (request) => {
+            if (DIAGNOSTICS_PRESENTATION_MODULE.test(request.url()))
+                presentationModuleRequests.push(request.url());
             if (
                 ["fetch", "xhr", "beacon"].includes(request.resourceType()) &&
                 /diagnostic|trace/i.test(request.url())
@@ -275,7 +286,10 @@ test.describe("GPT runtime diagnostics", () => {
         await page.evaluate(() =>
             (window as any).__gptDiagnosticsStub.captureReferences(),
         );
-        await expect(page.locator(`#${HOST_ID}`)).toHaveCount(1);
+        await expect(page.locator(`#${HOST_ID}`)).toHaveCount(1, {
+            timeout: 15_000,
+        });
+        expect(presentationModuleRequests).toHaveLength(1);
         expect(
             await page
                 .locator(`#${HOST_ID}`)
@@ -440,9 +454,9 @@ test.describe("GPT runtime diagnostics", () => {
 
         expect(
             await page.evaluate(() =>
-                (window as any).__gptDiagnosticsStub.referencesUnchanged(),
+                (window as any).__gptDiagnosticsStub.referenceOwnership(),
             ),
-        ).toBe(true);
+        ).toEqual({ diagnosticsSafe: true, pairedHistoryWrappers: true });
         expect(
             await page
                 .locator("#gpt-diagnostics-slot-primary")

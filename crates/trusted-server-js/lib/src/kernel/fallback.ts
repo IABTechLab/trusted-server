@@ -8,7 +8,6 @@ import type { BootManifestV1 } from '../core/types';
 export { AdUnitRegistrationError, type AdUnitRegistrationErrorCode } from '../core/registry';
 export { RequestAdsInputError, type RequestAdsInputErrorCode } from '../core/contracts/request_ads';
 
-import type { BootFailureReason } from './integration_registry';
 import { MAX_MANIFEST_MODULES } from './release_catalog';
 
 const SAFE_PROJECTION = {
@@ -18,6 +17,40 @@ const SAFE_PROJECTION = {
   bids: [],
 } as const;
 const CRITICAL_SRC_PATTERN = /^\/static\/tsjs=tsjs-unified\.min\.js\?v=[0-9a-f]{64}$/;
+
+export type BootFailureReason = 'abi_mismatch' | 'bundle_partial';
+
+function exactHttpOrigin(candidate: unknown): string | undefined {
+  if (typeof candidate !== 'string') return undefined;
+  try {
+    const parsed = new URL(candidate);
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+      parsed.username === '' &&
+      parsed.password === '' &&
+      parsed.origin === candidate
+      ? parsed.origin
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Resolve the document's authentication origin, including stamped opaque creatives. */
+export function trustedCriticalOrigin(runtimeDocument: Document): string | undefined {
+  try {
+    const view = runtimeDocument.defaultView;
+    const documentOrigin = exactHttpOrigin(view?.location.origin);
+    if (documentOrigin) return documentOrigin;
+    if (view?.location.origin !== 'null') return undefined;
+    const stamp = Object.getOwnPropertyDescriptor(view, '__tsCreativeOrigin');
+    if (!stamp || stamp.configurable || stamp.enumerable || !('value' in stamp) || stamp.writable) {
+      return undefined;
+    }
+    return exactHttpOrigin(stamp.value);
+  } catch {
+    return undefined;
+  }
+}
 
 export class TsjsUnavailableError extends Error {
   public readonly code = 'runtime_unavailable' as const;
@@ -142,11 +175,10 @@ export function captureTrustedCriticalSrc(
 ): string | undefined {
   try {
     const Script = runtimeDocument.defaultView?.HTMLScriptElement;
-    const origin = runtimeDocument.defaultView?.location.origin;
+    const origin = trustedCriticalOrigin(runtimeDocument);
     if (
       !Script ||
       !origin ||
-      origin === 'null' ||
       !(script instanceof Script) ||
       script.ownerDocument !== runtimeDocument ||
       script.id !== 'trustedserver-js' ||

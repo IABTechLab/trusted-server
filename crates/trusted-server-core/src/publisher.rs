@@ -309,11 +309,16 @@ pub fn handle_tsjs_dynamic(
     }
 
     if filename == "tsjs-unified.min.js" {
-        let module_ids = integration_registry
-            .tsjs_static_transport_selections(false)
-            .into_iter()
-            .map(|selection| integration_registry.tsjs_critical_module_ids(selection))
-            .find(|ids| trusted_server_js::concatenated_hash(ids) == requested_hash);
+        let creative_ids = crate::tsjs::creative_tsjs_module_ids();
+        let module_ids = (trusted_server_js::concatenated_hash(creative_ids) == requested_hash)
+            .then_some(creative_ids.to_vec())
+            .or_else(|| {
+                integration_registry
+                    .tsjs_static_transport_selections(false)
+                    .into_iter()
+                    .map(|selection| integration_registry.tsjs_critical_module_ids(selection))
+                    .find(|ids| trusted_server_js::concatenated_hash(ids) == requested_hash)
+            });
         let Some(module_ids) = module_ids else {
             return Ok(tsjs_not_found_response());
         };
@@ -6271,6 +6276,23 @@ mod tests {
             Some(&HeaderValue::from_static("nosniff"))
         );
         assert!(response.headers().contains_key(header::ETAG));
+    }
+
+    #[test]
+    fn tsjs_dynamic_serves_the_exact_rewritten_creative_bundle() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let src = crate::tsjs::tsjs_script_src(&["render_runtime", "creative"]);
+        let req = build_request(Method::GET, &format!("https://publisher.example{src}"));
+
+        let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "rewritten creative HTML must reference a transport-admitted artifact"
+        );
     }
 
     #[test]
