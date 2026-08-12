@@ -2,8 +2,8 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 use edgezero_cli::args::{
-    AuthArgs, BuildArgs, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs, DeployArgs,
-    ProvisionArgs, ServeArgs,
+    AuthArgs, BuildArgs, ConfigDiffArgs, ConfigGcArgs, ConfigPushArgs, ConfigValidateArgs,
+    DeployArgs, ProvisionArgs, ServeArgs,
 };
 use trusted_server_core::config::TrustedServerAppConfig;
 
@@ -49,6 +49,12 @@ enum ConfigCommand {
     Init(ConfigInitArgs),
     /// Diff `trusted-server.toml` against the live `EdgeZero` config.
     Diff(ConfigDiffArgs),
+    /// Reclaim orphaned chunk entries the config store leaked from prior
+    /// oversized pushes. Store-derived and untyped (no `TrustedServerAppConfig`).
+    /// A dry-run by default; deletes only with `--yes` + an explicit
+    /// `--older-than` (YOUR assertion that nothing superseded within that
+    /// window is still being served, and no push is running).
+    Gc(ConfigGcArgs),
     /// Push `trusted-server.toml` as a blob envelope through `EdgeZero`.
     Push(ConfigPushArgs),
     /// Validate `edgezero.toml` and the typed Trusted Server config.
@@ -95,6 +101,9 @@ fn dispatch(args: Args) -> Result<(), String> {
                 Err(err) => Err(err),
             }
         }
+        // `gc` inspects the STORE, not the typed config, so it is not
+        // parameterised over `TrustedServerAppConfig`.
+        Command::Config(ConfigCommand::Gc(args)) => edgezero_cli::run_config_gc(&args),
         Command::Config(ConfigCommand::Push(args)) => {
             edgezero_cli::run_config_push_typed::<TrustedServerAppConfig>(&args)
         }
@@ -123,7 +132,9 @@ mod tests {
     use std::path::PathBuf;
 
     use clap::Parser as _;
-    use edgezero_cli::args::{AuthSub, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs};
+    use edgezero_cli::args::{
+        AuthSub, ConfigDiffArgs, ConfigGcArgs, ConfigPushArgs, ConfigValidateArgs,
+    };
 
     use super::*;
 
@@ -268,6 +279,40 @@ mod tests {
         assert!(!diff.local);
         assert!(!diff.exit_code);
         assert!(!diff.no_env);
+    }
+
+    #[test]
+    fn config_gc_uses_edgezero_defaults() {
+        let args = parse(&["ts", "config", "gc", "--adapter", "fastly"]);
+        let Command::Config(ConfigCommand::Gc(gc)) = args.command else {
+            panic!("expected config gc command");
+        };
+        let default_gc = ConfigGcArgs::default();
+        assert_eq!(gc.adapter, "fastly");
+        assert_eq!(gc.manifest, default_gc.manifest);
+        assert_eq!(gc.store, default_gc.store);
+        assert_eq!(gc.older_than, None);
+        assert!(!gc.no_env);
+        assert!(!gc.yes);
+    }
+
+    #[test]
+    fn config_gc_accepts_destructive_flags() {
+        let args = parse(&[
+            "ts",
+            "config",
+            "gc",
+            "--adapter",
+            "fastly",
+            "--older-than",
+            "7d",
+            "--yes",
+        ]);
+        let Command::Config(ConfigCommand::Gc(gc)) = args.command else {
+            panic!("expected config gc command");
+        };
+        assert_eq!(gc.older_than.as_deref(), Some("7d"));
+        assert!(gc.yes);
     }
 
     #[test]

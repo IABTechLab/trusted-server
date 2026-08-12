@@ -20,6 +20,11 @@
 .edgezero/
 /dist/prebid/
 
+# Fastly local config-push lock (a persistent advisory-lock sidecar next to
+# the manifest; serialises concurrent `config push --local` / `provision`).
+# The glob also covers a manifest named something other than `fastly.toml`.
+.*.edgezero-lock
+
 # env
 .env*
 trusted-server.toml

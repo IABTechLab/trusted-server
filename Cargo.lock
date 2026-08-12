@@ -767,7 +767,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -1398,7 +1398,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.4#9e661ae520a8130660f18fd10f42703d7f3e050b"
+source = "git+https://github.com/stackpop/edgezero?rev=c2658795fb47b904f980dc73600f413f4d0e5bb8#c2658795fb47b904f980dc73600f413f4d0e5bb8"
 dependencies = [
  "toml",
 ]
@@ -1406,7 +1406,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-axum"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.4#9e661ae520a8130660f18fd10f42703d7f3e050b"
+source = "git+https://github.com/stackpop/edgezero?rev=c2658795fb47b904f980dc73600f413f4d0e5bb8#c2658795fb47b904f980dc73600f413f4d0e5bb8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1434,7 +1434,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-cloudflare"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.4#9e661ae520a8130660f18fd10f42703d7f3e050b"
+source = "git+https://github.com/stackpop/edgezero?rev=c2658795fb47b904f980dc73600f413f4d0e5bb8#c2658795fb47b904f980dc73600f413f4d0e5bb8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1449,7 +1449,7 @@ dependencies = [
  "log",
  "serde_json",
  "tempfile",
- "toml_edit",
+ "toml_edit 0.25.12+spec-1.1.0",
  "walkdir",
  "worker",
 ]
@@ -1457,7 +1457,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.4#9e661ae520a8130660f18fd10f42703d7f3e050b"
+source = "git+https://github.com/stackpop/edgezero?rev=c2658795fb47b904f980dc73600f413f4d0e5bb8#c2658795fb47b904f980dc73600f413f4d0e5bb8"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1479,14 +1479,14 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
- "toml_edit",
+ "toml_edit 0.25.12+spec-1.1.0",
  "walkdir",
 ]
 
 [[package]]
 name = "edgezero-adapter-spin"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.4#9e661ae520a8130660f18fd10f42703d7f3e050b"
+source = "git+https://github.com/stackpop/edgezero?rev=c2658795fb47b904f980dc73600f413f4d0e5bb8#c2658795fb47b904f980dc73600f413f4d0e5bb8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1506,14 +1506,14 @@ dependencies = [
  "subtle",
  "thiserror 2.0.18",
  "toml",
- "toml_edit",
+ "toml_edit 0.25.12+spec-1.1.0",
  "walkdir",
 ]
 
 [[package]]
 name = "edgezero-cli"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.4#9e661ae520a8130660f18fd10f42703d7f3e050b"
+source = "git+https://github.com/stackpop/edgezero?rev=c2658795fb47b904f980dc73600f413f4d0e5bb8#c2658795fb47b904f980dc73600f413f4d0e5bb8"
 dependencies = [
  "chrono",
  "clap",
@@ -1538,7 +1538,7 @@ dependencies = [
 [[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.4#9e661ae520a8130660f18fd10f42703d7f3e050b"
+source = "git+https://github.com/stackpop/edgezero?rev=c2658795fb47b904f980dc73600f413f4d0e5bb8#c2658795fb47b904f980dc73600f413f4d0e5bb8"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -1569,14 +1569,14 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.4#9e661ae520a8130660f18fd10f42703d7f3e050b"
+source = "git+https://github.com/stackpop/edgezero?rev=c2658795fb47b904f980dc73600f413f4d0e5bb8#c2658795fb47b904f980dc73600f413f4d0e5bb8"
 dependencies = [
  "log",
  "proc-macro2",
  "quote",
  "serde",
  "serde_json",
- "syn 2.0.118",
+ "syn 3.0.3",
  "toml",
  "validator",
 ]
@@ -3604,7 +3604,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "once_cell",
@@ -3624,7 +3624,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -3637,7 +3637,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -4770,6 +4770,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "syn"
+version = "3.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53e9bae58849f64dfa4f5d5ae372c8341f7305f82a3868709269343628b659a3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "sync_wrapper"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5075,6 +5086,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml_edit"
+version = "0.25.12+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2153edc6955a6c354fad8f5efd38b6a8769bdccf9fe50f8e1329f81b0baa5d7"
+dependencies = [
+ "indexmap 2.14.0",
+ "toml_datetime 1.1.1+spec-1.1.0",
+ "toml_parser",
+ "toml_writer",
+ "winnow 1.0.3",
+]
+
+[[package]]
 name = "toml_parser"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5340,7 +5364,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml",
- "toml_edit",
+ "toml_edit 0.23.10+spec-1.0.0",
  "trusted-server-core",
  "url",
  "webpki-roots",
@@ -5896,7 +5920,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
