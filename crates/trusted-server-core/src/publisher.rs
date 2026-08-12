@@ -1535,63 +1535,31 @@ fn assemble_if_shared(
     Ok(out)
 }
 
-/// Fingerprint of everything that changes the injected markup for a given URL.
+/// Fingerprint of every configuration input plus the compiled browser bundle.
 ///
-/// Two inputs, because either alone under-invalidates:
-///
-/// - The **compiled bundle**, so a JS deploy retires stored templates without a purge.
-/// - The **`[integrations]` configuration**, which decides the enabled set — and so the
-///   module IDs in the `<script src="/static/tsjs=…">` tag — and supplies the
-///   per-integration head inserts. `window.__tsjs_prebid={…}` carries the account ID,
-///   timeout and bidder list straight into the shared template.
-///
-/// The bundle hash was the whole fingerprint, and `all_module_ids()` makes it a constant
-/// for a given binary: enabling, disabling or reconfiguring an integration did not move
-/// it, so every reader kept being served a template built under the previous
-/// configuration until the entry expired.
-///
-/// Read from settings rather than from a built [`IntegrationRegistry`]: the registry is
-/// derived from exactly these entries, and building one here would add a second fallible
-/// construction to the request path for a value the transform already holds. Hashing the
-/// whole section over-invalidates — a field that affects no markup still moves the
-/// fingerprint — and never under-invalidates, which is the safe direction for a cache
-/// shared between readers.
+/// This intentionally over-invalidates. Trying to maintain a hand-written list already
+/// omitted publisher origin identity and creative-opportunity shaping fields. A digest of
+/// the complete typed settings cannot expose secret values and makes future config fields
+/// safe by default: a change misses until someone proves it irrelevant, never cross-serves
+/// an old template under new behavior.
 ///
 /// # Panics
 ///
-/// Does not panic: `serde_json::to_string` of an already-parsed [`serde_json::Value`] has
-/// no failure mode, and the `expect` documents that rather than hiding a real error
-/// behind a default.
-fn integration_fingerprint(settings: &Settings) -> String {
+/// Does not panic: serializing the already-deserialized typed settings to a JSON value is
+/// infallible for this schema.
+fn template_fingerprint(settings: &Settings) -> String {
     use sha2::Digest as _;
 
     let mut hasher = sha2::Sha256::new();
     hasher.update(
         trusted_server_js::concatenated_hash(&trusted_server_js::all_module_ids()).as_bytes(),
     );
-    // Sorted before hashing. `IntegrationSettings` derefs to a `HashMap`, whose iteration
-    // order varies per process, so an unsorted digest would differ between two requests
-    // to the same binary and the cache would never hit. Nested objects are already
-    // deterministic: `serde_json::Map` is `BTreeMap`-backed without `preserve_order`.
-    let mut entries: Vec<_> = settings.integrations.iter().collect();
-    entries.sort_by_key(|(id, _)| *id);
-    for (id, config) in entries {
-        // Length-prefixed, for the reason `TemplateCacheKey::to_cache_key` is: a
-        // delimiter a value can contain lets two distinct configurations digest
-        // identically, and here that means one configuration's template served under
-        // another's.
-        //
-        // Partner tokens and other secrets in this section reach the hasher but not the
-        // key: only the digest is used.
-        let config = serde_json::to_string(config)
-            .expect("serde_json::to_string of a Value should be infallible");
-        hasher.update(id.len().to_string().as_bytes());
-        hasher.update(b":");
-        hasher.update(id.as_bytes());
-        hasher.update(config.len().to_string().as_bytes());
-        hasher.update(b":");
-        hasher.update(config.as_bytes());
-    }
+    // `serde_json::Value` uses a sorted object map without `preserve_order`, making
+    // independently deserialized HashMaps canonical before they are serialized again.
+    let canonical = serde_json::to_value(settings)
+        .and_then(|value| serde_json::to_vec(&value))
+        .expect("serializing typed settings should be infallible");
+    hasher.update(canonical);
     hex::encode(hasher.finalize())
 }
 
@@ -1732,8 +1700,8 @@ fn build_cached_template_response(
         HeaderValue::from_str(&entry.metadata.content_type)
             .change_context_lazy(|| invalid("content type"))?,
     );
-    // The encoding the origin actually chose, not the one keyed on. See
-    // `TemplateCacheKey::accept_encoding` for why those differ.
+    // Stored templates are identity bytes; final reader negotiation is applied after
+    // assembly rather than replaying the origin's representation.
     if !entry.metadata.content_encoding.is_empty() && entry.metadata.content_encoding != "identity"
     {
         response.headers_mut().insert(
@@ -3672,8 +3640,8 @@ pub async fn handle_publisher_request(
     // Building it pre-fetch is what makes a lookup possible at all: a key that needed
     // the origin's response could only ever authorize a store, never satisfy a read.
     //
-    // Headers are read as forwarded, after `restrict_accept_encoding` — keying on what
-    // the client originally sent would key on a value the origin never saw.
+    // Configured Vary headers are read exactly as forwarded: absence, empty fields,
+    // repeated values and non-UTF8 bytes remain distinct.
     // GET only, and this is the single point that enforces it: the key governs both the
     // lookup and the store, so a `None` here excludes non-GET from each.
     //
@@ -3694,24 +3662,15 @@ pub async fn handle_publisher_request(
         url: target_uri.to_string(),
         request_host: request_host.to_string(),
         request_scheme: request_scheme.to_string(),
+        origin_identity: format!("{}\0{}", settings.publisher.origin_url, origin_host_header),
         assembly_mode,
         vary_values: settings
             .creative_opportunities
             .as_ref()
             .map(CreativeOpportunitiesConfig::template_cache_vary)
             .unwrap_or_else(|| VarySpec::new([]))
-            .values_from(|name| {
-                req.headers()
-                    .get(name)
-                    .and_then(|value| value.to_str().ok())
-            }),
-        accept_encoding: req
-            .headers()
-            .get(header::ACCEPT_ENCODING)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_string(),
-        integration_fingerprint: integration_fingerprint(settings),
+            .values_from(req.headers()),
+        template_fingerprint: template_fingerprint(settings),
         schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
     });
     *req.uri_mut() = target_uri;
@@ -6146,7 +6105,7 @@ mod tests {
         }
     }
 
-    mod integration_fingerprint_tests {
+    mod template_fingerprint_tests {
         use super::*;
 
         /// Base settings with one integration's config replaced.
@@ -6175,8 +6134,8 @@ mod tests {
             // integration off changed the injected `<script>` set and left the cache key
             // untouched, and every reader kept getting the template built while it was on.
             assert_ne!(
-                integration_fingerprint(&settings_with_prebid(true, 1000)),
-                integration_fingerprint(&settings_with_prebid(false, 1000)),
+                template_fingerprint(&settings_with_prebid(true, 1000)),
+                template_fingerprint(&settings_with_prebid(false, 1000)),
                 "the enabled integration set must select a different template"
             );
         }
@@ -6186,8 +6145,8 @@ mod tests {
             // Config reaches the template directly: the prebid head insert carries the
             // account ID, timeout and bidder list into bytes shared between readers.
             assert_ne!(
-                integration_fingerprint(&settings_with_prebid(true, 1000)),
-                integration_fingerprint(&settings_with_prebid(true, 2500)),
+                template_fingerprint(&settings_with_prebid(true, 1000)),
+                template_fingerprint(&settings_with_prebid(true, 2500)),
                 "an integration's configuration must select a different template"
             );
         }
@@ -6198,11 +6157,11 @@ mod tests {
             // An unsorted digest would differ between two requests to the same binary and
             // the cache would never hit — a fix that quietly disables the feature.
             let settings = settings_with_prebid(true, 1000);
-            let first = integration_fingerprint(&settings);
+            let first = template_fingerprint(&settings);
 
             for _ in 0..16 {
                 assert_eq!(
-                    integration_fingerprint(&settings),
+                    template_fingerprint(&settings),
                     first,
                     "the same configuration must always fingerprint identically"
                 );
@@ -6210,10 +6169,27 @@ mod tests {
             // A second, independently parsed `Settings` builds a fresh `HashMap` with a
             // different iteration order, which is what actually exercises the sort.
             assert_eq!(
-                integration_fingerprint(&settings_with_prebid(true, 1000)),
+                template_fingerprint(&settings_with_prebid(true, 1000)),
                 first,
                 "two equal configurations must fingerprint identically"
             );
+        }
+
+        #[test]
+        fn creative_and_origin_configuration_change_the_fingerprint() {
+            let base = super::template_neutrality_tests::settings_with_slots();
+
+            let mut creative = base.clone();
+            creative
+                .creative_opportunities
+                .as_mut()
+                .expect("fixture should configure creative opportunities")
+                .gam_network_id = "different-network".to_string();
+            assert_ne!(template_fingerprint(&base), template_fingerprint(&creative));
+
+            let mut origin = base.clone();
+            origin.publisher.origin_host_header_override = Some("tenant.example.com".to_string());
+            assert_ne!(template_fingerprint(&base), template_fingerprint(&origin));
         }
     }
 
@@ -6393,10 +6369,10 @@ mod tests {
                 url: "https://example.com/page".to_string(),
                 request_host: "example.com".to_string(),
                 request_scheme: "https".to_string(),
+                origin_identity: "https://origin.example.com\0origin.example.com".to_string(),
                 assembly_mode: AssemblyMode::Esi,
                 vary_values: vec![],
-                accept_encoding: "identity".to_string(),
-                integration_fingerprint: "fp".to_string(),
+                template_fingerprint: "fp".to_string(),
                 schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
             }
         }
@@ -7755,7 +7731,7 @@ mod tests {
 
         #[tokio::test]
         async fn two_integration_configurations_never_share_a_template() {
-            // `integration_fingerprint` folds the `[integrations]` config, and its own
+            // `template_fingerprint` folds the complete typed config, and its own
             // tests call it directly — so reverting the *call site* back to the
             // bundle-only hash, a constant for a given binary, left the entire suite
             // green while every configuration silently shared one template.

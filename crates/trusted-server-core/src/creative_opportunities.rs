@@ -421,6 +421,12 @@ impl CreativeOpportunitiesConfig {
     /// [`section_root`](Self::section_root); or when configured values make a
     /// dynamic path exceed 100 UTF-8 bytes.
     pub fn validate_runtime(&self) -> Result<(), String> {
+        if let Some(names) = &self.template_cache_vary {
+            crate::platform::VarySpec::try_new(names.clone()).map_err(|name| {
+                format!("template_cache_vary contains invalid HTTP header name `{name}`")
+            })?;
+        }
+
         // A network ID is required only when a slot renders the default
         // `/<network_id>/<slot_id>` path or substitutes `{network_id}`. Static
         // and `{slot_id}`/`{section}`-only templates leave it inert.
@@ -1983,6 +1989,21 @@ mod tests {
             toml::from_str::<CreativeOpportunitiesConfig>(removed_mode).is_err(),
             "client_fill is outside #1009's ESI byte-seam design and must be rejected"
         );
+    }
+
+    #[test]
+    fn template_cache_vary_rejects_invalid_header_names() {
+        let config: CreativeOpportunitiesConfig = toml::from_str(
+            r#"
+                gam_network_id = "99999"
+                template_cache_vary = ["rsc", "not a header"]
+            "#,
+        )
+        .expect("shape should deserialize before runtime validation");
+        let err = config
+            .validate_runtime()
+            .expect_err("invalid field names must fail configuration validation");
+        assert!(err.contains("not a header"), "unexpected error: {err}");
     }
 
     #[test]

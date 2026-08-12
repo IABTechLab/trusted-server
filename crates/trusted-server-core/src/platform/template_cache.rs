@@ -18,6 +18,7 @@
 //! Spike-only. Remove with the spike.
 
 use core::fmt;
+use std::collections::HashSet;
 
 use crate::creative_opportunities::AssemblyMode;
 
@@ -51,71 +52,72 @@ pub struct TemplateCacheKey {
     pub request_host: String,
     /// See [`Self::request_host`].
     pub request_scheme: String,
+    /// Publisher origin identity, including the outbound Host override. Two virtual
+    /// hosts can share a connection target while producing unrelated documents.
+    pub origin_identity: String,
     /// A2 and A3 emit different template bytes. Without this they poison each
     /// other's entries.
     pub assembly_mode: AssemblyMode,
     /// Values of the request headers the **origin** declares it varies on, in the
     /// order the origin listed them. Not a fixed list: the origin is authoritative,
     /// and hard-coding one here would silently drift when the origin's changes.
-    pub vary_values: Vec<(String, String)>,
-    /// The `Accept-Encoding` sent to the origin, **not** the encoding the origin
-    /// chose.
-    ///
-    /// The distinction is forced by ordering. The pipeline pairs input encoding to the
-    /// same output encoding, so the transformed bytes inherit whatever the origin
-    /// negotiated — and serving brotli bytes to a client that asked for gzip is a
-    /// broken response, so encoding must be keyed. But **a lookup happens before the
-    /// origin has chosen**, so the chosen value is unavailable at exactly the moment
-    /// the key is needed. Keying on it would mean storing under `br` and looking up
-    /// under `gzip, br`: a cache that never hits.
-    ///
-    /// Keying on the request side is sound because origin negotiation is a function of
-    /// what it was offered, so identical offers yield identical choices. The encoding
-    /// actually chosen is recorded in [`TemplateMetadata::content_encoding`] and is
-    /// what the served response declares.
-    ///
-    /// Read as forwarded, after `restrict_accept_encoding` narrows it — the value the
-    /// client sent is not necessarily the value the origin saw.
-    pub accept_encoding: String,
-    /// Identifies the enabled integration set and the tsjs bundle. Both change the
-    /// injected markup for the same URL.
-    pub integration_fingerprint: String,
+    pub vary_values: Vec<VaryHeaderValues>,
+    /// Digest of every setting that can shape the transformed template plus the tsjs
+    /// bundle. Over-invalidating is safe; omitting a shaping input cross-serves bytes.
+    pub template_fingerprint: String,
     /// See [`TEMPLATE_SCHEMA_VERSION`].
     pub schema_version: u32,
 }
 
 impl TemplateCacheKey {
-    /// Render the key as the opaque byte string the platform cache is keyed on.
+    /// Render a fixed-size opaque key for the platform cache.
     ///
-    /// Fields are length-prefixed rather than delimiter-joined. A delimiter is
-    /// ambiguous when a value can contain it — a URL with a `|`, or a `Vary` value
-    /// with one — and two distinct keys colliding here means one visitor's template
-    /// served to another. Length prefixes make that unrepresentable.
+    /// The canonical input is length-prefixed before hashing, so neither delimiters nor
+    /// raw request values can collide or leak into cache diagnostics.
     #[must_use]
     pub fn to_cache_key(&self) -> String {
-        let mut out = String::new();
-        let mut push = |part: &str| {
-            out.push_str(&part.len().to_string());
-            out.push(':');
-            out.push_str(part);
-        };
+        use sha2::Digest as _;
 
-        push("ts-c2");
-        push(&self.schema_version.to_string());
-        push(&format!("{:?}", self.assembly_mode));
-        push(&self.request_scheme);
-        push(&self.request_host);
-        push(&self.url);
-        push(&self.accept_encoding);
-        push(&self.integration_fingerprint);
-
-        push(&self.vary_values.len().to_string());
-        for (name, value) in &self.vary_values {
-            push(&name.to_ascii_lowercase());
-            push(value);
+        fn push(out: &mut Vec<u8>, part: &[u8]) {
+            out.extend_from_slice(&(part.len() as u64).to_be_bytes());
+            out.extend_from_slice(part);
         }
 
-        out
+        let mut canonical = Vec::new();
+        push(&mut canonical, b"ts-c2");
+        push(&mut canonical, &self.schema_version.to_be_bytes());
+        push(
+            &mut canonical,
+            match self.assembly_mode {
+                AssemblyMode::Inline => b"inline",
+                AssemblyMode::Esi => b"esi",
+            },
+        );
+        push(&mut canonical, self.request_scheme.as_bytes());
+        push(&mut canonical, self.request_host.as_bytes());
+        push(&mut canonical, self.origin_identity.as_bytes());
+        push(&mut canonical, self.url.as_bytes());
+        push(&mut canonical, self.template_fingerprint.as_bytes());
+        push(
+            &mut canonical,
+            &(self.vary_values.len() as u64).to_be_bytes(),
+        );
+        for varied in &self.vary_values {
+            push(&mut canonical, varied.name.as_bytes());
+            match &varied.values {
+                None => push(&mut canonical, b"absent"),
+                Some(values) => {
+                    push(&mut canonical, b"present");
+                    push(&mut canonical, &(values.len() as u64).to_be_bytes());
+                    for value in values {
+                        push(&mut canonical, value);
+                    }
+                }
+            }
+        }
+
+        let digest = sha2::Sha256::digest(canonical);
+        format!("ts-c2-v{}-{}", self.schema_version, hex::encode(digest))
     }
 
     /// Surrogate keys to attach at insert, for purge-based rollback.
@@ -127,25 +129,26 @@ impl TemplateCacheKey {
     pub fn surrogate_keys(&self) -> Vec<String> {
         vec![
             "ts-template".to_string(),
-            format!("ts-template-{}", surrogate_safe(&self.url)),
+            format!("ts-template-url-{}", digest_hex(self.url.as_bytes())),
         ]
     }
 }
 
-/// Reduce a URL to characters valid in a Fastly surrogate key.
+fn digest_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
+/// One configured `Vary` input exactly as it appeared on the request.
 ///
-/// Surrogate keys are space-delimited, so any whitespace would split one key into
-/// several and purge more than intended.
-fn surrogate_safe(url: &str) -> String {
-    url.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+/// `None` means absent. `Some(vec![vec![]])` means present with one empty field
+/// value. Repeated fields stay separate and ordered; no UTF-8 conversion is involved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaryHeaderValues {
+    /// Validated, lowercase header name.
+    pub name: String,
+    /// Every raw field value in wire order, or `None` when absent.
+    pub values: Option<Vec<Vec<u8>>>,
 }
 
 /// Origin response headers safe to store with a shared template and replay on a hit.
@@ -167,8 +170,8 @@ pub const REPLAYABLE_POLICY_HEADERS: &[&str] = &[
 
 /// Headers the key covers by construction, whatever the operator configured.
 ///
-/// `Accept-Encoding` has a dedicated key field ([`TemplateCacheKey::accept_encoding`]),
-/// so an origin declaring `Vary: Accept-Encoding` is already keyed correctly. Without
+/// The shared path offers one canonical encoding set upstream and stores decoded identity
+/// bytes, so an origin declaring `Vary: Accept-Encoding` is covered without reader input. Without
 /// this, that extremely ordinary declaration — any compressing origin sends it — reads
 /// as an uncovered gap and disqualifies the response, so **C2 would never cache anything
 /// against a real origin** unless the operator redundantly listed a header the key
@@ -208,9 +211,27 @@ impl VarySpec {
     /// Build from configured header names.
     #[must_use]
     pub fn new(names: impl IntoIterator<Item = String>) -> Self {
-        Self {
-            names: names.into_iter().map(|n| n.to_ascii_lowercase()).collect(),
+        Self::try_new(names).expect("VarySpec names should be validated at configuration load")
+    }
+
+    /// Build from configured names, validating and deduplicating them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the offending name when it is not a valid HTTP field name.
+    pub fn try_new(names: impl IntoIterator<Item = String>) -> Result<Self, String> {
+        let mut seen = HashSet::new();
+        let mut normalized = Vec::new();
+        for raw in names {
+            let name = http::header::HeaderName::from_bytes(raw.as_bytes())
+                .map_err(|_| raw.clone())?
+                .as_str()
+                .to_string();
+            if seen.insert(name.clone()) {
+                normalized.push(name);
+            }
         }
+        Ok(Self { names: normalized })
     }
 
     /// Configured names, lowercased.
@@ -225,13 +246,24 @@ impl VarySpec {
     /// entry, with an empty value — otherwise "absent" and "present but empty"
     /// would collide, and those are different requests to the origin.
     #[must_use]
-    pub fn values_from<'a, F>(&self, header: F) -> Vec<(String, String)>
-    where
-        F: Fn(&str) -> Option<&'a str>,
-    {
+    pub fn values_from(&self, headers: &http::HeaderMap) -> Vec<VaryHeaderValues> {
         self.names
             .iter()
-            .map(|name| (name.clone(), header(name).unwrap_or_default().to_string()))
+            .map(|name| {
+                let header_name = http::header::HeaderName::from_bytes(name.as_bytes())
+                    .expect("VarySpec names should already be validated");
+                let values = headers.contains_key(&header_name).then(|| {
+                    headers
+                        .get_all(&header_name)
+                        .iter()
+                        .map(|value| value.as_bytes().to_vec())
+                        .collect()
+                });
+                VaryHeaderValues {
+                    name: name.clone(),
+                    values,
+                }
+            })
             .collect()
     }
 
@@ -473,10 +505,13 @@ mod tests {
             url: "https://example.com/news/article".to_string(),
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
+            origin_identity: "https://origin.example.com\0origin.example.com".to_string(),
             assembly_mode: AssemblyMode::Esi,
-            vary_values: vec![("rsc".to_string(), "1".to_string())],
-            accept_encoding: "gzip".to_string(),
-            integration_fingerprint: "abc123".to_string(),
+            vary_values: vec![VaryHeaderValues {
+                name: "rsc".to_string(),
+                values: Some(vec![b"1".to_vec()]),
+            }],
+            template_fingerprint: "abc123".to_string(),
             schema_version: TEMPLATE_SCHEMA_VERSION,
         }
     }
@@ -507,21 +542,20 @@ mod tests {
         scheme.request_scheme = "http".to_string();
         assert_ne!(scheme.to_cache_key(), base, "scheme must change the key");
 
-        let mut encoding = key();
-        encoding.accept_encoding = "br".to_string();
+        let mut origin = key();
+        origin.origin_identity = "https://origin.example.com\0other.example.com".to_string();
         assert_ne!(
-            encoding.to_cache_key(),
+            origin.to_cache_key(),
             base,
-            "accept encoding must change the key; serving brotli to a gzip client \
-             is a broken response"
+            "origin Host identity must change the key"
         );
 
         let mut fingerprint = key();
-        fingerprint.integration_fingerprint = "def456".to_string();
+        fingerprint.template_fingerprint = "def456".to_string();
         assert_ne!(
             fingerprint.to_cache_key(),
             base,
-            "integration fingerprint must change the key"
+            "template fingerprint must change the key"
         );
 
         let mut schema = key();
@@ -533,7 +567,10 @@ mod tests {
         );
 
         let mut vary = key();
-        vary.vary_values = vec![("rsc".to_string(), "0".to_string())];
+        vary.vary_values = vec![VaryHeaderValues {
+            name: "rsc".to_string(),
+            values: Some(vec![b"0".to_vec()]),
+        }];
         assert_ne!(vary.to_cache_key(), base, "vary values must change the key");
     }
 
@@ -557,9 +594,24 @@ mod tests {
     }
 
     #[test]
+    fn rendered_key_is_fixed_size_and_contains_no_request_material() {
+        let rendered = key().to_cache_key();
+        assert_eq!(rendered.len(), "ts-c2-v2-".len() + 64);
+        for sensitive in ["example.com", "/news/article", "rsc", "abc123"] {
+            assert!(
+                !rendered.contains(sensitive),
+                "key leaked `{sensitive}`: {rendered}"
+            );
+        }
+    }
+
+    #[test]
     fn vary_header_names_are_matched_case_insensitively() {
         let mut upper = key();
-        upper.vary_values = vec![("RSC".to_string(), "1".to_string())];
+        upper.vary_values = vec![VaryHeaderValues {
+            name: "RSC".to_ascii_lowercase(),
+            values: Some(vec![b"1".to_vec()]),
+        }];
         assert_eq!(
             upper.to_cache_key(),
             key().to_cache_key(),
@@ -573,13 +625,25 @@ mod tests {
         // differing order means differing inputs rather than the same request.
         let mut a = key();
         a.vary_values = vec![
-            ("rsc".to_string(), "1".to_string()),
-            ("accept-encoding".to_string(), "gzip".to_string()),
+            VaryHeaderValues {
+                name: "rsc".to_string(),
+                values: Some(vec![b"1".to_vec()]),
+            },
+            VaryHeaderValues {
+                name: "x-route".to_string(),
+                values: Some(vec![b"article".to_vec()]),
+            },
         ];
         let mut b = key();
         b.vary_values = vec![
-            ("accept-encoding".to_string(), "gzip".to_string()),
-            ("rsc".to_string(), "1".to_string()),
+            VaryHeaderValues {
+                name: "x-route".to_string(),
+                values: Some(vec![b"article".to_vec()]),
+            },
+            VaryHeaderValues {
+                name: "rsc".to_string(),
+                values: Some(vec![b"1".to_vec()]),
+            },
         ];
         assert_ne!(a.to_cache_key(), b.to_cache_key());
     }
@@ -606,17 +670,49 @@ mod tests {
     }
 
     #[test]
+    fn punctuation_distinct_urls_have_distinct_surrogate_keys() {
+        let mut slash = key();
+        slash.url = "https://example.com/a/b".to_string();
+        let mut colon = key();
+        colon.url = "https://example.com/a:b".to_string();
+        assert_ne!(slash.surrogate_keys()[1], colon.surrogate_keys()[1]);
+    }
+
+    #[test]
     fn an_absent_vary_header_is_distinct_from_an_empty_one() {
         // "absent" and "present but empty" are different requests to the origin, so
         // they must not share a template.
         let spec = VarySpec::new(["RSC".to_string()]);
-        let absent = spec.values_from(|_| None);
-        let empty = spec.values_from(|_| Some(""));
-        assert_eq!(absent, empty, "both render as an empty value by design");
+        let absent_headers = http::HeaderMap::new();
+        let absent = spec.values_from(&absent_headers);
+        let mut empty_headers = http::HeaderMap::new();
+        empty_headers.insert("rsc", http::HeaderValue::from_static(""));
+        let empty = spec.values_from(&empty_headers);
+        assert_ne!(absent, empty);
 
         // The distinction that does matter: a present value differs from both.
-        let present = spec.values_from(|_| Some("1"));
+        let mut present_headers = http::HeaderMap::new();
+        present_headers.insert("rsc", http::HeaderValue::from_static("1"));
+        let present = spec.values_from(&present_headers);
         assert_ne!(present, absent);
+    }
+
+    #[test]
+    fn repeated_and_non_utf8_vary_values_are_preserved() {
+        let spec = VarySpec::new(["x-route".to_string()]);
+        let mut headers = http::HeaderMap::new();
+        headers.append("x-route", http::HeaderValue::from_static("first"));
+        headers.append(
+            "x-route",
+            http::HeaderValue::from_bytes(b"\xffsecond").expect("obs-text is valid field data"),
+        );
+        assert_eq!(
+            spec.values_from(&headers),
+            vec![VaryHeaderValues {
+                name: "x-route".to_string(),
+                values: Some(vec![b"first".to_vec(), b"\xffsecond".to_vec()]),
+            }]
+        );
     }
 
     #[test]
@@ -624,6 +720,20 @@ mod tests {
         assert_eq!(
             VarySpec::new(["RSC".to_string(), "Accept-Encoding".to_string()]).names(),
             ["rsc", "accept-encoding"]
+        );
+    }
+
+    #[test]
+    fn vary_spec_rejects_invalid_names_and_deduplicates_case_insensitively() {
+        assert_eq!(
+            VarySpec::try_new(["not a header".to_string()]),
+            Err("not a header".to_string())
+        );
+        assert_eq!(
+            VarySpec::try_new(["RSC".to_string(), "rsc".to_string()])
+                .expect("valid names")
+                .names(),
+            ["rsc"]
         );
     }
 
@@ -656,7 +766,7 @@ mod tests {
 
         assert!(
             spec.uncovered_by(["Accept-Encoding"]).is_empty(),
-            "the key has a dedicated accept_encoding field, so this is already covered"
+            "the shared path uses one upstream encoding offer and stores identity bytes"
         );
         assert_eq!(
             spec.uncovered_by(["accept-encoding, rsc"]),

@@ -183,10 +183,13 @@ mod tests {
             url: url.to_string(),
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
+            origin_identity: "https://origin.example.com\0origin.example.com".to_string(),
             assembly_mode: AssemblyMode::Esi,
-            vary_values: vec![("rsc".to_string(), "1".to_string())],
-            accept_encoding: "identity".to_string(),
-            integration_fingerprint: "fp".to_string(),
+            vary_values: vec![trusted_server_core::platform::VaryHeaderValues {
+                name: "rsc".to_string(),
+                values: Some(vec![b"1".to_vec()]),
+            }],
+            template_fingerprint: "fp".to_string(),
             schema_version: TEMPLATE_SCHEMA_VERSION,
         }
     }
