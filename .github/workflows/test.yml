@@ -1,4 +1,6 @@
 name: "Run Tests"
+run-name: >-
+  Run Tests / ${{ inputs.evidence_id || format('PR {0}', github.event.pull_request.number) }}
 
 permissions:
   contents: read
@@ -7,6 +9,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      evidence_id:
+        description: Unique cutover evidence identifier
+        required: true
+        type: string
+      release_id:
+        description: Exact generated TSJS release id
+        required: true
+        type: string
 
 jobs:
   test-rust:
@@ -299,3 +311,105 @@ jobs:
 
       - name: Run unit tests
         run: npm test -- --run
+
+  cutover-quality-evidence:
+    name: APS/TSJS cutover quality evidence
+    if: github.event_name == 'workflow_dispatch'
+    needs:
+      - test-rust
+      - test-axum
+      - test-cloudflare
+      - test-spin
+      - test-parity
+      - test-cli
+      - test-typescript
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read repository toolchain pins
+        id: toolchains
+        shell: bash
+        run: |
+          node_version="$(awk '$1 == "nodejs" { print $2 }' .tool-versions)"
+          rust_version="$(awk '$1 == "rust" { print $2 }' .tool-versions)"
+          test -n "$node_version"
+          test -n "$rust_version"
+          echo "node=$node_version" >> "$GITHUB_OUTPUT"
+          echo "rust=$rust_version" >> "$GITHUB_OUTPUT"
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.toolchains.outputs.node }}
+          cache: npm
+          cache-dependency-path: |
+            crates/trusted-server-js/lib/package-lock.json
+            docs/package-lock.json
+
+      - name: Set up pinned Rust quality targets
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.toolchains.outputs.rust }}
+          components: clippy, rustfmt
+          target: wasm32-wasip1,wasm32-unknown-unknown
+          cache-shared-key: cargo-${{ runner.os }}-aps-tsjs-quality
+
+      - name: Install exact JavaScript dependencies
+        run: |
+          npm --prefix crates/trusted-server-js/lib ci
+          npm --prefix docs ci
+
+      - name: Validate release id and run final quality gates
+        env:
+          EXPECTED_RELEASE_ID: ${{ inputs.release_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/aps-tsjs-quality-evidence
+          {
+            cargo fmt --all -- --check
+            npm --prefix crates/trusted-server-js/lib run format
+            npm --prefix docs run format
+            cargo clippy-fastly
+            cargo clippy-axum
+            cargo clippy-cloudflare
+            cargo clippy-cloudflare-wasm
+            cargo clippy-spin-native
+            cargo clippy-spin-wasm
+            cargo clippy --manifest-path crates/trusted-server-integration-tests/Cargo.toml --all-targets -- -D warnings
+            npm --prefix crates/trusted-server-js/lib run build
+            npm --prefix crates/trusted-server-js/lib run build:prebid-external
+            npm --prefix crates/trusted-server-js/lib run check:aps-contract
+            npm --prefix crates/trusted-server-js/lib run check:hard-cutover-absence
+            npm --prefix crates/trusted-server-js/lib run check:bundle
+            node --test crates/trusted-server-js/lib/test/contract/rc-july-adoption.test.mjs
+            npm --prefix docs run lint
+            npm --prefix docs run build
+            actual_release_id="$(npm --prefix crates/trusted-server-js/lib run --silent print:release-id)"
+            test -n "$EXPECTED_RELEASE_ID"
+            test "$actual_release_id" = "$EXPECTED_RELEASE_ID"
+          } 2>&1 | tee target/aps-tsjs-quality-evidence/quality.log
+          cp crates/trusted-server-js/dist/tsjs-release-v1.json target/aps-tsjs-quality-evidence/
+          cp crates/trusted-server-js/dist/tsjs-build-metrics-v1.json target/aps-tsjs-quality-evidence/
+
+      - name: Write exact quality evidence manifest
+        env:
+          EVIDENCE_ID: ${{ inputs.evidence_id }}
+          RELEASE_ID: ${{ inputs.release_id }}
+        run: >-
+          node -e 'const fs=require("node:fs");
+          const path="target/aps-tsjs-quality-evidence/evidence-manifest.json";
+          fs.writeFileSync(path,JSON.stringify({schemaVersion:1,evidenceId:process.env.EVIDENCE_ID,
+          releaseId:process.env.RELEASE_ID,commitSha:process.env.GITHUB_SHA,
+          runId:process.env.GITHUB_RUN_ID,conclusion:"success"},null,2)+"\n",{mode:384});'
+
+      - name: Upload exact quality evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: aps-tsjs-quality-${{ github.run_id }}
+          path: target/aps-tsjs-quality-evidence/
+          if-no-files-found: error
+          retention-days: 30

@@ -83,7 +83,7 @@ jobs:
           ATTESTATION_TEST_OUTCOME: ${{ steps.real-gam.outcome }}
         run: >-
           node -e 'const fs=require("node:fs");
-          const path="crates/trusted-server-integration-tests/browser/real-gam-evidence/attestation-v1.json";
+          const path="crates/trusted-server-integration-tests/browser/real-gam-evidence/evidence-manifest.json";
           fs.mkdirSync(require("node:path").dirname(path),{recursive:true});
           fs.writeFileSync(path,JSON.stringify({schemaVersion:1,evidenceId:process.env.ATTESTATION_EVIDENCE_ID,
           releaseId:process.env.ATTESTATION_RELEASE_ID,previousArtifactId:process.env.ATTESTATION_PREVIOUS_ARTIFACT_ID,
@@ -102,7 +102,7 @@ jobs:
           const files=[]; const walk=p=>{if(!fs.existsSync(p))return; for(const e of fs.readdirSync(p,{withFileTypes:true})){const q=path.join(p,e.name); e.isDirectory()?walk(q):files.push(q)}}; roots.forEach(walk);
           for(const file of files){if(forbiddenExt.has(path.extname(file)))throw Error("native capture forbidden: "+path.extname(file)); const body=fs.readFileSync(file); for(const secret of secrets){if(body.includes(Buffer.from(secret)))throw Error("protected value found in browser evidence")}}
           const traces=files.filter(file=>file.endsWith("sanitized-trace-v1.json"));
-          for(const file of traces){const text=fs.readFileSync(file,"utf8"); if(/"(?:accountId|aaxResponse|adm|authorization|creativeBody|descriptor|lifecycleTicket|nonce|postData|requestHeaders|responseBody|responseHeaders)"\s*:/.test(text)||text.includes("<script")||text.includes("<!doctype"))throw Error("unsafe field or body found in sanitized evidence")}
+          for(const file of traces){const text=fs.readFileSync(file,"utf8"); if(/"(?:accountId|aaxResponse|adm|authorization|capabilities?|creativeBody|descriptor|lifecycleTicket|nonce|postData|requestHeaders|responseBody|responseHeaders)"\s*:/.test(text)||/<script(?:\s|>)|<!doctype/i.test(text))throw Error("unsafe field or body found in sanitized evidence")}
           if(process.env.REAL_GAM_TEST_OUTCOME==="success"&&traces.length!==60)throw Error("successful three-browser run must emit 60 sanitized case traces");'
 
       - name: Upload real-GAM evidence
