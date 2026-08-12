@@ -32,8 +32,8 @@ adapters.
 
 **Source of truth:**
 `docs/superpowers/specs/2026-08-04-aps-render-fix-and-tsjs-resilience-design.md`
-revision 32, frozen review SHA
-`b8363baf815e0311ccce72cded37f66c4eccac298ed917e2ffe9d30c15dcb857`. This is the
+revision 33, frozen review SHA
+`958a79ccbbfe70c24a1529f6a4a469e15217cf5da799342a13d122fee4cdc99e`. This is the
 only implementation-plan document for the work. APS render
 and the runtime architecture are one coupled cutover: neither subsystem is useful or
 safe to release independently, so they remain in this one plan.
@@ -196,7 +196,7 @@ Every task's regression suite therefore remains green in task order.
 - Test: existing Rust, Vitest, and APS Playwright suites
 
 - [ ] **Step 1: Write and run the failing executable adoption-manifest test.** Extract
-      the `rcjuly-tsjs-manifest-v1` JSON block from the revision-32 spec, enumerate
+      the `rcjuly-tsjs-manifest-v1` JSON block from the revision-33 spec, enumerate
       every `includeRoot` and exact file at
       `905984e62a0858c53d9f0ff6dd3a1bf190cf311d` with `git ls-tree`, and fail for an
       unmapped pinned file, a `lib/src` file mapped only to `RCJ-QUAL-01`, a dead
@@ -252,11 +252,15 @@ Every task's regression suite therefore remains green in task order.
   For this pre-change capture, define the sets exactly as minimal `[core]`, reference
   `[core, creative, gpt, prebid, datadome]`, and maximal core plus every built
   integration. Record 23,317 / 8,687 / 7,686; 113,756 / 35,163 / 26,051; and
-  187,224 / 53,799 / 37,790 bytes respectively. The post-split semantic sets are
-  defined in Task 18D and must fit the derived ceilings without altering this
-  fixture. Expose the comparator as `npm run check:bundle` and run it in the
-  TypeScript CI job immediately after `npm run build`; a generated metrics file that
-  is not consumed by CI is not a gate.
+  187,224 / 53,799 / 37,790 bytes respectively. These original fields are immutable
+  historical measurements of the old artifact membership. After the split they are
+  printed as deltas only: they are not byte ceilings for the different post-split
+  semantic sets. Task 18E appends one separately identified role-correct capture to
+  this same JSON without changing these fields. Expose the comparator as
+  `npm run check:bundle` and run it in the TypeScript CI job immediately after
+  `npm run build`; before Task 18E it validates inventory/graph integrity and reports
+  historical deltas, and after Task 18E it also enforces the role-correct ceilings.
+  A generated metrics file that is not consumed by CI is not a gate.
 
   Extend `scripts/integration-tests-browser.sh` with
   `TS_BROWSER_FRAMEWORKS=nextjs` and use `npm --prefix ... exec -- playwright` for
@@ -1457,8 +1461,10 @@ collapse those checkpoints or carry unverified behavior between them.
 - [ ] **Step 5: Generate the inline controller and fallback from one TypeScript source**
       and test their bytes and terminal behavior at every checkpoint. Delete the old
       behavior-bearing `gpt_bootstrap.js` at the production switch. Pin the generated
-      artifact with a staleness assertion and the independent 20,056 raw / 5,741 gzip /
-      4,863 Brotli ceilings; there is never a hand-maintained second fallback or a
+      artifact with a staleness assertion. Report 19,101 raw / 5,468 gzip / 4,632
+      Brotli and their former 5% figures as historical old-artifact evidence only;
+      Task 18E captures and gates the generated post-split bootstrap artifact with the
+      role-correct formula. There is never a hand-maintained second fallback or a
       degraded GPT runtime.
 
 - [ ] **Step 6: Run:**
@@ -3458,13 +3464,18 @@ labelled `module.ts` paths are created here before Task 18D modifies them.
       turn and prove every sibling starts immediately with its own deadline and the
       one runtime/adapter/listener identities remain unchanged.
 
-- [ ] **Step D7: Make the production import, inventory, and immutable size gates
-      green, then commit.** Minimal critical means `[core,render_runtime]`; reference
+- [ ] **Step D7: Make the production import and inventory gates green, report the
+      historical size deltas, then commit and push.** Minimal critical means `[core,render_runtime]`; reference
       critical means `[core,render_runtime,creative,gpt,prebid,datadome]`; maximal
       TSJS total counts core and every production integration module exactly once.
       The release inventory also counts bootstrap exactly once under its separate
       bootstrap role/budget; it is not added to maximal TSJS total. Splitting never
-      excuses maximal-total growth.
+      excuses later maximal-total growth. At this pre-capture checkpoint,
+      `check:bundle` must validate the immutable historical subtree, semantic
+      membership, graph integrity, and artifact accounting, print the old-membership
+      values as deltas, and report `roleCorrectStatus: "pending-capture"`; it must not
+      compare the new semantic sets to the old membership's byte ceilings. Task 18E
+      closes that temporary pre-production state before Task 19.
 
   ```bash
   npm --prefix crates/trusted-server-js/lib test
@@ -3481,7 +3492,290 @@ labelled `module.ts` paths are created here before Task 18D modifies them.
   git add crates/trusted-server-js/lib/src/composition/browser.ts crates/trusted-server-js/lib/src/composition/browser_test.ts crates/trusted-server-js/lib/test/integrations/phase-slices.test.ts crates/trusted-server-js/lib/test/composition/browser.test.ts crates/trusted-server-js/lib/test/composition/maximal-runtime.test.ts
   git add crates/trusted-server-js/lib/build-all.mjs crates/trusted-server-js/lib/scripts/check-architecture.mjs crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs
   git commit -m "Split TSJS around the protected first display"
+  git push origin "$(git branch --show-current)"
   ```
+
+#### Task 18E: Resolve current-base conflicts and freeze role-correct transfer budgets
+
+This is an integration and measurement checkpoint, not production wiring. The PR
+continues to target `rc/july`. Resolve `main` first because the user explicitly
+requested a clean merge against it, then resolve the actual PR base. Do not use a
+blanket `ours` or `theirs` strategy: preserve upstream fixes and the revision-33
+runtime/APS contracts file-by-file.
+
+**Task 18E files:**
+
+- Modify as required: files conflicted by merging `origin/main`
+- Modify as required: files conflicted by merging `origin/rc/july`
+- Modify: `crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json`
+- Modify: `crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs`
+- Create: `crates/trusted-server-js/lib/scripts/bundle-metrics.mjs`
+- Modify: `crates/trusted-server-js/lib/test/build/release-v1.test.mjs`
+- Modify: `crates/trusted-server-integration-tests/browser/tests/shared/tsjs-performance.spec.ts`
+- Create: `scripts/validate-tsjs-performance-evidence.mjs`
+- Create: `.github/workflows/tsjs-performance-gate.yml`
+- Modify: `.github/workflows/test.yml`
+- Modify: `.github/workflows/integration-tests.yml`
+
+- [ ] **Step E1: Prove Task 18D is committed, pushed, and clean before integrating.**
+
+  ```bash
+  test -z "$(git status --porcelain)"
+  TASK18D_SHA="$(git rev-parse HEAD)"
+  git fetch origin "$(git branch --show-current)" main rc/july
+  test "$TASK18D_SHA" = "$(git rev-parse "origin/$(git branch --show-current)")"
+  ```
+
+- [ ] **Step E2: Merge current `origin/main` and resolve every conflict
+      deliberately.** For each conflict, compare the merge base, upstream side, and
+      Task 18D side. Retain upstream security/build/test fixes while preserving one
+      runtime, the 14-critical/6-deferred catalog, live APS proxying, external GPT/
+      Prebid bytes, and the hard-cutover contract. `git merge` may report conflicts;
+      resolve them before running any test, stage each resolved path explicitly, and
+      assert there is no unresolved, unstaged, or untracked residue. If `main` is
+      already contained, verify the no-op instead of manufacturing an empty commit.
+      Then run the focused suites for every conflicted subsystem plus the full JS
+      gate before completing the merge:
+
+  ```bash
+  MAIN_SHA="$(git rev-parse origin/main)"
+  git merge --no-ff --no-commit origin/main
+  # If Git reports conflicts: inspect all three stages, edit deliberately, and
+  # git add each exact resolved path before continuing.
+  test -z "$(git ls-files -u)"
+  git diff --quiet
+  test -z "$(git ls-files --others --exclude-standard)"
+  git diff --check
+  git diff --cached --check
+  npm --prefix crates/trusted-server-js/lib test
+  npm --prefix crates/trusted-server-js/lib run build
+  npm --prefix crates/trusted-server-js/lib run test:release
+  npm --prefix crates/trusted-server-js/lib run test:architecture
+  npm --prefix crates/trusted-server-js/lib run lint
+  npm --prefix crates/trusted-server-js/lib run typecheck
+  cargo test-fastly
+  cargo test-axum
+  cargo test-cloudflare
+  cargo test-spin
+  test -z "$(git ls-files -u)"
+  git diff --check
+  git diff --cached --check
+  git status --short
+  if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+    git commit -m "Merge current main into the TSJS cutover"
+  fi
+  git merge-base --is-ancestor "$MAIN_SHA" HEAD
+  ```
+
+- [ ] **Step E3: Merge current `origin/rc/july`, resolve the PR-base conflicts with
+      the same three-way discipline, and rerun the complete E2 verification.** Also
+      run the adoption ledger because `rc/july` is its source branch. As in E2,
+      resolve and stage before testing and commit only when `MERGE_HEAD` exists. List
+      and run the complete verification explicitly; do not treat “same as E2” as an
+      executable gate. Push only when the worktree is clean:
+
+  ```bash
+  RC_JULY_SHA="$(git rev-parse origin/rc/july)"
+  git merge --no-ff --no-commit origin/rc/july
+  # If Git reports conflicts: inspect all three stages, edit deliberately, and
+  # git add each exact resolved path before continuing.
+  test -z "$(git ls-files -u)"
+  git diff --quiet
+  test -z "$(git ls-files --others --exclude-standard)"
+  git diff --check
+  git diff --cached --check
+  node --test crates/trusted-server-js/lib/test/contract/rc-july-adoption.test.mjs
+  npm --prefix crates/trusted-server-js/lib test
+  npm --prefix crates/trusted-server-js/lib run build
+  npm --prefix crates/trusted-server-js/lib run test:release
+  npm --prefix crates/trusted-server-js/lib run test:architecture
+  npm --prefix crates/trusted-server-js/lib run lint
+  npm --prefix crates/trusted-server-js/lib run typecheck
+  cargo test-fastly
+  cargo test-axum
+  cargo test-cloudflare
+  cargo test-spin
+  test -z "$(git ls-files -u)"
+  git diff --check
+  git diff --cached --check
+  if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+    git commit -m "Merge current rc/july into the TSJS cutover"
+  fi
+  git merge-base --is-ancestor "$RC_JULY_SHA" HEAD
+  test -z "$(git status --porcelain)"
+  git push origin "$(git branch --show-current)"
+  ```
+
+- [ ] **Step E4: From that exact clean, pushed, post-conflict parent commit, build
+      once and append the role-correct capture to the existing JSON.** Never rewrite
+      any original top-level field. Add `roleCorrectTransfer` containing the capture
+      ref/SHA; exact Node/npm/TypeScript/Vite/esbuild identities (or the immutable
+      package-lock digest that covers Vite/esbuild); gzip/Brotli implementation,
+      version, and parameters; release id; the canonical release inventory with every
+      artifact's exact `id`, `role`, `phase`, `trigger`, `inputs`, `outputs`, `file`,
+      `bytes`, and `hash`; and exact raw/gzip/Brotli values for:
+  - bootstrap: the generated controller/fallback exactly once;
+  - minimal: `[core,render_runtime]`;
+  - reference: `[core,render_runtime,creative,gpt,prebid,datadome]`;
+  - maximal: core plus all twenty catalogued modules, excluding bootstrap.
+
+  Run exactly:
+
+  ```bash
+  CAPTURE_REF="$(git branch --show-current)"
+  CAPTURE_SHA="$(git rev-parse HEAD)"
+  git fetch origin "$CAPTURE_REF"
+  test "$CAPTURE_SHA" = "$(git rev-parse "origin/$CAPTURE_REF")"
+  test -z "$(git status --porcelain)"
+  npm --prefix crates/trusted-server-js/lib run build
+  npm --prefix crates/trusted-server-js/lib run test:release
+  ```
+
+  Recompute every generated artifact hash from its current bytes and assert the
+  release id, inventory, and metrics agree before copying only those generated values
+  into the new object with `apply_patch`. Do not add a recapture command or mutable
+  update mode to the comparator.
+
+- [ ] **Step E5: Test-drive the permanent comparator.** Pin one canonical digest over
+      every original top-level field except the newly appended
+      `roleCorrectTransfer`; this protects source, environment, sampling, bundles,
+      performance samples/ceilings, and evidence linkage together. Validate every
+      role-correct evidence field and exact semantic membership. At the freeze point,
+      prove the capture's release id, inventory, artifact hashes, and bytes equal the
+      exact clean capture parent. For bootstrap/minimal/reference/maximal and each
+      size kind, enforce `current <= ceil(captured * 1.05)`. Preserve all graph-
+      integrity blockers: no missing/unclassified/multiply counted artifact, omitted
+      maximal module, critical-to-deferred reachability, provider inlining, duplicate
+      adapter/runtime/listener owner, or production test/fake/no-op seam. Add negative
+      mutations for every original subtree and each forbidden edge. Add a fractional
+      boundary fixture proving exactly `ceil(captured * 1.05)` passes and
+      `ceil(captured * 1.05) + 1` fails; this must reject a `floor` implementation.
+      Extract deterministic inventory-set aggregation and raw/gzip/Brotli measurement
+      into pure `scripts/bundle-metrics.mjs`. The build calls that helper; Task 19 may
+      change production entry wiring in `build-all.mjs`, but cannot alter the frozen
+      measurement helper or comparator.
+
+  ```bash
+  npm --prefix crates/trusted-server-js/lib test -- --run test/build/release-v1.test.mjs
+  npm --prefix crates/trusted-server-js/lib run build
+  npm --prefix crates/trusted-server-js/lib run check:bundle
+  npm --prefix crates/trusted-server-js/lib run test:release
+  npm --prefix crates/trusted-server-js/lib run test:architecture
+  npm --prefix crates/trusted-server-js/lib run lint
+  npm --prefix crates/trusted-server-js/lib run typecheck
+  git diff --check
+  ```
+
+- [ ] **Step E6: Commit only the frozen capture/comparator checkpoint, push it, and
+      re-run `check:bundle` from a clean tree.** The capture's source SHA intentionally
+      names this commit's clean parent; its release id and artifact hashes must match
+      the files measured at that parent. Any future recapture or membership/formula
+      change requires a separate reviewed design.
+
+  ```bash
+  git add \
+    crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json \
+    crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs \
+    crates/trusted-server-js/lib/scripts/bundle-metrics.mjs \
+    crates/trusted-server-js/lib/test/build/release-v1.test.mjs \
+    .github/workflows/test.yml
+  git diff --cached --check
+  git commit -m "Freeze role-correct TSJS transfer budgets"
+  git push origin "$(git branch --show-current)"
+  test -z "$(git status --porcelain)"
+  npm --prefix crates/trusted-server-js/lib run build
+  npm --prefix crates/trusted-server-js/lib run check:bundle
+  ```
+
+- [ ] **Step E7: Implement and run the real browser-time, retained-heap, and request-
+      ordering gate before production wiring.** The browser fixture must exercise the
+      generated server controller, real critical artifact, one runtime, and real
+      first-display adapter through test-only prospective routes/composition; it may
+      not switch any production emitter or use `window.__tsjsPerf`. On Chromium
+      145.0.7632.6, `github-hosted:ubuntu-24.04`, and fixture
+      `tsjs-core-placeholder-v1`, use exactly five warmups and 50 samples, require the
+      real `tsjs:bids-script` and `tsjs:first-display` marks, and enforce p90 ≤28.6 ms
+      without selective reruns.
+
+  In one separate fresh Chromium context, run the real fixture once. At each heap
+  checkpoint, send `HeapProfiler.collectGarbage` exactly once, immediately read the
+  single `Runtime.getHeapUsage.usedSize`, and enforce 1,329,697 bytes after boot,
+  1,333,217 after first render, 1,333,217 after refresh, and 1,341,419 after SPA
+  navigation. Also assert exactly one critical TSJS request; no deferred request,
+  preload, preparation, or execution before `tsjs:first-display-paint`; independent
+  deferred starts after the gate; and no head-of-line blocking. Performance cannot
+  waive a correctness failure.
+
+  Put the entire measurement job—pinned runner/image, fixture preparation, commands,
+  environment, and named artifact upload—in standalone
+  `.github/workflows/tsjs-performance-gate.yml`, with `workflow_dispatch` and reusable
+  `workflow_call` inputs for evidence id and `preswitch | postswitch` mode. Other
+  workflows may call this file but cannot duplicate or redefine its measurement
+  steps.
+
+  ```bash
+  TS_BROWSER_FRAMEWORKS=nextjs \
+  TS_BROWSER_PROJECTS=chromium \
+  TSJS_PERF_MODE=gate \
+  TSJS_PERF_OUTPUT=crates/trusted-server-integration-tests/browser/test-results/tsjs-performance-preswitch.json \
+    ./scripts/integration-tests-browser.sh \
+      tests/shared/tsjs-performance.spec.ts --project=chromium
+  npm --prefix crates/trusted-server-js/lib run build
+  npm --prefix crates/trusted-server-js/lib run check:bundle
+  ```
+
+  Stage only the performance test and workflow wiring, commit and push, then dispatch
+  the focused integration workflow for that exact pushed SHA with a unique evidence
+  id and wait for its named pre-switch performance job to succeed. Upload the non-
+  baseline result as immutable pre-switch evidence; never overwrite the Task 0
+  fixture or Task 18E capture. Any pre-Task19 change to a production artifact or its
+  build inputs invalidates the role-correct capture and must receive separate design
+  review; E7 changes only the browser gate and workflow wiring.
+
+  ```bash
+  git add \
+    crates/trusted-server-integration-tests/browser/tests/shared/tsjs-performance.spec.ts \
+    scripts/validate-tsjs-performance-evidence.mjs \
+    .github/workflows/tsjs-performance-gate.yml \
+    .github/workflows/test.yml \
+    .github/workflows/integration-tests.yml
+  git diff --cached --check
+  git commit -m "Gate TSJS first-display performance before cutover"
+  git push origin "$(git branch --show-current)"
+  test -z "$(git status --porcelain)"
+  PRESWITCH_REF="$(git branch --show-current)"
+  PRESWITCH_SHA="$(git rev-parse HEAD)"
+  PRESWITCH_EVIDENCE_ID="aps-tsjs-preswitch-${PRESWITCH_SHA}"
+  PRESWITCH_RUN_ID="$(node scripts/dispatch-workflow-run.mjs \
+    tsjs-performance-gate.yml \
+    "$PRESWITCH_REF" \
+    evidence_id="$PRESWITCH_EVIDENCE_ID" \
+    mode=preswitch)"
+  gh run watch "$PRESWITCH_RUN_ID" --exit-status
+  PRESWITCH_EVIDENCE_DIR="$(mktemp -d)"
+  gh run download "$PRESWITCH_RUN_ID" \
+    --name "tsjs-performance-$PRESWITCH_EVIDENCE_ID" \
+    --dir "$PRESWITCH_EVIDENCE_DIR"
+  node scripts/validate-tsjs-performance-evidence.mjs \
+    --file "$PRESWITCH_EVIDENCE_DIR/tsjs-performance-preswitch.json" \
+    --evidence-id "$PRESWITCH_EVIDENCE_ID" \
+    --head-sha "$PRESWITCH_SHA" \
+    --mode preswitch
+  PRESWITCH_TAG="tsjs-performance-instrument-${PRESWITCH_SHA}"
+  test -z "$(git ls-remote --tags origin "refs/tags/$PRESWITCH_TAG")"
+  git tag -a "$PRESWITCH_TAG" "$PRESWITCH_SHA" \
+    -m "Freeze validated TSJS performance instrument"
+  git push origin "refs/tags/$PRESWITCH_TAG"
+  test "$PRESWITCH_SHA" = "$(git rev-parse "$PRESWITCH_TAG^{commit}")"
+  ```
+
+  The validator rejects a wrong evidence id/head SHA, environment or fixture drift,
+  anything other than five warmups/50 samples, missing real marks, p90/heap overflow,
+  a failed correctness/load-order assertion, or an incomplete result. Record the
+  immutable `{sha,tag,evidenceId,runId,artifactName}` tuple in the PR execution
+  evidence, not in either baseline object. The annotated tag is created only after
+  the evidence validates and is never moved, deleted, or force-pushed; its SHA is the
+  sole later byte-identity baseline.
 
 ### Task 19: Perform the coordinated production wiring switch
 
@@ -3543,7 +3837,8 @@ labelled `module.ts` paths are created here before Task 18D modifies them.
   - old-surface rejection plus new-surface fixture tests, proving the cutover commit
     contains no new behavior implementation or test repair.
 
-  Keep the immutable bundle-size gate wired and green. Task 18D must already have
+  Keep the immutable historical-reporting and role-correct bundle gates wired and
+  green. Task 18D must already have
   removed old-plus-new production membership; do not rebase the pre-change artifact
   or defer a failing critical/maximal budget until after the atomic switch.
 
@@ -3558,8 +3853,43 @@ labelled `module.ts` paths are created here before Task 18D modifies them.
   cannot satisfy the post-switch gate.
 
   ```bash
-  git diff --cached --quiet
+  test -z "$(git status --porcelain)"
+  test "$(gh pr view --json baseRefName --jq .baseRefName)" = "rc/july"
+  PRESWITCH_REF="$(git branch --show-current)"
+  git fetch origin \
+    'refs/tags/tsjs-performance-instrument-*:refs/tags/tsjs-performance-instrument-*'
+  PRESWITCH_TAGS="$(git tag --list 'tsjs-performance-instrument-*' \
+    --merged HEAD)"
+  test "$(printf '%s\n' "$PRESWITCH_TAGS" | sed '/^$/d' | wc -l | tr -d ' ')" -eq 1
+  PRESWITCH_TAG="$(printf '%s\n' "$PRESWITCH_TAGS" | sed '/^$/d')"
+  PRESWITCH_SHA="$(git rev-parse "$PRESWITCH_TAG^{commit}")"
+  test "$PRESWITCH_TAG" = "tsjs-performance-instrument-$PRESWITCH_SHA"
+  git merge-base --is-ancestor "$PRESWITCH_SHA" HEAD
+  PRESWITCH_EVIDENCE_ID="aps-tsjs-preswitch-${PRESWITCH_SHA}"
+  PRESWITCH_RUNS="$(gh run list \
+    --workflow tsjs-performance-gate.yml \
+    --event workflow_dispatch \
+    --limit 100 \
+    --json databaseId,displayTitle,headSha,conclusion)"
+  PRESWITCH_MATCHES="$(jq \
+    --arg sha "$PRESWITCH_SHA" \
+    --arg evidence "$PRESWITCH_EVIDENCE_ID" \
+    '[.[] | select(.headSha == $sha and (.displayTitle | contains($evidence)))]' \
+    <<<"$PRESWITCH_RUNS")"
+  test "$(jq 'length' <<<"$PRESWITCH_MATCHES")" -eq 1
+  PRESWITCH_RUN_ID="$(jq -er '.[0] | select(.conclusion == "success") | .databaseId' \
+    <<<"$PRESWITCH_MATCHES")"
+  PRESWITCH_EVIDENCE_DIR="$(mktemp -d)"
+  gh run download "$PRESWITCH_RUN_ID" \
+    --name "tsjs-performance-$PRESWITCH_EVIDENCE_ID" \
+    --dir "$PRESWITCH_EVIDENCE_DIR"
+  node scripts/validate-tsjs-performance-evidence.mjs \
+    --file "$PRESWITCH_EVIDENCE_DIR/tsjs-performance-preswitch.json" \
+    --evidence-id "$PRESWITCH_EVIDENCE_ID" \
+    --head-sha "$PRESWITCH_SHA" \
+    --mode preswitch
   npm --prefix crates/trusted-server-js/lib run build
+  npm --prefix crates/trusted-server-js/lib run check:bundle
   npm --prefix crates/trusted-server-js/lib run test:release
   npm --prefix crates/trusted-server-js/lib run test:architecture
   npm --prefix crates/trusted-server-js/lib test -- --run test/core/index.test.ts test/kernel/runtime.test.ts test/composition/browser.test.ts
@@ -3579,6 +3909,8 @@ labelled `module.ts` paths are created here before Task 18D modifies them.
   ./scripts/integration-tests-aps-runner-proxy.sh --runtime fastly
   ./scripts/integration-tests-aps-runner-proxy.sh --runtime cloudflare
   ./scripts/integration-tests-aps-runner-proxy.sh --runtime spin
+  test "$(gh run view "$PRESWITCH_RUN_ID" --json headSha,conclusion \
+    --jq '[.headSha,.conclusion] | @tsv')" = "$PRESWITCH_SHA	success"
   ```
 
 - [ ] **Step 2: Atomically switch production wiring in one task and one commit.** Make no
@@ -4217,40 +4549,61 @@ later group's spec files or workflow changes.
 
 **Files:**
 
-- Modify: `crates/trusted-server-js/lib/build-all.mjs`
-- Modify: `crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs`
+- Read: `crates/trusted-server-js/lib/build-all.mjs`
+- Read: `crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs`
+- Read: `crates/trusted-server-js/lib/scripts/bundle-metrics.mjs`
 - Read: `crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json`
-- Modify: `crates/trusted-server-integration-tests/browser/tests/shared/tsjs-performance.spec.ts`
-- Modify: `.github/workflows/test.yml`
-- Modify: `.github/workflows/integration-tests.yml`
+- Read: `crates/trusted-server-integration-tests/browser/tests/shared/tsjs-performance.spec.ts`
+- Read: `scripts/validate-tsjs-performance-evidence.mjs`
+- Read: `.github/workflows/tsjs-performance-gate.yml`
 
-- [ ] **Step 1: Consume, but do not regenerate, the pre-change artifact captured in Task 0.**
-      Build the canonical release inventory fresh and enforce these immutable raw /
-      gzip / Brotli ceilings: minimal critical 24,482 / 9,121 / 8,070; reference
-      critical 119,443 / 36,921 / 27,353; maximal total 196,585 / 56,488 / 39,679.
-      Independently enforce the generated bootstrap-controller/fallback ceilings
-      20,056 / 5,741 / 4,863. Reject missing/unclassified/multiply counted output,
-      reference reachability to deferred source, production-core test seams, and a
-      maximal inventory that omits a split module. A separate review is required to
-      change a baseline or ceiling.
+The E5/E7 bundle-metrics helper, comparator, browser test, evidence validator, and
+standalone workflow are the frozen measurement instrument. Task 23 changes none of
+them. Later general workflow composition may change, but never this standalone job or
+its called instrument paths. Any measurement-logic, membership, ceiling, or sampling
+change invalidates the pre-switch evidence and must return to Task 18E under separate
+design review. Production-only route selection is part of Task 19 and cannot alter
+sampling or comparison logic.
 
-- [ ] **Step 2: On Chromium 145.0.7632.6, `github-hosted:ubuntu-24.04`, and fixture**
+- [ ] **Step 1: Consume, but do not regenerate, both immutable subtrees captured in
+      Task 0 and Task 18E.** Build the canonical release inventory fresh. Print the
+      original `bundles` values and current deltas as report-only historical evidence;
+      never apply those old-membership numbers as post-split ceilings. For
+      `roleCorrectTransfer`, independently enforce bootstrap, minimal critical,
+      reference critical, and maximal total with
+      `ceil(capturedBytes * 1.05)` for raw/gzip/Brotli. Revalidate the recorded source
+      parent, tool/compression identities, exact semantic membership,
+      historical-evidence digest, and release inventory. Validate every current
+      artifact hash against its current bytes; do not require current post-switch
+      hashes or release id to equal the frozen pre-switch capture. Captured hashes and
+      release id are immutable provenance reproducible by checking out the capture
+      source SHA, while current transfer bytes alone are compared to the frozen
+      ceilings. Reject missing/unclassified/
+      multiply counted output, reference reachability to deferred source, provider
+      inlining, duplicate adapter/runtime/listener ownership, production test/fake/
+      no-op seams, and a maximal inventory that omits any split module. A separate
+      reviewed design is required to alter historical evidence, recapture the
+      role-correct values, change membership, or change the 5% formula.
+
+- [ ] **Step 2: Rerun the exact pre-switch browser-time gate after the production
+      switch.** On Chromium 145.0.7632.6, `github-hosted:ubuntu-24.04`, and fixture
       `tsjs-core-placeholder-v1`, measure boot-to-first-display after five warmups and
-      50 samples and require p90 ≤28.6 ms. Do not rerun
-      selectively to turn a failed sample into a pass. The post-switch sample reads
-      the real `tsjs:bids-script` and `tsjs:first-display` performance marks and the
+      50 samples and require p90 ≤28.6 ms. Do not rerun selectively to turn a failed
+      sample into a pass. The post-switch sample reads the real `tsjs:bids-script`
+      and `tsjs:first-display` performance marks and the
       `tsjs:boot-to-first-display` measure installed in Task 19; fail if any sample
       falls back to the pre-change `window.__tsjsPerf` placeholder or lacks either
-      mark. The fixture must use the real server controller, critical artifact,
-      runtime, and first-display adapter path.
+      mark. The fixture must use the production-wired server controller, critical
+      artifact, runtime, and first-display adapter path.
 
-- [ ] **Step 3: Through Chromium CDP, run the exact retained-heap protocol.** After the
-      display samples, open one separate fresh context and execute the real fixture
-      once. At each checkpoint send `HeapProfiler.collectGarbage` exactly once,
-      immediately call `Runtime.getHeapUsage`, and compare that single `usedSize`
-      without averaging, max selection, or rerun. Enforce ceilings 1,329,697 bytes
-      after boot, 1,333,217 after first render, 1,333,217 after refresh, and 1,341,419
-      after SPA navigation. Firefox/WebKit remain correctness-only.
+- [ ] **Step 3: Rerun the identical Chromium CDP retained-heap protocol after the
+      switch.** After the display samples, open one separate fresh context and execute
+      the real fixture once. At each checkpoint send `HeapProfiler.collectGarbage`
+      exactly once, immediately call `Runtime.getHeapUsage`, and compare that single
+      `usedSize` without averaging, max selection, or rerun. Enforce ceilings
+      1,329,697 bytes after boot, 1,333,217 after first render, 1,333,217 after
+      refresh, and 1,341,419 after SPA navigation. Firefox/WebKit remain correctness-
+      only.
 
 - [ ] **Step 4: Assert the load-time behavior, not only the numbers.** The reference
       page makes exactly one critical TSJS request; no deferred request, preload,
@@ -4273,18 +4626,52 @@ later group's spec files or workflow changes.
   node crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs
   ```
 
-- [ ] **Step 6: Stage and commit the deterministic performance gates and their CI wiring:**
+- [ ] **Step 6: Prove the frozen post-switch instrument and its CI run without a gate-
+      code commit.** Dispatch the exact E7 workflow for the pushed post-switch SHA,
+      wait for success, download the uniquely named artifact, and validate its head
+      SHA, evidence id, environment/fixture, sample/heap counts, values, load ordering,
+      and pass status with the unchanged E7 validator. `git diff --exit-code` over all
+      instrument paths must remain byte-identical to the E7 commit as well as clean in
+      the worktree. Push and verify the exact post-switch SHA before dispatch:
 
   ```bash
-  git status --short
-  git add \
-    crates/trusted-server-js/lib/build-all.mjs \
+  git fetch origin \
+    'refs/tags/tsjs-performance-instrument-*:refs/tags/tsjs-performance-instrument-*'
+  PRESWITCH_TAGS="$(git tag --list 'tsjs-performance-instrument-*' \
+    --merged HEAD)"
+  test "$(printf '%s\n' "$PRESWITCH_TAGS" | sed '/^$/d' | wc -l | tr -d ' ')" -eq 1
+  PRESWITCH_TAG="$(printf '%s\n' "$PRESWITCH_TAGS" | sed '/^$/d')"
+  PRESWITCH_SHA="$(git rev-parse "$PRESWITCH_TAG^{commit}")"
+  test "$PRESWITCH_TAG" = "tsjs-performance-instrument-$PRESWITCH_SHA"
+  git merge-base --is-ancestor "$PRESWITCH_SHA" HEAD
+  git diff --exit-code "$PRESWITCH_SHA" -- \
+    crates/trusted-server-js/lib/scripts/bundle-metrics.mjs \
     crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs \
     crates/trusted-server-integration-tests/browser/tests/shared/tsjs-performance.spec.ts \
-    .github/workflows/test.yml \
-    .github/workflows/integration-tests.yml
-  git diff --cached --check
-  git commit -m "Enforce APS TSJS performance budgets"
+    scripts/validate-tsjs-performance-evidence.mjs \
+    .github/workflows/tsjs-performance-gate.yml
+  test -z "$(git status --porcelain)"
+  POSTSWITCH_REF="$(git branch --show-current)"
+  POSTSWITCH_SHA="$(git rev-parse HEAD)"
+  git push origin "$POSTSWITCH_REF"
+  git fetch origin "$POSTSWITCH_REF"
+  test "$POSTSWITCH_SHA" = "$(git rev-parse "origin/$POSTSWITCH_REF")"
+  POSTSWITCH_EVIDENCE_ID="aps-tsjs-postswitch-${POSTSWITCH_SHA}"
+  POSTSWITCH_RUN_ID="$(node scripts/dispatch-workflow-run.mjs \
+    tsjs-performance-gate.yml \
+    "$POSTSWITCH_REF" \
+    evidence_id="$POSTSWITCH_EVIDENCE_ID" \
+    mode=postswitch)"
+  gh run watch "$POSTSWITCH_RUN_ID" --exit-status
+  POSTSWITCH_EVIDENCE_DIR="$(mktemp -d)"
+  gh run download "$POSTSWITCH_RUN_ID" \
+    --name "tsjs-performance-$POSTSWITCH_EVIDENCE_ID" \
+    --dir "$POSTSWITCH_EVIDENCE_DIR"
+  node scripts/validate-tsjs-performance-evidence.mjs \
+    --file "$POSTSWITCH_EVIDENCE_DIR/tsjs-performance-current.json" \
+    --evidence-id "$POSTSWITCH_EVIDENCE_ID" \
+    --head-sha "$POSTSWITCH_SHA" \
+    --mode postswitch
   ```
 
 ### Task 24: Run final repository verification and assemble the cutover evidence
@@ -4589,8 +4976,9 @@ The plan is complete only when:
     notification, and every other integration regression suite passes without an
     unrelated feature rewrite.
 15. Format, lint, typecheck, adoption/architecture/absence checks, all adapter tests
-    and clippy targets, Vitest, bundle/artifact builds, Playwright, size, browser-time,
-    and retained-heap gates pass in attested clean-checkout quality, integration, and
+    and clippy targets, Vitest, bundle/artifact builds, Playwright, immutable
+    historical bundle reporting, role-correct transfer ceilings, browser-time, and
+    retained-heap gates pass in attested clean-checkout quality, integration, and
     real-GAM runs for the exact release SHA and release id.
 16. The binary cutover and 24-hour monitor complete or the exact prior immutable
     deployable binary is restored cleanly; the active binary retains no N/N-1 TSJS
