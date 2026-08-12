@@ -26,6 +26,14 @@ env:
   CF_BUILD_ARTIFACT_PATH: /tmp/integration-test-artifacts/cloudflare/build
 
 jobs:
+  tsjs-performance-gate:
+    name: TSJS first-display performance evidence
+    if: github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/tsjs-performance-gate.yml
+    with:
+      evidence_id: ${{ inputs.evidence_id }}
+      mode: preswitch
+
   prepare-artifacts:
     name: prepare integration artifacts
     runs-on: ubuntu-latest
@@ -299,32 +307,6 @@ jobs:
           name: playwright-traces
           path: crates/trusted-server-integration-tests/browser/test-results/
           retention-days: 7
-
-      - name: Record TSJS pre-change performance evidence
-        if: github.event_name == 'workflow_dispatch'
-        working-directory: crates/trusted-server-integration-tests/browser
-        env:
-          WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
-          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
-          VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy.toml
-          TEST_FRAMEWORK: nextjs
-          TSJS_PERF_MODE: baseline
-          TSJS_PERF_OUTPUT: crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json
-          TSJS_PERF_MACHINE_CLASS: github-hosted:ubuntu-24.04
-          TSJS_EVIDENCE_ID: ${{ inputs.evidence_id }}
-        run: >-
-          npm exec -- playwright test
-          tests/shared/tsjs-performance.spec.ts
-          --project=chromium
-
-      - name: Upload TSJS pre-change performance evidence
-        if: github.event_name == 'workflow_dispatch' && always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tsjs-performance-${{ inputs.evidence_id }}
-          path: crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json
-          if-no-files-found: error
-          retention-days: 30
 
   browser-tests-aps-tsjs-conformance:
     name: browser integration tests (APS/TSJS conformance)
