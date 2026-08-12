@@ -3,11 +3,16 @@
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { brotliCompressSync, constants as zlibConstants, gzipSync } from 'node:zlib';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { transform } from 'esbuild';
 import { build } from 'vite';
 
+import {
+  deriveInventorySetFiles,
+  measureBundleSet,
+  measureBytes,
+  BUNDLE_SEPARATOR,
+} from './scripts/bundle-metrics.mjs';
 import { computeReleaseId, RELEASE_SENTINEL, stampRelease } from './scripts/release-v1.mjs';
 
 const libDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -17,7 +22,6 @@ const metricsFile = 'tsjs-build-metrics-v1.json';
 const releaseFile = 'tsjs-release-v1.json';
 const catalogFile = 'tsjs-catalog-v1.json';
 const bootstrapFile = 'gpt-bootstrap-fallback.js';
-const separator = Buffer.from(';\n', 'utf8');
 
 fs.rmSync(distributionDirectory, { recursive: true, force: true });
 fs.mkdirSync(distributionDirectory, { recursive: true });
@@ -261,41 +265,19 @@ fs.writeFileSync(
   })}\n`
 );
 
-function compress(bytes) {
-  return {
-    gzipBytes: gzipSync(bytes, { level: 9, mtime: 0 }).byteLength,
-    brotliBytes: brotliCompressSync(bytes, {
-      params: {
-        [zlibConstants.BROTLI_PARAM_MODE]: zlibConstants.BROTLI_MODE_TEXT,
-        [zlibConstants.BROTLI_PARAM_QUALITY]: 11,
-        [zlibConstants.BROTLI_PARAM_SIZE_HINT]: bytes.byteLength,
-      },
-    }).byteLength,
-  };
-}
-
-function measureBundleSet(setFiles) {
-  const parts = setFiles.flatMap((file, index) => {
-    const bytes = fs.readFileSync(path.join(distributionDirectory, file));
-    return index === setFiles.length - 1 ? [bytes] : [bytes, separator];
-  });
-  const bytes = Buffer.concat(parts);
-  return {
-    files: setFiles,
-    rawBytes: bytes.byteLength,
-    ...compress(bytes),
-    sha256: createHash('sha256').update(bytes).digest('hex'),
-  };
-}
-
-const integrationFiles = releaseCatalog.map(({ id }) => `tsjs-${id}.js`);
-const referenceFiles = catalogModule.REFERENCE_CRITICAL_IDS.map((id) => `tsjs-${id}.js`);
 const bootstrapArtifact = artifacts[0];
 const bootstrapBytes = fs.readFileSync(path.join(distributionDirectory, bootstrapFile));
+const artifactContents = new Map(
+  artifactInventory.map(({ file }) => [
+    file,
+    fs.readFileSync(path.join(distributionDirectory, file)),
+  ])
+);
+const inventorySetFiles = deriveInventorySetFiles(artifactInventory, releaseCatalog);
 const metrics = {
   schemaVersion: 1,
   compression: {
-    concatenationSeparator: ';\\n',
+    concatenationSeparator: BUNDLE_SEPARATOR.toString('utf8'),
     gzipLevel: 9,
     gzipMtime: 0,
     brotliMode: 'text',
@@ -314,16 +296,15 @@ const metrics = {
   bootstrap: {
     file: bootstrapFile,
     entry: path.normalize(`src/${bootstrapArtifact.entry}`),
-    rawBytes: bootstrapBytes.byteLength,
-    ...compress(bootstrapBytes),
-    sha256: createHash('sha256').update(bootstrapBytes).digest('hex'),
+    ...measureBytes(bootstrapBytes),
     sources: bootstrapArtifact.moduleContributions,
   },
-  sets: {
-    minimal: measureBundleSet(catalogModule.MINIMAL_CRITICAL_IDS.map((id) => `tsjs-${id}.js`)),
-    reference: measureBundleSet(referenceFiles),
-    maximal: measureBundleSet(['tsjs-core.js', ...integrationFiles]),
-  },
+  sets: Object.fromEntries(
+    Object.entries(inventorySetFiles).map(([setName, setFiles]) => [
+      setName,
+      measureBundleSet(setFiles, artifactContents),
+    ])
+  ),
 };
 fs.writeFileSync(
   path.join(distributionDirectory, metricsFile),
