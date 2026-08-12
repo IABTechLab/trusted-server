@@ -1253,12 +1253,41 @@ mod tests {
             "bootstrap should scan ID-bearing elements instead of interpolating div_id into CSS"
         );
         assert!(
-            combined.contains(".startsWith(slot.div_id)"),
+            combined.contains("candidate.id.startsWith(divId)"),
             "bootstrap should match metacharacter-containing div_id prefixes with startsWith"
         );
         assert!(
             !combined.contains("[id^='\" + slot.div_id"),
             "bootstrap must not build a CSS attribute selector from raw div_id"
+        );
+    }
+
+    #[test]
+    fn head_inserts_bootstrap_installs_inner_div_slot_handoff() {
+        let integration = GptIntegration::new(test_config());
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+        let combined = integration.head_inserts(&ctx).join("");
+        assert!(
+            combined.contains("gptSlotHandoffs"),
+            "bootstrap should keep late publisher slot handoff state on window.tsjs"
+        );
+        assert!(
+            combined.contains("__tsSlotHandoffPatched"),
+            "bootstrap should install idempotent GPT handoff wrappers"
+        );
+        assert!(
+            combined.contains("return googletag.defineSlot") && combined.contains("actualDivId"),
+            "bootstrap should define the TS fallback on the actual inner div"
+        );
+        assert!(
+            !combined.contains("actualDivId + \"-container\""),
+            "bootstrap must not define a competing outer-container GPT slot"
         );
     }
 

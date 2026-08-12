@@ -577,7 +577,7 @@ The `to_openrtb()` method in `PrebidAuctionProvider` builds OpenRTB requests:
 - Sets bid floor and currency (`bidfloor`/`bidfloorcur`) from slot configuration
 - Marks impressions as `secure: 1` (HTTPS-only creatives)
 - Sets `tagid` from the slot ID
-- Adds site metadata with publisher domain, page URL, `site.ref` from the Referer header, and `site.publisher` from the domain
+- Adds site metadata with publisher domain, a validated publisher-owned page URL with query and fragment removed, `site.publisher` from the domain, and the browser `Referer` as `site.ref`. Removing query and fragment data from `site.page` can reduce contextual targeting or per-page reporting for sites whose page identity depends on query parameters
 - Injects EC ID in the user object
 - Merges current-request browser EIDs with KV-resolved EIDs and forwards the deduplicated result as `user.ext.eids`
 - Forwards user consent string and sets the GDPR flag based on geo and consent presence
