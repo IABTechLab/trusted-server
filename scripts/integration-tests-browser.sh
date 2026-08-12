@@ -17,6 +17,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 ORIGIN_PORT="${INTEGRATION_ORIGIN_PORT:-8888}"
+export ARTIFACTS_DIR="${ARTIFACTS_DIR:-$REPO_ROOT/target/integration-test-artifacts}"
 BROWSER_DIR="crates/trusted-server-integration-tests/browser"
 TSJS_LIB_DIR="crates/trusted-server-js/lib"
 NODE_VERSION="$(grep '^nodejs ' .tool-versions | awk '{print $2}')"
@@ -73,7 +74,7 @@ TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK=false \
 
 echo "==> Generating Viceroy configs..."
 INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT" ./scripts/generate-integration-viceroy-configs.sh
-GENERATED_VICEROY_CONFIG_PATH="$REPO_ROOT/target/integration-test-artifacts/configs/viceroy.toml"
+GENERATED_VICEROY_CONFIG_PATH="$ARTIFACTS_DIR/configs/viceroy.toml"
 
 # --- Build Docker images ---
 for framework in "${FRAMEWORKS[@]}"; do

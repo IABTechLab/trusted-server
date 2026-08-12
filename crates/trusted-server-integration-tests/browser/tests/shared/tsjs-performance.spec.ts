@@ -25,17 +25,16 @@ import {
 const REPO_ROOT = execFileSync("git", ["rev-parse", "--show-toplevel"], {
   encoding: "utf8",
 }).trim();
-const TSJS_CRATE = resolve(REPO_ROOT, "crates/trusted-server-js");
-const DIST = resolve(TSJS_CRATE, "dist");
-const RELEASE_FILE = resolve(DIST, "tsjs-release-v1.json");
 const WARMUPS = 5;
 const SAMPLES = 50;
 const PERCENTILE = 90;
-const P90_CEILING_MS = 33.6;
+const MAXIMUM_P90_RATIO = 1.1;
+const HARD_P90_CEILING_MS = 100;
+const REFERENCE_SHA = "62421ee44c62f24534ea8782a46dfa5bfbcea950";
 const EXPECTED_CHROMIUM = "145.0.7632.6";
 const MACHINE_CLASS = "github-hosted:ubuntu-24.04";
 const RUNNER_IMAGE = "ubuntu-24.04";
-const FIXTURE_ID = "tsjs-generated-loopback-v1";
+const FIXTURE_ID = "tsjs-generated-loopback-paired-v2";
 const CONTROLLER_ID = "generated-server-v1";
 const CRITICAL_IDS = ["render_runtime", "gpt"] as const;
 const DEFERRED_IDS = ["diagnostics_presentation", "gpt_later"] as const;
@@ -117,8 +116,11 @@ function exactArtifact(release: Release, id: string): ReleaseArtifact {
   return matches[0]!;
 }
 
-function loadFixtureResources(): FixtureResources {
-  const release = JSON.parse(readFileSync(RELEASE_FILE, "utf8")) as Release;
+function loadFixtureResources(repositoryRoot: string): FixtureResources {
+  const tsjsCrate = resolve(repositoryRoot, "crates/trusted-server-js");
+  const dist = resolve(tsjsCrate, "dist");
+  const releaseFile = resolve(dist, "tsjs-release-v1.json");
+  const release = JSON.parse(readFileSync(releaseFile, "utf8")) as Release;
   expect(release.version).toBe(1);
   const criticalArtifacts = [exactArtifact(release, "core")].concat(
     CRITICAL_IDS.map((id) => exactArtifact(release, id)),
@@ -127,7 +129,7 @@ function loadFixtureResources(): FixtureResources {
     expect(artifact.phase).toBe("critical");
   }
   const criticalBody = criticalArtifacts
-    .map((artifact) => readFileSync(resolve(DIST, artifact.file), "utf8"))
+    .map((artifact) => readFileSync(resolve(dist, artifact.file), "utf8"))
     .join(";\n");
   const criticalHash = createHash("sha256").update(criticalBody).digest("hex");
   const criticalSrc = `/static/tsjs=tsjs-unified.min.js?v=${criticalHash}`;
@@ -137,7 +139,7 @@ function loadFixtureResources(): FixtureResources {
     expect(artifact.phase).toBe("deferred");
     expect(artifact.trigger).toBe("first_display_or_idle");
     deferred.set(id, {
-      body: readFileSync(resolve(DIST, artifact.file), "utf8"),
+      body: readFileSync(resolve(dist, artifact.file), "utf8"),
       src: `/static/tsjs=tsjs-${id}.min.js?v=${artifact.hash}`,
     });
   }
@@ -168,7 +170,7 @@ function loadFixtureResources(): FixtureResources {
         [...CRITICAL_IDS, ...DEFERRED_IDS].join(","),
       ],
       {
-        cwd: REPO_ROOT,
+        cwd: repositoryRoot,
         encoding: "utf8",
         env: { ...process.env, TSJS_SKIP_BUILD: "1" },
       },
@@ -873,11 +875,12 @@ declare global {
 
 test.describe("TSJS first-display performance gate", () => {
   test.describe.configure({ retries: 0, mode: "serial" });
-  let activeFixtureServer: FixtureServer | undefined;
+  const activeFixtureServers: FixtureServer[] = [];
 
   test.afterEach(async () => {
-    await activeFixtureServer?.close();
-    activeFixtureServer = undefined;
+    await Promise.all(
+      activeFixtureServers.splice(0).map((server) => server.close()),
+    );
   });
 
   test("records complete real timing, heap, and request-ordering evidence", async ({
@@ -894,36 +897,83 @@ test.describe("TSJS first-display performance gate", () => {
     expect(browser.version()).toBe(EXPECTED_CHROMIUM);
     expect(process.env.TSJS_PERF_MACHINE_CLASS).toBe(MACHINE_CLASS);
     expect(process.env.TSJS_PERF_RUNNER_IMAGE).toBe(RUNNER_IMAGE);
-    const resources = loadFixtureResources();
-    const fixtureServer = await startFixtureServer(resources);
-    activeFixtureServer = fixtureServer;
+    const referenceRoot = process.env.TSJS_PERF_REFERENCE_ROOT;
+    expect(referenceRoot, "TSJS_PERF_REFERENCE_ROOT is required").toBeTruthy();
+    expect(
+      execFileSync("git", ["-C", referenceRoot!, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim(),
+    ).toBe(REFERENCE_SHA);
+    const referenceResources = loadFixtureResources(referenceRoot!);
+    const currentResources = loadFixtureResources(REPO_ROOT);
+    const referenceServer = await startFixtureServer(referenceResources);
+    const currentServer = await startFixtureServer(currentResources);
+    activeFixtureServers.push(referenceServer, currentServer);
+
+    const observeVariant = async (
+      fixtureServer: FixtureServer,
+      resources: FixtureResources,
+    ): Promise<BrowserObservation> => {
+      const run = await openFixture(browser, fixtureServer);
+      try {
+        const observation = await observeFixture(run);
+        expect(observation.releaseId).toBe(resources.release.releaseId);
+        return observation;
+      } finally {
+        await run.close();
+      }
+    };
 
     for (let index = 0; index < WARMUPS; index += 1) {
-      const run = await openFixture(browser, fixtureServer);
-      try {
-        await observeFixture(run);
-      } finally {
-        await run.close();
+      const variants =
+        index % 2 === 0
+          ? ([
+              [referenceServer, referenceResources],
+              [currentServer, currentResources],
+            ] as const)
+          : ([
+              [currentServer, currentResources],
+              [referenceServer, referenceResources],
+            ] as const);
+      for (const [server, resources] of variants) {
+        await observeVariant(server, resources);
       }
     }
 
-    const samples: number[] = [];
+    const referenceSamples: number[] = [];
+    const currentSamples: number[] = [];
     let representative: BrowserObservation | undefined;
     for (let index = 0; index < SAMPLES; index += 1) {
-      const run = await openFixture(browser, fixtureServer);
-      try {
-        representative = await observeFixture(run);
-        samples.push(representative.timingMs);
-        expect(representative.releaseId).toBe(resources.release.releaseId);
-      } finally {
-        await run.close();
+      const variants =
+        index % 2 === 0
+          ? ([
+              ["reference", referenceServer, referenceResources],
+              ["current", currentServer, currentResources],
+            ] as const)
+          : ([
+              ["current", currentServer, currentResources],
+              ["reference", referenceServer, referenceResources],
+            ] as const);
+      for (const [variant, server, resources] of variants) {
+        const observation = await observeVariant(server, resources);
+        if (variant === "reference") {
+          referenceSamples.push(observation.timingMs);
+        } else {
+          currentSamples.push(observation.timingMs);
+          representative = observation;
+        }
       }
     }
-    expect(samples).toHaveLength(SAMPLES);
-    const sampledP90 = p90(samples);
-    expect(sampledP90).toBeLessThanOrEqual(P90_CEILING_MS);
+    expect(referenceSamples).toHaveLength(SAMPLES);
+    expect(currentSamples).toHaveLength(SAMPLES);
+    const referenceP90 = p90(referenceSamples);
+    const currentP90 = p90(currentSamples);
+    expect(referenceP90).toBeGreaterThan(0);
+    expect(referenceP90).toBeLessThanOrEqual(HARD_P90_CEILING_MS);
+    expect(currentP90).toBeLessThanOrEqual(HARD_P90_CEILING_MS);
+    expect(currentP90).toBeLessThanOrEqual(referenceP90 * MAXIMUM_P90_RATIO);
 
-    const heapRun = await openFixture(browser, fixtureServer, true);
+    const heapRun = await openFixture(browser, currentServer, true);
     const retainedHeapBytes = {} as Record<HeapCheckpoint, number>;
     try {
       await expect
@@ -1016,7 +1066,7 @@ test.describe("TSJS first-display performance gate", () => {
       encoding: "utf8",
     }).trim();
     const evidence = {
-      schemaVersion: 2,
+      schemaVersion: 3,
       evidenceId,
       mode,
       headSha,
@@ -1029,10 +1079,18 @@ test.describe("TSJS first-display performance gate", () => {
         node: process.version,
         npm: npmVersion,
         typescript: packageVersion(
-          resolve(TSJS_CRATE, "lib/node_modules/typescript/package.json"),
+          resolve(
+            REPO_ROOT,
+            "crates/trusted-server-js/lib/node_modules/typescript/package.json",
+          ),
         ),
       },
-      sampling: { warmups: WARMUPS, samples: SAMPLES, percentile: PERCENTILE },
+      sampling: {
+        warmupsPerVariant: WARMUPS,
+        samplesPerVariant: SAMPLES,
+        percentile: PERCENTILE,
+        interleaving: "alternating-reference-current",
+      },
       marks: {
         source: "performance-entry",
         bidsScript: representative!.bidsScriptCount === 1,
@@ -1041,10 +1099,16 @@ test.describe("TSJS first-display performance gate", () => {
       },
       performance: {
         bootToFirstDisplayMs: {
-          samples,
+          reference: {
+            sha: REFERENCE_SHA,
+            samples: referenceSamples,
+            p90: referenceP90,
+          },
+          current: { samples: currentSamples, p90: currentP90 },
           percentile: PERCENTILE,
-          p90: sampledP90,
-          ceilingMs: P90_CEILING_MS,
+          maximumRatio: MAXIMUM_P90_RATIO,
+          observedRatio: currentP90 / referenceP90,
+          hardCeilingMs: HARD_P90_CEILING_MS,
         },
       },
       heap: {

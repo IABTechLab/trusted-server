@@ -3693,8 +3693,10 @@ runtime/APS contracts file-by-file.
       first-display adapter through test-only prospective routes/composition; it may
       not switch any production emitter or use `window.__tsjsPerf`. On Chromium
       145.0.7632.6, `github-hosted:ubuntu-24.04`, and fixture
-      `tsjs-generated-loopback-v1`, use exactly five warmups and 50 samples, require the
-      real `tsjs:bids-script` and `tsjs:first-display` marks, and enforce p90 ≤33.6 ms
+      `tsjs-generated-loopback-paired-v2`, use exactly five warmups and 50 samples per
+      variant, require the real `tsjs:bids-script` and `tsjs:first-display` marks,
+      alternate a frozen reference and current variant in one runner process, and
+      enforce current p90 ≤ reference p90 × 1.10 plus p90 ≤100 ms on both variants
       without selective reruns.
 
   **Corrected-instrument amendment (2026-08-12).** The earlier E7 run used
@@ -3705,22 +3707,23 @@ runtime/APS contracts file-by-file.
   `127.0.0.1` port for the Playwright test. Auction POST and page-bids use that same
   loopback origin; delayed `gpt_later`, request counts, resource timing, mark timing,
   manual heap lifecycle, and cleanup remain part of the instrument. Its fixture
-  provenance is `tsjs-generated-loopback-v1`; the unchanged generator remains
+  provenance is `tsjs-generated-loopback-paired-v2`; the unchanged generator remains
   `generated-server-v1`.
 
   This transport and provenance correction invalidates commit
   `a7a9bab36c4eee6bc180e9206ca6c6879303d37a` as the frozen E7 instrument, along
   with its run, evidence tuple, and any instrument tag. The workflow must extract
   non-empty repository pins with valid quoting and verify Node.js `v24.12.0`, npm
-  `11.6.2`, and Rust `1.95.0` before measurement. Do not infer or raise a threshold
-  from a local run or another OS. The next single corrected capture on the exact
-  pinned `github-hosted:ubuntu-24.04` environment freezes the corrected instrument
-  and the reviewed threshold decision. The first corrected pinned capture at
-  `62421ee44c62f24534ea8782a46dfa5bfbcea950` (run `31598415675`) measured p90 30.5
-  ms. Applying the existing 10% policy freezes the corrected p90 ceiling at 33.6 ms;
-  the old 28.6 ms ceiling measured the obsolete synthetic/core-only workload and is
-  retired. Record and review any capture-derived heap constant change before tagging;
-  after that checkpoint, both the corrected instrument bytes and its thresholds are
+  `11.6.2`, and Rust `1.95.0` before measurement. The first corrected pinned capture
+  at `62421ee44c62f24534ea8782a46dfa5bfbcea950` (run `31598415675`) measured p90
+  30.5 ms, but the unchanged artifact/instrument measured 40.8 ms in run
+  `31599101515`. That host-load variance invalidates the attempted 33.6 ms absolute
+  ceiling. Use commit `62421ee44c62f24534ea8782a46dfa5bfbcea950` as the immutable
+  detached reference and pair it against current in the same job, alternating order
+  for each warmup/sample. Freeze the 1.10 ratio and 100 ms per-side hard ceiling; do
+  not infer or raise either from a later run. Record and review any capture-derived
+  heap constant change before tagging; after that checkpoint, the corrected
+  instrument bytes, reference SHA, ratio, hard ceiling, and heap thresholds are
   immutable and the normal pre-switch validation/tag sequence below applies.
 
   In one separate fresh Chromium context, run the real fixture once. At each heap
@@ -3795,9 +3798,10 @@ runtime/APS contracts file-by-file.
   test "$PRESWITCH_SHA" = "$(git rev-parse "$PRESWITCH_TAG^{commit}")"
   ```
 
-  The validator rejects a wrong evidence id/head SHA, environment or fixture drift,
-  anything other than five warmups/50 samples, missing real marks, p90/heap overflow,
-  a failed correctness/load-order assertion, or an incomplete result. Record the
+  The validator rejects a wrong evidence id/head/reference SHA, environment or
+  fixture drift, anything other than five warmups/50 samples per variant or
+  alternating pair order, missing real marks, relative/hard p90 or heap overflow, a
+  failed correctness/load-order assertion, or an incomplete result. Record the
   immutable `{sha,tag,evidenceId,runId,artifactName}` tuple in the PR execution
   evidence, not in either baseline object. The annotated tag is created only after
   the evidence validates and is never moved, deleted, or force-pushed; its SHA is the
@@ -4613,9 +4617,11 @@ sampling or comparison logic.
 
 - [ ] **Step 2: Rerun the exact pre-switch browser-time gate after the production
       switch.** On Chromium 145.0.7632.6, `github-hosted:ubuntu-24.04`, and fixture
-      `tsjs-generated-loopback-v1`, measure boot-to-first-display after five warmups and
-      50 samples and require p90 ≤33.6 ms. Do not rerun selectively to turn a failed
-      sample into a pass. The post-switch sample reads the real `tsjs:bids-script`
+      `tsjs-generated-loopback-paired-v2`, alternate the frozen pre-switch reference
+      and post-switch current variant for five warmups and 50 samples per variant.
+      Require current p90 ≤ reference p90 × 1.10 and p90 ≤100 ms for each side. Do
+      not rerun selectively to turn a failed sample into a pass. The post-switch
+      sample reads the real `tsjs:bids-script`
       and `tsjs:first-display` performance marks and the
       `tsjs:boot-to-first-display` measure installed in Task 19; fail if any sample
       falls back to the pre-change `window.__tsjsPerf` placeholder or lacks either

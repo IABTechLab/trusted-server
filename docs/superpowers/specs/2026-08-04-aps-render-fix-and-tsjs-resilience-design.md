@@ -3486,23 +3486,28 @@ that no deferred request, preload, preparation, or execution precedes
 meaning.
 
 The performance job uses pinned Chromium 145.0.7632.6, the
-`github-hosted:ubuntu-24.04` runner class, fixture `tsjs-generated-loopback-v1`, five
-warmups, and 50 measured samples. One in-process `node:http` server on an ephemeral
-`127.0.0.1` port serves the exact generated server controller and exact built
-critical/deferred bytes; Playwright request interception or fulfillment is outside
-the instrument. The fixture exercises the real server boot/controller, critical
-artifact, runtime, and first-display adapter path and cannot retain a bespoke
-`__tsjsPerf` simulator.
+`github-hosted:ubuntu-24.04` runner class, fixture
+`tsjs-generated-loopback-paired-v2`, five warmups per variant, and 50 measured
+samples per variant. One in-process `node:http` server per variant on an ephemeral
+`127.0.0.1` port serves that variant's exact generated server controller and exact
+built critical/deferred bytes; Playwright request interception or fulfillment is
+outside the instrument. The fixture exercises the real server boot/controller,
+critical artifact, runtime, and first-display adapter path and cannot retain a
+bespoke `__tsjsPerf` simulator.
 
-The corrected pinned pre-switch capture at commit
-`62421ee44c62f24534ea8782a46dfa5bfbcea950` (workflow run `31598415675`) measured a
-30.5 ms p90. The former 26 ms value came from the obsolete synthetic controller and
-smaller core-only workload, so its 28.6 ms ceiling is not a valid comparison for the
-real critical graph. Applying the same 10% policy to the corrected real-path capture
-sets the p90 ceiling to 33.6 ms (`ceil(30.5 × 1.10 × 10) / 10`). This calibration is
-an instrument correction, not permission to recapture after production wiring or to
-select a favorable run. The job runs the declared sample set once and never
-selectively reruns or drops slow samples. Retained heap uses Chromium CDP forced-GC
+GitHub-hosted absolute timing is not stable enough to be an immutable gate. The
+corrected pre-switch commit `62421ee44c62f24534ea8782a46dfa5bfbcea950` measured
+30.5 ms p90 in workflow run `31598415675`, while the unchanged instrument and
+production artifact measured 40.8 ms in run `31599101515`. Therefore the former
+33.6 ms absolute ceiling is retired. The job checks out that exact pre-switch commit
+as a detached frozen reference, builds it independently, and alternates reference
+then current / current then reference within the same Chromium process for every
+warmup and measured pair. Current p90 must be at most reference p90 × 1.10, and both
+p90 values must also be at most the 100 ms catastrophic-regression ceiling. The job
+runs each declared sample pair once and never selectively reruns, drops, or
+reclassifies slow samples. This same frozen reference and comparator are used before
+and after cutover, so host contention is normalized without letting the current
+implementation redefine its baseline. Retained heap uses Chromium CDP forced-GC
 checkpoints after boot, first render, refresh, and SPA navigation. After the display
 samples, the job opens one separate fresh browser context, executes the real fixture
 once, and at each checkpoint sends `HeapProfiler.collectGarbage` once followed immediately by
@@ -4057,9 +4062,10 @@ The design is complete when all of the following are true:
 25. Bootstrap-controller, minimal-critical, reference-critical, and maximal-total
     remain within 5% of the one immutable role-correct §5.12 capture; the original
     pre-change values remain unchanged and are reported as historical deltas.
-    Boot-to-first-display p90 and retained-heap results remain within their original
-    immutable ceilings without recapture, selective sample reruns, or membership
-    loopholes.
+    Boot-to-first-display current p90 remains within 10% of the same-run frozen
+    pre-switch reference p90 and both remain below the immutable hard ceiling;
+    retained-heap results remain within their original immutable ceilings. Neither
+    gate permits recapture, selective sample reruns, or membership loopholes.
 26. A deferred module can register only from the exact current core-created local
     release script and can obtain only catalogued frozen capabilities from the one
     runtime. It cannot replace an adapter, slot registry, dispatcher, provider, or

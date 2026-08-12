@@ -248,6 +248,8 @@ jobs:
         working-directory: crates/trusted-server-js/lib
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Retrieve Node.js version
         id: node-version
