@@ -1082,6 +1082,18 @@ test('hard-cutover absence is exposed once and enforced after both production bu
   assert.ok(absenceStep > externalPrebidStep, 'absence must run after both production builds');
 });
 
+test('registered integration dispatch selects post-switch evidence without changing the instrument', () => {
+  const workflow = fs.readFileSync(
+    path.join(repositoryRoot, '.github/workflows/integration-tests.yml'),
+    'utf8'
+  );
+
+  assert.match(
+    workflow,
+    /mode: \$\{\{ startsWith\(inputs\.evidence_id, 'aps-tsjs-postswitch-'\) && 'postswitch' \|\| 'preswitch' \}\}/
+  );
+});
+
 test('release id changes independently with id, role, phase, trigger, bytes, and order', () => {
   const base = [bundle('core', 'a'), bundle('gpt', 'b')];
   assert.notEqual(computeReleaseId(base), computeReleaseId([bundle('changed', 'a'), base[1]]));
