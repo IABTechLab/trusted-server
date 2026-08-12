@@ -1086,9 +1086,10 @@ impl AuctionOrchestrator {
         //
         // NOTE: `select()` blocks until at least one backend responds and, on
         // some adapters, buffers the selected response body before returning.
-        // Hard deadline enforcement therefore depends on every backend's
-        // first-byte and between-bytes timeouts being set to at most the
-        // remaining auction budget, which Phase 1 above guarantees.
+        // Backend first-byte and between-bytes timeouts are capped to the
+        // remaining auction budget in Phase 1. They are transport timers, not
+        // absolute wall-clock limits, so connection setup and byte trickling
+        // remain bounded operational risks rather than strict deadline proof.
         let mut remaining = pending_requests;
 
         while !remaining.is_empty() {

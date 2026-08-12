@@ -10,7 +10,7 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::header::HeaderName;
 use http::{HeaderMap, Method, StatusCode, header};
-use serde::de::{self, Visitor};
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use url::Url;
@@ -184,6 +184,7 @@ addEventListener('message',receive);
 
 /// Configuration for the APS `OpenRTB` integration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 #[validate(schema(function = "validate_inventory_identity_override"))]
 pub struct ApsConfig {
     /// Whether APS integration is enabled.
@@ -223,52 +224,15 @@ fn deserialize_account_id<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    struct AccountIdVisitor;
-
-    impl Visitor<'_> for AccountIdVisitor {
-        type Value = String;
-
-        fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            formatter.write_str("a non-empty string or integer for account_id")
-        }
-
-        fn visit_str<E>(self, value: &str) -> Result<String, E>
-        where
-            E: de::Error,
-        {
-            let value = value.trim();
-            if value.is_empty() {
-                return Err(E::custom("account_id must not be empty"));
-            }
-            if value.len() > MAX_ACCOUNT_ID_BYTES {
-                return Err(E::custom("account_id is too large"));
-            }
-            Ok(value.to_string())
-        }
-
-        fn visit_string<E>(self, value: String) -> Result<String, E>
-        where
-            E: de::Error,
-        {
-            self.visit_str(&value)
-        }
-
-        fn visit_i64<E>(self, value: i64) -> Result<String, E>
-        where
-            E: de::Error,
-        {
-            Ok(value.to_string())
-        }
-
-        fn visit_u64<E>(self, value: u64) -> Result<String, E>
-        where
-            E: de::Error,
-        {
-            Ok(value.to_string())
-        }
+    let value = String::deserialize(deserializer)?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(D::Error::custom("account_id must not be empty"));
     }
-
-    deserializer.deserialize_any(AccountIdVisitor)
+    if value.len() > MAX_ACCOUNT_ID_BYTES {
+        return Err(D::Error::custom("account_id is too large"));
+    }
+    Ok(value.to_string())
 }
 
 fn validate_aps_endpoint(value: &str) -> Result<(), ValidationError> {
@@ -2128,20 +2092,37 @@ mod tests {
     }
 
     #[test]
-    fn config_accepts_canonical_string_and_integer_ids() {
+    fn config_accepts_only_canonical_string_account_id() {
         let canonical: ApsConfig = serde_json::from_value(json!({
             "account_id": "  example-account  "
         }))
         .expect("should parse canonical account ID");
-        let integer: ApsConfig =
-            serde_json::from_value(json!({"account_id": 1234})).expect("should parse integer ID");
+        let integer = serde_json::from_value::<ApsConfig>(json!({"account_id": 1234}));
+        let legacy_alias = serde_json::from_value::<ApsConfig>(json!({
+            "pub_id": "legacy-account"
+        }));
+        let mixed_fields = serde_json::from_value::<ApsConfig>(json!({
+            "account_id": "example-account",
+            "pub_id": "legacy-account"
+        }));
         let debug: ApsConfig = serde_json::from_value(json!({
             "account_id": "example-account",
             "debug": true
         }))
         .expect("should parse debug flag");
         assert_eq!(canonical.account_id, "example-account");
-        assert_eq!(integer.account_id, "1234");
+        assert!(
+            integer.is_err(),
+            "integer account IDs must fail the hard cutover"
+        );
+        assert!(
+            legacy_alias.is_err(),
+            "the legacy pub_id alias must fail the hard cutover"
+        );
+        assert!(
+            mixed_fields.is_err(),
+            "mixed account_id and pub_id fields must fail the hard cutover"
+        );
         assert!(!canonical.enabled);
         assert!(!canonical.debug);
         assert!(debug.debug);
@@ -3287,6 +3268,31 @@ mod tests {
         assert_eq!(registration.integration_id, APS_INTEGRATION_ID);
         assert!(registration.proxies.is_empty());
         assert!(registration.js_disabled);
+    }
+
+    #[test]
+    fn config_without_enabled_registers_neither_integration_nor_provider() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                APS_INTEGRATION_ID,
+                &json!({"account_id": "example-account"}),
+            )
+            .expect("should insert default-disabled APS config");
+
+        assert!(
+            register(&settings)
+                .expect("should evaluate APS integration registration")
+                .is_none(),
+            "omitted enabled should not register APS browser routes"
+        );
+        assert!(
+            register_providers(&settings)
+                .expect("should evaluate APS provider registration")
+                .is_empty(),
+            "omitted enabled should not register the APS auction provider"
+        );
     }
 
     #[test]

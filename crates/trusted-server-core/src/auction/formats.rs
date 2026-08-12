@@ -986,6 +986,21 @@ fn convert_to_openrtb_response_impl_with_report(
                 processed.len()
             );
 
+            if processed.trim().is_empty() {
+                log::warn!(
+                    "Auction {}: skipping winning bid for slot '{}' from '{}' because creative processing rejected its only render source",
+                    auction_request.id,
+                    slot_id,
+                    bid.bidder
+                );
+                delivery.dropped_winner_count += 1;
+                record_auction_drop(
+                    &mut delivery.dropped_winner_reasons,
+                    AuctionDropReason::CreativeProcessingRejected,
+                );
+                continue;
+            }
+
             (Some(processed), None)
         } else if let Some(renderer) = bid.renderer.as_ref() {
             let Some(ext) = (BidExt {
@@ -2074,6 +2089,32 @@ mod tests {
         );
         assert_eq!(renderer["id"], "upstream-renderer-bid");
         assert!(renderer.get("ext").is_some(), "should include renderer ext");
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_drops_creative_rejected_by_processing() {
+        let mut settings = make_settings();
+        settings.auction.sanitize_creatives = true;
+        settings.auction.rewrite_creatives = false;
+        let auction_request = make_auction_request();
+        let mut bid = make_bid("div-gpt-top", "appnexus", Some(2.75));
+        bid.creative = Some("<script>window.fictionalCreative = true;</script>".to_string());
+        let result = make_result(bid);
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
+            .expect("should omit a creative rejected by configured processing");
+        let json = response_json(response);
+
+        assert!(
+            json["seatbid"].as_array().is_none_or(Vec::is_empty),
+            "should not serialize an empty adm"
+        );
+        assert_eq!(json["ext"]["orchestrator"]["dropped_winner_count"], 1);
+        assert_eq!(
+            json["ext"]["orchestrator"]["dropped_winner_reasons"]["creative_processing_rejected"],
+            1,
+            "should report the exact processing rejection"
+        );
     }
 
     #[test]

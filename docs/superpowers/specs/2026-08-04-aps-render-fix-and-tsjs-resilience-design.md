@@ -1069,8 +1069,9 @@ APS response handling is deterministic and reports typed local drop reasons:
 Drop reasons must remain visible in the existing debug/log surfaces for all auction
 entry points. This is not a new external telemetry contract.
 
-APS configuration accepts only canonical `account_id`; the `pub_id` deserialization
-alias and its integer coercion are deleted at the hard cutover.
+APS configuration accepts only canonical string `account_id`. Integer account IDs,
+`pub_id`-only configuration, and mixed `account_id` + `pub_id` shapes are rejected at
+the hard cutover; unknown APS configuration fields are not silently ignored.
 
 ### 3.4 Mediation provenance
 

@@ -43,13 +43,13 @@ providers = ["aps", "prebid"]
 timeout_ms = 2000
 ```
 
-`account_id` is required. It accepts a non-empty string or integer account identifier; no alternate field name is supported.
+`account_id` is required. It accepts only a non-empty string account identifier; integer values and alternate field names are rejected.
 
 `debug` defaults to `false`. Enable it only on controlled test sites because it includes the raw APS request and response, including identity, consent, device, page, account, bid, and creative data, in the client-visible `/auction` response.
 
 `allow_script_creatives` defaults to `false`. While disabled, APS script bids are rejected before per-impression reduction, floors, mediation, and winner selection. Enable it only for a controlled cohort after the browser-security checks in [Rollout](#rollout) pass.
 
-Set `inventory_domain` and `inventory_page_origin` together only when the public deployment hostname differs from the inventory identity authorized by APS. The domain becomes `site.domain`. The HTTPS page origin replaces the current page's scheme and host while preserving its path and query. The origin must be the inventory domain or one of its subdomains and cannot include credentials, a port, path, query, or fragment. These values come only from operator configuration; Trusted Server never accepts APS inventory identity from the client auction payload.
+Set `inventory_domain` and `inventory_page_origin` together only when the public deployment hostname differs from the inventory identity authorized by APS. The domain becomes `site.domain`. The HTTPS page origin replaces the current page's scheme and host while preserving its path; query and fragment data are removed before forwarding. The origin must be the inventory domain or one of its subdomains and cannot include credentials, a port, path, query, or fragment. These values come only from operator configuration; Trusted Server never accepts APS inventory identity from the client auction payload.
 
 APS uses ordinary auction slot IDs and banner formats. It does not read APS-specific creative-opportunity slot IDs or `bidders.aps.slotID`.
 
@@ -73,7 +73,7 @@ Trusted Server builds the APS request independently from its Prebid Server reque
 - page, site, device, and consent fields allowed by the existing privacy gates; and
 - eligible EIDs only when consent policy permits them.
 
-Precise latitude/longitude, disallowed identifiers, unsupported media types, and Trusted Server/Prebid-only extensions are not forwarded. Unsafe or oversized page URLs are omitted or replaced by the validated publisher fallback.
+Precise latitude/longitude, disallowed identifiers, unsupported media types, and Trusted Server/Prebid-only extensions are not forwarded. The page URL is a validated publisher-owned URL with query and fragment removed; the raw browser `Referer` is not forwarded as `site.ref`. Unsafe or oversized page URLs are omitted or replaced by the validated publisher fallback.
 
 Raw outbound and inbound payloads are logged only at TRACE level. With debug disabled, auction metadata contains only aggregate counts and drop reasons.
 
@@ -185,7 +185,7 @@ The publisher policy must permit the same-origin renderer route, for example:
 frame-src 'self'
 ```
 
-Do not add `allow-same-origin` to the outer renderer sandbox. The renderer endpoint supplies its own CSP for the fixed runner and HTTPS creative resources.
+Do not add `allow-same-origin` to the outer renderer sandbox. The renderer endpoint supplies its own CSP for the fixed runner and HTTPS creative resources. The same-origin renderer route inherits the publisher page scheme; use HTTPS in production. APS endpoints and third-party creative URLs always require HTTPS.
 
 Before enabling script creatives, verify under the publisher's actual CSP that both iframe and script-tag creatives:
 
