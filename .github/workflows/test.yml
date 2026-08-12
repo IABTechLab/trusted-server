@@ -270,6 +270,9 @@ jobs:
       - name: Build bundle
         run: npm run build
 
+      - name: Build pure external Prebid artifact
+        run: npm run build:prebid-external
+
       - name: Verify release inventory
         run: npm run test:release
 
@@ -285,8 +288,8 @@ jobs:
       - name: Verify generated APS renderer contract
         run: npm run check:aps-contract
 
-      - name: Enforce hard-cutover architecture
-        run: npm run check:architecture
+      - name: Enforce hard-cutover absence
+        run: npm run check:hard-cutover-absence
 
       - name: Run embedded APS renderer contract
         run: node --test test/contract/aps-renderer-es5.test.mjs

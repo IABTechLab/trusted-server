@@ -1036,7 +1036,7 @@ test('role-correct bundle check reports historical deltas and enforces transfer 
 test('critical render trace source is data-only and guarded against presentation regression', () => {
   const traceSource = fs.readFileSync(path.join(libDirectory, 'src/core/trace.ts'), 'utf8');
   const architectureSource = fs.readFileSync(
-    path.join(libDirectory, 'scripts/check-architecture.mjs'),
+    path.join(libDirectory, 'scripts/check-hard-cutover-absence.mjs'),
     'utf8'
   );
 
@@ -1059,6 +1059,27 @@ test('bundle budgets are exposed through the package and enforced after the CI b
   assert.ok(releaseStep > buildStep, 'release verification must run after the TSJS build');
   assert.ok(budgetStep > buildStep, 'bundle budget check must run after the TSJS build');
   assert.ok(budgetStep > releaseStep, 'bundle budget check must run after release verification');
+});
+
+test('hard-cutover absence is exposed once and enforced after both production builds', () => {
+  const packageJson = JSON.parse(fs.readFileSync(path.join(libDirectory, 'package.json'), 'utf8'));
+  const workflow = fs.readFileSync(path.join(repositoryRoot, '.github/workflows/test.yml'), 'utf8');
+  const buildStep = workflow.indexOf('run: npm run build');
+  const externalPrebidStep = workflow.indexOf('run: npm run build:prebid-external');
+  const absenceStep = workflow.indexOf('run: npm run check:hard-cutover-absence');
+
+  assert.equal(
+    packageJson.scripts['check:hard-cutover-absence'],
+    'node scripts/check-hard-cutover-absence.mjs'
+  );
+  assert.equal(
+    packageJson.scripts['check:architecture'],
+    packageJson.scripts['check:hard-cutover-absence'],
+    'architecture and absence commands must share one policy implementation'
+  );
+  assert.notEqual(buildStep, -1);
+  assert.ok(externalPrebidStep > buildStep, 'pure Prebid must build after the TSJS release');
+  assert.ok(absenceStep > externalPrebidStep, 'absence must run after both production builds');
 });
 
 test('release id changes independently with id, role, phase, trigger, bytes, and order', () => {
