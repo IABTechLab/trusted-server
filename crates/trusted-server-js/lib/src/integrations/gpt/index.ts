@@ -60,11 +60,8 @@ function trustedServerOpportunity(bid: AuctionBidData): GptDiagnosticsTrustedSer
   const hasAdId = isNonEmptyString(bid.hb_adid);
   const hasInline = isNonEmptyString(bid.adm);
   const hasCache = isNonEmptyString(bid.hb_cache_host) && isNonEmptyString(bid.hb_cache_path);
-  const hasRenderer = bid.renderer !== undefined;
 
-  return hasAdId && (hasInline || hasCache || hasRenderer)
-    ? 'renderable_candidate'
-    : 'unrenderable_candidate';
+  return hasAdId && (hasInline || hasCache) ? 'renderable_candidate' : 'unrenderable_candidate';
 }
 
 // ------------------------------------------------------------------
@@ -1671,7 +1668,6 @@ export function installTsRenderBridge(): void {
       return;
     }
 
-    const sourceSlotId = slotIdForMessageSource(e.source);
     const prebidRendererEntry = getApsPrebidRenderer(adId);
     if (prebidRendererEntry) {
       // Fail closed for a TS-owned APS ad ID before checking its source. Native
@@ -1681,35 +1677,23 @@ export function installTsRenderBridge(): void {
       if (!messageSourceBelongsToAdUnit(e.source, prebidRendererEntry.adUnitCode)) return;
       const renderer = validateApsRenderer(prebidRendererEntry.renderer);
       const rendererUrl = apsRendererUrl();
-      if (!renderer || !rendererUrl) {
-        const attemptId = sourceSlotId ? safelyRecordCreativeRequest(sourceSlotId) : undefined;
-        safelyRecordCreativeFailure(attemptId, 'missing_render_source');
-        return;
-      }
+      if (!renderer || !rendererUrl) return;
       if (!hasConsumedPrebidApsIdCapacity(consumedPrebidApsIds, adId)) return;
       if (!consumeApsPrebidRenderer(adId, prebidRendererEntry)) return;
       recordConsumedPrebidApsId(consumedPrebidApsIds, adId, prebidRendererEntry.expiresAt);
 
-      const attemptId = sourceSlotId ? safelyRecordCreativeRequest(sourceSlotId) : undefined;
-      try {
-        port.postMessage(
-          JSON.stringify({
-            message: 'Prebid Response',
-            adId,
-            renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
-            rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
-            rendererUrl,
-            apsRenderer: renderer,
-            width: renderer.width,
-            height: renderer.height,
-          })
-        );
-      } catch (err) {
-        safelyRecordCreativeFailure(attemptId, 'response_post_failed');
-        log.warn(`[tsjs-gpt] APS Prebid response post failed for '${adId}'`, err);
-        return;
-      }
-      safelyRecordCreativeResponse(attemptId);
+      port.postMessage(
+        JSON.stringify({
+          message: 'Prebid Response',
+          adId,
+          renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+          rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+          rendererUrl,
+          apsRenderer: renderer,
+          width: renderer.width,
+          height: renderer.height,
+        })
+      );
 
       try {
         prebidRendererEntry.markUsed();
@@ -1719,6 +1703,7 @@ export function installTsRenderBridge(): void {
       return;
     }
 
+    const sourceSlotId = slotIdForMessageSource(e.source);
     if (!sourceSlotId) return;
 
     // Resolve the bid by the requesting slot, not by the first bid whose hb_adid
@@ -1743,33 +1728,20 @@ export function installTsRenderBridge(): void {
       if (consumedServerApsBySlot.get(slotId) === adId) return;
       const renderer = validateApsRenderer(matchedBid.renderer);
       const rendererUrl = apsRendererUrl();
-      if (!renderer || !rendererUrl) {
-        const attemptId = safelyRecordCreativeRequest(slotId);
-        safelyRecordCreativeFailure(attemptId, 'missing_render_source');
-        return;
-      }
+      if (!renderer || !rendererUrl) return;
       consumedServerApsBySlot.set(slotId, adId);
-
-      const attemptId = safelyRecordCreativeRequest(slotId);
-      try {
-        port.postMessage(
-          JSON.stringify({
-            message: 'Prebid Response',
-            adId,
-            renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
-            rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
-            rendererUrl,
-            apsRenderer: renderer,
-            width: renderer.width,
-            height: renderer.height,
-          })
-        );
-      } catch (err) {
-        safelyRecordCreativeFailure(attemptId, 'response_post_failed');
-        log.warn(`[tsjs-gpt] APS server response post failed for '${slotId}'`, err);
-        return;
-      }
-      safelyRecordCreativeResponse(attemptId);
+      port.postMessage(
+        JSON.stringify({
+          message: 'Prebid Response',
+          adId,
+          renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+          rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+          rendererUrl,
+          apsRenderer: renderer,
+          width: renderer.width,
+          height: renderer.height,
+        })
+      );
       return;
     }
 
