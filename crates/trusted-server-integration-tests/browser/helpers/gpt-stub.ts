@@ -292,7 +292,10 @@ export async function installGptStub(page: Page): Promise<void> {
           facts?: Record<string, unknown>,
         ): void;
         listenerCounts(): Record<string, number>;
-        referencesUnchanged(): boolean;
+        referenceOwnership(): {
+          diagnosticsSafe: boolean;
+          pairedHistoryWrappers: boolean;
+        };
         refreshCount(): number;
         renderUniversalCreative(slotId: string, adId: string): void;
         slot(id: string, adUnitPath?: string): StubSlot;
@@ -402,17 +405,21 @@ export async function installGptStub(page: Page): Promise<void> {
         references.pushState = window.history.pushState;
         references.replaceState = window.history.replaceState;
       },
-      referencesUnchanged() {
-        return (
+      referenceOwnership() {
+        const pushStateChanged =
+          window.history.pushState !== references.pushState;
+        const replaceStateChanged =
+          window.history.replaceState !== references.replaceState;
+        return {
+          diagnosticsSafe:
           commandQueue.push === references.commandPush &&
           googletag.display === references.display &&
           googletag.defineSlot === references.defineSlot &&
           pubadsService.refresh === references.refresh &&
           window.fetch === references.fetch &&
-          window.XMLHttpRequest.prototype.open === references.xhrOpen &&
-          window.history.pushState === references.pushState &&
-          window.history.replaceState === references.replaceState
-        );
+          window.XMLHttpRequest.prototype.open === references.xhrOpen,
+          pairedHistoryWrappers: pushStateChanged && replaceStateChanged,
+        };
       },
     };
   });

@@ -1,5 +1,12 @@
 import { test, expect } from "@playwright/test";
 import { runtimeUrl } from "../../helpers/state.js";
+import {
+  criticalTsjsFixture,
+  routeCriticalTsjsFixture,
+  type CriticalTsjsFixture,
+} from "../../helpers/tsjs-fixture.js";
+
+const CREATIVE_FIXTURE = criticalTsjsFixture(["render_runtime", "creative"]);
 
 // Creative iframes are sandboxed WITHOUT `allow-same-origin`, so the creative
 // runtime executes in an opaque origin whose `location.href` is `about:srcdoc`.
@@ -22,18 +29,15 @@ const CREATIVE_SANDBOX_TOKENS = [
 function creativeDocument(
   origin: string,
   bundleUrl: string,
-  releaseId: string,
+  fixture: CriticalTsjsFixture,
+  signedClick: string,
 ): string {
   const signedClick =
     "/first-party/click?tsurl=https%3A%2F%2Fadvertiser.example%2Flanding&foo=1&tstoken=browser-test-token";
   const boot = JSON.stringify({
     abi: 1,
-    releaseId,
-    manifest: {
-      version: 1,
-      releaseId,
-      integrations: [{ id: "creative", required: true }],
-    },
+    releaseId: fixture.releaseId,
+    manifest: fixture.manifest,
     auctionProjection: {
       version: 1,
       auction: { version: 1, auctionId: "creative-sandbox", results: [] },
@@ -59,7 +63,10 @@ function creativeDocument(
       window.__tsCreativeOrigin = ${JSON.stringify(origin)};
       window.tsjs = { boot: ${boot}, que: [], _integrationConfig: {} };
     </script>
-    <script src="${bundleUrl}"></script>
+    <script>
+      try { window.__tsCreativeOrigin = 'https://attacker.invalid'; } catch (_error) {}
+    </script>
+    <script src="${bundleUrl}" id="trustedserver-js"></script>
   </head>
   <body>
     <a id="creative-link" href="${signedClick}" data-tsclick="${signedClick}">ad</a>
@@ -96,22 +103,8 @@ test.describe("Sandboxed creative iframe", () => {
 
     await page.goto(runtimeUrl("/"), { waitUntil: "domcontentloaded" });
 
-    // Reuse whichever hashed bundle URL the server injected into the page so
-    // this test never has to know the current content hash; fall back to the
-    // stable unified path if the fixture page carries no injected script.
-    const runtime = await page.evaluate(() => {
-      const script = Array.from(document.querySelectorAll("script[src]")).find(
-        (element) =>
-          (element as HTMLScriptElement).src.includes("/static/tsjs="),
-      );
-      return {
-        bundleUrl: script ? (script as HTMLScriptElement).src : null,
-        releaseId: (window as any).tsjs?.releaseId as string | undefined,
-      };
-    });
-    const bundleUrl =
-      runtime.bundleUrl ?? runtimeUrl("/static/tsjs=tsjs-unified.min.js");
-    expect(runtime.releaseId).toMatch(/^[a-f0-9]{64}$/);
+    await routeCriticalTsjsFixture(page, CREATIVE_FIXTURE);
+    const bundleUrl = new URL(CREATIVE_FIXTURE.criticalSrc, origin).toString();
 
     // Mirrors the srcdoc document the client builds: the first-party parent
     // stamps its own origin ahead of any creative markup, then the runtime,
@@ -158,7 +151,8 @@ test.describe("Sandboxed creative iframe", () => {
         html: creativeDocument(
           new URL(runtimeUrl("/")).origin,
           bundleUrl,
-          runtime.releaseId!,
+          CREATIVE_FIXTURE,
+          signedClick,
         ),
       },
     );

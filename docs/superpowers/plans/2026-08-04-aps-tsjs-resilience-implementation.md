@@ -1364,13 +1364,24 @@ collapse those checkpoints or carry unverified behavior between them.
 
   Add exact critical-tag authentication cases. The server emits one parser-inserted
   `script#trustedserver-js` immediately after the controller. The controller resolves
-  root-relative `criticalSrc` exactly once against its captured
-  `window.location.origin`, never `document.baseURI`, requires same origin plus exact
+  root-relative `criticalSrc` exactly once against its trusted document origin,
+  never `document.baseURI`, requires same origin plus exact
   path/query round-trip, and compares that canonical absolute value to the unique
   element's resolved `src`. Missing/duplicate id, publisher-created replacement,
   detached node, changed `src`, base-element influence, origin/path/query mismatch,
   and any redirected local route fail the critical transaction as `abi_mismatch`;
   no module registration or fallback runtime construction may occur first.
+
+  For an ordinary document the trusted origin is the captured exact HTTP(S)
+  `window.location.origin`. Add the sandboxed-creative exception in the existing
+  bootstrap/core-owned fallback boundary: only when the document origin is `"null"`,
+  accept the exact own non-enumerable/non-configurable/non-writable data stamp
+  `window.__tsCreativeOrigin` written before bidder markup. Reject missing,
+  inherited, accessor-backed, mutable, enumerable, credentialed, and non-origin
+  stamps. Use this same helper for critical-source capture and registry
+  current-script ownership; move the shared failure-reason type to that boundary so
+  the registry imports it without a fallback/registry module cycle. Do not create a
+  new uncaptured production-source ownership entry.
 
   Exercise the queue boundary as a real Array: pushes before/during/at activation and
   commit, retained ingress references, snapshot-versus-forward exactly once, nested
@@ -2963,7 +2974,13 @@ them as one implementation change.
   existing policy across direct, SSAT, cache, and auction paths. Cover dynamic-node
   guards, sandbox attributes, font/CORS/body/base behavior, opaque-origin click
   recovery through `/first-party/proxy-rebuild`, validated absolute HTTP(S), and
-  rejection of credentials, malformed values, and non-network schemes. Delete the
+  rejection of credentials, malformed values, and non-network schemes. For each
+  rewritten independent creative document that needs a guard, emit the complete
+  document-local boot controller plus exactly one authenticated critical tag for
+  core + `render_runtime` + `creative`, with no other critical or deferred module.
+  Cover body and body-less insertion, exact tag identity/source/manifest/release,
+  the immutable opaque-origin stamp, and zero TSJS injection when creative is
+  disabled or both guards are false. Delete the
   mutable/install creative globals only in Task 22.
 
 - [ ] **Step A5: Run and commit the creative slice before diagnostics or other modules.**
@@ -4082,6 +4099,7 @@ later group's spec files or workflow changes.
 - Modify: `crates/trusted-server-integration-tests/browser/tests/shared/creative-sandbox.spec.ts`
 - Modify: `crates/trusted-server-integration-tests/browser/tests/nextjs/gpt-diagnostics.spec.ts`
 - Modify: `crates/trusted-server-integration-tests/browser/tests/nextjs/navigation.spec.ts`
+- Create: `crates/trusted-server-integration-tests/browser/helpers/tsjs-fixture.ts`
 - Modify: `crates/trusted-server-integration-tests/browser/helpers/gpt-stub.ts`
 - Modify: `crates/trusted-server-integration-tests/browser/helpers/infra.ts`
 - Modify: `crates/trusted-server-integration-tests/browser/helpers/state.ts`
@@ -4108,6 +4126,13 @@ later group's spec files or workflow changes.
       only in the real-GAM pre-production gate. Create and stage each fixture in the
       first checkpoint that consumes it; do not leave 20B/20C fixture changes dirty
       across the 20A commit.
+
+  Build all synthetic critical-runtime pages from one shared helper that reads the
+  generated release manifest, concatenates exact core plus selected critical
+  artifact bytes with the production separator, hashes those response bytes, emits
+  the exact `BootManifestV1`, serves only that canonical content-addressed URL, and
+  always uses `script#trustedserver-js`. Do not execute anonymous inline/path
+  bundles or hand-maintain abbreviated manifests in browser tests.
 
 - [ ] **Step 3: Implement every spec §7.2 browser-observable race as grouped tables with exact**
       terminal, DOM, targeting, listener, port, timer, and network assertions:

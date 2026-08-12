@@ -1,6 +1,7 @@
 import type { BootManifestV1 } from '../core/types';
 
 import { DisposableStack, type DisposeCallback } from './disposable';
+import { trustedCriticalOrigin, type BootFailureReason } from './fallback';
 
 const INTEGRATION_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const RELEASE_ID = /^[0-9a-f]{64}$/;
@@ -10,7 +11,6 @@ const BOOT_DEADLINE_MS = 10_000;
 const EMPTY_BINDING = Object.freeze({});
 const ABORTED = Symbol('aborted');
 
-export type BootFailureReason = 'abi_mismatch' | 'bundle_partial';
 export type IntegrationRegistryState =
   'collecting' | 'preparing' | 'activating' | 'publishing' | 'committed' | 'failed' | 'disposed';
 
@@ -675,8 +675,8 @@ class IntegrationRegistryOwner {
     const manifest = this.manifestValue;
     if (!script || !document || !Script || !manifest) return false;
     try {
-      const origin = document.defaultView?.location.origin;
-      if (!origin || origin === 'null') return false;
+      const origin = trustedCriticalOrigin(document);
+      if (!origin) return false;
       const expected = new URL(manifest.criticalSrc, origin);
       return (
         script instanceof Script &&

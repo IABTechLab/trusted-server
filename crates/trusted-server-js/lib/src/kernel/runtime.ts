@@ -8,10 +8,10 @@ import {
   captureTrustedCriticalSrc,
   createFallbackFields,
   publicLog,
+  type BootFailureReason,
 } from './fallback';
 import {
   createIntegrationRegistry,
-  type BootFailureReason,
   type CoreActivationContext,
   type CorePreparationContext,
   type IntegrationBindings,

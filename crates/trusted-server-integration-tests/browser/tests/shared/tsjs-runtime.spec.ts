@@ -1,19 +1,18 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { expect, test, type Page } from "@playwright/test";
+import {
+  criticalTsjsFixture,
+  loadCriticalTsjsFixture,
+  type CriticalTsjsFixture,
+} from "../../helpers/tsjs-fixture.js";
 
-const TSJS_CRATE = resolve(__dirname, "../../../../trusted-server-js");
-const CORE_BUNDLE = resolve(TSJS_CRATE, "dist/tsjs-core.js");
-const GPT_BUNDLE = resolve(TSJS_CRATE, "dist/tsjs-gpt.js");
-const RELEASE = JSON.parse(
-  readFileSync(resolve(TSJS_CRATE, "dist/tsjs-release-v1.json"), "utf8"),
-) as { releaseId: string };
+const KERNEL_FIXTURE = criticalTsjsFixture(["render_runtime"]);
+const FALLBACK_FIXTURE = criticalTsjsFixture([]);
 
-function boot(releaseId: string) {
+function boot(fixture: CriticalTsjsFixture) {
   return {
     abi: 1,
-    releaseId,
-    manifest: { version: 1, releaseId, integrations: [] },
+    releaseId: fixture.releaseId,
+    manifest: fixture.manifest,
     auctionProjection: {
       version: 1,
       auction: { version: 1, auctionId: "browser-initial", results: [] },
@@ -94,9 +93,9 @@ test.describe("TSJS hard-cutover runtime", () => {
         setConfig() {},
         getConfig() {},
       };
-    }, boot(RELEASE.releaseId));
+    }, boot(KERNEL_FIXTURE));
 
-    await page.addScriptTag({ path: CORE_BUNDLE });
+    await loadCriticalTsjsFixture(page, KERNEL_FIXTURE);
     await waitForRuntime(page, "kernel");
 
     const state = await page.evaluate(() => {
@@ -140,7 +139,7 @@ test.describe("TSJS hard-cutover runtime", () => {
     expect(new Set(state.queueOrder).size).toBe(4);
     expect(state.queueFrozen).toBe(true);
     expect(state.bootFrozen).toBe(true);
-    expect(state.releaseId).toBe(RELEASE.releaseId);
+    expect(state.releaseId).toBe(KERNEL_FIXTURE.releaseId);
     expect(state.legacy).toEqual([]);
   });
 
@@ -148,7 +147,7 @@ test.describe("TSJS hard-cutover runtime", () => {
     page,
   }) => {
     await openRuntimePage(page);
-    await page.evaluate((initialBoot) => {
+    await page.evaluate(({ initialBoot, releaseId }) => {
       const browserWindow = window as unknown as {
         tsjs: Record<string, unknown>;
         fallbackEffects: { messageListeners: number; timeouts: number };
@@ -169,13 +168,13 @@ test.describe("TSJS hard-cutover runtime", () => {
         return nativeSetTimeout(handler, timeout);
       }) as typeof window.setTimeout;
       browserWindow.tsjs = {
-        boot: initialBoot,
+        boot: { ...initialBoot, manifest: { version: 2, releaseId } },
         que: [],
-        _integrationConfig: Object.create({ hostile: true }),
+        _integrationConfig: {},
       };
-    }, boot(RELEASE.releaseId));
+    }, { initialBoot: boot(FALLBACK_FIXTURE), releaseId: FALLBACK_FIXTURE.releaseId });
 
-    await page.addScriptTag({ path: CORE_BUNDLE });
+    await loadCriticalTsjsFixture(page, FALLBACK_FIXTURE);
     await waitForRuntime(page, "fallback");
     const before = await page.evaluate(() => ({
       effects: {
@@ -190,7 +189,7 @@ test.describe("TSJS hard-cutover runtime", () => {
       ).sort(),
     }));
 
-    await page.addScriptTag({ path: GPT_BUNDLE });
+    await page.addScriptTag({ content: "window.tsjs._registerIntegration({});" });
     await page.evaluate(() => {
       window.dispatchEvent(
         new MessageEvent("message", { data: { message: "Prebid Request" } }),

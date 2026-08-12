@@ -9,6 +9,11 @@ import {
 
 const browserPackage = resolve(__dirname, "../..");
 const realGamConfig = resolve(browserPackage, "playwright.real-gam.config.ts");
+const realGamConfigured = [
+  process.env.TS_REAL_GAM_PAGE_URL,
+  process.env.TS_REAL_GAM_AUTH_HEADER,
+  process.env.TS_REAL_GAM_EXPECTED_RELEASE_ID,
+].every(Boolean);
 
 test.describe("protected real-GAM test network", () => {
   test.describe.configure({ mode: "serial" });
@@ -55,6 +60,10 @@ test.describe("protected real-GAM test network", () => {
       page,
       browserName,
     }, testInfo) => {
+      test.skip(
+        !realGamConfigured,
+        "protected real-GAM cases run only through playwright.real-gam.config.ts",
+      );
       test.setTimeout(contract.deadlineMs + 30_000);
       await runAttestedRealGamCase({
         page,
