@@ -37,6 +37,7 @@ use http::{HeaderValue, Method, Request, Response, StatusCode, Uri, header};
 use crate::auction::endpoints::{
     merge_auction_eids, resolve_auction_eids, resolve_client_auction_eids,
 };
+use crate::auction::formats::sanitize_publisher_page_url;
 use crate::auction::orchestrator::{
     AuctionOrchestrator, DispatchAuctionOutcome, DispatchedAuction,
 };
@@ -2690,19 +2691,24 @@ pub(crate) fn write_bids_to_state(
     settings: &Settings,
     request_origin: &str,
     include_debug_bid: bool,
-) {
+    auction_id: Option<&str>,
+) -> std::collections::HashSet<String> {
     log::debug!(
         "write_bids_to_state: {} winning bid(s): [{}]",
         winning_bids.len(),
         winning_bids.keys().cloned().collect::<Vec<_>>().join(", ")
     );
-    ad_bids_state.set(build_bid_map(
+    let bid_map = build_bid_map_with_auction_id(
         winning_bids,
         price_granularity,
         settings,
         request_origin,
         include_debug_bid,
-    ));
+        auction_id,
+    );
+    let delivered_winner_slots = bid_map.keys().cloned().collect();
+    ad_bids_state.set(bid_map);
+    delivered_winner_slots
 }
 
 /// Maximum serialized size (in bytes) of a dump embedded in the `ts-debug`
@@ -3275,6 +3281,10 @@ async fn collect_non_html_auction(
     services: &RuntimeServices,
     settings: &Settings,
 ) {
+    let auction_id = telemetry
+        .auction_request
+        .as_ref()
+        .and_then(|_| diagnostics_auction_id(settings));
     let placeholder = mediator_placeholder_request();
     let result = orchestrator
         .collect_dispatched_auction(
@@ -3283,6 +3293,15 @@ async fn collect_non_html_auction(
             &make_collect_context(settings, services, &placeholder),
         )
         .await;
+    let delivered_winner_slots = write_bids_to_state(
+        &result.winning_bids,
+        params.price_granularity,
+        &params.ad_bids_state,
+        settings,
+        &request_origin(&params.request_scheme, &params.request_host),
+        settings.debug.inject_adm_for_testing,
+        auction_id.as_deref(),
+    );
     if let (Some(observation), Some(auction_request)) =
         (telemetry.observation, telemetry.auction_request.as_ref())
     {
@@ -3292,19 +3311,12 @@ async fn collect_non_html_auction(
                 AuctionTerminalOutcome::Completed {
                     request: auction_request,
                     result: &result,
+                    delivered_winner_slots: Some(&delivered_winner_slots),
                 },
             )
         })
         .await;
     }
-    write_bids_to_state(
-        &result.winning_bids,
-        params.price_granularity,
-        &params.ad_bids_state,
-        settings,
-        &request_origin(&params.request_scheme, &params.request_host),
-        settings.debug.inject_adm_for_testing,
-    );
 }
 
 // Private orchestration helper called only from `body_close_hold_loop`.
@@ -3323,12 +3335,29 @@ async fn collect_stream_auction(
         settings,
         request_origin,
     } = deps;
+    let auction_id = telemetry
+        .auction_request
+        .as_ref()
+        .and_then(|_| diagnostics_auction_id(settings));
     log::info!("body_close_hold_loop: collecting dispatched auction before held body tail");
     let placeholder = mediator_placeholder_request();
     let collect_ctx = make_collect_context(settings, services, &placeholder);
     let result = orchestrator
         .collect_dispatched_auction(dispatched, services, &collect_ctx)
         .await;
+    log::info!(
+        "body_close_hold_loop: collect complete - {} winning bid(s)",
+        result.winning_bids.len()
+    );
+    let delivered_winner_slots = write_bids_to_state(
+        &result.winning_bids,
+        *price_granularity,
+        ad_bids_state,
+        settings,
+        request_origin,
+        settings.debug.inject_adm_for_testing,
+        auction_id.as_deref(),
+    );
     if let (Some(observation), Some(auction_request)) =
         (telemetry.observation, telemetry.auction_request.as_ref())
     {
@@ -3338,23 +3367,12 @@ async fn collect_stream_auction(
                 AuctionTerminalOutcome::Completed {
                     request: auction_request,
                     result: &result,
+                    delivered_winner_slots: Some(&delivered_winner_slots),
                 },
             )
         })
         .await;
     }
-    log::info!(
-        "body_close_hold_loop: collect complete - {} winning bid(s)",
-        result.winning_bids.len()
-    );
-    write_bids_to_state(
-        &result.winning_bids,
-        *price_granularity,
-        ad_bids_state,
-        settings,
-        request_origin,
-        settings.debug.inject_adm_for_testing,
-    );
 
     if settings.debug.auction_html_comment {
         prepend_auction_debug_comment("stream", &result, ad_bids_state);
@@ -4288,10 +4306,11 @@ pub(crate) fn build_auction_request(
     // so SSPs, injected creatives, and brand-safety pixels see the publisher's
     // own origin. On the SSAT proxy path `request_info.host` is the trusted
     // server edge host, which must not leak into the bid request.
-    let page_url = format!(
+    let page_candidate = format!(
         "{}://{}{}",
         request_info.scheme, publisher_domain, slots_ctx.request_path
     );
+    let page_url = sanitize_publisher_page_url(Some(&page_candidate), publisher_domain);
     let ec_id = ec_id.filter(|id| !id.is_empty());
     let request_id = ec_id.map_or_else(
         || format!("ts-req-{}", uuid::Uuid::new_v4().simple()),
@@ -4320,6 +4339,21 @@ pub(crate) fn build_auction_request(
         }),
         context: std::collections::HashMap::new(),
     }
+}
+
+/// Mint the browser-visible auction correlation token for GPT diagnostics.
+///
+/// The token is freshly generated per auction and carries no user identity.
+/// [`AuctionRequest::id`] must never be used here: for a consented visitor it is
+/// `ts-{ec_id}`, so publishing it in `window.tsjs.bids` would hand the `HttpOnly`
+/// EC identifier to any script on the page, and — being stable per visitor — it
+/// could not distinguish one auction from the next either.
+///
+/// Returns `None` unless the GPT diagnostics integration is enabled, since
+/// nothing else consumes the value.
+fn diagnostics_auction_id(settings: &Settings) -> Option<String> {
+    crate::integrations::gpt_diagnostics::is_enabled(settings)
+        .then(|| format!("ts-auc-{}", uuid::Uuid::new_v4().simple()))
 }
 
 /// Escape a JSON string so it is safe to embed inside a JS double-quoted string literal
@@ -4362,19 +4396,38 @@ const GAM_TARGETING_VALUE_MAX_LEN: usize = 40;
 /// targeting value — falsey on the page, so GPT skips the key and the render
 /// bridge has nothing to match, exactly the failure the fallback chain closes.
 fn non_empty(value: Option<&str>) -> Option<&str> {
-    value.filter(|v| !v.is_empty())
+    value.filter(|value| !value.is_empty())
 }
 
 /// Build a price-bucketed bid map from winning bids.
 ///
 /// Returns a JSON object map of slot ID → bid metadata including the bucketed
 /// CPM (`hb_pb`), bidder (`hb_bidder`), and optional ad ID, nurl, and burl.
+#[cfg(test)]
 pub(crate) fn build_bid_map(
     winning_bids: &std::collections::HashMap<String, Bid>,
     granularity: crate::price_bucket::PriceGranularity,
     settings: &Settings,
     request_origin: &str,
     include_debug_bid: bool,
+) -> serde_json::Map<String, serde_json::Value> {
+    build_bid_map_with_auction_id(
+        winning_bids,
+        granularity,
+        settings,
+        request_origin,
+        include_debug_bid,
+        None,
+    )
+}
+
+pub(crate) fn build_bid_map_with_auction_id(
+    winning_bids: &std::collections::HashMap<String, Bid>,
+    granularity: crate::price_bucket::PriceGranularity,
+    settings: &Settings,
+    request_origin: &str,
+    include_debug_bid: bool,
+    auction_id: Option<&str>,
 ) -> serde_json::Map<String, serde_json::Value> {
     // Inline creatives render in a foreign origin (PUC's srcdoc under GAM), so
     // their proxy/click URLs must be absolute against the origin the visitor is
@@ -4389,7 +4442,7 @@ pub(crate) fn build_bid_map(
     winning_bids
         .iter()
         .filter_map(|(slot_id, bid)| {
-            bid.price.map(|cpm| {
+            bid.price.and_then(|cpm| {
                 let bucket = price_bucket(cpm, granularity);
                 let mut obj = serde_json::Map::new();
                 obj.insert("hb_pb".to_string(), serde_json::Value::String(bucket));
@@ -4397,6 +4450,12 @@ pub(crate) fn build_bid_map(
                     "hb_bidder".to_string(),
                     serde_json::Value::String(bid.bidder.clone()),
                 );
+                if let Some(auction_id) = auction_id {
+                    obj.insert(
+                        "hb_auction_id".to_string(),
+                        serde_json::Value::String(auction_id.to_owned()),
+                    );
+                }
                 // Winning creative dimensions — the bridge sizes the inline
                 // render from these, falling back to the first configured slot
                 // format only when absent, which mis-sizes a multi-size slot.
@@ -4408,28 +4467,26 @@ pub(crate) fn build_bid_map(
                 if bid.height > 0 {
                     obj.insert("h".to_string(), serde_json::Value::from(bid.height));
                 }
-                // hb_adid: use PBS Cache UUID when present — the Prebid Universal Creative uses
-                // this as the cache lookup key, NOT the OpenRTB bid ID (bid.ad_id). Fall back to
-                // bid.ad_id for APS and other non-PBS providers.
-                //
-                // `bid.bid_id` (the OpenRTB bid's own `id`) is the last resort: it is
-                // always present per spec but only unique per bid instance, not a
-                // creative identifier. It still satisfies what hb_adid needs here —
-                // a stable value GAM's Universal Creative echoes back verbatim so
-                // the render bridge can find this exact winning bid — for bidders
-                // that return neither a cache UUID nor `adid`. Without it those
-                // bids carry no hb_adid at all, so no targeting key reaches GAM and
-                // the render handshake can never start.
+                // hb_adid: use the PBS Cache UUID when present — the Prebid
+                // Universal Creative uses this as the cache lookup key. Fall back
+                // to the selected typed-renderer bid ID, then `adid`, then the
+                // OpenRTB bid ID. The latter is the last resort: it is unique per
+                // bid instance rather than a creative, but GAM echoes it verbatim
+                // so the render bridge can find the exact winning bid.
+                let renderer_bid_id = bid.renderer.as_ref().and_then(|renderer| {
+                    renderer
+                        .as_aps()
+                        .map(|renderer| renderer.bid_id.as_str())
+                });
                 let hb_adid = non_empty(bid.cache_id.as_deref())
+                    .or_else(|| renderer_bid_id.and_then(|id| non_empty(Some(id))))
                     .or_else(|| non_empty(bid.ad_id.as_deref()))
                     .or_else(|| non_empty(bid.bid_id.as_deref()));
                 if let Some(id) = hb_adid {
                     // GAM drops an over-long targeting value, so the creative
                     // echoes nothing and the bridge's equality check never
-                    // matches — the same silent no-render as a missing hb_adid.
-                    // Log rather than truncate: a truncated id is no longer
-                    // unique per bid, which is what lets one slot's render claim
-                    // another slot's creative.
+                    // matches. Log rather than truncate: a truncated ID is no
+                    // longer unique per bid.
                     if id.len() > GAM_TARGETING_VALUE_MAX_LEN {
                         log::warn!(
                             "hb_adid for slot '{slot_id}' is {} characters, over GAM's \
@@ -4444,32 +4501,6 @@ pub(crate) fn build_bid_map(
                     );
                 }
 
-                // Cache endpoint coordinates — only present for PBS bids with Prebid Cache enabled.
-                // The Prebid Universal Creative constructs:
-                //   https://<hb_cache_host><hb_cache_path>?uuid=<hb_adid>
-                //
-                // Gated on a non-blank `cache_id`: PBS reports the cache `url`
-                // and `cacheId` independently, and hb_adid falls back to a
-                // non-cache identifier (`adid`, then the bid id). Emitting the
-                // coordinates without a cache UUID would point the Universal
-                // Creative at `?uuid=<non-cache-id>` — a guaranteed cache miss —
-                // instead of letting it fall through to the inline `adm`. The
-                // gate matches the `non_empty` chain above so a blank `cacheId`
-                // cannot pass here while losing the hb_adid precedence.
-                if non_empty(bid.cache_id.as_deref()).is_some() {
-                    if let Some(ref host) = bid.cache_host {
-                        obj.insert(
-                            "hb_cache_host".to_string(),
-                            serde_json::Value::String(host.clone()),
-                        );
-                    }
-                    if let Some(ref path) = bid.cache_path {
-                        obj.insert(
-                            "hb_cache_path".to_string(),
-                            serde_json::Value::String(path.clone()),
-                        );
-                    }
-                }
                 // Win/billing notification URLs, fired verbatim by the bridge.
                 // Per OpenRTB these are the canonical carriers of
                 // `${AUCTION_PRICE}`, so expand it from the same winning CPM used
@@ -4486,21 +4517,39 @@ pub(crate) fn build_bid_map(
                 }
                 // Always include the winning creative so the pbRender bridge can
                 // render it locally when GAM serves the Prebid Universal Creative
-                // — no PBS Cache round trip. The `hb_cache_*` coordinates above
-                // remain as the fallback for an absent `adm`.
+                // — no PBS Cache round trip.
                 //
-                // Sanitize dangerous markup first, then optionally rewrite URLs
-                // to first-party proxies — the same creative-processing policy as
-                // the `/auction` path (see `auction::formats`), except for the
-                // inline render context. This `adm` is rendered by the Prebid
-                // Universal Creative inside GAM's iframe (`f.srcdoc = d.ad`), a
-                // foreign origin where root-relative `/first-party/…` URLs resolve
+                // Optionally sanitize dangerous markup, then optionally rewrite
+                // URLs to first-party proxies — the same opt-in creative-processing
+                // policy as the `/auction` path (see `auction::formats`), except
+                // for the inline render context. This `adm` is rendered by the
+                // Prebid Universal Creative inside GAM's iframe (`f.srcdoc = d.ad`),
+                // a foreign origin where root-relative `/first-party/…` URLs resolve
                 // against GAM and 404. The inline rewriter therefore emits
                 // absolute first-party URLs and omits the tsjs bundle injection.
-                // Sanitization also enforces the 1 MiB creative cap, returning an
-                // empty string for oversized or unparseable markup — in which case
-                // the entry is omitted and the bridge falls back to the PBS Cache
-                // coordinates.
+                let has_renderer = if let Some(ref renderer) = bid.renderer {
+                    let renderer = match serde_json::to_value(renderer) {
+                        Ok(renderer) => renderer,
+                        Err(error) => {
+                            log::warn!(
+                                "Skipping winning bid for slot '{}' because its typed renderer could not be serialized: {error}",
+                                slot_id
+                            );
+                            return None;
+                        }
+                    };
+                    obj.insert("renderer".to_string(), renderer);
+                    true
+                } else {
+                    false
+                };
+                // Every `Some(raw)` — including an explicit empty string, which
+                // PBS can return — counts as a supplied creative and goes
+                // through processing, so an empty `adm` cannot masquerade as
+                // "absent" and re-enable the raw cache fallback below.
+                // Processing may reject the creative outright (empty output):
+                // sanitization can strip everything, parsing can fail, or the
+                // size cap can trip.
                 if let Some(ref raw_creative) = bid.creative {
                     // Resolve ${AUCTION_PRICE} from the exact winning CPM BEFORE
                     // sanitizing, rewriting, and signing — URL rewriting would
@@ -4512,8 +4561,54 @@ pub(crate) fn build_bid_map(
                         &base_origin,
                         &priced,
                     );
-                    if !adm.is_empty() {
+                    if adm.trim().is_empty() {
+                        // Rejected. The PBS Cache coordinates are deliberately
+                        // NOT emitted as a fallback: the Universal Creative
+                        // fetches the cached bid's ORIGINAL adm, which would
+                        // hand the client an unprocessed copy of the very
+                        // markup processing just refused.
+                        if !has_renderer {
+                            log::warn!(
+                                "Skipping winning bid for slot '{}' because creative processing rejected its only render source",
+                                slot_id
+                            );
+                            return None;
+                        }
+                        log::warn!(
+                            "Creative for slot '{}' from '{}' rejected by processing; rendering through its typed renderer without a cache fallback",
+                            slot_id,
+                            bid.bidder
+                        );
+                    } else {
                         obj.insert("adm".to_string(), serde_json::Value::String(adm));
+                    }
+                } else {
+                    // No creative of the bid's own, so the cache is the sole
+                    // render source and its coordinates are safe to emit. The
+                    // Prebid Universal Creative constructs:
+                    //   https://<hb_cache_host><hb_cache_path>?uuid=<hb_adid>
+                    //
+                    // Gated on a non-blank `cache_id`: PBS reports the cache
+                    // `url` and `cacheId` independently, and hb_adid falls back
+                    // to a non-cache identifier (`adid`, then the bid id).
+                    // Emitting the coordinates without a cache UUID would point
+                    // the Universal Creative at `?uuid=<non-cache-id>` — a
+                    // guaranteed cache miss. The gate matches the `non_empty`
+                    // chain used for hb_adid above so a blank `cacheId` cannot
+                    // pass here while losing the hb_adid precedence.
+                    if non_empty(bid.cache_id.as_deref()).is_some() {
+                        if let Some(ref host) = bid.cache_host {
+                            obj.insert(
+                                "hb_cache_host".to_string(),
+                                serde_json::Value::String(host.clone()),
+                            );
+                        }
+                        if let Some(ref path) = bid.cache_path {
+                            obj.insert(
+                                "hb_cache_path".to_string(),
+                                serde_json::Value::String(path.clone()),
+                            );
+                        }
                     }
                 }
                 // Verbose per-bid debug blob only under the testing flag; also
@@ -4544,7 +4639,7 @@ pub(crate) fn build_bid_map(
                         }),
                     );
                 }
-                (slot_id.clone(), serde_json::Value::Object(obj))
+                Some((slot_id.clone(), serde_json::Value::Object(obj)))
             })
         })
         .collect()
@@ -5300,8 +5395,8 @@ pub async fn handle_page_bids(
     // skip the live auction, matching the existing bot/prefetch behaviour.
     let ad_stack_enabled = auction_enabled && consent_allows_auction;
 
-    let winning_bids = if matched_slots.is_empty() {
-        std::collections::HashMap::new()
+    let (winning_bids, prebuilt_bid_map) = if matched_slots.is_empty() {
+        (std::collections::HashMap::new(), None)
     } else {
         // Same publisher identity as the outbound bid request — see the
         // matching note on the initial-navigation observation above.
@@ -5357,17 +5452,28 @@ pub async fn handle_page_bids(
             {
                 Ok(result) => {
                     let winning_bids = result.winning_bids.clone();
+                    let auction_id = diagnostics_auction_id(settings);
+                    let bid_map = build_bid_map_with_auction_id(
+                        &winning_bids,
+                        co_config.price_granularity,
+                        settings,
+                        &page_bids_request_origin,
+                        settings.debug.inject_adm_for_testing,
+                        auction_id.as_deref(),
+                    );
+                    let delivered_winner_slots = bid_map.keys().cloned().collect();
                     emit_auction_events_best_effort_lazy(services, || {
                         build_auction_events(
                             observation,
                             AuctionTerminalOutcome::Completed {
                                 request: &auction_request,
                                 result: &result,
+                                delivered_winner_slots: Some(&delivered_winner_slots),
                             },
                         )
                     })
                     .await;
-                    winning_bids
+                    (winning_bids, Some(bid_map))
                 }
                 Err(e) => {
                     log::warn!("page-bids auction failed: {e:?}");
@@ -5384,7 +5490,7 @@ pub async fn handle_page_bids(
                         )
                     })
                     .await;
-                    std::collections::HashMap::new()
+                    (std::collections::HashMap::new(), None)
                 }
             }
         } else {
@@ -5410,17 +5516,20 @@ pub async fn handle_page_bids(
                 )
             })
             .await;
-            std::collections::HashMap::new()
+            (std::collections::HashMap::new(), None)
         }
     };
 
-    let bid_map = build_bid_map(
-        &winning_bids,
-        co_config.price_granularity,
-        settings,
-        &page_bids_request_origin,
-        settings.debug.inject_adm_for_testing,
-    );
+    let bid_map = prebuilt_bid_map.unwrap_or_else(|| {
+        build_bid_map_with_auction_id(
+            &winning_bids,
+            co_config.price_granularity,
+            settings,
+            &page_bids_request_origin,
+            settings.debug.inject_adm_for_testing,
+            None,
+        )
+    });
 
     // Gate slots on the ad-stack kill switch / consent: when disabled, return no
     // slots so the SPA hook does not call `adInit()` / create GPT slots.
@@ -5541,6 +5650,8 @@ mod tests {
             burl: None,
             bid_id: None,
             ad_id: None,
+            creative_id: None,
+            renderer: None,
             cache_id: None,
             cache_host: None,
             cache_path: None,
@@ -6837,7 +6948,7 @@ mod tests {
                 &self,
                 _request: &AuctionRequest,
                 context: &crate::auction::types::AuctionContext<'_>,
-            ) -> Result<crate::platform::PlatformPendingRequest, Report<TrustedServerError>>
+            ) -> Result<crate::auction::provider::ProviderRequestOutcome, Report<TrustedServerError>>
             {
                 let request = PlatformHttpRequest::new(
                     HttpRequest::builder()
@@ -6855,6 +6966,7 @@ mod tests {
                     .change_context(TrustedServerError::Auction {
                         message: "stub bid launch failed".to_string(),
                     })
+                    .map(crate::auction::provider::ProviderRequestOutcome::pending)
             }
 
             async fn parse_response(
@@ -6877,6 +6989,8 @@ mod tests {
                         nurl: None,
                         burl: None,
                         bid_id: None,
+                        creative_id: None,
+                        renderer: None,
                         ad_id: Some("stub-creative-1".to_string()),
                         cache_id: None,
                         cache_host: None,
@@ -9061,7 +9175,7 @@ mod tests {
 
     mod ssat_cache_policy_tests {
         use super::*;
-        use crate::auction::provider::AuctionProvider;
+        use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
         use crate::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
         use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
         use crate::platform::test_support::{
@@ -9142,7 +9256,7 @@ mod tests {
                 &self,
                 _request: &AuctionRequest,
                 context: &AuctionContext<'_>,
-            ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+            ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
                 let request = PlatformHttpRequest::new(
                     HttpRequest::builder()
                         .method(Method::POST)
@@ -9159,6 +9273,7 @@ mod tests {
                     .change_context(TrustedServerError::Auction {
                         message: "test provider launch failed".to_string(),
                     })
+                    .map(ProviderRequestOutcome::pending)
             }
 
             async fn parse_response(
@@ -12690,10 +12805,11 @@ mod tests {
     #[cfg(test)]
     mod creative_opportunities_tests {
         use super::super::{
-            MatchedSlotsContext, build_ad_slots_script, build_auction_request, build_bid_map,
-            build_bids_script, html_escape_for_script,
+            AdBidsState, MatchedSlotsContext, build_ad_slots_script, build_auction_request,
+            build_bid_map, build_bids_script, diagnostics_auction_id, html_escape_for_script,
+            write_bids_to_state,
         };
-        use crate::auction::types::{Bid, MediaType};
+        use crate::auction::types::{ApsRendererV1, ApsTagType, Bid, BidRenderer, MediaType};
         use crate::consent::ConsentContext;
         use crate::creative_opportunities::{
             CreativeOpportunitiesConfig, CreativeOpportunityFormat, CreativeOpportunitySlot,
@@ -12765,6 +12881,8 @@ mod tests {
                 nurl: Some(nurl.to_string()),
                 burl: Some(burl.to_string()),
                 bid_id: None,
+                creative_id: None,
+                renderer: None,
                 ad_id: Some(ad_id.to_string()),
                 cache_id: None,
                 cache_host: None,
@@ -12941,6 +13059,141 @@ mod tests {
             );
         }
 
+        /// Guards the browser-visible token every auction path shares: it must
+        /// be fresh per auction and absent unless diagnostics can consume it.
+        #[test]
+        fn diagnostics_auction_id_is_fresh_and_gated() {
+            let mut settings = test_settings();
+            assert_eq!(
+                diagnostics_auction_id(&settings),
+                None,
+                "no token should be minted without the diagnostics integration"
+            );
+
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+                .expect("should enable diagnostics");
+            let first =
+                diagnostics_auction_id(&settings).expect("enabled diagnostics should mint a token");
+            let second =
+                diagnostics_auction_id(&settings).expect("enabled diagnostics should mint a token");
+
+            assert!(
+                first.starts_with("ts-auc-"),
+                "token should use the diagnostics prefix, got `{first}`"
+            );
+            assert_ne!(first, second, "each auction should mint its own token");
+        }
+
+        #[test]
+        fn initial_document_bids_script_includes_auction_id_only_for_winning_bids() {
+            let slot = make_slot();
+            let slots = [slot];
+            let slots_ctx = MatchedSlotsContext {
+                matched_slots: &slots,
+                request_path: "/2024/01/my-article/",
+            };
+            let request_info = RequestInfo {
+                host: "publisher.example.com".to_string(),
+                scheme: "https".to_string(),
+            };
+            let mut auction_request = build_auction_request(
+                &slots_ctx,
+                None,
+                &ConsentContext::default(),
+                &request_info,
+                "publisher.example.com",
+                Some("Mozilla/5.0"),
+            );
+            auction_request.id = "initial-auction-example-123".to_string();
+            let mut winning_bids = HashMap::new();
+            winning_bids.insert(
+                "atf_sidebar_ad".to_string(),
+                make_bid(
+                    "atf_sidebar_ad",
+                    1.50,
+                    "example_bidder",
+                    "abc123",
+                    "https://example.com/win",
+                    "https://example.com/bill",
+                ),
+            );
+
+            let state = AdBidsState::default();
+            write_bids_to_state(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &state,
+                &test_settings(),
+                "",
+                false,
+                Some(&auction_request.id),
+            );
+            let script = state
+                .script_cell()
+                .lock()
+                .expect("should lock initial bid state")
+                .clone()
+                .expect("should generate initial-document bids script");
+            let bid_json = script
+                .strip_prefix(
+                    "<script>(function(){var t=window.tsjs=window.tsjs||{};var b=JSON.parse(\"",
+                )
+                .and_then(|script| {
+                    script.strip_suffix(
+                        "\");var s=t.scheduleInitialAdInit;if(typeof s===\"function\")s(b);else t.bids=b;})();</script>",
+                    )
+                })
+                .expect("should emit the initial-document tsjs.bids script shape");
+            let bid_json: String = serde_json::from_str(&format!("\"{bid_json}\""))
+                .expect("should decode initial-document JSON.parse input");
+            let bids: serde_json::Value = serde_json::from_str(&bid_json)
+                .expect("should serialize initial-document bids as JSON");
+
+            assert_eq!(
+                bids["atf_sidebar_ad"]["hb_auction_id"], auction_request.id,
+                "initial-document bids should expose the current request ID only on the winner"
+            );
+
+            write_bids_to_state(
+                &HashMap::new(),
+                PriceGranularity::Dense,
+                &state,
+                &test_settings(),
+                "",
+                false,
+                Some(&auction_request.id),
+            );
+            let empty_script = state
+                .script_cell()
+                .lock()
+                .expect("should lock empty initial bid state")
+                .clone()
+                .expect("should generate empty initial-document bids script");
+            let empty_bid_json = empty_script
+                .strip_prefix(
+                    "<script>(function(){var t=window.tsjs=window.tsjs||{};var b=JSON.parse(\"",
+                )
+                .and_then(|script| {
+                    script.strip_suffix(
+                        "\");var s=t.scheduleInitialAdInit;if(typeof s===\"function\")s(b);else t.bids=b;})();</script>",
+                    )
+                })
+                .expect("should emit the empty initial-document tsjs.bids script shape");
+            let empty_bid_json: String = serde_json::from_str(&format!("\"{empty_bid_json}\""))
+                .expect("should decode empty initial-document JSON.parse input");
+            let empty_bids: serde_json::Value = serde_json::from_str(&empty_bid_json)
+                .expect("should serialize empty initial-document bids as JSON");
+            assert!(
+                empty_bids
+                    .as_object()
+                    .expect("initial-document bids should be an object")
+                    .is_empty(),
+                "initial-document bids should not fabricate metadata without a winner"
+            );
+        }
+
         #[test]
         fn bid_map_omits_zero_creative_dimensions() {
             // Missing OpenRTB w/h parse to 0. Emitting w:0/h:0 would make the
@@ -13058,10 +13311,13 @@ mod tests {
 
         #[test]
         fn build_bid_map_sanitizes_hostile_adm() {
-            // The inline-adm path must run the same creative-processing boundary
-            // as the `/auction` path (sanitize → rewrite) before the creative
-            // reaches window.tsjs.bids, so hostile executable markup never lands
-            // in the client-facing `adm` for the Prebid Universal Creative to run.
+            // The inline-adm path must run the same opt-in creative-processing
+            // boundary as the `/auction` path (sanitize → rewrite) before the
+            // creative reaches window.tsjs.bids, so with sanitization enabled
+            // hostile executable markup never lands in the client-facing `adm`
+            // for the Prebid Universal Creative to run.
+            let mut settings = test_settings();
+            settings.auction.sanitize_creatives = true;
             let mut winning_bids = HashMap::new();
             let mut bid = make_bid(
                 "atf_sidebar_ad",
@@ -13078,13 +13334,7 @@ mod tests {
             );
             winning_bids.insert("atf_sidebar_ad".to_string(), bid);
 
-            let map = build_bid_map(
-                &winning_bids,
-                PriceGranularity::Dense,
-                &test_settings(),
-                "",
-                false,
-            );
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, "", false);
             let adm = map
                 .get("atf_sidebar_ad")
                 .and_then(|v| v.as_object())
@@ -13111,8 +13361,9 @@ mod tests {
         }
 
         #[test]
-        fn build_bid_map_can_skip_rewriting_but_not_sanitization() {
+        fn build_bid_map_can_skip_rewriting_while_sanitizing() {
             let mut settings = test_settings();
+            settings.auction.sanitize_creatives = true;
             settings.auction.rewrite_creatives = false;
             let mut winning_bids = HashMap::new();
             let mut bid = make_bid(
@@ -13169,10 +13420,11 @@ mod tests {
 
         #[test]
         fn build_bid_map_omits_oversized_adm() {
-            // Creatives larger than the sanitize pass's 1 MiB cap are rejected
-            // (empty result), so the inline `adm` is omitted and the pbRender
-            // bridge falls back to the PBS Cache coordinates instead of shipping
-            // an unbounded creative to the client.
+            // Creatives larger than the 1 MiB cap are rejected (empty result)
+            // in every processing mode, so the bid is omitted rather than
+            // recording a blank winner or shipping an unbounded creative to the
+            // client. Runs with default settings to cover the shipped
+            // configuration.
             let mut winning_bids = HashMap::new();
             let mut bid = make_bid(
                 "atf_sidebar_ad",
@@ -13192,13 +13444,124 @@ mod tests {
                 "",
                 false,
             );
+            assert!(
+                !map.contains_key("atf_sidebar_ad"),
+                "should omit the bid when the creative exceeds the 1 MiB cap"
+            );
+        }
+
+        // A supplied creative that processing rejects must not fall back to the
+        // PBS Cache coordinates: the GPT bridge fetches the cached bid's ORIGINAL
+        // adm, which would undo sanitization and the size cap entirely.
+        fn cached_bid_with_creative(creative: &str) -> Bid {
+            Bid {
+                slot_id: "atf_sidebar_ad".to_string(),
+                price: Some(1.50),
+                currency: "USD".to_string(),
+                creative: Some(creative.to_string()),
+                adomain: None,
+                bidder: "prebid".to_string(),
+                width: 300,
+                height: 250,
+                nurl: None,
+                burl: None,
+                ad_id: Some("bid-impression-id".to_string()),
+                bid_id: Some("openrtb-bid-id".to_string()),
+                creative_id: None,
+                // No typed renderer: these cases assert what happens when the
+                // supplied markup is the bid's only render source.
+                renderer: None,
+                cache_id: Some("cache-uuid".to_string()),
+                cache_host: Some("prebid-cache.example.com".to_string()),
+                cache_path: Some("/cache".to_string()),
+                metadata: Default::default(),
+            }
+        }
+
+        // These fixtures carry cache coordinates but no typed renderer, so a
+        // rejected creative leaves the bid with no render source at all and it
+        // is dropped outright — which subsumes the property under test: the
+        // cache coordinates never reach the client, so the cached (unprocessed)
+        // copy of the markup cannot be fetched in place of what was refused.
+        fn assert_no_render_source(settings: &Settings, creative: String, case: &str) {
+            let mut winning_bids = HashMap::new();
+            let mut bid = cached_bid_with_creative("");
+            bid.creative = Some(creative);
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, settings, "", false);
+
+            match map.get("atf_sidebar_ad").and_then(|v| v.as_object()) {
+                None => {}
+                Some(obj) => {
+                    assert!(
+                        obj.get("adm").is_none(),
+                        "{case}: rejected creative should not emit adm"
+                    );
+                    assert!(
+                        obj.get("hb_cache_host").is_none(),
+                        "{case}: rejected creative should suppress hb_cache_host"
+                    );
+                    assert!(
+                        obj.get("hb_cache_path").is_none(),
+                        "{case}: rejected creative should suppress hb_cache_path"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn build_bid_map_suppresses_cache_fallback_for_rejected_creatives() {
+            let mut sanitizing = test_settings();
+            sanitizing.auction.sanitize_creatives = true;
+
+            // Script-only creative: sanitization strips everything.
+            assert_no_render_source(
+                &sanitizing,
+                "<script>document.write('ad')</script>".to_string(),
+                "script-only",
+            );
+            // Oversized creative: rejected by the cap in every mode.
+            assert_no_render_source(
+                &test_settings(),
+                format!("<div>{}</div>", "a".repeat(1024 * 1024 + 1)),
+                "oversized",
+            );
+            // An explicit empty `adm` is a supplied creative, not an absent one:
+            // classifying it as absent would re-enable the raw cache fallback.
+            assert_no_render_source(&test_settings(), String::new(), "explicit-empty");
+        }
+
+        #[test]
+        fn build_bid_map_keeps_cache_fallback_for_absent_creatives() {
+            // A bid with no supplied creative is the legitimate PBS Cache case:
+            // the coordinates are the only render source.
+            let mut winning_bids = HashMap::new();
+            let mut bid = cached_bid_with_creative("");
+            bid.creative = None;
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+            );
             let obj = map
                 .get("atf_sidebar_ad")
                 .and_then(|v| v.as_object())
                 .expect("should have a bid entry");
-            assert!(
-                obj.get("adm").is_none(),
-                "should omit the inline adm when the creative exceeds the 1 MiB cap"
+
+            assert_eq!(
+                obj.get("hb_cache_host").and_then(|v| v.as_str()),
+                Some("prebid-cache.example.com"),
+                "absent creative should keep hb_cache_host"
+            );
+            assert_eq!(
+                obj.get("hb_cache_path").and_then(|v| v.as_str()),
+                Some("/cache"),
+                "absent creative should keep hb_cache_path"
             );
         }
 
@@ -13210,6 +13573,7 @@ mod tests {
             // root-relative `/first-party/proxy` would resolve against GAM and 404.
             // The tsjs bundle must NOT be injected into that foreign-origin iframe.
             let mut settings = test_settings();
+            settings.auction.rewrite_creatives = true;
             settings.publisher.domain = "example.com".to_string();
 
             let mut winning_bids = HashMap::new();
@@ -13259,6 +13623,7 @@ mod tests {
             // origin the visitor is on (here an HTTP dev host with a port), not the
             // configured publisher domain.
             let mut settings = test_settings();
+            settings.auction.rewrite_creatives = true;
             settings.publisher.domain = "example.com".to_string();
 
             let mut winning_bids = HashMap::new();
@@ -13503,9 +13868,9 @@ mod tests {
                     height: 250,
                     nurl: None,
                     burl: None,
-                    // Present alongside cache_id/ad_id to prove cache_id still wins
-                    // — bid_id is the last resort, not a co-equal fallback.
-                    bid_id: Some("should-be-ignored-bid-id".to_string()),
+                    bid_id: None,
+                    creative_id: None,
+                    renderer: None,
                     ad_id: Some("bid-impression-id".to_string()),
                     cache_id: Some("f47447a0-b759-4f2f-9887-af458b79b570".to_string()),
                     cache_host: Some("openads.adsrvr.org".to_string()),
@@ -13528,7 +13893,7 @@ mod tests {
             assert_eq!(
                 obj.get("hb_adid").and_then(|v| v.as_str()),
                 Some("f47447a0-b759-4f2f-9887-af458b79b570"),
-                "should use cache_id for hb_adid, not ad_id or bid_id"
+                "should use cache_id for hb_adid, not ad_id"
             );
             assert_eq!(
                 obj.get("hb_cache_host").and_then(|v| v.as_str()),
@@ -13558,10 +13923,10 @@ mod tests {
                     height: 250,
                     nurl: None,
                     burl: None,
-                    // Present alongside ad_id to prove ad_id still wins — bid_id
-                    // is the last resort, not a co-equal fallback.
-                    bid_id: Some("should-be-ignored-bid-id".to_string()),
+                    bid_id: None,
                     ad_id: Some("aps-bid-token".to_string()),
+                    creative_id: None,
+                    renderer: None,
                     cache_id: None,
                     cache_host: None,
                     cache_path: None,
@@ -13583,7 +13948,7 @@ mod tests {
             assert_eq!(
                 obj.get("hb_adid").and_then(|v| v.as_str()),
                 Some("aps-bid-token"),
-                "should fall back to ad_id when cache_id absent, ignoring bid_id"
+                "should fall back to ad_id when cache_id absent"
             );
             assert!(
                 obj.get("hb_cache_host").is_none(),
@@ -13596,208 +13961,66 @@ mod tests {
         }
 
         #[test]
-        fn bid_map_falls_back_to_bid_id_when_cache_id_and_ad_id_absent() {
-            // Real shape for bidders that return neither a Prebid Cache UUID nor
-            // `adid` in the OpenRTB response, but always carry `id` (the bid's own
-            // identifier) per spec. Without this fallback the bid reaches the page
-            // with no hb_adid, so no targeting key is set and the render bridge
-            // never receives a matching `Prebid Request`.
-            let mut winning_bids = HashMap::new();
-            winning_bids.insert(
-                "atf_sidebar_ad".to_string(),
-                Bid {
-                    slot_id: "atf_sidebar_ad".to_string(),
-                    price: Some(1.00),
-                    currency: "USD".to_string(),
-                    creative: None,
-                    adomain: None,
-                    bidder: "example-bidder".to_string(),
-                    width: 300,
-                    height: 250,
-                    nurl: None,
-                    burl: None,
-                    bid_id: Some("019f7e2a-b45b-70b0-a2d1-b651c430700b".to_string()),
-                    ad_id: None,
-                    cache_id: None,
-                    cache_host: None,
-                    cache_path: None,
-                    metadata: Default::default(),
-                },
-            );
-            let map = build_bid_map(
-                &winning_bids,
-                PriceGranularity::Dense,
-                &test_settings(),
-                "",
-                false,
-            );
-            let obj = map
-                .get("atf_sidebar_ad")
-                .expect("should have bid entry")
+        fn bid_map_exposes_aps_renderer_and_selected_bid_id() {
+            // Sanitization is opt-in, so enable it: the script-only creative
+            // below is what drives this bid onto the renderer path. Left at the
+            // default it would survive processing as an ordinary creative.
+            let mut settings = test_settings();
+            settings.auction.sanitize_creatives = true;
+            let mut bid = make_bid("atf_sidebar_ad", 1.50, "aps", "fallback-ad", "", "");
+            bid.bid_id = Some("selected-bid".to_string());
+            bid.creative = Some("<script>reject()</script>".to_string());
+            bid.nurl = None;
+            bid.burl = None;
+            bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
+                version: 1,
+                account_id: "example-account".to_string(),
+                bid_id: "selected-bid".to_string(),
+                creative_id: None,
+                tag_type: ApsTagType::Iframe,
+                creative_url: "https://creative.example/render".to_string(),
+                aax_response: "fictional-base64</script>".to_string(),
+                width: 300,
+                height: 250,
+            }));
+            let winning_bids = HashMap::from([("atf_sidebar_ad".to_string(), bid)]);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, "", false);
+            let obj = map["atf_sidebar_ad"]
                 .as_object()
-                .expect("should be object");
-            assert_eq!(
-                obj.get("hb_adid").and_then(|v| v.as_str()),
-                Some("019f7e2a-b45b-70b0-a2d1-b651c430700b"),
-                "should fall back to bid_id when cache_id and ad_id are both absent"
+                .expect("should include APS bid");
+
+            assert_eq!(obj["hb_bidder"], "aps");
+            assert_eq!(obj["hb_adid"], "selected-bid");
+            assert_eq!(obj["renderer"]["type"], "aps");
+            assert_eq!(obj["renderer"]["bidId"], "selected-bid");
+            assert!(obj.get("adm").is_none());
+
+            let script = build_bids_script(&map);
+            assert!(!script.contains("</script></script>"));
+            assert!(script.contains("\\u003C/script\\u003E"));
+        }
+
+        #[test]
+        fn bid_map_omits_creative_rejected_by_processing_without_renderer() {
+            // Sanitization is opt-in, so enable it: script-only markup is what
+            // makes processing reject this bid's only render source.
+            let mut settings = test_settings();
+            settings.auction.sanitize_creatives = true;
+            let mut bid = make_bid("atf_sidebar_ad", 1.50, "kargo", "fallback-ad", "", "");
+            bid.creative = Some("<script>reject()</script>".to_string());
+            let winning_bids = HashMap::from([("atf_sidebar_ad".to_string(), bid)]);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, "", false);
+
+            assert!(
+                !map.contains_key("atf_sidebar_ad"),
+                "should omit a bid whose only creative was rejected"
             );
         }
 
         #[test]
-        fn bid_map_skips_blank_cache_id_and_ad_id_for_hb_adid() {
-            // A bidder that emits `cacheId`/`adid` as empty strings must not win
-            // the precedence: an empty hb_adid is falsey on the page, so GPT skips
-            // the targeting key and the render bridge has nothing to match — the
-            // same failure as omitting hb_adid entirely.
-            let mut winning_bids = HashMap::new();
-            winning_bids.insert(
-                "atf_sidebar_ad".to_string(),
-                Bid {
-                    slot_id: "atf_sidebar_ad".to_string(),
-                    price: Some(1.00),
-                    currency: "USD".to_string(),
-                    creative: None,
-                    adomain: None,
-                    bidder: "example-bidder".to_string(),
-                    width: 300,
-                    height: 250,
-                    nurl: None,
-                    burl: None,
-                    bid_id: Some("019f7e2a-b45b-70b0-a2d1-b651c430700b".to_string()),
-                    ad_id: Some(String::new()),
-                    cache_id: Some(String::new()),
-                    cache_host: None,
-                    cache_path: None,
-                    metadata: Default::default(),
-                },
-            );
-            let map = build_bid_map(
-                &winning_bids,
-                PriceGranularity::Dense,
-                &test_settings(),
-                "",
-                false,
-            );
-            let obj = map
-                .get("atf_sidebar_ad")
-                .expect("should have bid entry")
-                .as_object()
-                .expect("should be object");
-            assert_eq!(
-                obj.get("hb_adid").and_then(|v| v.as_str()),
-                Some("019f7e2a-b45b-70b0-a2d1-b651c430700b"),
-                "should treat blank cache_id and ad_id as absent and use bid_id"
-            );
-        }
-
-        #[test]
-        fn bid_map_omits_cache_coordinates_without_a_cache_id() {
-            // PBS reports the cache `url` and `cacheId` independently. With
-            // coordinates but no UUID, hb_adid holds a non-cache identifier, so
-            // emitting them would send the Universal Creative to
-            // `?uuid=<bid id>` — a guaranteed miss — instead of the inline adm.
-            let mut winning_bids = HashMap::new();
-            winning_bids.insert(
-                "atf_sidebar_ad".to_string(),
-                Bid {
-                    slot_id: "atf_sidebar_ad".to_string(),
-                    price: Some(1.00),
-                    currency: "USD".to_string(),
-                    creative: None,
-                    adomain: None,
-                    bidder: "example-bidder".to_string(),
-                    width: 300,
-                    height: 250,
-                    nurl: None,
-                    burl: None,
-                    bid_id: Some("019f7e2a-b45b-70b0-a2d1-b651c430700b".to_string()),
-                    ad_id: None,
-                    cache_id: None,
-                    cache_host: Some("cache.example.com".to_string()),
-                    cache_path: Some("/cache".to_string()),
-                    metadata: Default::default(),
-                },
-            );
-            let map = build_bid_map(
-                &winning_bids,
-                PriceGranularity::Dense,
-                &test_settings(),
-                "",
-                false,
-            );
-            let obj = map
-                .get("atf_sidebar_ad")
-                .expect("should have bid entry")
-                .as_object()
-                .expect("should be object");
-            assert!(
-                obj.get("hb_cache_host").is_none(),
-                "should omit hb_cache_host when there is no cache UUID to look up"
-            );
-            assert!(
-                obj.get("hb_cache_path").is_none(),
-                "should omit hb_cache_path when there is no cache UUID to look up"
-            );
-        }
-
-        #[test]
-        fn bid_map_omits_cache_coordinates_for_a_blank_cache_id() {
-            // A blank `cacheId` loses the hb_adid precedence to `adid`/the bid
-            // id, so the cache gate must treat it as absent too. Otherwise the
-            // coordinates ship alongside a non-cache hb_adid and the Universal
-            // Creative fetches `?uuid=<adid>` — a guaranteed miss — rather than
-            // falling through to the inline adm.
-            let mut winning_bids = HashMap::new();
-            winning_bids.insert(
-                "atf_sidebar_ad".to_string(),
-                Bid {
-                    slot_id: "atf_sidebar_ad".to_string(),
-                    price: Some(1.00),
-                    currency: "USD".to_string(),
-                    creative: None,
-                    adomain: None,
-                    bidder: "example-bidder".to_string(),
-                    width: 300,
-                    height: 250,
-                    nurl: None,
-                    burl: None,
-                    bid_id: Some("019f7e2a-b45b-70b0-a2d1-b651c430700b".to_string()),
-                    ad_id: Some("creative-123".to_string()),
-                    cache_id: Some(String::new()),
-                    cache_host: Some("cache.example.com".to_string()),
-                    cache_path: Some("/cache".to_string()),
-                    metadata: Default::default(),
-                },
-            );
-            let map = build_bid_map(
-                &winning_bids,
-                PriceGranularity::Dense,
-                &test_settings(),
-                "",
-                false,
-            );
-            let obj = map
-                .get("atf_sidebar_ad")
-                .expect("should have bid entry")
-                .as_object()
-                .expect("should be object");
-            assert_eq!(
-                obj.get("hb_adid").and_then(|v| v.as_str()),
-                Some("creative-123"),
-                "should fall back to ad_id when cache_id is blank"
-            );
-            assert!(
-                obj.get("hb_cache_host").is_none(),
-                "should omit hb_cache_host when the cache UUID is blank"
-            );
-            assert!(
-                obj.get("hb_cache_path").is_none(),
-                "should omit hb_cache_path when the cache UUID is blank"
-            );
-        }
-
-        #[test]
-        fn bid_map_omits_hb_adid_when_cache_id_ad_id_and_bid_id_all_absent() {
+        fn bid_map_omits_hb_adid_when_both_cache_id_and_ad_id_absent() {
             let mut winning_bids = HashMap::new();
             winning_bids.insert(
                 "atf_sidebar_ad".to_string(),
@@ -13813,6 +14036,8 @@ mod tests {
                     nurl: None,
                     burl: None,
                     bid_id: None,
+                    creative_id: None,
+                    renderer: None,
                     ad_id: None,
                     cache_id: None,
                     cache_host: None,
@@ -13834,7 +14059,7 @@ mod tests {
                 .expect("should be object");
             assert!(
                 obj.get("hb_adid").is_none(),
-                "should omit hb_adid when no cache_id, ad_id, or bid_id"
+                "should omit hb_adid when no cache_id and no ad_id"
             );
         }
 
@@ -13855,6 +14080,8 @@ mod tests {
                     nurl: None,
                     burl: None,
                     bid_id: None,
+                    creative_id: None,
+                    renderer: None,
                     ad_id: None,
                     cache_id: None,
                     cache_host: None,
@@ -14023,12 +14250,58 @@ mod tests {
             );
             assert_eq!(
                 request.publisher.page_url.as_deref(),
-                Some("https://www.example.com/2024/01/my-article/?edition=fictional"),
-                "page_url host should be the configured publisher domain, not the edge host"
+                Some("https://www.example.com/2024/01/my-article/"),
+                "page_url should use configured publisher identity without client query data"
             );
             assert_eq!(
-                site.page, "https://www.example.com/2024/01/my-article/?edition=fictional",
-                "site.page host should be the configured publisher domain, not the edge host"
+                site.page, "https://www.example.com/2024/01/my-article/",
+                "site.page should use configured publisher identity without client query data"
+            );
+        }
+
+        #[test]
+        fn auction_request_preserves_configured_publisher_domain_with_query() {
+            // On the SSAT proxy path the browser addresses the trusted-server
+            // edge host, but the auction must advertise the configured
+            // publisher domain to SSPs — otherwise injected creatives and the
+            // brand-safety pixel leak the edge/staging host.
+            let slot = make_slot();
+            let slots = [slot];
+            let slots_ctx = MatchedSlotsContext {
+                matched_slots: &slots,
+                request_path: "/2024/01/my-article/?edition=fictional",
+            };
+            let request_info = RequestInfo {
+                host: "ts.example.com".to_string(),
+                scheme: "https".to_string(),
+            };
+
+            let request = build_auction_request(
+                &slots_ctx,
+                None,
+                &ConsentContext::default(),
+                &request_info,
+                "www.example.com",
+                Some("Mozilla/5.0"),
+            );
+
+            assert_eq!(
+                request.publisher.domain, "www.example.com",
+                "publisher.domain should be the configured publisher domain, not the edge host"
+            );
+            let site = request.site.expect("should populate site metadata");
+            assert_eq!(
+                site.domain, "www.example.com",
+                "site.domain should be the configured publisher domain, not the edge host"
+            );
+            assert_eq!(
+                request.publisher.page_url.as_deref(),
+                Some("https://www.example.com/2024/01/my-article/"),
+                "page_url should remove client query data"
+            );
+            assert_eq!(
+                site.page, "https://www.example.com/2024/01/my-article/",
+                "site.page should remove client query data"
             );
         }
 
@@ -14112,11 +14385,108 @@ mod tests {
 
     mod page_bids_no_match_tests {
         use super::super::*;
+        use super::build_services_with_http_client;
         use crate::auction::AuctionOrchestrator;
+        use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
+        use crate::auction::types::{AuctionRequest, AuctionResponse, Bid};
         use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
-        use crate::platform::test_support::noop_services;
+        use crate::platform::test_support::{StubHttpClient, noop_services};
+        use crate::platform::{PlatformHttpRequest, PlatformResponse};
         use crate::test_support::tests::crate_test_settings_str;
+        use error_stack::{Report, ResultExt};
         use http::Method;
+        use std::sync::{Arc, Mutex};
+
+        const AUCTION_ID_TEST_PROVIDER: &str = "auction_id_test_provider";
+        const AUCTION_ID_TEST_BACKEND: &str = "auction-id-test-backend";
+
+        struct AuctionIdTestProvider {
+            captured_request: Arc<Mutex<Option<AuctionRequest>>>,
+            winning_bid: bool,
+        }
+
+        #[async_trait::async_trait(?Send)]
+        impl AuctionProvider for AuctionIdTestProvider {
+            fn provider_name(&self) -> &'static str {
+                AUCTION_ID_TEST_PROVIDER
+            }
+
+            async fn request_bids(
+                &self,
+                request: &AuctionRequest,
+                context: &AuctionContext<'_>,
+            ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+                *self
+                    .captured_request
+                    .lock()
+                    .expect("should lock captured auction request") = Some(request.clone());
+                let request = PlatformHttpRequest::new(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("https://bidder.example.test/bids")
+                        .body(EdgeBody::empty())
+                        .expect("should build test bidder request"),
+                    AUCTION_ID_TEST_BACKEND,
+                );
+                context
+                    .services
+                    .http_client()
+                    .send_async(request)
+                    .await
+                    .change_context(TrustedServerError::Auction {
+                        message: "test bidder launch failed".to_string(),
+                    })
+                    .map(ProviderRequestOutcome::pending)
+            }
+
+            async fn parse_response(
+                &self,
+                _response: PlatformResponse,
+                response_time_ms: u64,
+            ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+                let bids = if self.winning_bid {
+                    vec![Bid {
+                        slot_id: "atf".to_string(),
+                        price: Some(1.50),
+                        currency: "USD".to_string(),
+                        creative: None,
+                        adomain: None,
+                        bidder: AUCTION_ID_TEST_PROVIDER.to_string(),
+                        width: 300,
+                        height: 250,
+                        nurl: None,
+                        burl: None,
+                        bid_id: None,
+                        creative_id: None,
+                        renderer: None,
+                        ad_id: Some("winner-123".to_string()),
+                        cache_id: None,
+                        cache_host: None,
+                        cache_path: None,
+                        metadata: Default::default(),
+                    }]
+                } else {
+                    Vec::new()
+                };
+                Ok(AuctionResponse::success(
+                    AUCTION_ID_TEST_PROVIDER,
+                    bids,
+                    response_time_ms,
+                ))
+            }
+
+            fn timeout_ms(&self) -> u32 {
+                100
+            }
+
+            fn backend_name(
+                &self,
+                _services: &RuntimeServices,
+                _timeout_ms: u32,
+            ) -> Option<String> {
+                Some(AUCTION_ID_TEST_BACKEND.to_string())
+            }
+        }
 
         fn settings_with_co() -> Settings {
             let toml = format!(
@@ -14259,6 +14629,206 @@ mod tests {
             )
             .await
             .expect("should return ok response")
+        }
+
+        fn auction_id_test_orchestrator(
+            settings: &Settings,
+            captured_request: Arc<Mutex<Option<AuctionRequest>>>,
+            winning_bid: bool,
+        ) -> AuctionOrchestrator {
+            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            orchestrator.register_provider(Arc::new(AuctionIdTestProvider {
+                captured_request,
+                winning_bid,
+            }));
+            orchestrator
+        }
+
+        #[tokio::test]
+        async fn page_bids_response_includes_auction_id_only_for_winning_bids() {
+            let mut settings = settings_with_co();
+            settings.auction.providers = vec![AUCTION_ID_TEST_PROVIDER.to_string()];
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+                .expect("should enable diagnostics");
+            let slots = article_slot();
+            let winning_stub = Arc::new(StubHttpClient::new());
+            winning_stub.push_response(200, b"winner".to_vec());
+            let winning_services = build_services_with_http_client(
+                Arc::clone(&winning_stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let winning_request = Arc::new(Mutex::new(None));
+            let winning_orchestrator =
+                auction_id_test_orchestrator(&settings, Arc::clone(&winning_request), true);
+            let ec_context = EcContext::new_for_test(
+                Some("page-auction-example-123".to_string()),
+                crate::consent::ConsentContext {
+                    jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                    ..Default::default()
+                },
+            );
+
+            let winning_response = handle_page_bids(
+                &settings,
+                &winning_services,
+                None,
+                AuctionDispatch {
+                    orchestrator: &winning_orchestrator,
+                    slots: &slots,
+                    registry: None,
+                },
+                &ec_context,
+                make_page_bids_request("/2024/01/my-article/"),
+            )
+            .await
+            .expect("should return winning page-bids response");
+            let winning_body: serde_json::Value = serde_json::from_slice(
+                &winning_response
+                    .into_body()
+                    .into_bytes()
+                    .expect("should read winning page-bids response body"),
+            )
+            .expect("should serialize winning page-bids response as JSON");
+            let auction_request = winning_request
+                .lock()
+                .expect("should lock captured winning request")
+                .clone()
+                .expect("should dispatch a winning auction request");
+
+            assert_eq!(
+                auction_request.id, "ts-page-auction-example-123",
+                "test EC ID should produce a deterministic auction request ID"
+            );
+            let winning_auction_id = winning_body["bids"]["atf"]["hb_auction_id"]
+                .as_str()
+                .expect("page-bids should expose an auction ID on the winner")
+                .to_string();
+            assert!(
+                winning_auction_id.starts_with("ts-auc-"),
+                "page-bids should expose a freshly minted diagnostics token, got `{winning_auction_id}`"
+            );
+            assert_ne!(
+                winning_auction_id, auction_request.id,
+                "browser-visible auction ID must not be the EC-derived request ID"
+            );
+            assert!(
+                !winning_auction_id.contains("page-auction-example-123"),
+                "browser-visible auction ID must not embed the EC ID"
+            );
+
+            let no_winner_stub = Arc::new(StubHttpClient::new());
+            no_winner_stub.push_response(200, b"no-bid".to_vec());
+            let no_winner_services = build_services_with_http_client(
+                Arc::clone(&no_winner_stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let no_winner_orchestrator =
+                auction_id_test_orchestrator(&settings, Arc::new(Mutex::new(None)), false);
+            let no_winner_response = handle_page_bids(
+                &settings,
+                &no_winner_services,
+                None,
+                AuctionDispatch {
+                    orchestrator: &no_winner_orchestrator,
+                    slots: &slots,
+                    registry: None,
+                },
+                &ec_context,
+                make_page_bids_request("/2024/01/my-article/"),
+            )
+            .await
+            .expect("should return no-winner page-bids response");
+            let no_winner_body: serde_json::Value = serde_json::from_slice(
+                &no_winner_response
+                    .into_body()
+                    .into_bytes()
+                    .expect("should read no-winner page-bids response body"),
+            )
+            .expect("should serialize no-winner page-bids response as JSON");
+
+            assert!(
+                no_winner_body["bids"]
+                    .as_object()
+                    .expect("page-bids should return a bids object")
+                    .is_empty(),
+                "page-bids should not fabricate auction metadata without a winner"
+            );
+        }
+
+        /// The browser-visible auction ID is minted per auction and only for
+        /// deployments that run the diagnostics integration, so it can neither
+        /// carry EC identity across auctions nor reach pages that ignore it.
+        #[tokio::test]
+        async fn page_bids_auction_id_is_per_auction_and_gated_on_diagnostics() {
+            async fn winning_auction_id(settings: &Settings) -> Option<String> {
+                let slots = article_slot();
+                let stub = Arc::new(StubHttpClient::new());
+                stub.push_response(200, b"winner".to_vec());
+                let services = build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                );
+                let orchestrator =
+                    auction_id_test_orchestrator(settings, Arc::new(Mutex::new(None)), true);
+                let ec_context = EcContext::new_for_test(
+                    Some("page-auction-example-123".to_string()),
+                    crate::consent::ConsentContext {
+                        jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                        ..Default::default()
+                    },
+                );
+                let response = handle_page_bids(
+                    settings,
+                    &services,
+                    None,
+                    AuctionDispatch {
+                        orchestrator: &orchestrator,
+                        slots: &slots,
+                        registry: None,
+                    },
+                    &ec_context,
+                    make_page_bids_request("/2024/01/my-article/"),
+                )
+                .await
+                .expect("should return page-bids response");
+                let body: serde_json::Value = serde_json::from_slice(
+                    &response
+                        .into_body()
+                        .into_bytes()
+                        .expect("should read page-bids response body"),
+                )
+                .expect("should serialize page-bids response as JSON");
+                body["bids"]["atf"]["hb_auction_id"]
+                    .as_str()
+                    .map(str::to_string)
+            }
+
+            let mut settings = settings_with_co();
+            settings.auction.providers = vec![AUCTION_ID_TEST_PROVIDER.to_string()];
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+                .expect("should enable diagnostics");
+
+            let first = winning_auction_id(&settings)
+                .await
+                .expect("first auction should expose a diagnostics token");
+            let second = winning_auction_id(&settings)
+                .await
+                .expect("second auction should expose a diagnostics token");
+            assert_ne!(
+                first, second,
+                "each auction for the same visitor should mint its own token"
+            );
+
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": false }))
+                .expect("should disable diagnostics");
+            assert_eq!(
+                winning_auction_id(&settings).await,
+                None,
+                "no auction metadata should reach the page without the diagnostics integration"
+            );
         }
 
         /// The deprecated `/__ts/page-bids` alias must be handled identically to
@@ -14770,7 +15340,7 @@ mod tests {
     /// the handler emitted.
     mod navigation_publisher_domain_tests {
         use super::*;
-        use crate::auction::provider::AuctionProvider;
+        use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
         use crate::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
         use crate::auction::types::AuctionRequest;
         use crate::auction::{AuctionContext, AuctionOrchestrator};
@@ -14778,7 +15348,7 @@ mod tests {
         use crate::platform::test_support::{
             NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend,
         };
-        use crate::platform::{ClientInfo, PlatformPendingRequest, PlatformResponse};
+        use crate::platform::{ClientInfo, PlatformResponse};
         use crate::test_support::tests::crate_test_settings_str;
         use std::sync::Mutex;
 
@@ -14807,7 +15377,7 @@ mod tests {
                 &self,
                 request: &AuctionRequest,
                 _context: &AuctionContext<'_>,
-            ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+            ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
                 *self.captured.lock().expect("should lock captured request") =
                     Some(request.clone());
                 Err(Report::new(TrustedServerError::Auction {
@@ -14892,9 +15462,6 @@ mod tests {
             over_limit.id = "over_limit_dynamic".to_string();
             over_limit.page_patterns = vec!["/*".to_string()];
             over_limit.gam_unit_path = Some("/{section}/{section}".to_string());
-            over_limit
-                .compile_unit_template()
-                .expect("should compile dynamic GAM unit template");
 
             let mut valid_static = article_slot()
                 .into_iter()
@@ -14916,11 +15483,7 @@ mod tests {
                 .clone()
                 .expect("should dispatch an auction request");
             let slot_ids: Vec<_> = request.slots.iter().map(|slot| slot.id.as_str()).collect();
-            assert_eq!(
-                slot_ids,
-                ["valid_static_sibling"],
-                "auction request should exclude the over-limit dynamic slot"
-            );
+            assert_eq!(slot_ids, vec!["valid_static_sibling"]);
         }
 
         /// [`EcContext`] whose consent context permits the server-side auction.

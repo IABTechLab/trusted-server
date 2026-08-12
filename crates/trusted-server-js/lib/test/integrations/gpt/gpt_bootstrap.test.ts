@@ -193,19 +193,21 @@ describe('gpt_bootstrap.js fallback', () => {
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),
       setTargeting: vi.fn().mockReturnThis(),
-      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar-container'),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
     };
     const mockPubads = {
       enableSingleRequest: vi.fn(),
       getSlots: vi.fn().mockReturnValue([]),
       refresh: vi.fn(),
     };
+    const defineSlot = vi.fn().mockReturnValue(mockSlot);
+    const display = vi.fn();
     (window as TestWindow).googletag = {
       cmd: { push: vi.fn((fn: () => void) => fn()) },
-      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      defineSlot,
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
-      display: vi.fn(),
+      display,
     };
     document.body.innerHTML =
       '<div id="div-atf-sidebar-container"><div id="div-atf-sidebar"></div></div>';
@@ -223,24 +225,20 @@ describe('gpt_bootstrap.js fallback', () => {
 
     ts.adInit!();
 
-    const googletag = (window as TestWindow).googletag!;
-    expect(googletag.defineSlot).toHaveBeenCalledWith(
-      '/123/atf',
-      [[300, 250]],
-      'div-atf-sidebar-container'
-    );
+    expect(defineSlot).toHaveBeenCalledWith('/123/atf', [[300, 250]], 'div-atf-sidebar');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '1.00');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
-    expect(googletag.display).toHaveBeenCalledWith('div-atf-sidebar-container');
+    expect(display).toHaveBeenCalledWith('div-atf-sidebar');
     expect(ts.servicesEnabled).toBe(true);
   });
 
   it('fallback adInit cancels queued work when the generation advances before the queue drains', () => {
     const commandQueue: Array<() => void> = [];
+    const nativeRefresh = vi.fn();
     const mockPubads = {
       enableSingleRequest: vi.fn(),
       getSlots: vi.fn().mockReturnValue([]),
-      refresh: vi.fn(),
+      refresh: nativeRefresh,
     };
     const defineSlot = vi.fn();
     (window as TestWindow).googletag = {
@@ -271,7 +269,7 @@ describe('gpt_bootstrap.js fallback', () => {
     ts.navGeneration = 1;
     commandQueue.splice(0).forEach((fn) => fn());
     expect(defineSlot).not.toHaveBeenCalled();
-    expect(mockPubads.refresh).not.toHaveBeenCalled();
+    expect(nativeRefresh).not.toHaveBeenCalled();
     expect(mockPubads.enableSingleRequest).not.toHaveBeenCalled();
   });
 });

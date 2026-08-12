@@ -41,11 +41,41 @@ export interface AuctionDebugBidData {
   height?: number;
   nurl?: string | null;
   burl?: string | null;
+  bid_id?: string | null;
   ad_id?: string | null;
+  creative_id?: string | null;
   cache_id?: string | null;
   cache_host?: string | null;
   cache_path?: string | null;
   metadata?: Record<string, unknown>;
+}
+
+export type ApsTagType = 'iframe' | 'script';
+
+/** Version 1 Trusted Server APS renderer descriptor. */
+export interface ApsRendererV1 {
+  type: 'aps';
+  version: 1;
+  accountId: string;
+  bidId: string;
+  creativeId?: string;
+  tagType: ApsTagType;
+  creativeUrl: string;
+  aaxResponse: string;
+  width: number;
+  height: number;
+}
+
+export type AuctionBidRenderer = ApsRendererV1;
+
+/** A client-side Prebid bid's generated ad ID bound to its APS render capability. */
+export interface ApsPrebidRendererEntry {
+  adUnitCode: string;
+  renderer: ApsRendererV1;
+  registeredAt: number;
+  expiresAt: number;
+  /** Mark the bid as won and rendered after replying to Universal Creative. */
+  markUsed(): void;
 }
 
 /** Bid targeting data from the server-side auction, injected into `window.tsjs.bids`. */
@@ -55,27 +85,26 @@ export interface AuctionBidData {
   hb_adid?: string;
   hb_cache_host?: string;
   hb_cache_path?: string;
+  /** Opaque server-auction correlation ID used only by GPT diagnostics. */
+  hb_auction_id?: string;
   /** Winning creative width; the bridge sizes the inline render from this. */
   w?: number;
   /** Winning creative height; the bridge sizes the inline render from this. */
   h?: number;
   nurl?: string;
   burl?: string;
+  /** Typed winning-bid renderer capability. */
+  renderer?: AuctionBidRenderer;
+  /** Winning creative width used by the inline render bridge. */
+  w?: number;
+  /** Winning creative height used by the inline render bridge. */
+  h?: number;
   /**
-   * Sanitized winning creative markup for local rendering through the pbRender
-   * bridge. Present whenever the winning bid carried a creative that passed the
-   * server-side sanitize/rewrite boundary; absent when there was no creative or
-   * it was rejected (e.g. over the 1 MiB cap), in which case the bridge falls
-   * back to the PBS Cache coordinates. This is NOT gated by
-   * `inject_adm_for_testing`.
+   * Sanitized winning creative markup for the inline render bridge. Present
+   * when the server retained a non-empty creative; not gated by debug mode.
    */
   adm?: string;
-  /**
-   * Verbose per-bid debug blob (carries the raw, un-sanitized creative among
-   * other fields). Only present when `[debug] inject_adm_for_testing = true`;
-   * its presence is also the client-side gate for the testing-only direct
-   * GAM-replace path.
-   */
+  /** Debug-only bid field mirror. Only present when `[debug] inject_adm_for_testing = true`. */
   debug_bid?: AuctionDebugBidData;
 }
 
@@ -109,6 +138,66 @@ export interface GptDiagnosticsDurations {
   renderToViewableMs?: number;
 }
 
+/**
+ * Ad Manager's own identifiers for the delivered ad, as reported by
+ * `slotRenderEnded`.
+ *
+ * These are documented GPT callback fields carrying the publisher's own Ad
+ * Manager data — the same values `?google_console=1` shows. They name what Ad
+ * Manager delivered; they claim nothing about which demand source supplied it.
+ */
+export interface GptDiagnosticsAdManagerIdentity {
+  lineItemId?: number;
+  creativeId?: number;
+  campaignId?: number;
+  advertiserId?: number;
+  sourceAgnosticLineItemId?: number;
+  sourceAgnosticCreativeId?: number;
+  yieldGroupIds?: number[];
+  companyIds?: number[];
+}
+
+/**
+ * How Ad Manager classified the delivered ad, derived only from the render
+ * facts GPT reported.
+ */
+export type GptDiagnosticsResponseClass =
+  | 'empty'
+  | 'backfill'
+  | 'reservation'
+  | 'unclassified_non_empty';
+
+/** The request path observed for a GPT request cycle. */
+export type GptDiagnosticsRequestPath =
+  | 'trusted_server_direct'
+  | 'prebid_refresh'
+  | 'publisher_refresh'
+  | 'competing'
+  | 'unattributed';
+
+/** The Trusted Server creative opportunity observed for a request. */
+export type GptDiagnosticsTrustedServerOpportunity =
+  | 'renderable_candidate'
+  | 'unrenderable_candidate'
+  | 'no_candidate';
+
+/** A safe failure category observed while obtaining or posting creative markup. */
+export type GptDiagnosticsCreativeFailure =
+  | 'missing_render_source'
+  | 'cache_fetch_failed'
+  | 'invalid_cache_payload'
+  | 'response_post_failed';
+
+/** Delivery evidence derived for a GPT request cycle. */
+export type GptDiagnosticsDelivery =
+  | 'trusted_server_response_sent'
+  | 'trusted_server_selected'
+  | 'candidate_unconfirmed'
+  | 'no_candidate'
+  | 'unknown'
+  | 'pending'
+  | 'not_applicable';
+
 export interface GptDiagnosticsRequestCycle {
   requestNumber: number;
   requestedAtMs?: number;
@@ -122,6 +211,23 @@ export interface GptDiagnosticsRequestCycle {
   isBackfill?: boolean;
   slotContentChanged?: boolean;
   incompleteSequence: boolean;
+  adManager?: GptDiagnosticsAdManagerIdentity;
+  responseClass?: GptDiagnosticsResponseClass;
+  requestPath?: GptDiagnosticsRequestPath;
+  requestIntentId?: number;
+  trustedServerAuctionId?: string;
+  opportunityToRequestMs?: number;
+  replacedRequestNumber?: number;
+  previousRenderToRequestMs?: number;
+  creativeChanged?: boolean;
+  previousCreativeId?: GptDiagnosticsAdManagerIdentity['creativeId'];
+  loadObservedBeforeRender?: boolean;
+  trustedServerOpportunity?: GptDiagnosticsTrustedServerOpportunity;
+  trustedServerCreativeRequestAtMs?: number;
+  trustedServerCreativeResponseAtMs?: number;
+  trustedServerCreativeFailures?: GptDiagnosticsCreativeFailure[];
+  /** Derived on every snapshot; absent only on a cycle read before derivation. */
+  delivery?: GptDiagnosticsDelivery;
 }
 
 export interface GptDiagnosticsSlotExport {
@@ -143,6 +249,25 @@ export interface GptDiagnosticsCallbackIssue {
   reason: string;
 }
 
+/** A safe reason that attribution evidence could not be associated or retained. */
+export type GptDiagnosticsAttributionIssueReason =
+  | 'creative_request_without_slot'
+  | 'creative_request_without_cycle'
+  | 'creative_request_ambiguous_cycle'
+  | 'creative_request_on_empty_cycle'
+  | 'creative_attempt_capacity'
+  | 'creative_attempt_unknown'
+  | 'creative_attempt_expired'
+  | 'creative_attempt_evicted';
+
+/** An attribution issue without auction-sensitive data. */
+export interface GptDiagnosticsAttributionIssue {
+  reason: GptDiagnosticsAttributionIssueReason;
+  timestampMs: number;
+  runtimeSlotNumber?: number;
+  slotElementId?: string;
+}
+
 export interface GptDiagnosticsCoverageCounters {
   observed: number;
   matched: number;
@@ -159,20 +284,76 @@ export interface GptDiagnosticsExportV1 {
   };
   slots: GptDiagnosticsSlotExport[];
   callbackIssues: GptDiagnosticsCallbackIssue[];
+  attributionIssues?: GptDiagnosticsAttributionIssue[];
   coverage: Record<GptDiagnosticsCallbackKind, GptDiagnosticsCoverageCounters>;
   metadata: {
     droppedCallbacks: number;
+    droppedAttributionIssues?: number;
     evictedSlots: number;
     evictedRequestCycles: number;
   };
 }
 
+/** GPT slot object identity, the only key diagnostics correlates slots by. */
+export interface GptDiagnosticsSlotHandle {
+  getSlotElementId?(): string;
+  getAdUnitPath?(): string;
+}
+
+/** The documented, read-only operator API. It records no evidence. */
 export interface GptDiagnosticsApi {
   snapshot(): GptDiagnosticsExportV1;
   export(): void;
   subscribe(listener: (snapshot: GptDiagnosticsExportV1) => void): () => void;
   show(): void;
   hide(): void;
+}
+
+/**
+ * Evidence writers used by Trusted Server's own integration modules.
+ *
+ * Separate bundles can only reach each other through `window.tsjs`, so this
+ * channel is reachable from the page like anything else there. Keeping it off
+ * [`GptDiagnosticsApi`] is what makes the documented operator surface read-only
+ * and stops the writers from becoming part of the public contract.
+ */
+export interface GptDiagnosticsRecorder {
+  /** Record Trusted Server's creative opportunity for an associated GPT slot. */
+  recordTrustedServerOpportunity(
+    slot: GptDiagnosticsSlotHandle,
+    auctionSlotId: string,
+    opportunity: GptDiagnosticsTrustedServerOpportunity,
+    trustedServerAuctionId?: string
+  ): void;
+  /** Mark slots whose next observed GPT request follows the Prebid refresh path. */
+  recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
+  /** Record a creative markup request and return its opaque attempt ID. */
+  recordTrustedServerCreativeRequest(auctionSlotId: string): number | undefined;
+  /** Record that a creative attempt successfully posted markup. */
+  recordTrustedServerCreativeResponse(attemptId: number): void;
+  /** Record a safe failure category for a creative attempt. */
+  recordTrustedServerCreativeFailure(
+    attemptId: number,
+    reason: GptDiagnosticsCreativeFailure
+  ): void;
+}
+
+/**
+ * Lifecycle state for a GPT slot TS created before its publisher declares it.
+ *
+ * Stored on `window.tsjs` so the head bootstrap and the full TSJS bundle share
+ * one handoff protocol.
+ */
+export interface GptSlotHandoff {
+  gamUnitPath: string;
+  formats: Array<[number, number]>;
+  /** Stable configured prefix used to safely bridge framework-generated IDs. */
+  divIdPrefix: string;
+  /** Element ID GPT received when TS created the fallback slot. */
+  slotElementId: string;
+  publisherClaimed: boolean;
+  suppressPublisherDisplay: boolean;
+  suppressPublisherRefresh: boolean;
 }
 
 export interface TsjsApi {
@@ -202,6 +383,11 @@ export interface TsjsApi {
   adSlots?: AuctionSlot[];
   /** Winning bid targeting data injected before </body>. */
   bids?: Record<string, AuctionBidData>;
+  /**
+   * Bounded client-side Prebid APS renderer capabilities keyed by Prebid's generated
+   * `hb_adid`. The Universal Creative bridge consumes each entry at most once.
+   */
+  apsPrebidRenderers?: Record<string, ApsPrebidRendererEntry>;
   /** Initialises GPT slots with server-side bid targeting and calls refresh(). */
   adInit?: () => void;
   /** GPT slot objects TS defined — used to destroy stale slots on SPA navigation. */
@@ -225,6 +411,8 @@ export interface TsjsApi {
    * client-side auction that would clear the just-applied TS targeting.
    */
   adInitRefreshInProgress?: boolean;
+  /** Scoped context marking an active Prebid-controlled GPT refresh delegation. */
+  prebidRefreshDispatchInProgress?: boolean;
   /**
    * Whether the publisher disabled GPT initial load through
    * `googletag.setConfig()` or `googletag.pubads().disableInitialLoad()`.
@@ -235,6 +423,10 @@ export interface TsjsApi {
    * slots so they are not left blank.
    */
   gptInitialLoadDisabled?: boolean;
+  /** Late publisher claims for TS-created GPT slots, keyed by actual div ID. */
+  gptSlotHandoffs?: Record<string, GptSlotHandoff>;
+  /** True only while TS calls a GPT function that the handoff wrappers observe. */
+  gptSlotHandoffInternal?: boolean;
   /** Guards SPA pushState hook installation. */
   spaHookInstalled?: boolean;
   /**
@@ -274,4 +466,9 @@ export interface TsjsApi {
   ) => void;
   /** Read-only GPT lifecycle diagnostics API, present only in an activated tab. */
   gptDiagnostics?: GptDiagnosticsApi;
+  /**
+   * Internal evidence channel for Trusted Server integration modules. Not part
+   * of the operator API; present only in an activated tab.
+   */
+  gptDiagnosticsRecorder?: GptDiagnosticsRecorder;
 }

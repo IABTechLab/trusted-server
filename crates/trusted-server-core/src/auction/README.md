@@ -117,7 +117,7 @@ When a request arrives at the `/auction` endpoint, it goes through the following
                               ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │  9. Each Provider Processes Request                                  │
-│     - Transform AuctionRequest → Provider format (e.g., APS TAM)     │
+│     - Transform AuctionRequest → Provider OpenRTB request            │
 │     - Send HTTP request to provider endpoint                         │
 │     - Parse provider response                                        │
 │     - Transform → AuctionResponse with Bid[]                         │
@@ -136,7 +136,7 @@ When a request arrives at the `/auction` endpoint, it goes through the following
 ┌──────────────────────────────────────────────────────────────────────┐
 │  11. Transform to OpenRTB Response (mod.rs:274-322)                  │
 │      - Build seatbid array (one per winning bid)                     │
-│      - Always sanitize creative HTML                                 │
+│      - Sanitize creative HTML when enabled (opt-in)                  │
 │      - Rewrite creative HTML when enabled (default)                  │
 │      - Add orchestrator metadata (timing, strategy, bid count)       │
 └──────────────────────────────────────────────────────────────────────┘
@@ -189,30 +189,21 @@ AdSlot {
 
 #### 3. Provider Execution
 Each registered provider (APS, Prebid, etc.) receives the `AuctionRequest` and:
-- Transforms it to their specific format (e.g., APS TAM, OpenRTB)
+- Transforms it to the provider's OpenRTB request format
 - Makes HTTP request to their endpoint
 - Parses the response
 - Returns `AuctionResponse` with `Bid[]`
 
 For example, APS provider:
 ```rust
-// Transform AuctionRequest → ApsBidRequest
-let aps_request = ApsBidRequest {
-    pub_id: "5128",
-    slots: vec![
-        ApsSlot {
-            slot_id: "header-banner",
-            sizes: vec![[728, 90], [970, 250]],
-            slot_name: Some("header-banner"),
-        }
-    ],
-    page_url: Some("https://example.com"),
-    ua: Some("Mozilla/5.0..."),
-    timeout: Some(800),
-};
+// Transform AuctionRequest → APS OpenRTB request
+// - ext.account = configured account_id
+// - ext.sdk = { source: "prebid", version: "2.2.0" }
+// - banner slots become secure impressions with matching formats/floors
+// - existing consent, identity, device, and geo privacy gates apply
 
-// HTTP POST to http://localhost:6767/e/dtb/bid
-// Parse response → AuctionResponse
+// HTTP POST to https://aps.example.com/e/pb/bid
+// Parse decoded-price response → AuctionResponse with a typed renderer
 ```
 
 #### 4. Response Assembly
@@ -223,17 +214,29 @@ The orchestrator collects all bids and creates an OpenRTB response:
   "id": "auction-response",
   "seatbid": [
     {
-      "seat": "amazon-aps",
+      "seat": "aps",
       "bid": [
         {
-          "id": "amazon-aps-header-banner",
+          "id": "fictional-selected-bid-id",
           "impid": "header-banner",
           "price": 2.5,
-          "adm": "<iframe src=\"/first-party/proxy?tsurl=...\">",
           "w": 728,
           "h": 90,
-          "crid": "amazon-aps-creative",
-          "adomain": ["amazon.com"]
+          "ext": {
+            "trusted_server": {
+              "renderer": {
+                "type": "aps",
+                "version": 1,
+                "accountId": "example-account",
+                "bidId": "fictional-selected-bid-id",
+                "tagType": "iframe",
+                "creativeUrl": "https://creative.example/render",
+                "aaxResponse": "<base64 minimized one-bid envelope>",
+                "width": 728,
+                "height": 90
+              }
+            }
+          }
         }
       ]
     }
@@ -249,12 +252,15 @@ The orchestrator collects all bids and creates an OpenRTB response:
 }
 ```
 
-Creative HTML is always sanitized. By default, each auction delivery path then
-rewrites eligible URLs through the first-party proxy (`/first-party/proxy`). The
-`POST /auction` response also injects the creative runtime; the publisher SSAT
-inline path uses absolute first-party URLs without injecting that bundle. Setting
-`[auction].rewrite_creatives = false` skips rewriting in both paths and runtime
-injection on `POST /auction`.
+With `[auction].sanitize_creatives = true` (opt-in, default `false`),
+executable markup is stripped with its inner content before delivery. With
+`[auction].rewrite_creatives = true` (the default), each auction delivery path
+rewrites eligible URLs through the first-party proxy (`/first-party/proxy`) and
+removes bidder `<base>` elements. The `POST /auction` response also injects the
+creative runtime; the publisher SSAT inline path uses absolute first-party URLs
+without injecting that bundle. With both disabled, the creative ships exactly
+as the bidder returned it. In every mode, creatives over the 1 MiB cap are
+rejected.
 
 ## Route Registration & Endpoints
 
@@ -268,7 +274,7 @@ The trusted-server handles several types of routes defined in `crates/trusted-se
 | `/first-party/proxy`      | GET    | `handle_first_party_proxy()`   | Proxy creatives through first-party domain       | 84   |
 | `/first-party/click`      | GET    | `handle_first_party_click()`   | Track clicks on ads                              | 85   |
 | `/first-party/sign`       | GET/POST | `handle_first_party_proxy_sign()` | Generate signed URLs for creatives            | 86   |
-| `/first-party/proxy-rebuild` | POST | `handle_first_party_proxy_rebuild()` | Rebuild creative HTML with new settings     | 89   |
+| `/first-party/proxy-rebuild` | GET/POST | `handle_first_party_proxy_rebuild()` | Re-sign mutated click URLs (GET 302s for the opaque-origin click guard) | 89   |
 | `/static/tsjs=*`          | GET    | `handle_tsjs_dynamic()`        | Serve tsjs library (Prebid.js alternative)       | 66   |
 | `/.well-known/ts.jwks.json` | GET  | `handle_jwks_endpoint()`       | Public key distribution for request signing      | 71   |
 | `/verify-signature`       | POST   | `handle_verify_signature()`    | Verify signed requests                           | 74   |
@@ -385,8 +391,7 @@ The `/auction` endpoint is the primary entry point for auctions:
 **Key Transformations:**
 - `adUnits[].code` → `seatbid[].bid[].impid` (slot identifier)
 - `mediaTypes.banner.sizes` → evaluated by providers, winning size in `bid.w` and `bid.h`
-- Creative HTML is always sanitized, then rewritten to use `/first-party/proxy` URLs by default
-- `[auction].rewrite_creatives = false` skips rewriting in both delivery paths and `POST /auction` creative runtime injection, not sanitization
+- Creative HTML: `[auction].sanitize_creatives = true` (opt-in) strips executable markup; `[auction].rewrite_creatives = true` (default) rewrites eligible URLs to `/first-party/proxy` in both delivery paths (with creative runtime injection on `POST /auction` only); with both disabled the creative ships as the bidder returned it
 - Multiple bids per slot become separate `seatbid` entries
 - Orchestrator metadata added in `ext.orchestrator`
 
@@ -485,9 +490,9 @@ timeout_ms = 500
 
 ```rust
 use async_trait::async_trait;
-use crate::auction::provider::AuctionProvider;
+use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use crate::auction::types::{AuctionContext, AuctionRequest, AuctionResponse};
-use crate::platform::{PlatformPendingRequest, PlatformResponse};
+use crate::platform::PlatformResponse;
 
 pub struct YourAuctionProvider {
     config: YourConfig,
@@ -503,10 +508,10 @@ impl AuctionProvider for YourAuctionProvider {
         &self,
         request: &AuctionRequest,
         _context: &AuctionContext<'_>,
-    ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+    ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
         // 1. Transform AuctionRequest to your provider's format
-        // 2. Launch HTTP request through services.http_client().send_async(...)
-        // 3. Return PlatformPendingRequest for the orchestrator to await
+        // 2. Launch through services.http_client().send_async(...)
+        // 3. Wrap the handle with ProviderRequestOutcome::pending(...)
         todo!()
     }
 

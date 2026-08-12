@@ -3921,7 +3921,7 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
-    fn test_auction_rewrite_creatives_defaults_to_true_when_omitted() {
+    fn test_auction_creative_processing_defaults_when_omitted() {
         let toml_str = crate_test_settings_str()
             + r#"
             [auction]
@@ -3933,7 +3933,11 @@ origin_host_header_overide = "www.example.com""#,
 
         assert!(
             settings.auction.rewrite_creatives,
-            "should preserve creative rewriting when the setting is omitted"
+            "creative rewriting stays enabled when the setting is omitted"
+        );
+        assert!(
+            !settings.auction.sanitize_creatives,
+            "creative sanitization is opt-in when the setting is omitted"
         );
     }
 
