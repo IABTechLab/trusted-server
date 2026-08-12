@@ -11,6 +11,7 @@ import {
 } from '../../adapters/googletag';
 import type { MessagingAdapter } from '../../adapters/messaging';
 import {
+  parseBrowserAuctionProjectionV1,
   isAuctionCandidateIdV1,
   isRendererReservationIdV1,
 } from '../../core/contracts/auction_projection';
@@ -24,7 +25,7 @@ import { log } from '../../core/log';
 import { prepareAdmIframe } from '../../core/render';
 import { DisposableStack } from '../../kernel/disposable';
 import type { RuntimeCapabilityV1 } from '../../kernel/runtime';
-import type { NavigationSession, RenderAttemptScope } from '../../kernel/sessions';
+import type { NavigationSession, RenderAttemptScope, RuntimeSession } from '../../kernel/sessions';
 import {
   createSlotOperation,
   renderDirectCacheAttempt,
@@ -43,7 +44,13 @@ import {
   type PucGamAttemptInput,
 } from '../../services/puc_bridge';
 import type { ReservationService } from '../../services/reservations';
-import { createSlotService, type SlotRequestOutcome, type SlotService } from '../../services/slots';
+import { createPageBidsController } from '../../services/projections';
+import {
+  createBrowserSlotReconciliationBoundary,
+  createSlotService,
+  type SlotRequestOutcome,
+  type SlotService,
+} from '../../services/slots';
 import type {
   TargetingBoundary,
   TargetingOwnership,
@@ -61,6 +68,30 @@ import { createGptStartup } from './startup';
 
 export const GPT_INTEGRATION_ID = 'gpt' as const;
 
+export type GptLaterNavigationResult =
+  | Readonly<{
+      status: 'committed';
+      navigationGeneration: object;
+      current: true;
+    }>
+  | Readonly<{
+      status: 'rejected';
+      navigationGeneration: object;
+      current: boolean;
+    }>;
+
+export interface GptCapabilityV1 {
+  readonly activateLaterLifecycle: () => Readonly<{
+    readonly navigate: (path: string) => Promise<GptLaterNavigationResult>;
+    readonly release: () => void;
+  }>;
+  readonly adapter: GoogletagAdapter;
+  readonly directAuctionUnitForSlot: (slot: object) => Readonly<object> | undefined;
+  readonly installRefreshPolicy: ReturnType<typeof createGptStartup>['installRefreshPolicy'];
+  readonly navigation: () => NavigationSession | undefined;
+  readonly slots: SlotService;
+}
+
 const MAX_CONFIG_DEPTH = 16;
 const MAX_CONFIG_NODES = 512;
 const MAX_CONFIG_MEMBERS = 256;
@@ -77,6 +108,7 @@ const reflectApplyIntrinsic = Reflect.apply;
 interface ProductionAuctionCapability {
   readonly navigation: NavigationSession;
   readonly projection: Readonly<BrowserAuctionProjectionV1>;
+  readonly session: RuntimeSession;
 }
 
 interface ProductionSlotsCapability {
@@ -84,6 +116,9 @@ interface ProductionSlotsCapability {
 }
 
 interface ProductionRenderCapability {
+  readonly attachPucGamAttemptRegistrar: (
+    registrar: (input: PucGamAttemptInput) => boolean
+  ) => () => void;
   readonly artifacts: Readonly<{
     current: (slot: string) => CommittedRenderArtifact | undefined;
     release: (artifact: CommittedRenderArtifact) => boolean;
@@ -122,6 +157,7 @@ interface InitialProjectionServices {
   readonly render: ProductionRenderCapability;
   readonly slots: SlotService;
   readonly targeting: TargetingService;
+  readonly requestClass?: string;
 }
 
 export interface GptSlotOperationInput extends Omit<PucGamAttemptInput, 'attempt'> {
@@ -819,7 +855,7 @@ export async function publishInitialGptProjection(
         owner,
         placement,
         pucBridge: input.pucBridge,
-        requestClass: 'initial',
+        requestClass: input.requestClass ?? 'initial',
         reservations: render.reservations,
         slot: binding.slot,
         slots,
@@ -927,8 +963,10 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
     !messages ||
     !trace ||
     !document?.defaultView ||
+    typeof auction.session?.replaceNavigation !== 'function' ||
     typeof runtime.protectFirstDisplayAttemptBatch !== 'function' ||
     typeof slotCapability.attachPhysicalService !== 'function' ||
+    typeof render.attachPucGamAttemptRegistrar !== 'function' ||
     typeof render.createAttempt !== 'function' ||
     typeof render.registerRenderer !== 'function' ||
     typeof render.renderWinner !== 'function' ||
@@ -951,6 +989,10 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
     }
   );
   scope.onDispose(() => googletag.dispose());
+  const reconciliation = createBrowserSlotReconciliationBoundary(
+    document,
+    document.defaultView.MutationObserver
+  );
   const slots = createSlotService({
     disposeCommittedArtifact: (navigationGeneration, registeredSlotId) => {
       const artifact = render.artifacts.current(registeredSlotId);
@@ -958,6 +1000,7 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
         render.artifacts.release(artifact);
     },
     googletag,
+    ...(reconciliation ? { reconciliation } : {}),
   });
   scope.onDispose(() => slots.dispose());
   const targeting = createTargetingService();
@@ -1014,9 +1057,138 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
     : undefined;
   if (diagnosticsFacts) scope.onDispose(diagnosticsFacts.dispose);
   let pucBridge: PucBridge | undefined;
-  const gptCapability = Object.freeze({
+  let criticalReconciliationRelease: (() => void) | undefined;
+  let laterLifecycleActive = false;
+  let laterLifecycleRelease: (() => void) | undefined;
+  const gptCapability: GptCapabilityV1 = Object.freeze({
+    activateLaterLifecycle: () => {
+      if (!active || laterLifecycleActive) {
+        throw new TypeError('GPT later lifecycle is unavailable');
+      }
+      const currentBridge = pucBridge;
+      if (!currentBridge) throw new TypeError('GPT later bridge is unavailable');
+      const releaseReconciliation = criticalReconciliationRelease;
+      if (!releaseReconciliation) {
+        throw new TypeError('GPT critical reconciliation owner is unavailable');
+      }
+      criticalReconciliationRelease = undefined;
+      const controllers = new Set<AbortController>();
+      let ownerActive = true;
+      laterLifecycleActive = true;
+      const rejected = (navigation?: NavigationSession): GptLaterNavigationResult => {
+        const rejectedNavigation =
+          navigation ?? auction.session.currentNavigation ?? auction.navigation;
+        return Object.freeze({
+          status: 'rejected',
+          navigationGeneration: rejectedNavigation.generation,
+          current: ownerActive && active && rejectedNavigation.isCurrent(),
+        });
+      };
+      const release = (): void => {
+        if (!ownerActive) return;
+        ownerActive = false;
+        laterLifecycleActive = false;
+        if (laterLifecycleRelease === release) laterLifecycleRelease = undefined;
+        for (const controller of controllers) controller.abort();
+        controllers.clear();
+        releaseReconciliation();
+      };
+      laterLifecycleRelease = release;
+      return Object.freeze({
+        navigate: async (path: string): Promise<GptLaterNavigationResult> => {
+          if (
+            !ownerActive ||
+            !active ||
+            typeof path !== 'string' ||
+            path.length === 0 ||
+            path.length > 4_096 ||
+            !path.startsWith('/')
+          ) {
+            return rejected();
+          }
+          const replacement = auction.session.replaceNavigation();
+          if (!replacement.ok || !ownerActive || !active) return rejected();
+          const navigation = replacement.value;
+          const controller = new AbortController();
+          controllers.add(controller);
+          const abortForNavigation = (): void => controller.abort();
+          navigation.signal.addEventListener('abort', abortForNavigation, { once: true });
+          try {
+            const fetcher = globalThis.fetch;
+            if (typeof fetcher !== 'function') return rejected(navigation);
+            const response = await fetcher(`/_ts/page-bids?path=${encodeURIComponent(path)}`, {
+              credentials: 'include',
+              headers: { 'X-TSJS-Page-Bids': '1' },
+              signal: controller.signal,
+            });
+            if (!ownerActive || !active || !navigation.isCurrent() || !response.ok) {
+              return rejected(navigation);
+            }
+            const candidate = await response.json();
+            if (!ownerActive || !active || !navigation.isCurrent()) return rejected(navigation);
+            const pageBids = createPageBidsController({
+              navigation,
+              parseProjection: (value) =>
+                parseBrowserAuctionProjectionV1(value, render.cachePolicy),
+              slotRegistry: slots.projectionRegistry(navigation),
+            });
+            if (pageBids.commit(candidate).status !== 'committed') return rejected(navigation);
+            const projection = navigation.currentAuctionProjection as
+              Readonly<BrowserAuctionProjectionV1> | undefined;
+            if (!projection || !ownerActive || !active || !navigation.isCurrent()) {
+              return rejected(navigation);
+            }
+            await publishInitialGptProjection(document, {
+              googletag,
+              navigation,
+              projection,
+              protect: () => true,
+              pucBridge: currentBridge,
+              render,
+              requestClass: 'page-bids',
+              slots,
+              targeting,
+            });
+            if (!ownerActive || !active || !navigation.isCurrent()) return rejected(navigation);
+            return Object.freeze({
+              status: 'committed',
+              navigationGeneration: navigation.generation,
+              current: true,
+            });
+          } catch (error) {
+            if (!controller.signal.aborted && ownerActive && navigation.isCurrent()) {
+              log.warn('GPT page-bids navigation failed', error);
+            }
+            return rejected(navigation);
+          } finally {
+            navigation.signal.removeEventListener('abort', abortForNavigation);
+            controllers.delete(controller);
+          }
+        },
+        release,
+      });
+    },
     adapter: googletag,
+    directAuctionUnitForSlot: (slot: object): Readonly<object> | undefined => {
+      const navigation = auction.session.currentNavigation;
+      if (!active || !navigation?.isCurrent()) return undefined;
+      const records = slots.snapshotRegisteredSlots(navigation) ?? Object.freeze([]);
+      for (let index = 0; index < records.length; index += 1) {
+        const record = records[index];
+        if (
+          record?.directAuctionUnit &&
+          slots.isBoundGptSlot(navigation.generation, record.registeredSlotId, slot)
+        ) {
+          return record.directAuctionUnit;
+        }
+      }
+      return undefined;
+    },
     installRefreshPolicy: startup.installRefreshPolicy,
+    navigation: () => {
+      const navigation = auction.session.currentNavigation;
+      return active && navigation?.isCurrent() ? navigation : undefined;
+    },
     slots,
   });
   const eventsCapability = Object.freeze({
@@ -1042,6 +1214,7 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
       const publisherRelease: { current?: () => void } = {};
       const slotServiceRelease: { current?: () => void } = {};
       const bridgeRelease: { current?: () => void } = {};
+      const pucRegistrarRelease: { current?: () => void } = {};
       onDispose(resetGuardState);
       onDispose(() => cacheRelease.current?.());
       onDispose(() => diagnosticsEventRelease.current?.());
@@ -1049,13 +1222,20 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
       onDispose(() => publisherRelease.current?.());
       onDispose(() => slotServiceRelease.current?.());
       onDispose(() => bridgeRelease.current?.());
+      onDispose(() => pucRegistrarRelease.current?.());
       onDispose(() => {
         active = false;
+        const release = laterLifecycleRelease;
+        laterLifecycleRelease = undefined;
+        release?.();
+        const releaseCriticalReconciliation = criticalReconciliationRelease;
+        criticalReconciliationRelease = undefined;
+        releaseCriticalReconciliation?.();
       });
 
       slotServiceRelease.current = slotCapability.attachPhysicalService(slots);
-      slots.activate();
       slots.start();
+      criticalReconciliationRelease = slots.activateReconciliation();
       const bridge = createPucBridge({
         messaging: messages.messaging,
         publisherOrigin: render.publisherOrigin,
@@ -1069,6 +1249,9 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
         bridge.dispose();
         if (pucBridge === bridge) pucBridge = undefined;
       };
+      pucRegistrarRelease.current = render.attachPucGamAttemptRegistrar((input) =>
+        bridge.registerGamAttempt(input)
+      );
       const releaseDiagnostics = googletag.observeDiagnostics((fact) => {
         const observation = projectGptTraceFact(fact);
         if (observation) trace.observations.publish(observation);

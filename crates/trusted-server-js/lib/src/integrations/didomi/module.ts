@@ -140,6 +140,7 @@ export function createDidomiRuntime(
 
 export function createDidomiIntegrationRegistration(release: string): IntegrationRegistration {
   return createLifecycleIntegrationRegistration(DIDOMI_INTEGRATION_ID, release, {
+    createOwnedRuntime: () => createDidomiRuntime(),
     validateConfig: didomiBootConfig,
   });
 }

@@ -29,9 +29,21 @@ function manifestIds(candidate: unknown): readonly string[] {
 }
 
 function createIntegrationRegistry(options: TestRegistryOptions) {
+  const knownIntegrationIds = options.knownIntegrationIds ?? manifestIds(options.manifest);
   return createIntegrationRegistryOwner({
     ...options,
-    knownIntegrationIds: options.knownIntegrationIds ?? manifestIds(options.manifest),
+    knownIntegrationIds,
+    catalog: Object.freeze(
+      knownIntegrationIds.map((id) =>
+        Object.freeze({
+          id,
+          phase: 'critical' as const,
+          trigger: null,
+          consumes: Object.freeze([]),
+          provides: Object.freeze([]),
+        })
+      )
+    ),
   });
 }
 
@@ -39,7 +51,8 @@ function manifest(ids: readonly string[]): BootManifestV1 {
   return {
     version: 1,
     releaseId: RELEASE_ID,
-    integrations: ids.map((id) => ({ id, required: true as const })),
+    criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
+    integrations: ids.map((id) => ({ id, phase: 'critical' as const })),
   };
 }
 
@@ -48,8 +61,10 @@ function registration(
   hooks: Partial<IntegrationRegistration> = {}
 ): IntegrationRegistration {
   return {
+    abi: 1,
     id,
-    release: RELEASE_ID,
+    phase: 'critical',
+    releaseId: RELEASE_ID,
     prepare: () => ({ activate: () => undefined }),
     ...hooks,
   };
@@ -68,9 +83,124 @@ async function install(
 
 afterEach(() => {
   vi.useRealTimers();
+  document.head.replaceChildren();
+  Object.defineProperty(document, 'currentScript', { configurable: true, value: null });
 });
 
 describe('integration manifest and registration admission', () => {
+  it('accepts only the exact five-field release-bound registrar ABI', () => {
+    const registry = createIntegrationRegistry({
+      manifest: manifest(['gpt']),
+      releaseId: RELEASE_ID,
+      startedAtMs: 0,
+      now: () => 0,
+    });
+    const exact = registration('gpt');
+
+    expect(Reflect.ownKeys(exact)).toEqual(['abi', 'id', 'phase', 'releaseId', 'prepare']);
+    expect(registry.register(exact)).toBe(true);
+  });
+
+  it.each([
+    ['old three-field ABI', { id: 'gpt', release: RELEASE_ID, prepare: vi.fn() }],
+    ['missing abi', { id: 'gpt', phase: 'critical', releaseId: RELEASE_ID, prepare: vi.fn() }],
+    ['unknown field', { ...registration('gpt'), unexpected: true }],
+    ['wrong phase', { ...registration('gpt'), phase: 'deferred' }],
+    ['custom prototype', Object.assign(Object.create({ inherited: true }), registration('gpt'))],
+    ['null prototype', Object.assign(Object.create(null), registration('gpt'))],
+  ])('rejects %s without invoking module code', async (_name, candidate) => {
+    const registry = createIntegrationRegistry({
+      manifest: manifest(['gpt']),
+      releaseId: RELEASE_ID,
+      startedAtMs: 0,
+      now: () => 0,
+    });
+
+    expect(registry.register(candidate)).toBe(false);
+    await expect(install(registry)).resolves.toMatchObject({
+      state: 'fallback',
+      reason: 'abi_mismatch',
+    });
+    const prepare = (candidate as { prepare?: unknown }).prepare;
+    if (vi.isMockFunction(prepare)) expect(prepare).not.toHaveBeenCalled();
+  });
+
+  it('authenticates every critical registration to the captured connected core script', () => {
+    const criticalScript = document.createElement('script');
+    criticalScript.id = 'trustedserver-js';
+    criticalScript.src = `${window.location.origin}/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
+    document.head.append(criticalScript);
+    Object.defineProperty(document, 'currentScript', {
+      configurable: true,
+      value: criticalScript,
+    });
+    const registry = createIntegrationRegistryOwner({
+      catalog: Object.freeze([
+        Object.freeze({
+          id: 'gpt',
+          phase: 'critical' as const,
+          trigger: null,
+          consumes: Object.freeze([]),
+          provides: Object.freeze([]),
+        }),
+      ]),
+      criticalScript,
+      document,
+      knownIntegrationIds: Object.freeze(['gpt']),
+      manifest: manifest(['gpt']),
+      releaseId: RELEASE_ID,
+      startedAtMs: 0,
+      now: () => 0,
+    });
+
+    expect(registry.register(registration('gpt'))).toBe(true);
+  });
+
+  it.each(['different current script', 'disconnected script', 'wrong exact source'])(
+    'rejects a critical registration from a %s',
+    (failure) => {
+      const criticalScript = document.createElement('script');
+      criticalScript.id = 'trustedserver-js';
+      criticalScript.src = `${window.location.origin}/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
+      document.head.append(criticalScript);
+      Object.defineProperty(document, 'currentScript', {
+        configurable: true,
+        value: criticalScript,
+      });
+      const registry = createIntegrationRegistryOwner({
+        catalog: Object.freeze([
+          Object.freeze({
+            id: 'gpt',
+            phase: 'critical' as const,
+            trigger: null,
+            consumes: Object.freeze([]),
+            provides: Object.freeze([]),
+          }),
+        ]),
+        criticalScript,
+        document,
+        knownIntegrationIds: Object.freeze(['gpt']),
+        manifest: manifest(['gpt']),
+        releaseId: RELEASE_ID,
+        startedAtMs: 0,
+        now: () => 0,
+      });
+      if (failure === 'different current script') {
+        Object.defineProperty(document, 'currentScript', {
+          configurable: true,
+          value: document.createElement('script'),
+        });
+      } else if (failure === 'disconnected script') {
+        criticalScript.remove();
+      } else {
+        criticalScript.src = `${window.location.origin}/static/tsjs=tsjs-unified.min.js?v=${'d'.repeat(64)}`;
+      }
+
+      expect(registry.register(registration('gpt'))).toBe(false);
+      expect(registry.state).toBe('failed');
+    }
+  );
+
   it('exposes only a frozen facade while mutable registry state stays in a closure', () => {
     const registry = createIntegrationRegistry({
       manifest: manifest([]),
@@ -84,6 +214,7 @@ describe('integration manifest and registration admission', () => {
       'dispose',
       'install',
       'manifest',
+      'prepareDeferred',
       'register',
       'state',
     ]);
@@ -94,8 +225,8 @@ describe('integration manifest and registration admission', () => {
 
   it('rejects an integration array with executable iteration without invoking it', async () => {
     const iterator = vi.fn(function* () {
-      for (let index = 0; index < 17; index += 1) {
-        yield { id: `module_${index}`, required: true };
+      for (let index = 0; index < 21; index += 1) {
+        yield { id: `module_${index}`, phase: 'critical' };
       }
     });
     const integrations: unknown[] = [];
@@ -135,7 +266,7 @@ describe('integration manifest and registration admission', () => {
         ],
       },
     ],
-    ['over capacity', manifest(Array.from({ length: 17 }, (_, index) => `module_${index}`))],
+    ['over capacity', manifest(Array.from({ length: 21 }, (_, index) => `module_${index}`))],
   ])('rejects a malformed manifest: %s', async (_name, candidate) => {
     const registry = createIntegrationRegistry({
       manifest: candidate,
@@ -186,7 +317,7 @@ describe('integration manifest and registration admission', () => {
 
   it.each([
     ['unknown id', registration('unknown')],
-    ['wrong bundle release', registration('gpt', { release: OTHER_RELEASE_ID })],
+    ['wrong bundle release', registration('gpt', { releaseId: OTHER_RELEASE_ID })],
   ])('quarantines %s before prepare is called', async (_name, candidate) => {
     const prepare = vi.fn(candidate.prepare);
     const registry = createIntegrationRegistry({
@@ -249,6 +380,24 @@ describe('integration manifest and registration admission', () => {
     expect(secondPrepare).not.toHaveBeenCalled();
   });
 
+  it('rejects a critical registration that skips the next manifest entry', async () => {
+    const prepare = vi.fn(() => ({ activate: () => undefined }));
+    const registry = createIntegrationRegistry({
+      manifest: manifest(['gpt', 'prebid']),
+      releaseId: RELEASE_ID,
+      startedAtMs: 0,
+      now: () => 0,
+    });
+
+    expect(registry.register(registration('prebid', { prepare }))).toBe(false);
+    expect(registry.state).toBe('failed');
+    expect(prepare).not.toHaveBeenCalled();
+    await expect(install(registry)).resolves.toMatchObject({
+      state: 'fallback',
+      reason: 'abi_mismatch',
+    });
+  });
+
   it('snapshots accepted registration code so retained objects cannot swap it later', async () => {
     const acceptedPrepare = vi.fn(() => ({ activate: () => undefined }));
     const swappedPrepare = vi.fn(() => ({
@@ -257,8 +406,10 @@ describe('integration manifest and registration admission', () => {
       },
     }));
     const candidate = {
+      abi: 1 as const,
       id: 'gpt',
-      release: RELEASE_ID,
+      phase: 'critical' as const,
+      releaseId: RELEASE_ID,
       prepare: acceptedPrepare,
     };
     const registry = createIntegrationRegistry({
@@ -270,7 +421,7 @@ describe('integration manifest and registration admission', () => {
 
     expect(registry.register(candidate)).toBe(true);
     candidate.id = 'unknown';
-    candidate.release = OTHER_RELEASE_ID;
+    candidate.releaseId = OTHER_RELEASE_ID;
     candidate.prepare = swappedPrepare;
 
     await expect(install(registry)).resolves.toMatchObject({ state: 'kernel' });
@@ -340,8 +491,8 @@ describe('integration manifest and registration admission', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it('accepts exactly 16 required modules in manifest order', async () => {
-    const ids = Array.from({ length: 16 }, (_, index) => `module_${index}`);
+  it('accepts exactly 14 critical modules in manifest order', async () => {
+    const ids = Array.from({ length: 14 }, (_, index) => `module_${index}`);
     const order: string[] = [];
     const registry = createIntegrationRegistry({
       manifest: manifest(ids),
@@ -363,13 +514,175 @@ describe('integration manifest and registration admission', () => {
     }
 
     await expect(install(registry, order)).resolves.toMatchObject({ state: 'kernel' });
-    expect(order.slice(0, 16)).toEqual(ids.map((id) => `prepare:${id}`));
-    expect(order.slice(16, 32)).toEqual(ids.map((id) => `activate:${id}`));
-    expect(order.slice(32)).toEqual(['publish', 'drain']);
+    expect(order.slice(0, 14)).toEqual(ids.map((id) => `prepare:${id}`));
+    expect(order.slice(14, 28)).toEqual(ids.map((id) => `activate:${id}`));
+    expect(order.slice(28)).toEqual(['publish', 'drain']);
   });
 });
 
 describe('integration preparation and activation transaction', () => {
+  it('stages only declared provider capabilities for later critical consumers', async () => {
+    const gpt = Object.freeze({ kind: 'gpt' });
+    let consumerInterfaces: Readonly<Record<string, unknown>> | undefined;
+    const registry = createIntegrationRegistryOwner({
+      catalog: Object.freeze([
+        Object.freeze({
+          id: 'gpt',
+          phase: 'critical' as const,
+          trigger: null,
+          consumes: Object.freeze(['runtime.v1']),
+          provides: Object.freeze(['gpt.v1']),
+        }),
+        Object.freeze({
+          id: 'prebid',
+          phase: 'critical' as const,
+          trigger: null,
+          consumes: Object.freeze(['gpt.v1']),
+          provides: Object.freeze([]),
+        }),
+      ]),
+      knownIntegrationIds: Object.freeze(['gpt', 'prebid']),
+      manifest: manifest(['gpt', 'prebid']),
+      releaseId: RELEASE_ID,
+      runtimeCapability: Object.freeze({ kind: 'runtime' }),
+      startedAtMs: 0,
+      now: () => 0,
+    });
+    registry.register(
+      registration('gpt', {
+        prepare: ({ interfaces }) => {
+          expect(Reflect.ownKeys(interfaces)).toEqual(['runtime.v1']);
+          return { activate: () => undefined, interfaces: Object.freeze({ 'gpt.v1': gpt }) };
+        },
+      })
+    );
+    registry.register(
+      registration('prebid', {
+        prepare: ({ interfaces }) => {
+          consumerInterfaces = interfaces;
+          return { activate: () => undefined, interfaces: Object.freeze({}) };
+        },
+      })
+    );
+
+    await expect(install(registry)).resolves.toMatchObject({ state: 'kernel' });
+    expect(consumerInterfaces).toEqual(Object.freeze({ 'gpt.v1': gpt }));
+    expect(Object.isFrozen(consumerInterfaces)).toBe(true);
+    expect(Reflect.ownKeys(consumerInterfaces ?? {})).toEqual(['gpt.v1']);
+  });
+
+  it('prepares a deferred consumer from committed critical capabilities only', async () => {
+    const gpt = Object.freeze({ kind: 'gpt' });
+    const registry = createIntegrationRegistryOwner({
+      catalog: Object.freeze([
+        Object.freeze({
+          id: 'gpt',
+          phase: 'critical' as const,
+          trigger: null,
+          consumes: Object.freeze([]),
+          provides: Object.freeze(['gpt.v1']),
+        }),
+        Object.freeze({
+          id: 'gpt_later',
+          phase: 'deferred' as const,
+          trigger: 'first_display_or_idle' as const,
+          consumes: Object.freeze(['gpt.v1']),
+          provides: Object.freeze([]),
+        }),
+      ]),
+      knownIntegrationIds: Object.freeze(['gpt', 'gpt_later']),
+      manifest: {
+        ...manifest(['gpt']),
+        integrations: Object.freeze([
+          Object.freeze({ id: 'gpt', phase: 'critical' as const }),
+          Object.freeze({
+            id: 'gpt_later',
+            phase: 'deferred' as const,
+            trigger: 'first_display_or_idle' as const,
+            src: `/static/tsjs=tsjs-gpt_later.min.js?v=${'d'.repeat(64)}`,
+          }),
+        ]),
+      },
+      releaseId: RELEASE_ID,
+      startedAtMs: 0,
+      now: () => 0,
+    });
+    registry.register(
+      registration('gpt', {
+        prepare: () => ({
+          activate: () => undefined,
+          interfaces: Object.freeze({ 'gpt.v1': gpt }),
+        }),
+      })
+    );
+    await expect(install(registry)).resolves.toMatchObject({ state: 'kernel' });
+
+    const prepare = vi.fn(({ interfaces }: IntegrationPrepareContext) => {
+      expect(interfaces).toEqual(Object.freeze({ 'gpt.v1': gpt }));
+      return { activate: () => undefined };
+    });
+    const prepared = registry.prepareDeferred(
+      { ...registration('gpt_later', { prepare }), phase: 'deferred' },
+      Object.freeze({
+        signal: new AbortController().signal,
+        onDispose: vi.fn(),
+      })
+    );
+
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(prepared).toMatchObject({ activate: expect.any(Function) });
+  });
+
+  it.each([
+    ['missing declared key', Object.freeze({})],
+    ['unknown key', Object.freeze({ 'gpt.v1': Object.freeze({}), 'other.v1': Object.freeze({}) })],
+    ['mutable facade', Object.freeze({ 'gpt.v1': {} })],
+    [
+      'custom facade prototype',
+      Object.freeze({ 'gpt.v1': Object.freeze(Object.create({ inherited: true })) }),
+    ],
+  ])('rejects provider interfaces with a %s', async (_name, interfaces) => {
+    const prepareConsumer = vi.fn(() => ({
+      activate: () => undefined,
+      interfaces: Object.freeze({}),
+    }));
+    const registry = createIntegrationRegistryOwner({
+      catalog: Object.freeze([
+        Object.freeze({
+          id: 'gpt',
+          phase: 'critical' as const,
+          trigger: null,
+          consumes: Object.freeze([]),
+          provides: Object.freeze(['gpt.v1']),
+        }),
+        Object.freeze({
+          id: 'prebid',
+          phase: 'critical' as const,
+          trigger: null,
+          consumes: Object.freeze(['gpt.v1']),
+          provides: Object.freeze([]),
+        }),
+      ]),
+      knownIntegrationIds: Object.freeze(['gpt', 'prebid']),
+      manifest: manifest(['gpt', 'prebid']),
+      releaseId: RELEASE_ID,
+      startedAtMs: 0,
+      now: () => 0,
+    });
+    registry.register(
+      registration('gpt', {
+        prepare: () => ({ activate: () => undefined, interfaces }),
+      })
+    );
+    registry.register(registration('prebid', { prepare: prepareConsumer }));
+
+    await expect(install(registry)).resolves.toMatchObject({
+      state: 'fallback',
+      reason: 'bundle_partial',
+    });
+    expect(prepareConsumer).not.toHaveBeenCalled();
+  });
+
   it('prepares core-owned bindings before module preparation and activates afterward', async () => {
     const order: string[] = [];
     const registry = createIntegrationRegistry({

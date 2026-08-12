@@ -48,6 +48,7 @@ export function createDataDomeRuntime(
 
 export function createDataDomeIntegrationRegistration(release: string): IntegrationRegistration {
   return createLifecycleIntegrationRegistration(DATADOME_INTEGRATION_ID, release, {
+    createOwnedRuntime: () => createDataDomeRuntime(),
     validateConfig: (candidate) => candidate === undefined,
   });
 }

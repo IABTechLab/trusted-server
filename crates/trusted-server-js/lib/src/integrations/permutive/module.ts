@@ -1,8 +1,10 @@
-import type { IntegrationRegistration } from '../../kernel/integration_registry';
-import {
-  createLifecycleIntegrationRegistration,
-  type IntegrationLifecycleRuntime,
-} from '../../kernel/lifecycle_module';
+import type {
+  IntegrationActivationContext,
+  IntegrationPrepareContext,
+  IntegrationRegistration,
+} from '../../kernel/integration_registry';
+import type { IntegrationLifecycleRuntime } from '../../kernel/lifecycle_module';
+import type { RuntimeCapabilityV1 } from '../../kernel/runtime';
 import { log } from '../../core/log';
 
 import { installPermutiveGuard, resetGuardState } from './script_guard';
@@ -39,6 +41,12 @@ export interface PermutiveRuntimeDependencies {
   readonly setTimeout: (callback: () => void, delay: number) => number;
   readonly started: () => void;
   readonly timedOut: () => void;
+}
+
+export interface PermutiveContextCapabilityV1 {
+  readonly activateLifecycle: () => () => void;
+  readonly segments: () => readonly string[];
+  readonly startLifecycle: () => void;
 }
 
 function bestEffort(action: () => void): void {
@@ -204,7 +212,90 @@ export function createPermutiveRuntime(
 }
 
 export function createPermutiveIntegrationRegistration(release: string): IntegrationRegistration {
-  return createLifecycleIntegrationRegistration(PERMUTIVE_INTEGRATION_ID, release, {
-    validateConfig: (candidate) => candidate === undefined,
+  return Object.freeze({
+    abi: 1,
+    id: PERMUTIVE_INTEGRATION_ID,
+    phase: 'critical',
+    releaseId: release,
+    prepare: ({ config, interfaces, onDispose }: IntegrationPrepareContext) => {
+      const runtimeCapability = interfaces['runtime.v1'];
+      if (
+        config !== undefined ||
+        typeof runtimeCapability !== 'object' ||
+        runtimeCapability === null ||
+        !Object.isFrozen(runtimeCapability) ||
+        typeof (runtimeCapability as RuntimeCapabilityV1).registerAuctionContext !== 'function'
+      ) {
+        throw new TypeError('Permutive context capability graph is invalid');
+      }
+      const runtime = runtimeCapability as RuntimeCapabilityV1;
+      const lifecycle = createPermutiveRuntime({
+        installGuard: () => undefined,
+        registerContext: () => () => undefined,
+        resetGuard: () => undefined,
+      });
+      let criticalActive = false;
+      let releaseContext: (() => void) | undefined;
+      let lifecycleRelease: (() => void) | undefined;
+      const capability: PermutiveContextCapabilityV1 = Object.freeze({
+        activateLifecycle: () => {
+          if (!criticalActive || lifecycleRelease) {
+            throw new TypeError('Permutive lifecycle is unavailable');
+          }
+          lifecycleRelease = lifecycle.activate(undefined);
+          return (): void => {
+            const releaseLifecycle = lifecycleRelease;
+            lifecycleRelease = undefined;
+            releaseLifecycle?.();
+          };
+        },
+        segments: () =>
+          criticalActive ? snapshotSegments(getPermutiveSegments()) : Object.freeze([]),
+        startLifecycle: () => {
+          if (!criticalActive || !lifecycleRelease) {
+            throw new TypeError('Permutive lifecycle is not active');
+          }
+          lifecycle.start(undefined);
+        },
+      });
+      onDispose(() => {
+        criticalActive = false;
+        const releaseLifecycle = lifecycleRelease;
+        lifecycleRelease = undefined;
+        releaseLifecycle?.();
+        const release = releaseContext;
+        releaseContext = undefined;
+        release?.();
+        resetGuardState();
+      });
+      return Object.freeze({
+        activate: ({ onDispose: onActivationDispose }: IntegrationActivationContext) => {
+          if (criticalActive) throw new Error('Permutive context is already active');
+          try {
+            installPermutiveGuard();
+            releaseContext = runtime.registerAuctionContext(PERMUTIVE_INTEGRATION_ID, () => {
+              const segments = snapshotSegments(getPermutiveSegments());
+              return segments.length === 0
+                ? undefined
+                : Object.freeze({ permutive_segments: segments });
+            });
+            if (!releaseContext) throw new Error('Permutive context registration failed');
+          } catch (error) {
+            releaseContext = undefined;
+            resetGuardState();
+            throw error;
+          }
+          criticalActive = true;
+          onActivationDispose(() => {
+            criticalActive = false;
+            const release = releaseContext;
+            releaseContext = undefined;
+            release?.();
+            resetGuardState();
+          });
+        },
+        interfaces: Object.freeze({ 'permutive_context.v1': capability }),
+      });
+    },
   });
 }

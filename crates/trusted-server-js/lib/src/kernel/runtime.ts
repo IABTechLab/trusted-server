@@ -1,16 +1,31 @@
 import { prepareQueue, publishQueue, type PublishedQueue } from '../core/queue';
 import { EMBEDDED_RELEASE_ID } from '../core/release';
+import type { GptDiagnosticsApi } from '../core/types';
 
-import { buildFallbackBoot, buildKernelBoot, createFallbackFields, publicLog } from './fallback';
+import {
+  buildFallbackBoot,
+  buildKernelBoot,
+  captureTrustedCriticalSrc,
+  createFallbackFields,
+  publicLog,
+} from './fallback';
 import {
   createIntegrationRegistry,
   type BootFailureReason,
   type CoreActivationContext,
   type CorePreparationContext,
   type IntegrationBindings,
+  type IntegrationCatalogEntry,
   type IntegrationInstallResult,
   type IntegrationRegistry,
 } from './integration_registry';
+import {
+  createDeferredPhaseLoader,
+  createProtectedFirstDisplayGate,
+  type DeferredPhaseLoader,
+  type PhaseScheduler,
+  type ProtectedFirstDisplayGate,
+} from './phase_loader';
 
 export type RuntimeState = 'unclaimed' | 'installing' | 'kernel' | 'failed' | 'fallback';
 
@@ -24,6 +39,7 @@ const TERMINAL_FIELDS = Object.freeze([
   'addAdUnits',
   'requestAds',
   'diagnostics',
+  '_registerIntegration',
   '_internal',
   'que',
 ]);
@@ -78,6 +94,9 @@ export interface RuntimeOptions {
   readonly releaseId: string;
   readonly manifest: unknown;
   readonly knownIntegrationIds: readonly string[];
+  readonly catalog?: readonly IntegrationCatalogEntry[];
+  readonly document?: Document;
+  readonly phaseScheduler?: PhaseScheduler;
   readonly boot?: unknown;
   readonly now?: () => number;
   readonly getBindings?: (id: string) => IntegrationBindings;
@@ -95,7 +114,119 @@ export interface Runtime {
   readonly start: () => boolean;
   readonly registerIntegration: (registration: unknown) => boolean;
   readonly install: () => Promise<IntegrationInstallResult>;
+  readonly protectFirstDisplayAttemptBatch: (
+    terminalLatches: readonly PromiseLike<unknown>[]
+  ) => boolean;
   readonly dispose: () => void;
+}
+
+/** Closure-private kernel capability consumed only by release-bound providers. */
+export interface RuntimeCapabilityV1 {
+  readonly attachAuctionContextService: (
+    service: RuntimeAuctionContextService
+  ) => (() => void) | undefined;
+  readonly boot: () => Readonly<object> | undefined;
+  readonly document: Document | undefined;
+  readonly enqueue: (callback: () => void) => boolean;
+  readonly generation: object;
+  readonly protectFirstDisplayAttemptBatch: (
+    terminalLatches: readonly PromiseLike<unknown>[]
+  ) => boolean;
+  readonly registerAuctionContext: (
+    integrationId: string,
+    contributor: RuntimeAuctionContextContributor
+  ) => (() => void) | undefined;
+}
+
+export type RuntimeAuctionContextContributor = () => Readonly<Record<string, unknown>> | undefined;
+
+/** Sole runtime-private bridge between the render owner and context contributors. */
+export interface RuntimeAuctionContextService {
+  readonly register: (
+    integrationId: string,
+    contributor: RuntimeAuctionContextContributor
+  ) => (() => void) | undefined;
+}
+
+interface DirectCapabilityV1 {
+  readonly addAdUnits: RuntimeKernel['addAdUnits'];
+  readonly requestAds: RuntimeKernel['requestAds'];
+  readonly diagnostics: Readonly<object>;
+}
+
+interface GptDiagnosticsCapabilityV1 {
+  readonly api: GptDiagnosticsApi;
+  readonly attachPresentation: (controls: Readonly<Record<string, unknown>>) => () => void;
+}
+
+function snapshotGptDiagnosticsCapability(
+  candidate: unknown
+): GptDiagnosticsCapabilityV1 | undefined {
+  if (
+    typeof candidate !== 'object' ||
+    candidate === null ||
+    Array.isArray(candidate) ||
+    Object.getPrototypeOf(candidate) !== Object.prototype ||
+    !Object.isFrozen(candidate) ||
+    Reflect.ownKeys(candidate).sort().join(',') !== 'api,attachPresentation'
+  ) {
+    return undefined;
+  }
+  const fields = candidate as Readonly<Record<string, unknown>>;
+  const api = fields['api'];
+  if (
+    typeof fields['attachPresentation'] !== 'function' ||
+    typeof api !== 'object' ||
+    api === null ||
+    !Object.isFrozen(api) ||
+    Reflect.ownKeys(api).sort().join(',') !== 'export,hide,show,snapshot,subscribe' ||
+    !Reflect.ownKeys(api).every(
+      (key) => typeof (api as Record<PropertyKey, unknown>)[key] === 'function'
+    )
+  ) {
+    return undefined;
+  }
+  return candidate as GptDiagnosticsCapabilityV1;
+}
+
+function snapshotDirectCapability(candidate: unknown): DirectCapabilityV1 | undefined {
+  if (
+    typeof candidate !== 'object' ||
+    candidate === null ||
+    Array.isArray(candidate) ||
+    Object.getPrototypeOf(candidate) !== Object.prototype ||
+    !Object.isFrozen(candidate)
+  ) {
+    return undefined;
+  }
+  const keys = Reflect.ownKeys(candidate);
+  if (
+    keys.length !== 3 ||
+    !['addAdUnits', 'requestAds', 'diagnostics'].every((key) => keys.includes(key))
+  ) {
+    return undefined;
+  }
+  const values: Record<string, unknown> = {};
+  for (const key of keys) {
+    if (typeof key !== 'string') return undefined;
+    const descriptor = Object.getOwnPropertyDescriptor(candidate, key);
+    if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return undefined;
+    values[key] = descriptor.value;
+  }
+  if (
+    typeof values['addAdUnits'] !== 'function' ||
+    typeof values['requestAds'] !== 'function' ||
+    typeof values['diagnostics'] !== 'object' ||
+    values['diagnostics'] === null ||
+    !Object.isFrozen(values['diagnostics'])
+  ) {
+    return undefined;
+  }
+  return Object.freeze({
+    addAdUnits: values['addAdUnits'] as RuntimeKernel['addAdUnits'],
+    requestAds: values['requestAds'] as RuntimeKernel['requestAds'],
+    diagnostics: values['diagnostics'] as Readonly<object>,
+  });
 }
 
 class RuntimeOwner implements Runtime {
@@ -109,6 +240,13 @@ class RuntimeOwner implements Runtime {
   private installPromise: Promise<IntegrationInstallResult> | undefined;
   private kernelBoot: Readonly<object> | undefined;
   private fallbackBoot: Readonly<object> | undefined;
+  private criticalScript: HTMLScriptElement | undefined;
+  private trustedCriticalSrc: string | undefined;
+  private phaseGate: ProtectedFirstDisplayGate | undefined;
+  private phaseLoader: DeferredPhaseLoader | undefined;
+  private auctionContextService: RuntimeAuctionContextService | undefined;
+  private directProvider: DirectCapabilityV1 | undefined;
+  private gptDiagnosticsProvider: GptDiagnosticsCapabilityV1 | undefined;
 
   public constructor(options: RuntimeOptions) {
     this.options = options;
@@ -126,6 +264,16 @@ class RuntimeOwner implements Runtime {
     let claimMutationStarted = false;
     try {
       if (!canClaimRuntimeTarget(this.options.target)) return false;
+      const runtimeDocument = this.runtimeDocument();
+      const Script = runtimeDocument?.defaultView?.HTMLScriptElement;
+      const currentScript = runtimeDocument?.currentScript;
+      this.criticalScript = Script && currentScript instanceof Script ? currentScript : undefined;
+      const capturedCriticalSrc =
+        runtimeDocument && this.criticalScript
+          ? captureTrustedCriticalSrc(runtimeDocument, this.criticalScript)
+          : undefined;
+      if (!capturedCriticalSrc) return false;
+      this.trustedCriticalSrc = capturedCriticalSrc;
       const startedAtMs = (this.options.now ?? (() => performance.now()))();
       queueDescriptor = Object.getOwnPropertyDescriptor(this.options.target, 'que');
       bootDescriptor = Object.getOwnPropertyDescriptor(this.options.target, 'boot');
@@ -150,7 +298,6 @@ class RuntimeOwner implements Runtime {
       }
       this.ingress = prepareQueue(this.options.target);
       const bootCandidate = this.bootCandidate();
-      this.fallbackBoot = buildFallbackBoot(EMBEDDED_RELEASE_ID, bootCandidate);
       this.registry = createIntegrationRegistry({
         // The manifest validator binds releaseId directly to the embedded build
         // stamp, so a separate comparison would duplicate the stamp in minified
@@ -158,11 +305,106 @@ class RuntimeOwner implements Runtime {
         manifest: this.options.manifest,
         releaseId: EMBEDDED_RELEASE_ID,
         knownIntegrationIds: this.options.knownIntegrationIds,
+        catalog:
+          this.options.catalog ??
+          Object.freeze(
+            this.options.knownIntegrationIds.map((id) =>
+              Object.freeze({
+                id,
+                phase: 'critical' as const,
+                trigger: null,
+                consumes: Object.freeze([]),
+                provides: Object.freeze([]),
+              })
+            )
+          ),
+        runtimeCapability: Object.freeze({
+          attachAuctionContextService: (service: RuntimeAuctionContextService) => {
+            if (
+              this.auctionContextService ||
+              typeof service !== 'object' ||
+              service === null ||
+              !Object.isFrozen(service) ||
+              typeof service.register !== 'function'
+            ) {
+              return undefined;
+            }
+            this.auctionContextService = service;
+            let released = false;
+            return () => {
+              if (released) return;
+              released = true;
+              if (this.auctionContextService === service) this.auctionContextService = undefined;
+            };
+          },
+          boot: () => this.kernelBoot,
+          document: runtimeDocument,
+          enqueue: (callback: () => void) => {
+            if (typeof callback !== 'function') return false;
+            try {
+              const queue = Object.getOwnPropertyDescriptor(this.options.target, 'que');
+              const queueValue = queue && 'value' in queue ? queue.value : undefined;
+              const push =
+                queueValue !== undefined && queueValue !== null
+                  ? Object.getOwnPropertyDescriptor(queueValue, 'push')
+                  : undefined;
+              if (!push || !('value' in push) || typeof push.value !== 'function') return false;
+              Reflect.apply(push.value, queueValue, [callback]);
+              return true;
+            } catch {
+              return false;
+            }
+          },
+          generation: this.generation,
+          protectFirstDisplayAttemptBatch: (terminalLatches: readonly PromiseLike<unknown>[]) =>
+            this.protectFirstDisplayAttemptBatch(terminalLatches),
+          registerAuctionContext: (integrationId, contributor) => {
+            try {
+              return this.auctionContextService?.register(integrationId, contributor);
+            } catch {
+              return undefined;
+            }
+          },
+        } satisfies RuntimeCapabilityV1),
+        onCapabilityStaged: (key, facade) => {
+          if (key === 'direct.v1') {
+            const direct = snapshotDirectCapability(facade);
+            if (!direct) throw new TypeError('direct.v1 capability is malformed');
+            if (this.directProvider) throw new TypeError('direct.v1 capability is already staged');
+            this.directProvider = direct;
+            return () => {
+              if (this.directProvider === direct) this.directProvider = undefined;
+            };
+          }
+          if (key === 'gpt_diag.v1') {
+            const diagnostics = snapshotGptDiagnosticsCapability(facade);
+            if (!diagnostics) throw new TypeError('gpt_diag.v1 capability is malformed');
+            if (this.gptDiagnosticsProvider) {
+              throw new TypeError('gpt_diag.v1 capability is already staged');
+            }
+            this.gptDiagnosticsProvider = diagnostics;
+            return () => {
+              if (this.gptDiagnosticsProvider === diagnostics) {
+                this.gptDiagnosticsProvider = undefined;
+              }
+            };
+          }
+          return undefined;
+        },
+        ...(this.criticalScript && runtimeDocument
+          ? { criticalScript: this.criticalScript, document: runtimeDocument }
+          : {}),
         startedAtMs,
         ...(this.options.now ? { now: this.options.now } : {}),
-        ...(this.options.getBindings ? { getBindings: this.options.getBindings } : {}),
+        getBindings: (id) => this.integrationBindings(id),
         isCurrentOwner: () => this.ownsRegistrationHandshake(),
       });
+      this.fallbackBoot = buildFallbackBoot(
+        EMBEDDED_RELEASE_ID,
+        bootCandidate,
+        this.trustedCriticalSrc
+      );
+      if (!this.fallbackBoot) throw new Error('Trusted critical artifact source is unavailable');
       if (this.registry.manifest) {
         this.kernelBoot = buildKernelBoot(
           EMBEDDED_RELEASE_ID,
@@ -197,13 +439,21 @@ class RuntimeOwner implements Runtime {
       this.ingress = undefined;
       this.kernelBoot = undefined;
       this.fallbackBoot = undefined;
+      this.criticalScript = undefined;
+      this.trustedCriticalSrc = undefined;
       return false;
     }
   }
 
   public registerIntegration(registration: unknown): boolean {
-    if (this.runtimeState !== 'installing' || !this.ownsRegistrationHandshake()) return false;
-    return this.registry?.register(registration) ?? false;
+    if (this.runtimeState === 'installing') {
+      if (!this.ownsRegistrationHandshake()) return false;
+      return this.registry?.register(registration) ?? false;
+    }
+    if (this.runtimeState === 'kernel' && this.ownsTerminalRegistrationHandshake()) {
+      return this.phaseLoader?.register(registration) ?? false;
+    }
+    return false;
   }
 
   public install(): Promise<IntegrationInstallResult> {
@@ -260,7 +510,12 @@ class RuntimeOwner implements Runtime {
           if (!this.ownsRegistrationHandshake()) {
             throw new Error('Runtime owner generation changed');
           }
-          published = publishQueue(this.options.target, this.ingress as unknown[], this.kernelFields());
+          published = publishQueue(
+            this.options.target,
+            this.ingress as unknown[],
+            this.kernelFields()
+          );
+          this.startDeferredPhase();
         },
         drainPreload: () => published?.drain(),
       })
@@ -277,18 +532,60 @@ class RuntimeOwner implements Runtime {
   }
 
   public dispose(): void {
+    this.phaseLoader?.dispose();
+    this.phaseGate?.dispose();
     this.registry?.dispose();
   }
 
+  public protectFirstDisplayAttemptBatch(
+    terminalLatches: readonly PromiseLike<unknown>[]
+  ): boolean {
+    return this.phaseGate?.protectAttemptBatch(terminalLatches) ?? false;
+  }
+
   private kernelFields(): Readonly<Record<string, unknown>> {
-    const diagnostics =
-      this.options.getDiagnosticsForPublish?.() ?? this.options.kernel.diagnostics;
+    const direct = this.directProvider;
+    const requiresDirect = this.options.catalog?.some(
+      ({ id, provides }) => id === 'render_runtime' && provides.includes('direct.v1')
+    );
+    if (requiresDirect && !direct) {
+      throw new Error('Mandatory direct.v1 provider is unavailable');
+    }
+    const baseDiagnostics =
+      direct?.diagnostics ??
+      this.options.getDiagnosticsForPublish?.() ??
+      this.options.kernel.diagnostics;
+    const addAdUnits = direct?.addAdUnits ?? this.options.kernel.addAdUnits;
+    const requestAds = direct?.requestAds ?? this.options.kernel.requestAds;
     if (
-      (typeof diagnostics !== 'object' && typeof diagnostics !== 'function') ||
-      diagnostics === null ||
-      !Object.isFrozen(diagnostics)
+      (typeof baseDiagnostics !== 'object' && typeof baseDiagnostics !== 'function') ||
+      baseDiagnostics === null ||
+      !Object.isFrozen(baseDiagnostics)
     ) {
       throw new Error('Published diagnostics namespace must be frozen');
+    }
+    let diagnostics = baseDiagnostics;
+    const gptDiagnostics = this.gptDiagnosticsProvider?.api;
+    if (gptDiagnostics) {
+      const descriptors = Object.getOwnPropertyDescriptors(baseDiagnostics);
+      if (
+        Object.getOwnPropertySymbols(baseDiagnostics).length !== 0 ||
+        Object.prototype.hasOwnProperty.call(descriptors, 'gpt') ||
+        !Object.values(descriptors).every(
+          (descriptor) => descriptor.enumerable && 'value' in descriptor
+        )
+      ) {
+        throw new Error('Published diagnostics namespace is malformed');
+      }
+      diagnostics = Object.freeze(
+        Object.defineProperties(
+          {},
+          {
+            ...descriptors,
+            gpt: { enumerable: true, value: gptDiagnostics },
+          }
+        )
+      );
     }
     const fields: Record<string, unknown> = {};
     Object.defineProperties(fields, {
@@ -299,9 +596,9 @@ class RuntimeOwner implements Runtime {
         value: this.kernelBoot,
       },
       log: { enumerable: true, value: publicLog },
-      _registerIntegration: { enumerable: true, value: () => false },
-      addAdUnits: { enumerable: true, value: this.options.kernel.addAdUnits },
-      requestAds: { enumerable: true, value: this.options.kernel.requestAds },
+      _registerIntegration: { enumerable: true, value: this.registrationHandshake },
+      addAdUnits: { enumerable: true, value: addAdUnits },
+      requestAds: { enumerable: true, value: requestAds },
       diagnostics: { enumerable: true, value: diagnostics },
       _internal: {
         enumerable: false,
@@ -312,12 +609,15 @@ class RuntimeOwner implements Runtime {
   }
 
   private commitFallback(reason: BootFailureReason): void {
-    if (!this.ownsRegistrationHandshake() || !this.ingress) return;
-    const published = publishQueue(this.options.target, this.ingress, createFallbackFields({
+    if (!this.ownsRegistrationHandshake() || !this.ingress || !this.trustedCriticalSrc) return;
+    const fields = createFallbackFields({
       releaseId: EMBEDDED_RELEASE_ID,
       reason,
       boot: this.fallbackBoot,
-    }));
+      trustedCriticalSrc: this.trustedCriticalSrc,
+    });
+    if (!fields) return;
+    const published = publishQueue(this.options.target, this.ingress, fields);
     this.runtimeState = 'fallback';
     published.drain();
   }
@@ -339,6 +639,71 @@ class RuntimeOwner implements Runtime {
     } catch {
       return false;
     }
+  }
+
+  private ownsTerminalRegistrationHandshake(): boolean {
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(
+        this.options.target,
+        '_registerIntegration'
+      );
+      return (
+        descriptor !== undefined &&
+        'value' in descriptor &&
+        descriptor.value === this.registrationHandshake &&
+        descriptor.configurable === false &&
+        descriptor.enumerable === true &&
+        descriptor.writable === false
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private runtimeDocument(): Document | undefined {
+    if (this.options.document) return this.options.document;
+    return typeof document === 'undefined' ? undefined : document;
+  }
+
+  private startDeferredPhase(): void {
+    const runtimeDocument = this.runtimeDocument();
+    const manifest = this.registry?.manifest;
+    if (!runtimeDocument || !manifest) return;
+    const gate = createProtectedFirstDisplayGate({
+      document: runtimeDocument,
+      ...(this.options.phaseScheduler ? { scheduler: this.options.phaseScheduler } : {}),
+      markPaint: () => {
+        try {
+          runtimeDocument.defaultView?.performance.mark('tsjs:first-display-paint');
+        } catch {
+          // A publisher performance shim cannot block the protected phase gate.
+        }
+      },
+    });
+    this.phaseGate = gate;
+    const criticalScript = this.criticalScript;
+    if (criticalScript) {
+      this.phaseLoader = createDeferredPhaseLoader({
+        criticalScript,
+        document: runtimeDocument,
+        gate: gate.ready,
+        manifest,
+        prepare: (registration, owner) =>
+          this.registry?.prepareDeferred(registration, owner) ?? {
+            activate: () => undefined,
+          },
+        releaseId: EMBEDDED_RELEASE_ID,
+        ...(this.options.phaseScheduler
+          ? {
+              scheduler: {
+                clearTimeout: this.options.phaseScheduler.clearTimeout,
+                setTimeout: this.options.phaseScheduler.setTimeout,
+              },
+            }
+          : {}),
+      });
+    }
+    gate.commit();
   }
 
   private ownsInstallingActivation(context: CoreActivationContext): boolean {
@@ -363,6 +728,32 @@ class RuntimeOwner implements Runtime {
     if (this.options.boot !== undefined) return this.options.boot;
     const descriptor = Object.getOwnPropertyDescriptor(this.options.target, 'boot');
     return descriptor && 'value' in descriptor ? descriptor.value : undefined;
+  }
+
+  private integrationBindings(id: string): IntegrationBindings {
+    const fallback = Object.freeze({ config: undefined, interfaces: Object.freeze({}) });
+    const bindings = this.options.getBindings?.(id) ?? fallback;
+    if (id !== 'creative' && id !== 'gpt_diagnostics') return bindings;
+    const boot = this.kernelBoot;
+    if (!boot) return bindings;
+    try {
+      if (id === 'creative') {
+        const creative = Object.getOwnPropertyDescriptor(boot, 'creative');
+        return creative && 'value' in creative
+          ? Object.freeze({ config: creative.value, interfaces: bindings.interfaces })
+          : bindings;
+      }
+      const diagnostics = Object.getOwnPropertyDescriptor(boot, 'diagnostics');
+      const gpt =
+        diagnostics && 'value' in diagnostics
+          ? Object.getOwnPropertyDescriptor(diagnostics.value, 'gpt')
+          : undefined;
+      return gpt && 'value' in gpt
+        ? Object.freeze({ config: gpt.value, interfaces: bindings.interfaces })
+        : bindings;
+    } catch {
+      return bindings;
+    }
   }
 
   private invokeSynchronousActivation<Context>(
@@ -397,6 +788,8 @@ export function createRuntime(options: RuntimeOptions): Runtime {
     start: () => owner.start(),
     registerIntegration: (registration: unknown) => owner.registerIntegration(registration),
     install: () => owner.install(),
+    protectFirstDisplayAttemptBatch: (terminalLatches: readonly PromiseLike<unknown>[]) =>
+      owner.protectFirstDisplayAttemptBatch(terminalLatches),
     dispose: () => owner.dispose(),
   });
 }

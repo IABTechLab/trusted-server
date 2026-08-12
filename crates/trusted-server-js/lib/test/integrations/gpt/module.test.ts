@@ -138,22 +138,89 @@ function callbacks(order: string[]): IntegrationInstallCallbacks {
 
 describe('transactional GPT integration module', () => {
   afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
     resetGuardState();
     delete (window as Window & { googletag?: unknown }).googletag;
+    document.getElementById('critical-slot')?.remove();
+    document.getElementById('spa-winner')?.remove();
   });
 
   it.each([false, true])(
     'uses only catalog capabilities and conditions diagnostics-only GPT listeners (active=%s)',
     async (diagnosticsActive) => {
+      vi.useFakeTimers();
+      const NativeMutationObserver = window.MutationObserver;
+      const activeMutationObservers = new Set<MutationObserver>();
+      class TrackingMutationObserver implements MutationObserver {
+        readonly inner: MutationObserver;
+
+        constructor(callback: MutationCallback) {
+          this.inner = new NativeMutationObserver(callback);
+        }
+
+        disconnect(): void {
+          activeMutationObservers.delete(this);
+          this.inner.disconnect();
+        }
+
+        observe(target: Node, options?: MutationObserverInit): void {
+          activeMutationObservers.add(this);
+          this.inner.observe(target, options);
+        }
+
+        takeRecords(): MutationRecord[] {
+          return this.inner.takeRecords();
+        }
+      }
+      vi.stubGlobal('MutationObserver', TrackingMutationObserver);
       const listenerTypes: string[] = [];
       const removedTypes: string[] = [];
+      const targeting = new Map<string, readonly string[]>();
+      const publisherSlot = {
+        clearTargeting: vi.fn((key?: string) => {
+          if (key === undefined) targeting.clear();
+          else targeting.delete(key);
+          return publisherSlot;
+        }),
+        getAdUnitPath: () => '/123/spa-winner',
+        getSlotElementId: () => 'spa-winner',
+        getTargeting: (key: string) => targeting.get(key) ?? [],
+        setTargeting: vi.fn((key: string, value: string | readonly string[]) => {
+          targeting.set(key, typeof value === 'string' ? [value] : value);
+          return publisherSlot;
+        }),
+      };
+      const definedSlots: object[] = [];
+      const createDefinedSlot = (adUnitPath: string, elementId: string) => ({
+        addService: vi.fn(),
+        clearTargeting: vi.fn(),
+        getAdUnitPath: () => adUnitPath,
+        getSlotElementId: () => elementId,
+        getTargeting: () => [],
+        setTargeting: vi.fn(),
+      });
+      const defineSlot = vi.fn((adUnitPath: string, _sizes: unknown, elementId: string) => {
+        const slot = createDefinedSlot(adUnitPath, elementId);
+        definedSlots.push(slot);
+        return slot;
+      });
+      const destroySlots = vi.fn((slots: readonly object[]) => {
+        for (const slot of slots) {
+          const index = definedSlots.indexOf(slot);
+          if (index >= 0) definedSlots.splice(index, 1);
+        }
+        return true;
+      });
+      const display = vi.fn();
+      const refresh = vi.fn();
       const pubads = {
         addEventListener: vi.fn((type: string, _listener: (event: unknown) => void) => {
           listenerTypes.push(type);
         }),
         disableInitialLoad: vi.fn(),
-        getSlots: vi.fn(() => []),
-        refresh: vi.fn(),
+        getSlots: vi.fn(() => [publisherSlot, ...definedSlots]),
+        refresh,
         removeEventListener: vi.fn((type: string, _listener: (event: unknown) => void) => {
           removedTypes.push(type);
         }),
@@ -162,9 +229,9 @@ describe('transactional GPT integration module', () => {
         apiReady: true,
         pubadsReady: true,
         cmd: { push: (command: () => void) => (command(), 0) },
-        defineSlot: vi.fn(),
-        destroySlots: vi.fn(() => true),
-        display: vi.fn(),
+        defineSlot,
+        destroySlots,
+        display,
         getConfig: vi.fn(() => ({ disableInitialLoad: false })),
         pubads: () => pubads,
         setConfig: vi.fn(),
@@ -181,6 +248,7 @@ describe('transactional GPT integration module', () => {
         ]),
       });
       const runtime = Object.freeze({
+        attachAuctionContextService: () => () => undefined,
         boot: () =>
           Object.freeze({
             auctionProjection: Object.freeze({
@@ -188,9 +256,22 @@ describe('transactional GPT integration module', () => {
               auction: Object.freeze({
                 version: 1,
                 auctionId: 'initial',
-                results: Object.freeze([]),
+                results: Object.freeze([
+                  Object.freeze({
+                    slot: 'critical-slot',
+                    outcome: 'no_bid' as const,
+                  }),
+                ]),
               }),
-              slots: Object.freeze([]),
+              slots: Object.freeze([
+                Object.freeze({
+                  slot: 'critical-slot',
+                  gamUnitPath: '/123/critical-slot',
+                  divId: 'critical-slot',
+                  formats: Object.freeze([Object.freeze([300, 250] as const)]),
+                  targeting: Object.freeze({}),
+                }),
+              ]),
               bids: Object.freeze([]),
             }),
             diagnostics: Object.freeze({
@@ -201,8 +282,10 @@ describe('transactional GPT integration module', () => {
             manifest: bootManifest,
           }),
         document,
+        enqueue: () => true,
         generation: Object.freeze({}),
         protectFirstDisplayAttemptBatch: protect,
+        registerAuctionContext: () => () => undefined,
       } satisfies RuntimeCapabilityV1);
       const registry = createIntegrationRegistry({
         manifest: bootManifest,
@@ -254,11 +337,53 @@ describe('transactional GPT integration module', () => {
         startedAtMs: 0,
         now: () => 0,
       });
+      const criticalElement = document.createElement('div');
+      criticalElement.id = 'critical-slot';
+      document.body.appendChild(criticalElement);
       expect(registry.register(createRenderRuntimeIntegrationRegistration(RELEASE_ID))).toBe(true);
       expect(registry.register(createProductionGptRegistration(RELEASE_ID))).toBe(true);
 
       const result = await registry.install(callbacks([]));
       expect(result.state).toBe('kernel');
+      const gpt = providerFacades.get('gpt.v1') as {
+        activateLaterLifecycle: () => Readonly<{
+          navigate: (path: string) => Promise<unknown>;
+          release: () => void;
+        }>;
+        navigation: () => Readonly<{
+          generation: object;
+          currentAuctionProjection?: Readonly<{ auction?: Readonly<{ auctionId?: string }> }>;
+        }>;
+        slots: {
+          request: (input: Readonly<Record<string, unknown>>) => unknown;
+        };
+      };
+      await vi.waitFor(() => expect(definedSlots).toHaveLength(1));
+      const criticalNavigation = gpt.navigation();
+      gpt.slots.request({
+        intentId: 'critical-request',
+        navigationGeneration: criticalNavigation.generation,
+        operation: 'display',
+        registeredSlotId: 'critical-slot',
+        requestClass: 'initial',
+      });
+      await vi.waitFor(() => expect(display).toHaveBeenCalledOnce());
+      expect(protect).not.toHaveBeenCalled();
+      expect(activeMutationObservers.size).toBe(2);
+      const firstPhysicalSlot = definedSlots[0];
+      expect(firstPhysicalSlot).toBeDefined();
+      criticalElement.remove();
+      const replacementElement = document.createElement('div');
+      replacementElement.id = 'critical-slot';
+      document.body.appendChild(replacementElement);
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(250);
+      expect(destroySlots).toHaveBeenCalledWith([firstPhysicalSlot]);
+      expect(definedSlots).toHaveLength(1);
+      expect(definedSlots[0]).not.toBe(firstPhysicalSlot);
+      expect(activeMutationObservers.size).toBe(2);
+      expect(vi.getTimerCount()).toBe(0);
+      vi.useRealTimers();
       expect([...providerFacades.keys()]).toEqual([
         'slots.v1',
         'auction.v1',
@@ -275,8 +400,10 @@ describe('transactional GPT integration module', () => {
         'render',
       ]);
       const render = providerFacades.get('render.v1') as {
+        attachPucGamAttemptRegistrar: (registrar: (input: unknown) => boolean) => () => void;
         registerRenderer: (type: 'cache', renderer: () => boolean) => () => void;
       };
+      expect(() => render.attachPucGamAttemptRegistrar(() => true)).toThrow('duplicated');
       expect(() => render.registerRenderer('cache', () => false)).toThrow('duplicated');
       expect(protect).not.toHaveBeenCalled();
       expect([...listenerTypes].sort()).toEqual(
@@ -294,9 +421,124 @@ describe('transactional GPT integration module', () => {
       );
       expect(listenerTypes.slice(0, 2)).toEqual(['slotRequested', 'slotRenderEnded']);
 
+      const placement = {
+        slot: 'spa-winner',
+        gamUnitPath: '/123/spa-winner',
+        divId: 'spa-winner',
+        formats: [[300, 250]],
+        targeting: {},
+      };
+      const bid = {
+        candidateId: 'BBBBBBBBBBBB',
+        slot: placement.slot,
+        provider: 'trusted',
+        upstreamBidId: 'spa-upstream',
+        cpm: 2,
+        currency: 'USD',
+        targeting: { hb_bidder: 'trusted' },
+        rendererReservationId: `r1_${'s'.repeat(22)}`,
+        renderSource: {
+          type: 'adm',
+          version: 1,
+          adm: '<main>spa winner</main>',
+          width: 300,
+          height: 250,
+        },
+      };
+      const pageBids = {
+        version: 1,
+        auction: {
+          version: 1,
+          auctionId: 'spa-production',
+          results: [{ slot: placement.slot, outcome: 'winner', candidateId: bid.candidateId }],
+        },
+        slots: [placement],
+        bids: [bid],
+      };
+      const slotElement = document.createElement('div');
+      slotElement.id = placement.divId;
+      document.body.appendChild(slotElement);
+      const fetchPageBids = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue({ ok: true, json: async () => pageBids } as Response);
+      const initialNavigation = gpt.navigation();
+      expect(refresh).not.toHaveBeenCalled();
+      const later = gpt.activateLaterLifecycle();
+      expect(Object.isFrozen(later)).toBe(true);
+      expect(activeMutationObservers.size).toBe(2);
+      expect(() => gpt.activateLaterLifecycle()).toThrow('unavailable');
+      const navigationResult = await later.navigate('/spa-production?route=one');
+      expect(navigationResult).toEqual({
+        status: 'committed',
+        navigationGeneration: expect.any(Object),
+        current: true,
+      });
+      expect(fetchPageBids).toHaveBeenCalledExactlyOnceWith(
+        '/_ts/page-bids?path=%2Fspa-production%3Froute%3Done',
+        expect.objectContaining({
+          credentials: 'include',
+          headers: { 'X-TSJS-Page-Bids': '1' },
+          signal: expect.any(AbortSignal),
+        })
+      );
+      expect(gpt.navigation()).not.toBe(initialNavigation);
+      expect(gpt.navigation()?.currentAuctionProjection?.auction?.auctionId).toBe('spa-production');
+      expect(refresh).toHaveBeenCalledExactlyOnceWith(
+        [publisherSlot],
+        Object.freeze({ changeCorrelator: false })
+      );
+
+      let resolveStaleResponse!: (response: Response) => void;
+      const concurrentPageBids = {
+        version: 1,
+        auction: {
+          version: 1,
+          auctionId: 'concurrent-current',
+          results: [],
+        },
+        slots: [],
+        bids: [],
+      };
+      fetchPageBids
+        .mockReturnValueOnce(
+          new Promise<Response>((resolve) => {
+            resolveStaleResponse = resolve;
+          })
+        )
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => concurrentPageBids,
+        } as Response);
+      const staleNavigation = later.navigate('/stale-generation');
+      await vi.waitFor(() => expect(fetchPageBids).toHaveBeenCalledTimes(2));
+      const currentNavigation = later.navigate('/current-generation');
+      await expect(currentNavigation).resolves.toEqual({
+        status: 'committed',
+        navigationGeneration: expect.any(Object),
+        current: true,
+      });
+      resolveStaleResponse({ ok: true, json: async () => pageBids } as Response);
+      const staleResult = await staleNavigation;
+      expect(staleResult).toEqual({
+        status: 'rejected',
+        navigationGeneration: expect.any(Object),
+        current: false,
+      });
+      expect((staleResult as { navigationGeneration: object }).navigationGeneration).not.toBe(
+        ((await currentNavigation) as { navigationGeneration: object }).navigationGeneration
+      );
+      later.release();
+      expect(activeMutationObservers.size).toBe(1);
+      await later.navigate('/disposed-owner');
+      expect(fetchPageBids).toHaveBeenCalledTimes(3);
+      fetchPageBids.mockRestore();
+      slotElement.remove();
+
       if (result.state === 'kernel') result.dispose();
+      expect(activeMutationObservers.size).toBe(0);
       expect(removedTypes.sort()).toEqual([...listenerTypes].sort());
       expect(providerFacades.size).toBe(0);
+      expect(() => render.attachPucGamAttemptRegistrar(() => true)).toThrow('unavailable');
       expect(() => render.registerRenderer('cache', () => false)).toThrow('inactive');
     }
   );

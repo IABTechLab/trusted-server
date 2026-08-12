@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { GoogletagAdapter } from '../../../src/adapters/googletag';
 import {
@@ -8,9 +8,9 @@ import {
 } from '../../../src/adapters/prebid';
 import {
   createPrebidRefreshPolicy,
+  createPrebidIntegrationRegistration,
   createPrebidSelectionCoordinator,
   createPrebidSyntheticRefreshRunner,
-  createPrebidIntegrationRegistration,
   preparePrebidRegisteredRefreshAuction,
   publishPrebidBid,
   type PrebidBidPublicationInput,
@@ -19,6 +19,7 @@ import {
 import { createTestNavigationIdentityIssuer } from '../../../src/kernel/identity';
 import {
   createIntegrationRegistry,
+  type IntegrationActivationContext,
   type IntegrationInstallCallbacks,
   type IntegrationRegistration,
 } from '../../../src/kernel/integration_registry';
@@ -36,7 +37,8 @@ function manifest(ids: readonly string[]) {
   return {
     version: 1,
     releaseId: RELEASE_ID,
-    integrations: ids.map((id) => ({ id, required: true })),
+    criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
+    integrations: ids.map((id) => ({ id, phase: 'critical' as const })),
   };
 }
 
@@ -44,7 +46,7 @@ function registration(
   id: string,
   prepare: IntegrationRegistration['prepare']
 ): IntegrationRegistration {
-  return Object.freeze({ id, release: RELEASE_ID, prepare });
+  return Object.freeze({ abi: 1, id, phase: 'critical', releaseId: RELEASE_ID, prepare });
 }
 
 function callbacks(order: string[]): IntegrationInstallCallbacks {
@@ -55,7 +57,373 @@ function callbacks(order: string[]): IntegrationInstallCallbacks {
   };
 }
 
-describe('transactional Prebid integration module', () => {
+function recursivelyFrozen(candidate: unknown, seen = new Set<object>()): boolean {
+  if (candidate === null || (typeof candidate !== 'object' && typeof candidate !== 'function')) {
+    return typeof candidate !== 'number' || Number.isFinite(candidate);
+  }
+  if (typeof candidate === 'function' || seen.has(candidate) || !Object.isFrozen(candidate)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(candidate);
+  if (
+    prototype !== Object.prototype &&
+    prototype !== null &&
+    !(Array.isArray(candidate) && prototype === Array.prototype)
+  ) {
+    return false;
+  }
+  seen.add(candidate);
+  return Reflect.ownKeys(candidate).every((key) => {
+    const descriptor = Object.getOwnPropertyDescriptor(candidate, key);
+    return (
+      descriptor !== undefined && 'value' in descriptor && recursivelyFrozen(descriptor.value, seen)
+    );
+  });
+}
+
+function createLegacyPrebidRegistrationForTest(_releaseId: string): IntegrationRegistration {
+  return registration('prebid', ({ config, interfaces }) => {
+    if (!recursivelyFrozen(config)) throw new TypeError('Prebid test config is invalid');
+    const runtime = interfaces['prebid'] as
+      Readonly<{ activate?: () => unknown; start?: (config: unknown) => void }> | undefined;
+    if (
+      !runtime ||
+      !Object.isFrozen(runtime) ||
+      typeof runtime.activate !== 'function' ||
+      typeof runtime.start !== 'function'
+    ) {
+      throw new TypeError('Prebid test runtime is unavailable');
+    }
+    const activate = runtime.activate;
+    const start = runtime.start;
+    return Object.freeze({
+      activate: ({ afterCommit, onDispose }: IntegrationActivationContext) => {
+        const release = activate();
+        if (typeof release !== 'function') {
+          throw new TypeError('Prebid test runtime disposer is unavailable');
+        }
+        onDispose(release as () => void);
+        afterCommit(() => start(config));
+      },
+    });
+  });
+}
+
+type TrustedServerBidder = Readonly<{
+  callBids: (
+    request: Readonly<object>,
+    addBidResponse: (adUnitCode: string, bid: Readonly<Record<string, unknown>>) => void,
+    done: () => void
+  ) => void;
+}>;
+
+function recursivelyFreeze<T>(value: T): T {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    for (const child of Object.values(value)) recursivelyFreeze(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+function productionPrebidBinding(userIdModules: readonly object[]) {
+  const listeners = new Map<string, Set<(event: unknown) => void>>();
+  const responses = new Map<string, readonly Readonly<Record<string, unknown>>[]>();
+  let bidder: TrustedServerBidder | undefined;
+  let highest: readonly object[] = Object.freeze([]);
+  const responseFor = (adUnitCode: string) => {
+    const response = [...(responses.get(adUnitCode) ?? [])] as object[] & { bids: object[] };
+    response.bids = response;
+    return response;
+  };
+  const pbjs = {
+    addAdUnits: vi.fn(),
+    getBidResponsesForAdUnitCode: vi.fn((adUnitCode: string) => responseFor(adUnitCode)),
+    getHighestCpmBids: vi.fn(() => [...highest]),
+    offEvent: vi.fn((type: string, listener: (event: unknown) => void) => {
+      listeners.get(type)?.delete(listener);
+    }),
+    onEvent: vi.fn((type: string, listener: (event: unknown) => void) => {
+      const current = listeners.get(type) ?? new Set();
+      current.add(listener);
+      listeners.set(type, current);
+    }),
+    processQueue: vi.fn(),
+    registerBidAdapter: vi.fn((factory: () => TrustedServerBidder) => {
+      bidder = factory();
+    }),
+    renderAd: vi.fn(),
+    requestBids: vi.fn(),
+    setTargetingForGPTAsync: vi.fn(),
+    que: Object.freeze({
+      push: (command: () => void) => {
+        command();
+        return 1;
+      },
+    }),
+  };
+  const stamp = recursivelyFreeze({
+    abi: 1,
+    artifactReleaseId: 'b'.repeat(64),
+    prebidVersion: '10.26.0',
+    moduleStems: ['alphaBidAdapter', 'sharedIdSystem'],
+    bidderCodes: ['alpha'],
+    bidderAliases: [],
+    userIdModules: [...userIdModules],
+  });
+  Object.defineProperty(pbjs, '__trustedServerArtifactV1', {
+    configurable: false,
+    enumerable: false,
+    value: stamp,
+    writable: false,
+  });
+  return Object.freeze({
+    addResponse: (adUnitCode: string, bid: Readonly<Record<string, unknown>>): void => {
+      responses.set(adUnitCode, Object.freeze([bid]));
+      for (const listener of listeners.get('bidResponse') ?? []) listener(bid);
+    },
+    bidder: () => bidder,
+    emit: (type: string, event: unknown): void => {
+      for (const listener of listeners.get(type) ?? []) listener(event);
+    },
+    pbjs,
+    select: (bids: readonly object[]): void => {
+      highest = Object.freeze([...bids]);
+    },
+  });
+}
+
+function requiredUserIdConfig() {
+  return Object.freeze({
+    clientSideBidders: Object.freeze(['alpha']),
+    requiredUserIdModules: Object.freeze([
+      Object.freeze({
+        moduleName: 'sharedIdSystem',
+        configNames: Object.freeze(['sharedId']),
+        eidSources: Object.freeze(['sharedid.org']),
+      }),
+    ]),
+  });
+}
+
+function initialProductionPrebidHarness(userIdModules: readonly object[]) {
+  const binding = productionPrebidBinding(userIdModules);
+  (window as unknown as { pbjs?: unknown }).pbjs = binding.pbjs;
+  const runtime = createRuntimeSession({
+    createIdentityIssuer: () =>
+      createTestNavigationIdentityIssuer({
+        getRandomValues: (target) => {
+          target.fill(9);
+          return target;
+        },
+      }),
+  });
+  const navigationResult = runtime.startInitialNavigation();
+  if (!navigationResult.ok) throw new Error('Expected initial navigation');
+  const navigation = navigationResult.value;
+  const renderSource = Object.freeze({
+    type: 'adm' as const,
+    version: 1 as const,
+    adm: '<main>production-prebid</main>',
+    width: 300,
+    height: 250,
+  });
+  const bid = Object.freeze({
+    candidateId: 'AAAAAAAAAAAA',
+    slot: 'slot-one',
+    provider: 'aps',
+    upstreamBidId: 'upstream-one',
+    cpm: 1.25,
+    currency: 'USD' as const,
+    targeting: Object.freeze({ hb_bidder: 'trustedServer' }),
+    rendererReservationId: `r1_${'p'.repeat(22)}`,
+    renderSource,
+  });
+  const projection = Object.freeze({
+    version: 1,
+    auction: Object.freeze({
+      version: 1,
+      auctionId: 'auction-one',
+      results: Object.freeze([
+        Object.freeze({
+          slot: bid.slot,
+          outcome: 'winner' as const,
+          candidateId: bid.candidateId,
+        }),
+      ]),
+    }),
+    bids: Object.freeze([bid]),
+  });
+  if (!navigation.installAuctionProjection(projection)) throw new Error('Expected projection');
+  const reservations = createReservationService({
+    prepareRenderSource: (candidate) =>
+      typeof candidate === 'object' && candidate !== null && Object.isFrozen(candidate)
+        ? (candidate as typeof renderSource)
+        : undefined,
+  });
+  const artifacts = createCommittedArtifactStore();
+  const registerPucGamAttempt = vi.fn(() => true);
+  const createAttempt = (owner: RenderAttemptScope) =>
+    createRenderAttempt({
+      artifacts,
+      owner,
+      prepareRenderSource: (candidate) =>
+        typeof candidate === 'object' && candidate !== null && Object.isFrozen(candidate)
+          ? (candidate as typeof renderSource)
+          : undefined,
+      reservations,
+    });
+  const preparationDisposers: Array<() => void> = [];
+  const activationDisposers: Array<() => void> = [];
+  const afterCommit: Array<() => void> = [];
+  const controller = new AbortController();
+  return Object.freeze({
+    activationContext: Object.freeze({
+      afterCommit: (callback: () => void) => afterCommit.push(callback),
+      onDispose: (callback: () => void) => activationDisposers.push(callback),
+      signal: controller.signal,
+    }),
+    afterCommit,
+    bid,
+    binding,
+    config: requiredUserIdConfig(),
+    dispose: () => {
+      for (let index = activationDisposers.length - 1; index >= 0; index -= 1) {
+        activationDisposers[index]?.();
+      }
+      for (let index = preparationDisposers.length - 1; index >= 0; index -= 1) {
+        preparationDisposers[index]?.();
+      }
+      reservations.dispose();
+      artifacts.dispose();
+      runtime.dispose();
+      delete (window as unknown as { pbjs?: unknown }).pbjs;
+    },
+    interfaces: Object.freeze({
+      'runtime.v1': Object.freeze({ document }),
+      'slots.v1': Object.freeze({}),
+      'render.v1': Object.freeze({
+        createAttempt,
+        navigation,
+        projection,
+        registerPucGamAttempt,
+        reservations,
+      }),
+      'messages.v1': Object.freeze({}),
+      'aps.v1': Object.freeze({}),
+    }),
+    navigation,
+    prepareContext: Object.freeze({
+      config: requiredUserIdConfig(),
+      interfaces: Object.freeze({
+        'runtime.v1': Object.freeze({ document }),
+        'slots.v1': Object.freeze({}),
+        'render.v1': Object.freeze({
+          createAttempt,
+          navigation,
+          projection,
+          registerPucGamAttempt,
+          reservations,
+        }),
+        'messages.v1': Object.freeze({}),
+        'aps.v1': Object.freeze({}),
+      }),
+      onDispose: (callback: () => void) => preparationDisposers.push(callback),
+      signal: controller.signal,
+    }),
+    registerPucGamAttempt,
+    reservations,
+  });
+}
+
+describe('production Prebid critical registration', () => {
+  afterEach(() => {
+    delete (window as unknown as { pbjs?: unknown }).pbjs;
+  });
+
+  it('passes exact configured user-ID/EID requirements into artifact admission', async () => {
+    const harness = initialProductionPrebidHarness([]);
+    try {
+      const prepared = await createPrebidIntegrationRegistration(RELEASE_ID).prepare(
+        harness.prepareContext
+      );
+      const capability = prepared.interfaces?.['prebid.v1'] as
+        Readonly<{ adapter?: PrebidAdapter }> | undefined;
+      expect(capability?.adapter?.bindingStatus()).toBe('incompatible');
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it('publishes the initial TS winner and promotes its exact selection through render.v1', async () => {
+    const harness = initialProductionPrebidHarness([
+      Object.freeze({
+        moduleName: 'sharedIdSystem',
+        configNames: Object.freeze(['sharedId']),
+        eidSources: Object.freeze(['sharedid.org']),
+      }),
+    ]);
+    try {
+      const prepared = await createPrebidIntegrationRegistration(RELEASE_ID).prepare(
+        harness.prepareContext
+      );
+      prepared.activate(harness.activationContext);
+      for (const callback of harness.afterCommit) callback();
+      const bidder = harness.binding.bidder();
+      if (!bidder) throw new Error('Expected trustedServer bidder registration');
+      const done = vi.fn();
+      let admitted: Readonly<Record<string, unknown>> | undefined;
+      bidder.callBids(
+        Object.freeze({
+          auctionId: 'auction-one',
+          bids: Object.freeze([
+            Object.freeze({
+              adUnitCode: 'slot-one',
+              adUnitId: 'unit-one',
+              auctionId: 'auction-one',
+              bidId: 'request-one',
+              src: 'client',
+              transactionId: 'transaction-one',
+            }),
+          ]),
+        }),
+        (adUnitCode, response) => {
+          const enriched = Object.freeze({ ...response, adUnitCode });
+          admitted = enriched;
+          harness.binding.addResponse(adUnitCode, enriched);
+        },
+        done
+      );
+      expect(done).toHaveBeenCalledOnce();
+      expect(admitted).toMatchObject({
+        adId: harness.bid.rendererReservationId,
+        bidderCode: 'trustedServer',
+        requestId: 'request-one',
+      });
+      const selected = admitted;
+      if (!selected) throw new Error('Expected admitted TS bid');
+      harness.binding.select([
+        Object.freeze({
+          ...selected,
+          adUnitCode: 'slot-one',
+          auctionId: 'auction-one',
+        }),
+      ]);
+      expect(harness.reservations.recognize(harness.bid.rendererReservationId)).toMatchObject({
+        state: 'awaiting_prebid_selection',
+      });
+      harness.binding.emit('auctionEnd', Object.freeze({ auctionId: 'auction-one' }));
+      expect(harness.binding.pbjs.getHighestCpmBids).toHaveBeenCalledOnce();
+      expect(harness.registerPucGamAttempt).toHaveBeenCalledOnce();
+      expect(harness.reservations.recognize(harness.bid.rendererReservationId)).toMatchObject({
+        state: 'renderable',
+      });
+    } finally {
+      harness.dispose();
+    }
+  });
+});
+
+describe('transactional test-composition Prebid boundary', () => {
   it('prepares inertly, activates reversible listeners, and starts only after commit', async () => {
     const config = Object.freeze({ clientSideBidders: Object.freeze(['rubicon']) });
     const order: string[] = [];
@@ -83,7 +451,7 @@ describe('transactional Prebid integration module', () => {
         interfaces: Object.freeze({ prebid: Object.freeze({ activate, start }) }),
       }),
     });
-    registry.register(createPrebidIntegrationRegistration(RELEASE_ID));
+    registry.register(createLegacyPrebidRegistrationForTest(RELEASE_ID));
     registry.register(
       registration('gate', async () => {
         order.push('gate:prepare');
@@ -134,7 +502,7 @@ describe('transactional Prebid integration module', () => {
         }),
       }),
     });
-    registry.register(createPrebidIntegrationRegistration(RELEASE_ID));
+    registry.register(createLegacyPrebidRegistrationForTest(RELEASE_ID));
     registry.register(
       registration('broken', () => ({
         activate: () => {
@@ -171,7 +539,7 @@ describe('transactional Prebid integration module', () => {
         }),
       }),
     });
-    registry.register(createPrebidIntegrationRegistration(RELEASE_ID));
+    registry.register(createLegacyPrebidRegistrationForTest(RELEASE_ID));
 
     await expect(registry.install(callbacks([]))).resolves.toMatchObject({
       state: 'fallback',
@@ -189,7 +557,7 @@ describe('transactional Prebid integration module', () => {
       now: () => 0,
       getBindings: () => ({ config: Object.freeze({}), interfaces: Object.freeze({}) }),
     });
-    registry.register(createPrebidIntegrationRegistration(RELEASE_ID));
+    registry.register(createLegacyPrebidRegistrationForTest(RELEASE_ID));
 
     await expect(registry.install(callbacks([]))).resolves.toMatchObject({
       state: 'fallback',
@@ -224,7 +592,7 @@ describe('transactional Prebid integration module', () => {
         }),
       }),
     });
-    registry.register(createPrebidIntegrationRegistration(RELEASE_ID));
+    registry.register(createLegacyPrebidRegistrationForTest(RELEASE_ID));
 
     await expect(registry.install(callbacks([]))).resolves.toMatchObject({
       state: 'fallback',
@@ -252,7 +620,7 @@ describe('transactional Prebid integration module', () => {
         }),
       }),
     });
-    registry.register(createPrebidIntegrationRegistration(RELEASE_ID));
+    registry.register(createLegacyPrebidRegistrationForTest(RELEASE_ID));
 
     await expect(registry.install(callbacks([]))).resolves.toMatchObject({
       state: 'kernel',

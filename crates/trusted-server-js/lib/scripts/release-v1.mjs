@@ -2,22 +2,50 @@ import { createHash } from 'node:crypto';
 
 export const RELEASE_SENTINEL = '__TSJS_RELEASE_ID_SENTINEL_V1__';
 
-export function computeReleaseId(bundles) {
+const RELEASE_PREFIX = Buffer.from('tsjs-release-v1\0', 'ascii');
+
+function u64(value) {
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error('Invalid release frame length');
+  const bytes = Buffer.alloc(8);
+  bytes.writeBigUInt64BE(BigInt(value));
+  return bytes;
+}
+
+function framed(value) {
+  const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value, 'utf8');
+  return Buffer.concat([u64(bytes.byteLength), bytes]);
+}
+
+function validateArtifact(artifact, seen) {
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(artifact.id) || seen.has(artifact.id)) {
+    throw new Error('Invalid release bundle id');
+  }
+  for (const field of ['role', 'phase', 'trigger']) {
+    if (typeof artifact[field] !== 'string') {
+      throw new Error(`Invalid release artifact ${field}: ${artifact.id}`);
+    }
+  }
+  seen.add(artifact.id);
+}
+
+export function computeReleaseId(artifacts) {
   const hasher = createHash('sha256');
-  hasher.update('tsjs-release-v1\0');
+  hasher.update(RELEASE_PREFIX);
+  hasher.update(u64(artifacts.length));
   const seen = new Set();
-  for (const bundle of bundles) {
-    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(bundle.id) || seen.has(bundle.id)) {
-      throw new Error('Invalid release bundle id');
-    }
-    seen.add(bundle.id);
-    const bytes = Buffer.isBuffer(bundle.bytes) ? bundle.bytes : Buffer.from(bundle.bytes);
+  for (const artifact of artifacts) {
+    validateArtifact(artifact, seen);
+    const bytes = Buffer.isBuffer(artifact.bytes)
+      ? artifact.bytes
+      : Buffer.from(artifact.bytes, 'utf8');
     if (bytes.toString('utf8').split(RELEASE_SENTINEL).length - 1 !== 1) {
-      throw new Error(`Expected exactly one release sentinel: ${bundle.id}`);
+      throw new Error(`Expected exactly one release sentinel: ${artifact.id}`);
     }
-    hasher.update(`${bundle.id}\0${bytes.byteLength}\0`);
-    hasher.update(bytes);
-    hasher.update('\0');
+    hasher.update(framed(artifact.id));
+    hasher.update(framed(artifact.role));
+    hasher.update(framed(artifact.phase));
+    hasher.update(framed(artifact.trigger));
+    hasher.update(framed(bytes));
   }
   return hasher.digest('hex');
 }

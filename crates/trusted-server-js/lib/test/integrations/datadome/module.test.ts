@@ -1,4 +1,14 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const ownedGuard = vi.hoisted(() => ({
+  install: vi.fn(),
+  reset: vi.fn(),
+}));
+
+vi.mock('../../../src/integrations/datadome/script_guard', () => ({
+  installDataDomeGuard: ownedGuard.install,
+  resetGuardState: ownedGuard.reset,
+}));
 
 import {
   createDataDomeIntegrationRegistration,
@@ -21,16 +31,15 @@ function callbacks(order: string[]): IntegrationInstallCallbacks {
 }
 
 describe('transactional DataDome integration module', () => {
+  beforeEach(() => {
+    ownedGuard.install.mockReset();
+    ownedGuard.reset.mockReset();
+  });
+
   it('prepares inertly, activates before publication, and releases exactly once', async () => {
     const order: string[] = [];
-    const release = vi.fn(() => order.push('release'));
-    const runtime = Object.freeze({
-      activate: vi.fn(() => {
-        order.push('datadome:activate');
-        return release;
-      }),
-      start: vi.fn(() => order.push('datadome:start')),
-    });
+    ownedGuard.install.mockImplementation(() => order.push('datadome:activate'));
+    ownedGuard.reset.mockImplementation(() => order.push('datadome:release'));
     const registry = createIntegrationRegistry({
       manifest: {
         version: 1,
@@ -44,22 +53,22 @@ describe('transactional DataDome integration module', () => {
       now: () => 0,
       getBindings: () => ({
         config: undefined,
-        interfaces: Object.freeze({ datadome: runtime }),
+        interfaces: Object.freeze({}),
       }),
     });
     registry.register(createDataDomeIntegrationRegistration(RELEASE_ID));
 
-    expect(runtime.activate).not.toHaveBeenCalled();
-    expect(runtime.start).not.toHaveBeenCalled();
+    expect(ownedGuard.install).not.toHaveBeenCalled();
     const result = await registry.install(callbacks(order));
 
     expect(result).toMatchObject({ state: 'kernel' });
-    expect(order).toEqual(['core', 'datadome:activate', 'publish', 'datadome:start', 'drain']);
+    expect(order).toEqual(['core', 'datadome:activate', 'publish', 'drain']);
     if (result.state === 'kernel') {
       result.dispose();
       result.dispose();
     }
-    expect(release).toHaveBeenCalledOnce();
+    expect(ownedGuard.reset).toHaveBeenCalledOnce();
+    expect(order[order.length - 1]).toBe('datadome:release');
   });
 
   it.each([null, Object.freeze({}), false])('rejects non-absent config %j', async (config) => {

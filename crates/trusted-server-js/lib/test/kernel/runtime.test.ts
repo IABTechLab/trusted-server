@@ -6,9 +6,29 @@ import {
   TsjsUnavailableError,
   type AdUnitRegistrationErrorCode,
 } from '../../src/kernel/fallback';
-import { createRuntime } from '../../src/kernel/runtime';
+import { createRuntime as createRuntimeOwner, type RuntimeOptions } from '../../src/kernel/runtime';
+import { createDiagnosticsPresentationIntegrationRegistration } from '../../src/integrations/gpt_diagnostics/presentation';
+import { createLifecycleIntegrationRegistration } from '../../src/kernel/lifecycle_module';
 
 const RELEASE = 'a'.repeat(64);
+const TRUSTED_CRITICAL_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
+
+function installTestCriticalScript(runtimeDocument: Document): void {
+  if (runtimeDocument.currentScript) return;
+  const script = runtimeDocument.createElement('script');
+  script.id = 'trustedserver-js';
+  script.src = new URL(TRUSTED_CRITICAL_SRC, runtimeDocument.location.origin).href;
+  runtimeDocument.head.insertBefore(script, null);
+  Object.defineProperty(runtimeDocument, 'currentScript', {
+    configurable: true,
+    value: script,
+  });
+}
+
+function createRuntime(options: RuntimeOptions) {
+  installTestCriticalScript(options.document ?? document);
+  return createRuntimeOwner(options);
+}
 
 function boot(results: readonly object[] = []) {
   return {
@@ -33,10 +53,28 @@ function boot(results: readonly object[] = []) {
 }
 
 function manifest(ids: readonly string[]) {
+  const deferredIds = new Set([
+    'diagnostics_presentation',
+    'gpt_later',
+    'osano_lifecycle',
+    'permutive_lifecycle',
+    'prebid_later',
+    'sourcepoint_lifecycle',
+  ]);
   return {
     version: 1,
     releaseId: RELEASE,
-    integrations: ids.map((id) => ({ id, required: true })),
+    criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
+    integrations: ids.map((id) =>
+      deferredIds.has(id)
+        ? {
+            id,
+            phase: 'deferred' as const,
+            trigger: 'first_display_or_idle' as const,
+            src: `/static/tsjs=tsjs-${id}.min.js?v=${'d'.repeat(64)}`,
+          }
+        : { id, phase: 'critical' as const }
+    ),
   };
 }
 
@@ -63,7 +101,12 @@ function thrownBy(callback: () => unknown): unknown {
 }
 
 describe('Runtime bootstrap owner', () => {
-  afterEach(() => vi.useRealTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    document.head.replaceChildren();
+    Object.defineProperty(document, 'currentScript', { configurable: true, value: null });
+  });
 
   it('exports the exact programmatic registration error taxonomy', () => {
     type ExpectedCode =
@@ -83,6 +126,147 @@ describe('Runtime bootstrap owner', () => {
 
     expectTypeOf<AdUnitRegistrationErrorCode>().toEqualTypeOf<ExpectedCode>();
     expectTypeOf<AdUnitRegistrationError['code']>().toEqualTypeOf<ExpectedCode>();
+  });
+
+  it.each([
+    {
+      boundary: 'no document',
+      arrange: () => {
+        vi.stubGlobal('document', undefined);
+        return undefined;
+      },
+    },
+    {
+      boundary: 'no critical tag',
+      arrange: () => document,
+    },
+    {
+      boundary: 'wrong realm and owner document',
+      arrange: () => {
+        const frame = document.createElement('iframe');
+        document.body.append(frame);
+        const foreignDocument = frame.contentDocument;
+        if (!foreignDocument) throw new Error('should expose an iframe document');
+        const script = foreignDocument.createElement('script');
+        script.id = 'trustedserver-js';
+        script.src = new URL(TRUSTED_CRITICAL_SRC, window.location.origin).href;
+        foreignDocument.head.append(script);
+        Object.defineProperty(document, 'currentScript', { configurable: true, value: script });
+        return document;
+      },
+    },
+    {
+      boundary: 'wrong id',
+      arrange: () => {
+        const script = document.createElement('script');
+        script.id = 'publisher-script';
+        script.src = new URL(TRUSTED_CRITICAL_SRC, window.location.origin).href;
+        document.head.append(script);
+        Object.defineProperty(document, 'currentScript', { configurable: true, value: script });
+        return document;
+      },
+    },
+    {
+      boundary: 'disconnected tag',
+      arrange: () => {
+        const script = document.createElement('script');
+        script.id = 'trustedserver-js';
+        script.src = new URL(TRUSTED_CRITICAL_SRC, window.location.origin).href;
+        Object.defineProperty(document, 'currentScript', { configurable: true, value: script });
+        return document;
+      },
+    },
+    {
+      boundary: 'duplicate tag',
+      arrange: () => {
+        const script = document.createElement('script');
+        script.id = 'trustedserver-js';
+        script.src = new URL(TRUSTED_CRITICAL_SRC, window.location.origin).href;
+        const duplicate = script.cloneNode() as HTMLScriptElement;
+        document.head.append(script, duplicate);
+        Object.defineProperty(document, 'currentScript', { configurable: true, value: script });
+        return document;
+      },
+    },
+    {
+      boundary: 'cross-origin source',
+      arrange: () => {
+        const script = document.createElement('script');
+        script.id = 'trustedserver-js';
+        script.src = `https://attacker.example${TRUSTED_CRITICAL_SRC}`;
+        document.head.append(script);
+        Object.defineProperty(document, 'currentScript', { configurable: true, value: script });
+        return document;
+      },
+    },
+    {
+      boundary: 'fragment source',
+      arrange: () => {
+        const script = document.createElement('script');
+        script.id = 'trustedserver-js';
+        script.src = `${new URL(TRUSTED_CRITICAL_SRC, window.location.origin).href}#publisher`;
+        document.head.append(script);
+        Object.defineProperty(document, 'currentScript', { configurable: true, value: script });
+        return document;
+      },
+    },
+    {
+      boundary: 'wrong route',
+      arrange: () => {
+        const script = document.createElement('script');
+        script.id = 'trustedserver-js';
+        script.src = new URL(
+          `/static/tsjs=tsjs-publisher.min.js?v=${'c'.repeat(64)}`,
+          window.location.origin
+        ).href;
+        document.head.append(script);
+        Object.defineProperty(document, 'currentScript', { configurable: true, value: script });
+        return document;
+      },
+    },
+    {
+      boundary: 'malformed artifact hash',
+      arrange: () => {
+        const script = document.createElement('script');
+        script.id = 'trustedserver-js';
+        script.src = new URL(
+          `/static/tsjs=tsjs-unified.min.js?v=${'C'.repeat(64)}`,
+          window.location.origin
+        ).href;
+        document.head.append(script);
+        Object.defineProperty(document, 'currentScript', { configurable: true, value: script });
+        return document;
+      },
+    },
+  ])('rejects caller-supplied critical source at the $boundary boundary', ({ arrange }) => {
+    const runtimeDocument = arrange();
+    const queued = vi.fn();
+    const target = { boot: boot(), que: [queued] };
+    const bootDescriptor = Object.getOwnPropertyDescriptor(target, 'boot');
+    const queueDescriptor = Object.getOwnPropertyDescriptor(target, 'que');
+    const options: RuntimeOptions & Record<string, unknown> = {
+      target,
+      releaseId: RELEASE,
+      manifest: manifest([]),
+      knownIntegrationIds: Object.freeze([] as string[]),
+      boot: target.boot,
+      ...(runtimeDocument ? { document: runtimeDocument } : {}),
+      kernel: {
+        addAdUnits: vi.fn(),
+        diagnostics: Object.freeze({}),
+        requestAds: vi.fn(),
+      },
+    };
+    options['trustedCriticalSrc'] = TRUSTED_CRITICAL_SRC;
+    const runtime = createRuntimeOwner(options);
+
+    expect(runtime.start()).toBe(false);
+    expect(runtime.state).toBe('unclaimed');
+    expect(Object.getOwnPropertyDescriptor(target, 'boot')).toEqual(bootDescriptor);
+    expect(Object.getOwnPropertyDescriptor(target, 'que')).toEqual(queueDescriptor);
+    expect(target).not.toHaveProperty('_registerIntegration');
+    expect(target).not.toHaveProperty('_internal');
+    expect(queued).not.toHaveBeenCalled();
   });
 
   it('commits one kernel after core/integration activation and afterCommit before queue drain', async () => {
@@ -108,8 +292,10 @@ describe('Runtime bootstrap owner', () => {
     expect(target.config).toEqual({ publisher: true });
     expect(
       runtime.registerIntegration({
+        abi: 1,
         id: 'gpt',
-        release: RELEASE,
+        phase: 'critical',
+        releaseId: RELEASE,
         prepare: () => ({
           activate: ({ afterCommit }: { afterCommit(callback: () => void): void }) => {
             order.push('integration');
@@ -134,6 +320,581 @@ describe('Runtime bootstrap owner', () => {
         id: 'late',
       })
     ).toBe(false);
+  });
+
+  it('publishes direct.v1 through stable public closures only after provider activation', async () => {
+    const target: Record<string, unknown> = {};
+    const addAdUnits = vi.fn((candidate: unknown) => Object.freeze({ candidate }));
+    const requestAds = vi.fn(async (_candidate?: unknown) =>
+      Object.freeze({ slots: Object.freeze([]) })
+    );
+    let active = false;
+    const runtime = createRuntime({
+      target,
+      releaseId: RELEASE,
+      manifest: manifest(['render_runtime']),
+      knownIntegrationIds: Object.freeze(['render_runtime']),
+      catalog: Object.freeze([
+        Object.freeze({
+          id: 'render_runtime',
+          phase: 'critical' as const,
+          trigger: null,
+          consumes: Object.freeze(['runtime.v1']),
+          provides: Object.freeze(['direct.v1']),
+        }),
+      ]),
+      boot: boot(),
+      kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+    });
+    expect(runtime.start()).toBe(true);
+    expect(
+      runtime.registerIntegration({
+        abi: 1,
+        id: 'render_runtime',
+        phase: 'critical',
+        releaseId: RELEASE,
+        prepare: ({ interfaces }: { interfaces: Readonly<Record<string, unknown>> }) => {
+          expect(Reflect.ownKeys(interfaces)).toEqual(['runtime.v1']);
+          return Object.freeze({
+            activate: ({ onDispose }: { onDispose(callback: () => void): void }) => {
+              active = true;
+              onDispose(() => {
+                active = false;
+              });
+            },
+            interfaces: Object.freeze({
+              'direct.v1': Object.freeze({
+                addAdUnits: (candidate: unknown) => {
+                  if (!active) throw new Error('inactive');
+                  return addAdUnits(candidate);
+                },
+                requestAds: async (candidate?: unknown) => {
+                  if (!active) throw new Error('inactive');
+                  return requestAds(candidate);
+                },
+                diagnostics: Object.freeze({ owner: 'render_runtime' }),
+              }),
+            }),
+          });
+        },
+      })
+    ).toBe(true);
+
+    await expect(runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+    const api = target as {
+      addAdUnits: (candidate: unknown) => unknown;
+      requestAds: (candidate?: unknown) => Promise<unknown>;
+      diagnostics: unknown;
+    };
+    expect(api.addAdUnits('unit')).toEqual({ candidate: 'unit' });
+    await expect(api.requestAds()).resolves.toEqual({ slots: [] });
+    expect(api.diagnostics).toEqual({ owner: 'render_runtime' });
+    runtime.dispose();
+    expect(() => api.addAdUnits('late')).toThrow('inactive');
+  });
+
+  it('publishes the staged critical GPT diagnostics API without waiting for presentation', async () => {
+    const target: Record<string, unknown> = {};
+    const renderTrace = Object.freeze({ current: vi.fn(), history: vi.fn(), subscribe: vi.fn() });
+    const gpt = Object.freeze({
+      snapshot: vi.fn(() => Object.freeze({ slots: Object.freeze([]) })),
+      export: vi.fn(),
+      subscribe: vi.fn(() => vi.fn()),
+      show: vi.fn(),
+      hide: vi.fn(),
+    });
+    const runtime = createRuntime({
+      target,
+      releaseId: RELEASE,
+      manifest: manifest(['render_runtime', 'gpt_diagnostics', 'diagnostics_presentation']),
+      knownIntegrationIds: Object.freeze([
+        'render_runtime',
+        'gpt_diagnostics',
+        'diagnostics_presentation',
+      ]),
+      catalog: Object.freeze([
+        Object.freeze({
+          id: 'render_runtime',
+          phase: 'critical' as const,
+          trigger: null,
+          consumes: Object.freeze(['runtime.v1']),
+          provides: Object.freeze(['direct.v1']),
+        }),
+        Object.freeze({
+          id: 'gpt_diagnostics',
+          phase: 'critical' as const,
+          trigger: null,
+          consumes: Object.freeze(['runtime.v1']),
+          provides: Object.freeze(['gpt_diag.v1']),
+        }),
+        Object.freeze({
+          id: 'diagnostics_presentation',
+          phase: 'deferred' as const,
+          trigger: 'first_display_or_idle' as const,
+          consumes: Object.freeze(['runtime.v1', 'gpt_diag.v1']),
+          provides: Object.freeze([]),
+        }),
+      ]),
+      boot: {
+        ...boot(),
+        diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: true } },
+      },
+      kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+    });
+    expect(runtime.start()).toBe(true);
+    expect(
+      runtime.registerIntegration({
+        abi: 1,
+        id: 'render_runtime',
+        phase: 'critical',
+        releaseId: RELEASE,
+        prepare: () =>
+          Object.freeze({
+            activate: () => undefined,
+            interfaces: Object.freeze({
+              'direct.v1': Object.freeze({
+                addAdUnits: vi.fn(),
+                requestAds: vi.fn(),
+                diagnostics: Object.freeze({ renderTrace }),
+              }),
+            }),
+          }),
+      })
+    ).toBe(true);
+    expect(
+      runtime.registerIntegration({
+        abi: 1,
+        id: 'gpt_diagnostics',
+        phase: 'critical',
+        releaseId: RELEASE,
+        prepare: () =>
+          Object.freeze({
+            activate: () => undefined,
+            interfaces: Object.freeze({
+              'gpt_diag.v1': Object.freeze({ api: gpt, attachPresentation: vi.fn() }),
+            }),
+          }),
+      })
+    ).toBe(true);
+
+    await expect(runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+    const diagnostics = target['diagnostics'] as Readonly<Record<string, unknown>>;
+    expect(Object.isFrozen(diagnostics)).toBe(true);
+    expect(Reflect.ownKeys(diagnostics)).toEqual(['renderTrace', 'gpt']);
+    expect(diagnostics['renderTrace']).toBe(renderTrace);
+    expect(diagnostics['gpt']).toBe(gpt);
+  });
+
+  it('binds creative and GPT diagnostics from the private validated boot snapshot', async () => {
+    const target: Record<string, unknown> = {};
+    const prepared = new Map<string, unknown>();
+    const runtime = createRuntime({
+      target,
+      releaseId: RELEASE,
+      manifest: manifest(['creative', 'gpt_diagnostics', 'diagnostics_presentation']),
+      knownIntegrationIds: Object.freeze([
+        'creative',
+        'gpt_diagnostics',
+        'diagnostics_presentation',
+      ]),
+      catalog: Object.freeze([
+        Object.freeze({
+          id: 'creative',
+          phase: 'critical' as const,
+          trigger: null,
+          consumes: Object.freeze(['runtime.v1']),
+          provides: Object.freeze([]),
+        }),
+        Object.freeze({
+          id: 'gpt_diagnostics',
+          phase: 'critical' as const,
+          trigger: null,
+          consumes: Object.freeze(['runtime.v1']),
+          provides: Object.freeze(['gpt_diag.v1']),
+        }),
+        Object.freeze({
+          id: 'diagnostics_presentation',
+          phase: 'deferred' as const,
+          trigger: 'first_display_or_idle' as const,
+          consumes: Object.freeze(['runtime.v1', 'gpt_diag.v1']),
+          provides: Object.freeze([]),
+        }),
+      ]),
+      boot: {
+        ...boot(),
+        creative: { version: 1, enabled: true, clickGuard: true, renderGuard: false },
+        diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: true } },
+      },
+      getBindings: () =>
+        Object.freeze({
+          config: Object.freeze({ publisherControlled: true }),
+          interfaces: Object.freeze({}),
+        }),
+      kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+    });
+    expect(runtime.start()).toBe(true);
+    for (const id of ['creative', 'gpt_diagnostics']) {
+      expect(
+        runtime.registerIntegration({
+          abi: 1,
+          id,
+          phase: 'critical',
+          releaseId: RELEASE,
+          prepare: ({ config }: { config: unknown }) => {
+            prepared.set(id, config);
+            return id === 'gpt_diagnostics'
+              ? Object.freeze({
+                  activate: () => undefined,
+                  interfaces: Object.freeze({
+                    'gpt_diag.v1': Object.freeze({
+                      api: Object.freeze({
+                        snapshot: vi.fn(),
+                        export: vi.fn(),
+                        subscribe: vi.fn(),
+                        show: vi.fn(),
+                        hide: vi.fn(),
+                      }),
+                      attachPresentation: vi.fn(),
+                    }),
+                  }),
+                })
+              : Object.freeze({ activate: () => undefined });
+          },
+        })
+      ).toBe(true);
+    }
+
+    await expect(runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+    expect(prepared.get('creative')).toEqual({
+      version: 1,
+      enabled: true,
+      clickGuard: true,
+      renderGuard: false,
+    });
+    expect(prepared.get('gpt_diagnostics')).toEqual({ active: true });
+    expect(Object.isFrozen(prepared.get('creative'))).toBe(true);
+    expect(Object.isFrozen(prepared.get('gpt_diagnostics'))).toBe(true);
+  });
+
+  it('keeps the authenticated registrar live and starts deferred loading only after the gate', async () => {
+    vi.useFakeTimers();
+    const frames: FrameRequestCallback[] = [];
+    const idle: Array<() => void> = [];
+    const criticalHash = 'c'.repeat(64);
+    const deferredHash = 'd'.repeat(64);
+    const criticalScript = document.createElement('script');
+    criticalScript.id = 'trustedserver-js';
+    criticalScript.src = `${window.location.origin}/static/tsjs=tsjs-unified.min.js?v=${criticalHash}`;
+    document.head.insertBefore(criticalScript, null);
+    Object.defineProperty(document, 'currentScript', {
+      configurable: true,
+      value: criticalScript,
+    });
+    const target: Record<string, unknown> = {};
+    const deferredPrepare = vi.fn(() => Object.freeze({ activate: () => undefined }));
+    const runtime = createRuntime({
+      target,
+      releaseId: RELEASE,
+      document,
+      manifest: {
+        version: 1,
+        releaseId: RELEASE,
+        criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${criticalHash}`,
+        integrations: [
+          { id: 'render_runtime', phase: 'critical' },
+          {
+            id: 'gpt_later',
+            phase: 'deferred',
+            trigger: 'first_display_or_idle',
+            src: `/static/tsjs=tsjs-gpt_later.min.js?v=${deferredHash}`,
+          },
+        ],
+      },
+      knownIntegrationIds: Object.freeze(['render_runtime', 'gpt_later']),
+      catalog: Object.freeze([
+        Object.freeze({
+          id: 'render_runtime',
+          phase: 'critical' as const,
+          trigger: null,
+          consumes: Object.freeze([]),
+          provides: Object.freeze([]),
+        }),
+        Object.freeze({
+          id: 'gpt_later',
+          phase: 'deferred' as const,
+          trigger: 'first_display_or_idle' as const,
+          consumes: Object.freeze([]),
+          provides: Object.freeze([]),
+        }),
+      ]),
+      boot: boot(),
+      getBindings: () => Object.freeze({ config: undefined, interfaces: Object.freeze({}) }),
+      phaseScheduler: {
+        cancelAnimationFrame: vi.fn(),
+        cancelIdleCallback: vi.fn(),
+        clearTimeout,
+        requestAnimationFrame: (callback) => {
+          frames.push(callback);
+          return frames.length;
+        },
+        requestIdleCallback: (callback) => {
+          idle.push(callback);
+          return idle.length;
+        },
+        setTimeout,
+      },
+      kernel: {
+        addAdUnits: vi.fn(),
+        diagnostics: Object.freeze({}),
+        requestAds: vi.fn(),
+      },
+    });
+
+    expect(runtime.start()).toBe(true);
+    expect(
+      runtime.registerIntegration({
+        abi: 1,
+        id: 'render_runtime',
+        phase: 'critical',
+        releaseId: RELEASE,
+        prepare: () => Object.freeze({ activate: () => undefined }),
+      })
+    ).toBe(true);
+    await expect(runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+    expect(Object.getOwnPropertyDescriptor(target, '_registerIntegration')).toMatchObject({
+      configurable: false,
+      enumerable: true,
+      writable: false,
+    });
+    expect(document.head.querySelectorAll('script')).toHaveLength(1);
+
+    expect(runtime.protectFirstDisplayAttemptBatch([Promise.resolve()])).toBe(true);
+    await Promise.resolve();
+    await Promise.resolve();
+    frames.shift()?.(1);
+    frames.shift()?.(2);
+    idle.shift()?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    const deferredScript = [...document.head.querySelectorAll('script')].find(
+      (script) => script !== criticalScript
+    );
+    expect(deferredScript?.src).toContain('tsjs-gpt_later.min.js');
+    Object.defineProperty(document, 'currentScript', {
+      configurable: true,
+      value: deferredScript,
+    });
+    const register = target['_registerIntegration'];
+    expect(typeof register).toBe('function');
+    expect(
+      Reflect.apply(register as (...args: unknown[]) => unknown, target, [
+        {
+          abi: 1,
+          id: 'gpt_later',
+          phase: 'deferred',
+          releaseId: RELEASE,
+          prepare: deferredPrepare,
+        },
+      ])
+    ).toBe(true);
+    deferredScript?.dispatchEvent(new Event('load'));
+    await vi.waitFor(() => expect(deferredPrepare).toHaveBeenCalledOnce());
+  });
+
+  it('loads overlay-only presentation, GPT later, and Prebid later as separate authenticated artifacts', async () => {
+    vi.useFakeTimers();
+    const criticalHash = 'c'.repeat(64);
+    const deferredHash = 'd'.repeat(64);
+    const criticalScript = document.createElement('script');
+    criticalScript.id = 'trustedserver-js';
+    criticalScript.src = `${window.location.origin}/static/tsjs=tsjs-unified.min.js?v=${criticalHash}`;
+    document.head.insertBefore(criticalScript, null);
+    let executingScript: HTMLScriptElement | null = criticalScript;
+    vi.spyOn(document, 'currentScript', 'get').mockImplementation(() => executingScript);
+    const frames: FrameRequestCallback[] = [];
+    const idle: Array<() => void> = [];
+    const target: Record<string, unknown> = {};
+    const traceAttach = vi.fn(() => vi.fn());
+    const traceDiagnostics = Object.freeze({
+      current: vi.fn(() => Object.freeze({})),
+      history: vi.fn(() => Object.freeze([])),
+      subscribe: vi.fn(() => vi.fn()),
+    });
+    const traceDataCapability = Object.freeze({ diagnostics: traceDiagnostics });
+    const tracePresentationCapability = Object.freeze({ attachPresentation: traceAttach });
+    const gptLaterRelease = vi.fn();
+    const prebidLaterRelease = vi.fn();
+    const gptLater = Object.freeze({
+      activate: vi.fn(() => gptLaterRelease),
+      start: vi.fn(),
+    });
+    const prebidLater = Object.freeze({
+      activate: vi.fn(() => prebidLaterRelease),
+      start: vi.fn(),
+    });
+    const deferredIds = Object.freeze(['diagnostics_presentation', 'gpt_later', 'prebid_later']);
+    const manifestEntries = deferredIds.map((id) =>
+      Object.freeze({
+        id,
+        phase: 'deferred' as const,
+        trigger: 'first_display_or_idle' as const,
+        src: `/static/tsjs=tsjs-${id}.min.js?v=${deferredHash}`,
+      })
+    );
+    const runtime = createRuntime({
+      target,
+      releaseId: RELEASE,
+      document,
+      manifest: {
+        version: 1,
+        releaseId: RELEASE,
+        criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${criticalHash}`,
+        integrations: [{ id: 'trace_provider', phase: 'critical' }, ...manifestEntries],
+      },
+      knownIntegrationIds: Object.freeze([
+        'trace_provider',
+        'optional_gpt_diag_provider',
+        ...deferredIds,
+      ]),
+      catalog: Object.freeze([
+        Object.freeze({
+          id: 'trace_provider',
+          phase: 'critical' as const,
+          trigger: null,
+          consumes: Object.freeze([]),
+          provides: Object.freeze(['trace.v1', 'trace.presentation.v1']),
+        }),
+        Object.freeze({
+          id: 'optional_gpt_diag_provider',
+          phase: 'critical' as const,
+          trigger: null,
+          consumes: Object.freeze([]),
+          provides: Object.freeze(['gpt_diag.v1']),
+        }),
+        Object.freeze({
+          id: 'diagnostics_presentation',
+          phase: 'deferred' as const,
+          trigger: 'first_display_or_idle' as const,
+          consumes: Object.freeze([
+            'runtime.v1',
+            'trace.presentation.v1',
+            'gpt_diag.v1?gpt_diagnostics_active',
+          ]),
+          provides: Object.freeze([]),
+        }),
+        ...deferredIds.slice(1).map((id) =>
+          Object.freeze({
+            id,
+            phase: 'deferred' as const,
+            trigger: 'first_display_or_idle' as const,
+            consumes: Object.freeze([]),
+            provides: Object.freeze([]),
+          })
+        ),
+      ]),
+      boot: {
+        ...boot(),
+        diagnostics: { version: 1, renderTraceOverlay: true, gpt: { active: false } },
+      },
+      getBindings: (id) =>
+        Object.freeze({
+          config: id === 'gpt_later' || id === 'prebid_later' ? Object.freeze({}) : undefined,
+          interfaces: Object.freeze(
+            id === 'gpt_later'
+              ? { gpt_later: gptLater }
+              : id === 'prebid_later'
+                ? { prebid_later: prebidLater }
+                : {}
+          ),
+        }),
+      phaseScheduler: {
+        cancelAnimationFrame: vi.fn(),
+        cancelIdleCallback: vi.fn(),
+        clearTimeout,
+        requestAnimationFrame: (callback) => {
+          frames.push(callback);
+          return frames.length;
+        },
+        requestIdleCallback: (callback) => {
+          idle.push(callback);
+          return idle.length;
+        },
+        setTimeout,
+      },
+      kernel: {
+        addAdUnits: vi.fn(),
+        diagnostics: Object.freeze({}),
+        requestAds: vi.fn(),
+      },
+    });
+
+    expect(runtime.start()).toBe(true);
+    expect(
+      runtime.registerIntegration({
+        abi: 1,
+        id: 'trace_provider',
+        phase: 'critical',
+        releaseId: RELEASE,
+        prepare: () =>
+          Object.freeze({
+            activate: () => undefined,
+            interfaces: Object.freeze({
+              'trace.v1': traceDataCapability,
+              'trace.presentation.v1': tracePresentationCapability,
+            }),
+          }),
+      })
+    ).toBe(true);
+    expect(Reflect.ownKeys(traceDataCapability)).toEqual(['diagnostics']);
+    expect(traceDataCapability).not.toHaveProperty('attachPresentation');
+    await expect(runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+    expect(document.head.querySelectorAll('script')).toHaveLength(1);
+    expect(traceAttach).not.toHaveBeenCalled();
+    expect(gptLater.activate).not.toHaveBeenCalled();
+    expect(prebidLater.activate).not.toHaveBeenCalled();
+
+    const loadedSources: string[] = [];
+    const originalHeadAppend = document.head.append.bind(document.head);
+    vi.spyOn(document.head, 'append').mockImplementation((...nodes) => {
+      originalHeadAppend(...nodes);
+      for (const node of nodes) {
+        if (!(node instanceof HTMLScriptElement) || node === criticalScript) continue;
+        const entry = manifestEntries.find(({ src }) => node.src.endsWith(src));
+        if (!entry) throw new Error('Unexpected deferred artifact source');
+        executingScript = node;
+        loadedSources.push(node.src);
+        const registration =
+          entry.id === 'diagnostics_presentation'
+            ? createDiagnosticsPresentationIntegrationRegistration(RELEASE)
+            : createLifecycleIntegrationRegistration(entry.id, RELEASE);
+        expect(runtime.registerIntegration(registration)).toBe(true);
+        node.onload?.(new Event('load'));
+        executingScript = criticalScript;
+      }
+    });
+
+    expect(runtime.protectFirstDisplayAttemptBatch([Promise.resolve()])).toBe(true);
+    await Promise.resolve();
+    await Promise.resolve();
+    frames.shift()?.(1);
+    frames.shift()?.(2);
+    idle.shift()?.();
+    await vi.waitFor(() => {
+      expect(traceAttach).toHaveBeenCalledOnce();
+      expect(gptLater.start).toHaveBeenCalledOnce();
+      expect(prebidLater.start).toHaveBeenCalledOnce();
+    });
+    expect(loadedSources).toEqual(
+      manifestEntries.map(({ src }) => new URL(src, window.location.origin).href)
+    );
+    expect(new Set(loadedSources)).toHaveLength(3);
+    expect(loadedSources.every((source) => !source.includes('tsjs-unified'))).toBe(true);
+    expect(gptLater.activate).toHaveBeenCalledOnce();
+    expect(prebidLater.activate).toHaveBeenCalledOnce();
+
+    runtime.dispose();
+    expect(gptLaterRelease).toHaveBeenCalledOnce();
+    expect(prebidLaterRelease).toHaveBeenCalledOnce();
   });
 
   it('resolves the frozen diagnostics namespace only after core and module activation', async () => {
@@ -199,8 +960,10 @@ describe('Runtime bootstrap owner', () => {
     expect(runtime.start()).toBe(true);
     expect(
       runtime.registerIntegration({
+        abi: 1,
         id: 'gpt',
-        release: RELEASE,
+        phase: 'critical',
+        releaseId: RELEASE,
         prepare: ({ onDispose }: { onDispose(callback: () => void): void }) => {
           order.push('module:prepare');
           onDispose(() => order.push('module:dispose'));
@@ -257,8 +1020,10 @@ describe('Runtime bootstrap owner', () => {
     expect(runtime.start()).toBe(true);
     expect(
       runtime.registerIntegration({
+        abi: 1,
         id: 'gpt',
-        release: RELEASE,
+        phase: 'critical',
+        releaseId: RELEASE,
         prepare: () => ({ activate: activateModule }),
       })
     ).toBe(true);
@@ -318,8 +1083,10 @@ describe('Runtime bootstrap owner', () => {
     expect(runtime.start()).toBe(true);
     expect(
       runtime.registerIntegration({
+        abi: 1,
         id: 'gpt',
-        release: RELEASE,
+        phase: 'critical',
+        releaseId: RELEASE,
         prepare: () => ({
           activate: ({ afterCommit }: { afterCommit(callback: () => void): void }) => {
             order.push('module-activation');
@@ -394,11 +1161,136 @@ describe('Runtime bootstrap owner', () => {
       (target as unknown as { _registerIntegration(value: unknown): boolean })._registerIntegration(
         {
           id: 'gpt',
-          release: RELEASE,
+          releaseId: RELEASE,
           prepare: vi.fn(),
         }
       )
     ).toBe(false);
+  });
+
+  it('publishes the captured exact critical source when the manifest field is missing', async () => {
+    const criticalSrc = `/static/tsjs=tsjs-unified.min.js?v=${'d'.repeat(64)}`;
+    const criticalScript = document.createElement('script');
+    criticalScript.id = 'trustedserver-js';
+    criticalScript.src = new URL(criticalSrc, window.location.origin).href;
+    document.head.insertBefore(criticalScript, null);
+    Object.defineProperty(document, 'currentScript', {
+      configurable: true,
+      value: criticalScript,
+    });
+    const candidateManifest = {
+      version: 1,
+      releaseId: RELEASE,
+      integrations: [],
+    };
+    const target = {
+      boot: {
+        ...boot(),
+        manifest: candidateManifest,
+      },
+    };
+    const runtime = createRuntime({
+      target,
+      releaseId: RELEASE,
+      document,
+      manifest: candidateManifest,
+      knownIntegrationIds: Object.freeze([] as string[]),
+      boot: target.boot,
+      kernel: {
+        addAdUnits: vi.fn(),
+        diagnostics: Object.freeze({}),
+        requestAds: vi.fn(),
+      },
+    });
+
+    expect(runtime.start()).toBe(true);
+    await expect(runtime.install()).resolves.toEqual({
+      state: 'fallback',
+      reason: 'abi_mismatch',
+    });
+    expect((target as { boot: { manifest: unknown } }).boot.manifest).toEqual({
+      version: 1,
+      releaseId: RELEASE,
+      criticalSrc,
+      integrations: [],
+    });
+  });
+
+  it('publishes the captured exact critical source when the manifest field is malformed', async () => {
+    const criticalSrc = `/static/tsjs=tsjs-unified.min.js?v=${'d'.repeat(64)}`;
+    const criticalScript = document.createElement('script');
+    criticalScript.id = 'trustedserver-js';
+    criticalScript.src = new URL(criticalSrc, window.location.origin).href;
+    document.head.insertBefore(criticalScript, null);
+    Object.defineProperty(document, 'currentScript', {
+      configurable: true,
+      value: criticalScript,
+    });
+    const candidateManifest = {
+      version: 1,
+      releaseId: RELEASE,
+      criticalSrc: `${criticalSrc}&publisher=1`,
+      integrations: [],
+    };
+    const target = {
+      boot: {
+        ...boot(),
+        manifest: candidateManifest,
+      },
+    };
+    const runtime = createRuntime({
+      target,
+      releaseId: RELEASE,
+      document,
+      manifest: candidateManifest,
+      knownIntegrationIds: Object.freeze([] as string[]),
+      boot: target.boot,
+      kernel: {
+        addAdUnits: vi.fn(),
+        diagnostics: Object.freeze({}),
+        requestAds: vi.fn(),
+      },
+    });
+
+    expect(runtime.start()).toBe(true);
+    await expect(runtime.install()).resolves.toEqual({
+      state: 'fallback',
+      reason: 'abi_mismatch',
+    });
+    expect((target as { boot: { manifest: unknown } }).boot.manifest).toEqual({
+      version: 1,
+      releaseId: RELEASE,
+      criticalSrc,
+      integrations: [],
+    });
+  });
+
+  it('leaves the namespace unclaimed when no trusted critical source exists', () => {
+    const target = {
+      boot: boot(),
+      que: [vi.fn()],
+    };
+    const bootDescriptor = Object.getOwnPropertyDescriptor(target, 'boot');
+    const queueDescriptor = Object.getOwnPropertyDescriptor(target, 'que');
+    const runtime = createRuntimeOwner({
+      target,
+      releaseId: RELEASE,
+      manifest: { version: 1, releaseId: RELEASE, integrations: [] },
+      knownIntegrationIds: Object.freeze([] as string[]),
+      boot: target.boot,
+      kernel: {
+        addAdUnits: vi.fn(),
+        diagnostics: Object.freeze({}),
+        requestAds: vi.fn(),
+      },
+    });
+
+    expect(runtime.start()).toBe(false);
+    expect(runtime.state).toBe('unclaimed');
+    expect(Object.getOwnPropertyDescriptor(target, 'boot')).toEqual(bootDescriptor);
+    expect(Object.getOwnPropertyDescriptor(target, 'que')).toEqual(queueDescriptor);
+    expect(target).not.toHaveProperty('_registerIntegration');
+    expect(target).not.toHaveProperty('_internal');
   });
 
   it('publishes an exact terminal namespace with no publisher-owned fields', async () => {
@@ -493,8 +1385,10 @@ describe('Runtime bootstrap owner', () => {
     expect(first.start()).toBe(true);
     expect(
       first.registerIntegration({
+        abi: 1,
         id: 'gpt',
-        release: RELEASE,
+        phase: 'critical',
+        releaseId: RELEASE,
         prepare: ({ onDispose }: { onDispose(callback: () => void): void }) => {
           onDispose(staleDisposal);
           return stalePreparation.then(() => ({ activate: staleModuleActivation }));
@@ -508,8 +1402,10 @@ describe('Runtime bootstrap owner', () => {
     expect(second.start()).toBe(true);
     expect(
       second.registerIntegration({
+        abi: 1,
         id: 'gpt',
-        release: RELEASE,
+        phase: 'critical',
+        releaseId: RELEASE,
         prepare: () => ({ activate: vi.fn() }),
       })
     ).toBe(true);
@@ -551,7 +1447,13 @@ describe('Runtime bootstrap owner', () => {
 
     expect(first.start()).toBe(true);
     const registration = new Proxy(
-      { id: 'gpt', release: RELEASE, prepare: () => ({ activate: staleModuleActivation }) },
+      {
+        abi: 1,
+        id: 'gpt',
+        phase: 'critical',
+        releaseId: RELEASE,
+        prepare: () => ({ activate: staleModuleActivation }),
+      },
       {
         ownKeys(candidate) {
           expect(Reflect.deleteProperty(target, '_registerIntegration')).toBe(true);
@@ -564,8 +1466,10 @@ describe('Runtime bootstrap owner', () => {
     expect(second.start()).toBe(true);
     expect(
       second.registerIntegration({
+        abi: 1,
         id: 'gpt',
-        release: RELEASE,
+        phase: 'critical',
+        releaseId: RELEASE,
         prepare: () => ({ activate: vi.fn() }),
       })
     ).toBe(true);
@@ -598,6 +1502,7 @@ describe('Runtime bootstrap owner', () => {
     const firstModule = await import('../../src/kernel/runtime');
     vi.resetModules();
     const secondModule = await import('../../src/kernel/runtime');
+    installTestCriticalScript(document);
     const first = firstModule.createRuntime(options);
     const second = secondModule.createRuntime(options);
 
@@ -635,8 +1540,17 @@ describe('Runtime bootstrap owner', () => {
   });
 
   it.each([
-    ['wrong release', { id: 'gpt', release: 'b'.repeat(64), prepare: vi.fn() }],
-    ['unknown id', { id: 'aps', release: RELEASE, prepare: vi.fn() }],
+    [
+      'wrong release',
+      {
+        abi: 1,
+        id: 'gpt',
+        phase: 'critical',
+        releaseId: 'b'.repeat(64),
+        prepare: vi.fn(),
+      },
+    ],
+    ['unknown id', { abi: 1, id: 'aps', phase: 'critical', releaseId: RELEASE, prepare: vi.fn() }],
   ])(
     'classifies %s registration as abi_mismatch without invoking module code',
     async (_name, registration) => {
@@ -665,7 +1579,13 @@ describe('Runtime bootstrap owner', () => {
 
   it('classifies duplicate registration as abi_mismatch', async () => {
     const prepare = vi.fn(() => ({ activate: vi.fn() }));
-    const registration = { id: 'gpt', release: RELEASE, prepare };
+    const registration = {
+      abi: 1,
+      id: 'gpt',
+      phase: 'critical',
+      releaseId: RELEASE,
+      prepare,
+    };
     const runtime = createRuntime({
       target: {},
       releaseId: RELEASE,
@@ -717,7 +1637,13 @@ describe('Runtime bootstrap owner', () => {
         kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
       });
       runtime.start();
-      runtime.registerIntegration({ id: 'gpt', release: RELEASE, prepare });
+      runtime.registerIntegration({
+        abi: 1,
+        id: 'gpt',
+        phase: 'critical',
+        releaseId: RELEASE,
+        prepare,
+      });
 
       await expect(runtime.install()).resolves.toEqual({
         state: 'fallback',
@@ -742,8 +1668,10 @@ describe('Runtime bootstrap owner', () => {
     });
     runtime.start();
     runtime.registerIntegration({
+      abi: 1,
       id: 'gpt',
-      release: RELEASE,
+      phase: 'critical',
+      releaseId: RELEASE,
       prepare: () =>
         new Promise<{ activate(): void }>((resolve) => {
           finish = resolve;
@@ -771,8 +1699,10 @@ describe('Runtime bootstrap owner', () => {
     });
     runtime.start();
     runtime.registerIntegration({
+      abi: 1,
       id: 'gpt',
-      release: RELEASE,
+      phase: 'critical',
+      releaseId: RELEASE,
       prepare: () => ({
         activate: ({ afterCommit }: { afterCommit(callback: () => void): void }) =>
           afterCommit(() => {

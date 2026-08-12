@@ -9,6 +9,7 @@ export { AdUnitRegistrationError, type AdUnitRegistrationErrorCode } from '../co
 export { RequestAdsInputError, type RequestAdsInputErrorCode } from '../core/contracts/request_ads';
 
 import type { BootFailureReason } from './integration_registry';
+import { MAX_MANIFEST_MODULES } from './release_catalog';
 
 const SAFE_PROJECTION = {
   version: 1,
@@ -16,6 +17,7 @@ const SAFE_PROJECTION = {
   slots: [],
   bids: [],
 } as const;
+const CRITICAL_SRC_PATTERN = /^\/static\/tsjs=tsjs-unified\.min\.js\?v=[0-9a-f]{64}$/;
 
 export class TsjsUnavailableError extends Error {
   public readonly code = 'runtime_unavailable' as const;
@@ -85,20 +87,29 @@ function snapshotOwnArray(value: unknown, maximum: number): readonly unknown[] |
 
 function manifestMatches(candidate: unknown, expected: BootManifestV1): boolean {
   const record = ownDataRecord(candidate);
-  if (!record || !exactKeys(record, ['version', 'releaseId', 'integrations'])) return false;
-  if (record.version !== 1 || record.releaseId !== expected.releaseId) return false;
-  const integrations = snapshotOwnArray(record.integrations, 16);
+  if (!record || !exactKeys(record, ['version', 'releaseId', 'criticalSrc', 'integrations'])) {
+    return false;
+  }
+  if (
+    record.version !== 1 ||
+    record.releaseId !== expected.releaseId ||
+    record.criticalSrc !== expected.criticalSrc
+  ) {
+    return false;
+  }
+  const integrations = snapshotOwnArray(record.integrations, MAX_MANIFEST_MODULES);
   if (!integrations || integrations.length !== expected.integrations.length) return false;
   return integrations.every((entry, index) => {
     const fields = ownDataRecord(entry);
     const accepted = expected.integrations[index];
-    return Boolean(
-      accepted &&
-      fields &&
-      exactKeys(fields, ['id', 'required']) &&
-      fields.id === accepted.id &&
-      fields.required === true
-    );
+    if (!accepted || !fields || fields.id !== accepted.id || fields.phase !== accepted.phase) {
+      return false;
+    }
+    return accepted.phase === 'critical'
+      ? exactKeys(fields, ['id', 'phase'])
+      : exactKeys(fields, ['id', 'phase', 'trigger', 'src']) &&
+          fields.trigger === accepted.trigger &&
+          fields.src === accepted.src;
   });
 }
 
@@ -119,6 +130,43 @@ function readBootField(boot: unknown, key: string): unknown {
 function parseCachePolicy(candidate: unknown): ReturnType<typeof parseCacheFetchPolicyV1> {
   try {
     return parseCacheFetchPolicyV1(candidate);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Capture the canonical source owned by one connected exact critical-artifact tag. */
+export function captureTrustedCriticalSrc(
+  runtimeDocument: Document,
+  script: HTMLScriptElement
+): string | undefined {
+  try {
+    const Script = runtimeDocument.defaultView?.HTMLScriptElement;
+    const origin = runtimeDocument.defaultView?.location.origin;
+    if (
+      !Script ||
+      !origin ||
+      origin === 'null' ||
+      !(script instanceof Script) ||
+      script.ownerDocument !== runtimeDocument ||
+      script.id !== 'trustedserver-js' ||
+      !script.isConnected
+    ) {
+      return undefined;
+    }
+    const matches = runtimeDocument.querySelectorAll('script#trustedserver-js');
+    if (matches.length !== 1 || matches[0] !== script) return undefined;
+    const absolute = new URL(script.src);
+    const criticalSrc = `${absolute.pathname}${absolute.search}`;
+    if (
+      absolute.origin !== origin ||
+      absolute.hash !== '' ||
+      !CRITICAL_SRC_PATTERN.test(criticalSrc) ||
+      new URL(criticalSrc, origin).href !== absolute.href
+    ) {
+      return undefined;
+    }
+    return criticalSrc;
   } catch {
     return undefined;
   }
@@ -150,8 +198,8 @@ export function buildKernelBoot(
   if (record.cachePolicy !== undefined && !cachePolicy) return undefined;
   const auctionProjection = parseBrowserAuctionProjectionV1(record.auctionProjection, cachePolicy);
   const creative = ownPlainDataRecord(record.creative);
-  const diagnostics = ownDataRecord(record.diagnostics);
-  const gptDiagnostics = ownDataRecord(diagnostics?.gpt);
+  const diagnostics = ownPlainDataRecord(record.diagnostics);
+  const gptDiagnostics = ownPlainDataRecord(diagnostics?.gpt);
   if (
     !auctionProjection ||
     !creative ||
@@ -172,12 +220,18 @@ export function buildKernelBoot(
     return undefined;
   }
   const diagnosticsModule = manifest.integrations.filter(({ id }) => id === 'gpt_diagnostics');
+  const diagnosticsPresentationModule = manifest.integrations.filter(
+    ({ id }) => id === 'diagnostics_presentation'
+  );
   const creativeModule = manifest.integrations.filter(({ id }) => id === 'creative');
+  const diagnosticsPresentationRequired = diagnostics.renderTraceOverlay || gptDiagnostics.active;
   if (
     (creative.enabled && creativeModule.length !== 1) ||
     (!creative.enabled && creativeModule.length !== 0) ||
     (gptDiagnostics.active && diagnosticsModule.length !== 1) ||
-    (!gptDiagnostics.active && diagnosticsModule.length !== 0)
+    (!gptDiagnostics.active && diagnosticsModule.length !== 0) ||
+    (diagnosticsPresentationRequired && diagnosticsPresentationModule.length !== 1) ||
+    (!diagnosticsPresentationRequired && diagnosticsPresentationModule.length !== 0)
   ) {
     return undefined;
   }
@@ -202,16 +256,29 @@ export function buildKernelBoot(
 }
 
 /** Build the immutable boot snapshot shared by every terminal fallback. */
-export function buildFallbackBoot(releaseId: string, candidate: unknown): Readonly<object> {
+export function buildFallbackBoot(
+  releaseId: string,
+  candidate: unknown,
+  trustedCriticalSrc: string
+): Readonly<object> | undefined {
+  if (!CRITICAL_SRC_PATTERN.test(trustedCriticalSrc)) {
+    return undefined;
+  }
   const cacheCandidate = readBootField(candidate, 'cachePolicy');
   const cachePolicy = cacheCandidate === undefined ? undefined : parseCachePolicy(cacheCandidate);
   const projection =
     parseBrowserAuctionProjectionV1(readBootField(candidate, 'auctionProjection'), cachePolicy) ??
     SAFE_PROJECTION;
+  const manifest: BootManifestV1 = {
+    version: 1,
+    releaseId,
+    criticalSrc: trustedCriticalSrc,
+    integrations: [],
+  };
   return deepFreeze({
     abi: 1,
     releaseId,
-    manifest: { version: 1, releaseId, integrations: [] },
+    manifest,
     auctionProjection: projection,
     ...(cachePolicy ? { cachePolicy } : {}),
     creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
@@ -253,13 +320,15 @@ export interface FallbackFieldsOptions {
   readonly releaseId: string;
   readonly reason: BootFailureReason;
   readonly boot: unknown;
+  readonly trustedCriticalSrc: string;
 }
 
 /** Construct the complete, non-rendering public shell without runtime services. */
 export function createFallbackFields(
   options: FallbackFieldsOptions
-): Readonly<Record<string, unknown>> {
-  const boot = buildFallbackBoot(options.releaseId, options.boot);
+): Readonly<Record<string, unknown>> | undefined {
+  const boot = buildFallbackBoot(options.releaseId, options.boot, options.trustedCriticalSrc);
+  if (!boot) return undefined;
   const projection = boot as {
     readonly auctionProjection: {
       readonly auction: { readonly results: readonly { slot: string }[] };

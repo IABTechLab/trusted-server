@@ -12,6 +12,7 @@ import {
   createIntegrationRegistry,
   type IntegrationRegistration,
 } from '../../src/kernel/integration_registry';
+import { RELEASE_CATALOG } from '../../src/kernel/release_catalog';
 
 const RELEASE_ID = 'a'.repeat(64);
 const CRITICAL_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
@@ -33,23 +34,48 @@ const configFor = (id: string): unknown => {
   return undefined;
 };
 
+function catalogFor(ids: readonly string[]) {
+  return Object.freeze(
+    ids.map((id) => {
+      const entry = RELEASE_CATALOG.find((candidate) => candidate.id === id);
+      if (!entry) throw new TypeError(`Missing release catalog row: ${id}`);
+      return Object.freeze({
+        id: entry.id,
+        phase: entry.phase,
+        trigger: entry.trigger,
+        consumes: Object.freeze([...entry.consumes]),
+        provides: Object.freeze([...entry.provides]),
+      });
+    })
+  );
+}
+
+function runtimeCapability() {
+  return Object.freeze({
+    document,
+    enqueue: (callback: () => void) => {
+      callback();
+      return true;
+    },
+    registerAuctionContext: () => () => undefined,
+  });
+}
+
 describe('remaining integration lifecycle modules', () => {
-  it('activates a maximal manifest once in order and disposes it in exact reverse order', async () => {
+  it('activates the provider-owned maximal lifecycle set without foreign runtime authority', async () => {
     const order: string[] = [];
     const ids = Object.freeze(registrations.map(([id]) => id));
+    const foreignActivations = new Map<string, ReturnType<typeof vi.fn>>();
+    const foreignStarts = new Map<string, ReturnType<typeof vi.fn>>();
     const interfaces = Object.freeze(
       Object.fromEntries(
-        ids.map((id) => [
-          id,
-          Object.freeze({
-            activate: (config: unknown) => {
-              expect(config).toEqual(configFor(id));
-              order.push(`activate:${id}`);
-              return () => order.push(`dispose:${id}`);
-            },
-            start: () => order.push(`start:${id}`),
-          }),
-        ])
+        ids.map((id) => {
+          const activate = vi.fn(() => vi.fn());
+          const start = vi.fn();
+          foreignActivations.set(id, activate);
+          foreignStarts.set(id, start);
+          return [id, Object.freeze({ activate, start })];
+        })
       )
     );
     const registry = createIntegrationRegistry({
@@ -61,8 +87,10 @@ describe('remaining integration lifecycle modules', () => {
       },
       releaseId: RELEASE_ID,
       knownIntegrationIds: ids,
+      catalog: catalogFor(ids),
       startedAtMs: 0,
       now: () => 0,
+      runtimeCapability: runtimeCapability(),
       getBindings: (id) => ({ config: configFor(id), interfaces }),
     });
     for (const [, createRegistration] of registrations) {
@@ -76,15 +104,12 @@ describe('remaining integration lifecycle modules', () => {
     });
 
     expect(result).toMatchObject({ state: 'kernel' });
-    expect(order).toEqual([
-      'core',
-      ...ids.map((id) => `activate:${id}`),
-      'publish',
-      ...ids.map((id) => `start:${id}`),
-      'drain',
-    ]);
+    expect(order).toEqual(['core', 'publish', 'drain']);
+    for (const id of ids) {
+      expect(foreignActivations.get(id)).not.toHaveBeenCalled();
+      expect(foreignStarts.get(id)).not.toHaveBeenCalled();
+    }
     if (result.state === 'kernel') result.dispose();
-    expect(order.slice(-ids.length)).toEqual([...ids].reverse().map((id) => `dispose:${id}`));
   });
 
   it.each(registrations)(
@@ -101,8 +126,10 @@ describe('remaining integration lifecycle modules', () => {
         },
         releaseId: RELEASE_ID,
         knownIntegrationIds: Object.freeze([id]),
+        catalog: catalogFor([id]),
         startedAtMs: 0,
         now: () => 0,
+        runtimeCapability: runtimeCapability(),
         getBindings: () => ({
           config: configFor(id),
           interfaces: Object.freeze({ [id]: Object.freeze({ activate, start }) }),
@@ -113,8 +140,9 @@ describe('remaining integration lifecycle modules', () => {
       await expect(
         registry.install({ activateCore: vi.fn(), publish: vi.fn(), drainPreload: vi.fn() })
       ).resolves.toMatchObject({ state: 'kernel' });
-      expect(activate).toHaveBeenCalledOnce();
-      expect(start).toHaveBeenCalledOnce();
+      expect(activate).not.toHaveBeenCalled();
+      expect(start).not.toHaveBeenCalled();
+      registry.dispose();
     }
   );
 });

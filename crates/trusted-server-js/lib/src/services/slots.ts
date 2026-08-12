@@ -143,6 +143,7 @@ export interface SlotServiceInventory {
 /** Runtime-owned slot registry and physical-cycle boundary. */
 export interface SlotService {
   readonly activate: () => void;
+  readonly activateReconciliation: () => () => void;
   readonly adoptGptSlot: (
     navigationGeneration: object,
     registeredSlotId: string,
@@ -3143,30 +3144,66 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       : Object.freeze({ action: 'replace', slots: Object.freeze(forwarded) });
   };
 
+  const deactivateReconciliation = (): void => {
+    if (!reconciliationActive) return;
+    reconciliationActive = false;
+    const states = mapValueSnapshot(navigationStates);
+    for (let stateIndex = 0; stateIndex < states.length; stateIndex += 1) {
+      const state = states[stateIndex];
+      if (!state) continue;
+      const observerRelease = state.observerRelease;
+      state.observerRelease = undefined;
+      try {
+        observerRelease?.();
+      } catch {
+        // Logical observer ownership is already released.
+      }
+      const records = mapValueSnapshot(state.records);
+      for (let recordIndex = 0; recordIndex < records.length; recordIndex += 1) {
+        const record = records[recordIndex];
+        if (record) cancelReconciliation(record);
+      }
+    }
+  };
+
+  const activateReconciliation = (): (() => void) => {
+    if (disposed || reconciliationActive) {
+      throw new Error('reconciliation owner is unavailable');
+    }
+    const states = mapValueSnapshot(navigationStates);
+    const installed: NavigationState[] = [];
+    for (let index = 0; index < states.length; index += 1) {
+      const state = states[index];
+      if (!state || !installNavigationObserver(state)) {
+        for (let releaseIndex = installed.length - 1; releaseIndex >= 0; releaseIndex -= 1) {
+          const installedState = installed[releaseIndex];
+          const release = installedState?.observerRelease;
+          if (installedState) installedState.observerRelease = undefined;
+          try {
+            release?.();
+          } catch {
+            // Failed activation retains no observer ownership.
+          }
+        }
+        throw new Error('reconciliation observer failed');
+      }
+      if (state.observerRelease) installed[installed.length] = state;
+    }
+    reconciliationActive = true;
+    let active = true;
+    return (): void => {
+      if (!active) return;
+      active = false;
+      deactivateReconciliation();
+    };
+  };
+
   const service: SlotService = Object.freeze({
     activate: (): void => {
       if (reconciliationActive) return;
-      const states = mapValueSnapshot(navigationStates);
-      const installed: NavigationState[] = [];
-      for (let index = 0; index < states.length; index += 1) {
-        const state = states[index];
-        if (!state || !installNavigationObserver(state)) {
-          for (let releaseIndex = installed.length - 1; releaseIndex >= 0; releaseIndex -= 1) {
-            const installedState = installed[releaseIndex];
-            const release = installedState?.observerRelease;
-            if (installedState) installedState.observerRelease = undefined;
-            try {
-              release?.();
-            } catch {
-              // Failed activation retains no observer ownership.
-            }
-          }
-          throw new Error('reconciliation observer failed');
-        }
-        if (state.observerRelease) installed[installed.length] = state;
-      }
-      reconciliationActive = true;
+      activateReconciliation();
     },
+    activateReconciliation,
     start: (): GoogletagOperation<void> => {
       if (activation) return activation;
       let subscriptions: BindingSubscriptionAdmission | undefined;
@@ -3190,6 +3227,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     adoptGptSlot,
     dispose: (): void => {
       if (disposed) return;
+      deactivateReconciliation();
       disposed = true;
       const states = mapValueSnapshot(navigationStates);
       for (let index = 0; index < states.length; index += 1) {

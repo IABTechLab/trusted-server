@@ -7,17 +7,24 @@ import {
 import { createNoopMessagingAdapter } from '../../src/adapters/messaging';
 import { createNoopPrebidAdapter } from '../../src/adapters/prebid';
 import { createTestBrowserRuntimeComposition } from '../../src/composition/browser_test';
+import { createApsIntegrationRegistration } from '../../src/integrations/aps/module';
 import { createCreativeIntegrationRegistration } from '../../src/integrations/creative/module';
 import { createDataDomeIntegrationRegistration } from '../../src/integrations/datadome/module';
 import { createDidomiIntegrationRegistration } from '../../src/integrations/didomi/module';
 import { createGoogleTagManagerIntegrationRegistration } from '../../src/integrations/google_tag_manager/module';
+import { createGptLaterIntegrationRegistration } from '../../src/integrations/gpt/later';
 import { createGptIntegrationRegistration } from '../../src/integrations/gpt/module';
 import { createGptDiagnosticsIntegrationRegistration } from '../../src/integrations/gpt_diagnostics/module';
+import { createDiagnosticsPresentationIntegrationRegistration } from '../../src/integrations/gpt_diagnostics/presentation';
 import { createLockrIntegrationRegistration } from '../../src/integrations/lockr/module';
+import { createOsanoLifecycleIntegrationRegistration } from '../../src/integrations/osano/lifecycle';
 import { createOsanoIntegrationRegistration } from '../../src/integrations/osano/module';
+import { createPermutiveLifecycleIntegrationRegistration } from '../../src/integrations/permutive/lifecycle';
 import { createPermutiveIntegrationRegistration } from '../../src/integrations/permutive/module';
+import { createPrebidLaterIntegrationRegistration } from '../../src/integrations/prebid/later';
 import { createPrebidIntegrationRegistration } from '../../src/integrations/prebid/module';
 import { createRenderRuntimeIntegrationRegistration } from '../../src/integrations/render_runtime/module';
+import { createSourcepointLifecycleIntegrationRegistration } from '../../src/integrations/sourcepoint/lifecycle';
 import { createSourcepointIntegrationRegistration } from '../../src/integrations/sourcepoint/module';
 import { createTestlightIntegrationRegistration } from '../../src/integrations/testlight/module';
 import type { BootManifestV1 } from '../../src/core/types';
@@ -58,11 +65,20 @@ const EXPECTED_MAXIMAL_INTEGRATION_IDS = Object.freeze([
   'sourcepoint_lifecycle',
 ]);
 const CRITICAL_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
+const DEFERRED_INTEGRATION_IDS = Object.freeze([
+  'diagnostics_presentation',
+  'gpt_later',
+  'osano_lifecycle',
+  'permutive_lifecycle',
+  'prebid_later',
+  'sourcepoint_lifecycle',
+] as const);
 
 type RegistrationFactory = (release: string) => IntegrationRegistration;
 
 const REGISTRATION_FACTORIES = new Map<string, RegistrationFactory>([
   ['render_runtime', createRenderRuntimeIntegrationRegistration],
+  ['aps', createApsIntegrationRegistration],
   ['creative', createCreativeIntegrationRegistration],
   ['datadome', createDataDomeIntegrationRegistration],
   ['didomi', createDidomiIntegrationRegistration],
@@ -75,6 +91,12 @@ const REGISTRATION_FACTORIES = new Map<string, RegistrationFactory>([
   ['prebid', createPrebidIntegrationRegistration],
   ['sourcepoint_consent', createSourcepointIntegrationRegistration],
   ['testlight', createTestlightIntegrationRegistration],
+  ['diagnostics_presentation', createDiagnosticsPresentationIntegrationRegistration],
+  ['gpt_later', createGptLaterIntegrationRegistration],
+  ['osano_lifecycle', createOsanoLifecycleIntegrationRegistration],
+  ['permutive_lifecycle', createPermutiveLifecycleIntegrationRegistration],
+  ['prebid_later', createPrebidLaterIntegrationRegistration],
+  ['sourcepoint_lifecycle', createSourcepointLifecycleIntegrationRegistration],
 ]);
 
 function maximalIntegrationIds(): readonly string[] {
@@ -157,6 +179,7 @@ function integrationConfig(id: string): unknown {
 }
 
 interface MaximalHarnessOptions {
+  readonly blockDeferredId?: (typeof DEFERRED_INTEGRATION_IDS)[number];
   readonly configOverrides?: Readonly<Record<string, unknown>>;
   readonly failAfterActivation?: string;
 }
@@ -166,6 +189,14 @@ interface TrackedListener {
   readonly listener: EventListenerOrEventListenerObject;
   readonly target: EventTarget;
   readonly type: string;
+}
+
+interface TrackedDeferredDeadline {
+  active: boolean;
+  readonly handle: ReturnType<typeof setTimeout>;
+  id?: string;
+  readonly identity: number;
+  readonly startedAt: number;
 }
 
 function captureOption(options?: boolean | AddEventListenerOptions): boolean {
@@ -180,6 +211,41 @@ function createMaximalHarness(options: MaximalHarnessOptions = {}) {
     if (!factory) throw new Error(`Missing real registration factory for ${id}`);
     return tracedRegistration(factory(TEST_RELEASE_ID), events, options.failAfterActivation);
   });
+  const registrationsById = new Map(
+    registrations.map((registration) => [registration.id, registration])
+  );
+  const criticalRegistrations = registrations.filter(({ phase }) => phase === 'critical');
+  const deferredRegistrations = registrations.filter(({ phase }) => phase === 'deferred');
+  const frames: FrameRequestCallback[] = [];
+  const idle: Array<() => void> = [];
+  const deferredDeadlines: TrackedDeferredDeadline[] = [];
+  let nextDeferredDeadlineIdentity = 1;
+  const trackedSetTimeout = (
+    callback: () => void,
+    delayMs: number
+  ): ReturnType<typeof setTimeout> => {
+    let deadline: TrackedDeferredDeadline | undefined;
+    const handle = setTimeout(() => {
+      if (deadline) deadline.active = false;
+      callback();
+    }, delayMs);
+    if (delayMs === 10_000) {
+      deadline = {
+        active: true,
+        handle,
+        identity: nextDeferredDeadlineIdentity,
+        startedAt: Date.now(),
+      };
+      nextDeferredDeadlineIdentity += 1;
+      deferredDeadlines.push(deadline);
+    }
+    return handle;
+  };
+  const trackedClearTimeout = (handle: ReturnType<typeof setTimeout>): void => {
+    const deadline = deferredDeadlines.find((candidate) => candidate.handle === handle);
+    if (deadline) deadline.active = false;
+    clearTimeout(handle);
+  };
   // JSDOM lazily installs its selector engine's own document-scoped listeners.
   // Materialize that test-environment infrastructure before tracking runtime effects.
   document.querySelectorAll('[id]');
@@ -264,6 +330,7 @@ function createMaximalHarness(options: MaximalHarnessOptions = {}) {
   vi.stubGlobal('MutationObserver', TrackedMutationObserver);
 
   let activeCaptureListeners = 0;
+  const captureListenerIdentities = new Set<(event: MessageEvent) => void>();
   const googletag = Object.freeze({
     ...createNoopGoogletagAdapter(),
     observeDiagnostics: (observer: GoogletagDiagnosticsObserver) => {
@@ -277,12 +344,14 @@ function createMaximalHarness(options: MaximalHarnessOptions = {}) {
     ...createNoopMessagingAdapter(),
     installCaptureListener: (listener: (event: MessageEvent) => void) => {
       activeCaptureListeners += 1;
+      captureListenerIdentities.add(listener);
       window.addEventListener('message', listener, true);
       let active = true;
       return (): void => {
         if (!active) return;
         active = false;
         activeCaptureListeners -= 1;
+        captureListenerIdentities.delete(listener);
         window.removeEventListener('message', listener, true);
       };
     },
@@ -321,6 +390,20 @@ function createMaximalHarness(options: MaximalHarnessOptions = {}) {
           interfaces: Object.freeze({}),
         }),
       kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      phaseScheduler: {
+        cancelAnimationFrame: vi.fn(),
+        cancelIdleCallback: vi.fn(),
+        clearTimeout: trackedClearTimeout,
+        requestAnimationFrame: (callback) => {
+          frames.push(callback);
+          return frames.length;
+        },
+        requestIdleCallback: (callback) => {
+          idle.push(callback);
+          return idle.length;
+        },
+        setTimeout: trackedSetTimeout,
+      },
     },
     {
       adapters: {
@@ -334,10 +417,71 @@ function createMaximalHarness(options: MaximalHarnessOptions = {}) {
 
   expect(composition.runtime.start()).toBe(true);
   expect(composition.runtime.start()).toBe(false);
-  for (const registration of registrations) {
-    expect(composition.runtime.registerIntegration(registration)).toBe(true);
+  for (const registration of criticalRegistrations) {
+    expect(
+      composition.runtime.registerIntegration(registration),
+      `register ${registration.id}`
+    ).toBe(true);
     events.push(`register:${registration.id}`);
   }
+  const criticalScript = document.querySelector<HTMLScriptElement>('#trustedserver-js');
+  if (!criticalScript) throw new Error('Maximal fixture critical script is unavailable');
+  const nativeHeadAppend = document.head.append.bind(document.head);
+  const appendDeferred = vi.spyOn(document.head, 'append').mockImplementation((...nodes) => {
+    nativeHeadAppend(...nodes);
+    for (const node of nodes) {
+      if (!(node instanceof HTMLScriptElement) || node === criticalScript) continue;
+      const matchedId = /\/static\/tsjs=tsjs-([a-z0-9_-]+)\.min\.js$/.exec(
+        new URL(node.src).pathname
+      )?.[1];
+      const registration = matchedId ? registrationsById.get(matchedId) : undefined;
+      if (!registration || registration.phase !== 'deferred') {
+        throw new Error(`Unexpected deferred artifact ${node.src}`);
+      }
+      const deadline = [...deferredDeadlines]
+        .reverse()
+        .find((candidate) => candidate.active && candidate.id === undefined);
+      if (!deadline) throw new Error(`Deferred deadline is unavailable for ${registration.id}`);
+      deadline.id = registration.id;
+      if (registration.id === options.blockDeferredId) continue;
+      Object.defineProperty(document, 'currentScript', { configurable: true, value: node });
+      expect(
+        composition.runtime.registerIntegration(registration),
+        `register deferred ${registration.id}`
+      ).toBe(true);
+      events.push(`register:${registration.id}`);
+      node.onload?.(new Event('load'));
+      Object.defineProperty(document, 'currentScript', {
+        configurable: true,
+        value: criticalScript,
+      });
+    }
+  });
+
+  const loadDeferred = async (): Promise<void> => {
+    expect(composition.runtime.protectFirstDisplayAttemptBatch([Promise.resolve()])).toBe(true);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(frames).toHaveLength(1);
+    frames.shift()?.(1);
+    expect(frames).toHaveLength(1);
+    frames.shift()?.(2);
+    expect(idle).toHaveLength(1);
+    idle.shift()?.();
+    const expectedDeferredIds = deferredRegistrations
+      .map(({ id }) => id)
+      .filter((id) => id !== options.blockDeferredId);
+    await vi.waitFor(() => {
+      expect(
+        events
+          .filter((event) => event.startsWith('register:'))
+          .filter((event) => deferredRegistrations.some(({ id }) => event === `register:${id}`))
+      ).toEqual(expectedDeferredIds.map((id) => `register:${id}`));
+      expect(deferredDeadlines.filter(({ id }) => id !== undefined)).toHaveLength(
+        deferredRegistrations.length
+      );
+    });
+  };
 
   const assertReleased = async (): Promise<void> => {
     composition.runtime.dispose();
@@ -373,15 +517,31 @@ function createMaximalHarness(options: MaximalHarnessOptions = {}) {
     }
     listenerRecords.length = 0;
     for (const observer of [...activeMutationObservers]) observer.disconnect();
+    appendDeferred.mockRestore();
     Object.defineProperty(eventTargetPrototype, 'addEventListener', addDescriptor);
     Object.defineProperty(eventTargetPrototype, 'removeEventListener', removeDescriptor);
   };
 
   return Object.freeze({
     assertReleased,
+    criticalIntegrationIds: criticalRegistrations.map(({ id }) => id),
     composition,
+    deferredDeadlines: () =>
+      Object.freeze(
+        deferredDeadlines.flatMap(({ active, id, identity, startedAt }) =>
+          id === undefined ? [] : [Object.freeze({ active, id, identity, startedAt })]
+        )
+      ),
+    deferredIntegrationIds: deferredRegistrations.map(({ id }) => id),
     events,
     integrationIds,
+    loadDeferred,
+    ownershipIdentities: () =>
+      Object.freeze({
+        adapters: composition.adapters,
+        captureListeners: Object.freeze([...captureListenerIdentities]),
+        runtime: composition.runtime,
+      }),
     resourceCounts: () =>
       Object.freeze({
         captureListeners: activeCaptureListeners,
@@ -479,147 +639,148 @@ describe('generated maximal browser runtime transaction', () => {
 
   it('owns all server bundles once and disposes them in exact reverse generated order', async () => {
     vi.useFakeTimers();
-    const integrationIds = maximalIntegrationIds();
-    const events: string[] = [];
-    const registrations = integrationIds.map((id) => {
-      const factory = REGISTRATION_FACTORIES.get(id);
-      if (!factory) throw new Error(`Missing real registration factory for ${id}`);
-      return tracedRegistration(factory(TEST_RELEASE_ID), events);
-    });
-    const activeObservers = new Set<GoogletagDiagnosticsObserver>();
-    const activeMutationObservers = new Set<MutationObserver>();
-    const NativeMutationObserver = window.MutationObserver;
-    class TrackedMutationObserver extends NativeMutationObserver {
-      public constructor(callback: MutationCallback) {
-        super(callback);
-        activeMutationObservers.add(this);
+    const harness = createMaximalHarness();
+    try {
+      const installed = await harness.composition.runtime.install();
+      if (installed.state === 'fallback') {
+        throw new Error(`${installed.reason}: ${harness.events.join(',')}`);
       }
+      expect(installed).toEqual({
+        state: 'kernel',
+        runtimeFailures: [],
+        dispose: expect.any(Function),
+      });
+      expect(harness.composition.runtime.state).toBe('kernel');
 
-      public override disconnect(): void {
-        activeMutationObservers.delete(this);
-        super.disconnect();
-      }
+      await harness.loadDeferred();
+      expect(harness.events.filter((event) => event.startsWith('register:'))).toEqual(
+        harness.integrationIds.map((id) => `register:${id}`)
+      );
+      expect(harness.events.filter((event) => event.startsWith('prepare:'))).toEqual(
+        harness.integrationIds.map((id) => `prepare:${id}`)
+      );
+      expect(harness.events.filter((event) => event.startsWith('activate:'))).toEqual(
+        harness.integrationIds.map((id) => `activate:${id}`)
+      );
+
+      window.dispatchEvent(new Event('resize'));
+      harness.composition.runtime.dispose();
+      harness.composition.runtime.dispose();
+      await Promise.resolve();
+      expect(harness.events.filter((event) => event.startsWith('dispose:'))).toEqual(
+        [...harness.integrationIds].reverse().map((id) => `dispose:${id}`)
+      );
+      await harness.assertReleased();
+    } finally {
+      harness.restoreInstrumentation();
     }
-    vi.stubGlobal('MutationObserver', TrackedMutationObserver);
-    let activeCaptureListeners = 0;
-    const googletag = Object.freeze({
-      ...createNoopGoogletagAdapter(),
-      observeDiagnostics: (observer: GoogletagDiagnosticsObserver) => {
-        activeObservers.add(observer);
-        return (): void => {
-          activeObservers.delete(observer);
-        };
-      },
-    });
-    const target: Record<string, unknown> = {};
-    const appendChildBefore = Element.prototype.appendChild;
-    const insertBeforeBefore = Element.prototype.insertBefore;
-    const fetchBefore = Object.getOwnPropertyDescriptor(window, 'fetch');
-    const sendBeaconBefore = Object.getOwnPropertyDescriptor(navigator, 'sendBeacon');
-    const didomiBefore = Object.getOwnPropertyDescriptor(window, 'didomiConfig');
-    const testlightBefore = Object.getOwnPropertyDescriptor(window, 'testlight');
-    const composition = createTestBrowserRuntimeComposition(
-      {
-        target,
-        releaseId: TEST_RELEASE_ID,
-        manifest: maximalManifest(),
-        knownIntegrationIds: integrationIds,
-        catalog: maximalRegistryCatalog(),
-        boot: {
-          auctionProjection: {
-            version: 1,
-            auction: { version: 1, auctionId: 'initial', results: [] },
-            slots: [],
-            bids: [],
-          },
-          creative: { version: 1, enabled: true, clickGuard: true, renderGuard: false },
-          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: true } },
-        },
-        getBindings: (id) =>
-          Object.freeze({ config: integrationConfig(id), interfaces: Object.freeze({}) }),
-        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
-      },
-      {
-        adapters: {
-          googletag,
-          messaging: Object.freeze({
-            ...createNoopMessagingAdapter(),
-            installCaptureListener: () => {
-              activeCaptureListeners += 1;
-              let active = true;
-              return (): void => {
-                if (!active) return;
-                active = false;
-                activeCaptureListeners -= 1;
-              };
-            },
-          }),
-          prebid: createNoopPrebidAdapter(),
-        },
-        coreActivations: { correctnessGptListeners: vi.fn() },
-      }
-    );
-
-    expect(composition.runtime.start()).toBe(true);
-    expect(composition.runtime.start()).toBe(false);
-    for (const registration of registrations) {
-      expect(registration.releaseId).toBe(TEST_RELEASE_ID);
-      expect(composition.runtime.registerIntegration(registration)).toBe(true);
-      events.push(`register:${registration.id}`);
-    }
-
-    const installed = await composition.runtime.install();
-
-    if (installed.state === 'fallback') {
-      throw new Error(`${installed.reason}: ${events.join(',')}`);
-    }
-    expect(installed).toEqual({
-      state: 'kernel',
-      runtimeFailures: [],
-      dispose: expect.any(Function),
-    });
-    expect(composition.runtime.state).toBe('kernel');
-    expect(target['releaseId']).toBe(TEST_RELEASE_ID);
-    expect(events.filter((event) => event.startsWith('register:'))).toEqual(
-      integrationIds.map((id) => `register:${id}`)
-    );
-    expect(events.filter((event) => event.startsWith('prepare:'))).toEqual(
-      integrationIds.map((id) => `prepare:${id}`)
-    );
-    expect(events.filter((event) => event.startsWith('activate:'))).toEqual(
-      integrationIds.map((id) => `activate:${id}`)
-    );
-    expect(composition.runtimeSessionForTest()?.interfaces).toMatchObject(
-      Object.fromEntries(integrationIds.map((id) => [id, expect.any(Object)]))
-    );
-    expect(composition.auctionContextRegistryForTest()?.snapshotInventoryForTest()).toEqual({
-      disposed: false,
-      registrations: ['permutive_context'],
-    });
-    expect(activeObservers.size).toBe(1);
-    expect(activeMutationObservers.size).toBeGreaterThan(0);
-    expect(activeCaptureListeners).toBe(1);
-
-    window.dispatchEvent(new Event('resize'));
-    composition.runtime.dispose();
-    composition.runtime.dispose();
-    await Promise.resolve();
-
-    expect(events.filter((event) => event.startsWith('dispose:'))).toEqual(
-      [...integrationIds].reverse().map((id) => `dispose:${id}`)
-    );
-    expect(activeObservers.size).toBe(0);
-    expect(activeMutationObservers.size).toBe(0);
-    expect(activeCaptureListeners).toBe(0);
-    expect(composition.auctionContextRegistryForTest()).toBeUndefined();
-    expect(vi.getTimerCount()).toBe(0);
-    expect(Element.prototype.appendChild).toBe(appendChildBefore);
-    expect(Element.prototype.insertBefore).toBe(insertBeforeBefore);
-    expect(Object.getOwnPropertyDescriptor(window, 'fetch')).toEqual(fetchBefore);
-    expect(Object.getOwnPropertyDescriptor(navigator, 'sendBeacon')).toEqual(sendBeaconBefore);
-    expect(Object.getOwnPropertyDescriptor(window, 'didomiConfig')).toEqual(didomiBefore);
-    expect(Object.getOwnPropertyDescriptor(window, 'testlight')).toEqual(testlightBefore);
   });
+
+  it.each(DEFERRED_INTEGRATION_IDS)(
+    'starts five deferred siblings independently while %s remains blocked to its own deadline',
+    async (blockedId) => {
+      vi.useFakeTimers();
+      const harness = createMaximalHarness({ blockDeferredId: blockedId });
+      try {
+        const installed = await harness.composition.runtime.install();
+        expect(installed.state).toBe('kernel');
+        const ownershipBefore = harness.ownershipIdentities();
+        expect(ownershipBefore.captureListeners).toHaveLength(1);
+
+        await harness.loadDeferred();
+
+        const activeIds = harness.integrationIds.filter((id) => id !== blockedId);
+        await vi.waitFor(() => {
+          expect(harness.events.filter((event) => event.startsWith('register:'))).toEqual(
+            activeIds.map((id) => `register:${id}`)
+          );
+          expect(harness.events.filter((event) => event.startsWith('prepare:'))).toEqual(
+            activeIds.map((id) => `prepare:${id}`)
+          );
+          expect(harness.events.filter((event) => event.startsWith('activate:'))).toEqual(
+            activeIds.map((id) => `activate:${id}`)
+          );
+        });
+
+        const startedDeadlines = harness.deferredDeadlines();
+        expect(startedDeadlines.map(({ id }) => id)).toEqual(DEFERRED_INTEGRATION_IDS);
+        expect(new Set(startedDeadlines.map(({ identity }) => identity).values()).size).toBe(6);
+        expect(new Set(startedDeadlines.map(({ startedAt }) => startedAt).values()).size).toBe(1);
+        expect(startedDeadlines.filter(({ active }) => active).map(({ id }) => id)).toEqual([
+          blockedId,
+        ]);
+        expect(document.querySelector(`script[src*="tsjs-${blockedId}.min.js"]`)).not.toBeNull();
+        expect(harness.ownershipIdentities()).toEqual(ownershipBefore);
+
+        const elapsedSinceStart = Date.now() - (startedDeadlines[0]?.startedAt ?? Date.now());
+        await vi.advanceTimersByTimeAsync(9_999 - elapsedSinceStart);
+        expect(harness.deferredDeadlines().find(({ id }) => id === blockedId)?.active).toBe(true);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(harness.deferredDeadlines().find(({ id }) => id === blockedId)?.active).toBe(false);
+        expect(document.querySelector(`script[src*="tsjs-${blockedId}.min.js"]`)).toBeNull();
+        expect(harness.events.filter((event) => event.startsWith('dispose:'))).toEqual([]);
+        expect(harness.ownershipIdentities()).toEqual(ownershipBefore);
+
+        await harness.assertReleased();
+        expect(harness.events.filter((event) => event.startsWith('dispose:'))).toEqual(
+          [...activeIds].reverse().map((id) => `dispose:${id}`)
+        );
+      } finally {
+        harness.composition.runtime.dispose();
+        await Promise.resolve();
+        harness.restoreInstrumentation();
+      }
+    }
+  );
+
+  it.each(DEFERRED_INTEGRATION_IDS)(
+    'contains an acquired %s failure without delaying or replacing deferred siblings',
+    async (failureId) => {
+      vi.useFakeTimers();
+      const harness = createMaximalHarness({ failAfterActivation: failureId });
+      try {
+        const installed = await harness.composition.runtime.install();
+        expect(installed.state).toBe('kernel');
+        const ownershipBefore = harness.ownershipIdentities();
+        expect(ownershipBefore.captureListeners).toHaveLength(1);
+
+        await harness.loadDeferred();
+
+        await vi.waitFor(() => {
+          expect(harness.events.filter((event) => event.startsWith('register:'))).toEqual(
+            harness.integrationIds.map((id) => `register:${id}`)
+          );
+          expect(harness.events.filter((event) => event.startsWith('prepare:'))).toEqual(
+            harness.integrationIds.map((id) => `prepare:${id}`)
+          );
+          expect(harness.events.filter((event) => event.startsWith('activate:'))).toEqual(
+            harness.integrationIds.map((id) => `activate:${id}`)
+          );
+          expect(harness.events.filter((event) => event.startsWith('dispose:'))).toEqual([
+            `dispose:${failureId}`,
+          ]);
+        });
+
+        const startedDeadlines = harness.deferredDeadlines();
+        expect(startedDeadlines.map(({ id }) => id)).toEqual(DEFERRED_INTEGRATION_IDS);
+        expect(new Set(startedDeadlines.map(({ identity }) => identity).values()).size).toBe(6);
+        expect(new Set(startedDeadlines.map(({ startedAt }) => startedAt).values()).size).toBe(1);
+        expect(startedDeadlines.some(({ active }) => active)).toBe(false);
+        expect(harness.ownershipIdentities()).toEqual(ownershipBefore);
+
+        await harness.assertReleased();
+        const disposalEvents = harness.events.filter((event) => event.startsWith('dispose:'));
+        expect(disposalEvents).toHaveLength(harness.integrationIds.length);
+        for (const id of harness.integrationIds) {
+          expect(disposalEvents.filter((event) => event === `dispose:${id}`)).toHaveLength(1);
+        }
+      } finally {
+        harness.composition.runtime.dispose();
+        await Promise.resolve();
+        harness.restoreInstrumentation();
+      }
+    }
+  );
 
   it.each([
     {
@@ -645,13 +806,13 @@ describe('generated maximal browser runtime transaction', () => {
     );
     try {
       const installed = await harness.composition.runtime.install();
-      const failureIndex = harness.integrationIds.indexOf(failureId);
+      const failureIndex = harness.criticalIntegrationIds.indexOf(failureId);
       const preparedIds =
         phase === 'activate'
-          ? harness.integrationIds
-          : harness.integrationIds.slice(0, failureIndex + 1);
+          ? harness.criticalIntegrationIds
+          : harness.criticalIntegrationIds.slice(0, failureIndex + 1);
       const activatedIds =
-        phase === 'activate' ? harness.integrationIds.slice(0, failureIndex + 1) : [];
+        phase === 'activate' ? harness.criticalIntegrationIds.slice(0, failureIndex + 1) : [];
 
       expect(installed).toEqual({ state: 'fallback', reason: 'bundle_partial' });
       expect(harness.composition.runtime.state).toBe('fallback');
@@ -660,7 +821,7 @@ describe('generated maximal browser runtime transaction', () => {
         reason: 'bundle_partial',
       });
       expect(harness.events.filter((event) => event.startsWith('register:'))).toEqual(
-        harness.integrationIds.map((id) => `register:${id}`)
+        harness.criticalIntegrationIds.map((id) => `register:${id}`)
       );
       expect(harness.events.filter((event) => event.startsWith('prepare:'))).toEqual(
         preparedIds.map((id) => `prepare:${id}`)
@@ -728,6 +889,10 @@ describe('generated maximal browser runtime transaction', () => {
       const installed = await harness.composition.runtime.install();
       const expectedRuntimeFailures =
         kind === 'storage' ? [{ id: 'sourcepoint_consent', phase: 'after_commit' }] : [];
+      const activeIntegrationIds =
+        kind === 'storage'
+          ? harness.integrationIds.filter((id) => id !== 'sourcepoint_lifecycle')
+          : harness.integrationIds;
 
       expect(installed).toEqual({
         state: 'kernel',
@@ -735,15 +900,13 @@ describe('generated maximal browser runtime transaction', () => {
         dispose: expect.any(Function),
       });
       expect(harness.composition.runtime.state).toBe('kernel');
+      await harness.loadDeferred();
       expect(harness.events.filter((event) => event.startsWith('prepare:'))).toEqual(
-        harness.integrationIds.map((id) => `prepare:${id}`)
+        activeIntegrationIds.map((id) => `prepare:${id}`)
       );
       expect(harness.events.filter((event) => event.startsWith('activate:'))).toEqual(
-        harness.integrationIds.map((id) => `activate:${id}`)
+        activeIntegrationIds.map((id) => `activate:${id}`)
       );
-      expect(
-        harness.composition.auctionContextRegistryForTest()?.snapshotInventoryForTest()
-      ).toEqual({ disposed: false, registrations: ['permutive_context'] });
       expect(harness.resourceCounts()).toMatchObject({
         captureListeners: 1,
         listeners: expect.any(Number),
@@ -774,7 +937,7 @@ describe('generated maximal browser runtime transaction', () => {
         disposedBeforeRuntimeRelease
       );
       await harness.assertReleased();
-      const reverseIds = [...harness.integrationIds].reverse();
+      const reverseIds = [...activeIntegrationIds].reverse();
       const expectedDisposals =
         kind === 'storage'
           ? [

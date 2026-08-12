@@ -136,6 +136,7 @@ export function createLockrRuntime(
 
 export function createLockrIntegrationRegistration(release: string): IntegrationRegistration {
   return createLifecycleIntegrationRegistration(LOCKR_INTEGRATION_ID, release, {
+    createOwnedRuntime: () => createLockrRuntime(),
     validateConfig: (candidate) => candidate === undefined,
   });
 }

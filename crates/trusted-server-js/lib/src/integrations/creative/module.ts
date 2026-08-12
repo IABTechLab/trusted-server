@@ -4,13 +4,14 @@ import type {
   IntegrationPrepareContext,
   IntegrationRegistration,
 } from '../../kernel/integration_registry';
+import type { RuntimeCapabilityV1 } from '../../kernel/runtime';
+
+import { installClickGuard } from './click';
+import { installDynamicIframeProxy } from './iframe';
+import { installDynamicImageProxy } from './image';
+import { createCreativeStartup } from './startup';
 
 export const CREATIVE_INTEGRATION_ID = 'creative' as const;
-
-interface CreativeIntegrationRuntime {
-  readonly activate: (config: Readonly<CreativeBootV1>) => () => void;
-  readonly start: (config: Readonly<CreativeBootV1>) => void;
-}
 
 function readCreativeBoot(candidate: unknown): Readonly<CreativeBootV1> | undefined {
   try {
@@ -49,11 +50,11 @@ function readCreativeBoot(candidate: unknown): Readonly<CreativeBootV1> | undefi
   }
 }
 
-function readCreativeRuntime(
+function readRuntimeCapability(
   interfaces: Readonly<Record<string, unknown>>
-): CreativeIntegrationRuntime | undefined {
+): RuntimeCapabilityV1 | undefined {
   try {
-    const descriptor = Object.getOwnPropertyDescriptor(interfaces, CREATIVE_INTEGRATION_ID);
+    const descriptor = Object.getOwnPropertyDescriptor(interfaces, 'runtime.v1');
     if (!descriptor || !('value' in descriptor)) return undefined;
     const candidate = descriptor.value;
     if (
@@ -61,41 +62,38 @@ function readCreativeRuntime(
       candidate === null ||
       Array.isArray(candidate) ||
       !Object.isFrozen(candidate) ||
-      Reflect.ownKeys(candidate).length !== 2
+      !(candidate as RuntimeCapabilityV1).document
     ) {
       return undefined;
     }
-    const activate = Object.getOwnPropertyDescriptor(candidate, 'activate');
-    const start = Object.getOwnPropertyDescriptor(candidate, 'start');
-    if (
-      !activate ||
-      !('value' in activate) ||
-      typeof activate.value !== 'function' ||
-      !start ||
-      !('value' in start) ||
-      typeof start.value !== 'function'
-    ) {
-      return undefined;
-    }
-    return candidate as CreativeIntegrationRuntime;
+    return candidate as RuntimeCapabilityV1;
   } catch {
     return undefined;
   }
 }
 
 /** Build the inert, release-bound creative module for the coordinated runtime. */
-export function createCreativeIntegrationRegistration(release: string): IntegrationRegistration {
+export function createCreativeIntegrationRegistration(releaseId: string): IntegrationRegistration {
   return Object.freeze({
+    abi: 1,
     id: CREATIVE_INTEGRATION_ID,
-    release,
-    prepare: async ({ config, interfaces }: IntegrationPrepareContext) => {
+    phase: 'critical',
+    releaseId,
+    prepare: ({ config, interfaces }: IntegrationPrepareContext) => {
       const creative = readCreativeBoot(config);
       if (!creative) throw new TypeError('Creative boot configuration is invalid');
-      const runtime = readCreativeRuntime(interfaces);
-      if (!runtime) throw new TypeError('Creative integration runtime is unavailable');
+      const runtimeCapability = readRuntimeCapability(interfaces);
+      const runtimeDocument = runtimeCapability?.document;
+      if (!runtimeDocument) throw new TypeError('Creative runtime capability is unavailable');
       if (!creative.enabled || (!creative.clickGuard && !creative.renderGuard)) {
         return Object.freeze({ activate: () => undefined });
       }
+      const runtime = createCreativeStartup({
+        document: runtimeDocument,
+        installClickGuard: () => installClickGuard(false),
+        installDynamicIframeProxy: () => installDynamicIframeProxy(false),
+        installDynamicImageProxy: () => installDynamicImageProxy(false),
+      });
 
       return Object.freeze({
         activate: ({ afterCommit, onDispose }: IntegrationActivationContext) => {

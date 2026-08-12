@@ -1,4 +1,20 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const ownedGuards = vi.hoisted(() => ({
+  installClick: vi.fn(),
+  installIframe: vi.fn(),
+  installImage: vi.fn(),
+}));
+
+vi.mock('../../../src/integrations/creative/click', () => ({
+  installClickGuard: ownedGuards.installClick,
+}));
+vi.mock('../../../src/integrations/creative/iframe', () => ({
+  installDynamicIframeProxy: ownedGuards.installIframe,
+}));
+vi.mock('../../../src/integrations/creative/image', () => ({
+  installDynamicImageProxy: ownedGuards.installImage,
+}));
 
 import { createCreativeIntegrationRegistration } from '../../../src/integrations/creative/module';
 import {
@@ -13,8 +29,23 @@ function manifest(ids: readonly string[]) {
   return {
     version: 1,
     releaseId: RELEASE_ID,
-    integrations: ids.map((id) => ({ id, required: true })),
+    criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
+    integrations: ids.map((id) => ({ id, phase: 'critical' as const })),
   };
+}
+
+function catalog(ids: readonly string[]) {
+  return Object.freeze(
+    ids.map((id) =>
+      Object.freeze({
+        id,
+        phase: 'critical' as const,
+        trigger: null,
+        consumes: Object.freeze(id === 'creative' ? ['runtime.v1'] : []),
+        provides: Object.freeze([]),
+      })
+    )
+  );
 }
 
 function callbacks(order: string[]): IntegrationInstallCallbacks {
@@ -29,10 +60,27 @@ function registration(
   id: string,
   prepare: IntegrationRegistration['prepare']
 ): IntegrationRegistration {
-  return Object.freeze({ id, release: RELEASE_ID, prepare });
+  return Object.freeze({ abi: 1, id, phase: 'critical', releaseId: RELEASE_ID, prepare });
+}
+
+function runtimeCapability() {
+  return Object.freeze({ document });
+}
+
+function guard(name: string, order: string[]) {
+  return Object.freeze({
+    dispose: vi.fn(() => order.push(`dispose:${name}`)),
+    scan: vi.fn(() => order.push(`scan:${name}`)),
+  });
 }
 
 describe('transactional creative integration module', () => {
+  beforeEach(() => {
+    ownedGuards.installClick.mockReset();
+    ownedGuards.installIframe.mockReset();
+    ownedGuards.installImage.mockReset();
+  });
+
   it('prepares inertly, activates reversible guards, and scans only after commit', async () => {
     const config = Object.freeze({
       version: 1,
@@ -41,13 +89,21 @@ describe('transactional creative integration module', () => {
       renderGuard: true,
     });
     const order: string[] = [];
-    const release = vi.fn(() => order.push('release'));
-    const activate = vi.fn((received: unknown) => {
-      order.push('creative:activate');
-      expect(received).toBe(config);
-      return release;
+    const click = guard('click', order);
+    const image = guard('image', order);
+    const iframe = guard('iframe', order);
+    ownedGuards.installClick.mockImplementation(() => {
+      order.push('install:click');
+      return click;
     });
-    const start = vi.fn(() => order.push('creative:scan'));
+    ownedGuards.installImage.mockImplementation(() => {
+      order.push('install:image');
+      return image;
+    });
+    ownedGuards.installIframe.mockImplementation(() => {
+      order.push('install:iframe');
+      return iframe;
+    });
     let finishPreparation: (() => void) | undefined;
     const preparationGate = new Promise<void>((resolve) => {
       finishPreparation = resolve;
@@ -56,11 +112,13 @@ describe('transactional creative integration module', () => {
       manifest: manifest(['creative', 'gate']),
       releaseId: RELEASE_ID,
       knownIntegrationIds: Object.freeze(['creative', 'gate']),
+      catalog: catalog(['creative', 'gate']),
       startedAtMs: 0,
       now: () => 0,
+      runtimeCapability: runtimeCapability(),
       getBindings: () => ({
         config,
-        interfaces: Object.freeze({ creative: Object.freeze({ activate, start }) }),
+        interfaces: Object.freeze({}),
       }),
     });
     registry.register(createCreativeIntegrationRegistration(RELEASE_ID));
@@ -74,8 +132,7 @@ describe('transactional creative integration module', () => {
 
     const installing = registry.install(callbacks(order));
     await vi.waitFor(() => expect(order).toEqual(['gate:prepare']));
-    expect(activate).not.toHaveBeenCalled();
-    expect(start).not.toHaveBeenCalled();
+    expect(ownedGuards.installClick).not.toHaveBeenCalled();
 
     finishPreparation?.();
     const result = await installing;
@@ -84,17 +141,21 @@ describe('transactional creative integration module', () => {
     expect(order).toEqual([
       'gate:prepare',
       'core',
-      'creative:activate',
+      'install:click',
+      'install:image',
+      'install:iframe',
       'gate:activate',
       'publish',
-      'creative:scan',
+      'scan:click',
+      'scan:image',
+      'scan:iframe',
       'drain',
     ]);
     if (result.state === 'kernel') {
       result.dispose();
       result.dispose();
     }
-    expect(release).toHaveBeenCalledTimes(1);
+    expect(order.slice(-3)).toEqual(['dispose:iframe', 'dispose:image', 'dispose:click']);
   });
 
   it('performs no runtime work when enabled with both guards false', async () => {
@@ -104,35 +165,39 @@ describe('transactional creative integration module', () => {
       clickGuard: false,
       renderGuard: false,
     });
-    const activate = vi.fn();
-    const start = vi.fn();
     const registry = createIntegrationRegistry({
       manifest: manifest(['creative']),
       releaseId: RELEASE_ID,
       knownIntegrationIds: Object.freeze(['creative']),
+      catalog: catalog(['creative']),
       startedAtMs: 0,
       now: () => 0,
+      runtimeCapability: runtimeCapability(),
       getBindings: () => ({
         config,
-        interfaces: Object.freeze({ creative: Object.freeze({ activate, start }) }),
+        interfaces: Object.freeze({}),
       }),
     });
     registry.register(createCreativeIntegrationRegistration(RELEASE_ID));
 
     await expect(registry.install(callbacks([]))).resolves.toMatchObject({ state: 'kernel' });
-    expect(activate).not.toHaveBeenCalled();
-    expect(start).not.toHaveBeenCalled();
+    expect(ownedGuards.installClick).not.toHaveBeenCalled();
+    expect(ownedGuards.installImage).not.toHaveBeenCalled();
+    expect(ownedGuards.installIframe).not.toHaveBeenCalled();
   });
 
   it('unwinds creative activation before a later module failure', async () => {
-    const release = vi.fn();
-    const start = vi.fn();
+    const order: string[] = [];
+    const click = guard('click', order);
+    ownedGuards.installClick.mockReturnValue(click);
     const registry = createIntegrationRegistry({
       manifest: manifest(['creative', 'broken']),
       releaseId: RELEASE_ID,
       knownIntegrationIds: Object.freeze(['creative', 'broken']),
+      catalog: catalog(['creative', 'broken']),
       startedAtMs: 0,
       now: () => 0,
+      runtimeCapability: runtimeCapability(),
       getBindings: () => ({
         config: Object.freeze({
           version: 1,
@@ -140,9 +205,7 @@ describe('transactional creative integration module', () => {
           clickGuard: true,
           renderGuard: false,
         }),
-        interfaces: Object.freeze({
-          creative: Object.freeze({ activate: () => release, start }),
-        }),
+        interfaces: Object.freeze({}),
       }),
     });
     registry.register(createCreativeIntegrationRegistration(RELEASE_ID));
@@ -158,8 +221,8 @@ describe('transactional creative integration module', () => {
       state: 'fallback',
       reason: 'bundle_partial',
     });
-    expect(release).toHaveBeenCalledTimes(1);
-    expect(start).not.toHaveBeenCalled();
+    expect(click.dispose).toHaveBeenCalledTimes(1);
+    expect(click.scan).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -210,6 +273,7 @@ describe('transactional creative integration module', () => {
       manifest: manifest(['creative']),
       releaseId: RELEASE_ID,
       knownIntegrationIds: Object.freeze(['creative']),
+      catalog: catalog(['creative']),
       startedAtMs: 0,
       now: () => 0,
       getBindings: () => ({
@@ -227,11 +291,12 @@ describe('transactional creative integration module', () => {
     expect(start).not.toHaveBeenCalled();
   });
 
-  it('fails preparation without effects when composition omits the creative boundary', async () => {
+  it('fails preparation without effects when composition omits runtime.v1', async () => {
     const registry = createIntegrationRegistry({
       manifest: manifest(['creative']),
       releaseId: RELEASE_ID,
       knownIntegrationIds: Object.freeze(['creative']),
+      catalog: catalog(['creative']),
       startedAtMs: 0,
       now: () => 0,
       getBindings: () => ({
@@ -252,17 +317,22 @@ describe('transactional creative integration module', () => {
     });
   });
 
-  it('isolates a post-commit scan failure to the creative module', async () => {
+  it('contains a post-commit guard scan failure inside the creative module', async () => {
     const runtimeFailures: unknown[] = [];
-    const start = vi.fn(() => {
+    const order: string[] = [];
+    const click = guard('click', order);
+    vi.mocked(click.scan).mockImplementation(() => {
       throw new Error('fictional creative scan failure');
     });
+    ownedGuards.installClick.mockReturnValue(click);
     const registry = createIntegrationRegistry({
       manifest: manifest(['creative']),
       releaseId: RELEASE_ID,
       knownIntegrationIds: Object.freeze(['creative']),
+      catalog: catalog(['creative']),
       startedAtMs: 0,
       now: () => 0,
+      runtimeCapability: runtimeCapability(),
       onRuntimeFailure: (failure) => runtimeFailures.push(failure),
       getBindings: () => ({
         config: Object.freeze({
@@ -271,17 +341,16 @@ describe('transactional creative integration module', () => {
           clickGuard: true,
           renderGuard: false,
         }),
-        interfaces: Object.freeze({
-          creative: Object.freeze({ activate: () => vi.fn(), start }),
-        }),
+        interfaces: Object.freeze({}),
       }),
     });
     registry.register(createCreativeIntegrationRegistration(RELEASE_ID));
 
     await expect(registry.install(callbacks([]))).resolves.toMatchObject({
       state: 'kernel',
-      runtimeFailures: [{ id: 'creative', phase: 'after_commit' }],
+      runtimeFailures: [],
     });
-    expect(runtimeFailures).toEqual([{ id: 'creative', phase: 'after_commit' }]);
+    expect(click.scan).toHaveBeenCalledOnce();
+    expect(runtimeFailures).toEqual([]);
   });
 });
