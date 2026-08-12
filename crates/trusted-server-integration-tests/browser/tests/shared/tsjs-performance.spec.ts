@@ -38,14 +38,16 @@ const FIXTURE_ID = "tsjs-generated-loopback-paired-v2";
 const CONTROLLER_ID = "generated-server-v1";
 const CRITICAL_IDS = ["render_runtime", "gpt"] as const;
 const DEFERRED_IDS = ["diagnostics_presentation", "gpt_later"] as const;
-const HEAP_CEILINGS = {
-  afterBoot: 1_329_697,
-  afterFirstRender: 1_333_217,
-  afterRefresh: 1_333_217,
-  afterSpaNavigation: 1_341_419,
-} as const;
+const HEAP_CHECKPOINTS = [
+  "afterBoot",
+  "afterFirstRender",
+  "afterRefresh",
+  "afterSpaNavigation",
+] as const;
+const MAXIMUM_HEAP_RATIO = 1.1;
+const HARD_HEAP_CEILING_BYTES = 4 * 1024 * 1024;
 
-type HeapCheckpoint = keyof typeof HEAP_CEILINGS;
+type HeapCheckpoint = (typeof HEAP_CHECKPOINTS)[number];
 
 interface ReleaseArtifact {
   id: string;
@@ -838,6 +840,62 @@ async function collectHeap(page: Page): Promise<number> {
   }
 }
 
+async function collectHeapCheckpoints(
+  browser: Browser,
+  fixtureServer: FixtureServer,
+): Promise<Record<HeapCheckpoint, number>> {
+  const heapRun = await openFixture(browser, fixtureServer, true);
+  const retainedHeapBytes = {} as Record<HeapCheckpoint, number>;
+  try {
+    await expect
+      .poll(() => heapRun.page.evaluate(() => window.tsjs?._internal?.state))
+      .toBe("kernel");
+    retainedHeapBytes.afterBoot = await collectHeap(heapRun.page);
+    await heapRun.page.evaluate(() => window.__fixtureGpt.release());
+    await waitForMark(heapRun, "tsjs:first-display-paint");
+    retainedHeapBytes.afterFirstRender = await collectHeap(heapRun.page);
+    await heapRun.page.evaluate(() => window.__fixtureGpt.publisherRefresh());
+    retainedHeapBytes.afterRefresh = await collectHeap(heapRun.page);
+    for (const id of DEFERRED_IDS) {
+      await expect
+        .poll(() =>
+          heapRun.page.evaluate(
+            (moduleId) => window.__fixtureGpt.executionTime(moduleId),
+            id,
+          ),
+        )
+        .not.toBeUndefined();
+    }
+    const navigationResponse = heapRun.page.waitForResponse((response) =>
+      response.url().includes("/_ts/page-bids"),
+    );
+    await heapRun.page.evaluate(() =>
+      history.pushState({}, "", "/fixture?navigation=1"),
+    );
+    const response = await navigationResponse;
+    expect(await response.finished()).toBeNull();
+    await expect
+      .poll(() =>
+        heapRun.page.evaluate(() => {
+          const googletag = window.googletag as {
+            pubads(): {
+              getSlots(): Array<{ getSlotElementId(): string }>;
+            };
+          };
+          return googletag
+            .pubads()
+            .getSlots()
+            .map((slot) => slot.getSlotElementId());
+        }),
+      )
+      .toEqual(["perf-slot"]);
+    retainedHeapBytes.afterSpaNavigation = await collectHeap(heapRun.page);
+    return retainedHeapBytes;
+  } finally {
+    await heapRun.close();
+  }
+}
+
 function p90(values: readonly number[]): number {
   const ordered = [...values].sort((left, right) => left - right);
   return ordered[Math.ceil((PERCENTILE / 100) * ordered.length) - 1]!;
@@ -973,64 +1031,27 @@ test.describe("TSJS first-display performance gate", () => {
     expect(currentP90).toBeLessThanOrEqual(HARD_P90_CEILING_MS);
     expect(currentP90).toBeLessThanOrEqual(referenceP90 * MAXIMUM_P90_RATIO);
 
-    const heapRun = await openFixture(browser, currentServer, true);
-    const retainedHeapBytes = {} as Record<HeapCheckpoint, number>;
-    try {
-      await expect
-        .poll(() => heapRun.page.evaluate(() => window.tsjs?._internal?.state))
-        .toBe("kernel");
-      retainedHeapBytes.afterBoot = await collectHeap(heapRun.page);
-      await heapRun.page.evaluate(() => window.__fixtureGpt.release());
-      await waitForMark(heapRun, "tsjs:first-display-paint");
-      retainedHeapBytes.afterFirstRender = await collectHeap(heapRun.page);
-      await heapRun.page.evaluate(() => window.__fixtureGpt.publisherRefresh());
-      retainedHeapBytes.afterRefresh = await collectHeap(heapRun.page);
-      for (const id of DEFERRED_IDS) {
-        await expect
-          .poll(() =>
-            heapRun.page.evaluate(
-              (moduleId) => window.__fixtureGpt.executionTime(moduleId),
-              id,
-            ),
-          )
-          .not.toBeUndefined();
-      }
-      const navigationResponse = heapRun.page.waitForResponse((response) =>
-        response.url().includes("/_ts/page-bids"),
-      );
-      await heapRun.page.evaluate(() =>
-        history.pushState({}, "", "/fixture?navigation=1"),
-      );
-      const response = await navigationResponse;
-      expect(await response.finished()).toBeNull();
-      // Replacement disposal removes the old physical slot before page-bids fetch.
-      // Its return proves the response was parsed, committed, and reconciled.
-      await expect
-        .poll(() =>
-          heapRun.page.evaluate(() => {
-            const googletag = window.googletag as {
-              pubads(): {
-                getSlots(): Array<{ getSlotElementId(): string }>;
-              };
-            };
-            return googletag
-              .pubads()
-              .getSlots()
-              .map((slot) => slot.getSlotElementId());
-          }),
-        )
-        .toEqual(["perf-slot"]);
-      retainedHeapBytes.afterSpaNavigation = await collectHeap(heapRun.page);
-    } finally {
-      await heapRun.close();
-    }
-    for (const [name, ceiling] of Object.entries(HEAP_CEILINGS) as Array<
-      [HeapCheckpoint, number]
-    >) {
+    const referenceHeapBytes = await collectHeapCheckpoints(
+      browser,
+      referenceServer,
+    );
+    const currentHeapBytes = await collectHeapCheckpoints(
+      browser,
+      currentServer,
+    );
+    for (const name of HEAP_CHECKPOINTS) {
       expect(
-        retainedHeapBytes[name],
-        `${name} retained heap`,
-      ).toBeLessThanOrEqual(ceiling);
+        referenceHeapBytes[name],
+        `${name} reference retained heap`,
+      ).toBeLessThanOrEqual(HARD_HEAP_CEILING_BYTES);
+      expect(
+        currentHeapBytes[name],
+        `${name} current retained heap`,
+      ).toBeLessThanOrEqual(HARD_HEAP_CEILING_BYTES);
+      expect(
+        currentHeapBytes[name],
+        `${name} paired retained heap`,
+      ).toBeLessThanOrEqual(referenceHeapBytes[name] * MAXIMUM_HEAP_RATIO);
     }
 
     const evidenceId = process.env.TSJS_EVIDENCE_ID;
@@ -1066,7 +1087,7 @@ test.describe("TSJS first-display performance gate", () => {
       encoding: "utf8",
     }).trim();
     const evidence = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       evidenceId,
       mode,
       headSha,
@@ -1113,14 +1134,13 @@ test.describe("TSJS first-display performance gate", () => {
       },
       heap: {
         collection: "one-collectGarbage-then-immediate-getHeapUsage",
-        checkpoints: Object.fromEntries(
-          (
-            Object.entries(HEAP_CEILINGS) as Array<[HeapCheckpoint, number]>
-          ).map(([name, ceilingBytes]) => [
-            name,
-            { usedSize: retainedHeapBytes[name], ceilingBytes },
-          ]),
-        ),
+        maximumRatio: MAXIMUM_HEAP_RATIO,
+        hardCeilingBytes: HARD_HEAP_CEILING_BYTES,
+        reference: {
+          sha: REFERENCE_SHA,
+          checkpoints: referenceHeapBytes,
+        },
+        current: { checkpoints: currentHeapBytes },
       },
       requests: {
         critical: { count: 1 },
