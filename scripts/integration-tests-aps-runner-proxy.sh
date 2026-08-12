@@ -39,14 +39,13 @@ ABSENCE_PATTERNS=(
   aps_runner_proxy_test_endpoint
   aps_runner_proxy_fixture
   aps-runner-proxy-fixture-bounded
-  /integrations/aps/renderer/v1
-  /integrations/aps/runner.js
   x-ts-aps-logical-url
 )
 
-# The fixed APS upstream URL is intentionally not an absence sentinel: the
-# legacy production renderer already embeds that legitimate URL. The entries
-# above are unique to the feature-only local routes and test transport.
+# The production renderer and live runner-proxy routes are intentionally not
+# absence sentinels. The entries above are unique to the feature-only local
+# upstream and test transport; finding one in a release artifact would mean the
+# hermetic fixture or its routing seam leaked into production.
 
 CARGO_TEST_PID=""
 CARGO_TEST_PGID=""
