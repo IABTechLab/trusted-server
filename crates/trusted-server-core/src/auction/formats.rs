@@ -312,9 +312,16 @@ pub(crate) struct OpenRtbResponseConversion {
 
 /// Convert `OrchestrationResult` to `OpenRTB` response format.
 ///
-/// Always sanitizes creative HTML in the `adm` field and optionally rewrites it
-/// according to the auction configuration. Typed renderers are serialized in
-/// the response extension instead of entering the HTML sanitizer.
+/// Creative HTML in the `adm` field is optionally sanitized and optionally
+/// rewritten according to the auction configuration
+/// ([`AuctionConfig::sanitize_creatives`], opt-in, and
+/// [`AuctionConfig::rewrite_creatives`], default-on); with both disabled the
+/// creative ships exactly as the bidder returned it, subject to the 1 MiB
+/// per-creative cap. Typed renderers are serialized in the response extension
+/// instead of entering that pipeline at all.
+///
+/// [`AuctionConfig::sanitize_creatives`]: crate::auction_config_types::AuctionConfig::sanitize_creatives
+/// [`AuctionConfig::rewrite_creatives`]: crate::auction_config_types::AuctionConfig::rewrite_creatives
 ///
 /// # Errors
 ///
@@ -363,8 +370,10 @@ pub(crate) fn convert_to_openrtb_response_with_report(
         let width = to_openrtb_i32(bid.width, "width", &bid_context);
         let height = to_openrtb_i32(bid.height, "height", &bid_context);
 
-        // Ordinary markup remains on the mandatory sanitize/rewrite path. A
-        // typed renderer is serialized separately and never enters the HTML sanitizer.
+        // Ordinary markup goes through the configured creative processing:
+        // sanitization is opt-in, rewriting is on by default, and with both
+        // disabled the creative ships exactly as the bidder returned it. A typed
+        // renderer is serialized separately and never enters that pipeline.
         let serialize_renderer = |renderer: &BidRenderer| {
             (BidExt {
                 trusted_server: BidTrustedServerExt { renderer },
@@ -387,10 +396,11 @@ pub(crate) fn convert_to_openrtb_response_with_report(
             let processed = creative::process_auction_creative(settings, raw_creative);
 
             log::debug!(
-                "Processed creative for auction {} slot {} bidder {} (rewrite {}, raw {} bytes, output {} bytes)",
+                "Processed creative for auction {} slot {} bidder {} (sanitize {}, rewrite {}, raw {} bytes, output {} bytes)",
                 auction_request.id,
                 slot_id,
                 bid.bidder,
+                settings.auction.sanitize_creatives,
                 rewrite_creatives,
                 raw_creative.len(),
                 processed.len()
@@ -1189,7 +1199,18 @@ mod tests {
         assert_eq!(bid["id"], json!("appnexus-div-gpt-top"));
         assert_eq!(bid["impid"], json!("div-gpt-top"));
         assert_eq!(bid["price"], json!(2.75));
-        assert_eq!(bid["adm"], json!("<div>Ad</div>"));
+        // Rewriting is on by default, and a body-less fragment still receives
+        // the creative runtime (prepended), so the markup is carried rather
+        // than returned verbatim.
+        let adm = bid["adm"].as_str().expect("should serialize adm");
+        assert!(
+            adm.contains("<div>Ad</div>"),
+            "should carry the creative: {adm}"
+        );
+        assert!(
+            adm.contains("/static/tsjs=tsjs-unified.min.js"),
+            "should inject the creative runtime into a body-less fragment: {adm}"
+        );
         assert_eq!(bid["crid"], json!("appnexus-creative"));
         assert_eq!(bid["w"], json!(300));
         assert_eq!(bid["h"], json!(250));
@@ -1210,8 +1231,10 @@ mod tests {
     }
 
     #[test]
-    fn convert_to_openrtb_response_rewrites_sanitized_creative_by_default() {
-        let settings = make_settings();
+    fn convert_to_openrtb_response_rewrites_sanitized_creative_when_enabled() {
+        let mut settings = make_settings();
+        settings.auction.sanitize_creatives = true;
+        settings.auction.rewrite_creatives = true;
         let auction_request = make_auction_request();
         let result = make_result(make_complete_creative_bid());
 
@@ -1258,9 +1281,85 @@ mod tests {
     }
 
     #[test]
-    fn convert_to_openrtb_response_can_skip_rewriting_but_not_sanitization() {
+    fn convert_to_openrtb_response_can_skip_sanitization_when_disabled() {
+        // Sanitization strips every executable element with its inner content, which
+        // destroys script-based creatives (the majority of programmatic display).
+        // Publishers whose creatives render in a foreign-origin frame — where the
+        // markup cannot reach the publisher origin — can opt out and deliver the
+        // creative exactly as the bidder returned it.
+        let mut settings = make_settings();
+        settings.auction.sanitize_creatives = false;
+        settings.auction.rewrite_creatives = false;
+        let auction_request = make_auction_request();
+        let result = make_result(make_complete_creative_bid());
+
+        let original = make_complete_creative_bid()
+            .creative
+            .expect("should have a creative fixture");
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
+            .expect("should convert creative with sanitization disabled");
+        let adm = response_adm(response);
+
+        assert_eq!(
+            adm, original,
+            "should deliver the creative byte-for-byte as the bidder returned it"
+        );
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_rewrites_raw_markup_without_sanitizing() {
+        // The fourth mode: rewriting enabled while sanitization stays off. The
+        // rewriter converts eligible resource/click URLs on the raw bidder
+        // markup and preserves executable content.
+        let mut settings = make_settings();
+        settings.auction.sanitize_creatives = false;
+        settings.auction.rewrite_creatives = true;
+        let auction_request = make_auction_request();
+        let result = make_result(make_complete_creative_bid());
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
+            .expect("should convert creative with rewriting only");
+        let adm = response_adm(response);
+
+        assert!(
+            adm.contains("/first-party/proxy?tsurl="),
+            "should rewrite accepted resource URLs: {adm}"
+        );
+        assert!(
+            adm.contains("/first-party/click?tsurl="),
+            "should rewrite accepted click URLs: {adm}"
+        );
+        assert!(
+            adm.contains("auction-script-marker"),
+            "should preserve script content when sanitization is disabled: {adm}"
+        );
+        assert!(
+            adm.contains("auction-handler-marker"),
+            "should preserve event handlers when sanitization is disabled: {adm}"
+        );
+    }
+
+    #[test]
+    fn sanitize_creatives_defaults_to_disabled() {
+        let config = crate::auction_config_types::AuctionConfig::default();
+        assert!(
+            !config.sanitize_creatives,
+            "sanitization is opt-in: it blanks script-based creatives"
+        );
+        assert!(
+            config.rewrite_creatives,
+            "creative URL rewriting stays enabled by default"
+        );
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_can_skip_rewriting_while_sanitizing() {
+        // The two controls are independent: sanitization can stay on while URL
+        // rewriting is off.
         let mut settings = make_settings();
         settings.auction.rewrite_creatives = false;
+        settings.auction.sanitize_creatives = true;
         let auction_request = make_auction_request();
         let result = make_result(make_complete_creative_bid());
 
@@ -1349,7 +1448,12 @@ mod tests {
 
     #[test]
     fn convert_to_openrtb_response_skips_invalid_winners_without_dropping_valid_slots() {
-        let settings = make_settings();
+        // Sanitization is opt-in, so enable it here: script-only markup is what
+        // makes the `rejected` and `renderer` fixtures below reach the
+        // processing-rejected path. Left at the default they would survive
+        // processing as ordinary (script-bearing) creatives.
+        let mut settings = make_settings();
+        settings.auction.sanitize_creatives = true;
         let auction_request = make_auction_request();
         let mut missing = make_bid("missing", "invalid", Some(3.0));
         missing.creative = None;
@@ -1436,7 +1540,13 @@ mod tests {
             .iter()
             .find(|bid| bid["impid"] == "ordinary")
             .expect("should preserve ordinary winner");
-        assert_eq!(ordinary["adm"], "<div>Ad</div>");
+        assert!(
+            ordinary["adm"]
+                .as_str()
+                .is_some_and(|adm| adm.contains("<div>Ad</div>")),
+            "should preserve ordinary creative markup: {}",
+            ordinary["adm"]
+        );
         let renderer = bids
             .iter()
             .find(|bid| bid["impid"] == "renderer")
@@ -1473,7 +1583,13 @@ mod tests {
         let json = response_json(response);
         let bid = &json["seatbid"][0]["bid"][0];
 
-        assert_eq!(bid["adm"], "<div>Ad</div>");
+        // Rewriting is on by default and a body-less fragment still receives the
+        // creative runtime, so the markup is carried rather than returned verbatim.
+        let adm = bid["adm"].as_str().expect("should serialize adm");
+        assert!(
+            adm.contains("<div>Ad</div>"),
+            "should carry the creative markup: {adm}"
+        );
         assert!(
             bid.get("ext").is_none(),
             "should omit renderer extension when creative markup wins precedence"
@@ -1630,10 +1746,12 @@ mod tests {
             "should preserve top slot impid"
         );
         assert_eq!(top_bid["price"], json!(2.75), "should preserve top price");
-        assert_eq!(
-            top_bid["adm"],
-            json!("<div>Ad</div>"),
-            "should preserve top creative"
+        assert!(
+            top_bid["adm"]
+                .as_str()
+                .is_some_and(|adm| adm.contains("<div>Ad</div>")),
+            "should preserve top creative: {}",
+            top_bid["adm"]
         );
 
         let sidebar_seatbid = seatbids
@@ -1661,10 +1779,12 @@ mod tests {
             json!(1.25),
             "should preserve sidebar price"
         );
-        assert_eq!(
-            sidebar_bid["adm"],
-            json!("<div>Sidebar</div>"),
-            "should preserve sidebar creative"
+        assert!(
+            sidebar_bid["adm"]
+                .as_str()
+                .is_some_and(|adm| adm.contains("<div>Sidebar</div>")),
+            "should preserve sidebar creative: {}",
+            sidebar_bid["adm"]
         );
         assert_eq!(
             json["ext"]["orchestrator"]["total_bids"],

@@ -2,11 +2,21 @@
 import { log } from '../../core/log';
 import { creativeGlobal } from '../../shared/globals';
 import { delay, queueTask } from '../../shared/async';
+import { hasOpaqueOrigin, TRUSTED_BASE_URL } from '../../shared/origin';
 import { createMutationScheduler } from '../../shared/scheduler';
 
 type AnchorLike = HTMLAnchorElement | HTMLAreaElement;
 type Canon = { base: string; params: Record<string, string> };
 type Diff = { add: Record<string, string>; del: string[] };
+
+// Rebuild URLs already written to an anchor's href by an earlier repair pass
+// (the opaque-origin GET fallback). They are not `/first-party/click` URLs, so
+// they cannot be canonicalized and deliberately never replace the canonical
+// `data-tsclick`. Without remembering them, a later click would canonicalize
+// the fallback against the original signed click, fail the base comparison, and
+// navigate the pre-mutation URL — silently dropping the mutation the fallback
+// exists to carry.
+const pendingRebuilds = new WeakMap<AnchorLike, string>();
 
 // Allow query/localStorage flag to crank logging when debugging creatives.
 function enableDebugFromEnv(): void {
@@ -34,9 +44,12 @@ function parseQuery(qs: string): Record<string, string> {
 }
 
 // Decode a signed /first-party/click URL back into its clear destination + params.
+// URLs resolve against the pinned trusted base, not `location.href`: inside the
+// sandboxed `srcdoc` creative iframe `location.href` is `about:srcdoc`, which
+// `new URL` rejects as a base for the root-relative URLs the rewriter emits.
 function canonFromFirstPartyClick(url: string): Canon | null {
   try {
-    const u = new URL(url, location.href);
+    const u = new URL(url, TRUSTED_BASE_URL);
     if (!(u.pathname === '/first-party/click' || u.pathname.startsWith('/first-party/click')))
       return null;
     const p = parseQuery(u.search);
@@ -55,7 +68,7 @@ function canonFromAnyHref(href: string): Canon | null {
   const fp = canonFromFirstPartyClick(href);
   if (fp) return fp;
   try {
-    const u = new URL(href, location.href);
+    const u = new URL(href, TRUSTED_BASE_URL);
     const params = parseQuery(u.search);
     u.search = '';
     u.hash = '';
@@ -68,8 +81,8 @@ function canonFromAnyHref(href: string): Canon | null {
 // Compare two URLs but ignore http↔https differences that creatives often introduce.
 function sameBaseIgnoreScheme(aBase: string, bBase: string): boolean {
   try {
-    const au = new URL(aBase, location.href);
-    const bu = new URL(bBase, location.href);
+    const au = new URL(aBase, TRUSTED_BASE_URL);
+    const bu = new URL(bBase, TRUSTED_BASE_URL);
     return au.hostname === bu.hostname && au.pathname === bu.pathname;
   } catch {
     return aBase === bBase;
@@ -145,6 +158,11 @@ function buildProxyRebuildUrl(tsClickStr: string, diff: Diff): string {
 }
 
 // Call the proxy-rebuild endpoint so the edge can re-sign mutated click params.
+// In an opaque origin (sandboxed srcdoc without `allow-same-origin`) the JSON
+// POST is cross-origin (`Origin: null`), triggers a CORS preflight the edge
+// does not answer, and always fails — so the guard skips it and recovers via
+// the GET navigation fallback, which the edge answers with a 302 chain (no
+// CORS applies to navigations).
 async function rebuildClick(a: AnchorLike, tsClickStr: string, diff: Diff): Promise<string> {
   const addKeys = Object.keys(diff.add);
   const delKeys = diff.del;
@@ -154,7 +172,7 @@ async function rebuildClick(a: AnchorLike, tsClickStr: string, diff: Diff): Prom
 
   const fallback = buildProxyRebuildUrl(tsClickStr, diff);
 
-  if (typeof fetch !== 'function') {
+  if (typeof fetch !== 'function' || hasOpaqueOrigin()) {
     try {
       const el = a as Element;
       el.setAttribute('href', fallback);
@@ -188,13 +206,7 @@ async function rebuildClick(a: AnchorLike, tsClickStr: string, diff: Diff): Prom
     const data = (await resp.json()) as { href?: string; base?: string } | null;
     const href = data && typeof data.href === 'string' ? data.href : null;
     if (href) {
-      const el = a as Element;
-      try {
-        el.setAttribute('data-tsclick', href);
-        el.setAttribute('href', href);
-      } catch (err) {
-        log.debug('tsjs-creative:click: failed to update anchor attributes', err);
-      }
+      persistRebuiltClick(a, href);
       log.info('tsjs-creative:click: rebuilt click', {
         added: addKeys,
         removed: delKeys,
@@ -223,6 +235,12 @@ async function computeFinalUrl(a: AnchorLike, tsClickStr: string): Promise<strin
   const currentHref = rawHref || a.href || '';
   if (!currentHref) return tsClickStr;
 
+  // The href is a rebuild URL this guard wrote during an earlier repair pass and
+  // the creative has not touched it since. It already carries that pass's
+  // mutation; canonicalizing it against the original signed click would compare
+  // two different bases, fail the diff, and navigate the pre-mutation URL.
+  if (pendingRebuilds.get(a) === currentHref) return currentHref;
+
   const mutated = canonFromAnyHref(currentHref);
   if (!mutated) return tsClickStr;
 
@@ -249,13 +267,138 @@ async function computeFinalUrl(a: AnchorLike, tsClickStr: string): Promise<strin
   return rebuildClick(a, tsClickStr, diff);
 }
 
+// Resolve a click URL against the pinned trusted base and require an http(s)
+// scheme. The inputs (anchor href / data-tsclick attributes) are
+// creative-controlled DOM text, so anything else — javascript:, data:, vbscript:
+// — must never reach a navigation sink or an href write. Returns null for
+// unparseable or non-http(s) URLs so callers fail closed.
+function resolveSafeNavigationUrl(url: string): string | null {
+  try {
+    const resolved = new URL(url, TRUSTED_BASE_URL);
+    if (resolved.protocol === 'http:' || resolved.protocol === 'https:') {
+      return resolved.toString();
+    }
+    log.warn('tsjs-creative:click: refusing non-http(s) navigation', resolved.protocol);
+  } catch (err) {
+    log.debug('tsjs-creative:click: could not resolve navigation URL', err);
+  }
+  return null;
+}
+
+// Longest rebuild URL we will navigate to. Fastly Compute rejects request URLs
+// over 8192 bytes before the handler runs, and a signed click with many
+// tracking parameters can exceed that once nested inside another query string.
+// The margin covers percent-encoding growth and the request line's own overhead.
+const MAX_REBUILD_URL_LENGTH = 7000;
+
+const REBUILD_PATH = '/first-party/proxy-rebuild';
+
+// Navigate the rebuild as a form POST rather than a GET URL.
+//
+// The click is too long to nest in a query string, but a request body has no
+// such bound, and a form submission is a navigation — so it is not subject to
+// the CORS rules that rule out `fetch` from an opaque origin. The sandbox grants
+// `allow-forms`, and the endpoint answers a form-encoded POST with the same 302
+// it gives a GET. Only ever called from a click handler: submitting outside a
+// user gesture would navigate the frame on its own.
+function submitRebuildNavigation(anchor: AnchorLike, rebuildUrl: string): boolean {
+  try {
+    if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
+      return false;
+    }
+    const parsed = new URL(rebuildUrl, TRUSTED_BASE_URL);
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = parsed.origin + parsed.pathname;
+    form.target = anchor.getAttribute('target') || '_self';
+    form.style.display = 'none';
+    for (const field of ['tsclick', 'add', 'del']) {
+      const value = parsed.searchParams.get(field);
+      if (value === null) continue;
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = field;
+      input.value = value;
+      form.appendChild(input);
+    }
+    if (!form.querySelector('input[name="tsclick"]')) return false;
+    (document.body ?? document.documentElement).appendChild(form);
+    form.submit();
+    return true;
+  } catch (err) {
+    log.warn('tsjs-creative:click: rebuild form navigation failed', err);
+    return false;
+  }
+}
+
 // Send the user to the resolved URL while respecting middle clicks and targets.
+// Root-relative URLs are absolutized against the pinned trusted base first: in
+// the sandboxed srcdoc iframe there is no usable document URL for the
+// navigation APIs to resolve them against.
 function navigate(a: AnchorLike, url: string, isMiddle: boolean): void {
+  const resolved = resolveSafeNavigationUrl(url);
+  if (!resolved) return;
+  // An over-long recovery URL would be rejected by the platform before the
+  // handler runs, losing the click entirely. Carry it in a form body instead.
+  if (
+    !isMiddle &&
+    resolved.length > MAX_REBUILD_URL_LENGTH &&
+    resolved.includes(REBUILD_PATH) &&
+    submitRebuildNavigation(a, resolved)
+  ) {
+    return;
+  }
   const target = a.getAttribute('target') || (isMiddle ? '_blank' : '_self');
   if (target === '_blank' || isMiddle) {
-    window.open(url, target, 'noopener,noreferrer');
+    window.open(resolved, target, 'noopener,noreferrer');
   } else {
-    location.href = url;
+    location.href = resolved;
+  }
+}
+
+// Persist a rebuilt click onto the anchor. `href` always takes the new value,
+// but `data-tsclick` — the canonical signed click that future mutation diffs
+// compare against — is only updated when the value is itself a signed
+// /first-party/click URL. Writing the GET proxy-rebuild fallback there would
+// make every later canonicalization fail and lose subsequent mutations.
+// Root-relative form of a first-party URL — the shape the server-side rewriter
+// emits and the shape `data-tsclick` must keep. `href` is absolutized so it
+// resolves inside the srcdoc frame, but the canonical attribute has to stay in
+// the server's format: it is echoed back as the rebuild payload's `tsclick`.
+function canonicalClickValue(resolved: string): string {
+  try {
+    const url = new URL(resolved, TRUSTED_BASE_URL);
+    return `${url.pathname}${url.search}`;
+  } catch {
+    return resolved;
+  }
+}
+
+function persistRebuiltClick(anchor: AnchorLike, finalUrl: string): void {
+  // Persist the validated, absolutized URL — never the raw input. Beyond
+  // enforcing the http(s) allowlist, an absolute URL keeps the anchor's
+  // default navigation working inside the srcdoc iframe, where a relative
+  // href would resolve against about:srcdoc.
+  const resolved = resolveSafeNavigationUrl(finalUrl);
+  if (!resolved) return;
+  if (canonFromFirstPartyClick(resolved)) {
+    pendingRebuilds.delete(anchor);
+  } else {
+    // Not a signed click (the GET rebuild fallback): remember it so a later
+    // click navigates this repaired URL rather than the canonical original.
+    pendingRebuilds.set(anchor, resolved);
+  }
+  // Writing an unchanged value still emits a mutation record, which would wake
+  // the observer, recompute the same URL, and write again forever.
+  if (anchor.getAttribute('href') === resolved) return;
+  try {
+    const el = anchor as Element;
+    if (canonFromFirstPartyClick(resolved)) {
+      el.setAttribute('data-tsclick', canonicalClickValue(resolved));
+    }
+    el.setAttribute('href', resolved);
+  } catch (err) {
+    log.debug('tsjs-creative:click: failed to persist rebuilt href', err);
   }
 }
 
@@ -277,13 +420,7 @@ async function guardNavigation(
 ): Promise<void> {
   const finalUrl = await rebuildIfNeeded(anchor, tsClickStr);
   if (finalUrl && finalUrl !== tsClickStr) {
-    try {
-      const el = anchor as Element;
-      el.setAttribute('data-tsclick', finalUrl);
-      el.setAttribute('href', finalUrl);
-    } catch (err) {
-      log.debug('tsjs-creative:click: failed to persist rebuilt href before navigation', err);
-    }
+    persistRebuiltClick(anchor, finalUrl);
   }
   navigate(anchor, finalUrl || tsClickStr, isMiddle);
 }
@@ -318,16 +455,7 @@ function monitorAnchorMutations(): void {
     void rebuildIfNeeded(anchor, tsClickStr)
       .then((finalUrl) => {
         if (finalUrl && finalUrl !== tsClickStr) {
-          try {
-            const el = anchor as Element;
-            el.setAttribute('data-tsclick', finalUrl);
-            el.setAttribute('href', finalUrl);
-          } catch (err) {
-            log.debug(
-              'tsjs-creative:click: failed to persist rebuilt href during mutation flush',
-              err
-            );
-          }
+          persistRebuiltClick(anchor, finalUrl);
         }
       })
       .catch((err) => {

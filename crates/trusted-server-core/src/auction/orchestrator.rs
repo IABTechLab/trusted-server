@@ -2477,6 +2477,7 @@ mod tests {
         futures::executor::block_on(async {
             let config = AuctionConfig {
                 enabled: true,
+                sanitize_creatives: true,
                 rewrite_creatives: true,
                 providers: vec![],
                 mediator: None,

@@ -364,7 +364,11 @@ fn named_routes() -> [NamedRoute; 13] {
         },
         NamedRoute {
             path: "/first-party/proxy-rebuild",
-            primary_methods: &[Method::POST],
+            // GET serves the click guard's navigation fallback: the creative
+            // iframe is an opaque origin (sandbox without `allow-same-origin`),
+            // so its JSON POST is blocked by CORS and the guard navigates here
+            // for a 302 instead.
+            primary_methods: &[Method::GET, Method::POST],
             handler: NamedRouteHandler::FirstPartyProxyRebuild,
         },
     ]

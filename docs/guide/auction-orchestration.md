@@ -12,7 +12,7 @@ Key capabilities:
 - **Strategy-based winner selection** — Automatic strategy detection based on configuration
 - **Mediator support** — Optional external mediator for final winner selection and unified floor pricing
 - **Provider abstraction** — Pluggable provider interface for adding new demand sources
-- **Creative rewriting** — Winning creatives are sanitized and rewritten with first-party proxy URLs by default
+- **Creative processing** — Winning creatives are rewritten to first-party proxy URLs by default, with opt-in sanitization
 
 ## System Flow (Prebid + APS)
 
@@ -143,7 +143,7 @@ sequenceDiagram
     Note over Client,Mock: Response Assembly
     activate TS
     activate Client
-    Orch->>Orch: Transform to OpenRTB response<br/>Preserve typed render source<br/>Sanitize ordinary creative HTML<br/>Optionally rewrite creative URLs<br/>Add orchestrator metadata
+    Orch->>Orch: Transform to OpenRTB response<br/>Preserve typed render source<br/>Optionally sanitize creative HTML<br/>Optionally rewrite creative URLs<br/>Add orchestrator metadata
 
     Orch-->>TS: OpenRTB BidResponse
     Note right of Orch: APS winner carries ext.trusted_server.renderer<br/>with no adm; ordinary winners retain sanitized adm/cache data
@@ -194,7 +194,7 @@ AuctionOrchestrator.run_auction()
   ▼
 Convert OrchestrationResult → OpenRTB 2.x Response
   │
-  ├─ Sanitize creative HTML
+  ├─[sanitize_creatives=true] Strip executable markup
   ├─[rewrite_creatives=true] Rewrite URLs and inject creative TSJS
   ├─ Add ext.orchestrator metadata
   └─ Set consent and optional EID response headers
@@ -588,39 +588,45 @@ EC identity is maintained with the `ts-ec` cookie; auction responses do not emit
 
 ## Creative Processing
 
-Winning creatives returned by `POST /auction` are always passed through the
-server-side sanitizer. By default, the sanitized HTML is then processed by an
+Winning creatives returned by `POST /auction` pass through two independent
+transforms. `sanitize_creatives` (opt-in, default `false`) strips executable
+markup with its inner content. `rewrite_creatives` (default `true`) runs an
 HTML rewriter (`lol_html`) that converts eligible external resource and click
 URLs to signed first-party paths, adds `data-tsclick`, rewrites inline CSS
-`url(...)` values, and injects the unified creative TSJS runtime when a `<body>`
-exists.
+`url(...)` values, removes bidder-supplied `<base>` elements, and injects the
+unified creative TSJS runtime exactly once, whether or not the bidder supplied a
+`<body>` element. In every mode, a creative
+larger than the 1 MiB per-creative cap is rejected and its `adm` is dropped.
 
 ```toml
 [auction]
+sanitize_creatives = false
 rewrite_creatives = true
 ```
 
-| Setting           | Winning-bid `adm` behavior                                                                                                                                           |
-| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Omitted or `true` | Sanitize, rewrite eligible URLs, add click-guard attributes, and inject creative TSJS.                                                                               |
-| `false`           | Sanitize, then return sanitized but not rewritten HTML. Accepted asset and click URLs remain direct, so the browser may contact third-party hosts without mediation. |
+| `sanitize_creatives` | `rewrite_creatives` | Winning-bid `adm` behavior                                                                                                              |
+| -------------------- | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `false` (default)    | `false`             | Deliver the creative exactly as the bidder returned it (subject to the size cap).                                                       |
+| `true`               | `false`             | Strip executable markup, then deliver without rewriting. Accepted asset and click URLs remain direct.                                   |
+| `false`              | `true` (default)    | Rewrite eligible URLs, add click-guard attributes, and inject creative TSJS into the raw bidder markup. Executable markup is preserved. |
+| `true`               | `true`              | Sanitize first, then rewrite eligible URLs, add click-guard attributes, and inject creative TSJS.                                       |
 
-Disabling rewriting does not disable or reverse sanitization. Scripts,
-stylesheets, style blocks, forms, event handlers, dangerous URL schemes, and
-other rejected content remain removed. It also removes the injected creative
-runtime and first-party proxy/click mediation from the resulting `adm`.
-Sanitizer-accepted hosts are not allowlisted or trusted merely because their
-URLs remain in the output.
+When sanitization is enabled, scripts, stylesheets, style blocks, forms, event
+handlers, dangerous URL schemes, and other rejected content are removed together
+with their inner content — which blanks script-based creatives. Disabling
+rewriting removes the injected creative runtime and first-party proxy/click
+mediation from the resulting `adm`, so the browser may contact third-party hosts
+without mediation. Sanitizer-accepted hosts are not allowlisted or trusted
+merely because their URLs remain in the output.
 
-The setting applies to winning-bid `adm` in both the shared `POST /auction`
+Both settings apply to winning-bid `adm` in both the shared `POST /auction`
 response converter and the production publisher SSAT/page-bids path. The former
 emits root-relative first-party URLs and injects creative TSJS; the latter emits
 absolute first-party URLs for its foreign-origin renderer and does not inject
-that bundle. Both paths always sanitize, and both skip rewriting when the
-setting is `false`. HTML/CSS returned by `/first-party/proxy` continues to be
+that bundle. HTML/CSS returned by `/first-party/proxy` continues to be
 rewritten independently. `[debug].inject_adm_for_testing` adds the diagnostic
 `debug_bid` blob and enables a testing-only direct GAM replacement; it does not
-control whether sanitized `adm` is delivered.
+control whether processed `adm` is delivered.
 
 **Elements handled by the rewrite pass:**
 
@@ -635,10 +641,11 @@ control whether sanitized `adm` is delivered.
 | `<style>`, `[style]`             | `url()` references          | `/first-party/proxy?tsurl=...` |
 | SVG `<image>`, `<use>`           | `href`, `xlink:href`        | `/first-party/proxy?tsurl=...` |
 
-The rewrite pass leaves relative URLs and non-network schemes unchanged. On the
-auction path, mandatory sanitization runs first and strips dangerous schemes,
-so only sanitizer-accepted values reach this pass. Domains in the
-`rewrite.exclude_domains` config list (supports wildcards like
+The rewrite pass leaves relative URLs and non-network schemes unchanged. When
+`sanitize_creatives` is also enabled, sanitization runs first and strips
+dangerous schemes, so only sanitizer-accepted values reach this pass; with
+sanitization disabled, the rewriter operates on the raw bidder markup. Domains
+in the `rewrite.exclude_domains` config list (supports wildcards like
 `*.cdn.example.com`) are also skipped.
 
 Each proxied URL includes a `tstoken` HMAC signature for tamper protection. See [Proxy Signing](/guide/proxy-signing) for details.
@@ -650,6 +657,7 @@ Each proxied URL includes a `tstoken` HMAC signature for tamper protection. See 
 ```toml
 [auction]
 enabled = true
+sanitize_creatives = false     # Opt-in; blanks script-based creatives when enabled
 rewrite_creatives = true
 providers = ["prebid", "aps"]
 mediator = "adserver_mock"    # Remove for parallel_only strategy
@@ -681,13 +689,18 @@ price_floor = 0.50
 
 #### `[auction]`
 
-| Field               | Type     | Default | Description                                                       |
-| ------------------- | -------- | ------- | ----------------------------------------------------------------- |
-| `enabled`           | bool     | `false` | Enable the auction system                                         |
-| `rewrite_creatives` | bool     | `true`  | Rewrite sanitized winning-bid `adm` through first-party endpoints |
-| `providers`         | string[] | `[]`    | Ordered list of provider names to call                            |
-| `mediator`          | string?  | `null`  | Provider name to use as mediator (enables `parallel_mediation`)   |
-| `timeout_ms`        | u32      | `2000`  | Overall auction timeout in milliseconds                           |
+| Field                | Type     | Default | Description                                                     |
+| -------------------- | -------- | ------- | --------------------------------------------------------------- |
+| `enabled`            | bool     | `false` | Enable the auction system                                       |
+| `sanitize_creatives` | bool     | `false` | Strip executable markup from winning-bid `adm` before delivery  |
+| `rewrite_creatives`  | bool     | `true`  | Rewrite winning-bid `adm` through first-party endpoints         |
+| `providers`          | string[] | `[]`    | Ordered list of provider names to call                          |
+| `mediator`           | string?  | `null`  | Provider name to use as mediator (enables `parallel_mediation`) |
+| `timeout_ms`         | u32      | `2000`  | Overall auction timeout in milliseconds                         |
+
+Both creative-processing fields must be present in the TOML for their
+environment overrides to apply; see
+[Environment Variable Overrides](#environment-variable-overrides).
 
 #### `[integrations.prebid]`
 
@@ -745,12 +758,15 @@ timeout_ms = 500               # Mediator budget (called after providers)
 
 The typed `ts config validate`, `ts config diff`, and `ts config push` flows can
 override auction values that already exist in the TOML. EdgeZero v0.0.4 does
-not create missing leaves, so existing configs must add
-`rewrite_creatives = true` before relying on its environment override.
+not create missing leaves, so existing configs must add **both**
+`rewrite_creatives = true` and `sanitize_creatives = false` under `[auction]`
+before relying on the corresponding environment overrides — an override for a
+missing leaf is silently ignored.
 
 ```bash
 TRUSTED_SERVER__AUCTION__ENABLED=true
 TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES=true
+TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES=false
 TRUSTED_SERVER__AUCTION__PROVIDERS=prebid,aps
 TRUSTED_SERVER__AUCTION__MEDIATOR=adserver_mock
 TRUSTED_SERVER__AUCTION__TIMEOUT_MS=2000
@@ -759,10 +775,11 @@ TRUSTED_SERVER__INTEGRATIONS__APS__ACCOUNT_ID=example-account
 TRUSTED_SERVER__INTEGRATIONS__APS__DEBUG=false
 ```
 
-Before rolling back to a binary without `rewrite_creatives`, restore the value
-to `true`, push the default-compatible blob, and then roll back. See
-[Configuration](/guide/configuration#auction-configuration) for the complete
-migration and rollback sequence.
+Before rolling back to a binary that does not know a creative-processing field,
+remove that field's non-default value (`rewrite_creatives = false` or
+`sanitize_creatives = true`), push the default-compatible blob, and then roll
+back. See [Configuration](/guide/configuration#auction-configuration) for the
+complete migration, upgrade-sequencing, and rollback guidance.
 
 ## Floor Prices
 
