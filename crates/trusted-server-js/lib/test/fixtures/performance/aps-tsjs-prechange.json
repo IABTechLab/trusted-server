@@ -129,5 +129,803 @@
   "evidence": {
     "evidenceId": "aps-tsjs-baseline-88f1432e33f310a202177feb656eba21ff0173de",
     "workflowRunId": 31074816129
+  },
+  "roleCorrectTransfer": {
+    "schemaVersion": 1,
+    "source": {
+      "ref": "spec/aps-tsjs-resilience-design",
+      "sha": "d270c4bfa70dc6b26515281aec7e915189aa9f75"
+    },
+    "originalTopLevelSha256": "53f762603ad49239f1756171440be422e190cc231efafc56cf37a11e1a38ddf4",
+    "tools": {
+      "node": "v24.12.0",
+      "npm": "11.6.2",
+      "typescript": "6.0.3",
+      "vite": "8.2.1",
+      "esbuild": "0.28.1",
+      "packageLockSha256": "083ef76165b0518a3157d56dc4fd2697c8ab67ebf43efad1e9f9b06c2edafad5"
+    },
+    "compression": {
+      "concatenationSeparator": ";\n",
+      "gzip": {
+        "implementation": "node:zlib.gzipSync",
+        "version": "zlib 1.3.1-470d3a2",
+        "level": 9,
+        "mtime": 0
+      },
+      "brotli": {
+        "implementation": "node:zlib.brotliCompressSync",
+        "version": "brotli 1.1.0",
+        "mode": "text",
+        "quality": 11,
+        "sizeHint": "input-bytes"
+      }
+    },
+    "release": {
+      "version": 1,
+      "releaseId": "28b027e9ab3703e7585d5b1876b7566fb3ce65252056110386e5c98f27ca2f31",
+      "artifacts": [
+        {
+          "id": "bootstrap",
+          "role": "bootstrap",
+          "phase": null,
+          "trigger": null,
+          "inputs": [],
+          "outputs": [],
+          "file": "gpt-bootstrap-fallback.js",
+          "bytes": 42399,
+          "hash": "573885a4a50a1e0734d36a812f672811e2b3f6f89613cf9d9b4ae3793e935a88"
+        },
+        {
+          "id": "core",
+          "role": "core",
+          "phase": null,
+          "trigger": null,
+          "inputs": [],
+          "outputs": ["runtime.v1"],
+          "file": "tsjs-core.js",
+          "bytes": 85581,
+          "hash": "68a58eed281549497d9fd56908f633638d69cc73fd2e6356bdc2d2e9164c0db2"
+        },
+        {
+          "id": "render_runtime",
+          "role": "integration",
+          "phase": "critical",
+          "trigger": null,
+          "inputs": ["runtime.v1"],
+          "outputs": [
+            "slots.v1",
+            "auction.v1",
+            "render.v1",
+            "messages.v1",
+            "trace.v1",
+            "trace.presentation.v1",
+            "direct.v1"
+          ],
+          "file": "tsjs-render_runtime.js",
+          "bytes": 155275,
+          "hash": "2cb7e0b217fd19a10a56e4ac37418dcf15ed627d6e7b4610a5f9edbed02cdd1a"
+        },
+        {
+          "id": "aps",
+          "role": "integration",
+          "phase": "critical",
+          "trigger": null,
+          "inputs": ["runtime.v1", "slots.v1", "render.v1", "messages.v1", "trace.v1"],
+          "outputs": ["aps.v1"],
+          "file": "tsjs-aps.js",
+          "bytes": 16782,
+          "hash": "22d342537e5e30558a606a449cd252ea6dd2d6473e789414c8789e17fd6ee9d8"
+        },
+        {
+          "id": "creative",
+          "role": "integration",
+          "phase": "critical",
+          "trigger": null,
+          "inputs": ["runtime.v1"],
+          "outputs": [],
+          "file": "tsjs-creative.js",
+          "bytes": 21093,
+          "hash": "6681a9f9506cca079a2d913b09fae826aed0043798ba959f9a4c9d00b3cc9388"
+        },
+        {
+          "id": "datadome",
+          "role": "integration",
+          "phase": "critical",
+          "trigger": null,
+          "inputs": ["runtime.v1"],
+          "outputs": [],
+          "file": "tsjs-datadome.js",
+          "bytes": 23375,
+          "hash": "c0b154ec8f0c07a577c8037518e62f7a8eca8991d039adcfcf35a11be5f6f842"
+        },
+        {
+          "id": "didomi",
+          "role": "integration",
+          "phase": "critical",
+          "trigger": null,
+          "inputs": ["runtime.v1"],
+          "outputs": [],
+          "file": "tsjs-didomi.js",
+          "bytes": 15489,
+          "hash": "482bfc2669bcb20a4cb99dc451d0081d63d31c5fdd983d283b5a4de9855ca54e"
+        },
+        {
+          "id": "google_tag_manager",
+          "role": "integration",
+          "phase": "critical",
+          "trigger": null,
+          "inputs": ["runtime.v1"],
+          "outputs": [],
+          "file": "tsjs-google_tag_manager.js",
+          "bytes": 26343,
+          "hash": "3d708b2fbc68ebf947e67823f3e413dba7e2de8b4e5aefd05dac26ad76f8cc04"
+        },
+        {
+          "id": "gpt",
+          "role": "integration",
+          "phase": "critical",
+          "trigger": null,
+          "inputs": [
+            "runtime.v1",
+            "slots.v1",
+            "auction.v1",
+            "render.v1",
+            "messages.v1",
+            "trace.v1"
+          ],
+          "outputs": ["gpt.v1", "gpt.events.v1", "pbs_cache.baseline.v1"],
+          "file": "tsjs-gpt.js",
+          "bytes": 199361,
+          "hash": "21126364229d67f82a1aeaa0b2a9d6b13e01c70b6aa14dbf725c3024a5f474f3"
+        },
+        {
+          "id": "gpt_diagnostics",
+          "role": "integration",
+          "phase": "critical",
+          "trigger": null,
+          "inputs": ["runtime.v1", "gpt.events.v1"],
+          "outputs": ["gpt_diag.v1"],
+          "file": "tsjs-gpt_diagnostics.js",
+          "bytes": 29975,
+          "hash": "d5f0f8a8791379e8109d3e861e81f850e96a55fb84fa6eb42f01e664f95439e8"
+        },
+        {
+          "id": "lockr",
+          "role": "integration",
+          "phase": "critical",
+          "trigger": null,
+          "inputs": ["runtime.v1"],
+          "outputs": [],
+          "file": "tsjs-lockr.js",
+          "bytes": 24031,
+          "hash": "83575c3b595b7fb5b53ca4f16076c09e4ce147a97204d089223413ec13f37cb1"
+        },
+        {
+          "id": "osano_consent",
+          "role": "integration",
+          "phase": "critical",
+          "trigger": null,
+          "inputs": ["runtime.v1"],
+          "outputs": ["osano_consent.v1"],
+          "file": "tsjs-osano_consent.js",
+          "bytes": 10511,
+          "hash": "67d8d4d682fdfdac080613cb2d6b885898ca39680cb4e2332e96a914afa838ea"
+        },
+        {
+          "id": "permutive_context",
+          "role": "integration",
+          "phase": "critical",
+          "trigger": null,
+          "inputs": ["runtime.v1"],
+          "outputs": ["permutive_context.v1"],
+          "file": "tsjs-permutive_context.js",
+          "bytes": 17818,
+          "hash": "40bcac1dc75ab9b8c2ba69cf0e0c4a540e56ae165959f9fa44a0518c70d24a9a"
+        },
+        {
+          "id": "sourcepoint_consent",
+          "role": "integration",
+          "phase": "critical",
+          "trigger": null,
+          "inputs": ["runtime.v1"],
+          "outputs": ["sourcepoint_consent.v1"],
+          "file": "tsjs-sourcepoint_consent.js",
+          "bytes": 18789,
+          "hash": "6d9d612be675b690a4507693d9fcc3f0644c937d9513460704690c680e7dd086"
+        },
+        {
+          "id": "prebid",
+          "role": "integration",
+          "phase": "critical",
+          "trigger": null,
+          "inputs": ["runtime.v1", "slots.v1", "render.v1", "messages.v1", "aps.v1?aps"],
+          "outputs": ["prebid.v1"],
+          "file": "tsjs-prebid.js",
+          "bytes": 36716,
+          "hash": "12d08a121e31a81bb9bad7d4bdf9a8fe8bf33f951192ee676ed843fe409c848e"
+        },
+        {
+          "id": "testlight",
+          "role": "integration",
+          "phase": "critical",
+          "trigger": null,
+          "inputs": ["runtime.v1"],
+          "outputs": [],
+          "file": "tsjs-testlight.js",
+          "bytes": 16232,
+          "hash": "e11c1671529947844631a7da92277e026b0ca15107e6ab45219722c5405f14a1"
+        },
+        {
+          "id": "diagnostics_presentation",
+          "role": "integration",
+          "phase": "deferred",
+          "trigger": "first_display_or_idle",
+          "inputs": ["runtime.v1", "trace.presentation.v1", "gpt_diag.v1?gpt_diagnostics_active"],
+          "outputs": [],
+          "file": "tsjs-diagnostics_presentation.js",
+          "bytes": 39944,
+          "hash": "1a89ddf277ef7a837d74b50bc52d91ab66ffc4c28036213762957aa6c8ed4e03"
+        },
+        {
+          "id": "gpt_later",
+          "role": "integration",
+          "phase": "deferred",
+          "trigger": "first_display_or_idle",
+          "inputs": ["runtime.v1", "slots.v1", "auction.v1", "render.v1", "gpt.v1", "trace.v1"],
+          "outputs": [],
+          "file": "tsjs-gpt_later.js",
+          "bytes": 5420,
+          "hash": "e0077da3429deca44f2d9aceb246f9e7fc301c4dcb6635b69b8111057c028e07"
+        },
+        {
+          "id": "osano_lifecycle",
+          "role": "integration",
+          "phase": "deferred",
+          "trigger": "first_display_or_idle",
+          "inputs": ["runtime.v1", "osano_consent.v1"],
+          "outputs": [],
+          "file": "tsjs-osano_lifecycle.js",
+          "bytes": 3663,
+          "hash": "d1e5abf7f90e3802beb700b2fd1ee4382c010a9b77429ee95c104692d79686e5"
+        },
+        {
+          "id": "permutive_lifecycle",
+          "role": "integration",
+          "phase": "deferred",
+          "trigger": "first_display_or_idle",
+          "inputs": ["runtime.v1", "permutive_context.v1"],
+          "outputs": [],
+          "file": "tsjs-permutive_lifecycle.js",
+          "bytes": 3675,
+          "hash": "014b790757de56ebe26cad6121df4174fc686d402846eed98766ba9263acc86b"
+        },
+        {
+          "id": "prebid_later",
+          "role": "integration",
+          "phase": "deferred",
+          "trigger": "first_display_or_idle",
+          "inputs": ["runtime.v1", "slots.v1", "gpt.v1", "prebid.v1"],
+          "outputs": [],
+          "file": "tsjs-prebid_later.js",
+          "bytes": 11160,
+          "hash": "69ec41f65b4e40ed1cca1df28d18ee98e5a39c79eb96aaa8b0d880f42f9799f0"
+        },
+        {
+          "id": "sourcepoint_lifecycle",
+          "role": "integration",
+          "phase": "deferred",
+          "trigger": "first_display_or_idle",
+          "inputs": ["runtime.v1", "sourcepoint_consent.v1"],
+          "outputs": [],
+          "file": "tsjs-sourcepoint_lifecycle.js",
+          "bytes": 3681,
+          "hash": "d061d95fa12c4ee0c06a714ab769f1aa91cf88dcc285bf3f528b31ce2d2393e6"
+        }
+      ]
+    },
+    "sourceOwners": {
+      "src/adapters/googletag.ts": [
+        "gpt"
+      ],
+      "src/adapters/messaging.ts": [
+        "render_runtime",
+        "gpt"
+      ],
+      "src/adapters/prebid.ts": [
+        "prebid"
+      ],
+      "src/composition/browser.ts": [
+        "core"
+      ],
+      "src/composition/index.ts": [
+        "core"
+      ],
+      "src/core/auction.ts": [
+        "render_runtime"
+      ],
+      "src/core/config.ts": [
+        "bootstrap",
+        "core",
+        "render_runtime",
+        "gpt"
+      ],
+      "src/core/contracts/aps_renderer.ts": [
+        "bootstrap",
+        "core",
+        "render_runtime",
+        "aps",
+        "gpt"
+      ],
+      "src/core/contracts/auction_projection.ts": [
+        "bootstrap",
+        "core",
+        "render_runtime",
+        "gpt",
+        "prebid",
+        "prebid_later"
+      ],
+      "src/core/contracts/generated/renderer_validator_v1.ts": [
+        "bootstrap",
+        "core",
+        "render_runtime",
+        "aps",
+        "gpt"
+      ],
+      "src/core/contracts/request_ads.ts": [
+        "bootstrap",
+        "core",
+        "render_runtime"
+      ],
+      "src/core/index.ts": [
+        "core"
+      ],
+      "src/core/log.ts": [
+        "bootstrap",
+        "core",
+        "render_runtime",
+        "creative",
+        "datadome",
+        "didomi",
+        "google_tag_manager",
+        "gpt",
+        "gpt_diagnostics",
+        "lockr",
+        "osano_consent",
+        "permutive_context",
+        "sourcepoint_consent",
+        "testlight",
+        "diagnostics_presentation"
+      ],
+      "src/core/queue.ts": [
+        "bootstrap",
+        "core"
+      ],
+      "src/core/registry.ts": [
+        "bootstrap",
+        "core",
+        "render_runtime"
+      ],
+      "src/core/release.ts": [
+        "bootstrap",
+        "core",
+        "render_runtime",
+        "aps",
+        "creative",
+        "datadome",
+        "didomi",
+        "google_tag_manager",
+        "gpt",
+        "gpt_diagnostics",
+        "lockr",
+        "osano_consent",
+        "permutive_context",
+        "sourcepoint_consent",
+        "prebid",
+        "testlight",
+        "diagnostics_presentation",
+        "gpt_later",
+        "osano_lifecycle",
+        "permutive_lifecycle",
+        "prebid_later",
+        "sourcepoint_lifecycle"
+      ],
+      "src/core/render.ts": [
+        "render_runtime",
+        "gpt"
+      ],
+      "src/core/styles/normalize.css?inline": [
+        "render_runtime",
+        "gpt"
+      ],
+      "src/core/templates/iframe.html?raw": [
+        "render_runtime",
+        "gpt"
+      ],
+      "src/core/trace.ts": [
+        "render_runtime",
+        "gpt_diagnostics"
+      ],
+      "src/integrations/aps/index.ts": [
+        "aps"
+      ],
+      "src/integrations/aps/module.ts": [
+        "aps"
+      ],
+      "src/integrations/aps/render.ts": [
+        "aps"
+      ],
+      "src/integrations/creative/click.ts": [
+        "creative"
+      ],
+      "src/integrations/creative/dynamic_src_guard.ts": [
+        "creative"
+      ],
+      "src/integrations/creative/iframe.ts": [
+        "creative"
+      ],
+      "src/integrations/creative/image.ts": [
+        "creative"
+      ],
+      "src/integrations/creative/index.ts": [
+        "creative"
+      ],
+      "src/integrations/creative/module.ts": [
+        "creative"
+      ],
+      "src/integrations/creative/proxy_sign.ts": [
+        "creative"
+      ],
+      "src/integrations/creative/startup.ts": [
+        "creative"
+      ],
+      "src/integrations/datadome/index.ts": [
+        "datadome"
+      ],
+      "src/integrations/datadome/module.ts": [
+        "datadome"
+      ],
+      "src/integrations/datadome/script_guard.ts": [
+        "datadome"
+      ],
+      "src/integrations/didomi/index.ts": [
+        "didomi"
+      ],
+      "src/integrations/didomi/module.ts": [
+        "didomi"
+      ],
+      "src/integrations/google_tag_manager/index.ts": [
+        "google_tag_manager"
+      ],
+      "src/integrations/google_tag_manager/module.ts": [
+        "google_tag_manager"
+      ],
+      "src/integrations/google_tag_manager/script_guard.ts": [
+        "google_tag_manager"
+      ],
+      "src/integrations/gpt/bootstrap_fallback.ts": [
+        "bootstrap"
+      ],
+      "src/integrations/gpt/diagnostics_facts.ts": [
+        "gpt"
+      ],
+      "src/integrations/gpt/index.ts": [
+        "gpt"
+      ],
+      "src/integrations/gpt/later.ts": [
+        "gpt_later"
+      ],
+      "src/integrations/gpt/module.ts": [
+        "gpt"
+      ],
+      "src/integrations/gpt/script_guard.ts": [
+        "gpt"
+      ],
+      "src/integrations/gpt/startup.ts": [
+        "gpt"
+      ],
+      "src/integrations/gpt_diagnostics/badges.ts": [
+        "diagnostics_presentation"
+      ],
+      "src/integrations/gpt_diagnostics/binding.ts": [
+        "diagnostics_presentation"
+      ],
+      "src/integrations/gpt_diagnostics/data_api.ts": [
+        "gpt_diagnostics"
+      ],
+      "src/integrations/gpt_diagnostics/exhaustive.ts": [
+        "diagnostics_presentation"
+      ],
+      "src/integrations/gpt_diagnostics/index.ts": [
+        "gpt_diagnostics"
+      ],
+      "src/integrations/gpt_diagnostics/module.ts": [
+        "gpt_diagnostics"
+      ],
+      "src/integrations/gpt_diagnostics/observer.ts": [
+        "gpt_diagnostics"
+      ],
+      "src/integrations/gpt_diagnostics/overlay.ts": [
+        "diagnostics_presentation"
+      ],
+      "src/integrations/gpt_diagnostics/presentation.ts": [
+        "diagnostics_presentation"
+      ],
+      "src/integrations/gpt_diagnostics/store.ts": [
+        "gpt_diagnostics"
+      ],
+      "src/integrations/lockr/index.ts": [
+        "lockr"
+      ],
+      "src/integrations/lockr/module.ts": [
+        "lockr"
+      ],
+      "src/integrations/lockr/script_guard.ts": [
+        "lockr"
+      ],
+      "src/integrations/osano/consent.ts": [
+        "osano_consent"
+      ],
+      "src/integrations/osano/consent_mirror.ts": [
+        "osano_consent"
+      ],
+      "src/integrations/osano/lifecycle.ts": [
+        "osano_lifecycle"
+      ],
+      "src/integrations/osano/module.ts": [
+        "osano_consent"
+      ],
+      "src/integrations/permutive/context.ts": [
+        "permutive_context"
+      ],
+      "src/integrations/permutive/lifecycle.ts": [
+        "permutive_lifecycle"
+      ],
+      "src/integrations/permutive/module.ts": [
+        "permutive_context"
+      ],
+      "src/integrations/permutive/script_guard.ts": [
+        "permutive_context"
+      ],
+      "src/integrations/permutive/segments.ts": [
+        "permutive_context"
+      ],
+      "src/integrations/prebid/index.ts": [
+        "prebid"
+      ],
+      "src/integrations/prebid/later.ts": [
+        "prebid_later"
+      ],
+      "src/integrations/prebid/module.ts": [
+        "prebid"
+      ],
+      "src/integrations/prebid/refresh.ts": [
+        "prebid",
+        "prebid_later"
+      ],
+      "src/integrations/prebid/startup.ts": [
+        "prebid"
+      ],
+      "src/integrations/render_runtime/index.ts": [
+        "render_runtime"
+      ],
+      "src/integrations/render_runtime/module.ts": [
+        "render_runtime"
+      ],
+      "src/integrations/sourcepoint/consent.ts": [
+        "sourcepoint_consent"
+      ],
+      "src/integrations/sourcepoint/consent_mirror.ts": [
+        "sourcepoint_consent"
+      ],
+      "src/integrations/sourcepoint/lifecycle.ts": [
+        "sourcepoint_lifecycle"
+      ],
+      "src/integrations/sourcepoint/module.ts": [
+        "sourcepoint_consent"
+      ],
+      "src/integrations/sourcepoint/script_guard.ts": [
+        "sourcepoint_consent"
+      ],
+      "src/integrations/testlight/index.ts": [
+        "testlight"
+      ],
+      "src/integrations/testlight/module.ts": [
+        "testlight"
+      ],
+      "src/kernel/diagnostics.ts": [
+        "render_runtime"
+      ],
+      "src/kernel/disposable.ts": [
+        "core",
+        "render_runtime",
+        "gpt"
+      ],
+      "src/kernel/fallback.ts": [
+        "bootstrap",
+        "core"
+      ],
+      "src/kernel/identity.ts": [
+        "render_runtime",
+        "gpt"
+      ],
+      "src/kernel/integration_registry.ts": [
+        "core"
+      ],
+      "src/kernel/lifecycle_module.ts": [
+        "datadome",
+        "didomi",
+        "google_tag_manager",
+        "lockr",
+        "testlight"
+      ],
+      "src/kernel/phase_loader.ts": [
+        "core"
+      ],
+      "src/kernel/release_catalog.ts": [
+        "bootstrap",
+        "core",
+        "render_runtime",
+        "datadome",
+        "didomi",
+        "google_tag_manager",
+        "lockr",
+        "testlight"
+      ],
+      "src/kernel/runtime.ts": [
+        "core"
+      ],
+      "src/kernel/sessions.ts": [
+        "render_runtime"
+      ],
+      "src/services/auction_batch.ts": [
+        "render_runtime"
+      ],
+      "src/services/context.ts": [
+        "render_runtime"
+      ],
+      "src/services/projections.ts": [
+        "render_runtime",
+        "gpt"
+      ],
+      "src/services/puc_bridge.ts": [
+        "gpt"
+      ],
+      "src/services/render.ts": [
+        "render_runtime",
+        "gpt"
+      ],
+      "src/services/reservations.ts": [
+        "render_runtime",
+        "gpt"
+      ],
+      "src/services/slots.ts": [
+        "gpt"
+      ],
+      "src/services/targeting.ts": [
+        "gpt"
+      ],
+      "src/shared/async.ts": [
+        "creative"
+      ],
+      "src/shared/beacon_guard.ts": [
+        "google_tag_manager"
+      ],
+      "src/shared/dom_insertion_dispatcher.ts": [
+        "datadome",
+        "google_tag_manager",
+        "gpt",
+        "lockr",
+        "permutive_context",
+        "sourcepoint_consent"
+      ],
+      "src/shared/globals.ts": [
+        "creative"
+      ],
+      "src/shared/origin.ts": [
+        "render_runtime",
+        "creative"
+      ],
+      "src/shared/realm.ts": [
+        "gpt_diagnostics",
+        "diagnostics_presentation"
+      ],
+      "src/shared/scheduler.ts": [
+        "creative"
+      ],
+      "src/shared/script_guard.ts": [
+        "datadome",
+        "google_tag_manager",
+        "gpt",
+        "lockr",
+        "permutive_context",
+        "sourcepoint_consent"
+      ]
+    },
+    "sets": {
+      "bootstrap": {
+        "artifactIds": ["bootstrap"],
+        "files": ["gpt-bootstrap-fallback.js"],
+        "rawBytes": 42399,
+        "gzipBytes": 11875,
+        "brotliBytes": 10544,
+        "sha256": "573885a4a50a1e0734d36a812f672811e2b3f6f89613cf9d9b4ae3793e935a88"
+      },
+      "minimal": {
+        "artifactIds": ["core", "render_runtime"],
+        "files": ["tsjs-core.js", "tsjs-render_runtime.js"],
+        "rawBytes": 240858,
+        "gzipBytes": 64804,
+        "brotliBytes": 48983,
+        "sha256": "e0eddfbedcbc33fdf42d779c20885a7a59227ac20f2b996d3c4323fcba53b339"
+      },
+      "reference": {
+        "artifactIds": ["core", "render_runtime", "creative", "gpt", "prebid", "datadome"],
+        "files": [
+          "tsjs-core.js",
+          "tsjs-render_runtime.js",
+          "tsjs-creative.js",
+          "tsjs-gpt.js",
+          "tsjs-prebid.js",
+          "tsjs-datadome.js"
+        ],
+        "rawBytes": 521411,
+        "gzipBytes": 141812,
+        "brotliBytes": 100719,
+        "sha256": "f8561bf2fcd08f8304ade928bddee3b80daeab883c2dad465f6a8fdc71850366"
+      },
+      "maximal": {
+        "artifactIds": [
+          "core",
+          "render_runtime",
+          "aps",
+          "creative",
+          "datadome",
+          "didomi",
+          "google_tag_manager",
+          "gpt",
+          "gpt_diagnostics",
+          "lockr",
+          "osano_consent",
+          "permutive_context",
+          "sourcepoint_consent",
+          "prebid",
+          "testlight",
+          "diagnostics_presentation",
+          "gpt_later",
+          "osano_lifecycle",
+          "permutive_lifecycle",
+          "prebid_later",
+          "sourcepoint_lifecycle"
+        ],
+        "files": [
+          "tsjs-core.js",
+          "tsjs-render_runtime.js",
+          "tsjs-aps.js",
+          "tsjs-creative.js",
+          "tsjs-datadome.js",
+          "tsjs-didomi.js",
+          "tsjs-google_tag_manager.js",
+          "tsjs-gpt.js",
+          "tsjs-gpt_diagnostics.js",
+          "tsjs-lockr.js",
+          "tsjs-osano_consent.js",
+          "tsjs-permutive_context.js",
+          "tsjs-sourcepoint_consent.js",
+          "tsjs-prebid.js",
+          "tsjs-testlight.js",
+          "tsjs-diagnostics_presentation.js",
+          "tsjs-gpt_later.js",
+          "tsjs-osano_lifecycle.js",
+          "tsjs-permutive_lifecycle.js",
+          "tsjs-prebid_later.js",
+          "tsjs-sourcepoint_lifecycle.js"
+        ],
+        "rawBytes": 764954,
+        "gzipBytes": 189910,
+        "brotliBytes": 128456,
+        "sha256": "4277387f0d01937b4829e644cf59d807c26a289274953bf269878e90d1c34378"
+      }
+    }
   }
 }

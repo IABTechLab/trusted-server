@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
@@ -13,10 +14,11 @@ import {
 } from '../../scripts/release-v1.mjs';
 import {
   checkBundleBudgets,
-  deriveSemanticBundleSetIds,
   findCriticalDeferredSourceViolations,
   validateSemanticBundleSets,
 } from '../../scripts/check-bundle-budgets.mjs';
+import * as bundleBudgets from '../../scripts/check-bundle-budgets.mjs';
+import * as bundleMetrics from '../../scripts/bundle-metrics.mjs';
 
 const testDirectory = path.dirname(fileURLToPath(import.meta.url));
 const libDirectory = path.resolve(testDirectory, '../..');
@@ -71,6 +73,37 @@ const CRITICAL_CONSENT_ARTIFACTS = Object.freeze([
     capability: 'sourcepoint_consent.v1',
   }),
 ]);
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function readBuildEvidence() {
+  return {
+    baseline: JSON.parse(
+      fs.readFileSync(
+        path.join(libDirectory, 'test/fixtures/performance/aps-tsjs-prechange.json'),
+        'utf8'
+      )
+    ),
+    catalog: JSON.parse(
+      fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-catalog-v1.json'), 'utf8')
+    ),
+    metrics: JSON.parse(
+      fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-build-metrics-v1.json'), 'utf8')
+    ),
+    release: JSON.parse(
+      fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-release-v1.json'), 'utf8')
+    ),
+  };
+}
 
 function executeGeneratedArtifact(window, file, registrations) {
   Object.defineProperty(window, 'tsjs', {
@@ -207,8 +240,12 @@ test('bundle metrics use the required five-module reference vector', () => {
     ])
   );
 
-  assert.deepEqual(actualIds, deriveSemanticBundleSetIds(catalog.modules));
+  assert.deepEqual(actualIds, bundleMetrics.deriveSemanticBundleSetIds(catalog.modules));
   assert.equal(metrics.bootstrap.file, 'gpt-bootstrap-fallback.js');
+  assert.equal(
+    metrics.compression.concatenationSeparator,
+    bundleMetrics.BUNDLE_SEPARATOR.toString('utf8')
+  );
   for (const size of ['rawBytes', 'gzipBytes', 'brotliBytes']) {
     assert.ok(Number.isSafeInteger(metrics.bootstrap[size]) && metrics.bootstrap[size] > 0);
   }
@@ -221,6 +258,103 @@ test('bundle metrics use the required five-module reference vector', () => {
     'tsjs-prebid.js',
     'tsjs-datadome.js',
   ]);
+});
+
+test('bundle metrics has sole ownership of semantic transfer-set derivation', () => {
+  const comparatorSource = fs.readFileSync(
+    path.join(libDirectory, 'scripts/check-bundle-budgets.mjs'),
+    'utf8'
+  );
+
+  assert.equal(typeof bundleMetrics.deriveSemanticBundleSetIds, 'function');
+  assert.match(
+    comparatorSource,
+    /import\s*\{[^}]*deriveSemanticBundleSetIds[^}]*\}\s*from '\.\/bundle-metrics\.mjs'/s
+  );
+  assert.doesNotMatch(comparatorSource, /const REFERENCE_INCLUDE_ORDER|function isCatalogModule/);
+  assert.doesNotMatch(comparatorSource, /function deriveSemanticBundleSetIds\s*\(/);
+});
+
+test('role-correct budgets use deterministic pure aggregation and compression metrics', () => {
+  const metrics = JSON.parse(
+    fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-build-metrics-v1.json'), 'utf8')
+  );
+  const catalog = JSON.parse(
+    fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-catalog-v1.json'), 'utf8')
+  );
+  const release = JSON.parse(
+    fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-release-v1.json'), 'utf8')
+  );
+  const contents = new Map(
+    release.artifacts.map(({ file }) => [
+      file,
+      fs.readFileSync(path.resolve(libDirectory, '../dist', file)),
+    ])
+  );
+
+  assert.equal(typeof bundleMetrics.deriveInventorySetFiles, 'function');
+  assert.equal(typeof bundleMetrics.measureBundleSet, 'function');
+  assert.equal(typeof bundleMetrics.measureBytes, 'function');
+  assert.deepEqual(
+    bundleMetrics.deriveInventorySetFiles(release.artifacts, catalog.modules),
+    Object.fromEntries(Object.entries(metrics.sets).map(([name, set]) => [name, set.files]))
+  );
+  for (const [name, files] of Object.entries(
+    bundleMetrics.deriveInventorySetFiles(release.artifacts, catalog.modules)
+  )) {
+    assert.deepEqual(bundleMetrics.measureBundleSet(files, contents), metrics.sets[name]);
+  }
+  assert.deepEqual(
+    bundleMetrics.measureBytes(contents.get('gpt-bootstrap-fallback.js')),
+    Object.fromEntries(
+      ['rawBytes', 'gzipBytes', 'brotliBytes', 'sha256'].map((key) => [key, metrics.bootstrap[key]])
+    )
+  );
+});
+
+test('release build has one bundle aggregation and compression measurement owner', () => {
+  const buildSource = fs.readFileSync(path.join(libDirectory, 'build-all.mjs'), 'utf8');
+
+  assert.match(
+    buildSource,
+    /import\s*\{[^}]*deriveInventorySetFiles[^}]*measureBundleSet[^}]*measureBytes[^}]*\}\s*from '\.\/scripts\/bundle-metrics\.mjs'/s
+  );
+  assert.match(buildSource, /deriveInventorySetFiles\(artifactInventory, releaseCatalog\)/);
+  assert.match(buildSource, /measureBundleSet\(/);
+  assert.match(buildSource, /measureBytes\(bootstrapBytes\)/);
+  assert.doesNotMatch(buildSource, /node:zlib|const separator\s*=|function compress\s*\(/);
+  assert.doesNotMatch(buildSource, /function measureBundleSet\s*\(/);
+  assert.doesNotMatch(buildSource, /MINIMAL_CRITICAL_IDS|REFERENCE_CRITICAL_IDS/);
+});
+
+test('role-correct capture appends provenance without changing historical evidence', () => {
+  const baseline = JSON.parse(
+    fs.readFileSync(
+      path.join(libDirectory, 'test/fixtures/performance/aps-tsjs-prechange.json'),
+      'utf8'
+    )
+  );
+  const original = Object.fromEntries(
+    Object.entries(baseline).filter(([key]) => key !== 'roleCorrectTransfer')
+  );
+
+  assert.ok(baseline.roleCorrectTransfer, 'role-correct capture must be appended');
+  assert.deepEqual(baseline.roleCorrectTransfer.source, {
+    ref: 'spec/aps-tsjs-resilience-design',
+    sha: 'd270c4bfa70dc6b26515281aec7e915189aa9f75',
+  });
+  assert.equal(
+    baseline.roleCorrectTransfer.originalTopLevelSha256,
+    createHash('sha256').update(canonicalJson(original)).digest('hex')
+  );
+  assert.equal(
+    baseline.roleCorrectTransfer.originalTopLevelSha256,
+    '53f762603ad49239f1756171440be422e190cc231efafc56cf37a11e1a38ddf4'
+  );
+  assert.equal(
+    baseline.roleCorrectTransfer.compression.concatenationSeparator,
+    bundleMetrics.BUNDLE_SEPARATOR.toString('utf8')
+  );
 });
 
 test('bundle budget membership rejects every noncanonical release inventory shape', () => {
@@ -267,51 +401,411 @@ test('bundle budget membership rejects every noncanonical release inventory shap
     () => validateSemanticBundleSets(multiplyCounted, release, catalog),
     /contains a duplicate/
   );
+
+  const omittedMaximalModule = structuredClone(metrics);
+  omittedMaximalModule.sets.maximal.files.pop();
+  assert.throws(
+    () => validateSemanticBundleSets(omittedMaximalModule, release, catalog),
+    /buildMetrics\.sets\.maximal has semantic ids/
+  );
 });
 
 test('critical bundle graphs exclude deferred entries and transitive presentation sources', () => {
-  const metrics = JSON.parse(
-    fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-build-metrics-v1.json'), 'utf8')
-  );
-  const release = JSON.parse(
-    fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-release-v1.json'), 'utf8')
-  );
+  const { baseline, metrics, release } = readBuildEvidence();
+  const sourceOwners = baseline.roleCorrectTransfer.sourceOwners;
   const cleanMetrics = structuredClone(metrics);
-  assert.deepEqual(findCriticalDeferredSourceViolations(cleanMetrics, release), []);
+  assert.deepEqual(findCriticalDeferredSourceViolations(cleanMetrics, release, sourceOwners), []);
 
   const reachesDeferredEntry = structuredClone(cleanMetrics);
   reachesDeferredEntry.modules[0].sources.push({
     file: 'src/integrations/gpt/later.ts',
     renderedBytes: 1,
   });
-  assert.deepEqual(findCriticalDeferredSourceViolations(reachesDeferredEntry, release), [
-    'core reaches deferred-owned source src/integrations/gpt/later.ts',
-  ]);
+  assert.deepEqual(
+    findCriticalDeferredSourceViolations(reachesDeferredEntry, release, sourceOwners),
+    ['core reaches deferred-owned source src/integrations/gpt/later.ts']
+  );
 
   const reachesPresentationHelper = structuredClone(cleanMetrics);
   reachesPresentationHelper.modules[0].sources.push({
     file: 'src/integrations/gpt_diagnostics/overlay.ts',
     renderedBytes: 1,
   });
-  assert.deepEqual(findCriticalDeferredSourceViolations(reachesPresentationHelper, release), [
-    'core reaches deferred-owned source src/integrations/gpt_diagnostics/overlay.ts',
-  ]);
+  assert.deepEqual(
+    findCriticalDeferredSourceViolations(reachesPresentationHelper, release, sourceOwners),
+    ['core reaches deferred-owned source src/integrations/gpt_diagnostics/overlay.ts']
+  );
 
   const reachesRenderTracePresentation = structuredClone(cleanMetrics);
   reachesRenderTracePresentation.modules[0].sources.push({
     file: 'src/integrations/gpt_diagnostics/presentation.ts',
     renderedBytes: 1,
   });
-  assert.deepEqual(findCriticalDeferredSourceViolations(reachesRenderTracePresentation, release), [
-    'core reaches deferred-owned source src/integrations/gpt_diagnostics/presentation.ts',
-  ]);
+  assert.deepEqual(
+    findCriticalDeferredSourceViolations(reachesRenderTracePresentation, release, sourceOwners),
+    ['core reaches deferred-owned source src/integrations/gpt_diagnostics/presentation.ts']
+  );
 });
 
-test('pre-capture bundle check reports historical deltas without applying old membership ceilings', () => {
+test('permanent comparator pins every historical and role-correct evidence subtree', () => {
+  const evidence = readBuildEvidence();
+  assert.equal(typeof bundleBudgets.validateRoleCorrectTransfer, 'function');
+  assert.doesNotThrow(() => bundleBudgets.validateRoleCorrectTransfer(evidence));
+
+  const originalMutations = {
+    schemaVersion: (candidate) => (candidate.schemaVersion = 2),
+    mode: (candidate) => (candidate.mode = 'changed'),
+    source: (candidate) => (candidate.source.sha = 'a'.repeat(40)),
+    environment: (candidate) => (candidate.environment.node = 'changed'),
+    sampling: (candidate) => (candidate.sampling.warmups += 1),
+    bundles: (candidate) => (candidate.bundles.minimal.rawBytes += 1),
+    performance: (candidate) => (candidate.performance.bootToFirstDisplayMs.samples[0] += 1),
+    evidence: (candidate) => (candidate.evidence.workflowRunId += 1),
+  };
+  for (const [subtree, mutate] of Object.entries(originalMutations)) {
+    const candidate = structuredClone(evidence);
+    mutate(candidate.baseline);
+    assert.throws(
+      () => bundleBudgets.validateRoleCorrectTransfer(candidate),
+      /historical evidence digest/,
+      `${subtree} mutation must fail`
+    );
+  }
+
+  const captureMutations = {
+    schemaVersion: (candidate) => (candidate.schemaVersion = 2),
+    source: (candidate) => (candidate.source.sha = 'a'.repeat(40)),
+    originalTopLevelSha256: (candidate) => (candidate.originalTopLevelSha256 = 'a'.repeat(64)),
+    tools: (candidate) => (candidate.tools.node = 'changed'),
+    compression: (candidate) => (candidate.compression.gzip.level = 8),
+    release: (candidate) => (candidate.release.artifacts[0].bytes += 1),
+    sourceOwners: (candidate) => candidate.sourceOwners['src/kernel/runtime.ts'].push('gpt'),
+    sets: (candidate) => candidate.sets.maximal.artifactIds.pop(),
+  };
+  for (const [subtree, mutate] of Object.entries(captureMutations)) {
+    const candidate = structuredClone(evidence);
+    mutate(candidate.baseline.roleCorrectTransfer);
+    assert.throws(
+      () => bundleBudgets.validateRoleCorrectTransfer(candidate),
+      /role-correct capture digest/,
+      `${subtree} mutation must fail`
+    );
+  }
+});
+
+test('capture release and generated bytes exactly match the clean capture parent', () => {
+  const evidence = readBuildEvidence();
+  const contents = new Map(
+    evidence.release.artifacts.map(({ file }) => [
+      file,
+      fs.readFileSync(path.resolve(libDirectory, '../dist', file)),
+    ])
+  );
+  assert.doesNotThrow(() =>
+    bundleBudgets.validateRoleCorrectTransfer({
+      ...evidence,
+      currentArtifactContents: contents,
+      requireExactCapture: true,
+    })
+  );
+
+  const changed = structuredClone(evidence);
+  changed.release.artifacts[0].hash = 'a'.repeat(64);
+  assert.throws(
+    () =>
+      bundleBudgets.validateRoleCorrectTransfer({
+        ...changed,
+        currentArtifactContents: contents,
+        requireExactCapture: true,
+      }),
+    /clean capture parent/
+  );
+  const changedBytes = new Map(contents);
+  changedBytes.set('gpt-bootstrap-fallback.js', Buffer.from('changed'));
+  assert.throws(
+    () =>
+      bundleBudgets.validateRoleCorrectTransfer({
+        ...evidence,
+        currentArtifactContents: changedBytes,
+        requireExactCapture: true,
+      }),
+    /current artifact bytes/
+  );
+
+  const understatedMetrics = structuredClone(evidence);
+  understatedMetrics.metrics.sets.minimal.rawBytes -= 1;
+  assert.throws(
+    () =>
+      bundleBudgets.validateRoleCorrectTransfer({
+        ...understatedMetrics,
+        currentArtifactContents: contents,
+      }),
+    /build metrics do not match current artifact bytes/
+  );
+
+  const changedMetadata = structuredClone(evidence);
+  changedMetadata.release.artifacts[2].inputs = [];
+  assert.throws(
+    () => bundleBudgets.validateRoleCorrectTransfer(changedMetadata),
+    /canonical capture metadata/
+  );
+
+  const unexpectedReleaseField = structuredClone(evidence);
+  unexpectedReleaseField.release.unexpected = true;
+  assert.throws(
+    () => bundleBudgets.validateRoleCorrectTransfer(unexpectedReleaseField),
+    /current release inventory must have exact keys/
+  );
+
+  const unexpectedArtifactField = structuredClone(evidence);
+  unexpectedArtifactField.release.artifacts[0].unexpected = true;
+  assert.throws(
+    () => bundleBudgets.validateRoleCorrectTransfer(unexpectedArtifactField),
+    /current release artifact 0 must have exact keys/
+  );
+});
+
+test('source ownership capture rejects an omitted current non-entry module source', () => {
+  const evidence = readBuildEvidence();
+  const currentArtifactContents = new Map(
+    evidence.release.artifacts.map(({ file }) => [
+      file,
+      fs.readFileSync(path.resolve(libDirectory, '../dist', file)),
+    ])
+  );
+  const omittedModuleSource = structuredClone(evidence);
+  const gptIndex = omittedModuleSource.release.artifacts
+    .filter(({ role }) => role !== 'bootstrap')
+    .findIndex(({ id }) => id === 'gpt');
+  const gptModule = omittedModuleSource.metrics.modules[gptIndex];
+  const sourceIndex = gptModule.sources.findIndex(
+    ({ file }) => file === 'src/integrations/gpt/startup.ts'
+  );
+  assert.notEqual(sourceIndex, -1);
+  assert.notEqual(gptModule.sources[sourceIndex].file, gptModule.entry);
+  gptModule.sources.splice(sourceIndex, 1);
+  assert.throws(
+    () =>
+      bundleBudgets.validateRoleCorrectTransfer({
+        ...omittedModuleSource,
+        currentArtifactContents,
+      }),
+    /current source ownership differs from immutable capture/
+  );
+});
+
+test('source ownership capture rejects cleared current bootstrap sources', () => {
+  const evidence = readBuildEvidence();
+  const currentArtifactContents = new Map(
+    evidence.release.artifacts.map(({ file }) => [
+      file,
+      fs.readFileSync(path.resolve(libDirectory, '../dist', file)),
+    ])
+  );
+  evidence.metrics.bootstrap.sources = [];
+  assert.throws(
+    () => bundleBudgets.validateRoleCorrectTransfer({ ...evidence, currentArtifactContents }),
+    /current source ownership differs from immutable capture/
+  );
+});
+
+test('source ownership capture pins artifact-owner order', () => {
+  const { baseline, metrics, release } = readBuildEvidence();
+  const reorderedOwners = structuredClone(baseline.roleCorrectTransfer.sourceOwners);
+  reorderedOwners['src/core/release.ts'].reverse();
+  assert.match(
+    bundleBudgets.findProductionGraphViolations(metrics, release, reorderedOwners).join('\n'),
+    /current source ownership differs from immutable capture/
+  );
+});
+
+test('source ownership graph rejects duplicate bootstrap sources and captured owners', () => {
+  const { baseline, metrics, release } = readBuildEvidence();
+  const duplicateBootstrapSource = structuredClone(metrics);
+  duplicateBootstrapSource.bootstrap.sources.push(
+    structuredClone(duplicateBootstrapSource.bootstrap.sources[0])
+  );
+  assert.throws(
+    () =>
+      bundleBudgets.findProductionGraphViolations(
+        duplicateBootstrapSource,
+        release,
+        baseline.roleCorrectTransfer.sourceOwners
+      ),
+    /gpt-bootstrap-fallback\.js\.sources\[.*\] is invalid/
+  );
+
+  const duplicateCapturedOwner = structuredClone(baseline.roleCorrectTransfer.sourceOwners);
+  duplicateCapturedOwner['src/kernel/runtime.ts'].push('core');
+  assert.throws(
+    () => bundleBudgets.findProductionGraphViolations(metrics, release, duplicateCapturedOwner),
+    /captured source ownership is invalid/
+  );
+});
+
+test('exact release key validation accepts equivalent insertion order', () => {
+  const evidence = readBuildEvidence();
+  evidence.release = Object.fromEntries(Object.entries(evidence.release).reverse());
+  evidence.release.artifacts = evidence.release.artifacts.map((artifact) =>
+    Object.fromEntries(Object.entries(artifact).reverse())
+  );
+
+  assert.doesNotThrow(() => bundleBudgets.validateRoleCorrectTransfer(evidence));
+});
+
+test('transfer ceilings use ceil at a fractional five-percent boundary', () => {
+  assert.equal(typeof bundleBudgets.enforceTransferCeilings, 'function');
+  const captured = Object.fromEntries(
+    ['bootstrap', 'minimal', 'reference', 'maximal'].map((setName) => [
+      setName,
+      { rawBytes: 10, gzipBytes: 10, brotliBytes: 10 },
+    ])
+  );
+  const atCeiling = structuredClone(captured);
+  for (const set of Object.values(atCeiling)) {
+    set.rawBytes = 11;
+    set.gzipBytes = 11;
+    set.brotliBytes = 11;
+  }
+  assert.doesNotThrow(() => bundleBudgets.enforceTransferCeilings(captured, atCeiling));
+  atCeiling.reference.gzipBytes += 1;
+  assert.throws(
+    () => bundleBudgets.enforceTransferCeilings(captured, atCeiling),
+    /reference\.gzipBytes is 12 bytes; ceiling is 11/
+  );
+});
+
+test('production bundle graphs reject every frozen forbidden edge', () => {
+  const { baseline, metrics, release } = readBuildEvidence();
+  const sourceOwners = baseline.roleCorrectTransfer.sourceOwners;
+  assert.equal(typeof bundleBudgets.findProductionGraphViolations, 'function');
+  assert.deepEqual(bundleBudgets.findProductionGraphViolations(metrics, release, sourceOwners), []);
+  const rejectSource = (artifactId, file, pattern) => {
+    const candidate = structuredClone(metrics);
+    const artifactIndex = release.artifacts
+      .filter(({ role }) => role !== 'bootstrap')
+      .findIndex(({ id }) => id === artifactId);
+    candidate.modules[artifactIndex].sources.push({ file, renderedBytes: 1 });
+    assert.match(
+      bundleBudgets.findProductionGraphViolations(candidate, release, sourceOwners).join('\n'),
+      pattern
+    );
+  };
+
+  rejectSource('gpt', 'src/integrations/render_runtime/index.ts', /inlines provider/);
+  rejectSource('aps', 'src/kernel/runtime.ts', /inlines provider core/);
+  rejectSource('gpt', 'src/adapters/prebid.ts', /owned by prebid/);
+  rejectSource('aps', 'src/shared/dom_insertion_dispatcher.ts', /owned by .*gpt/);
+  rejectSource('aps', 'src/test/fake_adapter.ts', /test\/fake\/no-op seam/);
+  const vendoredProvider = structuredClone(metrics);
+  vendoredProvider.modules[1].sources.push({
+    file: 'node_modules/prebid.js/build/dist/prebid.js',
+    renderedBytes: 1,
+  });
+  assert.throws(
+    () => bundleBudgets.findProductionGraphViolations(vendoredProvider, release, sourceOwners),
+    /sources\[.*\] is invalid/
+  );
+});
+
+test('production bundle graphs scan bootstrap sources for test and fake seams', () => {
+  const { baseline, metrics, release } = readBuildEvidence();
+  metrics.bootstrap.sources.push({ file: 'src/test/fake_adapter.ts', renderedBytes: 1 });
+
+  assert.match(
+    bundleBudgets
+      .findProductionGraphViolations(metrics, release, baseline.roleCorrectTransfer.sourceOwners)
+      .join('\n'),
+    /bootstrap reaches production test\/fake\/no-op seam src\/test\/fake_adapter\.ts/
+  );
+});
+
+test('production bundle graphs reject provider implementation modules, not only entries', () => {
+  const { baseline, metrics, release } = readBuildEvidence();
+  const gptIndex = release.artifacts
+    .filter(({ role }) => role !== 'bootstrap')
+    .findIndex(({ id }) => id === 'gpt');
+  metrics.modules[gptIndex].sources.push({
+    file: 'src/integrations/render_runtime/module.ts',
+    renderedBytes: 1,
+  });
+
+  assert.match(
+    bundleBudgets
+      .findProductionGraphViolations(metrics, release, baseline.roleCorrectTransfer.sourceOwners)
+      .join('\n'),
+    /gpt inlines provider render_runtime.*src\/integrations\/render_runtime\/module\.ts/
+  );
+});
+
+for (const [consumerId, providerId, providerSource] of [
+  ['gpt_later', 'gpt', 'src/integrations/gpt/module.ts'],
+  ['osano_lifecycle', 'osano_consent', 'src/integrations/osano/consent.ts'],
+  ['prebid_later', 'prebid', 'src/integrations/prebid/module.ts'],
+  ['sourcepoint_lifecycle', 'sourcepoint_consent', 'src/integrations/sourcepoint/consent.ts'],
+  ['gpt_later', 'gpt', 'src/integrations/gpt/startup.ts'],
+  ['prebid_later', 'prebid', 'src/integrations/prebid/startup.ts'],
+  ['diagnostics_presentation', 'gpt_diagnostics', 'src/integrations/gpt_diagnostics/store.ts'],
+]) {
+  test(`production bundle graph rejects ${consumerId} inlining ${providerId} implementation`, () => {
+    const { baseline, metrics, release } = readBuildEvidence();
+    const artifactIndex = release.artifacts
+      .filter(({ role }) => role !== 'bootstrap')
+      .findIndex(({ id }) => id === consumerId);
+    metrics.modules[artifactIndex].sources.push({ file: providerSource, renderedBytes: 1 });
+
+    assert.match(
+      bundleBudgets
+        .findProductionGraphViolations(metrics, release, baseline.roleCorrectTransfer.sourceOwners)
+        .join('\n'),
+      new RegExp(
+        `${consumerId} inlines provider ${providerId}.*${providerSource.replaceAll('.', '\\.')}`
+      )
+    );
+  });
+}
+
+test('critical bundle graph rejects deferred-presentation-only source ownership', () => {
+  const { baseline, metrics, release } = readBuildEvidence();
+  const coreIndex = release.artifacts
+    .filter(({ role }) => role !== 'bootstrap')
+    .findIndex(({ id }) => id === 'core');
+  metrics.modules[coreIndex].sources.push({
+    file: 'src/integrations/gpt_diagnostics/exhaustive.ts',
+    renderedBytes: 1,
+  });
+
+  assert.match(
+    bundleBudgets
+      .findProductionGraphViolations(metrics, release, baseline.roleCorrectTransfer.sourceOwners)
+      .join('\n'),
+    /core reaches deferred-owned source src\/integrations\/gpt_diagnostics\/exhaustive\.ts/
+  );
+});
+
+test('production bundle graphs reject actual underscore-named test seams', () => {
+  const { baseline, metrics, release } = readBuildEvidence();
+  const apsIndex = release.artifacts
+    .filter(({ role }) => role !== 'bootstrap')
+    .findIndex(({ id }) => id === 'aps');
+  metrics.modules[apsIndex].sources.push({
+    file: 'src/composition/browser_test.ts',
+    renderedBytes: 1,
+  });
+
+  assert.match(
+    bundleBudgets
+      .findProductionGraphViolations(metrics, release, baseline.roleCorrectTransfer.sourceOwners)
+      .join('\n'),
+    /aps reaches production test\/fake\/no-op seam src\/composition\/browser_test\.ts/
+  );
+});
+
+test('role-correct bundle check reports historical deltas and enforces transfer ceilings', () => {
   const result = checkBundleBudgets();
 
-  assert.equal(result.roleCorrectStatus, 'pending-capture');
-  assert.equal(result.transferCeilingsEnforced, false);
+  assert.equal(result.roleCorrectStatus, 'frozen');
+  assert.equal(result.transferCeilingsEnforced, true);
   assert.deepEqual(Object.keys(result.historicalDeltas), [
     'bootstrap',
     'minimal',
@@ -324,6 +818,12 @@ test('pre-capture bundle check reports historical deltas without applying old me
         report[size].deltaBytes,
         report[size].currentBytes - report[size].historicalBytes
       );
+    }
+  }
+  for (const [setName, report] of Object.entries(result.roleCorrectTransfer)) {
+    for (const size of ['rawBytes', 'gzipBytes', 'brotliBytes']) {
+      assert.equal(report[size].ceilingBytes, Math.ceil(report[size].capturedBytes * 1.05));
+      assert.ok(report[size].currentBytes <= report[size].ceilingBytes, `${setName}.${size}`);
     }
   }
 });
@@ -346,11 +846,14 @@ test('bundle budgets are exposed through the package and enforced after the CI b
   const packageJson = JSON.parse(fs.readFileSync(path.join(libDirectory, 'package.json'), 'utf8'));
   const workflow = fs.readFileSync(path.join(repositoryRoot, '.github/workflows/test.yml'), 'utf8');
   const buildStep = workflow.indexOf('run: npm run build');
+  const releaseStep = workflow.indexOf('run: npm run test:release');
   const budgetStep = workflow.indexOf('run: npm run check:bundle');
 
   assert.equal(packageJson.scripts['check:bundle'], 'node scripts/check-bundle-budgets.mjs');
   assert.notEqual(buildStep, -1);
+  assert.ok(releaseStep > buildStep, 'release verification must run after the TSJS build');
   assert.ok(budgetStep > buildStep, 'bundle budget check must run after the TSJS build');
+  assert.ok(budgetStep > releaseStep, 'bundle budget check must run after release verification');
 });
 
 test('release id changes independently with id, role, phase, trigger, bytes, and order', () => {
