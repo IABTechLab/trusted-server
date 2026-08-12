@@ -34,7 +34,7 @@ const TRANSFER_SET_NAMES = Object.freeze(['bootstrap', ...SET_NAMES]);
 const HISTORICAL_EVIDENCE_SHA256 =
   '53f762603ad49239f1756171440be422e190cc231efafc56cf37a11e1a38ddf4';
 const ROLE_CORRECT_CAPTURE_SHA256 =
-  'fd8b549ed2c87037fb07d751a96058da86c2ec48231f6bd69add78d55a4c915f';
+  'f1d73d517e4888ef4dc3a84b34166e9aeb6a2bde99dec1c835f151f4e070f64a';
 const BOOTSTRAP_BASELINE = Object.freeze({
   rawBytes: 19_101,
   gzipBytes: 5_468,
