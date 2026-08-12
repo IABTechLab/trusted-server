@@ -47,7 +47,10 @@ import {
   createCommittedArtifactStore,
   createRenderAttempt,
   createRendererNonceRegistry,
+  createSlotOperation,
+  renderDirectCacheAttempt,
   renderDirectAdmAttempt,
+  resolveCacheAdmAttempt,
   type RenderAttempt,
 } from '../../services/render';
 import type { SlotRecord, SlotService } from '../../services/slots';
@@ -723,11 +726,14 @@ export function createRenderRuntimeIntegrationRegistration(
         artifacts,
         cachePolicy,
         createAttempt,
+        createSlotOperation,
         navigation,
         projection,
+        renderDirectCacheAttempt,
         renderWinner,
         rendererNonces,
         reservations,
+        resolveCacheAdmAttempt,
         publisherOrigin: origin,
         registerRenderer: (type: RegisteredRenderSource, renderer: RegisteredRenderer) => {
           if (!active) throw new TypeError('render source provider is inactive');

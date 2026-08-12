@@ -122,6 +122,7 @@ import {
   createCommittedArtifactStore,
   createRenderAttempt,
   createRendererNonceRegistry,
+  createSlotOperation,
   resolveCacheAdmAttempt,
   renderDirectCacheAttempt,
   resizeCollapsedPucShell,
@@ -237,13 +238,19 @@ export interface BrowserRuntimeComposition extends BrowserComposition {
   readonly pucBridgeForTest: () => PucBridge | undefined;
   /** Join one prospective GPT attempt through the runtime-owned services in tests. */
   readonly startGptSlotOperationForTest: (
-    input: Omit<GptSlotOperationInput, 'pucBridge' | 'slots'>
+    input: Omit<GptSlotOperationInput, 'createSlotOperation' | 'pucBridge' | 'slots'>
   ) => SlotOperationCreationResult;
   /** Publish one prospective server winner through the ordered GPT transaction in tests. */
   readonly publishGptWinnerForTest: (
     input: Omit<
       GptWinnerPublicationInput,
-      'googletag' | 'navigation' | 'pucBridge' | 'reservations' | 'slots' | 'targeting'
+      | 'createSlotOperation'
+      | 'googletag'
+      | 'navigation'
+      | 'pucBridge'
+      | 'reservations'
+      | 'slots'
+      | 'targeting'
     >
   ) => Promise<GptWinnerPublicationResult>;
 }
@@ -1162,6 +1169,7 @@ export function createTestBrowserRuntimeComposition(
         artifact,
         attempt: created.value,
         bid,
+        createSlotOperation,
         googletag: composition.adapters.googletag,
         navigation,
         operation: binding.operation,
@@ -1892,7 +1900,13 @@ export function createTestBrowserRuntimeComposition(
     publishGptWinnerForTest: (
       input: Omit<
         GptWinnerPublicationInput,
-        'googletag' | 'navigation' | 'pucBridge' | 'reservations' | 'slots' | 'targeting'
+        | 'createSlotOperation'
+        | 'googletag'
+        | 'navigation'
+        | 'pucBridge'
+        | 'reservations'
+        | 'slots'
+        | 'targeting'
       >
     ): Promise<GptWinnerPublicationResult> => {
       const services = browserServices;
@@ -1902,6 +1916,7 @@ export function createTestBrowserRuntimeComposition(
       }
       return publishGptWinner({
         ...input,
+        createSlotOperation,
         googletag: composition.adapters.googletag,
         navigation,
         pucBridge: services.pucBridge,
@@ -1911,12 +1926,13 @@ export function createTestBrowserRuntimeComposition(
       });
     },
     startGptSlotOperationForTest: (
-      input: Omit<GptSlotOperationInput, 'pucBridge' | 'slots'>
+      input: Omit<GptSlotOperationInput, 'createSlotOperation' | 'pucBridge' | 'slots'>
     ): SlotOperationCreationResult => {
       const services = browserServices;
       if (!services) return Object.freeze({ ok: false, reason: 'invalid_attempt' });
       return startGptSlotOperation({
         ...input,
+        createSlotOperation,
         pucBridge: services.pucBridge,
         slots: services.slots,
       });

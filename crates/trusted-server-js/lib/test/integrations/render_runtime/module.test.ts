@@ -289,6 +289,23 @@ describe('render_runtime provider', () => {
     ) as PreparedIntegration;
     const render = prepared.interfaces?.['render.v1'] as {
       attachPucGamAttemptRegistrar: (registrar: (input: unknown) => boolean) => () => void;
+      createAttempt: (
+        owner: Readonly<Record<string, unknown>>
+      ) => Readonly<{ ok: boolean; value?: RenderAttempt }>;
+      createSlotOperation: (
+        input: Readonly<{ primary: RenderAttempt }>
+      ) => Readonly<{ ok: true; value: object }> | Readonly<{ ok: false; reason: string }>;
+      navigation: {
+        createAuctionBatch: (auctionId: string) =>
+          | {
+              createRenderAttempt: (
+                slot: string
+              ) => Readonly<{ ok: boolean; value?: Readonly<Record<string, unknown>> }>;
+            }
+          | undefined;
+      };
+      renderDirectCacheAttempt: (input: unknown) => boolean;
+      resolveCacheAdmAttempt: (input: unknown) => boolean;
       registerPucGamAttempt: (input: unknown) => boolean;
       registerRenderer: (
         type: 'aps',
@@ -339,6 +356,16 @@ describe('render_runtime provider', () => {
         afterCommit: vi.fn(),
       } satisfies IntegrationActivationContext)
     );
+    const batch = render.navigation.createAuctionBatch('cross-bundle-render-capability');
+    const owner = batch?.createRenderAttempt('slot-one');
+    expect(owner?.ok).toBe(true);
+    const attempt = render.createAttempt(owner?.value ?? Object.freeze({}));
+    expect(attempt.ok).toBe(true);
+    expect(render.createSlotOperation({ primary: attempt.value as RenderAttempt })).toMatchObject({
+      ok: true,
+    });
+    expect(typeof render.renderDirectCacheAttempt).toBe('function');
+    expect(typeof render.resolveCacheAdmAttempt).toBe('function');
     const hostileCause = new Error('publisher-owned validation trap');
     const hostileValidation = new Proxy(Object.freeze({}), {
       getPrototypeOf: () => {

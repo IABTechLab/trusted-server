@@ -26,17 +26,16 @@ import { prepareAdmIframe } from '../../core/render';
 import { DisposableStack } from '../../kernel/disposable';
 import type { RuntimeCapabilityV1 } from '../../kernel/runtime';
 import type { NavigationSession, RenderAttemptScope, RuntimeSession } from '../../kernel/sessions';
-import {
-  createSlotOperation,
-  renderDirectCacheAttempt,
-  resolveCacheAdmAttempt,
-  type CommittedRenderArtifact,
-  type RenderAttempt,
-  type RenderAttemptCreationResult,
-  type RenderFailureReason,
-  type RendererNonceRegistry,
-  type SlotOperationCreationResult,
-  type SlotOperationOptions,
+import type {
+  CacheAdmResolutionOptions,
+  CommittedRenderArtifact,
+  DirectCacheAttemptOptions,
+  RenderAttempt,
+  RenderAttemptCreationResult,
+  RenderFailureReason,
+  RendererNonceRegistry,
+  SlotOperationCreationResult,
+  SlotOperationOptions,
 } from '../../services/render';
 import {
   createPucBridge,
@@ -128,14 +127,17 @@ interface ProductionRenderCapability {
     owner: RenderAttemptScope,
     parentAttemptId?: string
   ) => RenderAttemptCreationResult;
+  readonly createSlotOperation: (options: SlotOperationOptions) => SlotOperationCreationResult;
   readonly publisherOrigin: string;
   readonly registerRenderer: (
     type: 'cache',
     renderer: (attempt: RenderAttempt, container: HTMLElement) => boolean
   ) => () => void;
   readonly rendererNonces: RendererNonceRegistry;
+  readonly renderDirectCacheAttempt: (options: DirectCacheAttemptOptions) => boolean;
   readonly renderWinner: (attempt: RenderAttempt) => boolean;
   readonly reservations: ReservationService;
+  readonly resolveCacheAdmAttempt: (options: CacheAdmResolutionOptions) => boolean;
 }
 
 interface ProductionMessagesCapability {
@@ -163,6 +165,7 @@ interface InitialProjectionServices {
 export interface GptSlotOperationInput extends Omit<PucGamAttemptInput, 'attempt'> {
   readonly attempt: RenderAttempt;
   readonly createFallback?: SlotOperationOptions['createFallback'];
+  readonly createSlotOperation: (options: SlotOperationOptions) => SlotOperationCreationResult;
   readonly operation: 'display' | 'refresh';
   readonly pucBridge: Pick<PucBridge, 'recordNonemptyGam' | 'registerGamAttempt'>;
   readonly requestClass: string;
@@ -514,6 +517,7 @@ export async function publishGptWinner(
       artifact: publishedArtifact,
       attempt: input.attempt,
       ...(input.createFallback === undefined ? {} : { createFallback: input.createFallback }),
+      createSlotOperation: input.createSlotOperation,
       operation: input.operation,
       owner: input.owner,
       pucBridge: {
@@ -581,7 +585,7 @@ function settleFromSlotOutcome(
  * optional `SlotOperation` fallback child.
  */
 export function startGptSlotOperation(input: GptSlotOperationInput): SlotOperationCreationResult {
-  const operation = createSlotOperation({
+  const operation = input.createSlotOperation({
     primary: input.attempt,
     ...(input.createFallback === undefined ? {} : { createFallback: input.createFallback }),
   });
@@ -849,6 +853,7 @@ export async function publishInitialGptProjection(
         artifact,
         attempt,
         bid,
+        createSlotOperation: render.createSlotOperation,
         googletag,
         navigation,
         operation: binding.operation,
@@ -968,8 +973,11 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
     typeof slotCapability.attachPhysicalService !== 'function' ||
     typeof render.attachPucGamAttemptRegistrar !== 'function' ||
     typeof render.createAttempt !== 'function' ||
+    typeof render.createSlotOperation !== 'function' ||
     typeof render.registerRenderer !== 'function' ||
+    typeof render.renderDirectCacheAttempt !== 'function' ||
     typeof render.renderWinner !== 'function' ||
+    typeof render.resolveCacheAdmAttempt !== 'function' ||
     typeof render.publisherOrigin !== 'string' ||
     typeof trace.observations?.publish !== 'function'
   ) {
@@ -1017,7 +1025,7 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
       attempt.fail('cache_network_error');
       return false;
     }
-    return renderDirectCacheAttempt({
+    return render.renderDirectCacheAttempt({
       attempt,
       cachePolicy,
       container,
@@ -1039,7 +1047,7 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
       attempt.fail('cache_network_error');
       return false;
     }
-    return resolveCacheAdmAttempt({
+    return render.resolveCacheAdmAttempt({
       attempt: attempt as RenderAttempt,
       cachePolicy,
       fetcher: (input, init) => fetchCache(input, init),

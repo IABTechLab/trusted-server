@@ -23,6 +23,7 @@ import { createRuntimeSession } from '../../../src/kernel/sessions';
 import {
   createCommittedArtifactStore,
   createRenderAttempt,
+  createSlotOperation,
   type CommittedRenderArtifact,
   type RenderAttempt,
 } from '../../../src/services/render';
@@ -698,6 +699,7 @@ describe('transactional GPT integration module', () => {
             prepareRenderSource: (candidate) => candidate as never,
             reservations,
           }),
+        createSlotOperation,
         publisherOrigin: window.location.origin,
         registerRenderer: vi.fn(),
         rendererNonces: Object.freeze({}),
@@ -952,9 +954,11 @@ describe('transactional GPT integration module', () => {
       }),
       recordNonemptyGam: vi.fn(() => true),
     };
+    const invokeCreateSlotOperation = vi.fn(createSlotOperation);
     const started = startGptSlotOperation({
       artifact: harness.artifact,
       attempt: harness.primary,
+      createSlotOperation: invokeCreateSlotOperation,
       createFallback: (parentAttemptId) => {
         expect(harness.primary.snapshot().outcome).toEqual({
           outcome: 'failed',
@@ -973,6 +977,10 @@ describe('transactional GPT integration module', () => {
     });
 
     expect(started.ok).toBe(true);
+    expect(invokeCreateSlotOperation).toHaveBeenCalledExactlyOnceWith({
+      primary: harness.primary,
+      createFallback: expect.any(Function),
+    });
     expect(bridge.registerGamAttempt).toHaveBeenCalledTimes(1);
     expect(slot.request).toHaveBeenCalledWith({
       intentId: harness.primary.id,
@@ -1030,6 +1038,7 @@ describe('transactional GPT integration module', () => {
     const input = {
       artifact: harness.artifact,
       attempt: harness.primary,
+      createSlotOperation,
       operation: 'display' as const,
       owner: harness.primaryOwner,
       pucBridge: bridge,
@@ -1068,6 +1077,7 @@ describe('transactional GPT integration module', () => {
       const started = startGptSlotOperation({
         artifact: harness.artifact,
         attempt: harness.primary,
+        createSlotOperation,
         createFallback,
         operation: 'refresh',
         owner: harness.primaryOwner,
@@ -1224,6 +1234,7 @@ describe('ordered GPT winner publication', () => {
       artifact: harness.artifact,
       attempt: harness.primary,
       bid,
+      createSlotOperation,
       googletag,
       navigation: harness.navigation,
       operation: 'refresh',

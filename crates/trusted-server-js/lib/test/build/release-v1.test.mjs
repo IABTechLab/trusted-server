@@ -171,6 +171,199 @@ test('generated maximal integration artifacts execute their real catalog entrypo
   }
 });
 
+test('generated GPT consumes branded render operations without inlining their private store', () => {
+  const metrics = JSON.parse(
+    fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-build-metrics-v1.json'), 'utf8')
+  );
+  const renderRuntime = metrics.modules.find(({ file }) => file === 'tsjs-render_runtime.js');
+  const gpt = metrics.modules.find(({ file }) => file === 'tsjs-gpt.js');
+
+  assert.ok(renderRuntime, 'render_runtime metrics must exist');
+  assert.ok(gpt, 'GPT metrics must exist');
+  assert.ok(
+    renderRuntime.sources.some(({ file }) => file === 'src/services/render.ts'),
+    'render_runtime must own the branded render implementation'
+  );
+  assert.equal(
+    gpt.sources.some(({ file }) => file === 'src/services/render.ts'),
+    false,
+    'GPT must invoke branded operations through render.v1'
+  );
+});
+
+test('independently generated render_runtime and GPT bundles start one branded display flow', async () => {
+  const release = JSON.parse(
+    fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-release-v1.json'), 'utf8')
+  );
+  const dom = new JSDOM(
+    '<!doctype html><html><head></head><body><div id="slot-one"></div></body></html>',
+    {
+      runScripts: 'outside-only',
+      url: 'https://publisher.example/article',
+    }
+  );
+  const registrations = [];
+  const preparationDisposers = [];
+  const activationDisposers = [];
+  const displayCalls = [];
+  try {
+    const targeting = new Map();
+    const definedSlots = [];
+    const pubads = {
+      addEventListener: () => undefined,
+      disableInitialLoad: () => undefined,
+      getSlots: () => definedSlots,
+      refresh: () => undefined,
+      removeEventListener: () => undefined,
+    };
+    dom.window.googletag = {
+      apiReady: true,
+      pubadsReady: true,
+      cmd: { push: (command) => (command(), 1) },
+      defineSlot: (adUnitPath, _sizes, elementId) => {
+        const slot = {
+          addService: () => slot,
+          clearTargeting: (key) => {
+            if (key === undefined) targeting.clear();
+            else targeting.delete(key);
+            return slot;
+          },
+          getAdUnitPath: () => adUnitPath,
+          getSlotElementId: () => elementId,
+          getTargeting: (key) => targeting.get(key) ?? [],
+          setTargeting: (key, value) => {
+            targeting.set(key, typeof value === 'string' ? [value] : [...value]);
+            return slot;
+          },
+        };
+        definedSlots.push(slot);
+        return slot;
+      },
+      destroySlots: () => true,
+      display: (elementId) => displayCalls.push(elementId),
+      getConfig: () => ({ disableInitialLoad: false }),
+      pubads: () => pubads,
+      setConfig: () => undefined,
+    };
+    const boot = dom.window.eval(`(() => {
+      const freeze = Object.freeze;
+      const placement = freeze({
+        slot: 'slot-one',
+        gamUnitPath: '/123/slot-one',
+        divId: 'slot-one',
+        formats: freeze([freeze([300, 250])]),
+        targeting: freeze({})
+      });
+      const bid = freeze({
+        candidateId: 'AAAAAAAAAAAA',
+        slot: 'slot-one',
+        provider: 'trusted',
+        upstreamBidId: 'upstream-one',
+        cpm: 2,
+        currency: 'USD',
+        targeting: freeze({ hb_bidder: 'trusted' }),
+        rendererReservationId: 'r1_aaaaaaaaaaaaaaaaaaaaaa',
+        renderSource: freeze({
+          type: 'adm',
+          version: 1,
+          adm: '<main>trusted</main>',
+          width: 300,
+          height: 250
+        })
+      });
+      return freeze({
+        auctionProjection: freeze({
+          version: 1,
+          auction: freeze({
+            version: 1,
+            auctionId: 'generated-cross-bundle',
+            results: freeze([freeze({
+              slot: 'slot-one',
+              outcome: 'winner',
+              candidateId: 'AAAAAAAAAAAA'
+            })])
+          }),
+          slots: freeze([placement]),
+          bids: freeze([bid])
+        }),
+        diagnostics: freeze({
+          version: 1,
+          renderTraceOverlay: false,
+          gpt: freeze({ active: false })
+        }),
+        manifest: freeze({
+          version: 1,
+          releaseId: '${release.releaseId}',
+          criticalSrc: '/static/tsjs=tsjs-unified.min.js?v=${release.releaseId}',
+          integrations: freeze([
+            freeze({ id: 'render_runtime', phase: 'critical' }),
+            freeze({ id: 'gpt', phase: 'critical' })
+          ])
+        })
+      });
+    })()`);
+    const runtime = dom.window.Object.freeze({
+      attachAuctionContextService: () => () => undefined,
+      boot: () => boot,
+      document: dom.window.document,
+      enqueue: () => true,
+      generation: dom.window.Object.freeze({}),
+      protectFirstDisplayAttemptBatch: () => true,
+      registerAuctionContext: () => () => undefined,
+    });
+
+    executeGeneratedArtifact(dom.window, 'tsjs-render_runtime.js', registrations);
+    executeGeneratedArtifact(dom.window, 'tsjs-gpt.js', registrations);
+    const renderRegistration = registrations.find(({ id }) => id === 'render_runtime');
+    const gptRegistration = registrations.find(({ id }) => id === 'gpt');
+    assert.ok(renderRegistration);
+    assert.ok(gptRegistration);
+    const renderPrepared = renderRegistration.prepare(
+      dom.window.Object.freeze({
+        config: undefined,
+        interfaces: dom.window.Object.freeze({ 'runtime.v1': runtime }),
+        onDispose: (callback) => preparationDisposers.push(callback),
+        signal: new dom.window.AbortController().signal,
+      })
+    );
+    renderPrepared.activate(
+      dom.window.Object.freeze({
+        afterCommit: () => undefined,
+        onDispose: (callback) => activationDisposers.push(callback),
+        signal: new dom.window.AbortController().signal,
+      })
+    );
+    const gptPrepared = gptRegistration.prepare(
+      dom.window.Object.freeze({
+        config: undefined,
+        interfaces: dom.window.Object.freeze({
+          'runtime.v1': runtime,
+          ...renderPrepared.interfaces,
+        }),
+        onDispose: (callback) => preparationDisposers.push(callback),
+        signal: new dom.window.AbortController().signal,
+      })
+    );
+    gptPrepared.activate(
+      dom.window.Object.freeze({
+        afterCommit: (callback) => callback(),
+        onDispose: (callback) => activationDisposers.push(callback),
+        signal: new dom.window.AbortController().signal,
+      })
+    );
+    for (let index = 0; index < 10 && displayCalls.length === 0; index += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    assert.equal(displayCalls.length, 1);
+    assert.equal(displayCalls[0], definedSlots[0]);
+  } finally {
+    activationDisposers.reverse().forEach((release) => release());
+    preparationDisposers.reverse().forEach((release) => release());
+    dom.window.close();
+  }
+});
+
 for (const fixture of CRITICAL_CONSENT_ARTIFACTS) {
   test(`generated ${fixture.id} artifact activates through runtime.v1 and publishes ${fixture.capability}`, () => {
     const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
