@@ -9,7 +9,6 @@
 #
 # Usage:
 #   ./scripts/c2-local-test.sh              # esi mode (shared template + edge assembly)
-#   ./scripts/c2-local-test.sh client_fill  # shared template, browser fetches its own bids
 #   ./scripts/c2-local-test.sh inline       # today's shipped behaviour, as a control
 #
 # Spike-only. Remove with the spike.
@@ -18,9 +17,9 @@ set -euo pipefail
 
 MODE="${1:-esi}"
 case "$MODE" in
-  inline | client_fill | esi) ;;
+  inline | esi) ;;
   *)
-    echo "Unknown mode '$MODE'. Use one of: inline, client_fill, esi." >&2
+    echo "Unknown mode '$MODE'. Use one of: inline, esi." >&2
     exit 1
     ;;
 esac
@@ -285,8 +284,7 @@ WINNING_BID='\"hb_pb\":\"4.25\"'
 # not an esi:include — nothing parses ESI on the render path any more.
 SEAM_MARKER='<!--ts-seam-bids-->'
 
-# Shared by every mode that stores a template, so `esi` and `client_fill` cannot drift
-# apart on the two properties that have nothing to do with the seam.
+# Shared by the ESI assertions below.
 check_hit_is_private() {
   local hdrs
   hdrs=$(curl -s -D- -o /dev/null -H "Host: ts.example.com" \
@@ -313,34 +311,6 @@ if [ "$MODE" = "inline" ]; then
     "$(grep -c 'c2_template_cache stored' "$WORK/viceroy.log" || true)" "0"
   check "inline delivers the winning bid" \
     "$(grep -cF "$WINNING_BID" "$SERVED" || true)" "1"
-elif [ "$MODE" = "client_fill" ]; then
-  # The assertion this mode never had. `client_fill` stored a template on every
-  # request and read one back on none of them: both hit paths demanded a seam marker,
-  # and this mode emits none by design, so each hit was discarded as transform drift
-  # and refetched the origin. Its caching had never worked.
-  check "second request is served from cache" "$FETCHES" "1"
-  # Asserted on the *distinct* values rather than on a line count: viceroy emits each
-  # log line twice (once to the log endpoint, once to stdout), so counting lines
-  # measures the logger. One distinct value means every store agreed, and `false` is
-  # the value this mode must produce — a `true` here would mean it had grown a seam.
-  check "the stored template has no seam marker, by design" \
-    "$(grep -ohE 'seam marker present: [a-z]+' "$WORK/viceroy.log" | sort -u | tr '\n' '/')" \
-    "seam marker present: false/"
-  check "no seam marker reaches the browser" \
-    "$(grep -cF "$SEAM_MARKER" "$SERVED" || true)" "0"
-  # The mode's defining property: the browser fetches its own bids, so the server
-  # splices none. A page carrying the server's bucketed price would mean this mode had
-  # quietly become `esi`.
-  check "the server splices no bids" \
-    "$(grep -cF "$WINNING_BID" "$SERVED" || true)" "0"
-  check "the server schedules no initial adInit" \
-    "$(grep -c 'scheduleInitialAdInit' "$SERVED" || true)" "0"
-  # `root_auction_is_useful` refuses to dispatch here: an auction nothing reads would
-  # bill the SSPs and hold the response for its full budget with no consumer.
-  check "no root auction is dispatched" \
-    "$(grep -c "POST /bid" "$WORK/origin.log" || true)" "0"
-  check_hit_is_private
-  check_post_reaches_origin
 else
   check "second request is served from cache" "$FETCHES" "1"
   check "no unresolved seam marker reaches the browser" \
@@ -457,16 +427,6 @@ COMPLETE=$(echo "$B_LINE" | sed -n 's/.*complete=\([0-9]*\)ms.*/\1/p')
 if [ "$MODE" = "inline" ]; then
   check "inline delivers the article before the auction resolves" \
     "$(awk -v f="$FIRST_BODY" -v c="$COMPLETE" 'BEGIN { print (f < c / 3) ? "yes" : "no" }')" \
-    "yes"
-elif [ "$MODE" = "client_fill" ]; then
-  check "the origin fetch stays compressed" \
-    "$(grep -c 'served PLAINTEXT' "$WORK/origin.log" || true)" "0"
-  # There is no seam to hold, so there is nothing to hold *for*: the whole response
-  # lands well inside the bid endpoint's delay. Stated as a bound on the total rather
-  # than as a ratio, because with no auction the first body byte and the last arrive
-  # together and `first < complete / 3` would be meaningless here.
-  check "the whole response lands without waiting for an auction" \
-    "$(awk -v c="$COMPLETE" -v d="$BID_DELAY" 'BEGIN { print (c < d * 500) ? "yes" : "no" }')" \
     "yes"
 else
   # The property the unit tests cannot reach: in-process there is no bid provider, so

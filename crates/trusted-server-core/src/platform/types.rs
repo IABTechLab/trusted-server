@@ -173,11 +173,6 @@ pub struct RuntimeServices {
     /// per request rather than failing. Spike-only; see
     /// [`crate::platform::template_cache`].
     pub(crate) template_cache: Arc<dyn super::PlatformTemplateCache>,
-    /// Edge assembler for shared templates. Defaults to
-    /// [`UnavailableTemplateAssembler`], which refuses rather than serving a document
-    /// with an unresolved marker in it. Spike-only; see
-    /// [`crate::platform::template_assembly`].
-    pub(crate) template_assembler: Arc<dyn super::PlatformTemplateAssembler>,
     /// Dynamic backend registration and name prediction.
     pub(crate) backend: Arc<dyn PlatformBackend>,
     /// Outbound HTTP client abstraction.
@@ -237,12 +232,6 @@ impl RuntimeServices {
     #[must_use]
     pub fn template_cache(&self) -> &dyn super::PlatformTemplateCache {
         &*self.template_cache
-    }
-
-    /// The edge template assembler. Spike-only.
-    #[must_use]
-    pub fn template_assembler(&self) -> &dyn super::PlatformTemplateAssembler {
-        &*self.template_assembler
     }
 
     /// Returns the dynamic backend service.
@@ -305,20 +294,6 @@ impl RuntimeServices {
             ..self
         }
     }
-
-    /// Returns a clone of this instance with the template assembler replaced.
-    ///
-    /// Spike-only (#1009).
-    #[must_use]
-    pub fn with_template_assembler(
-        self,
-        assembler: Arc<dyn super::PlatformTemplateAssembler>,
-    ) -> Self {
-        Self {
-            template_assembler: assembler,
-            ..self
-        }
-    }
 }
 
 impl fmt::Debug for RuntimeServices {
@@ -338,7 +313,6 @@ pub struct RuntimeServicesBuilder {
     secret_store: Option<Arc<dyn PlatformSecretStore>>,
     kv_store: Option<Arc<dyn PlatformKvStore>>,
     template_cache: Option<Arc<dyn super::PlatformTemplateCache>>,
-    template_assembler: Option<Arc<dyn super::PlatformTemplateAssembler>>,
     backend: Option<Arc<dyn PlatformBackend>>,
     http_client: Option<Arc<dyn PlatformHttpClient>>,
     geo: Option<Arc<dyn PlatformGeo>>,
@@ -353,7 +327,6 @@ impl RuntimeServicesBuilder {
             secret_store: None,
             kv_store: None,
             template_cache: None,
-            template_assembler: None,
             backend: None,
             http_client: None,
             geo: None,
@@ -380,16 +353,6 @@ impl RuntimeServicesBuilder {
     #[must_use]
     pub fn template_cache(mut self, cache: Arc<dyn super::PlatformTemplateCache>) -> Self {
         self.template_cache = Some(cache);
-        self
-    }
-
-    /// Set the edge template assembler. Spike-only.
-    #[must_use]
-    pub fn template_assembler(
-        mut self,
-        assembler: Arc<dyn super::PlatformTemplateAssembler>,
-    ) -> Self {
-        self.template_assembler = Some(assembler);
         self
     }
 
@@ -460,11 +423,6 @@ impl RuntimeServicesBuilder {
             template_cache: self
                 .template_cache
                 .unwrap_or_else(|| Arc::new(super::UnavailableTemplateCache)),
-            // Defaulted to a refusal rather than to a pass-through: an adapter with no
-            // assembler must not serve a template with an unresolved marker in it.
-            template_assembler: self
-                .template_assembler
-                .unwrap_or_else(|| Arc::new(super::UnavailableTemplateAssembler)),
             backend: self
                 .backend
                 .expect("should set backend before building RuntimeServices"),

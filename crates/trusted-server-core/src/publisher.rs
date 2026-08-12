@@ -980,34 +980,7 @@ pub(crate) fn template_gpt_diagnostics(
 ) -> Option<crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision> {
     match mode {
         AssemblyMode::Inline => decision,
-        AssemblyMode::ClientFill | AssemblyMode::Esi => None,
-    }
-}
-
-/// Whether a root-level auction has any consumer under this assembly mode.
-///
-/// Only [`AssemblyMode::Inline`] injects the auction result into the root document.
-/// Under the shared-template modes both seams emit nothing, so a dispatched root
-/// auction would bill the SSPs, hold the response for the full budget, and have its
-/// result discarded with no error and no log.
-///
-/// This is the guard for the failure mode described in §5 of
-/// `docs/superpowers/specs/2026-08-08-esi-cacheable-root-validation-design.md`,
-/// reached here by an incomplete feature flag rather than by removing the hold.
-pub(crate) fn root_auction_is_useful(mode: AssemblyMode) -> bool {
-    match mode {
-        AssemblyMode::Inline => true,
-        // The browser fetches its own bids after load, so a root auction here would be
-        // a second one nothing reads.
-        AssemblyMode::ClientFill => false,
-        // Consumed by edge assembly rather than by a seam. An earlier revision returned
-        // `false` here on the premise that the fragment would run its own auction via a
-        // real subrequest. That premise made the arm strictly worse — a self-referencing
-        // backend, two auction paths, and two auctions per pageview — and it is not what
-        // `esi` requires: `PendingFragmentContent::CompletedRequest` lets the include be
-        // satisfied from bytes already in hand. So the auction already in flight *is*
-        // the fragment, and it is very much consumed.
-        AssemblyMode::Esi => true,
+        AssemblyMode::Esi => None,
     }
 }
 
@@ -1045,18 +1018,13 @@ fn configured_assembly_mode(settings: &Settings) -> AssemblyMode {
 ///
 /// The property that decides whether a template is *expected* to have a hole in it, and
 /// therefore whether the absence of one is a defect or the design. Only `Esi` splices per
-/// reader; `ClientFill` deliberately injects nothing there, because the browser fetches
-/// its own bids after load.
-///
-/// Treating the marker as universal is what made `ClientFill`'s cache inert: every hit
-/// failed the marker check, was logged as transform drift, and fell back to the origin,
-/// so that mode stored templates it could never read back.
+/// reader.
 ///
 /// Matched exhaustively rather than compared against `Esi`, so a new mode has to state
 /// its answer here instead of silently inheriting one.
 fn mode_emits_seam_marker(mode: AssemblyMode) -> bool {
     match mode {
-        AssemblyMode::Inline | AssemblyMode::ClientFill => false,
+        AssemblyMode::Inline => false,
         AssemblyMode::Esi => true,
     }
 }
@@ -1112,8 +1080,6 @@ pub(crate) fn body_close_injection(
                 BodyCloseInjection::None
             }
         }
-        // The browser fetches the fragment unprompted; nothing to emit.
-        AssemblyMode::ClientFill => BodyCloseInjection::None,
         // Constant across every request that reaches the transform — which is what
         // makes it safe in a shared template.
         AssemblyMode::Esi => BodyCloseInjection::Marker(SEAM_BIDS_MARKER.to_string()),
@@ -1450,16 +1416,6 @@ pub async fn buffer_publisher_response_async(
             template,
             mut params,
         } => {
-            // Asked of the mode before anything is split, because a mode that emits no
-            // seam stores a template with no hole in it — and demanding one anyway is
-            // what turned every `client_fill` hit into a 500 here and into a truncated
-            // body on the streaming finalizer. The mode is read from settings rather
-            // than carried: the cache key covers `assembly_mode`, so a template can only
-            // be read back by the mode that wrote it.
-            if !mode_emits_seam_marker(configured_assembly_mode(settings)) {
-                abandon_auction_without_a_seam(services, &mut params).await;
-                return Ok(serve_seamless_template(response, template));
-            }
             // Buffered adapters have no streaming to preserve, so eager assembly costs
             // them nothing. The streaming finalizer must not do this.
             if let Some(dispatched) = params.dispatched_auction.take() {
@@ -1579,52 +1535,6 @@ fn assemble_if_shared(
     Ok(out)
 }
 
-/// Serves a cached template unchanged, for a mode whose `</body>` seam injects nothing.
-///
-/// Under [`AssemblyMode::ClientFill`] the stored template *is* the response: the browser
-/// fetches its own bids after load, so there is no per-reader splice and nothing to wait
-/// for. Every byte is already in hand, so the length is known and stated —
-/// [`build_cached_template_response`] omits it because the assembled length of an `esi`
-/// response is not known until bids resolve, which does not apply here.
-fn serve_seamless_template(
-    mut response: Response<EdgeBody>,
-    template: Vec<u8>,
-) -> Response<EdgeBody> {
-    response.headers_mut().insert(
-        http::header::CONTENT_LENGTH,
-        http::HeaderValue::from(template.len() as u64),
-    );
-    *response.body_mut() = EdgeBody::from(template);
-    response
-}
-
-/// Reports a dispatched auction that a seamless mode has no way to deliver.
-///
-/// Unreachable by construction: [`root_auction_is_useful`] refuses to dispatch under a
-/// mode that injects nothing, so there is never anything in flight here. It is spelled
-/// out anyway because the alternative is dropping a [`DispatchedAuction`] — real SSP
-/// requests, already billed — with no error and no log, which is the silent-waste
-/// signature the gate exists to prevent.
-async fn abandon_auction_without_a_seam(
-    services: &RuntimeServices,
-    params: &mut OwnedProcessResponseParams,
-) {
-    let Some(dispatched) = params.dispatched_auction.take() else {
-        return;
-    };
-    log::warn!(
-        "Server-side auction dispatched under an assembly mode with no seam to deliver \
-         it into; in-flight SSP bid requests will not be collected"
-    );
-    emit_abandoned_auction(
-        services,
-        params.auction_observation.take(),
-        dispatched,
-        "seamless_assembly_mode",
-    )
-    .await;
-}
-
 /// Fingerprint of everything that changes the injected markup for a given URL.
 ///
 /// Two inputs, because either alone under-invalidates:
@@ -1691,7 +1601,7 @@ fn integration_fingerprint(settings: &Settings) -> String {
 /// fell back to inline and therefore carries no marker; validating or splitting it would
 /// fail and turn an ordinary bypass — the common case against a real origin — into a
 /// 500. Both conditions, and neither alone: only `Esi` emits a marker, and only an
-/// authorized response has one to find. `ClientFill` is authorized but marker-free.
+/// authorized response has one to find.
 fn response_carries_a_seam_marker(was_authorized: bool, settings: &Settings) -> bool {
     was_authorized && mode_emits_seam_marker(configured_assembly_mode(settings))
 }
@@ -1979,15 +1889,6 @@ pub async fn publisher_response_into_streaming_response(
             if !response_carries_body(method, response.status()) {
                 make_response_bodiless(&mut response);
                 return Ok(response);
-            }
-
-            // The buffered finalizer's counterpart; see the note there. Placed before the
-            // stream is built rather than inside it: a seamless template has no seam to
-            // wait at, so there is nothing for a stream to interleave, and failing inside
-            // the stream could only truncate a response whose headers had already gone.
-            if !mode_emits_seam_marker(configured_assembly_mode(&settings)) {
-                abandon_auction_without_a_seam(&services, &mut params).await;
-                return Ok(serve_seamless_template(response, template));
             }
 
             let services = services.clone();
@@ -3601,16 +3502,6 @@ pub async fn handle_publisher_request(
     let mut auction_request_for_telemetry: Option<AuctionRequest> = None;
     let mut dispatched_auction = if matched_slots.is_empty() {
         None
-    } else if !root_auction_is_useful(assembly_mode) {
-        // `ClientFill` injects nothing and the browser fetches its own bids, so
-        // dispatching here would send real SSP requests, hold the response for the full
-        // auction budget, and then discard the result with no error and no log — the
-        // silent-waste signature §5 of the design doc is entirely about.
-        log::debug!(
-            "skipping root auction dispatch: assembly mode {assembly_mode:?} has no \
-             consumer for the result"
-        );
-        None
     } else {
         // Telemetry attribution must use the same publisher identity as the
         // outbound bid request. On the navigation path `request_host` is the
@@ -3870,10 +3761,7 @@ pub async fn handle_publisher_request(
                 // it means the transform changed without the version moving.
                 //
                 // Asked of the mode, not of every template. The key covers
-                // `assembly_mode`, so a hit was stored by this same mode — and a mode
-                // that emits no marker stores a template with none. Demanding one
-                // unconditionally made every `client_fill` hit fail this check, report
-                // drift that had not happened, and refetch the origin.
+                // `assembly_mode`, so a hit was stored by this same mode.
                 let seam_check = mode_emits_seam_marker(assembly_mode)
                     .then(|| split_template_at_seam(&entry.body).err())
                     .flatten();
@@ -4997,7 +4885,7 @@ pub(crate) fn c2_bypass_reason(
 /// Under [`AssemblyMode::Inline`] the response is per-navigation and not shared,
 /// so emitting `tsjs.adSlots` only when the ad stack runs is correct.
 ///
-/// Under [`AssemblyMode::ClientFill`] and [`AssemblyMode::Esi`] the document is a
+/// Under [`AssemblyMode::Esi`] the document is a
 /// **shared template**, and `should_run_ad_stack` is request-dependent — it folds
 /// in consent, bot classification, prefetch status and the auction kill switch.
 /// Emitting conditionally there would freeze the first-filling request's decision
@@ -5018,7 +4906,7 @@ pub(crate) fn template_ad_slots_script(
     request_path: &str,
 ) -> Option<String> {
     match mode {
-        AssemblyMode::ClientFill | AssemblyMode::Esi => None,
+        AssemblyMode::Esi => None,
         AssemblyMode::Inline => {
             if !should_run_ad_stack {
                 return None;
@@ -5188,23 +5076,11 @@ fn page_bids_unknown_format() -> Response<EdgeBody> {
 /// client-controlled: strip any query string or fragment and force a leading
 /// `/` so slot `page_patterns` always match against a canonical path shape.
 /// How the page-bids endpoint serializes its answer.
-///
-/// A format rather than a second endpoint. The two forms carry the same data behind
-/// the same cross-site gate, so a new path would have duplicated the gate, the
-/// deprecation alias and the `private, no-store` header across four adapter routers
-/// for a difference in wrapping.
-///
-/// Spike-only, for the #1009 ESI validation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum PageBidsFormat {
     /// `application/json`. What the SPA navigation hook consumes.
     #[default]
     Json,
-    /// An executable `<script>` tag, byte-identical to what the `</body>` seam injects
-    /// inline. ESI splices fragment bytes verbatim into the document, so the fragment
-    /// must already be markup — pointing an `esi:include` at the JSON form would put
-    /// raw JSON where a script belongs.
-    Fragment,
 }
 
 impl PageBidsFormat {
@@ -5213,13 +5089,11 @@ impl PageBidsFormat {
     /// # Errors
     ///
     /// Returns the offending value if it names no known format. Unknown values are
-    /// rejected rather than defaulting, because the default is JSON and the failure
-    /// that causes — a typo in an `esi:include` splicing JSON into the document — is
-    /// silent, produces a broken page, and looks nothing like its cause.
+    /// rejected rather than defaulting so callers cannot silently negotiate a response
+    /// representation the endpoint no longer supports.
     fn parse(raw: Option<&str>) -> Result<Self, String> {
         match raw {
             None | Some("json") => Ok(Self::Json),
-            Some("fragment") => Ok(Self::Fragment),
             Some(other) => Err(other.to_string()),
         }
     }
@@ -5543,41 +5417,20 @@ pub async fn handle_page_bids(
         Vec::new()
     };
 
-    let (body, content_type) = match format {
-        PageBidsFormat::Json => {
-            let body = serde_json::json!({
-                "slots": slots_json,
-                "bids": bid_map,
-            });
-            let json_str =
-                serde_json::to_string(&body).change_context(TrustedServerError::Proxy {
-                    message: "Failed to serialize page-bids response".to_string(),
-                })?;
-            (json_str, "application/json")
-        }
-        // Deliberately reuses `build_bids_script` rather than formatting a script
-        // here. The fragment and the inline `</body>` injection must stay
-        // byte-identical, or the two assembly modes stop being comparable and the
-        // spike measures the difference between two script shapes instead of between
-        // two delivery mechanisms.
-        //
-        // Slots *and* bids. An earlier version sent only bids, on the reasoning that
-        // "the template already carries the slot markup" — conflating the publisher's
-        // `<div>` with `tsjs.adSlots`, which is TS's own slot configuration and is what
-        // `adInit` iterates. Without it the page rendered correctly and served no ads.
-        PageBidsFormat::Fragment => (
-            build_seam_script(
-                &serde_json::to_string(&slots_json).unwrap_or_else(|_| "[]".to_string()),
-                &bid_map,
-            ),
-            "text/html; charset=utf-8",
-        ),
-    };
+    debug_assert_eq!(format, PageBidsFormat::Json);
+    let body = serde_json::json!({
+        "slots": slots_json,
+        "bids": bid_map,
+    });
+    let body = serde_json::to_string(&body).change_context(TrustedServerError::Proxy {
+        message: "Failed to serialize page-bids response".to_string(),
+    })?;
 
     let mut response = Response::new(EdgeBody::from(body));
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, no-store"),
@@ -6218,19 +6071,18 @@ mod tests {
 
         #[test]
         fn shared_modes_render_byte_identical_documents_for_every_request_shape() {
-            for mode in [AssemblyMode::ClientFill, AssemblyMode::Esi] {
-                let shapes = every_shape();
-                let baseline = render(mode, shapes[0]);
+            let mode = AssemblyMode::Esi;
+            let shapes = every_shape();
+            let baseline = render(mode, shapes[0]);
 
-                for shape in &shapes[1..] {
-                    let rendered = render(mode, *shape);
-                    assert_eq!(
-                        rendered, baseline,
-                        "{mode:?}: rendered template differs for {shape:?}. A shared \
-                         template that varies by request freezes the first-filling \
-                         request's decision for every later reader."
-                    );
-                }
+            for shape in &shapes[1..] {
+                let rendered = render(mode, *shape);
+                assert_eq!(
+                    rendered, baseline,
+                    "{mode:?}: rendered template differs for {shape:?}. A shared \
+                     template that varies by request freezes the first-filling \
+                     request's decision for every later reader."
+                );
             }
         }
 
@@ -6239,26 +6091,25 @@ mod tests {
             // Byte-identity alone would be satisfied by rendering the same wrong
             // thing every time, so also assert the specific things that must be
             // absent.
-            for mode in [AssemblyMode::ClientFill, AssemblyMode::Esi] {
-                let rendered = render(
-                    mode,
-                    RequestShape {
-                        ad_stack_ran: true,
-                        diagnostics_active: true,
-                        bids_available: true,
-                    },
+            let mode = AssemblyMode::Esi;
+            let rendered = render(
+                mode,
+                RequestShape {
+                    ad_stack_ran: true,
+                    diagnostics_active: true,
+                    bids_available: true,
+                },
+            );
+            for forbidden in [
+                ".adSlots",
+                ".bids=",
+                "__tsjs_gpt_diagnostics_active",
+                "history.replaceState",
+            ] {
+                assert!(
+                    !rendered.contains(forbidden),
+                    "{mode:?}: template contains request-scoped `{forbidden}`:\n{rendered}"
                 );
-                for forbidden in [
-                    ".adSlots",
-                    ".bids=",
-                    "__tsjs_gpt_diagnostics_active",
-                    "history.replaceState",
-                ] {
-                    assert!(
-                        !rendered.contains(forbidden),
-                        "{mode:?}: template contains request-scoped `{forbidden}`:\n{rendered}"
-                    );
-                }
             }
         }
 
@@ -6292,69 +6143,6 @@ mod tests {
                 with_ads.contains(".adSlots"),
                 "inline with a matched slot should carry adSlots"
             );
-        }
-    }
-
-    mod root_auction_gate_tests {
-        //! Guards the silent-waste failure mode: dispatching an auction whose result
-        //! nothing will consume. A dispatched root auction bills the SSPs and holds the
-        //! response for the full budget, so discarding the result is real spend with no
-        //! error and no log.
-
-        use super::*;
-        use crate::creative_opportunities::AssemblyMode;
-
-        #[test]
-        fn a_mode_dispatches_exactly_when_something_will_read_the_result() {
-            // Stated per-variant because the three modes consume the result in three
-            // different ways, and an earlier revision that derived this from the seam
-            // decision got `Esi` wrong twice in opposite directions.
-            assert!(
-                root_auction_is_useful(AssemblyMode::Inline),
-                "inline reads `ad_bids_state` at the `</body>` seam"
-            );
-            assert!(
-                root_auction_is_useful(AssemblyMode::Esi),
-                "esi consumes the result at edge assembly rather than at a seam"
-            );
-            assert!(
-                !root_auction_is_useful(AssemblyMode::ClientFill),
-                "client-fill fetches its own bids after load, so a root auction here \
-                 would be a second one nothing reads"
-            );
-        }
-
-        #[test]
-        fn consuming_the_result_is_not_the_same_as_emitting_bytes() {
-            // The distinction that made both earlier revisions wrong. `Esi` emits a
-            // `Marker` and reads nothing from `ad_bids_state` — so a gate derived from
-            // "does the seam emit" or from "does the seam read `ad_bids_state`" lands on
-            // the wrong answer. The result reaches the page through assembly, not
-            // through the seam.
-            assert!(matches!(
-                body_close_injection(AssemblyMode::Esi, true),
-                BodyCloseInjection::Marker(_)
-            ));
-            assert_ne!(
-                body_close_injection(AssemblyMode::Esi, true),
-                BodyCloseInjection::InlineBids,
-                "the esi seam does not read the auction result"
-            );
-            assert!(
-                root_auction_is_useful(AssemblyMode::Esi),
-                "and yet the auction is dispatched, because assembly reads it"
-            );
-        }
-
-        #[test]
-        fn a_mode_that_injects_nothing_and_assembles_nothing_never_dispatches() {
-            // `ClientFill` is the one mode where both are true, and it is the case the
-            // silent-waste guard exists for.
-            assert_eq!(
-                body_close_injection(AssemblyMode::ClientFill, true),
-                BodyCloseInjection::None
-            );
-            assert!(!root_auction_is_useful(AssemblyMode::ClientFill));
         }
     }
 
@@ -6498,9 +6286,8 @@ mod tests {
     }
 
     mod page_bids_format_tests {
-        //! The fragment format is what an `esi:include` splices into the document. Its
-        //! failure mode is silent: the wrong bytes still return `200` and still parse,
-        //! they just do nothing useful.
+        //! Page-bids is a JSON API. The old executable fragment was part of the removed
+        //! parser-based spike and must not remain as an accidental public surface.
 
         use super::*;
 
@@ -6514,44 +6301,20 @@ mod tests {
         }
 
         #[test]
-        fn the_fragment_format_is_selectable() {
+        fn the_removed_fragment_format_is_rejected() {
             assert_eq!(
                 PageBidsFormat::parse(Some("fragment")),
-                Ok(PageBidsFormat::Fragment)
+                Err("fragment".to_string())
             );
         }
 
         #[test]
         fn an_unknown_format_is_rejected_rather_than_defaulting_to_json() {
-            // Defaulting would make a typo in an `esi:include` splice raw JSON into the
-            // document: a 200, a broken page, and nothing in the logs pointing at the
-            // typo. Rejecting turns that into an immediate, locatable failure.
             assert_eq!(
                 PageBidsFormat::parse(Some("scrpit")),
                 Err("scrpit".to_string())
             );
             assert_eq!(PageBidsFormat::parse(Some("")), Err(String::new()));
-        }
-
-        #[test]
-        fn the_fragment_is_byte_identical_to_the_inline_injection() {
-            // The whole point of the A1-vs-A3 comparison is that only the *delivery*
-            // differs. If the fragment and the inline seam emitted different scripts,
-            // the spike would be measuring two script shapes rather than two delivery
-            // mechanisms, and its number would mean nothing.
-            let mut bids = serde_json::Map::new();
-            bids.insert("slot-a".to_string(), serde_json::json!({"cpm": 1.5}));
-
-            assert_eq!(
-                build_bids_script(&bids),
-                build_bids_script(&bids),
-                "the fragment reuses the inline builder, so this is a guard on that \
-                 reuse rather than on the format"
-            );
-            assert!(
-                build_bids_script(&bids).starts_with("<script>"),
-                "ESI splices bytes verbatim, so the fragment must already be markup"
-            );
         }
 
         #[test]
@@ -6814,24 +6577,6 @@ mod tests {
             settings
         }
 
-        /// A plain substitution assembler.
-        ///
-        /// Core has no ESI crate — the Fastly adapter owns that. Substituting the marker
-        /// directly is what an `esi:include` with one constant marker reduces to, so
-        /// this exercises the seam faithfully without importing a Fastly-only crate. It
-        /// also demonstrates that the *seam* is portable even though the crate is not.
-        struct SubstitutingAssembler;
-
-        impl crate::platform::PlatformTemplateAssembler for SubstitutingAssembler {
-            fn assemble(
-                &self,
-                template: &str,
-                fragment: &str,
-            ) -> Result<String, crate::platform::TemplateAssemblyError> {
-                Ok(template.replace(SEAM_BIDS_MARKER, fragment))
-            }
-        }
-
         fn services(
             http_client: Arc<StubHttpClient>,
             cache: Arc<MemoryTemplateCache>,
@@ -6845,7 +6590,6 @@ mod tests {
                 .geo(Arc::new(NoopGeo))
                 .client_info(ClientInfo::default())
                 .template_cache(cache)
-                .template_assembler(Arc::new(SubstitutingAssembler))
                 .build()
         }
 
@@ -7837,13 +7581,9 @@ mod tests {
         /// store, so sharing a cache would let the first user's entry answer for the
         /// second and the comparison would prove nothing.
         async fn stored_template_for(user: &SyntheticUser) -> Vec<u8> {
-            stored_template_for_mode("esi", user).await
-        }
-
-        async fn stored_template_for_mode(mode: &str, user: &SyntheticUser) -> Vec<u8> {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
-            let settings = Arc::new(settings_with_mode(mode));
+            let settings = Arc::new(settings_with_mode("esi"));
             let services = RuntimeServices::builder()
                 .config_store(Arc::new(NoopConfigStore))
                 .secret_store(Arc::new(NoopSecretStore))
@@ -7855,7 +7595,6 @@ mod tests {
                 .template_cache(
                     Arc::clone(&cache) as Arc<dyn crate::platform::PlatformTemplateCache>
                 )
-                .template_assembler(Arc::new(SubstitutingAssembler))
                 .build();
             queue_shareable_html(&stub);
 
@@ -7972,115 +7711,6 @@ mod tests {
                     .is_empty(),
                 "inline must never write a shared template"
             );
-        }
-
-        #[tokio::test]
-        async fn client_fill_shares_a_template_across_readers_too() {
-            // `ClientFill` had no end-to-end coverage at all: every test in this module
-            // ran `esi` or `inline`, and the neutrality tests recompose the processor's
-            // inputs by hand instead of calling `create_html_stream_processor`. A leak
-            // reintroduced in the real wiring, scoped to this mode, passed the entire
-            // suite.
-            //
-            // Running the same two synthetic users through the real pipeline under
-            // `client_fill` closes that: the mode is now exercised where it is actually
-            // composed, not only where its decision functions are called directly.
-            let alice = SyntheticUser {
-                ec_id: "cccccccccccccccccccccccccccccccc.alice2",
-                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
-                geo_marker: "AliceTown",
-            };
-            let bob = SyntheticUser {
-                ec_id: "dddddddddddddddddddddddddddddddd.bobbb2",
-                jurisdiction: crate::consent::jurisdiction::Jurisdiction::Gdpr,
-                geo_marker: "BobTown",
-            };
-
-            let alice_template = stored_template_for_mode("client_fill", &alice).await;
-            let bob_template = stored_template_for_mode("client_fill", &bob).await;
-
-            assert_eq!(
-                alice_template, bob_template,
-                "client-fill templates must be shareable across readers"
-            );
-
-            let template = String::from_utf8(alice_template).expect("template should be utf-8");
-            for forbidden in [
-                alice.ec_id,
-                bob.ec_id,
-                alice.geo_marker,
-                bob.geo_marker,
-                "adSlots",
-                "window.tsjs",
-                // The mode injects nothing at `</body>`, so not even a marker belongs.
-                SEAM_BIDS_MARKER,
-            ] {
-                assert!(
-                    !template.contains(forbidden),
-                    "`{forbidden}` must not appear in a client-fill template: {template}"
-                );
-            }
-        }
-
-        #[tokio::test]
-        async fn a_client_fill_hit_is_served_from_the_cache_on_either_finalizer() {
-            // `client_fill` stored templates and never read one back. Both hit paths
-            // demanded a seam marker unconditionally, and this mode injects nothing at
-            // `</body>` by design — so every hit failed the marker check, logged a
-            // transform-drift error naming a schema version that had not moved, and
-            // refetched the origin. The mode's caching had never worked.
-            //
-            // The neutrality test above cannot see this: it runs one request per reader
-            // against a fresh cache, so it only ever proves the stored bytes are
-            // reader-agnostic. Proving a *hit* needs a second request against a warm one.
-            for finalizer in [Finalizer::Streaming, Finalizer::Buffered] {
-                let stub = Arc::new(StubHttpClient::new());
-                let cache = Arc::new(MemoryTemplateCache::default());
-                let settings = Arc::new(settings_with_mode("client_fill"));
-                let services = services(Arc::clone(&stub), Arc::clone(&cache));
-                // One origin response only: a second fetch would find the queue empty, so
-                // the fixture is itself part of the assertion.
-                queue_shareable_html(&stub);
-
-                let cold =
-                    body_of(run_via(&settings, &services, navigation_request(), finalizer).await)
-                        .await;
-                assert_eq!(
-                    stub.recorded_request_uris().len(),
-                    1,
-                    "the cold request must fetch the origin"
-                );
-
-                let warm =
-                    body_of(run_via(&settings, &services, navigation_request(), finalizer).await)
-                        .await;
-                assert_eq!(
-                    stub.recorded_request_uris().len(),
-                    1,
-                    "the warm request must be served from the cache — client_fill stores a \
-                     template for exactly the same reason esi does, so it must read one back"
-                );
-                assert_eq!(
-                    warm, cold,
-                    "a mode with no seam serves the stored template unchanged"
-                );
-
-                let served = String::from_utf8(warm).expect("served document should be UTF-8");
-                assert!(
-                    !served.contains(SEAM_BIDS_MARKER),
-                    "client_fill injects nothing at `</body>`, so no marker may appear \
-                     anywhere: {served}"
-                );
-                assert!(
-                    !served.contains("scheduleInitialAdInit"),
-                    "the browser fetches its own bids under client_fill; the server must \
-                     splice none: {served}"
-                );
-                assert!(
-                    served.contains("origin"),
-                    "the page itself must still be served: {served}"
-                );
-            }
         }
 
         /// [`settings_with_mode`], with one integration configured a stated way.
@@ -8269,8 +7899,8 @@ mod tests {
         #[tokio::test]
         async fn an_active_diagnostics_request_never_stores_a_template() {
             // An independent review reintroduced a diagnostics leak scoped to
-            // `ClientFill` and the whole suite stayed green. Investigating showed the
-            // mutation is not actually exploitable: `requires_private_no_store()` is a
+            // A request-private diagnostics mutation could otherwise leak through a
+            // shared template. `requires_private_no_store()` is a
             // strict superset of the condition under which diagnostics markup is
             // emitted, and that stamp lands *before* the C2 gate reads response headers,
             // so such a request never stores a template at all.
@@ -8871,21 +8501,19 @@ mod tests {
 
         #[test]
         fn a_plain_shareable_html_200_is_cacheable() {
-            for mode in [AssemblyMode::ClientFill, AssemblyMode::Esi] {
-                assert_eq!(
-                    c2_bypass_reason(
-                        mode,
-                        false,
-                        false,
-                        StatusCode::OK,
-                        "text/html",
-                        &shareable(),
-                        &nothing_covered(),
-                    ),
-                    None,
-                    "{mode:?}: a shareable HTML 200 should be eligible"
-                );
-            }
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &shareable(),
+                    &nothing_covered(),
+                ),
+                None,
+                "ESI shareable HTML 200 should be eligible"
+            );
         }
 
         #[test]
@@ -9112,22 +8740,20 @@ mod tests {
         fn shared_modes_emit_no_head_script_regardless_of_the_gating_decision() {
             let settings = settings_with_slots();
             let slots = [slot()];
+            let mode = AssemblyMode::Esi;
+            let ran = template_ad_slots_script(mode, true, &settings, &slots, "/");
+            let did_not_run = template_ad_slots_script(mode, false, &settings, &slots, "/");
 
-            for mode in [AssemblyMode::ClientFill, AssemblyMode::Esi] {
-                let ran = template_ad_slots_script(mode, true, &settings, &slots, "/");
-                let did_not_run = template_ad_slots_script(mode, false, &settings, &slots, "/");
-
-                assert_eq!(
-                    ran, did_not_run,
-                    "{mode:?}: the template must be byte-identical whether or not the ad \
-                     stack ran; a cached object cannot carry one request's consent, bot, \
-                     prefetch or kill-switch decision"
-                );
-                assert_eq!(
-                    ran, None,
-                    "{mode:?}: adSlots belongs in the per-request fragment, not the template"
-                );
-            }
+            assert_eq!(
+                ran, did_not_run,
+                "{mode:?}: the template must be byte-identical whether or not the ad \
+                 stack ran; a cached object cannot carry one request's consent, bot, \
+                 prefetch or kill-switch decision"
+            );
+            assert_eq!(
+                ran, None,
+                "{mode:?}: adSlots belongs in the per-request seam, not the template"
+            );
         }
 
         #[test]

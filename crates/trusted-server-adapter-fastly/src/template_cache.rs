@@ -238,16 +238,16 @@ mod tests {
         // the other's template.
         let cache = cache();
         let esi = key("https://example.com/mode-split");
-        let mut client_fill = esi.clone();
-        client_fill.assembly_mode = AssemblyMode::ClientFill;
+        let mut inline = esi.clone();
+        inline.assembly_mode = AssemblyMode::Inline;
 
         let body = b"esi-template".to_vec();
         run(cache.put(&esi, &metadata_for(&body), body)).expect("should store");
 
         assert_eq!(
-            run(cache.get(&client_fill)).err(),
+            run(cache.get(&inline)).err(),
             Some(TemplateCacheMiss::NotFound),
-            "client-fill must not read the ESI arm's template"
+            "inline must not read the ESI arm's template"
         );
     }
 

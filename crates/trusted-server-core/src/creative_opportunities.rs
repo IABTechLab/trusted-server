@@ -186,15 +186,14 @@ fn derive_section(path: &str, section_root: &str, section_segment: usize) -> Str
 /// How per-user ad state reaches the page.
 ///
 /// `Inline` is the shipped behaviour: the auction result is injected before
-/// `</body>` and the root document is therefore uncacheable. The other two serve
-/// a request-neutral shared template and fill the per-user holes afterwards —
-/// `ClientFill` from the browser, `Esi` at the edge.
+/// `</body>` and the root document is therefore uncacheable. `Esi` stores a
+/// request-neutral shared template and fills its per-request byte seam at the edge.
 ///
 /// Spike-only, for the #1009 ESI validation. Remove with the spike.
 ///
 /// # Why the template must be request-neutral
 ///
-/// Under `ClientFill` and `Esi` the template is shared across visitors, so
+/// Under `Esi` the template is shared across visitors, so
 /// nothing whose *presence* depends on the request may appear in it — not merely
 /// nothing whose *value* does. `tsjs.adSlots` is the trap: its content is derived
 /// from config and path, but whether it is emitted at all is gated on consent,
@@ -207,9 +206,10 @@ pub enum AssemblyMode {
     /// Inject bids inline before `</body>`. Root uncacheable. Shipped behaviour.
     #[default]
     Inline,
-    /// Serve a shared template; the browser fetches the per-user fragment.
-    ClientFill,
-    /// Serve a shared template; assemble the fragment at the edge with ESI.
+    /// Serve a shared template; assemble its inert marker with an exact byte split.
+    ///
+    /// The operator-facing spelling remains `esi` for continuity, but no general
+    /// purpose ESI parser executes on this path.
     Esi,
 }
 
@@ -1959,11 +1959,7 @@ mod tests {
 
     #[test]
     fn assembly_mode_deserializes_each_variant() {
-        for (raw, expected) in [
-            ("inline", AssemblyMode::Inline),
-            ("client_fill", AssemblyMode::ClientFill),
-            ("esi", AssemblyMode::Esi),
-        ] {
+        for (raw, expected) in [("inline", AssemblyMode::Inline), ("esi", AssemblyMode::Esi)] {
             let toml = format!(
                 r#"
                     gam_network_id = "99999"
@@ -1978,6 +1974,15 @@ mod tests {
                 "should resolve `{raw}` to {expected:?}"
             );
         }
+
+        let removed_mode = r#"
+            gam_network_id = "99999"
+            assembly_mode = "client_fill"
+        "#;
+        assert!(
+            toml::from_str::<CreativeOpportunitiesConfig>(removed_mode).is_err(),
+            "client_fill is outside #1009's ESI byte-seam design and must be rejected"
+        );
     }
 
     #[test]

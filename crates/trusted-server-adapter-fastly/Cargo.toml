@@ -19,7 +19,6 @@ derive_more = { workspace = true }
 edgezero-adapter-fastly = { workspace = true, features = ["fastly"] }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }
-esi = "0.7"
 fastly = { workspace = true }
 fern = { workspace = true }
 futures = { workspace = true }

@@ -166,8 +166,7 @@ impl StreamProcessor for HtmlWithPostProcessing {
 /// §6.7.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum BodyCloseInjection {
-    /// Emit nothing. Either no slots matched under the inline path, or a
-    /// client-fill mode where the browser fetches the fragment unprompted.
+    /// Emit nothing because no slots matched under the inline path.
     #[default]
     None,
     /// Read the auction result from `ad_bids_state` and inject it, falling back to

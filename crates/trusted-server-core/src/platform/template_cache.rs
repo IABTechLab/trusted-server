@@ -488,7 +488,7 @@ mod tests {
         let base = key().to_cache_key();
 
         let mut mode = key();
-        mode.assembly_mode = AssemblyMode::ClientFill;
+        mode.assembly_mode = AssemblyMode::Inline;
         assert_ne!(
             mode.to_cache_key(),
             base,

@@ -36,7 +36,6 @@ mod error;
 mod http;
 mod image_optimizer;
 mod kv;
-pub mod template_assembly;
 mod template_cache;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -54,9 +53,6 @@ pub use image_optimizer::{
     PlatformImageOptimizerParams, PlatformImageOptimizerRegion,
 };
 pub use kv::UnavailableKvStore;
-pub use template_assembly::{
-    PlatformTemplateAssembler, TemplateAssemblyError, UnavailableTemplateAssembler,
-};
 pub use template_cache::REPLAYABLE_POLICY_HEADERS;
 pub use template_cache::{
     PlatformTemplateCache, TEMPLATE_SCHEMA_VERSION, TemplateCacheError, TemplateCacheKey,
