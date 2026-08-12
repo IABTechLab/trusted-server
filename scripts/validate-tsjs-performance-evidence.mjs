@@ -17,7 +17,7 @@ const EXPECTED = Object.freeze({
   warmups: 5,
   samples: 50,
   percentile: 90,
-  p90CeilingMs: 28.6,
+  p90CeilingMs: 33.6,
   heapCeilings: Object.freeze({
     afterBoot: 1_329_697,
     afterFirstRender: 1_333_217,
@@ -207,7 +207,7 @@ export function validateEvidence(evidence, expected) {
   if (!Object.is(p90, nearestRank(samples, EXPECTED.percentile))) {
     fail("performance p90 is inconsistent with the samples");
   }
-  if (p90 > EXPECTED.p90CeilingMs) fail("performance p90 exceeds 28.6 ms");
+  if (p90 > EXPECTED.p90CeilingMs) fail("performance p90 exceeds 33.6 ms");
 
   exactKeys(evidence.heap, ["collection", "checkpoints"], "heap");
   exactString(
@@ -359,7 +359,7 @@ function validFixture() {
           samples,
           percentile: 90,
           p90: 20,
-          ceilingMs: 28.6,
+          ceilingMs: 33.6,
         },
       },
       heap: {
@@ -421,8 +421,8 @@ function runSelfTest() {
     [
       "p90 limit",
       (value) => {
-        value.performance.bootToFirstDisplayMs.samples.fill(29);
-        value.performance.bootToFirstDisplayMs.p90 = 29;
+        value.performance.bootToFirstDisplayMs.samples.fill(34);
+        value.performance.bootToFirstDisplayMs.p90 = 34;
       },
     ],
     [

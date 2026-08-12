@@ -3487,16 +3487,26 @@ that no deferred request, preload, preparation, or execution precedes
 meaning.
 
 The performance job uses pinned Chromium 145.0.7632.6, the
-`github-hosted:ubuntu-24.04` runner class, fixture `tsjs-core-placeholder-v1`, five
-warmups, and 50 measured samples. The fixture id remains the baseline identity, but
-the post-change fixture must exercise the real server boot/controller, critical
-artifact, runtime, and first-display adapter path; it cannot retain a bespoke
-`__tsjsPerf` simulator. Its p90 ceiling is 28.6 ms, exactly 10% over the recorded
-26 ms. It runs the declared sample set once and never selectively reruns or drops
-slow samples. Retained heap uses Chromium CDP forced-GC checkpoints after boot,
-first render, refresh, and SPA navigation. After the display samples, the job opens
-one separate fresh browser context, executes the real fixture once, and at each
-checkpoint sends `HeapProfiler.collectGarbage` once followed immediately by
+`github-hosted:ubuntu-24.04` runner class, fixture `tsjs-generated-loopback-v1`, five
+warmups, and 50 measured samples. One in-process `node:http` server on an ephemeral
+`127.0.0.1` port serves the exact generated server controller and exact built
+critical/deferred bytes; Playwright request interception or fulfillment is outside
+the instrument. The fixture exercises the real server boot/controller, critical
+artifact, runtime, and first-display adapter path and cannot retain a bespoke
+`__tsjsPerf` simulator.
+
+The corrected pinned pre-switch capture at commit
+`62421ee44c62f24534ea8782a46dfa5bfbcea950` (workflow run `31598415675`) measured a
+30.5 ms p90. The former 26 ms value came from the obsolete synthetic controller and
+smaller core-only workload, so its 28.6 ms ceiling is not a valid comparison for the
+real critical graph. Applying the same 10% policy to the corrected real-path capture
+sets the p90 ceiling to 33.6 ms (`ceil(30.5 × 1.10 × 10) / 10`). This calibration is
+an instrument correction, not permission to recapture after production wiring or to
+select a favorable run. The job runs the declared sample set once and never
+selectively reruns or drops slow samples. Retained heap uses Chromium CDP forced-GC
+checkpoints after boot, first render, refresh, and SPA navigation. After the display
+samples, the job opens one separate fresh browser context, executes the real fixture
+once, and at each checkpoint sends `HeapProfiler.collectGarbage` once followed immediately by
 `Runtime.getHeapUsage`; the single `usedSize` is the checkpoint statistic (there is
 no hidden averaging, maximum selection, or rerun). The checked-in baseline and exact
 10% floor ceilings are:
