@@ -213,6 +213,16 @@ forbid(
   'APS runner downloader, updater, or pinned artifact metadata',
   /APS_RUNNER_(?:ASSET|DIGEST|SRI|VERSION)|runner[_-]cache|offline[_ -]runner|prebid-creative\.js[^\n]*(?:digest|integrity|version)|(?:download|update)[^\n]*prebid-creative\.js/gi
 );
+const browserPackageManifests = [
+  'crates/trusted-server-integration-tests/browser/package.json',
+  'crates/trusted-server-integration-tests/browser/package-lock.json',
+];
+for (const manifest of browserPackageManifests) {
+  const source = fs.readFileSync(path.join(repositoryRoot, manifest), 'utf8');
+  if (source.includes('prebid-universal-creative')) {
+    violations.push(`${manifest}:1: PUC package is vendored into the local harness`);
+  }
+}
 
 for (const manifest of [
   'crates/trusted-server-adapter-fastly/Cargo.toml',

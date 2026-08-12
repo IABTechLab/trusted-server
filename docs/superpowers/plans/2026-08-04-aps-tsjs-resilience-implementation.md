@@ -2217,7 +2217,8 @@ with an earlier one.
       **bytes.** Keep it limited to the public `prebidMessenger`, dynamic-renderer,
       and `h.sendMessage` behavior exercised by this protocol. The external GAM
       configuration selects PUC 1.17.2 and never `latest`; the real-GAM gate, not a
-      repository artifact, validates that release. Add only the failing
+      repository package or artifact, validates that release. Do not add
+      `prebid-universal-creative` to any repository package or lockfile. Add only the failing
       claim-recognition and join tests for the exact JSON string
       `{message:"Prebid Request",adId,adServerDomain}`, object/extended shapes,
       zero/two ports, native id, live/tombstoned TS id, duplicate simultaneous claim,
@@ -4325,10 +4326,13 @@ later group's spec files or workflow changes.
 - Create: `.github/workflows/aps-real-gam.yml`
 - Do not create a second runbook; this plan contains the release gate and commands
 
-- [ ] **Step 1: Add a manually dispatched `aps-real-gam.yml` job using the protected GitHub**
-      environment `aps-real-gam` and a required `workflow_dispatch` string input
-      `release_id`, plus required `evidence_id` and `previous_artifact_id` inputs used
-      only for attestation/rollback evidence. Its exact environment contract is
+- [ ] **Step 1: Add a manually dispatched and reusable `aps-real-gam.yml` job using the protected GitHub**
+      environment `aps-real-gam` and identical required `workflow_dispatch` and
+      `workflow_call` string inputs `release_id`, `evidence_id`, and
+      `previous_artifact_id`. The direct entrypoint supports post-merge reruns; before
+      merge, the default-branch-dispatchable `integration-tests.yml` wrapper calls the
+      exact branch-local workflow for every `aps-tsjs-cutover-<sha>` evidence run.
+      Its exact environment contract is
       `TS_REAL_GAM_PAGE_URL`, `TS_REAL_GAM_AUTH_HEADER`, and
       `TS_REAL_GAM_EXPECTED_RELEASE_ID`; the first two are protected secrets and no
       value is checked in. The template contains fictional placeholders only. This job
@@ -4341,7 +4345,10 @@ later group's spec files or workflow changes.
 
 - [ ] **Step 2: Cover SSAT APS-PUC, Trusted Server Prebid APS-PUC, page-bids APS-PUC, direct APS,**
       direct ADM plus baseline PBS Cache regression, attributable empty fallback, SRA, refresh, SPA navigation, and
-      collapsed-shell resize.
+      collapsed-shell resize. Require the protected page's exact frozen API to report
+      `pucRelease: "1.17.2"`; missing, `latest`, or any other value fails before a case
+      runs. The browser package and lockfile contain no PUC dependency; this gate
+      observes the release configured by GAM rather than installing its bytes.
 
 - [ ] **Step 3: Add negative fixtures for wrong id/source, invalid descriptor, no outer claim,**
       no owner registration, no document acknowledgement, and APS runner failure.
@@ -4803,7 +4810,7 @@ sampling or comparison logic.
   npm --prefix docs run build
   ```
 
-- [ ] **Step 4: Configure, commit, and run three clean-checkout workflows for the exact**
+- [ ] **Step 4: Configure, commit, and run two clean-checkout dispatches covering three workflows for the exact**
       release commit. Add `workflow_dispatch` with required `evidence_id` and
       `release_id` inputs to
       `test.yml`; that workflow executes the complete format/typecheck/lint/Vitest/
@@ -4814,7 +4821,13 @@ sampling or comparison logic.
       same ref/release id.
 
   Add manual `evidence_id`, `release_id`, and `previous_artifact_id` inputs where
-  relevant and include the evidence id in each workflow's `run-name`. After the
+  relevant and include the evidence id in each workflow's `run-name`. Make the
+  protected workflow reusable with the same inputs. Because GitHub resolves a manual
+  entrypoint from the default branch, the already-default-branch-dispatchable
+  `integration-tests.yml` calls the exact branch-local real-GAM workflow whenever
+  `evidence_id` starts with `aps-tsjs-cutover-`; the called job and integration job
+  share the same run id and evidence id. Ordinary PR events never call the protected
+  workflow. After the
   checked build, derive `RELEASE_ID` only from Task 8's validated generated
   manifest. For the repository's Fastly production target, the authoritative prior
   immutable artifact is the one active Fastly service version immediately before
@@ -4866,20 +4879,18 @@ sampling or comparison logic.
     evidence_id="$EVIDENCE_ID" \
     release_id="$RELEASE_ID" \
     previous_artifact_id="$PREVIOUS_ARTIFACT_ID")"
-  REAL_GAM_RUN_ID="$(node scripts/dispatch-workflow-run.mjs \
-    aps-real-gam.yml "$RELEASE_REF" \
-    evidence_id="$EVIDENCE_ID" \
-    release_id="$RELEASE_ID" \
-    previous_artifact_id="$PREVIOUS_ARTIFACT_ID")"
-  for RUN_ID in "$QUALITY_RUN_ID" "$INTEGRATION_RUN_ID" "$REAL_GAM_RUN_ID"; do
+  # The integration dispatch invokes the exact branch-local reusable real-GAM job.
+  REAL_GAM_RUN_ID="$INTEGRATION_RUN_ID"
+  for RUN_ID in "$QUALITY_RUN_ID" "$INTEGRATION_RUN_ID"; do
     gh run watch "$RUN_ID" --exit-status
     test "$RELEASE_SHA" = "$(gh run view "$RUN_ID" --json headSha --jq .headSha)"
     test success = "$(gh run view "$RUN_ID" --json conclusion --jq .conclusion)"
   done
   ```
 
-  All three exact runs must conclude `success`; every evidence manifest must report
-  the same embedded release id and commit SHA, and integration plus real-GAM
+  Both exact runs, including both jobs in the integration wrapper, must conclude
+  `success`; all three workflow evidence artifacts must report the same embedded
+  release id and commit SHA, and integration plus real-GAM
   artifacts must report the same prior artifact id. The dispatch helper or a
   post-download manifest check verifies those fields against `RELEASE_ID`,
   `RELEASE_SHA`, and `PREVIOUS_ARTIFACT_ID`; a run-name alone is not evidence. An
@@ -4903,7 +4914,7 @@ sampling or comparison logic.
       release commit. Each artifact contains `evidence-manifest.json`; validate its
       evidence id, release id, commit SHA, run id, conclusion, and applicable prior
       artifact id against the exact dispatched values. The GitHub Actions artifacts
-      for those three successful runs are the sole evidence location; do not modify
+      for those three successful workflow artifacts are the sole evidence location; do not modify
       a workflow after dispatch and do not create another repository document:
 
   ```bash
@@ -4914,7 +4925,7 @@ sampling or comparison logic.
   gh run download "$INTEGRATION_RUN_ID" \
     --name "aps-tsjs-cutover-$RELEASE_SHA" \
     --dir "$CUTOVER_EVIDENCE_DIR/integration"
-  gh run download "$REAL_GAM_RUN_ID" \
+  gh run download "$INTEGRATION_RUN_ID" \
     --name "aps-real-gam-$REAL_GAM_RUN_ID" \
     --dir "$CUTOVER_EVIDENCE_DIR/real-gam"
   jq -e --arg evidence "$EVIDENCE_ID" --arg release "$RELEASE_ID" \

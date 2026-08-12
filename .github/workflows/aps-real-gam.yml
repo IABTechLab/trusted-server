@@ -6,6 +6,20 @@ permissions:
   contents: read
 
 on:
+  workflow_call:
+    inputs:
+      release_id:
+        description: Exact TSJS release id deployed to the protected test network
+        required: true
+        type: string
+      evidence_id:
+        description: Unique cutover evidence identifier
+        required: true
+        type: string
+      previous_artifact_id:
+        description: Immutable artifact identifier used for rollback
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       release_id:

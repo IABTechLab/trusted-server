@@ -1481,7 +1481,9 @@ response port. All three values are strings; `adId` and `adServerDomain` are
 nonempty. Object-form or extended payloads are rejected. Universal Creative owns
 this shape, so it cannot carry a TS nonce. Hermetic unit and browser tests exercise a
 locally authored contract harness limited to that public message/helper behavior;
-the pre-production real-GAM conformance gate exercises the actual PUC release.
+the pre-production real-GAM conformance gate exercises the actual PUC release. The
+protected page's frozen test API exposes `pucRelease`, and the gate accepts only the
+exact value `1.17.2`; a missing, publisher-selected, or `latest` value blocks cutover.
 
 The bridge is one capture-phase dispatcher installed as the first reversible core
 effect in the synchronous activation barrier, before any integration-module

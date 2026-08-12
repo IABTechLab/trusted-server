@@ -45,6 +45,17 @@ jobs:
       evidence_id: ${{ inputs.evidence_id }}
       mode: ${{ startsWith(inputs.evidence_id, 'aps-tsjs-postswitch-') && 'postswitch' || 'preswitch' }}
 
+  real-gam-attestation:
+    name: protected real-GAM attestation
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      startsWith(inputs.evidence_id, 'aps-tsjs-cutover-')
+    uses: ./.github/workflows/aps-real-gam.yml
+    with:
+      evidence_id: ${{ inputs.evidence_id }}
+      release_id: ${{ inputs.release_id }}
+      previous_artifact_id: ${{ inputs.previous_artifact_id }}
+
   prepare-artifacts:
     name: prepare integration artifacts
     if: github.event_name == 'pull_request'
