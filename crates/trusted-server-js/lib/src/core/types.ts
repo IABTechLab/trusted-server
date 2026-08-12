@@ -134,24 +134,6 @@ export interface RenderRecord {
   at: number;
 }
 
-/**
- * Lifecycle state for a GPT slot TS created before its publisher declares it.
- *
- * Stored on `window.tsjs` so the head bootstrap and the full TSJS bundle share
- * one handoff protocol.
- */
-export interface GptSlotHandoff {
-  gamUnitPath: string;
-  formats: Array<[number, number]>;
-  /** Stable configured prefix used to safely bridge framework-generated IDs. */
-  divIdPrefix: string;
-  /** Element ID GPT received when TS created the fallback slot. */
-  slotElementId: string;
-  publisherClaimed: boolean;
-  suppressPublisherDisplay: boolean;
-  suppressPublisherRefresh: boolean;
-}
-
 export type GptDiagnosticsCallbackKind =
   | 'slotRequested'
   | 'slotResponseReceived'
