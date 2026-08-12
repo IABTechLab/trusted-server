@@ -4717,22 +4717,31 @@ sampling or comparison logic.
   git fetch origin "$POSTSWITCH_REF"
   test "$POSTSWITCH_SHA" = "$(git rev-parse "origin/$POSTSWITCH_REF")"
   POSTSWITCH_EVIDENCE_ID="aps-tsjs-postswitch-${POSTSWITCH_SHA}"
+  POSTSWITCH_RELEASE_ID="$(npm --prefix crates/trusted-server-js/lib run --silent print:release-id)"
   POSTSWITCH_RUN_ID="$(node scripts/dispatch-workflow-run.mjs \
-    tsjs-performance-gate.yml \
+    integration-tests.yml \
     "$POSTSWITCH_REF" \
     evidence_id="$POSTSWITCH_EVIDENCE_ID" \
-    mode=postswitch)"
+    release_id="$POSTSWITCH_RELEASE_ID" \
+    previous_artifact_id=not-applicable-performance-only)"
   gh run watch "$POSTSWITCH_RUN_ID" --exit-status
   POSTSWITCH_EVIDENCE_DIR="$(mktemp -d)"
   gh run download "$POSTSWITCH_RUN_ID" \
     --name "tsjs-performance-$POSTSWITCH_EVIDENCE_ID" \
     --dir "$POSTSWITCH_EVIDENCE_DIR"
   node scripts/validate-tsjs-performance-evidence.mjs \
-    --file "$POSTSWITCH_EVIDENCE_DIR/tsjs-performance-current.json" \
+    --file "$POSTSWITCH_EVIDENCE_DIR/tsjs-performance-postswitch.json" \
     --evidence-id "$POSTSWITCH_EVIDENCE_ID" \
     --head-sha "$POSTSWITCH_SHA" \
     --mode postswitch
   ```
+
+  Dispatch through `integration-tests.yml` while the reusable performance workflow
+  exists only on the PR branch: GitHub resolves `workflow_dispatch` entrypoints from
+  the default branch, but the wrapper can invoke the exact branch-local reusable
+  workflow. The post-switch prefix selects only the performance job; the rollback
+  artifact input is required by the wrapper schema but is not consumed by this
+  non-deployment evidence run.
 
 ### Task 24: Run final repository verification and assemble the cutover evidence
 
