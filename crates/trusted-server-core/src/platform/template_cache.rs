@@ -32,7 +32,8 @@ use crate::creative_opportunities::AssemblyMode;
 /// | ------- | --------- |
 /// | 1       | `</body>` seam marker was `<esi:include src="/_ts/page-bids?format=fragment"/>` |
 /// | 2       | Marker is the inert comment [`SEAM_BIDS_MARKER`](crate::publisher::SEAM_BIDS_MARKER); the seam hands slots to `scheduleInitialAdInit` instead of assigning them |
-pub const TEMPLATE_SCHEMA_VERSION: u32 = 2;
+/// | 3       | Canonical collision-safe key, explicit origin freshness, and complete repeated document-policy metadata |
+pub const TEMPLATE_SCHEMA_VERSION: u32 = 3;
 
 /// Inputs that select one cached template.
 ///
@@ -55,8 +56,8 @@ pub struct TemplateCacheKey {
     /// Publisher origin identity, including the outbound Host override. Two virtual
     /// hosts can share a connection target while producing unrelated documents.
     pub origin_identity: String,
-    /// A2 and A3 emit different template bytes. Without this they poison each
-    /// other's entries.
+    /// Inline and ESI modes emit different template bytes. Without this they poison
+    /// each other's entries.
     pub assembly_mode: AssemblyMode,
     /// Values of the request headers the **origin** declares it varies on, in the
     /// order the origin listed them. Not a fixed list: the origin is authoritative,
@@ -167,6 +168,14 @@ pub const REPLAYABLE_POLICY_HEADERS: &[&str] = &[
     "content-security-policy-report-only",
     "permissions-policy",
     "referrer-policy",
+    "strict-transport-security",
+    "cross-origin-opener-policy",
+    "cross-origin-embedder-policy",
+    "cross-origin-resource-policy",
+    "origin-agent-cluster",
+    "reporting-endpoints",
+    "report-to",
+    "link",
     "x-frame-options",
     "x-content-type-options",
     "content-language",
@@ -175,13 +184,15 @@ pub const REPLAYABLE_POLICY_HEADERS: &[&str] = &[
 
 /// Headers the key covers by construction, whatever the operator configured.
 ///
-/// The shared path offers one canonical encoding set upstream and stores decoded identity
-/// bytes, so an origin declaring `Vary: Accept-Encoding` is covered without reader input. Without
-/// this, that extremely ordinary declaration — any compressing origin sends it — reads
+/// The shared path stores decoded identity bytes and negotiates the reader representation
+/// only after assembly, so an origin declaring `Vary: Accept-Encoding` is covered without
+/// reader input. This assumes those origin variants differ only by HTTP content coding;
+/// operators must leave ESI disabled if an origin changes document semantics instead.
+/// Without this carve-out, the ordinary declaration sent by any compressing origin reads
 /// as an uncovered gap and disqualifies the response, so **C2 would never cache anything
-/// against a real origin** unless the operator redundantly listed a header the key
-/// already covers. Found by review before it could make the spike measure a hit rate of
-/// approximately zero and read that as a result.
+/// against a real origin** unless the operator redundantly listed a header the transform
+/// already normalizes. Found by review before it could make the spike measure a hit rate
+/// of approximately zero and read that as a result.
 const STRUCTURALLY_COVERED: &[&str] = &["accept-encoding"];
 
 /// Request headers to include in the cache key, and where the list comes from.
@@ -214,6 +225,11 @@ pub struct VarySpec {
 
 impl VarySpec {
     /// Build from configured header names.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a name is not a valid HTTP field name. Runtime configuration is
+    /// validated with [`Self::try_new`] before this constructor is used.
     #[must_use]
     pub fn new(names: impl IntoIterator<Item = String>) -> Self {
         Self::try_new(names).expect("VarySpec names should be validated at configuration load")
@@ -258,11 +274,9 @@ impl VarySpec {
         self.names
             .iter()
             .map(|name| {
-                let header_name = http::header::HeaderName::from_bytes(name.as_bytes())
-                    .expect("VarySpec names should already be validated");
-                let values = headers.contains_key(&header_name).then(|| {
+                let values = headers.contains_key(name.as_str()).then(|| {
                     headers
-                        .get_all(&header_name)
+                        .get_all(name.as_str())
                         .iter()
                         .map(|value| value.as_bytes().to_vec())
                         .collect()
@@ -310,8 +324,8 @@ impl VarySpec {
 /// safe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateMetadata {
-    /// Encoding of the stored bytes. Also in the key; stored so a reader need not
-    /// re-derive it.
+    /// Encoding of the stored bytes. C2 writes only `identity`; retaining the field in
+    /// metadata makes corrupt or stale representations fail validation on read.
     pub content_encoding: String,
     /// Content type to rebuild the response with.
     pub content_type: String,
@@ -370,23 +384,58 @@ impl TemplateMetadata {
         for line in text.lines() {
             let (key, value) = line.split_once('=')?;
             match key {
-                "v" => schema_version = Some(value.parse().ok()?),
-                "ce" => content_encoding = Some(value.to_string()),
-                "h" => {
-                    if let Some((name, header_value)) = value.split_once(':') {
-                        policy_headers.push((name.to_string(), header_value.to_string()));
+                "v" => {
+                    if schema_version.replace(value.parse().ok()?).is_some() {
+                        return None;
                     }
                 }
-                "ct" => content_type = Some(value.to_string()),
-                "len" => body_len = Some(value.parse().ok()?),
+                "ce" => {
+                    if content_encoding.replace(value.to_string()).is_some() {
+                        return None;
+                    }
+                }
+                "h" => {
+                    let (name, header_value) = value.split_once(':')?;
+                    let name = http::header::HeaderName::from_bytes(name.as_bytes()).ok()?;
+                    if !REPLAYABLE_POLICY_HEADERS.contains(&name.as_str()) {
+                        return None;
+                    }
+                    http::HeaderValue::from_bytes(header_value.as_bytes()).ok()?;
+                    policy_headers.push((name.as_str().to_string(), header_value.to_string()));
+                }
+                "ct" => {
+                    if content_type.replace(value.to_string()).is_some() {
+                        return None;
+                    }
+                }
+                "len" => {
+                    if body_len.replace(value.parse().ok()?).is_some() {
+                        return None;
+                    }
+                }
                 _ => return None,
             }
+        }
+        let content_encoding = content_encoding?;
+        // Every template is decoded before insert. Accepting another value here would
+        // let corrupt metadata label plaintext bytes as gzip on a warm hit.
+        if content_encoding != "identity" {
+            return None;
+        }
+        let content_type = content_type?;
+        http::HeaderValue::from_bytes(content_type.as_bytes()).ok()?;
+        if !content_type
+            .split(';')
+            .next()
+            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/html"))
+        {
+            return None;
         }
         Some(Self {
             schema_version: schema_version?,
             policy_headers,
-            content_encoding: content_encoding?,
-            content_type: content_type?,
+            content_encoding,
+            content_type,
             body_len: body_len?,
         })
     }
@@ -464,6 +513,10 @@ impl TemplateCacheReservation {
     }
 
     /// Fulfil the reservation with a validated template.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform cache error when the reservation cannot be fulfilled.
     pub fn insert(
         mut self,
         metadata: &TemplateMetadata,
@@ -472,15 +525,23 @@ impl TemplateCacheReservation {
     ) -> Result<(), TemplateCacheError> {
         self.inner
             .take()
-            .expect("reservation should be consumed once")
+            .ok_or_else(|| TemplateCacheError::Backend {
+                message: "template reservation was already consumed".to_string(),
+            })?
             .insert(metadata, body, max_age)
     }
 
     /// Explicitly give up the reservation. Drop performs the same operation as a net.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform cache error when the reservation cannot be cancelled.
     pub fn cancel(mut self) -> Result<(), TemplateCacheError> {
         self.inner
             .take()
-            .expect("reservation should be consumed once")
+            .ok_or_else(|| TemplateCacheError::Backend {
+                message: "template reservation was already consumed".to_string(),
+            })?
             .cancel()
     }
 }
@@ -498,6 +559,10 @@ impl Drop for TemplateCacheReservation {
 /// Adapter-specific ownership token returned by a transactional lookup.
 pub trait PlatformTemplateCacheReservation: Send {
     /// Insert and discharge the obligation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter-specific cache error when the insert fails.
     fn insert(
         self: Box<Self>,
         metadata: &TemplateMetadata,
@@ -506,6 +571,10 @@ pub trait PlatformTemplateCacheReservation: Send {
     ) -> Result<(), TemplateCacheError>;
 
     /// Cancel and allow a waiting request to take ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter-specific cache error when cancellation fails.
     fn cancel(self: Box<Self>) -> Result<(), TemplateCacheError>;
 }
 
@@ -576,8 +645,8 @@ pub struct TemplateEntry {
 /// The null object, used by every adapter without a template cache.
 ///
 /// Reporting [`TemplateCacheMiss::Unsupported`] rather than erroring means the
-/// shared assembly modes degrade to transforming per request on Cloudflare, Axum and
-/// Spin instead of failing — the modes stay portable, only the caching is not.
+/// ESI assembly mode degrades to transforming per request on Cloudflare, Axum and Spin
+/// instead of failing — the mode stays portable, only the caching is not.
 pub struct UnavailableTemplateCache;
 
 #[async_trait::async_trait(?Send)]
@@ -741,7 +810,7 @@ mod tests {
     #[test]
     fn rendered_key_is_fixed_size_and_contains_no_request_material() {
         let rendered = key().to_cache_key();
-        assert_eq!(rendered.len(), "ts-c2-v2-".len() + 64);
+        assert_eq!(rendered.len(), "ts-c2-v3-".len() + 64);
         for sensitive in ["example.com", "/news/article", "rsc", "abc123"] {
             assert!(
                 !rendered.contains(sensitive),
@@ -931,8 +1000,21 @@ mod tests {
     #[test]
     fn metadata_round_trips() {
         let metadata = TemplateMetadata {
-            content_encoding: "gzip".to_string(),
-            policy_headers: Vec::new(),
+            content_encoding: "identity".to_string(),
+            policy_headers: vec![
+                (
+                    "content-security-policy".to_string(),
+                    "default-src 'self'".to_string(),
+                ),
+                (
+                    "content-security-policy".to_string(),
+                    "script-src 'self'".to_string(),
+                ),
+                (
+                    "link".to_string(),
+                    "</app.js>; rel=preload; as=script".to_string(),
+                ),
+            ],
             content_type: "text/html; charset=utf-8".to_string(),
             schema_version: TEMPLATE_SCHEMA_VERSION,
             body_len: 42,
@@ -949,12 +1031,36 @@ mod tests {
             &b"v=notanumber\nce=gzip\nct=text/html\nlen=1"[..],
             &b"v=1\nce=gzip\nct=text/html"[..],
             &b"v=1\nce=gzip\nct=text/html\nlen=1\nunexpected=1"[..],
+            &b"v=1\nv=1\nce=identity\nct=text/html\nlen=1"[..],
+            &b"v=1\nce=identity\nct=text/html\nlen=1\nh=cache-control:public"[..],
+            &b"v=1\nce=identity\nct=text/html\nlen=1\nh=not-a-policy:value"[..],
+            &b"v=1\nce=identity\nct=text/html\nlen=1\nh=malformed"[..],
+            &b"v=1\nce=identity\nct=application/json\nlen=1"[..],
             &[0xff, 0xfe][..],
         ] {
             assert_eq!(
                 TemplateMetadata::decode(raw),
                 None,
                 "malformed metadata must be a miss, not a partial read: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_policy_allowlist_covers_document_security_and_delivery_headers() {
+        for required in [
+            "strict-transport-security",
+            "cross-origin-opener-policy",
+            "cross-origin-embedder-policy",
+            "cross-origin-resource-policy",
+            "origin-agent-cluster",
+            "reporting-endpoints",
+            "report-to",
+            "link",
+        ] {
+            assert!(
+                REPLAYABLE_POLICY_HEADERS.contains(&required),
+                "warm ESI hits must preserve {required}"
             );
         }
     }

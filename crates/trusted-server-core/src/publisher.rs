@@ -21,7 +21,7 @@
 use std::borrow::Cow;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use brotli::Decompressor;
 use brotli::enc::BrotliEncoderParams;
@@ -63,7 +63,7 @@ use crate::platform::{
     GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices, VarySpec,
 };
 use crate::price_bucket::{PriceGranularity, price_bucket};
-use crate::response_privacy::CDN_CACHE_HEADERS;
+use crate::response_privacy::enforce_private_no_store;
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{
@@ -74,6 +74,43 @@ use crate::streaming_replacer::create_url_replacer;
 
 const SUPPORTED_ENCODING_VALUES: [&str; 3] = ["gzip", "deflate", "br"];
 const DEFAULT_PUBLISHER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
+const HEADER_X_TS_C2_CACHE: &str = "x-ts-c2-cache";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum C2ResponseState {
+    Hit,
+    MissReserved,
+    MissStored,
+    MissStoreError,
+    BypassRequest,
+    BypassResponse,
+    Unsupported,
+    Invalid,
+    BackendError,
+}
+
+impl C2ResponseState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::MissReserved => "miss-reserved",
+            Self::MissStored => "miss-stored",
+            Self::MissStoreError => "miss-store-error",
+            Self::BypassRequest => "bypass-request",
+            Self::BypassResponse => "bypass-response",
+            Self::Unsupported => "unsupported",
+            Self::Invalid => "invalid",
+            Self::BackendError => "backend-error",
+        }
+    }
+}
+
+fn set_c2_response_state(response: &mut Response<EdgeBody>, state: C2ResponseState) {
+    response.headers_mut().insert(
+        HEADER_X_TS_C2_CACHE,
+        HeaderValue::from_static(state.as_str()),
+    );
+}
 
 fn body_as_reader(
     body: EdgeBody,
@@ -205,11 +242,16 @@ fn restrict_accept_encoding(req: &mut Request<EdgeBody>) {
     // origin responds without compression. Adding encodings here would cause the
     // origin to compress its response even though the client never asked for it,
     // and the client would then receive content it cannot decode.
+    if !req.headers().contains_key(header::ACCEPT_ENCODING) {
+        return;
+    }
     let Some(current) = req
         .headers()
-        .get(header::ACCEPT_ENCODING)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
+        .get_all(header::ACCEPT_ENCODING)
+        .iter()
+        .map(|value| value.to_str().ok())
+        .collect::<Option<Vec<_>>>()
+        .map(|values| values.join(", "))
     else {
         return;
     };
@@ -275,6 +317,158 @@ fn accept_encoding_qvalue(header_value: &str, target: &str) -> Option<f32> {
     }
 
     matched_qvalue
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderEncodingError {
+    Malformed,
+    NoAcceptableEncoding,
+}
+
+fn parse_quality_value(value: &str) -> Option<f32> {
+    let value = value.trim();
+    let (whole, fraction) = value
+        .split_once('.')
+        .map_or((value, None), |(whole, fraction)| (whole, Some(fraction)));
+    let fraction_is_valid = fraction.is_none_or(|fraction| {
+        fraction.len() <= 3 && fraction.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    if !fraction_is_valid {
+        return None;
+    }
+    match whole {
+        "0" => value.parse().ok(),
+        "1" if fraction.is_none_or(|fraction| fraction.bytes().all(|byte| byte == b'0')) => {
+            Some(1.0)
+        }
+        _ => None,
+    }
+}
+
+fn negotiate_reader_compression(
+    headers: &edgezero_core::http::HeaderMap,
+) -> Result<Compression, ReaderEncodingError> {
+    if !headers.contains_key(header::ACCEPT_ENCODING) {
+        return Ok(Compression::None);
+    }
+
+    let mut qualities = Vec::<(String, f32)>::new();
+    for field in headers.get_all(header::ACCEPT_ENCODING) {
+        let field = field.to_str().map_err(|_| ReaderEncodingError::Malformed)?;
+        for item in field
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+        {
+            let mut parts = item.split(';');
+            let token = parts
+                .next()
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .ok_or(ReaderEncodingError::Malformed)?
+                .to_ascii_lowercase();
+            if token != "*" && http::HeaderName::from_bytes(token.as_bytes()).is_err() {
+                return Err(ReaderEncodingError::Malformed);
+            }
+            let mut quality = 1.0;
+            let mut saw_quality = false;
+            for parameter in parts {
+                let (name, value) = parameter
+                    .trim()
+                    .split_once('=')
+                    .ok_or(ReaderEncodingError::Malformed)?;
+                if !name.trim().eq_ignore_ascii_case("q") || saw_quality {
+                    return Err(ReaderEncodingError::Malformed);
+                }
+                quality = parse_quality_value(value).ok_or(ReaderEncodingError::Malformed)?;
+                saw_quality = true;
+            }
+            if qualities.iter().any(|(seen, _)| seen == &token) {
+                return Err(ReaderEncodingError::Malformed);
+            }
+            qualities.push((token, quality));
+        }
+    }
+
+    let explicit = |name: &str| {
+        qualities
+            .iter()
+            .find_map(|(candidate, quality)| (candidate == name).then_some(*quality))
+    };
+    let wildcard = explicit("*");
+    let quality_for = |name: &str| explicit(name).or(wildcard).unwrap_or(0.0);
+    // Identity is implicitly acceptable at q=1 unless explicitly excluded, or a
+    // wildcard q=0 excludes every unlisted coding.
+    let identity_quality =
+        explicit("identity").unwrap_or_else(|| if wildcard == Some(0.0) { 0.0 } else { 1.0 });
+
+    let candidates = [
+        (Compression::Brotli, quality_for("br")),
+        (Compression::Gzip, quality_for("gzip")),
+        (Compression::Deflate, quality_for("deflate")),
+        (Compression::None, identity_quality),
+    ];
+    let mut selected = None;
+    for (compression, quality) in candidates {
+        if quality > 0.0 && selected.is_none_or(|(_, best)| quality > best) {
+            selected = Some((compression, quality));
+        }
+    }
+    selected
+        .map(|(compression, _)| compression)
+        .ok_or(ReaderEncodingError::NoAcceptableEncoding)
+}
+
+fn set_response_compression(response: &mut Response<EdgeBody>, compression: Compression) {
+    let encoding = match compression {
+        Compression::None => None,
+        Compression::Gzip => Some("gzip"),
+        Compression::Deflate => Some("deflate"),
+        Compression::Brotli => Some("br"),
+    };
+    if let Some(encoding) = encoding {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_ENCODING, HeaderValue::from_static(encoding));
+    } else {
+        response.headers_mut().remove(header::CONTENT_ENCODING);
+    }
+    let varies_on_encoding = response
+        .headers()
+        .get_all(header::VARY)
+        .iter()
+        .any(|value| {
+            value.to_str().is_ok_and(|value| {
+                value
+                    .split(',')
+                    .any(|name| name.trim().eq_ignore_ascii_case("accept-encoding"))
+            })
+        });
+    if !varies_on_encoding {
+        response
+            .headers_mut()
+            .append(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+    }
+    response.headers_mut().remove(header::CONTENT_LENGTH);
+}
+
+fn response_compression(response: &Response<EdgeBody>) -> Compression {
+    response
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(Compression::from_content_encoding)
+        .unwrap_or(Compression::None)
+}
+
+fn encode_complete_body(
+    body: Vec<u8>,
+    compression: Compression,
+) -> Result<Vec<u8>, Report<TrustedServerError>> {
+    let mut encoder = BodyStreamEncoder::new(compression);
+    let mut encoded = encoder.encode_chunk(body)?;
+    encoded.extend_from_slice(&encoder.finish()?);
+    Ok(encoded)
 }
 
 /// Unified tsjs static serving: `/static/tsjs=<filename>`
@@ -433,6 +627,7 @@ fn process_response_streaming<W: Write>(
     body: EdgeBody,
     output: &mut W,
     params: &ProcessResponseParams,
+    output_compression: Compression,
 ) -> Result<(), Report<TrustedServerError>> {
     let is_html = is_html_content_type(params.content_type);
     let is_rsc_flight =
@@ -448,7 +643,7 @@ fn process_response_streaming<W: Write>(
     let compression = Compression::from_content_encoding(params.content_encoding);
     let config = PipelineConfig {
         input_compression: compression,
-        output_compression: compression,
+        output_compression,
         chunk_size: 8192,
     };
     // Bound how much decoded gzip output may sit in the heap at once, using the
@@ -514,13 +709,21 @@ async fn process_response_streaming_async<W: Write>(
         params.content_encoding
     );
 
-    let compression = Compression::from_content_encoding(&params.content_encoding);
+    let input_compression = Compression::from_content_encoding(&params.content_encoding);
+    // A C2 template is always identity bytes. Decode during the transform instead of
+    // recompressing and immediately decoding the entire buffered result afterwards.
+    let output_compression = if params.template_cache_key.is_some() {
+        Compression::None
+    } else {
+        input_compression
+    };
     let mut processor = PublisherBodyProcessor::new(params, settings, integration_registry)?;
     process_body_chunks_async(
         body,
         output,
         &mut processor,
-        compression,
+        input_compression,
+        output_compression,
         settings.publisher.max_buffered_body_bytes,
     )
     .await
@@ -562,11 +765,12 @@ async fn process_body_chunks_async<W: Write, P: StreamProcessor>(
     body: EdgeBody,
     writer: &mut W,
     processor: &mut P,
-    compression: Compression,
+    input_compression: Compression,
+    output_compression: Compression,
     max_body_bytes: usize,
 ) -> Result<(), Report<TrustedServerError>> {
-    let mut decoder = BodyStreamDecoder::new(compression, max_body_bytes);
-    let mut encoder = BodyStreamEncoder::new(compression);
+    let mut decoder = BodyStreamDecoder::new(input_compression, max_body_bytes);
+    let mut encoder = BodyStreamEncoder::new(output_compression);
     let mut source = BodyChunkSource::new(body, STREAM_CHUNK_SIZE).with_max_bytes(max_body_bytes);
 
     while let Some(segments) =
@@ -998,7 +1202,7 @@ pub(crate) fn template_gpt_diagnostics(
 /// Carries no URL. Every byte here is a byte every reader of the shared template
 /// receives, so nothing request-scoped may appear, and keeping a URL out also removes
 /// any escaping question at the seam.
-pub const SEAM_BIDS_MARKER: &str = "<!--ts-seam-bids-->";
+pub const SEAM_BIDS_MARKER: &str = "<!--ts-c2-v3-seam-7f4c9e2d-bids-->";
 
 /// The mode the operator asked for, before availability is taken into account.
 ///
@@ -1272,7 +1476,14 @@ pub struct OwnedProcessResponseParams {
 /// lifetime is only known after the origin proves this representation is shareable.
 pub(crate) struct AuthorizedTemplateStore {
     reservation: crate::platform::TemplateCacheReservation,
-    max_age: Duration,
+    expires_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TemplateStoreOutcome {
+    Stored,
+    Expired,
+    Error,
 }
 
 /// Buffers a [`PublisherResponse`] into a single [`Response`], collecting the
@@ -1363,26 +1574,10 @@ pub async fn buffer_publisher_response_async(
                 services,
             )
             .await?;
+            // Authorized C2 transforms are emitted as identity by
+            // `process_response_streaming_async`; inline transforms retain the origin
+            // coding. This avoids recompressing and immediately decoding a full document.
             let bytes = output.into_inner();
-            // Decode before either storing or splicing. Both are textual operations and
-            // the transform's output follows the origin's encoding.
-            //
-            // Only shared modes pay this. Under `Inline` the bytes go out exactly as the
-            // encoder produced them, still compressed, which is what the encoder is for.
-            let bytes = if params.template_cache_key.is_some() {
-                let decoded = decode_transformed_body(
-                    bytes,
-                    &params.content_encoding,
-                    settings.publisher.max_buffered_body_bytes,
-                )?;
-                // The response now carries plaintext, so it must stop claiming otherwise.
-                response
-                    .headers_mut()
-                    .remove(http::header::CONTENT_ENCODING);
-                decoded
-            } else {
-                bytes
-            };
             // Store first, assemble second — never the reverse. The stored bytes are
             // shared between visitors; the assembled ones carry this visitor's bids.
             // Swapping these two lines is the C3 leak.
@@ -1390,6 +1585,11 @@ pub async fn buffer_publisher_response_async(
             // request cannot store twice, which would leave nothing for assembly to gate
             // on.
             let was_authorized = params.template_cache_key.is_some();
+            let bytes = if response_carries_a_seam_marker(was_authorized, settings) {
+                normalize_fresh_template_seam(bytes)
+            } else {
+                bytes
+            };
             // Validate before the store, not after.
             //
             // `assemble_if_shared` does the same split and would reject a malformed
@@ -1409,8 +1609,23 @@ pub async fn buffer_publisher_response_async(
                     }
                 })?;
             }
-            store_template_if_authorized(services, &mut params, &bytes).await;
+            let store_outcome = store_template_if_authorized(services, &mut params, &bytes).await;
+            if was_authorized {
+                set_c2_response_state(
+                    &mut response,
+                    match store_outcome {
+                        Some(TemplateStoreOutcome::Stored) => C2ResponseState::MissStored,
+                        Some(TemplateStoreOutcome::Expired) => C2ResponseState::BypassResponse,
+                        Some(TemplateStoreOutcome::Error) | None => C2ResponseState::MissStoreError,
+                    },
+                );
+            }
             let bytes = assemble_if_shared(was_authorized, settings, &params, bytes)?;
+            let bytes = if was_authorized {
+                encode_complete_body(bytes, response_compression(&response))?
+            } else {
+                bytes
+            };
             response.headers_mut().insert(
                 http::header::CONTENT_LENGTH,
                 http::HeaderValue::from(bytes.len() as u64),
@@ -1456,6 +1671,7 @@ pub async fn buffer_publisher_response_async(
             assembled.extend_from_slice(head);
             assembled.extend_from_slice(seam.as_bytes());
             assembled.extend_from_slice(tail);
+            let assembled = encode_complete_body(assembled, response_compression(&response))?;
             response.headers_mut().insert(
                 http::header::CONTENT_LENGTH,
                 http::HeaderValue::from(assembled.len() as u64),
@@ -1468,38 +1684,6 @@ pub async fn buffer_publisher_response_async(
             Ok(response)
         }
     }
-}
-
-/// Decodes transformed body bytes so they can be stored and spliced as text.
-///
-/// The pipeline pairs input encoding to output encoding, so a compressed origin yields a
-/// compressed transform. Everything the shared-template path does afterwards is textual:
-/// finding the seam marker, splitting on it, inserting a script. None of that works on
-/// compressed bytes — the marker is not present to find, `from_utf8` fails, and a spliced
-/// gzip stream is undecodable in the browser.
-///
-/// An earlier attempt forced `Accept-Encoding: identity` on the *origin request* instead.
-/// That worked and cost far too much: the origin then sent ~674 KB uncompressed where it
-/// would have sent ~100 KB, adding seconds to the fetch. The fetch should stay
-/// compressed; only the assembled response needs to be text.
-///
-/// # Errors
-///
-/// Returns an error if the bytes do not decode, which would mean the encoder and the
-/// declared `Content-Encoding` disagree.
-fn decode_transformed_body(
-    bytes: Vec<u8>,
-    content_encoding: &str,
-    max_decoded_bytes: usize,
-) -> Result<Vec<u8>, Report<TrustedServerError>> {
-    let compression = Compression::from_content_encoding(content_encoding);
-    if matches!(compression, Compression::None) {
-        return Ok(bytes);
-    }
-    let mut decoder = BodyStreamDecoder::new(compression, max_decoded_bytes);
-    let mut out = decoder.decode_chunk(bytes::Bytes::from(bytes))?.to_vec();
-    out.extend_from_slice(&decoder.finish()?);
-    Ok(out)
 }
 
 /// Splices this visitor's slots and bids into the seam, if the mode assembles.
@@ -1595,7 +1779,7 @@ fn seam_script_for(params: &OwnedProcessResponseParams) -> String {
     params
         .seam_ad_slots
         .as_deref()
-        .map(|slots| build_seam_script(slots, &params.ad_bids_state.bids()))
+        .map(|slots| params.ad_bids_state.build_seam_script(slots))
         .unwrap_or_default()
 }
 
@@ -1654,6 +1838,44 @@ fn split_template_at_seam(template: &[u8]) -> Result<(&[u8], &[u8]), SeamError> 
     Ok((&template[..at], &template[at + marker.len()..]))
 }
 
+/// Make a freshly transformed ESI template contain one unambiguous seam.
+///
+/// `lol_html` emits the marker at `</body>`. HTML fragments and malformed-but-browser-
+/// renderable documents may have no body handler, so append a terminal seam rather than
+/// converting a valid origin 200 into a TS 500. If any later processing creates an
+/// ambiguous result, neutralize every existing marker and mint a new terminal seam. That
+/// avoids guessing which occurrence belongs to this transform.
+fn normalize_fresh_template_seam(mut template: Vec<u8>) -> Vec<u8> {
+    let marker = SEAM_BIDS_MARKER.as_bytes();
+    let positions = template
+        .windows(marker.len())
+        .enumerate()
+        .filter_map(|(at, window)| (window == marker).then_some(at))
+        .collect::<Vec<_>>();
+
+    if positions.is_empty() {
+        log::warn!("c2_template_cache transform emitted no body seam; appending a terminal seam");
+        template.extend_from_slice(marker);
+        return template;
+    }
+
+    if positions.len() > 1 {
+        let mut escaped = marker.to_vec();
+        // Byte 4 is the first byte inside `<!-- ... -->`; changing it preserves an
+        // invisible comment and keeps offsets stable.
+        escaped[4] = b'x';
+        for at in &positions {
+            template[*at..*at + marker.len()].copy_from_slice(&escaped);
+        }
+        template.extend_from_slice(marker);
+        log::warn!(
+            "c2_template_cache neutralized {} ambiguous seam markers and appended a terminal seam",
+            positions.len()
+        );
+    }
+    template
+}
+
 /// Why a template could not be split at its seam.
 #[derive(Debug, derive_more::Display)]
 pub(crate) enum SeamError {
@@ -1691,17 +1913,12 @@ impl core::error::Error for SeamError {}
 /// Spike-only, for the #1009 ESI validation.
 fn build_cached_template_response(
     entry: &crate::platform::TemplateEntry,
+    reader_compression: Compression,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let invalid = |what: &str| TrustedServerError::Proxy {
         message: format!("cached template has an unusable {what}"),
     };
     let mut response = Response::new(EdgeBody::empty());
-    // First, not last: see the note above. The assembled response is per-user even
-    // though the template it was built from is not.
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("private, no-store"),
-    );
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_str(&entry.metadata.content_type)
@@ -1726,13 +1943,20 @@ fn build_cached_template_response(
     // is what the allowlist encodes. Without this a hit silently dropped the origin's
     // Content-Security-Policy and framing protection — a weaker page, served faster.
     for (name, value) in &entry.metadata.policy_headers {
-        if let (Ok(name), Ok(value)) = (
-            header::HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(value),
-        ) {
-            response.headers_mut().insert(name, value);
+        let name = header::HeaderName::from_bytes(name.as_bytes())
+            .change_context_lazy(|| invalid("policy header name"))?;
+        if !crate::platform::REPLAYABLE_POLICY_HEADERS.contains(&name.as_str()) {
+            return Err(Report::new(invalid("policy header allowlist")));
         }
+        let value =
+            HeaderValue::from_str(value).change_context_lazy(|| invalid("policy header value"))?;
+        response.headers_mut().append(name, value);
     }
+    // Last, after replay. Metadata decoding rejects cache-controlling names, and this
+    // terminal stamp is defense in depth for direct/test entries and future format bugs.
+    enforce_private_no_store(&mut response);
+    set_response_compression(&mut response, reader_compression);
+    set_c2_response_state(&mut response, C2ResponseState::Hit);
     Ok(response)
 }
 
@@ -1752,10 +1976,15 @@ async fn store_template_if_authorized(
     _services: &RuntimeServices,
     params: &mut OwnedProcessResponseParams,
     bytes: &[u8],
-) {
-    let Some(store) = params.template_cache_key.take() else {
-        return;
-    };
+) -> Option<TemplateStoreOutcome> {
+    let store = params.template_cache_key.take()?;
+    let max_age = store.expires_at.saturating_duration_since(Instant::now());
+    if max_age.is_zero() {
+        log::debug!(
+            "c2_template_cache store skipped: origin freshness expired during transformation"
+        );
+        return Some(TemplateStoreOutcome::Expired);
+    }
     let metadata = crate::platform::TemplateMetadata {
         // `identity`, not the origin's encoding. The caller decoded before storing,
         // because the seam split is textual — so recording the origin's encoding here
@@ -1767,10 +1996,7 @@ async fn store_template_if_authorized(
         schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
         body_len: bytes.len() as u64,
     };
-    match store
-        .reservation
-        .insert(&metadata, bytes.to_vec(), store.max_age)
-    {
+    match store.reservation.insert(&metadata, bytes.to_vec(), max_age) {
         Ok(()) => {
             // Reports whether the seam marker made it into the stored bytes. The marker
             // is deliberately invisible from the outside — assembly replaces it before
@@ -1784,8 +2010,12 @@ async fn store_template_if_authorized(
                     .windows(SEAM_BIDS_MARKER.len())
                     .any(|w| w == SEAM_BIDS_MARKER.as_bytes())
             );
+            Some(TemplateStoreOutcome::Stored)
         }
-        Err(err) => log::warn!("c2_template_cache store failed: {err}"),
+        Err(err) => {
+            log::warn!("c2_template_cache store failed: {err}");
+            Some(TemplateStoreOutcome::Error)
+        }
     }
 }
 
@@ -1868,6 +2098,17 @@ pub async fn publisher_response_into_streaming_response(
             let services = services.clone();
             let settings = Arc::clone(&settings);
             let orchestrator = Arc::clone(&orchestrator);
+            let compression = response_compression(&response);
+            // Arm the drop warning before constructing the lazy body. A reader can
+            // disconnect after receiving the cached article prefix but before the seam
+            // is polled, just like on the ordinary streaming path.
+            let dispatched_auction = params.dispatched_auction.take().map(|dispatched| {
+                let telemetry = AuctionTelemetryCarry {
+                    observation: params.auction_observation.take(),
+                    auction_request: params.auction_request.take(),
+                };
+                (DispatchedAuctionGuard::new(dispatched), telemetry)
+            });
 
             // This is the whole point of the variant. The template's head goes out
             // immediately, so the article paints while the auction is still running; the
@@ -1876,15 +2117,20 @@ pub async fn publisher_response_into_streaming_response(
             let stream = async_stream::try_stream! {
                 let (head, tail) = split_template_at_seam(&template)
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
-                yield bytes::Bytes::copy_from_slice(head);
+                let mut encoder = BodyStreamEncoder::new(compression);
+                let encoded_head = encoder
+                    .encode_chunk(head.to_vec())
+                    .map_err(publisher_stream_error)?;
+                if !encoded_head.is_empty() {
+                    yield bytes::Bytes::from(encoded_head);
+                }
 
-                if let Some(dispatched) = params.dispatched_auction.take() {
+                if let Some((mut guard, telemetry)) = dispatched_auction
+                    && let Some(dispatched) = guard.take()
+                {
                     collect_stream_auction(
                         dispatched,
-                        AuctionTelemetryCarry {
-                            observation: params.auction_observation.take(),
-                            auction_request: params.auction_request.take(),
-                        },
+                        telemetry,
                         &AuctionCollectDeps {
                             price_granularity: params.price_granularity,
                             ad_bids_state: &params.ad_bids_state,
@@ -1898,11 +2144,28 @@ pub async fn publisher_response_into_streaming_response(
                         },
                     )
                     .await;
+                    guard.disarm();
                 }
 
                 let seam = seam_script_for(&params);
-                yield bytes::Bytes::from(seam);
-                yield bytes::Bytes::copy_from_slice(tail);
+                if !seam.is_empty() {
+                    let encoded_seam = encoder
+                        .encode_chunk(seam.into_bytes())
+                        .map_err(publisher_stream_error)?;
+                    if !encoded_seam.is_empty() {
+                        yield bytes::Bytes::from(encoded_seam);
+                    }
+                }
+                let encoded_tail = encoder
+                    .encode_chunk(tail.to_vec())
+                    .map_err(publisher_stream_error)?;
+                if !encoded_tail.is_empty() {
+                    yield bytes::Bytes::from(encoded_tail);
+                }
+                let trailer = encoder.finish().map_err(publisher_stream_error)?;
+                if !trailer.is_empty() {
+                    yield bytes::Bytes::from(trailer);
+                }
             };
             *response.body_mut() = EdgeBody::from_stream::<_, std::io::Error>(stream);
             Ok(response)
@@ -2240,7 +2503,13 @@ pub fn stream_publisher_body<W: Write>(
         gpt_diagnostics: params.gpt_diagnostics.as_ref(),
         shared_template_authorized: params.template_cache_key.is_some(),
     };
-    process_response_streaming(body, output, &borrowed)
+    let input_compression = Compression::from_content_encoding(&params.content_encoding);
+    let output_compression = if params.template_cache_key.is_some() {
+        Compression::None
+    } else {
+        input_compression
+    };
+    process_response_streaming(body, output, &borrowed, output_compression)
 }
 
 /// Stream publisher body with a `</body` tail hold for live bid injection.
@@ -2347,12 +2616,18 @@ pub async fn stream_publisher_body_async<W: Write>(
         }
     };
 
-    let compression = Compression::from_content_encoding(&params.content_encoding);
+    let input_compression = Compression::from_content_encoding(&params.content_encoding);
+    let output_compression = if params.template_cache_key.is_some() {
+        Compression::None
+    } else {
+        input_compression
+    };
     stream_html_with_auction_hold(
         body,
         output,
         &mut processor,
-        compression,
+        input_compression,
+        output_compression,
         AuctionCollectCtx {
             dispatched,
             telemetry,
@@ -2501,6 +2776,8 @@ pub(crate) struct AdBidsState {
     script: Arc<Mutex<Option<String>>>,
     /// The same bids, structured, for the shared-template seam.
     bids: Arc<Mutex<serde_json::Map<String, serde_json::Value>>>,
+    /// Optional per-request diagnostics emitted before either bids-script shape.
+    debug_prefix: Arc<Mutex<String>>,
 }
 
 #[cfg(test)]
@@ -2536,6 +2813,20 @@ impl AdBidsState {
         self.bids.lock().expect("should lock bid map").clone()
     }
 
+    /// Build the shared-template seam, retaining the same debug prefix as inline.
+    fn build_seam_script(&self, slots_json: &str) -> String {
+        let seam = build_seam_script(slots_json, &self.bids());
+        let prefix = self
+            .debug_prefix
+            .lock()
+            .expect("should lock bid debug prefix");
+        if prefix.is_empty() {
+            seam
+        } else {
+            format!("{prefix}\n{seam}")
+        }
+    }
+
     /// Put `comment` immediately before the rendered bids script.
     ///
     /// Debug-only, and deliberately confined to the script: the structured map is what
@@ -2555,6 +2846,15 @@ impl AdBidsState {
                 // always sets Some(_); this branch is unreachable in production.
                 *state = Some(comment.to_string());
             }
+        }
+        let mut prefix = self
+            .debug_prefix
+            .lock()
+            .expect("should lock bid debug prefix");
+        if prefix.is_empty() {
+            *prefix = comment.to_string();
+        } else {
+            *prefix = format!("{comment}\n{prefix}");
         }
     }
 }
@@ -2798,7 +3098,8 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
     body: EdgeBody,
     output: &mut W,
     processor: &mut P,
-    compression: Compression,
+    input_compression: Compression,
+    output_compression: Compression,
     ctx: AuctionCollectCtx<'_>,
 ) -> Result<(), Report<TrustedServerError>> {
     if body.is_stream() {
@@ -2807,7 +3108,8 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
             body,
             output,
             processor,
-            compression,
+            input_compression,
+            output_compression,
             ctx,
             max_body_bytes,
         )
@@ -2818,7 +3120,26 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
     // enforces, matching the streaming arm above and the no-hold buffered path.
     let max_body_bytes = ctx.deps.settings.publisher.max_buffered_body_bytes;
     let body = body_as_reader(body)?;
-    match compression {
+    if output_compression == Compression::None {
+        return match input_compression {
+            Compression::None => body_close_hold_loop(body, output, processor, ctx).await,
+            Compression::Gzip => {
+                let decoder = GzipDecodeReader::new(body, max_body_bytes);
+                body_close_hold_loop(decoder, output, processor, ctx).await
+            }
+            Compression::Deflate => {
+                let decoder = ZlibDecoder::new(body);
+                body_close_hold_loop(decoder, output, processor, ctx).await
+            }
+            Compression::Brotli => {
+                let decoder = Decompressor::new(body, STREAM_CHUNK_SIZE);
+                body_close_hold_loop(decoder, output, processor, ctx).await
+            }
+        };
+    }
+
+    debug_assert_eq!(input_compression, output_compression);
+    match input_compression {
         Compression::None => body_close_hold_loop(body, output, processor, ctx).await,
         Compression::Gzip => {
             // `GzipDecodeReader` decodes concatenated gzip members (RFC 1952)
@@ -2873,7 +3194,8 @@ async fn body_close_hold_loop_stream<W: Write, P: StreamProcessor>(
     body: EdgeBody,
     writer: &mut W,
     processor: &mut P,
-    compression: Compression,
+    input_compression: Compression,
+    output_compression: Compression,
     ctx: AuctionCollectCtx<'_>,
     max_body_bytes: usize,
 ) -> Result<(), Report<TrustedServerError>> {
@@ -2882,8 +3204,8 @@ async fn body_close_hold_loop_stream<W: Write, P: StreamProcessor>(
         telemetry,
         deps: collect_refs,
     } = ctx;
-    let mut decoder = BodyStreamDecoder::new(compression, max_body_bytes);
-    let mut encoder = BodyStreamEncoder::new(compression);
+    let mut decoder = BodyStreamDecoder::new(input_compression, max_body_bytes);
+    let mut encoder = BodyStreamEncoder::new(output_compression);
     let mut source = BodyChunkSource::new(body, STREAM_CHUNK_SIZE).with_max_bytes(max_body_bytes);
     let mut state = AuctionHoldState::new(DispatchedAuctionGuard::new(dispatched), telemetry);
 
@@ -3626,6 +3948,12 @@ pub async fn handle_publisher_request(
             .is_some_and(CreativeOpportunitiesConfig::origin_is_cookie_independent);
     let request_requires_origin =
         request_bypasses_c2(req.headers()) || gpt_diagnostics.requires_private_no_store();
+    let reader_compression = negotiate_reader_compression(req.headers());
+    let reader_supports_assembly = reader_compression.is_ok();
+    // A failed negotiation bypasses C2 below, so this value is used only on an
+    // admitted path. Keeping an identity fallback avoids making that relationship
+    // a panic-prone invariant in the public request handler.
+    let reader_compression = reader_compression.unwrap_or(Compression::None);
 
     if should_run_ad_stack {
         req.headers_mut().remove(header::IF_NONE_MATCH);
@@ -3637,14 +3965,21 @@ pub async fn handle_publisher_request(
     let method_is_cacheable = req.method() == Method::GET;
     let request_can_use_shared_template = method_is_cacheable
         && matches!(assembly_mode, AssemblyMode::Esi)
+        && !request_host.is_empty()
         && !request_had_authorization
         && !cookie_disqualifies
-        && !request_requires_origin;
+        && !request_requires_origin
+        && reader_supports_assembly;
 
-    // Only advertise encodings the rewrite pipeline can decode and re-encode. A cold
-    // reservation switches this to the canonical shared offer after lookup; an
-    // unsupported/backend-failed cache keeps the reader-compatible offer for inline.
-    restrict_accept_encoding(&mut req);
+    // Only advertise encodings the rewrite pipeline can decode and re-encode. The
+    // template is normalized to identity after the origin responds, then encoded for
+    // this reader after assembly; the origin offer itself remains reader-compatible so
+    // a response-gate bypass can still fall back to inline losslessly.
+    if !matches!(assembly_mode, AssemblyMode::Esi) || reader_supports_assembly {
+        restrict_accept_encoding(&mut req);
+    } else {
+        log::debug!("c2_template_cache bypass: reader accepts no representation TS can assemble");
+    }
     // Strip the internal `fastly-ssl` scheme signal before forwarding to the
     // origin. On the EdgeZero path the entry point re-injects this header from
     // trusted Fastly TLS metadata so in-process scheme detection works; the
@@ -3693,6 +4028,8 @@ pub async fn handle_publisher_request(
             template_fingerprint: template_fingerprint(settings),
             schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
         });
+    let mut c2_response_state =
+        matches!(assembly_mode, AssemblyMode::Esi).then_some(C2ResponseState::BypassRequest);
     *req.uri_mut() = target_uri;
     req.headers_mut().insert(
         header::HOST,
@@ -3752,6 +4089,7 @@ pub async fn handle_publisher_request(
                             "c2_template_cache could not purge unusable URL variants: {purge_err}"
                         );
                     }
+                    c2_response_state = Some(C2ResponseState::Invalid);
                 } else {
                     // Deliberately *not* assembled here. The auction is still in flight,
                     // and awaiting it now would hold the first byte until it resolves —
@@ -3761,7 +4099,7 @@ pub async fn handle_publisher_request(
                     //
                     // Headers are constructed rather than replayed, so no origin header
                     // can reach a second reader through the cache.
-                    let response = build_cached_template_response(&entry)?;
+                    let response = build_cached_template_response(&entry, reader_compression)?;
                     let mut params = build_template_assembly_params(
                         &entry,
                         settings,
@@ -3784,9 +4122,11 @@ pub async fn handle_publisher_request(
             Ok(crate::platform::TemplateCacheLookup::Reserved(reservation)) => {
                 log::debug!("c2_template_cache cold miss: insert reservation acquired");
                 template_cache_reservation = Some(reservation);
+                c2_response_state = Some(C2ResponseState::MissReserved);
             }
             Ok(crate::platform::TemplateCacheLookup::Unsupported) => {
                 log::debug!("c2_template_cache bypass: platform has no shared cache");
+                c2_response_state = Some(C2ResponseState::Unsupported);
             }
             Ok(crate::platform::TemplateCacheLookup::Invalid(miss)) => {
                 log::warn!(
@@ -3797,20 +4137,13 @@ pub async fn handle_publisher_request(
                         "c2_template_cache could not purge invalid URL variants: {purge_err}"
                     );
                 }
+                c2_response_state = Some(C2ResponseState::Invalid);
             }
-            Err(err) => log::warn!("c2_template_cache backend failure: {err}; falling back inline"),
+            Err(err) => {
+                log::warn!("c2_template_cache backend failure: {err}; falling back inline");
+                c2_response_state = Some(C2ResponseState::BackendError);
+            }
         }
-    }
-
-    // Every actual shared miss offers the same supported set upstream. The stored
-    // template is decoded to identity, so reader encoding neither changes nor
-    // partitions C2. Do this only after acquiring a reservation: adapters without C2
-    // fall back inline and must retain the reader-compatible offer above.
-    if template_cache_reservation.is_some() {
-        req.headers_mut().insert(
-            header::ACCEPT_ENCODING,
-            HeaderValue::from_static("br, gzip, deflate"),
-        );
     }
 
     // SSP requests are already racing through the platform HTTP client, so
@@ -3884,34 +4217,60 @@ pub async fn handle_publisher_request(
         .and_then(|h| h.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    let template_cache_key =
-        template_cache_reservation.and_then(|reservation| {
-            match c2_cache_ttl(
-                assembly_mode,
-                request_had_authorization,
-                cookie_disqualifies,
-                response.status(),
-                &gate_content_type,
-                response.headers(),
-                &settings
-                    .creative_opportunities
-                    .as_ref()
-                    .map(CreativeOpportunitiesConfig::template_cache_vary)
-                    .unwrap_or_else(|| VarySpec::new([])),
-            ) {
-                Err(reason) => {
-                    log::debug!("c2_template_cache bypass: {reason}");
-                    None
-                }
-                Ok(ttl) => {
-                    log::debug!("c2_template_cache eligible for {}s", ttl.as_secs());
-                    Some(AuthorizedTemplateStore {
-                        reservation,
-                        max_age: ttl,
-                    })
-                }
+    let mut template_cache_key = template_cache_reservation.and_then(|reservation| {
+        match c2_cache_ttl(
+            assembly_mode,
+            request_had_authorization,
+            cookie_disqualifies,
+            response.status(),
+            &gate_content_type,
+            response.headers(),
+            &settings
+                .creative_opportunities
+                .as_ref()
+                .map(CreativeOpportunitiesConfig::template_cache_vary)
+                .unwrap_or_else(|| VarySpec::new([])),
+        ) {
+            Err(reason) => {
+                log::debug!("c2_template_cache bypass: {reason}");
+                None
             }
-        });
+            Ok(ttl) => {
+                log::debug!("c2_template_cache eligible for {}s", ttl.as_secs());
+                let Some(expires_at) = Instant::now().checked_add(ttl) else {
+                    log::warn!("c2_template_cache bypass: origin freshness cannot be represented");
+                    return None;
+                };
+                Some(AuthorizedTemplateStore {
+                    reservation,
+                    expires_at,
+                })
+            }
+        }
+    });
+    let policy_headers = if template_cache_key.is_some() {
+        match replayable_policy_headers(response.headers()) {
+            Ok(headers) => headers,
+            Err(reason) => {
+                // The eligibility gate checks this same input immediately above. Keep
+                // the second read fail-closed in case future code mutates the response
+                // between authorization and metadata capture.
+                log::warn!(
+                    "c2_template_cache bypass: policy metadata changed after validation ({reason})"
+                );
+                template_cache_key = None;
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    if c2_response_state == Some(C2ResponseState::MissReserved) && template_cache_key.is_none() {
+        c2_response_state = Some(C2ResponseState::BypassResponse);
+    }
+    if let Some(state) = c2_response_state {
+        set_c2_response_state(&mut response, state);
+    }
 
     // Both seams resolve the mode the same way, from the gate's verdict rather than
     // from configuration. Deciding them independently is what produced a document with
@@ -3963,38 +4322,11 @@ pub async fn handle_publisher_request(
     // `should_run_ad_stack`: a bot, prefetch, kill-switched or consent-denied request can
     // assemble an empty-bids document and would otherwise keep the origin's public
     // caching directives, letting a downstream cache serve it to a later eligible reader.
-    let policy_headers: Vec<(String, String)> = crate::platform::REPLAYABLE_POLICY_HEADERS
-        .iter()
-        .filter_map(|name| {
-            response
-                .headers()
-                .get(*name)
-                .and_then(|value| value.to_str().ok())
-                .map(|value| ((*name).to_string(), value.to_string()))
-        })
-        .collect();
-
     let assembled_response_must_be_private = template_cache_key.is_some();
     if (should_run_ad_stack || assembled_response_must_be_private)
         && is_html_content_type(origin_content_type)
     {
-        response.headers_mut().insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("private, no-store"),
-        );
-        response.headers_mut().remove(header::ETAG);
-        response.headers_mut().remove(header::LAST_MODIFIED);
-        // Every CDN-targeted cache directive, not just the browser-facing
-        // `Cache-Control` above: an origin emitting any of these would otherwise
-        // instruct an intermediary to store a synthesized per-navigation
-        // document. `Surrogate-Control` and `Fastly-Surrogate-Control` cover
-        // Fastly; `CDN-Cache-Control` is the standard targeted field (RFC 9213)
-        // and `Cloudflare-CDN-Cache-Control` is the Cloudflare-specific field
-        // that overrides it there, so both are needed to close the gap on the
-        // Cloudflare adapter.
-        for directive in CDN_CACHE_HEADERS {
-            response.headers_mut().remove(*directive);
-        }
+        enforce_private_no_store(&mut response);
     }
 
     let content_type = response
@@ -4011,8 +4343,12 @@ pub async fn handle_publisher_request(
         .get(header::CONTENT_ENCODING)
         .map(|h| h.to_str().unwrap_or_default())
         .unwrap_or_default()
-        .to_lowercase();
+        .trim()
+        .to_ascii_lowercase();
     let route = classify_response_route(status, &content_type, &content_encoding, request_host);
+    if template_cache_key.is_some() {
+        set_response_compression(&mut response, reader_compression);
+    }
 
     match route {
         ResponseRoute::PassThrough => {
@@ -4733,10 +5069,6 @@ fn match_renderable_slots(
         .collect()
 }
 
-/// Build the `tsjs.adSlots` `<script>` tag from matched slots.
-///
-/// Property names match what the client-side TSJS bundle expects:
-/// `gam_unit_path`, `div_id`, `formats`, and `targeting`.
 /// Why a response must not enter the shared transformed-template cache (C2).
 ///
 /// `cache::core` is not an HTTP cache: it stores whatever bytes it is handed and
@@ -4754,8 +5086,9 @@ pub(crate) enum C2BypassReason {
     /// happens after the cache has already stored the origin's.
     #[display("origin response carries Set-Cookie")]
     OriginSetCookie,
-    /// The origin declared the response non-shareable.
-    #[display("origin marked the response private, no-store or no-cache")]
+    /// The origin declared the response non-shareable, or supplied a CDN-specific
+    /// policy C2 does not interpret and therefore cannot safely override.
+    #[display("origin cache policy is not eligible for C2 sharing")]
     OriginNotShareable,
     /// Cache directives or HTTP dates were malformed. Failing closed prevents a
     /// parser disagreement from extending a representation's lifetime.
@@ -4777,6 +5110,13 @@ pub(crate) enum C2BypassReason {
     /// Not HTML, so there is no template to transform.
     #[display("content type is not text/html")]
     NotHtml,
+    /// A single-valued representation header was absent, repeated or malformed.
+    #[display("origin representation headers are ambiguous or malformed")]
+    MalformedRepresentationHeaders,
+    /// The body cannot be decoded by the transform. Authorizing it would rewrite
+    /// `Content-Encoding` while returning the untouched bytes on the fallback route.
+    #[display("origin content encoding is not supported by the template transform")]
+    UnsupportedContentEncoding,
     /// The request carried a `Cookie`, which TS forwards to origin unchanged — there
     /// is no `Cookie` strip on the publisher path. Cookie-personalized HTML is
     /// therefore cross-servable unless the origin declares `Vary: Cookie` or marks
@@ -4805,6 +5145,16 @@ pub(crate) enum C2BypassReason {
     /// response was shareable. A review found the gap between the comment and the code.
     #[display("origin sent Vary: *, so no request key can select this response")]
     VaryWildcard,
+    /// Cookie-selected HTML contradicts the reader-neutral-template contract even if
+    /// an operator accidentally lists `cookie` in the configured Vary key.
+    #[display("origin sent Vary: Cookie, contradicting cookie independence")]
+    VaryCookie,
+    /// A response-bound CSP nonce cannot safely be replayed with a shared document.
+    #[display("origin CSP contains a response-bound nonce")]
+    CspNonce,
+    /// A policy header selected for replay could not be represented losslessly.
+    #[display("origin policy header is malformed")]
+    MalformedPolicyHeader,
 }
 
 fn request_bypasses_c2(headers: &edgezero_core::http::HeaderMap) -> bool {
@@ -4828,23 +5178,29 @@ fn request_bypasses_c2(headers: &edgezero_core::http::HeaderMap) -> bool {
             return true;
         };
         for directive in value.split(',').map(str::trim) {
-            let (name, argument) = directive
+            let name = directive
                 .split_once('=')
-                .map_or((directive, None), |(name, value)| (name, Some(value)));
+                .map_or(directive, |(name, _)| name);
             match name.trim().to_ascii_lowercase().as_str() {
                 "no-cache" | "no-store" => return true,
-                "max-age" if argument.is_some_and(|value| value.trim_matches('"') == "0") => {
-                    return true;
-                }
+                // C2 does not expose object age/remaining freshness at this layer,
+                // so it cannot prove either request constraint is satisfied.
+                "max-age" | "min-fresh" => return true,
                 _ => {}
             }
         }
     }
 
     headers.get_all(header::PRAGMA).iter().any(|value| {
-        value
-            .to_str()
-            .map_or(true, |value| value.eq_ignore_ascii_case("no-cache"))
+        value.to_str().map_or(true, |value| {
+            value.split(',').any(|directive| {
+                directive
+                    .split_once('=')
+                    .map_or(directive, |(name, _)| name)
+                    .trim()
+                    .eq_ignore_ascii_case("no-cache")
+            })
+        })
     })
 }
 
@@ -4897,10 +5253,10 @@ pub(crate) fn c2_bypass_reason(
 /// never more; its `Age` is deducted before this cap is applied.
 const MAX_TEMPLATE_CACHE_TTL: Duration = Duration::from_secs(60);
 
-fn single_header_value<'a>(
-    headers: &'a edgezero_core::http::HeaderMap,
+fn single_header_value(
+    headers: &edgezero_core::http::HeaderMap,
     name: header::HeaderName,
-) -> Result<Option<&'a str>, C2BypassReason> {
+) -> Result<Option<&str>, C2BypassReason> {
     let mut values = headers.get_all(name).iter();
     let Some(first) = values.next() else {
         return Ok(None);
@@ -4914,15 +5270,48 @@ fn single_header_value<'a>(
         .map_err(|_| C2BypassReason::MalformedCachePolicy)
 }
 
+fn single_representation_header_value(
+    headers: &edgezero_core::http::HeaderMap,
+    name: header::HeaderName,
+) -> Result<Option<&str>, C2BypassReason> {
+    let mut values = headers.get_all(name).iter();
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(C2BypassReason::MalformedRepresentationHeaders);
+    }
+    first
+        .to_str()
+        .map(Some)
+        .map_err(|_| C2BypassReason::MalformedRepresentationHeaders)
+}
+
 fn parse_delta_seconds(value: &str) -> Result<u64, C2BypassReason> {
-    value
-        .trim()
-        .trim_matches('"')
+    let value = value.trim();
+    let quoted_at_start = value.starts_with('"');
+    let quoted_at_end = value.ends_with('"');
+    let digits = match (quoted_at_start, quoted_at_end) {
+        (true, true) if value.len() >= 2 => &value[1..value.len() - 1],
+        (false, false) => value,
+        _ => return Err(C2BypassReason::MalformedCachePolicy),
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(C2BypassReason::MalformedCachePolicy);
+    }
+    digits
         .parse::<u64>()
         .map_err(|_| C2BypassReason::MalformedCachePolicy)
 }
 
 fn origin_shared_ttl(headers: &edgezero_core::http::HeaderMap) -> Result<Duration, C2BypassReason> {
+    origin_shared_ttl_at(headers, SystemTime::now())
+}
+
+fn origin_shared_ttl_at(
+    headers: &edgezero_core::http::HeaderMap,
+    now: SystemTime,
+) -> Result<Duration, C2BypassReason> {
     let mut max_age = None;
     let mut shared_max_age = None;
 
@@ -4957,8 +5346,12 @@ fn origin_shared_ttl(headers: &edgezero_core::http::HeaderMap) -> Result<Duratio
         }
     }
 
+    let date = single_header_value(headers, header::DATE)?
+        .map(httpdate::parse_http_date)
+        .transpose()
+        .map_err(|_| C2BypassReason::MalformedCachePolicy)?;
     let freshness = match shared_max_age.or(max_age) {
-        Some(seconds) => seconds,
+        Some(seconds) => Duration::from_secs(seconds),
         None => {
             let expires = single_header_value(headers, header::EXPIRES)?
                 .ok_or(C2BypassReason::NoPositiveFreshness)
@@ -4966,15 +5359,10 @@ fn origin_shared_ttl(headers: &edgezero_core::http::HeaderMap) -> Result<Duratio
                     httpdate::parse_http_date(value)
                         .map_err(|_| C2BypassReason::MalformedCachePolicy)
                 })?;
-            let date = match single_header_value(headers, header::DATE)? {
-                Some(value) => httpdate::parse_http_date(value)
-                    .map_err(|_| C2BypassReason::MalformedCachePolicy)?,
-                None => std::time::SystemTime::now(),
-            };
+            let date = date.unwrap_or(now);
             expires
                 .duration_since(date)
                 .map_err(|_| C2BypassReason::NoPositiveFreshness)?
-                .as_secs()
         }
     };
 
@@ -4982,11 +5370,39 @@ fn origin_shared_ttl(headers: &edgezero_core::http::HeaderMap) -> Result<Duratio
         .map(parse_delta_seconds)
         .transpose()?
         .unwrap_or(0);
+    // `Age` may be absent even when an upstream cache emitted an old `Date`.
+    // RFC 9111's corrected age is at least the apparent age; ignoring it would
+    // grant an already-expired representation a new C2 lifetime.
+    let apparent_age = date
+        .and_then(|date| now.duration_since(date).ok())
+        .unwrap_or_default();
+    let current_age = Duration::from_secs(age).max(apparent_age);
     let remaining = freshness
-        .checked_sub(age)
-        .filter(|seconds| *seconds > 0)
+        .checked_sub(current_age)
+        .filter(|duration| !duration.is_zero())
         .ok_or(C2BypassReason::NoPositiveFreshness)?;
-    Ok(Duration::from_secs(remaining).min(MAX_TEMPLATE_CACHE_TTL))
+    Ok(remaining.min(MAX_TEMPLATE_CACHE_TTL))
+}
+
+fn replayable_policy_headers(
+    headers: &edgezero_core::http::HeaderMap,
+) -> Result<Vec<(String, String)>, C2BypassReason> {
+    let mut captured = Vec::new();
+    for name in crate::platform::REPLAYABLE_POLICY_HEADERS {
+        for value in headers.get_all(*name) {
+            let value = value
+                .to_str()
+                .map_err(|_| C2BypassReason::MalformedPolicyHeader)?;
+            if (*name == "content-security-policy"
+                || *name == "content-security-policy-report-only")
+                && value.to_ascii_lowercase().contains("'nonce-")
+            {
+                return Err(C2BypassReason::CspNonce);
+            }
+            captured.push(((*name).to_string(), value.to_string()));
+        }
+    }
+    Ok(captured)
 }
 
 pub(crate) fn c2_cache_ttl(
@@ -5010,6 +5426,17 @@ pub(crate) fn c2_cache_ttl(
     if response_headers.contains_key(header::SET_COOKIE) {
         return Err(C2BypassReason::OriginSetCookie);
     }
+    // Core Cache has no HTTP semantics, so silently ignoring a CDN-specific policy
+    // would let a public standard Cache-Control override (for example)
+    // `Surrogate-Control: no-store`. Different vendors define precedence and
+    // extensions differently; fail closed until C2 has an explicit parser rather than
+    // guessing that every such field is equivalent to Cache-Control.
+    if crate::response_privacy::CDN_CACHE_HEADERS
+        .iter()
+        .any(|name| response_headers.contains_key(*name))
+    {
+        return Err(C2BypassReason::OriginNotShareable);
+    }
     // Checked here, among the leak vectors, because storing under a key that does not
     // cover the origin's Vary is cross-serving rather than mere ineligibility: a request
     // differing only in the uncovered header would read this template.
@@ -5026,6 +5453,9 @@ pub(crate) fn c2_cache_ttl(
             if name == "*" {
                 return Err(C2BypassReason::VaryWildcard);
             }
+            if name.eq_ignore_ascii_case(header::COOKIE.as_str()) {
+                return Err(C2BypassReason::VaryCookie);
+            }
             header::HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| C2BypassReason::MalformedCachePolicy)?;
         }
@@ -5038,9 +5468,26 @@ pub(crate) fn c2_cache_ttl(
     if status != StatusCode::OK {
         return Err(C2BypassReason::NonOkStatus);
     }
-    if !is_html_content_type(content_type) {
+    let declared_content_type =
+        single_representation_header_value(response_headers, header::CONTENT_TYPE)?;
+    if declared_content_type.is_some_and(|declared| declared != content_type)
+        || !is_html_content_type(content_type)
+    {
         return Err(C2BypassReason::NotHtml);
     }
+    let content_encoding =
+        single_representation_header_value(response_headers, header::CONTENT_ENCODING)?
+            .map_or_else(
+                || "identity".to_string(),
+                |value| value.trim().to_ascii_lowercase(),
+            );
+    if content_encoding.is_empty() {
+        return Err(C2BypassReason::MalformedRepresentationHeaders);
+    }
+    if !is_supported_content_encoding(&content_encoding) {
+        return Err(C2BypassReason::UnsupportedContentEncoding);
+    }
+    replayable_policy_headers(response_headers)?;
     origin_shared_ttl(response_headers)
 }
 
@@ -5057,8 +5504,8 @@ pub(crate) fn c2_cache_ttl(
 /// a no-ads template to consenting users, and a consenting fill would serve ad
 /// markup to someone who refused.
 ///
-/// So those modes return [`None`] **unconditionally**, and `adSlots` moves to the
-/// per-request fragment alongside the bids. The head seam is not a template hole.
+/// So ESI returns [`None`] **unconditionally**, and `adSlots` moves to the
+/// per-request body seam alongside the bids. The head is not a template hole.
 ///
 /// See `docs/superpowers/specs/2026-08-08-esi-cacheable-root-validation-design.md`
 /// §6.7.
@@ -5083,6 +5530,10 @@ pub(crate) fn template_ad_slots_script(
     }
 }
 
+/// Build the `tsjs.adSlots` `<script>` tag from matched slots.
+///
+/// Property names match what the client-side TSJS bundle expects:
+/// `gam_unit_path`, `div_id`, `formats`, and `targeting`.
 pub(crate) fn build_ad_slots_script(
     matched_slots: &[crate::creative_opportunities::CreativeOpportunitySlot],
     co_config: &crate::creative_opportunities::CreativeOpportunitiesConfig,
@@ -5719,6 +6170,30 @@ mod tests {
         assert!(
             !comment.contains("mediator_response"),
             "should omit mediator_response when no mediator ran: {comment}"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_reaches_the_shared_template_seam() {
+        let result = OrchestrationResult {
+            provider_responses: vec![AuctionResponse::no_bid("prebid", 12)],
+            mediator_response: None,
+            winning_bids: std::collections::HashMap::new(),
+            total_time_ms: 12,
+            metadata: std::collections::HashMap::new(),
+        };
+        let state = AdBidsState::with_script("BIDS_SCRIPT");
+        prepend_auction_debug_comment("stream", &result, &state);
+
+        let seam = state.build_seam_script("[]");
+
+        assert!(
+            seam.contains("<!-- ts-debug:"),
+            "debug state must reach ESI"
+        );
+        assert!(
+            seam.find("<!-- ts-debug:") < seam.find("<script>"),
+            "the diagnostic comment should precede the executable seam: {seam}"
         );
     }
 
@@ -6622,7 +7097,7 @@ mod tests {
                         url: key().url,
                     },
                 )),
-                max_age: Duration::from_secs(30),
+                expires_at: Instant::now() + Duration::from_secs(30),
             }
         }
 
@@ -6649,8 +7124,12 @@ mod tests {
             let mut params = make_stream_params(&settings, "identity");
             params.template_cache_key = None;
 
-            store_template_if_authorized(&services_with(Arc::clone(&cache)), &mut params, b"body")
-                .await;
+            let _ = store_template_if_authorized(
+                &services_with(Arc::clone(&cache)),
+                &mut params,
+                b"body",
+            )
+            .await;
 
             assert!(
                 cache.recorded().is_empty(),
@@ -6665,7 +7144,7 @@ mod tests {
             let mut params = make_stream_params(&settings, "identity");
             params.template_cache_key = Some(authorization(&cache));
 
-            store_template_if_authorized(
+            let _ = store_template_if_authorized(
                 &services_with(Arc::clone(&cache)),
                 &mut params,
                 b"<html>transformed</html>",
@@ -6690,13 +7169,36 @@ mod tests {
             params.template_cache_key = Some(authorization(&cache));
             let services = services_with(Arc::clone(&cache));
 
-            store_template_if_authorized(&services, &mut params, b"first").await;
-            store_template_if_authorized(&services, &mut params, b"second").await;
+            let _ = store_template_if_authorized(&services, &mut params, b"first").await;
+            let _ = store_template_if_authorized(&services, &mut params, b"second").await;
 
             assert_eq!(
                 cache.recorded().len(),
                 1,
                 "authorization must be single-use"
+            );
+        }
+
+        #[tokio::test]
+        async fn origin_freshness_keeps_ticking_while_the_template_is_built() {
+            let cache = Arc::new(RecordingCache::default());
+            let settings = create_test_settings();
+            let mut params = make_stream_params(&settings, "identity");
+            let mut expired = authorization(&cache);
+            expired.expires_at = Instant::now();
+            params.template_cache_key = Some(expired);
+
+            let outcome = store_template_if_authorized(
+                &services_with(Arc::clone(&cache)),
+                &mut params,
+                b"body",
+            )
+            .await;
+
+            assert_eq!(outcome, Some(TemplateStoreOutcome::Expired));
+            assert!(
+                cache.recorded().is_empty(),
+                "C2 must not invent a new TTL after origin freshness elapsed"
             );
         }
     }
@@ -6713,6 +7215,7 @@ mod tests {
         };
         use crate::test_support::tests::crate_test_settings_str;
         use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         /// A working cache, unlike the recorder above — this one has to actually return
         /// what it stored, or a hit proves nothing.
@@ -6727,6 +7230,9 @@ mod tests {
             /// Every key `put` was called with, so a test can re-key an entry exactly
             /// instead of reconstructing what the request derived.
             stored_keys: Arc<Mutex<Vec<crate::platform::TemplateCacheKey>>>,
+            /// Force the lookup transaction to fail, for the fail-open + telemetry
+            /// contract. A backend outage must never become a publisher outage.
+            fail_lookup: AtomicBool,
         }
 
         struct MemoryTemplateReservation {
@@ -6772,6 +7278,11 @@ mod tests {
                     .lock()
                     .expect("should lock lookups")
                     .push(key.clone());
+                if self.fail_lookup.load(Ordering::Relaxed) {
+                    return Err(crate::platform::TemplateCacheError::Backend {
+                        message: "injected lookup failure".to_string(),
+                    });
+                }
                 if let Some(entry) = self
                     .entries
                     .lock()
@@ -7139,48 +7650,6 @@ mod tests {
             .await
         }
 
-        /// [`run`], surfacing a finalizer failure instead of panicking on it.
-        ///
-        /// Needed by the tests that drive a template the seam cannot split: what they
-        /// assert is what happened to the *cache* on the way to the failure.
-        async fn try_run(
-            settings: &Arc<Settings>,
-            services: &RuntimeServices,
-            request: Request<EdgeBody>,
-        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-            let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
-            let registry =
-                IntegrationRegistry::new(settings).expect("should create integration registry");
-            let consent = crate::consent::ConsentContext {
-                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
-                ..Default::default()
-            };
-            let mut ec_context = EcContext::new_for_test(None, consent);
-            let publisher_response = handle_publisher_request(
-                settings,
-                services,
-                None,
-                &mut ec_context,
-                AuctionDispatch {
-                    orchestrator: &orchestrator,
-                    slots: &[article_slot()],
-                    registry: None,
-                },
-                request,
-            )
-            .await?;
-
-            publisher_response_into_streaming_response(
-                publisher_response,
-                &Method::GET,
-                Arc::clone(settings),
-                &registry,
-                orchestrator,
-                services.clone(),
-            )
-            .await
-        }
-
         async fn run_with_orchestrator(
             settings: &Arc<Settings>,
             services: &RuntimeServices,
@@ -7268,14 +7737,29 @@ mod tests {
             // the assertion.
             queue_shareable_html(&stub);
 
-            let first = body_of(run(&settings, &services, navigation_request()).await).await;
+            let cold = run(&settings, &services, navigation_request()).await;
+            assert_eq!(
+                cold.headers()
+                    .get(HEADER_X_TS_C2_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("miss-stored"),
+                "a successful cold fill must be distinguishable from a bypass"
+            );
+            let first = body_of(cold).await;
             assert_eq!(
                 stub.recorded_request_uris().len(),
                 1,
                 "the cold request must fetch the origin"
             );
 
-            let second = body_of(run(&settings, &services, navigation_request()).await).await;
+            let warm = run(&settings, &services, navigation_request()).await;
+            assert_eq!(
+                warm.headers()
+                    .get(HEADER_X_TS_C2_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("hit")
+            );
+            let second = body_of(warm).await;
             assert_eq!(
                 stub.recorded_request_uris().len(),
                 1,
@@ -7284,6 +7768,173 @@ mod tests {
             assert_eq!(
                 second, first,
                 "the cached template must be byte-identical to what was stored"
+            );
+        }
+
+        #[tokio::test]
+        async fn one_identity_template_is_negotiated_per_reader_on_miss_and_hit() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            stub.push_response_with_headers(
+                200,
+                gzip_encode(b"<html><head></head><body>origin</body></html>"),
+                vec![
+                    ("content-type", "text/html; charset=utf-8"),
+                    ("content-encoding", "gzip"),
+                    ("cache-control", "public, max-age=300"),
+                    ("vary", "accept-encoding"),
+                ],
+            );
+
+            let mut gzip_request = navigation_request();
+            gzip_request
+                .headers_mut()
+                .insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+            let cold = run(&settings, &services, gzip_request).await;
+            assert_eq!(
+                cold.headers()
+                    .get(header::CONTENT_ENCODING)
+                    .and_then(|value| value.to_str().ok()),
+                Some("gzip")
+            );
+            assert!(
+                cold.headers().get_all(header::VARY).iter().any(|value| {
+                    value.to_str().is_ok_and(|value| {
+                        value
+                            .split(',')
+                            .any(|name| name.trim().eq_ignore_ascii_case("accept-encoding"))
+                    })
+                }),
+                "the encoded cold response must declare reader negotiation"
+            );
+            let cold_decoded = gzip_decode(&body_of(cold).await);
+
+            let warm_identity = run(&settings, &services, navigation_request()).await;
+            assert!(
+                warm_identity
+                    .headers()
+                    .get(header::CONTENT_ENCODING)
+                    .is_none(),
+                "a reader that did not advertise compression must receive identity"
+            );
+            let warm_identity_body = body_of(warm_identity).await;
+
+            let mut warm_gzip_request = navigation_request();
+            warm_gzip_request
+                .headers_mut()
+                .insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+            let warm_gzip = run(&settings, &services, warm_gzip_request).await;
+            assert_eq!(
+                warm_gzip
+                    .headers()
+                    .get(header::CONTENT_ENCODING)
+                    .and_then(|value| value.to_str().ok()),
+                Some("gzip")
+            );
+            assert_eq!(
+                warm_gzip
+                    .headers()
+                    .get(header::VARY)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Accept-Encoding")
+            );
+            let warm_gzip_decoded = gzip_decode(&body_of(warm_gzip).await);
+
+            let mut warm_brotli_request = navigation_request();
+            warm_brotli_request.headers_mut().insert(
+                header::ACCEPT_ENCODING,
+                HeaderValue::from_static("br, gzip;q=0.5"),
+            );
+            let warm_brotli = run(&settings, &services, warm_brotli_request).await;
+            assert_eq!(
+                warm_brotli
+                    .headers()
+                    .get(header::CONTENT_ENCODING)
+                    .and_then(|value| value.to_str().ok()),
+                Some("br")
+            );
+            let warm_brotli_decoded = brotli_decode(&body_of(warm_brotli).await);
+
+            assert_eq!(stub.recorded_request_uris().len(), 1);
+            assert_eq!(cold_decoded, warm_identity_body);
+            assert_eq!(warm_gzip_decoded, warm_identity_body);
+            assert_eq!(warm_brotli_decoded, warm_identity_body);
+        }
+
+        #[tokio::test]
+        async fn a_reader_that_refuses_every_supported_encoding_bypasses_c2_losslessly() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+            let mut request = navigation_request();
+            request.headers_mut().insert(
+                header::ACCEPT_ENCODING,
+                HeaderValue::from_static("zstd, identity;q=0"),
+            );
+
+            let _ = body_of(run(&settings, &services, request).await).await;
+
+            let forwarded = stub.recorded_request_headers();
+            assert!(
+                forwarded[0].iter().any(|(name, value)| {
+                    name.eq_ignore_ascii_case("accept-encoding") && value == "zstd, identity;q=0"
+                }),
+                "an unsupported offer must reach origin unchanged so TS can pass through the \
+                 representation instead of sending forbidden identity"
+            );
+            assert!(
+                cache
+                    .lookups
+                    .lock()
+                    .expect("should lock lookups")
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unsupported_origin_encoding_bypasses_c2_without_relabeling_the_body() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            let wire_body = b"opaque-zstd-wire-bytes".to_vec();
+            stub.push_response_with_headers(
+                200,
+                wire_body.clone(),
+                vec![
+                    ("content-type", "text/html; charset=utf-8"),
+                    ("content-encoding", "zstd"),
+                    ("cache-control", "public, max-age=300"),
+                ],
+            );
+
+            let response = run(&settings, &services, navigation_request()).await;
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_ENCODING)
+                    .and_then(|value| value.to_str().ok()),
+                Some("zstd"),
+                "the pass-through bytes must keep the origin's representation label"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(HEADER_X_TS_C2_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("bypass-response")
+            );
+            assert_eq!(body_of(response).await, wire_body);
+            assert!(
+                cache
+                    .entries
+                    .lock()
+                    .expect("should lock entries")
+                    .is_empty()
             );
         }
 
@@ -7348,17 +7999,37 @@ mod tests {
             serde_json::from_str(&unescaped).expect("the embedded payload should be a JSON object")
         }
 
+        #[test]
+        fn repeated_fresh_markers_are_all_neutralized_before_a_new_terminal_seam_is_added() {
+            let input = format!("prefix{SEAM_BIDS_MARKER}middle{SEAM_BIDS_MARKER}publisher-tail");
+
+            let normalized = normalize_fresh_template_seam(input.into_bytes());
+
+            assert_eq!(
+                normalized
+                    .windows(SEAM_BIDS_MARKER.len())
+                    .filter(|window| *window == SEAM_BIDS_MARKER.as_bytes())
+                    .count(),
+                1
+            );
+            assert!(
+                normalized.ends_with(SEAM_BIDS_MARKER.as_bytes()),
+                "normalization must mint its own unambiguous terminal seam"
+            );
+        }
+
         /// Shareable HTML that already contains the seam marker.
         ///
-        /// Not contrived: the marker is a plain HTML comment, and an origin is free to
-        /// emit one. The seam then adds its own and the template carries two, which
-        /// `split_template_at_seam` refuses because splitting on the first would leave
-        /// the second visible in the served page.
+        /// The marker is reserved, but publisher content can still contain it. Fresh
+        /// normalization must disambiguate that content from the transform-owned seam.
         fn queue_html_that_collides_with_the_marker(stub: &StubHttpClient) {
             stub.push_response_with_headers(
                 200,
-                format!("<html><head></head><body>origin{SEAM_BIDS_MARKER}</body></html>")
-                    .into_bytes(),
+                format!(
+                    "<html><head></head><body>origin{SEAM_BIDS_MARKER}</body></html>\
+                     {SEAM_BIDS_MARKER}"
+                )
+                .into_bytes(),
                 vec![
                     ("content-type", "text/html; charset=utf-8"),
                     ("cache-control", "public, max-age=300"),
@@ -7367,30 +8038,93 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_template_the_seam_cannot_split_is_never_stored() {
-            // The store used to run first and the validation second, so the one request
-            // that produced an unusable template failed loudly *and left it in the
-            // cache* — every reader after it got the broken entry until it expired,
-            // with no further error to point at.
+        async fn an_origin_marker_collision_is_normalized_before_store() {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let settings = Arc::new(settings_with_mode("esi"));
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
             queue_html_that_collides_with_the_marker(&stub);
 
-            let outcome = try_run(&settings, &services, navigation_request()).await;
+            let cold = String::from_utf8(
+                body_of(run(&settings, &services, navigation_request()).await).await,
+            )
+            .expect("cold document should be UTF-8");
+            let warm = String::from_utf8(
+                body_of(run(&settings, &services, navigation_request()).await).await,
+            )
+            .expect("warm document should be UTF-8");
 
             assert!(
-                outcome.is_err(),
-                "a template with two markers cannot be assembled and must not be served"
+                cold.contains("origin") && cold.contains("window.tsjs"),
+                "a reserved-comment collision must not turn a valid origin 200 into a 500"
             );
+            assert!(!cold.contains(SEAM_BIDS_MARKER));
+            assert!(!warm.contains(SEAM_BIDS_MARKER));
+            assert_eq!(stub.recorded_request_uris().len(), 1);
+            let entries = cache.entries.lock().expect("should lock entries");
+            let template = &entries
+                .values()
+                .next()
+                .expect("template should be stored")
+                .body;
+            assert_eq!(
+                template
+                    .windows(SEAM_BIDS_MARKER.len())
+                    .filter(|window| *window == SEAM_BIDS_MARKER.as_bytes())
+                    .count(),
+                1,
+                "the stored template must retain exactly the transform-owned seam"
+            );
+            let seam_at = template
+                .windows(SEAM_BIDS_MARKER.len())
+                .position(|window| window == SEAM_BIDS_MARKER.as_bytes())
+                .expect("stored template should contain its seam");
+            let body_close_at = template
+                .windows(b"</body>".len())
+                .position(|window| window.eq_ignore_ascii_case(b"</body>"))
+                .expect("fixture should retain its body close");
             assert!(
-                cache
+                seam_at < body_close_at,
+                "publisher content after </body> must not be mistaken for TS's seam"
+            );
+        }
+
+        #[tokio::test]
+        async fn html_without_an_explicit_body_gets_a_terminal_seam_instead_of_a_500() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            stub.push_response_with_headers(
+                200,
+                b"<div>origin fragment</div>".to_vec(),
+                vec![
+                    ("content-type", "text/html; charset=utf-8"),
+                    ("cache-control", "public, max-age=300"),
+                ],
+            );
+
+            let cold = String::from_utf8(
+                body_of(run(&settings, &services, navigation_request()).await).await,
+            )
+            .expect("cold fragment should be UTF-8");
+            let warm = String::from_utf8(
+                body_of(run(&settings, &services, navigation_request()).await).await,
+            )
+            .expect("warm fragment should be UTF-8");
+
+            for document in [&cold, &warm] {
+                assert!(document.contains("origin fragment"));
+                assert!(!document.contains(SEAM_BIDS_MARKER));
+            }
+            assert_eq!(stub.recorded_request_uris().len(), 1);
+            assert!(
+                !cache
                     .entries
                     .lock()
                     .expect("should lock entries")
                     .is_empty(),
-                "nothing the seam cannot split may reach the shared cache"
+                "the recovered template should remain cacheable"
             );
         }
 
@@ -7433,6 +8167,14 @@ mod tests {
             queue_shareable_html(&stub);
             let response = run(&settings, &services, navigation_request()).await;
             let status = response.status();
+            assert_eq!(
+                response
+                    .headers()
+                    .get(HEADER_X_TS_C2_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("invalid"),
+                "an invalid-object recovery must be observable without exposing its key"
+            );
             let served = String::from_utf8(body_of(response).await)
                 .expect("served document should be UTF-8");
 
@@ -8295,6 +9037,119 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn real_diagnostics_query_bypasses_c2_and_keeps_its_private_bootstrap() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let mut raw = settings_with_mode("esi");
+            raw.integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+                .expect("should configure diagnostics");
+            let settings = Arc::new(raw);
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+
+            let mut request = navigation_request();
+            *request.uri_mut() = "https://ts.example.com/article?ts_console=1"
+                .parse()
+                .expect("should parse diagnostics URI");
+            let response = run(&settings, &services, request).await;
+            assert_eq!(
+                response
+                    .headers()
+                    .get(HEADER_X_TS_C2_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("bypass-request")
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("private, no-store")
+            );
+            assert!(response.headers().contains_key(header::SET_COOKIE));
+            let document = String::from_utf8(body_of(response).await)
+                .expect("diagnostics document should be UTF-8");
+            assert!(document.contains("__tsjs_gpt_diagnostics_active"));
+            assert!(document.contains("tsjs-gpt_diagnostics.min.js"));
+            assert!(
+                cache
+                    .lookups
+                    .lock()
+                    .expect("should lock lookups")
+                    .is_empty(),
+                "the real query activation must bypass lookup before origin work"
+            );
+        }
+
+        #[tokio::test]
+        async fn real_diagnostics_cookie_bypasses_a_warm_cookie_independent_template() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let mut raw = settings_with_mode("esi");
+            raw.creative_opportunities
+                .as_mut()
+                .expect("fixture configures creative opportunities")
+                .origin_is_cookie_independent = Some(true);
+            raw.integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+                .expect("should configure diagnostics");
+            let settings = Arc::new(raw);
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+            queue_shareable_html(&stub);
+
+            let _ = body_of(run(&settings, &services, navigation_request()).await).await;
+            let mut diagnostics = navigation_request();
+            diagnostics.headers_mut().insert(
+                header::COOKIE,
+                HeaderValue::from_static("__Host-ts-console=1"),
+            );
+            let response = run(&settings, &services, diagnostics).await;
+            assert_eq!(
+                response
+                    .headers()
+                    .get(HEADER_X_TS_C2_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("bypass-request")
+            );
+            let document = String::from_utf8(body_of(response).await)
+                .expect("diagnostics document should be UTF-8");
+
+            assert_eq!(stub.recorded_request_uris().len(), 2);
+            assert_eq!(
+                cache.lookups.lock().expect("should lock lookups").len(),
+                1,
+                "the diagnostics cookie must bypass the otherwise-eligible warm lookup"
+            );
+            assert!(document.contains("__tsjs_gpt_diagnostics_active"));
+        }
+
+        #[tokio::test]
+        async fn a_cache_backend_failure_falls_back_to_origin_and_is_observable() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            cache.fail_lookup.store(true, Ordering::Relaxed);
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+
+            let response = run(&settings, &services, navigation_request()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(HEADER_X_TS_C2_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("backend-error")
+            );
+            let document = String::from_utf8(body_of(response).await)
+                .expect("fallback document should be UTF-8");
+            assert!(document.contains("origin"));
+            assert_eq!(stub.recorded_request_uris().len(), 1);
+        }
+
+        #[tokio::test]
         async fn a_cache_hit_streams_rather_than_buffering() {
             // The property that makes the cache worth having, and the one that regressed
             // silently. Buffered assembly held the first byte until the auction resolved
@@ -8506,6 +9361,91 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_cache_hit_preserves_every_repeated_policy_header_in_order() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            stub.push_response_with_headers(
+                200,
+                b"<html><head></head><body>origin</body></html>".to_vec(),
+                vec![
+                    ("content-type", "text/html; charset=utf-8"),
+                    ("cache-control", "public, max-age=300"),
+                    ("content-security-policy", "default-src 'self'"),
+                    ("content-security-policy", "script-src 'self'"),
+                    ("link", "</one.js>; rel=preload; as=script"),
+                    ("link", "</two.css>; rel=preload; as=style"),
+                    ("cross-origin-opener-policy", "same-origin"),
+                    ("cross-origin-embedder-policy", "require-corp"),
+                ],
+            );
+
+            let _ = run(&settings, &services, navigation_request()).await;
+            let warm = run(&settings, &services, navigation_request()).await;
+
+            let values = |name: &'static str| {
+                warm.headers()
+                    .get_all(name)
+                    .iter()
+                    .map(|value| value.to_str().expect("policy header should be text"))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                values("content-security-policy"),
+                ["default-src 'self'", "script-src 'self'"]
+            );
+            assert_eq!(
+                values("link"),
+                [
+                    "</one.js>; rel=preload; as=script",
+                    "</two.css>; rel=preload; as=style"
+                ]
+            );
+            assert_eq!(values("cross-origin-opener-policy"), ["same-origin"]);
+            assert_eq!(values("cross-origin-embedder-policy"), ["require-corp"]);
+        }
+
+        #[tokio::test]
+        async fn nonce_bearing_csp_bypasses_the_shared_template_cache() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            for _ in 0..2 {
+                stub.push_response_with_headers(
+                    200,
+                    b"<html><head><script nonce=reader-nonce></script></head><body>origin</body></html>"
+                        .to_vec(),
+                    vec![
+                        ("content-type", "text/html; charset=utf-8"),
+                        ("cache-control", "public, max-age=300"),
+                        (
+                            "content-security-policy",
+                            "default-src 'self'; script-src 'nonce-reader-nonce'",
+                        ),
+                    ],
+                );
+            }
+
+            let _ = body_of(run(&settings, &services, navigation_request()).await).await;
+            let _ = body_of(run(&settings, &services, navigation_request()).await).await;
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "a response-bound CSP nonce and its HTML must never be reused from C2"
+            );
+            assert!(
+                cache
+                    .entries
+                    .lock()
+                    .expect("should lock entries")
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
         async fn a_post_is_never_answered_from_a_cached_get() {
             // `handle_publisher_request` is the `*`-method fallback route, so a publisher
             // path that renders a page on GET and accepts a form or webhook on POST reaches
@@ -8637,9 +9577,10 @@ mod tests {
             // The fail-closed default. An operator who has not stated the origin's Vary
             // must not acquire a shared cache by omission — and a real origin varies on
             // something, so this is the common path, not an edge case.
-            // Deliberately not `Accept-Encoding`: the key has a dedicated field for that
-            // one, so it is covered whatever the operator configured. Using it here
-            // would test the structural-coverage carve-out rather than the drift guard.
+            // Deliberately not `Accept-Encoding`: the shared path normalizes supported
+            // content codings to one identity template, so that header is covered
+            // whatever the operator configured. Using it here would test the
+            // structural-coverage carve-out rather than the drift guard.
             let mut varying = shareable();
             varying.insert(header::VARY, HeaderValue::from_static("rsc"));
 
@@ -8679,12 +9620,11 @@ mod tests {
                     StatusCode::OK,
                     "text/html",
                     &varying,
-                    &nothing_covered(),
+                    &VarySpec::new(["cookie".to_string()]),
                 ),
-                Some(C2BypassReason::VaryNotCovered(VaryGap(vec![
-                    "cookie".to_string()
-                ]))),
-                "the origin's own declaration must override the operator's assertion"
+                Some(C2BypassReason::VaryCookie),
+                "the origin's declaration must override both cookie independence and an \
+                 accidentally configured per-cookie key"
             );
         }
 
@@ -8741,6 +9681,31 @@ mod tests {
                 ),
                 Some(C2BypassReason::OriginNotShareable)
             );
+        }
+
+        #[test]
+        fn cdn_specific_cache_policy_cannot_be_overridden_by_public_cache_control() {
+            for name in crate::response_privacy::CDN_CACHE_HEADERS {
+                let mut split = shareable();
+                split.insert(
+                    header::HeaderName::from_static(name),
+                    HeaderValue::from_static("no-store"),
+                );
+
+                assert_eq!(
+                    c2_bypass_reason(
+                        AssemblyMode::Esi,
+                        false,
+                        false,
+                        StatusCode::OK,
+                        "text/html",
+                        &split,
+                        &nothing_covered(),
+                    ),
+                    Some(C2BypassReason::OriginNotShareable),
+                    "C2 must fail closed on the CDN-specific policy header {name}"
+                );
+            }
         }
 
         #[test]
@@ -8801,6 +9766,18 @@ mod tests {
                 ),
                 Ok(Duration::from_secs(15))
             );
+
+            let old_date_without_age = headers(&[
+                (header::CACHE_CONTROL, "public, max-age=60"),
+                (header::DATE, "Wed, 12 Aug 2026 08:00:00 GMT"),
+            ]);
+            let one_minute_later = httpdate::parse_http_date("Wed, 12 Aug 2026 08:01:00 GMT")
+                .expect("should parse fixture time");
+            assert_eq!(
+                origin_shared_ttl_at(&old_date_without_age, one_minute_later),
+                Err(C2BypassReason::NoPositiveFreshness),
+                "an old Date is apparent age even when an upstream omitted Age"
+            );
         }
 
         #[test]
@@ -8822,6 +9799,14 @@ mod tests {
                     headers(&[(header::CACHE_CONTROL, "max-age=tomorrow")]),
                     C2BypassReason::MalformedCachePolicy,
                 ),
+                (
+                    headers(&[(header::CACHE_CONTROL, "max-age=\"60")]),
+                    C2BypassReason::MalformedCachePolicy,
+                ),
+                (
+                    headers(&[(header::CACHE_CONTROL, "max-age=+60")]),
+                    C2BypassReason::MalformedCachePolicy,
+                ),
             ] {
                 assert_eq!(
                     c2_bypass_reason(
@@ -8840,18 +9825,23 @@ mod tests {
 
         #[test]
         fn expires_can_authorize_but_never_extend_an_expired_response() {
+            let now = httpdate::parse_http_date("Wed, 12 Aug 2026 08:00:00 GMT")
+                .expect("should parse fixture time");
             let fresh = headers(&[
                 (header::DATE, "Wed, 12 Aug 2026 08:00:00 GMT"),
                 (header::EXPIRES, "Wed, 12 Aug 2026 08:00:30 GMT"),
             ]);
-            assert_eq!(origin_shared_ttl(&fresh), Ok(Duration::from_secs(30)));
+            assert_eq!(
+                origin_shared_ttl_at(&fresh, now),
+                Ok(Duration::from_secs(30))
+            );
 
             let expired = headers(&[
                 (header::DATE, "Wed, 12 Aug 2026 08:01:00 GMT"),
                 (header::EXPIRES, "Wed, 12 Aug 2026 08:00:30 GMT"),
             ]);
             assert_eq!(
-                origin_shared_ttl(&expired),
+                origin_shared_ttl_at(&expired, now),
                 Err(C2BypassReason::NoPositiveFreshness)
             );
         }
@@ -8861,8 +9851,12 @@ mod tests {
             for (name, value) in [
                 (header::CACHE_CONTROL, "no-cache"),
                 (header::CACHE_CONTROL, "max-age=0"),
+                (header::CACHE_CONTROL, "max-age=30"),
+                (header::CACHE_CONTROL, "max-age=\"0"),
+                (header::CACHE_CONTROL, "min-fresh=10"),
                 (header::CACHE_CONTROL, "no-store"),
                 (header::PRAGMA, "no-cache"),
+                (header::PRAGMA, "legacy-extension, no-cache"),
                 (header::RANGE, "bytes=0-99"),
                 (header::IF_NONE_MATCH, "\"etag\""),
                 (header::IF_MODIFIED_SINCE, "Wed, 12 Aug 2026 08:00:00 GMT"),
@@ -8872,7 +9866,7 @@ mod tests {
             }
             assert!(!request_bypasses_c2(&headers(&[(
                 header::CACHE_CONTROL,
-                "max-age=30"
+                "public"
             )])));
         }
 
@@ -8967,9 +9961,7 @@ mod tests {
                     &varying,
                     &VarySpec::new(["rsc".to_string()]),
                 ),
-                Some(C2BypassReason::VaryNotCovered(VaryGap(vec![
-                    "cookie".to_string()
-                ]))),
+                Some(C2BypassReason::VaryCookie),
                 "a repeated Vary header must not hide names behind the first value"
             );
         }
@@ -9132,6 +10124,45 @@ mod tests {
                     "`{content_type}` has no HTML template to transform"
                 );
             }
+        }
+
+        #[test]
+        fn unsupported_content_encoding_is_refused_before_representation_headers_change() {
+            let map = headers(&[
+                (header::CACHE_CONTROL, "public, max-age=60"),
+                (header::CONTENT_ENCODING, "zstd"),
+            ]);
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &map,
+                    &nothing_covered(),
+                ),
+                Some(C2BypassReason::UnsupportedContentEncoding)
+            );
+
+            let mut repeated = headers(&[(header::CACHE_CONTROL, "public, max-age=60")]);
+            repeated.append(header::CONTENT_TYPE, HeaderValue::from_static("text/html"));
+            repeated.append(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &repeated,
+                    &nothing_covered(),
+                ),
+                Some(C2BypassReason::MalformedRepresentationHeaders)
+            );
         }
 
         #[test]
@@ -10793,6 +11824,59 @@ mod tests {
             Some("identity"),
             "publisher fallback should request identity when the client only accepts unsupported encodings"
         );
+    }
+
+    #[test]
+    fn esi_reader_encoding_negotiation_honours_quality_identity_and_repeated_fields() {
+        let headers = |values: &[&str]| {
+            let mut headers = edgezero_core::http::HeaderMap::new();
+            for value in values {
+                headers.append(
+                    header::ACCEPT_ENCODING,
+                    HeaderValue::from_str(value).expect("should build accept-encoding"),
+                );
+            }
+            headers
+        };
+
+        assert_eq!(
+            negotiate_reader_compression(&headers(&[])),
+            Ok(Compression::None)
+        );
+        assert_eq!(
+            negotiate_reader_compression(&headers(&["gzip;q=0.8", "br;q=0.4, identity;q=0.1"])),
+            Ok(Compression::Gzip)
+        );
+        assert_eq!(
+            negotiate_reader_compression(&headers(&["gzip, br"])),
+            Ok(Compression::Brotli),
+            "server preference breaks an equal-quality tie"
+        );
+        assert_eq!(
+            negotiate_reader_compression(&headers(&["gzip;q=0.5"])),
+            Ok(Compression::None),
+            "implicit identity has q=1"
+        );
+        assert_eq!(
+            negotiate_reader_compression(&headers(&["zstd, identity;q=0"])),
+            Err(ReaderEncodingError::NoAcceptableEncoding)
+        );
+        assert_eq!(
+            negotiate_reader_compression(&headers(&["gzip;q=invalid"])),
+            Err(ReaderEncodingError::Malformed)
+        );
+        for malformed in [
+            "gzip;q=1e-1",
+            "gzip;q=0.1234",
+            "gzip;q=1.001",
+            "not a coding;q=1",
+        ] {
+            assert_eq!(
+                negotiate_reader_compression(&headers(&[malformed])),
+                Err(ReaderEncodingError::Malformed),
+                "{malformed} is not valid Accept-Encoding syntax"
+            );
+        }
     }
 
     #[test]

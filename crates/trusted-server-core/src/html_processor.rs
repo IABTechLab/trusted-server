@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use lol_html::{
-    EndTagHandler, Settings as RewriterSettings, element,
+    EndTagHandler, Settings as RewriterSettings, doc_comments, element, end,
     html_content::{ContentType, EndTag},
     text,
 };
@@ -346,6 +346,40 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let ad_bids_state = config.ad_bids_state.clone();
     let gpt_diagnostics = config.gpt_diagnostics.clone();
 
+    // A publisher can legitimately emit the same inert comment text as the reserved
+    // C2 seam, including after `</body>`. Neutralize source comments while they are
+    // parsed; markup injected by the body end-tag handler is output, not reparsed, so
+    // the transform-owned marker remains the only exact copy.
+    let mut document_content_handlers = Vec::new();
+    if let BodyCloseInjection::Marker(marker) = &body_close
+        && let Some(reserved) = marker
+            .strip_prefix("<!--")
+            .and_then(|marker| marker.strip_suffix("-->"))
+    {
+        let reserved = reserved.to_string();
+        let escaped = format!("x{reserved}");
+        document_content_handlers.push(doc_comments!(move |comment| {
+            if comment.text() == reserved {
+                comment.set_text(&escaped)?;
+            }
+            Ok(())
+        }));
+    }
+    if let BodyCloseInjection::Marker(marker) = &body_close {
+        let marker = marker.clone();
+        let injected_bids = Arc::clone(&injected_bids);
+        document_content_handlers.push(end!(move |document_end| {
+            // HTML fragments and malformed-but-renderable documents may never expose a
+            // body end tag. Always mint a transform-owned terminal seam in that case;
+            // otherwise source bytes equal to the reserved marker could be mistaken for
+            // ownership by the post-transform exact-count validator.
+            if !injected_bids.swap(true, Ordering::SeqCst) {
+                document_end.append(&marker, ContentType::Html);
+            }
+            Ok(())
+        }));
+    }
+
     let mut element_content_handlers = vec![
         // Inject unified tsjs bundle once at the start of <head>
         element!("head", {
@@ -445,7 +479,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             Ok(())
                         });
                     handlers.push(handler);
-                } else {
+                } else if matches!(body_close, BodyCloseInjection::InlineBids) {
                     // No end tag (implicitly closed or EOF `<body>`): lol_html
                     // cannot attach an end-tag handler, so tsjs.bids/adInit() are
                     // never injected even though adSlots was injected at `<head>`.
@@ -697,6 +731,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     }
 
     let rewriter_settings = RewriterSettings {
+        document_content_handlers,
         element_content_handlers,
         ..RewriterSettings::default()
     };
@@ -1832,6 +1867,40 @@ mod tests {
         assert!(
             !html.contains("JSON.parse"),
             "should NOT inject tsjs.bids when no slots matched"
+        );
+    }
+
+    #[test]
+    fn bodyless_marker_mode_emits_an_owned_terminal_seam_even_after_source_bytes() {
+        const MARKER: &str = "<!--reserved-c2-seam-->";
+        let config = HtmlProcessorConfig {
+            body_close: BodyCloseInjection::Marker(MARKER.to_string()),
+            origin_host: "origin.example.com".to_string(),
+            request_host: "example.com".to_string(),
+            request_scheme: "https".to_string(),
+            integrations: IntegrationRegistry::empty_for_tests(),
+            ad_slots_script: None,
+            ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
+            gpt_diagnostics: None,
+        };
+        let source =
+            format!(r#"<html><head></head><script>var collision="{MARKER}";</script></html>"#);
+
+        let mut processor = create_html_processor(config);
+        let output = processor
+            .process_chunk(source.as_bytes(), true)
+            .expect("should process bodyless HTML");
+        let html = std::str::from_utf8(&output).expect("should be utf8");
+
+        assert_eq!(
+            html.matches(MARKER).count(),
+            2,
+            "one source occurrence plus one transform-owned seam must reach normalization"
+        );
+        assert!(
+            html.ends_with(MARKER),
+            "the transform-owned fallback must be unambiguously terminal"
         );
     }
 

@@ -292,10 +292,12 @@ pub struct CreativeOpportunitiesConfig {
     /// key the origin's `Vary` is not yet known. See `VarySpec` for why the alternatives
     /// (two-phase lookup, or storing the list and re-keying) were not taken.
     ///
-    /// **Unset or empty means nothing is covered, so any origin `Vary` disqualifies the
-    /// response and no template is ever cached.** That is the intended default: a
-    /// deployment that has not stated what its origin varies on must not get a shared
-    /// cache by omission.
+    /// **Unset or empty means no operator-stated header is covered, so any origin
+    /// `Vary` other than structurally covered `Accept-Encoding` disqualifies the
+    /// response.** `Cookie` may never be configured: a per-cookie object violates the
+    /// reader-neutral template contract. This fail-closed default prevents a deployment
+    /// that has not stated what its origin varies on from gaining a shared cache by
+    /// omission.
     ///
     /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -310,9 +312,9 @@ pub struct CreativeOpportunitiesConfig {
     ///
     /// Setting `true` asserts the origin serves the same HTML with or without cookies.
     /// It is not taken on trust alone — if the origin ever declares `Vary: Cookie`, the
-    /// drift guard reports an uncovered header and the response is refused regardless of
-    /// this flag. So a wrong assertion is caught whenever the origin is honest about it,
-    /// and this only widens the window where the origin personalizes *silently*.
+    /// response is refused regardless of this flag or the configured key. So a wrong
+    /// assertion is caught whenever the origin is honest about it, and this only widens
+    /// the window where the origin personalizes *silently*.
     ///
     /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -329,11 +331,6 @@ impl CreativeOpportunitiesConfig {
         self.assembly_mode.unwrap_or_default()
     }
 
-    /// Headers the cache key covers, per operator config.
-    ///
-    /// Unset yields an empty spec, which covers nothing — so any origin `Vary` reads as
-    /// a gap and the response is never cached. Failing closed is deliberate: an
-    /// unconfigured deployment should not acquire a shared cache silently.
     /// Whether a cookie-bearing request may participate in the shared cache.
     ///
     /// Defaults to `false`, which is the conservative reading and also the one that
@@ -344,6 +341,12 @@ impl CreativeOpportunitiesConfig {
         self.origin_is_cookie_independent.unwrap_or(false)
     }
 
+    /// Headers the cache key covers, per operator config.
+    ///
+    /// Unset yields an empty operator spec, so any origin `Vary` other than the
+    /// structurally covered `Accept-Encoding` reads as a gap and the response is never
+    /// cached. Failing closed is deliberate: an unconfigured deployment should not
+    /// acquire a shared cache silently.
     #[must_use]
     pub fn template_cache_vary(&self) -> crate::platform::VarySpec {
         crate::platform::VarySpec::new(self.template_cache_vary.clone().unwrap_or_default())
@@ -425,6 +428,12 @@ impl CreativeOpportunitiesConfig {
             crate::platform::VarySpec::try_new(names.clone()).map_err(|name| {
                 format!("template_cache_vary contains invalid HTTP header name `{name}`")
             })?;
+            if names.iter().any(|name| name.eq_ignore_ascii_case("cookie")) {
+                return Err(
+                    "template_cache_vary must not include Cookie; C2 templates are reader-neutral"
+                        .to_string(),
+                );
+            }
         }
 
         // A network ID is required only when a slot renders the default
@@ -2004,6 +2013,18 @@ mod tests {
             .validate_runtime()
             .expect_err("invalid field names must fail configuration validation");
         assert!(err.contains("not a header"), "unexpected error: {err}");
+
+        let cookie_key: CreativeOpportunitiesConfig = toml::from_str(
+            r#"
+                gam_network_id = "99999"
+                template_cache_vary = ["Cookie"]
+            "#,
+        )
+        .expect("shape should deserialize before runtime validation");
+        let err = cookie_key
+            .validate_runtime()
+            .expect_err("per-cookie templates violate the reader-neutral C2 contract");
+        assert!(err.contains("Cookie"), "unexpected error: {err}");
     }
 
     #[test]

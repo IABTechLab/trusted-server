@@ -1,7 +1,7 @@
 //! Fastly Core Cache backing for the shared transformed-template cache (C2).
 //!
 //! Only the Fastly adapter implements this; every other adapter uses
-//! `UnavailableTemplateCache`, so the shared assembly modes stay portable and only
+//! `UnavailableTemplateCache`, so the ESI assembly mode stays portable and only
 //! the caching is Fastly-only.
 //!
 //! **Why Core Cache and not read-through caching.** Read-through with `after_send` +
@@ -60,29 +60,39 @@ fn backend_error(message: impl Into<String>) -> TemplateCacheError {
     }
 }
 
-fn read_found(found: Found, key: &TemplateCacheKey) -> Result<TemplateEntry, TemplateCacheMiss> {
+enum ReadFoundError {
+    Invalid(TemplateCacheMiss),
+    Backend(TemplateCacheError),
+}
+
+fn read_found(found: &Found, key: &TemplateCacheKey) -> Result<TemplateEntry, ReadFoundError> {
     if found.is_stale() {
-        return Err(TemplateCacheMiss::NotFound);
+        return Err(ReadFoundError::Invalid(TemplateCacheMiss::NotFound));
     }
 
-    let metadata = TemplateMetadata::decode(&found.user_metadata())
-        .ok_or(TemplateCacheMiss::UnreadableMetadata)?;
+    let metadata = TemplateMetadata::decode(&found.user_metadata()).ok_or(
+        ReadFoundError::Invalid(TemplateCacheMiss::UnreadableMetadata),
+    )?;
     if metadata.schema_version != key.schema_version {
-        return Err(TemplateCacheMiss::SchemaMismatch);
+        return Err(ReadFoundError::Invalid(TemplateCacheMiss::SchemaMismatch));
     }
     if found
         .known_length()
         .is_some_and(|length| length != metadata.body_len)
     {
-        return Err(TemplateCacheMiss::Truncated);
+        return Err(ReadFoundError::Invalid(TemplateCacheMiss::Truncated));
     }
 
     let body = found
         .to_stream()
-        .map_err(|_| TemplateCacheMiss::NotFound)?
+        .map_err(|error| {
+            ReadFoundError::Backend(backend_error(format!(
+                "opening cached template body failed: {error:?}"
+            )))
+        })?
         .into_bytes();
     if body.len() as u64 != metadata.body_len {
-        return Err(TemplateCacheMiss::Truncated);
+        return Err(ReadFoundError::Invalid(TemplateCacheMiss::Truncated));
     }
     Ok(TemplateEntry { metadata, body })
 }
@@ -155,9 +165,10 @@ impl PlatformTemplateCache for FastlyTemplateCache {
         let found = transaction.found().ok_or_else(|| {
             backend_error("transaction returned neither a hit nor an insert obligation")
         })?;
-        Ok(match read_found(found, key) {
+        Ok(match read_found(&found, key) {
             Ok(entry) => TemplateCacheLookup::Hit(entry),
-            Err(miss) => TemplateCacheLookup::Invalid(miss),
+            Err(ReadFoundError::Invalid(miss)) => TemplateCacheLookup::Invalid(miss),
+            Err(ReadFoundError::Backend(error)) => return Err(error),
         })
     }
 
@@ -172,7 +183,15 @@ impl PlatformTemplateCache for FastlyTemplateCache {
             .map_err(|_| TemplateCacheMiss::NotFound)?
             .ok_or(TemplateCacheMiss::NotFound)?;
 
-        read_found(found, key)
+        read_found(&found, key).map_err(|error| match error {
+            ReadFoundError::Invalid(miss) => miss,
+            ReadFoundError::Backend(error) => {
+                // This legacy method cannot expose a backend error. Production uses
+                // `lookup_or_reserve`, which preserves it for bounded diagnostics.
+                log::warn!("c2_template_cache legacy read failed: {error}");
+                TemplateCacheMiss::NotFound
+            }
+        })
     }
 
     async fn put(

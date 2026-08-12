@@ -5273,7 +5273,6 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
- "derive_more",
  "edgezero-adapter-fastly",
  "edgezero-core",
  "error-stack",
