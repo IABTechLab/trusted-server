@@ -32,7 +32,7 @@ jobs:
     uses: ./.github/workflows/tsjs-performance-gate.yml
     with:
       evidence_id: ${{ inputs.evidence_id }}
-      mode: preswitch
+      mode: ${{ startsWith(inputs.evidence_id, 'aps-tsjs-postswitch-') && 'postswitch' || 'preswitch' }}
 
   prepare-artifacts:
     name: prepare integration artifacts
