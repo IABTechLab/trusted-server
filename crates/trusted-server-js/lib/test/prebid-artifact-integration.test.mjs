@@ -29,6 +29,18 @@ let shimCode;
 let prebidVersion;
 let artifactManifest;
 
+function cloneAndDeepFreezeInWindow(pageWindow, value) {
+  const cloned = pageWindow.JSON.parse(JSON.stringify(value));
+  const freeze = (entry) => {
+    if (entry && typeof entry === 'object') {
+      for (const key of pageWindow.Object.getOwnPropertyNames(entry)) freeze(entry[key]);
+      pageWindow.Object.freeze(entry);
+    }
+    return entry;
+  };
+  return freeze(cloned);
+}
+
 beforeAll(async () => {
   outputDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'trusted-server-prebid-artifacts-'));
 
@@ -211,9 +223,7 @@ describe('external bundle + served shim evaluated together', () => {
     pageWindow.eval(
       `window.__conflictingRequestBids=function conflictingRequestBids(){};window.pbjs={que:[],cmd:[]};["addAdUnits","getBidResponsesForAdUnitCode","getHighestCpmBids","offEvent","onEvent","processQueue","registerBidAdapter","renderAd","requestBids","setTargetingForGPTAsync"].forEach(function(name){window.pbjs[name]=name==="requestBids"?window.__conflictingRequestBids:function(){};});`
     );
-    pageWindow.eval(
-      `window.__conflictingStamp=(function freeze(value){if(value&&typeof value==='object'){Object.getOwnPropertyNames(value).forEach(function(key){freeze(value[key]);});Object.freeze(value);}return value;})(${JSON.stringify(conflictingStamp)});`
-    );
+    pageWindow.__conflictingStamp = cloneAndDeepFreezeInWindow(pageWindow, conflictingStamp);
     pageWindow.Object.defineProperty(pageWindow.pbjs, '__trustedServerArtifactV1', {
       value: pageWindow.__conflictingStamp,
       enumerable: false,
@@ -245,19 +255,15 @@ describe('external bundle + served shim evaluated together', () => {
     pageWindow.AbortController = AbortController;
     if (!('isSecureContext' in pageWindow)) pageWindow.isSecureContext = true;
     pageWindow.eval('window.pbjs = { que: [], cmd: [] };');
-    pageWindow.eval(
-      `window.__exactStamp=(function freeze(value){if(value&&typeof value==='object'){Object.getOwnPropertyNames(value).forEach(function(key){freeze(value[key]);});Object.freeze(value);}return value;})(${JSON.stringify(
-        {
-          abi: artifactManifest.abi,
-          artifactReleaseId: artifactManifest.artifactReleaseId,
-          prebidVersion: artifactManifest.prebidVersion,
-          moduleStems: artifactManifest.moduleStems,
-          bidderCodes: artifactManifest.bidderCodes,
-          bidderAliases: artifactManifest.bidderAliases,
-          userIdModules: artifactManifest.userIdModules,
-        }
-      )});`
-    );
+    pageWindow.__exactStamp = cloneAndDeepFreezeInWindow(pageWindow, {
+      abi: artifactManifest.abi,
+      artifactReleaseId: artifactManifest.artifactReleaseId,
+      prebidVersion: artifactManifest.prebidVersion,
+      moduleStems: artifactManifest.moduleStems,
+      bidderCodes: artifactManifest.bidderCodes,
+      bidderAliases: artifactManifest.bidderAliases,
+      userIdModules: artifactManifest.userIdModules,
+    });
     pageWindow.Object.defineProperty(pageWindow.pbjs, '__trustedServerArtifactV1', {
       value: pageWindow.__exactStamp,
       enumerable: false,
@@ -290,11 +296,7 @@ describe('external bundle + served shim evaluated together', () => {
     pageWindow.eval(
       `window.__fakeRequestBids=function fakeRequestBids(){};window.pbjs={que:[],cmd:[]};["addAdUnits","getBidResponsesForAdUnitCode","getHighestCpmBids","offEvent","onEvent","processQueue","registerBidAdapter","renderAd","requestBids","setTargetingForGPTAsync"].forEach(function(name){window.pbjs[name]=name==="requestBids"?window.__fakeRequestBids:function(){};});`
     );
-    pageWindow.eval(
-      `window.__boundaryStamp=(function freeze(value){if(value&&typeof value==='object'){Object.getOwnPropertyNames(value).forEach(function(key){freeze(value[key]);});Object.freeze(value);}return value;})(${JSON.stringify(
-        boundaryStamp
-      )});`
-    );
+    pageWindow.__boundaryStamp = cloneAndDeepFreezeInWindow(pageWindow, boundaryStamp);
     pageWindow.Object.defineProperty(pageWindow.pbjs, '__trustedServerArtifactV1', {
       value: pageWindow.__boundaryStamp,
       enumerable: false,
@@ -333,11 +335,7 @@ describe('external bundle + served shim evaluated together', () => {
     pageWindow.eval(
       `window.__fakeRequestBids=function fakeRequestBids(){};window.pbjs={que:[],cmd:[]};["addAdUnits","getBidResponsesForAdUnitCode","getHighestCpmBids","offEvent","onEvent","processQueue","registerBidAdapter","renderAd","requestBids","setTargetingForGPTAsync"].forEach(function(name){window.pbjs[name]=name==="requestBids"?window.__fakeRequestBids:function(){};});`
     );
-    pageWindow.eval(
-      `window.__malformedStamp=(function freeze(value){if(value&&typeof value==='object'){Object.getOwnPropertyNames(value).forEach(function(key){freeze(value[key]);});Object.freeze(value);}return value;})(${JSON.stringify(
-        malformedStamp
-      )});`
-    );
+    pageWindow.__malformedStamp = cloneAndDeepFreezeInWindow(pageWindow, malformedStamp);
     pageWindow.Object.defineProperty(pageWindow.pbjs, '__trustedServerArtifactV1', {
       value: pageWindow.__malformedStamp,
       enumerable: false,
