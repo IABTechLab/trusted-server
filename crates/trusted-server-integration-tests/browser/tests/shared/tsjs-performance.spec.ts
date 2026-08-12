@@ -1,66 +1,742 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, resolve } from "node:path";
-import { test, expect, type Browser, type Page } from "@playwright/test";
+import { createHash } from "node:crypto";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import {
+  expect,
+  test,
+  type Browser,
+  type BrowserContext,
+  type Page,
+  type Route,
+} from "@playwright/test";
 
 const REPO_ROOT = execFileSync("git", ["rev-parse", "--show-toplevel"], {
   encoding: "utf8",
 }).trim();
 const TSJS_CRATE = resolve(REPO_ROOT, "crates/trusted-server-js");
-const CORE_BUNDLE = resolve(TSJS_CRATE, "dist/tsjs-core.js");
-const BUILD_METRICS = resolve(TSJS_CRATE, "dist/tsjs-build-metrics-v1.json");
+const DIST = resolve(TSJS_CRATE, "dist");
+const RELEASE_FILE = resolve(DIST, "tsjs-release-v1.json");
 const WARMUPS = 5;
 const SAMPLES = 50;
 const PERCENTILE = 90;
+const P90_CEILING_MS = 28.6;
+const EXPECTED_CHROMIUM = "145.0.7632.6";
+const MACHINE_CLASS = "github-hosted:ubuntu-24.04";
+const RUNNER_IMAGE = "ubuntu-24.04";
+const FIXTURE_ID = "tsjs-core-placeholder-v1";
+const CONTROLLER_ID = "generated-server-v1";
+const CRITICAL_IDS = ["render_runtime", "gpt"] as const;
+const DEFERRED_IDS = ["diagnostics_presentation", "gpt_later"] as const;
+const HEAP_CEILINGS = {
+  afterBoot: 1_329_697,
+  afterFirstRender: 1_333_217,
+  afterRefresh: 1_333_217,
+  afterSpaNavigation: 1_341_419,
+} as const;
 
-type HeapCheckpoint =
-  | "afterBoot"
-  | "afterFirstRender"
-  | "afterRefresh"
-  | "afterSpaNavigation";
+type HeapCheckpoint = keyof typeof HEAP_CEILINGS;
 
-interface PerfApi {
-  requestAds(options?: { slots?: readonly string[] }): Promise<unknown>;
+interface ReleaseArtifact {
+  id: string;
+  role: "bootstrap" | "core" | "integration";
+  phase: "critical" | "deferred" | null;
+  trigger: "first_display_or_idle" | null;
+  file: string;
+  hash: string;
 }
 
-function fixtureDocument(): string {
-  return `<!doctype html>
-<meta charset="utf-8">
-<title>TSJS deterministic performance fixture v1</title>
-<div id="perf-slot"></div>
-<script>
-  performance.mark("tsjs:boot");
-  new MutationObserver(function recordFirstDisplay() {
-    if (performance.getEntriesByName("tsjs:first-display").length === 0) {
-      performance.mark("tsjs:first-display");
-    }
-  }).observe(document.getElementById("perf-slot"), {
-    childList: true,
-    characterData: true,
-    subtree: true
+interface Release {
+  version: 1;
+  releaseId: string;
+  artifacts: ReleaseArtifact[];
+}
+
+interface FixtureResources {
+  release: Release;
+  controllerDocument: string;
+  criticalBody: string;
+  criticalSrc: string;
+  deferred: Map<string, { body: string; src: string }>;
+}
+
+interface FixtureRun {
+  context: BrowserContext;
+  page: Page;
+  criticalRequests: string[];
+  deferredRequests: string[];
+  pageErrors: string[];
+  consoleMessages: string[];
+  close(): Promise<void>;
+}
+
+interface BrowserObservation {
+  timingMs: number;
+  markTimingMs: number;
+  bidsScriptCount: number;
+  firstDisplayCount: number;
+  firstDisplayPaintCount: number;
+  measureCount: number;
+  runtimeState: string | undefined;
+  releaseId: string | undefined;
+  displayCount: number;
+  diagnosticsPresentationCount: number;
+  criticalScriptCount: number;
+  deferred: Array<{
+    id: string;
+    startTime: number;
+    responseEnd: number;
+    loadTime: number;
+    preparationTime: number;
+    executionTime: number;
+  }>;
+  paintTime: number;
+  preloadBeforePaintCount: number;
+}
+
+function exactArtifact(release: Release, id: string): ReleaseArtifact {
+  const matches = release.artifacts.filter((artifact) => artifact.id === id);
+  if (matches.length !== 1)
+    throw new Error(`expected one release artifact for ${id}`);
+  return matches[0]!;
+}
+
+function loadFixtureResources(): FixtureResources {
+  const release = JSON.parse(readFileSync(RELEASE_FILE, "utf8")) as Release;
+  expect(release.version).toBe(1);
+  const criticalArtifacts = [exactArtifact(release, "core")].concat(
+    CRITICAL_IDS.map((id) => exactArtifact(release, id)),
+  );
+  for (const artifact of criticalArtifacts.slice(1)) {
+    expect(artifact.phase).toBe("critical");
+  }
+  const criticalBody = criticalArtifacts
+    .map((artifact) => readFileSync(resolve(DIST, artifact.file), "utf8"))
+    .join(";\n");
+  const criticalHash = createHash("sha256").update(criticalBody).digest("hex");
+  const criticalSrc = `/static/tsjs=tsjs-unified.min.js?v=${criticalHash}`;
+  const deferred = new Map<string, { body: string; src: string }>();
+  for (const id of DEFERRED_IDS) {
+    const artifact = exactArtifact(release, id);
+    expect(artifact.phase).toBe("deferred");
+    expect(artifact.trigger).toBe("first_display_or_idle");
+    deferred.set(id, {
+      body: readFileSync(resolve(DIST, artifact.file), "utf8"),
+      src: `/static/tsjs=tsjs-${id}.min.js?v=${artifact.hash}`,
+    });
+  }
+  const directory = mkdtempSync(join(tmpdir(), "tsjs-performance-controller-"));
+  const projectionPath = resolve(directory, "projection.json");
+  let controllerDocument: string;
+  try {
+    writeFileSync(projectionPath, `${JSON.stringify(initialProjection())}\n`);
+    const host = /^host: (.+)$/mu.exec(
+      execFileSync("rustc", ["-vV"], { encoding: "utf8" }),
+    )?.[1];
+    if (!host) throw new Error("Rust host target is unavailable");
+    controllerDocument = execFileSync(
+      "cargo",
+      [
+        "run",
+        "--quiet",
+        "--package",
+        "trusted-server-integration-tests",
+        "--bin",
+        "generate-tsjs-prospective-fixture",
+        "--target",
+        host,
+        "--",
+        "--projection",
+        projectionPath,
+        "--ids",
+        [...CRITICAL_IDS, ...DEFERRED_IDS].join(","),
+      ],
+      {
+        cwd: REPO_ROOT,
+        encoding: "utf8",
+        env: { ...process.env, TSJS_SKIP_BUILD: "1" },
+      },
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+  const criticalTag = `<script src="${criticalSrc}" id="trustedserver-js"></script>`;
+  expect(controllerDocument.match(/tsjs:bids-script/gu)).toHaveLength(1);
+  expect(controllerDocument.match(/id="trustedserver-js"/gu)).toHaveLength(1);
+  expect(controllerDocument).toContain(criticalTag);
+  expect(controllerDocument).toContain(`"releaseId":"${release.releaseId}"`);
+  for (const { src } of deferred.values())
+    expect(controllerDocument).toContain(src);
+  return {
+    release,
+    controllerDocument,
+    criticalBody,
+    criticalSrc,
+    deferred,
+  };
+}
+
+function initialProjection() {
+  const candidateId = "AAAAAAAAAAAA";
+  return {
+    version: 1,
+    auction: {
+      version: 1,
+      auctionId: "performance-initial",
+      results: [{ slot: "perf-slot", outcome: "winner", candidateId }],
+    },
+    slots: [
+      {
+        slot: "perf-slot",
+        gamUnitPath: "/123/performance",
+        divId: "perf-slot",
+        formats: [[300, 250]],
+        targeting: {},
+      },
+    ],
+    bids: [
+      {
+        candidateId,
+        slot: "perf-slot",
+        provider: "trusted",
+        upstreamBidId: "performance-upstream",
+        cpm: 1,
+        currency: "USD",
+        targeting: { hb_bidder: "trusted" },
+        rendererReservationId: `r1_${"a".repeat(22)}`,
+        renderSource: {
+          type: "adm",
+          version: 1,
+          adm: "<main>fictional performance creative</main>",
+          width: 300,
+          height: 250,
+        },
+      },
+    ],
+  };
+}
+
+function fixtureDocument(
+  resources: FixtureResources,
+  manualDisplay: boolean,
+): string {
+  const criticalTag = `<script src="${resources.criticalSrc}" id="trustedserver-js"></script>`;
+  const controlledCriticalTag = `<script>window.__fixtureGpt.setManual(true);</script>${criticalTag}`;
+  const withControlledGpt = resources.controllerDocument.replace(
+    criticalTag,
+    controlledCriticalTag,
+  );
+  if (withControlledGpt === resources.controllerDocument)
+    throw new Error("generated controller critical tag is unavailable");
+  if (manualDisplay) return withControlledGpt;
+  const released = withControlledGpt.replace(
+    "</body>",
+    "<script>window.__fixtureGpt.release();</script></body>",
+  );
+  if (released === withControlledGpt)
+    throw new Error("generated controller body is unavailable");
+  return released;
+}
+
+async function installFixtureGpt(context: BrowserContext): Promise<void> {
+  await context.addInitScript(() => {
+    type Listener = (event: Record<string, unknown>) => void;
+    type Slot = {
+      addService(service: object): Slot;
+      clearTargeting(key?: string): Slot;
+      getAdUnitPath(): string;
+      getSlotElementId(): string;
+      getTargeting(key: string): string[];
+      setTargeting(key: string, value: string | string[]): Slot;
+    };
+    const listeners = new Map<string, Set<Listener>>();
+    const slots = new Map<string, Slot>();
+    const physical = new Set<Slot>();
+    const commands: Array<() => void> = [];
+    const calls: string[] = [];
+    let ready = true;
+    let displayCount = 0;
+    const createSlot = (id: string, path: string): Slot => {
+      const targeting = new Map<string, string[]>();
+      const slot: Slot = {
+        addService: () => slot,
+        clearTargeting: (key?: string) => {
+          calls.push(`clearTargeting:${key ?? "*"}`);
+          if (key === undefined) targeting.clear();
+          else targeting.delete(key);
+          return slot;
+        },
+        getAdUnitPath: () => path,
+        getSlotElementId: () => id,
+        getTargeting: (key: string) => {
+          calls.push(`getTargeting:${key}`);
+          return [...(targeting.get(key) ?? [])];
+        },
+        setTargeting: (key: string, value: string | string[]) => {
+          calls.push(`setTargeting:${key}`);
+          targeting.set(key, Array.isArray(value) ? [...value] : [value]);
+          return slot;
+        },
+      };
+      slots.set(id, slot);
+      return slot;
+    };
+    const emit = (
+      name: string,
+      slot: Slot,
+      facts: Record<string, unknown> = {},
+    ) => {
+      for (const listener of listeners.get(name) ?? [])
+        listener({ slot, ...facts });
+    };
+    const pubads = {
+      addEventListener(name: string, listener: Listener) {
+        calls.push(`addEventListener:${name}`);
+        const registered = listeners.get(name) ?? new Set<Listener>();
+        registered.add(listener);
+        listeners.set(name, registered);
+      },
+      removeEventListener(name: string, listener: Listener) {
+        listeners.get(name)?.delete(listener);
+      },
+      disableInitialLoad() {},
+      enableSingleRequest() {},
+      getConfig: () => ({ disableInitialLoad: false }),
+      getSlots: () => [...physical],
+      refresh(requested?: Slot[]) {
+        calls.push("refresh");
+        for (const slot of requested ?? [...physical]) {
+          queueMicrotask(() => {
+            emit("slotRequested", slot);
+            emit("slotRenderEnded", slot, { isEmpty: true });
+          });
+        }
+      },
+    };
+    const googletag = {
+      apiReady: true,
+      pubadsReady: true,
+      cmd: {
+        push(command: () => void) {
+          if (ready) command();
+          else commands.push(command);
+          return commands.length;
+        },
+      },
+      defineSlot(path: string, _sizes: unknown, id: string) {
+        calls.push(`defineSlot:${id}`);
+        const slot = slots.get(id) ?? createSlot(id, path);
+        physical.add(slot);
+        return slot;
+      },
+      destroySlots(requested?: Slot[]) {
+        for (const slot of requested ?? [...physical]) physical.delete(slot);
+        return true;
+      },
+      display(target: string | Slot) {
+        calls.push("display");
+        const slot = typeof target === "string" ? slots.get(target) : target;
+        if (!slot) return;
+        displayCount += 1;
+        queueMicrotask(() => {
+          emit("slotRequested", slot);
+          emit("slotRenderEnded", slot, { isEmpty: true });
+        });
+      },
+      getConfig: () => ({ disableInitialLoad: false }),
+      pubads: () => pubads,
+      setConfig() {},
+    };
+    const loadTimes = new Map<string, number>();
+    const preparationTimes = new Map<string, number>();
+    const executionTimes = new Map<string, number>();
+    const preloadTimes: number[] = [];
+    new MutationObserver((records) => {
+      for (const record of records) {
+        for (const added of record.addedNodes) {
+          if (added instanceof HTMLLinkElement) {
+            if (
+              added.relList.contains("preload") &&
+              /tsjs-(?:diagnostics_presentation|gpt_later)\.min\.js/u.test(
+                added.href,
+              )
+            ) {
+              preloadTimes.push(performance.now());
+            }
+            continue;
+          }
+          if (!(added instanceof HTMLScriptElement)) continue;
+          const match = /tsjs-([a-z0-9_-]+)\.min\.js/u.exec(added.src);
+          if (!match?.[1]) continue;
+          added.addEventListener(
+            "load",
+            () => {
+              const id = match[1]!;
+              loadTimes.set(id, performance.now());
+              // The runtime's property onload handler was registered before this
+              // observer listener. It invokes synchronous module preparation before
+              // its first await, so reaching this listener proves preparation ran.
+              preparationTimes.set(id, performance.now());
+              queueMicrotask(() => {
+                // The loader's await continuation was queued before this listener;
+                // these deferred modules activate synchronously in that continuation.
+                executionTimes.set(id, performance.now());
+              });
+            },
+            {
+              once: true,
+            },
+          );
+        }
+      }
+    }).observe(document, { childList: true, subtree: true });
+    window.googletag = googletag;
+    Object.defineProperty(window, "__fixtureGpt", {
+      configurable: true,
+      value: {
+        displayCount: () => displayCount,
+        calls: () => [...calls],
+        executionTime: (id: string) => executionTimes.get(id),
+        loadTime: (id: string) => loadTimes.get(id),
+        preparationTime: (id: string) => preparationTimes.get(id),
+        preloadTimes: () => [...preloadTimes],
+        publisherRefresh() {
+          const slot = [...physical][0];
+          if (!slot)
+            return Promise.reject(
+              new Error("publisher GPT slot is unavailable"),
+            );
+          const service = googletag.pubads();
+          return new Promise<void>((resolveRefresh, rejectRefresh) => {
+            const timeout = window.setTimeout(() => {
+              service.removeEventListener("slotRenderEnded", onRendered);
+              rejectRefresh(
+                new Error("publisher GPT refresh did not complete"),
+              );
+            }, 5_000);
+            const onRendered: Listener = (event) => {
+              if (event.slot !== slot) return;
+              window.clearTimeout(timeout);
+              service.removeEventListener("slotRenderEnded", onRendered);
+              resolveRefresh();
+            };
+            service.addEventListener("slotRenderEnded", onRendered);
+            service.refresh([slot]);
+          });
+        },
+        release() {
+          ready = true;
+          googletag.apiReady = true;
+          commands.splice(0).forEach((command) => command());
+        },
+        setManual(manual: boolean) {
+          ready = !manual;
+          googletag.apiReady = !manual;
+        },
+      },
+    });
   });
-</script>`;
+}
+
+function noBidAuction(requestBody: unknown) {
+  const request = requestBody as {
+    id?: unknown;
+    imp?: Array<{ id?: unknown }>;
+  };
+  const auctionId =
+    typeof request.id === "string" ? request.id : "performance-refresh";
+  const results = (Array.isArray(request.imp) ? request.imp : []).map(
+    (imp) => ({
+      slot: typeof imp.id === "string" ? imp.id : "perf-slot",
+      outcome: "no_bid",
+    }),
+  );
+  return {
+    id: auctionId,
+    cur: "USD",
+    seatbid: [],
+    ext: {
+      trusted_server: { slot_results: { version: 1, auctionId, results } },
+    },
+  };
+}
+
+async function fulfillFixtureRoute(
+  route: Route,
+  resources: FixtureResources,
+  manualDisplay: boolean,
+): Promise<void> {
+  const url = new URL(route.request().url());
+  if (url.pathname === "/fixture") {
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html; charset=utf-8",
+      body: fixtureDocument(resources, manualDisplay),
+    });
+    return;
+  }
+  if (`${url.pathname}${url.search}` === resources.criticalSrc) {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/javascript; charset=utf-8",
+      headers: { "X-Content-Type-Options": "nosniff" },
+      body: resources.criticalBody,
+    });
+    return;
+  }
+  for (const [id, artifact] of resources.deferred) {
+    if (`${url.pathname}${url.search}` !== artifact.src) continue;
+    if (id === "gpt_later")
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 200));
+    await route.fulfill({
+      status: 200,
+      contentType: "application/javascript; charset=utf-8",
+      headers: { "X-Content-Type-Options": "nosniff" },
+      body: artifact.body,
+    });
+    return;
+  }
+  if (url.pathname === "/_ts/auction") {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(noBidAuction(route.request().postDataJSON())),
+    });
+    return;
+  }
+  if (url.pathname === "/_ts/page-bids") {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        version: 1,
+        auction: {
+          version: 1,
+          auctionId: "performance-navigation",
+          results: [{ slot: "perf-slot", outcome: "no_bid" }],
+        },
+        slots: [
+          {
+            slot: "perf-slot",
+            gamUnitPath: "/123/performance",
+            divId: "perf-slot",
+            formats: [[300, 250]],
+            targeting: {},
+          },
+        ],
+        bids: [],
+      }),
+    });
+    return;
+  }
+  await route.fulfill({ status: 404, body: "not found" });
 }
 
 async function openFixture(
   browser: Browser,
-): Promise<{ page: Page; close(): Promise<void> }> {
+  resources: FixtureResources,
+  manualDisplay = false,
+): Promise<FixtureRun> {
   const context = await browser.newContext();
+  await installFixtureGpt(context);
   const page = await context.newPage();
-  await page.setContent(fixtureDocument(), { waitUntil: "load" });
-  await page.addScriptTag({ path: CORE_BUNDLE });
-  return { page, close: () => context.close() };
+  const criticalRequests: string[] = [];
+  const deferredRequests: string[] = [];
+  const pageErrors: string[] = [];
+  const consoleMessages: string[] = [];
+  page.on("request", (request) => {
+    const url = request.url();
+    if (url.includes("/static/tsjs=tsjs-unified.min.js"))
+      criticalRequests.push(url);
+    if (
+      DEFERRED_IDS.some((id) => url.includes(`/static/tsjs=tsjs-${id}.min.js`))
+    ) {
+      deferredRequests.push(url);
+    }
+  });
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  page.on("console", (message) =>
+    consoleMessages.push(`${message.type()}: ${message.text()}`),
+  );
+  await page.route("https://performance.example/**", (route) =>
+    fulfillFixtureRoute(route, resources, manualDisplay),
+  );
+  await page.goto("https://performance.example/fixture", { waitUntil: "load" });
+  return {
+    context,
+    page,
+    criticalRequests,
+    deferredRequests,
+    pageErrors,
+    consoleMessages,
+    close: () => context.close(),
+  };
 }
 
-async function render(page: Page): Promise<number> {
-  return page.evaluate(async () => {
-    const perfWindow = window as unknown as { tsjs: PerfApi };
-    await perfWindow.tsjs.requestAds({ slots: ["perf-slot"] });
-    const boot = performance.getEntriesByName("tsjs:boot")[0]?.startTime ?? performance.now();
-    const firstDisplay =
-      performance.getEntriesByName("tsjs:first-display")[0]?.startTime ?? performance.now();
-    return firstDisplay - boot;
-  });
+async function waitForMark(run: FixtureRun, name: string): Promise<void> {
+  const { page } = run;
+  try {
+    await expect
+      .poll(() =>
+        page.evaluate(
+          (mark) => performance.getEntriesByName(mark).length,
+          name,
+        ),
+      )
+      .toBe(1);
+  } catch (error) {
+    const diagnostics = await page.evaluate(() => ({
+      runtimeState: window.tsjs?._internal?.state,
+      runtimeReason: (window.tsjs?._internal as { reason?: string } | undefined)
+        ?.reason,
+      names: window.tsjs ? Object.getOwnPropertyNames(window.tsjs) : [],
+      marks: performance
+        .getEntriesByType("mark")
+        .map((entry) => ({ name: entry.name, startTime: entry.startTime })),
+      displayCount: window.__fixtureGpt.displayCount(),
+      gptCalls: window.__fixtureGpt.calls(),
+      renderTrace: window.tsjs?.diagnostics?.renderTrace?.current(),
+      renderHistory: window.tsjs?.diagnostics?.renderTrace?.history(),
+    }));
+    throw new Error(
+      `${name} was not recorded: ${JSON.stringify({ ...diagnostics, consoleMessages: run.consoleMessages, criticalRequests: run.criticalRequests, deferredRequests: run.deferredRequests, pageErrors: run.pageErrors })}; ${String(error)}`,
+    );
+  }
+}
+
+async function observeFixture(run: FixtureRun): Promise<BrowserObservation> {
+  await waitForMark(run, "tsjs:first-display");
+  await waitForMark(run, "tsjs:first-display-paint");
+  for (const id of DEFERRED_IDS) {
+    await expect
+      .poll(() =>
+        run.page.evaluate(
+          (moduleId) => window.__fixtureGpt.executionTime(moduleId),
+          id,
+        ),
+      )
+      .not.toBeUndefined();
+  }
+  const observation = await run.page.evaluate((deferredIds) => {
+    const entries = (name: string) => performance.getEntriesByName(name);
+    const bids = entries("tsjs:bids-script");
+    const display = entries("tsjs:first-display");
+    const paint = entries("tsjs:first-display-paint");
+    const measure = entries("tsjs:boot-to-first-display");
+    const resources = performance.getEntriesByType(
+      "resource",
+    ) as PerformanceResourceTiming[];
+    const deferred = deferredIds.map((id) => {
+      const resource = resources.find((entry) =>
+        entry.name.includes(`tsjs-${id}.min.js`),
+      );
+      if (!resource)
+        throw new Error(`missing real deferred resource entry for ${id}`);
+      const loadTime = window.__fixtureGpt.loadTime(id);
+      const preparationTime = window.__fixtureGpt.preparationTime(id);
+      const executionTime = window.__fixtureGpt.executionTime(id);
+      if (
+        loadTime === undefined ||
+        preparationTime === undefined ||
+        executionTime === undefined
+      ) {
+        throw new Error(
+          `missing real deferred lifecycle observation for ${id}`,
+        );
+      }
+      return {
+        id,
+        startTime: resource.startTime,
+        responseEnd: resource.responseEnd,
+        loadTime,
+        preparationTime,
+        executionTime,
+      };
+    });
+    const paintTime = paint[0]?.startTime ?? -1;
+    return {
+      timingMs: measure[0]?.duration ?? Number.NaN,
+      markTimingMs:
+        (display[0]?.startTime ?? Number.NaN) -
+        (bids[0]?.startTime ?? Number.NaN),
+      bidsScriptCount: bids.length,
+      firstDisplayCount: display.length,
+      firstDisplayPaintCount: paint.length,
+      measureCount: measure.length,
+      runtimeState: window.tsjs?._internal?.state,
+      releaseId: window.tsjs?.releaseId,
+      displayCount: window.__fixtureGpt.displayCount(),
+      diagnosticsPresentationCount: document.querySelectorAll(
+        "#ts-render-trace-panel",
+      ).length,
+      criticalScriptCount: document.querySelectorAll("script#trustedserver-js")
+        .length,
+      deferred,
+      paintTime,
+      preloadBeforePaintCount: window.__fixtureGpt
+        .preloadTimes()
+        .filter((time) => time < paintTime).length,
+    };
+  }, DEFERRED_IDS);
+  expect(observation.bidsScriptCount).toBe(1);
+  expect(observation.firstDisplayCount).toBe(1);
+  expect(observation.firstDisplayPaintCount).toBe(1);
+  expect(observation.measureCount).toBe(1);
+  expect(observation.runtimeState).toBe("kernel");
+  expect(observation.displayCount).toBe(1);
+  expect(observation.diagnosticsPresentationCount).toBe(1);
+  expect(observation.criticalScriptCount).toBe(1);
+  expect(run.criticalRequests).toHaveLength(1);
+  expect(run.deferredRequests).toHaveLength(DEFERRED_IDS.length);
+  expect(run.pageErrors).toEqual([]);
+  expect(Number.isFinite(observation.timingMs)).toBe(true);
+  expect(observation.timingMs).toBeGreaterThanOrEqual(0);
+  expect(observation.timingMs).toBeCloseTo(observation.markTimingMs, 8);
+  expect(observation.preloadBeforePaintCount).toBe(0);
+  expect(
+    observation.deferred.every(
+      (entry) => entry.startTime >= observation.paintTime,
+    ),
+  ).toBe(true);
+  expect(
+    observation.deferred.every(
+      (entry) => entry.preparationTime >= observation.paintTime,
+    ),
+  ).toBe(true);
+  expect(
+    observation.deferred.every(
+      (entry) => entry.executionTime >= observation.paintTime,
+    ),
+  ).toBe(true);
+  expect(
+    observation.deferred.every(
+      (entry) =>
+        entry.startTime <= entry.responseEnd &&
+        entry.responseEnd <= entry.loadTime &&
+        entry.loadTime <= entry.preparationTime &&
+        entry.preparationTime <= entry.executionTime,
+    ),
+  ).toBe(true);
+  expect(
+    Math.max(...observation.deferred.map((entry) => entry.startTime)) -
+      Math.min(...observation.deferred.map((entry) => entry.startTime)),
+  ).toBeLessThanOrEqual(50);
+  const fast = observation.deferred.find(
+    ({ id }) => id === "diagnostics_presentation",
+  )!;
+  const slow = observation.deferred.find(({ id }) => id === "gpt_later")!;
+  expect(fast.responseEnd).toBeLessThan(slow.responseEnd);
+  expect(fast.loadTime).toBeLessThan(slow.loadTime);
+  expect(fast.executionTime).toBeLessThan(slow.executionTime);
+  expect(fast.executionTime).toBeLessThan(slow.responseEnd);
+  return observation;
 }
 
 async function collectHeap(page: Page): Promise<number> {
@@ -74,145 +750,250 @@ async function collectHeap(page: Page): Promise<number> {
   }
 }
 
-function p90(values: number[]): number {
+function p90(values: readonly number[]): number {
   const ordered = [...values].sort((left, right) => left - right);
   return ordered[Math.ceil((PERCENTILE / 100) * ordered.length) - 1]!;
 }
 
 function packageVersion(packagePath: string): string {
-  const packageJson = JSON.parse(readFileSync(packagePath, "utf8")) as {
-    version: string;
-  };
-  return packageJson.version;
+  return (JSON.parse(readFileSync(packagePath, "utf8")) as { version: string })
+    .version;
 }
 
-test.describe("TSJS deterministic performance evidence", () => {
-  test("records bundle, p90 display, and forced-GC heap baselines", async ({
+declare global {
+  interface Window {
+    googletag: unknown;
+    __fixtureGpt: {
+      displayCount(): number;
+      calls(): string[];
+      executionTime(id: string): number | undefined;
+      loadTime(id: string): number | undefined;
+      preparationTime(id: string): number | undefined;
+      preloadTimes(): number[];
+      publisherRefresh(): Promise<void>;
+      release(): void;
+      setManual(manual: boolean): void;
+    };
+    tsjs?: {
+      _internal?: { state?: string };
+      diagnostics?: {
+        renderTrace?: { current(): unknown; history(): unknown };
+      };
+      releaseId?: string;
+      requestAds(options?: { slots?: readonly string[] }): Promise<unknown>;
+    };
+  }
+}
+
+test.describe("TSJS first-display performance gate", () => {
+  test.describe.configure({ retries: 0, mode: "serial" });
+
+  test("records complete real timing, heap, and request-ordering evidence", async ({
     browser,
     browserName,
   }) => {
-    test.setTimeout(180_000);
+    test.setTimeout(240_000);
     const mode = process.env.TSJS_PERF_MODE;
     test.skip(
-      mode !== "baseline" && mode !== "gate",
+      mode !== "preswitch" && mode !== "postswitch",
       "performance evidence run only",
     );
     expect(browserName).toBe("chromium");
+    expect(browser.version()).toBe(EXPECTED_CHROMIUM);
+    expect(process.env.TSJS_PERF_MACHINE_CLASS).toBe(MACHINE_CLASS);
+    expect(process.env.TSJS_PERF_RUNNER_IMAGE).toBe(RUNNER_IMAGE);
+    const resources = loadFixtureResources();
 
     for (let index = 0; index < WARMUPS; index += 1) {
-      const fixture = await openFixture(browser);
+      const run = await openFixture(browser, resources);
       try {
-        await render(fixture.page);
+        await observeFixture(run);
       } finally {
-        await fixture.close();
+        await run.close();
       }
     }
 
-    const displaySamplesMs: number[] = [];
+    const samples: number[] = [];
+    let representative: BrowserObservation | undefined;
     for (let index = 0; index < SAMPLES; index += 1) {
-      const fixture = await openFixture(browser);
+      const run = await openFixture(browser, resources);
       try {
-        displaySamplesMs.push(await render(fixture.page));
+        representative = await observeFixture(run);
+        samples.push(representative.timingMs);
+        expect(representative.releaseId).toBe(resources.release.releaseId);
       } finally {
-        await fixture.close();
+        await run.close();
       }
     }
+    expect(samples).toHaveLength(SAMPLES);
+    const sampledP90 = p90(samples);
+    expect(sampledP90).toBeLessThanOrEqual(P90_CEILING_MS);
 
-    const heapFixture = await openFixture(browser);
+    const heapRun = await openFixture(browser, resources, true);
     const retainedHeapBytes = {} as Record<HeapCheckpoint, number>;
     try {
-      retainedHeapBytes.afterBoot = await collectHeap(heapFixture.page);
-      await render(heapFixture.page);
-      retainedHeapBytes.afterFirstRender = await collectHeap(heapFixture.page);
-      await heapFixture.page.evaluate(async () => {
-        const perfWindow = window as unknown as { tsjs: PerfApi };
-        await perfWindow.tsjs.requestAds({ slots: ["perf-slot"] });
-      });
-      retainedHeapBytes.afterRefresh = await collectHeap(heapFixture.page);
-      await heapFixture.page.evaluate(async () => {
-        location.hash = "performance-fixture-navigation";
-        const oldSlot = document.getElementById("perf-slot");
-        const replacement = document.createElement("div");
-        replacement.id = "perf-slot";
-        oldSlot?.replaceWith(replacement);
-        const perfWindow = window as unknown as { tsjs: PerfApi };
-        await perfWindow.tsjs.requestAds({ slots: ["perf-slot"] });
-      });
-      retainedHeapBytes.afterSpaNavigation = await collectHeap(
-        heapFixture.page,
+      await expect
+        .poll(() => heapRun.page.evaluate(() => window.tsjs?._internal?.state))
+        .toBe("kernel");
+      retainedHeapBytes.afterBoot = await collectHeap(heapRun.page);
+      await heapRun.page.evaluate(() => window.__fixtureGpt.release());
+      await waitForMark(heapRun, "tsjs:first-display-paint");
+      retainedHeapBytes.afterFirstRender = await collectHeap(heapRun.page);
+      await heapRun.page.evaluate(() => window.__fixtureGpt.publisherRefresh());
+      retainedHeapBytes.afterRefresh = await collectHeap(heapRun.page);
+      for (const id of DEFERRED_IDS) {
+        await expect
+          .poll(() =>
+            heapRun.page.evaluate(
+              (moduleId) => window.__fixtureGpt.executionTime(moduleId),
+              id,
+            ),
+          )
+          .not.toBeUndefined();
+      }
+      const navigationResponse = heapRun.page.waitForResponse((response) =>
+        response.url().includes("/_ts/page-bids"),
       );
+      await heapRun.page.evaluate(() =>
+        history.pushState({}, "", "/fixture?navigation=1"),
+      );
+      const response = await navigationResponse;
+      expect(await response.finished()).toBeNull();
+      // Replacement disposal removes the old physical slot before page-bids fetch.
+      // Its return proves the response was parsed, committed, and reconciled.
+      await expect
+        .poll(() =>
+          heapRun.page.evaluate(() => {
+            const googletag = window.googletag as {
+              pubads(): {
+                getSlots(): Array<{ getSlotElementId(): string }>;
+              };
+            };
+            return googletag
+              .pubads()
+              .getSlots()
+              .map((slot) => slot.getSlotElementId());
+          }),
+        )
+        .toEqual(["perf-slot"]);
+      retainedHeapBytes.afterSpaNavigation = await collectHeap(heapRun.page);
     } finally {
-      await heapFixture.close();
+      await heapRun.close();
+    }
+    for (const [name, ceiling] of Object.entries(HEAP_CEILINGS) as Array<
+      [HeapCheckpoint, number]
+    >) {
+      expect(
+        retainedHeapBytes[name],
+        `${name} retained heap`,
+      ).toBeLessThanOrEqual(ceiling);
     }
 
+    const evidenceId = process.env.TSJS_EVIDENCE_ID;
+    const headSha = process.env.GITHUB_SHA;
     const outputArgument = process.env.TSJS_PERF_OUTPUT;
+    expect(evidenceId, "TSJS_EVIDENCE_ID is required").toMatch(
+      /^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/u,
+    );
+    expect(headSha, "GITHUB_SHA is required").toMatch(/^[0-9a-f]{40}$/u);
     expect(outputArgument, "TSJS_PERF_OUTPUT is required").toBeTruthy();
     const outputPath = isAbsolute(outputArgument!)
       ? outputArgument!
       : resolve(REPO_ROOT, outputArgument!);
-    const buildMetrics = JSON.parse(readFileSync(BUILD_METRICS, "utf8")) as {
-      schemaVersion: number;
-      sets: Record<string, unknown>;
-    };
-    expect(buildMetrics.schemaVersion).toBe(1);
-
+    const deferredBeforePaint = representative!.deferred.filter(
+      ({ startTime }) => startTime < representative!.paintTime,
+    ).length;
+    const deferredPreparationBeforePaint = representative!.deferred.filter(
+      ({ preparationTime }) => preparationTime < representative!.paintTime,
+    ).length;
+    const deferredExecutionBeforePaint = representative!.deferred.filter(
+      ({ executionTime }) => executionTime < representative!.paintTime,
+    ).length;
+    const deferredStarts = representative!.deferred.map(
+      ({ startTime }) => startTime,
+    );
+    const fastDeferred = representative!.deferred.find(
+      ({ id }) => id === "diagnostics_presentation",
+    )!;
+    const slowDeferred = representative!.deferred.find(
+      ({ id }) => id === "gpt_later",
+    )!;
     const npmVersion = execFileSync("npm", ["--version"], {
       encoding: "utf8",
     }).trim();
-    const artifact = {
-      schemaVersion: 1,
+    const evidence = {
+      schemaVersion: 2,
+      evidenceId,
       mode,
-      source: {
-        ref: execFileSync("git", ["branch", "--show-current"], {
-          cwd: REPO_ROOT,
-          encoding: "utf8",
-        }).trim(),
-        sha: execFileSync("git", ["rev-parse", "HEAD"], {
-          cwd: REPO_ROOT,
-          encoding: "utf8",
-        }).trim(),
-      },
+      headSha,
       environment: {
+        chromium: browser.version(),
+        controller: CONTROLLER_ID,
+        machineClass: process.env.TSJS_PERF_MACHINE_CLASS,
+        runnerImage: process.env.TSJS_PERF_RUNNER_IMAGE,
+        fixture: FIXTURE_ID,
         node: process.version,
         npm: npmVersion,
         typescript: packageVersion(
-          resolve(
-            REPO_ROOT,
-            "crates/trusted-server-js/lib/node_modules/typescript/package.json",
-          ),
+          resolve(TSJS_CRATE, "lib/node_modules/typescript/package.json"),
         ),
-        chromium: browser.version(),
-        ciMachineClass:
-          process.env.TSJS_PERF_MACHINE_CLASS ??
-          (process.env.CI
-            ? "github-hosted:ubuntu-latest"
-            : `local:${process.platform}-${process.arch}`),
-        fixture: "tsjs-core-placeholder-v1",
       },
-      sampling: {
-        warmups: WARMUPS,
-        samples: SAMPLES,
-        percentile: PERCENTILE,
+      sampling: { warmups: WARMUPS, samples: SAMPLES, percentile: PERCENTILE },
+      marks: {
+        source: "performance-entry",
+        bidsScript: representative!.bidsScriptCount === 1,
+        firstDisplay: representative!.firstDisplayCount === 1,
+        firstDisplayPaint: representative!.firstDisplayPaintCount === 1,
       },
-      bundles: buildMetrics.sets,
       performance: {
         bootToFirstDisplayMs: {
-          samples: displaySamplesMs,
-          p90: p90(displaySamplesMs),
+          samples,
+          percentile: PERCENTILE,
+          p90: sampledP90,
+          ceilingMs: P90_CEILING_MS,
         },
-        retainedHeapBytes,
       },
-      evidence: {
-        evidenceId: process.env.TSJS_EVIDENCE_ID ?? null,
-        workflowRunId: process.env.GITHUB_RUN_ID
-          ? Number(process.env.GITHUB_RUN_ID)
-          : null,
+      heap: {
+        collection: "one-collectGarbage-then-immediate-getHeapUsage",
+        checkpoints: Object.fromEntries(
+          (
+            Object.entries(HEAP_CEILINGS) as Array<[HeapCheckpoint, number]>
+          ).map(([name, ceilingBytes]) => [
+            name,
+            { usedSize: retainedHeapBytes[name], ceilingBytes },
+          ]),
+        ),
       },
+      requests: {
+        critical: { count: 1 },
+        deferred: {
+          count: representative!.deferred.length,
+          requestBeforePaintCount: deferredBeforePaint,
+          preloadBeforePaintCount: representative!.preloadBeforePaintCount,
+          preparationBeforePaintCount: deferredPreparationBeforePaint,
+          executionBeforePaintCount: deferredExecutionBeforePaint,
+          independentlyTriggered:
+            Math.max(...deferredStarts) - Math.min(...deferredStarts) <= 50,
+          headOfLineBlocking: !(
+            fastDeferred.responseEnd < slowDeferred.responseEnd &&
+            fastDeferred.loadTime < slowDeferred.loadTime &&
+            fastDeferred.executionTime < slowDeferred.executionTime &&
+            fastDeferred.executionTime < slowDeferred.responseEnd
+          ),
+        },
+      },
+      assertions: { correctness: true, loadOrder: true },
+      provenance: {
+        workflowName: process.env.TSJS_PERF_WORKFLOW_NAME,
+        workflowFile: process.env.TSJS_PERF_WORKFLOW_FILE,
+        runId: Number(process.env.GITHUB_RUN_ID),
+        runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT),
+        artifactName: process.env.TSJS_PERF_ARTIFACT_NAME,
+        headSha,
+      },
+      result: "complete",
     };
-
     mkdirSync(dirname(outputPath), { recursive: true });
-    writeFileSync(outputPath, `${JSON.stringify(artifact, null, 2)}\n`);
-    expect(displaySamplesMs).toHaveLength(SAMPLES);
-    expect(Object.values(retainedHeapBytes)).toHaveLength(4);
+    writeFileSync(outputPath, `${JSON.stringify(evidence, null, 2)}\n`);
   });
 });

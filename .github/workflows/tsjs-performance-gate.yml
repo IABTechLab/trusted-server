@@ -1,0 +1,132 @@
+name: "TSJS Performance Gate"
+run-name: >-
+  TSJS Performance Gate / ${{ inputs.evidence_id }} / ${{ inputs.mode }}
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      evidence_id:
+        description: Unique identifier bound to the uploaded evidence
+        required: true
+        type: string
+      mode:
+        description: Cutover side measured by this run
+        required: true
+        type: choice
+        options:
+          - preswitch
+          - postswitch
+  workflow_call:
+    inputs:
+      evidence_id:
+        description: Unique identifier bound to the uploaded evidence
+        required: true
+        type: string
+      mode:
+        description: Cutover side measured by this run (preswitch or postswitch)
+        required: true
+        type: string
+
+env:
+  TSJS_PERF_MACHINE_CLASS: github-hosted:ubuntu-24.04
+  TSJS_PERF_RUNNER_IMAGE: ubuntu-24.04
+  TSJS_PERF_WORKFLOW_NAME: TSJS Performance Gate
+  TSJS_PERF_WORKFLOW_FILE: .github/workflows/tsjs-performance-gate.yml
+
+jobs:
+  measure:
+    name: measure ${{ inputs.mode }} (${{ inputs.evidence_id }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      TSJS_EVIDENCE_ID: ${{ inputs.evidence_id }}
+      TSJS_PERF_MODE: ${{ inputs.mode }}
+      TSJS_PERF_ARTIFACT_NAME: tsjs-performance-${{ inputs.evidence_id }}
+      TSJS_PERF_OUTPUT: crates/trusted-server-integration-tests/browser/test-results/tsjs-performance-${{ inputs.mode }}.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate immutable measurement inputs
+        shell: bash
+        run: |
+          test "$TSJS_PERF_MODE" = preswitch || test "$TSJS_PERF_MODE" = postswitch
+          [[ "$TSJS_EVIDENCE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$ ]]
+
+      - name: Read repository toolchain pins
+        id: toolchains
+        shell: bash
+        run: |
+          echo "node=$(awk '$1 == \"nodejs\" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+          echo "rust=$(awk '$1 == \"rust\" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.toolchains.outputs.node }}
+          cache: npm
+          cache-dependency-path: |
+            crates/trusted-server-js/lib/package-lock.json
+            crates/trusted-server-integration-tests/browser/package-lock.json
+
+      - name: Set up pinned Rust for the generated controller fixture
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.toolchains.outputs.rust }}
+          cache-shared-key: cargo-${{ runner.os }}-tsjs-performance
+
+      - name: Build the real TSJS artifacts once
+        working-directory: crates/trusted-server-js/lib
+        run: |
+          npm ci
+          npm run build
+          npm run check:bundle
+
+      - name: Install the lockfile-pinned Chromium setup
+        working-directory: crates/trusted-server-integration-tests/browser
+        run: |
+          npm ci
+          node -e 'const version = require("@playwright/test/package.json").version; if (version !== "1.58.2") throw new Error("unexpected Playwright " + version)'
+          npx playwright install --with-deps chromium
+
+      - name: Run the complete TSJS performance sample exactly once
+        working-directory: crates/trusted-server-integration-tests/browser
+        env:
+          CI: "true"
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          config_file="$RUNNER_TEMP/tsjs-performance-playwright.config.mjs"
+          printf "%s\n" \
+            "export default {" \
+            "  testDir: process.cwd()," \
+            "  timeout: 30000," \
+            "  retries: 0," \
+            "  workers: 1," \
+            "  use: { headless: true }," \
+            "  projects: [{ name: 'chromium', use: { browserName: 'chromium' } }]," \
+            "  reporter: [['list']]," \
+            "  outputDir: './test-results'" \
+            "};" > "$config_file"
+          npx playwright test \
+            tests/shared/tsjs-performance.spec.ts \
+            --config="$config_file" \
+            --project=chromium \
+            --workers=1
+
+      - name: Validate the generated evidence before upload
+        run: >-
+          node scripts/validate-tsjs-performance-evidence.mjs
+          --file "$TSJS_PERF_OUTPUT"
+          --evidence-id "$TSJS_EVIDENCE_ID"
+          --head-sha "${{ github.sha }}"
+          --mode "$TSJS_PERF_MODE"
+
+      - name: Upload immutable TSJS performance evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TSJS_PERF_ARTIFACT_NAME }}
+          path: ${{ env.TSJS_PERF_OUTPUT }}
+          if-no-files-found: error
+          retention-days: 30
