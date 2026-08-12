@@ -41,6 +41,7 @@ function clientAuctionBundlePaths() {
  */
 async function loadClientAuctionBundles(page: Page): Promise<void> {
     const bundles = clientAuctionBundlePaths();
+    await page.addScriptTag({ path: bundles.core });
     await page.addScriptTag({ path: bundles.gpt });
     await page.addScriptTag({ path: bundles.prebid });
     const decoupledBundle = await page.evaluate(() =>
