@@ -1,5 +1,29 @@
 // Origin helpers shared by creative runtime modules.
 
+const nativeUrl = typeof URL === 'undefined' ? undefined : URL;
+
+// Normalize a candidate first-party origin, returning '' when it is unusable.
+// URL parsing keeps valid IPv6 literals working while the credential and
+// character checks make the result safe to embed in the srcdoc stamp.
+export function normalizeTrustedOrigin(candidate: unknown): string {
+  if (typeof candidate !== 'string' || !candidate || !nativeUrl) return '';
+  try {
+    const parsed = new nativeUrl(candidate);
+    if (
+      (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') ||
+      parsed.username !== '' ||
+      parsed.password !== ''
+    ) {
+      return '';
+    }
+    const origin = parsed.origin;
+    if (!origin || origin === 'null' || /['"<>\\\s]/.test(origin)) return '';
+    return origin;
+  } catch {
+    return '';
+  }
+}
+
 // A sandboxed srcdoc creative without `allow-same-origin` runs in an opaque
 // origin: every fetch from it is cross-origin (`Origin: null`), and any
 // preflighted request fails against endpoints that do not answer CORS.
@@ -32,16 +56,16 @@ export function hasOpaqueOrigin(): boolean {
 // creative markup whenever rewriting is enabled.
 export const TRUSTED_BASE_URL: string = (() => {
   try {
-    const stamped = (window as { __tsCreativeOrigin?: unknown }).__tsCreativeOrigin;
-    if (typeof stamped === 'string' && /^https?:\/\/[a-z0-9.-]+(:\d+)?$/i.test(stamped)) {
-      return stamped;
-    }
+    const stamped = normalizeTrustedOrigin(
+      (window as { __tsCreativeOrigin?: unknown }).__tsCreativeOrigin
+    );
+    if (stamped) return stamped;
   } catch {
     // fall through
   }
   try {
-    const origin = location.origin;
-    if (origin && origin !== 'null') return origin;
+    const origin = normalizeTrustedOrigin(location.origin);
+    if (origin) return origin;
   } catch {
     // fall through
   }
@@ -59,15 +83,7 @@ export const TRUSTED_BASE_URL: string = (() => {
 // so normalize it to its origin while retaining the same HTTP(S)-only and
 // credential-free trust boundary.
 export function trustedHttpOrigin(baseUrl: string = TRUSTED_BASE_URL): string {
-  if (!baseUrl) return '';
-  try {
-    const parsed = new URL(baseUrl);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
-    if (parsed.username !== '' || parsed.password !== '') return '';
-    return parsed.origin;
-  } catch {
-    return '';
-  }
+  return normalizeTrustedOrigin(baseUrl);
 }
 
 export function trustedDocumentHttpOrigin(

@@ -181,10 +181,32 @@ describe('render', () => {
     const creativeHtml = '<div>creative</div>';
     const documentHtml = buildCreativeDocument(creativeHtml);
 
-    expect(documentHtml).toContain(`window.__tsCreativeOrigin = '${location.origin}'`);
+    expect(documentHtml).toContain(`value: '${location.origin}'`);
     expect(documentHtml.indexOf('__tsCreativeOrigin')).toBeLessThan(
       documentHtml.indexOf(creativeHtml)
     );
+  });
+
+  it('defines the stamped origin so creative script cannot overwrite it', async () => {
+    const { buildCreativeDocument } = await import('../../src/core/render');
+    const documentHtml = buildCreativeDocument('<div>creative</div>');
+
+    expect(documentHtml).toContain("Object.defineProperty(window, '__tsCreativeOrigin'");
+    expect(documentHtml).toContain('writable: false');
+    expect(documentHtml).toContain('configurable: false');
+
+    const parsed = new DOMParser().parseFromString(documentHtml, 'text/html');
+    const stamp = parsed.querySelector('head script')?.textContent;
+    expect(stamp, 'document should carry the stamping script').toBeTruthy();
+    const host: Record<string, unknown> = {};
+    new Function('window', stamp as string)(host);
+    expect(host.__tsCreativeOrigin).toBe(location.origin);
+    try {
+      host.__tsCreativeOrigin = 'https://attacker.example';
+    } catch {
+      // Strict-mode assignment may throw; the immutable value must survive either way.
+    }
+    expect(host.__tsCreativeOrigin).toBe(location.origin);
   });
 
   it('accepts safe static markup during sanitization', async () => {

@@ -1659,6 +1659,35 @@ describe('Prebid selection coordination', () => {
     harness.runtime.dispose();
   });
 
+  it('selects an APS reservation after Prebid strips unknown top-level fields', () => {
+    // The legacy adapter carried the executable APS descriptor in a custom
+    // top-level field, which Prebid normalization dropped. The hard-cutover
+    // contract is stronger: only first-class `adId` plus per-bid `meta`
+    // identity cross Prebid; the executable source remains in the reservation.
+    const harness = prepareSelection();
+    const selected = harness.admitted('m');
+    const normalized = Object.freeze({
+      adId: selected.bid.adId,
+      adUnitCode: selected.adUnitCode,
+      auctionId: selected.auctionId,
+      bidderCode: selected.bid.bidderCode,
+      cpm: selected.bid.cpm,
+      meta: Object.freeze({ ...selected.bid.meta }),
+      requestId: selected.bid.requestId,
+    });
+
+    harness.coordinator.auctionEnded(
+      Object.freeze({ auctionId: selected.auctionId }),
+      Object.freeze({ highestBids: () => Object.freeze([normalized]) })
+    );
+
+    expect(harness.reservations.recognize(selected.bid.adId)).toMatchObject({
+      state: 'renderable',
+    });
+    expect(harness.activateAttempt).toHaveBeenCalledOnce();
+    harness.runtime.dispose();
+  });
+
   it('tombstones a selected reservation when its PUC attempt cannot activate', () => {
     const harness = prepareSelection({ activateResult: false });
     const selected = harness.admitted('f');

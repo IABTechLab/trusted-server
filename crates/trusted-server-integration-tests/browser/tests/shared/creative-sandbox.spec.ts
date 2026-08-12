@@ -23,9 +23,8 @@ function creativeDocument(
   origin: string,
   bundleUrl: string,
   releaseId: string,
+  signedClick: string,
 ): string {
-  const signedClick =
-    "/first-party/click?tsurl=https%3A%2F%2Fadvertiser.example%2Flanding&foo=1&tstoken=browser-test-token";
   const boot = JSON.stringify({
     abi: 1,
     releaseId,
@@ -56,8 +55,16 @@ function creativeDocument(
 <html>
   <head>
     <script>
-      window.__tsCreativeOrigin = ${JSON.stringify(origin)};
+      Object.defineProperty(window, '__tsCreativeOrigin', {
+        value: ${JSON.stringify(origin)},
+        writable: false,
+        configurable: false,
+        enumerable: false,
+      });
       window.tsjs = { boot: ${boot}, que: [], _integrationConfig: {} };
+    </script>
+    <script>
+      try { window.__tsCreativeOrigin = 'https://attacker.invalid'; } catch (_error) {}
     </script>
     <script src="${bundleUrl}"></script>
   </head>
@@ -71,6 +78,21 @@ test.describe("Sandboxed creative iframe", () => {
   test("recovers a mutated click through the GET rebuild fallback", async ({
     page,
   }) => {
+    const origin = new URL(runtimeUrl("/")).origin;
+    const landing = runtimeUrl("/health");
+    const signResponse = await page.request.post(
+      runtimeUrl("/first-party/sign"),
+      { data: { url: landing } },
+    );
+    expect(signResponse.ok()).toBe(true);
+    const signedProxyHref = ((await signResponse.json()) as { href: string })
+      .href;
+    const signedClick = signedProxyHref.replace(
+      "/first-party/proxy?",
+      "/first-party/click?",
+    );
+    expect(signedClick.startsWith("/first-party/click?")).toBe(true);
+
     await page.goto(runtimeUrl("/"), { waitUntil: "domcontentloaded" });
 
     // Prefer whichever hashed bundle URL the server injected into the page so
@@ -90,8 +112,14 @@ test.describe("Sandboxed creative iframe", () => {
       runtime.bundleUrl ?? runtimeUrl("/static/tsjs=tsjs-unified.min.js");
     expect(runtime.releaseId).toMatch(/^[a-f0-9]{64}$/);
 
-    const rebuildRequest = page.waitForRequest(
-      (request) => request.url().includes("/first-party/proxy-rebuild"),
+    const rebuildResponse = page.waitForResponse(
+      (response) => response.url().includes("/first-party/proxy-rebuild"),
+      { timeout: 15_000 },
+    );
+    const clickResponse = page.waitForResponse(
+      (response) =>
+        response.url().includes("/first-party/click") &&
+        response.request().resourceType() === "document",
       { timeout: 15_000 },
     );
 
@@ -107,9 +135,10 @@ test.describe("Sandboxed creative iframe", () => {
       {
         sandbox: CREATIVE_SANDBOX_TOKENS,
         html: creativeDocument(
-          new URL(runtimeUrl("/")).origin,
+          origin,
           bundleUrl,
           runtime.releaseId!,
+          signedClick,
         ),
       },
     );
@@ -150,17 +179,18 @@ test.describe("Sandboxed creative iframe", () => {
 
     // The creative mutates its own click target, the shape the click guard
     // exists to repair.
-    await link.evaluate((element) => {
-      element.setAttribute(
-        "href",
-        "https://advertiser.example/landing?foo=1&bar=2",
-      );
-    });
+    await link.evaluate((element, click) => {
+      element.setAttribute("href", `${click}&bar=2`);
+    }, signedClick);
 
     await link.click({ force: true });
 
-    const request = await rebuildRequest;
-    expect(request.url()).toContain("tsclick=");
-    expect(decodeURIComponent(request.url())).toContain("bar");
+    const rebuild = await rebuildResponse;
+    expect(rebuild.url().startsWith(origin)).toBe(true);
+    expect(rebuild.status()).toBe(302);
+    const click = await clickResponse;
+    expect(click.url().startsWith(origin)).toBe(true);
+    expect(click.status()).toBe(302);
+    expect(decodeURIComponent(click.url())).toContain("bar=2");
   });
 });

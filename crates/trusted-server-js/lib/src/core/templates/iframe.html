@@ -1,11 +1,23 @@
-<!DOCTYPE html>
+<!doctype html>
 <html>
   <head>
     <meta charset="utf-8" />
     <script>
-      window.__tsCreativeOrigin = '%TRUSTED_ORIGIN%';
+      // Creative markup can execute before the body-injected runtime. Keep the
+      // first-party resolution stamp immutable so bidder code cannot redirect
+      // click recovery or signed resource resolution to another origin.
+      Object.defineProperty(window, '__tsCreativeOrigin', {
+        value: '%TRUSTED_ORIGIN%',
+        writable: false,
+        configurable: false,
+        enumerable: false,
+      });
     </script>
-    <style>%NORMALIZE_CSS%</style>
+    <style>
+      %NORMALIZE_CSS%
+    </style>
   </head>
-  <body style="margin:0;padding:0;overflow:hidden">%CREATIVE_HTML%</body>
+  <body style="margin: 0; padding: 0; overflow: hidden">
+    %CREATIVE_HTML%
+  </body>
 </html>

@@ -299,6 +299,53 @@ function resolveSafeNavigationUrl(url: string): string | null {
   return null;
 }
 
+// Fastly rejects request URLs over 8192 bytes before the handler runs. Leave
+// room for request-line overhead and percent-encoding expansion.
+const MAX_REBUILD_URL_LENGTH = 7000;
+const REBUILD_PATH = '/first-party/proxy-rebuild';
+
+function isRebuildNavigationUrl(url: string): boolean {
+  try {
+    return new URL(url, TRUSTED_BASE_URL).pathname === REBUILD_PATH;
+  } catch {
+    return false;
+  }
+}
+
+// An opaque-origin creative cannot use the JSON fetch path. For a recovery URL
+// too long to navigate as GET, submit the same fields in a form body; this stays
+// a user-initiated navigation and therefore does not require CORS.
+function submitRebuildNavigation(anchor: AnchorLike, rebuildUrl: string): boolean {
+  try {
+    if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
+      return false;
+    }
+    const parsed = new URL(rebuildUrl, TRUSTED_BASE_URL);
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = parsed.origin + parsed.pathname;
+    form.target = anchor.getAttribute('target') || '_self';
+    form.rel = 'noopener noreferrer';
+    form.style.display = 'none';
+    for (const field of ['tsclick', 'add', 'del']) {
+      const value = parsed.searchParams.get(field);
+      if (value === null) continue;
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = field;
+      input.value = value;
+      form.appendChild(input);
+    }
+    if (!form.querySelector('input[name="tsclick"]')) return false;
+    (document.body ?? document.documentElement).appendChild(form);
+    form.submit();
+    return true;
+  } catch (err) {
+    log.warn('tsjs-creative:click: rebuild form navigation failed', err);
+    return false;
+  }
+}
+
 // Send the user to the resolved URL while respecting middle clicks and targets.
 // Root-relative URLs are absolutized against the pinned trusted base first: in
 // the sandboxed srcdoc iframe there is no usable document URL for the
@@ -306,6 +353,14 @@ function resolveSafeNavigationUrl(url: string): string | null {
 function navigate(a: AnchorLike, url: string, isMiddle: boolean): void {
   const resolved = resolveSafeNavigationUrl(url);
   if (!resolved) return;
+  if (
+    !isMiddle &&
+    resolved.length > MAX_REBUILD_URL_LENGTH &&
+    isRebuildNavigationUrl(resolved) &&
+    submitRebuildNavigation(a, resolved)
+  ) {
+    return;
+  }
   const target = a.getAttribute('target') || (isMiddle ? '_blank' : '_self');
   if (target === '_blank' || isMiddle) {
     window.open(resolved, target, 'noopener,noreferrer');
@@ -319,6 +374,15 @@ function navigate(a: AnchorLike, url: string, isMiddle: boolean): void {
 // compare against — is only updated when the value is itself a signed
 // /first-party/click URL. Writing the GET proxy-rebuild fallback there would
 // make every later canonicalization fail and lose subsequent mutations.
+function canonicalClickValue(resolved: string): string {
+  try {
+    const url = new URL(resolved, TRUSTED_BASE_URL);
+    return `${url.pathname}${url.search}`;
+  } catch {
+    return resolved;
+  }
+}
+
 function persistRebuiltClick(
   anchor: AnchorLike,
   finalUrl: string,
@@ -343,7 +407,7 @@ function persistRebuiltClick(
   try {
     const el = anchor as Element;
     if (canonFromFirstPartyClick(resolved)) {
-      el.setAttribute('data-tsclick', resolved);
+      el.setAttribute('data-tsclick', canonicalClickValue(resolved));
     }
     el.setAttribute('href', resolved);
   } catch (err) {

@@ -76,7 +76,7 @@ rejected and its `adm` is dropped.
 | `false` (default)    | `false`             | Deliver the creative exactly as the bidder returned it (subject to the size cap).                                                                                                                                                     |
 | `true`               | `false`             | Strip executable markup (`script`/`object`/`embed`/`form`, event handlers) with its inner content, then deliver without rewriting. Sanitizer-accepted external resource, click, and inline CSS URLs remain direct.                    |
 | `false`              | `true` (default)    | Rewrite eligible resource/CSS and click URLs in the raw bidder markup to signed first-party endpoints, removing any bidder `<base>` element. Executable markup is preserved.                                                          |
-| `true`               | `true`              | Sanitize first, then rewrite. `POST /auction` emits root-relative endpoints and injects creative TSJS when a `<body>` exists; SSAT/page-bids emits absolute endpoints for its foreign-origin renderer and does not inject the bundle. |
+| `true`               | `true`              | Sanitize first, then rewrite. `POST /auction` emits root-relative endpoints and injects creative TSJS exactly once, including for body-less fragments; SSAT/page-bids emits absolute endpoints for its foreign-origin renderer and does not inject the bundle. |
 
 ::: warning Sanitization blanks script-based creatives
 Sanitization removes `script`/`object`/`embed`/`form` and similar elements
@@ -94,11 +94,18 @@ directly.
 Creatives rendered by Trusted Server's own path run in a sandboxed iframe
 **without** `allow-same-origin`, i.e. an opaque origin. The injected creative
 runtime's click guard recovers mutated clicks there via a GET
-`/first-party/proxy-rebuild` navigation (302 chain), and proxied assets carry
-`Access-Control-Allow-Origin: *` so CORS-mode subresources (ES modules,
-`crossorigin` fonts) still load.
+`/first-party/proxy-rebuild` navigation (302 chain), or a form POST when nesting
+the signed click would exceed the platform request-URL bound.
 
-One capability is unavailable in that context: **dynamic** resource signing,
+The generic `/first-party/proxy` deliberately emits no CORS grant and strips
+one supplied upstream. Otherwise an opaque bidder frame could read bodies
+fetched with Trusted Server's forwarded identity and client-derived headers.
+Ordinary subresources (`<img>`, `<script src>`, stylesheets, media) are
+unaffected; CORS-mode subresources (ES modules, `crossorigin` fonts, fetch/XHR)
+need the constrained asset capability tracked in
+[#982](https://github.com/IABTechLab/trusted-server/issues/982).
+
+Another unavailable capability in that context is **dynamic** resource signing,
 which rewrites URLs on elements a creative inserts at runtime. It is installed
 only when `renderGuard` is enabled in the immutable
 `window.tsjs.boot.creative` configuration, and that is `false` by default —

@@ -969,9 +969,9 @@ fn convert_to_openrtb_response_impl_with_report(
             continue;
         }
 
-        // Ordinary markup remains on the mandatory sanitize/rewrite path. A
-        // typed render source is serialized separately and never enters the
-        // HTML sanitizer.
+        // Ordinary markup follows the independently configured processing
+        // path: sanitization is opt-in and rewriting is default-on. A typed
+        // render source is serialized separately and never enters either pass.
         let (adm, ext) = if let Some(raw_creative) = creative {
             let processed = creative::process_auction_creative(settings, raw_creative);
 
