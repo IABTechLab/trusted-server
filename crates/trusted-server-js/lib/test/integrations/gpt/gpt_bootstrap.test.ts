@@ -170,9 +170,6 @@ describe('gpt_bootstrap.js fallback', () => {
       getSlots: vi.fn().mockReturnValue([]),
       refresh: vi.fn(),
     };
-    // The bootstrap's slot-handoff install wraps defineSlot/display/refresh
-    // with patched delegating functions, so assertions must target the
-    // original spies captured here, not the (re-assigned) googletag members.
     const defineSlot = vi.fn().mockReturnValue(mockSlot);
     const display = vi.fn();
     (window as TestWindow).googletag = {
@@ -207,13 +204,11 @@ describe('gpt_bootstrap.js fallback', () => {
 
   it('fallback adInit cancels queued work when the generation advances before the queue drains', () => {
     const commandQueue: Array<() => void> = [];
-    // Captured spies: the handoff patcher reassigns pubads.refresh (and
-    // googletag.defineSlot/display) to delegating wrappers on drain.
-    const refresh = vi.fn();
+    const nativeRefresh = vi.fn();
     const mockPubads = {
       enableSingleRequest: vi.fn(),
       getSlots: vi.fn().mockReturnValue([]),
-      refresh,
+      refresh: nativeRefresh,
     };
     const defineSlot = vi.fn();
     (window as TestWindow).googletag = {
@@ -244,7 +239,7 @@ describe('gpt_bootstrap.js fallback', () => {
     ts.navGeneration = 1;
     commandQueue.splice(0).forEach((fn) => fn());
     expect(defineSlot).not.toHaveBeenCalled();
-    expect(refresh).not.toHaveBeenCalled();
+    expect(nativeRefresh).not.toHaveBeenCalled();
     expect(mockPubads.enableSingleRequest).not.toHaveBeenCalled();
   });
 });

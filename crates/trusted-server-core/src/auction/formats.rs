@@ -29,8 +29,8 @@ use crate::settings::Settings;
 
 use super::orchestrator::OrchestrationResult;
 use super::types::{
-    AdFormat, AdSlot, AuctionRequest, DeviceInfo, MediaType, OrchestratorExt, ProviderSummary,
-    PublisherInfo, SiteInfo, UserInfo,
+    AdFormat, AdSlot, AuctionRequest, BidRenderer, DeviceInfo, MediaType, OrchestratorExt,
+    ProviderSummary, PublisherInfo, SiteInfo, UserInfo,
 };
 
 /// Request body for `POST /auction` (tsjs / Prebid.js wire format).
@@ -317,16 +317,18 @@ pub(crate) struct OpenRtbResponseConversion {
 /// ([`AuctionConfig::sanitize_creatives`], opt-in, and
 /// [`AuctionConfig::rewrite_creatives`], default-on); with both disabled the
 /// creative ships exactly as the bidder returned it, subject to the 1 MiB
-/// per-creative cap.
+/// per-creative cap. Typed renderers are serialized in the response extension
+/// instead of entering that pipeline at all.
 ///
 /// [`AuctionConfig::sanitize_creatives`]: crate::auction_config_types::AuctionConfig::sanitize_creatives
 /// [`AuctionConfig::rewrite_creatives`]: crate::auction_config_types::AuctionConfig::rewrite_creatives
 ///
 /// # Errors
 ///
-/// Returns an error if:
-/// - A winning bid is missing a price or render source
-/// - The response serialization fails
+/// Returns an error if response serialization fails.
+///
+/// Winners without a decoded price or a deliverable creative are omitted and
+/// recorded in the returned delivery report so other slots can still render.
 pub fn convert_to_openrtb_response(
     result: &OrchestrationResult,
     settings: &Settings,
@@ -346,17 +348,20 @@ pub(crate) fn convert_to_openrtb_response_with_report(
     ec_allowed: bool,
 ) -> Result<OpenRtbResponseConversion, Report<TrustedServerError>> {
     let mut seatbids = Vec::with_capacity(result.winning_bids.len());
+    let rewrite_creatives = settings.auction.rewrite_creatives;
     let mut delivery = AuctionDeliveryReport::default();
 
     for (slot_id, bid) in &result.winning_bids {
-        let price = bid.price.ok_or_else(|| {
-            Report::new(TrustedServerError::Auction {
-                message: format!(
-                    "Winning bid for slot '{}' from '{}' has no decoded price",
-                    slot_id, bid.bidder
-                ),
-            })
-        })?;
+        let Some(price) = bid.price else {
+            log::warn!(
+                "Auction {}: skipping winning bid for slot '{}' from '{}' because it has no decoded price",
+                auction_request.id,
+                slot_id,
+                bid.bidder
+            );
+            delivery.record_drop("no_decoded_price");
+            continue;
+        };
 
         let bid_context = format!(
             "auction {} slot {} bidder {}",
@@ -365,8 +370,16 @@ pub(crate) fn convert_to_openrtb_response_with_report(
         let width = to_openrtb_i32(bid.width, "width", &bid_context);
         let height = to_openrtb_i32(bid.height, "height", &bid_context);
 
-        // Ordinary markup remains on the mandatory sanitize/rewrite path. A
-        // typed renderer is serialized separately and never enters the HTML sanitizer.
+        // Ordinary markup goes through the configured creative processing:
+        // sanitization is opt-in, rewriting is on by default, and with both
+        // disabled the creative ships exactly as the bidder returned it. A typed
+        // renderer is serialized separately and never enters that pipeline.
+        let serialize_renderer = |renderer: &BidRenderer| {
+            (BidExt {
+                trusted_server: BidTrustedServerExt { renderer },
+            })
+            .to_ext()
+        };
         let (adm, ext) = if let Some(raw_creative) = bid
             .creative
             .as_deref()
@@ -374,7 +387,7 @@ pub(crate) fn convert_to_openrtb_response_with_report(
         {
             if bid.renderer.is_some() {
                 log::warn!(
-                    "Auction {}: winning bid for slot '{}' from '{}' has both creative markup and a renderer; using creative markup",
+                    "Auction {}: winning bid for slot '{}' from '{}' has both creative markup and a renderer; using creative markup when it remains renderable",
                     auction_request.id,
                     slot_id,
                     bid.bidder
@@ -388,17 +401,38 @@ pub(crate) fn convert_to_openrtb_response_with_report(
                 slot_id,
                 bid.bidder,
                 settings.auction.sanitize_creatives,
-                settings.auction.rewrite_creatives,
+                rewrite_creatives,
                 raw_creative.len(),
                 processed.len()
             );
 
-            (Some(processed), None)
+            if processed.trim().is_empty() {
+                let Some(renderer) = bid.renderer.as_ref() else {
+                    log::warn!(
+                        "Auction {}: skipping winning bid for slot '{}' from '{}' because creative processing rejected its only render source",
+                        auction_request.id,
+                        slot_id,
+                        bid.bidder
+                    );
+                    delivery.record_drop("creative_processing_rejected");
+                    continue;
+                };
+                let Some(ext) = serialize_renderer(renderer) else {
+                    log::warn!(
+                        "Auction {}: skipping winning bid for slot '{}' from '{}' because its renderer extension could not be serialized",
+                        auction_request.id,
+                        slot_id,
+                        bid.bidder
+                    );
+                    delivery.record_drop("renderer_extension_serialization_failed");
+                    continue;
+                };
+                (None, Some(ext))
+            } else {
+                (Some(processed), None)
+            }
         } else if let Some(renderer) = bid.renderer.as_ref() {
-            let Some(ext) = (BidExt {
-                trusted_server: BidTrustedServerExt { renderer },
-            })
-            .to_ext() else {
+            let Some(ext) = serialize_renderer(renderer) else {
                 log::warn!(
                     "Auction {}: skipping winning bid for slot '{}' from '{}' because its renderer extension could not be serialized",
                     auction_request.id,
@@ -1125,8 +1159,7 @@ mod tests {
 
     #[test]
     fn convert_to_openrtb_response_serializes_winning_bid_and_orchestrator_ext() {
-        let mut settings = make_settings();
-        settings.auction.rewrite_creatives = false;
+        let settings = make_settings();
         let auction_request = make_auction_request();
         let result = make_result(make_bid("div-gpt-top", "appnexus", Some(2.75)));
 
@@ -1166,7 +1199,18 @@ mod tests {
         assert_eq!(bid["id"], json!("appnexus-div-gpt-top"));
         assert_eq!(bid["impid"], json!("div-gpt-top"));
         assert_eq!(bid["price"], json!(2.75));
-        assert_eq!(bid["adm"], json!("<div>Ad</div>"));
+        // Rewriting is on by default, and a body-less fragment still receives
+        // the creative runtime (prepended), so the markup is carried rather
+        // than returned verbatim.
+        let adm = bid["adm"].as_str().expect("should serialize adm");
+        assert!(
+            adm.contains("<div>Ad</div>"),
+            "should carry the creative: {adm}"
+        );
+        assert!(
+            adm.contains("/static/tsjs=tsjs-unified.min.js"),
+            "should inject the creative runtime into a body-less fragment: {adm}"
+        );
         assert_eq!(bid["crid"], json!("appnexus-creative"));
         assert_eq!(bid["w"], json!(300));
         assert_eq!(bid["h"], json!(250));
@@ -1244,6 +1288,7 @@ mod tests {
         // markup cannot reach the publisher origin — can opt out and deliver the
         // creative exactly as the bidder returned it.
         let mut settings = make_settings();
+        settings.auction.sanitize_creatives = false;
         settings.auction.rewrite_creatives = false;
         let auction_request = make_auction_request();
         let result = make_result(make_complete_creative_bid());
@@ -1253,7 +1298,7 @@ mod tests {
             .expect("should have a creative fixture");
 
         let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
-            .expect("should convert creative with rewriting disabled");
+            .expect("should convert creative with sanitization disabled");
         let adm = response_adm(response);
 
         assert_eq!(
@@ -1296,7 +1341,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_creatives_defaults_to_enabled() {
+    fn sanitize_creatives_defaults_to_disabled() {
         let config = crate::auction_config_types::AuctionConfig::default();
         assert!(
             !config.sanitize_creatives,
@@ -1310,6 +1355,8 @@ mod tests {
 
     #[test]
     fn convert_to_openrtb_response_can_skip_rewriting_while_sanitizing() {
+        // The two controls are independent: sanitization can stay on while URL
+        // rewriting is off.
         let mut settings = make_settings();
         settings.auction.rewrite_creatives = false;
         settings.auction.sanitize_creatives = true;
@@ -1401,16 +1448,23 @@ mod tests {
 
     #[test]
     fn convert_to_openrtb_response_skips_invalid_winners_without_dropping_valid_slots() {
+        // Sanitization is opt-in, so enable it here: script-only markup is what
+        // makes the `rejected` and `renderer` fixtures below reach the
+        // processing-rejected path. Left at the default they would survive
+        // processing as ordinary (script-bearing) creatives.
         let mut settings = make_settings();
-        settings.auction.rewrite_creatives = false;
+        settings.auction.sanitize_creatives = true;
         let auction_request = make_auction_request();
         let mut missing = make_bid("missing", "invalid", Some(3.0));
         missing.creative = None;
         let mut whitespace = make_bid("whitespace", "invalid", Some(2.9));
         whitespace.creative = Some(" \n\t ".to_string());
+        let mut rejected = make_bid("rejected", "invalid", Some(2.8));
+        rejected.creative = Some("<script>reject()</script>".to_string());
+        let unpriced = make_bid("unpriced", "invalid", None);
         let ordinary = make_bid("ordinary", "appnexus", Some(2.75));
         let mut renderer = make_bid("renderer", "aps", Some(2.5));
-        renderer.creative = Some("  ".to_string());
+        renderer.creative = Some("<script>reject()</script>".to_string());
         renderer.bid_id = Some("upstream-renderer-bid".to_string());
         renderer.creative_id = None;
         renderer.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
@@ -1430,6 +1484,8 @@ mod tests {
             winning_bids: HashMap::from([
                 (missing.slot_id.clone(), missing),
                 (whitespace.slot_id.clone(), whitespace),
+                (rejected.slot_id.clone(), rejected),
+                (unpriced.slot_id.clone(), unpriced),
                 (ordinary.slot_id.clone(), ordinary),
                 (renderer.slot_id.clone(), renderer),
             ]),
@@ -1445,10 +1501,18 @@ mod tests {
             HashSet::from(["ordinary".to_string(), "renderer".to_string()]),
             "should report only serialized winners as delivered"
         );
-        assert_eq!(conversion.delivery.dropped_winner_count, 2);
+        assert_eq!(conversion.delivery.dropped_winner_count, 4);
         assert_eq!(
             conversion.delivery.dropped_winner_reasons["no_render_source"],
             2
+        );
+        assert_eq!(
+            conversion.delivery.dropped_winner_reasons["no_decoded_price"],
+            1
+        );
+        assert_eq!(
+            conversion.delivery.dropped_winner_reasons["creative_processing_rejected"],
+            1
         );
         let json = response_json(conversion.response);
         let bids: Vec<&JsonValue> = json["seatbid"]
@@ -1459,16 +1523,30 @@ mod tests {
             .collect();
 
         assert_eq!(bids.len(), 2, "should omit only invalid winners");
-        assert_eq!(json["ext"]["orchestrator"]["dropped_winner_count"], 2);
+        assert_eq!(json["ext"]["orchestrator"]["dropped_winner_count"], 4);
         assert_eq!(
             json["ext"]["orchestrator"]["dropped_winner_reasons"]["no_render_source"],
             2
+        );
+        assert_eq!(
+            json["ext"]["orchestrator"]["dropped_winner_reasons"]["no_decoded_price"],
+            1
+        );
+        assert_eq!(
+            json["ext"]["orchestrator"]["dropped_winner_reasons"]["creative_processing_rejected"],
+            1
         );
         let ordinary = bids
             .iter()
             .find(|bid| bid["impid"] == "ordinary")
             .expect("should preserve ordinary winner");
-        assert_eq!(ordinary["adm"], "<div>Ad</div>");
+        assert!(
+            ordinary["adm"]
+                .as_str()
+                .is_some_and(|adm| adm.contains("<div>Ad</div>")),
+            "should preserve ordinary creative markup: {}",
+            ordinary["adm"]
+        );
         let renderer = bids
             .iter()
             .find(|bid| bid["impid"] == "renderer")
@@ -1484,8 +1562,7 @@ mod tests {
 
     #[test]
     fn convert_to_openrtb_response_prefers_creative_when_both_render_sources_exist() {
-        let mut settings = make_settings();
-        settings.auction.rewrite_creatives = false;
+        let settings = make_settings();
         let auction_request = make_auction_request();
         let mut bid = make_bid("div-gpt-top", "aps", Some(2.75));
         bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
@@ -1506,7 +1583,13 @@ mod tests {
         let json = response_json(response);
         let bid = &json["seatbid"][0]["bid"][0];
 
-        assert_eq!(bid["adm"], "<div>Ad</div>");
+        // Rewriting is on by default and a body-less fragment still receives the
+        // creative runtime, so the markup is carried rather than returned verbatim.
+        let adm = bid["adm"].as_str().expect("should serialize adm");
+        assert!(
+            adm.contains("<div>Ad</div>"),
+            "should carry the creative markup: {adm}"
+        );
         assert!(
             bid.get("ext").is_none(),
             "should omit renderer extension when creative markup wins precedence"
@@ -1611,8 +1694,7 @@ mod tests {
 
     #[test]
     fn convert_to_openrtb_response_serializes_multiple_winning_bids() {
-        let mut settings = make_settings();
-        settings.auction.rewrite_creatives = false;
+        let settings = make_settings();
         let auction_request = make_auction_request();
         let top_bid = make_bid("div-gpt-top", "appnexus", Some(2.75));
         let mut sidebar_bid = make_bid("div-gpt-sidebar", "rubicon", Some(1.25));
@@ -1664,10 +1746,12 @@ mod tests {
             "should preserve top slot impid"
         );
         assert_eq!(top_bid["price"], json!(2.75), "should preserve top price");
-        assert_eq!(
-            top_bid["adm"],
-            json!("<div>Ad</div>"),
-            "should preserve top creative"
+        assert!(
+            top_bid["adm"]
+                .as_str()
+                .is_some_and(|adm| adm.contains("<div>Ad</div>")),
+            "should preserve top creative: {}",
+            top_bid["adm"]
         );
 
         let sidebar_seatbid = seatbids
@@ -1695,10 +1779,12 @@ mod tests {
             json!(1.25),
             "should preserve sidebar price"
         );
-        assert_eq!(
-            sidebar_bid["adm"],
-            json!("<div>Sidebar</div>"),
-            "should preserve sidebar creative"
+        assert!(
+            sidebar_bid["adm"]
+                .as_str()
+                .is_some_and(|adm| adm.contains("<div>Sidebar</div>")),
+            "should preserve sidebar creative: {}",
+            sidebar_bid["adm"]
         );
         assert_eq!(
             json["ext"]["orchestrator"]["total_bids"],
@@ -1726,17 +1812,19 @@ mod tests {
     }
 
     #[test]
-    fn convert_to_openrtb_response_errors_when_winning_bid_has_no_price() {
+    fn convert_to_openrtb_response_drops_winning_bid_without_price() {
         let settings = make_settings();
         let auction_request = make_auction_request();
         let result = make_result(make_bid("div-gpt-top", "appnexus", None));
 
-        let err = convert_to_openrtb_response(&result, &settings, &auction_request, false)
-            .expect_err("should reject winning bid without decoded price");
-
-        assert!(
-            format!("{err:?}").contains("has no decoded price"),
-            "should explain missing decoded price"
+        let conversion =
+            convert_to_openrtb_response_with_report(&result, &settings, &auction_request, false)
+                .expect("should omit a winner without a decoded price");
+        assert!(conversion.delivery.delivered_winner_slots.is_empty());
+        assert_eq!(conversion.delivery.dropped_winner_count, 1);
+        assert_eq!(
+            conversion.delivery.dropped_winner_reasons["no_decoded_price"], 1,
+            "should report the omitted malformed winner"
         );
     }
 

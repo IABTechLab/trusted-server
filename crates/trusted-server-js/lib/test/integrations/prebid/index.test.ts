@@ -54,9 +54,17 @@ interface TestGoogletag {
   pubads: () => unknown;
 }
 
+interface ApsPrebidTestEntry {
+  adUnitCode: string;
+  markUsed(): void;
+}
+
 interface PrebidTestWindow {
   pbjs?: unknown;
-  tsjs?: unknown;
+  tsjs?: {
+    apsPrebidRenderers?: Record<string, ApsPrebidTestEntry>;
+    [key: string]: unknown;
+  };
   googletag?: TestGoogletag;
   __tsjs_prebid?: InjectedPrebidTestConfig;
   __tsjsPrebidShimInstalled?: boolean;
@@ -137,6 +145,7 @@ const {
     getUserIdsAsEids: typeof mockGetUserIdsAsEids;
     getConfig: typeof mockGetConfig;
     removeAdUnit: ReturnType<typeof vi.fn>;
+    markWinningBidAsUsed: typeof mockMarkWinningBidAsUsed;
     adUnits: TestAdUnit[];
     setTargetingForGPTAsync?: (adUnitCodes?: string[]) => void;
     [key: string]: unknown;
@@ -179,6 +188,8 @@ const {
     mockMarkWinningBidAsUsed,
     mockOnEvent,
     mockRemoveAdUnit,
+    mockMarkWinningBidAsUsed,
+    mockOnEvent,
     mockPbjs,
   };
 });
@@ -195,6 +206,7 @@ import { log } from '../../../src/core/log';
 import envelope from '../../fixtures/aps-renderer-v1.json';
 import { GptDiagnosticsObserver } from '../../../src/integrations/gpt_diagnostics/observer';
 import { GptDiagnosticsStore } from '../../../src/integrations/gpt_diagnostics/store';
+import envelope from '../../fixtures/aps-renderer-v1.json';
 
 // installPrebidNpm is a per-page no-op once the sentinel is set (the module
 // self-init above already set it), so every test starts from a clean page.
@@ -260,7 +272,7 @@ describe('prebid/auctionBidsToPrebidBids', () => {
     ];
     const bidRequests = [{ adUnitCode: 'div-gpt-1', bidId: 'bid-abc' }];
 
-    const result = auctionBidsToPrebidBids(auctionBids, bidRequests);
+    const result = auctionBidsToPrebidBids(auctionBids, bidRequests, true);
 
     expect(result).toHaveLength(1);
     expect(result[0]).toEqual({
@@ -294,9 +306,11 @@ describe('prebid/auctionBidsToPrebidBids', () => {
       },
     ];
 
-    const result = auctionBidsToPrebidBids(auctionBids, [
-      { adUnitCode: 'div-aps', bidId: 'prebid-request-id' },
-    ]);
+    const result = auctionBidsToPrebidBids(
+      auctionBids,
+      [{ adUnitCode: 'div-aps', bidId: 'prebid-request-id' }],
+      true
+    );
 
     expect(result).toHaveLength(1);
     expect(result[0]).toEqual(
@@ -328,7 +342,8 @@ describe('prebid/auctionBidsToPrebidBids', () => {
           adomain: [],
         },
       ],
-      [{ adUnitCode: 'div-aps', bidId: 'prebid-request-id' }]
+      [{ adUnitCode: 'div-aps', bidId: 'prebid-request-id' }],
+      true
     );
 
     expect(result).toEqual([]);
@@ -348,7 +363,7 @@ describe('prebid/auctionBidsToPrebidBids', () => {
       },
     ];
 
-    const result = auctionBidsToPrebidBids(auctionBids, []);
+    const result = auctionBidsToPrebidBids(auctionBids, [], true);
 
     expect(result).toHaveLength(1);
     expect(result[0].requestId).toBe('div-gpt-2');
@@ -383,7 +398,7 @@ describe('prebid/auctionBidsToPrebidBids', () => {
       { adUnitCode: 'slot-b', bidId: 'req-b' },
     ];
 
-    const result = auctionBidsToPrebidBids(auctionBids, bidRequests);
+    const result = auctionBidsToPrebidBids(auctionBids, bidRequests, true);
 
     expect(result).toHaveLength(2);
     expect(result[0].requestId).toBe('req-a');
@@ -404,7 +419,7 @@ describe('prebid/installPrebidNpm', () => {
     delete testWindow.__tsjs_prebid;
     delete testWindow.__tsjs_prebid_diagnostics;
     delete testWindow.tsjs;
-    delete (mockPbjs as unknown as Record<string, unknown>).__tsApsBidResponseListenerInstalled;
+    delete mockPbjs['__tsApsBidResponseListenerInstalled'];
   });
 
   afterEach(() => {
@@ -446,21 +461,17 @@ describe('prebid/installPrebidNpm', () => {
       trustedServerRenderer: renderer,
     });
 
-    const entry = testWindow.tsjs.apsPrebidRenderers['prebid-generated-ad-id'];
+    const entry = testWindow.tsjs?.apsPrebidRenderers?.['prebid-generated-ad-id'];
     expect(entry).toEqual(
       expect.objectContaining({
         adUnitCode: 'div-aps',
         renderer,
         expiresAt: expect.any(Number),
-        markRendered: expect.any(Function),
-        markWinner: expect.any(Function),
+        markUsed: expect.any(Function),
       })
     );
 
-    entry.markWinner();
-    entry.markRendered();
-    // markWinner routes through the public markWinningBidAsUsed API, which
-    // marks the bid as both winning and rendered in one call.
+    entry?.markUsed();
     expect(mockMarkWinningBidAsUsed).toHaveBeenCalledWith({
       adId: 'prebid-generated-ad-id',
       events: true,
@@ -489,7 +500,8 @@ describe('prebid/installPrebidNpm', () => {
           adomain: [],
         },
       ],
-      [{ adUnitCode: 'div-aps', bidId: 'req-strip' }]
+      [{ adUnitCode: 'div-aps', bidId: 'req-strip' }],
+      true
     );
 
     // Prebid delivered the bid with the custom top-level field REMOVED — only
@@ -507,7 +519,7 @@ describe('prebid/installPrebidNpm', () => {
 
     const entry = testWindow.tsjs.apsPrebidRenderers['stripped-field-ad-id'];
     expect(entry).toEqual(
-      expect.objectContaining({ adUnitCode: 'div-aps', renderer, markWinner: expect.any(Function) })
+      expect.objectContaining({ adUnitCode: 'div-aps', renderer, markUsed: expect.any(Function) })
     );
     // The capability is scrubbed from the delivered bid after registration.
     expect(delivered.meta).not.toHaveProperty('trustedServerRenderer');
@@ -538,7 +550,8 @@ describe('prebid/installPrebidNpm', () => {
         { ...sharedBid, renderer: firstRenderer, creativeId: 'cr-aps-first' },
         { ...sharedBid, renderer: secondRenderer, creativeId: 'cr-aps-second' },
       ],
-      [{ adUnitCode: 'div-aps', bidId: 'req-shared' }]
+      [{ adUnitCode: 'div-aps', bidId: 'req-shared' }],
+      true
     );
     expect(built).toHaveLength(2);
 
@@ -623,7 +636,8 @@ describe('prebid/installPrebidNpm', () => {
           adomain: [],
         },
       ],
-      [{ adUnitCode: 'div-aps', bidId: 'req-accepted' }]
+      [{ adUnitCode: 'div-aps', bidId: 'req-accepted' }],
+      true
     );
 
     // Prebid emits bidAccepted and bidResponse with the same in-place-mutated
@@ -685,7 +699,7 @@ describe('prebid/installPrebidNpm', () => {
     expect(testWindow.tsjs.apsPrebidRenderers['corrupt-meta-with-field-ad-id']).toBeDefined();
   });
 
-  it('does not register malformed or non-trusted APS renderer capabilities', () => {
+  it('makes failed APS renderer registrations ineligible when zero-CPM bids are allowed', () => {
     const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
     installPrebidNpm();
 
@@ -698,6 +712,7 @@ describe('prebid/installPrebidNpm', () => {
       adId: 'malformed-ad-id',
       adUnitCode: 'div-aps',
       ttl: 300,
+      cpm: 1.23,
       trustedServerRenderer: { ...apsRenderer(), aaxResponse: 'invalid' },
     };
     bidResponseListener!(malformedBid);
@@ -712,6 +727,8 @@ describe('prebid/installPrebidNpm', () => {
     expect(testWindow.tsjs?.apsPrebidRenderers?.['malformed-ad-id']).toBeUndefined();
     expect(testWindow.tsjs?.apsPrebidRenderers?.['foreign-ad-id']).toBeUndefined();
     expect(malformedBid).not.toHaveProperty('trustedServerRenderer');
+    // Prebid's allowZeroCpmBids path still requires cpm >= 0.
+    expect(malformedBid['cpm']).toBe(-1);
     expect(warnSpy).toHaveBeenCalledWith(
       '[tsjs-prebid] rejected APS renderer capability that failed registration'
     );
@@ -4299,44 +4316,91 @@ describe('prebid/self-init without the external bundle', () => {
     vi.resetModules();
   });
 
-  it('disables the integration and leaves pbjs and GPT untouched', async () => {
-    // Simulate a failed external bundle load: window.pbjs is still the
-    // head-injected stub with no Prebid.js API. The module captures the
-    // global at evaluation time, so reset the registry and re-import.
+  it('keeps basic Prebid enabled when only the APS lifecycle API is unavailable', async () => {
     vi.resetModules();
-    const barePbjs: {
-      que: Array<() => void>;
-      cmd: Array<() => void>;
-      requestBids?: unknown;
-    } = { que: [], cmd: [] };
-    testWindow.pbjs = barePbjs;
+    const registerBidAdapter = vi.fn();
+    const onEvent = vi.fn();
+    const originalRequestBids = vi.fn();
+    const compatiblePbjs = {
+      ...mockPbjs,
+      registerBidAdapter,
+      onEvent,
+      requestBids: originalRequestBids,
+      markWinningBidAsUsed: undefined,
+      que: [] as Array<() => void>,
+      cmd: [] as Array<() => void>,
+    };
+    testWindow.pbjs = compatiblePbjs;
     const pubads = { refresh: vi.fn() };
     const cmdPush = vi.fn((callback: () => void) => callback());
     testWindow.googletag = { cmd: { push: cmdPush }, pubads: () => pubads };
-    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     await import('../../../src/integrations/prebid/index');
 
-    // The bail-out is logged loudly.
-    const hasBailOutError = errorSpy.mock.calls.some((args) =>
-      args.some((a) => typeof a === 'string' && a.includes('has no Prebid.js API'))
+    expect(registerBidAdapter).toHaveBeenCalledTimes(1);
+    expect(compatiblePbjs.requestBids).not.toBe(originalRequestBids);
+
+    const adapter = registerBidAdapter.mock.calls[0][2] as TestAdapterSpec;
+    const convertedBids = adapter.interpretResponse(
+      {
+        body: {
+          seatbid: [
+            {
+              seat: 'appnexus',
+              bid: [
+                {
+                  impid: 'ordinary-slot',
+                  price: 2.5,
+                  adm: '<div>ordinary creative</div>',
+                  w: 300,
+                  h: 250,
+                },
+              ],
+            },
+            {
+              seat: 'aps',
+              bid: [
+                {
+                  impid: 'aps-slot',
+                  price: 3.5,
+                  ext: { trusted_server: { renderer: apsRenderer() } },
+                },
+              ],
+            },
+          ],
+        },
+      },
+      {
+        tsjsBidRequests: [
+          { adUnitCode: 'ordinary-slot', bidId: 'ordinary-request' },
+          { adUnitCode: 'aps-slot', bidId: 'aps-request' },
+        ],
+      }
     );
-    expect(hasBailOutError).toBe(true);
 
-    // requestBids is left unwrapped and no adapter registration was attempted.
-    expect(barePbjs.requestBids).toBeUndefined();
-
-    // The refresh handler must not install: a wrapped googletag refresh
-    // would clear TS-applied targeting and then fail to run any auction.
-    expect(cmdPush).not.toHaveBeenCalled();
+    expect(convertedBids).toHaveLength(1);
+    expect(convertedBids[0]).toEqual(
+      expect.objectContaining({
+        requestId: 'ordinary-request',
+        bidderCode: 'appnexus',
+        ad: '<div>ordinary creative</div>',
+      })
+    );
+    expect(convertedBids).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ bidderCode: 'aps' })])
+    );
+    expect(onEvent).not.toHaveBeenCalledWith('bidResponse', expect.any(Function));
     expect(
-      (pubads as { refresh: unknown; __tsRefreshWrapped?: boolean }).__tsRefreshWrapped
-    ).toBeUndefined();
+      warnSpy.mock.calls.some((args) =>
+        args.some(
+          (value) => typeof value === 'string' && value.includes('APS renderer bids disabled')
+        )
+      )
+    ).toBe(true);
+    expect(testWindow.__tsjsPrebidShimInstalled).toBe(true);
 
-    // The sentinel stays unset so a later successful install can still run.
-    expect(testWindow.__tsjsPrebidShimInstalled).toBeUndefined();
-
-    errorSpy.mockRestore();
+    warnSpy.mockRestore();
   });
 });
 

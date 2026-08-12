@@ -1,5 +1,30 @@
 // Origin helpers shared by creative runtime modules.
 
+// Normalize a candidate first-party origin, returning '' when it is unusable.
+//
+// Parsing with `URL` rather than matching origin grammar by hand keeps valid
+// but less common forms working — notably IPv6 literals such as
+// `http://[::1]:7676`, which a DNS-shaped pattern rejects. `URL.origin`
+// serializes back to `scheme://host[:port]`, so the result is also what gets
+// embedded in the srcdoc stamp.
+//
+// The final character check is defence in depth for that embedding: an http(s)
+// origin cannot contain quotes, backslashes, angle brackets, or whitespace, so
+// anything that does is not the value we think it is and is discarded rather
+// than written into the document.
+export function normalizeTrustedOrigin(candidate: unknown): string {
+  if (typeof candidate !== 'string' || !candidate) return '';
+  try {
+    const parsed = new URL(candidate);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+    const origin = parsed.origin;
+    if (!origin || origin === 'null' || /['"<>\\\s]/.test(origin)) return '';
+    return origin;
+  } catch {
+    return '';
+  }
+}
+
 // A sandboxed srcdoc creative without `allow-same-origin` runs in an opaque
 // origin: every fetch from it is cross-origin (`Origin: null`), and any
 // preflighted request fails against endpoints that do not answer CORS.
@@ -32,16 +57,16 @@ export function hasOpaqueOrigin(): boolean {
 // creative markup whenever rewriting is enabled.
 export const TRUSTED_BASE_URL: string = (() => {
   try {
-    const stamped = (window as { __tsCreativeOrigin?: unknown }).__tsCreativeOrigin;
-    if (typeof stamped === 'string' && /^https?:\/\/[a-z0-9.-]+(:\d+)?$/i.test(stamped)) {
-      return stamped;
-    }
+    const stamped = normalizeTrustedOrigin(
+      (window as { __tsCreativeOrigin?: unknown }).__tsCreativeOrigin
+    );
+    if (stamped) return stamped;
   } catch {
     // fall through
   }
   try {
-    const origin = location.origin;
-    if (origin && origin !== 'null') return origin;
+    const origin = normalizeTrustedOrigin(location.origin);
+    if (origin) return origin;
   } catch {
     // fall through
   }

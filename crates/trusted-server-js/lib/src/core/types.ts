@@ -74,10 +74,8 @@ export interface ApsPrebidRendererEntry {
   renderer: ApsRendererV1;
   registeredAt: number;
   expiresAt: number;
-  /** Notify Prebid that GAM selected this bid before replying to Universal Creative. */
-  markWinner(): void;
-  /** Mark Prebid's bid used after response dispatch; PUC terminal events determine creative success. */
-  markRendered(): void;
+  /** Mark the bid as won and rendered after replying to Universal Creative. */
+  markUsed(): void;
 }
 
 /** Bid targeting data from the server-side auction, injected into `window.tsjs.bids`. */
@@ -104,12 +102,8 @@ export interface AuctionBidData {
   /** Winning creative height used by the inline render bridge. */
   h?: number;
   /**
-   * Sanitized winning creative markup for local rendering through the pbRender
-   * bridge. Present whenever the winning bid carried a creative that passed the
-   * server-side sanitize/rewrite boundary; absent when there was no creative or
-   * it was rejected (e.g. over the 1 MiB cap), in which case the bridge falls
-   * back to the PBS Cache coordinates. This is NOT gated by
-   * `inject_adm_for_testing`.
+   * Sanitized winning creative markup for the inline render bridge. Present
+   * when the server retained a non-empty creative; not gated by debug mode.
    */
   adm?: string;
   /** Debug-only bid field mirror. Only present when `[debug] inject_adm_for_testing = true`. */
@@ -386,6 +380,24 @@ export interface GptDiagnosticsRecorder {
     attemptId: number,
     reason: GptDiagnosticsCreativeFailure
   ): void;
+}
+
+/**
+ * Lifecycle state for a GPT slot TS created before its publisher declares it.
+ *
+ * Stored on `window.tsjs` so the head bootstrap and the full TSJS bundle share
+ * one handoff protocol.
+ */
+export interface GptSlotHandoff {
+  gamUnitPath: string;
+  formats: Array<[number, number]>;
+  /** Stable configured prefix used to safely bridge framework-generated IDs. */
+  divIdPrefix: string;
+  /** Element ID GPT received when TS created the fallback slot. */
+  slotElementId: string;
+  publisherClaimed: boolean;
+  suppressPublisherDisplay: boolean;
+  suppressPublisherRefresh: boolean;
 }
 
 export interface TsjsApi {

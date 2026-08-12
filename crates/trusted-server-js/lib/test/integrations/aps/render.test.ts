@@ -231,8 +231,7 @@ describe('Prebid APS renderer registry', () => {
     for (let index = 0; index <= 256; index += 1) {
       expect(
         registerApsPrebidRenderer(`prebid-${index}`, 'fictional-slot', descriptor(), 300, {
-          markWinner: vi.fn(),
-          markRendered: vi.fn(),
+          markUsed: vi.fn(),
         })
       ).toBe(true);
     }
@@ -245,7 +244,7 @@ describe('Prebid APS renderer registry', () => {
   });
 
   it('rejects unsafe Prebid IDs and invalid descriptors', () => {
-    const lifecycle = { markWinner: vi.fn(), markRendered: vi.fn() };
+    const lifecycle = { markUsed: vi.fn() };
     expect(
       registerApsPrebidRenderer('__proto__', 'fictional-slot', descriptor(), 300, lifecycle)
     ).toBe(false);
@@ -448,6 +447,9 @@ describe('Universal Creative APS source', () => {
 
   it('computes an absolute renderer URL from the publisher origin', () => {
     expect(apsRendererUrl()).toBe(new URL(APS_RENDERER_PATH, window.location.origin).href);
+    expect(apsRendererUrl('http://publisher.example')).toBe(
+      `http://publisher.example${APS_RENDERER_PATH}`
+    );
     expect(apsRendererUrl('not an origin')).toBeUndefined();
   });
 

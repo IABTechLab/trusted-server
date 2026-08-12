@@ -68,6 +68,10 @@ const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
 /// When `bids` is supplied, each entry's `bidder`/`params` pair is forwarded
 /// directly as `imp.ext.prebid.bidder.<bidder>`.
 ///
+/// APS `OpenRTB` demand is never forwarded through Prebid Server. An ad unit
+/// whose only bidder is `aps` intentionally does not use PBS stored-request
+/// fallback; configure a non-APS PBS bidder for stored-request demand instead.
+///
 /// ## Context passthrough (`config`)
 ///
 /// The optional `config` object is filtered through

@@ -1,4 +1,6 @@
 import { readFileSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
 import { resolve } from 'node:path';
 
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
@@ -81,31 +83,82 @@ type TestWindow = Omit<Window, 'tsjs'> & {
   tsjs?: Partial<TsjsApi>;
 };
 
+async function runGptBootstrapWithGoogleTag(googletag: object): Promise<void> {
+  const bootstrapUrl = new URL(
+    '../../../../../trusted-server-core/src/integrations/gpt_bootstrap.js',
+    import.meta.url
+  );
+  const urlPath = decodeURIComponent(bootstrapUrl.pathname);
+  let bootstrapPath: string;
+  if (urlPath.startsWith('/@fs/')) {
+    bootstrapPath = urlPath.slice('/@fs'.length);
+  } else if (bootstrapUrl.protocol === 'file:') {
+    bootstrapPath = urlPath;
+  } else {
+    bootstrapPath = path.resolve(process.cwd(), `.${urlPath}`);
+  }
+  const bootstrap = await readFile(bootstrapPath, 'utf8');
+  const runBootstrap = new Function('window', 'googletag', bootstrap) as (
+    window: Window,
+    googletag: object
+  ) => void;
+  runBootstrap(window, googletag);
+}
+
+type HandoffImplementation = 'bootstrap' | 'bundle';
+
+async function installHandoff(implementation: HandoffImplementation): Promise<void> {
+  if (implementation === 'bootstrap') {
+    const bootstrap = readFileSync(
+      resolve(process.cwd(), '../../trusted-server-core/src/integrations/gpt_bootstrap.js'),
+      'utf8'
+    );
+    window.eval(bootstrap);
+    return;
+  }
+
+  const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+  installTsAdInit();
+}
+
+interface ResponsiveSlotElementOptions {
+  containerVisible?: boolean;
+  containerWidth?: number;
+  containerHeight?: number;
+  elementHidden?: boolean;
+  elementWidth?: number;
+  elementHeight?: number;
+  checkVisibility?: boolean;
+}
+
 function appendResponsiveSlotElement(
   id: string,
-  containerHasLayout: boolean,
-  elementHidden = false,
-  elementHasLayout = false,
-  containerVisible = containerHasLayout
+  {
+    containerVisible = false,
+    containerWidth = 0,
+    containerHeight = 0,
+    elementHidden = false,
+    elementWidth = 0,
+    elementHeight = 0,
+    checkVisibility,
+  }: ResponsiveSlotElementOptions = {}
 ): HTMLDivElement {
   const container = document.createElement('div');
   container.id = `${id}-container`;
   container.dataset.responsiveSlotTest = 'true';
   container.style.display = containerVisible ? 'block' : 'none';
   container.getBoundingClientRect = () =>
-    ({
-      width: containerHasLayout ? 320 : 0,
-      height: containerHasLayout ? 100 : 0,
-    }) as DOMRect;
+    ({ width: containerWidth, height: containerHeight }) as DOMRect;
 
   const element = document.createElement('div');
   element.id = id;
   element.style.display = elementHidden ? 'none' : 'block';
-  element.getBoundingClientRect = () =>
-    ({
-      width: elementHasLayout ? 300 : 0,
-      height: elementHasLayout ? 250 : 0,
-    }) as DOMRect;
+  element.getBoundingClientRect = () => ({ width: elementWidth, height: elementHeight }) as DOMRect;
+  if (checkVisibility !== undefined) {
+    (element as HTMLElement & { checkVisibility?: () => boolean }).checkVisibility = vi
+      .fn()
+      .mockReturnValue(checkVisibility);
+  }
   container.appendChild(element);
   document.body.appendChild(container);
   return element;
@@ -117,18 +170,6 @@ function runGptBootstrap(): void {
     'utf8'
   );
   window.eval(bootstrap);
-}
-
-type HandoffImplementation = 'bootstrap' | 'bundle';
-
-async function installHandoff(implementation: HandoffImplementation): Promise<void> {
-  if (implementation === 'bootstrap') {
-    runGptBootstrap();
-    return;
-  }
-
-  const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
-  installTsAdInit();
 }
 
 describe('installTsAdInit', () => {
@@ -155,10 +196,10 @@ describe('installTsAdInit', () => {
 
   afterEach(() => {
     document.getElementById('div-atf-sidebar')?.remove();
+    document.getElementById('div-new-slot')?.remove();
     document.getElementById('div-atf-sidebar-2')?.remove();
     document.getElementById('div-size-hydrated')?.remove();
     document.getElementById('ad-header-0-_r_1_')?.remove();
-    document.getElementById('div-new-slot')?.remove();
     document.getElementById("ad'prefix-real")?.remove();
     document.querySelectorAll('[data-responsive-slot-test]').forEach((element) => element.remove());
   });
@@ -217,6 +258,15 @@ describe('installTsAdInit', () => {
         hb_adid: 'abc-uuid',
         hb_cache_host: 'cache.example.com',
         hb_cache_path: '/cache',
+      },
+      'renderable_candidate',
+    ],
+    [
+      'typed renderer',
+      {
+        hb_pb: '1.00',
+        hb_adid: apsRenderer().bidId,
+        renderer: apsRenderer(),
       },
       'renderable_candidate',
     ],
@@ -310,8 +360,6 @@ describe('installTsAdInit', () => {
       getSlotElementId: vi.fn().mockReturnValue('div-new-slot'),
       getTargeting: vi.fn().mockReturnValue([]),
     };
-    // Defining a TS slot installs the slot-handoff refresh wrapper over
-    // `pubads.refresh`, so assert on the original spy rather than the property.
     const refresh = vi.fn();
     const mockPubads = {
       enableSingleRequest: vi.fn(),
@@ -378,219 +426,6 @@ describe('installTsAdInit', () => {
     expect(refresh).toHaveBeenCalledWith([existingSlot]);
   });
 
-  function configureOpportunityDiagnostics(
-    bid: AuctionBidData | undefined,
-    recordTrustedServerOpportunity: ReturnType<typeof vi.fn>
-  ) {
-    const mockSlot = {
-      addService: vi.fn().mockReturnThis(),
-      setTargeting: vi.fn().mockReturnThis(),
-      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
-      getTargeting: vi.fn().mockReturnValue([]),
-    };
-    const mockPubads = {
-      enableSingleRequest: vi.fn(),
-      getSlots: vi.fn().mockReturnValue([mockSlot]),
-      addEventListener: vi.fn(),
-      refresh: vi.fn(),
-    };
-    (window as TestWindow).googletag = {
-      cmd: { push: vi.fn((fn: () => void) => fn()) },
-      defineSlot: vi.fn().mockReturnValue(mockSlot),
-      pubads: vi.fn().mockReturnValue(mockPubads),
-      enableServices: vi.fn(),
-    };
-    (window as TestWindow).tsjs = {
-      adSlots: [
-        {
-          id: 'atf_sidebar_ad',
-          gam_unit_path: '/123/atf',
-          div_id: 'div-atf-sidebar',
-          formats: [[300, 250]],
-          targeting: {},
-        },
-      ],
-      bids: bid ? { atf_sidebar_ad: bid } : {},
-      gptDiagnosticsRecorder: {
-        recordTrustedServerOpportunity,
-      } as unknown as TsjsApi['gptDiagnosticsRecorder'],
-    };
-
-    return { mockPubads, mockSlot };
-  }
-
-  it.each([
-    [
-      'inline markup',
-      { hb_pb: '1.00', hb_adid: 'abc-uuid', adm: '<div>Creative</div>' },
-      'renderable_candidate',
-    ],
-    [
-      'complete cache coordinates',
-      {
-        hb_bidder: 'example-bidder',
-        hb_adid: 'abc-uuid',
-        hb_cache_host: 'cache.example.com',
-        hb_cache_path: '/cache',
-      },
-      'renderable_candidate',
-    ],
-    [
-      'an ad ID without a render source',
-      { hb_pb: '1.00', hb_adid: 'abc-uuid' },
-      'unrenderable_candidate',
-    ],
-    [
-      'a render source without an ad ID',
-      { hb_pb: '1.00', adm: '<div>Creative</div>' },
-      'unrenderable_candidate',
-    ],
-    [
-      'no non-empty Trusted Server bid targeting',
-      { hb_pb: '', hb_bidder: '', hb_adid: '', adm: '<div>Creative</div>' },
-      'no_candidate',
-    ],
-  ] as const)(
-    'records exactly one %s opportunity for every resolved GPT slot',
-    async (_description, bid, expectedOpportunity) => {
-      const recordTrustedServerOpportunity = vi.fn();
-      const { mockSlot } = configureOpportunityDiagnostics(
-        bid as AuctionBidData,
-        recordTrustedServerOpportunity
-      );
-
-      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
-      installTsAdInit();
-      (window as TestWindow).tsjs!.adInit!();
-
-      expect(recordTrustedServerOpportunity).toHaveBeenCalledTimes(1);
-      expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
-        mockSlot,
-        'atf_sidebar_ad',
-        expectedOpportunity
-      );
-    }
-  );
-
-  it('forwards winning bid auction metadata to diagnostics only when present', async () => {
-    const recordTrustedServerOpportunity = vi.fn();
-    const { mockSlot } = configureOpportunityDiagnostics(
-      {
-        hb_pb: '1.00',
-        hb_bidder: 'example',
-        hb_adid: 'creative-1',
-        hb_auction_id: 'auction-123',
-      },
-      recordTrustedServerOpportunity
-    );
-
-    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
-    installTsAdInit();
-    (window as TestWindow).tsjs!.adInit!();
-
-    expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
-      mockSlot,
-      'atf_sidebar_ad',
-      'unrenderable_candidate',
-      'auction-123'
-    );
-  });
-
-  it('records no_candidate when the resolved slot has no bid', async () => {
-    const recordTrustedServerOpportunity = vi.fn();
-    const { mockSlot } = configureOpportunityDiagnostics(undefined, recordTrustedServerOpportunity);
-
-    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
-    installTsAdInit();
-    (window as TestWindow).tsjs!.adInit!();
-
-    expect(recordTrustedServerOpportunity).toHaveBeenCalledTimes(1);
-    expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
-      mockSlot,
-      'atf_sidebar_ad',
-      'no_candidate'
-    );
-  });
-
-  it('keeps targeting, display, and refresh running when opportunity diagnostics throws', async () => {
-    const existingSlot = {
-      addService: vi.fn().mockReturnThis(),
-      setTargeting: vi.fn().mockReturnThis(),
-      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
-      getTargeting: vi.fn().mockReturnValue([]),
-    };
-    const definedSlot = {
-      addService: vi.fn().mockReturnThis(),
-      setTargeting: vi.fn().mockReturnThis(),
-      getSlotElementId: vi.fn().mockReturnValue('div-new-slot'),
-      getTargeting: vi.fn().mockReturnValue([]),
-    };
-    const originalRefresh = vi.fn();
-    const mockPubads = {
-      enableSingleRequest: vi.fn(),
-      getSlots: vi.fn().mockReturnValue([existingSlot]),
-      addEventListener: vi.fn(),
-      refresh: originalRefresh,
-    };
-    const display = vi.fn();
-    (window as TestWindow).googletag = {
-      cmd: { push: vi.fn((fn: () => void) => fn()) },
-      defineSlot: vi.fn().mockReturnValue(definedSlot),
-      pubads: vi.fn().mockReturnValue(mockPubads),
-      enableServices: vi.fn(),
-      display,
-    };
-    const newSlotDiv = document.createElement('div');
-    newSlotDiv.id = 'div-new-slot';
-    document.body.appendChild(newSlotDiv);
-    const recordTrustedServerOpportunity = vi.fn(() => {
-      throw new Error('diagnostics unavailable');
-    });
-    (window as TestWindow).tsjs = {
-      adSlots: [
-        {
-          id: 'atf_sidebar_ad',
-          gam_unit_path: '/123/atf',
-          div_id: 'div-atf-sidebar',
-          formats: [[300, 250]],
-          targeting: {},
-        },
-        {
-          id: 'new_slot_ad',
-          gam_unit_path: '/123/new',
-          div_id: 'div-new-slot',
-          formats: [[728, 90]],
-          targeting: {},
-        },
-      ],
-      bids: {
-        atf_sidebar_ad: {
-          hb_pb: '1.00',
-          hb_adid: 'existing-id',
-          adm: '<div>Existing</div>',
-        },
-        new_slot_ad: {
-          hb_pb: '2.00',
-          hb_adid: 'new-id',
-          adm: '<div>New</div>',
-        },
-      },
-      gptDiagnosticsRecorder: {
-        recordTrustedServerOpportunity,
-      } as unknown as TsjsApi['gptDiagnosticsRecorder'],
-    };
-
-    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
-    installTsAdInit();
-    expect(() => (window as TestWindow).tsjs!.adInit!()).not.toThrow();
-
-    expect(recordTrustedServerOpportunity).toHaveBeenCalledTimes(2);
-    expect(existingSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '1.00');
-    expect(definedSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '2.00');
-    expect(display).toHaveBeenCalledWith('div-new-slot');
-    expect(originalRefresh).toHaveBeenCalledWith([existingSlot]);
-  });
-
   it('reads window.tsjs.bids synchronously and applies bid targeting before refresh', async () => {
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),
@@ -646,6 +481,7 @@ describe('installTsAdInit', () => {
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_cache_host', 'cache.example.com');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_cache_path', '/pbc/v1/cache');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
+    expect(mockPubads.enableSingleRequest).toHaveBeenCalledOnce();
     expect(mockPubads.refresh).toHaveBeenCalled();
 
     fetchSpy.mockRestore();
@@ -1145,11 +981,7 @@ describe('installTsAdInit', () => {
       bids: {},
     };
 
-    const bootstrap = readFileSync(
-      resolve(process.cwd(), '../../trusted-server-core/src/integrations/gpt_bootstrap.js'),
-      'utf8'
-    );
-    window.eval(bootstrap);
+    runGptBootstrap();
     (window as TestWindow).tsjs!.adInit!();
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -1725,7 +1557,7 @@ describe('installTsAdInit', () => {
       bids: {},
     };
 
-    runGptBootstrap();
+    await runGptBootstrapWithGoogleTag(googletag);
 
     mockPubads.disableInitialLoad();
     expect(disableInitialLoadMock).toHaveBeenCalledOnce();
@@ -1782,7 +1614,7 @@ describe('installTsAdInit', () => {
       bids: {},
     };
 
-    runGptBootstrap();
+    await runGptBootstrapWithGoogleTag(googletag);
 
     // Older GPT runtimes may expose setConfig without getConfig. In that case,
     // the wrapper tracks explicit initial-load updates directly.
@@ -2032,7 +1864,8 @@ describe('installTsAdInit', () => {
         },
       ],
       bids: {},
-    };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -2622,7 +2455,19 @@ describe('installTsAdInit', () => {
   it.each([
     { implementation: 'runtime', activeIndexes: [2], publisherOwned: true, selectedIndex: 2 },
     { implementation: 'runtime', activeIndexes: [], selectedIndex: null },
-    { implementation: 'runtime', activeIndexes: [], elementLayoutIndexes: [1], selectedIndex: 1 },
+    {
+      implementation: 'runtime',
+      candidateIndexes: [2],
+      activeIndexes: [],
+      selectedIndex: null,
+    },
+    {
+      implementation: 'runtime',
+      activeIndexes: [],
+      elementLayoutIndexes: [1],
+      visibleContainerIndexes: [1],
+      selectedIndex: 1,
+    },
     { implementation: 'runtime', activeIndexes: [0, 2], selectedIndex: null },
     {
       implementation: 'runtime',
@@ -2637,10 +2482,30 @@ describe('installTsAdInit', () => {
       visibleContainerIndexes: [2],
       selectedIndex: 2,
     },
+    {
+      implementation: 'runtime',
+      activeIndexes: [],
+      hiddenElementIndexes: [0, 1, 3],
+      visibleContainerIndexes: [1, 2],
+      containerWidthIndexes: [2],
+      selectedIndex: 2,
+    },
     { implementation: 'runtime', activeIndexes: [2], divId: '', selectedIndex: null },
     { implementation: 'bootstrap', activeIndexes: [2], publisherOwned: true, selectedIndex: 2 },
     { implementation: 'bootstrap', activeIndexes: [], selectedIndex: null },
-    { implementation: 'bootstrap', activeIndexes: [], elementLayoutIndexes: [1], selectedIndex: 1 },
+    {
+      implementation: 'bootstrap',
+      candidateIndexes: [2],
+      activeIndexes: [],
+      selectedIndex: null,
+    },
+    {
+      implementation: 'bootstrap',
+      activeIndexes: [],
+      elementLayoutIndexes: [1],
+      visibleContainerIndexes: [1],
+      selectedIndex: 1,
+    },
     { implementation: 'bootstrap', activeIndexes: [0, 2], selectedIndex: null },
     {
       implementation: 'bootstrap',
@@ -2655,6 +2520,14 @@ describe('installTsAdInit', () => {
       visibleContainerIndexes: [2],
       selectedIndex: 2,
     },
+    {
+      implementation: 'bootstrap',
+      activeIndexes: [],
+      hiddenElementIndexes: [0, 1, 3],
+      visibleContainerIndexes: [1, 2],
+      containerWidthIndexes: [2],
+      selectedIndex: 2,
+    },
     { implementation: 'bootstrap', activeIndexes: [2], divId: '', selectedIndex: null },
   ] as const)(
     '$implementation resolves responsive matches $activeIndexes to $selectedIndex',
@@ -2666,15 +2539,33 @@ describe('installTsAdInit', () => {
         'elementLayoutIndexes' in testCase ? testCase.elementLayoutIndexes : [];
       const visibleContainerIndexes =
         'visibleContainerIndexes' in testCase ? testCase.visibleContainerIndexes : activeIndexes;
+      const containerWidthIndexes =
+        'containerWidthIndexes' in testCase ? testCase.containerWidthIndexes : activeIndexes;
+      const containerHeightIndexes =
+        'containerHeightIndexes' in testCase ? testCase.containerHeightIndexes : activeIndexes;
+      const elementWidthIndexes =
+        'elementWidthIndexes' in testCase ? testCase.elementWidthIndexes : elementLayoutIndexes;
+      const elementHeightIndexes =
+        'elementHeightIndexes' in testCase ? testCase.elementHeightIndexes : elementLayoutIndexes;
+      const candidateIndexes =
+        'candidateIndexes' in testCase ? testCase.candidateIndexes : [0, 1, 2, 3];
       const divId = 'divId' in testCase ? testCase.divId : 'ad-responsive-';
       const publisherOwned = 'publisherOwned' in testCase && testCase.publisherOwned;
       const elements = ['a', 'b', 'c', 'd'].map((suffix, index) =>
         appendResponsiveSlotElement(
-          `ad-responsive-${suffix}`,
-          (activeIndexes as readonly number[]).includes(index),
-          (hiddenElementIndexes as readonly number[]).includes(index),
-          (elementLayoutIndexes as readonly number[]).includes(index),
-          (visibleContainerIndexes as readonly number[]).includes(index)
+          (candidateIndexes as readonly number[]).includes(index)
+            ? `ad-responsive-${suffix}`
+            : `unrelated-responsive-${suffix}`,
+          {
+            containerVisible: (visibleContainerIndexes as readonly number[]).includes(index),
+            containerWidth: (containerWidthIndexes as readonly number[]).includes(index) ? 320 : 0,
+            containerHeight: (containerHeightIndexes as readonly number[]).includes(index)
+              ? 100
+              : 0,
+            elementHidden: (hiddenElementIndexes as readonly number[]).includes(index),
+            elementWidth: (elementWidthIndexes as readonly number[]).includes(index) ? 300 : 0,
+            elementHeight: (elementHeightIndexes as readonly number[]).includes(index) ? 250 : 0,
+          }
         )
       );
       const selectedElement = selectedIndex === null ? undefined : elements[selectedIndex];
@@ -2743,6 +2634,142 @@ describe('installTsAdInit', () => {
     }
   );
 
+  it.each(['runtime', 'bootstrap'] as const)(
+    '$implementation reports an ambiguous prefix once during adInit',
+    async (implementation) => {
+      const elements = ['a', 'b', 'c', 'd'].map((suffix) =>
+        appendResponsiveSlotElement(`ad-warning-${suffix}`, { containerVisible: true })
+      );
+      const mockSlot = {
+        addService: vi.fn().mockReturnThis(),
+        setTargeting: vi.fn().mockReturnThis(),
+        getSlotElementId: vi.fn().mockReturnValue(elements[0]!.id),
+        getTargeting: vi.fn().mockReturnValue([]),
+      };
+      const mockPubads = {
+        enableSingleRequest: vi.fn(),
+        getSlots: vi.fn().mockReturnValue([]),
+        addEventListener: vi.fn(),
+        refresh: vi.fn(),
+      };
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: vi.fn().mockReturnValue(mockSlot),
+        display: vi.fn(),
+        pubads: vi.fn().mockReturnValue(mockPubads),
+        enableServices: vi.fn(),
+      };
+      const bootstrapWarn = vi.fn();
+      (window as TestWindow).tsjs = {
+        adSlots: [
+          {
+            id: 'warning_slot',
+            gam_unit_path: '/123/warning',
+            div_id: 'ad-warning-',
+            formats: [[300, 250]],
+            targeting: {},
+          },
+          {
+            id: 'warning_slot_duplicate',
+            gam_unit_path: '/123/warning',
+            div_id: 'ad-warning-',
+            formats: [[300, 250]],
+            targeting: {},
+          },
+        ],
+        bids: {},
+        ...(implementation === 'bootstrap' ? { log: { warn: bootstrapWarn } } : {}),
+      };
+
+      const runtimeWarn = vi.spyOn(console, 'warn');
+      if (implementation === 'runtime') {
+        const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+        installTsAdInit();
+      } else {
+        runGptBootstrap();
+      }
+      (window as TestWindow).tsjs!.adInit!();
+
+      if (implementation === 'runtime') {
+        const warningCall = runtimeWarn.mock.calls.find((call) =>
+          call.includes('GPT slot prefix did not resolve to one active element')
+        );
+        expect(runtimeWarn).toHaveBeenCalledTimes(1);
+        expect(warningCall).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              divId: 'ad-warning-',
+              prefixMatchCount: 4,
+              activeMatchCount: 0,
+            }),
+          ])
+        );
+      } else {
+        expect(bootstrapWarn).toHaveBeenCalledTimes(1);
+        expect(bootstrapWarn).toHaveBeenCalledWith(
+          'GPT slot prefix did not resolve to one active element',
+          {
+            divId: 'ad-warning-',
+            prefixMatchCount: 4,
+            activeMatchCount: 0,
+          }
+        );
+      }
+      runtimeWarn.mockRestore();
+    }
+  );
+
+  it.each(['runtime', 'bootstrap'] as const)(
+    '$implementation trusts checkVisibility when resolving a visible slot',
+    async (implementation) => {
+      const element = appendResponsiveSlotElement('ad-native-slot', {
+        checkVisibility: true,
+      });
+      const mockSlot = {
+        addService: vi.fn().mockReturnThis(),
+        setTargeting: vi.fn().mockReturnThis(),
+        getSlotElementId: vi.fn().mockReturnValue(element.id),
+        getTargeting: vi.fn().mockReturnValue([]),
+      };
+      const defineSlot = vi.fn().mockReturnValue(mockSlot);
+      const mockPubads = {
+        enableSingleRequest: vi.fn(),
+        getSlots: vi.fn().mockReturnValue([]),
+        addEventListener: vi.fn(),
+        refresh: vi.fn(),
+      };
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot,
+        display: vi.fn(),
+        pubads: vi.fn().mockReturnValue(mockPubads),
+        enableServices: vi.fn(),
+      };
+      (window as TestWindow).tsjs = {
+        adSlots: [
+          {
+            id: 'native_visibility_slot',
+            gam_unit_path: '/123/native-visibility',
+            div_id: 'ad-native-',
+            formats: [[300, 250]],
+            targeting: {},
+          },
+        ],
+        bids: {},
+      };
+
+      if (implementation === 'runtime') {
+        const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+        installTsAdInit();
+      } else {
+        runGptBootstrap();
+      }
+      (window as TestWindow).tsjs!.adInit!();
+
+      expect(defineSlot).toHaveBeenCalledWith('/123/native-visibility', [[300, 250]], element.id);
+    }
+  );
+
   it('resolves dynamic div prefixes without interpolating div_id into a CSS selector', async () => {
     const dynamicDiv = document.createElement('div');
     dynamicDiv.id = "ad'prefix-real";
@@ -2784,6 +2811,127 @@ describe('installTsAdInit', () => {
 
     expect(() => (window as TestWindow).tsjs!.adInit!()).not.toThrow();
     expect(mockPubads.refresh).toHaveBeenCalledWith([dynamicSlot]);
+  });
+
+  it('forwards winning bid auction metadata to diagnostics only when present', async () => {
+    const recordTrustedServerOpportunity = vi.fn();
+    const { mockSlot } = configureOpportunityDiagnostics(
+      {
+        hb_pb: '1.00',
+        hb_bidder: 'example',
+        hb_adid: 'creative-1',
+        hb_auction_id: 'auction-123',
+      },
+      recordTrustedServerOpportunity
+    );
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      mockSlot,
+      'atf_sidebar_ad',
+      'unrenderable_candidate',
+      'auction-123'
+    );
+  });
+
+  it('records no_candidate when the resolved slot has no bid', async () => {
+    const recordTrustedServerOpportunity = vi.fn();
+    const { mockSlot } = configureOpportunityDiagnostics(undefined, recordTrustedServerOpportunity);
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledTimes(1);
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      mockSlot,
+      'atf_sidebar_ad',
+      'no_candidate'
+    );
+  });
+
+  it('keeps targeting, display, and refresh running when opportunity diagnostics throws', async () => {
+    const existingSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const definedSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-new-slot'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    // Defining a TS slot installs the slot-handoff refresh wrapper over
+    // `pubads.refresh`, so assert on the original spy rather than the property.
+    const refresh = vi.fn();
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([existingSlot]),
+      addEventListener: vi.fn(),
+      refresh,
+    };
+    const display = vi.fn();
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(definedSlot),
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+      display,
+    };
+    const newSlotDiv = document.createElement('div');
+    newSlotDiv.id = 'div-new-slot';
+    document.body.appendChild(newSlotDiv);
+    const recordTrustedServerOpportunity = vi.fn(() => {
+      throw new Error('diagnostics unavailable');
+    });
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+        {
+          id: 'new_slot_ad',
+          gam_unit_path: '/123/new',
+          div_id: 'div-new-slot',
+          formats: [[728, 90]],
+          targeting: {},
+        },
+      ],
+      bids: {
+        atf_sidebar_ad: {
+          hb_pb: '1.00',
+          hb_adid: 'existing-id',
+          adm: '<div>Existing</div>',
+        },
+        new_slot_ad: {
+          hb_pb: '2.00',
+          hb_adid: 'new-id',
+          adm: '<div>New</div>',
+        },
+      },
+      gptDiagnosticsRecorder: {
+        recordTrustedServerOpportunity,
+      } as unknown as TsjsApi['gptDiagnosticsRecorder'],
+    };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    expect(() => (window as TestWindow).tsjs!.adInit!()).not.toThrow();
+
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledTimes(2);
+    expect(existingSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '1.00');
+    expect(definedSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '2.00');
+    expect(display).toHaveBeenCalledWith('div-new-slot');
+    expect(refresh).toHaveBeenCalledWith([existingSlot]);
   });
 });
 
@@ -2868,6 +3016,7 @@ describe('installTsRenderBridge', () => {
           targeting: {},
         },
       ],
+      divToSlotId: { 'div-header': 'homepage_header' },
     };
   });
 
@@ -2907,641 +3056,6 @@ describe('installTsRenderBridge', () => {
     expect(bridgeListener, 'bridge listener should be registered').toBeDefined();
     return bridgeListener!;
   }
-
-  it('serves one exact APS dynamic-renderer response without cache fetches or beacons', async () => {
-    const renderer = apsRenderer();
-    (window as TestWindow).tsjs.bids.homepage_header = {
-      hb_adid: renderer.bidId,
-      hb_bidder: 'aps',
-      hb_pb: '1.23',
-      renderer,
-      // These must not be used even if unexpected legacy fields coexist.
-      nurl: 'https://notify.example/win',
-      burl: 'https://notify.example/bill',
-      hb_cache_host: 'cache.example.com',
-      hb_cache_path: '/cache',
-    };
-
-    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
-    const bridgeListener = await captureBridgeListener();
-    const source = createTrustedSlotIframe();
-    const stopSpy = vi.fn();
-    const portMessages: string[] = [];
-    const fakePort = { postMessage: (message: string) => portMessages.push(message) };
-    const event = Object.assign(new Event('message'), {
-      data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
-      ports: [fakePort],
-      source,
-      stopImmediatePropagation: stopSpy,
-    }) as unknown as MessageEvent;
-
-    bridgeListener(event);
-    bridgeListener(event);
-
-    expect(stopSpy).toHaveBeenCalledTimes(2);
-    expect(fetchStub).not.toHaveBeenCalled();
-    expect(beaconSpy).not.toHaveBeenCalled();
-    // Server-rendered APS descriptors are reusable: GAM can issue repeated
-    // Universal Creative requests for the same winning ad ID.
-    expect(portMessages).toHaveLength(2);
-    const response = JSON.parse(portMessages[0]) as Record<string, unknown>;
-    expect(Object.keys(response).sort()).toEqual(
-      [
-        'adId',
-        'apsRenderer',
-        'height',
-        'message',
-        'renderer',
-        'rendererUrl',
-        'rendererVersion',
-        'width',
-      ].sort()
-    );
-    expect(response).toEqual({
-      message: 'Prebid Response',
-      adId: renderer.bidId,
-      renderer: expect.stringContaining('window.render=function'),
-      rendererVersion: 4,
-      rendererUrl: new URL('/integrations/aps/renderer', window.location.origin).href,
-      apsRenderer: renderer,
-      width: 300,
-      height: 250,
-    });
-    expect(String(response.renderer)).not.toContain(renderer.accountId);
-    expect(String(response.renderer)).not.toContain(renderer.aaxResponse);
-
-    // Universal Creative's dynamic-renderer path evaluates the returned static
-    // source and calls window.render(response, helper, targetWindow). Consume
-    // the exact bridge response through that deployed protocol shape.
-    const dynamicWindow = window as unknown as {
-      render?: (data: Record<string, unknown>, helper: unknown, target: Window) => Promise<void>;
-    };
-    window.eval(String(response.renderer));
-    try {
-      const rendered = dynamicWindow.render!(response, undefined, window);
-      const outerFrame = document.querySelector<HTMLIFrameElement>(
-        'iframe[src*="/integrations/aps/renderer#tsaps="]'
-      )!;
-      expect(outerFrame).not.toBeNull();
-      expect(outerFrame.getAttribute('sandbox')).not.toContain('allow-same-origin');
-
-      const rendererPost = vi.spyOn(outerFrame.contentWindow!, 'postMessage');
-      outerFrame.dispatchEvent(new Event('load'));
-      const bootstrap = rendererPost.mock.calls[0][0] as { nonce: string };
-      const transferredPort = rendererPost.mock.calls[0][2]?.[0] as MessagePort | undefined;
-      expect(transferredPort).toBeDefined();
-      await new Promise<void>((resolve) => {
-        transferredPort!.onmessage = (message) => {
-          expect(message.data).toEqual({ renderer });
-          transferredPort!.postMessage({
-            message: 'trusted-server/aps/renderer-ready',
-            nonce: bootstrap.nonce,
-          });
-          resolve();
-        };
-      });
-      await expect(rendered).resolves.toBeUndefined();
-      outerFrame.remove();
-    } finally {
-      delete dynamicWindow.render;
-    }
-    beaconSpy.mockRestore();
-  });
-
-  it('resizes only the authenticated collapsed 1x1 creative shell after responding', async () => {
-    (window as TestWindow).tsjs.bids.homepage_header = {
-      hb_adid: 'collapsed-inline-ad-id',
-      hb_bidder: 'fictional',
-      hb_pb: '1.23',
-      adm: '<div>fictional creative</div>',
-      w: 300,
-      h: 250,
-    };
-    const bridgeListener = await captureBridgeListener();
-    const source = createTrustedSlotIframe();
-    const slot = document.getElementById('div-header')!;
-    const selectedFrame = slot.querySelector<HTMLIFrameElement>('iframe')!;
-    slot.style.width = '1px';
-    slot.style.height = '1px';
-    selectedFrame.width = '1';
-    selectedFrame.height = '1';
-    selectedFrame.style.width = '1px';
-    selectedFrame.style.height = '1px';
-
-    const siblingSlot = document.createElement('div');
-    siblingSlot.style.width = '1px';
-    siblingSlot.style.height = '1px';
-    const siblingFrame = document.createElement('iframe');
-    siblingFrame.width = '1';
-    siblingFrame.height = '1';
-    siblingFrame.style.width = '1px';
-    siblingFrame.style.height = '1px';
-    siblingSlot.appendChild(siblingFrame);
-    document.body.appendChild(siblingSlot);
-
-    try {
-      bridgeListener(
-        Object.assign(new Event('message'), {
-          data: JSON.stringify({ message: 'Prebid Request', adId: 'collapsed-inline-ad-id' }),
-          ports: [{ postMessage: vi.fn() }],
-          source,
-          stopImmediatePropagation: vi.fn(),
-        }) as unknown as MessageEvent
-      );
-
-      expect(selectedFrame.style.width).toBe('300px');
-      expect(selectedFrame.style.height).toBe('250px');
-      expect(slot.style.width).toBe('300px');
-      expect(slot.style.height).toBe('250px');
-      expect(siblingFrame.style.width).toBe('1px');
-      expect(siblingFrame.style.height).toBe('1px');
-    } finally {
-      siblingSlot.remove();
-    }
-  });
-
-  it('does not resize an authenticated shell whose computed dimensions are not pixels', async () => {
-    (window as TestWindow).tsjs.bids.homepage_header = {
-      hb_adid: 'relative-inline-ad-id',
-      hb_bidder: 'fictional',
-      hb_pb: '1.23',
-      adm: '<div>fictional creative</div>',
-      w: 300,
-      h: 250,
-    };
-    const bridgeListener = await captureBridgeListener();
-    const source = createTrustedSlotIframe();
-    const slot = document.getElementById('div-header')!;
-    const frame = slot.querySelector<HTMLIFrameElement>('iframe')!;
-    slot.style.width = '1vw';
-    slot.style.height = '1vh';
-    frame.width = '1';
-    frame.height = '1';
-    frame.style.width = '1vw';
-    frame.style.height = '1vh';
-
-    bridgeListener(
-      Object.assign(new Event('message'), {
-        data: JSON.stringify({ message: 'Prebid Request', adId: 'relative-inline-ad-id' }),
-        ports: [{ postMessage: vi.fn() }],
-        source,
-        stopImmediatePropagation: vi.fn(),
-      }) as unknown as MessageEvent
-    );
-
-    expect(frame.style.width).toBe('1vw');
-    expect(frame.style.height).toBe('1vh');
-    expect(slot.style.width).toBe('1vw');
-    expect(slot.style.height).toBe('1vh');
-  });
-
-  it('serves a registered Prebid APS renderer when its generated ad ID differs from the APS bid ID', async () => {
-    const renderer = apsRenderer();
-    const prebidAdId = 'prebid-generated-ad-id';
-    const markWinner = vi.fn();
-    const markRendered = vi.fn();
-    (window as TestWindow).tsjs.apsPrebidRenderers = {
-      [prebidAdId]: {
-        adUnitCode: 'div-header',
-        renderer,
-        registeredAt: Date.now(),
-        expiresAt: Date.now() + 60_000,
-        markWinner,
-        markRendered,
-      },
-    };
-
-    const bridgeListener = await captureBridgeListener();
-    const source = createTrustedSlotIframe();
-    const stopSpy = vi.fn();
-    const portMessages: string[] = [];
-    const event = Object.assign(new Event('message'), {
-      data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
-      ports: [{ postMessage: (message: string) => portMessages.push(message) }],
-      source,
-      stopImmediatePropagation: stopSpy,
-    }) as unknown as MessageEvent;
-
-    bridgeListener(event);
-    const foreignIframe = document.createElement('iframe');
-    document.body.appendChild(foreignIframe);
-    bridgeListener(
-      Object.assign(new Event('message'), {
-        data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
-        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
-        source: foreignIframe.contentWindow,
-        stopImmediatePropagation: stopSpy,
-      }) as unknown as MessageEvent
-    );
-
-    expect(stopSpy).toHaveBeenCalledTimes(2);
-    expect(portMessages).toHaveLength(1);
-    expect(markWinner).toHaveBeenCalledTimes(1);
-    expect(markRendered).toHaveBeenCalledTimes(1);
-    expect(JSON.parse(portMessages[0])).toEqual(
-      expect.objectContaining({
-        message: 'Prebid Response',
-        adId: prebidAdId,
-        apsRenderer: renderer,
-        width: renderer.width,
-        height: renderer.height,
-      })
-    );
-    expect(renderer.bidId).not.toBe(prebidAdId);
-    expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
-    expect(fetchStub).not.toHaveBeenCalled();
-    foreignIframe.remove();
-  });
-
-  it('still serves the APS renderer when markWinner throws', async () => {
-    const renderer = apsRenderer();
-    const prebidAdId = 'throwing-mark-winner-ad-id';
-    const markWinner = vi.fn(() => {
-      throw new Error('fictional markWinner failure');
-    });
-    const markRendered = vi.fn();
-    (window as TestWindow).tsjs.apsPrebidRenderers = {
-      [prebidAdId]: {
-        adUnitCode: 'div-header',
-        renderer,
-        registeredAt: Date.now(),
-        expiresAt: Date.now() + 60_000,
-        markWinner,
-        markRendered,
-      },
-    };
-
-    const bridgeListener = await captureBridgeListener();
-    const source = createTrustedSlotIframe();
-    const portMessages: string[] = [];
-
-    expect(() =>
-      bridgeListener(
-        Object.assign(new Event('message'), {
-          data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
-          ports: [{ postMessage: (message: string) => portMessages.push(message) }],
-          source,
-          stopImmediatePropagation: vi.fn(),
-        }) as unknown as MessageEvent
-      )
-    ).not.toThrow();
-
-    expect(portMessages).toHaveLength(1);
-    expect(JSON.parse(portMessages[0])).toEqual(
-      expect.objectContaining({
-        message: 'Prebid Response',
-        adId: prebidAdId,
-        apsRenderer: renderer,
-      })
-    );
-    expect(markWinner).toHaveBeenCalledTimes(1);
-    expect(markRendered).toHaveBeenCalledTimes(1);
-  });
-
-  it('still completes the APS render when markRendered throws', async () => {
-    const renderer = apsRenderer();
-    const prebidAdId = 'throwing-mark-rendered-ad-id';
-    const markWinner = vi.fn();
-    const markRendered = vi.fn(() => {
-      throw new Error('fictional markRendered failure');
-    });
-    (window as TestWindow).tsjs.apsPrebidRenderers = {
-      [prebidAdId]: {
-        adUnitCode: 'div-header',
-        renderer,
-        registeredAt: Date.now(),
-        expiresAt: Date.now() + 60_000,
-        markWinner,
-        markRendered,
-      },
-    };
-
-    const bridgeListener = await captureBridgeListener();
-    const source = createTrustedSlotIframe();
-    const portMessages: string[] = [];
-
-    expect(() =>
-      bridgeListener(
-        Object.assign(new Event('message'), {
-          data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
-          ports: [{ postMessage: (message: string) => portMessages.push(message) }],
-          source,
-          stopImmediatePropagation: vi.fn(),
-        }) as unknown as MessageEvent
-      )
-    ).not.toThrow();
-
-    expect(portMessages).toHaveLength(1);
-    expect(JSON.parse(portMessages[0])).toEqual(
-      expect.objectContaining({
-        message: 'Prebid Response',
-        adId: prebidAdId,
-        apsRenderer: renderer,
-      })
-    );
-    expect(markWinner).toHaveBeenCalledTimes(1);
-    expect(markRendered).toHaveBeenCalledTimes(1);
-  });
-
-  it('prunes expired consumed APS renderer IDs', async () => {
-    vi.useFakeTimers();
-    try {
-      const renderer = apsRenderer();
-      const prebidAdId = 'expiring-consumed-ad-id';
-      const start = Date.now();
-      const firstMarkWinner = vi.fn();
-      const firstMarkRendered = vi.fn();
-      const secondMarkWinner = vi.fn();
-      const secondMarkRendered = vi.fn();
-      (window as TestWindow).tsjs.apsPrebidRenderers = {
-        [prebidAdId]: {
-          adUnitCode: 'div-header',
-          renderer,
-          registeredAt: start,
-          expiresAt: start + 60_000,
-          markWinner: firstMarkWinner,
-          markRendered: firstMarkRendered,
-        },
-      };
-
-      const bridgeListener = await captureBridgeListener();
-      const source = createTrustedSlotIframe();
-      const stopImmediatePropagation = vi.fn();
-      const portMessages: string[] = [];
-      const sendRequest = (): void => {
-        bridgeListener(
-          Object.assign(new Event('message'), {
-            data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
-            ports: [{ postMessage: (message: string) => portMessages.push(message) }],
-            source,
-            stopImmediatePropagation,
-          }) as unknown as MessageEvent
-        );
-      };
-
-      sendRequest();
-      vi.advanceTimersByTime(60_001);
-      (window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId] = {
-        adUnitCode: 'div-header',
-        renderer,
-        registeredAt: Date.now(),
-        expiresAt: Date.now() + 60_000,
-        markWinner: secondMarkWinner,
-        markRendered: secondMarkRendered,
-      };
-      sendRequest();
-
-      expect(portMessages).toHaveLength(2);
-      expect(stopImmediatePropagation).toHaveBeenCalledTimes(2);
-      expect(firstMarkWinner).toHaveBeenCalledTimes(1);
-      expect(firstMarkRendered).toHaveBeenCalledTimes(1);
-      expect(secondMarkWinner).toHaveBeenCalledTimes(1);
-      expect(secondMarkRendered).toHaveBeenCalledTimes(1);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('fails closed when consumed APS renderer tombstones reach capacity', async () => {
-    const renderer = apsRenderer();
-    const capacity = 256;
-    const callbacks = Array.from({ length: capacity + 1 }, () => ({
-      markWinner: vi.fn(),
-      markRendered: vi.fn(),
-    }));
-    const entries = Object.fromEntries(
-      callbacks.map((lifecycle, index) => [
-        `capacity-ad-${index}`,
-        {
-          adUnitCode: 'div-header',
-          renderer,
-          registeredAt: Date.now(),
-          expiresAt: Date.now() + 60_000,
-          ...lifecycle,
-        },
-      ])
-    );
-    (window as TestWindow).tsjs.apsPrebidRenderers = entries;
-
-    const bridgeListener = await captureBridgeListener();
-    const source = createTrustedSlotIframe();
-    const stopImmediatePropagation = vi.fn();
-    const portMessages: string[] = [];
-    const sendRequest = (adId: string): void => {
-      bridgeListener(
-        Object.assign(new Event('message'), {
-          data: JSON.stringify({ message: 'Prebid Request', adId }),
-          ports: [{ postMessage: (message: string) => portMessages.push(message) }],
-          source,
-          stopImmediatePropagation,
-        }) as unknown as MessageEvent
-      );
-    };
-
-    for (let index = 0; index < capacity; index += 1) {
-      sendRequest(`capacity-ad-${index}`);
-    }
-    sendRequest(`capacity-ad-${capacity}`);
-    sendRequest('capacity-ad-0');
-
-    expect(portMessages).toHaveLength(capacity);
-    expect(callbacks[capacity].markWinner).not.toHaveBeenCalled();
-    expect(callbacks[capacity].markRendered).not.toHaveBeenCalled();
-    expect(entries[`capacity-ad-${capacity}`]).toBeDefined();
-    expect(callbacks[0].markWinner).toHaveBeenCalledTimes(1);
-    expect(stopImmediatePropagation).toHaveBeenCalledTimes(capacity + 2);
-  });
-
-  it('does not expose a registered Prebid APS renderer to another slot iframe', async () => {
-    const renderer = apsRenderer();
-    const prebidAdId = 'prebid-generated-ad-id';
-    (window as TestWindow).tsjs.apsPrebidRenderers = {
-      [prebidAdId]: {
-        adUnitCode: 'div-header',
-        renderer,
-        registeredAt: Date.now(),
-        expiresAt: Date.now() + 60_000,
-        markWinner: vi.fn(),
-        markRendered: vi.fn(),
-      },
-    };
-
-    const footer = document.createElement('div');
-    footer.id = 'div-footer';
-    const foreignIframe = document.createElement('iframe');
-    footer.appendChild(foreignIframe);
-    document.body.appendChild(footer);
-
-    const bridgeListener = await captureBridgeListener();
-    const stopSpy = vi.fn();
-    const portMessages: string[] = [];
-    bridgeListener(
-      Object.assign(new Event('message'), {
-        data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
-        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
-        source: foreignIframe.contentWindow,
-        stopImmediatePropagation: stopSpy,
-      }) as unknown as MessageEvent
-    );
-
-    expect(stopSpy).toHaveBeenCalledTimes(1);
-    expect(portMessages).toEqual([]);
-    expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeDefined();
-    footer.remove();
-  });
-
-  it('drops an expired Prebid APS renderer without claiming the creative request', async () => {
-    const prebidAdId = 'expired-prebid-ad-id';
-    (window as TestWindow).tsjs.apsPrebidRenderers = {
-      [prebidAdId]: {
-        adUnitCode: 'div-header',
-        renderer: apsRenderer(),
-        registeredAt: Date.now() - 61_000,
-        expiresAt: Date.now() - 1_000,
-        markWinner: vi.fn(),
-        markRendered: vi.fn(),
-      },
-    };
-
-    const bridgeListener = await captureBridgeListener();
-    const source = createTrustedSlotIframe();
-    const stopSpy = vi.fn();
-    const portMessages: string[] = [];
-    bridgeListener(
-      Object.assign(new Event('message'), {
-        data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
-        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
-        source,
-        stopImmediatePropagation: stopSpy,
-      }) as unknown as MessageEvent
-    );
-
-    expect(stopSpy).not.toHaveBeenCalled();
-    expect(portMessages).toEqual([]);
-    expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
-  });
-
-  it('validates APS data before claiming the Prebid request', async () => {
-    const renderer = { ...apsRenderer(), aaxResponse: 'invalid' };
-    (window as TestWindow).tsjs.bids.homepage_header = {
-      hb_adid: renderer.bidId,
-      hb_bidder: 'aps',
-      renderer,
-    };
-
-    const bridgeListener = await captureBridgeListener();
-    const source = createTrustedSlotIframe();
-    const stopSpy = vi.fn();
-    const portMessages: string[] = [];
-    bridgeListener(
-      Object.assign(new Event('message'), {
-        data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
-        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
-        source,
-        stopImmediatePropagation: stopSpy,
-      }) as unknown as MessageEvent
-    );
-
-    expect(stopSpy).not.toHaveBeenCalled();
-    expect(portMessages).toEqual([]);
-    expect(fetchStub).not.toHaveBeenCalled();
-  });
-
-  it('accepts an APS request from a dynamic slot root resolved from its configured prefix', async () => {
-    const renderer = apsRenderer();
-    (window as TestWindow).tsjs.bids.homepage_header = {
-      hb_adid: renderer.bidId,
-      hb_bidder: 'aps',
-      renderer,
-    };
-    (window as TestWindow).tsjs.adSlots[0].div_id = 'div-header-';
-
-    const bridgeListener = await captureBridgeListener();
-    const source = createTrustedSlotIframe('div-header-dynamic');
-    const portMessages: string[] = [];
-    bridgeListener(
-      Object.assign(new Event('message'), {
-        data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
-        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
-        source,
-        stopImmediatePropagation: vi.fn(),
-      }) as unknown as MessageEvent
-    );
-
-    expect(portMessages).toHaveLength(1);
-    document.getElementById('div-header-dynamic')?.remove();
-  });
-
-  it('does not let an overlapping slot prefix claim another slot iframe', async () => {
-    const renderer = apsRenderer();
-    (window as TestWindow).tsjs.bids.homepage_header = {
-      hb_adid: renderer.bidId,
-      hb_bidder: 'aps',
-      renderer,
-    };
-    (window as TestWindow).tsjs.adSlots.push({
-      id: 'homepage_header_mobile',
-      formats: [[320, 50]],
-      gam_unit_path: '/a/b/mobile',
-      div_id: 'div-header-mobile',
-      targeting: {},
-    });
-
-    const bridgeListener = await captureBridgeListener();
-    const source = createTrustedSlotIframe('div-header-mobile');
-    const portMessages: string[] = [];
-    const stopSpy = vi.fn();
-    bridgeListener(
-      Object.assign(new Event('message'), {
-        data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
-        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
-        source,
-        stopImmediatePropagation: stopSpy,
-      }) as unknown as MessageEvent
-    );
-
-    expect(stopSpy).not.toHaveBeenCalled();
-    expect(portMessages).toEqual([]);
-    document.getElementById('div-header-mobile')?.remove();
-  });
-
-  it('ignores an APS ad ID requested by another configured slot', async () => {
-    const renderer = apsRenderer();
-    (window as TestWindow).tsjs.bids.homepage_header = {
-      hb_adid: renderer.bidId,
-      hb_bidder: 'aps',
-      renderer,
-    };
-    (window as TestWindow).tsjs.adSlots.push({
-      id: 'homepage_footer',
-      formats: [[300, 250]],
-      gam_unit_path: '/a/b/footer',
-      div_id: 'div-footer',
-      targeting: {},
-    });
-    const footer = document.createElement('div');
-    footer.id = 'div-footer';
-    const foreignIframe = document.createElement('iframe');
-    footer.appendChild(foreignIframe);
-    document.body.appendChild(footer);
-
-    const bridgeListener = await captureBridgeListener();
-    const stopSpy = vi.fn();
-    const portMessages: string[] = [];
-    bridgeListener(
-      Object.assign(new Event('message'), {
-        data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
-        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
-        source: foreignIframe.contentWindow,
-        stopImmediatePropagation: stopSpy,
-      }) as unknown as MessageEvent
-    );
-
-    expect(stopSpy).not.toHaveBeenCalled();
-    expect(portMessages).toEqual([]);
-    expect(fetchStub).not.toHaveBeenCalled();
-    footer.remove();
-  });
 
   it('records an inline creative request and response with the same opaque attempt ID', async () => {
     const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(41);
@@ -3717,6 +3231,500 @@ describe('installTsRenderBridge', () => {
     expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
     expect(beaconSpy).not.toHaveBeenCalled();
     beaconSpy.mockRestore();
+  });
+
+  it('serves a registered Prebid APS renderer when its generated ad ID differs from the APS bid ID', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'prebid-generated-ad-id';
+    const markUsed = vi.fn();
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markUsed,
+      },
+    };
+    const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(48);
+    const recordTrustedServerCreativeResponse = vi.fn();
+    const recordTrustedServerCreativeFailure = vi.fn();
+    (window as TestWindow).tsjs.gptDiagnosticsRecorder = {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } as unknown as TsjsApi['gptDiagnosticsRecorder'];
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    const event = Object.assign(new Event('message'), {
+      data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+      ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+      source,
+      stopImmediatePropagation: stopSpy,
+    }) as unknown as MessageEvent;
+
+    bridgeListener(event);
+    const foreignIframe = document.createElement('iframe');
+    document.body.appendChild(foreignIframe);
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source: foreignIframe.contentWindow,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+
+    expect(stopSpy).toHaveBeenCalledTimes(2);
+    expect(portMessages).toHaveLength(1);
+    expect(markUsed).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(portMessages[0])).toEqual(
+      expect.objectContaining({
+        message: 'Prebid Response',
+        adId: prebidAdId,
+        apsRenderer: renderer,
+        width: renderer.width,
+        height: renderer.height,
+      })
+    );
+    expect(renderer.bidId).not.toBe(prebidAdId);
+    expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
+    expect(fetchStub).not.toHaveBeenCalled();
+    expect(recordTrustedServerCreativeRequest).toHaveBeenCalledOnce();
+    expect(recordTrustedServerCreativeRequest).toHaveBeenCalledWith('homepage_header');
+    expect(recordTrustedServerCreativeResponse).toHaveBeenCalledWith(48);
+    expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
+    foreignIframe.remove();
+  });
+
+  it.each(['server', 'Prebid'] as const)(
+    'records response_post_failed when posting a %s APS renderer throws',
+    async (sourceKind) => {
+      const renderer = apsRenderer();
+      const adId = sourceKind === 'server' ? renderer.bidId : 'prebid-post-failure-ad-id';
+      const markUsed = vi.fn();
+      if (sourceKind === 'server') {
+        (window as TestWindow).tsjs.bids.homepage_header = {
+          hb_adid: adId,
+          hb_bidder: 'aps',
+          renderer,
+        };
+      } else {
+        (window as TestWindow).tsjs.apsPrebidRenderers = {
+          [adId]: {
+            adUnitCode: 'div-header',
+            renderer,
+            registeredAt: Date.now(),
+            expiresAt: Date.now() + 60_000,
+            markUsed,
+          },
+        };
+      }
+
+      const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(50);
+      const recordTrustedServerCreativeResponse = vi.fn();
+      const recordTrustedServerCreativeFailure = vi.fn();
+      (window as TestWindow).tsjs.gptDiagnosticsRecorder = {
+        recordTrustedServerCreativeRequest,
+        recordTrustedServerCreativeResponse,
+        recordTrustedServerCreativeFailure,
+      } as unknown as TsjsApi['gptDiagnosticsRecorder'];
+
+      const bridgeListener = await captureBridgeListener();
+      const source = createTrustedSlotIframe();
+      expect(() =>
+        bridgeListener(
+          Object.assign(new Event('message'), {
+            data: JSON.stringify({ message: 'Prebid Request', adId }),
+            ports: [
+              {
+                postMessage: vi.fn(() => {
+                  throw new Error('port closed');
+                }),
+              },
+            ],
+            source,
+            stopImmediatePropagation: vi.fn(),
+          }) as unknown as MessageEvent
+        )
+      ).not.toThrow();
+
+      expect(recordTrustedServerCreativeRequest).toHaveBeenCalledWith('homepage_header');
+      expect(recordTrustedServerCreativeFailure).toHaveBeenCalledWith(50, 'response_post_failed');
+      expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
+      expect(markUsed).not.toHaveBeenCalled();
+    }
+  );
+
+  it('still serves the APS renderer when markUsed throws', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'throwing-mark-used-ad-id';
+    const markUsed = vi.fn(() => {
+      throw new Error('fictional markUsed failure');
+    });
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markUsed,
+      },
+    };
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const portMessages: string[] = [];
+
+    expect(() =>
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+          ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      )
+    ).not.toThrow();
+
+    expect(portMessages).toHaveLength(1);
+    expect(JSON.parse(portMessages[0])).toEqual(
+      expect.objectContaining({
+        message: 'Prebid Response',
+        adId: prebidAdId,
+        apsRenderer: renderer,
+      })
+    );
+    expect(markUsed).toHaveBeenCalledTimes(1);
+  });
+
+  it('prunes expired consumed APS renderer IDs', async () => {
+    vi.useFakeTimers();
+    try {
+      const renderer = apsRenderer();
+      const prebidAdId = 'expiring-consumed-ad-id';
+      const start = Date.now();
+      const firstMarkUsed = vi.fn();
+      const secondMarkUsed = vi.fn();
+      (window as TestWindow).tsjs.apsPrebidRenderers = {
+        [prebidAdId]: {
+          adUnitCode: 'div-header',
+          renderer,
+          registeredAt: start,
+          expiresAt: start + 60_000,
+          markUsed: firstMarkUsed,
+        },
+      };
+
+      const bridgeListener = await captureBridgeListener();
+      const source = createTrustedSlotIframe();
+      const stopImmediatePropagation = vi.fn();
+      const portMessages: string[] = [];
+      const sendRequest = (): void => {
+        bridgeListener(
+          Object.assign(new Event('message'), {
+            data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+            ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+            source,
+            stopImmediatePropagation,
+          }) as unknown as MessageEvent
+        );
+      };
+
+      sendRequest();
+      vi.advanceTimersByTime(60_001);
+      (window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId] = {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markUsed: secondMarkUsed,
+      };
+      sendRequest();
+
+      expect(portMessages).toHaveLength(2);
+      expect(stopImmediatePropagation).toHaveBeenCalledTimes(2);
+      expect(firstMarkUsed).toHaveBeenCalledTimes(1);
+      expect(secondMarkUsed).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('fails closed when consumed APS renderer tombstones reach capacity', async () => {
+    const renderer = apsRenderer();
+    const capacity = 256;
+    const callbacks = Array.from({ length: capacity + 1 }, () => ({
+      markUsed: vi.fn(),
+    }));
+    const entries = Object.fromEntries(
+      callbacks.map((lifecycle, index) => [
+        `capacity-ad-${index}`,
+        {
+          adUnitCode: 'div-header',
+          renderer,
+          registeredAt: Date.now(),
+          expiresAt: Date.now() + 60_000,
+          ...lifecycle,
+        },
+      ])
+    );
+    (window as TestWindow).tsjs.apsPrebidRenderers = entries;
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const stopImmediatePropagation = vi.fn();
+    const portMessages: string[] = [];
+    const sendRequest = (adId: string): void => {
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId }),
+          ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+          source,
+          stopImmediatePropagation,
+        }) as unknown as MessageEvent
+      );
+    };
+
+    for (let index = 0; index < capacity; index += 1) {
+      sendRequest(`capacity-ad-${index}`);
+    }
+    sendRequest(`capacity-ad-${capacity}`);
+    sendRequest('capacity-ad-0');
+
+    expect(portMessages).toHaveLength(capacity);
+    expect(callbacks[capacity].markUsed).not.toHaveBeenCalled();
+    expect(entries[`capacity-ad-${capacity}`]).toBeDefined();
+    expect(callbacks[0].markUsed).toHaveBeenCalledTimes(1);
+    expect(stopImmediatePropagation).toHaveBeenCalledTimes(capacity + 2);
+  });
+
+  it('does not expose a registered Prebid APS renderer to another slot iframe', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'prebid-generated-ad-id';
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markUsed: vi.fn(),
+      },
+    };
+
+    const footer = document.createElement('div');
+    footer.id = 'div-footer';
+    const foreignIframe = document.createElement('iframe');
+    footer.appendChild(foreignIframe);
+    document.body.appendChild(footer);
+
+    const bridgeListener = await captureBridgeListener();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source: foreignIframe.contentWindow,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+
+    expect(stopSpy).toHaveBeenCalledTimes(1);
+    expect(portMessages).toEqual([]);
+    expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeDefined();
+    footer.remove();
+  });
+
+  it('drops an expired Prebid APS renderer without claiming the creative request', async () => {
+    const prebidAdId = 'expired-prebid-ad-id';
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer: apsRenderer(),
+        registeredAt: Date.now() - 61_000,
+        expiresAt: Date.now() - 1_000,
+        markUsed: vi.fn(),
+      },
+    };
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+
+    expect(stopSpy).not.toHaveBeenCalled();
+    expect(portMessages).toEqual([]);
+    expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
+  });
+
+  it.each(['server', 'Prebid'] as const)(
+    'records missing_render_source for invalid %s APS data',
+    async (sourceKind) => {
+      const renderer = { ...apsRenderer(), aaxResponse: 'invalid' };
+      const adId = sourceKind === 'server' ? renderer.bidId : 'prebid-invalid-renderer-ad-id';
+      const markUsed = vi.fn();
+      if (sourceKind === 'server') {
+        (window as TestWindow).tsjs.bids.homepage_header = {
+          hb_adid: adId,
+          hb_bidder: 'aps',
+          renderer,
+        };
+      } else {
+        (window as TestWindow).tsjs.apsPrebidRenderers = {
+          [adId]: {
+            adUnitCode: 'div-header',
+            renderer,
+            registeredAt: Date.now(),
+            expiresAt: Date.now() + 60_000,
+            markUsed,
+          },
+        };
+      }
+
+      const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(49);
+      const recordTrustedServerCreativeResponse = vi.fn();
+      const recordTrustedServerCreativeFailure = vi.fn();
+      (window as TestWindow).tsjs.gptDiagnosticsRecorder = {
+        recordTrustedServerCreativeRequest,
+        recordTrustedServerCreativeResponse,
+        recordTrustedServerCreativeFailure,
+      } as unknown as TsjsApi['gptDiagnosticsRecorder'];
+
+      const bridgeListener = await captureBridgeListener();
+      const source = createTrustedSlotIframe();
+      const stopSpy = vi.fn();
+      const portMessages: string[] = [];
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId }),
+          ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+          source,
+          stopImmediatePropagation: stopSpy,
+        }) as unknown as MessageEvent
+      );
+
+      if (sourceKind === 'server') {
+        // The server descriptor is validated before the handler claims the
+        // message, so invalid data never suppresses another legitimate handler.
+        expect(stopSpy).not.toHaveBeenCalled();
+      } else {
+        expect(stopSpy).toHaveBeenCalledOnce();
+      }
+      expect(portMessages).toEqual([]);
+      expect(fetchStub).not.toHaveBeenCalled();
+      expect(recordTrustedServerCreativeRequest).toHaveBeenCalledWith('homepage_header');
+      expect(recordTrustedServerCreativeFailure).toHaveBeenCalledWith(49, 'missing_render_source');
+      expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
+      expect(markUsed).not.toHaveBeenCalled();
+    }
+  );
+
+  it('accepts an APS request from a dynamic slot root resolved from its configured prefix', async () => {
+    const renderer = apsRenderer();
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: renderer.bidId,
+      hb_bidder: 'aps',
+      renderer,
+    };
+    (window as TestWindow).tsjs.adSlots[0].div_id = 'div-header-';
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe('div-header-dynamic');
+    const portMessages: string[] = [];
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent
+    );
+
+    expect(portMessages).toHaveLength(1);
+    document.getElementById('div-header-dynamic')?.remove();
+  });
+
+  it('does not let an overlapping slot prefix claim another slot iframe', async () => {
+    const renderer = apsRenderer();
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: renderer.bidId,
+      hb_bidder: 'aps',
+      renderer,
+    };
+    (window as TestWindow).tsjs.adSlots.push({
+      id: 'homepage_header_mobile',
+      formats: [[320, 50]],
+      gam_unit_path: '/a/b/mobile',
+      div_id: 'div-header-mobile',
+      targeting: {},
+    });
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe('div-header-mobile');
+    const portMessages: string[] = [];
+    const stopSpy = vi.fn();
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+
+    expect(stopSpy).not.toHaveBeenCalled();
+    expect(portMessages).toEqual([]);
+    document.getElementById('div-header-mobile')?.remove();
+  });
+
+  it('ignores an APS ad ID requested by another configured slot', async () => {
+    const renderer = apsRenderer();
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: renderer.bidId,
+      hb_bidder: 'aps',
+      renderer,
+    };
+    (window as TestWindow).tsjs.adSlots.push({
+      id: 'homepage_footer',
+      formats: [[300, 250]],
+      gam_unit_path: '/a/b/footer',
+      div_id: 'div-footer',
+      targeting: {},
+    });
+    const footer = document.createElement('div');
+    footer.id = 'div-footer';
+    const foreignIframe = document.createElement('iframe');
+    footer.appendChild(foreignIframe);
+    document.body.appendChild(footer);
+
+    const bridgeListener = await captureBridgeListener();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source: foreignIframe.contentWindow,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+
+    expect(stopSpy).not.toHaveBeenCalled();
+    expect(portMessages).toEqual([]);
+    expect(fetchStub).not.toHaveBeenCalled();
+    footer.remove();
   });
 
   it('calls stopImmediatePropagation and fetches PBS Cache for a TS bid', async () => {
@@ -4073,6 +4081,61 @@ describe('installTsRenderBridge', () => {
     expect(fetchStub).not.toHaveBeenCalled();
   });
 
+  it('uses the adInit-resolved div when a responsive prefix becomes ambiguous', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    fetchStub.mockResolvedValue({
+      ok: true,
+      text: () => Promise.resolve('<div>Responsive Creative</div>'),
+    } as Response);
+
+    const resolvedSlot = document.createElement('div');
+    resolvedSlot.id = 'div-responsive-a';
+    const iframe = document.createElement('iframe');
+    resolvedSlot.appendChild(iframe);
+    document.body.appendChild(resolvedSlot);
+    const laterSibling = document.createElement('div');
+    laterSibling.id = 'div-responsive-b';
+    document.body.appendChild(laterSibling);
+
+    (window as TestWindow).tsjs!.adSlots = [
+      {
+        id: 'homepage_header',
+        formats: [[728, 90]] as [number, number][],
+        gam_unit_path: '/a/b/c',
+        div_id: 'div-responsive-',
+        targeting: {},
+      },
+    ];
+    (window as TestWindow).tsjs!.divToSlotId = {
+      'div-responsive-a': 'homepage_header',
+    };
+
+    const bridgeListener = await captureBridgeListener();
+    const portMessages: string[] = [];
+    const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+    const stopSpy = vi.fn();
+
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [fakePort],
+        source: iframe.contentWindow,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(fetchStub).toHaveBeenCalledWith(
+      'https://openads.example.com/cache?uuid=test-cache-uuid',
+      { mode: 'cors' }
+    );
+    expect(portMessages).toHaveLength(1);
+    expect(stopSpy).toHaveBeenCalled();
+    expect(beaconSpy).toHaveBeenCalledWith('https://ssp.example/win');
+    expect(beaconSpy).toHaveBeenCalledWith('https://ssp.example/bill');
+    beaconSpy.mockRestore();
+  });
+
   it('declines to render when the PBS Cache response carries no adm', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
     const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(44);
@@ -4314,6 +4377,7 @@ describe('installTsRenderBridge', () => {
           targeting: {},
         },
       ],
+      divToSlotId: { 'div-a': 'slot_a', 'div-b': 'slot_b' },
     };
 
     const bridgeListener = await captureBridgeListener();
@@ -4377,6 +4441,7 @@ describe('installTsRenderBridge', () => {
           targeting: {},
         },
       ],
+      divToSlotId: { 'div-header': 'homepage_header' },
     };
 
     let bridgeListener: ((e: MessageEvent) => unknown) | undefined;
@@ -4458,6 +4523,7 @@ describe('installTsRenderBridge', () => {
           targeting: {},
         },
       ],
+      divToSlotId: { 'div-header': 'homepage_header' },
     };
 
     const bridgeListener = await captureBridgeListener();
@@ -4526,6 +4592,7 @@ describe('installTsRenderBridge', () => {
           targeting: {},
         },
       ],
+      divToSlotId: { 'div-header': 'homepage_header', 'div-in-content': 'homepage_in_content' },
     };
 
     const bridgeListener = await captureBridgeListener();
@@ -4773,6 +4840,219 @@ describe('installTsRenderBridge', () => {
       new MessageEvent('message', { data: JSON.stringify({ message: 'Other' }) })
     );
     await new Promise<void>((r) => setTimeout(r, 50));
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
+  it('serves one exact APS dynamic-renderer response without cache fetches or beacons', async () => {
+    const renderer = apsRenderer();
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: renderer.bidId,
+      hb_bidder: 'aps',
+      hb_pb: '1.23',
+      renderer,
+      // These must not be used even if unexpected legacy fields coexist.
+      nurl: 'https://notify.example/win',
+      burl: 'https://notify.example/bill',
+      hb_cache_host: 'cache.example.com',
+      hb_cache_path: '/cache',
+    };
+
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    const fakePort = { postMessage: (message: string) => portMessages.push(message) };
+    const event = Object.assign(new Event('message'), {
+      data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
+      ports: [fakePort],
+      source,
+      stopImmediatePropagation: stopSpy,
+    }) as unknown as MessageEvent;
+
+    bridgeListener(event);
+    bridgeListener(event);
+
+    expect(stopSpy).toHaveBeenCalledTimes(2);
+    expect(fetchStub).not.toHaveBeenCalled();
+    expect(beaconSpy).not.toHaveBeenCalled();
+    // Server-rendered APS descriptors are reusable: GAM can issue repeated
+    // Universal Creative requests for the same winning ad ID.
+    expect(portMessages).toHaveLength(2);
+    const response = JSON.parse(portMessages[0]) as Record<string, unknown>;
+    expect(Object.keys(response).sort()).toEqual(
+      [
+        'adId',
+        'apsRenderer',
+        'height',
+        'message',
+        'renderer',
+        'rendererUrl',
+        'rendererVersion',
+        'width',
+      ].sort()
+    );
+    expect(response).toEqual({
+      message: 'Prebid Response',
+      adId: renderer.bidId,
+      renderer: expect.stringContaining('window.render=function'),
+      rendererVersion: 4,
+      rendererUrl: new URL('/integrations/aps/renderer', window.location.origin).href,
+      apsRenderer: renderer,
+      width: 300,
+      height: 250,
+    });
+    expect(String(response.renderer)).not.toContain(renderer.accountId);
+    expect(String(response.renderer)).not.toContain(renderer.aaxResponse);
+
+    // Universal Creative's dynamic-renderer path evaluates the returned static
+    // source and calls window.render(response, helper, targetWindow). Consume
+    // the exact bridge response through that deployed protocol shape.
+    const dynamicWindow = window as unknown as {
+      render?: (data: Record<string, unknown>, helper: unknown, target: Window) => Promise<void>;
+    };
+    window.eval(String(response.renderer));
+    try {
+      const rendered = dynamicWindow.render!(response, undefined, window);
+      const outerFrame = document.querySelector<HTMLIFrameElement>(
+        'iframe[src*="/integrations/aps/renderer#tsaps="]'
+      )!;
+      expect(outerFrame).not.toBeNull();
+      expect(outerFrame.getAttribute('sandbox')).not.toContain('allow-same-origin');
+
+      const rendererPost = vi.spyOn(outerFrame.contentWindow!, 'postMessage');
+      outerFrame.dispatchEvent(new Event('load'));
+      const bootstrap = rendererPost.mock.calls[0][0] as { nonce: string };
+      const transferredPort = rendererPost.mock.calls[0][2]?.[0] as MessagePort | undefined;
+      expect(transferredPort).toBeDefined();
+      await new Promise<void>((resolve) => {
+        transferredPort!.onmessage = (message) => {
+          expect(message.data).toEqual({ renderer });
+          transferredPort!.postMessage({
+            message: 'trusted-server/aps/renderer-ready',
+            nonce: bootstrap.nonce,
+          });
+          resolve();
+        };
+      });
+      await expect(rendered).resolves.toBeUndefined();
+      outerFrame.remove();
+    } finally {
+      delete dynamicWindow.render;
+    }
+    beaconSpy.mockRestore();
+  });
+
+  it('resizes only the authenticated collapsed 1x1 creative shell after responding', async () => {
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: 'collapsed-inline-ad-id',
+      hb_bidder: 'fictional',
+      hb_pb: '1.23',
+      adm: '<div>fictional creative</div>',
+      w: 300,
+      h: 250,
+    };
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const slot = document.getElementById('div-header')!;
+    const selectedFrame = slot.querySelector<HTMLIFrameElement>('iframe')!;
+    slot.style.width = '1px';
+    slot.style.height = '1px';
+    selectedFrame.width = '1';
+    selectedFrame.height = '1';
+    selectedFrame.style.width = '1px';
+    selectedFrame.style.height = '1px';
+
+    const siblingSlot = document.createElement('div');
+    siblingSlot.style.width = '1px';
+    siblingSlot.style.height = '1px';
+    const siblingFrame = document.createElement('iframe');
+    siblingFrame.width = '1';
+    siblingFrame.height = '1';
+    siblingFrame.style.width = '1px';
+    siblingFrame.style.height = '1px';
+    siblingSlot.appendChild(siblingFrame);
+    document.body.appendChild(siblingSlot);
+
+    try {
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: 'collapsed-inline-ad-id' }),
+          ports: [{ postMessage: vi.fn() }],
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+
+      expect(selectedFrame.style.width).toBe('300px');
+      expect(selectedFrame.style.height).toBe('250px');
+      expect(slot.style.width).toBe('300px');
+      expect(slot.style.height).toBe('250px');
+      expect(siblingFrame.style.width).toBe('1px');
+      expect(siblingFrame.style.height).toBe('1px');
+    } finally {
+      siblingSlot.remove();
+    }
+  });
+
+  it('does not resize an authenticated shell whose computed dimensions are not pixels', async () => {
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: 'relative-inline-ad-id',
+      hb_bidder: 'fictional',
+      hb_pb: '1.23',
+      adm: '<div>fictional creative</div>',
+      w: 300,
+      h: 250,
+    };
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const slot = document.getElementById('div-header')!;
+    const frame = slot.querySelector<HTMLIFrameElement>('iframe')!;
+    slot.style.width = '1vw';
+    slot.style.height = '1vh';
+    frame.width = '1';
+    frame.height = '1';
+    frame.style.width = '1vw';
+    frame.style.height = '1vh';
+
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'relative-inline-ad-id' }),
+        ports: [{ postMessage: vi.fn() }],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent
+    );
+
+    expect(frame.style.width).toBe('1vw');
+    expect(frame.style.height).toBe('1vh');
+    expect(slot.style.width).toBe('1vw');
+    expect(slot.style.height).toBe('1vh');
+  });
+
+  it('validates APS data before claiming the Prebid request', async () => {
+    const renderer = { ...apsRenderer(), aaxResponse: 'invalid' };
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: renderer.bidId,
+      hb_bidder: 'aps',
+      renderer,
+    };
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+
+    expect(stopSpy).not.toHaveBeenCalled();
+    expect(portMessages).toEqual([]);
     expect(fetchStub).not.toHaveBeenCalled();
   });
 });

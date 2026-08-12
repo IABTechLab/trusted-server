@@ -74,7 +74,51 @@ describe('creative/click.ts', () => {
     });
 
     expect(anchor.getAttribute('href')).toBe(absolute(PROXY_RESPONSE));
-    expect(anchor.getAttribute('data-tsclick')).toBe(absolute(PROXY_RESPONSE));
+    // data-tsclick keeps the server's root-relative shape: it is echoed back as
+    // the rebuild payload's `tsclick`, which the server parses as a click path.
+    expect(anchor.getAttribute('data-tsclick')).toBe(PROXY_RESPONSE);
+  });
+
+  it('sends a root-relative tsclick on a second rebuild after a successful one', async () => {
+    // Regression: persisting an absolute canonical click made the next rebuild
+    // POST a value the server rejects as an invalid click path, so the second
+    // mutation was silently lost on non-opaque consumers.
+    vi.useFakeTimers();
+
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ href: PROXY_RESPONSE }),
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const anchor = document.createElement('a');
+    anchor.setAttribute('data-tsclick', FIRST_PARTY_CLICK);
+    anchor.setAttribute('href', FIRST_PARTY_CLICK);
+    document.body.appendChild(anchor);
+
+    await importCreativeModule();
+
+    anchor.setAttribute('href', MUTATED_CLICK);
+    await Promise.resolve();
+    await vi.runAllTimersAsync();
+
+    expect(anchor.getAttribute('data-tsclick')).toBe(PROXY_RESPONSE);
+
+    // A second mutation now diffs against the rebuilt canonical click.
+    anchor.setAttribute('href', 'https://example.com/landing?baz=3');
+    await Promise.resolve();
+    await vi.runAllTimersAsync();
+
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
+    const payloads = fetchMock.mock.calls.map(
+      (call) => JSON.parse(call[1]?.body as string) as { tsclick: string }
+    );
+    // Every payload must carry the server's root-relative click form: an
+    // absolute one is rejected as an invalid click path.
+    for (const payload of payloads) {
+      expect(payload.tsclick.startsWith('/first-party/click?')).toBe(true);
+    }
+    expect(payloads.some((payload) => payload.tsclick === PROXY_RESPONSE)).toBe(true);
   });
 
   it('skips the doomed POST and uses the GET fallback in an opaque origin', async () => {
@@ -209,6 +253,60 @@ describe('creative/click.ts', () => {
       expect(navigated).not.toBe(absolute(FIRST_PARTY_CLICK));
     } finally {
       window.open = originalOpen;
+      if (originDescriptor) {
+        Object.defineProperty(window, 'origin', originDescriptor);
+      } else {
+        delete (window as { origin?: string }).origin;
+      }
+    }
+  });
+
+  it('navigates an over-long rebuild through a form POST instead of a GET URL', async () => {
+    // Fastly rejects request URLs over 8192 bytes before the handler runs, and
+    // a signed click with many tracking params exceeds that once nested in
+    // another query string. A form body has no such bound, and a submission is
+    // a navigation — so it is not blocked by CORS from the opaque origin.
+    vi.useFakeTimers();
+
+    const originDescriptor = Object.getOwnPropertyDescriptor(window, 'origin');
+    Object.defineProperty(window, 'origin', { value: 'null', configurable: true });
+    global.fetch = undefined as unknown as typeof fetch;
+
+    const submits: HTMLFormElement[] = [];
+    const originalSubmit = HTMLFormElement.prototype.submit;
+    HTMLFormElement.prototype.submit = function patched(this: HTMLFormElement) {
+      submits.push(this);
+    };
+
+    try {
+      // A signed click long enough that the nested rebuild URL crosses the cap.
+      const filler = 'a'.repeat(6800);
+      const longClick = `/first-party/click?tsurl=https%3A%2F%2Fexample.com%2Flanding&foo=1&pad=${filler}&tstoken=token123`;
+      const anchor = document.createElement('a');
+      anchor.setAttribute('data-tsclick', longClick);
+      anchor.setAttribute('href', longClick);
+      document.body.appendChild(anchor);
+
+      await importCreativeModule();
+
+      anchor.setAttribute('href', `https://example.com/landing?pad=${filler}&bar=2`);
+      await Promise.resolve();
+      await vi.runAllTimersAsync();
+
+      anchor.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+      await vi.runAllTimersAsync();
+
+      expect(submits.length).toBeGreaterThan(0);
+      const form = submits[0];
+      expect(form.method.toLowerCase()).toBe('post');
+      expect(form.action).toContain('/first-party/proxy-rebuild');
+      const tsclick = form.querySelector('input[name="tsclick"]') as HTMLInputElement | null;
+      expect(tsclick?.value).toBe(longClick);
+      const add = form.querySelector('input[name="add"]') as HTMLInputElement | null;
+      expect(add?.value).toContain('bar');
+    } finally {
+      HTMLFormElement.prototype.submit = originalSubmit;
       if (originDescriptor) {
         Object.defineProperty(window, 'origin', originDescriptor);
       } else {

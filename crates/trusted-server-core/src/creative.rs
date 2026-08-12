@@ -583,7 +583,18 @@ fn process_auction_creative_with_rewriter(
 /// Universal Creative's `srcdoc` under GAM), use [`rewrite_inline_creative_html`].
 #[must_use]
 pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
-    rewrite_creative_html_impl(settings, markup, "", true)
+    rewrite_creative_html_impl(settings, markup, "", true, MAX_CREATIVE_SIZE)
+}
+
+/// Rewrite an HTML document proxied through `/first-party/proxy`.
+///
+/// Same rewrite pass as [`rewrite_creative_html`], but bounded by the proxy's
+/// own [`MAX_REWRITABLE_BODY_SIZE`] rather than the per-creative auction cap:
+/// a proxied document is a whole page, not an `adm`, and legitimately exceeds
+/// 1 MiB. The creative runtime is still injected so click mediation survives.
+#[must_use]
+pub fn rewrite_proxied_html(settings: &Settings, markup: &str) -> String {
+    rewrite_creative_html_impl(settings, markup, "", true, MAX_REWRITABLE_BODY_SIZE)
 }
 
 /// Rewrite an inline ad creative for rendering in a **foreign-origin** context —
@@ -610,7 +621,7 @@ pub fn rewrite_inline_creative_html(
     base_origin: &str,
     markup: &str,
 ) -> String {
-    rewrite_creative_html_impl(settings, markup, base_origin, false)
+    rewrite_creative_html_impl(settings, markup, base_origin, false, MAX_CREATIVE_SIZE)
 }
 
 /// The clear-price auction macro DSPs embed in creative markup and tracking URLs.
@@ -641,15 +652,25 @@ pub fn expand_auction_price_macro(markup: &str, cpm: f64) -> String {
 
 /// Shared creative rewriter. `base_origin` is prefixed onto first-party proxy and
 /// click paths (empty for root-relative, `https://<domain>` for absolute);
-/// `inject_tsjs` controls the `<body>` tsjs bundle injection. See the two public
-/// wrappers, [`rewrite_creative_html`] and [`rewrite_inline_creative_html`], for
-/// the two supported render contexts.
+/// `inject_tsjs` controls the `<body>` tsjs bundle injection; `max_output_size`
+/// bounds the rewritten result. See the public wrappers,
+/// [`rewrite_creative_html`], [`rewrite_inline_creative_html`], and
+/// [`rewrite_proxied_html`], for the supported render contexts.
 fn rewrite_creative_html_impl(
     settings: &Settings,
     markup: &str,
     base_origin: &str,
     inject_tsjs: bool,
+    max_output_size: usize,
 ) -> String {
+    // Nothing to rewrite, and nothing to attach a runtime to: an empty input is
+    // an upstream rejection (the sanitizer fails closed this way) or an empty
+    // body, and must stay empty so callers can act on it. Injecting the runtime
+    // here would turn a rejected creative into a non-empty script-only `adm`
+    // that renders as a blank frame.
+    if markup.is_empty() {
+        return String::new();
+    }
     // No size parsing needed now; all absolute/protocol-relative URLs are proxied uniformly.
     let mut out = Vec::with_capacity(markup.len() + 64);
     // Shared with the `body` handler through an `Rc` so the outcome is readable
@@ -657,10 +678,12 @@ fn rewrite_creative_html_impl(
     // independent copy and always report "not injected".
     let injected_ts_creative = std::rc::Rc::new(std::cell::Cell::new(false));
     // Rewriting amplifies: every short URL becomes a signed proxy/click URL and
-    // anchors gain a `data-tsclick` copy, so an input comfortably under the cap
-    // can expand well past it. Bound the OUTPUT too, and stop accumulating once
-    // the limit trips, so a bidder cannot drive unbounded allocation in the
-    // WASM runtime by packing a creative with URL-bearing elements.
+    // anchors gain a `data-tsclick` copy, so an input comfortably under the
+    // caller's input bound can expand well past it. Bound the OUTPUT too, and
+    // stop accumulating once the limit trips, so a bidder cannot drive unbounded
+    // allocation in the WASM runtime by packing a creative with URL-bearing
+    // elements. The bound is the caller's, not a single global: auction `adm`
+    // and proxied HTML documents have very different legitimate sizes.
     let overflowed = std::cell::Cell::new(false);
     let mut rewriter = HtmlRewriter::new(
         HtmlSettings {
@@ -855,7 +878,7 @@ fn rewrite_creative_html_impl(
             if overflowed.get() {
                 return;
             }
-            if out.len() + c.len() > MAX_CREATIVE_SIZE {
+            if out.len() + c.len() > max_output_size {
                 overflowed.set(true);
                 out.clear();
                 out.shrink_to_fit();
@@ -876,8 +899,8 @@ fn rewrite_creative_html_impl(
     }
     if overflowed.get() {
         log::warn!(
-            "rewrite_creative_html: rewritten creative exceeds {} byte cap; rejecting",
-            MAX_CREATIVE_SIZE
+            "rewrite_creative_html: rewritten output exceeds {} byte cap; rejecting",
+            max_output_size
         );
         return String::new();
     }
@@ -895,12 +918,16 @@ fn rewrite_creative_html_impl(
     // not synthesize one. Without this fallback such fragments would ship
     // without the click guard, leaving rewritten links unmediated once bidder
     // script mutates them.
-    if inject_tsjs && !injected_ts_creative.get() {
+    //
+    // Empty output is never injected into: the markup was rejected upstream or
+    // rewrote to nothing, and a script-only result would read as an accepted
+    // creative that renders blank.
+    if inject_tsjs && !injected_ts_creative.get() && !rewritten.is_empty() {
         rewritten.insert_str(0, &tsjs::tsjs_unified_script_tag());
-        if rewritten.len() > MAX_CREATIVE_SIZE {
+        if rewritten.len() > max_output_size {
             log::warn!(
-                "rewrite_creative_html: creative exceeds {} byte cap after runtime injection; rejecting",
-                MAX_CREATIVE_SIZE
+                "rewrite_creative_html: output exceeds {} byte cap after runtime injection; rejecting",
+                max_output_size
             );
             return String::new();
         }
@@ -942,7 +969,7 @@ impl StreamProcessor for CreativeHtmlProcessor<'_> {
             let markup = String::from_utf8(std::mem::take(&mut self.buffer))
                 .map_err(|e| io::Error::other(format!("Invalid UTF-8 in HTML: {e}")))?;
 
-            let rewritten = rewrite_creative_html(self.settings, &markup);
+            let rewritten = rewrite_proxied_html(self.settings, &markup);
             Ok(rewritten.into_bytes())
         } else {
             Ok(Vec::new())
@@ -1786,6 +1813,66 @@ mod tests {
         assert!(
             !out.contains("/static/tsjs="),
             "inline rewriting must not inject the bundle: {out}"
+        );
+    }
+
+    #[test]
+    fn proxied_html_may_exceed_the_auction_creative_cap() {
+        // The proxy buffers documents up to MAX_REWRITABLE_BODY_SIZE; applying
+        // the 1 MiB auction cap here would blank otherwise valid pages.
+        let settings = crate::test_support::tests::create_test_settings();
+        let filler = "<p>lorem ipsum dolor sit amet consectetur</p>";
+        let body = filler.repeat((super::MAX_CREATIVE_SIZE / filler.len()) + 64);
+        let document = format!("<html><body>{body}</body></html>");
+        assert!(
+            document.len() > super::MAX_CREATIVE_SIZE,
+            "document must exceed the auction cap to be meaningful"
+        );
+
+        let out = super::rewrite_proxied_html(&settings, &document);
+
+        assert!(
+            out.len() > super::MAX_CREATIVE_SIZE,
+            "proxied HTML over the auction cap must survive rewriting"
+        );
+        assert!(
+            out.contains("lorem ipsum"),
+            "proxied HTML must keep its content"
+        );
+    }
+
+    #[test]
+    fn rewrite_returns_empty_for_empty_input() {
+        // An empty input is an upstream rejection (the sanitizer fails closed
+        // this way) or an empty body. Injecting the runtime would turn it into
+        // a non-empty script-only result that renders as a blank frame and
+        // reads as an accepted creative.
+        let settings = crate::test_support::tests::create_test_settings();
+
+        assert!(
+            rewrite_creative_html(&settings, "").is_empty(),
+            "empty creative input must stay empty"
+        );
+        assert!(
+            super::rewrite_proxied_html(&settings, "").is_empty(),
+            "empty proxied body must stay empty"
+        );
+    }
+
+    #[test]
+    fn sanitizer_rejection_stays_empty_through_processing() {
+        // Script-only markup sanitizes to nothing; the rewrite pass must not
+        // resurrect it as a runtime-only `adm`.
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.auction.sanitize_creatives = true;
+        settings.auction.rewrite_creatives = true;
+
+        let processed =
+            process_auction_creative(&settings, "<script>document.write('ad')</script>");
+
+        assert!(
+            processed.is_empty(),
+            "a sanitizer-rejected creative must remain rejected: {processed}"
         );
     }
 

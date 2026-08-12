@@ -26,7 +26,7 @@ function clientAuctionBundlePaths() {
         core: resolve(TSJS_CRATE, "dist/tsjs-core.js"),
         gpt: resolve(TSJS_CRATE, "dist/tsjs-gpt.js"),
         prebid: resolve(TSJS_CRATE, "dist/prebid", manifest.filename),
-        shim: resolve(TSJS_CRATE, "dist/tsjs-prebid.js"),
+        prebidShim: resolve(TSJS_CRATE, "dist/tsjs-prebid.js"),
     };
 }
 
@@ -50,7 +50,7 @@ async function loadClientAuctionBundles(page: Page): Promise<void> {
         ),
     );
     if (decoupledBundle) {
-        await page.addScriptTag({ path: bundles.shim });
+        await page.addScriptTag({ path: bundles.prebidShim });
     }
 }
 

@@ -182,7 +182,8 @@ describe('GPT diagnostics public types', () => {
     >();
     expectTypeOf<GptDiagnosticsResponseClass>().toEqualTypeOf<
       'empty' | 'backfill' | 'reservation' | 'unclassified_non_empty'
-    >();    expectTypeOf(snapshot).toEqualTypeOf<GptDiagnosticsExportV1>();
+    >();
+    expectTypeOf(snapshot).toEqualTypeOf<GptDiagnosticsExportV1>();
     expectTypeOf<GptDiagnosticsSlotExport>().not.toHaveProperty('bidder');
     expectTypeOf<GptDiagnosticsSlotExport>().not.toHaveProperty('targeting');
     expectTypeOf<GptDiagnosticsRequestCycle>().not.toHaveProperty('price');

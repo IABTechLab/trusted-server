@@ -1066,6 +1066,12 @@ apply when the integration section exists in `trusted-server.toml`.
 | `client_side_bidders`      | Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side (see [Prebid docs](/guide/integrations/prebid#client-side-bidders)) |
 | `script_patterns`          | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                           |
 
+APS is configured exclusively under `[integrations.aps]`. `aps` entries in
+`bidders` or `client_side_bidders` are logged and removed case-insensitively so
+an upgrade does not prevent Trusted Server from starting. Remove those entries
+from operator configuration; this guard prevents APS demand from reaching
+Prebid Server or the client-side Prebid bundle.
+
 **Example**:
 
 ```toml
@@ -1258,8 +1264,9 @@ context that shares the publisher's origin. With `rewrite_creatives = true`
 not excluded by rewrite configuration are converted to signed first-party
 endpoints, and any bidder-supplied `<base>` element is removed. The
 `POST /auction` path emits root-relative endpoints and injects the creative TSJS
-runtime when a `<body>` exists; the foreign-origin SSAT renderer emits absolute
-endpoints and does not inject that bundle. With both disabled, `adm` ships
+runtime exactly once — whether or not the bidder supplied a `<body>`, since bare
+fragments are the common `adm` shape; the foreign-origin SSAT renderer emits
+absolute endpoints and does not inject that bundle. With both disabled, `adm` ships
 exactly as the bidder returned it — except that a creative larger than the
 1 MiB per-creative cap is rejected in every mode and its `adm` is dropped.
 Accepted external URLs are not host allowlisted by the sanitizer. Neither

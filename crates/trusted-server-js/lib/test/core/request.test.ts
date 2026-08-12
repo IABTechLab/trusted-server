@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import type { AdUnit } from '../../src/core/types';
 import envelope from '../fixtures/aps-renderer-v1.json';
 
 /** Test view of the global scope with a mockable `fetch`. */
@@ -89,7 +90,7 @@ describe('request.requestAds', () => {
       width: apsBid.w,
       height: apsBid.h,
     };
-    testGlobal.fetch = vi.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       headers: { get: () => 'application/json' },
@@ -117,7 +118,7 @@ describe('request.requestAds', () => {
     addAdUnits({
       code: 'slot1',
       mediaTypes: { banner: { sizes: [[300, 250]] } },
-    } as unknown as AddAdUnitsArg);
+    } satisfies AdUnit);
 
     requestAds();
     await flushRequestAds();
@@ -145,7 +146,7 @@ describe('request.requestAds', () => {
   });
 
   it('does not mutate the slot for an invalid APS descriptor', async () => {
-    testGlobal.fetch = vi.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       headers: { get: () => 'application/json' },
@@ -174,7 +175,7 @@ describe('request.requestAds', () => {
     addAdUnits({
       code: 'slot1',
       mediaTypes: { banner: { sizes: [[300, 250]] } },
-    } as unknown as AddAdUnitsArg);
+    } satisfies AdUnit);
 
     requestAds();
     await flushRequestAds();

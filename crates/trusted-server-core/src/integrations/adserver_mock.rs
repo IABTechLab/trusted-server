@@ -258,8 +258,6 @@ impl AdServerMockProvider {
     /// fields back, so they are restored from the index using
     /// `(seat, impid, bidder)` where bidder is recovered from the echoed `crid`
     /// field (`"{bidder}-creative"` format set during request construction).
-    /// `bid_id` is the exception: the mediation response carries its own
-    /// `OpenRTB` bid `id`, which is preferred over the original SSP bid's.
     fn parse_mediation_response(
         &self,
         json: &Json,
