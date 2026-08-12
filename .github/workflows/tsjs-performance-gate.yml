@@ -48,6 +48,8 @@ jobs:
       TSJS_PERF_OUTPUT: crates/trusted-server-integration-tests/browser/test-results/tsjs-performance-${{ inputs.mode }}.json
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Validate immutable measurement inputs
         shell: bash
@@ -94,6 +96,17 @@ jobs:
           npm ci
           npm run build
           npm run check:bundle
+
+      - name: Build the frozen paired-reference artifacts
+        shell: bash
+        run: |
+          reference_sha="62421ee44c62f24534ea8782a46dfa5bfbcea950"
+          reference_root="$RUNNER_TEMP/tsjs-performance-reference"
+          test "$(git cat-file -t "$reference_sha")" = commit
+          git worktree add --detach "$reference_root" "$reference_sha"
+          npm --prefix "$reference_root/crates/trusted-server-js/lib" ci
+          npm --prefix "$reference_root/crates/trusted-server-js/lib" run build
+          echo "TSJS_PERF_REFERENCE_ROOT=$reference_root" >> "$GITHUB_ENV"
 
       - name: Install the lockfile-pinned Chromium setup
         working-directory: crates/trusted-server-integration-tests/browser

@@ -5,19 +5,22 @@ import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 const EXPECTED = Object.freeze({
-  schemaVersion: 2,
+  schemaVersion: 3,
   chromium: "145.0.7632.6",
   machineClass: "github-hosted:ubuntu-24.04",
   runnerImage: "ubuntu-24.04",
-  fixture: "tsjs-generated-loopback-v1",
+  fixture: "tsjs-generated-loopback-paired-v2",
   controller: "generated-server-v1",
   node: "v24.12.0",
   npm: "11.6.2",
   typescript: "6.0.3",
-  warmups: 5,
-  samples: 50,
+  warmupsPerVariant: 5,
+  samplesPerVariant: 50,
   percentile: 90,
-  p90CeilingMs: 33.6,
+  interleaving: "alternating-reference-current",
+  referenceSha: "62421ee44c62f24534ea8782a46dfa5bfbcea950",
+  maximumRatio: 1.1,
+  hardCeilingMs: 100,
   heapCeilings: Object.freeze({
     afterBoot: 1_329_697,
     afterFirstRender: 1_333_217,
@@ -162,13 +165,14 @@ export function validateEvidence(evidence, expected) {
 
   exactKeys(
     evidence.sampling,
-    ["warmups", "samples", "percentile"],
+    ["warmupsPerVariant", "samplesPerVariant", "percentile", "interleaving"],
     "sampling",
   );
   if (
-    evidence.sampling.warmups !== EXPECTED.warmups ||
-    evidence.sampling.samples !== EXPECTED.samples ||
-    evidence.sampling.percentile !== EXPECTED.percentile
+    evidence.sampling.warmupsPerVariant !== EXPECTED.warmupsPerVariant ||
+    evidence.sampling.samplesPerVariant !== EXPECTED.samplesPerVariant ||
+    evidence.sampling.percentile !== EXPECTED.percentile ||
+    evidence.sampling.interleaving !== EXPECTED.interleaving
   ) {
     fail("sampling contract drifted");
   }
@@ -187,27 +191,63 @@ export function validateEvidence(evidence, expected) {
   const timing = evidence.performance.bootToFirstDisplayMs;
   exactKeys(
     timing,
-    ["samples", "percentile", "p90", "ceilingMs"],
+    [
+      "reference",
+      "current",
+      "percentile",
+      "maximumRatio",
+      "observedRatio",
+      "hardCeilingMs",
+    ],
     "performance timing",
-  );
-  if (
-    !Array.isArray(timing.samples) ||
-    timing.samples.length !== EXPECTED.samples
-  ) {
-    fail("performance samples must contain exactly 50 values");
-  }
-  const samples = timing.samples.map((value, index) =>
-    finiteNumber(value, `performance sample ${index}`),
   );
   if (timing.percentile !== EXPECTED.percentile)
     fail("performance percentile drifted");
-  if (timing.ceilingMs !== EXPECTED.p90CeilingMs)
-    fail("performance ceiling drifted");
-  const p90 = finiteNumber(timing.p90, "performance p90");
-  if (!Object.is(p90, nearestRank(samples, EXPECTED.percentile))) {
-    fail("performance p90 is inconsistent with the samples");
+  if (timing.maximumRatio !== EXPECTED.maximumRatio)
+    fail("performance ratio limit drifted");
+  if (timing.hardCeilingMs !== EXPECTED.hardCeilingMs)
+    fail("performance hard ceiling drifted");
+  exactKeys(
+    timing.reference,
+    ["sha", "samples", "p90"],
+    "reference performance timing",
+  );
+  exactString(
+    timing.reference.sha,
+    EXPECTED.referenceSha,
+    "performance reference SHA",
+  );
+  exactKeys(timing.current, ["samples", "p90"], "current performance timing");
+  const validateVariant = (variant, path) => {
+    if (
+      !Array.isArray(variant.samples) ||
+      variant.samples.length !== EXPECTED.samplesPerVariant
+    ) {
+      fail(`${path} samples must contain exactly 50 values`);
+    }
+    const samples = variant.samples.map((value, index) =>
+      finiteNumber(value, `${path} performance sample ${index}`),
+    );
+    const variantP90 = finiteNumber(variant.p90, `${path} performance p90`);
+    if (!Object.is(variantP90, nearestRank(samples, EXPECTED.percentile))) {
+      fail(`${path} performance p90 is inconsistent with the samples`);
+    }
+    if (variantP90 > EXPECTED.hardCeilingMs)
+      fail(`${path} performance p90 exceeds the hard ceiling`);
+    return variantP90;
+  };
+  const referenceP90 = validateVariant(timing.reference, "reference");
+  const currentP90 = validateVariant(timing.current, "current");
+  if (referenceP90 <= 0) fail("reference performance p90 must be positive");
+  const observedRatio = finiteNumber(
+    timing.observedRatio,
+    "performance observed ratio",
+  );
+  if (Math.abs(observedRatio - currentP90 / referenceP90) > Number.EPSILON) {
+    fail("performance observed ratio is inconsistent with the p90 values");
   }
-  if (p90 > EXPECTED.p90CeilingMs) fail("performance p90 exceeds 33.6 ms");
+  if (currentP90 > referenceP90 * EXPECTED.maximumRatio)
+    fail("current performance p90 exceeds the paired 10% limit");
 
   exactKeys(evidence.heap, ["collection", "checkpoints"], "heap");
   exactString(
@@ -329,11 +369,12 @@ export function validateEvidence(evidence, expected) {
 function validFixture() {
   const evidenceId = "aps-tsjs-preswitch-12345678";
   const headSha = "a".repeat(40);
-  const samples = Array.from({ length: 50 }, () => 20);
+  const referenceSamples = Array.from({ length: 50 }, () => 20);
+  const currentSamples = Array.from({ length: 50 }, () => 21);
   return {
     expected: { evidenceId, headSha, mode: "preswitch" },
     evidence: {
-      schemaVersion: 2,
+      schemaVersion: 3,
       evidenceId,
       mode: "preswitch",
       headSha,
@@ -342,12 +383,17 @@ function validFixture() {
         controller: "generated-server-v1",
         machineClass: "github-hosted:ubuntu-24.04",
         runnerImage: "ubuntu-24.04",
-        fixture: "tsjs-generated-loopback-v1",
+        fixture: "tsjs-generated-loopback-paired-v2",
         node: "v24.12.0",
         npm: "11.6.2",
         typescript: "6.0.3",
       },
-      sampling: { warmups: 5, samples: 50, percentile: 90 },
+      sampling: {
+        warmupsPerVariant: 5,
+        samplesPerVariant: 50,
+        percentile: 90,
+        interleaving: "alternating-reference-current",
+      },
       marks: {
         source: "performance-entry",
         bidsScript: true,
@@ -356,10 +402,16 @@ function validFixture() {
       },
       performance: {
         bootToFirstDisplayMs: {
-          samples,
+          reference: {
+            sha: EXPECTED.referenceSha,
+            samples: referenceSamples,
+            p90: 20,
+          },
+          current: { samples: currentSamples, p90: 21 },
           percentile: 90,
-          p90: 20,
-          ceilingMs: 33.6,
+          maximumRatio: 1.1,
+          observedRatio: 21 / 20,
+          hardCeilingMs: 100,
         },
       },
       heap: {
@@ -410,28 +462,54 @@ function runSelfTest() {
     ["node", (value) => (value.environment.node = "v24.11.0")],
     ["npm", (value) => (value.environment.npm = "11.6.1")],
     ["typescript", (value) => (value.environment.typescript = "6.0.2")],
-    ["warmups", (value) => (value.sampling.warmups = 4)],
+    ["warmups", (value) => (value.sampling.warmupsPerVariant = 4)],
+    ["interleaving", (value) => (value.sampling.interleaving = "sequential")],
     [
-      "sample count",
-      (value) => value.performance.bootToFirstDisplayMs.samples.pop(),
+      "current sample count",
+      (value) => value.performance.bootToFirstDisplayMs.current.samples.pop(),
+    ],
+    [
+      "reference sample count",
+      (value) => value.performance.bootToFirstDisplayMs.reference.samples.pop(),
     ],
     ["percentile", (value) => (value.sampling.percentile = 95)],
     ["real marks", (value) => (value.marks.source = "synthetic")],
     ["missing mark", (value) => (value.marks.firstDisplay = false)],
     [
-      "p90 limit",
+      "paired p90 limit",
       (value) => {
-        value.performance.bootToFirstDisplayMs.samples.fill(34);
-        value.performance.bootToFirstDisplayMs.p90 = 34;
+        value.performance.bootToFirstDisplayMs.current.samples.fill(23);
+        value.performance.bootToFirstDisplayMs.current.p90 = 23;
+        value.performance.bootToFirstDisplayMs.observedRatio = 23 / 20;
+      },
+    ],
+    [
+      "hard p90 limit",
+      (value) => {
+        value.performance.bootToFirstDisplayMs.reference.samples.fill(101);
+        value.performance.bootToFirstDisplayMs.reference.p90 = 101;
+        value.performance.bootToFirstDisplayMs.current.samples.fill(101);
+        value.performance.bootToFirstDisplayMs.current.p90 = 101;
+        value.performance.bootToFirstDisplayMs.observedRatio = 1;
       },
     ],
     [
       "p90 consistency",
-      (value) => (value.performance.bootToFirstDisplayMs.p90 = 19),
+      (value) => (value.performance.bootToFirstDisplayMs.current.p90 = 19),
     ],
     [
       "finite sample",
-      (value) => (value.performance.bootToFirstDisplayMs.samples[0] = null),
+      (value) =>
+        (value.performance.bootToFirstDisplayMs.current.samples[0] = null),
+    ],
+    [
+      "reference SHA",
+      (value) =>
+        (value.performance.bootToFirstDisplayMs.reference.sha = "b".repeat(40)),
+    ],
+    [
+      "observed ratio",
+      (value) => (value.performance.bootToFirstDisplayMs.observedRatio = 1),
     ],
     [
       "heap",
@@ -552,8 +630,23 @@ function runSelfTest() {
   );
   assert.match(
     performanceTest,
-    /FIXTURE_ID = "tsjs-generated-loopback-v1"/u,
-    "the browser gate must identify the generated loopback fixture",
+    /FIXTURE_ID = "tsjs-generated-loopback-paired-v2"/u,
+    "the browser gate must identify the paired generated loopback fixture",
+  );
+  assert.match(
+    performanceTest,
+    /REFERENCE_SHA = "62421ee44c62f24534ea8782a46dfa5bfbcea950"/u,
+    "the browser gate must bind the frozen pre-switch reference SHA",
+  );
+  assert.match(
+    performanceTest,
+    /index % 2 === 0[\s\S]*referenceServer[\s\S]*currentServer/u,
+    "the browser gate must alternate reference/current order",
+  );
+  assert.match(
+    performanceWorkflow,
+    /git worktree add --detach "\$reference_root" "\$reference_sha"/u,
+    "the performance workflow must build the frozen reference in a detached worktree",
   );
   assert.doesNotMatch(
     performanceTest,
@@ -658,6 +751,16 @@ function runSelfTest() {
     "the browser test launcher must pass Playwright an absolute config path",
   );
   assert.match(
+    browserTestScript,
+    /export ARTIFACTS_DIR="\$\{ARTIFACTS_DIR:-\$REPO_ROOT\/target\/integration-test-artifacts\}"/u,
+    "the browser test launcher must establish one effective artifacts directory",
+  );
+  assert.match(
+    browserTestScript,
+    /GENERATED_VICEROY_CONFIG_PATH="\$ARTIFACTS_DIR\/configs\/viceroy\.toml"/u,
+    "the browser test launcher must consume the config generated in the effective artifacts directory",
+  );
+  assert.match(
     apsProxyScript,
     /ARTIFACTS_DIR="\$\{ARTIFACTS_DIR:-\$REPO_ROOT\/target\/integration-test-artifacts\}"/u,
     "the APS proxy launcher must establish one effective artifacts directory",
@@ -671,6 +774,11 @@ function runSelfTest() {
     generalTestWorkflow,
     /tsjs-performance-gate\.yml/u,
     "general CI must not redefine or automatically rerun immutable performance evidence",
+  );
+  assert.match(
+    generalTestWorkflow,
+    /test-typescript:[\s\S]*?uses: actions\/checkout@v4\n        with:\n          fetch-depth: 0/u,
+    "the rc/july adoption contract must receive the pinned baseline commit",
   );
   console.log(
     `TSJS performance evidence self-test passed (${mutations.length} mutations)`,
