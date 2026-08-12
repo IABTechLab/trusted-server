@@ -1094,6 +1094,51 @@ test('registered integration dispatch selects post-switch evidence without chang
   );
 });
 
+test('cutover workflows bind exact release evidence and prior artifact provenance', () => {
+  const qualityWorkflow = fs.readFileSync(
+    path.join(repositoryRoot, '.github/workflows/test.yml'),
+    'utf8'
+  );
+  const integrationWorkflow = fs.readFileSync(
+    path.join(repositoryRoot, '.github/workflows/integration-tests.yml'),
+    'utf8'
+  );
+  const realGamWorkflow = fs.readFileSync(
+    path.join(repositoryRoot, '.github/workflows/aps-real-gam.yml'),
+    'utf8'
+  );
+
+  for (const [name, workflow] of [
+    ['quality', qualityWorkflow],
+    ['integration', integrationWorkflow],
+    ['real-GAM', realGamWorkflow],
+  ]) {
+    assert.match(workflow, /evidence_id:[\s\S]*?required: true/, `${name} evidence id`);
+    assert.match(workflow, /release_id:[\s\S]*?required: true/, `${name} release id`);
+    assert.match(workflow, /evidence-manifest\.json/, `${name} evidence manifest`);
+    assert.match(workflow, /commitSha/, `${name} commit SHA binding`);
+    assert.match(workflow, /runId/, `${name} run id binding`);
+    assert.match(workflow, /conclusion/, `${name} conclusion binding`);
+  }
+  for (const [name, workflow] of [
+    ['integration', integrationWorkflow],
+    ['real-GAM', realGamWorkflow],
+  ]) {
+    assert.match(workflow, /previous_artifact_id:[\s\S]*?required: true/, `${name} prior input`);
+    assert.match(workflow, /previousArtifactId/, `${name} prior artifact binding`);
+  }
+  assert.match(qualityWorkflow, /aps-tsjs-quality-\$\{\{ github\.run_id \}\}/);
+  assert.match(qualityWorkflow, /set -euo pipefail[\s\S]*?quality\.log/);
+  assert.match(qualityWorkflow, /tsjs-build-metrics-v1\.json/);
+  assert.match(integrationWorkflow, /aps-tsjs-cutover-\$\{\{ github\.sha \}\}/);
+  assert.match(integrationWorkflow, /for runtime in axum fastly cloudflare spin/);
+  assert.match(integrationWorkflow, /aps-proxy-\$runtime\.log/);
+  assert.match(integrationWorkflow, /--project=chromium --project=firefox --project=webkit/);
+  assert.match(integrationWorkflow, /Scrub all integration evidence before upload/);
+  assert.match(realGamWorkflow, /aps-real-gam-\$\{\{ github\.run_id \}\}/);
+  assert.match(realGamWorkflow, /capabilities\?/);
+});
+
 test('release id changes independently with id, role, phase, trigger, bytes, and order', () => {
   const base = [bundle('core', 'a'), bundle('gpt', 'b')];
   assert.notEqual(computeReleaseId(base), computeReleaseId([bundle('changed', 'a'), base[1]]));

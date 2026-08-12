@@ -16,6 +16,14 @@ on:
         description: Unique identifier used to bind this run to an evidence artifact
         required: true
         type: string
+      release_id:
+        description: Exact generated TSJS release id
+        required: true
+        type: string
+      previous_artifact_id:
+        description: Immutable artifact identifier used for rollback
+        required: true
+        type: string
 
 env:
   ORIGIN_PORT: 8888
@@ -28,7 +36,10 @@ env:
 jobs:
   tsjs-performance-gate:
     name: TSJS first-display performance evidence
-    if: github.event_name == 'workflow_dispatch'
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (startsWith(inputs.evidence_id, 'aps-tsjs-preswitch-') ||
+       startsWith(inputs.evidence_id, 'aps-tsjs-postswitch-'))
     uses: ./.github/workflows/tsjs-performance-gate.yml
     with:
       evidence_id: ${{ inputs.evidence_id }}
@@ -363,3 +374,153 @@ jobs:
           name: playwright-report-aps-tsjs-conformance
           path: crates/trusted-server-integration-tests/browser/playwright-report/
           retention-days: 7
+
+  cutover-suite:
+    name: exact APS/TSJS integration evidence
+    if: github.event_name == 'workflow_dispatch' && startsWith(inputs.evidence_id, 'aps-tsjs-cutover-')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up the complete integration environment
+        id: shared-setup
+        uses: ./.github/actions/setup-integration-test-env
+        with:
+          origin-port: ${{ env.ORIGIN_PORT }}
+          install-viceroy: "true"
+          build-cloudflare: "true"
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.shared-setup.outputs.node-version }}
+          cache: npm
+          cache-dependency-path: |
+            crates/trusted-server-js/lib/package-lock.json
+            crates/trusted-server-integration-tests/browser/package-lock.json
+
+      - name: Install exact integration runtimes
+        run: npm install -g wrangler@4.64.0
+
+      - name: Install pinned Spin
+        uses: fermyon/actions/spin/setup@v1
+        with:
+          version: "v4.0.2"
+
+      - name: Generate integration Viceroy configs
+        run: ./scripts/generate-integration-viceroy-configs.sh
+        env:
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+
+      - name: Build and validate the exact TSJS release
+        env:
+          EXPECTED_RELEASE_ID: ${{ inputs.release_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/aps-tsjs-cutover-evidence
+          npm --prefix crates/trusted-server-js/lib ci
+          npm --prefix crates/trusted-server-js/lib run build
+          npm --prefix crates/trusted-server-js/lib run build:prebid-external
+          npm --prefix crates/trusted-server-js/lib run check:bundle 2>&1 | tee target/aps-tsjs-cutover-evidence/bundle.log
+          actual_release_id="$(npm --prefix crates/trusted-server-js/lib run --silent print:release-id)"
+          test -n "$EXPECTED_RELEASE_ID"
+          test "$actual_release_id" = "$EXPECTED_RELEASE_ID"
+          cp crates/trusted-server-js/dist/tsjs-release-v1.json target/aps-tsjs-cutover-evidence/
+          cp crates/trusted-server-js/dist/tsjs-build-metrics-v1.json target/aps-tsjs-cutover-evidence/
+
+      - name: Run route parity and the full adapter integration suite
+        env:
+          WASM_BINARY_PATH: ${{ github.workspace }}/target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm
+          AXUM_BINARY_PATH: ${{ github.workspace }}/target/debug/trusted-server-axum
+          CLOUDFLARE_WRANGLER_DIR: ${{ github.workspace }}/crates/trusted-server-adapter-cloudflare
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+          VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy.toml
+          RUST_LOG: info
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test \
+            --manifest-path crates/trusted-server-integration-tests/Cargo.toml \
+            --test parity 2>&1 | tee target/aps-tsjs-cutover-evidence/route-parity.log
+          cargo test \
+            --manifest-path crates/trusted-server-integration-tests/Cargo.toml \
+            --target x86_64-unknown-linux-gnu \
+            -- --include-ignored \
+            --skip test_wordpress_fastly --skip test_nextjs_fastly \
+            --test-threads=1 2>&1 | tee target/aps-tsjs-cutover-evidence/integration.log
+
+      - name: Install Chromium, Firefox, and WebKit
+        working-directory: crates/trusted-server-integration-tests/browser
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium firefox webkit
+
+      - name: Run the focused three-browser APS/TSJS matrix
+        working-directory: crates/trusted-server-integration-tests/browser
+        env:
+          WASM_BINARY_PATH: ${{ github.workspace }}/target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+          VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy.toml
+          TEST_FRAMEWORK: nextjs
+          TS_BROWSER_PROJECTS: chromium,firefox,webkit
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx playwright test \
+            tests/shared/aps-renderer.spec.ts \
+            tests/shared/aps-puc-lifecycle.spec.ts \
+            tests/shared/tsjs-runtime.spec.ts \
+            tests/shared/creative-sandbox.spec.ts \
+            tests/nextjs/gpt-diagnostics.spec.ts \
+            tests/nextjs/navigation.spec.ts \
+            --project=chromium --project=firefox --project=webkit \
+            --reporter=list \
+            2>&1 | tee "$GITHUB_WORKSPACE/target/aps-tsjs-cutover-evidence/playwright-sanitized-report.log"
+
+      - name: Run the APS runner-proxy corpus on every adapter
+        shell: bash
+        run: |
+          set -euo pipefail
+          for runtime in axum fastly cloudflare spin; do
+            ./scripts/integration-tests-aps-runner-proxy.sh --runtime "$runtime" \
+              2>&1 | tee "target/aps-tsjs-cutover-evidence/aps-proxy-$runtime.log"
+          done
+        env:
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+          RUST_LOG: info
+
+      - name: Write exact integration evidence manifest
+        env:
+          EVIDENCE_ID: ${{ inputs.evidence_id }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          PREVIOUS_ARTIFACT_ID: ${{ inputs.previous_artifact_id }}
+        run: >-
+          node -e 'const fs=require("node:fs");
+          fs.mkdirSync("target/aps-tsjs-cutover-evidence",{recursive:true});
+          fs.writeFileSync("target/aps-tsjs-cutover-evidence/evidence-manifest.json",
+          JSON.stringify({schemaVersion:1,evidenceId:process.env.EVIDENCE_ID,
+          releaseId:process.env.RELEASE_ID,previousArtifactId:process.env.PREVIOUS_ARTIFACT_ID,
+          commitSha:process.env.GITHUB_SHA,runId:process.env.GITHUB_RUN_ID,
+          conclusion:"success"},null,2)+"\n",{mode:384});'
+
+      - name: Scrub all integration evidence before upload
+        env:
+          INTEGRATION_AUTHORIZATION: integration-test-proxy-secret
+        run: >-
+          node -e 'const fs=require("node:fs"),path=require("node:path");
+          const root="target/aps-tsjs-cutover-evidence", files=[];
+          const walk=p=>{for(const e of fs.readdirSync(p,{withFileTypes:true})){const q=path.join(p,e.name);e.isDirectory()?walk(q):files.push(q)}}; walk(root);
+          const forbiddenExt=new Set([".har",".zip",".webm"]), forbiddenField=/"(?:accountId|aaxResponse|adm|authorization|capabilities?|creativeBody|descriptor|lifecycleTicket|nonce|postData|requestHeaders|responseBody|responseHeaders)"\s*:/u;
+          for(const file of files){if(forbiddenExt.has(path.extname(file)))throw Error("native capture forbidden: "+file);if(path.extname(file)===".png")continue;const text=fs.readFileSync(file,"utf8");if(text.includes(process.env.INTEGRATION_AUTHORIZATION)||forbiddenField.test(text)||/<script(?:\s|>)|<!doctype/iu.test(text))throw Error("unsafe payload or capability found in evidence: "+file)}'
+
+      - name: Upload exact integration evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: aps-tsjs-cutover-${{ github.sha }}
+          path: target/aps-tsjs-cutover-evidence/
+          if-no-files-found: error
+          retention-days: 30
