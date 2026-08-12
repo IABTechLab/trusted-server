@@ -626,7 +626,7 @@ export class GptDiagnosticsOverlay {
 
     const summary = this.document.createElement('div');
     summary.className = 'tsgd-summary';
-    summary.textContent = `${snapshot.slots.length} slots · ${snapshot.callbackIssues.length} callback issues · ${snapshot.attributionIssues?.length ?? 0} attribution issues`;
+    summary.textContent = `${snapshot.slots.length} slots · ${snapshot.callbackIssues.length} callback issues · ${snapshot.attributionIssues.length} attribution issues`;
     const coverage = this.document.createElement('ul');
     coverage.className = 'tsgd-coverage';
     for (const [kind, counters] of Object.entries(snapshot.coverage)) {

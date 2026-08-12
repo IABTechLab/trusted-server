@@ -1167,12 +1167,21 @@ fn apply_datadome_client_tag_cache_privacy(
         return;
     }
 
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("private, max-age=0"),
-    );
-    response.headers_mut().remove("surrogate-control");
-    response.headers_mut().remove("fastly-surrogate-control");
+    let already_uncacheable = response
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|value| value.contains("private") || value.contains("no-store"));
+    if !already_uncacheable {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, max-age=0"),
+        );
+    }
+    for header_name in CDN_CACHE_HEADERS {
+        response.headers_mut().remove(*header_name);
+    }
 }
 
 /// Drop a bodiless response's body and correct its framing headers.
@@ -1449,27 +1458,42 @@ pub(crate) fn is_prefetch_request(req: &Request<EdgeBody>) -> bool {
     header("sec-purpose") || header("purpose")
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ServerSideAdStackConfig {
+    ad_templates_enabled: bool,
+    auction_enabled: bool,
+}
+
 /// Returns true only when the publisher request should run the full
 /// server-side ad stack: auction dispatch plus initial ad-slot injection.
-///
-/// `auction_enabled` is the global `[auction].enabled` kill switch — when
-/// false, no automatic server-side auction or ad-slot injection runs.
-pub(crate) fn should_run_server_side_ad_stack(
+fn should_run_server_side_ad_stack(
     is_get: bool,
     is_navigation: bool,
     is_prefetch: bool,
     is_bot: bool,
     has_matched_slots: bool,
     consent_allows_auction: bool,
-    auction_enabled: bool,
+    config: ServerSideAdStackConfig,
 ) -> bool {
     is_get
         && is_navigation
         && !is_prefetch
         && !is_bot
+        && config.ad_templates_enabled
         && has_matched_slots
         && consent_allows_auction
-        && auction_enabled
+        && config.auction_enabled
+}
+
+fn mint_browser_auction_id(
+    identity_generator: &dyn AuctionIdentityGenerator,
+) -> Result<String, Report<TrustedServerError>> {
+    mint_response_unique_base64url_identity(identity_generator, &mut HashSet::new(), "a1_", 9, 8)
+        .ok_or_else(|| {
+            Report::new(TrustedServerError::Auction {
+                message: "Failed to mint browser auction identity".to_string(),
+            })
+        })
 }
 
 /// Build the request origin (`scheme://host`, where `host` includes any port)
@@ -1493,12 +1517,24 @@ pub(crate) fn write_projection_to_state(
     request_origin: &str,
     browser_slots_json: Option<&str>,
 ) -> HashSet<String> {
+    let browser_auction_id = match mint_browser_auction_id(&SystemAuctionIdentityGenerator) {
+        Ok(auction_id) => auction_id,
+        Err(error) => {
+            log::error!("initial browser auction identity failed closed: {error:?}");
+            *ad_bids_state.lock().expect("should lock projection state") = Some(
+                r#"{"version":1,"auction":{"version":1,"auctionId":"a1_unavailable","results":[]},"slots":[],"bids":[]}"#
+                    .to_string(),
+            );
+            return HashSet::new();
+        }
+    };
     let projected = coordinated_cutover_v1::build_browser_auction_projection_v1(
         result,
         price_granularity,
         settings,
         request_origin,
         None,
+        Some(&browser_auction_id),
         &SystemAuctionIdentityGenerator,
     )
     .and_then(|projection| {
@@ -1546,7 +1582,7 @@ pub(crate) fn write_projection_to_state(
                 version: 1,
                 auction: AuctionDecisionSetV1 {
                     version: 1,
-                    auction_id: result.decision_set.auction_id.clone(),
+                    auction_id: browser_auction_id,
                     results: result
                         .decision_set
                         .results
@@ -2031,7 +2067,10 @@ pub async fn handle_publisher_request(
     let is_prefetch = is_prefetch_request(&req);
     let is_bot = is_bot_user_agent(&req);
 
-    let matched_slots = if is_get {
+    let creative_opportunities = settings.creative_opportunities.as_ref();
+    let ad_templates_enabled = creative_opportunities.is_some_and(|config| config.enabled);
+    let ad_templates_disabled = creative_opportunities.is_some_and(|config| !config.enabled);
+    let matched_slots = if is_get && ad_templates_enabled {
         settings
             .creative_opportunities
             .as_ref()
@@ -2054,7 +2093,10 @@ pub async fn handle_publisher_request(
         is_bot,
         !matched_slots.is_empty(),
         consent_allows_auction,
-        auction.orchestrator.is_enabled(),
+        ServerSideAdStackConfig {
+            ad_templates_enabled,
+            auction_enabled: auction.orchestrator.is_enabled(),
+        },
     );
     let should_run_auction = should_run_ad_stack;
     // Diagnostic: shows which gate suppresses the server-side auction. Pair with
@@ -2062,14 +2104,16 @@ pub async fn handle_publisher_request(
     // when `consent_allows_auction=false`.
     log::debug!(
         "server-side ad-stack gate: is_get={is_get} is_navigation={is_navigation} \
-         is_prefetch={is_prefetch} is_bot={is_bot} matched_slots={} \
-         consent_allows_auction={consent_allows_auction} orchestrator_enabled={} \
-         -> should_run_auction={should_run_auction}",
+         is_prefetch={is_prefetch} is_bot={is_bot} ad_templates_enabled={ad_templates_enabled} \
+         matched_slots={} consent_allows_auction={consent_allows_auction} \
+         orchestrator_enabled={} -> should_run_auction={should_run_auction}",
         matched_slots.len(),
         auction.orchestrator.is_enabled(),
     );
 
-    if matched_slots.is_empty() && settings.creative_opportunities.is_some() {
+    if ad_templates_disabled {
+        log::debug!("Server-side ad templates are disabled by configuration");
+    } else if matched_slots.is_empty() && settings.creative_opportunities.is_some() {
         log::debug!(
             "No creative opportunity slots matched path '{}' — skipping auction and injection",
             request_path
@@ -2194,7 +2238,9 @@ pub async fn handle_publisher_request(
                 }
             }
         } else {
-            let skip_reason = if !auction.orchestrator.is_enabled() {
+            let skip_reason = if ad_templates_disabled {
+                "ad_templates_disabled"
+            } else if !auction.orchestrator.is_enabled() {
                 "auction_disabled"
             } else if !consent_allows_auction {
                 "consent_denied"
@@ -2263,6 +2309,10 @@ pub async fn handle_publisher_request(
         .extensions()
         .get::<crate::integrations::datadome::DataDomeClientTagSuppressed>()
         .is_some();
+    if suppress_datadome_client_side_tag {
+        req.headers_mut().remove(header::IF_NONE_MATCH);
+        req.headers_mut().remove(header::IF_MODIFIED_SINCE);
+    }
     let mut platform_request = PlatformHttpRequest::new(req, backend_name);
     if services.http_client().supports_streaming_responses() {
         platform_request = platform_request.with_stream_response();
@@ -2347,23 +2397,40 @@ pub async fn handle_publisher_request(
         .get(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .unwrap_or_default();
-    if should_run_ad_stack && is_html_content_type(origin_content_type) {
-        response.headers_mut().insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("private, no-store"),
-        );
-        response.headers_mut().remove(header::ETAG);
-        response.headers_mut().remove(header::LAST_MODIFIED);
-        // Every CDN-targeted cache directive, not just the browser-facing
-        // `Cache-Control` above: an origin emitting any of these would otherwise
-        // instruct an intermediary to store a synthesized per-navigation
-        // document. `Surrogate-Control` and `Fastly-Surrogate-Control` cover
-        // Fastly; `CDN-Cache-Control` is the standard targeted field (RFC 9213)
-        // and `Cloudflare-CDN-Cache-Control` is the Cloudflare-specific field
-        // that overrides it there, so both are needed to close the gap on the
-        // Cloudflare adapter.
-        for directive in CDN_CACHE_HEADERS {
-            response.headers_mut().remove(*directive);
+    if is_html_content_type(origin_content_type) {
+        if should_run_ad_stack {
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, no-store"),
+            );
+            response.headers_mut().remove(header::ETAG);
+            response.headers_mut().remove(header::LAST_MODIFIED);
+            // Every CDN-targeted cache directive, not just the browser-facing
+            // `Cache-Control` above: an origin emitting any of these would otherwise
+            // instruct an intermediary to store a synthesized per-navigation
+            // document. `Surrogate-Control` and `Fastly-Surrogate-Control` cover
+            // Fastly; `CDN-Cache-Control` is the standard targeted field (RFC 9213)
+            // and `Cloudflare-CDN-Cache-Control` is the Cloudflare-specific field
+            // that overrides it there, so both are needed to close the gap on the
+            // Cloudflare adapter.
+            for directive in CDN_CACHE_HEADERS {
+                response.headers_mut().remove(*directive);
+            }
+        } else {
+            let origin_cache_control = response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_ascii_lowercase);
+            if !origin_cache_control
+                .as_deref()
+                .is_some_and(|value| value.contains("private") || value.contains("no-store"))
+            {
+                response.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("max-age=60"),
+                );
+            }
         }
     }
 
@@ -2728,6 +2795,7 @@ pub(crate) mod coordinated_cutover_v1 {
         settings: &Settings,
         request_origin: &str,
         cache_policy: Option<&CacheFetchPolicyV1>,
+        browser_auction_id: Option<&str>,
         identity_generator: &dyn AuctionIdentityGenerator,
     ) -> Result<CanonicalBrowserAuctionProjectionV1, Report<TrustedServerError>> {
         let mut reservation_ids = HashSet::new();
@@ -2762,7 +2830,7 @@ pub(crate) mod coordinated_cutover_v1 {
                 });
                 continue;
             };
-            let Some(upstream_bid_id) = bid.bid_id.clone() else {
+            let Some(upstream_bid_id) = bid.bid_id.clone().filter(|id| !id.is_empty()) else {
                 projected_results.push(SlotAuctionDecisionV1::Failed {
                     slot: slot.clone(),
                     reason: AuctionSlotFailureReason::WinnerNotRenderable,
@@ -2811,7 +2879,9 @@ pub(crate) mod coordinated_cutover_v1 {
                 version: 1,
                 auction: crate::auction::types::AuctionDecisionSetV1 {
                     version: 1,
-                    auction_id: result.decision_set.auction_id.clone(),
+                    auction_id: browser_auction_id
+                        .unwrap_or(&result.decision_set.auction_id)
+                        .to_string(),
                     results: projected_results,
                 },
                 slots: Vec::new(),
@@ -3024,18 +3094,7 @@ fn page_bids_terminal_projection_v1(
     reason: Option<AuctionSlotFailureReason>,
     request_origin: &str,
 ) -> Result<CanonicalBrowserAuctionProjectionV1, Report<TrustedServerError>> {
-    let auction_id = mint_response_unique_base64url_identity(
-        &SystemAuctionIdentityGenerator,
-        &mut HashSet::new(),
-        "a1_",
-        9,
-        8,
-    )
-    .ok_or_else(|| {
-        Report::new(TrustedServerError::Auction {
-            message: "Failed to mint page-bids auction identity".to_string(),
-        })
-    })?;
+    let auction_id = mint_browser_auction_id(&SystemAuctionIdentityGenerator)?;
     let results = reason.map_or_else(Vec::new, |reason| {
         matched_slots
             .iter()
@@ -3133,7 +3192,11 @@ pub async fn handle_page_bids(
     let path_param = normalize_page_bids_path(&requested_page);
     let page_path_and_query = normalize_page_bids_path_and_query(&requested_page);
 
-    let matched_slots = match_renderable_slots(auction.slots, co_config, &path_param);
+    let matched_slots = if co_config.enabled {
+        match_renderable_slots(auction.slots, co_config, &path_param)
+    } else {
+        Vec::new()
+    };
     let browser_slots = build_browser_slots_v1(&matched_slots, co_config, &path_param);
 
     let request_info = crate::http_util::RequestInfo::from_request(&req, services.client_info());
@@ -3153,7 +3216,10 @@ pub async fn handle_page_bids(
     let is_bot = is_bot_user_agent(&req);
 
     let auction_enabled = auction.orchestrator.is_enabled();
-    if !auction_enabled {
+    let ad_templates_enabled = co_config.enabled;
+    if !ad_templates_enabled {
+        log::debug!("page-bids: [creative_opportunities].enabled is false — skipping templates");
+    } else if !auction_enabled {
         log::debug!("page-bids: [auction].enabled is false — skipping auction");
     } else if matched_slots.is_empty() {
         log::debug!(
@@ -3169,13 +3235,13 @@ pub async fn handle_page_bids(
         );
     }
 
-    // The [auction].enabled kill switch and a consent denial disable the entire
-    // server-side ad stack. In those states the endpoint must return no slots,
+    // The template switch, [auction].enabled, and a consent denial disable the
+    // entire server-side ad stack. In those states the endpoint returns no slots,
     // so the coordinated runtime cannot create or refresh GPT placements.
     // Bot/prefetch requests, by contrast,
     // keep their slot definitions (the placement structure is unchanged) but
     // skip the live auction, matching the existing bot/prefetch behaviour.
-    let ad_stack_enabled = auction_enabled && consent_allows_auction;
+    let ad_stack_enabled = ad_templates_enabled && auction_enabled && consent_allows_auction;
 
     let projection = if matched_slots.is_empty() {
         page_bids_terminal_projection_v1(
@@ -3238,12 +3304,15 @@ pub async fn handle_page_bids(
                 .await
             {
                 Ok(result) => {
+                    let browser_auction_id =
+                        mint_browser_auction_id(&SystemAuctionIdentityGenerator)?;
                     let projection = coordinated_cutover_v1::build_browser_auction_projection_v1(
                         &result,
                         co_config.price_granularity,
                         settings,
                         &page_bids_request_origin,
                         None,
+                        Some(&browser_auction_id),
                         &SystemAuctionIdentityGenerator,
                     )?;
                     let projection = coordinated_cutover_v1::attach_browser_slots_v1(
@@ -3298,7 +3367,9 @@ pub async fn handle_page_bids(
                 }
             }
         } else {
-            let skip_reason = if !auction_enabled {
+            let skip_reason = if !ad_templates_enabled {
+                "ad_templates_disabled"
+            } else if !auction_enabled {
                 "auction_disabled"
             } else if !consent_allows_auction {
                 "consent_denied"
@@ -3539,6 +3610,7 @@ mod tests {
                 &Settings::default(),
                 "https://publisher.example",
                 None,
+                None,
                 &generator,
             )
             .expect("valid winner should project");
@@ -3599,9 +3671,13 @@ mod tests {
                 .expect("should store projection JSON");
             let projection: serde_json::Value =
                 serde_json::from_str(&stored).expect("should store the exact projection shape");
-            assert_eq!(
-                projection["auction"]["auctionId"],
-                result.decision_set.auction_id
+            let browser_auction_id = projection["auction"]["auctionId"]
+                .as_str()
+                .expect("browser projection should carry an auction identity");
+            assert!(browser_auction_id.starts_with("a1_"));
+            assert_ne!(
+                browser_auction_id, result.decision_set.auction_id,
+                "browser-visible identity must not expose an EC-derived upstream request id"
             );
             assert_eq!(projection["slots"][0]["slot"], "slot-1");
             assert_eq!(projection["slots"][0]["gamUnitPath"], "/123/slot-1");
@@ -3627,6 +3703,7 @@ mod tests {
                 PriceGranularity::Dense,
                 &Settings::default(),
                 "https://publisher.example",
+                None,
                 None,
                 &generator,
             )
@@ -3662,6 +3739,7 @@ mod tests {
                 &Settings::default(),
                 "https://publisher.example",
                 None,
+                None,
                 &generator,
             )
             .expect("valid APS winner should project");
@@ -3695,6 +3773,7 @@ mod tests {
                 &Settings::default(),
                 "https://publisher.example",
                 Some(&policy),
+                None,
                 &generator,
             )
             .expect("valid cache winner should project");
@@ -3715,6 +3794,7 @@ mod tests {
                 PriceGranularity::Dense,
                 &Settings::default(),
                 "https://publisher.example",
+                None,
                 None,
                 &ScriptedIdentityGenerator::new([]),
             )
@@ -3749,6 +3829,7 @@ mod tests {
                 &Settings::default(),
                 "https://publisher.example",
                 Some(&policy),
+                None,
                 &ScriptedIdentityGenerator::new([vec![8; 16]]),
             )
             .expect("ambiguous source should remain an explicit winner failure");
@@ -3774,6 +3855,7 @@ mod tests {
                 &Settings::default(),
                 "https://publisher.example",
                 None,
+                None,
                 &ScriptedIdentityGenerator::new([vec![5; 16]]),
             )
             .expect("invalid winner targeting should remain an explicit slot result");
@@ -3794,6 +3876,33 @@ mod tests {
         }
 
         #[test]
+        fn blank_upstream_bid_id_fails_only_the_affected_winner() {
+            let mut bid = tagged_adm_bid("slot-1", "AAAAAAAAAAAA", 1.5);
+            bid.bid_id = Some(String::new());
+            let result = result_with_winners(vec![bid]);
+
+            let canonical = coordinated_cutover_v1::build_browser_auction_projection_v1(
+                &result,
+                PriceGranularity::Dense,
+                &Settings::default(),
+                "https://publisher.example",
+                None,
+                None,
+                &ScriptedIdentityGenerator::new([]),
+            )
+            .expect("blank upstream identity should remain an explicit slot failure");
+
+            assert!(canonical.projection.bids.is_empty());
+            assert_eq!(
+                canonical.projection.auction.results[0],
+                SlotAuctionDecisionV1::Failed {
+                    slot: "slot-1".to_string(),
+                    reason: AuctionSlotFailureReason::WinnerNotRenderable,
+                }
+            );
+        }
+
+        #[test]
         fn unavailable_reservation_randomness_is_identity_generation_failed() {
             let result = result_with_winners(vec![tagged_adm_bid("slot-1", "AAAAAAAAAAAA", 1.5)]);
             let canonical = coordinated_cutover_v1::build_browser_auction_projection_v1(
@@ -3801,6 +3910,7 @@ mod tests {
                 PriceGranularity::Dense,
                 &Settings::default(),
                 "https://publisher.example",
+                None,
                 None,
                 &ScriptedIdentityGenerator::new([]),
             )
@@ -4739,7 +4849,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn navigation_without_matched_slots_preserves_origin_cache_policy() {
+        async fn navigation_without_matched_slots_uses_short_browser_cache_policy() {
             // Arrange
             let settings = settings_with_enabled_auction_and_creative_opportunities();
             let stub = Arc::new(StubHttpClient::new());
@@ -4789,7 +4899,7 @@ mod tests {
             );
 
             for (header_name, expected) in [
-                (header::CACHE_CONTROL, "public, max-age=300"),
+                (header::CACHE_CONTROL, "max-age=60"),
                 (header::ETAG, ORIGIN_ETAG),
                 (header::LAST_MODIFIED, ORIGIN_LAST_MODIFIED),
                 (
@@ -5309,6 +5419,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn suppressed_datadome_request_drops_origin_validators() {
+        let settings = create_test_settings();
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"<html><body>origin</body></html>".to_vec(),
+            vec![("content-type", "text/html; charset=utf-8")],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let mut req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/page")
+            .header(header::HOST, "publisher.example")
+            .header(header::IF_NONE_MATCH, "\"cached-page\"")
+            .header(header::IF_MODIFIED_SINCE, "Wed, 21 Oct 2015 07:28:00 GMT")
+            .body(EdgeBody::empty())
+            .expect("should build conditional request");
+        req.extensions_mut()
+            .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+
+        let _response = run_publisher_proxy(&settings, &services, req).await;
+
+        let headers = stub
+            .recorded_request_headers()
+            .into_iter()
+            .next()
+            .expect("should record one outbound request");
+        assert!(
+            headers.iter().all(|(name, _)| {
+                !name.eq_ignore_ascii_case(header::IF_NONE_MATCH.as_str())
+                    && !name.eq_ignore_ascii_case(header::IF_MODIFIED_SINCE.as_str())
+            }),
+            "tag-suppressed origin requests must not revalidate a shared representation"
+        );
+    }
+
+    #[tokio::test]
     async fn handle_publisher_request_does_not_self_generate_ec() {
         // EC generation is the adapter's real-browser-gated responsibility. This
         // handler must never mint an EC ID on its own: for a navigation from a
@@ -5413,6 +5562,8 @@ mod tests {
             .header(header::CACHE_CONTROL, "public, max-age=600")
             .header("surrogate-control", "max-age=600")
             .header("fastly-surrogate-control", "max-age=600")
+            .header("cdn-cache-control", "max-age=600")
+            .header("cloudflare-cdn-cache-control", "max-age=600")
             .body(EdgeBody::empty())
             .expect("should build cacheable HTML response");
 
@@ -5438,6 +5589,29 @@ mod tests {
         assert!(
             response.headers().get("fastly-surrogate-control").is_none(),
             "suppressed HTML should not retain Fastly-Surrogate-Control"
+        );
+        assert!(response.headers().get("cdn-cache-control").is_none());
+        assert!(
+            response
+                .headers()
+                .get("cloudflare-cdn-cache-control")
+                .is_none()
+        );
+
+        let mut no_store_response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(EdgeBody::empty())
+            .expect("should build no-store HTML response");
+        super::apply_datadome_client_tag_cache_privacy(
+            &mut no_store_response,
+            &Method::GET,
+            true,
+            "text/html; charset=utf-8",
+        );
+        assert_eq!(
+            no_store_response.headers()[header::CACHE_CONTROL],
+            "no-store"
         );
     }
 
@@ -5608,38 +5782,68 @@ mod tests {
 
     #[test]
     fn server_side_ad_stack_runs_only_when_all_auction_gates_pass() {
+        let enabled = ServerSideAdStackConfig {
+            ad_templates_enabled: true,
+            auction_enabled: true,
+        };
         assert!(
-            should_run_server_side_ad_stack(true, true, false, false, true, true, true),
+            should_run_server_side_ad_stack(true, true, false, false, true, true, enabled),
             "GET, real navigation, matched slots, and consent should run TS ad stack"
         );
 
         assert!(
-            !should_run_server_side_ad_stack(false, true, false, false, true, true, true),
+            !should_run_server_side_ad_stack(false, true, false, false, true, true, enabled),
             "non-GET requests should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, false, false, false, true, true, true),
+            !should_run_server_side_ad_stack(true, false, false, false, true, true, enabled),
             "non-document requests should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, true, false, true, true, true),
+            !should_run_server_side_ad_stack(true, true, true, false, true, true, enabled),
             "prefetch requests should skip TS ad stack and injection"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, true, true, true, true),
+            !should_run_server_side_ad_stack(true, true, false, true, true, true, enabled),
             "bot requests should skip TS ad stack and injection"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, false, true, true),
+            !should_run_server_side_ad_stack(true, true, false, false, false, true, enabled),
             "requests with no matching slots should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, true, false, true),
+            !should_run_server_side_ad_stack(true, true, false, false, true, false, enabled),
             "requests without required consent should skip TS ad stack and injection"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, true, true, false),
+            !should_run_server_side_ad_stack(
+                true,
+                true,
+                false,
+                false,
+                true,
+                true,
+                ServerSideAdStackConfig {
+                    ad_templates_enabled: true,
+                    auction_enabled: false,
+                },
+            ),
             "disabled [auction].enabled kill switch should skip TS ad stack and injection"
+        );
+        assert!(
+            !should_run_server_side_ad_stack(
+                true,
+                true,
+                false,
+                false,
+                true,
+                true,
+                ServerSideAdStackConfig {
+                    ad_templates_enabled: false,
+                    auction_enabled: true,
+                },
+            ),
+            "disabled [creative_opportunities].enabled switch should skip TS ad stack"
         );
     }
 
@@ -7096,8 +7300,12 @@ mod tests {
                 "should preserve streamed HTML content. Got: {html}"
             );
             assert!(
-                html.contains(&format!(r#""auctionId":"{}""#, auction_request.id)),
-                "the immutable pre-core boot must contain the collected auction projection. Got: {html}"
+                html.contains(r#""auctionId":"a1_"#),
+                "the immutable pre-core boot must contain the collected auction projection with a browser-only auction id. Got: {html}"
+            );
+            assert!(
+                !html.contains(&format!(r#""auctionId":"{}""#, auction_request.id)),
+                "the immutable pre-core boot must not expose the upstream auction id. Got: {html}"
             );
             assert!(
                 !html.contains(r#""auctionId":"initial""#),
@@ -7170,8 +7378,12 @@ mod tests {
                 "should decode the second gzip member that a single-member decoder drops. Got: {html}"
             );
             assert!(
-                html.contains(r#""auctionId":"test-auction""#),
-                "should emit the collected projection before the head bundle. Got: {html}"
+                html.contains(r#""auctionId":"a1_"#),
+                "should emit the collected projection with a browser-only auction id before the head bundle. Got: {html}"
+            );
+            assert!(
+                !html.contains(r#""auctionId":"test-auction""#),
+                "should not expose the upstream auction id to the browser. Got: {html}"
             );
             assert!(!html.contains(".bids="));
         });
@@ -7469,8 +7681,12 @@ mod tests {
             "the origin body should remain lazy after the pre-head collect. Got: {html}"
         );
         assert!(
-            html.contains(r#""auctionId":"test-auction""#),
-            "the first head chunk must contain the exact collected projection. Got: {html}"
+            html.contains(r#""auctionId":"a1_"#),
+            "the first head chunk must contain the exact collected projection with a browser-only auction id. Got: {html}"
+        );
+        assert!(
+            !html.contains(r#""auctionId":"test-auction""#),
+            "the first head chunk must not expose the upstream auction id. Got: {html}"
         );
         assert!(
             !html.contains(r#""auctionId":"initial""#),
@@ -7961,8 +8177,13 @@ mod tests {
 
         let html = String::from_utf8(gzip_decode(&output)).expect("should be valid UTF-8");
         assert!(
-            html.contains(r#""auctionId":"test-auction""#),
-            "should collect the exact projection before the compressed head. Got head: {}",
+            html.contains(r#""auctionId":"a1_"#),
+            "should collect the exact projection with a browser-only auction id before the compressed head. Got head: {}",
+            &html[..html.len().min(500)]
+        );
+        assert!(
+            !html.contains(r#""auctionId":"test-auction""#),
+            "should not expose the upstream auction id in the compressed head. Got head: {}",
             &html[..html.len().min(500)]
         );
         assert!(!html.contains(".bids="));
@@ -8265,6 +8486,7 @@ mod tests {
 
         fn make_config() -> CreativeOpportunitiesConfig {
             CreativeOpportunitiesConfig {
+                enabled: true,
                 gam_network_id: "21765378893".to_string(),
                 auction_timeout_ms: Some(500),
                 price_granularity: PriceGranularity::Dense,
@@ -8494,6 +8716,15 @@ mod tests {
                 crate_test_settings_str()
             );
             Settings::from_toml(&toml).expect("should parse settings with creative_opportunities")
+        }
+
+        fn settings_with_co_templates_disabled() -> Settings {
+            let toml = format!(
+                "{}\n[auction]\nenabled = true\n\n[creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
+                crate_test_settings_str()
+            );
+            Settings::from_toml(&toml)
+                .expect("should parse settings with server-side ad templates disabled")
         }
 
         async fn run_page_bids(
@@ -8901,6 +9132,20 @@ mod tests {
                 0,
                 "disabled auction must not produce bids"
             );
+        }
+
+        #[tokio::test]
+        async fn disabled_server_side_ad_templates_return_an_empty_projection() {
+            let settings = settings_with_co_templates_disabled();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let slots = article_slot();
+            let req = make_page_bids_request("/2024/01/my-article/");
+
+            let body = run_page_bids_consent_allowed(&settings, &orchestrator, &slots, req).await;
+
+            assert_eq!(body["auction"]["results"], serde_json::json!([]));
+            assert_eq!(body["slots"], serde_json::json!([]));
+            assert_eq!(body["bids"], serde_json::json!([]));
         }
 
         #[tokio::test]

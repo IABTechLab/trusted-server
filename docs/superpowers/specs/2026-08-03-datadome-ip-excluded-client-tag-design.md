@@ -149,10 +149,10 @@ For IP-based skips, extend the existing informational log with
 `client_tag=omitted`:
 
 ```text
-[datadome] protection decision=skipped rule=excluded-ip-cidrs reason=client_ip client_tag=omitted method=GET host=example.com path=/page
+[datadome] protection decision=skipped rule=excluded-ip-cidrs reason=client_ip client_tag=omitted method=GET
 ```
 
-The existing rule ID, reason, and request metadata remain part of the log.
+The existing rule ID, reason, and method remain part of the log. Host and path are omitted to avoid placing dynamic request data in the protection logs.
 Client IP values are not included. Non-IP skip logs retain their current
 behavior and level.
 

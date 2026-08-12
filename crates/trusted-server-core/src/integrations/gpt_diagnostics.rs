@@ -25,9 +25,6 @@ pub const GPT_DIAGNOSTICS_INTEGRATION_ID: &str = "gpt_diagnostics";
 pub const GPT_DIAGNOSTICS_QUERY: &str = "ts_console";
 /// Host-only browser-session activation cookie.
 pub const GPT_DIAGNOSTICS_COOKIE: &str = "__Host-ts-console";
-/// Request-scoped browser program that removes the consumed directive from the visible URL.
-pub const GPT_DIAGNOSTICS_BOOTSTRAP_SOURCE: &str = include_str!("gpt_diagnostics_bootstrap.js");
-
 const SET_CONSOLE_COOKIE: &str = "__Host-ts-console=1; Path=/; Secure; HttpOnly; SameSite=Lax";
 const CLEAR_CONSOLE_COOKIE: &str =
     "__Host-ts-console=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0";
@@ -64,7 +61,7 @@ pub enum GptDiagnosticsCookieAction {
 pub struct GptDiagnosticsRequestDecision {
     active: bool,
     reserved_directive: bool,
-    cleanup_browser_url: bool,
+    clean_browser_path_and_query: Option<String>,
     cookie_action: GptDiagnosticsCookieAction,
 }
 
@@ -96,8 +93,10 @@ impl GptDiagnosticsRequestDecision {
     /// Build the one-time inline URL-cleanup tag after reserved input was consumed.
     #[must_use]
     pub fn url_cleanup_script_tag(&self) -> Option<String> {
-        self.cleanup_browser_url
-            .then(|| format!("<script>{GPT_DIAGNOSTICS_BOOTSTRAP_SOURCE}</script>"))
+        let clean_path = serde_json::to_string(self.clean_browser_path_and_query.as_ref()?).ok()?;
+        Some(format!(
+            "<script>try{{history.replaceState(history.state,'',{clean_path}+location.hash)}}catch(_error){{}}</script>"
+        ))
     }
 }
 
@@ -187,7 +186,8 @@ pub fn prepare_request(
 
     let mut decision = GptDiagnosticsRequestDecision {
         reserved_directive: had_reserved_query,
-        cleanup_browser_url: eligible_navigation && had_reserved_query,
+        clean_browser_path_and_query: (eligible_navigation && had_reserved_query)
+            .then_some(clean_path),
         ..GptDiagnosticsRequestDecision::default()
     };
     if integration_enabled && eligible_navigation && had_reserved_query {

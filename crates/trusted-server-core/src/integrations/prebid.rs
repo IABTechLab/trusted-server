@@ -2368,8 +2368,13 @@ impl PrebidAuctionProvider {
         // not an ad ID, so it is not used as a fallback: surfacing it as `ad_id`
         // (which is exposed raw in the debug bid) would mislead any consumer that
         // treats `ad_id` as a creative identifier. Absent `adid`, `ad_id` is None.
-        // The bid ID is carried separately in `bid_id` instead.
-        let bid_id = bid_obj.get("id").and_then(|v| v.as_str()).map(String::from);
+        // The bid ID is carried separately in `bid_id` instead. Treat a blank
+        // value as absent so it cannot become an unusable browser identity.
+        let bid_id = bid_obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+            .map(String::from);
         let ad_id = bid_obj
             .get("adid")
             .and_then(|v| v.as_str())
@@ -7798,6 +7803,26 @@ set = { networkId = 42 }
         assert!(
             bid.cache_id.is_none(),
             "should not synthesize cache_id from id"
+        );
+    }
+
+    #[test]
+    fn parse_bid_treats_blank_bid_id_as_absent() {
+        let bid_json = serde_json::json!({
+            "id": "",
+            "impid": "atf_sidebar_ad",
+            "price": 1.0,
+            "w": 300,
+            "h": 250,
+        });
+        let provider = PrebidAuctionProvider::new(base_config());
+        let bid = provider
+            .parse_bid(&bid_json, "example-bidder")
+            .expect("should parse bid");
+
+        assert!(
+            bid.bid_id.is_none(),
+            "should treat an empty OpenRTB bid id as absent"
         );
     }
 

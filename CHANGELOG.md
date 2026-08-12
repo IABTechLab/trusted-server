@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Breaking** — Replaced the legacy APS contextual integration with APS OpenRTB at `/e/pb/bid`. APS configuration now uses canonical `account_id` (`pub_id` remains a compatibility alias), no longer requires APS-specific slot IDs, and defaults script creative eligibility off. Operators must update the endpoint, disable native APS demand for Trusted Server cohorts, and prepare GAM/Universal Creative targeting for `hb_bidder=aps` before rollout. APS renderer winners now preserve the upstream bid `id`, omit `crid` when APS omits it, and carry `ext.trusted_server.renderer` instead of `adm`; external `/auction` consumers must support this response shape.
+- Publisher HTML now uses `Cache-Control: max-age=60` when server-side ad templates are inactive, while preserving origin `private`/`no-store` policies and CDN-specific cache headers. Set `[creative_opportunities].enabled = false` to disable publisher HTML and SPA template delivery without disabling direct `POST /auction` callers.
 - **Breaking** — `bid_param_zone_overrides` inner values must now be JSON objects; previously non-object or empty values (`"header" = "x"`, `"header" = {}`) were accepted and silently produced a dead rule at runtime. They now fail at startup with a configuration error. Operators upgrading should audit their `bid_param_zone_overrides` config for non-object zone entries.
 - **Breaking** — Integration configuration strings are no longer globally reinterpreted as JSON scalars. Operators upgrading should audit `[integrations.*]` settings and use native TOML/typed-config booleans and numbers (for example, `enabled = true`, not `enabled = "true"`); quoted numeric and boolean scalars now fail validation instead of silently converting.
 - **Breaking** — Sourcepoint browser module inclusion now requires explicit `[integrations.sourcepoint].enabled = true`; operators relying on the previous unconditional Sourcepoint module should enable the integration before upgrading.
@@ -25,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Protocol-relative creative URLs now honor `rewrite.exclude_domains`, so excluded creative assets stay direct and excluded absolute or protocol-relative URLs submitted to `/first-party/sign` are rejected.
-- Server-side ad template bids now always carry `hb_adid` in `window.tsjs.bids`. Bidders that return neither a Prebid Cache UUID nor an `adid` previously produced no `hb_adid` at all, so no `hb_adid` GPT targeting key was set and the Universal Creative render bridge had nothing to match — the winning creative never rendered. The OpenRTB bid `id`, which is mandatory per spec, is now the last-resort source; `cache_id` and `adid` still take priority where present.
+- The canonical browser auction projection now rejects blank upstream bid IDs per winner, uses a server-minted renderer reservation as the sole GAM render identity, and emits cache coordinates only as part of a validated cache render source. This replaces the legacy `window.tsjs.bids` `hb_adid` fallback chain.
 
 ### Added
 

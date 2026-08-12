@@ -155,7 +155,9 @@ fn validate_enabled_integrations(
     validate_integration::<SourcepointConfig>(settings, "sourcepoint")?;
     validate_integration::<OsanoConfig>(settings, "osano")?;
     validate_integration::<GoogleTagManagerConfig>(settings, "google_tag_manager")?;
-    validate_integration::<DataDomeConfig>(settings, "datadome")?;
+    if let Some(config) = settings.integration_config::<DataDomeConfig>("datadome")? {
+        crate::integrations::datadome::DataDomeIntegration::validate_config_for_startup(config)?;
+    }
     validate_integration::<GptConfig>(settings, "gpt")?;
     validate_integration::<GptDiagnosticsConfig>(settings, "gpt_diagnostics")?;
 
@@ -321,8 +323,35 @@ formats = [{ width = 300, height = 250 }]
     fn absent_gam_unit_template_is_accepted_by_legacy_schema() {
         let creative_opportunities = serialized_creative_opportunities(None);
 
+        assert!(
+            creative_opportunities.get("enabled").is_none(),
+            "default template switch should be omitted for legacy binaries"
+        );
         serde_json::from_value::<LegacyCreativeOpportunitiesConfig>(creative_opportunities)
             .expect("should accept absent GAM unit template");
+    }
+
+    #[test]
+    fn disabled_creative_opportunities_flag_is_visible_to_legacy_schema() {
+        let mut toml = crate_test_settings_str();
+        toml.push_str(
+            r#"
+
+[creative_opportunities]
+enabled = false
+gam_network_id = "99999"
+"#,
+        );
+        let app_config: TrustedServerAppConfig =
+            toml::from_str(&toml).expect("should deserialize app config wrapper");
+        let creative_opportunities = serde_json::to_value(app_config)
+            .expect("should serialize app config wrapper")
+            .get("creative_opportunities")
+            .cloned()
+            .expect("should contain creative opportunities");
+
+        serde_json::from_value::<LegacyCreativeOpportunitiesConfig>(creative_opportunities)
+            .expect_err("legacy binaries should reject an explicit disabled switch");
     }
 
     #[test]
@@ -402,6 +431,44 @@ password = "production-admin-password-32-bytes"
             error_text.contains("osano") || error_text.contains("typo"),
             "error should mention Osano or the invalid field: {err:?}"
         );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_invalid_datadome_test_bypass() {
+        for (enable_protection, store, name, expected_message) in [
+            (
+                false,
+                "ts_secrets",
+                "datadome_test_bypass",
+                "requires enable_protection",
+            ),
+            (true, "", "datadome_test_bypass", "credential_secret_store"),
+            (true, "ts_secrets", "", "credential_secret_name"),
+        ] {
+            let mut settings = valid_settings();
+            settings
+                .integrations
+                .insert_config(
+                    "datadome",
+                    &serde_json::json!({
+                        "enabled": true,
+                        "enable_protection": enable_protection,
+                        "protection_test_bypass": {
+                            "enabled": true,
+                            "credential_secret_store": store,
+                            "credential_secret_name": name,
+                        },
+                    }),
+                )
+                .expect("should insert DataDome config");
+
+            let err = validate_settings_for_deploy(&settings)
+                .expect_err("should reject invalid DataDome test bypass");
+            assert!(
+                format!("{err:?}").contains(expected_message),
+                "error should mention the invalid bypass setting: {err:?}"
+            );
+        }
     }
 
     #[test]

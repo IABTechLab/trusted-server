@@ -284,10 +284,15 @@ Every task's regression suite therefore remains green in task order.
 
   The integration workflow runs the same focused command on its pinned CI image and
   uploads the resulting JSON. Add required manual input `evidence_id` and include it
-  in `run-name`. Map that input directly into the focused job as
-  `TSJS_PERF_EVIDENCE_ID: ${{ inputs.evidence_id }}` and upload the resulting baseline
-  JSON as `aps-tsjs-baseline-${{ github.run_id }}`. The performance test writes that
-  exact environment value into top-level string field `evidenceId`.
+  in `run-name`. Map that input directly into the focused job:
+
+  ```yaml
+  TSJS_PERF_EVIDENCE_ID: ${{ inputs.evidence_id }}
+  ```
+
+  Upload the resulting baseline JSON as `aps-tsjs-baseline-` followed by the GitHub
+  workflow run id. The performance test writes that exact environment value into
+  top-level string field `evidenceId`.
   `dispatch-workflow-run.mjs` validates that the ref is a pushed
   branch/tag, dispatches with a unique evidence id, polls for exactly that run, and
   prints its numeric run id. Record the unique evidence id—not the later GitHub

@@ -186,6 +186,9 @@ auction_html_comment = false
 # trace_route_enabled = false
 
 [creative_opportunities]
+# Set to false to disable server-side ad templates while retaining slot definitions
+# and direct POST /auction callers.
+enabled = true
 gam_network_id = "123456789"
 # FCP is not affected by this value — body content above </body> has already
 # streamed and painted before the hold begins. What this caps is the slip on

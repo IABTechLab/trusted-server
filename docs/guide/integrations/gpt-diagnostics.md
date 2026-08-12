@@ -78,6 +78,8 @@ Visible, Filled, Empty, Pending/Incomplete, and Unbound/Ambiguous slots.
 
 Each request cycle can show:
 
+- Exact GPT slot element ID and ad unit path.
+- Initial request and numbered refresh cycles.
 - The observed request path, request-intent ID, and direct Trusted Server opportunity.
 - Opaque Trusted Server auction-ID correlation and opportunity-to-request latency when available.
 - Observed replacement of an earlier retained filled render, including GPT creative-ID transitions.
