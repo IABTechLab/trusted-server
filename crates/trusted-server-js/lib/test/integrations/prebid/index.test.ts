@@ -188,8 +188,6 @@ const {
     mockMarkWinningBidAsUsed,
     mockOnEvent,
     mockRemoveAdUnit,
-    mockMarkWinningBidAsUsed,
-    mockOnEvent,
     mockPbjs,
   };
 });
@@ -206,7 +204,6 @@ import { log } from '../../../src/core/log';
 import envelope from '../../fixtures/aps-renderer-v1.json';
 import { GptDiagnosticsObserver } from '../../../src/integrations/gpt_diagnostics/observer';
 import { GptDiagnosticsStore } from '../../../src/integrations/gpt_diagnostics/store';
-import envelope from '../../fixtures/aps-renderer-v1.json';
 
 // installPrebidNpm is a per-page no-op once the sentinel is set (the module
 // self-init above already set it), so every test starts from a clean page.

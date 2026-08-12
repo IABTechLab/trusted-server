@@ -6,7 +6,7 @@ import envelope from '../fixtures/aps-renderer-v1.json';
 /** Test view of the global scope with a mockable `fetch`. */
 const testGlobal = globalThis as unknown as { fetch: ReturnType<typeof vi.fn> };
 
-type AddAdUnitsArg = Parameters<typeof addAdUnits>[0];
+type AddAdUnitsArg = AdUnit;
 
 async function flushRequestAds(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
