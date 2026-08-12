@@ -136,7 +136,7 @@ When a request arrives at the `/auction` endpoint, it goes through the following
 ┌──────────────────────────────────────────────────────────────────────┐
 │  11. Transform to OpenRTB Response (mod.rs:274-322)                  │
 │      - Build seatbid array (one per winning bid)                     │
-│      - Always sanitize creative HTML                                 │
+│      - Sanitize creative HTML when enabled (opt-in)                  │
 │      - Rewrite creative HTML when enabled (default)                  │
 │      - Add orchestrator metadata (timing, strategy, bid count)       │
 └──────────────────────────────────────────────────────────────────────┘
@@ -252,12 +252,15 @@ The orchestrator collects all bids and creates an OpenRTB response:
 }
 ```
 
-Creative HTML is always sanitized. By default, each auction delivery path then
-rewrites eligible URLs through the first-party proxy (`/first-party/proxy`). The
-`POST /auction` response also injects the creative runtime; the publisher SSAT
-inline path uses absolute first-party URLs without injecting that bundle. Setting
-`[auction].rewrite_creatives = false` skips rewriting in both paths and runtime
-injection on `POST /auction`.
+With `[auction].sanitize_creatives = true` (opt-in, default `false`),
+executable markup is stripped with its inner content before delivery. With
+`[auction].rewrite_creatives = true` (the default), each auction delivery path
+rewrites eligible URLs through the first-party proxy (`/first-party/proxy`) and
+removes bidder `<base>` elements. The `POST /auction` response also injects the
+creative runtime; the publisher SSAT inline path uses absolute first-party URLs
+without injecting that bundle. With both disabled, the creative ships exactly
+as the bidder returned it. In every mode, creatives over the 1 MiB cap are
+rejected.
 
 ## Route Registration & Endpoints
 
@@ -271,7 +274,7 @@ The trusted-server handles several types of routes defined in `crates/trusted-se
 | `/first-party/proxy`      | GET    | `handle_first_party_proxy()`   | Proxy creatives through first-party domain       | 84   |
 | `/first-party/click`      | GET    | `handle_first_party_click()`   | Track clicks on ads                              | 85   |
 | `/first-party/sign`       | GET/POST | `handle_first_party_proxy_sign()` | Generate signed URLs for creatives            | 86   |
-| `/first-party/proxy-rebuild` | POST | `handle_first_party_proxy_rebuild()` | Rebuild creative HTML with new settings     | 89   |
+| `/first-party/proxy-rebuild` | GET/POST | `handle_first_party_proxy_rebuild()` | Re-sign mutated click URLs (GET 302s for the opaque-origin click guard) | 89   |
 | `/static/tsjs=*`          | GET    | `handle_tsjs_dynamic()`        | Serve tsjs library (Prebid.js alternative)       | 66   |
 | `/.well-known/ts.jwks.json` | GET  | `handle_jwks_endpoint()`       | Public key distribution for request signing      | 71   |
 | `/verify-signature`       | POST   | `handle_verify_signature()`    | Verify signed requests                           | 74   |
@@ -388,8 +391,7 @@ The `/auction` endpoint is the primary entry point for auctions:
 **Key Transformations:**
 - `adUnits[].code` → `seatbid[].bid[].impid` (slot identifier)
 - `mediaTypes.banner.sizes` → evaluated by providers, winning size in `bid.w` and `bid.h`
-- Creative HTML is always sanitized, then rewritten to use `/first-party/proxy` URLs by default
-- `[auction].rewrite_creatives = false` skips rewriting in both delivery paths and `POST /auction` creative runtime injection, not sanitization
+- Creative HTML: `[auction].sanitize_creatives = true` (opt-in) strips executable markup; `[auction].rewrite_creatives = true` (default) rewrites eligible URLs to `/first-party/proxy` in both delivery paths (with creative runtime injection on `POST /auction` only); with both disabled the creative ships as the bidder returned it
 - Multiple bids per slot become separate `seatbid` entries
 - Orchestrator metadata added in `ext.orchestrator`
 

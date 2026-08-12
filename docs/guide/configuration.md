@@ -1244,38 +1244,60 @@ Settings for the auction orchestrator that coordinates multiple bid providers.
 
 ### `[auction]`
 
-| Field               | Type          | Default            | Description                                                       |
-| ------------------- | ------------- | ------------------ | ----------------------------------------------------------------- |
-| `enabled`           | Boolean       | `false`            | Enable the auction orchestrator                                   |
-| `rewrite_creatives` | Boolean       | `true`             | Rewrite sanitized winning-bid `adm` through first-party endpoints |
-| `providers`         | Array[String] | `[]`               | Provider names that participate (e.g., `["prebid", "aps"]`)       |
-| `mediator`          | String        | Optional           | Mediator provider name (runs parallel mediation when set)         |
-| `timeout_ms`        | Integer       | `2000`             | Auction timeout in milliseconds                                   |
-| `creative_store`    | String        | `"creative_store"` | Deprecated; creatives are now delivered inline                    |
+| Field                | Type          | Default            | Description                                                    |
+| -------------------- | ------------- | ------------------ | -------------------------------------------------------------- |
+| `enabled`            | Boolean       | `false`            | Enable the auction orchestrator                                |
+| `sanitize_creatives` | Boolean       | `false`            | Strip executable markup from winning-bid `adm` before delivery |
+| `rewrite_creatives`  | Boolean       | `true`             | Rewrite winning-bid `adm` through first-party endpoints        |
+| `providers`          | Array[String] | `[]`               | Provider names that participate (e.g., `["prebid", "aps"]`)    |
+| `mediator`           | String        | Optional           | Mediator provider name (runs parallel mediation when set)      |
+| `timeout_ms`         | Integer       | `2000`             | Auction timeout in milliseconds                                |
+| `creative_store`     | String        | `"creative_store"` | Deprecated; creatives are now delivered inline                 |
 
 Creative markup delivered by `POST /auction` and the publisher SSAT/page-bids
-path is always server-sanitized. With `rewrite_creatives = true` (the default),
-eligible absolute or protocol-relative resource and click URLs not excluded by
-rewrite configuration are converted to signed first-party endpoints. The
+path is processed by two independent passes. With `sanitize_creatives = true`
+(opt-in, default `false`), executable markup (`script`/`object`/`embed`/`form`
+and event handlers) is stripped together with its inner content — note this
+blanks script-based creatives, so enable it only when creatives render in a
+context that shares the publisher's origin. With `rewrite_creatives = true`
+(the default), eligible absolute or protocol-relative resource and click URLs
+not excluded by rewrite configuration are converted to signed first-party
+endpoints, and any bidder-supplied `<base>` element is removed. The
 `POST /auction` path emits root-relative endpoints and injects the creative TSJS
-runtime when a `<body>` exists; the foreign-origin SSAT renderer emits absolute
-endpoints and does not inject that bundle. Setting the option to `false` returns
-sanitized but not rewritten `adm` from both paths. Accepted external URLs remain
-direct and are not host allowlisted by the sanitizer. The setting does not
-affect HTML or CSS fetched through `/first-party/proxy`. See
+runtime exactly once — whether or not the bidder supplied a `<body>`, since bare
+fragments are the common `adm` shape; the foreign-origin SSAT renderer emits
+absolute endpoints and does not inject that bundle. With both disabled, `adm` ships
+exactly as the bidder returned it — except that a creative larger than the
+1 MiB per-creative cap is rejected in every mode and its `adm` is dropped.
+Accepted external URLs are not host allowlisted by the sanitizer. Neither
+setting affects HTML or CSS fetched through `/first-party/proxy`. See
 [Creative Processing](/guide/creative-processing#auction-rewrite-control).
 
-::: warning Existing configs and rollback
-Configs created before `rewrite_creatives` was introduced must first add
-`rewrite_creatives = true` under `[auction]`. After adding the leaf, set
-`TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES`, run `ts config validate`, and push
-the resolved config.
+::: warning Existing configs, upgrade sequencing, and rollback
+Default values are omitted from stored JSON; non-default values
+(`sanitize_creatives = true`, `rewrite_creatives = false`) are serialized, and
+older `AuctionConfig` schemas reject unknown fields.
 
-The default `true` is omitted from stored JSON so older binaries can read the
-blob during rollback. An explicit `false` must remain serialized. Before rolling
-back to a binary without this field, remove the `false` environment override (or
-set the file value to `true`), push the resulting default-compatible blob, and
-only then roll back the binary.
+**Upgrading:** binaries that predate `sanitize_creatives` reject a blob that
+carries it, so in a rolling deployment upgrade the binary **first**, then push
+a config with `sanitize_creatives = true` if you want sanitization. Between the
+binary upgrade and the config push, sanitization is off (the new default) —
+during that interval the creative iframe sandbox is the only isolation for
+`/auction` markup. There is no mixed-version-safe value that keeps the old
+unconditional sanitization: omission means "sanitize" on old code and "don't"
+on new code, while an explicit `true` fails startup on old code.
+
+**Rolling back:** before reverting to a binary that does not know a field,
+remove that field's non-default value (and any environment override), run
+`ts config validate`, push the resulting default-compatible blob, and only then
+roll back the binary.
+
+**Environment overlays:** EdgeZero v0.0.4 overlays cannot create missing TOML
+leaves. Existing configs must add **both** leaves under `[auction]`
+(`rewrite_creatives` and `sanitize_creatives`) before
+`TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES` /
+`TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES` can take effect — an override for
+a missing leaf is silently ignored.
 :::
 
 **Example**:
@@ -1283,6 +1305,7 @@ only then roll back the binary.
 ```toml
 [auction]
 enabled = true
+sanitize_creatives = false
 rewrite_creatives = true
 providers = ["aps", "prebid"]
 timeout_ms = 2000
@@ -1305,6 +1328,7 @@ server_url = "https://prebid-server.example.com/openrtb2/auction"
 
 ```bash
 TRUSTED_SERVER__AUCTION__ENABLED=true
+TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES=false
 TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES=true
 TRUSTED_SERVER__AUCTION__PROVIDERS=aps,prebid
 TRUSTED_SERVER__AUCTION__PROVIDERS__0=aps
