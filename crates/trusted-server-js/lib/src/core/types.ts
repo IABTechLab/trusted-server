@@ -338,6 +338,24 @@ export interface GptDiagnosticsRecorder {
   ): void;
 }
 
+/**
+ * Lifecycle state for a GPT slot TS created before its publisher declares it.
+ *
+ * Stored on `window.tsjs` so the head bootstrap and the full TSJS bundle share
+ * one handoff protocol.
+ */
+export interface GptSlotHandoff {
+  gamUnitPath: string;
+  formats: Array<[number, number]>;
+  /** Stable configured prefix used to safely bridge framework-generated IDs. */
+  divIdPrefix: string;
+  /** Element ID GPT received when TS created the fallback slot. */
+  slotElementId: string;
+  publisherClaimed: boolean;
+  suppressPublisherDisplay: boolean;
+  suppressPublisherRefresh: boolean;
+}
+
 export interface TsjsApi {
   version: string;
   que: Array<() => void>;
@@ -405,6 +423,10 @@ export interface TsjsApi {
    * slots so they are not left blank.
    */
   gptInitialLoadDisabled?: boolean;
+  /** Late publisher claims for TS-created GPT slots, keyed by actual div ID. */
+  gptSlotHandoffs?: Record<string, GptSlotHandoff>;
+  /** True only while TS calls a GPT function that the handoff wrappers observe. */
+  gptSlotHandoffInternal?: boolean;
   /** Guards SPA pushState hook installation. */
   spaHookInstalled?: boolean;
   /**
