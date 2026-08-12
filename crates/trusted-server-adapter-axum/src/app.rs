@@ -279,8 +279,8 @@ async fn dispatch_fallback(
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
-    if method == Method::GET && path.starts_with("/static/tsjs=") {
-        return handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SMaxageFallback);
+    if path.starts_with("/static/tsjs=") {
+        return handle_tsjs_dynamic(&req, &state.registry);
     }
 
     if state.registry.has_route(&method, &path) {

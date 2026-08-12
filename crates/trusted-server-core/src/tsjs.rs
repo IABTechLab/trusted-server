@@ -1,41 +1,99 @@
 use std::collections::HashSet;
 
 use error_stack::Report;
+use serde::Deserialize;
 use trusted_server_js::{
-    TsjsModulePhase, all_integration_metadata, all_module_ids, concatenated_hash, release_id,
-    single_module_hash,
+    MAX_MANIFEST_MODULES, TsjsModulePhase, all_integration_metadata, all_module_ids,
+    concatenated_hash, release_id, single_module_hash,
 };
+use validator::Validate;
 
 use crate::error::TrustedServerError;
+use crate::settings::{IntegrationConfig, Settings};
 
 /// Serialize one exact `BootManifestV1` without publishing it into HTML.
 ///
-/// `module_ids` contains enabled integration bundles in actual injection order;
-/// core is implicit and therefore rejected here. Unknown, duplicate, malformed,
-/// or over-capacity inventories fail closed.
+/// `module_ids` contains enabled integration bundles in catalog-filtered injection
+/// order; core is implicit and therefore rejected here. Unknown, duplicate,
+/// malformed, phase-overridden, or over-capacity inventories fail closed.
 ///
 /// # Errors
 ///
 /// Returns an error when the integration inventory exceeds the bounded capacity,
 /// contains an invalid module ID, or cannot be serialized.
 pub fn tsjs_boot_manifest_v1(module_ids: &[&str]) -> Result<String, Report<TrustedServerError>> {
-    if module_ids.len() > 16 {
-        return Err(boot_manifest_error("more than 16 integration modules"));
+    if module_ids.len() > MAX_MANIFEST_MODULES {
+        return Err(boot_manifest_error(
+            "integration inventory exceeds catalog capacity",
+        ));
     }
-    let known = all_module_ids().into_iter().collect::<HashSet<_>>();
+    let catalog = all_integration_metadata();
+    let catalog_order = catalog
+        .iter()
+        .enumerate()
+        .map(|(index, metadata)| (metadata.id, index))
+        .collect::<std::collections::HashMap<_, _>>();
     let mut seen = HashSet::new();
     let mut integrations = Vec::with_capacity(module_ids.len());
+    let mut critical_ids = Vec::new();
+    let mut provided = HashSet::from(["runtime.v1"]);
+    let mut previous_order = None;
     for id in module_ids {
-        if *id == "core" || !valid_integration_id(id) || !known.contains(id) || !seen.insert(*id) {
+        let Some(order) = catalog_order.get(id).copied() else {
             return Err(boot_manifest_error("invalid integration inventory"));
+        };
+        if *id == "core"
+            || !valid_integration_id(id)
+            || !seen.insert(*id)
+            || previous_order.is_some_and(|previous| order <= previous)
+        {
+            return Err(boot_manifest_error(
+                "invalid integration inventory or catalog order",
+            ));
         }
+        previous_order = Some(order);
+        let metadata = catalog
+            .get(order)
+            .ok_or_else(|| boot_manifest_error("catalog metadata is unavailable"))?;
+        if metadata
+            .inputs
+            .iter()
+            .any(|declaration| !declaration.contains('?') && !provided.contains(declaration))
+        {
+            return Err(boot_manifest_error(
+                "integration inventory omits a required provider",
+            ));
+        }
+        provided.extend(metadata.outputs.iter().copied());
         let encoded = serde_json::to_string(id)
             .map_err(|_| boot_manifest_error("integration id serialization failed"))?;
-        integrations.push(format!(r#"{{"id":{encoded},"required":true}}"#));
+        match metadata.phase {
+            Some(TsjsModulePhase::Critical) => {
+                critical_ids.push(*id);
+                integrations.push(format!(r#"{{"id":{encoded},"phase":"critical"}}"#));
+            }
+            Some(TsjsModulePhase::Deferred) => {
+                let src = tsjs_single_module_script_src(id)
+                    .ok_or_else(|| boot_manifest_error("deferred module src is unavailable"))?;
+                let encoded_src = serde_json::to_string(&src)
+                    .map_err(|_| boot_manifest_error("module src serialization failed"))?;
+                integrations.push(format!(
+                    r#"{{"id":{encoded},"phase":"deferred","trigger":"first_display_or_idle","src":{encoded_src}}}"#
+                ));
+            }
+            None => return Err(boot_manifest_error("integration phase is unavailable")),
+        }
     }
+    if module_ids.first() != Some(&"render_runtime") {
+        return Err(boot_manifest_error(
+            "integration inventory must begin with render_runtime",
+        ));
+    }
+    let critical_src = tsjs_script_src(&critical_ids);
     Ok(format!(
-        r#"{{"version":1,"releaseId":"{}","integrations":[{}]}}"#,
+        r#"{{"version":1,"releaseId":"{}","criticalSrc":"{}","integrations":[{}]}}"#,
         release_id(),
+        critical_src,
         integrations.join(",")
     ))
 }
@@ -239,6 +297,58 @@ pub struct CreativeBootConfigV1 {
     pub render_guard: bool,
 }
 
+impl Default for CreativeBootConfigV1 {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            click_guard: true,
+            render_guard: false,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
+struct CreativeBrowserConfigV1 {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "default_true")]
+    click_guard: bool,
+    #[serde(default)]
+    render_guard: bool,
+}
+
+impl IntegrationConfig for CreativeBrowserConfigV1 {
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+/// Resolve the exact server-owned creative browser boot policy.
+pub(crate) fn creative_boot_config_v1(
+    settings: &Settings,
+) -> Result<CreativeBootConfigV1, Report<TrustedServerError>> {
+    if !settings.integrations.contains_key("creative") {
+        return Ok(CreativeBootConfigV1::default());
+    }
+    let Some(config) = settings.integration_config::<CreativeBrowserConfigV1>("creative")? else {
+        return Ok(CreativeBootConfigV1 {
+            enabled: false,
+            click_guard: false,
+            render_guard: false,
+        });
+    };
+    Ok(CreativeBootConfigV1 {
+        enabled: true,
+        click_guard: config.click_guard,
+        render_guard: config.render_guard,
+    })
+}
+
 /// Inputs for the one hard-cutover browser boot transport.
 #[derive(Clone, Copy, Debug)]
 pub struct TsjsBootScriptConfigV1<'a> {
@@ -402,24 +512,25 @@ pub fn tsjs_unified_script_tag() -> String {
 
 /// `/static` URL for one module with its own cache-busting hash.
 #[must_use]
-pub fn tsjs_single_module_script_src(module_id: &str) -> String {
-    let hash = single_module_hash(module_id).unwrap_or_default();
-    format!("/static/tsjs=tsjs-{module_id}.min.js?v={hash}")
+pub fn tsjs_single_module_script_src(module_id: &str) -> Option<String> {
+    let metadata = trusted_server_js::integration_metadata(module_id)?;
+    if metadata.phase != Some(TsjsModulePhase::Deferred) {
+        return None;
+    }
+    let hash = single_module_hash(module_id)?;
+    Some(format!("/static/tsjs=tsjs-{module_id}.min.js?v={hash}"))
 }
 
 /// `/static` URL for a single deferred module with its own cache-busting hash.
 #[must_use]
-pub fn tsjs_deferred_script_src(module_id: &str) -> String {
+pub fn tsjs_deferred_script_src(module_id: &str) -> Option<String> {
     tsjs_single_module_script_src(module_id)
 }
 
 /// `<script defer>` tag for a single deferred module.
 #[must_use]
-pub fn tsjs_deferred_script_tag(module_id: &str) -> String {
-    format!(
-        "<script src=\"{}\" defer></script>",
-        tsjs_deferred_script_src(module_id)
-    )
+pub fn tsjs_deferred_script_tag(module_id: &str) -> Option<String> {
+    tsjs_deferred_script_src(module_id).map(|src| format!("<script src=\"{src}\" defer></script>"))
 }
 
 /// Generate all deferred `<script defer>` tags for the given module IDs.
@@ -429,7 +540,7 @@ pub fn tsjs_deferred_script_tag(module_id: &str) -> String {
 pub fn tsjs_deferred_script_tags(module_ids: &[&str]) -> String {
     module_ids
         .iter()
-        .map(|id| tsjs_deferred_script_tag(id))
+        .filter_map(|id| tsjs_deferred_script_tag(id))
         .collect::<String>()
 }
 
@@ -531,17 +642,36 @@ mod tests {
 
     #[test]
     fn boot_manifest_serializer_preserves_enabled_injection_order() {
-        let value = tsjs_boot_manifest_v1(&["prebid", "creative"])
-            .expect("should serialize known unique integrations");
+        let value = tsjs_boot_manifest_v1(&[
+            "render_runtime",
+            "creative",
+            "gpt",
+            "prebid",
+            "prebid_later",
+        ])
+        .expect("should serialize known unique integrations");
 
         assert_eq!(
             value,
             format!(
-                "{{\"version\":1,\"releaseId\":\"{}\",\"integrations\":[{{\"id\":\"prebid\",\"required\":true}},{{\"id\":\"creative\",\"required\":true}}]}}",
-                release_id()
+                "{{\"version\":1,\"releaseId\":\"{}\",\"criticalSrc\":\"{}\",\"integrations\":[{{\"id\":\"render_runtime\",\"phase\":\"critical\"}},{{\"id\":\"creative\",\"phase\":\"critical\"}},{{\"id\":\"gpt\",\"phase\":\"critical\"}},{{\"id\":\"prebid\",\"phase\":\"critical\"}},{{\"id\":\"prebid_later\",\"phase\":\"deferred\",\"trigger\":\"first_display_or_idle\",\"src\":\"{}\"}}]}}",
+                release_id(),
+                tsjs_script_src(&["render_runtime", "creative", "gpt", "prebid"]),
+                tsjs_single_module_script_src("prebid_later")
+                    .expect("should name catalogued deferred module")
             ),
             "should emit the exact BootManifestV1 field and integration order"
         );
+    }
+
+    #[test]
+    fn boot_manifest_rejects_non_catalog_order_and_capacity_boundaries() {
+        assert!(tsjs_boot_manifest_v1(&trusted_server_js::all_integration_ids()[..19]).is_ok());
+        assert!(tsjs_boot_manifest_v1(&trusted_server_js::all_integration_ids()[..20]).is_ok());
+        let mut twenty_one = trusted_server_js::all_integration_ids().to_vec();
+        twenty_one.push("render_runtime");
+        assert!(tsjs_boot_manifest_v1(&twenty_one).is_err());
+        assert!(tsjs_boot_manifest_v1(&["creative", "render_runtime"]).is_err());
     }
 
     #[test]
@@ -746,7 +876,7 @@ mod tests {
     #[test]
     fn boot_script_serializes_the_exact_hard_cutover_transport_and_mark() {
         let script = tsjs_boot_script_v1(TsjsBootScriptConfigV1 {
-            module_ids: &["creative", "gpt", "gpt_diagnostics"],
+            module_ids: &["render_runtime", "creative", "gpt", "gpt_diagnostics"],
             auction_projection_json:
                 r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"slots":[],"bids":[]}"#,
             creative: CreativeBootConfigV1 {
@@ -761,9 +891,10 @@ mod tests {
 
         assert!(script.starts_with("<script>(function(){var t=window.tsjs=window.tsjs||{};"));
         assert!(script.contains(&format!(
-            r#"t.boot={{"abi":1,"releaseId":"{}","manifest":{{"version":1,"releaseId":"{}","integrations":[{{"id":"creative","required":true}},{{"id":"gpt","required":true}},{{"id":"gpt_diagnostics","required":true}}]}},"auctionProjection":{{"version":1,"auction":{{"version":1,"auctionId":"initial","results":[]}},"slots":[],"bids":[]}},"creative":{{"version":1,"enabled":true,"clickGuard":true,"renderGuard":false}},"diagnostics":{{"version":1,"renderTraceOverlay":true,"gpt":{{"active":true}}}}}};"#,
+            r#"t.boot={{"abi":1,"releaseId":"{}","manifest":{{"version":1,"releaseId":"{}","criticalSrc":"{}","integrations":[{{"id":"render_runtime","phase":"critical"}},{{"id":"creative","phase":"critical"}},{{"id":"gpt","phase":"critical"}},{{"id":"gpt_diagnostics","phase":"critical"}}]}},"auctionProjection":{{"version":1,"auction":{{"version":1,"auctionId":"initial","results":[]}},"slots":[],"bids":[]}},"creative":{{"version":1,"enabled":true,"clickGuard":true,"renderGuard":false}},"diagnostics":{{"version":1,"renderTraceOverlay":true,"gpt":{{"active":true}}}}}};"#,
             release_id(),
-            release_id()
+            release_id(),
+            tsjs_script_src(&["render_runtime", "creative", "gpt", "gpt_diagnostics"])
         )));
         assert_eq!(script.matches("tsjs:bids-script").count(), 1);
         assert!(!script.contains("__tsjs"));
@@ -773,7 +904,7 @@ mod tests {
     #[test]
     fn boot_script_rejects_manifest_diagnostics_mismatch_and_escapes_projection_markup() {
         let mismatched = tsjs_boot_script_v1(TsjsBootScriptConfigV1 {
-            module_ids: &["creative"],
+            module_ids: &["render_runtime", "creative"],
             auction_projection_json: r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"slots":[],"bids":[]}"#,
             creative: CreativeBootConfigV1 {
                 enabled: true,
@@ -789,7 +920,7 @@ mod tests {
         );
 
         let script = tsjs_boot_script_v1(TsjsBootScriptConfigV1 {
-            module_ids: &["creative"],
+            module_ids: &["render_runtime", "creative"],
             auction_projection_json:
                 r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"slots":[],"bids":[],"probe":"</ScRiPt><script>&\u2028"}"#,
             creative: CreativeBootConfigV1 {
@@ -968,37 +1099,37 @@ mod tests {
 
     #[test]
     fn tsjs_single_module_script_src_formats_known_module_url_with_hash() {
-        let src = tsjs_single_module_script_src("creative");
+        let src =
+            tsjs_single_module_script_src("prebid_later").expect("should name a deferred module");
 
         assert!(
-            src.starts_with("/static/tsjs=tsjs-creative.min.js?v="),
+            src.starts_with("/static/tsjs=tsjs-prebid_later.min.js?v="),
             "should use per-module static bundle path"
         );
         assert_sha256_hex_hash(hash_query_value(&src));
+        assert_eq!(tsjs_single_module_script_src("creative"), None);
     }
 
     #[test]
-    fn tsjs_deferred_script_src_hashes_prebid_shim_and_empties_unknown_module() {
-        let prebid_src = tsjs_deferred_script_src("prebid");
+    fn tsjs_deferred_script_src_hashes_only_catalogued_deferred_modules() {
+        let prebid_src =
+            tsjs_deferred_script_src("prebid_later").expect("should name Prebid later slice");
         assert!(
-            prebid_src.starts_with("/static/tsjs=tsjs-prebid.min.js?v="),
-            "prebid shim should be served from the deferred tsjs route"
+            prebid_src.starts_with("/static/tsjs=tsjs-prebid_later.min.js?v="),
+            "Prebid later slice should use the deferred TSJS route"
         );
         assert_sha256_hex_hash(hash_query_value(&prebid_src));
-        assert_eq!(
-            tsjs_deferred_script_src("unknown-module"),
-            "/static/tsjs=tsjs-unknown-module.min.js?v=",
-            "should document current unknown-module hash behavior"
-        );
+        assert_eq!(tsjs_deferred_script_src("unknown-module"), None);
+        assert_eq!(tsjs_deferred_script_src("prebid"), None);
     }
 
     #[test]
     fn tsjs_deferred_script_tag_marks_script_defer() {
-        let src = tsjs_deferred_script_src("prebid");
+        let src = tsjs_deferred_script_src("prebid_later").expect("should name Prebid later slice");
 
         assert_eq!(
-            tsjs_deferred_script_tag("prebid"),
-            format!("<script src=\"{src}\" defer></script>"),
+            tsjs_deferred_script_tag("prebid_later"),
+            Some(format!("<script src=\"{src}\" defer></script>")),
             "should generate a deferred script tag"
         );
     }
@@ -1015,11 +1146,12 @@ mod tests {
     #[test]
     fn tsjs_deferred_script_tags_preserves_input_order() {
         assert_eq!(
-            tsjs_deferred_script_tags(&["prebid", "creative"]),
+            tsjs_deferred_script_tags(&["prebid_later", "sourcepoint_lifecycle"]),
             format!(
                 "{}{}",
-                tsjs_deferred_script_tag("prebid"),
-                tsjs_deferred_script_tag("creative")
+                tsjs_deferred_script_tag("prebid_later").expect("should build Prebid tag"),
+                tsjs_deferred_script_tag("sourcepoint_lifecycle")
+                    .expect("should build Sourcepoint tag")
             ),
             "should preserve caller-provided deferred module order"
         );
@@ -1050,11 +1182,7 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_deferred_script_src_has_empty_hash_for_unknown_module() {
-        assert_eq!(
-            tsjs_deferred_script_src("does-not-exist"),
-            "/static/tsjs=tsjs-does-not-exist.min.js?v=",
-            "should fall back to an empty cache-busting hash for an unknown module"
-        );
+    fn tsjs_deferred_script_src_rejects_unknown_module() {
+        assert_eq!(tsjs_deferred_script_src("does-not-exist"), None);
     }
 }

@@ -777,10 +777,19 @@ pub struct ProxyDispatchInput<'a> {
 }
 
 /// In-memory registry of integrations discovered from settings.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct IntegrationRegistry {
     inner: Arc<IntegrationRegistryInner>,
-    plan: Option<Arc<AuctionPlan>>,
+    creative_boot: crate::tsjs::CreativeBootConfigV1,
+}
+
+impl Default for IntegrationRegistry {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(IntegrationRegistryInner::default()),
+            creative_boot: crate::tsjs::CreativeBootConfigV1::default(),
+        }
+    }
 }
 
 impl IntegrationRegistry {
@@ -809,6 +818,7 @@ impl IntegrationRegistry {
         plan: Arc<AuctionPlan>,
     ) -> Result<Self, Report<TrustedServerError>> {
         let mut inner = IntegrationRegistryInner::default();
+        let creative_boot = crate::tsjs::creative_boot_config_v1(settings)?;
         let aps_proxy: Arc<dyn IntegrationProxy> =
             Arc::new(super::aps::ApsV1Integration::from_settings(settings)?);
         inner
@@ -893,7 +903,7 @@ impl IntegrationRegistry {
 
         Ok(Self {
             inner: Arc::new(inner),
-            plan: Some(plan),
+            creative_boot,
         })
     }
 
@@ -1195,6 +1205,12 @@ impl IntegrationRegistry {
         self.inner.enabled_integration_ids.contains(&integration_id)
     }
 
+    /// Return the exact server-owned creative browser boot policy.
+    #[must_use]
+    pub fn tsjs_creative_boot(&self) -> crate::tsjs::CreativeBootConfigV1 {
+        self.creative_boot
+    }
+
     /// Return JS module IDs that should be included in the tsjs bundle.
     ///
     /// Always includes JS-only modules with no Rust-side registration.
@@ -1243,12 +1259,124 @@ impl IntegrationRegistry {
             .collect()
     }
 
+    /// Return enabled TSJS catalog modules in the generated release order.
+    ///
+    /// This transport selector is deny-unknown and never accepts a phase or
+    /// ordering override from settings. Request-scoped diagnostics activation
+    /// may further filter the returned diagnostics rows when composing a manifest.
+    #[must_use]
+    pub fn tsjs_catalog_module_ids(&self, selection: TsjsCatalogSelectionV1) -> Vec<&'static str> {
+        self.tsjs_selected_catalog_metadata(selection)
+            .into_iter()
+            .map(|metadata| metadata.id)
+            .collect()
+    }
+
+    /// Return the enabled parser-blocking catalog slice in canonical order.
+    #[must_use]
+    pub fn tsjs_critical_module_ids(&self, selection: TsjsCatalogSelectionV1) -> Vec<&'static str> {
+        self.tsjs_selected_catalog_metadata(selection)
+            .into_iter()
+            .filter(|metadata| metadata.phase == Some(trusted_server_js::TsjsModulePhase::Critical))
+            .map(|metadata| metadata.id)
+            .collect()
+    }
+
+    /// Return the enabled post-paint catalog slice in canonical order.
+    #[must_use]
+    pub fn tsjs_deferred_module_ids(&self, selection: TsjsCatalogSelectionV1) -> Vec<&'static str> {
+        self.tsjs_selected_catalog_metadata(selection)
+            .into_iter()
+            .filter(|metadata| metadata.phase == Some(trusted_server_js::TsjsModulePhase::Deferred))
+            .map(|metadata| metadata.id)
+            .collect()
+    }
+
+    /// Return the bounded request-owned variants admitted by static transport.
+    ///
+    /// Integration predicates remain fixed by this registry. Creative guards and
+    /// diagnostics activity are document/session bits, so the content hash is
+    /// matched against only their configured, finite candidate combinations.
+    #[must_use]
+    pub fn tsjs_static_transport_selections(
+        &self,
+        render_trace_overlay: bool,
+    ) -> Vec<TsjsCatalogSelectionV1> {
+        let diagnostics_configured = self.integration_enabled("gpt_diagnostics");
+        let diagnostics_values: &[bool] = if diagnostics_configured {
+            &[false, true]
+        } else {
+            &[false]
+        };
+        let mut selections = Vec::with_capacity(diagnostics_values.len() * 2);
+        for creative_enabled in [false, true] {
+            for gpt_diagnostics_active in diagnostics_values {
+                selections.push(TsjsCatalogSelectionV1 {
+                    creative_enabled,
+                    creative_click_guard: creative_enabled,
+                    creative_render_guard: false,
+                    gpt_diagnostics_active: *gpt_diagnostics_active,
+                    render_trace_overlay,
+                });
+            }
+        }
+        selections
+    }
+
+    fn tsjs_catalog_module_enabled(
+        &self,
+        predicate: Option<&str>,
+        selection: TsjsCatalogSelectionV1,
+    ) -> bool {
+        match predicate {
+            Some("always") => true,
+            Some("creative_guard") => {
+                selection.creative_enabled
+                    && (selection.creative_click_guard || selection.creative_render_guard)
+            }
+            Some("gpt_diagnostics_active") => selection.gpt_diagnostics_active,
+            Some("diagnostics_presentation") => {
+                selection.render_trace_overlay || selection.gpt_diagnostics_active
+            }
+            Some("prebid_and_gpt") => {
+                self.integration_enabled("prebid") && self.integration_enabled("gpt")
+            }
+            Some(predicate) => predicate
+                .strip_prefix("integration:")
+                .is_some_and(|integration_id| self.integration_enabled(integration_id)),
+            None => false,
+        }
+    }
+
+    fn tsjs_selected_catalog_metadata(
+        &self,
+        selection: TsjsCatalogSelectionV1,
+    ) -> Vec<trusted_server_js::TsjsArtifactMetadata> {
+        let mut selected = Vec::new();
+        let mut provided = std::collections::HashSet::from(["runtime.v1"]);
+        for metadata in trusted_server_js::all_integration_metadata() {
+            if !self.tsjs_catalog_module_enabled(metadata.include, selection) {
+                continue;
+            }
+            let requirements_available = metadata
+                .inputs
+                .iter()
+                .all(|declaration| declaration.contains('?') || provided.contains(declaration));
+            if !requirements_available {
+                continue;
+            }
+            provided.extend(metadata.outputs.iter().copied());
+            selected.push(metadata);
+        }
+        selected
+    }
+
     #[cfg(test)]
     #[must_use]
     pub fn empty_for_tests() -> Self {
         Self {
             inner: Arc::new(IntegrationRegistryInner::default()),
-            plan: None,
+            creative_boot: crate::tsjs::CreativeBootConfigV1::default(),
         }
     }
 
@@ -1278,7 +1406,7 @@ impl IntegrationRegistry {
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
-            plan: None,
+            creative_boot: crate::tsjs::CreativeBootConfigV1::default(),
         }
     }
 
@@ -1309,7 +1437,7 @@ impl IntegrationRegistry {
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
-            plan: None,
+            creative_boot: crate::tsjs::CreativeBootConfigV1::default(),
         }
     }
 
@@ -1336,7 +1464,7 @@ impl IntegrationRegistry {
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
-            plan: None,
+            creative_boot: crate::tsjs::CreativeBootConfigV1::default(),
         }
     }
 
@@ -1403,7 +1531,7 @@ impl IntegrationRegistry {
                 deferred_js_ids: Vec::new(),
                 disabled_js_ids: Vec::new(),
             }),
-            plan: None,
+            creative_boot: crate::tsjs::CreativeBootConfigV1::default(),
         }
     }
 }
@@ -2236,6 +2364,50 @@ mod tests {
         assert!(
             deferred.contains(&"prebid"),
             "should serve the prebid shim as a deferred module"
+        );
+    }
+
+    #[test]
+    fn tsjs_catalog_selector_uses_generated_predicates_and_request_bits() {
+        let registry = IntegrationRegistry::empty_for_tests();
+
+        assert_eq!(
+            registry.tsjs_catalog_module_ids(TsjsCatalogSelectionV1::default()),
+            vec!["render_runtime"],
+            "always must select only the mandatory runtime without other inputs"
+        );
+        assert_eq!(
+            registry.tsjs_catalog_module_ids(TsjsCatalogSelectionV1 {
+                creative_enabled: true,
+                creative_click_guard: true,
+                ..TsjsCatalogSelectionV1::default()
+            }),
+            vec!["render_runtime", "creative"],
+            "creative requires enabled plus one guard"
+        );
+        assert_eq!(
+            registry.tsjs_catalog_module_ids(TsjsCatalogSelectionV1 {
+                creative_enabled: true,
+                ..TsjsCatalogSelectionV1::default()
+            }),
+            vec!["render_runtime"],
+            "creative enabled without a guard must remain absent"
+        );
+        assert_eq!(
+            registry.tsjs_catalog_module_ids(TsjsCatalogSelectionV1 {
+                gpt_diagnostics_active: true,
+                ..TsjsCatalogSelectionV1::default()
+            }),
+            vec!["render_runtime", "diagnostics_presentation"],
+            "diagnostics capture is omitted when its mandatory GPT provider is absent"
+        );
+        assert_eq!(
+            registry.tsjs_catalog_module_ids(TsjsCatalogSelectionV1 {
+                render_trace_overlay: true,
+                ..TsjsCatalogSelectionV1::default()
+            }),
+            vec!["render_runtime", "diagnostics_presentation"],
+            "overlay alone selects only presentation"
         );
     }
 

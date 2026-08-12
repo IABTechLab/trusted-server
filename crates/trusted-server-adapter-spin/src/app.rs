@@ -769,10 +769,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let path = req.uri().path().to_owned();
             let method = req.method().clone();
 
-            // Dynamic tsjs serving is GET-only; other methods fall through to the
-            // integration/publisher fallback.
-            let result = if method == Method::GET && path.starts_with("/static/tsjs=") {
-                handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SMaxageFallback)
+            let result = if path.starts_with("/static/tsjs=") {
+                handle_tsjs_dynamic(&req, &state.registry)
             } else if state.registry.has_route(&method, &path) {
                 let mut ec_context = EcContext::default();
                 state

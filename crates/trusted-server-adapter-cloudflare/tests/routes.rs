@@ -291,40 +291,32 @@ async fn tsjs_route_is_routed_not_5xx() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tsjs_route_emits_cloudflare_cache_header_for_matching_hash() {
-    let router = test_router();
-    let src = trusted_server_core::tsjs::tsjs_script_src(&["creative"]);
-    let req = request_builder()
-        .method("GET")
-        .uri(src)
-        .body(edgezero_core::body::Body::empty())
-        .expect("should build request");
+async fn tsjs_wrong_methods_are_local_no_store_404s() {
+    for method in ["HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"] {
+        let req = request_builder()
+            .method(method)
+            .uri(format!(
+                "/static/tsjs=tsjs-unified.min.js?v={}",
+                "0".repeat(64)
+            ))
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build wrong-method TSJS request");
+        let response = route(test_router(), req).await;
 
-    let resp = route(router, req).await;
-
-    assert_eq!(
-        resp.status().as_u16(),
-        200,
-        "matching TSJS hash should serve OK"
-    );
-    assert_eq!(
-        resp.headers()
-            .get("cache-control")
-            .and_then(|value| value.to_str().ok()),
-        Some("public, max-age=31536000, immutable"),
-        "browser cache policy should be immutable for matching TSJS hash"
-    );
-    assert_eq!(
-        resp.headers()
-            .get("cloudflare-cdn-cache-control")
-            .and_then(|value| value.to_str().ok()),
-        Some("max-age=31536000"),
-        "Cloudflare adapter should emit the Cloudflare-specific edge header"
-    );
-    assert!(
-        resp.headers().get("surrogate-control").is_none(),
-        "Cloudflare adapter must not emit Fastly Surrogate-Control"
-    );
+        assert_eq!(response.status().as_u16(), 404, "method {method}");
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+            "method {method}"
+        );
+        assert!(
+            !response.headers().contains_key("location"),
+            "method {method}"
+        );
+    }
 }
 
 /// Verify that every expected explicit route is registered in the route table.

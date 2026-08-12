@@ -9059,7 +9059,7 @@ mod tests {
             .find(|module_id| **module_id != "diagnostics_presentation")
             .expect("should enable one non-diagnostics deferred module");
         let src = crate::tsjs::tsjs_single_module_script_src(module_id)
-            .expect("should name enabled deferred module");
+            .expect("should name an enabled deferred module");
         let req = build_request(Method::GET, &format!("https://publisher.example{src}"));
 
         let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)

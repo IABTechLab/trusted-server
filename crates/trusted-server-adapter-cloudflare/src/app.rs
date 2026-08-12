@@ -458,15 +458,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             }
             let path = req.uri().path().to_owned();
             let method = req.method().clone();
-            // tsjs assets are served for GET only, matching the Axum/Fastly adapters.
-            let allow_tsjs = method == Method::GET;
-
-            let result = if allow_tsjs && path.starts_with("/static/tsjs=") {
-                handle_tsjs_dynamic(
-                    &req,
-                    &state.registry,
-                    EdgeCacheHeader::CloudflareCdnCacheControl,
-                )
+            let result = if path.starts_with("/static/tsjs=") {
+                handle_tsjs_dynamic(&req, &state.registry)
             } else if state.registry.has_route(&method, &path) {
                 let mut ec_context = EcContext::default();
                 state
