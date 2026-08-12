@@ -59,7 +59,7 @@ use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_eta
 use crate::integrations::IntegrationRegistry;
 use crate::platform::{GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
 use crate::price_bucket::{PriceGranularity, price_bucket};
-use crate::response_privacy::CDN_CACHE_HEADERS;
+use crate::response_privacy::enforce_synthesized_html_cache_privacy;
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{
@@ -1424,6 +1424,22 @@ pub async fn publisher_response_into_streaming_response(
     }
 }
 
+/// Returns whether a request can render an HTML document context.
+fn is_html_document_request(req: &Request<EdgeBody>) -> bool {
+    if let Some(destination) = req
+        .headers()
+        .get("sec-fetch-dest")
+        .and_then(|value| value.to_str().ok())
+    {
+        return matches!(
+            destination.trim().to_ascii_lowercase().as_str(),
+            "document" | "embed" | "fencedframe" | "frame" | "iframe" | "object"
+        );
+    }
+
+    is_navigation_request(req)
+}
+
 /// Removes request headers that can produce a bodyless or partial origin response.
 fn strip_conditional_and_range_headers(req: &mut Request<EdgeBody>) {
     req.headers_mut().remove(header::IF_NONE_MATCH);
@@ -1454,29 +1470,11 @@ fn apply_datadome_client_tag_cache_privacy(
     suppress_datadome_client_side_tag: bool,
     content_type: &str,
 ) {
-    if !suppress_datadome_client_side_tag
-        || !response_carries_body(method, response.status())
-        || !is_html_content_type(content_type)
+    if suppress_datadome_client_side_tag
+        && response_carries_body(method, response.status())
+        && is_html_content_type(content_type)
     {
-        return;
-    }
-
-    let already_uncacheable = response
-        .headers()
-        .get(header::CACHE_CONTROL)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|value| value.contains("private") || value.contains("no-store"));
-    if !already_uncacheable {
-        response.headers_mut().insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("private, max-age=0"),
-        );
-    }
-    response.headers_mut().remove(header::ETAG);
-    response.headers_mut().remove(header::LAST_MODIFIED);
-    for header_name in CDN_CACHE_HEADERS {
-        response.headers_mut().remove(*header_name);
+        enforce_synthesized_html_cache_privacy(response);
     }
 }
 
@@ -2900,10 +2898,11 @@ pub async fn handle_publisher_request(
         .extensions()
         .get::<crate::integrations::datadome::DataDomeClientTagSuppressed>()
         .is_some();
-    if should_run_ad_stack || suppress_datadome_client_side_tag {
-        // The origin content type is not known yet, so request hints cannot safely
-        // narrow this to HTML without allowing 304 or 206 responses to bypass a
-        // response mutation that becomes necessary after the fetch.
+    if should_run_ad_stack || (suppress_datadome_client_side_tag && is_html_document_request(&req))
+    {
+        // HTML document contexts whose output may be synthesized must not
+        // receive a cached 304 or partial 206. Non-document subresources contain
+        // no executable injected tag, so retain their validators and ranges.
         strip_conditional_and_range_headers(&mut req);
     }
 
@@ -3015,23 +3014,7 @@ pub async fn handle_publisher_request(
         .and_then(|h| h.to_str().ok())
         .unwrap_or_default();
     if should_run_ad_stack && is_html_content_type(origin_content_type) {
-        response.headers_mut().insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("private, no-store"),
-        );
-        response.headers_mut().remove(header::ETAG);
-        response.headers_mut().remove(header::LAST_MODIFIED);
-        // Every CDN-targeted cache directive, not just the browser-facing
-        // `Cache-Control` above: an origin emitting any of these would otherwise
-        // instruct an intermediary to store a synthesized per-navigation
-        // document. `Surrogate-Control` and `Fastly-Surrogate-Control` cover
-        // Fastly; `CDN-Cache-Control` is the standard targeted field (RFC 9213)
-        // and `Cloudflare-CDN-Cache-Control` is the Cloudflare-specific field
-        // that overrides it there, so both are needed to close the gap on the
-        // Cloudflare adapter.
-        for directive in CDN_CACHE_HEADERS {
-            response.headers_mut().remove(*directive);
-        }
+        enforce_synthesized_html_cache_privacy(&mut response);
     }
 
     let content_type = response
@@ -4218,7 +4201,8 @@ mod tests {
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
     use crate::integrations::IntegrationRegistry;
     use crate::platform::test_support::{
-        StubHttpClient, build_services_with_http_client, noop_services,
+        NoopSecretStore, StubHttpClient, build_services_with_http_client,
+        build_services_with_secret_http_client_and_client_ip, noop_services,
         noop_services_with_telemetry_sink,
     };
     use crate::test_support::tests::create_test_settings;
@@ -5386,7 +5370,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn suppressed_publisher_request_removes_conditional_validators() {
+    async fn suppressed_navigation_removes_conditional_and_range_headers() {
         let settings = create_test_settings();
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
@@ -5401,6 +5385,7 @@ mod tests {
             .method(Method::GET)
             .uri("https://publisher.example/page")
             .header(header::HOST, "publisher.example")
+            .header("sec-fetch-dest", "document")
             .header(header::IF_NONE_MATCH, "\"cached-page\"")
             .header(header::IF_MODIFIED_SINCE, "Wed, 21 Oct 2015 07:28:00 GMT")
             .header(header::RANGE, "bytes=0-18")
@@ -5427,7 +5412,105 @@ mod tests {
                 headers
                     .iter()
                     .all(|(name, _)| !name.eq_ignore_ascii_case(header_name.as_str())),
-                "suppressed requests must not forward {header_name}"
+                "suppressed navigations must not forward {header_name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn suppressed_iframe_removes_conditional_and_range_headers() {
+        let settings = create_test_settings();
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"<html><body>frame</body></html>".to_vec(),
+            vec![("content-type", "text/html; charset=utf-8")],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let mut req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/frame")
+            .header(header::HOST, "publisher.example")
+            .header("sec-fetch-dest", "iframe")
+            .header(header::IF_NONE_MATCH, "\"cached-frame\"")
+            .header(header::IF_MODIFIED_SINCE, "Wed, 21 Oct 2015 07:28:00 GMT")
+            .header(header::RANGE, "bytes=0-18")
+            .header(header::IF_RANGE, "\"cached-frame\"")
+            .body(EdgeBody::empty())
+            .expect("should build conditional iframe request");
+        req.extensions_mut()
+            .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+
+        let _response = run_publisher_proxy(&settings, &services, req).await;
+
+        let headers = stub
+            .recorded_request_headers()
+            .into_iter()
+            .next()
+            .expect("should record one outbound request");
+        for header_name in [
+            header::IF_NONE_MATCH,
+            header::IF_MODIFIED_SINCE,
+            header::RANGE,
+            header::IF_RANGE,
+        ] {
+            assert!(
+                headers
+                    .iter()
+                    .all(|(name, _)| !name.eq_ignore_ascii_case(header_name.as_str())),
+                "suppressed iframe documents must not forward {header_name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn suppressed_subresource_preserves_conditional_and_range_headers() {
+        let settings = create_test_settings();
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"video".to_vec(),
+            vec![("content-type", "video/mp4")],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let mut req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/video.mp4")
+            .header(header::HOST, "publisher.example")
+            .header("sec-fetch-dest", "video")
+            .header(header::IF_NONE_MATCH, "\"cached-video\"")
+            .header(header::IF_MODIFIED_SINCE, "Wed, 21 Oct 2015 07:28:00 GMT")
+            .header(header::RANGE, "bytes=0-18")
+            .header(header::IF_RANGE, "\"cached-video\"")
+            .body(EdgeBody::empty())
+            .expect("should build conditional subresource request");
+        req.extensions_mut()
+            .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+
+        let _response = run_publisher_proxy(&settings, &services, req).await;
+
+        let headers = stub
+            .recorded_request_headers()
+            .into_iter()
+            .next()
+            .expect("should record one outbound request");
+        for (header_name, expected) in [
+            (header::IF_NONE_MATCH, "\"cached-video\""),
+            (header::IF_MODIFIED_SINCE, "Wed, 21 Oct 2015 07:28:00 GMT"),
+            (header::RANGE, "bytes=0-18"),
+            (header::IF_RANGE, "\"cached-video\""),
+        ] {
+            assert_eq!(
+                headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(header_name.as_str()))
+                    .map(|(_, value)| value.as_str()),
+                Some(expected),
+                "suppressed subresources should preserve {header_name}"
             );
         }
     }
@@ -5547,6 +5630,77 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn datadome_filter_marker_survives_into_publisher_html_pipeline() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "datadome",
+                &serde_json::json!({
+                    "enabled": true,
+                    "enable_protection": true,
+                    "protection_excluded_ip_cidrs": ["192.0.2.0/24"],
+                    "client_side_key": "test-client-key",
+                }),
+            )
+            .expect("should configure DataDome integration");
+        let registry = IntegrationRegistry::new(&settings)
+            .expect("should create integration registry with DataDome");
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"<html><head></head><body>content</body></html>".to_vec(),
+            vec![("content-type", "text/html; charset=utf-8")],
+        );
+        let services = build_services_with_secret_http_client_and_client_ip(
+            NoopSecretStore,
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+            Some("192.0.2.10".parse().expect("should parse client IP")),
+        );
+        let mut req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/page")
+            .header(header::HOST, "publisher.example")
+            .header("sec-fetch-dest", "document")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let filter_outcome = registry
+            .filter_request(crate::integrations::RequestFilterRegistryInput {
+                settings: &settings,
+                services: &services,
+                req: &mut req,
+                geo_info: None,
+            })
+            .await
+            .expect("should run DataDome filter");
+        assert!(matches!(
+            filter_outcome,
+            crate::integrations::RequestFilterRegistryOutcome::Continue(_)
+        ));
+        let publisher_response = run_publisher_proxy(&settings, &services, req).await;
+        let response = buffer_publisher_response_async(
+            publisher_response,
+            &Method::GET,
+            &settings,
+            &registry,
+            &AuctionOrchestrator::new(settings.auction.clone()),
+            &services,
+        )
+        .await
+        .expect("should buffer publisher response");
+        let html = response_body_string(response);
+
+        assert!(!html.contains("window.ddjskey"));
+        assert!(!html.contains("/integrations/datadome/tags.js"));
+        assert_eq!(
+            stub.recorded_backend_names().len(),
+            1,
+            "only the publisher origin should be called"
+        );
+    }
+
     #[test]
     fn suppressed_datadome_tag_reaches_publisher_html_pipeline() {
         let mut settings = create_test_settings();
@@ -5613,8 +5767,8 @@ mod tests {
                 .headers()
                 .get(header::CACHE_CONTROL)
                 .and_then(|value| value.to_str().ok()),
-            Some("private, max-age=0"),
-            "suppressed HTML should be private"
+            Some("private, no-store"),
+            "suppressed HTML should be private and non-storable"
         );
         assert!(
             response.headers().get("surrogate-control").is_none(),
@@ -5658,8 +5812,8 @@ mod tests {
                 .headers()
                 .get(header::CACHE_CONTROL)
                 .and_then(|value| value.to_str().ok()),
-            Some("no-store"),
-            "suppressed HTML should preserve an existing no-store policy"
+            Some("private, no-store"),
+            "suppressed HTML should use the exact synthesized-HTML policy"
         );
     }
 

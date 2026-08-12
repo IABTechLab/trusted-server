@@ -40,10 +40,9 @@ request-filter wiring.
 3. **Private marker:** communicate the decision with a typed request extension,
    never a request/response header. The marker cannot leak to the origin or
    client.
-4. **Precise scope:** tag suppression is keyed only on decision reasons
-   `client_ip`, `client_ip_source`, `ip_cidr`, and `ip_cidr_source`.
+4. **Precise scope:** tag suppression uses typed scope metadata and applies whenever an IP exclusion overlaps the primary first-match skip reason.
 5. **Cache safety:** an HTML response with the tag omitted differs by client IP.
-   A suppressed processed HTML response must be `private, max-age=0` and have
+   A suppressed processed HTML response must be `private, no-store` and have
    `Surrogate-Control` and `Fastly-Surrogate-Control` removed. Do not alter
    cache headers when the response is not processed HTML, because this feature
    does not alter that body.
@@ -183,9 +182,11 @@ cargo test-fastly datadome::protection
 cargo test-fastly datadome::protection_scope
 ```
 
-**Acceptance:** only the four IP decision reasons add the private marker and
-produce the augmented informational skip log; all other exclusion and fail-open
-paths keep their current tag behavior.
+**Acceptance:** typed scope metadata adds the private marker whenever an
+applicable IP exclusion matches, including overlap with an earlier primary skip
+reason. Navigation suppression uses the augmented informational log,
+subresources use debug, and non-overlapping/fail-open paths keep their current
+tag behavior.
 
 ---
 
@@ -327,7 +328,7 @@ optimization.
       with a processable HTML content type, suppression `true`, and cacheable
       origin headers (`Cache-Control`, `Surrogate-Control`, and
       `Fastly-Surrogate-Control`). Assert the stream response is:
-  - `Cache-Control: private, max-age=0`; and
+  - `Cache-Control: private, no-store`; and
   - missing both surrogate cache headers.
 
 - [ ] **Step 2: Apply privacy only in the `ResponseRoute::Stream` HTML arm.**
@@ -349,9 +350,10 @@ optimization.
 cargo test-fastly publisher
 ```
 
-**Acceptance:** a shared cache cannot replay an IP-excluded client's tagless
-HTML to a non-excluded visitor, while unchanged responses retain their existing
-cacheability.
+**Acceptance:** newly synthesized tagless HTML is private and non-storable,
+while unchanged responses retain their existing cacheability. A shared cache in
+front of Trusted Server that already holds tag-bearing HTML must be bypassed or
+purged for guaranteed suppression.
 
 ---
 

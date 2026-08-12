@@ -90,6 +90,7 @@ pub use protection_scope::{
 use protection_scope::ProtectionScope;
 
 pub(crate) const DATADOME_INTEGRATION_ID: &str = "datadome";
+/// Fixed request header used by the staging-only protection test bypass.
 pub(crate) const HEADER_DATADOME_TEST_BYPASS: &str = "x-ts-datadome-bypass";
 
 /// Request marker indicating that Trusted Server should omit its automatic
@@ -136,7 +137,7 @@ pub struct ProtectionTestBypassConfig {
     #[serde(default = "default_protection_test_bypass_secret_store")]
     pub credential_secret_store: String,
 
-    /// Secret name containing the temporary bypass credential.
+    /// Secret name containing at least 32 bytes of high-entropy bypass material.
     #[serde(default = "default_protection_test_bypass_secret_name")]
     pub credential_secret_name: String,
 }
@@ -464,6 +465,12 @@ impl DataDomeIntegration {
         Ok(())
     }
 
+    /// Validates `DataDome` configuration before runtime registration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when protection, bypass, or client-tag configuration is
+    /// invalid.
     pub(crate) fn validate_config_for_startup(
         config: DataDomeConfig,
     ) -> Result<(), Report<TrustedServerError>> {

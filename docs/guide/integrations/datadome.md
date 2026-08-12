@@ -86,7 +86,7 @@ patterns = ["(?i)\\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|
 | `protection_excluded_ip_cidr_sources`  | array   | `[]`                             | Config Store sources containing dynamic client IP CIDR bypass lists     |
 | `protection_ip_list_cache_ttl_seconds` | integer | `300`                            | Process-local cache TTL for Config Store-backed IP CIDR bypass lists    |
 | `protection_exclusion_rules`           | array   | Static asset path regex          | Structured method/path/query/IP/ASN exclusion rules                     |
-| `protection_test_bypass`               | object  | omitted                          | Temporary static-header bypass for access-controlled staging tests      |
+| `protection_test_bypass`               | object  | omitted                          | Staging-only fixed-header bypass; secret must contain at least 32 bytes |
 | `enable_graphql_support`               | boolean | `false`                          | Reserved for future GraphQL body inspection; ignored in v1              |
 | `client_side_key`                      | string  | `""`                             | DataDome client-side JavaScript key used for tag injection              |
 | `inject_client_side_tag`               | boolean | `true`                           | Auto-inject the browser tag when `client_side_key` is non-empty         |
@@ -190,19 +190,25 @@ credential_secret_name = "datadome_test_bypass"
 ```
 
 `protection_test_bypass` requires `enable_protection = true`; it is disabled
-when omitted and is runtime-active only when `FASTLY_IS_STAGING=1`. A retained
+when omitted and is runtime-active only when `FASTLY_IS_STAGING=1`.
+`FASTLY_IS_STAGING` is supplied at runtime by Fastly (`1` in staging and `0` in
+production); it is not compiled into or promoted with the Wasm artifact. Verify
+staging through the `X-TS-ENV: staging` response signal and the integration
+activation log, and verify production omits that response signal. A retained
 section cannot bypass protection in a production or other non-staging runtime.
-Store the temporary credential in the configured Secret Store, configure this
-section only while needed, protect the site with an outer access control such
-as Basic Auth, and remove the section when testing finishes.
+Store a randomly generated credential containing at least 32 bytes of
+high-entropy material in the configured Secret Store, configure this section
+only while needed, protect the site with an outer access control such as Basic
+Auth, and remove the section when testing finishes.
 
-Whenever the enabled DataDome request filter runs, the fixed
-`x-ts-datadome-bypass` header is removed before configuration or credential
-checks. It therefore cannot reach DataDome or the publisher origin when the
-bypass is absent, disabled, inactive, or invalid. Active credentials are
-compared in constant time and never logged. Scope the header to the staging origin; do not attach it to every
-request in a browser context because that can disclose the credential to
-third-party origins. With Playwright:
+Whenever the enabled DataDome request filter runs on the Fastly adapter, the
+fixed `x-ts-datadome-bypass` header is removed before configuration or
+credential checks. It therefore cannot reach DataDome or the publisher origin
+through that path when the bypass is absent, disabled, inactive, or invalid.
+Active credentials are compared in constant time and never logged. Duplicate
+header values fail closed. Scope the header to the staging origin; do not attach
+it to every request in a browser context because that can disclose the
+credential to third-party origins. With Playwright:
 
 ```ts
 await context.route('https://staging.example.com/**', async (route) => {
@@ -229,15 +235,25 @@ This behavior applies to:
 - structured `ip_cidr_source` rules; and
 - a matching enabled `protection_test_bypass` credential in a staging runtime.
 
-ASN, method, path, query-parameter, static-asset, and internal-route
-exclusions do not automatically suppress the client-side tag. DataDome tags
-already present in publisher HTML are not removed or changed by this behavior,
-and `/integrations/datadome/tags.js` remains available when requested directly.
+Method, ASN, path, query-parameter, static-asset, and internal-route exclusions
+alone do not suppress the client-side tag. However, a simultaneous matching IP
+exclusion suppresses it regardless of which first-match rule and reason are
+logged. DataDome tags already present in publisher HTML are not removed or
+changed by this behavior, and `/integrations/datadome/tags.js` remains available
+when requested directly.
 
 Because the processed HTML differs by client IP or test credential,
-tag-suppressed HTML is marked `private, max-age=0` and removed from shared
-surrogate caches. The decision is reported in the existing protection log, for
-example:
+tag-suppressed HTML is marked `private, no-store`, has origin validators
+removed, and has shared-surrogate cache directives removed. This response-time
+policy cannot invalidate tag-bearing HTML already held by a shared cache in
+front of Trusted Server. Guaranteed suppression requires bypassing or purging
+that cache, or avoiding shared caching ahead of Trusted Server.
+
+IP-exclusion suppression skips are logged at `info` for navigations and `debug`
+for subresources; matching test-bypass events remain at `info` as security audit
+events. Protection API result logs classify `allowed`, `blocked`, and
+`failed_open` outcomes and use distinct `api_status` and `datadome_status`
+fields. For example:
 
 ```text
 [datadome] protection decision=skipped rule=protection-test-bypass reason=test_bypass client_tag=omitted method=GET

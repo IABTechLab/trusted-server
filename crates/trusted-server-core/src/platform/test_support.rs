@@ -770,6 +770,14 @@ pub(crate) fn build_services_with_secret_and_http_client(
     secret_store: impl PlatformSecretStore + 'static,
     http_client: Arc<dyn PlatformHttpClient>,
 ) -> RuntimeServices {
+    build_services_with_secret_http_client_and_client_ip(secret_store, http_client, None)
+}
+
+pub(crate) fn build_services_with_secret_http_client_and_client_ip(
+    secret_store: impl PlatformSecretStore + 'static,
+    http_client: Arc<dyn PlatformHttpClient>,
+    client_ip: Option<IpAddr>,
+) -> RuntimeServices {
     RuntimeServices::builder()
         .config_store(Arc::new(NoopConfigStore))
         .secret_store(Arc::new(secret_store))
@@ -778,7 +786,7 @@ pub(crate) fn build_services_with_secret_and_http_client(
         .http_client(http_client)
         .geo(Arc::new(NoopGeo))
         .client_info(ClientInfo {
-            client_ip: None,
+            client_ip,
             tls_protocol: None,
             tls_cipher: None,
             ..ClientInfo::default()

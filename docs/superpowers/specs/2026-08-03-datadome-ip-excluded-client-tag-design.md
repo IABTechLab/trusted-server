@@ -112,16 +112,11 @@ found in publisher HTML. That behavior must remain unchanged.
 ### 1. Capture an IP-exclusion marker at the request filter
 
 The request filter must attach a typed, internal request-scoped marker when the
-existing protection-scope evaluation returns a skip for one of these reasons:
-
-- `client_ip`
-- `client_ip_source`
-- `ip_cidr`
-- `ip_cidr_source`
-
-The marker must be attached only after the existing scope decision confirms the
-IP exclusion. It must not be inferred from request headers or recomputed later
-in the HTML pipeline.
+existing protection-scope evaluation reports `suppress_client_tag` metadata.
+The scope preserves the current first-match rule ID and typed reason for
+logging, while independently checking applicable IP exclusions when an earlier
+method, ASN, path, or query rule already matched. The marker must not be
+inferred from request headers or recomputed later in the HTML pipeline.
 
 The request-filter API currently exposes an immutable request view. Add the
 smallest internal mechanism needed for a filter to attach a typed request
@@ -134,19 +129,17 @@ suppressed; the existing skip log supplies the rule ID and reason.
 
 The marker must not be attached for:
 
-- `OPTIONS` or other excluded methods before scope evaluation;
 - internal or integration routes;
-- ASN exclusions;
-- path, query, or other non-IP structured exclusions;
-- unmatched IP rules;
+- method, ASN, path, or query exclusions without an overlapping IP match;
+- unmatched or method-inapplicable IP rules;
 - Protection API fail-open behavior; or
 - requests where `enable_protection` is false and the request filter does not
   run.
 
 ### 2. Enrich the existing skip log
 
-For IP-based skips, extend the existing informational log with
-`client_tag=omitted`:
+For navigation skips that suppress the tag, extend the existing informational
+log with `client_tag=omitted` (subresource suppression skips use `debug`):
 
 ```text
 [datadome] protection decision=skipped rule=excluded-ip-cidrs reason=client_ip client_tag=omitted method=GET
@@ -184,8 +177,11 @@ responses, which should retain their current processing.
 
 A processed HTML response differs by client IP when the generated tag is
 suppressed. In the `PublisherResponse::Stream` path, when suppression is active
-and the response is HTML, set `Cache-Control: private, max-age=0` and remove
-`Surrogate-Control` and `Fastly-Surrogate-Control` before the body is streamed.
+and the response is HTML, use the shared synthesized-HTML policy:
+`Cache-Control: private, no-store`, no origin validators, and no CDN-targeted
+cache headers. This response-time policy cannot invalidate tag-bearing HTML
+already held by a fronting shared cache; guaranteed suppression requires
+bypassing or purging that cache.
 
 This matches the existing per-user ad-stack cache policy. It prevents Fastly or
 another shared cache from replaying a tag-suppressed response to a visitor whose
