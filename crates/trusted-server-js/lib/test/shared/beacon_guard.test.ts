@@ -3,6 +3,22 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createBeaconGuard } from '../../src/shared/beacon_guard';
 import type { BeaconGuardConfig } from '../../src/shared/beacon_guard';
 
+function hasHttpHostname(url: string, hostname: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return (
+      (parsed.protocol === 'https:' || parsed.protocol === 'http:') && parsed.hostname === hostname
+    );
+  } catch {
+    return false;
+  }
+}
+
+function rewriteToProxy(url: string, proxyPath: string): string {
+  const parsed = new URL(url);
+  return `http://localhost${proxyPath}${parsed.pathname}${parsed.search}${parsed.hash}`;
+}
+
 describe('Beacon Guard', () => {
   let originalSendBeaconDescriptor: PropertyDescriptor | undefined;
   let originalFetchDescriptor: PropertyDescriptor | undefined;
@@ -24,9 +40,8 @@ describe('Beacon Guard', () => {
 
     config = {
       name: 'Test',
-      isTargetUrl: (url: string) => url.includes('analytics.example.com'),
-      rewriteUrl: (url: string) =>
-        url.replace(/https?:\/\/analytics\.example\.com/, 'http://localhost/proxy'),
+      isTargetUrl: (url: string) => hasHttpHostname(url, 'analytics.example.com'),
+      rewriteUrl: (url: string) => rewriteToProxy(url, '/proxy'),
     };
   });
 
@@ -89,6 +104,18 @@ describe('Beacon Guard', () => {
       navigator.sendBeacon('https://other.example.com/track', 'data');
 
       expect(sendBeaconSpy).toHaveBeenCalledWith('https://other.example.com/track', 'data');
+    });
+
+    it.each([
+      'https://analytics.example.com.evil.test/collect',
+      'https://analytics.example.com@evil.test/collect',
+    ])('should pass through an analytics hostname lookalike: %s', (url) => {
+      const guard = createBeaconGuard(config);
+      guard.install();
+
+      navigator.sendBeacon(url, 'data');
+
+      expect(sendBeaconSpy).toHaveBeenCalledWith(url, 'data');
     });
 
     it('should forward body data', () => {
@@ -324,8 +351,8 @@ describe('Beacon Guard', () => {
     it('should allow independent guards to coexist', () => {
       const config2: BeaconGuardConfig = {
         name: 'Other',
-        isTargetUrl: (url: string) => url.includes('other-tracker.com'),
-        rewriteUrl: (url: string) => url.replace(/https?:\/\/other-tracker\.com/, '/other-proxy'),
+        isTargetUrl: (url: string) => hasHttpHostname(url, 'other-tracker.com'),
+        rewriteUrl: (url: string) => rewriteToProxy(url, '/other-proxy'),
       };
 
       const guard1 = createBeaconGuard(config);
@@ -334,8 +361,12 @@ describe('Beacon Guard', () => {
       guard1.install();
       guard2.install();
 
+      const lookalikeUrl = 'https://other-tracker.com.evil.test/collect';
+      navigator.sendBeacon(lookalikeUrl, 'data');
+
       expect(guard1.isInstalled()).toBe(true);
       expect(guard2.isInstalled()).toBe(true);
+      expect(sendBeaconSpy).toHaveBeenCalledWith(lookalikeUrl, 'data');
     });
   });
 });
