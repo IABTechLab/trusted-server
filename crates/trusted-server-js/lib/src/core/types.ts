@@ -92,7 +92,6 @@ export interface BrowserAuctionProjectionV1 {
   bids: BrowserAuctionBidV1[];
 }
 
-
 export type GptDiagnosticsCallbackKind =
   | 'slotRequested'
   | 'slotResponseReceived'
@@ -189,16 +188,28 @@ export interface GptDiagnosticsApi {
   hide(): void;
 }
 
-/** Release-internal integration inventory emitted by the server before core. */
-export interface BootManifestIntegrationV1 {
+/** Release-internal critical module emitted inside the unified artifact. */
+export interface BootManifestCriticalIntegrationV1 {
   readonly id: string;
-  readonly required: true;
+  readonly phase: 'critical';
 }
 
-/** Exact bundle set and injection order required by one TSJS release. */
+/** Release-internal later module authenticated and loaded by core. */
+export interface BootManifestDeferredIntegrationV1 {
+  readonly id: string;
+  readonly phase: 'deferred';
+  readonly trigger: 'first_display_or_idle';
+  readonly src: string;
+}
+
+export type BootManifestIntegrationV1 =
+  BootManifestCriticalIntegrationV1 | BootManifestDeferredIntegrationV1;
+
+/** Exact phase-aware bundle set and injection order required by one TSJS release. */
 export interface BootManifestV1 {
   readonly version: 1;
   readonly releaseId: string;
+  readonly criticalSrc: string;
   readonly integrations: readonly BootManifestIntegrationV1[];
 }
 

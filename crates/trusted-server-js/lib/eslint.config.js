@@ -21,6 +21,7 @@ export const ARCHITECTURE_INTEGRATION_DIRECTORIES = Object.freeze([
   'osano',
   'permutive',
   'prebid',
+  'render_runtime',
   'sourcepoint',
   'testlight',
 ]);

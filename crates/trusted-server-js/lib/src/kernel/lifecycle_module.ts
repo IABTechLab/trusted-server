@@ -3,6 +3,7 @@ import type {
   IntegrationPrepareContext,
   IntegrationRegistration,
 } from './integration_registry';
+import { RELEASE_CATALOG } from './release_catalog';
 
 const MAX_CONFIG_DEPTH = 16;
 const MAX_CONFIG_NODES = 512;
@@ -14,6 +15,7 @@ export interface IntegrationLifecycleRuntime {
 }
 
 export interface LifecycleIntegrationRegistrationOptions {
+  readonly createOwnedRuntime?: (context: IntegrationPrepareContext) => IntegrationLifecycleRuntime;
   readonly validateConfig?: (candidate: unknown) => boolean;
 }
 
@@ -95,13 +97,18 @@ function readRuntime(
 /** Build a release-bound registration around one exact composition-owned runtime. */
 export function createLifecycleIntegrationRegistration(
   id: string,
-  release: string,
+  releaseId: string,
   options: LifecycleIntegrationRegistrationOptions = {}
 ): IntegrationRegistration {
+  const catalogEntry = RELEASE_CATALOG.find((entry) => entry.id === id);
+  if (!catalogEntry) throw new TypeError(`Unknown release catalog module: ${id}`);
   return Object.freeze({
+    abi: 1,
     id,
-    release,
-    prepare: async ({ config, interfaces }: IntegrationPrepareContext) => {
+    phase: catalogEntry.phase,
+    releaseId,
+    prepare: async (context: IntegrationPrepareContext) => {
+      const { config, interfaces } = context;
       const validateConfig = options.validateConfig ?? validFrozenConfig;
       let configValid: boolean;
       try {
@@ -112,7 +119,7 @@ export function createLifecycleIntegrationRegistration(
       if (!configValid) {
         throw new TypeError(`${id} integration config is invalid`);
       }
-      const runtime = readRuntime(id, interfaces);
+      const runtime = options.createOwnedRuntime?.(context) ?? readRuntime(id, interfaces);
       if (!runtime) throw new TypeError(`${id} integration runtime is unavailable`);
 
       return Object.freeze({

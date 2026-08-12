@@ -3,12 +3,18 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TsjsApi } from '../../src/core/types';
 
 const RELEASE = 'a'.repeat(64);
+const CRITICAL_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
 
 function boot() {
   return {
     abi: 1,
     releaseId: RELEASE,
-    manifest: { version: 1, releaseId: RELEASE, integrations: [] },
+    manifest: {
+      version: 1,
+      releaseId: RELEASE,
+      criticalSrc: CRITICAL_SRC,
+      integrations: [{ id: 'render_runtime', phase: 'critical' }],
+    },
     auctionProjection: {
       version: 1,
       auction: { version: 1, auctionId: 'initial', results: [] },
@@ -20,11 +26,26 @@ function boot() {
   };
 }
 
+async function loadMinimalProductionRuntime(): Promise<void> {
+  await import('../../src/composition/index');
+  await import('../../src/integrations/render_runtime/index');
+}
+
+function installCriticalScript(): void {
+  const script = document.createElement('script');
+  script.id = 'trustedserver-js';
+  script.src = new URL(CRITICAL_SRC, window.location.origin).href;
+  document.head.append(script);
+  Object.defineProperty(document, 'currentScript', { configurable: true, value: script });
+}
+
 describe('core production bootstrap', () => {
   beforeEach(async () => {
     await vi.resetModules();
+    document.head.replaceChildren();
     document.body.innerHTML = '';
     delete (window as unknown as { tsjs?: unknown }).tsjs;
+    installCriticalScript();
   });
 
   it('commits the exact hard-cutover API and drains the retained preload queue', async () => {
@@ -40,9 +61,9 @@ describe('core production bootstrap', () => {
     };
     (window as unknown as { tsjs?: unknown }).tsjs = preload;
 
-    await import('../../src/composition/index');
+    await loadMinimalProductionRuntime();
     await vi.waitFor(() =>
-      expect((window as unknown as { tsjs?: TsjsApi }).tsjs?._internal.state).toBe('kernel')
+      expect((window as unknown as { tsjs?: TsjsApi }).tsjs?._internal?.state).toBe('kernel')
     );
 
     const api = (window as unknown as { tsjs: TsjsApi }).tsjs;
@@ -71,9 +92,9 @@ describe('core production bootstrap', () => {
     (window as unknown as { tsjs?: unknown }).tsjs = preload;
 
     try {
-      await import('../../src/composition/index');
+      await loadMinimalProductionRuntime();
       await vi.waitFor(() =>
-        expect((window as unknown as { tsjs?: TsjsApi }).tsjs?._internal.state).toBe('kernel')
+        expect((window as unknown as { tsjs?: TsjsApi }).tsjs?._internal?.state).toBe('kernel')
       );
     } finally {
       readyState.mockRestore();

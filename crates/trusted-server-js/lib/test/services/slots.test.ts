@@ -1012,6 +1012,33 @@ describe('slot registry', () => {
 describe('navigation-owned DOM reconciliation', () => {
   afterEach(() => vi.useRealTimers());
 
+  it('installs reconciliation only for one explicit reversible deferred owner', () => {
+    const gpt = createGptHarness();
+    const dom = createReconciliationBoundary();
+    const service = createSlotService({
+      googletag: gpt.adapter,
+      reconciliation: dom.boundary,
+    });
+    const navigation = createNavigation();
+    bindTrustedSlot(service, navigation);
+
+    expect(dom.observe).not.toHaveBeenCalled();
+    const release = service.activateReconciliation();
+    expect(dom.observe).toHaveBeenCalledOnce();
+    const disconnect = dom.observe.mock.results[0]?.value;
+    expect(typeof disconnect).toBe('function');
+    expect(() => service.activateReconciliation()).toThrow('unavailable');
+
+    release();
+    release();
+    expect(disconnect).toHaveBeenCalledOnce();
+
+    const releaseAgain = service.activateReconciliation();
+    expect(dom.observe).toHaveBeenCalledTimes(2);
+    releaseAgain();
+    expect(dom.observe.mock.results[1]?.value).toHaveBeenCalledOnce();
+  });
+
   it('preserves the physical slot when DOM connectivity cannot be established', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);

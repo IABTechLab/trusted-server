@@ -1,4 +1,18 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const ownedGuards = vi.hoisted(() => ({
+  installBeacon: vi.fn(),
+  installScript: vi.fn(),
+  resetBeacon: vi.fn(),
+  resetScript: vi.fn(),
+}));
+
+vi.mock('../../../src/integrations/google_tag_manager/script_guard', () => ({
+  installGtmBeaconGuard: ownedGuards.installBeacon,
+  installGtmGuard: ownedGuards.installScript,
+  resetBeaconGuardState: ownedGuards.resetBeacon,
+  resetGuardState: ownedGuards.resetScript,
+}));
 
 import {
   createGoogleTagManagerIntegrationRegistration,
@@ -21,15 +35,19 @@ function callbacks(order: string[]): IntegrationInstallCallbacks {
 }
 
 describe('transactional Google Tag Manager integration module', () => {
+  beforeEach(() => {
+    ownedGuards.installBeacon.mockReset();
+    ownedGuards.installScript.mockReset();
+    ownedGuards.resetBeacon.mockReset();
+    ownedGuards.resetScript.mockReset();
+  });
+
   it('activates both guards before publication and releases them in reverse order', async () => {
     const order: string[] = [];
-    const runtime = createGoogleTagManagerRuntime({
-      installBeaconGuard: () => order.push('beacon:install'),
-      installScriptGuard: () => order.push('script:install'),
-      resetBeaconGuard: () => order.push('beacon:reset'),
-      resetScriptGuard: () => order.push('script:reset'),
-      started: () => order.push('gtm:start'),
-    });
+    ownedGuards.installBeacon.mockImplementation(() => order.push('beacon:install'));
+    ownedGuards.installScript.mockImplementation(() => order.push('script:install'));
+    ownedGuards.resetBeacon.mockImplementation(() => order.push('beacon:reset'));
+    ownedGuards.resetScript.mockImplementation(() => order.push('script:reset'));
     const registry = createIntegrationRegistry({
       manifest: {
         version: 1,
@@ -43,7 +61,7 @@ describe('transactional Google Tag Manager integration module', () => {
       now: () => 0,
       getBindings: () => ({
         config: undefined,
-        interfaces: Object.freeze({ google_tag_manager: runtime }),
+        interfaces: Object.freeze({}),
       }),
     });
     registry.register(createGoogleTagManagerIntegrationRegistration(RELEASE_ID));
@@ -52,14 +70,7 @@ describe('transactional Google Tag Manager integration module', () => {
     const result = await registry.install(callbacks(order));
 
     expect(result).toMatchObject({ state: 'kernel' });
-    expect(order).toEqual([
-      'core',
-      'script:install',
-      'beacon:install',
-      'publish',
-      'gtm:start',
-      'drain',
-    ]);
+    expect(order).toEqual(['core', 'script:install', 'beacon:install', 'publish', 'drain']);
     if (result.state === 'kernel') result.dispose();
     expect(order.slice(-2)).toEqual(['beacon:reset', 'script:reset']);
   });

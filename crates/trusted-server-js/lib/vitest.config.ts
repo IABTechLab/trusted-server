@@ -1,22 +1,24 @@
-import fs from 'node:fs';
 import path from 'node:path';
 
 import { configDefaults, defineConfig } from 'vitest/config';
 
-const integrationIds = fs
-  .readdirSync(path.resolve(import.meta.dirname, 'src/integrations'), { withFileTypes: true })
-  .filter(
-    (entry) =>
-      entry.isDirectory() &&
-      fs.existsSync(path.resolve(import.meta.dirname, 'src/integrations', entry.name, 'index.ts'))
-  )
-  .map((entry) => entry.name)
-  .sort();
+import { RELEASE_CATALOG } from './src/kernel/release_catalog.ts';
+
+const integrationIds = RELEASE_CATALOG.map(({ id }) => id);
 
 export default defineConfig({
   define: {
     __TSJS_EMBEDDED_RELEASE_ID_V1__: JSON.stringify('a'.repeat(64)),
     __TSJS_EMBEDDED_INTEGRATION_IDS_V1__: JSON.stringify(integrationIds),
+    __TSJS_EMBEDDED_RUNTIME_CATALOG_V1__: JSON.stringify(
+      RELEASE_CATALOG.map(({ id, phase, trigger, consumes, provides }) => ({
+        id,
+        phase,
+        trigger,
+        consumes,
+        provides,
+      }))
+    ),
   },
   resolve: {
     alias: {

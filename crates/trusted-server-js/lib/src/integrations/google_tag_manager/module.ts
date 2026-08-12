@@ -73,6 +73,7 @@ export function createGoogleTagManagerIntegrationRegistration(
   release: string
 ): IntegrationRegistration {
   return createLifecycleIntegrationRegistration(GOOGLE_TAG_MANAGER_INTEGRATION_ID, release, {
+    createOwnedRuntime: () => createGoogleTagManagerRuntime(),
     validateConfig: (candidate) => candidate === undefined,
   });
 }

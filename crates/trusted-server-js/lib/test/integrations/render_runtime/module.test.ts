@@ -5,7 +5,10 @@ import type {
   IntegrationPrepareContext,
   PreparedIntegration,
 } from '../../../src/kernel/integration_registry';
-import type { RuntimeCapabilityV1 } from '../../../src/kernel/runtime';
+import type {
+  RuntimeAuctionContextService,
+  RuntimeCapabilityV1,
+} from '../../../src/kernel/runtime';
 import { createRenderRuntimeIntegrationRegistration } from '../../../src/integrations/render_runtime/module';
 import { log } from '../../../src/core/log';
 import type { RenderAttempt } from '../../../src/services/render';
@@ -21,6 +24,7 @@ describe('render_runtime provider', () => {
     const release: Array<() => void> = [];
     const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
     const runtime = Object.freeze({
+      attachAuctionContextService: () => () => undefined,
       boot: () =>
         Object.freeze({
           auctionProjection: Object.freeze({
@@ -48,8 +52,10 @@ describe('render_runtime provider', () => {
           }),
         }),
       document,
+      enqueue: () => true,
       generation: Object.freeze({}),
       protectFirstDisplayAttemptBatch: vi.fn(() => true),
+      registerAuctionContext: () => () => undefined,
     } satisfies RuntimeCapabilityV1);
 
     createRenderRuntimeIntegrationRegistration(RELEASE_ID).prepare(
@@ -66,11 +72,19 @@ describe('render_runtime provider', () => {
     warn.mockRestore();
   });
 
-  it('stages the seven real capabilities inertly and activates direct registration once', () => {
+  it('stages the seven real capabilities inertly and activates direct registration once', async () => {
     const release: Array<() => void> = [];
     const activationRelease: Array<() => void> = [];
     const protect = vi.fn(() => true);
+    let contextService: RuntimeAuctionContextService | undefined;
     const runtime = Object.freeze({
+      attachAuctionContextService: (service: RuntimeAuctionContextService) => {
+        if (contextService) return undefined;
+        contextService = service;
+        return () => {
+          if (contextService === service) contextService = undefined;
+        };
+      },
       boot: () =>
         Object.freeze({
           auctionProjection: Object.freeze({
@@ -94,12 +108,18 @@ describe('render_runtime provider', () => {
             criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'b'.repeat(64)}`,
             integrations: Object.freeze([
               Object.freeze({ id: 'render_runtime', phase: 'critical' as const }),
+              Object.freeze({ id: 'permutive_context', phase: 'critical' as const }),
             ]),
           }),
         }),
       document,
+      enqueue: () => true,
       generation: Object.freeze({}),
       protectFirstDisplayAttemptBatch: protect,
+      registerAuctionContext: (
+        integrationId: string,
+        contributor: () => Readonly<Record<string, unknown>> | undefined
+      ) => contextService?.register(integrationId, contributor),
     } satisfies RuntimeCapabilityV1);
     const registration = createRenderRuntimeIntegrationRegistration(RELEASE_ID);
     const prepared = registration.prepare(
@@ -124,6 +144,7 @@ describe('render_runtime provider', () => {
     ]);
     const direct = interfaces?.['direct.v1'] as {
       addAdUnits: (candidate: unknown) => unknown;
+      requestAds: (candidate?: unknown) => Promise<unknown>;
     };
     const slotCapability = interfaces?.['slots.v1'] as {
       attachPhysicalService: (service: object) => () => void;
@@ -178,6 +199,38 @@ describe('render_runtime provider', () => {
     expect(slotCapability.snapshot().map(({ registeredSlotId }) => registeredSlotId)).toEqual([
       'programmatic',
     ]);
+    const releaseContext = runtime.registerAuctionContext('permutive_context', () =>
+      Object.freeze({ permutive_segments: Object.freeze(['segment-one']) })
+    );
+    expect(releaseContext).toBeTypeOf('function');
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () =>
+        Object.freeze({
+          id: 'auction-one',
+          cur: 'USD',
+          seatbid: Object.freeze([]),
+          ext: Object.freeze({
+            trusted_server: Object.freeze({
+              slot_results: Object.freeze({
+                version: 1,
+                auctionId: 'auction-one',
+                results: Object.freeze([
+                  Object.freeze({ slot: 'programmatic', outcome: 'no_bid' as const }),
+                ]),
+              }),
+            }),
+          }),
+        }),
+    } as Response);
+    await expect(direct.requestAds({ slots: ['programmatic'] })).resolves.toEqual({
+      slots: [{ slot: 'programmatic', path: 'primary', outcome: 'no_bid' }],
+    });
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toMatchObject({
+      config: { permutive_segments: ['segment-one'] },
+    });
+    fetcher.mockRestore();
+    releaseContext?.();
 
     activationRelease.reverse().forEach((callback) => callback());
     release.reverse().forEach((callback) => callback());
@@ -193,6 +246,7 @@ describe('render_runtime provider', () => {
     const release: Array<() => void> = [];
     const activationRelease: Array<() => void> = [];
     const runtime = Object.freeze({
+      attachAuctionContextService: () => () => undefined,
       boot: () =>
         Object.freeze({
           auctionProjection: Object.freeze({
@@ -220,8 +274,10 @@ describe('render_runtime provider', () => {
           }),
         }),
       document,
+      enqueue: () => true,
       generation: Object.freeze({}),
       protectFirstDisplayAttemptBatch: vi.fn(() => true),
+      registerAuctionContext: () => () => undefined,
     } satisfies RuntimeCapabilityV1);
     const prepared = createRenderRuntimeIntegrationRegistration(RELEASE_ID).prepare(
       Object.freeze({
@@ -232,6 +288,8 @@ describe('render_runtime provider', () => {
       } satisfies IntegrationPrepareContext)
     ) as PreparedIntegration;
     const render = prepared.interfaces?.['render.v1'] as {
+      attachPucGamAttemptRegistrar: (registrar: (input: unknown) => boolean) => () => void;
+      registerPucGamAttempt: (input: unknown) => boolean;
       registerRenderer: (
         type: 'aps',
         renderer: (attempt: RenderAttempt, container: HTMLElement) => boolean
@@ -269,6 +327,8 @@ describe('render_runtime provider', () => {
     });
 
     expect(() => render.registerRenderer('aps', renderer)).toThrow('inactive');
+    expect(() => render.attachPucGamAttemptRegistrar(() => true)).toThrow('unavailable');
+    expect(render.registerPucGamAttempt(Object.freeze({}))).toBe(false);
     expect(() => messages.registerApsValidation(validation)).toThrow('inactive');
     expect(messages.messaging.parseProtocolMessage('apsEnvelope', envelope)).toBeUndefined();
 
@@ -297,6 +357,18 @@ describe('render_runtime provider', () => {
       cause: hostileCause,
     });
     expect(Object.keys(validationError as object)).not.toContain('cause');
+    const pucAttempt = Object.freeze({ marker: 'exact-attempt' });
+    const pucRegistrar = vi.fn(() => true);
+    const releasePucRegistrar = render.attachPucGamAttemptRegistrar(pucRegistrar);
+    expect(render.registerPucGamAttempt(pucAttempt)).toBe(true);
+    expect(pucRegistrar).toHaveBeenCalledExactlyOnceWith(pucAttempt);
+    expect(() => render.attachPucGamAttemptRegistrar(() => true)).toThrow('duplicated');
+    releasePucRegistrar();
+    expect(render.registerPucGamAttempt(pucAttempt)).toBe(false);
+    const releaseThrowingPucRegistrar = render.attachPucGamAttemptRegistrar(() => {
+      throw new Error('contained GPT owner failure');
+    });
+    expect(render.registerPucGamAttempt(pucAttempt)).toBe(false);
     const releaseRenderer = render.registerRenderer('aps', renderer);
     const releaseValidation = messages.registerApsValidation(validation);
     expect(messages.messaging.parseProtocolMessage('apsEnvelope', envelope)).toEqual(envelope);
@@ -314,6 +386,8 @@ describe('render_runtime provider', () => {
     expect(() => messages.registerApsValidation(validation)).toThrow('duplicated');
 
     activationRelease.reverse().forEach((callback) => callback());
+    releaseThrowingPucRegistrar();
+    expect(render.registerPucGamAttempt(pucAttempt)).toBe(false);
     expect(() => render.registerRenderer('aps', vi.fn())).toThrow('inactive');
     expect(() => messages.registerApsValidation(validation)).toThrow('inactive');
     expect(messages.messaging.parseProtocolMessage('apsEnvelope', envelope)).toBeUndefined();
@@ -326,6 +400,7 @@ describe('render_runtime provider', () => {
     const release: Array<() => void> = [];
     const activationRelease: Array<() => void> = [];
     const runtime = Object.freeze({
+      attachAuctionContextService: () => () => undefined,
       boot: () =>
         Object.freeze({
           auctionProjection: Object.freeze({
@@ -363,8 +438,10 @@ describe('render_runtime provider', () => {
           }),
         }),
       document,
+      enqueue: () => true,
       generation: Object.freeze({}),
       protectFirstDisplayAttemptBatch: vi.fn(() => true),
+      registerAuctionContext: () => () => undefined,
     } satisfies RuntimeCapabilityV1);
     const prepared = createRenderRuntimeIntegrationRegistration(RELEASE_ID).prepare(
       Object.freeze({

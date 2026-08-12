@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -6,70 +7,67 @@ import { computeReleaseId, RELEASE_SENTINEL } from './release-v1.mjs';
 
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const distDirectory = path.resolve(directory, '..', '..', 'dist');
-const manifestPath = path.join(distDirectory, 'tsjs-release-v1.json');
-const value = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-
+const value = JSON.parse(fs.readFileSync(path.join(distDirectory, 'tsjs-release-v1.json'), 'utf8'));
 if (
   typeof value !== 'object' ||
   value === null ||
   Array.isArray(value) ||
-  Object.keys(value).join(',') !== 'version,releaseId,bundles' ||
+  Object.keys(value).join(',') !== 'version,releaseId,artifacts' ||
   value.version !== 1 ||
   !/^[0-9a-f]{64}$/.test(value.releaseId) ||
-  !Array.isArray(value.bundles) ||
-  value.bundles.length === 0
+  !Array.isArray(value.artifacts) ||
+  value.artifacts.length !== 22
 ) {
   throw new Error('Invalid tsjs-release-v1.json');
 }
 
-let previous = '';
-const normalizedBundles = [];
-for (let index = 0; index < value.bundles.length; index += 1) {
-  const bundle = value.bundles[index];
+const normalized = [];
+const files = new Set();
+for (const [index, artifact] of value.artifacts.entries()) {
   if (
-    typeof bundle !== 'object' ||
-    bundle === null ||
-    Array.isArray(bundle) ||
-    Object.keys(bundle).join(',') !== 'id,file' ||
-    !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(bundle.id) ||
-    bundle.file !== `tsjs-${bundle.id}.js` ||
-    (index === 0 ? bundle.id !== 'core' : bundle.id <= previous)
+    typeof artifact !== 'object' ||
+    artifact === null ||
+    Array.isArray(artifact) ||
+    Object.keys(artifact).join(',') !== 'id,role,phase,trigger,inputs,outputs,file,bytes,hash' ||
+    !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(artifact.id) ||
+    !['bootstrap', 'core', 'integration'].includes(artifact.role) ||
+    !Array.isArray(artifact.inputs) ||
+    !Array.isArray(artifact.outputs) ||
+    !Number.isSafeInteger(artifact.bytes) ||
+    artifact.bytes <= 0 ||
+    !/^[0-9a-f]{64}$/.test(artifact.hash) ||
+    files.has(artifact.file)
   ) {
-    throw new Error('Invalid canonical bundle inventory');
+    throw new Error('Invalid canonical artifact inventory');
   }
-  const source = fs.readFileSync(path.join(distDirectory, bundle.file), 'utf8');
   if (
-    source.includes('__TSJS_RELEASE_ID_SENTINEL_V1__') ||
+    (index === 0 && (artifact.id !== 'bootstrap' || artifact.role !== 'bootstrap')) ||
+    (index === 1 && (artifact.id !== 'core' || artifact.role !== 'core')) ||
+    (index >= 2 && artifact.role !== 'integration')
+  ) {
+    throw new Error('Invalid canonical artifact role/order');
+  }
+  files.add(artifact.file);
+  const bytes = fs.readFileSync(path.join(distDirectory, artifact.file));
+  const source = bytes.toString('utf8');
+  if (
+    bytes.byteLength !== artifact.bytes ||
+    createHash('sha256').update(bytes).digest('hex') !== artifact.hash ||
+    source.includes(RELEASE_SENTINEL) ||
     source.split(value.releaseId).length - 1 !== 1
   ) {
-    throw new Error(`Bundle release id mismatch: ${bundle.file}`);
+    throw new Error(`Artifact release mismatch: ${artifact.file}`);
   }
-  normalizedBundles.push({
-    id: bundle.id,
+  normalized.push({
+    id: artifact.id,
+    role: artifact.role,
+    phase: artifact.phase ?? '',
+    trigger: artifact.trigger ?? '',
     bytes: Buffer.from(source.replace(value.releaseId, RELEASE_SENTINEL)),
   });
-  previous = bundle.id;
 }
-const discovered = fs
-  .readdirSync(distDirectory)
-  .filter((file) => file.startsWith('tsjs-') && file.endsWith('.js'))
-  .sort((left, right) => {
-    if (left === 'tsjs-core.js') return -1;
-    if (right === 'tsjs-core.js') return 1;
-    return left < right ? -1 : left > right ? 1 : 0;
-  });
-if (
-  discovered.join(',') !== value.bundles.map(({ file }) => file).join(',') ||
-  computeReleaseId(normalizedBundles) !== value.releaseId
-) {
-  throw new Error('Release manifest does not match canonical bundle bytes');
-}
-const fallback = fs.readFileSync(path.join(distDirectory, 'gpt-bootstrap-fallback.js'), 'utf8');
-if (
-  fallback.includes('__TSJS_RELEASE_ID_SENTINEL_V1__') ||
-  fallback.split(value.releaseId).length - 1 !== 1
-) {
-  throw new Error('Generated fallback release id mismatch');
+if (computeReleaseId(normalized) !== value.releaseId) {
+  throw new Error('Release manifest does not match canonical artifact bytes');
 }
 
 process.stdout.write(`${value.releaseId}\n`);

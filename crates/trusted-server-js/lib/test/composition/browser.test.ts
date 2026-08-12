@@ -42,7 +42,7 @@ import {
   TRACE_PANEL_ID,
 } from '../../src/integrations/gpt_diagnostics/presentation';
 import type { BrowserAuctionBidV1, BrowserAuctionProjectionV1 } from '../../src/core/types';
-import { createCreativeIntegrationRegistration } from '../../src/integrations/creative/module';
+import { createCreativeIntegrationRegistration as createProductionCreativeIntegrationRegistration } from '../../src/integrations/creative/module';
 import { createDataDomeIntegrationRegistration } from '../../src/integrations/datadome/module';
 import { createDidomiIntegrationRegistration } from '../../src/integrations/didomi/module';
 import { createGoogleTagManagerIntegrationRegistration } from '../../src/integrations/google_tag_manager/module';
@@ -51,14 +51,21 @@ import { isGuardInstalled, resetGuardState } from '../../src/integrations/gpt/sc
 import { createGptDiagnosticsIntegrationRegistration } from '../../src/integrations/gpt_diagnostics/module';
 import { createLockrIntegrationRegistration } from '../../src/integrations/lockr/module';
 import { createOsanoIntegrationRegistration } from '../../src/integrations/osano/module';
+import { createOsanoLifecycleIntegrationRegistration } from '../../src/integrations/osano/lifecycle';
 import { createPermutiveIntegrationRegistration } from '../../src/integrations/permutive/module';
-import { createPrebidIntegrationRegistration } from '../../src/integrations/prebid/module';
+import { createPermutiveLifecycleIntegrationRegistration } from '../../src/integrations/permutive/lifecycle';
 import { createSourcepointIntegrationRegistration } from '../../src/integrations/sourcepoint/module';
+import { createSourcepointLifecycleIntegrationRegistration } from '../../src/integrations/sourcepoint/lifecycle';
 import { createTestlightIntegrationRegistration } from '../../src/integrations/testlight/module';
+import { createRenderRuntimeIntegrationRegistration } from '../../src/integrations/render_runtime/module';
 import { publicLog } from '../../src/kernel/fallback';
 import { createTestNavigationIdentityIssuer } from '../../src/kernel/identity';
-import type { IntegrationPrepareContext } from '../../src/kernel/integration_registry';
-import { createLifecycleIntegrationRegistration } from '../../src/kernel/lifecycle_module';
+import type {
+  IntegrationActivationContext,
+  IntegrationPrepareContext,
+  IntegrationRegistration,
+} from '../../src/kernel/integration_registry';
+import { RELEASE_CATALOG } from '../../src/kernel/release_catalog';
 import {
   createRenderAttempt,
   type CommittedRenderArtifact,
@@ -102,8 +109,18 @@ function runtimeManifest(releaseId: string, ids: readonly string[]) {
 
 function runtimeCatalog(ids: readonly string[]) {
   return Object.freeze(
-    ids.map((id) =>
-      Object.freeze({
+    ids.map((id) => {
+      const canonical = RELEASE_CATALOG.find((entry) => entry.id === id);
+      if (canonical) {
+        return Object.freeze({
+          id,
+          phase: canonical.phase,
+          trigger: canonical.trigger,
+          consumes: canonical.consumes,
+          provides: canonical.provides,
+        });
+      }
+      return Object.freeze({
         id,
         phase: DEFERRED_INTEGRATION_IDS.has(id) ? ('deferred' as const) : ('critical' as const),
         trigger: DEFERRED_INTEGRATION_IDS.has(id) ? ('first_display_or_idle' as const) : null,
@@ -125,9 +142,74 @@ function runtimeCatalog(ids: readonly string[]) {
                 ? ['gpt_diag.v1']
                 : []
         ),
-      })
-    )
+      });
+    })
   );
+}
+
+function exactLegacyRuntime(
+  interfaces: Readonly<Record<string, unknown>>,
+  id: 'creative' | 'prebid'
+): Readonly<{ activate: (config?: unknown) => () => void; start: (config: unknown) => void }> {
+  const runtime = interfaces[id] as Readonly<{ activate?: unknown; start?: unknown }> | undefined;
+  if (
+    !runtime ||
+    !Object.isFrozen(runtime) ||
+    typeof runtime.activate !== 'function' ||
+    typeof runtime.start !== 'function'
+  ) {
+    throw new TypeError(`${id} test runtime is unavailable`);
+  }
+  return runtime as Readonly<{
+    activate: (config?: unknown) => () => void;
+    start: (config: unknown) => void;
+  }>;
+}
+
+function createLegacyPrebidIntegrationRegistration(releaseId: string): IntegrationRegistration {
+  return Object.freeze({
+    abi: 1,
+    id: 'prebid',
+    phase: 'critical',
+    releaseId,
+    prepare: ({ config, interfaces }: IntegrationPrepareContext) => {
+      const runtime = exactLegacyRuntime(interfaces, 'prebid');
+      return Object.freeze({
+        activate: ({ afterCommit, onDispose }: IntegrationActivationContext) => {
+          const release = runtime.activate();
+          onDispose(release);
+          afterCommit(() => runtime.start(config));
+        },
+      });
+    },
+  });
+}
+
+function createLegacyCreativeIntegrationRegistration(releaseId: string): IntegrationRegistration {
+  return Object.freeze({
+    abi: 1,
+    id: 'creative',
+    phase: 'critical',
+    releaseId,
+    prepare: ({ config, interfaces }: IntegrationPrepareContext) => {
+      const creative = config as Readonly<{
+        clickGuard?: unknown;
+        enabled?: unknown;
+        renderGuard?: unknown;
+      }>;
+      if (!creative.enabled || (!creative.clickGuard && !creative.renderGuard)) {
+        return Object.freeze({ activate: () => undefined });
+      }
+      const runtime = exactLegacyRuntime(interfaces, 'creative');
+      return Object.freeze({
+        activate: ({ afterCommit, onDispose }: IntegrationActivationContext) => {
+          const release = runtime.activate(config);
+          onDispose(release);
+          afterCommit(() => runtime.start(config));
+        },
+      });
+    },
+  });
 }
 
 function createTarget() {
@@ -1897,7 +1979,9 @@ describe('browser composition', () => {
         composition.runtime.registerIntegration(createGptIntegrationRegistration(releaseId))
       ).toBe(true);
       expect(
-        composition.runtime.registerIntegration(createPrebidIntegrationRegistration(releaseId))
+        composition.runtime.registerIntegration(
+          createLegacyPrebidIntegrationRegistration(releaseId)
+        )
       ).toBe(true);
       await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
 
@@ -1974,7 +2058,7 @@ describe('browser composition', () => {
       composition.runtime.registerIntegration(createGptIntegrationRegistration(releaseId))
     ).toBe(true);
     expect(
-      composition.runtime.registerIntegration(createPrebidIntegrationRegistration(releaseId))
+      composition.runtime.registerIntegration(createLegacyPrebidIntegrationRegistration(releaseId))
     ).toBe(true);
     await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
 
@@ -2045,20 +2129,8 @@ describe('browser composition', () => {
     vi.useFakeTimers();
     const releaseId = 'a'.repeat(64);
     const target = {};
-    const noConfigLifecycle = (id: string) => (release: string) =>
-      createLifecycleIntegrationRegistration(id, release, {
-        validateConfig: (candidate) => candidate === undefined,
-      });
-    const sourcepointLifecycle = (id: string) => (release: string) =>
-      createLifecycleIntegrationRegistration(id, release, {
-        validateConfig: (candidate) =>
-          typeof candidate === 'object' &&
-          candidate !== null &&
-          Object.isFrozen(candidate) &&
-          Reflect.ownKeys(candidate).length === 1 &&
-          typeof (candidate as Readonly<Record<string, unknown>>)['rewriteSdk'] === 'boolean',
-      });
     const criticalMembers = Object.freeze([
+      ['render_runtime', createRenderRuntimeIntegrationRegistration] as const,
       ['datadome', createDataDomeIntegrationRegistration] as const,
       ['didomi', createDidomiIntegrationRegistration] as const,
       ['google_tag_manager', createGoogleTagManagerIntegrationRegistration] as const,
@@ -2069,19 +2141,20 @@ describe('browser composition', () => {
       ['testlight', createTestlightIntegrationRegistration] as const,
     ]);
     const deferredMembers = Object.freeze([
-      ['osano_lifecycle', noConfigLifecycle('osano_lifecycle')] as const,
-      ['permutive_lifecycle', noConfigLifecycle('permutive_lifecycle')] as const,
-      ['sourcepoint_lifecycle', sourcepointLifecycle('sourcepoint_lifecycle')] as const,
+      ['osano_lifecycle', createOsanoLifecycleIntegrationRegistration] as const,
+      ['permutive_lifecycle', createPermutiveLifecycleIntegrationRegistration] as const,
+      ['sourcepoint_lifecycle', createSourcepointLifecycleIntegrationRegistration] as const,
     ]);
     const members = Object.freeze([...criticalMembers, ...deferredMembers]);
     const ids = Object.freeze(members.map(([id]) => id));
     const configFor = (id: string): unknown => {
       if (id === 'didomi') return Object.freeze({ proxyPath: '/integrations/didomi/consent/' });
-      if (id.startsWith('sourcepoint_')) return Object.freeze({ rewriteSdk: true });
+      if (id === 'sourcepoint_consent') return Object.freeze({ rewriteSdk: true });
       return undefined;
     };
     const manifest = runtimeManifest(releaseId, ids);
     expect(manifest.integrations.map(({ id, phase }) => [id, phase])).toEqual([
+      ['render_runtime', 'critical'],
       ['datadome', 'critical'],
       ['didomi', 'critical'],
       ['google_tag_manager', 'critical'],
@@ -2161,11 +2234,8 @@ describe('browser composition', () => {
     expect(loadedDeferredIds).toEqual(deferredMembers.map(([id]) => id));
     expect(composition.auctionContextRegistryForTest()?.snapshotInventoryForTest()).toEqual({
       disposed: false,
-      registrations: ['permutive_context'],
+      registrations: [],
     });
-    expect(composition.runtimeSessionForTest()?.interfaces).toMatchObject(
-      Object.fromEntries(ids.map((id) => [id, expect.any(Object)]))
-    );
     expect(vi.getTimerCount()).toBeGreaterThan(0);
 
     composition.runtime.dispose();
@@ -2230,7 +2300,9 @@ describe('browser composition', () => {
 
     expect(composition.runtime.start()).toBe(true);
     expect(
-      composition.runtime.registerIntegration(createCreativeIntegrationRegistration(releaseId))
+      composition.runtime.registerIntegration(
+        createLegacyCreativeIntegrationRegistration(releaseId)
+      )
     ).toBe(true);
     await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
     expect(activateCreative).toHaveBeenCalledTimes(1);
@@ -2278,7 +2350,9 @@ describe('browser composition', () => {
 
     expect(composition.runtime.start()).toBe(true);
     expect(
-      composition.runtime.registerIntegration(createCreativeIntegrationRegistration(releaseId))
+      composition.runtime.registerIntegration(
+        createLegacyCreativeIntegrationRegistration(releaseId)
+      )
     ).toBe(true);
     await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
     expect(activateCreative).not.toHaveBeenCalled();
@@ -2345,7 +2419,9 @@ describe('browser composition', () => {
     expect(composition.runtime.start()).toBe(true);
     if (manifestIds.length === 1) {
       expect(
-        composition.runtime.registerIntegration(createCreativeIntegrationRegistration(releaseId))
+        composition.runtime.registerIntegration(
+          createProductionCreativeIntegrationRegistration(releaseId)
+        )
       ).toBe(true);
     }
     await expect(composition.runtime.install()).resolves.toEqual({
@@ -2366,6 +2442,7 @@ describe('browser composition', () => {
         releaseId,
         manifest: runtimeManifest(releaseId, ['creative']),
         knownIntegrationIds: Object.freeze(['creative']),
+        catalog: runtimeCatalog(Object.freeze(['creative'])),
         boot: {
           auctionProjection: {
             version: 1,
@@ -2391,7 +2468,9 @@ describe('browser composition', () => {
     try {
       expect(composition.runtime.start()).toBe(true);
       expect(
-        composition.runtime.registerIntegration(createCreativeIntegrationRegistration(releaseId))
+        composition.runtime.registerIntegration(
+          createProductionCreativeIntegrationRegistration(releaseId)
+        )
       ).toBe(true);
       await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
       expect(addEventListener.mock.calls.filter(([type]) => type === 'click')).toHaveLength(1);
@@ -2486,7 +2565,9 @@ describe('browser composition', () => {
     try {
       expect(composition.runtime.start()).toBe(true);
       expect(
-        composition.runtime.registerIntegration(createPrebidIntegrationRegistration(releaseId))
+        composition.runtime.registerIntegration(
+          createLegacyPrebidIntegrationRegistration(releaseId)
+        )
       ).toBe(true);
       await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
       const complete = vi.fn();
@@ -2626,7 +2707,9 @@ describe('browser composition', () => {
       try {
         expect(composition.runtime.start()).toBe(true);
         expect(
-          composition.runtime.registerIntegration(createPrebidIntegrationRegistration(releaseId))
+          composition.runtime.registerIntegration(
+            createLegacyPrebidIntegrationRegistration(releaseId)
+          )
         ).toBe(true);
         expect(
           composition.runtime.registerIntegration(

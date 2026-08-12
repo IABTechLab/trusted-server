@@ -1,4 +1,5 @@
 import type { IntegrationRegistration } from '../../kernel/integration_registry';
+import type { RuntimeCapabilityV1 } from '../../kernel/runtime';
 import {
   createLifecycleIntegrationRegistration,
   type IntegrationLifecycleRuntime,
@@ -223,6 +224,25 @@ export function createTestlightRuntime(
 
 export function createTestlightIntegrationRegistration(release: string): IntegrationRegistration {
   return createLifecycleIntegrationRegistration(TESTLIGHT_INTEGRATION_ID, release, {
+    createOwnedRuntime: ({ interfaces }) => {
+      const runtime = interfaces['runtime.v1'] as RuntimeCapabilityV1 | undefined;
+      const target = runtime?.document?.defaultView;
+      if (
+        !runtime ||
+        !Object.isFrozen(runtime) ||
+        typeof runtime.enqueue !== 'function' ||
+        !target
+      ) {
+        throw new TypeError('Testlight runtime capability is unavailable');
+      }
+      return createTestlightRuntime({
+        enqueue: (callback) => {
+          if (!runtime.enqueue(callback)) throw new Error('Testlight TSJS queue is unavailable');
+        },
+        started: () => log.info('Testlight integration initialized'),
+        target: target as Window & TestlightTarget,
+      });
+    },
     validateConfig: (candidate) => candidate === undefined,
   });
 }

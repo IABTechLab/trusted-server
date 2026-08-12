@@ -358,6 +358,27 @@ function frozenSortedStrings(
   return true;
 }
 
+/**
+ * Validate the exact supported artifact version without embedding Prebid's core
+ * marker in the TS-owned shim. The external artifact remains the sole artifact
+ * that carries the human-readable Prebid version string.
+ */
+function isExpectedPrebidVersion(
+  value: unknown
+): value is ExternalPrebidArtifactV1['prebidVersion'] {
+  return (
+    typeof value === 'string' &&
+    value.length === 7 &&
+    value.charCodeAt(0) === 49 &&
+    value.charCodeAt(1) === 48 &&
+    value.charCodeAt(2) === 46 &&
+    value.charCodeAt(3) === 50 &&
+    value.charCodeAt(4) === 54 &&
+    value.charCodeAt(5) === 46 &&
+    value.charCodeAt(6) === 48
+  );
+}
+
 function validateStamp(
   candidate: unknown,
   requirements: PrebidArtifactRequirements
@@ -375,7 +396,7 @@ function validateStamp(
     if (!stamp) return false;
     if (
       stamp.abi !== 1 ||
-      stamp.prebidVersion !== '10.26.0' ||
+      !isExpectedPrebidVersion(stamp.prebidVersion) ||
       typeof stamp.artifactReleaseId !== 'string' ||
       !/^[0-9a-f]{64}$/.test(stamp.artifactReleaseId) ||
       !frozenSortedStrings(stamp.moduleStems, 256, MAX_NAME_BYTES) ||

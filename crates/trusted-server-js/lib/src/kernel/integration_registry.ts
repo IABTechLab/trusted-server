@@ -4,7 +4,7 @@ import { DisposableStack, type DisposeCallback } from './disposable';
 
 const INTEGRATION_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const RELEASE_ID = /^[0-9a-f]{64}$/;
-const MAX_INTEGRATIONS = 16;
+const MAX_INTEGRATIONS = 20;
 const MAX_KNOWN_INTEGRATIONS = 256;
 const BOOT_DEADLINE_MS = 10_000;
 const EMPTY_BINDING = Object.freeze({});
@@ -42,11 +42,15 @@ export interface CorePreparationContext {
 
 export interface PreparedIntegration {
   readonly activate: (context: IntegrationActivationContext) => void;
+  /** Exact catalog-declared capability facades owned by this provider. */
+  readonly interfaces?: Readonly<Record<string, unknown>>;
 }
 
 export interface IntegrationRegistration {
+  readonly abi: 1;
   readonly id: string;
-  readonly release: string;
+  readonly phase: 'critical' | 'deferred';
+  readonly releaseId: string;
   readonly prepare: (
     context: IntegrationPrepareContext
   ) => PreparedIntegration | PromiseLike<PreparedIntegration>;
@@ -86,6 +90,13 @@ export interface IntegrationRegistryOptions {
   readonly releaseId: string;
   /** Frozen build/composition inventory of integration ids this core release knows. */
   readonly knownIntegrationIds: readonly string[];
+  /** Exact release-owned phase/order authority; production uses the embedded catalog. */
+  readonly catalog?: readonly IntegrationCatalogEntry[];
+  /** Kernel-owned root capability; never published or returned by the registry facade. */
+  readonly runtimeCapability?: Readonly<Record<string, unknown>>;
+  /** Captured parser-inserted critical script; required by production runtime. */
+  readonly criticalScript?: HTMLScriptElement;
+  readonly document?: Document;
   readonly startedAtMs: number;
   readonly now?: () => number;
   readonly signal?: AbortSignal;
@@ -93,13 +104,32 @@ export interface IntegrationRegistryOptions {
   /** Monotonic bootstrap-generation guard supplied by the composition owner. */
   readonly isCurrentOwner?: () => boolean;
   readonly onDisposalError?: (error: unknown) => void;
+  readonly onCapabilityStaged?: (
+    key: string,
+    facade: Readonly<Record<string, unknown>>
+  ) => void | DisposeCallback;
   readonly onRuntimeFailure?: (failure: IntegrationRuntimeFailure) => void;
+}
+
+export interface IntegrationCatalogEntry {
+  readonly id: string;
+  readonly phase: 'critical' | 'deferred';
+  readonly trigger: 'first_display_or_idle' | null;
+  readonly consumes: readonly string[];
+  readonly provides: readonly string[];
 }
 
 export interface IntegrationRegistry {
   readonly state: IntegrationRegistryState;
   readonly manifest: BootManifestV1 | undefined;
   readonly register: (candidate: unknown) => boolean;
+  readonly prepareDeferred: (
+    registration: IntegrationRegistration,
+    owner: Readonly<{
+      signal: AbortSignal;
+      onDispose: (callback: DisposeCallback) => void;
+    }>
+  ) => PreparedIntegration | PromiseLike<PreparedIntegration>;
   readonly install: (callbacks: IntegrationInstallCallbacks) => Promise<IntegrationInstallResult>;
   readonly dispose: () => void;
 }
@@ -133,10 +163,49 @@ function readExactDataFields(
   const fields: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
   for (const key of expected) {
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor || !('value' in descriptor)) return undefined;
+    if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return undefined;
     fields[key] = descriptor.value;
   }
   return fields;
+}
+
+/** Snapshot the exact inert five-field registrar value without invoking bundle code. */
+export function snapshotIntegrationRegistration(
+  candidate: unknown
+): IntegrationRegistration | undefined {
+  try {
+    if (
+      typeof candidate !== 'object' ||
+      candidate === null ||
+      Array.isArray(candidate) ||
+      Object.getPrototypeOf(candidate) !== Object.prototype
+    ) {
+      return undefined;
+    }
+    const fields = readExactDataFields(candidate, ['abi', 'id', 'phase', 'releaseId', 'prepare']);
+    if (!fields) return undefined;
+    const { abi, id, phase, releaseId, prepare } = fields;
+    if (
+      abi !== 1 ||
+      typeof id !== 'string' ||
+      !INTEGRATION_ID.test(id) ||
+      (phase !== 'critical' && phase !== 'deferred') ||
+      typeof releaseId !== 'string' ||
+      !RELEASE_ID.test(releaseId) ||
+      typeof prepare !== 'function'
+    ) {
+      return undefined;
+    }
+    return Object.freeze({
+      abi: 1,
+      id,
+      phase,
+      releaseId,
+      prepare: prepare as IntegrationRegistration['prepare'],
+    });
+  } catch {
+    return undefined;
+  }
 }
 
 function snapshotExactArray(value: unknown, maximumLength: number): readonly unknown[] | undefined {
@@ -173,14 +242,107 @@ function validateKnownIntegrationIds(candidate: unknown): ReadonlySet<string> | 
   return known;
 }
 
+const CAPABILITY = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/;
+const CONDITIONAL_CAPABILITY = /^([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+)\?([a-z][a-z0-9_]*)$/;
+
+function capabilityKey(declaration: string): string | undefined {
+  if (CAPABILITY.test(declaration)) return declaration;
+  return CONDITIONAL_CAPABILITY.exec(declaration)?.[1];
+}
+
+function validateCapabilityList(
+  candidate: unknown,
+  allowConditional: boolean
+): readonly string[] | undefined {
+  const declarations = snapshotExactArray(candidate, MAX_INTEGRATIONS);
+  if (!declarations || !Object.isFrozen(candidate)) return undefined;
+  const seen = new Set<string>();
+  const accepted: string[] = [];
+  for (const declaration of declarations) {
+    if (
+      typeof declaration !== 'string' ||
+      (!CAPABILITY.test(declaration) &&
+        !(allowConditional && CONDITIONAL_CAPABILITY.test(declaration))) ||
+      seen.has(declaration)
+    ) {
+      return undefined;
+    }
+    seen.add(declaration);
+    accepted.push(declaration);
+  }
+  return Object.freeze(accepted);
+}
+
+function validateCatalog(
+  candidate: unknown,
+  knownIntegrationIds: ReadonlySet<string>
+): readonly IntegrationCatalogEntry[] | undefined {
+  const entries = snapshotExactArray(candidate, MAX_INTEGRATIONS);
+  if (!entries || entries.length !== knownIntegrationIds.size) return undefined;
+  const seen = new Set<string>();
+  const catalog: IntegrationCatalogEntry[] = [];
+  let sawDeferred = false;
+  let criticalCount = 0;
+  const providerIndex = new Map<string, number>();
+  for (const entry of entries) {
+    const fields = readExactDataFields(entry, ['id', 'phase', 'trigger', 'consumes', 'provides']);
+    if (!fields || typeof fields.id !== 'string' || !knownIntegrationIds.has(fields.id)) {
+      return undefined;
+    }
+    const consumes = validateCapabilityList(fields.consumes, true);
+    const provides = validateCapabilityList(fields.provides, false);
+    if (!consumes || !provides) return undefined;
+    if (seen.has(fields.id)) return undefined;
+    seen.add(fields.id);
+    if (fields.phase === 'critical') {
+      if (fields.trigger !== null || sawDeferred || ++criticalCount > 14) return undefined;
+    } else if (fields.phase === 'deferred') {
+      sawDeferred = true;
+      if (fields.trigger !== 'first_display_or_idle' || provides.length !== 0) return undefined;
+    } else {
+      return undefined;
+    }
+    const index = catalog.length;
+    for (const capability of provides) {
+      if (capability === 'runtime.v1' || providerIndex.has(capability)) return undefined;
+      providerIndex.set(capability, index);
+    }
+    catalog.push(
+      Object.freeze({
+        id: fields.id,
+        phase: fields.phase,
+        trigger: fields.trigger,
+        consumes,
+        provides,
+      }) as IntegrationCatalogEntry
+    );
+  }
+  for (let index = 0; index < catalog.length; index += 1) {
+    const entry = catalog[index];
+    if (!entry) return undefined;
+    for (const declaration of entry.consumes) {
+      const key = capabilityKey(declaration);
+      const provider = key === 'runtime.v1' ? -1 : key ? providerIndex.get(key) : undefined;
+      if (provider === undefined || provider >= index) return undefined;
+    }
+  }
+  return Object.freeze(catalog);
+}
+
 function validateManifest(
   candidate: unknown,
   embeddedReleaseId: string,
-  knownIntegrationIds: ReadonlySet<string>
+  catalog: readonly IntegrationCatalogEntry[],
+  requireRenderRuntime: boolean
 ): BootManifestV1 | undefined {
   try {
     if (!RELEASE_ID.test(embeddedReleaseId)) return undefined;
-    const manifestFields = readExactDataFields(candidate, ['version', 'releaseId', 'integrations']);
+    const manifestFields = readExactDataFields(candidate, [
+      'version',
+      'releaseId',
+      'criticalSrc',
+      'integrations',
+    ]);
     if (!manifestFields) return undefined;
     if (manifestFields.version !== 1 || manifestFields.releaseId !== embeddedReleaseId) {
       return undefined;
@@ -188,23 +350,83 @@ function validateManifest(
     const manifestIntegrations = snapshotExactArray(manifestFields.integrations, MAX_INTEGRATIONS);
     if (!manifestIntegrations) return undefined;
 
+    if (
+      typeof manifestFields.criticalSrc !== 'string' ||
+      !/^\/static\/tsjs=tsjs-unified\.min\.js\?v=[0-9a-f]{64}$/.test(manifestFields.criticalSrc)
+    ) {
+      return undefined;
+    }
+
     const seen = new Set<string>();
-    const integrations: { readonly id: string; readonly required: true }[] = [];
+    const integrations: BootManifestV1['integrations'][number][] = [];
+    let sawDeferred = false;
+    let criticalCount = 0;
+    let previousCatalogIndex = -1;
     for (const entry of manifestIntegrations) {
-      const entryFields = readExactDataFields(entry, ['id', 'required']);
-      if (!entryFields) return undefined;
+      const phaseDescriptor = isRecord(entry) && Object.getOwnPropertyDescriptor(entry, 'phase');
+      if (!phaseDescriptor || !('value' in phaseDescriptor)) return undefined;
+      const phase = phaseDescriptor.value;
+      const entryFields = readExactDataFields(
+        entry,
+        phase === 'critical' ? ['id', 'phase'] : ['id', 'phase', 'trigger', 'src']
+      );
+      if (!entryFields || (phase !== 'critical' && phase !== 'deferred')) return undefined;
       if (typeof entryFields.id !== 'string' || !INTEGRATION_ID.test(entryFields.id)) {
         return undefined;
       }
-      if (!knownIntegrationIds.has(entryFields.id)) return undefined;
-      if (entryFields.required !== true || seen.has(entryFields.id)) return undefined;
+      const catalogIndex = catalog.findIndex(({ id }) => id === entryFields.id);
+      const catalogEntry = catalog[catalogIndex];
+      if (!catalogEntry || catalogIndex <= previousCatalogIndex || catalogEntry.phase !== phase) {
+        return undefined;
+      }
+      previousCatalogIndex = catalogIndex;
+      if (seen.has(entryFields.id) || (sawDeferred && phase === 'critical')) return undefined;
       seen.add(entryFields.id);
-      integrations.push(Object.freeze({ id: entryFields.id, required: true }));
+      if (phase === 'critical') {
+        criticalCount += 1;
+        if (criticalCount > 14 || catalogEntry.trigger !== null) return undefined;
+        integrations.push(Object.freeze({ id: entryFields.id, phase }));
+        continue;
+      }
+      sawDeferred = true;
+      if (
+        catalogEntry.trigger !== 'first_display_or_idle' ||
+        entryFields.trigger !== 'first_display_or_idle' ||
+        typeof entryFields.src !== 'string' ||
+        !new RegExp(`^/static/tsjs=tsjs-${entryFields.id}\\.min\\.js\\?v=[0-9a-f]{64}$`).test(
+          entryFields.src
+        )
+      ) {
+        return undefined;
+      }
+      integrations.push(
+        Object.freeze({
+          id: entryFields.id,
+          phase,
+          trigger: 'first_display_or_idle',
+          src: entryFields.src,
+        })
+      );
+    }
+    if (requireRenderRuntime && integrations[0]?.id !== 'render_runtime') return undefined;
+
+    const selected = new Set(integrations.map(({ id }) => id));
+    for (const integration of integrations) {
+      const catalogEntry = catalog.find(({ id }) => id === integration.id);
+      if (!catalogEntry) return undefined;
+      for (const declaration of catalogEntry.consumes) {
+        const conditional = CONDITIONAL_CAPABILITY.test(declaration);
+        const key = capabilityKey(declaration);
+        if (!key || key === 'runtime.v1') continue;
+        const provider = catalog.find(({ provides }) => provides.includes(key));
+        if (!provider || (!conditional && !selected.has(provider.id))) return undefined;
+      }
     }
 
     return Object.freeze({
       version: 1,
       releaseId: embeddedReleaseId,
+      criticalSrc: manifestFields.criticalSrc,
       integrations: Object.freeze(integrations),
     });
   } catch {
@@ -224,6 +446,23 @@ function hasOnlyFrozenDataValues(value: Record<PropertyKey, unknown>): boolean {
   return Reflect.ownKeys(value).every((key) => {
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     return descriptor !== undefined && 'value' in descriptor && isFrozenBinding(descriptor.value);
+  });
+}
+
+function isCapabilityFacade(value: unknown): value is Readonly<Record<string, unknown>> {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype ||
+    !Object.isFrozen(value)
+  ) {
+    return false;
+  }
+  return Reflect.ownKeys(value).every((key) => {
+    if (typeof key !== 'string') return false;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor !== undefined && descriptor.enumerable && 'value' in descriptor;
   });
 }
 
@@ -258,7 +497,11 @@ function observeThenableRejection(
 
 class IntegrationRegistryOwner {
   private readonly manifestValue: BootManifestV1 | undefined;
+  private readonly catalog: readonly IntegrationCatalogEntry[];
+  private readonly criticalScript: HTMLScriptElement | undefined;
+  private readonly document: Document | undefined;
   private readonly registrations = new Map<string, IntegrationRegistration>();
+  private readonly capabilities = new Map<string, Readonly<Record<string, unknown>>>();
   private readonly prepared: PreparedRecord[] = [];
   private readonly abortController = new AbortController();
   private readonly coreScope: DisposableStack;
@@ -269,17 +512,23 @@ class IntegrationRegistryOwner {
   private readonly releaseId: string;
   private readonly ownerSignal: AbortSignal | undefined;
   private readonly onDisposalError: (error: unknown) => void;
+  private readonly onCapabilityStaged: NonNullable<
+    IntegrationRegistryOptions['onCapabilityStaged']
+  >;
   private readonly onRuntimeFailure: (failure: IntegrationRuntimeFailure) => void;
   private deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   private failureReason: BootFailureReason | undefined;
   private installPromise: Promise<IntegrationInstallResult> | undefined;
   private registrationWaiter: (() => void) | undefined;
   private registryState: IntegrationRegistryState = 'collecting';
+  private nextCriticalRegistrationIndex = 0;
   private ownedCallbackDepth = 0;
   private unwindPending = false;
 
   public constructor(options: IntegrationRegistryOptions) {
     this.releaseId = options.releaseId;
+    this.criticalScript = options.criticalScript;
+    this.document = options.document;
     this.startedAtMs = options.startedAtMs;
     this.now = options.now ?? (() => performance.now());
     this.getBindings =
@@ -291,12 +540,42 @@ class IntegrationRegistryOwner {
     this.isCurrentOwner = options.isCurrentOwner ?? (() => true);
     this.ownerSignal = options.signal;
     this.onDisposalError = options.onDisposalError ?? (() => undefined);
+    this.onCapabilityStaged = options.onCapabilityStaged ?? (() => undefined);
     this.onRuntimeFailure = options.onRuntimeFailure ?? (() => undefined);
     this.coreScope = new DisposableStack(this.onDisposalError);
     const knownIntegrationIds = validateKnownIntegrationIds(options.knownIntegrationIds);
-    this.manifestValue = knownIntegrationIds
-      ? validateManifest(options.manifest, options.releaseId, knownIntegrationIds)
+    const catalogCandidate =
+      options.catalog ??
+      Object.freeze(
+        options.knownIntegrationIds.map((id) =>
+          Object.freeze({
+            id,
+            phase: 'critical' as const,
+            trigger: null,
+            consumes: Object.freeze([]),
+            provides: Object.freeze([]),
+          })
+        )
+      );
+    const catalog = knownIntegrationIds
+      ? validateCatalog(catalogCandidate, knownIntegrationIds)
       : undefined;
+    this.catalog = catalog ?? Object.freeze([]);
+    this.manifestValue = catalog
+      ? validateManifest(
+          options.manifest,
+          options.releaseId,
+          catalog,
+          catalog.length === MAX_INTEGRATIONS
+        )
+      : undefined;
+
+    const runtimeCapability = options.runtimeCapability ?? EMPTY_BINDING;
+    if (catalog && isCapabilityFacade(runtimeCapability)) {
+      this.capabilities.set('runtime.v1', runtimeCapability);
+    } else if (catalog) {
+      this.manifestValue = undefined;
+    }
 
     if (!this.manifestValue) {
       this.fail('abi_mismatch');
@@ -339,20 +618,25 @@ class IntegrationRegistryOwner {
       return false;
     }
     try {
-      const fields = readExactDataFields(candidate, ['id', 'release', 'prepare']);
-      if (!fields) {
+      const registration = snapshotIntegrationRegistration(candidate);
+      if (!registration) {
         this.fail('abi_mismatch');
         return false;
       }
-      const { id, release, prepare } = fields;
+      const { id, phase, releaseId, prepare } = registration;
+      const criticalIntegrations = this.manifestValue?.integrations.filter(
+        (entry) => entry.phase === 'critical'
+      );
+      const nextCritical = criticalIntegrations?.[this.nextCriticalRegistrationIndex];
       if (
-        typeof id !== 'string' ||
-        !INTEGRATION_ID.test(id) ||
-        typeof release !== 'string' ||
-        release !== this.releaseId ||
-        typeof prepare !== 'function' ||
-        !this.manifestValue?.integrations.some((entry) => entry.id === id) ||
-        this.registrations.has(id)
+        releaseId !== this.releaseId ||
+        !this.manifestValue?.integrations.some(
+          (entry) => entry.id === id && entry.phase === phase
+        ) ||
+        phase !== 'critical' ||
+        nextCritical?.id !== id ||
+        this.registrations.has(id) ||
+        !this.ownsCriticalScript()
       ) {
         this.fail('abi_mismatch');
         return false;
@@ -367,15 +651,44 @@ class IntegrationRegistryOwner {
       this.registrations.set(
         id,
         Object.freeze({
+          abi: 1,
           id,
-          release,
+          phase,
+          releaseId,
           prepare: prepare as IntegrationRegistration['prepare'],
         })
       );
+      this.nextCriticalRegistrationIndex += 1;
       if (this.hasEveryRequiredRegistration()) this.wakeRegistrationWaiter();
       return true;
     } catch {
       this.fail('abi_mismatch');
+      return false;
+    }
+  }
+
+  private ownsCriticalScript(): boolean {
+    if (!this.criticalScript && !this.document) return true;
+    const script = this.criticalScript;
+    const document = this.document;
+    const Script = document?.defaultView?.HTMLScriptElement;
+    const manifest = this.manifestValue;
+    if (!script || !document || !Script || !manifest) return false;
+    try {
+      const origin = document.defaultView?.location.origin;
+      if (!origin || origin === 'null') return false;
+      const expected = new URL(manifest.criticalSrc, origin);
+      return (
+        script instanceof Script &&
+        script.id === 'trustedserver-js' &&
+        script.isConnected &&
+        document.currentScript === script &&
+        expected.origin === origin &&
+        expected.hash === '' &&
+        `${expected.pathname}${expected.search}` === manifest.criticalSrc &&
+        script.src === expected.href
+      );
+    } catch {
       return false;
     }
   }
@@ -410,6 +723,54 @@ class IntegrationRegistryOwner {
       }
     );
     return this.installPromise;
+  }
+
+  public prepareDeferred(
+    registration: IntegrationRegistration,
+    owner: Readonly<{
+      signal: AbortSignal;
+      onDispose: (callback: DisposeCallback) => void;
+    }>
+  ): PreparedIntegration | PromiseLike<PreparedIntegration> {
+    const manifestEntry = this.manifestValue?.integrations.find(
+      (entry) => entry.id === registration.id && entry.phase === 'deferred'
+    );
+    if (
+      this.registryState !== 'committed' ||
+      !manifestEntry ||
+      registration.phase !== 'deferred' ||
+      registration.releaseId !== this.releaseId ||
+      owner.signal.aborted
+    ) {
+      throw new TypeError('Deferred integration is not admitted by the committed runtime');
+    }
+    const bindings = this.resolveBindings(registration.id);
+    let open = true;
+    const context: IntegrationPrepareContext = Object.freeze({
+      config: bindings.config,
+      interfaces: bindings.interfaces,
+      signal: owner.signal,
+      onDispose: (callback: DisposeCallback) => {
+        if (!open && !owner.signal.aborted) {
+          throw new Error('Deferred preparation disposal registration is closed');
+        }
+        owner.onDispose(callback);
+      },
+    });
+    let prepared: PreparedIntegration | PromiseLike<PreparedIntegration>;
+    try {
+      prepared = registration.prepare(context);
+    } catch (error) {
+      open = false;
+      throw error;
+    }
+    if (!isThenable(prepared)) {
+      open = false;
+      return prepared;
+    }
+    return Promise.resolve(prepared).finally(() => {
+      open = false;
+    });
   }
 
   public dispose(): void {
@@ -465,7 +826,9 @@ class IntegrationRegistryOwner {
 
   private hasEveryRequiredRegistration(): boolean {
     return Boolean(
-      this.manifestValue?.integrations.every((entry) => this.registrations.has(entry.id))
+      this.manifestValue?.integrations
+        .filter((entry) => entry.phase === 'critical')
+        .every((entry) => this.registrations.has(entry.id))
     );
   }
 
@@ -556,22 +919,11 @@ class IntegrationRegistryOwner {
     id: string,
     scope: DisposableStack
   ): { readonly context: IntegrationPrepareContext; readonly close: () => void } {
-    const bindings = this.getBindings(id);
-    const fields = readExactDataFields(bindings, ['config', 'interfaces']);
-    if (
-      !fields ||
-      !isFrozenBinding(fields.config) ||
-      !isRecord(fields.interfaces) ||
-      !Object.isFrozen(fields.interfaces) ||
-      !hasOnlyFrozenDataValues(fields.interfaces)
-    ) {
-      throw new TypeError('Integration bindings must expose exact frozen values');
-    }
-
+    const bindings = this.resolveBindings(id);
     let open = true;
     const context: IntegrationPrepareContext = Object.freeze({
-      config: fields.config,
-      interfaces: fields.interfaces,
+      config: bindings.config,
+      interfaces: bindings.interfaces,
       signal: this.abortController.signal,
       onDispose: (callback: DisposeCallback) => {
         if (!open && !scope.disposed) {
@@ -585,6 +937,99 @@ class IntegrationRegistryOwner {
       close: () => {
         open = false;
       },
+    });
+  }
+
+  private resolveBindings(id: string): IntegrationBindings {
+    const bindings = this.getBindings(id);
+    const fields = readExactDataFields(bindings, ['config', 'interfaces']);
+    if (
+      !fields ||
+      !isFrozenBinding(fields.config) ||
+      !isRecord(fields.interfaces) ||
+      !Object.isFrozen(fields.interfaces) ||
+      !hasOnlyFrozenDataValues(fields.interfaces)
+    ) {
+      throw new TypeError('Integration bindings must expose exact frozen values');
+    }
+
+    const catalogEntry = this.catalog.find((entry) => entry.id === id);
+    if (!catalogEntry) throw new TypeError('Integration catalog entry is unavailable');
+    const brokerInterfaces: Record<string, unknown> = {};
+    for (const declaration of catalogEntry.consumes) {
+      const key = capabilityKey(declaration);
+      const value = key ? this.capabilities.get(key) : undefined;
+      if (!key || (!value && !CONDITIONAL_CAPABILITY.test(declaration))) {
+        throw new TypeError('Required integration capability is unavailable');
+      }
+      if (value) brokerInterfaces[key] = value;
+    }
+    const interfaces =
+      catalogEntry.consumes.length === 0 && catalogEntry.provides.length === 0
+        ? fields.interfaces
+        : Object.freeze(brokerInterfaces);
+
+    return Object.freeze({
+      config: fields.config,
+      interfaces,
+    });
+  }
+
+  private snapshotPreparedIntegration(
+    id: string,
+    candidate: unknown,
+    scope: DisposableStack
+  ): PreparedIntegration | undefined {
+    const catalogEntry = this.catalog.find((entry) => entry.id === id);
+    if (!catalogEntry) return undefined;
+    const expectedFields =
+      catalogEntry.provides.length === 0 &&
+      isRecord(candidate) &&
+      !Object.prototype.hasOwnProperty.call(candidate, 'interfaces')
+        ? ['activate']
+        : ['activate', 'interfaces'];
+    const fields = readExactDataFields(candidate, expectedFields);
+    if (!fields || typeof fields.activate !== 'function') return undefined;
+
+    if (catalogEntry.provides.length === 0) {
+      if (
+        'interfaces' in fields &&
+        (!isRecord(fields.interfaces) ||
+          !Object.isFrozen(fields.interfaces) ||
+          Reflect.ownKeys(fields.interfaces).length !== 0)
+      ) {
+        return undefined;
+      }
+      return Object.freeze({ activate: fields.activate as PreparedIntegration['activate'] });
+    }
+
+    if (!isRecord(fields.interfaces) || !Object.isFrozen(fields.interfaces)) return undefined;
+    const providerInterfaces = fields.interfaces;
+    const keys = Reflect.ownKeys(providerInterfaces);
+    if (
+      keys.length !== catalogEntry.provides.length ||
+      !keys.every(
+        (key) =>
+          typeof key === 'string' &&
+          catalogEntry.provides.includes(key) &&
+          isCapabilityFacade(providerInterfaces[key])
+      )
+    ) {
+      return undefined;
+    }
+    for (const key of catalogEntry.provides) {
+      const facade = providerInterfaces[key];
+      if (!isCapabilityFacade(facade) || this.capabilities.has(key)) return undefined;
+      this.capabilities.set(key, facade);
+      scope.onDispose(() => {
+        if (this.capabilities.get(key) === facade) this.capabilities.delete(key);
+      });
+      const release = this.onCapabilityStaged(key, facade);
+      if (release !== undefined) scope.onDispose(release);
+    }
+    return Object.freeze({
+      activate: fields.activate as PreparedIntegration['activate'],
+      interfaces: providerInterfaces as Readonly<Record<string, unknown>>,
     });
   }
 
@@ -641,6 +1086,7 @@ class IntegrationRegistryOwner {
       if (!this.canContinue('preparing')) return this.fallbackResult();
     }
     for (const entry of this.manifestValue.integrations) {
+      if (entry.phase !== 'critical') continue;
       if (!this.canContinue('preparing')) return this.fallbackResult();
 
       const scope = new DisposableStack(this.onDisposalError);
@@ -683,17 +1129,15 @@ class IntegrationRegistryOwner {
           this.fail('bundle_partial');
           return this.fallbackResult();
         }
-        const preparedFields = readExactDataFields(prepared, ['activate']);
-        if (!preparedFields || typeof preparedFields.activate !== 'function') {
+        const acceptedPrepared = this.snapshotPreparedIntegration(entry.id, prepared, scope);
+        if (!acceptedPrepared) {
           throw new TypeError('prepare must return one exact activation module');
         }
         if (!this.canContinue('preparing')) return this.fallbackResult();
         this.prepared[recordIndex] = {
           id: entry.id,
           scope,
-          module: Object.freeze({
-            activate: preparedFields.activate as PreparedIntegration['activate'],
-          }),
+          module: acceptedPrepared,
           afterCommit: undefined,
         };
       } catch {
@@ -862,6 +1306,13 @@ export function createIntegrationRegistry(
       return owner.manifest;
     },
     register: (candidate: unknown) => owner.register(candidate),
+    prepareDeferred: (
+      registration: IntegrationRegistration,
+      deferredOwner: Readonly<{
+        signal: AbortSignal;
+        onDispose: (callback: DisposeCallback) => void;
+      }>
+    ) => owner.prepareDeferred(registration, deferredOwner),
     install: (callbacks: IntegrationInstallCallbacks) => owner.install(callbacks),
     dispose: () => owner.dispose(),
   });

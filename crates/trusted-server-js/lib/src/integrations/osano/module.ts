@@ -1,16 +1,31 @@
-import type { IntegrationRegistration } from '../../kernel/integration_registry';
-import {
-  createLifecycleIntegrationRegistration,
-  type IntegrationLifecycleRuntime,
-} from '../../kernel/lifecycle_module';
+import type {
+  IntegrationActivationContext,
+  IntegrationPrepareContext,
+  IntegrationRegistration,
+} from '../../kernel/integration_registry';
+import type { IntegrationLifecycleRuntime } from '../../kernel/lifecycle_module';
 
-import { disposeOsanoConsentMirror, initializeOsanoConsentMirror } from './consent_mirror';
+import {
+  disposeOsanoConsentMirror,
+  initializeOsanoConsentMirror,
+  mirrorOsanoConsent,
+} from './consent_mirror';
 
 export const OSANO_INTEGRATION_ID = 'osano_consent' as const;
 
 export interface OsanoRuntimeDependencies {
   readonly initialize: () => void;
   readonly reset: () => void;
+}
+
+export interface OsanoConsentCapabilityV1 {
+  readonly activateLifecycle: () => () => void;
+  readonly startLifecycle: () => void;
+}
+
+function runtimeCapability(interfaces: Readonly<Record<string, unknown>>): boolean {
+  const runtime = interfaces['runtime.v1'];
+  return typeof runtime === 'object' && runtime !== null && Object.isFrozen(runtime);
 }
 
 /** Bind the existing consent mirror's complete lifecycle to one release. */
@@ -43,7 +58,61 @@ export function createOsanoRuntime(
 }
 
 export function createOsanoIntegrationRegistration(release: string): IntegrationRegistration {
-  return createLifecycleIntegrationRegistration(OSANO_INTEGRATION_ID, release, {
-    validateConfig: (candidate) => candidate === undefined,
+  return Object.freeze({
+    abi: 1,
+    id: OSANO_INTEGRATION_ID,
+    phase: 'critical',
+    releaseId: release,
+    prepare: ({ config, interfaces, onDispose }: IntegrationPrepareContext) => {
+      if (config !== undefined || !runtimeCapability(interfaces)) {
+        throw new TypeError('Osano critical capability graph is invalid');
+      }
+      const lifecycle = createOsanoRuntime();
+      let criticalActive = false;
+      let lifecycleRelease: (() => void) | undefined;
+      const capability: OsanoConsentCapabilityV1 = Object.freeze({
+        activateLifecycle: () => {
+          if (!criticalActive || lifecycleRelease) {
+            throw new TypeError('Osano lifecycle is unavailable');
+          }
+          lifecycleRelease = lifecycle.activate(undefined);
+          return (): void => {
+            const releaseLifecycle = lifecycleRelease;
+            lifecycleRelease = undefined;
+            releaseLifecycle?.();
+          };
+        },
+        startLifecycle: () => {
+          if (!criticalActive || !lifecycleRelease) {
+            throw new TypeError('Osano lifecycle is not active');
+          }
+          lifecycle.start(undefined);
+        },
+      });
+      onDispose(() => {
+        criticalActive = false;
+        const releaseLifecycle = lifecycleRelease;
+        lifecycleRelease = undefined;
+        releaseLifecycle?.();
+        disposeOsanoConsentMirror();
+      });
+      return Object.freeze({
+        activate: ({
+          afterCommit,
+          onDispose: onActivationDispose,
+        }: IntegrationActivationContext) => {
+          if (criticalActive) throw new Error('Osano critical slice is already active');
+          criticalActive = true;
+          onActivationDispose(() => {
+            criticalActive = false;
+            disposeOsanoConsentMirror();
+          });
+          afterCommit(() => {
+            void mirrorOsanoConsent();
+          });
+        },
+        interfaces: Object.freeze({ 'osano_consent.v1': capability }),
+      });
+    },
   });
 }

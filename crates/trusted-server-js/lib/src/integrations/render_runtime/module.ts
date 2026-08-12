@@ -20,9 +20,13 @@ import type {
   IntegrationPrepareContext,
   IntegrationRegistration,
 } from '../../kernel/integration_registry';
-import type { RuntimeCapabilityV1 } from '../../kernel/runtime';
+import type {
+  RuntimeAuctionContextContributor,
+  RuntimeAuctionContextService,
+  RuntimeCapabilityV1,
+} from '../../kernel/runtime';
 import { createDiagnosticsIngress } from '../../kernel/diagnostics';
-import { createRuntimeSession } from '../../kernel/sessions';
+import { createRuntimeSession, type RuntimeSession } from '../../kernel/sessions';
 import {
   AdUnitRegistrationError,
   addAdUnitsResult,
@@ -30,8 +34,15 @@ import {
   serializeAuctionRequestBody,
 } from '../../core/registry';
 import { createAuctionBatchService } from '../../services/auction_batch';
+import {
+  createAuctionContextRegistry,
+  type AuctionContextContributor,
+  type AuctionContextRegistry,
+  type ContextContributorOwner,
+} from '../../services/context';
 import { prepareInitialAuctionProjection } from '../../services/projections';
 import { createReservationService } from '../../services/reservations';
+import type { PucGamAttemptInput } from '../../services/puc_bridge';
 import {
   createCommittedArtifactStore,
   createRenderAttempt,
@@ -88,8 +99,10 @@ function exactRuntimeCapability(
     typeof candidate !== 'object' ||
     candidate === null ||
     !Object.isFrozen(candidate) ||
+    typeof (candidate as RuntimeCapabilityV1).attachAuctionContextService !== 'function' ||
     typeof (candidate as RuntimeCapabilityV1).boot !== 'function' ||
-    typeof (candidate as RuntimeCapabilityV1).protectFirstDisplayAttemptBatch !== 'function'
+    typeof (candidate as RuntimeCapabilityV1).protectFirstDisplayAttemptBatch !== 'function' ||
+    typeof (candidate as RuntimeCapabilityV1).registerAuctionContext !== 'function'
   ) {
     throw new TypeError('render_runtime requires runtime.v1');
   }
@@ -106,6 +119,38 @@ function acceptedBoot(runtime: RuntimeCapabilityV1): AcceptedBoot {
 
 function slotResult(value: Record<string, unknown>): Readonly<Record<string, unknown>> {
   return Object.freeze(value);
+}
+
+function registerScopedContextContributor(
+  registry: AuctionContextRegistry,
+  runtimeOwner: RuntimeSession,
+  integrationId: string,
+  contributor: AuctionContextContributor
+): (() => void) | undefined {
+  let active = true;
+  let releaseRegistration: (() => void) | undefined;
+  const owner: ContextContributorOwner = Object.freeze({
+    generation: Object.freeze({}),
+    isCurrent: () => active && runtimeOwner.isCurrent(),
+    onDispose: (kind: string, callback: () => void) => {
+      if (kind !== 'auction-context-contributor' || !active || releaseRegistration) {
+        throw new Error('Auction context contributor disposer is unavailable');
+      }
+      releaseRegistration = callback;
+    },
+  });
+  if (!registry.register(integrationId, contributor, owner)) {
+    active = false;
+    releaseRegistration?.();
+    return undefined;
+  }
+  return (): void => {
+    if (!active) return;
+    active = false;
+    const release = releaseRegistration;
+    releaseRegistration = undefined;
+    release?.();
+  };
 }
 
 function createRuntimeSlotBroker(): RuntimeSlotBroker {
@@ -439,6 +484,16 @@ export function createRenderRuntimeIntegrationRegistration(
         },
       });
       scope.onDispose(() => session.dispose());
+      const contextRegistry = createAuctionContextRegistry({
+        manifestIntegrationIds: Object.freeze(boot.manifest.integrations.map(({ id }) => id)),
+        onContributorFailure: (failure) => log.warn('auction context contributor failed', failure),
+        runtimeOwner: session,
+      });
+      scope.onDispose(() => contextRegistry.dispose());
+      const auctionContextService: RuntimeAuctionContextService = Object.freeze({
+        register: (integrationId: string, contributor: RuntimeAuctionContextContributor) =>
+          registerScopedContextContributor(contextRegistry, session, integrationId, contributor),
+      });
       const navigationResult = session.startInitialNavigation(projection);
       if (!navigationResult.ok) throw new TypeError(navigationResult.reason);
       const navigation = navigationResult.value;
@@ -458,6 +513,10 @@ export function createRenderRuntimeIntegrationRegistration(
       }
       const registeredRenderers = new Map<RegisteredRenderSource, RegisteredRenderer>();
       scope.onDispose(() => registeredRenderers.clear());
+      let pucGamAttemptRegistrar: ((input: PucGamAttemptInput) => boolean) | undefined;
+      scope.onDispose(() => {
+        pucGamAttemptRegistrar = undefined;
+      });
       const createAttempt = (
         owner: Parameters<typeof createRenderAttempt>[0]['owner'],
         parentAttemptId?: string
@@ -590,7 +649,7 @@ export function createRenderRuntimeIntegrationRegistration(
             })
           );
         });
-        const requestBody = serializeAuctionRequestBody(adUnits, Object.freeze({}));
+        const requestBody = serializeAuctionRequestBody(adUnits, contextRegistry.snapshot());
         if (!requestBody) {
           return Object.freeze({
             slots: Object.freeze(
@@ -647,9 +706,25 @@ export function createRenderRuntimeIntegrationRegistration(
       });
       const auctionCapability = Object.freeze({ batches, navigation, projection, session });
       const renderCapability = Object.freeze({
+        attachPucGamAttemptRegistrar: (
+          registrar: (input: PucGamAttemptInput) => boolean
+        ): (() => void) => {
+          if (!active || typeof registrar !== 'function' || pucGamAttemptRegistrar) {
+            throw new TypeError('PUC GAM attempt registrar is unavailable or duplicated');
+          }
+          pucGamAttemptRegistrar = registrar;
+          let released = false;
+          return (): void => {
+            if (released) return;
+            released = true;
+            if (pucGamAttemptRegistrar === registrar) pucGamAttemptRegistrar = undefined;
+          };
+        },
         artifacts,
         cachePolicy,
         createAttempt,
+        navigation,
+        projection,
         renderWinner,
         rendererNonces,
         reservations,
@@ -670,6 +745,16 @@ export function createRenderRuntimeIntegrationRegistration(
             released = true;
             if (registeredRenderers.get(type) === renderer) registeredRenderers.delete(type);
           };
+        },
+        registerPucGamAttempt: (input: PucGamAttemptInput): boolean => {
+          if (!active) return false;
+          const registrar = pucGamAttemptRegistrar;
+          if (!registrar) return false;
+          try {
+            return registrar(input) === true;
+          } catch {
+            return false;
+          }
         },
       });
       const messagesCapability = Object.freeze({
@@ -708,10 +793,16 @@ export function createRenderRuntimeIntegrationRegistration(
       return Object.freeze({
         activate: (activation: IntegrationActivationContext) => {
           if (active) throw new Error('render_runtime already activated');
+          const releaseAuctionContext = runtime.attachAuctionContextService(auctionContextService);
+          if (!releaseAuctionContext) {
+            throw new TypeError('render_runtime auction context service is duplicated');
+          }
           active = true;
+          activation.onDispose(releaseAuctionContext);
           activation.onDispose(() => {
             active = false;
             apsValidation = undefined;
+            pucGamAttemptRegistrar = undefined;
             registeredRenderers.clear();
           });
         },
