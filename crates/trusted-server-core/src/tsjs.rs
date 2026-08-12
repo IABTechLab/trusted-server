@@ -1,7 +1,10 @@
 use std::collections::HashSet;
 
 use error_stack::Report;
-use trusted_server_js::{all_module_ids, concatenated_hash, release_id, single_module_hash};
+use trusted_server_js::{
+    TsjsModulePhase, all_integration_metadata, all_module_ids, concatenated_hash, release_id,
+    single_module_hash,
+};
 
 use crate::error::TrustedServerError;
 
@@ -35,6 +38,194 @@ pub fn tsjs_boot_manifest_v1(module_ids: &[&str]) -> Result<String, Report<Trust
         release_id(),
         integrations.join(",")
     ))
+}
+
+/// Serialize a dormant phase-aware `BootManifestV1` without publishing it.
+///
+/// This remains separate from the legacy production manifest serializer. It lets
+/// test-only prospective routes use generated release metadata before cutover.
+///
+/// # Errors
+///
+/// Returns an error when the requested inventory is invalid, omits an earlier
+/// required capability provider, or cannot be serialized.
+pub fn prospective_tsjs_boot_manifest_v1(
+    module_ids: &[&str],
+) -> Result<String, Report<TrustedServerError>> {
+    let selected = prospective_selected_metadata(module_ids)?;
+    let critical_ids = selected
+        .iter()
+        .filter_map(|metadata| {
+            (metadata.phase == Some(TsjsModulePhase::Critical)).then_some(metadata.id)
+        })
+        .collect::<Vec<_>>();
+    let mut provided = HashSet::from(["runtime.v1"]);
+    let mut integrations = Vec::with_capacity(selected.len());
+
+    for metadata in selected {
+        for dependency in metadata.inputs {
+            if dependency.contains('?') {
+                continue;
+            }
+            if !provided.contains(*dependency) {
+                return Err(boot_manifest_error(
+                    "selected catalog inventory omits a required capability provider",
+                ));
+            }
+        }
+
+        let id = serde_json::to_string(metadata.id)
+            .map_err(|_| boot_manifest_error("integration id serialization failed"))?;
+        match metadata.phase {
+            Some(TsjsModulePhase::Critical) => {
+                integrations.push(format!(r#"{{"id":{id},"phase":"critical"}}"#));
+            }
+            Some(TsjsModulePhase::Deferred) => {
+                let trigger = metadata.trigger.ok_or_else(|| {
+                    boot_manifest_error("deferred catalog trigger is unavailable")
+                })?;
+                let hash = single_module_hash(metadata.id)
+                    .ok_or_else(|| boot_manifest_error("deferred module hash is unavailable"))?;
+                let trigger = serde_json::to_string(trigger)
+                    .map_err(|_| boot_manifest_error("deferred trigger serialization failed"))?;
+                let src = serde_json::to_string(&format!(
+                    "/static/tsjs=tsjs-{}.min.js?v={hash}",
+                    metadata.id
+                ))
+                .map_err(|_| boot_manifest_error("deferred source serialization failed"))?;
+                integrations.push(format!(
+                    r#"{{"id":{id},"phase":"deferred","trigger":{trigger},"src":{src}}}"#
+                ));
+            }
+            None => {
+                return Err(boot_manifest_error(
+                    "catalog integration phase is unavailable",
+                ));
+            }
+        }
+
+        for capability in metadata.outputs {
+            provided.insert(*capability);
+        }
+    }
+
+    Ok(format!(
+        r#"{{"version":1,"releaseId":"{}","criticalSrc":"/static/tsjs=tsjs-unified.min.js?v={}","integrations":[{}]}}"#,
+        release_id(),
+        concatenated_hash(&critical_ids),
+        integrations.join(",")
+    ))
+}
+
+/// Serialize a dormant phase-aware controller fragment and one critical script tag.
+///
+/// HTML processing and production routes intentionally do not call this helper.
+/// Browser fixtures use it to exercise the prospective controller contract.
+///
+/// # Errors
+///
+/// Returns an error for an invalid manifest, projection, or boot bits that
+/// disagree with prospective catalog membership.
+pub fn prospective_tsjs_boot_controller_fragment_v1(
+    config: TsjsBootScriptConfigV1<'_>,
+    publisher_origin: &str,
+) -> Result<String, Report<TrustedServerError>> {
+    let manifest = prospective_tsjs_boot_manifest_v1(config.module_ids)?;
+    let projection = crate::auction::formats::coordinated_cutover_v1::canonicalize_browser_auction_projection_json_v1(
+        config.auction_projection_json,
+        publisher_origin,
+    )
+    .map_err(|_| boot_manifest_error("auction projection violates the version-1 contract"))?;
+
+    let selected = prospective_selected_metadata(config.module_ids)?;
+    let contains = |id: &str| selected.iter().any(|metadata| metadata.id == id);
+    let creative_required =
+        config.creative.enabled && (config.creative.click_guard || config.creative.render_guard);
+    if contains("creative") != creative_required
+        || (!config.creative.enabled
+            && (config.creative.click_guard || config.creative.render_guard))
+    {
+        return Err(boot_manifest_error(
+            "creative boot bits disagree with prospective manifest membership",
+        ));
+    }
+    if contains("gpt_diagnostics") != config.gpt_diagnostics_active {
+        return Err(boot_manifest_error(
+            "GPT diagnostics boot bit disagrees with prospective manifest membership",
+        ));
+    }
+    if contains("diagnostics_presentation")
+        != (config.render_trace_overlay || config.gpt_diagnostics_active)
+    {
+        return Err(boot_manifest_error(
+            "diagnostics presentation membership disagrees with prospective boot bits",
+        ));
+    }
+
+    let critical_ids = selected
+        .iter()
+        .filter_map(|metadata| {
+            (metadata.phase == Some(TsjsModulePhase::Critical)).then_some(metadata.id)
+        })
+        .collect::<Vec<_>>();
+    let critical_src = tsjs_script_src(&critical_ids);
+    let manifest = escape_json_for_inline_script(&manifest);
+    let projection = escape_json_for_inline_script(&projection);
+    let controller = format!(
+        "<script>(function(){{var t=window.tsjs=window.tsjs||{{}};t.boot={{\"abi\":1,\"releaseId\":\"{}\",\"manifest\":{},\"auctionProjection\":{},\"creative\":{{\"version\":1,\"enabled\":{},\"clickGuard\":{},\"renderGuard\":{}}},\"diagnostics\":{{\"version\":1,\"renderTraceOverlay\":{},\"gpt\":{{\"active\":{}}}}}}};(function(){{try{{window.performance.mark(\"tsjs:bids-script\");}}catch(_){{}}}})();}})();</script>",
+        release_id(),
+        manifest,
+        projection,
+        config.creative.enabled,
+        config.creative.click_guard,
+        config.creative.render_guard,
+        config.render_trace_overlay,
+        config.gpt_diagnostics_active,
+    );
+    Ok(format!(
+        r#"{controller}<script src="{critical_src}" id="trustedserver-js"></script>"#
+    ))
+}
+
+fn prospective_selected_metadata(
+    module_ids: &[&str],
+) -> Result<Vec<trusted_server_js::TsjsArtifactMetadata>, Report<TrustedServerError>> {
+    if module_ids.len() > trusted_server_js::MAX_MANIFEST_MODULES {
+        return Err(boot_manifest_error("more than 20 integration modules"));
+    }
+    let requested = module_ids.iter().copied().collect::<HashSet<_>>();
+    if requested.len() != module_ids.len()
+        || requested
+            .iter()
+            .any(|id| *id == "core" || !valid_integration_id(id))
+    {
+        return Err(boot_manifest_error(
+            "invalid prospective integration inventory",
+        ));
+    }
+
+    let metadata = all_integration_metadata();
+    if requested
+        .iter()
+        .any(|id| !metadata.iter().any(|entry| entry.id == *id))
+    {
+        return Err(boot_manifest_error(
+            "invalid prospective integration inventory",
+        ));
+    }
+    if metadata
+        .iter()
+        .filter(|entry| entry.include == Some("always"))
+        .any(|entry| !requested.contains(entry.id))
+    {
+        return Err(boot_manifest_error(
+            "prospective integration inventory omits an always-on catalog member",
+        ));
+    }
+    Ok(metadata
+        .into_iter()
+        .filter(|entry| requested.contains(entry.id))
+        .collect())
 }
 
 /// Exact immutable creative boot bits emitted for one document generation.
@@ -244,7 +435,64 @@ pub fn tsjs_deferred_script_tags(module_ids: &[&str]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+
     use super::*;
+
+    const VALID_BROWSER_AUCTION_PROJECTION_JSON: &str = r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"slots":[],"bids":[]}"#;
+    const PERFORMANCE_ORIGIN: &str = "https://performance.example";
+
+    fn prospective_aps_projection(creative_url: &str) -> String {
+        use crate::auction::types::{
+            ApsRendererV1, ApsTagType, AuctionDecisionSetV1, BidRenderSourceV1,
+            BrowserAuctionBidV1, BrowserAuctionProjectionV1, BrowserAuctionSlotV1,
+            SlotAuctionDecisionV1,
+        };
+
+        let envelope = BASE64_STANDARD.encode(include_str!(
+            "../../trusted-server-js/lib/test/fixtures/aps-renderer-v1.json"
+        ));
+        serde_json::to_string(&BrowserAuctionProjectionV1 {
+            version: 1,
+            auction: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: "performance-initial".to_string(),
+                results: vec![SlotAuctionDecisionV1::Winner {
+                    slot: "perf-slot".to_string(),
+                    candidate_id: "AAAAAAAAAAAA".to_string(),
+                }],
+            },
+            slots: vec![BrowserAuctionSlotV1 {
+                slot: "perf-slot".to_string(),
+                gam_unit_path: "/123/performance".to_string(),
+                div_id: "perf-slot".to_string(),
+                formats: vec![[300, 250]],
+                targeting: Default::default(),
+            }],
+            bids: vec![BrowserAuctionBidV1 {
+                candidate_id: "AAAAAAAAAAAA".to_string(),
+                slot: "perf-slot".to_string(),
+                provider: "aps".to_string(),
+                upstream_bid_id: "fictional-selected-bid-id".to_string(),
+                cpm: 1.23,
+                currency: "USD".to_string(),
+                targeting: Default::default(),
+                renderer_reservation_id: "r1_aaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                render_source: BidRenderSourceV1::Aps(ApsRendererV1 {
+                    version: 1,
+                    account_id: "example-account-id".to_string(),
+                    bid_id: "fictional-selected-bid-id".to_string(),
+                    creative_id: None,
+                    tag_type: ApsTagType::Iframe,
+                    creative_url: creative_url.to_string(),
+                    aax_response: envelope,
+                    width: 300,
+                    height: 250,
+                }),
+            }],
+        })
+        .expect("should serialize a canonical APS projection")
+    }
 
     fn hash_query_value(src: &str) -> &str {
         src.split_once("?v=")
@@ -305,6 +553,194 @@ mod tests {
         ] {
             assert!(tsjs_boot_manifest_v1(ids).is_err(), "should reject {ids:?}");
         }
+    }
+
+    #[test]
+    fn prospective_manifest_serializes_generated_phase_order_and_deferred_sources() {
+        let manifest = prospective_tsjs_boot_manifest_v1(&[
+            "gpt_later",
+            "gpt",
+            "diagnostics_presentation",
+            "render_runtime",
+        ])
+        .expect("should serialize a dependency-complete catalog selection");
+
+        assert_eq!(
+            manifest,
+            format!(
+                concat!(
+                    r#"{{"version":1,"releaseId":"{}","criticalSrc":"/static/tsjs=tsjs-unified.min.js?v={}","integrations":["#,
+                    r#"{{"id":"render_runtime","phase":"critical"}},"#,
+                    r#"{{"id":"gpt","phase":"critical"}},"#,
+                    r#"{{"id":"diagnostics_presentation","phase":"deferred","trigger":"first_display_or_idle","src":"/static/tsjs=tsjs-diagnostics_presentation.min.js?v={}"}},"#,
+                    r#"{{"id":"gpt_later","phase":"deferred","trigger":"first_display_or_idle","src":"/static/tsjs=tsjs-gpt_later.min.js?v={}"}}]}}"#
+                ),
+                release_id(),
+                concatenated_hash(&["render_runtime", "gpt"]),
+                single_module_hash("diagnostics_presentation")
+                    .expect("should hash generated diagnostics presentation"),
+                single_module_hash("gpt_later").expect("should hash generated GPT lifecycle")
+            ),
+            "should canonicalize the requested selection to generated catalog order"
+        );
+    }
+
+    #[test]
+    fn prospective_manifest_rejects_missing_required_catalog_capability() {
+        assert!(
+            prospective_tsjs_boot_manifest_v1(&["render_runtime", "gpt_later"]).is_err(),
+            "gpt_later requires the earlier GPT provider"
+        );
+    }
+
+    #[test]
+    fn prospective_manifest_requires_generated_always_catalog_members() {
+        assert!(
+            prospective_tsjs_boot_manifest_v1(&["creative"]).is_err(),
+            "the generated always-on render runtime cannot be omitted"
+        );
+    }
+
+    #[test]
+    fn prospective_controller_rejects_noncanonical_or_oversized_browser_projections() {
+        let noncanonical = r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"slots":[],"bids":[],"unexpected":true}"#;
+        let padding = " ".repeat(crate::auction::types::MAX_BROWSER_AUCTION_PROJECTION_BYTES + 1);
+        let oversized = format!("{VALID_BROWSER_AUCTION_PROJECTION_JSON}{padding}");
+
+        for projection in [noncanonical, oversized.as_str()] {
+            assert!(
+                prospective_tsjs_boot_controller_fragment_v1(
+                    TsjsBootScriptConfigV1 {
+                        module_ids: &["render_runtime"],
+                        auction_projection_json: projection,
+                        creative: CreativeBootConfigV1 {
+                            enabled: false,
+                            click_guard: false,
+                            render_guard: false,
+                        },
+                        render_trace_overlay: false,
+                        gpt_diagnostics_active: false,
+                    },
+                    PERFORMANCE_ORIGIN
+                )
+                .is_err(),
+                "the prospective controller must reject {projection:?} before emission"
+            );
+        }
+    }
+
+    #[test]
+    fn prospective_controller_validates_aps_creative_urls_against_its_publisher_origin() {
+        let same_origin = prospective_aps_projection("https://performance.example/creative");
+        let foreign_origin = prospective_aps_projection("https://creative.example/render");
+        let config = |auction_projection_json| TsjsBootScriptConfigV1 {
+            module_ids: &["render_runtime"],
+            auction_projection_json,
+            creative: CreativeBootConfigV1 {
+                enabled: false,
+                click_guard: false,
+                render_guard: false,
+            },
+            render_trace_overlay: false,
+            gpt_diagnostics_active: false,
+        };
+
+        assert!(
+            prospective_tsjs_boot_controller_fragment_v1(config(&same_origin), PERFORMANCE_ORIGIN)
+                .is_err(),
+            "the publisher origin must reject an APS creative URL on the same origin"
+        );
+        assert!(
+            prospective_tsjs_boot_controller_fragment_v1(
+                config(&foreign_origin),
+                PERFORMANCE_ORIGIN
+            )
+            .is_ok(),
+            "a valid foreign HTTPS APS creative URL should remain accepted"
+        );
+    }
+
+    #[test]
+    fn prospective_controller_requires_creative_membership_to_match_enabled_guards() {
+        for (module_ids, creative) in [
+            (
+                &["render_runtime", "creative"][..],
+                CreativeBootConfigV1 {
+                    enabled: true,
+                    click_guard: false,
+                    render_guard: false,
+                },
+            ),
+            (
+                &["render_runtime"][..],
+                CreativeBootConfigV1 {
+                    enabled: false,
+                    click_guard: true,
+                    render_guard: false,
+                },
+            ),
+        ] {
+            assert!(
+                prospective_tsjs_boot_controller_fragment_v1(
+                    TsjsBootScriptConfigV1 {
+                        module_ids,
+                        auction_projection_json: VALID_BROWSER_AUCTION_PROJECTION_JSON,
+                        creative,
+                        render_trace_overlay: false,
+                        gpt_diagnostics_active: false,
+                    },
+                    PERFORMANCE_ORIGIN
+                )
+                .is_err(),
+                "creative membership must match enabled and at least one guard"
+            );
+        }
+    }
+
+    #[test]
+    fn prospective_controller_keeps_deferred_modules_out_of_html_script_tags() {
+        let controller = prospective_tsjs_boot_controller_fragment_v1(
+            TsjsBootScriptConfigV1 {
+                module_ids: &[
+                    "render_runtime",
+                    "gpt",
+                    "diagnostics_presentation",
+                    "gpt_later",
+                ],
+                auction_projection_json: VALID_BROWSER_AUCTION_PROJECTION_JSON,
+                creative: CreativeBootConfigV1 {
+                    enabled: false,
+                    click_guard: false,
+                    render_guard: false,
+                },
+                render_trace_overlay: true,
+                gpt_diagnostics_active: false,
+            },
+            PERFORMANCE_ORIGIN,
+        )
+        .expect("should serialize the dormant phase-aware controller");
+
+        assert!(
+            controller.contains(&format!(
+                r#""criticalSrc":"/static/tsjs=tsjs-unified.min.js?v={}""#,
+                concatenated_hash(&["render_runtime", "gpt"])
+            )),
+            "should carry the exact critical artifact source in BootManifestV1"
+        );
+        assert!(
+            controller.ends_with(&format!(
+                r#"<script src="/static/tsjs=tsjs-unified.min.js?v={}" id="trustedserver-js"></script>"#,
+                concatenated_hash(&["render_runtime", "gpt"])
+            )),
+            "should emit exactly one critical script tag"
+        );
+        assert!(
+            controller.matches("<script").count() == 2
+                && !controller
+                    .contains(r#"<script src="/static/tsjs=tsjs-diagnostics_presentation"#)
+                && !controller.contains(r#"<script src="/static/tsjs=tsjs-gpt_later"#),
+            "deferred modules must be present only in the manifest, not parser-time tags"
+        );
     }
 
     #[test]

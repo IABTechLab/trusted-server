@@ -383,7 +383,13 @@ impl AuctionSlotFailureReason {
 }
 
 /// Exactly one final server-auction decision for a requested slot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(
+    tag = "outcome",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum SlotAuctionDecisionV1 {
     /// A candidate won and joins exactly one projected bid.
     Winner {
@@ -449,8 +455,8 @@ impl Serialize for SlotAuctionDecisionV1 {
 }
 
 /// Ordered version-1 decision set for one server auction.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuctionDecisionSetV1 {
     /// Contract version.
     pub version: u8,
@@ -487,8 +493,8 @@ pub const MAX_BROWSER_AUCTION_RESULTS: usize = 256;
 pub const MAX_BROWSER_AUCTION_TARGETING_ENTRIES: usize = 32;
 
 /// One exact browser-facing winner projection.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BrowserAuctionBidV1 {
     /// Response-local mediator candidate identity.
     pub candidate_id: String,
@@ -527,7 +533,8 @@ pub struct BrowserAuctionSlotV1 {
 }
 
 /// Complete browser-facing version-1 auction projection.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserAuctionProjectionV1 {
     /// Contract version.
     pub version: u8,
