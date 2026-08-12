@@ -89,12 +89,14 @@ function validRenderer(renderer){
    typeof bid.price==='number'&&Number.isFinite(bid.price)&&bid.price>=0;
  }catch(_error){return false;}
 }
-var accepted=false;
-function start(renderer,reply){
- if(accepted||!validRenderer(renderer))return false;
- accepted=true;
+function receive(event){
+ if(event.source!==parent)return;
+ var message=event.data;
+ if(!keys(message,['nonce','renderer'])||message.nonce!==expected||!validRenderer(message.renderer))return;
  removeEventListener('message',receive);
+ var acceptedNonce=expected;
  expected='';
+ var renderer=message.renderer;
  window._aps=window._aps instanceof Map?window._aps:new Map();
  var account=window._aps.get(renderer.accountId);
  if(!account){
@@ -104,29 +106,9 @@ function start(renderer,reply){
  account.queue.push(new CustomEvent('prebid/creative/render',{detail:{aaxResponse:renderer.aaxResponse,seatBidId:renderer.bidId}}));
  var script=document.createElement('script');
  script.src='https://client.aps.amazon-adsystem.com/prebid-creative.js';
- script.onload=function(){reply('trusted-server/aps/renderer-ready');};
- script.onerror=function(){reply('trusted-server/aps/renderer-failed');};
+ script.onload=function(){parent.postMessage({message:'trusted-server/aps/renderer-ready',nonce:acceptedNonce},'*');};
+ script.onerror=function(){parent.postMessage({message:'trusted-server/aps/renderer-failed',nonce:acceptedNonce},'*');};
  document.head.appendChild(script);
- return true;
-}
-function receive(event){
- var message=event.data;
- if(keys(message,['nonce','renderer'])){
-  if(event.source!==parent||event.ports.length!==0||message.nonce!==expected)return;
-  var nonce=expected;
-  start(message.renderer,function(result){parent.postMessage({message:result,nonce:nonce},'*');});
-  return;
- }
- if(!keys(message,['nonce'])||event.ports.length!==1||message.nonce!==expected)return;
- var port=event.ports[0];
- if(!port)return;
- port.onmessage=function(portEvent){
-  var descriptor=portEvent.data;
-  if(accepted||portEvent.ports.length!==0||!keys(descriptor,['renderer'])){port.close();return;}
-  var nonce=expected;
-  if(!start(descriptor.renderer,function(result){try{port.postMessage({message:result,nonce:nonce});}finally{port.close();}}))port.close();
- };
- port.start();
 }
 addEventListener('message',receive);
 })();
@@ -2444,12 +2426,8 @@ mod tests {
     #[test]
     fn renderer_document_is_static_and_nonce_bound() {
         assert!(APS_RENDERER_DOCUMENT.contains("^#tsaps="));
-        assert!(APS_RENDERER_DOCUMENT.contains("html,body{margin:0;padding:0;overflow:hidden}"));
-        assert!(APS_RENDERER_DOCUMENT.contains("event.source!==parent||event.ports.length!==0"));
-        assert!(APS_RENDERER_DOCUMENT.contains("event.ports.length!==1"));
-        assert!(APS_RENDERER_DOCUMENT.contains("portEvent.ports.length!==0"));
+        assert!(APS_RENDERER_DOCUMENT.contains("event.source!==parent"));
         assert!(APS_RENDERER_DOCUMENT.contains("message.nonce!==expected"));
-        assert!(APS_RENDERER_DOCUMENT.contains("port.postMessage({message:result,nonce:nonce})"));
         assert!(APS_RENDERER_DOCUMENT.contains("prebid/creative/render"));
         assert!(APS_RENDERER_DOCUMENT.contains("window._aps instanceof Map"));
         assert!(APS_RENDERER_DOCUMENT.contains("store:new Map([['listeners',new Map()]])"));

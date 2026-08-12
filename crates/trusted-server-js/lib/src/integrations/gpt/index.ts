@@ -50,6 +50,10 @@ const TS_BID_TARGETING_KEYS = [
 ] as const;
 const TS_BASE_TARGETING_KEYS = [...TS_BID_TARGETING_KEYS, TS_INITIAL_TARGETING_KEY] as const;
 
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
 function bumpRenderGeneration(ts: TsjsApi): number {
   const next = (ts.renderGeneration ?? 0) + 1;
   ts.renderGeneration = next;
@@ -80,10 +84,6 @@ function recordGptBridgeRender(
   if (element) stampCreativeTrace(element, record);
 }
 
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === 'string' && value.length > 0;
-}
-
 function trustedServerOpportunity(bid: AuctionBidData): GptDiagnosticsTrustedServerOpportunity {
   const hasBidTargeting = TS_BID_TARGETING_KEYS.some((key) => isNonEmptyString(bid[key]));
   if (!hasBidTargeting) return 'no_candidate';
@@ -91,11 +91,8 @@ function trustedServerOpportunity(bid: AuctionBidData): GptDiagnosticsTrustedSer
   const hasAdId = isNonEmptyString(bid.hb_adid);
   const hasInline = isNonEmptyString(bid.adm);
   const hasCache = isNonEmptyString(bid.hb_cache_host) && isNonEmptyString(bid.hb_cache_path);
-  const hasRenderer = bid.renderer !== undefined;
 
-  return hasAdId && (hasInline || hasCache || hasRenderer)
-    ? 'renderable_candidate'
-    : 'unrenderable_candidate';
+  return hasAdId && (hasInline || hasCache) ? 'renderable_candidate' : 'unrenderable_candidate';
 }
 
 // ------------------------------------------------------------------
@@ -209,133 +206,63 @@ function findSlotElementByDivId(divId: string): HTMLElement | null {
   return resolveSlotElementByDivId(divId).element;
 }
 
-function candidateSlotRoots(divId: string): HTMLElement[] {
+function candidateSlotRoots(elementId: string): HTMLElement[] {
   const roots: HTMLElement[] = [];
-  const slotEl = findSlotElementByDivId(divId);
+  const slotEl = document.getElementById(elementId);
   if (slotEl) {
     roots.push(slotEl);
-    const container = document.getElementById(`${slotEl.id}-container`);
-    if (container) roots.push(container);
   }
 
-  const configuredContainer = document.getElementById(`${divId}-container`);
-  if (configuredContainer && !roots.includes(configuredContainer)) {
-    roots.push(configuredContainer);
+  const container = document.getElementById(`${elementId}-container`);
+  if (container && !roots.includes(container)) {
+    roots.push(container);
   }
 
   return roots;
 }
 
-type MessageSourceFrame = {
-  iframe: HTMLIFrameElement;
-  root: HTMLElement;
-};
+function candidateSlotRootsForConfiguredDivId(divId: string): HTMLElement[] {
+  const roots = candidateSlotRoots(divId);
+  const dynamicElements = Array.from(document.querySelectorAll<HTMLElement>('[id]')).filter(
+    (element) => element.id.startsWith(divId) && !element.id.endsWith('-container')
+  );
+  for (const element of dynamicElements) {
+    if (!roots.includes(element)) roots.push(element);
+    const container = document.getElementById(`${element.id}-container`);
+    if (container && !roots.includes(container)) roots.push(container);
+  }
+  return roots;
+}
 
-type MessageSourceSlotFrame = MessageSourceFrame & {
-  slotId: string;
-};
+function sourceIsInSlotRoots(source: MessageEventSource, roots: HTMLElement[]): boolean {
+  return roots.some((root) =>
+    Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
+  );
+}
 
-function sourceFrameInRoots(
-  source: MessageEventSource | null,
-  roots: readonly HTMLElement[]
-): MessageSourceFrame | undefined {
+function slotIdForMessageSource(source: MessageEventSource | null): string | undefined {
   if (!source) return undefined;
-  for (const root of roots) {
-    const iframe = Array.from(root.querySelectorAll('iframe')).find(
-      (candidate) => candidate.contentWindow === source
-    );
-    if (iframe) return { iframe, root };
-  }
-  return undefined;
-}
 
-function slotFrameForMessageSource(
-  source: MessageEventSource | null
-): MessageSourceSlotFrame | undefined {
-  // Prefer the adInit-resolved div registry: it maps the concrete element GPT
-  // rendered into, so an ambiguous responsive prefix cannot misroute a frame.
   const divToSlotId = window.tsjs?.divToSlotId ?? {};
-  for (const [elementId, slotId] of Object.entries(divToSlotId)) {
-    const root = document.getElementById(elementId);
-    const container = document.getElementById(`${elementId}-container`);
-    const roots = [root, container].filter((element): element is HTMLElement => element !== null);
-    const frame = sourceFrameInRoots(source, roots);
-    if (frame) return { ...frame, slotId };
-  }
+  const resolvedSlotId = Object.entries(divToSlotId).find(([elementId]) =>
+    sourceIsInSlotRoots(source, candidateSlotRoots(elementId))
+  )?.[1];
+  if (resolvedSlotId) return resolvedSlotId;
+
   const slots = window.tsjs?.adSlots ?? [];
-  // Then exact configured IDs before prefix/container fallbacks so a nested
-  // dynamic slot cannot be claimed by an overlapping parent slot.
-  for (const slot of slots) {
-    const root = document.getElementById(slot.div_id);
-    const frame = root ? sourceFrameInRoots(source, [root]) : undefined;
-    if (frame) return { ...frame, slotId: slot.id };
-  }
-  for (const slot of slots) {
-    const frame = sourceFrameInRoots(source, candidateSlotRoots(slot.div_id));
-    if (frame) return { ...frame, slotId: slot.id };
-  }
-  return undefined;
+  return [...slots]
+    .sort((left, right) => right.div_id.length - left.div_id.length)
+    .find((slot) => sourceIsInSlotRoots(source, candidateSlotRootsForConfiguredDivId(slot.div_id)))
+    ?.id;
 }
 
-function sourceFrameForAdUnit(
+function messageSourceBelongsToAdUnit(
   source: MessageEventSource | null,
   adUnitCode: string
-): MessageSourceFrame | undefined {
-  return sourceFrameInRoots(source, candidateSlotRoots(adUnitCode));
-}
-
-function hasOnePixelDimension(element: HTMLElement, dimension: 'width' | 'height'): boolean {
-  const computedDimension = window.getComputedStyle(element)[dimension];
-  const match = /^(\d+(?:\.\d+)?)px$/.exec(computedDimension);
-  return match !== null && Number(match[1]) <= 1;
-}
-
-function usesFixedPositioning(element: HTMLElement): boolean {
-  const position = window.getComputedStyle(element).position;
-  return position === 'fixed' || position === 'sticky';
-}
-
-/** Resize only an authenticated, still-collapsed ordinary display-creative shell. */
-function resizeCollapsedCreativeFrame(
-  source: MessageEventSource | null,
-  frame: MessageSourceFrame,
-  width: number,
-  height: number
-): void {
-  if (
-    !Number.isFinite(width) ||
-    !Number.isFinite(height) ||
-    width <= 0 ||
-    height <= 0 ||
-    !frame.iframe.isConnected ||
-    frame.iframe.contentWindow !== source ||
-    frame.iframe.getAttribute('width') !== '1' ||
-    frame.iframe.getAttribute('height') !== '1' ||
-    !hasOnePixelDimension(frame.iframe, 'width') ||
-    !hasOnePixelDimension(frame.iframe, 'height') ||
-    usesFixedPositioning(frame.iframe) ||
-    frame.iframe.closest('ins[data-anchor-status]')
-  ) {
-    return;
-  }
-
-  const wrapper = frame.iframe.parentElement;
-  if (
-    !wrapper ||
-    wrapper === document.body ||
-    wrapper === document.documentElement ||
-    !frame.root.contains(wrapper) ||
-    usesFixedPositioning(wrapper)
-  ) {
-    return;
-  }
-
-  frame.iframe.style.width = `${width}px`;
-  frame.iframe.style.height = `${height}px`;
-  if (hasOnePixelDimension(wrapper, 'width') && hasOnePixelDimension(wrapper, 'height')) {
-    wrapper.style.width = `${width}px`;
-    wrapper.style.height = `${height}px`;
-  }
+): boolean {
+  return source
+    ? sourceIsInSlotRoots(source, candidateSlotRootsForConfiguredDivId(adUnitCode))
+    : false;
 }
 
 function clearTargetingKeys(slot: GoogleTagSlot, keys: Iterable<string>): void {
@@ -748,6 +675,67 @@ function installInitialLoadDetector(ts: TsjsApi): void {
   });
 }
 
+/**
+ * Install `window.tsjs.scheduleInitialAdInit`.
+ *
+ * The server-injected `</body>` bids script calls this to run the initial
+ * `adInit()` after React hydration instead of synchronously at body-parse
+ * time. `adInit()` defines GPT slots on the publisher's `-container`
+ * wrappers, mutating those ad-slot subtrees; on a Next.js App Router page a
+ * synchronous call lands that mutation inside React's hydration window and
+ * trips a #418 hydration mismatch. Deferral: gate on window `load` (the
+ * client bundles that hydrate the tree have executed by then), then a double
+ * `requestAnimationFrame` so the call runs after React has committed. A
+ * single deferred call — no retry timer.
+ *
+ * The SSR document is navigation generation 0 by definition, so the scheduler
+ * pins the whole initial pass to generation 0 rather than capturing whatever
+ * the counter reads when the `</body>` script runs: the SPA hook is installed
+ * by the synchronous head bundle, so a navigation can commit while the HTML
+ * is still streaming, and capturing that advanced value would adopt the stale
+ * SSR bootstrap as current. For the same reason the initial bids payload is
+ * passed in and applied here, generation-guarded — assigning it
+ * unconditionally at body end would clobber the live bids a faster SPA
+ * navigation already applied. When a navigation has committed since — or
+ * commits while the deferred callback is pending — the SSR payload is
+ * dropped and `adInit()` is not run: running anyway would re-run the newer
+ * route's live slots/bids, destroying and redefining that route's TS slots
+ * and double-refreshing it. The generation counter (not a URL comparison)
+ * keeps this guard aligned with the SPA auction hook's pathname-and-query
+ * route identity: query changes cancel the initial call because they request
+ * fresh page bids, while an `/a → /b → /a` round trip remains
+ * distinguishable even though the final URL equals the original.
+ *
+ * Hidden documents: browsers do not service `requestAnimationFrame` while a
+ * document is hidden, so a background-tab load (Cmd+click, open-in-new-tab)
+ * holds the initial `adInit()` until the tab is first viewed. This is
+ * intended, not an oversight: the initial ad request then spends its
+ * impression on a tab someone is actually looking at instead of firing —
+ * unviewable — at parse time in a tab that may never be foregrounded, and
+ * riding rAF keeps a single code path whose post-hydration-commit guarantee
+ * holds whenever the request is actually issued.
+ */
+function installScheduleInitialAdInit(ts: TsjsApi): void {
+  ts.scheduleInitialAdInit = function (initialBids?: Record<string, AuctionBidData>) {
+    if ((ts.navGeneration ?? 0) !== 0) return;
+    if (initialBids) ts.bids = initialBids;
+    const runUnlessNavigated = (): void => {
+      if ((ts.navGeneration ?? 0) !== 0) return;
+      ts.adInit?.();
+    };
+    const afterHydrationFrames = (): void => {
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(runUnlessNavigated);
+      });
+    };
+    if (document.readyState === 'complete') {
+      afterHydrationFrames();
+    } else {
+      window.addEventListener('load', afterHydrationFrames, { once: true });
+    }
+  };
+}
+
 interface HandoffPatchedFunction {
   __tsSlotHandoffPatched?: boolean;
 }
@@ -941,67 +929,6 @@ function installLatePublisherSlotHandoff(ts: TsjsApi): void {
       pubads.refresh = patchedRefresh;
     }
   });
-}
-
-/**
- * Install `window.tsjs.scheduleInitialAdInit`.
- *
- * The server-injected `</body>` bids script calls this to run the initial
- * `adInit()` after React hydration instead of synchronously at body-parse
- * time. `adInit()` defines GPT slots on the publisher's `-container`
- * wrappers, mutating those ad-slot subtrees; on a Next.js App Router page a
- * synchronous call lands that mutation inside React's hydration window and
- * trips a #418 hydration mismatch. Deferral: gate on window `load` (the
- * client bundles that hydrate the tree have executed by then), then a double
- * `requestAnimationFrame` so the call runs after React has committed. A
- * single deferred call — no retry timer.
- *
- * The SSR document is navigation generation 0 by definition, so the scheduler
- * pins the whole initial pass to generation 0 rather than capturing whatever
- * the counter reads when the `</body>` script runs: the SPA hook is installed
- * by the synchronous head bundle, so a navigation can commit while the HTML
- * is still streaming, and capturing that advanced value would adopt the stale
- * SSR bootstrap as current. For the same reason the initial bids payload is
- * passed in and applied here, generation-guarded — assigning it
- * unconditionally at body end would clobber the live bids a faster SPA
- * navigation already applied. When a navigation has committed since — or
- * commits while the deferred callback is pending — the SSR payload is
- * dropped and `adInit()` is not run: running anyway would re-run the newer
- * route's live slots/bids, destroying and redefining that route's TS slots
- * and double-refreshing it. The generation counter (not a URL comparison)
- * keeps this guard aligned with the SPA auction hook's pathname-and-query
- * route identity: query changes cancel the initial call because they request
- * fresh page bids, while an `/a → /b → /a` round trip remains
- * distinguishable even though the final URL equals the original.
- *
- * Hidden documents: browsers do not service `requestAnimationFrame` while a
- * document is hidden, so a background-tab load (Cmd+click, open-in-new-tab)
- * holds the initial `adInit()` until the tab is first viewed. This is
- * intended, not an oversight: the initial ad request then spends its
- * impression on a tab someone is actually looking at instead of firing —
- * unviewable — at parse time in a tab that may never be foregrounded, and
- * riding rAF keeps a single code path whose post-hydration-commit guarantee
- * holds whenever the request is actually issued.
- */
-function installScheduleInitialAdInit(ts: TsjsApi): void {
-  ts.scheduleInitialAdInit = function (initialBids?: Record<string, AuctionBidData>) {
-    if ((ts.navGeneration ?? 0) !== 0) return;
-    if (initialBids) ts.bids = initialBids;
-    const runUnlessNavigated = (): void => {
-      if ((ts.navGeneration ?? 0) !== 0) return;
-      ts.adInit?.();
-    };
-    const afterHydrationFrames = (): void => {
-      window.requestAnimationFrame(() => {
-        window.requestAnimationFrame(runUnlessNavigated);
-      });
-    };
-    if (document.readyState === 'complete') {
-      afterHydrationFrames();
-    } else {
-      window.addEventListener('load', afterHydrationFrames, { once: true });
-    }
-  };
 }
 
 export function installTsAdInit(): void {
@@ -1678,36 +1605,6 @@ export function parseCachedBid(body: string): CachedBid | undefined {
   };
 }
 
-/** Maximum number of consumed APS Prebid IDs retained as security tombstones. */
-const MAX_CONSUMED_PREBID_APS_IDS = 256;
-
-function pruneConsumedPrebidApsIds(
-  consumedIds: Map<string, { expiresAt: number }>,
-  now: number
-): void {
-  for (const [adId, consumed] of consumedIds) {
-    if (consumed.expiresAt <= now) consumedIds.delete(adId);
-  }
-}
-
-function hasConsumedPrebidApsIdCapacity(
-  consumedIds: Map<string, { expiresAt: number }>,
-  adId: string
-): boolean {
-  if (consumedIds.has(adId) || consumedIds.size < MAX_CONSUMED_PREBID_APS_IDS) return true;
-
-  log.warn(`[tsjs-gpt] APS Prebid renderer tombstone capacity reached; declining '${adId}'`);
-  return false;
-}
-
-function recordConsumedPrebidApsId(
-  consumedIds: Map<string, { expiresAt: number }>,
-  adId: string,
-  expiresAt: number
-): void {
-  consumedIds.set(adId, { expiresAt });
-}
-
 function safelyRecordCreativeRequest(slotId: string): number | undefined {
   try {
     const attemptId =
@@ -1739,6 +1636,36 @@ function safelyRecordCreativeFailure(
   } catch {
     // Diagnostics must not alter creative delivery.
   }
+}
+
+/** Maximum number of consumed APS Prebid IDs retained as security tombstones. */
+const MAX_CONSUMED_PREBID_APS_IDS = 256;
+
+function pruneConsumedPrebidApsIds(
+  consumedIds: Map<string, { expiresAt: number }>,
+  now: number
+): void {
+  for (const [adId, consumed] of consumedIds) {
+    if (consumed.expiresAt <= now) consumedIds.delete(adId);
+  }
+}
+
+function hasConsumedPrebidApsIdCapacity(
+  consumedIds: Map<string, { expiresAt: number }>,
+  adId: string
+): boolean {
+  if (consumedIds.has(adId) || consumedIds.size < MAX_CONSUMED_PREBID_APS_IDS) return true;
+
+  log.warn(`[tsjs-gpt] APS Prebid renderer tombstone capacity reached; declining '${adId}'`);
+  return false;
+}
+
+function recordConsumedPrebidApsId(
+  consumedIds: Map<string, { expiresAt: number }>,
+  adId: string,
+  expiresAt: number
+): void {
+  consumedIds.set(adId, { expiresAt });
 }
 
 /**
@@ -1773,6 +1700,9 @@ export function installTsRenderBridge(): void {
   // keying on it alone would let one slot block a distinct slot's render.
   const renderingKeys = new Set<string>();
   const consumedPrebidApsIds = new Map<string, { expiresAt: number }>();
+  // One consumed APS ad ID per slot is sufficient: a newer bid replaces the
+  // slot's old ad ID in `window.tsjs.bids`, so the ownership guard rejects it.
+  const consumedServerApsBySlot = new Map<string, string>();
 
   window.addEventListener('message', (e: MessageEvent) => {
     let data: Record<string, unknown>;
@@ -1803,48 +1733,32 @@ export function installTsRenderBridge(): void {
       return;
     }
 
-    const sourceSlotFrame = slotFrameForMessageSource(e.source);
-    const sourceSlotId = sourceSlotFrame?.slotId;
     const prebidRendererEntry = getApsPrebidRenderer(adId);
     if (prebidRendererEntry) {
       // Fail closed for a TS-owned APS ad ID before checking its source. Native
       // Prebid handles ad IDs globally and would otherwise answer a request from
       // an unrelated iframe when this slot-bound capability rejects it.
       e.stopImmediatePropagation();
-      const sourceFrame = sourceFrameForAdUnit(e.source, prebidRendererEntry.adUnitCode);
-      if (!sourceFrame) return;
+      if (!messageSourceBelongsToAdUnit(e.source, prebidRendererEntry.adUnitCode)) return;
       const renderer = validateApsRenderer(prebidRendererEntry.renderer);
       const rendererUrl = apsRendererUrl();
-      if (!renderer || !rendererUrl) {
-        const attemptId = sourceSlotId ? safelyRecordCreativeRequest(sourceSlotId) : undefined;
-        safelyRecordCreativeFailure(attemptId, 'missing_render_source');
-        return;
-      }
+      if (!renderer || !rendererUrl) return;
       if (!hasConsumedPrebidApsIdCapacity(consumedPrebidApsIds, adId)) return;
       if (!consumeApsPrebidRenderer(adId, prebidRendererEntry)) return;
       recordConsumedPrebidApsId(consumedPrebidApsIds, adId, prebidRendererEntry.expiresAt);
 
-      const attemptId = sourceSlotId ? safelyRecordCreativeRequest(sourceSlotId) : undefined;
-      try {
-        port.postMessage(
-          JSON.stringify({
-            message: 'Prebid Response',
-            adId,
-            renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
-            rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
-            rendererUrl,
-            apsRenderer: renderer,
-            width: renderer.width,
-            height: renderer.height,
-          })
-        );
-      } catch (err) {
-        safelyRecordCreativeFailure(attemptId, 'response_post_failed');
-        log.warn(`[tsjs-gpt] APS Prebid response post failed for '${adId}'`, err);
-        return;
-      }
-      safelyRecordCreativeResponse(attemptId);
-      resizeCollapsedCreativeFrame(e.source, sourceFrame, renderer.width, renderer.height);
+      port.postMessage(
+        JSON.stringify({
+          message: 'Prebid Response',
+          adId,
+          renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+          rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+          rendererUrl,
+          apsRenderer: renderer,
+          width: renderer.width,
+          height: renderer.height,
+        })
+      );
 
       try {
         prebidRendererEntry.markUsed();
@@ -1854,7 +1768,8 @@ export function installTsRenderBridge(): void {
       return;
     }
 
-    if (!sourceSlotFrame || !sourceSlotId) return;
+    const sourceSlotId = slotIdForMessageSource(e.source);
+    if (!sourceSlotId) return;
 
     // Resolve the bid by the requesting slot, not by the first bid whose hb_adid
     // matches. hb_adid is not unique per bid: absent PBS Cache it falls back to a
@@ -1871,6 +1786,32 @@ export function installTsRenderBridge(): void {
     // pulling slot B's creative and firing slot B's win/billing beacons.
     if (!matchedBid || matchedBid.hb_adid !== adId) return;
 
+    if (matchedBid.renderer !== undefined) {
+      // This slot and ad ID belong to TS, so fail closed before validating the
+      // descriptor and never let native Prebid answer a rejected or replayed request.
+      e.stopImmediatePropagation();
+      if (consumedServerApsBySlot.get(slotId) === adId) return;
+      const renderer = validateApsRenderer(matchedBid.renderer);
+      const rendererUrl = apsRendererUrl();
+      if (!renderer || !rendererUrl) return;
+      consumedServerApsBySlot.set(slotId, adId);
+      port.postMessage(
+        JSON.stringify({
+          message: 'Prebid Response',
+          adId,
+          renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+          rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+          rendererUrl,
+          apsRenderer: renderer,
+          width: renderer.width,
+          height: renderer.height,
+        })
+      );
+      return;
+    }
+
+    const attemptId = safelyRecordCreativeRequest(slotId);
+
     const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
     // Prefer the winning creative's own dimensions; the first configured slot
     // format is only a fallback and mis-sizes a multi-size slot whose winner is
@@ -1885,47 +1826,6 @@ export function installTsRenderBridge(): void {
     const cachePath = isNonEmptyString(matchedBid.hb_cache_path)
       ? matchedBid.hb_cache_path
       : undefined;
-
-    if (matchedBid.renderer !== undefined) {
-      const renderer = validateApsRenderer(matchedBid.renderer);
-      const rendererUrl = apsRendererUrl();
-      if (!renderer || !rendererUrl) {
-        const attemptId = safelyRecordCreativeRequest(slotId);
-        safelyRecordCreativeFailure(attemptId, 'missing_render_source');
-        return;
-      }
-
-      // Ownership and the complete validated envelope are valid before this
-      // handler claims the message or suppresses another legitimate handler.
-      // GAM may ask PUC to render the same server-side APS capability again.
-      e.stopImmediatePropagation();
-
-      const attemptId = safelyRecordCreativeRequest(slotId);
-      try {
-        port.postMessage(
-          JSON.stringify({
-            message: 'Prebid Response',
-            adId,
-            renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
-            rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
-            rendererUrl,
-            apsRenderer: renderer,
-            width: renderer.width,
-            height: renderer.height,
-          })
-        );
-      } catch (err) {
-        safelyRecordCreativeFailure(attemptId, 'response_post_failed');
-        log.warn(`[tsjs-gpt] APS server response post failed for '${slotId}'`, err);
-        return;
-      }
-      safelyRecordCreativeResponse(attemptId);
-      resizeCollapsedCreativeFrame(e.source, sourceSlotFrame, renderer.width, renderer.height);
-      log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' through APS renderer`);
-      return;
-    }
-
-    const attemptId = safelyRecordCreativeRequest(slotId);
 
     if (inlineAdm) {
       e.stopImmediatePropagation();
@@ -1942,11 +1842,10 @@ export function installTsRenderBridge(): void {
         );
       } catch (err) {
         safelyRecordCreativeFailure(attemptId, 'response_post_failed');
-        log.warn('[tsjs-gpt] pbRender bridge: inline response failed', err);
+        log.warn(`[tsjs-gpt] pbRender bridge: response post failed for '${slotId}'`, err);
         return;
       }
       safelyRecordCreativeResponse(attemptId);
-      resizeCollapsedCreativeFrame(e.source, sourceSlotFrame, width, height);
       fireWinBillingBeacons(slotId, matchedBid);
       recordGptBridgeRender(slotId, matchedBid, 'inline', findSlotElementByDivId(slotId));
       log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from inline adm`);
@@ -1996,8 +1895,6 @@ export function installTsRenderBridge(): void {
             cached.price !== undefined
               ? expandAuctionPriceMacro(cached.adm, cached.price)
               : cached.adm;
-          const cachedWidth = cached.width ?? width;
-          const cachedHeight = cached.height ?? height;
           try {
             port.postMessage(
               JSON.stringify({
@@ -2005,8 +1902,8 @@ export function installTsRenderBridge(): void {
                 adId,
                 ad,
                 renderer: TS_DISPLAY_RENDERER,
-                width: cachedWidth,
-                height: cachedHeight,
+                width: cached.width ?? width,
+                height: cached.height ?? height,
               })
             );
           } catch (err) {
@@ -2015,7 +1912,6 @@ export function installTsRenderBridge(): void {
             return;
           }
           safelyRecordCreativeResponse(attemptId);
-          resizeCollapsedCreativeFrame(e.source, sourceSlotFrame, cachedWidth, cachedHeight);
           // Beacons carry the server-expanded ${AUCTION_PRICE} from the auction's
           // clearing price, not `cached.price` — the auction result is the
           // authoritative clearing price, and the cached copy is only the render
