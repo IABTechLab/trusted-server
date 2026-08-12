@@ -79,10 +79,13 @@ directives, or already-consumed freshness all bypass storage. The stored max age
 short operator safety ceiling and reduced by `Age`, apparent age from `Date`, and time spent
 transforming/auctioning before insertion.
 
-Requests carrying `Cache-Control: no-cache`, `no-store`, `max-age`, or `min-fresh`,
-`Pragma: no-cache`, range headers, or conditional validators bypass C2 lookup. C2 does not expose
-object age to the core layer, so it cannot prove a positive request-side age constraint is met.
-Authentication, cookie independence, and diagnostics privacy remain request-side gates.
+Requests carrying `Cache-Control: no-cache`, `no-store`, a positive or malformed `max-age`, or
+`min-fresh`, `Pragma: no-cache`, range headers, or conditional validators bypass C2 lookup. A
+browser reload's valid `max-age=0` is the deliberate exception: TS still builds a new private
+response and runs a new per-reader auction, but may reuse a fresh reader-neutral C2 template. C2
+does not expose object age to the core layer, so it cannot prove a positive request-side age
+constraint is met. Authentication, cookie independence, and diagnostics privacy remain
+request-side gates.
 
 Fastly `Surrogate-Control` is interpreted through a deliberately narrow grammar: exactly one
 positive `max-age` is required, while optional `stale-while-revalidate` and `stale-if-error`

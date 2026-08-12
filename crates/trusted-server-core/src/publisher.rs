@@ -5178,14 +5178,23 @@ fn request_bypasses_c2(headers: &edgezero_core::http::HeaderMap) -> bool {
             return true;
         };
         for directive in value.split(',').map(str::trim) {
-            let name = directive
+            let (name, argument) = directive
                 .split_once('=')
-                .map_or(directive, |(name, _)| name);
+                .map_or((directive, None), |(name, argument)| (name, Some(argument)));
             match name.trim().to_ascii_lowercase().as_str() {
                 "no-cache" | "no-store" => return true,
-                // C2 does not expose object age/remaining freshness at this layer,
-                // so it cannot prove either request constraint is satisfied.
-                "max-age" | "min-fresh" => return true,
+                // A browser reload's `max-age=0` requires a newly assembled response,
+                // not a second origin fetch for its reader-neutral template. The hit
+                // still runs this reader's auction and is stamped private/no-store.
+                // Positive or malformed constraints remain unprovable because C2 does
+                // not expose object age/remaining freshness at this layer.
+                "max-age"
+                    if argument.and_then(|argument| parse_delta_seconds(argument).ok())
+                        != Some(0) =>
+                {
+                    return true;
+                }
+                "min-fresh" => return true,
                 _ => {}
             }
         }
@@ -8553,6 +8562,79 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn max_age_zero_reload_reuses_a_warm_template_and_runs_a_fresh_auction() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_bidder("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+
+            queue_bid_response(&stub);
+            queue_shareable_html(&stub);
+            let cold = run_bidding(&settings, &services, navigation_request()).await;
+            assert_eq!(
+                cold.headers()
+                    .get(HEADER_X_TS_C2_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("miss-stored")
+            );
+            let _ = body_of(cold).await;
+
+            // Keep an origin response available so the old bypass behavior completes
+            // normally and fails on the observable cache state rather than a fixture
+            // underflow. A correct warm reload leaves this response untouched.
+            queue_bid_response(&stub);
+            queue_shareable_html(&stub);
+            let mut reload = navigation_request();
+            reload
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("max-age=0"));
+            let warm = run_bidding(&settings, &services, reload).await;
+            assert_eq!(
+                warm.headers()
+                    .get(HEADER_X_TS_C2_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("hit"),
+                "a browser reload must re-run per-reader assembly without refetching the \
+                 reader-neutral template"
+            );
+            assert_eq!(
+                warm.headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("private, no-store"),
+                "reusing C2 must not make the assembled response browser-cacheable"
+            );
+            let warm = String::from_utf8(body_of(warm).await)
+                .expect("warm reload document should be UTF-8");
+
+            let requests = stub.recorded_request_uris();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|uri| uri.contains("/article"))
+                    .count(),
+                1,
+                "the reload must reuse the warm article template"
+            );
+            assert_eq!(
+                stub.recorded_backend_names()
+                    .iter()
+                    .filter(|backend| backend.as_str() == "stub-bidder-backend")
+                    .count(),
+                2,
+                "each navigation must dispatch its own auction even when C2 hits"
+            );
+            assert_eq!(
+                seam_bids(&warm)
+                    .get("test-slot")
+                    .and_then(|bid| bid.get("hb_pb"))
+                    .and_then(serde_json::Value::as_str),
+                Some("3.50"),
+                "the reload's auction result must reach the assembled seam"
+            );
+        }
+
+        #[tokio::test]
         async fn the_marker_never_reaches_the_browser_on_either_path() {
             // The user-visible failure this whole chain exists to avoid: a page that
             // returns 200, parses fine, renders no ads, and reports no error, because
@@ -10148,10 +10230,9 @@ mod tests {
         }
 
         #[test]
-        fn request_revalidation_partial_and_conditional_semantics_bypass_c2() {
+        fn request_semantics_bypass_c2_except_for_a_max_age_zero_reload() {
             for (name, value) in [
                 (header::CACHE_CONTROL, "no-cache"),
-                (header::CACHE_CONTROL, "max-age=0"),
                 (header::CACHE_CONTROL, "max-age=30"),
                 (header::CACHE_CONTROL, "max-age=\"0"),
                 (header::CACHE_CONTROL, "min-fresh=10"),
@@ -10165,6 +10246,11 @@ mod tests {
                 let map = headers(&[(name.clone(), value)]);
                 assert!(request_bypasses_c2(&map), "{name}: {value} must bypass");
             }
+            assert!(
+                !request_bypasses_c2(&headers(&[(header::CACHE_CONTROL, "max-age=0")])),
+                "a browser reload may reuse C2 because the assembled response and auction \
+                 are still rebuilt for this reader"
+            );
             assert!(!request_bypasses_c2(&headers(&[(
                 header::CACHE_CONTROL,
                 "public"
