@@ -258,9 +258,9 @@ for (const [file, required] of requiredReplacements) {
 }
 
 if (violations.length > 0) {
-  console.error(`Architecture hard-cutover check failed (${violations.length} violations):`);
+  console.error(`Hard-cutover absence check failed (${violations.length} violations):`);
   for (const violation of violations.sort()) console.error(`- ${violation}`);
   process.exitCode = 1;
 } else {
-  console.log('Architecture hard-cutover check passed.');
+  console.log('Hard-cutover absence check passed.');
 }
