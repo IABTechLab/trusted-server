@@ -699,6 +699,43 @@ pub(crate) mod coordinated_cutover_v1 {
         })
     }
 
+    /// Parse and validate one browser-boot projection before it enters HTML.
+    ///
+    /// Browser boot requires full slot coverage, unlike the direct `/auction`
+    /// serializer that may carry an empty slot vector. The result is the exact
+    /// canonical JSON produced by the shared production validator.
+    pub(crate) fn canonicalize_browser_auction_projection_json_v1(
+        json: &str,
+        publisher_origin: &str,
+    ) -> Result<String, Report<TrustedServerError>> {
+        ensure!(
+            json.len() <= MAX_BROWSER_AUCTION_PROJECTION_BYTES,
+            projection_contract_error("Browser auction projection exceeds 8 MiB")
+        );
+        let projection =
+            serde_json::from_str::<BrowserAuctionProjectionV1>(json).map_err(|_| {
+                projection_contract_error(
+                    "Browser auction projection violates the version-1 schema",
+                )
+            })?;
+        ensure!(
+            projection.slots.len() == projection.auction.results.len(),
+            projection_contract_error(
+                "Browser auction slots must cover every decision for browser boot"
+            )
+        );
+
+        let canonical =
+            canonicalize_browser_auction_projection_v1(projection.clone(), publisher_origin)?;
+        ensure!(
+            !canonical.reduced_for_size && canonical.projection == projection,
+            projection_contract_error("Browser auction projection violates the version-1 contract")
+        );
+        String::from_utf8(canonical.json).map_err(|_| {
+            projection_contract_error("Browser auction projection serialization is not UTF-8")
+        })
+    }
+
     #[derive(Serialize)]
     struct TrustedServerOpenRtbBidExtV1<'a> {
         candidate_id: &'a str,
