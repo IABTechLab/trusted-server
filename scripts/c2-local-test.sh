@@ -84,8 +84,9 @@ info "Starting stub origin on :$ORIGIN_PORT"
 cat > "$WORK/origin.py" <<PYEOF
 """Stub publisher origin: one shareable page, plus a deliberately slow bid endpoint.
 
-The page is as shareable as HTML gets — no Set-Cookie, a public Cache-Control, and a
-Vary the cache key covers — so a bypass means a real bug rather than a fixture problem.
+The page uses the real Fastly policy that exposed #1009's response-side bypass: no
+Set-Cookie, a public Cache-Control, Surrogate-Control with stale windows, and a Vary the
+cache key covers. A bypass therefore means a real bug rather than a fixture problem.
 
 The bid endpoint returns a real winning bid. It used to return an empty seatbid, which made
 every assertion below measure a page with no ads on it — and that is how a seam that
@@ -144,7 +145,11 @@ class H(BaseHTTPRequestHandler):
         # stub hid a bug that broke the feature end to end: a gzip template has no
         # findable seam marker, and splicing plaintext bids into a gzip stream gives the
         # browser ERR_CONTENT_DECODING_FAILED.
-        base = [("Cache-Control", "public, max-age=300"), ("Vary", "Accept-Encoding")]
+        base = [
+            ("Cache-Control", "public, max-age=60"),
+            ("Surrogate-Control", "max-age=1200, stale-while-revalidate=21600, stale-if-error=604800"),
+            ("Vary", "Accept-Encoding"),
+        ]
         if "gzip" in (self.headers.get("Accept-Encoding") or ""):
             print("origin: served COMPRESSED", flush=True)
             self._send(gzip.compress(PAGE), "text/html; charset=utf-8",

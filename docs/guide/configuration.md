@@ -1408,11 +1408,18 @@ positive shared freshness. `private`, `no-store`, `no-cache`, exhausted or
 malformed freshness, `Set-Cookie`, `Vary: *`, `Vary: Cookie`, uncovered `Vary`
 names, response-bound CSP nonces, authorization, diagnostics sessions, range or
 conditional requests, request-side `max-age`/`min-fresh` constraints, and
-CDN-specific cache policy fields such as `Surrogate-Control` all bypass C2.
-Those vendor policies are refused rather than silently overridden by a public
-standard header. Origin `Age` and apparent age from `Date` are deducted, time
-spent transforming the page continues consuming freshness, and the remaining
-C2 lifetime is capped at 60 seconds.
+unsupported CDN-specific cache policy fields all bypass C2. Fastly
+`Surrogate-Control` is the narrow exception: C2 accepts exactly one positive
+`max-age` plus optional valid `stale-while-revalidate` and `stale-if-error`
+delta-seconds. Restrictive, duplicated, malformed, or unknown directives fail
+closed. Stale windows never extend C2 freshness, and when both standard and
+surrogate freshness are present C2 uses the shorter lifetime. Origin `Age` and
+apparent age from `Date` are deducted, time spent transforming the page continues
+consuming freshness, and the remaining C2 lifetime is capped at 60 seconds.
+
+A browser reload commonly sends `Cache-Control: max-age=0`; that intentionally
+bypasses C2 and reaches the origin. Verify a warm hit with an ordinary navigation
+or a request without reload cache directives, and check `X-TS-C2-Cache: hit`.
 
 `template_cache_vary` is necessary because lookup occurs before the origin can
 return `Vary`. Presence, empty values, repeated raw field values, host/scheme,

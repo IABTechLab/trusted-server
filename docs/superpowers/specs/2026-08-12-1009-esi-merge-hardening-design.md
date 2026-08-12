@@ -83,9 +83,17 @@ Requests carrying `Cache-Control: no-cache`, `no-store`, `max-age`, or `min-fres
 `Pragma: no-cache`, range headers, or conditional validators bypass C2 lookup. C2 does not expose
 object age to the core layer, so it cannot prove a positive request-side age constraint is met.
 Authentication, cookie independence, and diagnostics privacy remain request-side gates.
-CDN-specific cache-policy fields (`Surrogate-Control`, vendor CDN Cache-Control variants) also
-fail closed: C2 must not let a public standard header override a vendor-specific `no-store`, and
-the spike does not attempt to reproduce every vendor's precedence rules.
+
+Fastly `Surrogate-Control` is interpreted through a deliberately narrow grammar: exactly one
+positive `max-age` is required, while optional `stale-while-revalidate` and `stale-if-error`
+delta-seconds are validated but never extend C2's fresh lifetime. `private`, `no-store`, and
+`no-cache` refuse sharing; duplicate, missing-value, unknown, or malformed directives fail closed.
+When both standard freshness and `Surrogate-Control` are present, C2 uses the shorter lifetime,
+then deducts `Age`/apparent age and applies its 60-second ceiling. Standard positive freshness is
+still required, so the vendor header cannot authorize a response that the ordinary HTTP policy
+would not. Other vendor CDN cache-policy fields remain unsupported and disqualify the response.
+This covers the publisher's observed Fastly policy without pretending to implement every CDN's
+precedence rules.
 
 Request `no-cache` and `no-store` conservatively bypass both C2 lookup and insertion; the origin
 response is delivered through the inline path. On adapters without a shared-template cache, or

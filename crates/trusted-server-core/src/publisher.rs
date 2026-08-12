@@ -5304,6 +5304,79 @@ fn parse_delta_seconds(value: &str) -> Result<u64, C2BypassReason> {
         .map_err(|_| C2BypassReason::MalformedCachePolicy)
 }
 
+/// Parse the Fastly-specific freshness policy used by C2's hosting platform.
+///
+/// Fastly documents `max-age`, `stale-while-revalidate`, and `stale-if-error` for
+/// `Surrogate-Control`. C2 uses only `max-age` as fresh lifetime; the stale windows
+/// are validated so malformed policy cannot hide beside a valid max age, but Core
+/// Cache assembly does not serve stale templates under either extension.
+///
+/// Unknown directives fail closed rather than inheriting semantics from another CDN.
+fn surrogate_control_freshness(
+    headers: &edgezero_core::http::HeaderMap,
+) -> Result<Option<Duration>, C2BypassReason> {
+    let mut saw_header = false;
+    let mut max_age = None;
+    let mut stale_while_revalidate = None;
+    let mut stale_if_error = None;
+
+    for value in headers.get_all("surrogate-control") {
+        saw_header = true;
+        let value = value
+            .to_str()
+            .map_err(|_| C2BypassReason::MalformedCachePolicy)?;
+        if value.trim().is_empty() {
+            return Err(C2BypassReason::MalformedCachePolicy);
+        }
+        for directive in value.split(',') {
+            let directive = directive.trim();
+            if directive.is_empty() {
+                return Err(C2BypassReason::MalformedCachePolicy);
+            }
+            let (name, value) = directive
+                .split_once('=')
+                .map_or((directive, None), |(name, value)| (name, Some(value)));
+            let name = name.trim().to_ascii_lowercase();
+            match name.as_str() {
+                "private" | "no-store" | "no-cache" => {
+                    return Err(C2BypassReason::OriginNotShareable);
+                }
+                "max-age" => {
+                    let parsed =
+                        parse_delta_seconds(value.ok_or(C2BypassReason::MalformedCachePolicy)?)?;
+                    if max_age.replace(parsed).is_some() {
+                        return Err(C2BypassReason::MalformedCachePolicy);
+                    }
+                }
+                "stale-while-revalidate" => {
+                    let parsed =
+                        parse_delta_seconds(value.ok_or(C2BypassReason::MalformedCachePolicy)?)?;
+                    if stale_while_revalidate.replace(parsed).is_some() {
+                        return Err(C2BypassReason::MalformedCachePolicy);
+                    }
+                }
+                "stale-if-error" => {
+                    let parsed =
+                        parse_delta_seconds(value.ok_or(C2BypassReason::MalformedCachePolicy)?)?;
+                    if stale_if_error.replace(parsed).is_some() {
+                        return Err(C2BypassReason::MalformedCachePolicy);
+                    }
+                }
+                _ => return Err(C2BypassReason::MalformedCachePolicy),
+            }
+        }
+    }
+
+    if !saw_header {
+        return Ok(None);
+    }
+    let max_age = max_age.ok_or(C2BypassReason::NoPositiveFreshness)?;
+    if max_age == 0 {
+        return Err(C2BypassReason::NoPositiveFreshness);
+    }
+    Ok(Some(Duration::from_secs(max_age)))
+}
+
 fn origin_shared_ttl(headers: &edgezero_core::http::HeaderMap) -> Result<Duration, C2BypassReason> {
     origin_shared_ttl_at(headers, SystemTime::now())
 }
@@ -5377,10 +5450,20 @@ fn origin_shared_ttl_at(
         .and_then(|date| now.duration_since(date).ok())
         .unwrap_or_default();
     let current_age = Duration::from_secs(age).max(apparent_age);
-    let remaining = freshness
+    let standard_remaining = freshness
         .checked_sub(current_age)
         .filter(|duration| !duration.is_zero())
         .ok_or(C2BypassReason::NoPositiveFreshness)?;
+    let remaining = match surrogate_control_freshness(headers)? {
+        Some(freshness) => {
+            let surrogate_remaining = freshness
+                .checked_sub(current_age)
+                .filter(|duration| !duration.is_zero())
+                .ok_or(C2BypassReason::NoPositiveFreshness)?;
+            standard_remaining.min(surrogate_remaining)
+        }
+        None => standard_remaining,
+    };
     Ok(remaining.min(MAX_TEMPLATE_CACHE_TTL))
 }
 
@@ -5426,13 +5509,12 @@ pub(crate) fn c2_cache_ttl(
     if response_headers.contains_key(header::SET_COOKIE) {
         return Err(C2BypassReason::OriginSetCookie);
     }
-    // Core Cache has no HTTP semantics, so silently ignoring a CDN-specific policy
-    // would let a public standard Cache-Control override (for example)
-    // `Surrogate-Control: no-store`. Different vendors define precedence and
-    // extensions differently; fail closed until C2 has an explicit parser rather than
-    // guessing that every such field is equivalent to Cache-Control.
+    // Core Cache has no HTTP semantics. Fastly's documented Surrogate-Control subset
+    // is parsed by `origin_shared_ttl`; every other vendor-specific policy remains a
+    // bypass rather than guessing that unrelated CDNs share its grammar or precedence.
     if crate::response_privacy::CDN_CACHE_HEADERS
         .iter()
+        .filter(|name| **name != "surrogate-control")
         .any(|name| response_headers.contains_key(*name))
     {
         return Err(C2BypassReason::OriginNotShareable);
@@ -7772,6 +7854,55 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn fastly_surrogate_control_still_allows_a_cold_fill_and_warm_hit() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+
+            // This is the policy observed on the publisher that exposed the bug. The
+            // standard lifetime remains C2's upper bound; Fastly's longer surrogate
+            // lifetime and stale windows must not turn an otherwise shareable page into
+            // a response-side bypass.
+            stub.push_response_with_headers(
+                200,
+                b"<html><head></head><body>origin</body></html>".to_vec(),
+                vec![
+                    ("content-type", "text/html; charset=utf-8"),
+                    ("cache-control", "public, max-age=60"),
+                    (
+                        "surrogate-control",
+                        "max-age=1200, stale-while-revalidate=21600, \
+                         stale-if-error=604800",
+                    ),
+                ],
+            );
+
+            let cold = run(&settings, &services, navigation_request()).await;
+            assert_eq!(
+                cold.headers()
+                    .get(HEADER_X_TS_C2_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("miss-stored")
+            );
+            let _ = body_of(cold).await;
+
+            let warm = run(&settings, &services, navigation_request()).await;
+            assert_eq!(
+                warm.headers()
+                    .get(HEADER_X_TS_C2_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("hit")
+            );
+            let _ = body_of(warm).await;
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "the warm request must reuse the template authorized by Surrogate-Control"
+            );
+        }
+
+        #[tokio::test]
         async fn one_identity_template_is_negotiated_per_reader_on_miss_and_hit() {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
@@ -9704,6 +9835,176 @@ mod tests {
                     ),
                     Some(C2BypassReason::OriginNotShareable),
                     "C2 must fail closed on the CDN-specific policy header {name}"
+                );
+            }
+        }
+
+        #[test]
+        fn unsupported_vendor_freshness_does_not_authorize_c2() {
+            for name in crate::response_privacy::CDN_CACHE_HEADERS
+                .iter()
+                .filter(|name| **name != "surrogate-control")
+            {
+                let mut split = shareable();
+                split.insert(
+                    header::HeaderName::from_static(name),
+                    HeaderValue::from_static("max-age=60"),
+                );
+
+                assert_eq!(
+                    c2_bypass_reason(
+                        AssemblyMode::Esi,
+                        false,
+                        false,
+                        StatusCode::OK,
+                        "text/html",
+                        &split,
+                        &nothing_covered(),
+                    ),
+                    Some(C2BypassReason::OriginNotShareable),
+                    "the Fastly exception must not authorize the vendor policy {name}"
+                );
+            }
+        }
+
+        #[test]
+        fn observed_fastly_surrogate_policy_uses_the_shorter_standard_freshness() {
+            let publisher_headers = headers(&[
+                (header::CACHE_CONTROL, "public, max-age=60"),
+                (
+                    header::HeaderName::from_static("surrogate-control"),
+                    "max-age=1200, stale-while-revalidate=21600, stale-if-error=604800",
+                ),
+            ]);
+
+            assert_eq!(
+                c2_cache_ttl(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &publisher_headers,
+                    &nothing_covered(),
+                ),
+                Ok(Duration::from_secs(60)),
+                "the observed Fastly policy should authorize C2 without extending the \
+                 standard freshness lifetime"
+            );
+        }
+
+        #[test]
+        fn surrogate_freshness_can_shorten_but_never_extend_standard_freshness() {
+            for (cache_control, surrogate_control, expected) in [
+                ("public, max-age=300", "max-age=30", 30),
+                ("public, max-age=30", "max-age=300", 30),
+            ] {
+                let publisher_headers = headers(&[
+                    (header::CACHE_CONTROL, cache_control),
+                    (
+                        header::HeaderName::from_static("surrogate-control"),
+                        surrogate_control,
+                    ),
+                ]);
+
+                assert_eq!(
+                    c2_cache_ttl(
+                        AssemblyMode::Esi,
+                        false,
+                        false,
+                        StatusCode::OK,
+                        "text/html",
+                        &publisher_headers,
+                        &nothing_covered(),
+                    ),
+                    Ok(Duration::from_secs(expected))
+                );
+            }
+        }
+
+        #[test]
+        fn surrogate_stale_windows_do_not_extend_fresh_reuse() {
+            let publisher_headers = headers(&[
+                (header::CACHE_CONTROL, "public, max-age=300"),
+                (
+                    header::HeaderName::from_static("surrogate-control"),
+                    "max-age=20, stale-while-revalidate=600, stale-if-error=1200",
+                ),
+                (header::AGE, "10"),
+            ]);
+
+            assert_eq!(
+                c2_cache_ttl(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &publisher_headers,
+                    &nothing_covered(),
+                ),
+                Ok(Duration::from_secs(10)),
+                "stale windows are validated metadata, not fresh C2 lifetime"
+            );
+        }
+
+        #[test]
+        fn ambiguous_or_unsupported_surrogate_policy_fails_closed() {
+            for (policy, expected) in [
+                ("max-age", C2BypassReason::MalformedCachePolicy),
+                (
+                    "max-age=30, max-age=60",
+                    C2BypassReason::MalformedCachePolicy,
+                ),
+                ("max-age=tomorrow", C2BypassReason::MalformedCachePolicy),
+                ("max-age=30, public", C2BypassReason::MalformedCachePolicy),
+                ("stale-if-error=60", C2BypassReason::NoPositiveFreshness),
+                ("max-age=0", C2BypassReason::NoPositiveFreshness),
+                ("max-age=30,", C2BypassReason::MalformedCachePolicy),
+            ] {
+                let mut publisher_headers = shareable();
+                publisher_headers.insert(
+                    header::HeaderName::from_static("surrogate-control"),
+                    HeaderValue::from_str(policy).expect("should build Surrogate-Control"),
+                );
+
+                assert_eq!(
+                    c2_bypass_reason(
+                        AssemblyMode::Esi,
+                        false,
+                        false,
+                        StatusCode::OK,
+                        "text/html",
+                        &publisher_headers,
+                        &nothing_covered(),
+                    ),
+                    Some(expected),
+                    "`{policy}` must fail closed"
+                );
+            }
+        }
+
+        #[test]
+        fn restrictive_surrogate_policy_is_never_overridden_by_standard_freshness() {
+            for directive in ["private", "no-store", "no-cache"] {
+                let mut publisher_headers = shareable();
+                publisher_headers.insert(
+                    header::HeaderName::from_static("surrogate-control"),
+                    HeaderValue::from_str(directive).expect("should build Surrogate-Control"),
+                );
+
+                assert_eq!(
+                    c2_bypass_reason(
+                        AssemblyMode::Esi,
+                        false,
+                        false,
+                        StatusCode::OK,
+                        "text/html",
+                        &publisher_headers,
+                        &nothing_covered(),
+                    ),
+                    Some(C2BypassReason::OriginNotShareable),
+                    "`{directive}` must remain authoritative"
                 );
             }
         }

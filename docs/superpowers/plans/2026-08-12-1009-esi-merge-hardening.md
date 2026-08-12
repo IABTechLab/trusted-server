@@ -224,3 +224,25 @@ TypeScript/Vitest, Viceroy, shell harness.
       local certificate store; otherwise report the exact environment blocker.
 - [x] Run `git diff --check`, inspect the merge graph, and confirm the worktree contains only
       intended changes.
+
+### Task 13: Interpret Fastly Surrogate-Control conservatively
+
+**Files:**
+
+- Modify: `crates/trusted-server-core/src/publisher.rs`
+- Modify: `docs/guide/configuration.md`
+- Modify: `docs/superpowers/specs/2026-08-12-1009-esi-merge-hardening-design.md`
+
+- [x] Write a failing gate test using `Cache-Control: max-age=60` plus the observed publisher
+      `Surrogate-Control` policy (`max-age=1200`, `stale-while-revalidate=21600`, and
+      `stale-if-error=604800`).
+- [x] Write failing tests proving the shorter standard/surrogate freshness wins, stale windows do
+      not extend fresh reuse, restrictive directives are refused, and unknown, duplicate, or
+      malformed directives fail closed.
+- [x] Parse only Fastly's supported `max-age`, `stale-while-revalidate`, and `stale-if-error`
+      directives; continue refusing every other vendor CDN policy field.
+- [x] Keep request `Cache-Control: max-age=0` as an intentional C2 bypass so reload preserves its
+      revalidation semantics.
+- [x] Run focused tests, `cargo test-fastly`, target-matched formatting/clippy, both local harness
+      modes, and verify the observed publisher policy progresses from `miss-stored` to `hit` in
+      the local Fastly runtime on an ordinary navigation.
