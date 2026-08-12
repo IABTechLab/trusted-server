@@ -4,6 +4,13 @@ _Filename retains its original `esi-` prefix; the commit history and every
 cross-reference point at it. The subject moved, the path did not._
 
 **Issue:** IABTechLab/trusted-server#1009 · **Date:** 2026-08-08 ·
+
+> **Superseded for implementation, 2026-08-12.** This remains the measurement and
+> feasibility history. The final branch removes the general ESI parser and client-fill arm,
+> retaining `assembly_mode = "esi"` as the operator spelling for Fastly C2 plus exact
+> byte-seam assembly. See
+> [the merge-hardening design](./2026-08-12-1009-esi-merge-hardening-design.md).
+
 **Revised:** 2026-08-10
 **Baseline:** citations verified at `cfb98f4`; unchanged as of `b0ce56c3`.
 

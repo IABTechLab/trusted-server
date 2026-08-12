@@ -6,6 +6,15 @@
 stands.
 **Issue:** IABTechLab/trusted-server#1009
 
+> **Implementation update, 2026-08-12.** Design C is now the only shared-template
+> render path. The operator-facing value remains `assembly_mode = "esi"`, but the
+> `esi` crate, native include/subrequest design, executable fragment, and
+> `client_fill` comparison arm were removed. Fastly supplies C2; other adapters
+> fall back to inline processing. Sections 2–2c and Design B below are retained as
+> the investigation history, not as descriptions of current code. The merged and
+> hardened contract is
+> [the implementation design](./2026-08-12-1009-esi-merge-hardening-design.md).
+
 ---
 
 ## 1. The correction this document exists for
@@ -160,7 +169,7 @@ The template carries an **inert HTML comment sentinel** where the bids go, emitt
 existing `Marker` variant:
 
 ```
-<!--ts-bids-->
+<!--ts-c2-v3-seam-7f4c9e2d-bids-->
 ```
 
 On a C2 hit:
@@ -205,26 +214,25 @@ it and must stop.
 The issue's gating decision is: _is Fastly-first acceptable for the flagship perf path,
 with a portable fallback?_
 
-Design C makes that question unnecessary. It gets the full latency win on **all four
-adapters**, with no `esi` dependency on the critical render path, no self-referencing
-backend, and no second rendering architecture to maintain. The issue's own "Negative view"
-lists portability, dependency risk, and operational weight as the case against ESI — C
-removes all three.
+Design C keeps assembly portable, but only Fastly currently supplies the shared C2 cache;
+the other adapters degrade to their existing inline origin transform. It removes the
+`esi` dependency from the critical render path, needs no self-referencing backend, and
+avoids a second rendering architecture.
 
 **ESI is therefore sufficient but unnecessary.** For a single insertion point at a known
 location, its parsing generality buys nothing a byte split does not. That is a stronger
 answer than validating ESI, and it is the opposite of what the issue expected.
 
-Keep Design B reachable behind the existing `esi` mode: #1009 asks a literal question
-about ESI, the mechanism is already proven, and retaining it is cheap. Measure C.
+The existing `esi` mode now selects Design C. Design B is deliberately removed: retaining
+a parser and fragment surface for unused generality was not cheap once the real 1.4 MB
+Next.js page demonstrated parser truncation.
 
 ## 7. Sequencing
 
-1. Emit the comment sentinel instead of `esi:include`; keep `esi:include` behind the `esi`
-   mode for Design B.
+1. Emit the schema-bound comment sentinel instead of `esi:include`.
 2. Add the seam split to the C2 hit path, returning `PublisherResponse::Stream` rather than
    `Buffered`. Strip `Content-Length`.
-3. Store decoded; drop `accept_encoding` from the key.
+3. Store decoded identity; negotiate and encode the assembled response per reader.
 4. **Verify first byte arrives before the auction resolves.** This is the measurement that
    distinguishes C from A, and it is the point of the whole exercise. A delayed-response
    stub origin plus a slow auction makes it observable locally.
@@ -238,9 +246,11 @@ about ESI, the mechanism is already proven, and retaining it is cheap. Measure C
   (a bug already hit and fixed), the store must precede assembly, and headers must be
   final before the first byte. Streaming adds no new ordering hazard but makes the third
   unrecoverable rather than merely wrong.
-- **Sentinel absence** must fail loudly. A template without the sentinel means the
-  transform changed and the seam moved; silently appending bids would half-work.
+- **Sentinel corruption on a hit** purges the URL variant and refetches the origin before
+  headers commit. Fresh documents without an explicit body close receive a terminal seam;
+  publisher-authored copies are neutralized by the HTML parser.
 - **`template_cache_vary` remains spike-grade.** Operator-stated with a drift guard; the
   correct answer is a two-phase lookup.
-- **Request collapsing is untested.** Viceroy is single-threaded, so the concurrent
-  cold-request case cannot be produced locally.
+- **Request collapsing is implemented by Fastly's pre-origin Core Cache transaction.**
+  Viceroy proves reservation-before-insert and hit-after-insert; its single-threaded local
+  runtime still cannot reproduce two truly concurrent cold requests.

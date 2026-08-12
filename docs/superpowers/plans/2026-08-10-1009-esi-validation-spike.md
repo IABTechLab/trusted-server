@@ -1,5 +1,12 @@
 # #1009 ESI Validation Spike
 
+> **Superseded, 2026-08-12.** This document records the investigation, including the
+> parser/subrequest and client-fill arms that were later removed. The accepted implementation
+> keeps the public `esi` spelling but uses Fastly C2 plus exact byte-seam assembly. See
+> [the merge-hardening design](../specs/2026-08-12-1009-esi-merge-hardening-design.md) and
+> [implementation plan](./2026-08-12-1009-esi-merge-hardening.md). Unchecked items below are
+> historical experiments, not remaining work for the merged design.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps
 > use checkbox (`- [ ]`) syntax for tracking.

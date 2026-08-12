@@ -191,6 +191,24 @@ gam_network_id = "123456789"
 auction_timeout_ms = 500  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__AUCTION_TIMEOUT_MS
 price_granularity = "dense"
 
+# Initial-page delivery mode. `inline` is the default and current production
+# behaviour. `esi` is an opt-in Fastly Core Cache experiment: despite the name,
+# it uses an inert comment plus exact byte-seam assembly, not an ESI parser.
+# This and the two cache-safety keys below belong in this
+# [creative_opportunities] table. See docs/guide/configuration.md before enabling.
+# assembly_mode = "inline"
+
+# Request headers (other than Accept-Encoding, whose supported content coding TS
+# decodes to identity before storage) that the origin may name in Vary. Values
+# are keyed losslessly and the origin response is checked for drift before
+# storage. Never include Cookie: C2 templates must be reader-neutral.
+# template_cache_vary = ["rsc", "next-router-prefetch"]
+
+# Unsafe unless independently verified at the publisher origin. The default
+# excludes every cookie-bearing request from C2. Set true only when origin HTML
+# is byte-independent of Cookie; an origin Vary: Cookie is still refused.
+# origin_is_cookie_independent = false
+
 # `gam_unit_path` may be a template. Supported placeholders:
 #   {network_id} -> gam_network_id
 #   {slot_id}    -> the slot's id

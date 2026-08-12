@@ -76,34 +76,45 @@ and platform length limits.
 C2 never invents freshness. Eligibility requires a positive remaining shared lifetime derived
 from the origin's cache directives. `private`, `no-store`, `no-cache`, zero freshness, malformed
 directives, or already-consumed freshness all bypass storage. The stored max age is capped by the
-short operator safety ceiling and reduced by `Age`.
+short operator safety ceiling and reduced by `Age`, apparent age from `Date`, and time spent
+transforming/auctioning before insertion.
 
-Requests carrying `Cache-Control: no-cache`/`max-age=0`, `Pragma: no-cache`, range headers, or
-conditional validators bypass C2 lookup. Authentication, cookie independence, and diagnostics
-privacy remain request-side gates.
+Requests carrying `Cache-Control: no-cache`, `no-store`, `max-age`, or `min-fresh`,
+`Pragma: no-cache`, range headers, or conditional validators bypass C2 lookup. C2 does not expose
+object age to the core layer, so it cannot prove a positive request-side age constraint is met.
+Authentication, cookie independence, and diagnostics privacy remain request-side gates.
+CDN-specific cache-policy fields (`Surrogate-Control`, vendor CDN Cache-Control variants) also
+fail closed: C2 must not let a public standard header override a vendor-specific `no-store`, and
+the spike does not attempt to reproduce every vendor's precedence rules.
 
-`no-cache` forces a fresh origin read but may replace C2 with the newly validated response;
-request `no-store` forbids both lookup and insertion. On adapters without a shared-template cache,
-or when the cache backend fails before reservation, `esi` degrades to the existing inline path so
-an optimization outage does not add full-document buffering.
+Request `no-cache` and `no-store` conservatively bypass both C2 lookup and insertion; the origin
+response is delivered through the inline path. On adapters without a shared-template cache, or
+when the cache backend fails before reservation, `esi` likewise degrades to the existing inline
+path so an optimization outage does not add full-document buffering.
 
 ## Response assembly and representation
 
-Templates are stored as identity bytes because marker validation and splitting are textual. ESI
-misses offer a fixed, supported compressed `Accept-Encoding` set to the origin, independent of the
-reader, so every reader selects the same upstream representation before it is decoded. The final
-assembled response is encoded for the current client's accepted representation:
+Templates are stored as identity bytes because marker validation and splitting are textual. The
+origin offer remains a supported subset of the reader's `Accept-Encoding`; this is necessary so a
+response-gate bypass can return the origin representation without relabeling bytes or sending a
+coding the reader refused. A stored response is decoded to identity, and the final assembled
+response is encoded for the current client's accepted representation:
 
 - buffered misses assemble first and then encode;
 - Fastly hits encode the prefix, request seam, and suffix through one streaming encoder;
-- the template key does not vary on `Accept-Encoding`, because the stored representation is
-  always identity and the upstream offer is canonical.
+- the template key does not vary on `Accept-Encoding`, because the transform normalizes supported
+  HTTP content codings to one identity representation before storage.
+
+This normalization assumes the origin uses `Accept-Encoding` only to select an HTTP content
+coding, not to change document semantics. A publisher whose origin violates that convention must
+leave ESI disabled; otherwise one normalized representation could be shared across semantically
+different origin variants.
 
 Missing or repeated markers are optimization failures, not publisher outages. An invalid hit is
-discarded and replaced through the transactional miss path. A newly transformed document without
-a normal body-close seam receives a collision-resistant fallback marker at document end; if a
-valid seam still cannot be established, the document is not stored and is delivered safely rather
-than turning an origin 200 into a Trusted Server 5xx.
+purged and served from origin. Publisher-authored copies of the reserved comment are neutralized
+while parsing, before TS emits its own marker. A newly transformed document without a normal
+body-close seam receives a collision-resistant fallback marker at document end; if a valid seam
+still cannot be established, the document is not stored rather than poisoning later hits.
 
 ## Privacy and response metadata
 
@@ -122,9 +133,9 @@ Warm responses preserve repeated CSP/CSP-Report-Only and other per-document secu
 headers such as COOP, COEP, CORP, HSTS, Origin-Agent-Cluster, reporting headers, and `Link`.
 Privacy is stamped after replay so metadata cannot override it.
 
-A nonce-bearing CSP is not automatically rejected. If an origin explicitly marks the matching
-HTML and CSP response shareable, sharing that exact header/body pair is already part of the
-origin's cache contract. C2 must not extend its freshness beyond that contract.
+A nonce-bearing CSP or CSP-Report-Only response is rejected from C2. The nonce is commonly minted
+per response; replaying it with a transformed shared document would create an unnecessary and
+fragile coupling even if the origin accidentally left public freshness headers in place.
 
 ## Scope cleanup
 
@@ -140,9 +151,10 @@ it as edge byte-seam assembly and makes its Fastly-only cache acceleration expli
 
 ## Observability and operations
 
-Every request reports a distinct C2 state: bypass, hit, cold miss/reservation, invalid entry,
-backend error, store, or cancelled reservation. Backend errors are not collapsed into ordinary
-misses. A response header suitable for canary inspection is added without exposing key material.
+Every ESI request reports a bounded `X-TS-C2-Cache` state: `hit`, `miss-stored`,
+`miss-store-error`, `miss-reserved`, `bypass-request`, `bypass-response`, `unsupported`, `invalid`,
+or `backend-error`. Backend read errors are not collapsed into ordinary misses, and no key or
+request value is exposed.
 
 Rollback is:
 

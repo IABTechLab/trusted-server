@@ -4,6 +4,12 @@ Recorded output of the checks in
 [the plan](./2026-08-08-1009-measurement-and-stage-0.md). Results only — the origin
 hostname is operator config and is deliberately not reproduced here.
 
+> **Final implementation note, 2026-08-12.** The opt-in `esi` mode now uses Fastly
+> Core Cache plus an exact inert byte seam. The parser and client-fill experiments were
+> removed. Real-origin numbers in this file remain evidence about the observed path, not
+> a clean before/after benchmark. Current operational semantics are documented in
+> [the configuration guide](../../guide/configuration.md).
+
 ## Step A — origin `Vary` declaration and cookie exposure
 
 **Date:** 2026-08-08 · **Method:** direct `curl` against the publisher origin with the
