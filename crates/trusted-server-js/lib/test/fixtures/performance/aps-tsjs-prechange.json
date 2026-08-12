@@ -134,7 +134,7 @@
     "schemaVersion": 1,
     "source": {
       "ref": "spec/aps-tsjs-resilience-design",
-      "sha": "d270c4bfa70dc6b26515281aec7e915189aa9f75"
+      "sha": "63bc1a1928e7bb53e0aa4de86a1556b9eee2db3c"
     },
     "originalTopLevelSha256": "53f762603ad49239f1756171440be422e190cc231efafc56cf37a11e1a38ddf4",
     "tools": {
@@ -163,7 +163,7 @@
     },
     "release": {
       "version": 1,
-      "releaseId": "28b027e9ab3703e7585d5b1876b7566fb3ce65252056110386e5c98f27ca2f31",
+      "releaseId": "d335ea16a9b8d87c2625f39969591c75dea81210822421d6631f7d11f455e80c",
       "artifacts": [
         {
           "id": "bootstrap",
@@ -174,7 +174,7 @@
           "outputs": [],
           "file": "gpt-bootstrap-fallback.js",
           "bytes": 42399,
-          "hash": "573885a4a50a1e0734d36a812f672811e2b3f6f89613cf9d9b4ae3793e935a88"
+          "hash": "ed7231527be79dfd864bcc8275f90d51bf39c57eae92a8c6fe5ece8d68ef2f23"
         },
         {
           "id": "core",
@@ -185,7 +185,7 @@
           "outputs": ["runtime.v1"],
           "file": "tsjs-core.js",
           "bytes": 85581,
-          "hash": "68a58eed281549497d9fd56908f633638d69cc73fd2e6356bdc2d2e9164c0db2"
+          "hash": "f20236dd9b885218040d7dbd0c9aaa964e542a2c05f31d330e475f29979eb120"
         },
         {
           "id": "render_runtime",
@@ -203,8 +203,8 @@
             "direct.v1"
           ],
           "file": "tsjs-render_runtime.js",
-          "bytes": 155275,
-          "hash": "2cb7e0b217fd19a10a56e4ac37418dcf15ed627d6e7b4610a5f9edbed02cdd1a"
+          "bytes": 166529,
+          "hash": "27bf0bb447267c6ac8ca23110fff1b564ffed8f1c7cbc63e5db187b875c9b919"
         },
         {
           "id": "aps",
@@ -215,7 +215,7 @@
           "outputs": ["aps.v1"],
           "file": "tsjs-aps.js",
           "bytes": 16782,
-          "hash": "22d342537e5e30558a606a449cd252ea6dd2d6473e789414c8789e17fd6ee9d8"
+          "hash": "26b7a43479182619221f63df13a1d3589f00c1db59c993ebd656087501b1c37b"
         },
         {
           "id": "creative",
@@ -226,7 +226,7 @@
           "outputs": [],
           "file": "tsjs-creative.js",
           "bytes": 21093,
-          "hash": "6681a9f9506cca079a2d913b09fae826aed0043798ba959f9a4c9d00b3cc9388"
+          "hash": "14bc52d375444fb4b1dfb2dc8fad6759f8b048da8cbfe3d32d868c43c5df84e3"
         },
         {
           "id": "datadome",
@@ -237,7 +237,7 @@
           "outputs": [],
           "file": "tsjs-datadome.js",
           "bytes": 23375,
-          "hash": "c0b154ec8f0c07a577c8037518e62f7a8eca8991d039adcfcf35a11be5f6f842"
+          "hash": "f7558eff608af6f9eccff72c0a2c823152cd9e43dc309efcc39d9cb6b20e5c9b"
         },
         {
           "id": "didomi",
@@ -248,7 +248,7 @@
           "outputs": [],
           "file": "tsjs-didomi.js",
           "bytes": 15489,
-          "hash": "482bfc2669bcb20a4cb99dc451d0081d63d31c5fdd983d283b5a4de9855ca54e"
+          "hash": "c2c1777e297cdc6f2d97986e485dfc19af1192461b5ec4ee9dc494cff14d3f0e"
         },
         {
           "id": "google_tag_manager",
@@ -259,7 +259,7 @@
           "outputs": [],
           "file": "tsjs-google_tag_manager.js",
           "bytes": 26343,
-          "hash": "3d708b2fbc68ebf947e67823f3e413dba7e2de8b4e5aefd05dac26ad76f8cc04"
+          "hash": "a0576032a8486ec3b13d37a4127dfc243720c0b0764913af51f87a37c4dd2fda"
         },
         {
           "id": "gpt",
@@ -276,8 +276,8 @@
           ],
           "outputs": ["gpt.v1", "gpt.events.v1", "pbs_cache.baseline.v1"],
           "file": "tsjs-gpt.js",
-          "bytes": 199361,
-          "hash": "21126364229d67f82a1aeaa0b2a9d6b13e01c70b6aa14dbf725c3024a5f474f3"
+          "bytes": 179867,
+          "hash": "8eb8df3b1719eb50fc2a112f4c6b04a769dbb822d8f9a7d7f007db6c7cb9717f"
         },
         {
           "id": "gpt_diagnostics",
@@ -288,7 +288,7 @@
           "outputs": ["gpt_diag.v1"],
           "file": "tsjs-gpt_diagnostics.js",
           "bytes": 29975,
-          "hash": "d5f0f8a8791379e8109d3e861e81f850e96a55fb84fa6eb42f01e664f95439e8"
+          "hash": "c45b05bc61592f6bedfbc99f8d3f434dee0b9d0bf27dc830c94de98b91e8e767"
         },
         {
           "id": "lockr",
@@ -299,7 +299,7 @@
           "outputs": [],
           "file": "tsjs-lockr.js",
           "bytes": 24031,
-          "hash": "83575c3b595b7fb5b53ca4f16076c09e4ce147a97204d089223413ec13f37cb1"
+          "hash": "7a445686082b0b5ce159e8522de22a8bc0c5315d9720b68e333b845c555b9509"
         },
         {
           "id": "osano_consent",
@@ -310,7 +310,7 @@
           "outputs": ["osano_consent.v1"],
           "file": "tsjs-osano_consent.js",
           "bytes": 10511,
-          "hash": "67d8d4d682fdfdac080613cb2d6b885898ca39680cb4e2332e96a914afa838ea"
+          "hash": "1bbca9e39e540a61fdb152f6b7c0942524177280ae0414a39b118d201e9f6f6e"
         },
         {
           "id": "permutive_context",
@@ -321,7 +321,7 @@
           "outputs": ["permutive_context.v1"],
           "file": "tsjs-permutive_context.js",
           "bytes": 17818,
-          "hash": "40bcac1dc75ab9b8c2ba69cf0e0c4a540e56ae165959f9fa44a0518c70d24a9a"
+          "hash": "073f049e6b3e831638cc85527d934c9448348c890346654a47283a720c36242c"
         },
         {
           "id": "sourcepoint_consent",
@@ -332,7 +332,7 @@
           "outputs": ["sourcepoint_consent.v1"],
           "file": "tsjs-sourcepoint_consent.js",
           "bytes": 18789,
-          "hash": "6d9d612be675b690a4507693d9fcc3f0644c937d9513460704690c680e7dd086"
+          "hash": "dd8ab39f9770105edd81e05b654b4e4f3be1a32a5f4703e9f7d3138429b4668d"
         },
         {
           "id": "prebid",
@@ -343,7 +343,7 @@
           "outputs": ["prebid.v1"],
           "file": "tsjs-prebid.js",
           "bytes": 36716,
-          "hash": "12d08a121e31a81bb9bad7d4bdf9a8fe8bf33f951192ee676ed843fe409c848e"
+          "hash": "9d0dcef064192df2896d46acec902aaa7b680e185d93425d7f8c8971e8230026"
         },
         {
           "id": "testlight",
@@ -354,7 +354,7 @@
           "outputs": [],
           "file": "tsjs-testlight.js",
           "bytes": 16232,
-          "hash": "e11c1671529947844631a7da92277e026b0ca15107e6ab45219722c5405f14a1"
+          "hash": "72024e36854c50d92987a90415a8f7322d91a49fa3a41e62a05ea2e83b9446f8"
         },
         {
           "id": "diagnostics_presentation",
@@ -365,7 +365,7 @@
           "outputs": [],
           "file": "tsjs-diagnostics_presentation.js",
           "bytes": 39944,
-          "hash": "1a89ddf277ef7a837d74b50bc52d91ab66ffc4c28036213762957aa6c8ed4e03"
+          "hash": "228691fa182ed310a2d90c20474a94e414ff52107275827289bd4b058effa727"
         },
         {
           "id": "gpt_later",
@@ -376,7 +376,7 @@
           "outputs": [],
           "file": "tsjs-gpt_later.js",
           "bytes": 5420,
-          "hash": "e0077da3429deca44f2d9aceb246f9e7fc301c4dcb6635b69b8111057c028e07"
+          "hash": "fbba0fddf0aa6103279e6eab7644324fe678c826b04bf90710c03cb93b3d93ca"
         },
         {
           "id": "osano_lifecycle",
@@ -387,7 +387,7 @@
           "outputs": [],
           "file": "tsjs-osano_lifecycle.js",
           "bytes": 3663,
-          "hash": "d1e5abf7f90e3802beb700b2fd1ee4382c010a9b77429ee95c104692d79686e5"
+          "hash": "7fa5944563654d8a4f30e49ac38568070690eb7b53111ab8141b569266f3cb75"
         },
         {
           "id": "permutive_lifecycle",
@@ -398,7 +398,7 @@
           "outputs": [],
           "file": "tsjs-permutive_lifecycle.js",
           "bytes": 3675,
-          "hash": "014b790757de56ebe26cad6121df4174fc686d402846eed98766ba9263acc86b"
+          "hash": "4cc599b24335a6b5834b26a273f9db96d91be299046a2da5b8bcca3e94bca633"
         },
         {
           "id": "prebid_later",
@@ -409,7 +409,7 @@
           "outputs": [],
           "file": "tsjs-prebid_later.js",
           "bytes": 11160,
-          "hash": "69ec41f65b4e40ed1cca1df28d18ee98e5a39c79eb96aaa8b0d880f42f9799f0"
+          "hash": "2b5168cba9cf11ea570372192200308824be06c30c0d3fe928fd8ab43565b7af"
         },
         {
           "id": "sourcepoint_lifecycle",
@@ -420,7 +420,7 @@
           "outputs": [],
           "file": "tsjs-sourcepoint_lifecycle.js",
           "bytes": 3681,
-          "hash": "d061d95fa12c4ee0c06a714ab769f1aa91cf88dcc285bf3f528b31ce2d2393e6"
+          "hash": "314bb30e0c32174c4513112062175c83bb825902a515fcd88ab7fc6e3454831a"
         }
       ]
     },
@@ -792,12 +792,10 @@
         "gpt"
       ],
       "src/services/render.ts": [
-        "render_runtime",
-        "gpt"
+        "render_runtime"
       ],
       "src/services/reservations.ts": [
-        "render_runtime",
-        "gpt"
+        "render_runtime"
       ],
       "src/services/slots.ts": [
         "gpt"
@@ -847,17 +845,17 @@
         "artifactIds": ["bootstrap"],
         "files": ["gpt-bootstrap-fallback.js"],
         "rawBytes": 42399,
-        "gzipBytes": 11875,
-        "brotliBytes": 10544,
-        "sha256": "573885a4a50a1e0734d36a812f672811e2b3f6f89613cf9d9b4ae3793e935a88"
+        "gzipBytes": 11873,
+        "brotliBytes": 10556,
+        "sha256": "ed7231527be79dfd864bcc8275f90d51bf39c57eae92a8c6fe5ece8d68ef2f23"
       },
       "minimal": {
         "artifactIds": ["core", "render_runtime"],
         "files": ["tsjs-core.js", "tsjs-render_runtime.js"],
-        "rawBytes": 240858,
-        "gzipBytes": 64804,
-        "brotliBytes": 48983,
-        "sha256": "e0eddfbedcbc33fdf42d779c20885a7a59227ac20f2b996d3c4323fcba53b339"
+        "rawBytes": 252112,
+        "gzipBytes": 67751,
+        "brotliBytes": 51295,
+        "sha256": "16969c77296845647f39aa4b33120acdc0e57ee4dad66672f0d0cf8832705425"
       },
       "reference": {
         "artifactIds": ["core", "render_runtime", "creative", "gpt", "prebid", "datadome"],
@@ -869,10 +867,10 @@
           "tsjs-prebid.js",
           "tsjs-datadome.js"
         ],
-        "rawBytes": 521411,
-        "gzipBytes": 141812,
-        "brotliBytes": 100719,
-        "sha256": "f8561bf2fcd08f8304ade928bddee3b80daeab883c2dad465f6a8fdc71850366"
+        "rawBytes": 513171,
+        "gzipBytes": 139994,
+        "brotliBytes": 100070,
+        "sha256": "24ce899c89720b21c3811c85246b036c27205285c89b9e6156833785f5d14cda"
       },
       "maximal": {
         "artifactIds": [
@@ -921,10 +919,10 @@
           "tsjs-prebid_later.js",
           "tsjs-sourcepoint_lifecycle.js"
         ],
-        "rawBytes": 764954,
-        "gzipBytes": 189910,
-        "brotliBytes": 128456,
-        "sha256": "4277387f0d01937b4829e644cf59d807c26a289274953bf269878e90d1c34378"
+        "rawBytes": 756714,
+        "gzipBytes": 188047,
+        "brotliBytes": 127965,
+        "sha256": "97db2f847691459e03aa4cbf81ef037675eada923b67a10bf6eec9e20623d25d"
       }
     }
   }

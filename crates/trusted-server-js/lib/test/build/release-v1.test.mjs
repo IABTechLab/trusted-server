@@ -534,7 +534,7 @@ test('role-correct capture appends provenance without changing historical eviden
   assert.ok(baseline.roleCorrectTransfer, 'role-correct capture must be appended');
   assert.deepEqual(baseline.roleCorrectTransfer.source, {
     ref: 'spec/aps-tsjs-resilience-design',
-    sha: 'd270c4bfa70dc6b26515281aec7e915189aa9f75',
+    sha: '63bc1a1928e7bb53e0aa4de86a1556b9eee2db3c',
   });
   assert.equal(
     baseline.roleCorrectTransfer.originalTopLevelSha256,
