@@ -16,6 +16,8 @@ use crate::settings::vec_from_seq_or_map;
 
 const MAX_DYNAMIC_GAM_UNIT_PATH_BYTES: usize = 100;
 const MAX_SECTION_BYTES: usize = 100;
+const DEFAULT_TEMPLATE_CACHE_MAX_AGE_SECONDS: u32 = 60;
+const MAX_TEMPLATE_CACHE_MAX_AGE_SECONDS: u32 = 86_400;
 
 /// A single parsed segment of a [`gam_unit_path`](CreativeOpportunitySlot::gam_unit_path) template.
 #[derive(Debug, Clone)]
@@ -302,6 +304,16 @@ pub struct CreativeOpportunitiesConfig {
     /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_cache_vary: Option<Vec<String>>,
+    /// Maximum time a reader-neutral transformed template may remain in C2.
+    ///
+    /// This is a safety ceiling, not freshness authorization. The origin must still
+    /// provide positive shared freshness, and the stored lifetime is the smaller of
+    /// the origin's remaining edge freshness and this value. Defaults to 60 seconds
+    /// and may be configured from 1 second through 1 day.
+    ///
+    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_cache_max_age_seconds: Option<u32>,
     /// Operator assertion that the origin's HTML does not depend on request cookies.
     ///
     /// Unset or `false` disqualifies **every cookie-bearing request** from the shared
@@ -350,6 +362,15 @@ impl CreativeOpportunitiesConfig {
     #[must_use]
     pub fn template_cache_vary(&self) -> crate::platform::VarySpec {
         crate::platform::VarySpec::new(self.template_cache_vary.clone().unwrap_or_default())
+    }
+
+    /// Safety ceiling for one shared transformed-template cache entry.
+    #[must_use]
+    pub fn template_cache_max_age(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(
+            self.template_cache_max_age_seconds
+                .unwrap_or(DEFAULT_TEMPLATE_CACHE_MAX_AGE_SECONDS),
+        ))
     }
 }
 
@@ -420,10 +441,20 @@ impl CreativeOpportunitiesConfig {
     /// Returns an error string when [`gam_network_id`](Self::gam_network_id) is
     /// blank but consumed by a default path or `{network_id}` template; when a
     /// slot has an invalid identifier, page pattern set, format list, or
-    /// dimensions; when a `{section}` template lacks a valid
+    /// dimensions; when `template_cache_max_age_seconds` falls outside 1–86,400;
+    /// when a `{section}` template lacks a valid
     /// [`section_root`](Self::section_root); or when configured values make a
     /// dynamic path exceed 100 UTF-8 bytes.
     pub fn validate_runtime(&self) -> Result<(), String> {
+        if self
+            .template_cache_max_age_seconds
+            .is_some_and(|seconds| !(1..=MAX_TEMPLATE_CACHE_MAX_AGE_SECONDS).contains(&seconds))
+        {
+            return Err(format!(
+                "template_cache_max_age_seconds must be between 1 and {MAX_TEMPLATE_CACHE_MAX_AGE_SECONDS}"
+            ));
+        }
+
         if let Some(names) = &self.template_cache_vary {
             crate::platform::VarySpec::try_new(names.clone()).map_err(|name| {
                 format!("template_cache_vary contains invalid HTTP header name `{name}`")
@@ -1271,6 +1302,7 @@ mod tests {
             section_root: section_root.map(str::to_string),
             assembly_mode: None,
             template_cache_vary: None,
+            template_cache_max_age_seconds: None,
             origin_is_cookie_independent: None,
             section_segment: None,
             slot: vec![slot],
@@ -1671,6 +1703,7 @@ mod tests {
             section_root: None,
             assembly_mode: None,
             template_cache_vary: None,
+            template_cache_max_age_seconds: None,
             origin_is_cookie_independent: None,
             section_segment: None,
             slot: Vec::new(),
@@ -2025,6 +2058,70 @@ mod tests {
             .validate_runtime()
             .expect_err("per-cookie templates violate the reader-neutral C2 contract");
         assert!(err.contains("Cookie"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn template_cache_max_age_accepts_a_positive_value_up_to_one_day() {
+        for seconds in [1_u32, 1_200, 86_400] {
+            let config: CreativeOpportunitiesConfig = toml::from_str(&format!(
+                r#"
+                    gam_network_id = "99999"
+                    template_cache_max_age_seconds = {seconds}
+                "#
+            ))
+            .unwrap_or_else(|error| panic!("{seconds}s should deserialize: {error}"));
+
+            config
+                .validate_runtime()
+                .unwrap_or_else(|error| panic!("{seconds}s should validate: {error}"));
+            let serialized = serde_json::to_value(config).expect("should serialize config");
+            assert_eq!(
+                serialized
+                    .get("template_cache_max_age_seconds")
+                    .and_then(serde_json::Value::as_u64),
+                Some(u64::from(seconds)),
+                "the configured ceiling must survive typed configuration"
+            );
+        }
+    }
+
+    #[test]
+    fn template_cache_max_age_rejects_zero_and_more_than_one_day() {
+        for seconds in [0_u32, 86_401] {
+            let config: CreativeOpportunitiesConfig = toml::from_str(&format!(
+                r#"
+                    gam_network_id = "99999"
+                    template_cache_max_age_seconds = {seconds}
+                "#
+            ))
+            .unwrap_or_else(|error| panic!("shape should deserialize before validation: {error}"));
+
+            let error = config
+                .validate_runtime()
+                .expect_err("an unsafe template-cache ceiling must fail startup validation");
+            assert!(
+                error.contains("template_cache_max_age_seconds"),
+                "unexpected validation error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn unset_template_cache_max_age_is_omitted_for_rollback_compatibility() {
+        let config: CreativeOpportunitiesConfig =
+            toml::from_str("gam_network_id = \"99999\"").expect("should deserialize");
+
+        assert_eq!(
+            config.template_cache_max_age(),
+            std::time::Duration::from_secs(60),
+            "an absent ceiling must preserve the spike's existing lifetime"
+        );
+        let serialized = toml::to_string(&config).expect("should serialize");
+
+        assert!(
+            !serialized.contains("template_cache_max_age_seconds"),
+            "an unset new key must not break rollback to an older binary: {serialized}"
+        );
     }
 
     #[test]

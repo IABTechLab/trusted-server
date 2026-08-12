@@ -1385,9 +1385,10 @@ the mode but safely fall back to the inline transform on every request. This is
 not a top-level HTTP cache hit: Compute still runs and the final assembled
 response is always `Cache-Control: private, no-store`.
 
-All three keys below belong directly under `[creative_opportunities]`. They are
+All four keys below belong directly under `[creative_opportunities]`. They are
 one feature contract: `assembly_mode` selects how creative-opportunity state is
-delivered, while the other two constrain when that mode may share its template.
+delivered, while the other three constrain when and how long that mode may share
+its template.
 They are not a general top-level HTTP-cache configuration.
 
 ```toml
@@ -1397,6 +1398,10 @@ assembly_mode = "esi"
 # Every request header, except Accept-Encoding, that the publisher origin can
 # name in Vary for these documents. Names are validated and de-duplicated.
 template_cache_vary = ["rsc", "next-router-prefetch"]
+
+# Safety ceiling for the shared template. Defaults to 60; valid range 1–86400.
+# The origin's remaining edge freshness may make the actual lifetime shorter.
+template_cache_max_age_seconds = 1200
 
 # Default false. Enable only after proving publisher HTML ignores Cookie.
 origin_is_cookie_independent = true
@@ -1412,14 +1417,18 @@ unsupported CDN-specific cache policy fields all bypass C2. Fastly
 `Surrogate-Control` is the narrow exception: C2 accepts exactly one positive
 `max-age` plus optional valid `stale-while-revalidate` and `stale-if-error`
 delta-seconds. Restrictive, duplicated, malformed, or unknown directives fail
-closed. Stale windows never extend C2 freshness, and when both standard and
-surrogate freshness are present C2 uses the shorter lifetime. Origin `Age` and
-apparent age from `Date` are deducted, time spent transforming the page continues
-consuming freshness, and the remaining C2 lifetime is capped at 60 seconds.
+closed. Stale windows never extend C2 freshness. Freshness follows Fastly edge
+precedence: `Surrogate-Control: max-age`, then `Cache-Control: s-maxage`,
+`Cache-Control: max-age`, then `Expires`. Restrictive directives in either policy
+still refuse sharing. Origin `Age` and apparent age from `Date` are deducted, time
+spent transforming the page continues consuming freshness, and the remaining
+lifetime is capped by `template_cache_max_age_seconds`.
 
-A browser reload commonly sends `Cache-Control: max-age=0`; that intentionally
-bypasses C2 and reaches the origin. Verify a warm hit with an ordinary navigation
-or a request without reload cache directives, and check `X-TS-C2-Cache: hit`.
+A browser reload commonly sends `Cache-Control: max-age=0`. TS may reuse a fresh
+reader-neutral C2 template for that reload, but it still builds a new private
+response and runs a new per-reader auction. Explicit `no-cache`, `no-store`,
+positive or malformed `max-age`, range, and conditional requests still bypass C2.
+Check `X-TS-C2-Cache: hit` to verify template reuse.
 
 `template_cache_vary` is necessary because lookup occurs before the origin can
 return `Vary`. Presence, empty values, repeated raw field values, host/scheme,
@@ -1445,9 +1454,9 @@ Rollback must preserve configuration compatibility:
 
 1. Change `assembly_mode` to `inline` and deploy/push that configuration.
 2. Before rolling back to a binary that predates these fields, remove
-   `assembly_mode`, `template_cache_vary`, and
-   `origin_is_cookie_independent`, then push the cleaned configuration. Older
-   binaries use `deny_unknown_fields` and intentionally reject unknown keys.
+   `assembly_mode`, `template_cache_vary`, `template_cache_max_age_seconds`, and
+   `origin_is_cookie_independent`, then push the cleaned configuration. Older binaries
+   use `deny_unknown_fields` and intentionally reject unknown keys.
 3. Purge the Fastly surrogate key `ts-template` using the service's normal purge
    tooling, or wait for the bounded origin-derived lifetime to expire.
 

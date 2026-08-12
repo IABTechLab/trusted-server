@@ -4211,6 +4211,7 @@ pub async fn handle_publisher_request(
 
     crate::integrations::gpt_diagnostics::finalize_response(&gpt_diagnostics, &mut response);
 
+    let c2_cache_policy = C2CachePolicy::from_settings(settings);
     let gate_content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -4225,11 +4226,7 @@ pub async fn handle_publisher_request(
             response.status(),
             &gate_content_type,
             response.headers(),
-            &settings
-                .creative_opportunities
-                .as_ref()
-                .map(CreativeOpportunitiesConfig::template_cache_vary)
-                .unwrap_or_else(|| VarySpec::new([])),
+            &c2_cache_policy,
         ) {
             Err(reason) => {
                 log::debug!("c2_template_cache bypass: {reason}");
@@ -5227,6 +5224,36 @@ impl core::fmt::Display for VaryGap {
     }
 }
 
+/// Operator policy applied after the origin authorizes shared freshness.
+#[derive(Debug, Clone)]
+struct C2CachePolicy {
+    key_vary: VarySpec,
+    max_age: Duration,
+}
+
+impl C2CachePolicy {
+    fn from_settings(settings: &Settings) -> Self {
+        settings.creative_opportunities.as_ref().map_or_else(
+            || Self {
+                key_vary: VarySpec::new([]),
+                max_age: Duration::from_secs(60),
+            },
+            |config| Self {
+                key_vary: config.template_cache_vary(),
+                max_age: config.template_cache_max_age(),
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn for_test(key_vary: &VarySpec, max_age: Duration) -> Self {
+        Self {
+            key_vary: key_vary.clone(),
+            max_age,
+        }
+    }
+}
+
 /// Whether a response may be written to the shared transformed-template cache.
 ///
 /// Returns [`None`] when it is safe to cache, or the first disqualifying reason.
@@ -5246,6 +5273,7 @@ pub(crate) fn c2_bypass_reason(
     response_headers: &edgezero_core::http::HeaderMap,
     key_vary: &VarySpec,
 ) -> Option<C2BypassReason> {
+    let policy = C2CachePolicy::for_test(key_vary, Duration::from_secs(60));
     c2_cache_ttl(
         mode,
         request_had_authorization,
@@ -5253,14 +5281,10 @@ pub(crate) fn c2_bypass_reason(
         status,
         content_type,
         response_headers,
-        key_vary,
+        &policy,
     )
     .err()
 }
-
-/// Safety ceiling for a shared transformed template. The origin may authorize less,
-/// never more; its `Age` is deducted before this cap is applied.
-const MAX_TEMPLATE_CACHE_TTL: Duration = Duration::from_secs(60);
 
 fn single_header_value(
     headers: &edgezero_core::http::HeaderMap,
@@ -5386,13 +5410,17 @@ fn surrogate_control_freshness(
     Ok(Some(Duration::from_secs(max_age)))
 }
 
-fn origin_shared_ttl(headers: &edgezero_core::http::HeaderMap) -> Result<Duration, C2BypassReason> {
-    origin_shared_ttl_at(headers, SystemTime::now())
+fn origin_shared_ttl(
+    headers: &edgezero_core::http::HeaderMap,
+    max_age: Duration,
+) -> Result<Duration, C2BypassReason> {
+    origin_shared_ttl_at(headers, SystemTime::now(), max_age)
 }
 
 fn origin_shared_ttl_at(
     headers: &edgezero_core::http::HeaderMap,
     now: SystemTime,
+    template_cache_max_age: Duration,
 ) -> Result<Duration, C2BypassReason> {
     let mut max_age = None;
     let mut shared_max_age = None;
@@ -5432,21 +5460,23 @@ fn origin_shared_ttl_at(
         .map(httpdate::parse_http_date)
         .transpose()
         .map_err(|_| C2BypassReason::MalformedCachePolicy)?;
-    let freshness = match shared_max_age.or(max_age) {
-        Some(seconds) => Duration::from_secs(seconds),
-        None => {
-            let expires = single_header_value(headers, header::EXPIRES)?
-                .ok_or(C2BypassReason::NoPositiveFreshness)
-                .and_then(|value| {
-                    httpdate::parse_http_date(value)
-                        .map_err(|_| C2BypassReason::MalformedCachePolicy)
-                })?;
-            let date = date.unwrap_or(now);
-            expires
-                .duration_since(date)
-                .map_err(|_| C2BypassReason::NoPositiveFreshness)?
-        }
+    let standard_freshness = match shared_max_age.or(max_age) {
+        Some(seconds) => Some(Duration::from_secs(seconds)),
+        None => single_header_value(headers, header::EXPIRES)?
+            .map(|value| {
+                let expires = httpdate::parse_http_date(value)
+                    .map_err(|_| C2BypassReason::MalformedCachePolicy)?;
+                expires
+                    .duration_since(date.unwrap_or(now))
+                    .map_err(|_| C2BypassReason::NoPositiveFreshness)
+            })
+            .transpose()?,
     };
+    // Fastly gives Surrogate-Control precedence for its edge cache. Standard
+    // restrictive directives were still parsed above and remain hard refusals.
+    let freshness = surrogate_control_freshness(headers)?
+        .or(standard_freshness)
+        .ok_or(C2BypassReason::NoPositiveFreshness)?;
 
     let age = single_header_value(headers, header::AGE)?
         .map(parse_delta_seconds)
@@ -5459,21 +5489,15 @@ fn origin_shared_ttl_at(
         .and_then(|date| now.duration_since(date).ok())
         .unwrap_or_default();
     let current_age = Duration::from_secs(age).max(apparent_age);
-    let standard_remaining = freshness
+    let remaining = freshness
         .checked_sub(current_age)
         .filter(|duration| !duration.is_zero())
         .ok_or(C2BypassReason::NoPositiveFreshness)?;
-    let remaining = match surrogate_control_freshness(headers)? {
-        Some(freshness) => {
-            let surrogate_remaining = freshness
-                .checked_sub(current_age)
-                .filter(|duration| !duration.is_zero())
-                .ok_or(C2BypassReason::NoPositiveFreshness)?;
-            standard_remaining.min(surrogate_remaining)
-        }
-        None => standard_remaining,
-    };
-    Ok(remaining.min(MAX_TEMPLATE_CACHE_TTL))
+    let capped = remaining.min(template_cache_max_age);
+    if capped.is_zero() {
+        return Err(C2BypassReason::NoPositiveFreshness);
+    }
+    Ok(capped)
 }
 
 fn replayable_policy_headers(
@@ -5497,14 +5521,14 @@ fn replayable_policy_headers(
     Ok(captured)
 }
 
-pub(crate) fn c2_cache_ttl(
+fn c2_cache_ttl(
     mode: AssemblyMode,
     request_had_authorization: bool,
     cookie_disqualifies: bool,
     status: StatusCode,
     content_type: &str,
     response_headers: &edgezero_core::http::HeaderMap,
-    key_vary: &VarySpec,
+    policy: &C2CachePolicy,
 ) -> Result<Duration, C2BypassReason> {
     if matches!(mode, AssemblyMode::Inline) {
         return Err(C2BypassReason::InlineMode);
@@ -5552,7 +5576,7 @@ pub(crate) fn c2_cache_ttl(
         }
         vary_values.push(value);
     }
-    let uncovered = key_vary.uncovered_by(vary_values);
+    let uncovered = policy.key_vary.uncovered_by(vary_values);
     if !uncovered.is_empty() {
         return Err(C2BypassReason::VaryNotCovered(VaryGap(uncovered)));
     }
@@ -5579,7 +5603,7 @@ pub(crate) fn c2_cache_ttl(
         return Err(C2BypassReason::UnsupportedContentEncoding);
     }
     replayable_policy_headers(response_headers)?;
-    origin_shared_ttl(response_headers)
+    origin_shared_ttl(response_headers, policy.max_age)
 }
 
 /// What the `<head>` seam injects, given the assembly mode.
@@ -7321,6 +7345,8 @@ mod tests {
             /// Every key `put` was called with, so a test can re-key an entry exactly
             /// instead of reconstructing what the request derived.
             stored_keys: Arc<Mutex<Vec<crate::platform::TemplateCacheKey>>>,
+            /// Per-entry freshness handed from publisher policy to the platform cache.
+            stored_max_ages: Arc<Mutex<Vec<Duration>>>,
             /// Force the lookup transaction to fail, for the fail-open + telemetry
             /// contract. A backend outage must never become a publisher outage.
             fail_lookup: AtomicBool,
@@ -7329,6 +7355,7 @@ mod tests {
         struct MemoryTemplateReservation {
             entries: Arc<Mutex<HashMap<String, crate::platform::TemplateEntry>>>,
             stored_keys: Arc<Mutex<Vec<crate::platform::TemplateCacheKey>>>,
+            stored_max_ages: Arc<Mutex<Vec<Duration>>>,
             key: crate::platform::TemplateCacheKey,
         }
 
@@ -7337,12 +7364,16 @@ mod tests {
                 self: Box<Self>,
                 metadata: &crate::platform::TemplateMetadata,
                 body: Vec<u8>,
-                _max_age: Duration,
+                max_age: Duration,
             ) -> Result<(), crate::platform::TemplateCacheError> {
                 self.stored_keys
                     .lock()
                     .expect("should lock stored keys")
                     .push(self.key.clone());
+                self.stored_max_ages
+                    .lock()
+                    .expect("should lock stored max ages")
+                    .push(max_age);
                 self.entries.lock().expect("should lock entries").insert(
                     self.key.to_cache_key(),
                     crate::platform::TemplateEntry {
@@ -7388,6 +7419,7 @@ mod tests {
                         MemoryTemplateReservation {
                             entries: Arc::clone(&self.entries),
                             stored_keys: Arc::clone(&self.stored_keys),
+                            stored_max_ages: Arc::clone(&self.stored_max_ages),
                             key: key.clone(),
                         },
                     )),
@@ -7416,12 +7448,16 @@ mod tests {
                 key: &crate::platform::TemplateCacheKey,
                 metadata: &crate::platform::TemplateMetadata,
                 body: Vec<u8>,
-                _max_age: Duration,
+                max_age: Duration,
             ) -> Result<(), crate::platform::TemplateCacheError> {
                 self.stored_keys
                     .lock()
                     .expect("should lock stored keys")
                     .push(key.clone());
+                self.stored_max_ages
+                    .lock()
+                    .expect("should lock stored max ages")
+                    .push(max_age);
                 self.entries.lock().expect("should lock entries").insert(
                     key.to_cache_key(),
                     crate::platform::TemplateEntry {
@@ -7474,6 +7510,16 @@ mod tests {
             // without it.
             settings.proxy.allowed_domains =
                 vec!["*.example".to_string(), "*.example.com".to_string()];
+            settings
+        }
+
+        fn settings_with_mode_and_template_cache_max_age(mode: &str, seconds: u32) -> Settings {
+            let mut settings = settings_with_mode(mode);
+            settings
+                .creative_opportunities
+                .as_mut()
+                .expect("should configure creative opportunities")
+                .template_cache_max_age_seconds = Some(seconds);
             settings
         }
 
@@ -7866,13 +7912,12 @@ mod tests {
         async fn fastly_surrogate_control_still_allows_a_cold_fill_and_warm_hit() {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
-            let settings = Arc::new(settings_with_mode("esi"));
+            let settings = Arc::new(settings_with_mode_and_template_cache_max_age("esi", 1_200));
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
 
-            // This is the policy observed on the publisher that exposed the bug. The
-            // standard lifetime remains C2's upper bound; Fastly's longer surrogate
-            // lifetime and stale windows must not turn an otherwise shareable page into
-            // a response-side bypass.
+            // This is the policy observed on the publisher that exposed the bug. Fastly
+            // gives the surrogate lifetime edge precedence; the configured safety
+            // ceiling allows the origin's twenty-minute edge freshness.
             stub.push_response_with_headers(
                 200,
                 b"<html><head></head><body>origin</body></html>".to_vec(),
@@ -7895,6 +7940,15 @@ mod tests {
                 Some("miss-stored")
             );
             let _ = body_of(cold).await;
+            let stored_max_age = cache
+                .stored_max_ages
+                .lock()
+                .expect("should lock stored max ages")[0];
+            assert!(
+                stored_max_age <= Duration::from_secs(1_200)
+                    && stored_max_age > Duration::from_secs(1_195),
+                "the real store path should receive the configured twenty-minute ceiling, got {stored_max_age:?}"
+            );
 
             let warm = run(&settings, &services, navigation_request()).await;
             assert_eq!(
@@ -9950,7 +10004,7 @@ mod tests {
         }
 
         #[test]
-        fn observed_fastly_surrogate_policy_uses_the_shorter_standard_freshness() {
+        fn observed_fastly_surrogate_policy_uses_edge_freshness_capped_by_configuration() {
             let publisher_headers = headers(&[
                 (header::CACHE_CONTROL, "public, max-age=60"),
                 (
@@ -9967,19 +10021,19 @@ mod tests {
                     StatusCode::OK,
                     "text/html",
                     &publisher_headers,
-                    &nothing_covered(),
+                    &C2CachePolicy::for_test(&nothing_covered(), Duration::from_secs(300),),
                 ),
-                Ok(Duration::from_secs(60)),
-                "the observed Fastly policy should authorize C2 without extending the \
-                 standard freshness lifetime"
+                Ok(Duration::from_secs(300)),
+                "Fastly's edge freshness should take precedence over the shorter browser \
+                 lifetime, while the configured safety ceiling remains authoritative"
             );
         }
 
         #[test]
-        fn surrogate_freshness_can_shorten_but_never_extend_standard_freshness() {
+        fn fastly_surrogate_freshness_takes_precedence_over_standard_freshness() {
             for (cache_control, surrogate_control, expected) in [
                 ("public, max-age=300", "max-age=30", 30),
-                ("public, max-age=30", "max-age=300", 30),
+                ("public, max-age=30", "max-age=300", 300),
             ] {
                 let publisher_headers = headers(&[
                     (header::CACHE_CONTROL, cache_control),
@@ -9997,7 +10051,7 @@ mod tests {
                         StatusCode::OK,
                         "text/html",
                         &publisher_headers,
-                        &nothing_covered(),
+                        &C2CachePolicy::for_test(&nothing_covered(), Duration::from_secs(600),),
                     ),
                     Ok(Duration::from_secs(expected))
                 );
@@ -10023,7 +10077,7 @@ mod tests {
                     StatusCode::OK,
                     "text/html",
                     &publisher_headers,
-                    &nothing_covered(),
+                    &C2CachePolicy::for_test(&nothing_covered(), Duration::from_secs(600),),
                 ),
                 Ok(Duration::from_secs(10)),
                 "stale windows are validated metadata, not fresh C2 lifetime"
@@ -10092,6 +10146,58 @@ mod tests {
         }
 
         #[test]
+        fn restrictive_standard_policy_is_never_overridden_by_surrogate_freshness() {
+            for directive in ["private", "no-store", "no-cache"] {
+                let publisher_headers = headers(&[
+                    (
+                        header::CACHE_CONTROL,
+                        &format!("public, max-age=60, {directive}"),
+                    ),
+                    (
+                        header::HeaderName::from_static("surrogate-control"),
+                        "max-age=1200",
+                    ),
+                ]);
+
+                assert_eq!(
+                    c2_bypass_reason(
+                        AssemblyMode::Esi,
+                        false,
+                        false,
+                        StatusCode::OK,
+                        "text/html",
+                        &publisher_headers,
+                        &nothing_covered(),
+                    ),
+                    Some(C2BypassReason::OriginNotShareable),
+                    "standard `{directive}` must refuse C2 even with positive edge freshness"
+                );
+            }
+        }
+
+        #[test]
+        fn surrogate_control_can_authorize_fastly_edge_freshness_without_browser_freshness() {
+            let publisher_headers = headers(&[(
+                header::HeaderName::from_static("surrogate-control"),
+                "max-age=1200",
+            )]);
+
+            assert_eq!(
+                c2_cache_ttl(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &publisher_headers,
+                    &C2CachePolicy::for_test(&nothing_covered(), Duration::from_secs(300),),
+                ),
+                Ok(Duration::from_secs(300)),
+                "Fastly edge freshness should not require browser freshness"
+            );
+        }
+
+        #[test]
         fn repeated_cache_control_lines_without_a_disqualifier_still_cache() {
             // The other direction: reading every value must not turn an ordinary
             // multi-line `Cache-Control` into a bypass, or the fix would disable the
@@ -10128,9 +10234,9 @@ mod tests {
                     StatusCode::OK,
                     "text/html",
                     &fresh_headers,
-                    &nothing_covered(),
+                    &C2CachePolicy::for_test(&nothing_covered(), Duration::from_secs(60),),
                 ),
-                Ok(MAX_TEMPLATE_CACHE_TTL)
+                Ok(Duration::from_secs(60))
             );
 
             let aged = headers(&[
@@ -10145,7 +10251,7 @@ mod tests {
                     StatusCode::OK,
                     "text/html",
                     &aged,
-                    &nothing_covered(),
+                    &C2CachePolicy::for_test(&nothing_covered(), Duration::from_secs(60),),
                 ),
                 Ok(Duration::from_secs(15))
             );
@@ -10157,7 +10263,11 @@ mod tests {
             let one_minute_later = httpdate::parse_http_date("Wed, 12 Aug 2026 08:01:00 GMT")
                 .expect("should parse fixture time");
             assert_eq!(
-                origin_shared_ttl_at(&old_date_without_age, one_minute_later),
+                origin_shared_ttl_at(
+                    &old_date_without_age,
+                    one_minute_later,
+                    Duration::from_secs(60),
+                ),
                 Err(C2BypassReason::NoPositiveFreshness),
                 "an old Date is apparent age even when an upstream omitted Age"
             );
@@ -10215,7 +10325,7 @@ mod tests {
                 (header::EXPIRES, "Wed, 12 Aug 2026 08:00:30 GMT"),
             ]);
             assert_eq!(
-                origin_shared_ttl_at(&fresh, now),
+                origin_shared_ttl_at(&fresh, now, Duration::from_secs(60)),
                 Ok(Duration::from_secs(30))
             );
 
@@ -10224,7 +10334,7 @@ mod tests {
                 (header::EXPIRES, "Wed, 12 Aug 2026 08:00:30 GMT"),
             ]);
             assert_eq!(
-                origin_shared_ttl_at(&expired, now),
+                origin_shared_ttl_at(&expired, now, Duration::from_secs(60)),
                 Err(C2BypassReason::NoPositiveFreshness)
             );
         }
@@ -10622,6 +10732,7 @@ mod tests {
                 section_root: None,
                 assembly_mode: None,
                 template_cache_vary: None,
+                template_cache_max_age_seconds: None,
                 origin_is_cookie_independent: None,
                 section_segment: None,
                 slot: vec![slot()],
@@ -14406,6 +14517,7 @@ mod tests {
                 section_root: None,
                 assembly_mode: None,
                 template_cache_vary: None,
+                template_cache_max_age_seconds: None,
                 origin_is_cookie_independent: None,
                 section_segment: None,
                 slot: Vec::new(),

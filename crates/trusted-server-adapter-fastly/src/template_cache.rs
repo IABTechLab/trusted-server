@@ -25,32 +25,23 @@ use trusted_server_core::platform::{
     TemplateMetadata,
 };
 
-/// How long a cached template lives.
-///
-/// Deliberately short for the spike. A short TTL bounds every failure mode in this
-/// module — a poisoned template, a stale schema, a truncated write — and the only
-/// cost is hit rate, which is a measurement input rather than a correctness one.
-pub const TEMPLATE_CACHE_TTL: Duration = Duration::from_secs(60);
-
 /// Surrogate key attached to every stored template, so a single purge clears them
 /// all. This is the rollback lever: without it, backing out a bad template means
 /// waiting for the TTL.
 const PURGE_ALL_SURROGATE_KEY: &str = "ts-template";
 
 /// Fastly Core Cache implementation of the C2 template cache.
-pub struct FastlyTemplateCache {
-    ttl: Duration,
-}
+#[derive(Default)]
+pub struct FastlyTemplateCache;
 
 impl FastlyTemplateCache {
-    /// Create a cache whose entries live for `ttl`.
+    /// Create the Fastly Core Cache implementation.
     ///
-    /// Keep this short for the spike. A short TTL bounds every failure mode in this
-    /// module — a poisoned template, a stale schema, a bad transform — and costs
-    /// only hit rate.
+    /// Entry lifetime is supplied per insert after core validates origin freshness
+    /// and applies the operator's configured safety ceiling.
     #[must_use]
-    pub fn new(ttl: Duration) -> Self {
-        Self { ttl }
+    pub const fn new() -> Self {
+        Self
     }
 }
 
@@ -100,7 +91,6 @@ fn read_found(found: &Found, key: &TemplateCacheKey) -> Result<TemplateEntry, Re
 struct FastlyTemplateReservation {
     transaction: Transaction,
     surrogate_keys: Vec<String>,
-    ttl_cap: Duration,
 }
 
 impl PlatformTemplateCacheReservation for FastlyTemplateReservation {
@@ -120,7 +110,7 @@ impl PlatformTemplateCacheReservation for FastlyTemplateReservation {
 
         let mut writer = self
             .transaction
-            .insert(max_age.min(self.ttl_cap))
+            .insert(max_age)
             .surrogate_keys(self.surrogate_keys.iter().map(String::as_str))
             .known_length(body.len() as u64)
             .user_metadata(metadata.encode().into())
@@ -157,7 +147,6 @@ impl PlatformTemplateCache for FastlyTemplateCache {
                 TemplateCacheReservation::new(Box::new(FastlyTemplateReservation {
                     transaction,
                     surrogate_keys: key.surrogate_keys(),
-                    ttl_cap: self.ttl,
                 })),
             ));
         }
@@ -235,7 +224,7 @@ impl PlatformTemplateCache for FastlyTemplateCache {
         // still carries the length it was supposed to have.
         let surrogate_keys = key.surrogate_keys();
         let mut writer = tx
-            .insert(max_age.min(self.ttl))
+            .insert(max_age)
             .surrogate_keys(surrogate_keys.iter().map(String::as_str))
             .user_metadata(metadata.encode().into())
             .execute()
@@ -307,7 +296,7 @@ mod tests {
     }
 
     fn cache() -> FastlyTemplateCache {
-        FastlyTemplateCache::new(Duration::from_secs(60))
+        FastlyTemplateCache::new()
     }
 
     #[test]
@@ -317,7 +306,8 @@ mod tests {
         let body = b"<html><body>template</body></html>".to_vec();
         let metadata = metadata_for(&body);
 
-        run(cache.put(&key, &metadata, body.clone(), TEMPLATE_CACHE_TTL)).expect("should store");
+        run(cache.put(&key, &metadata, body.clone(), Duration::from_secs(60)))
+            .expect("should store");
 
         let entry = run(cache.get(&key)).expect("should read back");
         assert_eq!(entry.body, body, "bytes must survive the round trip");
@@ -362,7 +352,8 @@ mod tests {
         inline.assembly_mode = AssemblyMode::Inline;
 
         let body = b"esi-template".to_vec();
-        run(cache.put(&esi, &metadata_for(&body), body, TEMPLATE_CACHE_TTL)).expect("should store");
+        run(cache.put(&esi, &metadata_for(&body), body, Duration::from_secs(60)))
+            .expect("should store");
 
         assert_eq!(
             run(cache.get(&inline)).err(),
@@ -376,7 +367,7 @@ mod tests {
         let cache = cache();
         let key_v1 = key("https://example.com/schema");
         let body = b"old-shape".to_vec();
-        run(cache.put(&key_v1, &metadata_for(&body), body, TEMPLATE_CACHE_TTL))
+        run(cache.put(&key_v1, &metadata_for(&body), body, Duration::from_secs(60)))
             .expect("should store");
 
         // A deploy that changes the transform bumps the constant. The old entry must
@@ -426,7 +417,8 @@ mod tests {
         let cache = cache();
         let key = key("https://example.com/purge");
         let body = b"template".to_vec();
-        run(cache.put(&key, &metadata_for(&body), body, TEMPLATE_CACHE_TTL)).expect("should store");
+        run(cache.put(&key, &metadata_for(&body), body, Duration::from_secs(60)))
+            .expect("should store");
         run(cache.get(&key)).expect("should be present before purge");
 
         run(cache.purge_all()).expect("should purge");
@@ -448,13 +440,18 @@ mod tests {
             &key,
             &metadata_for(&first),
             first.clone(),
-            TEMPLATE_CACHE_TTL,
+            Duration::from_secs(60),
         ))
         .expect("first put stores");
 
         let second = b"second".to_vec();
-        run(cache.put(&key, &metadata_for(&second), second, TEMPLATE_CACHE_TTL))
-            .expect("second put should be a no-op, not an error");
+        run(cache.put(
+            &key,
+            &metadata_for(&second),
+            second,
+            Duration::from_secs(60),
+        ))
+        .expect("second put should be a no-op, not an error");
 
         assert_eq!(
             run(cache.get(&key)).expect("should read").body,
@@ -473,8 +470,13 @@ mod tests {
         let key = key("https://example.com/via-trait-object");
         let body = b"<html><body>template</body></html>".to_vec();
 
-        run(cache.put(&key, &metadata_for(&body), body.clone(), TEMPLATE_CACHE_TTL))
-            .expect("should store");
+        run(cache.put(
+            &key,
+            &metadata_for(&body),
+            body.clone(),
+            Duration::from_secs(60),
+        ))
+        .expect("should store");
 
         assert_eq!(
             run(cache.get(&key)).expect("should read back").body,
@@ -493,7 +495,7 @@ mod tests {
         let mut metadata = metadata_for(b"12345");
         metadata.body_len = 999;
 
-        let err = run(cache.put(&key, &metadata, b"12345".to_vec(), TEMPLATE_CACHE_TTL))
+        let err = run(cache.put(&key, &metadata, b"12345".to_vec(), Duration::from_secs(60)))
             .expect_err("a length mismatch must be refused");
         assert!(
             matches!(err, TemplateCacheError::Backend { .. }),

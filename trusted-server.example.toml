@@ -194,7 +194,7 @@ price_granularity = "dense"
 # Initial-page delivery mode. `inline` is the default and current production
 # behaviour. `esi` is an opt-in Fastly Core Cache experiment: despite the name,
 # it uses an inert comment plus exact byte-seam assembly, not an ESI parser.
-# This and the two cache-safety keys below belong in this
+# This and the three cache-safety keys below belong in this
 # [creative_opportunities] table. See docs/guide/configuration.md before enabling.
 # assembly_mode = "inline"
 
@@ -203,6 +203,11 @@ price_granularity = "dense"
 # are keyed losslessly and the origin response is checked for drift before
 # storage. Never include Cookie: C2 templates must be reader-neutral.
 # template_cache_vary = ["rsc", "next-router-prefetch"]
+
+# Safety ceiling for one reader-neutral C2 template, in seconds. The origin must
+# still authorize shared freshness; TS uses the smaller of that remaining edge
+# freshness and this value. Defaults to 60. Valid range: 1 through 86400.
+# template_cache_max_age_seconds = 1200  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__TEMPLATE_CACHE_MAX_AGE_SECONDS
 
 # Unsafe unless independently verified at the publisher origin. The default
 # excludes every cookie-bearing request from C2. Set true only when origin HTML

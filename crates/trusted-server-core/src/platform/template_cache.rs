@@ -214,9 +214,9 @@ const STRUCTURALLY_COVERED: &[&str] = &["accept-encoding"];
 ///    complexity.
 ///
 /// (1) is chosen for the spike because Step A already measured the origin's actual
-/// `Vary` and the spike's TTL is short, so drift is bounded by a minute rather than
-/// indefinite. **This is a spike-grade choice, not a production one** — see the
-/// drift guard below.
+/// `Vary`, the origin response is checked for drift before storage, and the configured
+/// template-cache ceiling bounds how long a newly introduced mismatch can survive.
+/// **This is a spike-grade choice, not a production one** — see the drift guard below.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VarySpec {
     /// Header names, lowercased, in a fixed order.

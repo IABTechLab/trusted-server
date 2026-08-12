@@ -246,3 +246,49 @@ TypeScript/Vitest, Viceroy, shell harness.
 - [x] Run focused tests, `cargo test-fastly`, target-matched formatting/clippy, both local harness
       modes, and verify the observed publisher policy progresses from `miss-stored` to `hit` in
       the local Fastly runtime on an ordinary navigation.
+
+### Task 14: Allow browser reloads to reuse a fresh ESI template
+
+Task 14 supersedes Task 13's conservative request `max-age=0` bypass after end-to-end testing
+proved that C2 reuses only the neutral template and still creates a new private response and
+auction.
+
+**Files:**
+
+- Modify: `crates/trusted-server-core/src/publisher.rs`
+- Modify: `docs/superpowers/specs/2026-08-12-1009-esi-merge-hardening-design.md`
+
+- [x] Write a failing end-to-end test proving `Cache-Control: max-age=0` reruns the auction but
+      does not refetch the reader-neutral publisher template.
+- [x] Treat only a valid zero request max age as compatible with C2; continue bypassing positive
+      or malformed constraints and every explicit revalidation directive.
+- [x] Verify the focused tests, formatting, and Fastly clippy, then commit independently.
+
+### Task 15: Make the ESI template-cache ceiling configurable
+
+Task 15 supersedes Task 13's shorter-of-standard-and-surrogate rule. The final behavior follows
+Fastly edge precedence while retaining restrictive directives as hard refusals.
+
+**Files:**
+
+- Modify: `crates/trusted-server-core/src/creative_opportunities.rs`
+- Modify: `crates/trusted-server-core/src/publisher.rs`
+- Modify: `crates/trusted-server-adapter-fastly/src/template_cache.rs`
+- Modify: `crates/trusted-server-adapter-fastly/src/app.rs`
+- Modify: `trusted-server.example.toml`
+- Modify: `docs/guide/configuration.md`
+- Modify: `docs/superpowers/specs/2026-08-12-1009-esi-merge-hardening-design.md`
+
+- [x] Add failing configuration tests for the 60-second default, an explicit 1,200-second ceiling,
+      zero, values above one day, and omission from serialized rollback-compatible config.
+- [x] Add failing freshness tests proving Fastly precedence, age deduction, and the configured
+      ceiling for the observed `Cache-Control: max-age=60` plus
+      `Surrogate-Control: max-age=1200` response.
+- [x] Implement `template_cache_max_age_seconds` under `[creative_opportunities]` and thread its
+      resolved duration into C2 eligibility.
+- [x] Remove the Fastly adapter's second hard-coded 60-second cap; the already-authorized
+      per-entry max age becomes the sole insertion lifetime.
+- [x] Update the example and operator guide, without editing the tracked deployment
+      `fastly.toml`.
+- [x] Run focused red/green tests, full adapter tests and clippy gates, documentation checks, and
+      inspect the final diff with `fastly.toml` excluded.

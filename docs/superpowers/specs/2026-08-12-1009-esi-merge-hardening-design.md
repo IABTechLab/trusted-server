@@ -76,8 +76,9 @@ and platform length limits.
 C2 never invents freshness. Eligibility requires a positive remaining shared lifetime derived
 from the origin's cache directives. `private`, `no-store`, `no-cache`, zero freshness, malformed
 directives, or already-consumed freshness all bypass storage. The stored max age is capped by the
-short operator safety ceiling and reduced by `Age`, apparent age from `Date`, and time spent
-transforming/auctioning before insertion.
+operator's `creative_opportunities.template_cache_max_age_seconds` safety ceiling and reduced by
+`Age`, apparent age from `Date`, and time spent transforming/auctioning before insertion. The
+ceiling defaults to 60 seconds for rollback compatibility and is constrained to 1–86,400 seconds.
 
 Requests carrying `Cache-Control: no-cache`, `no-store`, a positive or malformed `max-age`, or
 `min-fresh`, `Pragma: no-cache`, range headers, or conditional validators bypass C2 lookup. A
@@ -91,12 +92,13 @@ Fastly `Surrogate-Control` is interpreted through a deliberately narrow grammar:
 positive `max-age` is required, while optional `stale-while-revalidate` and `stale-if-error`
 delta-seconds are validated but never extend C2's fresh lifetime. `private`, `no-store`, and
 `no-cache` refuse sharing; duplicate, missing-value, unknown, or malformed directives fail closed.
-When both standard freshness and `Surrogate-Control` are present, C2 uses the shorter lifetime,
-then deducts `Age`/apparent age and applies its 60-second ceiling. Standard positive freshness is
-still required, so the vendor header cannot authorize a response that the ordinary HTTP policy
-would not. Other vendor CDN cache-policy fields remain unsupported and disqualify the response.
-This covers the publisher's observed Fastly policy without pretending to implement every CDN's
-precedence rules.
+Freshness follows Fastly's documented edge precedence: `Surrogate-Control: max-age`, then
+`Cache-Control: s-maxage`, `Cache-Control: max-age`, then `Expires`. Standard and surrogate
+`private`, `no-store`, and `no-cache` directives remain hard refusals even when a higher-priority
+field supplies positive freshness. C2 deducts `Age`/apparent age from the selected freshness and
+then applies the configured ceiling. Other vendor CDN cache-policy fields remain unsupported and
+disqualify the response. This covers the publisher's observed Fastly policy without pretending to
+implement every CDN's precedence rules.
 
 Request `no-cache` and `no-store` conservatively bypass both C2 lookup and insertion; the origin
 response is delivered through the inline path. On adapters without a shared-template cache, or
