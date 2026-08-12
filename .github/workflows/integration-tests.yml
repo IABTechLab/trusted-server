@@ -36,6 +36,7 @@ jobs:
 
   prepare-artifacts:
     name: prepare integration artifacts
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -72,6 +73,7 @@ jobs:
 
   integration-tests:
     name: integration tests
+    if: github.event_name == 'pull_request'
     needs: prepare-artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -131,6 +133,7 @@ jobs:
 
   integration-tests-fastly-ec:
     name: integration tests (Fastly EC lifecycle)
+    if: github.event_name == 'pull_request'
     needs: prepare-artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -169,6 +172,7 @@ jobs:
 
   aps-runner-proxy:
     name: APS runner proxy (${{ matrix.runtime }})
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -207,7 +211,7 @@ jobs:
         if: matrix.runtime == 'spin'
         uses: fermyon/actions/spin/setup@v1
         with:
-          version: "4.0.2"
+          version: "v4.0.2"
 
       - name: Run actual-adapter APS runner-proxy corpus
         run: ./scripts/integration-tests-aps-runner-proxy.sh --runtime ${{ matrix.runtime }}
@@ -217,6 +221,7 @@ jobs:
 
   browser-tests:
     name: browser integration tests
+    if: github.event_name == 'pull_request'
     needs: prepare-artifacts
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -310,6 +315,7 @@ jobs:
 
   browser-tests-aps-tsjs-conformance:
     name: browser integration tests (APS/TSJS conformance)
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

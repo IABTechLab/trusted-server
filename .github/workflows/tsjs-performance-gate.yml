@@ -59,8 +59,12 @@ jobs:
         id: toolchains
         shell: bash
         run: |
-          echo "node=$(awk '$1 == \"nodejs\" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
-          echo "rust=$(awk '$1 == \"rust\" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+          node_version="$(awk '$1 == "nodejs" { print $2 }' .tool-versions)"
+          rust_version="$(awk '$1 == "rust" { print $2 }' .tool-versions)"
+          test -n "$node_version"
+          test -n "$rust_version"
+          echo "node=$node_version" >> "$GITHUB_OUTPUT"
+          echo "rust=$rust_version" >> "$GITHUB_OUTPUT"
 
       - name: Set up pinned Node.js
         uses: actions/setup-node@v4
@@ -76,6 +80,13 @@ jobs:
         with:
           toolchain: ${{ steps.toolchains.outputs.rust }}
           cache-shared-key: cargo-${{ runner.os }}-tsjs-performance
+
+      - name: Verify installed toolchain pins
+        shell: bash
+        run: |
+          test "$(node --version)" = "v24.12.0"
+          test "$(npm --version)" = "11.6.2"
+          test "$(rustc --version | awk '{ print $2 }')" = "1.95.0"
 
       - name: Build the real TSJS artifacts once
         working-directory: crates/trusted-server-js/lib
