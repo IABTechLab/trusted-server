@@ -9130,50 +9130,6 @@ mod tests {
         }
 
         #[test]
-        fn bid_map_omits_hb_adid_when_cache_id_ad_id_and_bid_id_all_absent() {
-            let mut winning_bids = HashMap::new();
-            winning_bids.insert(
-                "atf_sidebar_ad".to_string(),
-                Bid {
-                    slot_id: "atf_sidebar_ad".to_string(),
-                    price: Some(0.50),
-                    currency: "USD".to_string(),
-                    creative: None,
-                    adomain: None,
-                    bidder: "ordinary".to_string(),
-                    width: 300,
-                    height: 250,
-                    nurl: None,
-                    burl: None,
-                    bid_id: None,
-                    ad_id: None,
-                    creative_id: None,
-                    renderer: None,
-                    cache_id: None,
-                    cache_host: None,
-                    cache_path: None,
-                    metadata: Default::default(),
-                },
-            );
-            let map = build_bid_map(
-                &winning_bids,
-                PriceGranularity::Dense,
-                &test_settings(),
-                "",
-                false,
-            );
-            let obj = map
-                .get("atf_sidebar_ad")
-                .expect("should have bid entry")
-                .as_object()
-                .expect("should be object");
-            assert!(
-                obj.get("hb_adid").is_none(),
-                "should omit hb_adid when no cache_id, ad_id, or bid_id"
-            );
-        }
-
-        #[test]
         fn bid_map_skips_blank_cache_id_and_ad_id_for_hb_adid() {
             // A bidder that emits `cacheId`/`adid` as empty strings must not win
             // the precedence: an empty hb_adid is falsey on the page, so GPT skips

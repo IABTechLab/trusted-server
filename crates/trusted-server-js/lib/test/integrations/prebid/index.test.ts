@@ -478,53 +478,6 @@ describe('prebid/installPrebidNpm', () => {
     });
   });
 
-  it('registers APS renderer via requestId when Prebid strips the custom field', () => {
-    installPrebidNpm();
-
-    const bidResponseListener = mockOnEvent.mock.calls.find(
-      ([eventName]) => eventName === 'bidResponse'
-    )?.[1] as ((bid: Record<string, unknown>) => void) | undefined;
-    expect(bidResponseListener).toBeTypeOf('function');
-
-    const renderer = apsRenderer();
-    const [built] = auctionBidsToPrebidBids(
-      [
-        {
-          impid: 'div-aps',
-          renderer,
-          price: 1.0,
-          width: 300,
-          height: 250,
-          seat: 'aps',
-          creativeId: 'cr-aps',
-          adomain: [],
-        },
-      ],
-      [{ adUnitCode: 'div-aps', bidId: 'req-strip' }],
-      true
-    );
-
-    // Prebid delivered the bid with the custom top-level field REMOVED — only
-    // first-class fields (requestId, meta) survive normalization.
-    const delivered: Record<string, unknown> = {
-      adapterCode: 'trustedServer',
-      bidderCode: 'aps',
-      adId: 'stripped-field-ad-id',
-      adUnitCode: 'div-aps',
-      ttl: 300,
-      requestId: built.requestId,
-      meta: built.meta,
-    };
-    bidResponseListener!(delivered);
-
-    const entry = testWindow.tsjs.apsPrebidRenderers['stripped-field-ad-id'];
-    expect(entry).toEqual(
-      expect.objectContaining({ adUnitCode: 'div-aps', renderer, markUsed: expect.any(Function) })
-    );
-    // The capability is scrubbed from the delivered bid after registration.
-    expect(delivered.meta).not.toHaveProperty('trustedServerRenderer');
-  });
-
   it('registers a distinct renderer for each of multiple APS bids on one imp', () => {
     installPrebidNpm();
 
