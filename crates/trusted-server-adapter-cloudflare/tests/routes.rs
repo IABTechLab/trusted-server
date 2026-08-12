@@ -290,6 +290,35 @@ async fn tsjs_route_is_routed_not_5xx() {
     assert!(status < 500, "tsjs route must not 5xx: got {status}");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tsjs_wrong_methods_are_local_no_store_404s() {
+    for method in ["HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"] {
+        let req = request_builder()
+            .method(method)
+            .uri(format!(
+                "/static/tsjs=tsjs-unified.min.js?v={}",
+                "0".repeat(64)
+            ))
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build wrong-method TSJS request");
+        let response = route(test_router(), req).await;
+
+        assert_eq!(response.status().as_u16(), 404, "method {method}");
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+            "method {method}"
+        );
+        assert!(
+            !response.headers().contains_key("location"),
+            "method {method}"
+        );
+    }
+}
+
 /// Verify that every expected explicit route is registered in the route table.
 ///
 /// Uses [`RouterService::routes()`] for introspection rather than checking

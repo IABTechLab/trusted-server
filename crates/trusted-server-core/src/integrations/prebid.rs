@@ -3286,15 +3286,17 @@ excluded_gam_ad_unit_path_suffixes = ["{suffix}"]
             !processed.contains("cdn.prebid.org/prebid.js"),
             "Prebid preload should be removed when auto-config is enabled"
         );
-        // Both scripts are `defer`, so they execute in document order. The
-        // bundle must run first: the shim disables the whole integration when
-        // it finds no Prebid.js API on window.pbjs.
+        // The external Prebid artifact remains distinct and precedes the one
+        // parser-time TSJS critical tag. Prebid's TS-owned adapter is included
+        // in that unified critical artifact, never a standalone shim tag.
         let bundle_index = processed
             .find(PREBID_BUNDLE_ROUTE)
             .expect("should inject external prebid bundle route");
         let shim_index = processed
-            .find("tsjs-prebid.min.js")
-            .expect("should inject deferred tsjs prebid shim");
+            .find("id=\"trustedserver-js\"")
+            .expect("should inject one critical TSJS tag");
+        assert!(processed.contains(r#""id":"prebid","phase":"critical""#));
+        assert!(!processed.contains("tsjs-prebid.min.js"));
         assert!(
             bundle_index < shim_index,
             "external prebid bundle must execute before the deferred tsjs shim"

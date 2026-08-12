@@ -229,6 +229,38 @@ async fn tsjs_route_prefix_is_handled_not_5xx() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tsjs_wrong_methods_are_local_no_store_404s() {
+    for method in ["HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"] {
+        let req = Request::builder()
+            .method(method)
+            .uri(format!(
+                "/static/tsjs=tsjs-unified.min.js?v={}",
+                "0".repeat(64)
+            ))
+            .body(AxumBody::empty())
+            .expect("should build wrong-method TSJS request");
+        let response = make_service()
+            .oneshot(req)
+            .await
+            .expect("should reject TSJS request locally");
+
+        assert_eq!(response.status().as_u16(), 404, "method {method}");
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+            "method {method}"
+        );
+        assert!(
+            !response.headers().contains_key("location"),
+            "method {method}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn aps_cutover_renderer_and_family_failures_are_local() {
     let renderer = Request::builder()
         .method("GET")

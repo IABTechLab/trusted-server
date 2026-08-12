@@ -297,8 +297,8 @@ fn publisher_fallback_methods() -> [Method; 7] {
     ]
 }
 
-fn uses_dynamic_tsjs_fallback(method: &Method, path: &str) -> bool {
-    *method == Method::GET && path.starts_with("/static/tsjs=")
+fn uses_dynamic_tsjs_fallback(_method: &Method, path: &str) -> bool {
+    path.starts_with("/static/tsjs=")
 }
 
 // ---------------------------------------------------------------------------
@@ -1642,18 +1642,18 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_tsjs_fallback_is_get_only() {
+    fn dynamic_tsjs_fallback_rejects_every_wrong_method_locally() {
         assert!(
             super::uses_dynamic_tsjs_fallback(&Method::GET, "/static/tsjs=tsjs-unified.js"),
             "GET should use the dynamic tsjs shortcut"
         );
         assert!(
-            !super::uses_dynamic_tsjs_fallback(&Method::HEAD, "/static/tsjs=tsjs-unified.js"),
-            "HEAD should fall through to the publisher/integration fallback"
+            super::uses_dynamic_tsjs_fallback(&Method::HEAD, "/static/tsjs=tsjs-unified.js"),
+            "HEAD should use the local TSJS rejection path"
         );
         assert!(
-            !super::uses_dynamic_tsjs_fallback(&Method::OPTIONS, "/static/tsjs=tsjs-unified.js"),
-            "OPTIONS should fall through to the publisher/integration fallback"
+            super::uses_dynamic_tsjs_fallback(&Method::OPTIONS, "/static/tsjs=tsjs-unified.js"),
+            "OPTIONS should use the local TSJS rejection path"
         );
     }
 

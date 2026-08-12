@@ -339,7 +339,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                 if !injected_tsjs.get() {
                     let mut snippet = String::new();
                     // The server has already interpreted and removed the reserved
-                    // directive. Its request-scoped cleanup program only updates the
+                    // directive. This request-scoped inline cleanup only updates the
                     // browser-visible URL and must run before publisher/core code.
                     if let Some(cleanup_tag) = gpt_diagnostics
                         .as_ref()
@@ -353,16 +353,20 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         origin_host: &patterns.origin_host,
                         document_state: &document_state,
                     };
-                    let immediate_ids = integrations.js_module_ids_immediate();
-                    let deferred_ids = integrations.js_module_ids_deferred();
-                    let diagnostics_active = gpt_diagnostics
+                    let diagnostics_requested = gpt_diagnostics
                         .as_ref()
                         .is_some_and(GptDiagnosticsRequestDecision::active);
-                    let mut manifest_ids = immediate_ids.clone();
-                    if diagnostics_active && !manifest_ids.contains(&"gpt_diagnostics") {
-                        manifest_ids.push("gpt_diagnostics");
-                    }
-                    manifest_ids.extend(deferred_ids.iter().copied());
+                    let creative = integrations.tsjs_creative_boot();
+                    let selection = crate::integrations::TsjsCatalogSelectionV1 {
+                        creative_enabled: creative.enabled,
+                        creative_click_guard: creative.click_guard,
+                        creative_render_guard: creative.render_guard,
+                        gpt_diagnostics_active: diagnostics_requested,
+                        render_trace_overlay,
+                    };
+                    let manifest_ids = integrations.tsjs_catalog_module_ids(selection);
+                    let critical_ids = integrations.tsjs_critical_module_ids(selection);
+                    let diagnostics_active = manifest_ids.contains(&"gpt_diagnostics");
                     let state = ad_bids_state
                         .lock()
                         .expect("should lock boot projection state");
@@ -381,30 +385,21 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         snippet.push_str(debug_comment);
                         snippet.push('\n');
                     }
-                    let creative_enabled = manifest_ids.contains(&"creative");
                     let boot = tsjs::tsjs_boot_script_v1(tsjs::TsjsBootScriptConfigV1 {
                         module_ids: &manifest_ids,
                         auction_projection_json: projection_json,
-                        creative: tsjs::CreativeBootConfigV1 {
-                            enabled: creative_enabled,
-                            click_guard: creative_enabled,
-                            render_guard: false,
-                        },
+                        creative,
                         render_trace_overlay,
                         gpt_diagnostics_active: diagnostics_active,
                     })
                     .or_else(|error| {
                         log::error!("invalid TSJS document boot projection: {error:?}");
                         tsjs::tsjs_boot_script_v1(tsjs::TsjsBootScriptConfigV1 {
-                            module_ids: &[],
+                            module_ids: &manifest_ids,
                             auction_projection_json: EMPTY_AUCTION_PROJECTION_JSON,
-                            creative: tsjs::CreativeBootConfigV1 {
-                                enabled: false,
-                                click_guard: false,
-                                render_guard: false,
-                            },
+                            creative,
                             render_trace_overlay,
-                            gpt_diagnostics_active: false,
+                            gpt_diagnostics_active: diagnostics_active,
                         })
                     })
                     .unwrap_or_default();
@@ -414,11 +409,9 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     for insert in integrations.head_inserts(&ctx) {
                         snippet.push_str(&insert);
                     }
-                    // Main bundle: core + non-deferred integrations (synchronous).
-                    snippet.push_str(&tsjs::tsjs_script_tag(&immediate_ids));
-                    // Deferred bundles: large modules like prebid loaded after
-                    // HTML parsing completes. Empty when none are enabled.
-                    snippet.push_str(&tsjs::tsjs_deferred_script_tags(&deferred_ids));
+                    // Exactly one parser-time TSJS tag: core plus selected critical modules.
+                    // Deferred modules are authenticated and loaded by the committed runtime.
+                    snippet.push_str(&tsjs::tsjs_script_tag(&critical_ids));
                     el.prepend(&snippet, ContentType::Html);
                     injected_tsjs.set(true);
                 }
@@ -842,13 +835,17 @@ mod tests {
     }
 
     #[test]
-    fn active_gpt_diagnostics_is_manifest_selected_without_a_standalone_module() {
+    fn active_gpt_diagnostics_uses_unified_transport_and_inline_url_cleanup() {
         let html = "<html><head><title>Test</title></head><body></body></html>";
         let mut settings = create_test_settings();
         settings
             .integrations
             .insert_config("gpt_diagnostics", &json!({ "enabled": true }))
             .expect("should insert GPT diagnostics config");
+        settings
+            .integrations
+            .insert_config("gpt", &json!({}))
+            .expect("should insert the GPT event provider config");
 
         let mut request = http::Request::builder()
             .method(http::Method::GET)
@@ -878,9 +875,10 @@ mod tests {
             .expect("should process HTML");
         let processed = String::from_utf8(output).expect("should produce valid UTF-8");
         let bundle_marker = "id=\"trustedserver-js\"";
-        let diagnostics_manifest_marker = r#""id":"gpt_diagnostics","required":true"#;
+        let diagnostics_manifest_marker = r#""id":"gpt_diagnostics","phase":"critical""#;
         let diagnostics_script_marker = "tsjs-gpt_diagnostics.min.js";
-        let cleanup_marker = "history.replaceState";
+        let cleanup_asset_marker = "tsjs-gpt_diagnostics-bootstrap.min.js";
+        let cleanup_program_marker = "history.replaceState";
 
         assert_eq!(
             processed.matches("__tsjs_gpt_diagnostics_active").count(),
@@ -900,19 +898,21 @@ mod tests {
         assert_eq!(
             processed.matches(diagnostics_script_marker).count(),
             0,
-            "should not emit a standalone diagnostics module before the atomic cutover"
+            "should not emit a standalone diagnostics module"
         );
-        assert_eq!(processed.matches(cleanup_marker).count(), 1);
+        assert_eq!(processed.matches(cleanup_asset_marker).count(), 0);
+        assert_eq!(processed.matches(cleanup_program_marker).count(), 1);
         let cleanup_index = processed
-            .find(cleanup_marker)
-            .expect("should include the request-scoped cleanup asset");
+            .find(cleanup_program_marker)
+            .expect("should include the request-scoped inline cleanup");
         let bundle_index = processed
             .find(bundle_marker)
-            .expect("should include immediate TSJS bundle");
+            .expect("should include the critical TSJS bundle");
         assert!(
             cleanup_index < bundle_index,
             "request-scoped URL cleanup must run before publisher/core work"
         );
+        assert!(processed.contains(r#""gpt":{"active":true}"#));
     }
 
     #[test]
@@ -1827,7 +1827,7 @@ mod tests {
             .expect("should process HTML");
         let output_str = std::str::from_utf8(&output).expect("should be valid UTF-8");
 
-        let script_count = output_str.matches("/static/tsjs=").count();
+        let script_count = output_str.matches("id=\"trustedserver-js\"").count();
         assert_eq!(
             script_count, 1,
             "script tag must appear exactly once, found {script_count} occurrences"

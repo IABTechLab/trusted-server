@@ -35,7 +35,7 @@ pub use registry::{
     IntegrationRegistrationBuilder, IntegrationRegistry, IntegrationRequestFilter,
     IntegrationScriptContext, IntegrationScriptRewriter, ProxyDispatchInput, RequestFilterDecision,
     RequestFilterEffects, RequestFilterInput, RequestFilterRegistryInput,
-    RequestFilterRegistryOutcome, ScriptRewriteAction,
+    RequestFilterRegistryOutcome, ScriptRewriteAction, TsjsCatalogSelectionV1,
 };
 
 /// Emit one integration value into the sole transient pre-core config transport.

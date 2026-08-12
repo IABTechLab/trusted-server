@@ -264,7 +264,7 @@ async fn dispatch_fallback(
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
-    if method == Method::GET && path.starts_with("/static/tsjs=") {
+    if path.starts_with("/static/tsjs=") {
         return handle_tsjs_dynamic(&req, &state.registry);
     }
 

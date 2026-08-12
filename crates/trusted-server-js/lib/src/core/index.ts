@@ -15,7 +15,7 @@ export type { Runtime, RuntimeOptions, RuntimeState } from '../kernel/runtime';
 
 import type { Runtime, RuntimeOptions } from '../kernel/runtime';
 
-import { EMBEDDED_INTEGRATION_IDS, EMBEDDED_RELEASE_ID } from './release';
+import { EMBEDDED_INTEGRATION_IDS, EMBEDDED_RELEASE_ID, EMBEDDED_RUNTIME_CATALOG } from './release';
 
 const KNOWN_INTEGRATIONS = new Set(EMBEDDED_INTEGRATION_IDS);
 const MAX_CONFIG_DEPTH = 16;
@@ -194,6 +194,7 @@ export function startProductionRuntime(createComposition: BrowserRuntimeComposit
       releaseId: EMBEDDED_RELEASE_ID,
       manifest: bootManifest(target),
       knownIntegrationIds: EMBEDDED_INTEGRATION_IDS,
+      catalog: EMBEDDED_RUNTIME_CATALOG,
       getBindings: (id) =>
         Object.freeze({
           config: configs?.[id],
