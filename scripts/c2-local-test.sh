@@ -4,8 +4,8 @@
 #
 # Runs Trusted Server under Viceroy against a stub origin and asserts the cache
 # behaves. Everything it needs is generated into a temp directory; your
-# `trusted-server.toml` is never read and your `fastly.toml` is restored on exit,
-# including on failure or Ctrl-C.
+# `trusted-server.toml` is never read and your tracked `fastly.toml` is never
+# modified, including while the harness is running.
 #
 # Usage:
 #   ./scripts/c2-local-test.sh              # esi mode (shared template + edge assembly)
@@ -49,12 +49,6 @@ cleanup() {
   local status=$?
   [ -n "${VICEROY_PID:-}" ] && kill "$VICEROY_PID" 2>/dev/null || true
   [ -n "${ORIGIN_PID:-}" ] && kill "$ORIGIN_PID" 2>/dev/null || true
-  # Restore fastly.toml unconditionally. `ts config push --local` edits it in
-  # place, and it is a tracked file — leaving it modified would put a stub
-  # config, and on a real deployment the operator's secrets, into `git status`.
-  if [ -f "$WORK/fastly.toml.orig" ]; then
-    cp "$WORK/fastly.toml.orig" "$REPO_ROOT/fastly.toml"
-  fi
   rm -rf "$WORK"
   exit $status
 }
@@ -62,6 +56,10 @@ trap cleanup EXIT INT TERM
 
 command -v viceroy >/dev/null || {
   echo "viceroy not found. Install: cargo install viceroy --version 0.17.0 --locked" >&2
+  exit 1
+}
+command -v node >/dev/null || {
+  echo "node not found. The harness executes the real GPT bundle to verify slot setup." >&2
   exit 1
 }
 
@@ -216,12 +214,18 @@ PYEOF
 
 "$TS" config validate --app-config "$WORK/app.toml" >/dev/null
 
-info "Seeding the config store (your fastly.toml is restored on exit)"
-cp "$REPO_ROOT/fastly.toml" "$WORK/fastly.toml.orig"
-(cd "$REPO_ROOT" && "$TS" config push --adapter fastly --local \
-  --app-config "$WORK/app.toml" --no-diff --yes >/dev/null)
+info "Seeding an isolated config store (tracked fastly.toml remains untouched)"
+# `config push --local` edits the adapter manifest. Give it a complete temporary
+# project instead of editing the tracked manifest and trying to restore it afterward:
+# a SIGKILL, machine crash, or failed restore could otherwise leave real serialized
+# credentials in a tracked file. The crates symlink keeps manifest path validation
+# pointed at this checkout without copying the workspace.
+cp "$REPO_ROOT/edgezero.toml" "$WORK/edgezero.toml"
 cp "$REPO_ROOT/fastly.toml" "$WORK/fastly.toml"
-cp "$WORK/fastly.toml.orig" "$REPO_ROOT/fastly.toml"
+ln -s "$REPO_ROOT/crates" "$WORK/crates"
+(cd "$WORK" && "$TS" config push --adapter fastly --local \
+  --manifest "$WORK/edgezero.toml" --app-config "$WORK/app.toml" \
+  --no-diff --yes >/dev/null)
 
 info "Starting Trusted Server on :$TS_PORT"
 # Deliberately not wrapped in a subshell: `$!` would then be the subshell's pid, so
@@ -244,7 +248,8 @@ fi
 
 req() { # req <output-file> [extra curl args...]
   local out="$1"; shift
-  curl -s -o "$out" -w '%{time_starttransfer} %{time_total} %{http_code}' \
+  curl -sS -D "$out.headers" -o "$out" \
+    -w '%{time_starttransfer} %{time_total} %{http_code}' \
     -H "Host: ts.example.com" \
     -H "Accept-Encoding: gzip" \
     -H "sec-fetch-dest: document" -H "sec-fetch-mode: navigate" \
@@ -257,6 +262,17 @@ info "Running assertions (mode: $MODE)"
 BEFORE=$(origin_gets)
 R1=$(req "$WORK/r1.html")
 R2=$(req "$WORK/r2.html")
+
+if [ -s "$WORK/r1.html" ]; then
+  ok "first response has a body"
+else
+  bad "first response body is empty"
+fi
+if [ -s "$WORK/r2.html" ]; then
+  ok "second response has a body"
+else
+  bad "second response body is empty"
+fi
 
 # Content assertions must never run against compressed bytes. `inline` responses stay
 # gzipped end to end — only the shared path decodes, because its seam split is textual —
@@ -273,6 +289,12 @@ FETCHES=$((AFTER - BEFORE))
 read -r TTFB1 TOTAL1 CODE1 <<< "$R1"
 read -r TTFB2 TOTAL2 CODE2 <<< "$R2"
 
+for value in "$TTFB1" "$TOTAL1" "$CODE1" "$TTFB2" "$TOTAL2" "$CODE2"; do
+  if ! [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    bad "curl returned a non-numeric timing/status field: '$value'"
+  fi
+done
+
 check "first request returns 200" "$CODE1" "200"
 check "second request returns 200" "$CODE2" "200"
 
@@ -282,7 +304,11 @@ check "second request returns 200" "$CODE2" "200"
 WINNING_BID='\"hb_pb\":\"4.25\"'
 # Must stay in step with `SEAM_BIDS_MARKER` in publisher.rs. An inert HTML comment,
 # not an esi:include — nothing parses ESI on the render path any more.
-SEAM_MARKER='<!--ts-seam-bids-->'
+SEAM_MARKER='<!--ts-c2-v3-seam-7f4c9e2d-bids-->'
+
+c2_state() {
+  awk 'tolower($1) == "x-ts-c2-cache:" { gsub(/\r/, "", $2); print $2 }' "$1" | tail -1
+}
 
 # Shared by the ESI assertions below.
 check_hit_is_private() {
@@ -313,6 +339,8 @@ if [ "$MODE" = "inline" ]; then
     "$(grep -cF "$WINNING_BID" "$SERVED" || true)" "1"
 else
   check "second request is served from cache" "$FETCHES" "1"
+  check "cold request reports a stored miss" "$(c2_state "$WORK/r1.html.headers")" "miss-stored"
+  check "warm request reports a cache hit" "$(c2_state "$WORK/r2.html.headers")" "hit"
   check "no unresolved seam marker reaches the browser" \
     "$(grep -cF "$SEAM_MARKER" "$SERVED" || true)" "0"
   check "a bids script is present" \
@@ -335,6 +363,115 @@ else
     "$(grep -cF 'var b=JSON.parse("{}")' "$SERVED" || true)" "0"
   check "the winning bid's bucketed price reaches the reader" \
     "$(grep -cF "$WINNING_BID" "$SERVED" || true)" "1"
+
+  GPT_BUNDLE=""
+  while IFS= read -r -d '' candidate; do
+    if [ -z "$GPT_BUNDLE" ] || [ "$candidate" -nt "$GPT_BUNDLE" ]; then
+      GPT_BUNDLE="$candidate"
+    fi
+  done < <(find "$REPO_ROOT/target/wasm32-wasip1/debug/build" \
+    -path '*/out/tsjs-gpt.js' -type f -print0)
+  if [ -z "$GPT_BUNDLE" ] || [ ! -s "$GPT_BUNDLE" ]; then
+    bad "the generated GPT module cannot be found"
+  else
+    cat > "$WORK/verify-seam.mjs" <<'NODEEOF'
+import fs from "node:fs";
+import vm from "node:vm";
+
+const [documentPath, gptPath] = process.argv.slice(2);
+const html = fs.readFileSync(documentPath, "utf8");
+const gpt = fs.readFileSync(gptPath, "utf8");
+const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/gi)].map((match) => match[1]);
+const seam = scripts.find((script) => script.includes('var b=JSON.parse("'));
+if (!seam) throw new Error("served document has no executable seam payload");
+
+const element = {
+  id: "ts-slot-header",
+  parentElement: null,
+  checkVisibility: () => true,
+  getBoundingClientRect: () => ({ width: 728, height: 90 }),
+  querySelectorAll: () => [],
+};
+const defined = [];
+const gptSlots = [];
+const pubads = {
+  addEventListener() {},
+  disableInitialLoad() {},
+  enableSingleRequest() {},
+  getSlots: () => gptSlots,
+  refresh() {},
+};
+const googletag = {
+  cmd: { push(...callbacks) { callbacks.forEach((callback) => callback()); return callbacks.length; } },
+  defineSlot(unit, formats, divId) {
+    defined.push({ unit, formats, divId });
+    const slot = {
+      addService() { return slot; },
+      clearTargeting() {},
+      getSlotElementId: () => divId,
+      setTargeting() { return slot; },
+    };
+    gptSlots.push(slot);
+    return slot;
+  },
+  destroySlots: () => true,
+  display() {},
+  enableServices() {},
+  pubads: () => pubads,
+};
+const listeners = new Map();
+const windowObject = {
+  addEventListener(type, callback) { listeners.set(type, callback); },
+  getComputedStyle: () => ({ display: "block", visibility: "visible" }),
+  googletag,
+  history: { pushState() {}, replaceState() {} },
+  location: {
+    host: "ts.example.com",
+    href: "https://ts.example.com/article",
+    origin: "https://ts.example.com",
+    pathname: "/article",
+    protocol: "https:",
+  },
+  requestAnimationFrame(callback) { callback(); return 1; },
+  tsjs: { navGeneration: 0 },
+};
+const documentObject = {
+  documentElement: {},
+  getElementById: (id) => id === element.id ? element : null,
+  querySelectorAll: () => [],
+  readyState: "complete",
+  visibilityState: "visible",
+};
+globalThis.window = windowObject;
+globalThis.document = documentObject;
+globalThis.history = windowObject.history;
+globalThis.location = windowObject.location;
+globalThis.requestAnimationFrame = windowObject.requestAnimationFrame;
+
+vm.runInThisContext(gpt, { filename: gptPath });
+vm.runInThisContext(seam, { filename: documentPath });
+
+const slots = windowObject.tsjs.adSlots ?? [];
+const bids = windowObject.tsjs.bids ?? {};
+if (slots.length !== 1 || slots[0].id !== "ts-slot-header") {
+  throw new Error(`scheduler received invalid slots: ${JSON.stringify(slots)}`);
+}
+if (!bids["ts-slot-header"] || bids["ts-slot-header"].hb_pb !== "4.25") {
+  throw new Error(`scheduler received no winning bid: ${JSON.stringify(bids)}`);
+}
+if (defined.length !== 1 || defined[0].divId !== "ts-slot-header") {
+  throw new Error(`GPT defineSlot contract failed: ${JSON.stringify(defined)}`);
+}
+console.log(`slots=${slots.length} bids=${Object.keys(bids).length} defined=${defined.length}`);
+NODEEOF
+    GPT_RESULT=$(node "$WORK/verify-seam.mjs" "$SERVED" "$GPT_BUNDLE" 2>&1) || {
+      bad "the served seam failed the real GPT module contract: $GPT_RESULT"
+      GPT_RESULT=""
+    }
+    [ -z "$GPT_RESULT" ] || check \
+      "the real scheduler defines the populated GPT slot" "$GPT_RESULT" \
+      "slots=1 bids=1 defined=1"
+  fi
 
   check_hit_is_private
   check_post_reaches_origin
@@ -424,6 +561,12 @@ echo
 FIRST_BODY=$(echo "$B_LINE" | sed -n 's/.*first_body_byte=\([0-9]*\)ms.*/\1/p')
 COMPLETE=$(echo "$B_LINE" | sed -n 's/.*complete=\([0-9]*\)ms.*/\1/p')
 
+if ! [[ "$FIRST_BODY" =~ ^[0-9]+$ && "$COMPLETE" =~ ^[0-9]+$ ]]; then
+  bad "socket probe did not return numeric body timings: '$B_LINE'"
+  FIRST_BODY=0
+  COMPLETE=0
+fi
+
 if [ "$MODE" = "inline" ]; then
   check "inline delivers the article before the auction resolves" \
     "$(awk -v f="$FIRST_BODY" -v c="$COMPLETE" 'BEGIN { print (f < c / 3) ? "yes" : "no" }')" \
@@ -432,10 +575,9 @@ else
   # The property the unit tests cannot reach: in-process there is no bid provider, so
   # there is no auction to wait on and reordering the stream is unobservable. Here the
   # bid endpoint really sleeps, so the first body byte either beats it or does not.
-  # Guards a regression: an earlier fix forced Accept-Encoding: identity on the origin
-  # request, which made the origin send ~674KB where it would have sent ~100KB and added
-  # seconds to the fetch. Only the assembled response needs to be text; the fetch must
-  # stay compressed.
+  # Guards a regression where assembly rewrote a reader's accepted gzip origin request
+  # to identity, making the origin send ~674KB where it would have sent ~100KB. The
+  # cache still stores identity; that does not require changing what this reader accepts.
   check "the origin fetch stays compressed" \
     "$(grep -c 'served PLAINTEXT' "$WORK/origin.log" || true)" "0"
   check "cache hit streams: the article is delivered before the auction resolves" \
