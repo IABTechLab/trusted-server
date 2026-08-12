@@ -1,10 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  CREATIVE_ATTEMPT_WINDOW_MS,
   GptDiagnosticsStore,
+  MAX_ATTRIBUTION_ISSUES,
   MAX_CALLBACK_ISSUES,
+  MAX_CREATIVE_ATTEMPTS,
   MAX_DIAGNOSTIC_SLOTS,
   MAX_REQUEST_CYCLES_PER_SLOT,
+  MAX_TRUSTED_SERVER_ASSOCIATIONS,
+  TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS,
   type GptDiagnosticsSlotLike,
 } from '../../../src/integrations/gpt_diagnostics/store';
 
@@ -15,13 +20,31 @@ function fakeSlot(elementId: string, adUnitPath = `/example/${elementId}`): GptD
   };
 }
 
+function associateSlot(
+  store: GptDiagnosticsStore,
+  slot: GptDiagnosticsSlotLike,
+  auctionSlotId: string
+): void {
+  store.recordTrustedServerOpportunity(slot, auctionSlotId, 'renderable_candidate');
+}
+
 function assertCoverageEquation(store: GptDiagnosticsStore): void {
   for (const counters of Object.values(store.snapshot().coverage)) {
     expect(counters.observed).toBe(counters.matched + counters.unmatched + counters.ambiguous);
   }
 }
 
+function last<T>(values: readonly T[]): T | undefined {
+  return values[values.length - 1];
+}
+
 describe('GptDiagnosticsStore', () => {
+  it('uses the explicit creative-attempt and attribution retention bounds', () => {
+    expect(CREATIVE_ATTEMPT_WINDOW_MS).toBe(30_000);
+    expect(MAX_CREATIVE_ATTEMPTS).toBe(128);
+    expect(MAX_ATTRIBUTION_ISSUES).toBe(128);
+  });
+
   it('records a complete filled lifecycle with valid timings and visibility', () => {
     let now = 10;
     const store = new GptDiagnosticsStore({ now: () => now });
@@ -445,5 +468,149 @@ describe('GptDiagnosticsStore', () => {
     const second = store.snapshot();
     expect(second.slots[0]!.requests[0]!.requestNumber).toBe(1);
     expect(second.coverage.slotRequested.matched).toBe(1);
+  });
+  it('ignores malformed publisher refresh inputs without recording intent', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+    const slot = fakeSlot('publisher-refresh-malformed');
+
+    expect(() => store.recordPublisherRefresh(null as never)).not.toThrow();
+    expect(() => store.recordPublisherRefresh('slots' as never)).not.toThrow();
+    expect(() => store.recordPublisherRefresh([null, 7, undefined, slot] as never)).not.toThrow();
+
+    store.recordSlotRequested(slot);
+    expect(store.snapshot().slots[0]!.requests[0]!.requestPath).toBe('publisher_refresh');
+    expect(store.snapshot().slots).toHaveLength(1);
+  });
+
+  it('trims the oldest auction-slot association beyond the retention bound', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+    const oldest = fakeSlot('association-oldest');
+    associateSlot(store, oldest, 'auction-oldest');
+    for (let index = 0; index < MAX_TRUSTED_SERVER_ASSOCIATIONS; index += 1) {
+      associateSlot(store, fakeSlot(`association-${index}`), `auction-${index}`);
+    }
+    store.recordSlotRequested(oldest);
+
+    expect(store.recordTrustedServerCreativeRequest('auction-oldest')).toBeUndefined();
+    expect(last(store.snapshot().attributionIssues)?.reason).toBe('creative_request_without_slot');
+    expect(store.recordTrustedServerCreativeRequest('auction-0')).toBeUndefined();
+    expect(last(store.snapshot().attributionIssues)?.reason).toBe('creative_request_without_cycle');
+  });
+
+  it.each([
+    {
+      name: 'a render that precedes its response',
+      kind: 'slotRenderEnded',
+      record: (store: GptDiagnosticsStore, slot: GptDiagnosticsSlotLike) =>
+        store.recordSlotRenderEnded(slot, { isEmpty: false }),
+      arrange: (store: GptDiagnosticsStore, slot: GptDiagnosticsSlotLike) =>
+        store.recordSlotResponseReceived(slot),
+    },
+    {
+      name: 'a load that precedes its render',
+      kind: 'slotOnload',
+      record: (store: GptDiagnosticsStore, slot: GptDiagnosticsSlotLike) =>
+        store.recordSlotOnload(slot),
+      arrange: (store: GptDiagnosticsStore, slot: GptDiagnosticsSlotLike) => {
+        store.recordSlotResponseReceived(slot);
+        store.recordSlotRenderEnded(slot, { isEmpty: false });
+      },
+    },
+    {
+      name: 'a viewable impression that precedes its render',
+      kind: 'impressionViewable',
+      record: (store: GptDiagnosticsStore, slot: GptDiagnosticsSlotLike) =>
+        store.recordImpressionViewable(slot),
+      arrange: (store: GptDiagnosticsStore, slot: GptDiagnosticsSlotLike) => {
+        store.recordSlotResponseReceived(slot);
+        store.recordSlotRenderEnded(slot, { isEmpty: false });
+      },
+    },
+  ])('reports $name as an invalid event order', ({ kind, record, arrange }) => {
+    let now = 100;
+    const store = new GptDiagnosticsStore({ now: () => now, defer: () => undefined });
+    const slot = fakeSlot(`out-of-order-${kind}`);
+
+    store.recordSlotRequested(slot);
+    arrange(store, slot);
+    // A backwards clock is the only way GPT can report a later callback with an
+    // earlier timestamp; diagnostics record the contradiction rather than hide it.
+    now = 1;
+    record(store, slot);
+
+    expect(store.snapshot().slots[0]!.requests[0]!.incompleteSequence).toBe(true);
+    expect(store.snapshot().callbackIssues).toContainEqual(
+      expect.objectContaining({ kind, disposition: 'matched', reason: 'invalid_event_order' })
+    );
+    assertCoverageEquation(store);
+  });
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY])(
+    'rejects the non-finite visibility percentage %s',
+    (percentage) => {
+      const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+      const slot = fakeSlot('visibility-non-finite');
+
+      store.recordSlotRequested(slot);
+      store.recordSlotVisibilityChanged(slot, percentage);
+
+      const snapshot = store.snapshot();
+      expect(snapshot.slots[0]!.currentVisibilityPercentage).toBeUndefined();
+      expect(snapshot.slots[0]!.maximumVisibilityPercentage).toBeUndefined();
+      expect(snapshot.callbackIssues).toContainEqual(
+        expect.objectContaining({
+          kind: 'slotVisibilityChanged',
+          disposition: 'unmatched',
+          reason: 'invalid_visibility_percentage',
+        })
+      );
+      assertCoverageEquation(store);
+    }
+  );
+
+  it('reports an unknown attempt ID for a creative failure without recording one', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+    const slot = fakeSlot('failure-unknown-attempt');
+    associateSlot(store, slot, 'auction-failure-unknown');
+    store.recordSlotRequested(slot);
+
+    store.recordTrustedServerCreativeFailure(4242, 'cache_fetch_failed');
+
+    expect(store.snapshot().slots[0]!.requests[0]!.trustedServerCreativeFailures).toBeUndefined();
+    expect(last(store.snapshot().attributionIssues)?.reason).toBe('creative_attempt_unknown');
+  });
+
+  it('keeps one outstanding delivery-boundary timer across a refresh burst', () => {
+    let now = 0;
+    const deferred: Array<{ callback: () => void; delayMs: number }> = [];
+    const store = new GptDiagnosticsStore({
+      now: () => now,
+      schedule: (callback) => callback(),
+      defer: (callback, delayMs) => deferred.push({ callback, delayMs }),
+    });
+    const slots = Array.from({ length: 8 }, (_, index) => fakeSlot(`burst-${index}`));
+
+    for (const [index, slot] of slots.entries()) {
+      now = index;
+      store.recordTrustedServerOpportunity(slot, `burst-auction-${index}`, 'renderable_candidate');
+      store.recordSlotRequested(slot);
+      store.recordSlotRenderEnded(slot, { isEmpty: false });
+    }
+
+    expect(deferred, 'a burst of candidate renders must share one timer').toMatchObject([
+      { delayMs: TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS },
+    ]);
+
+    // Firing at the earliest deadline re-arms once for the next one, never per render.
+    now = TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS;
+    deferred.shift()!.callback();
+    expect(deferred).toMatchObject([{ delayMs: 1 }]);
+
+    now = 7 + TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS;
+    deferred.shift()!.callback();
+    expect(deferred, 'no boundary remains once every candidate crossed it').toHaveLength(0);
+    for (const slot of store.snapshot().slots) {
+      expect(slot.requests[0]!.delivery).toBe('candidate_unconfirmed');
+    }
   });
 });

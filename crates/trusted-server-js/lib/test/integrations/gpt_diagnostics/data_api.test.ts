@@ -29,6 +29,42 @@ function controller(store = new GptDiagnosticsStore()) {
 }
 
 describe('critical GPT diagnostics data API', () => {
+  it('deeply isolates delivery evidence and exports attribution issues', () => {
+    const store = new GptDiagnosticsStore({ schedule: (callback) => callback() });
+    const slot = Object.freeze({
+      getSlotElementId: () => 'delivery-slot',
+      getAdUnitPath: () => '/example/delivery-slot',
+    });
+    store.recordSlotRequested(slot, 1);
+    store.recordSlotRenderEnded(
+      slot,
+      {
+        isEmpty: false,
+        adManager: {
+          yieldGroupIds: [10],
+          companyIds: [20],
+        },
+      },
+      2
+    );
+    store.recordTrustedServerCreativeRequest('unknown-auction-slot');
+    const target = controller(store);
+
+    const snapshot = target.api.snapshot();
+    const cycle = snapshot.slots[0]?.requests[0];
+
+    expect(cycle?.adManager).toEqual({ yieldGroupIds: [10], companyIds: [20] });
+    expect(Object.isFrozen(cycle?.adManager)).toBe(true);
+    expect(Object.isFrozen(cycle?.adManager?.yieldGroupIds)).toBe(true);
+    expect(Object.isFrozen(cycle?.adManager?.companyIds)).toBe(true);
+    expect(snapshot.attributionIssues).toEqual([
+      expect.objectContaining({ reason: 'creative_request_without_slot' }),
+    ]);
+    expect(Object.isFrozen(snapshot.attributionIssues)).toBe(true);
+    expect(Object.isFrozen(snapshot.attributionIssues?.[0])).toBe(true);
+    target.destroy();
+  });
+
   it('coalesces exactly zero, one, and two committed updates to the latest snapshot', () => {
     const tasks: Array<() => void> = [];
     const store = new GptDiagnosticsStore({ schedule: (callback) => callback() });

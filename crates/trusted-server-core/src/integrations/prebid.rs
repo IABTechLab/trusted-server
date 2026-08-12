@@ -2515,7 +2515,7 @@ impl AuctionProvider for PrebidAuctionProvider {
             context,
             signer_with_signature
                 .as_ref()
-                .map(|(s, sig, params)| (s, sig.clone(), params)),
+                .map(|(signer, signature, params)| (signer, signature.clone(), params)),
             request_info,
         );
 

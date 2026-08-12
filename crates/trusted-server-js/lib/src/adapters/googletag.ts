@@ -239,6 +239,18 @@ export type GoogletagDiagnosticsEventName =
   | 'impressionViewable'
   | 'slotVisibilityChanged';
 
+/** Safe Ad Manager identifiers copied from one GPT render callback. */
+export interface GoogletagDiagnosticsAdManagerIdentity {
+  readonly lineItemId?: number;
+  readonly creativeId?: number;
+  readonly campaignId?: number;
+  readonly advertiserId?: number;
+  readonly sourceAgnosticLineItemId?: number;
+  readonly sourceAgnosticCreativeId?: number;
+  readonly yieldGroupIds?: readonly number[];
+  readonly companyIds?: readonly number[];
+}
+
 export interface GoogletagDiagnosticsFact {
   readonly kind: GoogletagDiagnosticsEventName;
   readonly observedAtMs: number;
@@ -249,6 +261,7 @@ export interface GoogletagDiagnosticsFact {
   readonly slotContentChanged?: boolean;
   readonly inViewPercentage?: number;
   readonly responseIdentifier?: string;
+  readonly adManager?: GoogletagDiagnosticsAdManagerIdentity;
 }
 
 export type GptSlotTokenV1 = string & { readonly __brand: 'GptSlotTokenV1' };
@@ -1355,6 +1368,38 @@ export function createBrowserGoogletagAdapter(
               size = Object.freeze([width, height]);
             }
           }
+          const positiveInteger = (name: string): number | undefined => {
+            const value = safeMember(event as object, name);
+            return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+              ? value
+              : undefined;
+          };
+          const positiveIntegerList = (name: string): readonly number[] | undefined => {
+            const value = safeMember(event as object, name);
+            if (!Array.isArray(value)) return undefined;
+            const result = value
+              .map((entry) =>
+                typeof entry === 'number' && Number.isSafeInteger(entry) && entry > 0
+                  ? entry
+                  : undefined
+              )
+              .filter((entry): entry is number => entry !== undefined)
+              .slice(0, 8);
+            return result.length === 0 ? undefined : Object.freeze(result);
+          };
+          const adManagerCandidate = {
+            lineItemId: positiveInteger('lineItemId'),
+            creativeId: positiveInteger('creativeId'),
+            campaignId: positiveInteger('campaignId'),
+            advertiserId: positiveInteger('advertiserId'),
+            sourceAgnosticLineItemId: positiveInteger('sourceAgnosticLineItemId'),
+            sourceAgnosticCreativeId: positiveInteger('sourceAgnosticCreativeId'),
+            yieldGroupIds: positiveIntegerList('yieldGroupIds'),
+            companyIds: positiveIntegerList('companyIds'),
+          };
+          const adManager = Object.fromEntries(
+            Object.entries(adManagerCandidate).filter(([, value]) => value !== undefined)
+          ) as GoogletagDiagnosticsAdManagerIdentity;
           return Object.freeze({
             ...base,
             kind: eventType,
@@ -1362,6 +1407,7 @@ export function createBrowserGoogletagAdapter(
             ...(size ? { size } : {}),
             ...(typeof isBackfill === 'boolean' ? { isBackfill } : {}),
             ...(typeof slotContentChanged === 'boolean' ? { slotContentChanged } : {}),
+            ...(Object.keys(adManager).length === 0 ? {} : { adManager: Object.freeze(adManager) }),
           });
         }
         default:

@@ -804,6 +804,26 @@ use coordinated_cutover_v1::{
     serialize_trusted_server_auction_response_v1,
 };
 
+/// Delivery facts produced while serializing winning bids.
+#[derive(Debug, Default)]
+pub(crate) struct AuctionDeliveryReport {
+    /// Winning slot IDs included in the serialized response.
+    pub delivered_winner_slots: HashSet<String>,
+    /// Winners omitted because they could not be delivered safely.
+    pub dropped_winner_count: usize,
+    /// Machine-readable reasons for omitted winners.
+    pub dropped_winner_reasons: AuctionDropReasons,
+}
+
+/// Serialized response and the delivery facts used to produce it.
+#[cfg(test)]
+pub(crate) struct OpenRtbResponseConversion {
+    /// HTTP response returned to the auction client.
+    pub response: Response<EdgeBody>,
+    /// Delivery facts for telemetry and diagnostics.
+    pub delivery: AuctionDeliveryReport,
+}
+
 /// Convert `OrchestrationResult` to `OpenRTB` response format.
 ///
 /// Creative HTML in the `adm` field is optionally sanitized and optionally
@@ -827,19 +847,64 @@ pub fn convert_to_openrtb_response(
     auction_request: &AuctionRequest,
     ec_allowed: bool,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    convert_to_openrtb_response_impl(result, settings, auction_request, ec_allowed)
+}
+
+#[cfg(test)]
+pub(crate) fn convert_to_openrtb_response_with_report(
+    result: &OrchestrationResult,
+    settings: &Settings,
+    auction_request: &AuctionRequest,
+    ec_allowed: bool,
+) -> Result<OpenRtbResponseConversion, Report<TrustedServerError>> {
+    let (response, delivery) = convert_to_openrtb_response_impl_with_report(
+        result,
+        settings,
+        auction_request,
+        ec_allowed,
+    )?;
+    Ok(OpenRtbResponseConversion { response, delivery })
+}
+
+fn convert_to_openrtb_response_impl(
+    result: &OrchestrationResult,
+    settings: &Settings,
+    auction_request: &AuctionRequest,
+    ec_allowed: bool,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let (response, _) = convert_to_openrtb_response_impl_with_report(
+        result,
+        settings,
+        auction_request,
+        ec_allowed,
+    )?;
+    Ok(response)
+}
+
+fn convert_to_openrtb_response_impl_with_report(
+    result: &OrchestrationResult,
+    settings: &Settings,
+    auction_request: &AuctionRequest,
+    ec_allowed: bool,
+) -> Result<(Response<EdgeBody>, AuctionDeliveryReport), Report<TrustedServerError>> {
     let mut seatbids = Vec::with_capacity(result.winning_bids.len());
-    let mut dropped_winner_count = 0;
-    let mut dropped_winner_reasons = AuctionDropReasons::new();
+    let mut delivery = AuctionDeliveryReport::default();
 
     for (slot_id, bid) in &result.winning_bids {
-        let price = bid.price.ok_or_else(|| {
-            Report::new(TrustedServerError::Auction {
-                message: format!(
-                    "Winning bid for slot '{}' from '{}' has no decoded price",
-                    slot_id, bid.bidder
-                ),
-            })
-        })?;
+        let Some(price) = bid.price else {
+            log::warn!(
+                "Auction {}: skipping winning bid for slot '{}' from '{}' because it has no decoded price",
+                auction_request.id,
+                slot_id,
+                bid.bidder
+            );
+            delivery.dropped_winner_count += 1;
+            record_auction_drop(
+                &mut delivery.dropped_winner_reasons,
+                AuctionDropReason::InvalidPrice,
+            );
+            continue;
+        };
 
         let bid_context = format!(
             "auction {} slot {} bidder {}",
@@ -859,9 +924,9 @@ pub fn convert_to_openrtb_response(
                 slot_id,
                 bid.bidder
             );
-            dropped_winner_count += 1;
+            delivery.dropped_winner_count += 1;
             record_auction_drop(
-                &mut dropped_winner_reasons,
+                &mut delivery.dropped_winner_reasons,
                 AuctionDropReason::MultipleRenderSources,
             );
             continue;
@@ -896,9 +961,9 @@ pub fn convert_to_openrtb_response(
                     slot_id,
                     bid.bidder
                 );
-                dropped_winner_count += 1;
+                delivery.dropped_winner_count += 1;
                 record_auction_drop(
-                    &mut dropped_winner_reasons,
+                    &mut delivery.dropped_winner_reasons,
                     AuctionDropReason::RendererExtensionSerializationFailed,
                 );
                 continue;
@@ -911,9 +976,9 @@ pub fn convert_to_openrtb_response(
                 slot_id,
                 bid.bidder
             );
-            dropped_winner_count += 1;
+            delivery.dropped_winner_count += 1;
             record_auction_drop(
-                &mut dropped_winner_reasons,
+                &mut delivery.dropped_winner_reasons,
                 AuctionDropReason::NoRenderSource,
             );
             continue;
@@ -941,6 +1006,7 @@ pub fn convert_to_openrtb_response(
             bid: vec![openrtb_bid],
             ..Default::default()
         });
+        delivery.delivered_winner_slots.insert(slot_id.clone());
     }
 
     // Determine strategy name for response metadata
@@ -967,8 +1033,8 @@ pub fn convert_to_openrtb_response(
                 total_bids: result.total_bids(),
                 time_ms: result.total_time_ms,
                 provider_details,
-                dropped_winner_count,
-                dropped_winner_reasons,
+                dropped_winner_count: delivery.dropped_winner_count,
+                dropped_winner_reasons: delivery.dropped_winner_reasons.clone(),
             },
         }
         .to_ext(),
@@ -990,7 +1056,7 @@ pub fn convert_to_openrtb_response(
 
     attach_auction_response_headers(&mut response, auction_request, ec_allowed)?;
 
-    Ok(response)
+    Ok((response, delivery))
 }
 
 #[cfg(test)]
@@ -2229,17 +2295,25 @@ mod tests {
     }
 
     #[test]
-    fn convert_to_openrtb_response_errors_when_winning_bid_has_no_price() {
+    fn convert_to_openrtb_response_drops_winning_bid_without_price() {
         let settings = make_settings();
         let auction_request = make_auction_request();
         let result = make_result(make_bid("div-gpt-top", "appnexus", None));
 
-        let err = convert_to_openrtb_response(&result, &settings, &auction_request, false)
-            .expect_err("should reject winning bid without decoded price");
-
-        assert!(
-            format!("{err:?}").contains("has no decoded price"),
-            "should explain missing decoded price"
+        let conversion =
+            convert_to_openrtb_response_with_report(&result, &settings, &auction_request, false)
+                .expect("should omit a winner without a decoded price");
+        assert!(conversion.delivery.delivered_winner_slots.is_empty());
+        assert_eq!(conversion.delivery.dropped_winner_count, 1);
+        assert_eq!(
+            conversion.delivery.dropped_winner_reasons[&AuctionDropReason::InvalidPrice],
+            1,
+            "should report the omitted malformed winner"
+        );
+        assert_eq!(
+            conversion.response.status(),
+            StatusCode::OK,
+            "should still return a successful partial auction response"
         );
     }
 

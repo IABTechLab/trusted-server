@@ -400,7 +400,7 @@ TRUSTED_SERVER__TESTER_COOKIE__ENABLED=true
 
 ## EC Configuration
 
-Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_store` KV store is the only KV-backed EC lifecycle store; it holds identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones. Consent configuration controls request-local interpretation and forwarding, not separate KV persistence.
+Settings for Edge Cookie identifier generation. The `ec_store` KV store is the only KV-backed EC lifecycle store. It holds identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones. Consent configuration controls request-local interpretation and forwarding, not separate KV persistence.
 
 ### `[ec]`
 
@@ -495,7 +495,7 @@ Individual env var keys like `TRUSTED_SERVER__RESPONSE_HEADERS__X_CUSTOM_HEADER`
 
 **Use Cases**:
 
-- Custom tracking headers
+- Custom measurement headers
 - Cache control overrides
 - Debugging identifiers
 - CORS headers (if needed)
@@ -1063,6 +1063,12 @@ apply when the integration section exists in `trusted-server.toml`.
 | `debug_query_params`       | String        | `None`                                                                 | Extra query params appended for debugging                                                                                                             |
 | `client_side_bidders`      | Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side (see [Prebid docs](/guide/integrations/prebid#client-side-bidders)) |
 | `script_patterns`          | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                           |
+
+APS is configured exclusively under `[integrations.aps]`. `aps` entries in
+`bidders` or `client_side_bidders` are logged and removed case-insensitively so
+an upgrade does not prevent Trusted Server from starting. Remove those entries
+from operator configuration; this guard prevents APS demand from reaching
+Prebid Server or the client-side Prebid bundle.
 
 **Example**:
 
@@ -1665,5 +1671,5 @@ cat trusted-server.toml | npx toml-cli validate
 
 - Set up [Request Signing](/guide/request-signing) for secure API calls
 - Configure [First-Party Proxy](/guide/first-party-proxy) for URL proxying
-- Learn about [Edge Cookies](/guide/edge-cookies) for privacy-preserving identification
+- Learn about [Edge Cookies](/guide/edge-cookies) for first-party state management
 - Review [Integrations](/guide/integrations-overview) for partner support

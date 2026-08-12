@@ -401,7 +401,7 @@ mod tests {
 
     #[test]
     fn tsjs_script_src_is_stable_for_identical_module_ids() {
-        let module_ids = ["core", "lockr", "permutive"];
+        let module_ids = ["core", "lockr", "permutive_context"];
         let src = tsjs_script_src(&module_ids);
 
         assert_sha256_hex_hash(hash_query_value(&src));
@@ -519,7 +519,7 @@ mod tests {
     fn tsjs_script_src_differs_for_different_module_sets() {
         assert_ne!(
             tsjs_script_src(&["lockr"]),
-            tsjs_script_src(&["lockr", "permutive"]),
+            tsjs_script_src(&["lockr", "permutive_context"]),
             "should bust the cache when the module set content changes"
         );
     }

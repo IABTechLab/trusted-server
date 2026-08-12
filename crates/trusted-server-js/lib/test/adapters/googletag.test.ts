@@ -1208,6 +1208,14 @@ describe('browser googletag adapter readiness', () => {
         size: [300, 250],
         isBackfill: true,
         slotContentChanged: false,
+        lineItemId: 101,
+        creativeId: 202,
+        campaignId: 303,
+        advertiserId: 404,
+        sourceAgnosticLineItemId: 505,
+        sourceAgnosticCreativeId: 606,
+        yieldGroupIds: [707, -1, 808, Number.NaN],
+        companyIds: [909, 1010],
       })
     ).not.toThrow();
 
@@ -1226,10 +1234,24 @@ describe('browser googletag adapter readiness', () => {
         size: [300, 250],
         isBackfill: true,
         slotContentChanged: false,
+        adManager: {
+          lineItemId: 101,
+          creativeId: 202,
+          campaignId: 303,
+          advertiserId: 404,
+          sourceAgnosticLineItemId: 505,
+          sourceAgnosticCreativeId: 606,
+          yieldGroupIds: [707, 808],
+          companyIds: [909, 1010],
+        },
       },
     ]);
     expect(Object.isFrozen(facts[0])).toBe(true);
     expect(Object.isFrozen((facts[0] as { size: unknown }).size)).toBe(true);
+    const adManager = (facts[0] as { adManager: Record<string, unknown> }).adManager;
+    expect(Object.isFrozen(adManager)).toBe(true);
+    expect(Object.isFrozen(adManager['yieldGroupIds'])).toBe(true);
+    expect(Object.isFrozen(adManager['companyIds'])).toBe(true);
     const safeSlot = (facts[0] as { slot: Record<string, unknown> }).slot;
     expect(Object.isFrozen(safeSlot)).toBe(true);
     expect(Object.isFrozen(safeSlot['token'])).toBe(true);

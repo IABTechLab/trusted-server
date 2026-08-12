@@ -4,6 +4,23 @@ import type { Size } from '../../core/types';
 
 import type { GptDiagnosticsSlotLike, GptRenderFacts } from './store';
 
+function renderFacts(fact: Readonly<GoogletagDiagnosticsFact>): GptRenderFacts {
+  const adManager = fact.adManager;
+  return {
+    isEmpty: fact.isEmpty,
+    size: fact.size ? ([...fact.size] as Size) : undefined,
+    isBackfill: fact.isBackfill,
+    slotContentChanged: fact.slotContentChanged,
+    adManager: adManager
+      ? {
+          ...adManager,
+          yieldGroupIds: adManager.yieldGroupIds ? [...adManager.yieldGroupIds] : undefined,
+          companyIds: adManager.companyIds ? [...adManager.companyIds] : undefined,
+        }
+      : undefined,
+  };
+}
+
 export interface GptDiagnosticsObserverStore {
   markGptObserved(): void;
   recordSlotRequested(slot: GptDiagnosticsSlotLike, timestampMs?: number): void;
@@ -76,22 +93,8 @@ export class GptDiagnosticsObserver {
       case 'slotRenderEnded':
         this.handle(fact.kind, () =>
           observedAtMs === undefined
-            ? this.store.recordSlotRenderEnded(slot, {
-                isEmpty: fact.isEmpty,
-                size: fact.size ? ([...fact.size] as Size) : undefined,
-                isBackfill: fact.isBackfill,
-                slotContentChanged: fact.slotContentChanged,
-              })
-            : this.store.recordSlotRenderEnded(
-                slot,
-                {
-                  isEmpty: fact.isEmpty,
-                  size: fact.size ? ([...fact.size] as Size) : undefined,
-                  isBackfill: fact.isBackfill,
-                  slotContentChanged: fact.slotContentChanged,
-                },
-                observedAtMs
-              )
+            ? this.store.recordSlotRenderEnded(slot, renderFacts(fact))
+            : this.store.recordSlotRenderEnded(slot, renderFacts(fact), observedAtMs)
         );
         return;
       case 'slotOnload':

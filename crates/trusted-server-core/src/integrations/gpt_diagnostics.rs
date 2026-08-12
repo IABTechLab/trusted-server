@@ -137,6 +137,21 @@ pub fn register(
     ))
 }
 
+/// Whether the diagnostics integration is present and enabled in configuration.
+///
+/// This is the deployment-level switch, not the per-document activation state:
+/// callers that only need to know whether diagnostics could consume a value use
+/// this, while document behaviour uses [`GptDiagnosticsRequestDecision::active`].
+/// A configuration that cannot be parsed reads as disabled.
+#[must_use]
+pub fn is_enabled(settings: &Settings) -> bool {
+    settings
+        .integration_config::<GptDiagnosticsConfig>(GPT_DIAGNOSTICS_INTEGRATION_ID)
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 /// Evaluate activation and sanitize the request before generic cookie handling.
 ///
 /// The reserved query and cookie are always removed before the request reaches

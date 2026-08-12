@@ -339,7 +339,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                 if !injected_tsjs.get() {
                     let mut snippet = String::new();
                     // The server has already interpreted and removed the reserved
-                    // directive. Its external cleanup asset only updates the
+                    // directive. Its request-scoped cleanup program only updates the
                     // browser-visible URL and must run before publisher/core code.
                     if let Some(cleanup_tag) = gpt_diagnostics
                         .as_ref()
@@ -416,14 +416,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     }
                     // Main bundle: core + non-deferred integrations (synchronous).
                     snippet.push_str(&tsjs::tsjs_script_tag(&immediate_ids));
-                    // Active diagnostics loads synchronously after core so its
-                    // GPT listeners precede publisher scripts in the origin head.
-                    if let Some(module_tag) = gpt_diagnostics
-                        .as_ref()
-                        .and_then(GptDiagnosticsRequestDecision::module_script_tag)
-                    {
-                        snippet.push_str(&module_tag);
-                    }
                     // Deferred bundles: large modules like prebid loaded after
                     // HTML parsing completes. Empty when none are enabled.
                     snippet.push_str(&tsjs::tsjs_deferred_script_tags(&deferred_ids));
@@ -850,7 +842,7 @@ mod tests {
     }
 
     #[test]
-    fn active_gpt_diagnostics_loads_standalone_after_unified_bundle_once() {
+    fn active_gpt_diagnostics_is_manifest_selected_without_a_standalone_module() {
         let html = "<html><head><title>Test</title></head><body></body></html>";
         let mut settings = create_test_settings();
         settings
@@ -886,8 +878,9 @@ mod tests {
             .expect("should process HTML");
         let processed = String::from_utf8(output).expect("should produce valid UTF-8");
         let bundle_marker = "id=\"trustedserver-js\"";
-        let diagnostics_marker = "tsjs-gpt_diagnostics.min.js";
-        let cleanup_marker = "tsjs-gpt_diagnostics-bootstrap.min.js";
+        let diagnostics_manifest_marker = r#""id":"gpt_diagnostics","required":true"#;
+        let diagnostics_script_marker = "tsjs-gpt_diagnostics.min.js";
+        let cleanup_marker = "history.replaceState";
 
         assert_eq!(
             processed.matches("__tsjs_gpt_diagnostics_active").count(),
@@ -900,9 +893,14 @@ mod tests {
             "should inject the immediate TSJS bundle once"
         );
         assert_eq!(
-            processed.matches(diagnostics_marker).count(),
+            processed.matches(diagnostics_manifest_marker).count(),
             1,
-            "should inject one standalone diagnostics module"
+            "should select diagnostics once in immutable boot data"
+        );
+        assert_eq!(
+            processed.matches(diagnostics_script_marker).count(),
+            0,
+            "should not emit a standalone diagnostics module before the atomic cutover"
         );
         assert_eq!(processed.matches(cleanup_marker).count(), 1);
         let cleanup_index = processed
@@ -911,16 +909,9 @@ mod tests {
         let bundle_index = processed
             .find(bundle_marker)
             .expect("should include immediate TSJS bundle");
-        let diagnostics_index = processed
-            .find(diagnostics_marker)
-            .expect("should include standalone diagnostics module");
         assert!(
-            cleanup_index < bundle_index && bundle_index < diagnostics_index,
-            "cleanup must be an external CSP-compatible script before publisher/core work"
-        );
-        assert!(
-            !processed.contains("history.replaceState"),
-            "URL cleanup behavior must remain in its external request-scoped asset"
+            cleanup_index < bundle_index,
+            "request-scoped URL cleanup must run before publisher/core work"
         );
     }
 

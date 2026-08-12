@@ -92,7 +92,6 @@ export function prepareApsRenderSource(
   }
 }
 
-
 export interface DirectApsAttemptOptions {
   readonly attempt: RenderAttempt;
   readonly container: HTMLElement;

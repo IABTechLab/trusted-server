@@ -1,4 +1,11 @@
-import type { GptDiagnosticsApi, GptDiagnosticsExportV1 } from '../../core/types';
+import type {
+  GptDiagnosticsApi,
+  GptDiagnosticsCreativeFailure,
+  GptDiagnosticsExportV1,
+  GptDiagnosticsRecorder,
+  GptDiagnosticsSlotHandle,
+  GptDiagnosticsTrustedServerOpportunity,
+} from '../../core/types';
 import { DiagnosticsSubscriberLimitError } from '../../core/trace';
 
 import type { GptDiagnosticsBindingManager } from './binding';
@@ -7,6 +14,19 @@ import type { GptDiagnosticsStoreSnapshot } from './store';
 interface ApiStore {
   snapshot(): GptDiagnosticsStoreSnapshot;
   subscribeCommits(listener: () => void): () => void;
+  recordTrustedServerOpportunity(
+    slot: GptDiagnosticsSlotHandle,
+    auctionSlotId: string,
+    opportunity: GptDiagnosticsTrustedServerOpportunity,
+    trustedServerAuctionId?: string
+  ): void;
+  recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
+  recordTrustedServerCreativeRequest(auctionSlotId: string): number | undefined;
+  recordTrustedServerCreativeResponse(attemptId: number): void;
+  recordTrustedServerCreativeFailure(
+    attemptId: number,
+    reason: GptDiagnosticsCreativeFailure
+  ): void;
 }
 
 interface ApiBindingManager {
@@ -44,9 +64,27 @@ function scheduleTask(callback: () => void): () => void {
   return () => globalThis.clearTimeout(handle);
 }
 
+function safelyRecord(action: () => void): void {
+  try {
+    action();
+  } catch {
+    // Diagnostics must not alter delivery.
+  }
+}
+
+function safelyCreateAttempt(action: () => number | undefined): number | undefined {
+  try {
+    return action();
+  } catch {
+    return undefined;
+  }
+}
+
 /** Owns the public read-only diagnostics API and its source subscriptions. */
 export class GptDiagnosticsApiController {
   readonly api: GptDiagnosticsApi;
+  /** Internal evidence channel for Trusted Server integration modules. */
+  readonly recorder: GptDiagnosticsRecorder;
 
   private readonly store: ApiStore;
   private readonly bindings: ApiBindingManager;
@@ -86,6 +124,29 @@ export class GptDiagnosticsApiController {
       show: () => this.presentation.show(),
       hide: () => this.presentation.hide(),
     });
+    const recorder: GptDiagnosticsRecorder = {
+      recordTrustedServerOpportunity: (slot, auctionSlotId, opportunity, trustedServerAuctionId) =>
+        safelyRecord(() => {
+          if (trustedServerAuctionId === undefined) {
+            this.store.recordTrustedServerOpportunity(slot, auctionSlotId, opportunity);
+          } else {
+            this.store.recordTrustedServerOpportunity(
+              slot,
+              auctionSlotId,
+              opportunity,
+              trustedServerAuctionId
+            );
+          }
+        }),
+      recordPrebidRefresh: (slots) => safelyRecord(() => this.store.recordPrebidRefresh(slots)),
+      recordTrustedServerCreativeRequest: (auctionSlotId) =>
+        safelyCreateAttempt(() => this.store.recordTrustedServerCreativeRequest(auctionSlotId)),
+      recordTrustedServerCreativeResponse: (attemptId) =>
+        safelyRecord(() => this.store.recordTrustedServerCreativeResponse(attemptId)),
+      recordTrustedServerCreativeFailure: (attemptId, reason) =>
+        safelyRecord(() => this.store.recordTrustedServerCreativeFailure(attemptId, reason)),
+    };
+    this.recorder = Object.freeze(recorder);
   }
 
   snapshot(): GptDiagnosticsExportV1 {
@@ -105,6 +166,20 @@ export class GptDiagnosticsApiController {
                 ...cycle,
                 durations: Object.freeze({ ...cycle.durations }),
                 size: cycle.size ? Object.freeze([...cycle.size]) : undefined,
+                adManager: cycle.adManager
+                  ? Object.freeze({
+                      ...cycle.adManager,
+                      yieldGroupIds: cycle.adManager.yieldGroupIds
+                        ? Object.freeze([...cycle.adManager.yieldGroupIds])
+                        : undefined,
+                      companyIds: cycle.adManager.companyIds
+                        ? Object.freeze([...cycle.adManager.companyIds])
+                        : undefined,
+                    })
+                  : undefined,
+                trustedServerCreativeFailures: cycle.trustedServerCreativeFailures
+                  ? Object.freeze([...cycle.trustedServerCreativeFailures])
+                  : undefined,
               })
             )
           ),
@@ -113,6 +188,9 @@ export class GptDiagnosticsApiController {
     );
     const callbackIssues = Object.freeze(
       store.callbackIssues.map((issue) => Object.freeze({ ...issue }))
+    );
+    const attributionIssues = Object.freeze(
+      store.attributionIssues.map((issue) => Object.freeze({ ...issue }))
     );
     const coverage = Object.freeze(
       Object.fromEntries(
@@ -131,6 +209,7 @@ export class GptDiagnosticsApiController {
       }),
       slots,
       callbackIssues,
+      attributionIssues,
       coverage,
       metadata: Object.freeze({ ...store.metadata }),
     }) as GptDiagnosticsExportV1;

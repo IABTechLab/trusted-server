@@ -1,16 +1,20 @@
 # Creative Processing
 
-Learn how Trusted Server rewrites ad creative HTML and CSS to route resources through first-party domains.
+Trusted Server rewrites ad creative HTML and CSS to route resources
+through first-party domains.
 
 ## Overview
 
-Creative processing has separate auction-response and proxied-response paths. When rewriting is enabled for a path, it transforms third-party ad creatives by rewriting URLs to go through your first-party domain. This provides:
+Creative processing has separate auction-response and proxied-response
+paths. When rewriting is enabled for a path, it rewrites URLs in
+third-party ad creatives so resources are fetched through the
+publisher's first-party domain. This provides:
 
-- **Privacy Control** - Eligible, non-excluded external resources load through your domain
-- **First-Party Context** - Cookies and storage use your domain
-- **EC ID Integration** - Automatic ID forwarding to trackers
-- **Security** - Validated, signed URLs prevent tampering
-- **GDPR Compliance** - Controlled data sharing
+- **First-party delivery**: eligible, non-excluded external resource URLs route through the publisher's domain
+- **First-party context**: cookies and storage use the publisher's domain
+- **EC ID integration**: configurable ID forwarding to downstream endpoints
+- **Tamper resistance**: validated, signed URLs prevent in-flight URL substitution
+- **Configurable data sharing**: forwarding to vendors is per the deployer's configuration
 
 ## How It Works
 

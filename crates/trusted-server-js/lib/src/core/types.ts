@@ -122,6 +122,54 @@ export interface GptDiagnosticsDurations {
   renderToViewableMs?: number | undefined;
 }
 
+/**
+ * Ad Manager's own identifiers for the delivered ad, as reported by
+ * `slotRenderEnded`.
+ *
+ * These are documented GPT callback fields carrying the publisher's own Ad
+ * Manager data — the same values `?google_console=1` shows. They name what Ad
+ * Manager delivered; they claim nothing about which demand source supplied it.
+ */
+export interface GptDiagnosticsAdManagerIdentity {
+  lineItemId?: number | undefined;
+  creativeId?: number | undefined;
+  campaignId?: number | undefined;
+  advertiserId?: number | undefined;
+  sourceAgnosticLineItemId?: number | undefined;
+  sourceAgnosticCreativeId?: number | undefined;
+  yieldGroupIds?: number[] | undefined;
+  companyIds?: number[] | undefined;
+}
+
+/**
+ * How Ad Manager classified the delivered ad, derived only from the render
+ * facts GPT reported.
+ */
+export type GptDiagnosticsResponseClass =
+  'empty' | 'backfill' | 'reservation' | 'unclassified_non_empty';
+
+/** The request path observed for a GPT request cycle. */
+export type GptDiagnosticsRequestPath =
+  'trusted_server_direct' | 'prebid_refresh' | 'publisher_refresh' | 'competing' | 'unattributed';
+
+/** The Trusted Server creative opportunity observed for a request. */
+export type GptDiagnosticsTrustedServerOpportunity =
+  'renderable_candidate' | 'unrenderable_candidate' | 'no_candidate';
+
+/** A safe failure category observed while obtaining or posting creative markup. */
+export type GptDiagnosticsCreativeFailure =
+  'missing_render_source' | 'cache_fetch_failed' | 'invalid_cache_payload' | 'response_post_failed';
+
+/** Delivery evidence derived for a GPT request cycle. */
+export type GptDiagnosticsDelivery =
+  | 'trusted_server_response_sent'
+  | 'trusted_server_selected'
+  | 'candidate_unconfirmed'
+  | 'no_candidate'
+  | 'unknown'
+  | 'pending'
+  | 'not_applicable';
+
 export interface GptDiagnosticsRequestCycle {
   requestNumber: number;
   requestedAtMs?: number | undefined;
@@ -135,6 +183,23 @@ export interface GptDiagnosticsRequestCycle {
   isBackfill?: boolean | undefined;
   slotContentChanged?: boolean | undefined;
   incompleteSequence: boolean;
+  adManager?: GptDiagnosticsAdManagerIdentity | undefined;
+  responseClass?: GptDiagnosticsResponseClass | undefined;
+  requestPath?: GptDiagnosticsRequestPath | undefined;
+  requestIntentId?: number | undefined;
+  trustedServerAuctionId?: string | undefined;
+  opportunityToRequestMs?: number | undefined;
+  replacedRequestNumber?: number | undefined;
+  previousRenderToRequestMs?: number | undefined;
+  creativeChanged?: boolean | undefined;
+  previousCreativeId?: GptDiagnosticsAdManagerIdentity['creativeId'] | undefined;
+  loadObservedBeforeRender?: boolean | undefined;
+  trustedServerOpportunity?: GptDiagnosticsTrustedServerOpportunity | undefined;
+  trustedServerCreativeRequestAtMs?: number | undefined;
+  trustedServerCreativeResponseAtMs?: number | undefined;
+  trustedServerCreativeFailures?: GptDiagnosticsCreativeFailure[] | undefined;
+  /** Derived on every snapshot; absent only on a cycle read before derivation. */
+  delivery?: GptDiagnosticsDelivery | undefined;
 }
 
 export interface GptDiagnosticsSlotExport {
@@ -156,6 +221,25 @@ export interface GptDiagnosticsCallbackIssue {
   reason: string;
 }
 
+/** A safe reason that attribution evidence could not be associated or retained. */
+export type GptDiagnosticsAttributionIssueReason =
+  | 'creative_request_without_slot'
+  | 'creative_request_without_cycle'
+  | 'creative_request_ambiguous_cycle'
+  | 'creative_request_on_empty_cycle'
+  | 'creative_attempt_capacity'
+  | 'creative_attempt_unknown'
+  | 'creative_attempt_expired'
+  | 'creative_attempt_evicted';
+
+/** An attribution issue without auction-sensitive data. */
+export interface GptDiagnosticsAttributionIssue {
+  reason: GptDiagnosticsAttributionIssueReason;
+  timestampMs: number;
+  runtimeSlotNumber?: number;
+  slotElementId?: string;
+}
+
 export interface GptDiagnosticsCoverageCounters {
   observed: number;
   matched: number;
@@ -172,20 +256,46 @@ export interface GptDiagnosticsExportV1 {
   };
   slots: GptDiagnosticsSlotExport[];
   callbackIssues: GptDiagnosticsCallbackIssue[];
+  attributionIssues?: GptDiagnosticsAttributionIssue[];
   coverage: Record<GptDiagnosticsCallbackKind, GptDiagnosticsCoverageCounters>;
   metadata: {
     droppedCallbacks: number;
+    droppedAttributionIssues?: number;
     evictedSlots: number;
     evictedRequestCycles: number;
   };
 }
 
+/** GPT slot object identity, the only key diagnostics correlates slots by. */
+export interface GptDiagnosticsSlotHandle {
+  getSlotElementId?(): string;
+  getAdUnitPath?(): string;
+}
+
+/** The documented, read-only operator API. It records no evidence. */
 export interface GptDiagnosticsApi {
   snapshot(): GptDiagnosticsExportV1;
   export(): void;
   subscribe(listener: (snapshot: GptDiagnosticsExportV1) => void): () => void;
   show(): void;
   hide(): void;
+}
+
+/** Closure-private evidence channel shared only by release-bound TSJS modules. */
+export interface GptDiagnosticsRecorder {
+  recordTrustedServerOpportunity(
+    slot: GptDiagnosticsSlotHandle,
+    auctionSlotId: string,
+    opportunity: GptDiagnosticsTrustedServerOpportunity,
+    trustedServerAuctionId?: string
+  ): void;
+  recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
+  recordTrustedServerCreativeRequest(auctionSlotId: string): number | undefined;
+  recordTrustedServerCreativeResponse(attemptId: number): void;
+  recordTrustedServerCreativeFailure(
+    attemptId: number,
+    reason: GptDiagnosticsCreativeFailure
+  ): void;
 }
 
 /** Release-internal critical module emitted inside the unified artifact. */

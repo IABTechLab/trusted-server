@@ -6265,8 +6265,7 @@ mod tests {
             .iter()
             .find(|module_id| **module_id != "diagnostics_presentation")
             .expect("should enable one non-diagnostics deferred module");
-        let src = crate::tsjs::tsjs_single_module_script_src(module_id)
-            .expect("should name enabled deferred module");
+        let src = crate::tsjs::tsjs_single_module_script_src(module_id);
         let req = build_request(Method::GET, &format!("https://publisher.example{src}"));
 
         let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
@@ -9095,9 +9094,6 @@ mod tests {
             over_limit.id = "over_limit_dynamic".to_string();
             over_limit.page_patterns = vec!["/*".to_string()];
             over_limit.gam_unit_path = Some("/{section}/{section}".to_string());
-            over_limit
-                .compile_unit_template()
-                .expect("should compile dynamic GAM unit template");
 
             let mut valid_static = article_slot()
                 .into_iter()
@@ -9119,11 +9115,7 @@ mod tests {
                 .clone()
                 .expect("should dispatch an auction request");
             let slot_ids: Vec<_> = request.slots.iter().map(|slot| slot.id.as_str()).collect();
-            assert_eq!(
-                slot_ids,
-                ["valid_static_sibling"],
-                "auction request should exclude the over-limit dynamic slot"
-            );
+            assert_eq!(slot_ids, vec!["valid_static_sibling"]);
         }
 
         /// [`EcContext`] whose consent context permits the server-side auction.

@@ -106,6 +106,14 @@ npm --prefix "$TSJS_LIB_DIR" ci
 npm --prefix "$TSJS_LIB_DIR" run build
 npm --prefix "$TSJS_LIB_DIR" run build:prebid-external
 
+# --- Build browser-side Trusted Server and external Prebid fixtures ---
+echo "==> Building TSJS browser fixtures..."
+cd "$REPO_ROOT/$TSJS_LIB_DIR"
+npm ci
+npm run build
+npm run build:prebid-external
+cd "$REPO_ROOT/$BROWSER_DIR"
+
 # --- Export env vars for global-setup.ts ---
 export WASM_BINARY_PATH="$REPO_ROOT/target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm"
 export INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT"

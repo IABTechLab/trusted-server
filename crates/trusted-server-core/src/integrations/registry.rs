@@ -742,6 +742,16 @@ pub struct IntegrationMetadata {
     pub request_filters: usize,
 }
 
+/// Request/document-owned inputs for generated TSJS catalog predicates.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TsjsCatalogSelectionV1 {
+    pub creative_enabled: bool,
+    pub creative_click_guard: bool,
+    pub creative_render_guard: bool,
+    pub gpt_diagnostics_active: bool,
+    pub render_trace_overlay: bool,
+}
+
 impl IntegrationMetadata {
     fn new(id: &'static str) -> Self {
         Self {
@@ -1194,6 +1204,109 @@ impl IntegrationRegistry {
             .into_iter()
             .filter(|id| self.inner.deferred_js_ids.contains(id))
             .collect()
+    }
+
+    /// Return enabled TSJS catalog modules in generated release order.
+    #[must_use]
+    pub fn tsjs_catalog_module_ids(&self, selection: TsjsCatalogSelectionV1) -> Vec<&'static str> {
+        self.tsjs_selected_catalog_metadata(selection)
+            .into_iter()
+            .map(|metadata| metadata.id)
+            .collect()
+    }
+
+    /// Return the enabled parser-blocking catalog slice in canonical order.
+    #[must_use]
+    pub fn tsjs_critical_module_ids(&self, selection: TsjsCatalogSelectionV1) -> Vec<&'static str> {
+        self.tsjs_selected_catalog_metadata(selection)
+            .into_iter()
+            .filter(|metadata| metadata.phase == Some(trusted_server_js::TsjsModulePhase::Critical))
+            .map(|metadata| metadata.id)
+            .collect()
+    }
+
+    /// Return the enabled post-paint catalog slice in canonical order.
+    #[must_use]
+    pub fn tsjs_deferred_module_ids(&self, selection: TsjsCatalogSelectionV1) -> Vec<&'static str> {
+        self.tsjs_selected_catalog_metadata(selection)
+            .into_iter()
+            .filter(|metadata| metadata.phase == Some(trusted_server_js::TsjsModulePhase::Deferred))
+            .map(|metadata| metadata.id)
+            .collect()
+    }
+
+    /// Return the bounded request-owned variants admitted by static transport.
+    #[must_use]
+    pub fn tsjs_static_transport_selections(
+        &self,
+        render_trace_overlay: bool,
+    ) -> Vec<TsjsCatalogSelectionV1> {
+        let diagnostics_values: &[bool] = if self.integration_enabled("gpt_diagnostics") {
+            &[false, true]
+        } else {
+            &[false]
+        };
+        let mut selections = Vec::with_capacity(diagnostics_values.len() * 2);
+        for creative_enabled in [false, true] {
+            for gpt_diagnostics_active in diagnostics_values {
+                selections.push(TsjsCatalogSelectionV1 {
+                    creative_enabled,
+                    creative_click_guard: creative_enabled,
+                    creative_render_guard: false,
+                    gpt_diagnostics_active: *gpt_diagnostics_active,
+                    render_trace_overlay,
+                });
+            }
+        }
+        selections
+    }
+
+    fn tsjs_catalog_module_enabled(
+        &self,
+        predicate: Option<&str>,
+        selection: TsjsCatalogSelectionV1,
+    ) -> bool {
+        match predicate {
+            Some("always") => true,
+            Some("creative_guard") => {
+                selection.creative_enabled
+                    && (selection.creative_click_guard || selection.creative_render_guard)
+            }
+            Some("gpt_diagnostics_active") => selection.gpt_diagnostics_active,
+            Some("diagnostics_presentation") => {
+                selection.render_trace_overlay || selection.gpt_diagnostics_active
+            }
+            Some("prebid_and_gpt") => {
+                self.integration_enabled("prebid") && self.integration_enabled("gpt")
+            }
+            Some(predicate) => predicate
+                .strip_prefix("integration:")
+                .is_some_and(|integration_id| self.integration_enabled(integration_id)),
+            None => false,
+        }
+    }
+
+    fn tsjs_selected_catalog_metadata(
+        &self,
+        selection: TsjsCatalogSelectionV1,
+    ) -> Vec<trusted_server_js::TsjsArtifactMetadata> {
+        let mut selected = Vec::new();
+        let mut provided = std::collections::HashSet::from(["runtime.v1"]);
+        for metadata in trusted_server_js::all_integration_metadata() {
+            if !self.tsjs_catalog_module_enabled(metadata.include, selection) {
+                continue;
+            }
+            let requirements_available = metadata
+                .inputs
+                .iter()
+                .all(|declaration| declaration.contains('?') || provided.contains(declaration));
+            if !requirements_available {
+                continue;
+            }
+            provided.extend(metadata.outputs.iter().copied());
+            selected.push(metadata);
+        }
+        selected
     }
 
     #[cfg(test)]
@@ -2105,7 +2218,7 @@ mod tests {
     }
 
     #[test]
-    fn js_module_ids_include_explicitly_enabled_cmp_mirrors() {
+    fn catalog_ids_split_explicitly_enabled_cmp_owners_by_phase() {
         let mut settings = crate::test_support::tests::create_test_settings();
         settings
             .integrations
@@ -2117,15 +2230,25 @@ mod tests {
             .expect("should insert osano config");
 
         let registry = IntegrationRegistry::new(&settings).expect("should create registry");
-        let immediate = registry.js_module_ids_immediate();
+        let selection = TsjsCatalogSelectionV1::default();
+        let critical = registry.tsjs_critical_module_ids(selection);
+        let deferred = registry.tsjs_deferred_module_ids(selection);
 
         assert!(
-            immediate.contains(&"sourcepoint"),
-            "should include Sourcepoint when explicitly enabled"
+            critical.contains(&"sourcepoint_consent"),
+            "should include the Sourcepoint consent owner when explicitly enabled"
         );
         assert!(
-            immediate.contains(&"osano"),
-            "should include Osano when explicitly enabled"
+            critical.contains(&"osano_consent"),
+            "should include the Osano consent owner when explicitly enabled"
+        );
+        assert!(
+            deferred.contains(&"sourcepoint_lifecycle"),
+            "should defer the Sourcepoint lifecycle owner"
+        );
+        assert!(
+            deferred.contains(&"osano_lifecycle"),
+            "should defer the Osano lifecycle owner"
         );
 
         let metadata = registry.registered_integrations();

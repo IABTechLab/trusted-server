@@ -6,7 +6,7 @@
 
 ## Overview
 
-The Prebid integration enables server-side header bidding through Prebid Server while maintaining first-party context and privacy compliance.
+The Prebid integration enables server-side header bidding through Prebid Server while maintaining first-party context and applying publisher-configured consent enforcement.
 
 ## What is Prebid?
 
@@ -204,12 +204,12 @@ Full OpenRTB protocol conversion:
 
 - Converts ad units to OpenRTB `imp` objects
 - Injects publisher domain and page URL
-- Adds EC ID for privacy-safe tracking
+- Injects EC ID into bid requests for user recognition
 - Supports banner formats (video and native are currently not emitted by the Prebid provider)
 
 ### EC ID Injection
 
-Automatically injects privacy-preserving EC ID into bid requests for user recognition without cookies.
+Automatically injects EC ID into bid requests for user recognition via first-party context.
 
 ### Request Signing
 
@@ -301,7 +301,7 @@ the outgoing bidder params become:
 { "kargo": { "placementId": "_s2sHeaderPlacement" } }
 ```
 
-For an unrecognised zone (e.g., `sidebar`), the incoming params are left unchanged.
+For an unrecognized zone (e.g., `sidebar`), the incoming params are left unchanged.
 
 **Environment variable**:
 
@@ -574,7 +574,7 @@ The `to_openrtb()` method in `PrebidAuctionProvider` builds OpenRTB requests:
 - Sets bid floor and currency (`bidfloor`/`bidfloorcur`) from slot configuration
 - Marks impressions as `secure: 1` (HTTPS-only creatives)
 - Sets `tagid` from the slot ID
-- Adds site metadata with publisher domain, page URL, `site.ref` from the Referer header, and `site.publisher` from the domain
+- Adds site metadata with publisher domain, a validated publisher-owned page URL with query and fragment removed, `site.publisher` from the domain, and the browser `Referer` as `site.ref`. Removing query and fragment data from `site.page` can reduce contextual targeting or per-page reporting for sites whose page identity depends on query parameters
 - Injects EC ID in the user object
 - Merges current-request browser EIDs with KV-resolved EIDs and forwards the deduplicated result as `user.ext.eids`
 - Forwards user consent string and sets the GDPR flag based on geo and consent presence
@@ -600,4 +600,4 @@ The `to_openrtb()` method in `PrebidAuctionProvider` builds OpenRTB requests:
 - Review [Ad Serving Guide](/guide/ad-serving) for general concepts
 - Check [OpenRTB Support](/roadmap) on the roadmap for enhancements
 - Explore [Request Signing](/guide/request-signing) for authentication
-- Learn about [Edge Cookies](/guide/edge-cookies) for privacy-safe tracking
+- Learn about [Edge Cookies](/guide/edge-cookies) for state management

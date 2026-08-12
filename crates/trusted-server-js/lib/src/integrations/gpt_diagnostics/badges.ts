@@ -2,6 +2,7 @@ import type { GptDiagnosticsRequestCycle } from '../../core/types';
 import { realmOwnedElement, realmOwnedHtmlElement } from '../../shared/realm';
 
 import type { GptDiagnosticsBindingManager } from './binding';
+import { unhandledCase } from './exhaustive';
 import type {
   GptDiagnosticsBindingInput,
   GptDiagnosticsStoreSlotSnapshot,
@@ -93,6 +94,29 @@ function formatMilliseconds(value: number | undefined): string | undefined {
   return `${Math.round(value)} ms`;
 }
 
+/** Use the store's evidence ladder verbatim; presentation never re-derives ownership. */
+function deliveryLabel(cycle: GptDiagnosticsRequestCycle): string | undefined {
+  switch (cycle.delivery) {
+    case 'trusted_server_response_sent':
+      return 'TS response sent';
+    case 'trusted_server_selected':
+      return 'TS selected';
+    case 'pending':
+      return 'TS candidate (pending)';
+    case 'candidate_unconfirmed':
+      return 'TS unconfirmed';
+    case 'no_candidate':
+      return 'No TS candidate';
+    case 'unknown':
+      return 'Delivery unknown';
+    case 'not_applicable':
+    case undefined:
+      return undefined;
+    default:
+      return unhandledCase(cycle.delivery);
+  }
+}
+
 /** Format one observed GPT request cycle for both badge and accessible text surfaces. */
 export function formatGptDiagnosticsBadgeText(cycle: GptDiagnosticsRequestCycle): string {
   const firstLine: string[] = [];
@@ -100,6 +124,9 @@ export function formatGptDiagnosticsBadgeText(cycle: GptDiagnosticsRequestCycle)
   else if (cycle.isEmpty === false) firstLine.push('Filled');
   else if (cycle.renderAtMs !== undefined) firstLine.push('Rendered (fill unknown)');
   else firstLine.push('Pending');
+  const delivery = deliveryLabel(cycle);
+  if (delivery) firstLine.push(delivery);
+  if (cycle.requestPath === 'competing') firstLine.push('Competing paths');
   if (cycle.size) firstLine.push(`${cycle.size[0]}×${cycle.size[1]}`);
 
   const timingLine: string[] = [];

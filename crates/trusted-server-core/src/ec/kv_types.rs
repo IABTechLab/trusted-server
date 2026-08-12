@@ -51,7 +51,7 @@ pub struct KvEntry {
     /// Creation-time publisher property metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pub_properties: Option<KvPubProperties>,
-    /// Device class signals (TLS fingerprint, UA platform).
+    /// Device class signals (TLS handshake, UA platform).
     /// Written once on creation — never updated after.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<KvDevice>,
@@ -92,7 +92,7 @@ pub struct KvGeo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asn: Option<u32>,
     /// DMA/metro code (e.g. `807` = San Francisco).
-    /// Market-level targeting signal; not personal data.
+    /// Market-level targeting signal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dma: Option<i64>,
 }
@@ -143,7 +143,7 @@ where
     }
 }
 
-/// Coarse, non-PII device signals derived from TLS handshake and UA.
+/// Coarse device signals derived from TLS handshake and UA.
 ///
 /// Used by the `/_ts/api/v1/identify` endpoint for cross-suffix propagation decisions
 /// and buyer-facing device quality scoring. Written once on
@@ -151,7 +151,7 @@ where
 ///
 /// **Privacy:** `ja4_class` (Section 1 only) and `platform_class` are
 /// category signals, not unique device identifiers. The full JA4
-/// fingerprint (Sections 2–3) is never stored.
+/// string (Sections 2–3) is never stored.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KvDevice {
     /// Mobile signal: `0` = confirmed desktop, `1` = confirmed mobile,
@@ -160,14 +160,14 @@ pub struct KvDevice {
     pub is_mobile: u8,
     /// JA4 Section 1 only — browser family class identifier.
     /// e.g. `"t13d1516h2"` = Chrome, `"t13d2013h2"` = Safari.
-    /// Never stores the full JA4 fingerprint.
+    /// Never stores the full JA4 string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ja4_class: Option<String>,
     /// Coarse OS family from UA: `"mac"`, `"windows"`, `"ios"`,
     /// `"android"`, `"linux"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform_class: Option<String>,
-    /// SHA256 prefix (12 hex chars) of the HTTP/2 SETTINGS fingerprint.
+    /// SHA256 prefix (12 hex chars) of the HTTP/2 SETTINGS string.
     /// Used alongside `ja4_class` for browser confirmation and bot detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub h2_fp_hash: Option<String>,
