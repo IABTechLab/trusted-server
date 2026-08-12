@@ -3731,11 +3731,14 @@ runtime/APS contracts file-by-file.
   instrument bytes, reference SHA, ratio, hard ceiling, and heap thresholds are
   immutable and the normal pre-switch validation/tag sequence below applies.
 
-  In one separate fresh Chromium context, run the real fixture once. At each heap
-  checkpoint, send `HeapProfiler.collectGarbage` exactly once, immediately read the
-  single `Runtime.getHeapUsage.usedSize`, and enforce 1,329,697 bytes after boot,
-  1,333,217 after first render, 1,333,217 after refresh, and 1,341,419 after SPA
-  navigation. Also assert exactly one critical TSJS request; no deferred request,
+  In one separate fresh Chromium context per variant, run the real fixture once. At
+  each heap checkpoint, send `HeapProfiler.collectGarbage` exactly once and
+  immediately read the single `Runtime.getHeapUsage.usedSize`. The obsolete
+  synthetic-fixture absolute ceilings are retired: the corrected fixture first
+  reached this assertion in run `31600763735` and measured 1,620,848 bytes after
+  first render. Enforce current ≤ frozen reference × 1.10 and a 4 MiB hard ceiling
+  for each side at boot, first render, refresh, and SPA navigation. Also assert
+  exactly one critical TSJS request; no deferred request,
   preload, preparation, or execution before `tsjs:first-display-paint`; independent
   deferred starts after the gate; and no head-of-line blocking. Performance cannot
   waive a correctness failure.
@@ -4634,13 +4637,13 @@ sampling or comparison logic.
       artifact, runtime, and first-display adapter path.
 
 - [ ] **Step 3: Rerun the identical Chromium CDP retained-heap protocol after the
-      switch.** After the display samples, open one separate fresh context and execute
-      the real fixture once. At each checkpoint send `HeapProfiler.collectGarbage`
-      exactly once, immediately call `Runtime.getHeapUsage`, and compare that single
-      `usedSize` without averaging, max selection, or rerun. Enforce ceilings
-      1,329,697 bytes after boot, 1,333,217 after first render, 1,333,217 after
-      refresh, and 1,341,419 after SPA navigation. Firefox/WebKit remain correctness-
-      only.
+      switch.** After the display samples, open one separate fresh context per
+      variant and execute the real fixture once. At each checkpoint send
+      `HeapProfiler.collectGarbage` exactly once, immediately call
+      `Runtime.getHeapUsage`, and compare that single `usedSize` without averaging,
+      max selection, or rerun. At boot, first render, refresh, and SPA navigation,
+      require current ≤ frozen reference × 1.10 and both variants ≤4 MiB.
+      Firefox/WebKit remain correctness-only.
 
 - [ ] **Step 4: Assert the load-time behavior, not only the numbers.** The reference
       page makes exactly one critical TSJS request; no deferred request, preload,

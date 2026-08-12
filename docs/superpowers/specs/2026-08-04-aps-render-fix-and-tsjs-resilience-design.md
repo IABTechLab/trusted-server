@@ -3510,21 +3510,17 @@ reclassifies slow samples. This same frozen reference and comparator are used be
 and after cutover, so host contention is normalized without letting the current
 implementation redefine its baseline. Retained heap uses Chromium CDP forced-GC
 checkpoints after boot, first render, refresh, and SPA navigation. After the display
-samples, the job opens one separate fresh browser context, executes the real fixture
-once, and at each checkpoint sends `HeapProfiler.collectGarbage` once followed immediately by
-`Runtime.getHeapUsage`; the single `usedSize` is the checkpoint statistic (there is
-no hidden averaging, maximum selection, or rerun). The checked-in baseline and exact
-10% floor ceilings are:
-
-| Heap checkpoint      | Baseline bytes | Ceiling bytes |
-| -------------------- | -------------: | ------------: |
-| after boot           |      1,208,816 |     1,329,697 |
-| after first render   |      1,212,016 |     1,333,217 |
-| after refresh        |      1,212,016 |     1,333,217 |
-| after SPA navigation |      1,219,472 |     1,341,419 |
-
-Any checkpoint over its ceiling fails the one declared run; the job cannot replace
-only that measurement or rerun only the heap fixture.
+samples, the job opens one separate fresh browser context per variant and executes
+the exact same lifecycle. At each checkpoint it sends
+`HeapProfiler.collectGarbage` once followed immediately by `Runtime.getHeapUsage`;
+the single `usedSize` is the checkpoint statistic (there is no hidden averaging,
+maximum selection, or rerun). The prior absolute values came from the obsolete
+synthetic fixture, and the corrected real fixture first reached this assertion in
+run `31600763735`, measuring 1,620,848 bytes after first render. Therefore all four
+heap checkpoints use the same frozen-reference design as time: current must be at
+most reference × 1.10, and both variants must remain below the immutable 4 MiB hard
+ceiling. Any checkpoint over either limit fails the one declared run; the job cannot
+replace only that measurement or rerun only the heap fixture.
 Correctness runs independently in Chromium, Firefox, and WebKit. Correctness
 failures are never waived by a performance pass.
 

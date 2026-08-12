@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 const EXPECTED = Object.freeze({
-  schemaVersion: 3,
+  schemaVersion: 4,
   chromium: "145.0.7632.6",
   machineClass: "github-hosted:ubuntu-24.04",
   runnerImage: "ubuntu-24.04",
@@ -21,12 +21,14 @@ const EXPECTED = Object.freeze({
   referenceSha: "62421ee44c62f24534ea8782a46dfa5bfbcea950",
   maximumRatio: 1.1,
   hardCeilingMs: 100,
-  heapCeilings: Object.freeze({
-    afterBoot: 1_329_697,
-    afterFirstRender: 1_333_217,
-    afterRefresh: 1_333_217,
-    afterSpaNavigation: 1_341_419,
-  }),
+  heapCheckpoints: Object.freeze([
+    "afterBoot",
+    "afterFirstRender",
+    "afterRefresh",
+    "afterSpaNavigation",
+  ]),
+  heapMaximumRatio: 1.1,
+  heapHardCeilingBytes: 4 * 1024 * 1024,
   workflowName: "TSJS Performance Gate",
   workflowFile: ".github/workflows/tsjs-performance-gate.yml",
 });
@@ -249,31 +251,56 @@ export function validateEvidence(evidence, expected) {
   if (currentP90 > referenceP90 * EXPECTED.maximumRatio)
     fail("current performance p90 exceeds the paired 10% limit");
 
-  exactKeys(evidence.heap, ["collection", "checkpoints"], "heap");
+  exactKeys(
+    evidence.heap,
+    ["collection", "maximumRatio", "hardCeilingBytes", "reference", "current"],
+    "heap",
+  );
   exactString(
     evidence.heap.collection,
     "one-collectGarbage-then-immediate-getHeapUsage",
     "heap.collection",
   );
-  exactKeys(
-    evidence.heap.checkpoints,
-    Object.keys(EXPECTED.heapCeilings),
-    "heap.checkpoints",
+  if (evidence.heap.maximumRatio !== EXPECTED.heapMaximumRatio)
+    fail("heap ratio limit drifted");
+  if (evidence.heap.hardCeilingBytes !== EXPECTED.heapHardCeilingBytes)
+    fail("heap hard ceiling drifted");
+  exactKeys(evidence.heap.reference, ["sha", "checkpoints"], "heap.reference");
+  exactString(
+    evidence.heap.reference.sha,
+    EXPECTED.referenceSha,
+    "heap reference SHA",
   );
-  for (const [name, ceiling] of Object.entries(EXPECTED.heapCeilings)) {
-    const checkpoint = evidence.heap.checkpoints[name];
-    exactKeys(
-      checkpoint,
-      ["usedSize", "ceilingBytes"],
-      `heap.checkpoints.${name}`,
+  exactKeys(evidence.heap.current, ["checkpoints"], "heap.current");
+  exactKeys(
+    evidence.heap.reference.checkpoints,
+    EXPECTED.heapCheckpoints,
+    "heap.reference.checkpoints",
+  );
+  exactKeys(
+    evidence.heap.current.checkpoints,
+    EXPECTED.heapCheckpoints,
+    "heap.current.checkpoints",
+  );
+  for (const name of EXPECTED.heapCheckpoints) {
+    const referenceUsedSize = finiteNumber(
+      evidence.heap.reference.checkpoints[name],
+      `heap.reference.checkpoints.${name}`,
+      { integer: true, minimum: 1 },
     );
-    if (checkpoint.ceilingBytes !== ceiling)
-      fail(`${name} heap ceiling drifted`);
+    const currentUsedSize = finiteNumber(
+      evidence.heap.current.checkpoints[name],
+      `heap.current.checkpoints.${name}`,
+      { integer: true, minimum: 1 },
+    );
     if (
-      finiteNumber(checkpoint.usedSize, `${name} usedSize`, { integer: true }) >
-      ceiling
+      referenceUsedSize > EXPECTED.heapHardCeilingBytes ||
+      currentUsedSize > EXPECTED.heapHardCeilingBytes
     ) {
-      fail(`${name} retained heap exceeds its ceiling`);
+      fail(`${name} retained heap exceeds the hard ceiling`);
+    }
+    if (currentUsedSize > referenceUsedSize * EXPECTED.heapMaximumRatio) {
+      fail(`${name} retained heap exceeds the paired 10% limit`);
     }
   }
 
@@ -374,7 +401,7 @@ function validFixture() {
   return {
     expected: { evidenceId, headSha, mode: "preswitch" },
     evidence: {
-      schemaVersion: 3,
+      schemaVersion: 4,
       evidenceId,
       mode: "preswitch",
       headSha,
@@ -416,12 +443,19 @@ function validFixture() {
       },
       heap: {
         collection: "one-collectGarbage-then-immediate-getHeapUsage",
-        checkpoints: Object.fromEntries(
-          Object.entries(EXPECTED.heapCeilings).map(([name, ceilingBytes]) => [
-            name,
-            { usedSize: ceilingBytes, ceilingBytes },
-          ]),
-        ),
+        maximumRatio: 1.1,
+        hardCeilingBytes: 4 * 1024 * 1024,
+        reference: {
+          sha: EXPECTED.referenceSha,
+          checkpoints: Object.fromEntries(
+            EXPECTED.heapCheckpoints.map((name) => [name, 1_600_000]),
+          ),
+        },
+        current: {
+          checkpoints: Object.fromEntries(
+            EXPECTED.heapCheckpoints.map((name) => [name, 1_650_000]),
+          ),
+        },
       },
       requests: {
         critical: { count: 1 },
@@ -512,8 +546,19 @@ function runSelfTest() {
       (value) => (value.performance.bootToFirstDisplayMs.observedRatio = 1),
     ],
     [
-      "heap",
-      (value) => (value.heap.checkpoints.afterBoot.usedSize = 1_329_698),
+      "heap ratio",
+      (value) => (value.heap.current.checkpoints.afterBoot = 1_800_000),
+    ],
+    [
+      "heap hard ceiling",
+      (value) => {
+        value.heap.reference.checkpoints.afterBoot = 4 * 1024 * 1024 + 1;
+        value.heap.current.checkpoints.afterBoot = 4 * 1024 * 1024 + 1;
+      },
+    ],
+    [
+      "heap reference SHA",
+      (value) => (value.heap.reference.sha = "b".repeat(40)),
     ],
     ["critical count", (value) => (value.requests.critical.count = 2)],
     ["deferred count", (value) => (value.requests.deferred.count = 1)],
