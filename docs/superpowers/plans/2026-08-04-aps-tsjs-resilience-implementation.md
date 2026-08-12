@@ -3516,10 +3516,10 @@ labelled `module.ts` paths are created here before Task 18D modifies them.
 #### Task 18E: Resolve current-base conflicts and freeze role-correct transfer budgets
 
 This is an integration and measurement checkpoint, not production wiring. The PR
-continues to target `rc/july`. Resolve `main` first because the user explicitly
-requested a clean merge against it, then resolve the actual PR base. Do not use a
-blanket `ours` or `theirs` strategy: preserve upstream fixes and the revision-33
-runtime/APS contracts file-by-file.
+targets `main`; `rc/july` remains the frozen behavior/adoption source. Resolve the
+current PR base first, then merge the adoption source so its complete TSJS behavior
+ledger remains represented. Do not use a blanket `ours` or `theirs` strategy:
+preserve upstream fixes and the revision-33 runtime/APS contracts file-by-file.
 
 **Task 18E files:**
 
@@ -3585,7 +3585,7 @@ runtime/APS contracts file-by-file.
   git merge-base --is-ancestor "$MAIN_SHA" HEAD
   ```
 
-- [ ] **Step E3: Merge current `origin/rc/july`, resolve the PR-base conflicts with
+- [ ] **Step E3: Merge current `origin/rc/july`, resolve the adoption-source conflicts with
       the same three-way discipline, and rerun the complete E2 verification.** Also
       run the adoption ledger because `rc/july` is its source branch. As in E2,
       resolve and stage before testing and commit only when `MERGE_HEAD` exists. List
@@ -3905,7 +3905,7 @@ runtime/APS contracts file-by-file.
 
   ```bash
   test -z "$(git status --porcelain)"
-  test "$(gh pr view --json baseRefName --jq .baseRefName)" = "rc/july"
+  test "$(gh pr view --json baseRefName --jq .baseRefName)" = "main"
   PRESWITCH_REF="$(git branch --show-current)"
   git fetch origin \
     'refs/tags/tsjs-performance-instrument-*:refs/tags/tsjs-performance-instrument-*'
