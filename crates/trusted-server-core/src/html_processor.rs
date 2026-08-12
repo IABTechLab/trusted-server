@@ -173,7 +173,7 @@ pub enum BodyCloseInjection {
     /// Read the auction result from `ad_bids_state` and inject it, falling back to
     /// an empty payload. Today's shipped behaviour.
     InlineBids,
-    /// Emit this markup verbatim — an `<esi:include>` for the edge to assemble.
+    /// Emit this markup verbatim — an inert marker the assembly step splits on.
     /// Must be identical for every request that reaches the transform, or the
     /// cached template is not shared-safe.
     Marker(String),

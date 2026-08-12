@@ -26,7 +26,12 @@ use crate::creative_opportunities::AssemblyMode;
 /// Bump on **any** change to what the transform emits. Without it a deploy reads
 /// yesterday's template shape and assembles against markers that moved, which fails
 /// as a rendering bug far from its cause rather than as a cache miss.
-pub const TEMPLATE_SCHEMA_VERSION: u32 = 1;
+///
+/// | Version | Transform |
+/// | ------- | --------- |
+/// | 1       | `</body>` seam marker was `<esi:include src="/_ts/page-bids?format=fragment"/>` |
+/// | 2       | Marker is the inert comment [`SEAM_BIDS_MARKER`](crate::publisher::SEAM_BIDS_MARKER); the seam hands slots to `scheduleInitialAdInit` instead of assigning them |
+pub const TEMPLATE_SCHEMA_VERSION: u32 = 2;
 
 /// Inputs that select one cached template.
 ///

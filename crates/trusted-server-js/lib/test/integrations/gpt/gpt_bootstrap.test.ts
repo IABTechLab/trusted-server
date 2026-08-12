@@ -159,6 +159,36 @@ describe('gpt_bootstrap.js fallback', () => {
     expect(adInit).not.toHaveBeenCalled();
   });
 
+  it('fallback scheduler guards the SSR slot definitions with the same generation check', () => {
+    // The shared-template seam hands slots to the scheduler rather than assigning
+    // them itself, so the fallback has to honour the same guard as the bundle. If it
+    // applied them unconditionally, a page whose bundle failed to load would take the
+    // stale SSR slots over a committed navigation's.
+    runBootstrap();
+    const ts = (window as TestWindow).tsjs!;
+    ts.adInit = vi.fn();
+    const liveSlot = {
+      id: 'live_slot',
+      gam_unit_path: '/123/live',
+      div_id: 'div-live',
+      formats: [[300, 250]] as Array<[number, number]>,
+    };
+    const ssrSlot = {
+      id: 'ssr_slot',
+      gam_unit_path: '/123/ssr',
+      div_id: 'div-ssr',
+      formats: [[728, 90]] as Array<[number, number]>,
+    };
+
+    ts.scheduleInitialAdInit!({ ssr_slot: { hb_pb: '1.00' } }, [ssrSlot]);
+    expect(ts.adSlots).toEqual([ssrSlot]);
+
+    ts.adSlots = [liveSlot];
+    ts.navGeneration = 1;
+    ts.scheduleInitialAdInit!({ ssr_slot: { hb_pb: '1.00' } }, [ssrSlot]);
+    expect(ts.adSlots).toEqual([liveSlot]);
+  });
+
   it('fallback adInit defines, targets, and displays a TS slot through the command queue', () => {
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),

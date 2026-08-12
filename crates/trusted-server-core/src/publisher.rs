@@ -388,7 +388,7 @@ impl PublisherBodyProcessor {
                 settings,
                 integration_registry,
                 ad_slots_script: params.ad_slots_script.as_deref().map(str::to_string),
-                ad_bids_state: Arc::clone(&params.ad_bids_state),
+                ad_bids_state: Arc::clone(params.ad_bids_state.script_cell()),
                 gpt_diagnostics: params.gpt_diagnostics.clone(),
                 shared_template_authorized: params.template_cache_key.is_some(),
             })?)
@@ -1010,11 +1010,55 @@ pub(crate) fn root_auction_is_useful(mode: AssemblyMode) -> bool {
     }
 }
 
-/// The `esi:include` emitted at the `</body>` seam under [`AssemblyMode::Esi`].
+/// The marker emitted at the `</body>` seam under [`AssemblyMode::Esi`], reserving the
+/// place this reader's slots and bids are spliced into.
 ///
-/// No `path` query parameter: see [`body_close_injection`]. The adapter's include
-/// dispatcher appends it from the live request.
-pub const ESI_BIDS_INCLUDE: &str = "<esi:include src=\"/_ts/page-bids?format=fragment\"/>";
+/// An inert HTML comment, deliberately. It used to be an `<esi:include>`, from when the
+/// `esi` crate resolved it at the edge — but that crate was removed from the render path
+/// because it truncates any element larger than its 16 KB chunk size, and nothing has
+/// parsed ESI since. What remained was a tag that *looked* executable, would have been
+/// executed by any ESI-enabled layer in front of us, and renders as text in a browser if
+/// assembly is ever skipped. A comment cannot do any of those things: an unassembled
+/// template degrades to a page with no ads rather than a page with a visible tag.
+///
+/// Carries no URL. Every byte here is a byte every reader of the shared template
+/// receives, so nothing request-scoped may appear, and keeping a URL out also removes
+/// any escaping question at the seam.
+pub const SEAM_BIDS_MARKER: &str = "<!--ts-seam-bids-->";
+
+/// The mode the operator asked for, before availability is taken into account.
+///
+/// Spelled once, because the mode has to mean the same thing at the cache key, at the
+/// seam, and at both hit finalizers. Every one of those re-derived it from the same
+/// `Option` chain, and the finalizers had no way to ask at all — which is why they
+/// demanded a seam marker of a mode that emits none.
+fn configured_assembly_mode(settings: &Settings) -> AssemblyMode {
+    settings
+        .creative_opportunities
+        .as_ref()
+        .map(CreativeOpportunitiesConfig::assembly_mode)
+        .unwrap_or_default()
+}
+
+/// Whether this mode's `</body>` seam emits [`SEAM_BIDS_MARKER`].
+///
+/// The property that decides whether a template is *expected* to have a hole in it, and
+/// therefore whether the absence of one is a defect or the design. Only `Esi` splices per
+/// reader; `ClientFill` deliberately injects nothing there, because the browser fetches
+/// its own bids after load.
+///
+/// Treating the marker as universal is what made `ClientFill`'s cache inert: every hit
+/// failed the marker check, was logged as transform drift, and fell back to the origin,
+/// so that mode stored templates it could never read back.
+///
+/// Matched exhaustively rather than compared against `Esi`, so a new mode has to state
+/// its answer here instead of silently inheriting one.
+fn mode_emits_seam_marker(mode: AssemblyMode) -> bool {
+    match mode {
+        AssemblyMode::Inline | AssemblyMode::ClientFill => false,
+        AssemblyMode::Esi => true,
+    }
+}
 
 /// The assembly mode this response will actually be delivered under.
 ///
@@ -1033,11 +1077,7 @@ pub const ESI_BIDS_INCLUDE: &str = "<esi:include src=\"/_ts/page-bids?format=fra
 /// Bypassing is the *normal* case against a real origin, not an edge case, so this path
 /// runs far more often than the shared one.
 fn effective_assembly_mode(settings: &Settings, shared_template_authorized: bool) -> AssemblyMode {
-    let configured = settings
-        .creative_opportunities
-        .as_ref()
-        .map(CreativeOpportunitiesConfig::assembly_mode)
-        .unwrap_or_default();
+    let configured = configured_assembly_mode(settings);
     if matches!(configured, AssemblyMode::Inline) || shared_template_authorized {
         return configured;
     }
@@ -1055,21 +1095,9 @@ fn effective_assembly_mode(settings: &Settings, shared_template_authorized: bool
 /// two independent decisions: once [`template_ad_slots_script`] stopped emitting a
 /// head script under a shared mode, body-close injection stopped with it.
 ///
-/// `Esi` emits an `esi:include` pointing at the page-bids endpoint's **fragment**
-/// format, which returns the same executable `<script>` the inline seam injects.
-/// Aiming it at the default JSON form would splice raw JSON where a script belongs,
-/// which is why an unknown `format` is a `400` rather than a silent fall back to
-/// JSON.
-///
-/// The marker carries no `path`, because it is baked into a **shared** template and
-/// every byte in it is a byte every reader of that template receives. Keeping a URL out
-/// of the cached bytes also removes any escaping question at the seam.
-///
-/// Nothing reads the `src` attribute. Once assembly moved to
-/// `PendingFragmentContent::CompletedRequest`, the dispatcher stopped performing I/O and
-/// now substitutes the already-resolved fragment for any include regardless of its URL.
-/// The attribute is retained because a bare `esi:include` is not valid ESI and because a
-/// real-subrequest variant would need it.
+/// `Esi` emits [`SEAM_BIDS_MARKER`], an inert HTML comment marking where this reader's
+/// slots and bids are spliced in. Assembly is a byte split on that comment, performed by
+/// this crate on both the miss and the hit path; no ESI layer is involved.
 pub(crate) fn body_close_injection(
     mode: AssemblyMode,
     head_script_present: bool,
@@ -1087,7 +1115,7 @@ pub(crate) fn body_close_injection(
         AssemblyMode::ClientFill => BodyCloseInjection::None,
         // Constant across every request that reaches the transform — which is what
         // makes it safe in a shared template.
-        AssemblyMode::Esi => BodyCloseInjection::Marker(ESI_BIDS_INCLUDE.to_string()),
+        AssemblyMode::Esi => BodyCloseInjection::Marker(SEAM_BIDS_MARKER.to_string()),
     }
 }
 
@@ -1257,7 +1285,7 @@ pub struct OwnedProcessResponseParams {
     pub(crate) request_scheme: String,
     pub(crate) content_type: String,
     pub(crate) ad_slots_script: Option<String>,
-    pub(crate) ad_bids_state: Arc<Mutex<Option<String>>>,
+    pub(crate) ad_bids_state: AdBidsState,
     /// Observation context for the in-flight auction.
     pub(crate) auction_observation: Option<AuctionObservationContext>,
     /// Auction request snapshot used for telemetry after collection.
@@ -1388,6 +1416,25 @@ pub async fn buffer_publisher_response_async(
             // request cannot store twice, which would leave nothing for assembly to gate
             // on.
             let was_authorized = params.template_cache_key.is_some();
+            // Validate before the store, not after.
+            //
+            // `assemble_if_shared` does the same split and would reject a malformed
+            // template — but only once it had already been written, so every later
+            // reader was served an unusable entry until it expired or was purged. The
+            // one request that produced it failed loudly; everyone after it hit a
+            // template with no hole in it.
+            //
+            // The scan runs twice on a miss as a result. A miss is already paying an
+            // origin fetch and a full `lol_html` transform, and a wrong entry in a
+            // shared cache outlives the request that wrote it.
+            if response_carries_a_seam_marker(was_authorized, settings) {
+                split_template_at_seam(&bytes).change_context_lazy(|| {
+                    crate::error::TrustedServerError::Proxy {
+                        message: "refusing to store a template with no usable seam marker"
+                            .to_string(),
+                    }
+                })?;
+            }
             store_template_if_authorized(services, &mut params, &bytes).await;
             let bytes = assemble_if_shared(was_authorized, settings, &params, bytes)?;
             response.headers_mut().insert(
@@ -1402,6 +1449,16 @@ pub async fn buffer_publisher_response_async(
             template,
             mut params,
         } => {
+            // Asked of the mode before anything is split, because a mode that emits no
+            // seam stores a template with no hole in it — and demanding one anyway is
+            // what turned every `client_fill` hit into a 500 here and into a truncated
+            // body on the streaming finalizer. The mode is read from settings rather
+            // than carried: the cache key covers `assembly_mode`, so a template can only
+            // be read back by the mode that wrote it.
+            if !mode_emits_seam_marker(configured_assembly_mode(settings)) {
+                abandon_auction_without_a_seam(services, &mut params).await;
+                return Ok(serve_seamless_template(response, template));
+            }
             // Buffered adapters have no streaming to preserve, so eager assembly costs
             // them nothing. The streaming finalizer must not do this.
             if let Some(dispatched) = params.dispatched_auction.take() {
@@ -1430,10 +1487,7 @@ pub async fn buffer_publisher_response_async(
                     message: "cached template has no usable seam marker".to_string(),
                 }
             })?;
-            let seam = build_seam_script(
-                params.seam_ad_slots.as_deref().unwrap_or("[]"),
-                &current_bid_map(&params.ad_bids_state),
-            );
+            let seam = seam_script_for(&params);
             let mut assembled = Vec::with_capacity(head.len() + seam.len() + tail.len());
             assembled.extend_from_slice(head);
             assembled.extend_from_slice(seam.as_bytes());
@@ -1506,17 +1560,7 @@ fn assemble_if_shared(
     params: &OwnedProcessResponseParams,
     bytes: Vec<u8>,
 ) -> Result<Vec<u8>, Report<crate::error::TrustedServerError>> {
-    // Gated on the *authorization*, not on the configured mode. A bypassed response fell
-    // back to inline and therefore carries no marker; splitting it would fail and turn
-    // an ordinary bypass — the common case against a real origin — into a 500.
-    // Both conditions, and neither alone: only `Esi` emits a marker, and only an
-    // authorized response has one to find. `ClientFill` is authorized but marker-free.
-    let emits_a_marker = settings
-        .creative_opportunities
-        .as_ref()
-        .map(CreativeOpportunitiesConfig::assembly_mode)
-        .is_some_and(|mode| matches!(mode, AssemblyMode::Esi));
-    if !was_authorized || !emits_a_marker {
+    if !response_carries_a_seam_marker(was_authorized, settings) {
         return Ok(bytes);
     }
 
@@ -1525,14 +1569,7 @@ fn assemble_if_shared(
             message: "shared template has no usable seam marker".to_string(),
         }
     })?;
-    // `None` means the ad stack did not run — bot, prefetch, consent-denied, kill switch.
-    // Emitting an empty-slot seam would still call `scheduleInitialAdInit`, scheduling
-    // `adInit` for exactly the traffic that opted out. Emit nothing instead.
-    let seam = params
-        .seam_ad_slots
-        .as_deref()
-        .map(|slots| build_seam_script(slots, &current_bid_map(&params.ad_bids_state)))
-        .unwrap_or_default();
+    let seam = seam_script_for(params);
 
     let mut out = Vec::with_capacity(head.len() + seam.len() + tail.len());
     out.extend_from_slice(head);
@@ -1541,33 +1578,138 @@ fn assemble_if_shared(
     Ok(out)
 }
 
-/// The bids for this request, recovered from the rendered bids script.
+/// Serves a cached template unchanged, for a mode whose `</body>` seam injects nothing.
 ///
-/// # Known defect
+/// Under [`AssemblyMode::ClientFill`] the stored template *is* the response: the browser
+/// fetches its own bids after load, so there is no per-reader splice and nothing to wait
+/// for. Every byte is already in hand, so the length is known and stated —
+/// [`build_cached_template_response`] omits it because the assembled length of an `esi`
+/// response is not known until bids resolve, which does not apply here.
+fn serve_seamless_template(
+    mut response: Response<EdgeBody>,
+    template: Vec<u8>,
+) -> Response<EdgeBody> {
+    response.headers_mut().insert(
+        http::header::CONTENT_LENGTH,
+        http::HeaderValue::from(template.len() as u64),
+    );
+    *response.body_mut() = EdgeBody::from(template);
+    response
+}
+
+/// Reports a dispatched auction that a seamless mode has no way to deliver.
 ///
-/// `ad_bids_state` holds a *JS-escaped* `<script>`, and this reverses only the two
-/// escapes `html_escape_for_script` applies to angle brackets. Any bid whose JSON
-/// contains another escaped character is lost. Every fixture here has empty bids, so
-/// nothing catches it.
+/// Unreachable by construction: [`root_auction_is_useful`] refuses to dispatch under a
+/// mode that injects nothing, so there is never anything in flight here. It is spelled
+/// out anyway because the alternative is dropping a [`DispatchedAuction`] — real SSP
+/// requests, already billed — with no error and no log, which is the silent-waste
+/// signature the gate exists to prevent.
+async fn abandon_auction_without_a_seam(
+    services: &RuntimeServices,
+    params: &mut OwnedProcessResponseParams,
+) {
+    let Some(dispatched) = params.dispatched_auction.take() else {
+        return;
+    };
+    log::warn!(
+        "Server-side auction dispatched under an assembly mode with no seam to deliver \
+         it into; in-flight SSP bid requests will not be collected"
+    );
+    emit_abandoned_auction(
+        services,
+        params.auction_observation.take(),
+        dispatched,
+        "seamless_assembly_mode",
+    )
+    .await;
+}
+
+/// Fingerprint of everything that changes the injected markup for a given URL.
 ///
-/// The correct fix is to carry the bid map alongside the rendered script from
-/// `write_bids_to_state` rather than reconstructing it, which is a change in the auction
-/// collection path and is not made here.
-fn current_bid_map(
-    ad_bids_state: &Arc<Mutex<Option<String>>>,
-) -> serde_json::Map<String, serde_json::Value> {
-    let guard = ad_bids_state.lock().expect("should lock bid state");
-    let Some(script) = guard.as_deref() else {
-        return serde_json::Map::new();
-    };
-    let Some(start) = script.find("JSON.parse(\"") else {
-        return serde_json::Map::new();
-    };
-    let rest = &script[start + "JSON.parse(\"".len()..];
-    let Some(end) = rest.find("\")") else {
-        return serde_json::Map::new();
-    };
-    serde_json::from_str(&rest[..end].replace("\\u003c", "<").replace("\\u003e", ">"))
+/// Two inputs, because either alone under-invalidates:
+///
+/// - The **compiled bundle**, so a JS deploy retires stored templates without a purge.
+/// - The **`[integrations]` configuration**, which decides the enabled set — and so the
+///   module IDs in the `<script src="/static/tsjs=…">` tag — and supplies the
+///   per-integration head inserts. `window.__tsjs_prebid={…}` carries the account ID,
+///   timeout and bidder list straight into the shared template.
+///
+/// The bundle hash was the whole fingerprint, and `all_module_ids()` makes it a constant
+/// for a given binary: enabling, disabling or reconfiguring an integration did not move
+/// it, so every reader kept being served a template built under the previous
+/// configuration until the entry expired.
+///
+/// Read from settings rather than from a built [`IntegrationRegistry`]: the registry is
+/// derived from exactly these entries, and building one here would add a second fallible
+/// construction to the request path for a value the transform already holds. Hashing the
+/// whole section over-invalidates — a field that affects no markup still moves the
+/// fingerprint — and never under-invalidates, which is the safe direction for a cache
+/// shared between readers.
+///
+/// # Panics
+///
+/// Does not panic: `serde_json::to_string` of an already-parsed [`serde_json::Value`] has
+/// no failure mode, and the `expect` documents that rather than hiding a real error
+/// behind a default.
+fn integration_fingerprint(settings: &Settings) -> String {
+    use sha2::Digest as _;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(
+        trusted_server_js::concatenated_hash(&trusted_server_js::all_module_ids()).as_bytes(),
+    );
+    // Sorted before hashing. `IntegrationSettings` derefs to a `HashMap`, whose iteration
+    // order varies per process, so an unsorted digest would differ between two requests
+    // to the same binary and the cache would never hit. Nested objects are already
+    // deterministic: `serde_json::Map` is `BTreeMap`-backed without `preserve_order`.
+    let mut entries: Vec<_> = settings.integrations.iter().collect();
+    entries.sort_by_key(|(id, _)| *id);
+    for (id, config) in entries {
+        // Length-prefixed, for the reason `TemplateCacheKey::to_cache_key` is: a
+        // delimiter a value can contain lets two distinct configurations digest
+        // identically, and here that means one configuration's template served under
+        // another's.
+        //
+        // Partner tokens and other secrets in this section reach the hasher but not the
+        // key: only the digest is used.
+        let config = serde_json::to_string(config)
+            .expect("serde_json::to_string of a Value should be infallible");
+        hasher.update(id.len().to_string().as_bytes());
+        hasher.update(b":");
+        hasher.update(id.as_bytes());
+        hasher.update(config.len().to_string().as_bytes());
+        hasher.update(b":");
+        hasher.update(config.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// Whether this response's transformed bytes are expected to carry a seam marker.
+///
+/// Gated on the *authorization*, not on the configured mode alone. A bypassed response
+/// fell back to inline and therefore carries no marker; validating or splitting it would
+/// fail and turn an ordinary bypass — the common case against a real origin — into a
+/// 500. Both conditions, and neither alone: only `Esi` emits a marker, and only an
+/// authorized response has one to find. `ClientFill` is authorized but marker-free.
+fn response_carries_a_seam_marker(was_authorized: bool, settings: &Settings) -> bool {
+    was_authorized && mode_emits_seam_marker(configured_assembly_mode(settings))
+}
+
+/// What this request splices into the seam marker: a `<script>`, or nothing at all.
+///
+/// `seam_ad_slots` is `None` exactly when the ad stack did not run — bot, prefetch,
+/// consent-denied, auction kill switch. Emitting a seam anyway, with `[]` slots, still
+/// calls `scheduleInitialAdInit`, which schedules `adInit` for precisely the traffic
+/// that opted out. Absent is not the same as empty here.
+///
+/// Shared by the miss path and by **both** hit finalizers. They previously each spelled
+/// the decision out, and the two hit paths spelled it `unwrap_or("[]")` — so the gate
+/// held on a cache miss and was ignored on every cache hit.
+fn seam_script_for(params: &OwnedProcessResponseParams) -> String {
+    params
+        .seam_ad_slots
+        .as_deref()
+        .map(|slots| build_seam_script(slots, &params.ad_bids_state.bids()))
         .unwrap_or_default()
 }
 
@@ -1581,7 +1723,7 @@ fn build_template_assembly_params(
     request_host: &str,
     request_scheme: &str,
     price_granularity: PriceGranularity,
-    ad_bids_state: Arc<Mutex<Option<String>>>,
+    ad_bids_state: AdBidsState,
 ) -> OwnedProcessResponseParams {
     OwnedProcessResponseParams {
         // Already stored; storing again on a hit would be pointless work.
@@ -1613,7 +1755,7 @@ fn build_template_assembly_params(
 /// the template is not one this arm produced, and assembling it anyway would serve a page
 /// with either no bids or a visible marker in it.
 fn split_template_at_seam(template: &[u8]) -> Result<(&[u8], &[u8]), SeamError> {
-    let marker = ESI_BIDS_INCLUDE.as_bytes();
+    let marker = SEAM_BIDS_MARKER.as_bytes();
     let mut found = template
         .windows(marker.len())
         .enumerate()
@@ -1754,8 +1896,8 @@ async fn store_template_if_authorized(
                 "c2_template_cache stored {} bytes (seam marker present: {})",
                 bytes.len(),
                 bytes
-                    .windows(ESI_BIDS_INCLUDE.len())
-                    .any(|w| w == ESI_BIDS_INCLUDE.as_bytes())
+                    .windows(SEAM_BIDS_MARKER.len())
+                    .any(|w| w == SEAM_BIDS_MARKER.as_bytes())
             );
         }
         Err(err) => log::warn!("c2_template_cache store failed: {err}"),
@@ -1838,6 +1980,15 @@ pub async fn publisher_response_into_streaming_response(
                 return Ok(response);
             }
 
+            // The buffered finalizer's counterpart; see the note there. Placed before the
+            // stream is built rather than inside it: a seamless template has no seam to
+            // wait at, so there is nothing for a stream to interleave, and failing inside
+            // the stream could only truncate a response whose headers had already gone.
+            if !mode_emits_seam_marker(configured_assembly_mode(&settings)) {
+                abandon_auction_without_a_seam(&services, &mut params).await;
+                return Ok(serve_seamless_template(response, template));
+            }
+
             let services = services.clone();
             let settings = Arc::clone(&settings);
             let orchestrator = Arc::clone(&orchestrator);
@@ -1873,10 +2024,7 @@ pub async fn publisher_response_into_streaming_response(
                     .await;
                 }
 
-                let seam = build_seam_script(
-                    params.seam_ad_slots.as_deref().unwrap_or("[]"),
-                    &current_bid_map(&params.ad_bids_state),
-                );
+                let seam = seam_script_for(&params);
                 yield bytes::Bytes::from(seam);
                 yield bytes::Bytes::copy_from_slice(tail);
             };
@@ -2212,7 +2360,7 @@ pub fn stream_publisher_body<W: Write>(
         content_type: &params.content_type,
         integration_registry,
         ad_slots_script: params.ad_slots_script.as_deref(),
-        ad_bids_state: &params.ad_bids_state,
+        ad_bids_state: params.ad_bids_state.script_cell(),
         gpt_diagnostics: params.gpt_diagnostics.as_ref(),
         shared_template_authorized: params.template_cache_key.is_some(),
     };
@@ -2306,7 +2454,7 @@ pub async fn stream_publisher_body_async<W: Write>(
         settings,
         integration_registry,
         ad_slots_script: params.ad_slots_script.as_deref().map(str::to_string),
-        ad_bids_state: params.ad_bids_state.clone(),
+        ad_bids_state: Arc::clone(params.ad_bids_state.script_cell()),
         gpt_diagnostics: params.gpt_diagnostics.clone(),
         shared_template_authorized: params.template_cache_key.is_some(),
     }) {
@@ -2455,10 +2603,90 @@ fn request_origin(scheme: &str, host: &str) -> String {
     }
 }
 
+/// This request's auction result, in both forms the seams need.
+///
+/// The inline `</body>` seam injects a rendered `<script>`; the shared-template seam
+/// splices the bids into a script it builds itself, and therefore needs them
+/// structured. [`write_bids_to_state`] derives both from one bid map under one call, so
+/// the two can never describe different auctions.
+///
+/// # Why the map is carried rather than recovered
+///
+/// An earlier revision stored only the script and reconstructed the map by un-escaping
+/// it. [`html_escape_for_script`] escapes `"` as `\"`, so the extracted text was invalid
+/// JSON for every non-empty map; `serde_json::from_str` failed and `unwrap_or_default()`
+/// turned the failure into `{}`. Shared modes therefore served **zero bids**, silently,
+/// on every request that had any. Every fixture had empty bids, so nothing caught it.
+#[derive(Clone, Default)]
+pub(crate) struct AdBidsState {
+    /// Rendered bids `<script>`. Shared with the HTML processor's `</body>` handler,
+    /// which is why this stays an `Option<String>` cell rather than moving inside the
+    /// same lock as the map.
+    script: Arc<Mutex<Option<String>>>,
+    /// The same bids, structured, for the shared-template seam.
+    bids: Arc<Mutex<serde_json::Map<String, serde_json::Value>>>,
+}
+
+#[cfg(test)]
+impl AdBidsState {
+    /// A state whose rendered script is already set, for tests that exercise the inline
+    /// `</body>` seam without running an auction.
+    fn with_script(script: &str) -> Self {
+        let state = Self::default();
+        *state.script.lock().expect("should lock bid script") = Some(script.to_string());
+        state
+    }
+}
+
+impl AdBidsState {
+    /// The cell the HTML processor reads at the `</body>` seam.
+    pub(crate) fn script_cell(&self) -> &Arc<Mutex<Option<String>>> {
+        &self.script
+    }
+
+    /// Record one auction result, rendering the script from the same map that is
+    /// stored, so the two representations cannot drift.
+    fn set(&self, bid_map: serde_json::Map<String, serde_json::Value>) {
+        let bids_script = build_bids_script(&bid_map);
+        *self.script.lock().expect("should lock bid script") = Some(bids_script);
+        *self.bids.lock().expect("should lock bid map") = bid_map;
+    }
+
+    /// The structured bids the shared-template seam splices into the marker.
+    ///
+    /// Empty when no auction has been collected, which is the same payload the inline
+    /// seam falls back to.
+    pub(crate) fn bids(&self) -> serde_json::Map<String, serde_json::Value> {
+        self.bids.lock().expect("should lock bid map").clone()
+    }
+
+    /// Put `comment` immediately before the rendered bids script.
+    ///
+    /// Debug-only, and deliberately confined to the script: the structured map is what
+    /// the shared seam serializes, so prefixing an HTML comment onto it would be
+    /// meaningless there.
+    fn prepend_to_script(&self, comment: &str) {
+        let mut state = self
+            .script
+            .lock()
+            .expect("should lock bid script for debug");
+        match &mut *state {
+            Some(script) => {
+                *script = format!("{comment}\n{script}");
+            }
+            None => {
+                // invariant: write_bids_to_state is always called before this and
+                // always sets Some(_); this branch is unreachable in production.
+                *state = Some(comment.to_string());
+            }
+        }
+    }
+}
+
 pub(crate) fn write_bids_to_state(
     winning_bids: &std::collections::HashMap<String, Bid>,
     price_granularity: PriceGranularity,
-    ad_bids_state: &Arc<Mutex<Option<String>>>,
+    ad_bids_state: &AdBidsState,
     settings: &Settings,
     request_origin: &str,
     include_debug_bid: bool,
@@ -2468,15 +2696,13 @@ pub(crate) fn write_bids_to_state(
         winning_bids.len(),
         winning_bids.keys().cloned().collect::<Vec<_>>().join(", ")
     );
-    let bid_map = build_bid_map(
+    ad_bids_state.set(build_bid_map(
         winning_bids,
         price_granularity,
         settings,
         request_origin,
         include_debug_bid,
-    );
-    let bids_script = build_bids_script(&bid_map);
-    *ad_bids_state.lock().expect("should lock bid state") = Some(bids_script);
+    ));
 }
 
 /// Maximum serialized size (in bytes) of a dump embedded in the `ts-debug`
@@ -2569,7 +2795,7 @@ fn redact_bid_for_dump(bid: &crate::auction::types::Bid) -> serde_json::Value {
 pub(crate) fn prepend_auction_debug_comment(
     path_label: &str,
     result: &crate::auction::orchestrator::OrchestrationResult,
-    ad_bids_state: &Arc<Mutex<Option<String>>>,
+    ad_bids_state: &AdBidsState,
 ) {
     let ssp_count = result.provider_responses.len();
     let mediator_info = match &result.mediator_response {
@@ -2645,19 +2871,7 @@ pub(crate) fn prepend_auction_debug_comment(
         result.winning_bids.len(),
         result.total_time_ms,
     );
-    let mut state = ad_bids_state
-        .lock()
-        .expect("should lock bid state for debug");
-    match &mut *state {
-        Some(script) => {
-            *script = format!("{debug_comment}\n{script}");
-        }
-        None => {
-            // invariant: write_bids_to_state is always called before this and
-            // always sets Some(_); this branch is unreachable in production.
-            *state = Some(debug_comment);
-        }
-    }
+    ad_bids_state.prepend_to_script(&debug_comment);
 }
 
 /// Telemetry context carried from dispatch to collect.
@@ -2689,7 +2903,7 @@ struct AuctionCollectCtx<'a> {
 /// streaming loop.
 struct AuctionCollectDeps<'a> {
     price_granularity: PriceGranularity,
-    ad_bids_state: &'a Arc<Mutex<Option<String>>>,
+    ad_bids_state: &'a AdBidsState,
     orchestrator: &'a AuctionOrchestrator,
     services: &'a RuntimeServices,
     settings: &'a Settings,
@@ -3351,7 +3565,7 @@ pub async fn handle_publisher_request(
         .and_then(|co| co.auction_timeout_ms)
         .unwrap_or(settings.auction.timeout_ms);
 
-    let ad_bids_state: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let ad_bids_state = AdBidsState::default();
 
     let price_granularity = settings
         .creative_opportunities
@@ -3364,11 +3578,7 @@ pub async fn handle_publisher_request(
     // dispatch_auction returns — DispatchedAuction holds no lifetime — so req
     // can be mutated and sent to origin immediately after.
     let mut auction_observation: Option<AuctionObservationContext> = None;
-    let assembly_mode = settings
-        .creative_opportunities
-        .as_ref()
-        .map(CreativeOpportunitiesConfig::assembly_mode)
-        .unwrap_or_default();
+    let assembly_mode = configured_assembly_mode(settings);
 
     let mut auction_request_for_telemetry: Option<AuctionRequest> = None;
     let mut dispatched_auction = if matched_slots.is_empty() {
@@ -3569,37 +3779,32 @@ pub async fn handle_publisher_request(
             req.method()
         );
     }
-    let template_cache_key =
-        (method_is_cacheable && !matches!(assembly_mode, AssemblyMode::Inline)).then(|| {
-            crate::platform::TemplateCacheKey {
-                url: target_uri.to_string(),
-                request_host: request_host.to_string(),
-                request_scheme: request_scheme.to_string(),
-                assembly_mode,
-                vary_values: settings
-                    .creative_opportunities
-                    .as_ref()
-                    .map(CreativeOpportunitiesConfig::template_cache_vary)
-                    .unwrap_or_else(|| VarySpec::new([]))
-                    .values_from(|name| {
-                        req.headers()
-                            .get(name)
-                            .and_then(|value| value.to_str().ok())
-                    }),
-                accept_encoding: req
-                    .headers()
-                    .get(header::ACCEPT_ENCODING)
+    let template_cache_key = (method_is_cacheable
+        && !matches!(assembly_mode, AssemblyMode::Inline))
+    .then(|| crate::platform::TemplateCacheKey {
+        url: target_uri.to_string(),
+        request_host: request_host.to_string(),
+        request_scheme: request_scheme.to_string(),
+        assembly_mode,
+        vary_values: settings
+            .creative_opportunities
+            .as_ref()
+            .map(CreativeOpportunitiesConfig::template_cache_vary)
+            .unwrap_or_else(|| VarySpec::new([]))
+            .values_from(|name| {
+                req.headers()
+                    .get(name)
                     .and_then(|value| value.to_str().ok())
-                    .unwrap_or_default()
-                    .to_string(),
-                // Changes whenever any JS module changes, so a bundle deploy invalidates
-                // stored templates without needing a purge.
-                integration_fingerprint: trusted_server_js::concatenated_hash(
-                    &trusted_server_js::all_module_ids(),
-                ),
-                schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
-            }
-        });
+            }),
+        accept_encoding: req
+            .headers()
+            .get(header::ACCEPT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string(),
+        integration_fingerprint: integration_fingerprint(settings),
+        schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
+    });
     *req.uri_mut() = target_uri;
     req.headers_mut().insert(
         header::HOST,
@@ -3633,17 +3838,30 @@ pub async fn handle_publisher_request(
             Ok(entry) => {
                 log::debug!("c2_template_cache hit: {} bytes", entry.body.len());
 
-                // A template with no seam marker cannot be assembled, and serving it
-                // would be a page with slots and no ads. Treat it as a miss and fetch
-                // the origin: `schema_version` should make this unreachable, so it means
-                // the transform changed without the version moving.
-                if !entry
-                    .body
-                    .windows(ESI_BIDS_INCLUDE.len())
-                    .any(|w| w == ESI_BIDS_INCLUDE.as_bytes())
-                {
+                // The **strict** check — exactly one marker — and it runs here, before a
+                // single response header is constructed.
+                //
+                // This used to test only that a marker existed somewhere, and left the
+                // exactly-one check to `split_template_at_seam` inside the finalizer.
+                // By then a 200 with its headers had already been committed and, on the
+                // streaming adapter, the document head was already on the wire; the
+                // failure could only truncate the response mid-body. Failing here falls
+                // back to the origin instead, which is a slower correct page.
+                //
+                // `schema_version` should make either failure unreachable, so reaching
+                // it means the transform changed without the version moving.
+                //
+                // Asked of the mode, not of every template. The key covers
+                // `assembly_mode`, so a hit was stored by this same mode — and a mode
+                // that emits no marker stores a template with none. Demanding one
+                // unconditionally made every `client_fill` hit fail this check, report
+                // drift that had not happened, and refetch the origin.
+                let seam_check = mode_emits_seam_marker(assembly_mode)
+                    .then(|| split_template_at_seam(&entry.body).err())
+                    .flatten();
+                if let Some(err) = seam_check {
                     log::error!(
-                        "c2_template_cache hit has no seam marker; treating as a miss. \
+                        "c2_template_cache hit is unusable ({err}); treating as a miss. \
                          The transform changed without TEMPLATE_SCHEMA_VERSION moving."
                     );
                 } else {
@@ -3662,7 +3880,7 @@ pub async fn handle_publisher_request(
                         request_host,
                         request_scheme,
                         price_granularity,
-                        Arc::clone(&ad_bids_state),
+                        ad_bids_state.clone(),
                     );
                     params.seam_ad_slots = seam_ad_slots.clone();
                     params.dispatched_auction = dispatched_auction.take();
@@ -4392,8 +4610,16 @@ else t.bids=b;\
 /// `[]` default, so `adInit` defined no slots and the page rendered correctly with **no
 /// TS ads at all**. A review caught it; nothing here or in the harness would have.
 ///
-/// Slots are assigned before the scheduler is invoked, because `scheduleInitialAdInit`
-/// may fire `adInit` and `adInit` reads `ts.adSlots`.
+/// Both are handed to the **scheduler**, not assigned here. `scheduleInitialAdInit`
+/// drops the whole payload once a SPA navigation has committed, and slots assigned on
+/// the line before the call would already have overwritten that navigation's slots by
+/// the time the guard ran — the guard covered the bids and `adInit`, and the assignment
+/// it was there to protect happened in front of it. The `else` arm keeps the direct
+/// assignment for the one case with no scheduler to race against: the GPT integration
+/// active without its head bootstrap, which is not an expected deployment.
+///
+/// Slots are applied before bids inside the scheduler, because the scheduler may fire
+/// `adInit` and `adInit` reads `ts.adSlots`.
 pub(crate) fn build_seam_script(
     slots_json: &str,
     bid_map: &serde_json::Map<String, serde_json::Value>,
@@ -4403,11 +4629,11 @@ pub(crate) fn build_seam_script(
     format!(
         "<script>(function(){{\
 var t=window.tsjs=window.tsjs||{{}};\
-t.adSlots=JSON.parse(\"{}\");\
+var a=JSON.parse(\"{}\");\
 var b=JSON.parse(\"{}\");\
 var s=t.scheduleInitialAdInit;\
-if(typeof s===\"function\")s(b);\
-else t.bids=b;\
+if(typeof s===\"function\")s(b,a);\
+else{{t.adSlots=a;t.bids=b;}}\
 }})();</script>",
         html_escape_for_script(slots_json),
         html_escape_for_script(&bids)
@@ -4641,15 +4867,22 @@ pub(crate) fn c2_bypass_reason(
     if !uncovered.is_empty() {
         return Some(C2BypassReason::VaryNotCovered(VaryGap(uncovered)));
     }
-    // One pass over the header. `private` and `no-store` match the cookie-privacy
-    // net's reading; `no-cache` is added because it means "revalidate before reuse"
-    // rather than "do not store" — correct for an HTTP cache, too permissive for a
-    // spike-owned one.
+    // Every value, not the first. `Cache-Control` may arrive as repeated header lines —
+    // `Cache-Control: public, max-age=300` then `Cache-Control: private` — and HTTP
+    // treats that identically to one comma-joined line. `HeaderMap::get` returns only
+    // the first, so a `private` or `no-store` in a later line was invisible and the
+    // response was stored in a cache shared between readers. Same fail-open shape as the
+    // `Vary` reads above, which is why those already use `get_all`.
+    //
+    // `private` and `no-store` match the cookie-privacy net's reading; `no-cache` is
+    // added because it means "revalidate before reuse" rather than "do not store" —
+    // correct for an HTTP cache, too permissive for a spike-owned one.
     let non_shareable = response_headers
-        .get(header::CACHE_CONTROL)
-        .and_then(|value| value.to_str().ok())
+        .get_all(header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
         .map(str::to_ascii_lowercase)
-        .is_some_and(|value| {
+        .any(|value| {
             value.contains("private") || value.contains("no-store") || value.contains("no-cache")
         });
     if non_shareable {
@@ -5330,9 +5563,10 @@ mod tests {
             total_time_ms: 665,
             metadata: std::collections::HashMap::new(),
         };
-        let state = Arc::new(Mutex::new(Some("BIDS_SCRIPT".to_string())));
+        let state = AdBidsState::with_script("BIDS_SCRIPT");
         prepend_auction_debug_comment("stream", &result, &state);
         let comment = state
+            .script_cell()
             .lock()
             .expect("should lock state")
             .clone()
@@ -5391,9 +5625,10 @@ mod tests {
             total_time_ms: 12,
             metadata: std::collections::HashMap::new(),
         };
-        let state = Arc::new(Mutex::new(Some("BIDS_SCRIPT".to_string())));
+        let state = AdBidsState::with_script("BIDS_SCRIPT");
         prepend_auction_debug_comment("stream", &result, &state);
         let comment = state
+            .script_cell()
             .lock()
             .expect("should lock state")
             .clone()
@@ -5569,7 +5804,7 @@ mod tests {
             request_scheme: "https".to_owned(),
             content_type: "application/json".to_owned(),
             ad_slots_script: None,
-            ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            ad_bids_state: AdBidsState::default(),
             auction_observation: None,
             auction_request: None,
             dispatched_auction: None,
@@ -6012,6 +6247,145 @@ mod tests {
         }
     }
 
+    mod integration_fingerprint_tests {
+        use super::*;
+
+        /// Base settings with one integration's config replaced.
+        ///
+        /// Edits the parsed `[integrations]` map rather than appending TOML, so the two
+        /// fixtures differ in exactly the field under test — the base settings already
+        /// declare `[integrations.prebid]`, and a second table would not parse.
+        fn settings_with_prebid(enabled: bool, timeout_ms: u32) -> Settings {
+            let mut settings = create_test_settings();
+            settings.integrations.insert(
+                "prebid".to_string(),
+                serde_json::json!({
+                    "enabled": enabled,
+                    "server_url": "https://prebid.example.com/openrtb2/auction",
+                    "external_bundle_url": "https://assets.example.com/prebid/bundle.js",
+                    "timeout": timeout_ms,
+                }),
+            );
+            settings
+        }
+
+        #[test]
+        fn disabling_an_integration_changes_the_fingerprint() {
+            // The fingerprint was `concatenated_hash(all_module_ids())` — every module
+            // compiled into the binary, so a constant for that binary. Turning an
+            // integration off changed the injected `<script>` set and left the cache key
+            // untouched, and every reader kept getting the template built while it was on.
+            assert_ne!(
+                integration_fingerprint(&settings_with_prebid(true, 1000)),
+                integration_fingerprint(&settings_with_prebid(false, 1000)),
+                "the enabled integration set must select a different template"
+            );
+        }
+
+        #[test]
+        fn reconfiguring_an_integration_changes_the_fingerprint() {
+            // Config reaches the template directly: the prebid head insert carries the
+            // account ID, timeout and bidder list into bytes shared between readers.
+            assert_ne!(
+                integration_fingerprint(&settings_with_prebid(true, 1000)),
+                integration_fingerprint(&settings_with_prebid(true, 2500)),
+                "an integration's configuration must select a different template"
+            );
+        }
+
+        #[test]
+        fn the_fingerprint_is_stable_across_calls_for_one_configuration() {
+            // `IntegrationSettings` derefs to a `HashMap`, whose iteration order varies.
+            // An unsorted digest would differ between two requests to the same binary and
+            // the cache would never hit — a fix that quietly disables the feature.
+            let settings = settings_with_prebid(true, 1000);
+            let first = integration_fingerprint(&settings);
+
+            for _ in 0..16 {
+                assert_eq!(
+                    integration_fingerprint(&settings),
+                    first,
+                    "the same configuration must always fingerprint identically"
+                );
+            }
+            // A second, independently parsed `Settings` builds a fresh `HashMap` with a
+            // different iteration order, which is what actually exercises the sort.
+            assert_eq!(
+                integration_fingerprint(&settings_with_prebid(true, 1000)),
+                first,
+                "two equal configurations must fingerprint identically"
+            );
+        }
+    }
+
+    mod seam_script_tests {
+        use super::*;
+
+        fn seam() -> String {
+            build_seam_script(
+                r#"[{"id":"atf","div_id":"atf"}]"#,
+                &serde_json::Map::from_iter([(
+                    "atf".to_string(),
+                    serde_json::json!({"hb_pb": "1.50"}),
+                )]),
+            )
+        }
+
+        #[test]
+        fn no_slot_assignment_precedes_the_navigation_generation_guard() {
+            // `scheduleInitialAdInit` drops the whole SSR payload once a navigation has
+            // committed. The seam used to assign `t.adSlots` on the line *before* calling
+            // it, which is outside that guard — so a committed SPA navigation kept its own
+            // bids and silently lost its slots to the stale SSR document's.
+            let script = seam();
+            let guard = script
+                .find("t.scheduleInitialAdInit")
+                .expect("the seam should consult the scheduler");
+
+            assert!(
+                !script[..guard].contains("t.adSlots="),
+                "no slot assignment may run ahead of the navigation-generation guard: \
+                 {script}"
+            );
+        }
+
+        #[test]
+        fn the_slots_are_handed_to_the_scheduler_so_the_guard_can_apply_them() {
+            // Removing the unguarded assignment is only half the fix: the slots still have
+            // to arrive, or a shared-mode page defines no slots at all.
+            let script = seam();
+
+            assert!(
+                script.contains("s(b,a)"),
+                "the scheduler should receive bids and slots together: {script}"
+            );
+            assert!(
+                script.contains("atf"),
+                "the slot definitions should reach the page: {script}"
+            );
+        }
+
+        #[test]
+        fn a_page_with_no_scheduler_still_gets_its_slots() {
+            // The GPT integration active without its head bootstrap. There is no SPA hook
+            // to race with there, so the direct assignment is the correct fallback — and
+            // dropping it while moving the assignment would have served no ads at all.
+            let script = seam();
+            let fallback = script
+                .find("else")
+                .expect("the seam should carry a no-scheduler fallback");
+
+            assert!(
+                script[fallback..].contains("t.adSlots=a"),
+                "the fallback should still assign slots: {script}"
+            );
+            assert!(
+                script[fallback..].contains("t.bids=b"),
+                "the fallback should still assign bids: {script}"
+            );
+        }
+    }
+
     mod page_bids_format_tests {
         //! The fragment format is what an `esi:include` splices into the document. Its
         //! failure mode is silent: the wrong bytes still return `200` and still parse,
@@ -6246,6 +6620,14 @@ mod tests {
         #[derive(Default)]
         struct MemoryTemplateCache {
             entries: Mutex<HashMap<String, crate::platform::TemplateEntry>>,
+            /// Every key `get` was called with, so a test can assert what was *asked
+            /// for* rather than only what came back. A lookup that names a schema
+            /// version this binary cannot assemble is the bug; whether the entry
+            /// happened to survive the later marker check is not the same question.
+            lookups: Mutex<Vec<crate::platform::TemplateCacheKey>>,
+            /// Every key `put` was called with, so a test can re-key an entry exactly
+            /// instead of reconstructing what the request derived.
+            stored_keys: Mutex<Vec<crate::platform::TemplateCacheKey>>,
         }
 
         #[async_trait::async_trait(?Send)]
@@ -6255,6 +6637,10 @@ mod tests {
                 key: &crate::platform::TemplateCacheKey,
             ) -> Result<crate::platform::TemplateEntry, crate::platform::TemplateCacheMiss>
             {
+                self.lookups
+                    .lock()
+                    .expect("should lock lookups")
+                    .push(key.clone());
                 self.entries
                     .lock()
                     .expect("should lock entries")
@@ -6269,6 +6655,10 @@ mod tests {
                 metadata: &crate::platform::TemplateMetadata,
                 body: Vec<u8>,
             ) -> Result<(), crate::platform::TemplateCacheError> {
+                self.stored_keys
+                    .lock()
+                    .expect("should lock stored keys")
+                    .push(key.clone());
                 self.entries.lock().expect("should lock entries").insert(
                     key.to_cache_key(),
                     crate::platform::TemplateEntry {
@@ -6327,7 +6717,7 @@ mod tests {
                 template: &str,
                 fragment: &str,
             ) -> Result<String, crate::platform::TemplateAssemblyError> {
-                Ok(template.replace(ESI_BIDS_INCLUDE, fragment))
+                Ok(template.replace(SEAM_BIDS_MARKER, fragment))
             }
         }
 
@@ -6373,6 +6763,20 @@ mod tests {
                 .expect("should build navigation request")
         }
 
+        /// A navigation that opts out of the server-side ad stack.
+        ///
+        /// A prefetch is the cheapest of the four opt-outs to build (the others are bot
+        /// classification, denied consent, and the auction kill switch); all four reach
+        /// the seam the same way, as `seam_ad_slots == None`.
+        fn prefetch_navigation_request() -> Request<EdgeBody> {
+            let mut request = navigation_request();
+            request.headers_mut().insert(
+                "sec-purpose",
+                HeaderValue::from_static("prefetch;prerender"),
+            );
+            request
+        }
+
         /// A navigation carrying an **active** diagnostics decision, the way the real one
         /// arrives: in the request extensions, set from a per-reader cookie or query
         /// parameter.
@@ -6409,6 +6813,121 @@ mod tests {
             }
         }
 
+        /// Name of the bidding test double, matched by `[auction].providers`.
+        const STUB_BIDDER: &str = "stub-bidder";
+
+        /// The CPM the stub bids. Chosen so its price bucket (`"3.50"`) is a distinctive
+        /// string that cannot appear in the fixture page by accident.
+        const STUB_BID_CPM: f64 = 3.5;
+
+        /// An auction provider that returns one genuine winning bid.
+        ///
+        /// Every other fixture in this file leaves the orchestrator with no providers, so
+        /// every auction resolves to an empty bid map. That is exactly why a defect that
+        /// discarded *non-empty* maps survived: no test ever produced one.
+        struct WinningBidProvider;
+
+        #[async_trait::async_trait(?Send)]
+        impl crate::auction::provider::AuctionProvider for WinningBidProvider {
+            fn provider_name(&self) -> &'static str {
+                STUB_BIDDER
+            }
+
+            async fn request_bids(
+                &self,
+                _request: &AuctionRequest,
+                context: &crate::auction::types::AuctionContext<'_>,
+            ) -> Result<crate::platform::PlatformPendingRequest, Report<TrustedServerError>>
+            {
+                let request = PlatformHttpRequest::new(
+                    HttpRequest::builder()
+                        .method(Method::POST)
+                        .uri("https://bidder.example.com/openrtb2/auction")
+                        .body(EdgeBody::empty())
+                        .expect("should build stub bid request"),
+                    "stub-bidder-backend",
+                );
+                context
+                    .services
+                    .http_client()
+                    .send_async(request)
+                    .await
+                    .change_context(TrustedServerError::Auction {
+                        message: "stub bid launch failed".to_string(),
+                    })
+            }
+
+            async fn parse_response(
+                &self,
+                _response: crate::platform::PlatformResponse,
+                response_time_ms: u64,
+            ) -> Result<crate::auction::types::AuctionResponse, Report<TrustedServerError>>
+            {
+                Ok(crate::auction::types::AuctionResponse::success(
+                    STUB_BIDDER,
+                    vec![Bid {
+                        slot_id: "test-slot".to_string(),
+                        price: Some(STUB_BID_CPM),
+                        currency: "USD".to_string(),
+                        creative: None,
+                        adomain: None,
+                        bidder: STUB_BIDDER.to_string(),
+                        width: 728,
+                        height: 90,
+                        nurl: None,
+                        burl: None,
+                        bid_id: None,
+                        ad_id: Some("stub-creative-1".to_string()),
+                        cache_id: None,
+                        cache_host: None,
+                        cache_path: None,
+                        metadata: Default::default(),
+                    }],
+                    response_time_ms,
+                ))
+            }
+
+            fn timeout_ms(&self) -> u32 {
+                2000
+            }
+
+            fn backend_name(
+                &self,
+                _services: &RuntimeServices,
+                _timeout_ms: u32,
+            ) -> Option<String> {
+                Some("stub-bidder-backend".to_string())
+            }
+        }
+
+        /// [`settings_with_mode`], with an auction provider that actually bids.
+        fn settings_with_bidder(mode: &str) -> Settings {
+            let mut settings = settings_with_mode(mode);
+            settings.auction.providers = vec![STUB_BIDDER.to_string()];
+            settings
+        }
+
+        /// Queue the bidder's canned response.
+        ///
+        /// Must be pushed **before** the origin HTML: the stub client serves one shared
+        /// FIFO queue, and the auction is dispatched before the origin fetch.
+        fn queue_bid_response(stub: &StubHttpClient) {
+            stub.push_response(200, b"{}".to_vec());
+        }
+
+        /// Which finalizer a request is driven through.
+        ///
+        /// Both exist and both own an `AssembleTemplate` arm with its own seam call, so a
+        /// test that exercised one of them proves nothing about the other.
+        #[derive(Clone, Copy)]
+        enum Finalizer {
+            /// Fastly's path: headers commit first and the seam is spliced inside the
+            /// body stream.
+            Streaming,
+            /// Every buffered adapter's path: the seam is spliced eagerly.
+            Buffered,
+        }
+
         /// Runs the full request, **including the finalizer**.
         ///
         /// The finalizer is not optional here: the store happens once the transform has
@@ -6419,7 +6938,101 @@ mod tests {
             services: &RuntimeServices,
             request: Request<EdgeBody>,
         ) -> Response<EdgeBody> {
+            run_with_orchestrator(
+                settings,
+                services,
+                request,
+                AuctionOrchestrator::new(settings.auction.clone()),
+                Finalizer::Streaming,
+            )
+            .await
+        }
+
+        /// [`run`], through the chosen finalizer.
+        async fn run_via(
+            settings: &Arc<Settings>,
+            services: &RuntimeServices,
+            request: Request<EdgeBody>,
+            finalizer: Finalizer,
+        ) -> Response<EdgeBody> {
+            run_with_orchestrator(
+                settings,
+                services,
+                request,
+                AuctionOrchestrator::new(settings.auction.clone()),
+                finalizer,
+            )
+            .await
+        }
+
+        /// [`run`], with a provider registered so the auction returns a real bid.
+        async fn run_bidding(
+            settings: &Arc<Settings>,
+            services: &RuntimeServices,
+            request: Request<EdgeBody>,
+        ) -> Response<EdgeBody> {
+            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            orchestrator.register_provider(Arc::new(WinningBidProvider));
+            run_with_orchestrator(
+                settings,
+                services,
+                request,
+                orchestrator,
+                Finalizer::Streaming,
+            )
+            .await
+        }
+
+        /// [`run`], surfacing a finalizer failure instead of panicking on it.
+        ///
+        /// Needed by the tests that drive a template the seam cannot split: what they
+        /// assert is what happened to the *cache* on the way to the failure.
+        async fn try_run(
+            settings: &Arc<Settings>,
+            services: &RuntimeServices,
+            request: Request<EdgeBody>,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
             let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+            let registry =
+                IntegrationRegistry::new(settings).expect("should create integration registry");
+            let consent = crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            };
+            let mut ec_context = EcContext::new_for_test(None, consent);
+            let publisher_response = handle_publisher_request(
+                settings,
+                services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &[article_slot()],
+                    registry: None,
+                },
+                request,
+            )
+            .await?;
+
+            publisher_response_into_streaming_response(
+                publisher_response,
+                &Method::GET,
+                Arc::clone(settings),
+                &registry,
+                orchestrator,
+                services.clone(),
+            )
+            .await
+        }
+
+        async fn run_with_orchestrator(
+            settings: &Arc<Settings>,
+            services: &RuntimeServices,
+            request: Request<EdgeBody>,
+            orchestrator: AuctionOrchestrator,
+            finalizer: Finalizer,
+        ) -> Response<EdgeBody> {
+            let orchestrator = Arc::new(orchestrator);
             let registry =
                 IntegrationRegistry::new(settings).expect("should create integration registry");
             let consent = crate::consent::ConsentContext {
@@ -6442,16 +7055,28 @@ mod tests {
             .await
             .expect("should proxy publisher request");
 
-            publisher_response_into_streaming_response(
-                publisher_response,
-                &Method::GET,
-                Arc::clone(settings),
-                &registry,
-                orchestrator,
-                services.clone(),
-            )
-            .await
-            .expect("should finalize publisher response")
+            match finalizer {
+                Finalizer::Streaming => publisher_response_into_streaming_response(
+                    publisher_response,
+                    &Method::GET,
+                    Arc::clone(settings),
+                    &registry,
+                    orchestrator,
+                    services.clone(),
+                )
+                .await
+                .expect("should finalize publisher response"),
+                Finalizer::Buffered => buffer_publisher_response_async(
+                    publisher_response,
+                    &Method::GET,
+                    settings,
+                    &registry,
+                    &orchestrator,
+                    services,
+                )
+                .await
+                .expect("should finalize publisher response"),
+            }
         }
 
         /// Collects a response body whether it was buffered or streamed.
@@ -6510,6 +7135,355 @@ mod tests {
             response.headers().get(name).and_then(|v| v.to_str().ok())
         }
 
+        /// The bid payload the seam actually embedded, decoded from the served page.
+        ///
+        /// Deliberately **not** written as the inverse of [`html_escape_for_script`]: the
+        /// escaper emits `\"`, `\\` and `\uXXXX`, which are all JSON string escapes, so
+        /// re-quoting the payload and handing it to `serde_json`'s own string parser
+        /// decodes it without this test agreeing with the encoder about anything.
+        ///
+        /// Panics rather than returning an error, because a served page with no decodable
+        /// bid payload is the failure under test and its diagnostics belong at the
+        /// assertion.
+        fn seam_bids(document: &str) -> serde_json::Map<String, serde_json::Value> {
+            const OPEN: &str = "var b=JSON.parse(\"";
+            // The seam's fixed shape. A bare `")` could occur inside the payload; this
+            // nine-byte terminator cannot.
+            const CLOSE: &str = "\");var s=";
+            let start = document
+                .find(OPEN)
+                .unwrap_or_else(|| panic!("the seam must carry a bids payload: {document}"));
+            let rest = &document[start + OPEN.len()..];
+            let end = rest
+                .find(CLOSE)
+                .unwrap_or_else(|| panic!("the bids payload must terminate: {document}"));
+            let unescaped: String = serde_json::from_str(&format!("\"{}\"", &rest[..end]))
+                .expect("the embedded payload should be a valid JSON string literal");
+            serde_json::from_str(&unescaped).expect("the embedded payload should be a JSON object")
+        }
+
+        /// Shareable HTML that already contains the seam marker.
+        ///
+        /// Not contrived: the marker is a plain HTML comment, and an origin is free to
+        /// emit one. The seam then adds its own and the template carries two, which
+        /// `split_template_at_seam` refuses because splitting on the first would leave
+        /// the second visible in the served page.
+        fn queue_html_that_collides_with_the_marker(stub: &StubHttpClient) {
+            stub.push_response_with_headers(
+                200,
+                format!("<html><head></head><body>origin{SEAM_BIDS_MARKER}</body></html>")
+                    .into_bytes(),
+                vec![
+                    ("content-type", "text/html; charset=utf-8"),
+                    ("cache-control", "public, max-age=300"),
+                ],
+            );
+        }
+
+        #[tokio::test]
+        async fn a_template_the_seam_cannot_split_is_never_stored() {
+            // The store used to run first and the validation second, so the one request
+            // that produced an unusable template failed loudly *and left it in the
+            // cache* — every reader after it got the broken entry until it expired,
+            // with no further error to point at.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_html_that_collides_with_the_marker(&stub);
+
+            let outcome = try_run(&settings, &services, navigation_request()).await;
+
+            assert!(
+                outcome.is_err(),
+                "a template with two markers cannot be assembled and must not be served"
+            );
+            assert!(
+                cache
+                    .entries
+                    .lock()
+                    .expect("should lock entries")
+                    .is_empty(),
+                "nothing the seam cannot split may reach the shared cache"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unsplittable_cached_template_is_a_miss_before_any_header_commits() {
+            // The hit path used to check only that a marker existed *somewhere* and
+            // leave the exactly-one check to the finalizer. By then the 200 and its
+            // headers were committed and, on the streaming adapter, the document head
+            // was already on the wire — so the only available failure was a truncated
+            // response. Falling back to the origin is a slower correct page.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+
+            // Fill the cache legitimately, then corrupt the stored body in place so the
+            // entry is found under exactly the key the next request derives.
+            let _ = body_of(run(&settings, &services, navigation_request()).await).await;
+            {
+                let stored_key = cache
+                    .stored_keys
+                    .lock()
+                    .expect("should lock stored keys")
+                    .first()
+                    .cloned()
+                    .expect("the cold request should have stored a template");
+                let mut entries = cache.entries.lock().expect("should lock entries");
+                let entry = entries
+                    .get_mut(&stored_key.to_cache_key())
+                    .expect("the stored template should be readable");
+                entry.body = format!(
+                    "<html><head></head><body>origin{SEAM_BIDS_MARKER}\
+                     {SEAM_BIDS_MARKER}</body></html>"
+                )
+                .into_bytes();
+            }
+
+            // The fall-back must be able to reach the origin.
+            queue_shareable_html(&stub);
+            let response = run(&settings, &services, navigation_request()).await;
+            let status = response.status();
+            let served = String::from_utf8(body_of(response).await)
+                .expect("served document should be UTF-8");
+
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "the reader should get a complete page, not a committed-then-broken one"
+            );
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "an unusable entry must be treated as a miss and refetched"
+            );
+            assert!(
+                !served.contains(SEAM_BIDS_MARKER),
+                "no marker may survive into the served page: {served}"
+            );
+            assert!(
+                served.contains("window.tsjs"),
+                "and the fallback must still deliver the seam: {served}"
+            );
+        }
+
+        /// The schema version whose templates carried an `<esi:include/>` at the seam.
+        ///
+        /// Pinned as a literal rather than derived from [`TEMPLATE_SCHEMA_VERSION`]: the
+        /// point is that the current version is *not* this one, and a derived value
+        /// would move with it and assert nothing.
+        const ESI_INCLUDE_SCHEMA_VERSION: u32 = 1;
+
+        #[tokio::test]
+        async fn a_template_written_under_the_previous_schema_version_is_never_read() {
+            // v1 put `<esi:include src="/_ts/page-bids?format=fragment"/>` at the seam.
+            // v2 puts an inert comment there and hands slots to the scheduler, so a v1
+            // entry has no marker this binary can find. `schema_version` is the only
+            // thing keeping the two apart — nothing purges C2 on deploy.
+            assert_ne!(
+                crate::platform::TEMPLATE_SCHEMA_VERSION,
+                ESI_INCLUDE_SCHEMA_VERSION,
+                "the seam marker changed shape, so the schema version must have moved \
+                 off the value under which the old marker was stored"
+            );
+
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+
+            // Fill the cache the ordinary way, then plant a predecessor's entry
+            // alongside it: same request, previous schema version, previous marker.
+            // Re-keyed from the key the store actually used, so the fixture cannot
+            // drift from what the request derives.
+            let _ = body_of(run(&settings, &services, navigation_request()).await).await;
+            {
+                let stored_key = cache
+                    .stored_keys
+                    .lock()
+                    .expect("should lock stored keys")
+                    .first()
+                    .cloned()
+                    .expect("the cold request should have stored a template");
+                let mut entries = cache.entries.lock().expect("should lock entries");
+                let mut predecessor = entries
+                    .get(&stored_key.to_cache_key())
+                    .cloned()
+                    .expect("the stored template should be readable");
+                predecessor.body = b"<html><head></head><body>origin\
+                      <esi:include src=\"/_ts/page-bids?format=fragment\"/></body></html>"
+                    .to_vec();
+                predecessor.metadata.schema_version = ESI_INCLUDE_SCHEMA_VERSION;
+                let mut old_key = stored_key;
+                old_key.schema_version = ESI_INCLUDE_SCHEMA_VERSION;
+                entries.insert(old_key.to_cache_key(), predecessor);
+            }
+
+            let served = String::from_utf8(
+                body_of(run(&settings, &services, navigation_request()).await).await,
+            )
+            .expect("served document should be UTF-8");
+
+            assert!(
+                cache
+                    .lookups
+                    .lock()
+                    .expect("should lock lookups")
+                    .iter()
+                    .all(|key| key.schema_version != ESI_INCLUDE_SCHEMA_VERSION),
+                "no lookup may name a schema version whose templates this binary cannot \
+                 assemble"
+            );
+            assert!(
+                !served.contains("esi:include"),
+                "a predecessor's template must never reach a reader: {served}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_hit_for_opted_out_traffic_emits_no_seam_on_either_finalizer() {
+            // The miss path already honours this: `assemble_if_shared` emits nothing when
+            // the ad stack did not run. Both hit finalizers used `unwrap_or("[]")`
+            // instead, so a prefetch, a bot, a consent-denied reader, or every request
+            // under a disabled auction received a seam that still called
+            // `scheduleInitialAdInit` — scheduling `adInit` for exactly the traffic that
+            // opted out — as long as the template was already cached.
+            for finalizer in [Finalizer::Streaming, Finalizer::Buffered] {
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let settings = Arc::new(settings_with_mode("esi"));
+                let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                queue_shareable_html(&stub);
+
+                // A normal navigation fills the cache; only then is a hit available for
+                // the opted-out request, which is the whole point — the gate held on the
+                // miss and was ignored on the hit.
+                let cold = String::from_utf8(
+                    body_of(run_via(&settings, &services, navigation_request(), finalizer).await)
+                        .await,
+                )
+                .expect("cold document should be UTF-8");
+                assert!(
+                    cold.contains("scheduleInitialAdInit"),
+                    "the fixture must produce a seam for ordinary traffic, or this test \
+                     passes for the wrong reason: {cold}"
+                );
+
+                let served = String::from_utf8(
+                    body_of(
+                        run_via(
+                            &settings,
+                            &services,
+                            prefetch_navigation_request(),
+                            finalizer,
+                        )
+                        .await,
+                    )
+                    .await,
+                )
+                .expect("served document should be UTF-8");
+
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    1,
+                    "the opted-out request must be a cache hit, or the hit finalizer is \
+                     never reached"
+                );
+                assert!(
+                    !served.contains("scheduleInitialAdInit"),
+                    "a reader whose ad stack did not run must not have `adInit` \
+                     scheduled: {served}"
+                );
+                assert!(
+                    !served.contains("t.adSlots="),
+                    "no slot assignment may reach opted-out traffic: {served}"
+                );
+                assert!(
+                    !served.contains(SEAM_BIDS_MARKER),
+                    "the marker must still be consumed even when nothing replaces it: \
+                     {served}"
+                );
+                assert!(
+                    served.contains("origin"),
+                    "the page itself must still be served: {served}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_winning_bid_reaches_the_page_on_both_the_miss_and_the_hit_path() {
+            // The fixture every other test here lacks. With no registered provider the
+            // auction always resolves to `{}`, so a seam that discarded every non-empty
+            // bid map looked identical to one that worked — which is precisely how the
+            // shared modes shipped serving zero bids.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = Arc::new(settings_with_bidder("esi"));
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+
+            // Bid first, page second: one FIFO queue, and the auction is dispatched
+            // before the origin fetch.
+            queue_bid_response(&stub);
+            queue_shareable_html(&stub);
+
+            let cold = String::from_utf8(
+                body_of(run_bidding(&settings, &services, navigation_request()).await).await,
+            )
+            .expect("cold document should be UTF-8");
+            let cold_bids = seam_bids(&cold);
+            assert_eq!(
+                cold_bids
+                    .get("test-slot")
+                    .and_then(|bid| bid.get("hb_pb"))
+                    .and_then(serde_json::Value::as_str),
+                Some("3.50"),
+                "the miss path must deliver the winning bid's bucketed price, not an \
+                 empty map: {cold}"
+            );
+            assert_eq!(
+                cold_bids
+                    .get("test-slot")
+                    .and_then(|bid| bid.get("hb_bidder"))
+                    .and_then(serde_json::Value::as_str),
+                Some(STUB_BIDDER),
+                "the miss path must name the winning bidder: {cold}"
+            );
+
+            // The warm request needs only the bid response: a hit skips the origin
+            // entirely, so an unused page fixture here would mask a fetch.
+            queue_bid_response(&stub);
+            let warm = String::from_utf8(
+                body_of(run_bidding(&settings, &services, navigation_request()).await).await,
+            )
+            .expect("warm document should be UTF-8");
+            assert_eq!(
+                stub.recorded_request_uris()
+                    .iter()
+                    .filter(|uri| uri.contains("/article"))
+                    .count(),
+                1,
+                "the warm request must be served from the template cache"
+            );
+            let warm_bids = seam_bids(&warm);
+            assert_eq!(
+                warm_bids
+                    .get("test-slot")
+                    .and_then(|bid| bid.get("hb_pb"))
+                    .and_then(serde_json::Value::as_str),
+                Some("3.50"),
+                "the hit path must deliver this reader's winning bid, not an empty \
+                 map: {warm}"
+            );
+            assert_eq!(
+                warm_bids, cold_bids,
+                "both paths must splice the same bids for the same auction"
+            );
+        }
+
         #[tokio::test]
         async fn the_marker_never_reaches_the_browser_on_either_path() {
             // The user-visible failure this whole chain exists to avoid: a page that
@@ -6541,7 +7515,7 @@ mod tests {
             );
             for (label, document) in [("miss", &cold), ("hit", &warm)] {
                 assert!(
-                    !document.contains("esi:include"),
+                    !document.contains(SEAM_BIDS_MARKER),
                     "{label}: an unresolved marker reached the browser: {document}"
                 );
                 assert!(
@@ -6573,7 +7547,7 @@ mod tests {
             let template = core::str::from_utf8(&stored.body).expect("template should be utf-8");
 
             assert!(
-                template.contains("esi:include"),
+                template.contains(SEAM_BIDS_MARKER),
                 "the cached template must still carry the unresolved marker: {template}"
             );
             assert!(
@@ -6925,13 +7899,189 @@ mod tests {
                 "adSlots",
                 "window.tsjs",
                 // The mode injects nothing at `</body>`, so not even a marker belongs.
-                "esi:include",
+                SEAM_BIDS_MARKER,
             ] {
                 assert!(
                     !template.contains(forbidden),
                     "`{forbidden}` must not appear in a client-fill template: {template}"
                 );
             }
+        }
+
+        #[tokio::test]
+        async fn a_client_fill_hit_is_served_from_the_cache_on_either_finalizer() {
+            // `client_fill` stored templates and never read one back. Both hit paths
+            // demanded a seam marker unconditionally, and this mode injects nothing at
+            // `</body>` by design — so every hit failed the marker check, logged a
+            // transform-drift error naming a schema version that had not moved, and
+            // refetched the origin. The mode's caching had never worked.
+            //
+            // The neutrality test above cannot see this: it runs one request per reader
+            // against a fresh cache, so it only ever proves the stored bytes are
+            // reader-agnostic. Proving a *hit* needs a second request against a warm one.
+            for finalizer in [Finalizer::Streaming, Finalizer::Buffered] {
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let settings = Arc::new(settings_with_mode("client_fill"));
+                let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                // One origin response only: a second fetch would find the queue empty, so
+                // the fixture is itself part of the assertion.
+                queue_shareable_html(&stub);
+
+                let cold =
+                    body_of(run_via(&settings, &services, navigation_request(), finalizer).await)
+                        .await;
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    1,
+                    "the cold request must fetch the origin"
+                );
+
+                let warm =
+                    body_of(run_via(&settings, &services, navigation_request(), finalizer).await)
+                        .await;
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    1,
+                    "the warm request must be served from the cache — client_fill stores a \
+                     template for exactly the same reason esi does, so it must read one back"
+                );
+                assert_eq!(
+                    warm, cold,
+                    "a mode with no seam serves the stored template unchanged"
+                );
+
+                let served = String::from_utf8(warm).expect("served document should be UTF-8");
+                assert!(
+                    !served.contains(SEAM_BIDS_MARKER),
+                    "client_fill injects nothing at `</body>`, so no marker may appear \
+                     anywhere: {served}"
+                );
+                assert!(
+                    !served.contains("scheduleInitialAdInit"),
+                    "the browser fetches its own bids under client_fill; the server must \
+                     splice none: {served}"
+                );
+                assert!(
+                    served.contains("origin"),
+                    "the page itself must still be served: {served}"
+                );
+            }
+        }
+
+        /// [`settings_with_mode`], with one integration configured a stated way.
+        ///
+        /// Edits the parsed `[integrations]` map rather than appending TOML, so two
+        /// fixtures differ in exactly the field under test.
+        fn settings_with_prebid_timeout(mode: &str, timeout_ms: u32) -> Settings {
+            let mut settings = settings_with_mode(mode);
+            settings.integrations.insert(
+                "prebid".to_string(),
+                serde_json::json!({
+                    "enabled": true,
+                    "server_url": "https://prebid.example.com/openrtb2/auction",
+                    "external_bundle_url": "https://assets.example.com/prebid/bundle.js",
+                    "timeout": timeout_ms,
+                }),
+            );
+            settings
+        }
+
+        /// Every key the cache was asked to store, rendered.
+        fn stored_cache_keys(cache: &MemoryTemplateCache) -> Vec<String> {
+            cache
+                .stored_keys
+                .lock()
+                .expect("should lock stored keys")
+                .iter()
+                .map(crate::platform::TemplateCacheKey::to_cache_key)
+                .collect()
+        }
+
+        /// Every key the cache was asked to read, rendered.
+        fn looked_up_cache_keys(cache: &MemoryTemplateCache) -> Vec<String> {
+            cache
+                .lookups
+                .lock()
+                .expect("should lock lookups")
+                .iter()
+                .map(crate::platform::TemplateCacheKey::to_cache_key)
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn two_integration_configurations_never_share_a_template() {
+            // `integration_fingerprint` folds the `[integrations]` config, and its own
+            // tests call it directly — so reverting the *call site* back to the
+            // bundle-only hash, a constant for a given binary, left the entire suite
+            // green while every configuration silently shared one template.
+            //
+            // This drives the real request path and asserts on the keys the cache was
+            // actually handed, which is the only place that mutation is visible.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            let first = Arc::new(settings_with_prebid_timeout("esi", 1000));
+            let second = Arc::new(settings_with_prebid_timeout("esi", 2500));
+            queue_shareable_html(&stub);
+            queue_shareable_html(&stub);
+
+            let _ = run(&first, &services, navigation_request()).await;
+            let _ = run(&second, &services, navigation_request()).await;
+
+            let stored = stored_cache_keys(&cache);
+            assert_eq!(
+                stored.len(),
+                2,
+                "each configuration must store its own template, got {stored:?}"
+            );
+            assert_ne!(
+                stored[0], stored[1],
+                "two `[integrations]` configurations must key different templates; one key \
+                 serves the first configuration's injected markup to the second"
+            );
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "the second configuration must have missed and fetched the origin rather \
+                 than reading the first's template"
+            );
+        }
+
+        #[tokio::test]
+        async fn one_integration_configuration_keys_one_template() {
+            // The converse, and the failure mode a fingerprint fix can introduce:
+            // over-invalidating is as total as under-invalidating. A fingerprint that
+            // moves between two equal configurations is a cache that never hits, which
+            // the spike would report as "no measurable benefit" rather than as a bug.
+            //
+            // The two `Settings` are parsed independently, so their `[integrations]`
+            // maps iterate in different orders — which is what exercises the sort.
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            let first = Arc::new(settings_with_prebid_timeout("esi", 1000));
+            let second = Arc::new(settings_with_prebid_timeout("esi", 1000));
+            queue_shareable_html(&stub);
+
+            let _ = run(&first, &services, navigation_request()).await;
+            let _ = run(&second, &services, navigation_request()).await;
+
+            let looked_up = looked_up_cache_keys(&cache);
+            assert_eq!(
+                looked_up.len(),
+                2,
+                "both requests must consult the cache, got {looked_up:?}"
+            );
+            assert_eq!(
+                looked_up[0], looked_up[1],
+                "equal configurations must name one key, or the cache never hits"
+            );
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "the second request must be served from the first's template"
+            );
         }
 
         fn cookie_navigation_request() -> Request<EdgeBody> {
@@ -7130,7 +8280,7 @@ mod tests {
                 "the gate refused, so nothing may be stored"
             );
             assert!(
-                !document.contains("esi:include"),
+                !document.contains(SEAM_BIDS_MARKER),
                 "a marker must never be emitted when nothing will resolve it: {document}"
             );
             assert!(
@@ -7157,8 +8307,9 @@ mod tests {
             for (label, body) in [("miss", miss), ("hit", hit)] {
                 let text = String::from_utf8(body).expect("utf-8");
                 assert!(
-                    text.contains("adSlots=JSON.parse"),
-                    "{label}: the seam must carry slot definitions"
+                    text.contains("var a=JSON.parse(") && text.contains("s(b,a)"),
+                    "{label}: the seam must carry slot definitions and hand them to the \
+                     scheduler: {text}"
                 );
                 assert!(
                     text.contains("test-slot"),
@@ -7422,6 +8573,87 @@ mod tests {
                     "cookie".to_string()
                 ]))),
                 "the origin's own declaration must override the operator's assertion"
+            );
+        }
+
+        #[test]
+        fn a_private_directive_on_a_second_cache_control_line_is_refused() {
+            // `HeaderMap::get` returns the first value only. An origin that sends
+            // `Cache-Control: public, max-age=300` and then `Cache-Control: private` on a
+            // separate line means exactly what one comma-joined line would mean, but the
+            // second line was invisible — so a response the origin marked private was
+            // written to a cache shared between readers. The `Vary` reads a few lines up
+            // already use `get_all` for the same reason.
+            let mut split = edgezero_core::http::HeaderMap::new();
+            split.append(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=300"),
+            );
+            split.append(header::CACHE_CONTROL, HeaderValue::from_static("private"));
+
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &split,
+                    &nothing_covered(),
+                ),
+                Some(C2BypassReason::OriginNotShareable),
+                "a directive on any Cache-Control line must disqualify the response"
+            );
+        }
+
+        #[test]
+        fn a_no_store_directive_on_a_second_cache_control_line_is_refused() {
+            // Same defect, the other directive that matters — `no-store` is the one an
+            // origin uses for a response that must not be written down anywhere.
+            let mut split = edgezero_core::http::HeaderMap::new();
+            split.append(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("max-age=60"),
+            );
+            split.append(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &split,
+                    &nothing_covered(),
+                ),
+                Some(C2BypassReason::OriginNotShareable)
+            );
+        }
+
+        #[test]
+        fn repeated_cache_control_lines_without_a_disqualifier_still_cache() {
+            // The other direction: reading every value must not turn an ordinary
+            // multi-line `Cache-Control` into a bypass, or the fix would disable the
+            // cache instead of tightening it.
+            let mut split = edgezero_core::http::HeaderMap::new();
+            split.append(header::CACHE_CONTROL, HeaderValue::from_static("public"));
+            split.append(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("max-age=60"),
+            );
+
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &split,
+                    &nothing_covered(),
+                ),
+                None
             );
         }
 
@@ -8803,7 +10035,7 @@ mod tests {
             read_count: Arc::clone(&read_count),
             body_close_processed_at: Arc::clone(&body_close_processed_at),
         };
-        let ad_bids_state = Arc::new(Mutex::new(None));
+        let ad_bids_state = AdBidsState::default();
         let ctx = AuctionCollectCtx {
             dispatched,
             telemetry: AuctionTelemetryCarry {
@@ -8848,7 +10080,7 @@ mod tests {
         let settings = create_test_settings();
         let services = noop_services();
         let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-        let ad_bids_state = Arc::new(Mutex::new(None));
+        let ad_bids_state = AdBidsState::default();
         let mut state = AuctionHoldState::new(
             DispatchedAuctionGuard::new(DispatchedAuction::empty_for_test(
                 test_auction_request(),
@@ -8897,6 +10129,7 @@ mod tests {
         );
         assert!(
             ad_bids_state
+                .script_cell()
                 .lock()
                 .expect("should lock bid state")
                 .is_none(),
@@ -8914,6 +10147,7 @@ mod tests {
         );
         assert!(
             ad_bids_state
+                .script_cell()
                 .lock()
                 .expect("should lock bid state")
                 .is_some(),
@@ -9573,7 +10807,7 @@ mod tests {
             request_scheme: "https".to_string(),
             content_type: "text/css".to_string(),
             ad_slots_script: None,
-            ad_bids_state: Arc::new(Mutex::new(None)),
+            ad_bids_state: AdBidsState::default(),
             auction_observation: None,
             auction_request: None,
             dispatched_auction: None,
@@ -9624,7 +10858,7 @@ mod tests {
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
             ad_slots_script: None,
-            ad_bids_state: Arc::new(Mutex::new(None)),
+            ad_bids_state: AdBidsState::default(),
             auction_observation: None,
             auction_request: None,
             dispatched_auction: None,
@@ -9664,7 +10898,7 @@ mod tests {
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
             ad_slots_script: None,
-            ad_bids_state: Arc::new(Mutex::new(None)),
+            ad_bids_state: AdBidsState::default(),
             auction_observation: None,
             auction_request: None,
             dispatched_auction: None,
@@ -9782,7 +11016,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
                 ad_slots_script: None,
-                ad_bids_state: Arc::new(Mutex::new(None)),
+                ad_bids_state: AdBidsState::default(),
                 auction_observation: None,
                 auction_request: None,
                 dispatched_auction: None,
@@ -9838,7 +11072,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
                 ad_slots_script: None,
-                ad_bids_state: Arc::new(Mutex::new(None)),
+                ad_bids_state: AdBidsState::default(),
                 auction_observation: None,
                 auction_request: None,
                 dispatched_auction: None,
@@ -9897,7 +11131,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
                 ad_slots_script: None,
-                ad_bids_state: Arc::new(Mutex::new(None)),
+                ad_bids_state: AdBidsState::default(),
                 auction_observation: None,
                 auction_request: None,
                 dispatched_auction: None,
@@ -9956,7 +11190,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
                 ad_slots_script: None,
-                ad_bids_state: Arc::new(Mutex::new(None)),
+                ad_bids_state: AdBidsState::default(),
                 auction_observation: None,
                 auction_request: None,
                 dispatched_auction: None,
@@ -10015,7 +11249,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
                 ad_slots_script: None,
-                ad_bids_state: Arc::new(Mutex::new(None)),
+                ad_bids_state: AdBidsState::default(),
                 auction_observation: None,
                 auction_request: None,
                 dispatched_auction: None,
@@ -10062,7 +11296,7 @@ mod tests {
             request_scheme: "https".to_string(),
             content_type: "text/css".to_string(),
             ad_slots_script: None,
-            ad_bids_state: Arc::new(Mutex::new(None)),
+            ad_bids_state: AdBidsState::default(),
             auction_observation: None,
             auction_request: None,
             dispatched_auction: None,
@@ -10241,7 +11475,7 @@ mod tests {
                 IntegrationRegistry::new(&settings).expect("should create integration registry");
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
-            let state = Arc::new(Mutex::new(None));
+            let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
                 template_cache_key: None,
                 seam_ad_slots: None,
@@ -10308,7 +11542,7 @@ mod tests {
                 IntegrationRegistry::new(&settings).expect("should create integration registry");
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
-            let state = Arc::new(Mutex::new(None));
+            let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
                 template_cache_key: None,
                 seam_ad_slots: None,
@@ -10389,7 +11623,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
                 ad_slots_script: None,
-                ad_bids_state: Arc::new(Mutex::new(None)),
+                ad_bids_state: AdBidsState::default(),
                 auction_observation: None,
                 auction_request: Some(test_auction_request()),
                 dispatched_auction: Some(DispatchedAuction::empty_for_test(
@@ -10451,7 +11685,7 @@ mod tests {
             request_scheme: "https".to_string(),
             content_type: "text/css".to_string(),
             ad_slots_script: None,
-            ad_bids_state: Arc::new(Mutex::new(None)),
+            ad_bids_state: AdBidsState::default(),
             auction_observation: None,
             auction_request: None,
             dispatched_auction: None,
@@ -10590,7 +11824,7 @@ mod tests {
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
                     .to_string(),
             ),
-            ad_bids_state: Arc::new(Mutex::new(None)),
+            ad_bids_state: AdBidsState::default(),
             auction_observation: None,
             auction_request: dispatched_auction.as_ref().map(|_| test_auction_request()),
             dispatched_auction,
@@ -10935,7 +12169,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 content_type: "text/html; charset=utf-8".to_string(),
                 ad_slots_script: None,
-                ad_bids_state: Arc::new(Mutex::new(None)),
+                ad_bids_state: AdBidsState::default(),
                 auction_observation: Some(AuctionObservationContext::from_parts(
                     AuctionSource::SpaNavigation,
                     "proxy.example.com",
@@ -11123,7 +12357,7 @@ mod tests {
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
                     .to_string(),
             ),
-            ad_bids_state: Arc::new(Mutex::new(None)),
+            ad_bids_state: AdBidsState::default(),
             auction_observation: None,
             auction_request: Some(test_auction_request()),
             dispatched_auction: Some(DispatchedAuction::empty_for_test(
@@ -11181,7 +12415,7 @@ mod tests {
             IntegrationRegistry::new(&settings).expect("should create integration registry");
         let bids_script =
             r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{}");</script>"#;
-        let state = Arc::new(Mutex::new(Some(bids_script.to_string())));
+        let state = AdBidsState::with_script(bids_script);
         let params = OwnedProcessResponseParams {
             template_cache_key: None,
             seam_ad_slots: None,
@@ -11249,7 +12483,7 @@ mod tests {
             request_scheme: "https".to_string(),
             content_type: "text/html".to_string(),
             ad_slots_script: None,
-            ad_bids_state: Arc::new(Mutex::new(None)),
+            ad_bids_state: AdBidsState::default(),
             auction_observation: None,
             auction_request: None,
             dispatched_auction: None,
@@ -11360,7 +12594,7 @@ mod tests {
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
             ad_slots_script: None,
-            ad_bids_state: Arc::new(Mutex::new(None)),
+            ad_bids_state: AdBidsState::default(),
             auction_observation: None,
             auction_request: None,
             dispatched_auction: None,
@@ -11420,7 +12654,7 @@ mod tests {
             request_scheme: "https".to_string(),
             content_type: "text/html".to_string(),
             ad_slots_script: None,
-            ad_bids_state: Arc::new(Mutex::new(None)),
+            ad_bids_state: AdBidsState::default(),
             auction_observation: None,
             auction_request: None,
             dispatched_auction: None,

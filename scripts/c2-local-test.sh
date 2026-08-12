@@ -9,6 +9,7 @@
 #
 # Usage:
 #   ./scripts/c2-local-test.sh              # esi mode (shared template + edge assembly)
+#   ./scripts/c2-local-test.sh client_fill  # shared template, browser fetches its own bids
 #   ./scripts/c2-local-test.sh inline       # today's shipped behaviour, as a control
 #
 # Spike-only. Remove with the spike.
@@ -16,6 +17,13 @@
 set -euo pipefail
 
 MODE="${1:-esi}"
+case "$MODE" in
+  inline | client_fill | esi) ;;
+  *)
+    echo "Unknown mode '$MODE'. Use one of: inline, client_fill, esi." >&2
+    exit 1
+    ;;
+esac
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
 ORIGIN_PORT="${ORIGIN_PORT:-9099}"
@@ -81,9 +89,37 @@ cat > "$WORK/origin.py" <<PYEOF
 
 The page is as shareable as HTML gets — no Set-Cookie, a public Cache-Control, and a
 Vary the cache key covers — so a bypass means a real bug rather than a fixture problem.
+
+The bid endpoint returns a real winning bid. It used to return an empty seatbid, which made
+every assertion below measure a page with no ads on it — and that is how a seam that
+silently discarded every non-empty bid map passed this harness for weeks.
 """
 import gzip, json, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# The impid must be the configured slot id: that is what the auction request sends and
+# what the winning-bid map is keyed on. A mismatch yields no winner and no injected bid.
+# The price is bucketed by the dense granularity to exactly "4.25", which is the value
+# the assertions look for in the served page.
+BID_RESPONSE = {
+    "id": "stub",
+    "seatbid": [
+        {
+            "seat": "mocktioneer",
+            "bid": [
+                {
+                    "id": "stub-bid-1",
+                    "impid": "ts-slot-header",
+                    "adid": "stub-creative-1",
+                    "price": 4.25,
+                    "adm": "<div>stub creative</div>",
+                    "w": 728,
+                    "h": 90,
+                }
+            ],
+        }
+    ],
+}
 
 PAGE = b"""<!doctype html>
 <html><head><title>Stub article</title></head>
@@ -125,7 +161,7 @@ class H(BaseHTTPRequestHandler):
         if n:
             self.rfile.read(n)
         time.sleep($BID_DELAY)
-        self._send(json.dumps({"id": "stub", "seatbid": []}).encode(), "application/json")
+        self._send(json.dumps(BID_RESPONSE).encode(), "application/json")
 
     def log_message(self, fmt, *args):
         print("origin: " + fmt % args, flush=True)
@@ -222,6 +258,16 @@ info "Running assertions (mode: $MODE)"
 BEFORE=$(origin_gets)
 R1=$(req "$WORK/r1.html")
 R2=$(req "$WORK/r2.html")
+
+# Content assertions must never run against compressed bytes. `inline` responses stay
+# gzipped end to end — only the shared path decodes, because its seam split is textual —
+# and `grep` over a gzip stream matches nothing, which reads as a pass for every
+# "must not contain" check and as a silent failure for every "must contain" one.
+# Decode a copy and assert against that, in both modes.
+SERVED="$WORK/r2.served.html"
+if ! gzip -dc "$WORK/r2.html" > "$SERVED" 2>/dev/null; then
+  cp "$WORK/r2.html" "$SERVED"
+fi
 AFTER=$(origin_gets)
 FETCHES=$((AFTER - BEFORE))
 
@@ -231,47 +277,109 @@ read -r TTFB2 TOTAL2 CODE2 <<< "$R2"
 check "first request returns 200" "$CODE1" "200"
 check "second request returns 200" "$CODE2" "200"
 
-if [ "$MODE" = "inline" ]; then
-  check "inline fetches the origin every time" "$FETCHES" "2"
-  check "inline writes no shared template" \
-    "$(grep -c 'c2_template_cache stored' "$WORK/viceroy.log" || true)" "0"
-else
-  check "second request is served from cache" "$FETCHES" "1"
-  check "no unresolved esi:include reaches the browser" \
-    "$(grep -c 'esi:include' "$WORK/r2.html" || true)" "0"
-  check "a bids script is present" \
-    "$(grep -c 'window.tsjs' "$WORK/r2.html" || true)" "1"
-  # `window.tsjs` alone passes while initial ads are dead: shared modes suppress the head
-  # slot script, so if the seam does not carry slots, `adSlots` stays `[]` and `adInit`
-  # defines nothing. This harness passed green through exactly that bug.
-  check "the seam carries slot definitions, not just bids" \
-    "$(grep -c 'adSlots=JSON.parse' "$WORK/r2.html" || true)" "1"
-  check "the slot definitions are populated, not an empty array" \
-    "$(grep -c 'adSlots=JSON.parse("\[\]")' "$WORK/r2.html" || true)" "0"
+# The bid the stub origin returns, bucketed and then escaped the way the seam escapes
+# it. Asserted in both modes: a shared-mode failure that inline shares would otherwise
+# read as "the fixture never bids" rather than "the seam drops bids".
+WINNING_BID='\"hb_pb\":\"4.25\"'
+# Must stay in step with `SEAM_BIDS_MARKER` in publisher.rs. An inert HTML comment,
+# not an esi:include — nothing parses ESI on the render path any more.
+SEAM_MARKER='<!--ts-seam-bids-->'
 
-  HDRS=$(curl -s -D- -o /dev/null -H "Host: ts.example.com" \
+# Shared by every mode that stores a template, so `esi` and `client_fill` cannot drift
+# apart on the two properties that have nothing to do with the seam.
+check_hit_is_private() {
+  local hdrs
+  hdrs=$(curl -s -D- -o /dev/null -H "Host: ts.example.com" \
     -H "Accept-Encoding: gzip" \
     -H "sec-fetch-dest: document" -H "sec-fetch-mode: navigate" \
     "http://127.0.0.1:$TS_PORT/article")
   check "cache hit is not shared-cacheable" \
-    "$(echo "$HDRS" | grep -ci 'cache-control: private, no-store' || true)" "1"
+    "$(echo "$hdrs" | grep -ci 'cache-control: private, no-store' || true)" "1"
+}
 
-  POSTS_BEFORE=$(grep -c "POST /article" "$WORK/origin.log" || true)
+check_post_reaches_origin() {
+  local before
+  before=$(grep -c "POST /article" "$WORK/origin.log" || true)
   curl -s -o /dev/null -X POST -d 'x=1' -H "Host: ts.example.com" \
     -H "Accept-Encoding: gzip" \
     "http://127.0.0.1:$TS_PORT/article"
   check "a POST still reaches the origin" \
-    "$(( $(grep -c "POST /article" "$WORK/origin.log" || true) - POSTS_BEFORE ))" "1"
+    "$(( $(grep -c "POST /article" "$WORK/origin.log" || true) - before ))" "1"
+}
+
+if [ "$MODE" = "inline" ]; then
+  check "inline fetches the origin every time" "$FETCHES" "2"
+  check "inline writes no shared template" \
+    "$(grep -c 'c2_template_cache stored' "$WORK/viceroy.log" || true)" "0"
+  check "inline delivers the winning bid" \
+    "$(grep -cF "$WINNING_BID" "$SERVED" || true)" "1"
+elif [ "$MODE" = "client_fill" ]; then
+  # The assertion this mode never had. `client_fill` stored a template on every
+  # request and read one back on none of them: both hit paths demanded a seam marker,
+  # and this mode emits none by design, so each hit was discarded as transform drift
+  # and refetched the origin. Its caching had never worked.
+  check "second request is served from cache" "$FETCHES" "1"
+  # Asserted on the *distinct* values rather than on a line count: viceroy emits each
+  # log line twice (once to the log endpoint, once to stdout), so counting lines
+  # measures the logger. One distinct value means every store agreed, and `false` is
+  # the value this mode must produce — a `true` here would mean it had grown a seam.
+  check "the stored template has no seam marker, by design" \
+    "$(grep -ohE 'seam marker present: [a-z]+' "$WORK/viceroy.log" | sort -u | tr '\n' '/')" \
+    "seam marker present: false/"
+  check "no seam marker reaches the browser" \
+    "$(grep -cF "$SEAM_MARKER" "$SERVED" || true)" "0"
+  # The mode's defining property: the browser fetches its own bids, so the server
+  # splices none. A page carrying the server's bucketed price would mean this mode had
+  # quietly become `esi`.
+  check "the server splices no bids" \
+    "$(grep -cF "$WINNING_BID" "$SERVED" || true)" "0"
+  check "the server schedules no initial adInit" \
+    "$(grep -c 'scheduleInitialAdInit' "$SERVED" || true)" "0"
+  # `root_auction_is_useful` refuses to dispatch here: an auction nothing reads would
+  # bill the SSPs and hold the response for its full budget with no consumer.
+  check "no root auction is dispatched" \
+    "$(grep -c "POST /bid" "$WORK/origin.log" || true)" "0"
+  check_hit_is_private
+  check_post_reaches_origin
+else
+  check "second request is served from cache" "$FETCHES" "1"
+  check "no unresolved seam marker reaches the browser" \
+    "$(grep -cF "$SEAM_MARKER" "$SERVED" || true)" "0"
+  check "a bids script is present" \
+    "$(grep -c 'window.tsjs' "$SERVED" || true)" "1"
+  # `window.tsjs` alone passes while initial ads are dead: shared modes suppress the head
+  # slot script, so if the seam does not carry slots, `adSlots` stays `[]` and `adInit`
+  # defines nothing. This harness passed green through exactly that bug.
+  # The slots ride the scheduler call (`s(b,a)`) rather than a bare assignment, so the
+  # navigation-generation guard covers them; `var a=JSON.parse(...)` is where they land.
+  check "the seam carries slot definitions, not just bids" \
+    "$(grep -c 'var a=JSON.parse' "$SERVED" || true)" "1"
+  check "the slot definitions reach the guarded scheduler" \
+    "$(grep -cF 's(b,a)' "$SERVED" || true)" "1"
+  check "the slot definitions are populated, not an empty array" \
+    "$(grep -c 'var a=JSON.parse("\[\]")' "$SERVED" || true)" "0"
+  # The assertion the harness was missing entirely. `window.tsjs` and populated slots
+  # both pass on a page whose bids are `{}` — which is what shared modes served, on
+  # every request, for as long as this file has existed.
+  check "the seam carries a real bid, not an empty map" \
+    "$(grep -cF 'var b=JSON.parse("{}")' "$SERVED" || true)" "0"
+  check "the winning bid's bucketed price reaches the reader" \
+    "$(grep -cF "$WINNING_BID" "$SERVED" || true)" "1"
+
+  check_hit_is_private
+  check_post_reaches_origin
 fi
 
-if [ "$MODE" != "inline" ]; then
+if [ "$MODE" = "esi" ]; then
   info "Where the marker actually lives"
   echo "  The cached template (the shared copy — has a hole where bids go):"
   grep -oE "c2_template_cache stored [0-9]+ bytes \(seam marker present: [a-z]+\)" \
     "$WORK/viceroy.log" | sort -u | sed 's/^/    /'
   echo
   echo "  What the reader receives (hole filled, no marker):"
-  grep -oE "esi:include|window\.tsjs" "$WORK/r2.html" | sort | uniq -c | sed 's/^/    /'
+  printf '    %d seam marker(s), %d window.tsjs\n' \
+    "$(grep -cF "$SEAM_MARKER" "$SERVED" || true)" \
+    "$(grep -c 'window\.tsjs' "$SERVED" || true)"
   cat <<'EOF'
 
   The marker is never visible in page source, in any mode. It exists only inside
@@ -349,6 +457,16 @@ COMPLETE=$(echo "$B_LINE" | sed -n 's/.*complete=\([0-9]*\)ms.*/\1/p')
 if [ "$MODE" = "inline" ]; then
   check "inline delivers the article before the auction resolves" \
     "$(awk -v f="$FIRST_BODY" -v c="$COMPLETE" 'BEGIN { print (f < c / 3) ? "yes" : "no" }')" \
+    "yes"
+elif [ "$MODE" = "client_fill" ]; then
+  check "the origin fetch stays compressed" \
+    "$(grep -c 'served PLAINTEXT' "$WORK/origin.log" || true)" "0"
+  # There is no seam to hold, so there is nothing to hold *for*: the whole response
+  # lands well inside the bid endpoint's delay. Stated as a bound on the total rather
+  # than as a ratio, because with no auction the first body byte and the last arrive
+  # together and `first < complete / 3` would be meaningless here.
+  check "the whole response lands without waiting for an auction" \
+    "$(awk -v c="$COMPLETE" -v d="$BID_DELAY" 'BEGIN { print (c < d * 500) ? "yes" : "no" }')" \
     "yes"
 else
   # The property the unit tests cannot reach: in-process there is no bid provider, so

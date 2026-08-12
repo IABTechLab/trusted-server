@@ -260,8 +260,18 @@ export interface TsjsApi {
    * Lives in the bundle so the lifecycle is executable under test and shares
    * [`navGeneration`] with the SPA auction hook; `gpt_bootstrap.js` installs
    * a minimal fallback for pages where the bundle fails to load.
+   *
+   * `initialSlots` exists for the shared-template `</body>` seam, which is the
+   * only place slot definitions arrive with the bids rather than from the head
+   * script. Passing them here rather than assigning `tsjs.adSlots` before the
+   * call puts them behind the same generation guard: an assignment made ahead
+   * of the guard would clobber a committed SPA navigation's slots with the SSR
+   * document's, and then be read by that route's `adInit()`.
    */
-  scheduleInitialAdInit?: (initialBids?: Record<string, AuctionBidData>) => void;
+  scheduleInitialAdInit?: (
+    initialBids?: Record<string, AuctionBidData>,
+    initialSlots?: AuctionSlot[]
+  ) => void;
   /** Read-only GPT lifecycle diagnostics API, present only in an activated tab. */
   gptDiagnostics?: GptDiagnosticsApi;
 }

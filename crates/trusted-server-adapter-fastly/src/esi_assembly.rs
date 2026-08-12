@@ -140,7 +140,18 @@ impl PlatformTemplateAssembler for FastlyTemplateAssembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trusted_server_core::publisher::ESI_BIDS_INCLUDE;
+
+    /// A hand-written include, no longer the seam's marker.
+    ///
+    /// It used to be `trusted_server_core::publisher::ESI_BIDS_INCLUDE`, on the
+    /// reasoning that a test writing its own marker would keep passing after the
+    /// seam's shape changed. That reasoning expired with the seam: the marker is now
+    /// an inert HTML comment (`SEAM_BIDS_MARKER`), which this crate cannot resolve and
+    /// is not meant to. What is left under test here is the `esi` crate's own
+    /// behaviour over an ESI document — including
+    /// [`the_crate_truncates_a_script_larger_than_its_chunk_size`], the defect that
+    /// took the crate out of the render path in the first place.
+    const ESI_BIDS_INCLUDE: &str = "<esi:include src=\"/_ts/page-bids?format=fragment\"/>";
 
     const FRAGMENT: &str = "<script>window.tsjs={bids:{}};</script>";
 
@@ -150,9 +161,8 @@ mod tests {
 
     #[test]
     fn the_seams_own_marker_is_resolved() {
-        // Deliberately built from `ESI_BIDS_INCLUDE` rather than a hand-written
-        // include. The two live in different crates, and a test that wrote its own
-        // marker would keep passing after the seam's changed shape stopped parsing.
+        // The processor must resolve a well-formed include. This is the crate's
+        // contract, not the seam's — the seam no longer emits ESI at all.
         let assembled = assemble(&template_with_include(), FRAGMENT).expect("should assemble");
 
         assert!(
