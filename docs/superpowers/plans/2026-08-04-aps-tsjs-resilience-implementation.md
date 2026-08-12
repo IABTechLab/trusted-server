@@ -4859,7 +4859,12 @@ sampling or comparison logic.
   test -n "$FASTLY_SERVICE_ID"
   PREVIOUS_FASTLY_VERSION="$(fastly service version list \
     --service-id "$FASTLY_SERVICE_ID" --json | \
-    jq -er '[.[] | select(.active == true)] | if length == 1 then .[0].number else error("expected one active Fastly version") end')"
+    jq -er '[.[] | select((.Active? == true) or (.active? == true))] |
+      if length == 1 then
+        (.[0].Number? // .[0].number? // error("active Fastly version has no number"))
+      else
+        error("expected one active Fastly version")
+      end')"
   PREVIOUS_ARTIFACT_ID="fastly-service-version:$PREVIOUS_FASTLY_VERSION"
   git fetch origin "$RELEASE_REF"
   test "$RELEASE_SHA" = "$(git rev-parse "origin/$RELEASE_REF")"
@@ -4958,7 +4963,12 @@ infrastructure.
    ```bash
    CURRENT_FASTLY_VERSION="$(fastly service version list \
      --service-id "$FASTLY_SERVICE_ID" --json | \
-     jq -er '[.[] | select(.active == true)] | if length == 1 then .[0].number else error("expected one active Fastly version") end')"
+     jq -er '[.[] | select((.Active? == true) or (.active? == true))] |
+       if length == 1 then
+         (.[0].Number? // .[0].number? // error("active Fastly version has no number"))
+       else
+         error("expected one active Fastly version")
+       end')"
    test "$CURRENT_FASTLY_VERSION" = "$PREVIOUS_FASTLY_VERSION"
    ```
 
