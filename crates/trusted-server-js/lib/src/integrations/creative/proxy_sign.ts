@@ -1,4 +1,5 @@
 import { log } from '../../core/log';
+import { hasOpaqueOrigin } from '../../shared/origin';
 
 const PROXY_PREFIX = '/first-party/proxy';
 
@@ -21,6 +22,15 @@ export function shouldProxyExternalUrl(raw: string): boolean {
 
 export async function signProxyUrl(raw: string): Promise<string | null> {
   if (typeof fetch !== 'function') return null;
+  // A sandboxed srcdoc creative without `allow-same-origin` has an opaque
+  // origin: this JSON POST would preflight with `Origin: null` and fail, so
+  // skip the doomed request and leave the resource URL unsigned. Dynamic
+  // signing from opaque-origin creatives needs a same-origin parent
+  // postMessage broker — tracked in
+  // https://github.com/IABTechLab/trusted-server/issues/982. Until then,
+  // dynamically inserted resources degrade to loading directly, which the
+  // sandbox still isolates from the publisher origin.
+  if (hasOpaqueOrigin()) return null;
   let absolute: string;
   try {
     absolute = new URL(raw, location.href).toString();

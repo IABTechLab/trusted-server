@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
-import { resolvePrebidUserIdModulesFromEids } from '../../../src/integrations/prebid/user_id_modules';
+import {
+  knownUserIdConfigNames,
+  resolvePrebidUserIdModulesFromEids,
+} from '../../../src/integrations/prebid/user_id_modules';
 
 const sampleEids = [
   { source: 'yahoo.com', uids: [{ id: 'connect-id', atype: 3 }] },
@@ -61,6 +64,23 @@ describe('prebid user ID module registry', () => {
         'sharedIdSystem',
         'unifiedIdSystem',
       ],
+      missingSources: [],
+    });
+  });
+
+  it('exposes config names for modules that do not map EID sources', () => {
+    expect(knownUserIdConfigNames()).toEqual(
+      expect.arrayContaining(['lockrAIMId', 'pubProvidedId'])
+    );
+  });
+
+  it('maps the Google PAIR EID source to pairIdSystem', () => {
+    const result = resolvePrebidUserIdModulesFromEids([
+      { source: 'google.com', uids: [{ id: 'pair-id' }] },
+    ]);
+
+    expect(result).toEqual({
+      modules: ['userId', 'pairIdSystem'],
       missingSources: [],
     });
   });

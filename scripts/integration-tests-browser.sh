@@ -18,6 +18,7 @@ cd "$REPO_ROOT"
 
 ORIGIN_PORT="${INTEGRATION_ORIGIN_PORT:-8888}"
 BROWSER_DIR="crates/trusted-server-integration-tests/browser"
+TSJS_LIB_DIR="crates/trusted-server-js/lib"
 NODE_VERSION="$(grep '^nodejs ' .tool-versions | awk '{print $2}')"
 
 if [ -z "$NODE_VERSION" ]; then
@@ -54,6 +55,14 @@ echo "==> Installing Playwright dependencies..."
 cd "$REPO_ROOT/$BROWSER_DIR"
 npm ci
 npx playwright install chromium
+
+# --- Build browser-side Trusted Server and external Prebid fixtures ---
+echo "==> Building TSJS browser fixtures..."
+cd "$REPO_ROOT/$TSJS_LIB_DIR"
+npm ci
+npm run build
+npm run build:prebid-external
+cd "$REPO_ROOT/$BROWSER_DIR"
 
 # --- Export env vars for global-setup.ts ---
 export WASM_BINARY_PATH="$REPO_ROOT/target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm"
