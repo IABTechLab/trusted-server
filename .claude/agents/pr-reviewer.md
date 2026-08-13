@@ -313,15 +313,15 @@ if [ -n "$WT" ]; then
         # `reset --hard` + `clean -fd` restores tracked files and removes
         # untracked non-ignored files, but leaves *ignored* artefacts behind.
         # A prior invocation interrupted after running `node build-all.mjs`
-        # (step 7e) leaves a stale `crates/js/dist/` from the old head or a
-        # discarded suggestion; `crates/js/build.rs` consumes those bundles
+        # (step 7e) leaves a stale `crates/trusted-server-js/dist/` from the old head or a
+        # discarded suggestion; `crates/trusted-server-js/build.rs` consumes those bundles
         # via `include_str!()`, so the leftover would leak into this pass's
         # Rust compile output. Wipe that one ignored input before starting —
-        # `-x` is scoped to `crates/js/dist` so it doesn't blow away the
+        # `-x` is scoped to `crates/trusted-server-js/dist` so it doesn't blow away the
         # `target/` and `node_modules/` caches that speed up verification.
         git -C "$WT" reset --hard "$HEAD_REF"
         git -C "$WT" clean -fd
-        git -C "$WT" clean -fdx crates/js/dist
+        git -C "$WT" clean -fdx crates/trusted-server-js/dist
     elif [ -e "$WT" ]; then
         # A directory exists at $WT but git doesn't track it as a worktree
         # (aborted prior session, manual copy, etc.). Refuse to clobber it; the
@@ -524,7 +524,7 @@ For each changed file, evaluate:
 - Are new code paths tested?
 - Are edge cases covered (empty input, max values, error paths)?
 - If config-derived regex/pattern compilation changed: are invalid enabled-config startup failures and explicit `enabled = false` bypass cases both covered?
-- Rust tests: `cargo test-fastly && cargo test-axum && cargo test-cloudflare`
+- Rust tests: `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin`
 - JS tests: `npx vitest run` in `crates/trusted-server-js/lib/`
 
 ### 5. Classify findings
@@ -809,8 +809,8 @@ tree and run targeted checks.
 isolated worktree, and modifying the user's checkout in place to verify a
 suggestion would be exactly the side effect the workflow is designed to
 avoid). Instead, label every suggestion with
-"_(scratch verification skipped — local-mode review; please run `cargo check`
-/ `cargo test --workspace` after applying)_".
+"_(scratch verification skipped — local-mode review; please run the matching
+`cargo check-*` / `cargo test-*` aliases after applying)_".
 
 For modes where `WT` is set, the reviewer worktree from step 1 sits at the
 head and is the right scratch surface. Every command in this step is rooted
@@ -836,15 +836,15 @@ for suggestion in "${approved_suggestions[@]}"; do
     # 1. Reset to a clean head so the previous iteration's suggestion is
     #    gone — each suggestion verifies alone. `clean -fd` removes
     #    untracked tracked-by-git-but-untracked files, but it does NOT
-    #    touch `.gitignore`'d paths like `crates/js/dist/` — those are
-    #    consumed by `crates/js/build.rs` via `include_str!()`, so a stale
+    #    touch `.gitignore`'d paths like `crates/trusted-server-js/dist/` — those are
+    #    consumed by `crates/trusted-server-js/build.rs` via `include_str!()`, so a stale
     #    bundle from suggestion A would otherwise leak into suggestion B's
     #    Rust compile output. When the previous iteration ran
     #    `node build-all.mjs`, also wipe the dist tree.
     git -C "$WT" reset --hard "$HEAD_REF"
     git -C "$WT" clean -fd
     if [ "$prev_iteration_ran_js_build" = 1 ]; then
-        git -C "$WT" clean -fdx crates/js/dist
+        git -C "$WT" clean -fdx crates/trusted-server-js/dist
     fi
     prev_iteration_ran_js_build=0
     # Reset the per-iteration flag to a known value BEFORE the verification
@@ -866,7 +866,7 @@ for suggestion in "${approved_suggestions[@]}"; do
     #    verification logic runs `node build-all.mjs` for this suggestion,
     #    set ran_js_build=1 so the next iteration knows to clean the dist
     #    tree:
-    #        if suggestion touched crates/js/lib/src/ → ran_js_build=1
+    #        if suggestion touched crates/trusted-server-js/lib/src/ → ran_js_build=1
     prev_iteration_ran_js_build=$ran_js_build
     # 5. Record per-suggestion outcome (keep / mechanical revise + back to
     #    step 6 / demote to prose + back to step 6).
@@ -889,27 +889,29 @@ multi-line suggestion if their ranges are contiguous in the same file.
 
 ```bash
 (cd "$WT" && cargo fmt --all -- --check)                  # indent drift
-(cd "$WT" && cargo clippy -p <crate-of-each-touched-file> -- -D warnings)
-(cd "$WT" && cargo check --workspace)                     # full graph compile-check
+(cd "$WT" && cargo clippy-fastly)   # core + fastly adapter + js + openrtb
+# When the touched file lives in another adapter, use its alias instead:
+# clippy-axum / clippy-cloudflare + clippy-cloudflare-wasm /
+# clippy-spin-native + clippy-spin-wasm
+(cd "$WT" && cargo check-fastly && cargo check-axum && cargo check-cloudflare)
 ```
 
 Preflight is **compile-verified, not behaviour-verified**. A one-line logic
 suggestion (off-by-one, wrong comparison, swapped operands) can pass preflight
 and still fail tests. When emitting a suggestion that changes program
 behaviour and you ran only the preflight, label the suggestion explicitly in
-the inline comment with "_(compile-verified only — please re-run
-`cargo test --workspace` after applying)_". Pure-formatting / pure-comment /
+the inline comment with "_(compile-verified only — please re-run the matching
+`cargo test-*` alias after applying)_". Pure-formatting / pure-comment /
 pure-renaming suggestions don't need that disclaimer.
 
 **Full CI-equivalent gate (mandatory for the cases below):**
 
-The targeted preflight above narrows clippy to the touched crate. That's
+The targeted preflight above narrows clippy to the touched adapter. That's
 deliberately cheap so verification stays fast for one-line edits. But
-CLAUDE.md's required CI gate is `cargo clippy --workspace --all-targets
---all-features -- -D warnings` plus `cargo test --workspace`, and the
-targeted run won't catch issues that appear only under another feature flag,
-in `--tests`, or in a downstream crate. Use the full gate when **any** of
-these is true:
+CLAUDE.md's required CI gate is the full target-matched clippy alias chain
+plus all four adapter test aliases, and the targeted run won't catch issues
+that appear only under another adapter's target or feature set, in `--tests`,
+or in a downstream crate. Use the full gate when **any** of these is true:
 
 - The suggestion touches a public / `pub(crate)` API or signature.
 - The suggestion touches a `#[cfg(test)]` module, a test, or a feature gate.
@@ -921,8 +923,9 @@ these is true:
   **without** the compile-verified-only disclaimer.
 
 ```bash
-(cd "$WT" && cargo clippy --workspace --all-targets --all-features -- -D warnings)
-(cd "$WT" && cargo test --workspace)
+(cd "$WT" && cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare \
+          && cargo clippy-cloudflare-wasm && cargo clippy-spin-native && cargo clippy-spin-wasm)
+(cd "$WT" && cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin)
 ```
 
 **JS/TS suggestions** (run from the package root in a subshell so the
@@ -931,12 +934,12 @@ worktree's cwd is unaffected). CLAUDE.md's JS-side build pipeline also runs
 means a suggestion that edits `src/integrations/*/index.ts` could compile
 under `vitest` but break the runtime bundle the Rust crate `include_str!`s
 at build time. Run the build whenever the suggestion touches files under
-`crates/js/lib/src/`:
+`crates/trusted-server-js/lib/src/`:
 
 ```bash
-(cd "$WT/crates/js/lib" && npx vitest run)
-(cd "$WT/crates/js/lib" && npm run format)
-(cd "$WT/crates/js/lib" && node build-all.mjs)   # only when src/ changed
+(cd "$WT/crates/trusted-server-js/lib" && npx vitest run)
+(cd "$WT/crates/trusted-server-js/lib" && npm run format)
+(cd "$WT/crates/trusted-server-js/lib" && node build-all.mjs)   # only when src/ changed
 ```
 
 **Docs/markdown suggestions:**
@@ -1015,17 +1018,17 @@ git -C "$WT" restore --worktree --staged .
 git -C "$WT" clean -fd
 ```
 
-Gitignored artefacts (e.g. `target/`, `node_modules/`, `crates/js/dist/`)
+Gitignored artefacts (e.g. `target/`, `node_modules/`, `crates/trusted-server-js/dist/`)
 are **left in place** by default — they're caches that speed up the next
 verification pass. **Exception**: when the JS build (`node build-all.mjs`)
-ran, also clean the `crates/js/dist/` tree it produced, because
-`crates/js/build.rs` consumes those bundles via `include_str!()` and a stale
+ran, also clean the `crates/trusted-server-js/dist/` tree it produced, because
+`crates/trusted-server-js/build.rs` consumes those bundles via `include_str!()` and a stale
 `dist/` from a discarded suggestion will leak into the next verification's
 Rust compile output:
 
 ```bash
 # Only when JS build ran during this verification.
-git -C "$WT" clean -fdx crates/js/dist
+git -C "$WT" clean -fdx crates/trusted-server-js/dist
 ```
 
 If a suggestion edits something that lives in `.gitignore` (rare), call it
