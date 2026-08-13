@@ -4,7 +4,6 @@
 use std::io::Read as _;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 use edgezero_adapter_fastly::key_value_store::FastlyKvStore;
@@ -578,22 +577,6 @@ pub struct FastlyPlatformHttpClient;
 
 #[cfg(feature = "aps-runner-proxy-integration-test")]
 const APS_RUNNER_PROXY_TEST_BACKEND: &str = "aps_runner_proxy_fixture";
-const RAW_PROXY_DEADLINE_SAFETY_MARGIN: Duration = Duration::from_millis(250);
-const RAW_PROXY_PENDING_POLL_INTERVAL: Duration = Duration::from_millis(5);
-
-fn raw_proxy_call_start_deadline(policy: RawProxyPolicyV1) -> Option<Duration> {
-    policy.total_timeout.checked_sub(
-        policy
-            .blocking_read_timeout
-            .checked_add(RAW_PROXY_DEADLINE_SAFETY_MARGIN)?,
-    )
-}
-
-fn raw_proxy_pending_poll_sleep(elapsed: Duration, deadline: Duration) -> Duration {
-    deadline
-        .saturating_sub(elapsed)
-        .min(RAW_PROXY_PENDING_POLL_INTERVAL)
-}
 
 #[cfg(feature = "aps-runner-proxy-integration-test")]
 fn aps_runner_proxy_test_backend(
@@ -674,13 +657,9 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         }
 
         let started = web_time::Instant::now();
-        let call_start_deadline = raw_proxy_call_start_deadline(policy).ok_or_else(|| {
-            Report::new(PlatformError::HttpClient)
-                .attach("raw proxy timeout cannot reserve one bounded body read")
-        })?;
-        if policy.first_byte_timeout > call_start_deadline {
+        if policy.first_byte_timeout > policy.total_timeout {
             return Err(Report::new(PlatformError::HttpClient)
-                .attach("raw proxy first-byte timeout exceeds reduced deadline"));
+                .attach("raw proxy first-byte timeout exceeds total deadline"));
         }
         let backend_name = request.backend_name;
         let mut fastly_request = edge_request_to_fastly(request.request)?;
@@ -694,33 +673,16 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
             }
         };
         apply_fastly_cache_bypass(&mut fastly_request, request.bypass_cache);
-        let mut pending = fastly_request
+        let pending = fastly_request
             .send_async(&backend_name)
             .change_context(PlatformError::HttpClient)?;
-        let mut response = loop {
-            if started.elapsed() >= call_start_deadline {
-                return Err(Report::new(PlatformError::HttpClient)
-                    .attach("raw proxy reduced deadline exceeded before response headers"));
-            }
-            match pending.poll() {
-                fastly::http::request::PollResult::Pending(next) => {
-                    pending = next;
-                    let sleep =
-                        raw_proxy_pending_poll_sleep(started.elapsed(), call_start_deadline);
-                    if !sleep.is_zero() {
-                        std::thread::sleep(sleep);
-                    }
-                    if started.elapsed() >= call_start_deadline {
-                        return Err(Report::new(PlatformError::HttpClient).attach(
-                            "raw proxy reduced deadline exceeded while polling response headers",
-                        ));
-                    }
-                }
-                fastly::http::request::PollResult::Done(result) => {
-                    break result.change_context(PlatformError::HttpClient)?;
-                }
-            }
-        };
+        // The backend carries the requested first-byte timeout. Waiting in the
+        // SDK lets the host suspend the guest instead of guest-side polling.
+        let mut response = pending.wait().change_context(PlatformError::HttpClient)?;
+        if started.elapsed() >= policy.total_timeout {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("raw proxy total deadline exceeded before response headers"));
+        }
 
         let evidence = ProxyResponseEvidenceV1 {
             status: response.get_status().as_u16(),
@@ -739,9 +701,9 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         let mut body = Vec::new();
         let mut chunk = [0_u8; 64 * 1024];
         loop {
-            if started.elapsed() >= call_start_deadline {
+            if started.elapsed() >= policy.total_timeout {
                 return Err(Report::new(PlatformError::HttpClient)
-                    .attach("raw proxy reduced deadline exceeded before blocking body read"));
+                    .attach("raw proxy total deadline exceeded before blocking body read"));
             }
             let read = reader
                 .read(&mut chunk)
@@ -956,18 +918,29 @@ mod tests {
     }
 
     #[test]
-    fn raw_proxy_pending_poll_sleep_is_bounded_by_interval_and_deadline() {
-        assert_eq!(
-            raw_proxy_pending_poll_sleep(Duration::from_secs(1), Duration::from_secs(4)),
-            RAW_PROXY_PENDING_POLL_INTERVAL
+    fn raw_proxy_waits_with_the_sdk_without_sleep_polling() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/platform.rs"));
+        let raw_proxy = source
+            .split("async fn send_raw_proxy_v1(")
+            .nth(1)
+            .and_then(|source| source.split("fn supports_concurrent_fanout(").next())
+            .expect("should locate the Fastly raw proxy implementation");
+
+        assert!(
+            raw_proxy.contains("pending.wait()"),
+            "raw proxy should block in the Fastly SDK instead of guest-side polling"
         );
-        assert_eq!(
-            raw_proxy_pending_poll_sleep(Duration::from_millis(3_998), Duration::from_secs(4),),
-            Duration::from_millis(2)
+        assert!(!raw_proxy.contains("pending.poll()"));
+        assert!(!raw_proxy.contains("std::thread::sleep"));
+        assert!(
+            raw_proxy.contains("policy.total_timeout"),
+            "raw proxy should preserve the complete policy-owned total timeout"
         );
-        assert_eq!(
-            raw_proxy_pending_poll_sleep(Duration::from_secs(4), Duration::from_secs(4)),
-            Duration::ZERO
+        assert!(
+            !raw_proxy.contains("call_start_deadline")
+                && !raw_proxy.contains("reduced deadline")
+                && !raw_proxy.contains("SAFETY_MARGIN"),
+            "raw proxy must not reserve time outside the exact transport window"
         );
     }
 

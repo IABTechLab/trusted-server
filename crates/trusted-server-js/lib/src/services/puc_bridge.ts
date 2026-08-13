@@ -1,14 +1,10 @@
-import {
-  TSJS_MESSAGE_PROTOCOL_V1,
-  type MessagingAdapter,
-  type MessagingPort,
-} from '../adapters/messaging';
-import { mintBrowserLifecycleTicket } from '../kernel/identity';
+import type { MessagingAdapter, MessagingPort } from '../adapters/messaging';
+import { TSJS_MESSAGE_PROTOCOL_V1 } from '../core/contracts/message_protocol';
 import type { IdentityGenerationResult } from '../kernel/identity';
+import type { CollapsedPucShellResizeInput } from '../core/puc_shell';
 
 import type {
   CacheAdmSource,
-  CollapsedPucShellResizeInput,
   CommittedRenderArtifact,
   RenderAttempt,
   RenderFailureReason,
@@ -957,7 +953,7 @@ export interface PucBridgeOptions {
   readonly messaging: MessagingAdapter;
   readonly reservations: Pick<ReservationService, 'claim' | 'recognize'> &
     Partial<Pick<ReservationService, 'tombstone'>>;
-  readonly mintLifecycleTicket?: () => IdentityGenerationResult<string>;
+  readonly mintLifecycleTicket: () => IdentityGenerationResult<string>;
   readonly now?: () => number;
   readonly publisherOrigin?: string;
   readonly resizeCollapsedShell?: (input: CollapsedPucShellResizeInput) => boolean;
@@ -1365,7 +1361,7 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
   try {
     messaging = options.messaging;
     reservations = options.reservations;
-    mintLifecycleTicket = options.mintLifecycleTicket ?? mintBrowserLifecycleTicket;
+    mintLifecycleTicket = options.mintLifecycleTicket;
     nowSource = options.now ?? defaultNow;
     publisherOrigin = options.publisherOrigin;
     rendererNonces = options.rendererNonces;

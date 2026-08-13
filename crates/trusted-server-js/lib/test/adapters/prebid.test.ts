@@ -1395,6 +1395,22 @@ describe('browser Prebid adapter readiness', () => {
     }
   );
 
+  it('settles an operation when its signal getter reentrantly disposes the adapter', async () => {
+    const adapter = createBrowserPrebidAdapter({});
+    const command = vi.fn();
+    const options = Object.defineProperty({}, 'signal', {
+      get: () => {
+        adapter.dispose();
+        return undefined;
+      },
+    }) as { readonly signal?: AbortSignal };
+
+    const operation = adapter.run(command, options);
+
+    await expect(operation.result).rejects.toMatchObject({ code: 'operation_disposed' });
+    expect(command).not.toHaveBeenCalled();
+  });
+
   it.each([
     'add-getter',
     'before-install',

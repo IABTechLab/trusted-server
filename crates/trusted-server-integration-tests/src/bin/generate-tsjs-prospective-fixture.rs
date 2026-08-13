@@ -39,8 +39,8 @@ fn run(args: &Args) -> Result<String, DynError> {
             module_ids: &ids,
             auction_projection_json: &projection,
             creative: CreativeBootConfigV1 {
-                enabled: false,
-                click_guard: false,
+                enabled: true,
+                click_guard: ids.contains(&"creative"),
                 render_guard: false,
             },
             render_trace_overlay: true,
@@ -163,6 +163,7 @@ mod tests {
         let args = Args {
             ids: vec![
                 "render_runtime".to_string(),
+                "creative".to_string(),
                 "gpt".to_string(),
                 "diagnostics_presentation".to_string(),
                 "gpt_later".to_string(),
@@ -172,6 +173,9 @@ mod tests {
         let html = run(&args).expect("should serialize an E7 prospective fixture");
 
         assert!(html.contains(r#"id="perf-slot""#));
+        assert!(html.contains(
+            r#""creative":{"version":1,"enabled":true,"clickGuard":true,"renderGuard":false}"#
+        ));
         assert!(html.contains(r#""renderTraceOverlay":true"#));
         assert!(html.contains(r#""id":"diagnostics_presentation","phase":"deferred""#));
         assert!(html.contains(r#""id":"gpt_later","phase":"deferred""#));

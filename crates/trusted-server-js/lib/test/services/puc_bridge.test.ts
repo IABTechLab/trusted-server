@@ -77,11 +77,13 @@ function createHarness(
       ...(options.rendererUrl ? { expectedRendererUrl: options.rendererUrl } : {}),
       validateApsRenderer: () => true,
     }),
+    mintLifecycleTicket:
+      options.mintLifecycleTicket ??
+      (() => Object.freeze({ ok: true as const, value: LIFECYCLE_TICKET })),
     reservations: {
       claim: options.claim ?? (() => ({ recognized: false }) satisfies ReservationClaimResult),
       recognize,
     },
-    ...(options.mintLifecycleTicket ? { mintLifecycleTicket: options.mintLifecycleTicket } : {}),
     ...(options.now ? { now: options.now } : {}),
     ...(options.publisherOrigin ? { publisherOrigin: options.publisherOrigin } : {}),
     ...(options.resizeCollapsedShell ? { resizeCollapsedShell: options.resizeCollapsedShell } : {}),

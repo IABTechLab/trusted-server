@@ -580,7 +580,7 @@ function inspectBinding(
   | { readonly status: 'incompatible'; readonly binding?: object }
   | { readonly status: 'present'; readonly value: PresentPrebid } {
   if (value === undefined || value === null) return { status: 'pending' };
-  if ((typeof value !== 'object' || value === null) && typeof value !== 'function') {
+  if (typeof value !== 'object' && typeof value !== 'function') {
     return { status: 'incompatible' };
   }
   const binding = value as object;
@@ -1565,10 +1565,6 @@ export function createBrowserPrebidAdapter(
       return handle;
     }
     if (operation.settled) return handle;
-    if (disposed) {
-      fail(operation as PendingOperation<unknown>, 'operation_disposed');
-      return handle;
-    }
     if (signal !== undefined) {
       if ((typeof signal !== 'object' || signal === null) && typeof signal !== 'function') {
         rejectOperation(

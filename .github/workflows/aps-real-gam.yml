@@ -50,6 +50,8 @@ jobs:
 
       - name: Validate protected inputs and release binding
         env:
+          DISPATCH_EVIDENCE_ID: ${{ inputs.evidence_id }}
+          DISPATCH_PREVIOUS_ARTIFACT_ID: ${{ inputs.previous_artifact_id }}
           DISPATCH_RELEASE_ID: ${{ inputs.release_id }}
         run: |
           test -n "$TS_REAL_GAM_PAGE_URL"
@@ -57,8 +59,8 @@ jobs:
           test -n "$TS_REAL_GAM_EXPECTED_RELEASE_ID"
           test -n "$DISPATCH_RELEASE_ID"
           test "$DISPATCH_RELEASE_ID" = "$TS_REAL_GAM_EXPECTED_RELEASE_ID"
-          test -n "${{ inputs.evidence_id }}"
-          test -n "${{ inputs.previous_artifact_id }}"
+          test -n "$DISPATCH_EVIDENCE_ID"
+          test -n "$DISPATCH_PREVIOUS_ARTIFACT_ID"
 
       - name: Read Node.js version
         id: node-version

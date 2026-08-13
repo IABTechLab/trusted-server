@@ -1,11 +1,24 @@
 name: "TSJS Performance Gate"
 run-name: >-
-  TSJS Performance Gate / ${{ inputs.evidence_id }} / ${{ inputs.mode }}
+  TSJS Performance Gate / ${{ inputs.evidence_id || format('tsjs-pr-{0}', github.run_id) }} / ${{ inputs.mode || 'pull-request' }}
 
 permissions:
   contents: read
 
 on:
+  pull_request:
+    paths:
+      - ".github/workflows/tsjs-performance-gate.yml"
+      - ".tool-versions"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/trusted-server-core/**"
+      - "crates/trusted-server-core/src/auction/**"
+      - "crates/trusted-server-integration-tests/Cargo.toml"
+      - "crates/trusted-server-integration-tests/browser/**"
+      - "crates/trusted-server-integration-tests/src/bin/generate-tsjs-prospective-fixture.rs"
+      - "crates/trusted-server-js/**"
+      - "scripts/validate-tsjs-performance-evidence.mjs"
   workflow_dispatch:
     inputs:
       evidence_id:
@@ -38,14 +51,14 @@ env:
 
 jobs:
   measure:
-    name: measure ${{ inputs.mode }} (${{ inputs.evidence_id }})
+    name: measure ${{ inputs.mode || 'pull-request' }} (${{ inputs.evidence_id || format('tsjs-pr-{0}', github.run_id) }})
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     env:
-      TSJS_EVIDENCE_ID: ${{ inputs.evidence_id }}
-      TSJS_PERF_MODE: ${{ inputs.mode }}
-      TSJS_PERF_ARTIFACT_NAME: tsjs-performance-${{ inputs.evidence_id }}
-      TSJS_PERF_OUTPUT: crates/trusted-server-integration-tests/browser/test-results/tsjs-performance-${{ inputs.mode }}.json
+      TSJS_EVIDENCE_ID: ${{ inputs.evidence_id || format('tsjs-pr-{0}', github.run_id) }}
+      TSJS_PERF_MODE: ${{ inputs.mode || 'pull-request' }}
+      TSJS_PERF_ARTIFACT_NAME: tsjs-performance-${{ inputs.evidence_id || format('tsjs-pr-{0}', github.run_id) }}
+      TSJS_PERF_OUTPUT: crates/trusted-server-integration-tests/browser/test-results/tsjs-performance-${{ inputs.mode || 'pull-request' }}.json
     steps:
       - uses: actions/checkout@v4
         with:
@@ -54,7 +67,7 @@ jobs:
       - name: Validate immutable measurement inputs
         shell: bash
         run: |
-          test "$TSJS_PERF_MODE" = preswitch || test "$TSJS_PERF_MODE" = postswitch
+          test "$TSJS_PERF_MODE" = preswitch || test "$TSJS_PERF_MODE" = postswitch || test "$TSJS_PERF_MODE" = pull-request
           [[ "$TSJS_EVIDENCE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$ ]]
 
       - name: Read repository toolchain pins
@@ -97,16 +110,19 @@ jobs:
           npm run build
           npm run check:bundle
 
-      - name: Build the frozen paired-reference artifacts
+      - name: Build the exact current main artifacts
         shell: bash
         run: |
-          reference_sha="62421ee44c62f24534ea8782a46dfa5bfbcea950"
-          reference_root="$RUNNER_TEMP/tsjs-performance-reference"
-          test "$(git cat-file -t "$reference_sha")" = commit
-          git worktree add --detach "$reference_root" "$reference_sha"
-          npm --prefix "$reference_root/crates/trusted-server-js/lib" ci
-          npm --prefix "$reference_root/crates/trusted-server-js/lib" run build
-          echo "TSJS_PERF_REFERENCE_ROOT=$reference_root" >> "$GITHUB_ENV"
+          git fetch origin main
+          main_sha="$(git rev-parse origin/main)"
+          main_root="$RUNNER_TEMP/tsjs-performance-main"
+          [[ "$main_sha" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git cat-file -t "$main_sha")" = commit
+          git worktree add --detach "$main_root" "$main_sha"
+          npm --prefix "$main_root/crates/trusted-server-js/lib" ci
+          npm --prefix "$main_root/crates/trusted-server-js/lib" run build
+          echo "TSJS_PERF_MAIN_SHA=$main_sha" >> "$GITHUB_ENV"
+          echo "TSJS_PERF_MAIN_ROOT=$main_root" >> "$GITHUB_ENV"
 
       - name: Install the lockfile-pinned Chromium setup
         working-directory: crates/trusted-server-integration-tests/browser
@@ -140,14 +156,17 @@ jobs:
             --workers=1
 
       - name: Validate the generated evidence before upload
+        if: always()
         run: >-
           node scripts/validate-tsjs-performance-evidence.mjs
           --file "$TSJS_PERF_OUTPUT"
           --evidence-id "$TSJS_EVIDENCE_ID"
           --head-sha "${{ github.sha }}"
+          --main-sha "$TSJS_PERF_MAIN_SHA"
           --mode "$TSJS_PERF_MODE"
 
       - name: Upload immutable TSJS performance evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.TSJS_PERF_ARTIFACT_NAME }}

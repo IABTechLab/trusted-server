@@ -170,7 +170,8 @@ function requestPathFact(cycle: GptDiagnosticsRequestCycle): string {
     case undefined:
       return 'Request path: Unknown (not observed)';
     default:
-      return unhandledCase(cycle.requestPath) ?? 'Request path: Unknown (not observed)';
+      unhandledCase(cycle.requestPath);
+      return 'Request path: Unknown (not observed)';
   }
 }
 
@@ -185,10 +186,8 @@ function trustedServerOpportunityFact(cycle: GptDiagnosticsRequestCycle): string
     case undefined:
       return 'Direct opportunity: Unknown (not observed)';
     default:
-      return (
-        unhandledCase(cycle.trustedServerOpportunity) ??
-        'Direct opportunity: Unknown (not observed)'
-      );
+      unhandledCase(cycle.trustedServerOpportunity);
+      return 'Direct opportunity: Unknown (not observed)';
   }
 }
 

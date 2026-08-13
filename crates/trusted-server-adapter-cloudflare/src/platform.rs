@@ -574,33 +574,46 @@ impl CloudflareHttpClient {
             None
         };
         let operation = async {
-            #[cfg(feature = "aps-runner-proxy-integration-test")]
-            let mut response = if let Some(fetcher) = test_fetcher {
-                let mut bound_request: worker::HttpRequest = worker_request
-                    .try_into()
-                    .change_context(PlatformError::HttpClient)?;
-                bound_request.extensions_mut().insert(signal.clone());
-                let bound_response = fetcher
-                    .fetch_request(bound_request)
-                    .await
-                    .change_context(PlatformError::HttpClient)?;
-                worker::Response::try_from(bound_response)
-                    .change_context(PlatformError::HttpClient)?
-            } else {
-                let fetch = Fetch::Request(worker_request);
-                fetch
-                    .send_with_signal(&signal)
-                    .await
-                    .change_context(PlatformError::HttpClient)?
-            };
-            #[cfg(not(feature = "aps-runner-proxy-integration-test"))]
-            let mut response = {
-                let fetch = Fetch::Request(worker_request);
-                fetch
-                    .send_with_signal(&signal)
-                    .await
-                    .change_context(PlatformError::HttpClient)?
-            };
+            let fetch_operation = async {
+                #[cfg(feature = "aps-runner-proxy-integration-test")]
+                let response = if let Some(fetcher) = test_fetcher {
+                    let mut bound_request: worker::HttpRequest = worker_request
+                        .try_into()
+                        .change_context(PlatformError::HttpClient)?;
+                    bound_request.extensions_mut().insert(signal.clone());
+                    let bound_response = fetcher
+                        .fetch_request(bound_request)
+                        .await
+                        .change_context(PlatformError::HttpClient)?;
+                    worker::Response::try_from(bound_response)
+                        .change_context(PlatformError::HttpClient)?
+                } else {
+                    let fetch = Fetch::Request(worker_request);
+                    fetch
+                        .send_with_signal(&signal)
+                        .await
+                        .change_context(PlatformError::HttpClient)?
+                };
+                #[cfg(not(feature = "aps-runner-proxy-integration-test"))]
+                let response = {
+                    let fetch = Fetch::Request(worker_request);
+                    fetch
+                        .send_with_signal(&signal)
+                        .await
+                        .change_context(PlatformError::HttpClient)?
+                };
+                Ok::<worker::Response, Report<PlatformError>>(response)
+            }
+            .boxed_local();
+            let first_byte_deadline = worker::Delay::from(policy.first_byte_timeout).boxed_local();
+            let mut response =
+                match futures::future::select(fetch_operation, first_byte_deadline).await {
+                    Either::Left((response, _)) => response?,
+                    Either::Right(((), _)) => {
+                        return Err(Report::new(PlatformError::HttpClient)
+                            .attach("raw proxy first-byte deadline exceeded"));
+                    }
+                };
             let evidence = ProxyResponseEvidenceV1 {
                 status: response.status_code(),
                 content_type: Self::raw_header_evidence(response.headers(), "content-type"),
@@ -622,7 +635,18 @@ impl CloudflareHttpClient {
                         .stream()
                         .change_context(PlatformError::HttpClient)?;
                     let mut body = Vec::new();
-                    while let Some(chunk) = stream.next().await {
+                    loop {
+                        let read = stream.next().boxed_local();
+                        let read_deadline =
+                            worker::Delay::from(policy.blocking_read_timeout).boxed_local();
+                        let chunk = match futures::future::select(read, read_deadline).await {
+                            Either::Left((chunk, _)) => chunk,
+                            Either::Right(((), _)) => {
+                                return Err(Report::new(PlatformError::HttpClient)
+                                    .attach("raw proxy blocking-read deadline exceeded"));
+                            }
+                        };
+                        let Some(chunk) = chunk else { break };
                         let chunk = chunk.change_context(PlatformError::HttpClient)?;
                         let next_len = body.len().checked_add(chunk.len()).ok_or_else(|| {
                             Report::new(PlatformError::HttpClient)

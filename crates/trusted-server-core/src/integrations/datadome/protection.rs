@@ -4,8 +4,6 @@ use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::{HeaderMap, HeaderName, request_builder};
 use error_stack::{Report, ResultExt};
 use http::{Method, Request, Response, StatusCode, header};
-use sha2::{Digest as _, Sha256};
-use subtle::ConstantTimeEq as _;
 use url::Url;
 
 use crate::error::TrustedServerError;
@@ -36,20 +34,9 @@ enum ProtectionRequestError {
 impl DataDomeIntegration {
     pub(super) async fn filter_protection_request(
         &self,
-        mut input: RequestFilterInput<'_>,
+        input: RequestFilterInput<'_>,
     ) -> RequestFilterDecision {
-        let test_bypass_matched =
-            self.take_protection_test_bypass_header(input.request, input.services);
-        if test_bypass_matched {
-            input
-                .request
-                .extensions_mut()
-                .insert(super::DataDomeClientTagSuppressed);
-            log_protection_test_bypass(&input);
-            return RequestFilterDecision::Continue(RequestFilterEffects::default());
-        }
-
-        if !self.config.enable_protection || !self.is_request_protected(&mut input) {
+        if !self.config.enable_protection || !self.is_request_protected(&input) {
             return RequestFilterDecision::Continue(RequestFilterEffects::default());
         }
 
@@ -111,16 +98,10 @@ impl DataDomeIntegration {
             .change_context(Self::error("Failed to call DataDome Protection API"))
             .map_err(ProtectionRequestError::Runtime)?;
 
-        let status = platform_response.response.status();
-        let datadome_status = datadome_response_status(platform_response.response.headers());
-        let decision =
-            self.classify_protection_response(platform_response.response, input.request.method());
-        log_protection_result(&input, status, datadome_status, &decision);
-
-        Ok(decision)
+        Ok(self.classify_protection_response(platform_response.response, input.request.method()))
     }
 
-    fn is_request_protected(&self, input: &mut RequestFilterInput<'_>) -> bool {
+    fn is_request_protected(&self, input: &RequestFilterInput<'_>) -> bool {
         let req = &*input.request;
         if req.method() == Method::OPTIONS {
             return false;
@@ -145,61 +126,12 @@ impl DataDomeIntegration {
         match self.protection_scope.evaluate(&facts, input.services) {
             ProtectionScopeDecision::Protect => {}
             ProtectionScopeDecision::Skip { rule_id, reason } => {
-                let client_tag_omitted = is_ip_exclusion_reason(reason);
-                if client_tag_omitted {
-                    input
-                        .request
-                        .extensions_mut()
-                        .insert(super::DataDomeClientTagSuppressed);
-                }
-                log_protection_skip(input, &rule_id, reason);
+                log::debug!("[datadome] Skipping Protection API for rule {rule_id} ({reason})");
                 return false;
             }
         }
 
         true
-    }
-
-    fn take_protection_test_bypass_header(
-        &self,
-        req: &mut Request<EdgeBody>,
-        services: &RuntimeServices,
-    ) -> bool {
-        let Some(bypass) = self
-            .config
-            .protection_test_bypass
-            .as_ref()
-            .filter(|bypass| bypass.enabled)
-        else {
-            return false;
-        };
-        let Some(value) = req.headers_mut().remove(super::HEADER_DATADOME_TEST_BYPASS) else {
-            return false;
-        };
-
-        let store_name = StoreName::from(bypass.credential_secret_store.as_str());
-        let credential = match services
-            .secret_store()
-            .get_string(&store_name, &bypass.credential_secret_name)
-        {
-            Ok(credential) if !credential.is_empty() => credential,
-            Ok(_) => {
-                log::warn!(
-                    "[datadome] DataDome test bypass credential is empty; ignoring bypass header"
-                );
-                return false;
-            }
-            Err(err) => {
-                log::warn!(
-                    "[datadome] Failed to load DataDome test bypass credential; ignoring bypass header: {err:?}"
-                );
-                return false;
-            }
-        };
-
-        let actual = Sha256::digest(value.as_bytes());
-        let expected = Sha256::digest(credential.as_bytes());
-        bool::from(actual.ct_eq(&expected))
     }
 
     fn protection_validate_url(&self) -> String {
@@ -481,65 +413,6 @@ impl DataDomeIntegration {
     }
 }
 
-fn is_ip_exclusion_reason(reason: &str) -> bool {
-    matches!(
-        reason,
-        "client_ip" | "client_ip_source" | "ip_cidr" | "ip_cidr_source"
-    )
-}
-
-fn log_protection_test_bypass(input: &RequestFilterInput<'_>) {
-    log::info!(
-        "[datadome] protection decision=skipped rule=protection-test-bypass reason=test_bypass client_tag=omitted method={}",
-        input.request.method(),
-    );
-}
-
-fn log_protection_skip(input: &RequestFilterInput<'_>, rule_id: &str, reason: &str) {
-    if is_ip_exclusion_reason(reason) {
-        log::info!(
-            "[datadome] protection decision=skipped rule={} reason={} client_tag=omitted method={}",
-            rule_id,
-            reason,
-            input.request.method(),
-        );
-    } else {
-        log::debug!(
-            "[datadome] protection decision=skipped rule={} reason={} method={}",
-            rule_id,
-            reason,
-            input.request.method(),
-        );
-    }
-}
-
-fn log_protection_result(
-    input: &RequestFilterInput<'_>,
-    status: StatusCode,
-    datadome_status: Option<u16>,
-    decision: &RequestFilterDecision,
-) {
-    let method = input.request.method();
-
-    match decision {
-        RequestFilterDecision::Respond { .. } => log::info!(
-            "[datadome] protection decision=blocked status={} method={} route=short_circuit",
-            status.as_u16(),
-            method,
-        ),
-        RequestFilterDecision::Continue(_)
-            if status == StatusCode::OK && datadome_status == Some(status.as_u16()) =>
-        {
-            log::info!(
-                "[datadome] protection decision=allowed status={} method={} route=continue",
-                status.as_u16(),
-                method,
-            );
-        }
-        RequestFilterDecision::Continue(_) => {}
-    }
-}
-
 struct ProtectionPayload {
     fields: Vec<(String, String)>,
     uses_header_client_id: bool,
@@ -772,18 +645,11 @@ fn truncate_utf8(value: &str, limit: i32) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
 
-    use crate::integrations::datadome::{
-        DataDomeConfig, ProtectionExclusionRuleConfig, ProtectionMatcherConfig,
-        ProtectionTestBypassConfig,
-    };
-    use crate::platform::GeoInfo;
+    use crate::integrations::datadome::DataDomeConfig;
     use crate::platform::test_support::{
-        HashMapConfigStore, HashMapSecretStore, NoopConfigStore, NoopSecretStore, StubHttpClient,
-        build_services_with_config_and_secret, build_services_with_config_and_secret_and_client_ip,
-        build_services_with_secret_and_http_client, noop_services_with_client_ip,
+        HashMapSecretStore, NoopConfigStore, NoopSecretStore, build_services_with_config_and_secret,
     };
     use crate::settings::Settings;
 
@@ -796,404 +662,6 @@ mod tests {
             ..DataDomeConfig::default()
         };
         DataDomeIntegration::try_new(config).expect("should create integration")
-    }
-
-    fn request_for_filter() -> Request<EdgeBody> {
-        request_builder()
-            .method(Method::GET.as_str())
-            .uri("https://publisher.example/page")
-            .body(EdgeBody::empty())
-            .expect("should build filter request")
-    }
-
-    fn filter_marks_request(
-        config: DataDomeConfig,
-        services: &RuntimeServices,
-    ) -> Request<EdgeBody> {
-        filter_marks_request_with_geo(config, services, None)
-    }
-
-    fn filter_marks_request_with_geo(
-        config: DataDomeConfig,
-        services: &RuntimeServices,
-        geo_info: Option<&GeoInfo>,
-    ) -> Request<EdgeBody> {
-        let integration =
-            DataDomeIntegration::try_new(config).expect("should create DataDome integration");
-        let settings = Settings::default();
-        let mut request = request_for_filter();
-        let decision = futures::executor::block_on(integration.filter_protection_request(
-            RequestFilterInput {
-                settings: &settings,
-                services,
-                request: &mut request,
-                geo_info,
-                is_integration_route: false,
-            },
-        ));
-        assert!(
-            matches!(decision, RequestFilterDecision::Continue(_)),
-            "an excluded request should continue without a Protection API response"
-        );
-        request
-    }
-
-    fn has_client_tag_suppression_marker(request: &Request<EdgeBody>) -> bool {
-        request
-            .extensions()
-            .get::<super::super::DataDomeClientTagSuppressed>()
-            .is_some()
-    }
-
-    #[test]
-    fn protection_test_bypass_skips_api_suppresses_tag_and_strips_header() {
-        let config = DataDomeConfig {
-            enabled: true,
-            enable_protection: true,
-            protection_test_bypass: Some(ProtectionTestBypassConfig {
-                enabled: true,
-                credential_secret_store: "ts_secrets".to_string(),
-                credential_secret_name: "datadome_test_bypass".to_string(),
-            }),
-            ..DataDomeConfig::default()
-        };
-        let integration = DataDomeIntegration::try_new(config).expect("should create integration");
-        let mut secrets = HashMap::new();
-        secrets.insert(
-            "datadome_test_bypass".to_string(),
-            b"temporary-test-credential".to_vec(),
-        );
-        let http_client = Arc::new(StubHttpClient::new());
-        let services = build_services_with_secret_and_http_client(
-            HashMapSecretStore::new(secrets),
-            http_client.clone(),
-        );
-        let settings = Settings::default();
-        let mut request = request_for_filter();
-        request.headers_mut().insert(
-            super::super::HEADER_DATADOME_TEST_BYPASS,
-            edgezero_core::http::HeaderValue::from_static("temporary-test-credential"),
-        );
-
-        let decision = futures::executor::block_on(integration.filter_protection_request(
-            RequestFilterInput {
-                settings: &settings,
-                services: &services,
-                request: &mut request,
-                geo_info: None,
-                is_integration_route: false,
-            },
-        ));
-
-        assert!(
-            matches!(decision, RequestFilterDecision::Continue(_)),
-            "a matching test credential should continue without a challenge"
-        );
-        assert!(
-            has_client_tag_suppression_marker(&request),
-            "the bypass should suppress the automatic DataDome client tag"
-        );
-        assert!(
-            request
-                .headers()
-                .get(super::super::HEADER_DATADOME_TEST_BYPASS)
-                .is_none(),
-            "the bypass credential must not reach the publisher origin"
-        );
-        assert!(
-            http_client.recorded_backend_names().is_empty(),
-            "a matching test credential must not call the Protection API"
-        );
-    }
-
-    #[test]
-    fn protection_test_bypass_wins_over_other_exclusions() {
-        let config = DataDomeConfig {
-            enabled: true,
-            enable_protection: true,
-            protection_exclusion_rules: vec![ProtectionExclusionRuleConfig {
-                id: "staging-page-exclusion".to_string(),
-                enabled: true,
-                methods: Vec::new(),
-                matcher: ProtectionMatcherConfig::PathExact {
-                    paths: vec!["/page".to_string()],
-                },
-            }],
-            protection_test_bypass: Some(ProtectionTestBypassConfig {
-                enabled: true,
-                credential_secret_store: "ts_secrets".to_string(),
-                credential_secret_name: "datadome_test_bypass".to_string(),
-            }),
-            ..DataDomeConfig::default()
-        };
-        let integration = DataDomeIntegration::try_new(config).expect("should create integration");
-        let mut secrets = HashMap::new();
-        secrets.insert(
-            "datadome_test_bypass".to_string(),
-            b"temporary-test-credential".to_vec(),
-        );
-        let http_client = Arc::new(StubHttpClient::new());
-        let services = build_services_with_secret_and_http_client(
-            HashMapSecretStore::new(secrets),
-            http_client.clone(),
-        );
-        let settings = Settings::default();
-        let mut request = request_for_filter();
-        request.headers_mut().insert(
-            super::super::HEADER_DATADOME_TEST_BYPASS,
-            edgezero_core::http::HeaderValue::from_static("temporary-test-credential"),
-        );
-
-        let decision = futures::executor::block_on(integration.filter_protection_request(
-            RequestFilterInput {
-                settings: &settings,
-                services: &services,
-                request: &mut request,
-                geo_info: None,
-                is_integration_route: false,
-            },
-        ));
-
-        assert!(
-            matches!(decision, RequestFilterDecision::Continue(_)),
-            "a matching test credential should continue"
-        );
-        assert!(
-            has_client_tag_suppression_marker(&request),
-            "a matching test credential should suppress the tag even on an excluded path"
-        );
-        assert!(
-            http_client.recorded_backend_names().is_empty(),
-            "a matching test credential must not call the Protection API"
-        );
-    }
-
-    #[test]
-    fn protection_test_bypass_strips_invalid_credential_without_bypassing() {
-        let config = DataDomeConfig {
-            enabled: true,
-            enable_protection: true,
-            protection_test_bypass: Some(ProtectionTestBypassConfig {
-                enabled: true,
-                credential_secret_store: "ts_secrets".to_string(),
-                credential_secret_name: "datadome_test_bypass".to_string(),
-            }),
-            ..DataDomeConfig::default()
-        };
-        let integration = DataDomeIntegration::try_new(config).expect("should create integration");
-        let mut secrets = HashMap::new();
-        secrets.insert(
-            "datadome_server_side_key".to_string(),
-            b"server-side-key".to_vec(),
-        );
-        secrets.insert(
-            "datadome_test_bypass".to_string(),
-            b"temporary-test-credential".to_vec(),
-        );
-        let http_client = Arc::new(StubHttpClient::new());
-        http_client.push_response_with_headers(
-            200,
-            Vec::new(),
-            vec![(HEADER_DATADOME_RESPONSE, "200")],
-        );
-        let services = build_services_with_secret_and_http_client(
-            HashMapSecretStore::new(secrets),
-            http_client.clone(),
-        );
-        let settings = Settings::default();
-        let mut request = request_for_filter();
-        request.headers_mut().insert(
-            super::super::HEADER_DATADOME_TEST_BYPASS,
-            edgezero_core::http::HeaderValue::from_static("wrong-credential"),
-        );
-
-        let decision = futures::executor::block_on(integration.filter_protection_request(
-            RequestFilterInput {
-                settings: &settings,
-                services: &services,
-                request: &mut request,
-                geo_info: None,
-                is_integration_route: false,
-            },
-        ));
-
-        assert!(
-            matches!(decision, RequestFilterDecision::Continue(_)),
-            "an allowed Protection API response should continue"
-        );
-        assert!(
-            !has_client_tag_suppression_marker(&request),
-            "a non-matching credential must not suppress the DataDome client tag"
-        );
-        assert!(
-            request
-                .headers()
-                .get(super::super::HEADER_DATADOME_TEST_BYPASS)
-                .is_none(),
-            "an invalid bypass credential must not reach the publisher origin"
-        );
-        assert_eq!(
-            http_client.recorded_backend_names().len(),
-            1,
-            "a non-matching credential must still call the Protection API"
-        );
-    }
-
-    #[test]
-    fn ip_exclusions_mark_requests_for_client_tag_suppression() {
-        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
-        let mut inline = DataDomeConfig {
-            enabled: true,
-            enable_protection: true,
-            protection_excluded_ip_cidrs: vec!["192.0.2.0/24".to_string()],
-            ..DataDomeConfig::default()
-        };
-        let inline_request =
-            filter_marks_request(inline.clone(), &noop_services_with_client_ip(ip));
-        assert!(
-            has_client_tag_suppression_marker(&inline_request),
-            "inline IP exclusions should mark the request"
-        );
-
-        inline.protection_excluded_ip_cidrs.clear();
-        inline.protection_excluded_ip_cidr_sources =
-            vec![super::super::ProtectionIpCidrSourceConfig {
-                config_store: "datadome-test-source".to_string(),
-                key: "inline-source".to_string(),
-            }];
-        let mut source_values = HashMap::new();
-        source_values.insert("inline-source".to_string(), "192.0.2.0/24".to_string());
-        let source_services = build_services_with_config_and_secret_and_client_ip(
-            HashMapConfigStore::new(source_values),
-            NoopSecretStore,
-            ip,
-        );
-        let source_request = filter_marks_request(inline, &source_services);
-        assert!(
-            has_client_tag_suppression_marker(&source_request),
-            "Config Store IP exclusions should mark the request"
-        );
-
-        let structured_ip = DataDomeConfig {
-            enabled: true,
-            enable_protection: true,
-            protection_exclusion_rules: vec![ProtectionExclusionRuleConfig {
-                id: "structured-ip".to_string(),
-                enabled: true,
-                methods: Vec::new(),
-                matcher: ProtectionMatcherConfig::IpCidr {
-                    cidrs: vec!["192.0.2.0/24".to_string()],
-                },
-            }],
-            ..DataDomeConfig::default()
-        };
-        let structured_request =
-            filter_marks_request(structured_ip, &noop_services_with_client_ip(ip));
-        assert!(
-            has_client_tag_suppression_marker(&structured_request),
-            "structured IP exclusions should mark the request"
-        );
-
-        let structured_source = DataDomeConfig {
-            enabled: true,
-            enable_protection: true,
-            protection_exclusion_rules: vec![ProtectionExclusionRuleConfig {
-                id: "structured-ip-source".to_string(),
-                enabled: true,
-                methods: Vec::new(),
-                matcher: ProtectionMatcherConfig::IpCidrSource {
-                    config_store: "datadome-test-source".to_string(),
-                    key: "structured-source".to_string(),
-                },
-            }],
-            ..DataDomeConfig::default()
-        };
-        let mut structured_values = HashMap::new();
-        structured_values.insert("structured-source".to_string(), "192.0.2.0/24".to_string());
-        let structured_services = build_services_with_config_and_secret_and_client_ip(
-            HashMapConfigStore::new(structured_values),
-            NoopSecretStore,
-            ip,
-        );
-        let structured_source_request =
-            filter_marks_request(structured_source, &structured_services);
-        assert!(
-            has_client_tag_suppression_marker(&structured_source_request),
-            "structured Config Store IP exclusions should mark the request"
-        );
-    }
-
-    #[test]
-    fn non_ip_exclusions_do_not_mark_requests_for_client_tag_suppression() {
-        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
-        let cases = [DataDomeConfig {
-            enabled: true,
-            enable_protection: true,
-            protection_exclusion_rules: vec![ProtectionExclusionRuleConfig {
-                id: "path".to_string(),
-                enabled: true,
-                methods: Vec::new(),
-                matcher: ProtectionMatcherConfig::PathExact {
-                    paths: vec!["/page".to_string()],
-                },
-            }],
-            ..DataDomeConfig::default()
-        }];
-
-        for config in cases {
-            let request = filter_marks_request(config, &noop_services_with_client_ip(ip));
-            assert!(
-                !has_client_tag_suppression_marker(&request),
-                "non-IP exclusions should not mark the request"
-            );
-        }
-    }
-
-    #[test]
-    fn asn_exclusions_do_not_mark_requests_for_client_tag_suppression() {
-        let config = DataDomeConfig {
-            enabled: true,
-            enable_protection: true,
-            protection_excluded_asns: vec![64500],
-            ..DataDomeConfig::default()
-        };
-        let geo_info = GeoInfo {
-            city: String::new(),
-            country: String::new(),
-            continent: String::new(),
-            latitude: 0.0,
-            longitude: 0.0,
-            metro_code: 0,
-            region: None,
-            asn: Some(64500),
-        };
-        let request = filter_marks_request_with_geo(
-            config,
-            &noop_services_with_client_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))),
-            Some(&geo_info),
-        );
-        assert!(
-            !has_client_tag_suppression_marker(&request),
-            "ASN exclusions should not mark the request"
-        );
-    }
-
-    #[test]
-    fn non_matching_ip_does_not_mark_request_for_client_tag_suppression() {
-        let config = DataDomeConfig {
-            enabled: true,
-            enable_protection: true,
-            protection_excluded_ip_cidrs: vec!["192.0.2.0/24".to_string()],
-            ..DataDomeConfig::default()
-        };
-        let request = filter_marks_request(
-            config,
-            &noop_services_with_client_ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10))),
-        );
-        assert!(
-            !has_client_tag_suppression_marker(&request),
-            "a non-matching IP should not mark the request"
-        );
     }
 
     #[test]

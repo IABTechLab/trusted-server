@@ -55,7 +55,7 @@ const runtimeCatalog = releaseCatalog.map(({ id, phase, trigger, consumes, provi
 fs.rmSync(path.join(distributionDirectory, catalogModuleFile));
 
 const sourceById = Object.freeze({
-  render_runtime: 'integrations/render_runtime/index.ts',
+  render_runtime: 'integrations/render_runtime/transport_marker.ts',
   aps: 'integrations/aps/index.ts',
   creative: 'integrations/creative/index.ts',
   datadome: 'integrations/datadome/index.ts',
@@ -107,7 +107,7 @@ const artifacts = [
     inputs: [],
     outputs: ['runtime.v1'],
     file: 'tsjs-core.js',
-    entry: 'composition/index.ts',
+    entry: 'composition/critical_transport.ts',
   },
   ...releaseCatalog.map((entry) => ({
     id: entry.id,

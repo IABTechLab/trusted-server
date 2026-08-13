@@ -88,8 +88,9 @@ fn query_disables(query: Option<&str>) -> bool {
 ///
 /// Returns `404 Not Found` while `[debug] trace_route_enabled` is false. When
 /// enabled, sets (or with `?enabled=false` clears) the `ts-trace` cookie
-/// scoped to `publisher.cookie_domain` and returns `302 Found` redirecting to
-/// `/` — landing back on the homepage confirms the toggle round-trip worked.
+/// as a host-only cookie with no `Domain` attribute and returns `302 Found`
+/// redirecting to `/` — landing back on the homepage confirms the toggle
+/// round-trip worked.
 ///
 /// # Errors
 ///

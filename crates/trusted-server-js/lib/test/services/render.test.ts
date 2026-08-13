@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import apsEnvelope from '../fixtures/aps-renderer-v1.json';
 import { createBrowserMessagingAdapter, type MessagingAdapter } from '../../src/adapters/messaging';
 import { prepareAdmIframe } from '../../src/core/render';
+import { resizeCollapsedPucShell } from '../../src/core/puc_shell';
 import { createTestNavigationIdentityIssuer } from '../../src/kernel/identity';
 import { createRuntimeSession } from '../../src/kernel/sessions';
 import type { RenderAttemptScope, WinnerContext } from '../../src/kernel/sessions';
@@ -20,7 +21,6 @@ import {
   renderDirectCacheAttempt,
   renderDirectAdmAttempt,
   resolveCacheAdmAttempt,
-  resizeCollapsedPucShell,
   type CacheAdmSource,
   type CommittedRenderArtifact,
   type DirectAdmIframeConstructor,

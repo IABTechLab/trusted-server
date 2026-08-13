@@ -183,27 +183,10 @@ fn derive_section(path: &str, section_root: &str, section_segment: usize) -> Str
     }
 }
 
-const fn default_enabled() -> bool {
-    true
-}
-
-const fn is_default_enabled(value: &bool) -> bool {
-    *value == default_enabled()
-}
-
 /// Top-level configuration for the creative opportunities system.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreativeOpportunitiesConfig {
-    /// Enables server-side ad template delivery on publisher HTML and page-bids requests.
-    ///
-    /// This does not disable the direct `POST /auction` endpoint. The default is
-    /// `true` so existing creative-opportunity configurations retain their behavior.
-    #[serde(
-        default = "default_enabled",
-        skip_serializing_if = "is_default_enabled"
-    )]
-    pub enabled: bool,
     /// GAM network ID used to build default unit paths.
     pub gam_network_id: String,
     /// Maximum time in milliseconds to wait for the server-side auction before
@@ -261,7 +244,7 @@ pub struct CreativeOpportunitiesConfig {
     /// [`section_root`](Self::section_root) are omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section_segment: Option<usize>,
-    /// Slot templates. An empty vec or `enabled = false` disables template delivery.
+    /// Slot templates. Empty vec = feature disabled (no auction fired, no globals injected).
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub slot: Vec<CreativeOpportunitySlot>,
 }
@@ -350,12 +333,6 @@ impl CreativeOpportunitiesConfig {
 
         for slot in &self.slot {
             slot.validate_runtime()?;
-            if slot.providers.aps.is_some() {
-                log::warn!(
-                    "creative opportunity slot '{}': providers.aps is retained only for configuration compatibility and is ignored by APS OpenRTB",
-                    slot.id
-                );
-            }
         }
 
         if self
@@ -1166,39 +1143,12 @@ mod tests {
         assert_eq!(derive_section("/%%%/x", "home", 0), "_");
     }
 
-    #[test]
-    fn enabled_defaults_true_and_is_omitted_from_serialized_config() {
-        let config = make_config_with_section_template(None);
-        assert!(
-            config.enabled,
-            "template delivery should default to enabled"
-        );
-        let value = serde_json::to_value(&config).expect("should serialize config");
-        assert!(
-            value.get("enabled").is_none(),
-            "default enabled value should be omitted for rollback compatibility"
-        );
-    }
-
-    #[test]
-    fn disabled_template_switch_is_serialized() {
-        let mut config = make_config_with_section_template(None);
-        config.enabled = false;
-        let value = serde_json::to_value(&config).expect("should serialize config");
-        assert_eq!(
-            value.get("enabled"),
-            Some(&serde_json::Value::Bool(false)),
-            "explicitly disabled template delivery must remain in config blobs"
-        );
-    }
-
     fn make_config_with_section_template(
         section_root: Option<&str>,
     ) -> CreativeOpportunitiesConfig {
         let mut slot = make_slot("ad-header-0", vec!["/news/*"]);
         slot.gam_unit_path = Some("/{network_id}/example/{section}".to_string());
         CreativeOpportunitiesConfig {
-            enabled: true,
             gam_network_id: "99999".to_string(),
             auction_timeout_ms: None,
             price_granularity: PriceGranularity::default(),
@@ -1596,7 +1546,6 @@ mod tests {
         // Older binaries deserialize this struct with `deny_unknown_fields`, so
         // a pushed config blob must not carry `"section_root": null`.
         let config = CreativeOpportunitiesConfig {
-            enabled: true,
             gam_network_id: "99999".to_string(),
             auction_timeout_ms: None,
             price_granularity: PriceGranularity::default(),

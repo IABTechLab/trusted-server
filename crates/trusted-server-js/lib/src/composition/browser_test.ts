@@ -70,20 +70,25 @@ import {
   type GptDiagnosticsFactBuffer,
 } from '../integrations/gpt/diagnostics_facts';
 import {
-  createPrebidRefreshPolicy,
   createPrebidSelectionCoordinator,
-  createPrebidSyntheticRefreshRunner,
-  preparePrebidRegisteredRefreshAuction,
   publishPrebidBid,
   type PrebidSelectionCoordinator,
 } from '../integrations/prebid/module';
+import {
+  createPrebidRefreshPolicy,
+  createPrebidSyntheticRefreshRunner,
+  preparePrebidRegisteredRefreshAuction,
+} from '../integrations/prebid/refresh';
 import { createPrebidStartup } from '../integrations/prebid/startup';
 import { createLockrRuntime } from '../integrations/lockr/module';
 import { createOsanoRuntime } from '../integrations/osano/module';
 import { createPermutiveRuntime } from '../integrations/permutive/module';
 import { createSourcepointRuntime } from '../integrations/sourcepoint/module';
 import { createTestlightRuntime } from '../integrations/testlight/module';
-import { createBrowserNavigationIdentityIssuer } from '../kernel/identity';
+import {
+  createBrowserNavigationIdentityIssuer,
+  mintBrowserLifecycleTicket,
+} from '../kernel/identity';
 import {
   createDiagnosticsIngress,
   type DiagnosticsIngress,
@@ -125,13 +130,13 @@ import {
   createSlotOperation,
   resolveCacheAdmAttempt,
   renderDirectCacheAttempt,
-  resizeCollapsedPucShell,
   renderDirectAdmAttempt,
   type RenderAttempt,
   type CommittedArtifactStore,
   type RendererNonceRegistry,
   type SlotOperationCreationResult,
 } from '../services/render';
+import { resizeCollapsedPucShell } from '../core/puc_shell';
 import { createPucBridge, type PucBridge, type PucBridgeOptions } from '../services/puc_bridge';
 import {
   createBrowserSlotReconciliationBoundary,
@@ -1744,6 +1749,7 @@ export function createTestBrowserRuntimeComposition(
       const ingress = diagnosticsIngress;
       const pucBridge = createPucBridge({
         messaging: composition.adapters.messaging,
+        mintLifecycleTicket: mintBrowserLifecycleTicket,
         publisherOrigin: prepared.publisherOrigin,
         ...(compositionOptions.pucSchedulerForTest
           ? { scheduler: compositionOptions.pucSchedulerForTest }

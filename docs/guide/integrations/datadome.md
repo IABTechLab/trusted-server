@@ -86,7 +86,6 @@ patterns = ["(?i)\\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|
 | `protection_excluded_ip_cidr_sources`  | array   | `[]`                             | Config Store sources containing dynamic client IP CIDR bypass lists     |
 | `protection_ip_list_cache_ttl_seconds` | integer | `300`                            | Process-local cache TTL for Config Store-backed IP CIDR bypass lists    |
 | `protection_exclusion_rules`           | array   | Static asset path regex          | Structured method/path/query/IP/ASN exclusion rules                     |
-| `protection_test_bypass`               | object  | omitted                          | Temporary static-header bypass for access-controlled staging tests      |
 | `enable_graphql_support`               | boolean | `false`                          | Reserved for future GraphQL body inspection; ignored in v1              |
 | `client_side_key`                      | string  | `""`                             | DataDome client-side JavaScript key used for tag injection              |
 | `inject_client_side_tag`               | boolean | `true`                           | Auto-inject the browser tag when `client_side_key` is non-empty         |
@@ -169,75 +168,10 @@ A request is protected when all of the following are true:
 5. The client IP does not match `protection_excluded_ip_cidrs` or any Config Store-backed CIDR source.
 6. The client ASN is not listed in `protection_excluded_asns`.
 7. No `protection_exclusion_rules` match.
-8. The request does not contain a matching enabled `protection_test_bypass` credential.
 
 Static assets are excluded by default using a case-insensitive file-extension regex. Trusted Server internal routes such as `/static/tsjs=`, `/integrations/`, `/first-party/`, admin routes, discovery routes, and signature-verification routes are also excluded by default.
 
 Auction traffic at `/auction` is protected by default.
-
-### Staging test bypass
-
-For short-lived browser automation on an access-controlled staging site, you
-can configure a static header credential that skips only the server-side
-Protection API:
-
-```toml
-[integrations.datadome.protection_test_bypass]
-enabled = true
-credential_secret_store = "ts_secrets"
-credential_secret_name = "datadome_test_bypass"
-```
-
-`protection_test_bypass` requires `enable_protection = true`; it is disabled
-when omitted. Store the temporary credential in the configured Secret Store,
-configure this section only while needed, protect the site with an outer access
-control such as Basic Auth, and remove the section when testing finishes. Do not
-enable it in production.
-
-The fixed `x-ts-datadome-bypass` header is compared in constant time, removed
-before the request can reach DataDome or the publisher origin, and never
-logged. Scope the header to the staging origin; do not attach it to every
-request in a browser context because that can disclose the credential to
-third-party origins. With Playwright:
-
-```ts
-await context.route('https://staging.example.com/**', async (route) => {
-  const headers = {
-    ...route.request().headers(),
-    'x-ts-datadome-bypass': process.env.DATADOME_TEST_BYPASS!,
-  }
-  await route.continue({ headers })
-})
-```
-
-### Client-side tag suppression behavior
-
-On the Fastly adapter, a request that matches an IP-based DataDome exclusion
-or the configured test-bypass credential also omits Trusted Server's
-automatically injected client-side DataDome tag from processed HTML. This keeps
-the client-side layer consistent with the server-side Protection API skip.
-
-This behavior applies to:
-
-- `protection_excluded_ip_cidrs`;
-- `protection_excluded_ip_cidr_sources`;
-- structured `ip_cidr` rules;
-- structured `ip_cidr_source` rules; and
-- a matching enabled `protection_test_bypass` credential.
-
-ASN, method, path, query-parameter, static-asset, and internal-route
-exclusions do not automatically suppress the client-side tag. DataDome tags
-already present in publisher HTML are not removed or changed by this behavior,
-and `/integrations/datadome/tags.js` remains available when requested directly.
-
-Because the processed HTML differs by client IP or test credential,
-tag-suppressed HTML is marked `private, max-age=0` and removed from shared
-surrogate caches. The decision is reported in the existing protection log, for
-example:
-
-```text
-[datadome] protection decision=skipped rule=protection-test-bypass reason=test_bypass client_tag=omitted method=GET
-```
 
 ### Structured exclusion rules
 
