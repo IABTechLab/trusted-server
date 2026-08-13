@@ -3003,8 +3003,6 @@ pub async fn handle_publisher_request(
         return Ok(PublisherResponse::Buffered(response));
     }
 
-    crate::integrations::gpt_diagnostics::finalize_response(&gpt_diagnostics, &mut response);
-
     let ad_slots_script = if should_run_ad_stack {
         settings
             .creative_opportunities
@@ -3058,7 +3056,8 @@ pub async fn handle_publisher_request(
             }
         }
     }
-    }
+
+    crate::integrations::gpt_diagnostics::finalize_response(&gpt_diagnostics, &mut response);
 
     let content_type = response
         .headers()
@@ -4910,6 +4909,11 @@ mod tests {
             Settings::from_toml(&toml).expect("should parse settings with disabled ad templates")
         }
 
+        fn settings_without_creative_opportunities() -> Settings {
+            Settings::from_toml(&crate_test_settings_str())
+                .expect("should parse settings without creative opportunities")
+        }
+
         fn settings_with_dispatching_provider() -> Settings {
             let toml = format!(
                 "{}\n[auction]\nenabled = true\nproviders = [\"{UNEXPECTED_304_PROVIDER}\"]\n\n\
@@ -4972,8 +4976,16 @@ mod tests {
             stub: &StubHttpClient,
             cache_control: &'static str,
         ) {
+            queue_html_response_with_status_and_cache_control(stub, 200, cache_control);
+        }
+
+        fn queue_html_response_with_status_and_cache_control(
+            stub: &StubHttpClient,
+            status: u16,
+            cache_control: &'static str,
+        ) {
             stub.push_response_with_headers(
-                200,
+                status,
                 b"<html><body>origin</body></html>".to_vec(),
                 vec![
                     ("content-type", "text/html; charset=utf-8"),
@@ -5288,10 +5300,17 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn navigation_without_matched_slots_preserves_private_origin_cache_policy() {
+        async fn navigation_without_matched_slots_replaces_origin_cache_policy() {
             let settings = settings_with_enabled_auction_and_creative_opportunities();
 
-            for cache_control in ["private, max-age=0", "No-Store"] {
+            for cache_control in [
+                "no-cache",
+                "max-age=0",
+                "must-revalidate",
+                "s-maxage=0",
+                "private, max-age=0",
+                "No-Store",
+            ] {
                 // Arrange
                 let stub = Arc::new(StubHttpClient::new());
                 queue_html_response_with_cache_control(&stub, cache_control);
@@ -5311,8 +5330,148 @@ mod tests {
                         .headers
                         .get(header::CACHE_CONTROL)
                         .and_then(|value| value.to_str().ok()),
-                    Some(cache_control),
-                    "origin {cache_control} policy should not be weakened"
+                    Some("max-age=60"),
+                    "inactive server-side ad templates should replace origin {cache_control} policy"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn absent_creative_opportunities_use_short_browser_cache_policy() {
+            // Arrange
+            let settings = settings_without_creative_opportunities();
+            let stub = Arc::new(StubHttpClient::new());
+            queue_html_response_with_cache_control(&stub, "no-cache");
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+
+            // Act
+            let response =
+                run_with_slots(&settings, &services, &[], conditional_navigation_request()).await;
+            let response_head = response_head(response);
+
+            // Assert
+            assert_eq!(
+                response_head
+                    .headers
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("max-age=60"),
+                "absent creative opportunities should be treated as an inactive server-side ad stack"
+            );
+        }
+
+        #[tokio::test]
+        async fn inactive_ad_stack_preserves_non_ok_response_cache_policy() {
+            let settings = settings_with_disabled_ad_templates();
+
+            for status in [206, 404, 500, 503] {
+                // Arrange
+                let stub = Arc::new(StubHttpClient::new());
+                queue_html_response_with_status_and_cache_control(&stub, status, "no-cache");
+                let services = build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                );
+
+                // Act
+                let response = run_with_slots(
+                    &settings,
+                    &services,
+                    &[article_slot()],
+                    conditional_navigation_request(),
+                )
+                .await;
+                let response_head = response_head(response);
+
+                // Assert
+                assert_eq!(
+                    response_head
+                        .headers
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("no-cache"),
+                    "inactive server-side ad templates should preserve origin policy on {status}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn inactive_ad_stack_preserves_gpt_diagnostics_cache_privacy() {
+            // Arrange
+            let mut settings = settings_with_disabled_ad_templates();
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+                .expect("should enable GPT diagnostics");
+            let stub = Arc::new(StubHttpClient::new());
+            queue_html_response_with_cache_control(&stub, "no-cache");
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let request = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://ts.example.com/article?ts_console=1")
+                .header(header::HOST, "ts.example.com")
+                .header("sec-fetch-dest", "document")
+                .body(EdgeBody::empty())
+                .expect("should build GPT diagnostics request");
+
+            // Act
+            let response = run_with_slots(&settings, &services, &[article_slot()], request).await;
+            let response_head = response_head(response);
+
+            // Assert
+            assert_eq!(
+                response_head
+                    .headers
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("private, no-store"),
+                "active GPT diagnostics should retain cache privacy when server-side ad templates are inactive"
+            );
+        }
+
+        #[tokio::test]
+        async fn inactive_ad_stack_preserves_non_get_and_non_document_cache_policy() {
+            let settings = settings_with_disabled_ad_templates();
+
+            for request in [
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("https://ts.example.com/article")
+                    .header(header::HOST, "ts.example.com")
+                    .header("sec-fetch-dest", "document")
+                    .body(EdgeBody::empty())
+                    .expect("should build non-GET document request"),
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("https://ts.example.com/article")
+                    .header(header::HOST, "ts.example.com")
+                    .header("sec-fetch-dest", "empty")
+                    .body(EdgeBody::empty())
+                    .expect("should build non-document request"),
+            ] {
+                // Arrange
+                let stub = Arc::new(StubHttpClient::new());
+                queue_html_response_with_cache_control(&stub, "no-cache");
+                let services = build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                );
+
+                // Act
+                let response =
+                    run_with_slots(&settings, &services, &[article_slot()], request).await;
+                let response_head = response_head(response);
+
+                // Assert
+                assert_eq!(
+                    response_head
+                        .headers
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("no-cache"),
+                    "inactive server-side ad templates should preserve non-document request policy"
                 );
             }
         }
