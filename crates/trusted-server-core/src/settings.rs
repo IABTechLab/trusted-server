@@ -50,15 +50,21 @@ pub struct Publisher {
     /// exceeding it fails the response rather than allocating past the cap.
     /// Defaults to 16 MiB — a conservative cap that prevents Wasm-heap OOM.
     ///
-    /// On Fastly the *effective* ceiling for a publisher page is lower: the
-    /// platform HTTP client rejects any origin response whose raw (still
-    /// compressed) body exceeds 10 MiB before this buffer is ever filled, so
-    /// raising this value only helps highly compressible pages whose decoded
-    /// size exceeds the 16 MiB default while their compressed origin body stays
-    /// under 10 MiB. Raising it above ~10 MiB does not lift the platform cap for
-    /// uncompressed pages. That platform limit is removed once true streaming
-    /// lands (tracked for PR 15, issue #495), after which this setting becomes
-    /// the sole ceiling.
+    /// Fastly origin bodies are preserved as streams on the publisher path, so
+    /// this setting also caps the streaming pipeline twice over: cumulative
+    /// raw (still compressed) bytes pulled from origin, and cumulative decoded
+    /// bytes emitted by the decompressor — the latter so a decompression bomb
+    /// cannot push an unbounded decoded volume through the rewrite pipeline.
+    /// On the streaming path headers are already committed when either cap
+    /// trips, so the response is truncated mid-body (with the error logged)
+    /// rather than replaced with a 5xx.
+    ///
+    /// Buffered adapters keep using it as the post-rewrite output buffer cap.
+    /// There it additionally bounds how much decoded gzip output may sit in the
+    /// heap at once, so a bomb is rejected mid-decode instead of after its full
+    /// expansion; that bound is per-step, never cumulative, so a gzip-encoded
+    /// body is judged by the same post-rewrite total as an identity, deflate or
+    /// brotli one.
     ///
     /// Must be at least 1: a zero-byte cap fails every non-empty buffered
     /// publisher response at request time, so it is rejected at config
@@ -187,37 +193,6 @@ impl IntegrationSettings {
         Ok(())
     }
 
-    fn normalize_env_value(value: JsonValue) -> JsonValue {
-        match value {
-            JsonValue::Object(map) => JsonValue::Object(
-                map.into_iter()
-                    .map(|(key, val)| (key, Self::normalize_env_value(val)))
-                    .collect(),
-            ),
-            JsonValue::Array(items) => {
-                JsonValue::Array(items.into_iter().map(Self::normalize_env_value).collect())
-            }
-            JsonValue::String(raw) => {
-                if let Ok(parsed) = serde_json::from_str::<JsonValue>(&raw) {
-                    parsed
-                } else {
-                    JsonValue::String(raw)
-                }
-            }
-            other => other,
-        }
-    }
-
-    /// Normalizes all entries in place, converting JSON-encoded strings from
-    /// environment variables into their proper typed representations.
-    /// Called eagerly after deserialization so that TOML serialization in
-    /// build.rs preserves correct types.
-    pub fn normalize(&mut self) {
-        for value in self.entries.values_mut() {
-            *value = Self::normalize_env_value(value.clone());
-        }
-    }
-
     fn is_explicitly_disabled(raw: &JsonValue) -> bool {
         raw.as_object()
             .and_then(|map| map.get("enabled"))
@@ -299,12 +274,13 @@ pub struct EcPartner {
     /// This normalized domain is also the canonical EC KV `ids` map key.
     #[validate(custom(function = EcPartner::validate_source_domain))]
     pub source_domain: String,
-    /// `OpenRTB` `atype` value (typically 3).
+    /// `OpenRTB` `atype` value, including vendor-specific values such as PAIR's `571187`.
     #[serde(
         default = "EcPartner::default_openrtb_atype",
         deserialize_with = "from_value_or_str"
     )]
-    pub openrtb_atype: u8,
+    #[validate(range(min = 0, message = "must be a non-negative OpenRTB agent type"))]
+    pub openrtb_atype: i32,
     /// Whether this partner's UIDs appear in auction `user.eids`.
     #[serde(default, deserialize_with = "from_value_or_str")]
     pub bidstream_enabled: bool,
@@ -417,7 +393,7 @@ impl EcPartner {
     }
 
     #[must_use]
-    pub const fn default_openrtb_atype() -> u8 {
+    pub const fn default_openrtb_atype() -> i32 {
         3
     }
 
@@ -1894,26 +1870,35 @@ fn validate_tinybird_secret(value: &str, setting: &str) -> Result<(), Report<Tru
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugConfig {
-    /// Expose the JA4/TLS fingerprint debug endpoint at `GET /_ts/debug/ja4`.
+    /// Expose the JA4/TLS probabilistic identifier debug endpoint at `GET /_ts/debug/ja4`.
     ///
     /// When `false` (the default), the endpoint returns 404. Enable only for
-    /// intentional Fastly/browser TLS investigation — the endpoint reflects
+    /// intentional Fastly/browser TLS investigation. The endpoint reflects
     /// Fastly-observed TLS details that browser JS cannot normally read.
     #[serde(default)]
     pub ja4_endpoint_enabled: bool,
 
-    /// Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` showing
-    /// auction pipeline stats (SSP count, mediator status, winning bid count).
-    /// Never enable in production — visible in page source.
+    /// Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` dumping a
+    /// redacted per-provider auction result: pipeline stats (SSP count, mediator
+    /// status, winning bid count) plus every provider response — each bid's
+    /// creative previewed (not the full `adm` markup) and provider metadata
+    /// filtered to a fail-closed allowlist that drops identity-bearing keys.
+    /// Never enable in production — visible in page source and injects (bounded)
+    /// raw HTML from SSPs.
     #[serde(default)]
     pub auction_html_comment: bool,
 
-    /// Include raw `adm` creative markup in `window.tsjs.bids` for GPT/GAM
-    /// debug rendering through the Prebid Universal Creative bridge.
+    /// Enable the testing-only direct GAM-replace path and the verbose per-bid
+    /// `debug_bid` blob in `window.tsjs.bids`.
     ///
-    /// Use this to validate the server-side auction→GAM targeting→creative
-    /// rendering pipeline while PBS Cache is unavailable. Never enable in
-    /// production — injects raw HTML from SSPs.
+    /// Note: the sanitized winning `adm` is now injected **unconditionally** for
+    /// production inline rendering through the pbRender bridge (see
+    /// [`crate::publisher::build_bid_map`]); this flag no longer gates `adm`.
+    /// What it still gates is the client-side `debug_bid` signal that turns on
+    /// the direct GAM-creative replacement (`injectAdmIntoSlot`), which bypasses
+    /// GAM entirely — useful for validating the auction→creative pipeline while
+    /// PBS Cache is unavailable. The `debug_bid` blob also carries the raw,
+    /// un-sanitized creative for diagnostics, so never enable in production.
     #[serde(default)]
     pub inject_adm_for_testing: bool,
 }
@@ -2034,7 +2019,6 @@ impl Settings {
         mut settings: Self,
         validation_label: &str,
     ) -> Result<Self, Report<TrustedServerError>> {
-        settings.integrations.normalize();
         settings.proxy.normalize();
         settings.image_optimizer.normalize();
         settings.consent.validate();
@@ -2049,6 +2033,12 @@ impl Settings {
 
         settings.validate_admin_coverage()?;
         settings.validate_admin_handler_passwords()?;
+
+        if settings.auction.enabled && !settings.auction.rewrite_creatives {
+            log::warn!(
+                "Auction creative rewriting disabled; creative assets and clicks may contact third-party hosts directly"
+            );
+        }
 
         Ok(settings)
     }
@@ -2072,6 +2062,13 @@ impl Settings {
 
         if let Some(co) = &mut self.creative_opportunities {
             co.compile_slots();
+            // Parse `gam_unit_path` templates once here (mirrors the compiled
+            // glob cache) so request-time rendering is substitution-only.
+            co.compile_unit_templates().map_err(|err| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!("Invalid creative opportunity gam_unit_path template: {err}"),
+                })
+            })?;
             // Slots flow into injected HTML/JS, provider payloads, and GPT
             // calls. Env/private config can bypass static review, so validate
             // the full runtime shape on every load path.
@@ -2592,12 +2589,8 @@ mod tests {
 
     use crate::auction::build_orchestrator;
     use crate::integrations::{
-        IntegrationRegistry,
-        datadome::{DataDomeConfig, ProtectionMatcherConfig},
-        gpt::GptConfig,
-        nextjs::NextJsIntegrationConfig,
+        IntegrationRegistry, gpt::GptConfig, nextjs::NextJsIntegrationConfig,
         prebid::PrebidIntegrationConfig,
-        testlight::TestlightConfig,
     };
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
@@ -2807,6 +2800,46 @@ mod tests {
                 "should reject invalid source_domain {source_domain:?}"
             );
         }
+    }
+
+    #[test]
+    fn validate_accepts_vendor_specific_ec_partner_atype() {
+        let toml_str = format!(
+            r#"{}
+            [[ec.partners]]
+            name = "PAIR Partner"
+            source_domain = "google.com"
+            openrtb_atype = 571187
+            api_token = "test-vendor-token-32-bytes-minimum"
+            "#,
+            crate_test_settings_str(),
+        );
+
+        let settings = Settings::from_toml(&toml_str)
+            .expect("should accept vendor-specific OpenRTB agent type");
+
+        assert_eq!(
+            settings.ec.partners[0].openrtb_atype, 571187,
+            "should preserve PAIR's vendor-specific atype"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_negative_ec_partner_atype() {
+        let toml_str = format!(
+            r#"{}
+            [[ec.partners]]
+            name = "Invalid Partner"
+            source_domain = "partner.example.com"
+            openrtb_atype = -1
+            api_token = "test-vendor-token-32-bytes-minimum"
+            "#,
+            crate_test_settings_str(),
+        );
+
+        let result = Settings::from_toml(&toml_str);
+
+        assert!(result.is_err(), "should reject negative OpenRTB agent type");
     }
 
     #[test]
@@ -3154,336 +3187,6 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
-    fn test_prebid_bid_param_overrides_override_with_json_env() {
-        let toml_str = crate_test_settings_str();
-        let env_key = format!(
-            "{}{}INTEGRATIONS{}PREBID{}BID_PARAM_OVERRIDES",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        temp_env::with_var(
-            origin_key,
-            Some("https://origin.test-publisher.com"),
-            || {
-                temp_env::with_var(
-                    env_key,
-                    Some(r#"{"criteo":{"networkId":99999,"pubid":"server-pub"}}"#),
-                    || {
-                        let settings = Settings::from_toml_and_env(&toml_str)
-                            .expect("Settings should parse with bidder param override env");
-                        let cfg = settings
-                            .integration_config::<PrebidIntegrationConfig>("prebid")
-                            .expect("Prebid config query should succeed")
-                            .expect("Prebid config should exist with env override");
-                        let cfg_json =
-                            serde_json::to_value(&cfg).expect("should serialize config to JSON");
-
-                        assert_eq!(
-                            cfg_json["bid_param_overrides"]["criteo"]["networkId"],
-                            json!(99999),
-                            "should deserialize networkId override from env JSON"
-                        );
-                        assert_eq!(
-                            cfg_json["bid_param_overrides"]["criteo"]["pubid"],
-                            json!("server-pub"),
-                            "should deserialize pubid override from env JSON"
-                        );
-                    },
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn test_prebid_bid_param_override_rules_override_with_json_env() {
-        let toml_str = crate_test_settings_str();
-        let env_key = format!(
-            "{}{}INTEGRATIONS{}PREBID{}BID_PARAM_OVERRIDE_RULES",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        temp_env::with_var(
-            origin_key,
-            Some("https://origin.test-publisher.com"),
-            || {
-                temp_env::with_var(
-                    env_key,
-                    Some(
-                        r#"[{"when":{"bidder":"kargo","zone":"header"},"set":{"placementId":"server-header","keep":"yes"}}]"#,
-                    ),
-                    || {
-                        let settings = Settings::from_toml_and_env(&toml_str)
-                            .expect("Settings should parse canonical bidder param override rules");
-                        let cfg = settings
-                            .integration_config::<PrebidIntegrationConfig>("prebid")
-                            .expect("Prebid config query should succeed")
-                            .expect("Prebid config should exist with env override");
-                        let cfg_json =
-                            serde_json::to_value(&cfg).expect("should serialize config to JSON");
-
-                        assert_eq!(
-                            cfg_json["bid_param_override_rules"][0]["when"]["bidder"],
-                            json!("kargo"),
-                            "should deserialize bidder matcher from env JSON"
-                        );
-                        assert_eq!(
-                            cfg_json["bid_param_override_rules"][0]["when"]["zone"],
-                            json!("header"),
-                            "should deserialize zone matcher from env JSON"
-                        );
-                        assert_eq!(
-                            cfg_json["bid_param_override_rules"][0]["set"]["placementId"],
-                            json!("server-header"),
-                            "should deserialize set object from env JSON"
-                        );
-                    },
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn test_datadome_protection_scope_overrides_with_json_env() {
-        let toml_str = crate_test_settings_str();
-        let separator = ENVIRONMENT_VARIABLE_SEPARATOR;
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator
-        );
-        let enabled_key = format!(
-            "{}{}INTEGRATIONS{}DATADOME{}ENABLED",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
-        );
-        let enable_protection_key = format!(
-            "{}{}INTEGRATIONS{}DATADOME{}ENABLE_PROTECTION",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
-        );
-        let excluded_methods_key = format!(
-            "{}{}INTEGRATIONS{}DATADOME{}PROTECTION_EXCLUDED_METHODS",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
-        );
-        let cidr_sources_key = format!(
-            "{}{}INTEGRATIONS{}DATADOME{}PROTECTION_EXCLUDED_IP_CIDR_SOURCES",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
-        );
-        let rules_key = format!(
-            "{}{}INTEGRATIONS{}DATADOME{}PROTECTION_EXCLUSION_RULES",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
-        );
-
-        temp_env::with_vars(
-            [
-                (origin_key, Some("https://origin.test-publisher.com")),
-                (enabled_key, Some("true")),
-                (enable_protection_key, Some("true")),
-                (excluded_methods_key, Some(r#"["OPTIONS","TRACE"]"#)),
-                (
-                    cidr_sources_key,
-                    Some(r#"[{"config_store":"datadome-ip-bypass","key":"googlebot_ips"}]"#),
-                ),
-                (
-                    rules_key,
-                    Some(
-                        r#"[{"id":"legacy-static-get-head","methods":["GET","HEAD"],"type":"path_regex","patterns":["(?i)\\.(css|js)$"]},{"id":"next-rsc","type":"query_param_non_empty","names":["_rsc"]}]"#,
-                    ),
-                ),
-            ],
-            || {
-                let settings = Settings::from_toml_and_env(&toml_str)
-                    .expect("Settings should parse DataDome JSON env overrides");
-                let cfg = settings
-                    .integration_config::<DataDomeConfig>("datadome")
-                    .expect("DataDome config query should succeed")
-                    .expect("DataDome config should exist with env override");
-
-                assert!(cfg.enabled, "should parse enabled override as bool");
-                assert!(
-                    cfg.enable_protection,
-                    "should parse enable_protection override as bool"
-                );
-                assert_eq!(
-                    cfg.protection_excluded_methods,
-                    vec!["OPTIONS".to_string(), "TRACE".to_string()],
-                    "should parse method list from JSON env override"
-                );
-                assert_eq!(
-                    cfg.protection_excluded_ip_cidr_sources[0].config_store, "datadome-ip-bypass",
-                    "should parse CIDR source config_store from JSON env override"
-                );
-                assert_eq!(
-                    cfg.protection_excluded_ip_cidr_sources[0].key, "googlebot_ips",
-                    "should parse CIDR source key from JSON env override"
-                );
-                assert_eq!(
-                    cfg.protection_exclusion_rules.len(),
-                    2,
-                    "should parse all structured rules from JSON env override"
-                );
-                assert!(matches!(
-                    &cfg.protection_exclusion_rules[0].matcher,
-                    ProtectionMatcherConfig::PathRegex { patterns }
-                        if patterns == &vec!["(?i)\\.(css|js)$".to_string()]
-                ));
-                assert!(matches!(
-                    &cfg.protection_exclusion_rules[1].matcher,
-                    ProtectionMatcherConfig::QueryParamNonEmpty { names }
-                        if names == &vec!["_rsc".to_string()]
-                ));
-            },
-        );
-    }
-
-    #[test]
-    fn test_datadome_protection_scope_overrides_with_indexed_env() {
-        let toml_str = crate_test_settings_str();
-        let separator = ENVIRONMENT_VARIABLE_SEPARATOR;
-        let datadome_prefix = format!(
-            "{}{}INTEGRATIONS{}DATADOME{}",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
-        );
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator
-        );
-
-        temp_env::with_vars(
-            [
-                (origin_key, Some("https://origin.test-publisher.com")),
-                (format!("{datadome_prefix}ENABLED"), Some("true")),
-                (format!("{datadome_prefix}ENABLE_PROTECTION"), Some("true")),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUDED_METHODS{separator}0"),
-                    Some("OPTIONS"),
-                ),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUDED_METHODS{separator}1"),
-                    Some("TRACE"),
-                ),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUDED_ASNS{separator}0"),
-                    Some("19750"),
-                ),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUDED_IP_CIDRS{separator}0"),
-                    Some("198.51.100.0/24"),
-                ),
-                (
-                    format!(
-                        "{datadome_prefix}PROTECTION_EXCLUDED_IP_CIDR_SOURCES{separator}0{separator}CONFIG_STORE"
-                    ),
-                    Some("datadome-ip-bypass"),
-                ),
-                (
-                    format!(
-                        "{datadome_prefix}PROTECTION_EXCLUDED_IP_CIDR_SOURCES{separator}0{separator}KEY"
-                    ),
-                    Some("googlebot_ips"),
-                ),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}ID"),
-                    Some("legacy-static-get-head"),
-                ),
-                (
-                    format!(
-                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}METHODS{separator}0"
-                    ),
-                    Some("GET"),
-                ),
-                (
-                    format!(
-                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}METHODS{separator}1"
-                    ),
-                    Some("HEAD"),
-                ),
-                (
-                    format!(
-                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}TYPE"
-                    ),
-                    Some("path_regex"),
-                ),
-                (
-                    format!(
-                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}PATTERNS{separator}0"
-                    ),
-                    Some(r"(?i)\.(css|js)$"),
-                ),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}1{separator}ID"),
-                    Some("next-rsc"),
-                ),
-                (
-                    format!(
-                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}1{separator}TYPE"
-                    ),
-                    Some("query_param_non_empty"),
-                ),
-                (
-                    format!(
-                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}1{separator}NAMES{separator}0"
-                    ),
-                    Some("_rsc"),
-                ),
-            ],
-            || {
-                let settings = Settings::from_toml_and_env(&toml_str)
-                    .expect("Settings should parse DataDome indexed env overrides");
-                let cfg = settings
-                    .integration_config::<DataDomeConfig>("datadome")
-                    .expect("DataDome config query should succeed")
-                    .expect("DataDome config should exist with indexed env override");
-
-                assert_eq!(
-                    cfg.protection_excluded_methods,
-                    vec!["OPTIONS".to_string(), "TRACE".to_string()],
-                    "should parse indexed method list"
-                );
-                assert_eq!(
-                    cfg.protection_excluded_asns,
-                    vec![19750],
-                    "should parse indexed ASN list"
-                );
-                assert_eq!(
-                    cfg.protection_excluded_ip_cidrs,
-                    vec!["198.51.100.0/24".to_string()],
-                    "should parse indexed IP CIDR list"
-                );
-                assert_eq!(
-                    cfg.protection_excluded_ip_cidr_sources[0].key, "googlebot_ips",
-                    "should parse indexed CIDR source list"
-                );
-                assert!(matches!(
-                    &cfg.protection_exclusion_rules[0].matcher,
-                    ProtectionMatcherConfig::PathRegex { patterns }
-                        if patterns == &vec!["(?i)\\.(css|js)$".to_string()]
-                ));
-                assert!(matches!(
-                    &cfg.protection_exclusion_rules[1].matcher,
-                    ProtectionMatcherConfig::QueryParamNonEmpty { names }
-                        if names == &vec!["_rsc".to_string()]
-                ));
-            },
-        );
-    }
-
-    #[test]
     fn test_handlers_override_with_env() {
         let toml_str = crate_test_settings_str();
 
@@ -3656,7 +3359,7 @@ origin_host_header_overide = "www.example.com""#,
                 (origin_key, Some("https://origin.test-publisher.com")),
                 (partner_0_name_key, Some("Env Partner 0")),
                 (partner_0_source_domain_key, Some("envpartner0.example.com")),
-                (partner_0_openrtb_atype_key, Some("1")),
+                (partner_0_openrtb_atype_key, Some("571187")),
                 (partner_0_bidstream_enabled_key, Some("true")),
                 (partner_0_api_token_key, Some("env-token-0")),
                 (partner_1_name_key, Some("Env Partner 1")),
@@ -3675,7 +3378,7 @@ origin_host_header_overide = "www.example.com""#,
                     settings.ec.partners[0].source_domain,
                     "envpartner0.example.com"
                 );
-                assert_eq!(settings.ec.partners[0].openrtb_atype, 1);
+                assert_eq!(settings.ec.partners[0].openrtb_atype, 571187);
                 assert!(settings.ec.partners[0].bidstream_enabled);
                 assert_eq!(settings.ec.partners[0].api_token.expose(), "env-token-0");
                 assert_eq!(settings.ec.partners[1].name, "Env Partner 1");
@@ -4007,67 +3710,6 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
-    fn test_integration_settings_from_env() {
-        use crate::integrations::testlight::TestlightConfig;
-
-        let toml_str = crate_test_settings_str();
-
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        let integration_prefix = format!(
-            "{}{}INTEGRATIONS{}TESTLIGHT{}",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        let endpoint_key = format!("{}ENDPOINT", integration_prefix);
-        let timeout_key = format!("{}TIMEOUT_MS", integration_prefix);
-        let rewrite_key = format!("{}REWRITE_SCRIPTS", integration_prefix);
-        let enabled_key = format!("{}ENABLED", integration_prefix);
-
-        temp_env::with_var(
-            origin_key,
-            Some("https://origin.test-publisher.com"),
-            || {
-                temp_env::with_var(
-                    endpoint_key,
-                    Some("https://testlight-env.test/auction"),
-                    || {
-                        temp_env::with_var(timeout_key, Some("2500"), || {
-                            temp_env::with_var(rewrite_key, Some("true"), || {
-                                temp_env::with_var(enabled_key, Some("true"), || {
-                                    let settings = Settings::from_toml_and_env(&toml_str)
-                                        .expect("Settings should load");
-
-                                    let config = settings
-                                        .integration_config::<TestlightConfig>("testlight")
-                                        .expect("integration parsing should succeed")
-                                        .expect("integration should be enabled");
-
-                                    assert_eq!(
-                                        config.endpoint,
-                                        "https://testlight-env.test/auction"
-                                    );
-                                    assert_eq!(config.timeout_ms, 2500);
-                                    assert!(config.rewrite_scripts);
-                                    assert!(config.enabled);
-                                });
-                            });
-                        });
-                    },
-                );
-            },
-        );
-    }
-
-    #[test]
     fn test_disabled_integration_does_not_register() {
         use crate::integrations::testlight::TestlightConfig;
         use serde_json::json;
@@ -4228,62 +3870,6 @@ origin_host_header_overide = "www.example.com""#,
         );
     }
 
-    /// Tests the full build.rs round-trip: env vars are baked into Settings
-    /// at build time via `from_toml_and_env`, serialized to TOML, then parsed
-    /// back at runtime via `from_toml`. Verifies that env-sourced integration
-    /// values (strings like "true") are normalized to proper types so the
-    /// serialized TOML has correct types.
-    #[test]
-    fn test_env_var_roundtrip_normalizes_integration_types() {
-        let toml_str = crate_test_settings_str();
-
-        let integration_prefix = format!(
-            "{}{}INTEGRATIONS{}TESTLIGHT{}",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-        );
-        let enabled_key = format!("{}ENABLED", integration_prefix);
-        let endpoint_key = format!("{}ENDPOINT", integration_prefix);
-
-        temp_env::with_var(enabled_key, Some("true"), || {
-            temp_env::with_var(
-                endpoint_key,
-                Some("https://testlight-env.test/auction"),
-                || {
-                    // Step 1: Parse with env vars (what build.rs does)
-                    let settings =
-                        Settings::from_toml_and_env(&toml_str).expect("Settings should parse");
-
-                    // Verify normalization converted "true" to bool
-                    let raw = settings.integrations.get("testlight").unwrap();
-                    assert!(
-                        raw.get("enabled").unwrap().is_boolean(),
-                        "enabled should be normalized to bool, got: {:?}",
-                        raw.get("enabled")
-                    );
-
-                    // Step 2: Serialize to TOML (what build.rs does)
-                    let merged_toml =
-                        toml::to_string_pretty(&settings).expect("Should serialize to TOML");
-
-                    // Step 3: Parse back (what runtime does)
-                    let runtime_settings =
-                        Settings::from_toml(&merged_toml).expect("Runtime should parse");
-
-                    let config = runtime_settings
-                        .integration_config::<TestlightConfig>("testlight")
-                        .expect("should get config")
-                        .expect("should be enabled");
-
-                    assert_eq!(config.endpoint, "https://testlight-env.test/auction");
-                    assert!(config.enabled);
-                },
-            );
-        });
-    }
-
     /// Verifies that `from_toml` does NOT read environment variables.
     /// The runtime path should only use the pre-built TOML.
     #[test]
@@ -4332,6 +3918,45 @@ origin_host_header_overide = "www.example.com""#,
         // Invalid URLs should not crash and should return false
         assert!(!rewrite.is_excluded("not a url"));
         assert!(!rewrite.is_excluded(""));
+    }
+
+    #[test]
+    fn test_auction_creative_processing_defaults_when_omitted() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [auction]
+            enabled = true
+            providers = []
+            "#;
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+
+        assert!(
+            settings.auction.rewrite_creatives,
+            "creative rewriting stays enabled when the setting is omitted"
+        );
+        assert!(
+            !settings.auction.sanitize_creatives,
+            "creative sanitization is opt-in when the setting is omitted"
+        );
+    }
+
+    #[test]
+    fn test_auction_rewrite_creatives_accepts_explicit_false() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [auction]
+            enabled = true
+            providers = []
+            rewrite_creatives = false
+            "#;
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+
+        assert!(
+            !settings.auction.rewrite_creatives,
+            "should disable creative rewriting when explicitly configured"
+        );
     }
 
     #[test]
@@ -5377,6 +5002,13 @@ passphrase = "test-secret-key-32-bytes-minimum"
 [creative_opportunities]
 gam_network_id = "21765378893"
 auction_timeout_ms = 500
+section_root = "home"
+
+[[creative_opportunities.slot]]
+id = "atf"
+gam_unit_path = "/{network_id}/example/{section}"
+page_patterns = ["/"]
+formats = [{ width = 300, height = 250 }]
 "#;
         let settings = Settings::from_toml(toml).expect("should parse");
         let co = settings
@@ -5384,6 +5016,11 @@ auction_timeout_ms = 500
             .expect("should have creative_opportunities");
         assert_eq!(co.gam_network_id, "21765378893");
         assert_eq!(co.auction_timeout_ms, Some(500));
+        assert_eq!(
+            co.section_segment,
+            Some(0),
+            "startup finalization should materialize the dynamic-template compatibility marker"
+        );
     }
 
     #[test]
@@ -5557,7 +5194,25 @@ gam_unit_path = ""
 page_patterns = ["/"]
 formats = [{ width = 300, height = 250 }]
 "#,
-            "resolved GAM unit path must not be empty",
+            "gam_unit_path template must not be empty",
+        );
+    }
+
+    #[test]
+    fn settings_rejects_dynamic_gam_unit_path_over_byte_limit_using_configured_values() {
+        let gam_unit_path = "{network_id}".repeat(10);
+        let slot_body = format!(
+            r#"
+id = "atf"
+gam_unit_path = "{gam_unit_path}"
+page_patterns = ["/"]
+formats = [{{ width = 300, height = 250 }}]
+"#
+        );
+
+        assert_creative_opportunity_slot_config_rejected(
+            &slot_body,
+            "must render to at most 100 UTF-8 bytes",
         );
     }
 

@@ -224,7 +224,11 @@ pub(crate) struct StubHttpClient {
     // Reported by supports_concurrent_fanout(); set false to emulate
     // platforms whose send_async executes eagerly (e.g. Cloudflare Workers).
     concurrent_fanout: std::sync::atomic::AtomicBool,
+    // Reported by supports_streaming_responses(); set true to emulate Fastly's
+    // streaming response support.
+    streaming_responses_supported: std::sync::atomic::AtomicBool,
     image_optimizer_options: Mutex<Vec<Option<PlatformImageOptimizerOptions>>>,
+    cache_bypass_flags: Mutex<Vec<bool>>,
     stream_response_flags: Mutex<Vec<bool>>,
     request_methods: Mutex<Vec<String>>,
     request_uris: Mutex<Vec<String>>,
@@ -246,7 +250,9 @@ impl StubHttpClient {
             request_headers: Mutex::new(Vec::new()),
             select_errors: Mutex::new(VecDeque::new()),
             concurrent_fanout: std::sync::atomic::AtomicBool::new(true),
+            streaming_responses_supported: std::sync::atomic::AtomicBool::new(false),
             image_optimizer_options: Mutex::new(Vec::new()),
+            cache_bypass_flags: Mutex::new(Vec::new()),
             stream_response_flags: Mutex::new(Vec::new()),
             request_methods: Mutex::new(Vec::new()),
             request_uris: Mutex::new(Vec::new()),
@@ -257,6 +263,12 @@ impl StubHttpClient {
     /// Make `supports_concurrent_fanout()` report the given value.
     pub fn set_concurrent_fanout(&self, supported: bool) {
         self.concurrent_fanout
+            .store(supported, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Make `supports_streaming_responses()` report the given value.
+    pub fn set_streaming_responses_supported(&self, supported: bool) {
+        self.streaming_responses_supported
             .store(supported, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -319,6 +331,14 @@ impl StubHttpClient {
             .clone()
     }
 
+    /// Return cache-bypass flags captured per `send` or `send_async` call, in order.
+    pub(crate) fn recorded_cache_bypass_flags(&self) -> Vec<bool> {
+        self.cache_bypass_flags
+            .lock()
+            .expect("should lock cache bypass flags")
+            .clone()
+    }
+
     /// Return streaming-response flags captured per `send` call, in order.
     pub fn recorded_stream_response_flags(&self) -> Vec<bool> {
         self.stream_response_flags
@@ -363,6 +383,11 @@ impl PlatformHttpClient for StubHttpClient {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn supports_streaming_responses(&self) -> bool {
+        self.streaming_responses_supported
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     async fn send(
         &self,
         request: PlatformHttpRequest,
@@ -376,6 +401,10 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock image optimizer options")
             .push(request.image_optimizer.clone());
+        self.cache_bypass_flags
+            .lock()
+            .expect("should lock cache bypass flags")
+            .push(request.bypass_cache);
         self.stream_response_flags
             .lock()
             .expect("should lock stream response flags")
@@ -456,6 +485,10 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock calls")
             .push(backend_name.clone());
+        self.cache_bypass_flags
+            .lock()
+            .expect("should lock cache bypass flags")
+            .push(request.bypass_cache);
 
         let headers: Vec<(String, String)> = request
             .request
@@ -472,6 +505,21 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock request_headers")
             .push(headers);
+
+        // Capture the outgoing request body, mirroring `send()`, so tests
+        // exercising the async fan-out path (`request_bids` providers) can
+        // assert on it via `recorded_request_bodies()` too.
+        let (_, body) = request.request.into_parts();
+        let body_bytes = body
+            .into_bytes_bounded(MAX_RECORDED_BODY_BYTES)
+            .await
+            .change_context(PlatformError::HttpClient)
+            .attach("failed to capture StubHttpClient request body")?
+            .to_vec();
+        self.request_bodies
+            .lock()
+            .expect("should lock request bodies")
+            .push(body_bytes);
 
         let response = self
             .responses
@@ -621,6 +669,24 @@ pub(crate) fn noop_services() -> RuntimeServices {
     build_services_with_config(NoopConfigStore)
 }
 
+/// Build a [`RuntimeServices`] whose auction telemetry sink is the supplied
+/// recording (or otherwise custom) sink, so tests can assert which terminal
+/// auction events were emitted.
+pub(crate) fn noop_services_with_telemetry_sink(
+    auction_telemetry_sink: Arc<dyn crate::auction::telemetry::AuctionTelemetrySink>,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        .auction_telemetry_sink(auction_telemetry_sink)
+        .client_info(ClientInfo::default())
+        .build()
+}
+
 /// Build a [`RuntimeServices`] with a caller-supplied HTTP client and a [`StubBackend`].
 ///
 /// Uses [`StubBackend`] (always returns `Ok("stub-backend")`) rather than
@@ -644,6 +710,37 @@ pub(crate) fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
         .geo(Arc::new(NoopGeo))
         .client_info(ClientInfo {
             client_ip: Some(ip),
+            ..ClientInfo::default()
+        })
+        .build()
+}
+
+/// Build a [`RuntimeServices`] with a caller-supplied [`PlatformBackend`] and
+/// HTTP client.
+///
+/// Lets auction tests inject a backend whose
+/// [`PlatformBackend::canonicalize_transport_timeout_ms`] returns a controlled
+/// value, so the orchestrator's transport-timeout wiring can be asserted
+/// deterministically without depending on wall-clock timing.
+#[allow(
+    dead_code,
+    reason = "retained for target-specific transport-timeout tests"
+)]
+pub(crate) fn build_services_with_backend_and_http_client(
+    backend: Arc<dyn PlatformBackend>,
+    http_client: Arc<dyn PlatformHttpClient>,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(backend)
+        .http_client(http_client)
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo {
+            client_ip: None,
+            tls_protocol: None,
+            tls_cipher: None,
             ..ClientInfo::default()
         })
         .build()
@@ -700,6 +797,11 @@ mod tests {
             vec!["stub-backend"],
             "should record the backend name"
         );
+        assert_eq!(
+            stub.recorded_cache_bypass_flags(),
+            vec![false],
+            "should record the default cache-bypass flag"
+        );
     }
 
     #[test]
@@ -745,8 +847,9 @@ mod tests {
 
         let pending_a = futures::executor::block_on(stub.send_async(make_req("backend-a")))
             .expect("should start request a");
-        let pending_b = futures::executor::block_on(stub.send_async(make_req("backend-b")))
-            .expect("should start request b");
+        let pending_b =
+            futures::executor::block_on(stub.send_async(make_req("backend-b").with_cache_bypass()))
+                .expect("should start request b");
 
         assert_eq!(
             pending_a.backend_name(),
@@ -784,6 +887,11 @@ mod tests {
             names,
             vec!["backend-a", "backend-b"],
             "should record both send_async calls in order"
+        );
+        assert_eq!(
+            stub.recorded_cache_bypass_flags(),
+            vec![false, true],
+            "should record both send_async cache-bypass flags in order"
         );
     }
 
@@ -856,6 +964,7 @@ mod tests {
             certificate_check: true,
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
             between_bytes_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+            discriminator: None,
         };
         let name = stub.ensure(&spec).expect("should return a backend name");
         assert_eq!(name, "stub-backend", "should return fixed name");
