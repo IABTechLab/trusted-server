@@ -1202,7 +1202,7 @@ pub(crate) fn template_gpt_diagnostics(
 /// Carries no URL. Every byte here is a byte every reader of the shared template
 /// receives, so nothing request-scoped may appear, and keeping a URL out also removes
 /// any escaping question at the seam.
-pub const SEAM_BIDS_MARKER: &str = "<!--ts-c2-v3-seam-7f4c9e2d-bids-->";
+pub const AD_ASSEMBLY_SEAM: &str = "<!--ts-ad-seam-->";
 
 /// The mode the operator asked for, before availability is taken into account.
 ///
@@ -1218,7 +1218,7 @@ fn configured_assembly_mode(settings: &Settings) -> AssemblyMode {
         .unwrap_or_default()
 }
 
-/// Whether this mode's `</body>` seam emits [`SEAM_BIDS_MARKER`].
+/// Whether this mode's `</body>` seam emits [`AD_ASSEMBLY_SEAM`].
 ///
 /// The property that decides whether a template is *expected* to have a hole in it, and
 /// therefore whether the absence of one is a defect or the design. Only `Esi` splices per
@@ -1268,7 +1268,7 @@ fn effective_assembly_mode(settings: &Settings, shared_template_authorized: bool
 /// two independent decisions: once [`template_ad_slots_script`] stopped emitting a
 /// head script under a shared mode, body-close injection stopped with it.
 ///
-/// `Esi` emits [`SEAM_BIDS_MARKER`], an inert HTML comment marking where this reader's
+/// `Esi` emits [`AD_ASSEMBLY_SEAM`], an inert HTML comment marking where this reader's
 /// slots and bids are spliced in. Assembly is a byte split on that comment, performed by
 /// this crate on both the miss and the hit path; no ESI layer is involved.
 pub(crate) fn body_close_injection(
@@ -1286,7 +1286,7 @@ pub(crate) fn body_close_injection(
         }
         // Constant across every request that reaches the transform — which is what
         // makes it safe in a shared template.
-        AssemblyMode::Esi => BodyCloseInjection::Marker(SEAM_BIDS_MARKER.to_string()),
+        AssemblyMode::Esi => BodyCloseInjection::Marker(AD_ASSEMBLY_SEAM.to_string()),
     }
 }
 
@@ -1825,7 +1825,7 @@ fn build_template_assembly_params(
 /// the template is not one this arm produced, and assembling it anyway would serve a page
 /// with either no bids or a visible marker in it.
 fn split_template_at_seam(template: &[u8]) -> Result<(&[u8], &[u8]), SeamError> {
-    let marker = SEAM_BIDS_MARKER.as_bytes();
+    let marker = AD_ASSEMBLY_SEAM.as_bytes();
     let mut found = template
         .windows(marker.len())
         .enumerate()
@@ -1846,7 +1846,7 @@ fn split_template_at_seam(template: &[u8]) -> Result<(&[u8], &[u8]), SeamError> 
 /// ambiguous result, neutralize every existing marker and mint a new terminal seam. That
 /// avoids guessing which occurrence belongs to this transform.
 fn normalize_fresh_template_seam(mut template: Vec<u8>) -> Vec<u8> {
-    let marker = SEAM_BIDS_MARKER.as_bytes();
+    let marker = AD_ASSEMBLY_SEAM.as_bytes();
     let positions = template
         .windows(marker.len())
         .enumerate()
@@ -2007,8 +2007,8 @@ async fn store_template_if_authorized(
                 "c2_template_cache stored {} bytes (seam marker present: {})",
                 bytes.len(),
                 bytes
-                    .windows(SEAM_BIDS_MARKER.len())
-                    .any(|w| w == SEAM_BIDS_MARKER.as_bytes())
+                    .windows(AD_ASSEMBLY_SEAM.len())
+                    .any(|w| w == AD_ASSEMBLY_SEAM.as_bytes())
             );
             Some(TemplateStoreOutcome::Stored)
         }
@@ -6824,6 +6824,20 @@ mod tests {
         }
 
         #[test]
+        fn shared_template_ad_seam_is_readable_and_versioned() {
+            let BodyCloseInjection::Marker(marker) = body_close_injection(AssemblyMode::Esi, false)
+            else {
+                panic!("ESI mode should emit a shared-template marker");
+            };
+
+            assert_eq!(
+                (crate::platform::TEMPLATE_SCHEMA_VERSION, marker.as_str(),),
+                (4, "<!--ts-ad-seam-->"),
+                "the readable seam and its cache schema must move together"
+            );
+        }
+
+        #[test]
         fn shared_modes_render_byte_identical_documents_for_every_request_shape() {
             let mode = AssemblyMode::Esi;
             let shapes = every_shape();
@@ -8195,19 +8209,19 @@ mod tests {
 
         #[test]
         fn repeated_fresh_markers_are_all_neutralized_before_a_new_terminal_seam_is_added() {
-            let input = format!("prefix{SEAM_BIDS_MARKER}middle{SEAM_BIDS_MARKER}publisher-tail");
+            let input = format!("prefix{AD_ASSEMBLY_SEAM}middle{AD_ASSEMBLY_SEAM}publisher-tail");
 
             let normalized = normalize_fresh_template_seam(input.into_bytes());
 
             assert_eq!(
                 normalized
-                    .windows(SEAM_BIDS_MARKER.len())
-                    .filter(|window| *window == SEAM_BIDS_MARKER.as_bytes())
+                    .windows(AD_ASSEMBLY_SEAM.len())
+                    .filter(|window| *window == AD_ASSEMBLY_SEAM.as_bytes())
                     .count(),
                 1
             );
             assert!(
-                normalized.ends_with(SEAM_BIDS_MARKER.as_bytes()),
+                normalized.ends_with(AD_ASSEMBLY_SEAM.as_bytes()),
                 "normalization must mint its own unambiguous terminal seam"
             );
         }
@@ -8220,8 +8234,8 @@ mod tests {
             stub.push_response_with_headers(
                 200,
                 format!(
-                    "<html><head></head><body>origin{SEAM_BIDS_MARKER}</body></html>\
-                     {SEAM_BIDS_MARKER}"
+                    "<html><head></head><body>origin{AD_ASSEMBLY_SEAM}</body></html>\
+                     {AD_ASSEMBLY_SEAM}"
                 )
                 .into_bytes(),
                 vec![
@@ -8252,8 +8266,8 @@ mod tests {
                 cold.contains("origin") && cold.contains("window.tsjs"),
                 "a reserved-comment collision must not turn a valid origin 200 into a 500"
             );
-            assert!(!cold.contains(SEAM_BIDS_MARKER));
-            assert!(!warm.contains(SEAM_BIDS_MARKER));
+            assert!(!cold.contains(AD_ASSEMBLY_SEAM));
+            assert!(!warm.contains(AD_ASSEMBLY_SEAM));
             assert_eq!(stub.recorded_request_uris().len(), 1);
             let entries = cache.entries.lock().expect("should lock entries");
             let template = &entries
@@ -8263,15 +8277,15 @@ mod tests {
                 .body;
             assert_eq!(
                 template
-                    .windows(SEAM_BIDS_MARKER.len())
-                    .filter(|window| *window == SEAM_BIDS_MARKER.as_bytes())
+                    .windows(AD_ASSEMBLY_SEAM.len())
+                    .filter(|window| *window == AD_ASSEMBLY_SEAM.as_bytes())
                     .count(),
                 1,
                 "the stored template must retain exactly the transform-owned seam"
             );
             let seam_at = template
-                .windows(SEAM_BIDS_MARKER.len())
-                .position(|window| window == SEAM_BIDS_MARKER.as_bytes())
+                .windows(AD_ASSEMBLY_SEAM.len())
+                .position(|window| window == AD_ASSEMBLY_SEAM.as_bytes())
                 .expect("stored template should contain its seam");
             let body_close_at = template
                 .windows(b"</body>".len())
@@ -8309,7 +8323,7 @@ mod tests {
 
             for document in [&cold, &warm] {
                 assert!(document.contains("origin fragment"));
-                assert!(!document.contains(SEAM_BIDS_MARKER));
+                assert!(!document.contains(AD_ASSEMBLY_SEAM));
             }
             assert_eq!(stub.recorded_request_uris().len(), 1);
             assert!(
@@ -8351,8 +8365,8 @@ mod tests {
                     .get_mut(&stored_key.to_cache_key())
                     .expect("the stored template should be readable");
                 entry.body = format!(
-                    "<html><head></head><body>origin{SEAM_BIDS_MARKER}\
-                     {SEAM_BIDS_MARKER}</body></html>"
+                    "<html><head></head><body>origin{AD_ASSEMBLY_SEAM}\
+                     {AD_ASSEMBLY_SEAM}</body></html>"
                 )
                 .into_bytes();
             }
@@ -8383,7 +8397,7 @@ mod tests {
                 "an unusable entry must be treated as a miss and refetched"
             );
             assert!(
-                !served.contains(SEAM_BIDS_MARKER),
+                !served.contains(AD_ASSEMBLY_SEAM),
                 "no marker may survive into the served page: {served}"
             );
             assert!(
@@ -8534,7 +8548,7 @@ mod tests {
                     "no slot assignment may reach opted-out traffic: {served}"
                 );
                 assert!(
-                    !served.contains(SEAM_BIDS_MARKER),
+                    !served.contains(AD_ASSEMBLY_SEAM),
                     "the marker must still be consumed even when nothing replaces it: \
                      {served}"
                 );
@@ -8719,7 +8733,7 @@ mod tests {
             );
             for (label, document) in [("miss", &cold), ("hit", &warm)] {
                 assert!(
-                    !document.contains(SEAM_BIDS_MARKER),
+                    !document.contains(AD_ASSEMBLY_SEAM),
                     "{label}: an unresolved marker reached the browser: {document}"
                 );
                 assert!(
@@ -8751,7 +8765,7 @@ mod tests {
             let template = core::str::from_utf8(&stored.body).expect("template should be utf-8");
 
             assert!(
-                template.contains(SEAM_BIDS_MARKER),
+                template.contains(AD_ASSEMBLY_SEAM),
                 "the cached template must still carry the unresolved marker: {template}"
             );
             assert!(
@@ -9514,7 +9528,7 @@ mod tests {
                 "the gate refused, so nothing may be stored"
             );
             assert!(
-                !document.contains(SEAM_BIDS_MARKER),
+                !document.contains(AD_ASSEMBLY_SEAM),
                 "a marker must never be emitted when nothing will resolve it: {document}"
             );
             assert!(

@@ -165,11 +165,11 @@ non-obvious coupling in this design space.
 
 ### Design C — the recommendation
 
-The template carries an **inert HTML comment sentinel** where the bids go, emitted by the
-existing `Marker` variant:
+The template carries an **inert HTML comment sentinel** where the reader's ad slots and
+bids go, emitted by the existing `Marker` variant:
 
 ```
-<!--ts-c2-v3-seam-7f4c9e2d-bids-->
+<!--ts-ad-seam-->
 ```
 
 On a C2 hit:

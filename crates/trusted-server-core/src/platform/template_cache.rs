@@ -31,9 +31,10 @@ use crate::creative_opportunities::AssemblyMode;
 /// | Version | Transform |
 /// | ------- | --------- |
 /// | 1       | `</body>` seam marker was `<esi:include src="/_ts/page-bids?format=fragment"/>` |
-/// | 2       | Marker is the inert comment [`SEAM_BIDS_MARKER`](crate::publisher::SEAM_BIDS_MARKER); the seam hands slots to `scheduleInitialAdInit` instead of assigning them |
-/// | 3       | Canonical collision-safe key, explicit origin freshness, and complete repeated document-policy metadata |
-pub const TEMPLATE_SCHEMA_VERSION: u32 = 3;
+/// | 2       | Marker became the inert comment `<!--ts-seam-bids-->`; the seam hands slots to `scheduleInitialAdInit` instead of assigning them |
+/// | 3       | Marker became `<!--ts-c2-v3-seam-7f4c9e2d-bids-->`; canonical collision-safe key, explicit origin freshness, and complete repeated document-policy metadata |
+/// | 4       | Marker is the shorter, accurate [`AD_ASSEMBLY_SEAM`](crate::publisher::AD_ASSEMBLY_SEAM) |
+pub const TEMPLATE_SCHEMA_VERSION: u32 = 4;
 
 /// Inputs that select one cached template.
 ///
