@@ -708,23 +708,16 @@ impl CreativeOpportunitySlot {
     /// Converts this slot into an [`AdSlot`] ready for use in an auction request.
     ///
     /// Prebid Server bidder params are wired into the `bidders` map keyed by
-    /// bidder name. Legacy APS slot params are accepted in configuration but
-    /// intentionally ignored by the APS `OpenRTB` provider.
-    ///
-    /// When [`PrebidSlotParams::bidders`] is empty, a `trustedServer` entry is
-    /// injected so [`PrebidAuctionProvider`] expands all `config.bidders`
-    /// automatically. The slot's `targeting.zone` value is forwarded as
-    /// `trustedServer.zone` so zone-aware bid-param override rules fire correctly.
+    /// bidder name. APS slot params are ignored by the generic APS profile.
+    /// When [`PrebidSlotParams::bidders`] is empty, a `trustedServer` marker is
+    /// inserted for stored-request compatibility and carries the optional zone.
     #[must_use]
     pub fn to_ad_slot(&self) -> AdSlot {
         let mut bidders: HashMap<String, serde_json::Value> = HashMap::new();
         if let Some(ref prebid) = self.providers.prebid {
             if prebid.bidders.is_empty() {
-                // No explicit per-bidder override: let the Prebid provider expand
-                // all config.bidders. The "trustedServer" key triggers
-                // expand_trusted_server_bidders in PrebidAuctionProvider, giving
-                // each bidder an empty params object that the override engine then
-                // fills with zone-aware rules.
+                // No explicit per-bidder params: preserve the stored-request
+                // marker and carry the zone for profile routing.
                 let mut ts = serde_json::json!({ "bidderParams": {} });
                 if let Some(zone) = self.targeting.get("zone") {
                     ts["zone"] = serde_json::Value::String(zone.clone());
@@ -814,17 +807,14 @@ pub struct ApsSlotParams {
 
 /// Inline Prebid Server bidder parameters for a slot.
 ///
-/// When `bidders` is empty, `to_ad_slot` injects a `trustedServer` entry so
-/// [`PrebidAuctionProvider`] expands all `config.bidders` automatically.
-/// When `bidders` is non-empty the map is forwarded verbatim, bypassing
-/// automatic expansion (useful for slots that need explicit per-bidder params).
+/// When `bidders` is empty, `to_ad_slot` injects a `trustedServer` stored-request
+/// marker. When non-empty, the bidder map is forwarded verbatim.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrebidSlotParams {
     /// Per-bidder inline params map. Bidder name → params object.
     ///
-    /// Leave empty (or omit `bidders` in config) to auto-expand all
-    /// `config.bidders` with zone-aware param overrides.
+    /// Leave empty (or omit `bidders` in config) to use the stored-request path.
     ///
     /// Note: when this map is non-empty it is forwarded verbatim, so a slot's
     /// `targeting.zone` is **not** injected for these bidders (the `trustedServer`
@@ -868,7 +858,18 @@ pub fn match_slots<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::str::FromStr as _;
+
+    use edgezero_core::body::Body as EdgeBody;
+    use http::Request;
+
     use super::*;
+    use crate::auction::plan::{
+        AuctionPlan, AuctionPlanConfig, NotificationConfig, ProviderConfig, ProviderId, RoutingMode,
+    };
+    use crate::auction::routing::route_auction;
+    use crate::auction::types::{AuctionRequest, PublisherInfo, UserInfo};
 
     fn make_slot(id: &str, patterns: Vec<&str>) -> CreativeOpportunitySlot {
         CreativeOpportunitySlot {
@@ -1740,6 +1741,69 @@ mod tests {
         assert!(
             ts.get("bidderParams").is_some(),
             "should include bidderParams key for expand_trusted_server_bidders"
+        );
+    }
+
+    #[test]
+    fn creative_opportunity_canonical_slot_feeds_shared_stored_router_with_zone() {
+        let mut slot = make_slot("header", vec!["/"]);
+        slot.targeting
+            .insert("zone".to_string(), "header".to_string());
+        slot.providers.prebid = Some(PrebidSlotParams {
+            bidders: HashMap::new(),
+        });
+        let plan = AuctionPlan::compile(AuctionPlanConfig {
+            timeout_ms: 900,
+            providers: BTreeMap::from([(
+                ProviderId::from_str("pbs-primary").expect("should parse provider ID"),
+                ProviderConfig {
+                    protocol: "openrtb-2.6".to_string(),
+                    profile: "prebid-server".to_string(),
+                    endpoint: "https://pbs.example.test/openrtb".to_string(),
+                    timeout_ms: None,
+                    routing: RoutingMode::Explicit,
+                    notifications: NotificationConfig::default(),
+                    profile_config: serde_json::json!({}),
+                },
+            )]),
+            bidders: BTreeMap::new(),
+            mediator: None,
+            request_signing: None,
+        })
+        .expect("should compile plan");
+        let auction_request = AuctionRequest {
+            id: "auction-1".to_string(),
+            slots: vec![slot.to_ad_slot()],
+            publisher: PublisherInfo {
+                domain: "publisher.example.test".to_string(),
+                page_url: None,
+            },
+            user: UserInfo {
+                id: None,
+                consent: None,
+                eids: None,
+            },
+            device: None,
+            site: None,
+            context: HashMap::new(),
+        };
+        let inbound = Request::builder()
+            .uri("https://publisher.example.test/")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let routed = route_auction(auction_request, &inbound, &plan, None);
+
+        assert_eq!(routed.inputs().len(), 1);
+        assert!(routed.inputs()[0].slots()[0].has_trusted_stored_request());
+        assert_eq!(routed.inputs()[0].slots()[0].prebid_zone(), Some("header"));
+        assert!(
+            routed.inputs()[0].slots().iter().all(|slot| {
+                !slot
+                    .bidder_params()
+                    .keys()
+                    .any(|bidder| bidder.as_str() == "pbs-primary")
+            }),
+            "provider ID should not reach client-controlled bidder input"
         );
     }
 

@@ -2,7 +2,7 @@ use std::net::IpAddr;
 
 use error_stack::Report;
 
-use super::{GeoInfo, PlatformBackendSpec, PlatformError, StoreId, StoreName};
+use super::{BackendNamingPolicy, GeoInfo, PlatformBackendSpec, PlatformError, StoreId, StoreName};
 
 /// Synchronous, object-safe access to a key-value config store.
 ///
@@ -94,6 +94,9 @@ pub trait PlatformSecretStore: Send + Sync {
 
 /// Synchronous, object-safe dynamic backend management.
 pub trait PlatformBackend: Send + Sync {
+    /// Return this adapter's pure backend naming and transport timer policy.
+    fn naming_policy(&self) -> BackendNamingPolicy;
+
     /// Compute the deterministic backend name for the given spec without
     /// registering anything.
     ///
@@ -125,12 +128,11 @@ pub trait PlatformBackend: Send + Sync {
     /// connection pooling nor accumulates registrations toward the per-service
     /// dynamic backend limit.
     ///
-    /// The default returns the exact budget-bound value
-    /// (`remaining_ms.min(configured_ms)`): adapters that neither register nor
-    /// enforce a backend-name transport timeout gain nothing from rounding and
-    /// must not shorten bidder deadlines for no benefit.
+    /// Delegates to the same pure policy used by startup validation so runtime
+    /// transport timers and predicted names cannot drift.
     fn canonicalize_transport_timeout_ms(&self, remaining_ms: u32, configured_ms: u32) -> u32 {
-        remaining_ms.min(configured_ms)
+        self.naming_policy()
+            .canonicalize_transport_timeout_ms(remaining_ms, configured_ms)
     }
 }
 

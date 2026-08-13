@@ -1,7 +1,11 @@
 //! Auction configuration types (separated to avoid circular deps in build.rs).
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+
+pub use crate::auction::plan::{
+    BidderId, BidderRouteConfig, NotificationConfig, ProviderConfig, ProviderId, RoutingMode,
+};
 
 /// Auction orchestration configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -23,12 +27,15 @@ pub struct AuctionConfig {
     )]
     pub rewrite_creatives: bool,
 
-    /// Provider names that participate in bidding
-    /// Simply list the provider names (e.g., ["prebid", "aps"])
-    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
-    pub providers: Vec<String>,
+    /// Operator-defined bidder-provider instances, keyed by provider ID.
+    #[serde(default)]
+    pub providers: BTreeMap<ProviderId, ProviderConfig>,
 
-    /// Optional mediator provider name (e.g., "gam")
+    /// Client-visible bidder routes, keyed by bidder code.
+    #[serde(default)]
+    pub bidders: BTreeMap<BidderId, BidderRouteConfig>,
+
+    /// Optional separately registered mediator provider name.
     /// When set, runs parallel mediation strategy (bidders in parallel, then mediator decides)
     /// When omitted, runs parallel only strategy (bidders in parallel, highest CPM wins)
     pub mediator: Option<String>,
@@ -54,7 +61,8 @@ impl Default for AuctionConfig {
         Self {
             enabled: false,
             rewrite_creatives: default_rewrite_creatives(),
-            providers: Vec::new(),
+            providers: BTreeMap::new(),
+            bidders: BTreeMap::new(),
             mediator: None,
             timeout_ms: default_timeout(),
             creative_store: default_creative_store(),
@@ -89,10 +97,26 @@ fn default_allowed_context_keys() -> HashSet<String> {
     reason = "methods are used by the runtime crate but not by build.rs path inclusion"
 )]
 impl AuctionConfig {
-    /// Get all provider names.
-    #[must_use]
-    pub fn provider_names(&self) -> &[String] {
-        &self.providers
+    #[cfg(test)]
+    pub(crate) fn legacy_provider_map(names: &[&str]) -> BTreeMap<ProviderId, ProviderConfig> {
+        names
+            .iter()
+            .map(|name| {
+                let id = ProviderId::unchecked_for_legacy_test(name);
+                (
+                    id,
+                    ProviderConfig {
+                        protocol: "openrtb-2.6".to_string(),
+                        profile: "standard".to_string(),
+                        endpoint: format!("https://{name}.example/openrtb2/auction"),
+                        timeout_ms: None,
+                        routing: RoutingMode::AllEligible,
+                        notifications: NotificationConfig::default(),
+                        profile_config: serde_json::json!({}),
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Check if this config has a mediator configured.
@@ -141,5 +165,38 @@ mod tests {
             Some(&serde_json::Value::Bool(false)),
             "should preserve an explicit rewrite opt-out"
         );
+    }
+
+    #[test]
+    fn provider_list_shape_is_rejected() {
+        let error = serde_json::from_value::<AuctionConfig>(serde_json::json!({
+            "providers": ["prebid"]
+        }))
+        .expect_err("should reject the removed provider-list schema");
+
+        assert!(
+            error.to_string().contains("map") || error.to_string().contains("object"),
+            "should require map-shaped providers: {error}"
+        );
+    }
+
+    #[test]
+    fn map_schema_round_trips_provider_and_bidder_routes() {
+        let config: AuctionConfig = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "pbs-main": {
+                    "protocol": "openrtb-2.6",
+                    "profile": "prebid-server",
+                    "endpoint": "https://prebid.example/openrtb2/auction"
+                }
+            },
+            "bidders": {
+                "example-bidder": { "provider": "pbs-main" }
+            }
+        }))
+        .expect("should parse map-shaped auction config");
+
+        assert_eq!(config.providers.len(), 1);
+        assert_eq!(config.bidders.len(), 1);
     }
 }

@@ -9,7 +9,9 @@ use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, he
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
-use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::auction::{
+    AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
+};
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::sanitize_forwarded_headers;
@@ -63,8 +65,10 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let orchestrator = build_orchestrator(&settings)?;
-    let registry = IntegrationRegistry::new(&settings)?;
+    let plan = Arc::new(compile_auction_plan(&settings)?);
+    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Spin)?;
+    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
+    let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -801,6 +805,100 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn multi_provider_settings() -> Settings {
+        let mut settings = Settings::from_toml(
+            r#"
+                [[handlers]]
+                path = "^/_ts/admin"
+                username = "admin"
+                password = "admin-password"
+
+                [publisher]
+                domain = "publisher.example"
+                cookie_domain = ".publisher.example"
+                origin_url = "https://origin.publisher.example"
+                proxy_secret = "fictional-proxy-secret"
+
+                [ec]
+                passphrase = "fictional-secret-key-32-bytes-minimum"
+            "#,
+        )
+        .expect("should parse startup test settings");
+        settings.auction.enabled = true;
+        settings.auction.providers =
+            std::iter::IntoIterator::into_iter(["provider-a", "provider-b"])
+                .map(|id| {
+                    (
+                        id.parse().expect("should parse provider ID"),
+                        trusted_server_core::auction::ProviderConfig {
+                            protocol: "openrtb-2.6".to_string(),
+                            profile: "standard".to_string(),
+                            endpoint: format!("https://{id}.example/openrtb"),
+                            timeout_ms: None,
+                            routing: trusted_server_core::auction::RoutingMode::AllEligible,
+                            notifications:
+                                trusted_server_core::auction::NotificationConfig::default(),
+                            profile_config: "{}"
+                                .parse()
+                                .expect("should parse empty profile config object"),
+                        },
+                    )
+                })
+                .collect();
+        settings
+    }
+
+    #[test]
+    fn startup_registers_aps_renderer_route() {
+        let mut settings = multi_provider_settings();
+        settings.auction.providers.clear();
+        settings.auction.providers.insert(
+            "aps-main".parse().expect("should parse APS provider ID"),
+            trusted_server_core::auction::ProviderConfig {
+                protocol: "openrtb-2.6".to_string(),
+                profile: "aps".to_string(),
+                endpoint: "https://aps.example/e/pb/bid".to_string(),
+                timeout_ms: None,
+                routing: trusted_server_core::auction::RoutingMode::AllEligible,
+                notifications: trusted_server_core::auction::NotificationConfig::default(),
+                profile_config: "{\"account_id\":\"example-account\"}"
+                    .parse()
+                    .expect("should parse APS profile config"),
+            },
+        );
+
+        let state =
+            build_state_with_settings(settings).expect("Spin startup should register APS renderer");
+        assert!(
+            state.registry.has_route(
+                &edgezero_core::http::Method::GET,
+                "/integrations/aps/renderer"
+            ),
+            "Spin startup registry should expose the APS renderer"
+        );
+    }
+
+    #[test]
+    fn disabled_startup_accepts_dormant_multi_provider_auction_plan() {
+        let mut settings = multi_provider_settings();
+        settings.auction.enabled = false;
+
+        build_state_with_settings(settings)
+            .expect("disabled Spin auction should accept dormant fanout");
+    }
+
+    #[test]
+    fn startup_rejects_multi_provider_auction_plan() {
+        let error = match build_state_with_settings(multi_provider_settings()) {
+            Ok(_) => panic!("Spin startup should reject multi-provider fanout"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:?}").contains("concurrent provider fanout"),
+            "should identify unsupported fanout: {error:?}"
+        );
+    }
 
     #[test]
     fn scheme_host_from_spin_url_extracts_localhost_with_port() {

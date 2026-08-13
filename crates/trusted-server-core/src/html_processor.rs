@@ -839,8 +839,14 @@ mod tests {
             crate::integrations::gpt_diagnostics::prepare_request(&settings, &mut request)
                 .expect("should prepare diagnostics request");
         let mut config = create_test_config();
-        config.integrations =
-            IntegrationRegistry::new(&settings).expect("should build integration registry");
+        config.integrations = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should build integration registry");
         config.gpt_diagnostics = Some(decision);
 
         let processor = create_html_processor(config);
@@ -936,7 +942,14 @@ mod tests {
     #[test]
     fn test_html_processor_config_from_settings() {
         let settings = create_test_settings();
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
         let config = HtmlProcessorConfig::from_settings(
             &settings,
             &registry,
@@ -1048,7 +1061,14 @@ mod tests {
             )
             .expect("should insert testlight config");
 
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
         let mut config = create_test_config();
         config.integrations = registry;
 

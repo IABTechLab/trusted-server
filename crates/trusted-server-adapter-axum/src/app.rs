@@ -10,7 +10,9 @@ use edgezero_core::http::{
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
-use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::auction::{
+    AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
+};
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -69,8 +71,10 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let orchestrator = build_orchestrator(&settings)?;
-    let registry = IntegrationRegistry::new(&settings)?;
+    let plan = Arc::new(compile_auction_plan(&settings)?);
+    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Axum)?;
+    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
+    let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),

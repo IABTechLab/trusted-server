@@ -135,16 +135,28 @@ Review the draft, replace placeholders/secrets, then validate it.
 
 Edit `trusted-server.toml` to configure:
 
-- Ad server integrations
-- KV store mappings
-- EC configuration
-- Consent settings (`[gdpr]`)
+- browser integrations under `[integrations.*]`;
+- server auction providers under map-shaped `[auction.providers.<id>]`;
+- server bidder routes under `[auction.bidders.<id>]`;
+- KV store mappings;
+- EC configuration; and
+- consent settings (`[gdpr]`).
+
+Do not put a Prebid Server URL or server bidder list under
+`[integrations.prebid]`, and do not put APS account/endpoint/timeout fields under
+`[integrations.aps]`. Those server values belong to auction provider common
+fields and `profile_config`.
 
 Validate the config before pushing it to platform storage:
 
 ```bash
 ts config validate
 ```
+
+This command performs target-independent plan validation. Each adapter performs
+mandatory target-aware fan-out and backend-name validation at startup. The
+EdgeZero callback needed for target-aware pre-write push validation is not yet
+available in this tree, so startup remains the final target gate.
 
 See [Configuration](/guide/configuration) and [Trusted Server CLI](/guide/cli) for details.
 

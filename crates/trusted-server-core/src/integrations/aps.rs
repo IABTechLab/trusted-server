@@ -1,7 +1,8 @@
 //! Amazon Publisher Services (APS/TAM) `OpenRTB` integration.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -16,34 +17,53 @@ use serde_json::{Value as Json, json};
 use url::Url;
 use validator::{Validate, ValidationError};
 
+use crate::auction::openrtb::ignored_bidder_params_count;
+#[cfg(test)]
+use crate::auction::plan::{AuctionPlanConfig, NotificationConfig, ProviderConfig, RoutingMode};
+use crate::auction::profile::ApsProfilePlan;
+#[cfg(test)]
 use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
+use crate::auction::routing::ProviderAuctionInput;
+#[cfg(test)]
+use crate::auction::types::{AdSlot, AuctionContext, AuctionRequest};
 use crate::auction::types::{
-    AdSlot, ApsRendererV1, ApsTagType, AuctionContext, AuctionRequest, AuctionResponse, Bid,
-    BidRenderer, MediaType,
+    ApsRendererV1, ApsTagType, AuctionResponse, Bid, BidRenderer, MediaType,
 };
 use crate::error::TrustedServerError;
 use crate::integrations::{
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
     UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
+};
+#[cfg(test)]
+use crate::integrations::{
     ensure_integration_backend_with_timeout, predict_integration_backend_name,
 };
+#[cfg(test)]
+use crate::openrtb::ToExt;
+#[cfg(test)]
 use crate::openrtb::{
-    Banner, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs, RegsExt, Site, ToExt, User,
+    Banner, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs, RegsExt, Site, User,
     UserExt, to_openrtb_i32,
 };
-use crate::platform::{PlatformHttpRequest, PlatformResponse, RuntimeServices};
+#[cfg(test)]
+use crate::platform::PlatformHttpRequest;
+use crate::platform::{PlatformResponse, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
 
 const APS_INTEGRATION_ID: &str = "aps";
 const APS_RENDERER_ROUTE: &str = "/integrations/aps/renderer";
 const DEFAULT_CURRENCY: &str = "USD";
+#[cfg(test)]
 const APS_SDK_SOURCE: &str = "prebid";
+#[cfg(test)]
 const APS_SDK_VERSION: &str = "2.2.0";
 const MAX_ACCOUNT_ID_BYTES: usize = 1024;
 const MAX_CREATIVE_ID_BYTES: usize = 1024;
 const MAX_DEBUG_RESPONSE_PREVIEW_BYTES: usize = 512;
 const MAX_CREATIVE_URL_BYTES: usize = 4096;
+#[cfg(test)]
 const MAX_LANGUAGE_BYTES: usize = 8;
+#[cfg(test)]
 const MAX_PAGE_URL_BYTES: usize = 8192;
 const MAX_RENDER_ENVELOPE_BYTES: usize = 256 * 1024;
 const APS_RENDERER_CSP: &str = "default-src 'none'; sandbox allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation; script-src 'unsafe-inline' https:; connect-src https:; frame-src https:; img-src https: data:; media-src https: blob:; style-src 'unsafe-inline' https:; font-src https: data:;";
@@ -115,9 +135,10 @@ addEventListener('message',receive);
 "#;
 
 /// Configuration for the APS `OpenRTB` integration.
+#[cfg(test)]
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[validate(schema(function = "validate_inventory_identity_override"))]
-pub struct ApsConfig {
+pub struct LegacyApsProviderConfig {
     /// Whether APS integration is enabled.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -203,6 +224,7 @@ where
     deserializer.deserialize_any(AccountIdVisitor)
 }
 
+#[cfg(test)]
 fn validate_aps_endpoint(value: &str) -> Result<(), ValidationError> {
     let parsed = Url::parse(value).map_err(|_| ValidationError::new("invalid_aps_endpoint"))?;
     if parsed.scheme() != "https"
@@ -264,12 +286,12 @@ fn validate_inventory_page_origin(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-fn validate_inventory_identity_override(config: &ApsConfig) -> Result<(), ValidationError> {
-    let (Some(domain), Some(origin)) = (
-        config.inventory_domain.as_deref(),
-        config.inventory_page_origin.as_deref(),
-    ) else {
-        if config.inventory_domain.is_none() && config.inventory_page_origin.is_none() {
+fn validate_inventory_identity_override_values(
+    inventory_domain: Option<&str>,
+    inventory_page_origin: Option<&str>,
+) -> Result<(), ValidationError> {
+    let (Some(domain), Some(origin)) = (inventory_domain, inventory_page_origin) else {
+        if inventory_domain.is_none() && inventory_page_origin.is_none() {
             return Ok(());
         }
         return Err(ValidationError::new(
@@ -293,19 +315,33 @@ fn validate_inventory_identity_override(config: &ApsConfig) -> Result<(), Valida
     Ok(())
 }
 
+#[cfg(test)]
+fn validate_inventory_identity_override(
+    config: &LegacyApsProviderConfig,
+) -> Result<(), ValidationError> {
+    validate_inventory_identity_override_values(
+        config.inventory_domain.as_deref(),
+        config.inventory_page_origin.as_deref(),
+    )
+}
+
+#[cfg(test)]
 fn default_enabled() -> bool {
     false
 }
 
+#[cfg(test)]
 fn default_endpoint() -> String {
     "https://web.ads.aps.amazon-adsystem.com/e/pb/bid".to_string()
 }
 
+#[cfg(test)]
 fn default_timeout_ms() -> u32 {
     800
 }
 
-impl Default for ApsConfig {
+#[cfg(test)]
+impl Default for LegacyApsProviderConfig {
     fn default() -> Self {
         Self {
             enabled: false,
@@ -320,20 +356,90 @@ impl Default for ApsConfig {
     }
 }
 
+/// Browser integration toggle retained independently from APS server providers.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct ApsConfig {
+    /// Whether browser-side APS integration behavior is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[cfg(test)]
+impl IntegrationConfig for LegacyApsProviderConfig {
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
 impl IntegrationConfig for ApsConfig {
     fn is_enabled(&self) -> bool {
         self.enabled
     }
 }
 
+/// Typed server-side APS profile configuration used by the auction compiler.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ApsProfileConfig {
+    #[serde(deserialize_with = "deserialize_account_id")]
+    pub(crate) account_id: String,
+    #[serde(default)]
+    pub(crate) debug: bool,
+    #[serde(default)]
+    pub(crate) allow_script_creatives: bool,
+    #[serde(default)]
+    pub(crate) inventory_domain: Option<String>,
+    #[serde(default)]
+    pub(crate) inventory_page_origin: Option<String>,
+}
+
+/// Parse and validate server-owned APS profile fields without browser enablement.
+pub(crate) fn compile_profile_config(
+    value: serde_json::Value,
+) -> Result<ApsProfileConfig, Report<TrustedServerError>> {
+    let profile: ApsProfileConfig = serde_json::from_value(value).map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!("invalid `aps` profile_config: {error}"),
+        })
+    })?;
+    if let Some(domain) = profile.inventory_domain.as_deref() {
+        validate_inventory_domain(domain).map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("invalid `aps` profile_config inventory_domain: {error}"),
+            })
+        })?;
+    }
+    if let Some(origin) = profile.inventory_page_origin.as_deref() {
+        validate_inventory_page_origin(origin).map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("invalid `aps` profile_config inventory_page_origin: {error}"),
+            })
+        })?;
+    }
+    validate_inventory_identity_override_values(
+        profile.inventory_domain.as_deref(),
+        profile.inventory_page_origin.as_deref(),
+    )
+    .map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!("invalid `aps` profile_config inventory identity: {error}"),
+        })
+    })?;
+    Ok(profile)
+}
+
+#[cfg(test)]
 #[derive(Debug, Serialize)]
 struct ApsRequestExt<'a> {
     account: &'a str,
     sdk: ApsSdkExt,
 }
 
+#[cfg(test)]
 impl ToExt for ApsRequestExt<'_> {}
 
+#[cfg(test)]
 #[derive(Debug, Serialize)]
 struct ApsSdkExt {
     source: &'static str,
@@ -350,21 +456,506 @@ struct ApsRendererInput<'a> {
     height: u32,
 }
 
-#[derive(Clone)]
-struct ApsDebugRequest {
+#[derive(Debug, Clone)]
+pub(crate) struct ApsDebugRequest {
     body: String,
     headers: BTreeMap<String, Vec<String>>,
 }
 
-/// APS `OpenRTB` auction provider.
-pub struct ApsAuctionProvider {
-    config: ApsConfig,
+impl ApsDebugRequest {
+    pub(crate) fn capture(body: &[u8], headers: &HeaderMap) -> Self {
+        Self {
+            body: String::from_utf8_lossy(body).into_owned(),
+            headers: aps_debug_headers(headers),
+        }
+    }
 }
 
+struct PlannedApsResponsePolicy<'a> {
+    provider_id: &'a str,
+    endpoint: &'a str,
+    account_id: &'a str,
+    debug: bool,
+    allow_script_creatives: bool,
+    publisher_domain: &'a str,
+}
+
+fn aps_debug_headers(headers: &HeaderMap) -> BTreeMap<String, Vec<String>> {
+    // This metadata is client-visible. Keep the list fail-closed so upstream
+    // identity or authentication headers can never leak.
+    const ALLOWED_HEADERS: &[HeaderName] = &[header::CONTENT_TYPE];
+
+    let mut values = BTreeMap::<String, Vec<String>>::new();
+    for (name, value) in headers {
+        if !ALLOWED_HEADERS.contains(name) {
+            continue;
+        }
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        values
+            .entry(name.as_str().to_string())
+            .or_default()
+            .push(value.to_string());
+    }
+    values
+}
+
+fn aps_debug_body_preview(body: &[u8]) -> String {
+    let preview_len = body.len().min(MAX_DEBUG_RESPONSE_PREVIEW_BYTES);
+    let mut preview = String::from_utf8_lossy(&body[..preview_len]).into_owned();
+    if body.len() > preview_len {
+        preview.push_str(&format!("…(truncated {} bytes)", body.len() - preview_len));
+    }
+    preview
+}
+
+fn attach_planned_aps_metadata(
+    mut response: AuctionResponse,
+    policy: &PlannedApsResponsePolicy<'_>,
+    input: &ProviderAuctionInput,
+    debug_request: Option<ApsDebugRequest>,
+    response_body: Option<&[u8]>,
+    response_headers: &BTreeMap<String, Vec<String>>,
+    status: StatusCode,
+) -> AuctionResponse {
+    response.metadata.insert(
+        "routing".to_string(),
+        json!({
+            "unused_bidder_params_count": ignored_bidder_params_count(input)
+        }),
+    );
+    if !policy.debug {
+        return response;
+    }
+
+    let mut http_call = json!({
+        "responseheaders": response_headers,
+        "status": status.as_u16(),
+        "uri": policy.endpoint,
+    });
+    if let Some(http_call) = http_call.as_object_mut() {
+        if let Some(request) = debug_request {
+            http_call.insert("requestbody".to_string(), json!(request.body));
+            http_call.insert("requestheaders".to_string(), json!(request.headers));
+        }
+        if let Some(response_body) = response_body {
+            http_call.insert(
+                "responsebody".to_string(),
+                json!(aps_debug_body_preview(response_body)),
+            );
+        }
+    }
+    response.with_metadata(
+        "debug",
+        json!({
+            "httpcalls": {
+                (APS_INTEGRATION_ID): [http_call]
+            }
+        }),
+    )
+}
+
+fn planned_aps_renderer(
+    policy: &PlannedApsResponsePolicy<'_>,
+    input: ApsRendererInput<'_>,
+) -> Option<BidRenderer> {
+    let tag_type_value = match input.tag_type {
+        ApsTagType::Iframe => "iframe",
+        ApsTagType::Script => "script",
+    };
+    let envelope = json!({
+        "seatbid": [{
+            "bid": [{
+                "id": input.bid_id,
+                "price": input.price,
+                "w": input.width,
+                "h": input.height,
+                "ext": {
+                    "creativeurl": input.creative_url,
+                    "tagtype": tag_type_value
+                }
+            }]
+        }]
+    });
+    let serialized = serde_json::to_vec(&envelope).ok()?;
+    if serialized.len() > MAX_RENDER_ENVELOPE_BYTES {
+        return None;
+    }
+    Some(BidRenderer::Aps(ApsRendererV1 {
+        version: 1,
+        account_id: policy.account_id.to_string(),
+        bid_id: input.bid_id.to_string(),
+        creative_id: input.creative_id,
+        tag_type: input.tag_type,
+        creative_url: input.creative_url.to_string(),
+        aax_response: BASE64_STANDARD.encode(serialized),
+        width: input.width,
+        height: input.height,
+    }))
+}
+
+fn planned_aps_valid_creative_url(value: &str, publisher_domain: &str) -> bool {
+    if value.len() > MAX_CREATIVE_URL_BYTES {
+        return false;
+    }
+    let Ok(parsed) = Url::parse(value) else {
+        return false;
+    };
+    parsed.scheme() == "https"
+        && parsed
+            .host_str()
+            .is_some_and(|host| !host.eq_ignore_ascii_case(publisher_domain))
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+}
+
+fn planned_aps_parse_bid(
+    policy: &PlannedApsResponsePolicy<'_>,
+    value: &Json,
+    slots: &HashMap<&str, HashSet<(u32, u32)>>,
+    returned_seat: Option<&str>,
+) -> Result<Bid, &'static str> {
+    let bid_id = value
+        .get("id")
+        .and_then(Json::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or("missing_render_source")?;
+    let slot_id = value
+        .get("impid")
+        .and_then(Json::as_str)
+        .ok_or("unknown_impid")?;
+    let dimensions = slots.get(slot_id).ok_or("unknown_impid")?;
+    let price = value
+        .get("price")
+        .and_then(Json::as_f64)
+        .filter(|price| price.is_finite() && *price >= 0.0)
+        .ok_or("invalid_price")?;
+    if value
+        .get("mtype")
+        .is_some_and(|mtype| mtype.as_i64() != Some(1))
+    {
+        return Err("unsupported_media_type");
+    }
+    let width = value
+        .get("w")
+        .and_then(Json::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or("invalid_dimensions")?;
+    let height = value
+        .get("h")
+        .and_then(Json::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or("invalid_dimensions")?;
+    if width == 0 || height == 0 || !dimensions.contains(&(width, height)) {
+        return Err("invalid_dimensions");
+    }
+    let ext = value
+        .get("ext")
+        .and_then(Json::as_object)
+        .ok_or("missing_render_source")?;
+    let creative_url = ext
+        .get("creativeurl")
+        .and_then(Json::as_str)
+        .ok_or("missing_render_source")?;
+    if !planned_aps_valid_creative_url(creative_url, policy.publisher_domain) {
+        return Err("invalid_creative_url");
+    }
+    let tag_type = match ext.get("tagtype").and_then(Json::as_str) {
+        Some("iframe") => ApsTagType::Iframe,
+        Some("script") if policy.allow_script_creatives => ApsTagType::Script,
+        Some("script") => return Err("script_rendering_disabled"),
+        _ => return Err("unsupported_tagtype"),
+    };
+    let creative_id = value
+        .get("crid")
+        .and_then(Json::as_str)
+        .filter(|creative_id| !creative_id.is_empty())
+        .map(str::to_string);
+    if creative_id
+        .as_ref()
+        .is_some_and(|creative_id| creative_id.len() > MAX_CREATIVE_ID_BYTES)
+    {
+        return Err("creative_id_too_large");
+    }
+    let renderer = planned_aps_renderer(
+        policy,
+        ApsRendererInput {
+            bid_id,
+            creative_id: creative_id.clone(),
+            tag_type,
+            creative_url,
+            price,
+            width,
+            height,
+        },
+    )
+    .ok_or("render_payload_too_large")?;
+    let adomain = value
+        .get("adomain")
+        .and_then(Json::as_array)
+        .map(|domains| {
+            domains
+                .iter()
+                .filter_map(Json::as_str)
+                .map(str::to_string)
+                .collect()
+        });
+
+    Ok(Bid {
+        slot_id: slot_id.to_string(),
+        price: Some(price),
+        currency: DEFAULT_CURRENCY.to_string(),
+        creative: None,
+        adomain,
+        bidder: APS_INTEGRATION_ID.to_string(),
+        returned_seat: returned_seat.map(str::to_string),
+        width,
+        height,
+        nurl: None,
+        burl: None,
+        bid_id: Some(bid_id.to_string()),
+        ad_id: value.get("adid").and_then(Json::as_str).map(str::to_string),
+        creative_id,
+        renderer: Some(renderer),
+        cache_id: None,
+        cache_host: None,
+        cache_path: None,
+        metadata: HashMap::new(),
+    })
+}
+
+fn increment_planned_aps_reason(reasons: &mut BTreeMap<String, u64>, reason: &'static str) {
+    *reasons.entry(reason.to_string()).or_default() += 1;
+}
+
+fn parse_planned_aps_value(
+    value: &Json,
+    response_time_ms: u64,
+    input: &ProviderAuctionInput,
+    policy: &PlannedApsResponsePolicy<'_>,
+) -> AuctionResponse {
+    if !value.is_object()
+        || value.get("contextual").is_some()
+        || value
+            .get("cur")
+            .is_some_and(|currency| !currency.is_string())
+        || value
+            .get("seatbid")
+            .is_some_and(|seatbids| !seatbids.is_array())
+    {
+        return AuctionResponse::error(policy.provider_id, response_time_ms)
+            .with_metadata("drop_reasons", json!({"unexpected_response_shape": 1}));
+    }
+    if value
+        .get("cur")
+        .and_then(Json::as_str)
+        .is_some_and(|currency| !currency.eq_ignore_ascii_case(DEFAULT_CURRENCY))
+    {
+        return AuctionResponse::no_bid(policy.provider_id, response_time_ms)
+            .with_metadata("drop_reasons", json!({"unsupported_currency": 1}));
+    }
+
+    let slots = input
+        .slots()
+        .iter()
+        .map(|slot| {
+            let dimensions = slot
+                .slot()
+                .formats
+                .iter()
+                .filter(|format| format.media_type == MediaType::Banner)
+                .map(|format| (format.width, format.height))
+                .collect::<HashSet<_>>();
+            (slot.slot().id.as_str(), dimensions)
+        })
+        .collect::<HashMap<_, _>>();
+    let seatbids = value.get("seatbid").and_then(Json::as_array);
+    let seatbid_count = seatbids.map_or(0, Vec::len);
+    let mut reasons = BTreeMap::new();
+    let mut selected: HashMap<String, Bid> = HashMap::new();
+    let mut dropped = 0_u64;
+
+    for seatbid in seatbids.into_iter().flatten() {
+        let returned_seat = seatbid
+            .get("seat")
+            .and_then(Json::as_str)
+            .filter(|seat| !seat.is_empty());
+        let Some(bids) = seatbid.get("bid").and_then(Json::as_array) else {
+            dropped += 1;
+            increment_planned_aps_reason(&mut reasons, "empty_seatbid_bids");
+            continue;
+        };
+        for value in bids {
+            match planned_aps_parse_bid(policy, value, &slots, returned_seat) {
+                Ok(candidate) => {
+                    let replace = selected.get(&candidate.slot_id).is_none_or(|current| {
+                        let candidate_price = candidate.price.unwrap_or_default();
+                        let current_price = current.price.unwrap_or_default();
+                        candidate_price > current_price
+                            || (candidate_price == current_price
+                                && candidate.bid_id.as_deref().unwrap_or_default()
+                                    < current.bid_id.as_deref().unwrap_or_default())
+                    });
+                    if replace {
+                        if selected
+                            .insert(candidate.slot_id.clone(), candidate)
+                            .is_some()
+                        {
+                            dropped += 1;
+                            increment_planned_aps_reason(&mut reasons, "lost_to_higher_bid");
+                        }
+                    } else {
+                        dropped += 1;
+                        increment_planned_aps_reason(&mut reasons, "lost_to_higher_bid");
+                    }
+                }
+                Err(reason) => {
+                    dropped += 1;
+                    increment_planned_aps_reason(&mut reasons, reason);
+                }
+            }
+        }
+    }
+
+    if seatbid_count == 0 {
+        increment_planned_aps_reason(&mut reasons, "empty_seatbid");
+    }
+    let accepted = selected.len();
+    let metadata = [
+        ("seatbid_count".to_string(), json!(seatbid_count)),
+        ("accepted_bid_count".to_string(), json!(accepted)),
+        ("dropped_bid_count".to_string(), json!(dropped)),
+        ("drop_reasons".to_string(), json!(reasons)),
+    ];
+    let mut response = if selected.is_empty() {
+        AuctionResponse::no_bid(policy.provider_id, response_time_ms)
+    } else {
+        AuctionResponse::success(
+            policy.provider_id,
+            selected.into_values().collect(),
+            response_time_ms,
+        )
+    };
+    response.metadata.extend(metadata);
+    response
+}
+
+/// Parse one APS-profile response using only provider-local routed state.
+pub(crate) async fn parse_planned_aps_response(
+    provider_id: &str,
+    profile: &ApsProfilePlan,
+    endpoint: &str,
+    input: &ProviderAuctionInput,
+    response: PlatformResponse,
+    response_time_ms: u64,
+    debug_request: Option<ApsDebugRequest>,
+) -> Result<AuctionResponse, Report<TrustedServerError>> {
+    let policy = PlannedApsResponsePolicy {
+        provider_id,
+        endpoint,
+        account_id: &profile.account_id,
+        debug: profile.debug,
+        allow_script_creatives: profile.allow_script_creatives,
+        publisher_domain: &input.common_request().publisher.domain,
+    };
+    let response = response.response;
+    let status = response.status();
+    let response_headers = if policy.debug {
+        aps_debug_headers(response.headers())
+    } else {
+        BTreeMap::new()
+    };
+
+    if status == StatusCode::NO_CONTENT {
+        return Ok(attach_planned_aps_metadata(
+            AuctionResponse::no_bid(provider_id, response_time_ms),
+            &policy,
+            input,
+            debug_request,
+            Some(&[]),
+            &response_headers,
+            status,
+        ));
+    }
+    if !status.is_success() {
+        log::warn!("APS profile {provider_id} returns a non-success status");
+        let body = if policy.debug {
+            match collect_response_bounded(
+                response.into_body(),
+                UPSTREAM_RTB_MAX_RESPONSE_BYTES,
+                APS_INTEGRATION_ID,
+            )
+            .await
+            {
+                Ok(body) => Some(body),
+                Err(error) => {
+                    log::warn!("Failed to read APS profile debug response body: {error:?}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        return Ok(attach_planned_aps_metadata(
+            AuctionResponse::error(provider_id, response_time_ms),
+            &policy,
+            input,
+            debug_request,
+            body.as_deref(),
+            &response_headers,
+            status,
+        ));
+    }
+    let body = collect_response_bounded(
+        response.into_body(),
+        UPSTREAM_RTB_MAX_RESPONSE_BYTES,
+        APS_INTEGRATION_ID,
+    )
+    .await
+    .change_context(TrustedServerError::Auction {
+        message: format!("Failed to read APS profile {provider_id} response body"),
+    })?;
+    let value: Json = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            log::warn!("Failed to parse APS profile {provider_id} response JSON: {error}");
+            let parsed = AuctionResponse::error(provider_id, response_time_ms)
+                .with_metadata("drop_reasons", json!({"unexpected_response_shape": 1}));
+            return Ok(attach_planned_aps_metadata(
+                parsed,
+                &policy,
+                input,
+                debug_request,
+                Some(&body),
+                &response_headers,
+                status,
+            ));
+        }
+    };
+    let parsed = parse_planned_aps_value(&value, response_time_ms, input, &policy);
+    Ok(attach_planned_aps_metadata(
+        parsed,
+        &policy,
+        input,
+        debug_request,
+        Some(&body),
+        &response_headers,
+        status,
+    ))
+}
+
+/// Legacy APS `OpenRTB` auction provider retained only for parity tests.
+#[cfg(test)]
+pub struct ApsAuctionProvider {
+    config: LegacyApsProviderConfig,
+}
+
+#[cfg(test)]
 impl ApsAuctionProvider {
     /// Create an APS provider from validated configuration.
     #[must_use]
-    pub fn new(config: ApsConfig) -> Self {
+    pub fn new(config: LegacyApsProviderConfig) -> Self {
         Self { config }
     }
 
@@ -816,6 +1407,7 @@ impl ApsAuctionProvider {
             creative: None,
             adomain,
             bidder: APS_INTEGRATION_ID.to_string(),
+            returned_seat: None,
             width,
             height,
             nurl: None,
@@ -1042,9 +1634,10 @@ impl ApsAuctionProvider {
     }
 }
 
+#[cfg(test)]
 #[async_trait(?Send)]
 impl AuctionProvider for ApsAuctionProvider {
-    fn provider_name(&self) -> &'static str {
+    fn provider_name(&self) -> &str {
         APS_INTEGRATION_ID
     }
 
@@ -1230,19 +1823,18 @@ impl IntegrationProxy for ApsRendererIntegration {
 /// # Errors
 ///
 /// Returns an error when enabled APS configuration is invalid.
-pub fn register(
-    settings: &Settings,
-) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
-    let Some(_config) = settings.integration_config::<ApsConfig>(APS_INTEGRATION_ID)? else {
-        return Ok(None);
-    };
+#[must_use]
+pub fn register_for_plan(plan: &crate::auction::AuctionPlan) -> Option<IntegrationRegistration> {
+    if !plan.has_profile(APS_INTEGRATION_ID) {
+        return None;
+    }
     let integration = Arc::new(ApsRendererIntegration);
-    Ok(Some(
+    Some(
         IntegrationRegistration::builder(APS_INTEGRATION_ID)
             .with_proxy(integration)
             .without_js()
             .build(),
-    ))
+    )
 }
 
 /// Register the APS auction provider when enabled.
@@ -1250,10 +1842,45 @@ pub fn register(
 /// # Errors
 ///
 /// Returns an error when enabled APS configuration is invalid.
+#[cfg(test)]
+#[allow(clippy::missing_panics_doc)]
+pub fn register(
+    settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    let Some(_config) =
+        settings.integration_config::<LegacyApsProviderConfig>(APS_INTEGRATION_ID)?
+    else {
+        return Ok(None);
+    };
+    Ok(register_for_plan(
+        &crate::auction::AuctionPlan::compile(AuctionPlanConfig {
+            timeout_ms: 1000,
+            providers: BTreeMap::from([(
+                "aps".parse().expect("should parse APS provider ID"),
+                ProviderConfig {
+                    protocol: "openrtb-2.6".to_string(),
+                    profile: "aps".to_string(),
+                    endpoint: default_endpoint(),
+                    timeout_ms: None,
+                    routing: RoutingMode::AllEligible,
+                    notifications: NotificationConfig::default(),
+                    profile_config: serde_json::json!({"account_id":"example-account"}),
+                },
+            )]),
+            ..AuctionPlanConfig::default()
+        })
+        .expect("should compile APS renderer test plan"),
+    ))
+}
+
+#[cfg(test)]
+#[allow(clippy::missing_errors_doc)]
 pub fn register_providers(
     settings: &Settings,
 ) -> Result<Vec<Arc<dyn AuctionProvider>>, Report<TrustedServerError>> {
-    let Some(config) = settings.integration_config::<ApsConfig>(APS_INTEGRATION_ID)? else {
+    let Some(config) =
+        settings.integration_config::<LegacyApsProviderConfig>(APS_INTEGRATION_ID)?
+    else {
         return Ok(Vec::new());
     };
     log::info!("Registering APS OpenRTB provider");
@@ -1268,21 +1895,18 @@ pub fn register_providers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auction::test_support::canonical_parity_auction_request;
     use crate::auction::types::{
-        AdFormat, AdSlot, AuctionContext, AuctionRequest, BidStatus, DeviceInfo, PublisherInfo,
-        UserInfo,
+        AdFormat, AdSlot, AuctionContext, AuctionRequest, BidStatus, PublisherInfo, UserInfo,
     };
-    use crate::consent::ConsentContext;
-    use crate::openrtb::{Eid, Uid};
-    use crate::platform::GeoInfo;
     use crate::platform::test_support::{
         StubHttpClient, build_services_with_http_client, noop_services,
     };
     use crate::test_support::tests::create_test_settings;
     use serde_json::json;
 
-    fn config() -> ApsConfig {
-        ApsConfig {
+    fn config() -> LegacyApsProviderConfig {
+        LegacyApsProviderConfig {
             enabled: true,
             account_id: "example-account-id".to_string(),
             endpoint: default_endpoint(),
@@ -1356,6 +1980,7 @@ mod tests {
             settings: &settings,
             request: &downstream,
             timeout_ms: 321,
+            transport_timeout_ms: 321,
             provider_responses: None,
             services: &services,
         };
@@ -1387,14 +2012,27 @@ mod tests {
     }
 
     #[test]
+    fn config_defaults_to_the_800ms_aps_budget() {
+        let parsed: LegacyApsProviderConfig = serde_json::from_value(json!({
+            "account_id": "example-account"
+        }))
+        .expect("should parse APS defaults");
+
+        assert_eq!(
+            parsed.timeout_ms, 800,
+            "should preserve APS's 800ms default"
+        );
+    }
+
+    #[test]
     fn config_accepts_canonical_alias_and_integer_ids() {
-        let canonical: ApsConfig = serde_json::from_value(json!({
+        let canonical: LegacyApsProviderConfig = serde_json::from_value(json!({
             "account_id": "  example-account  "
         }))
         .expect("should parse canonical account ID");
-        let alias: ApsConfig =
+        let alias: LegacyApsProviderConfig =
             serde_json::from_value(json!({"pub_id": 1234})).expect("should parse legacy alias");
-        let debug: ApsConfig = serde_json::from_value(json!({
+        let debug: LegacyApsProviderConfig = serde_json::from_value(json!({
             "account_id": "example-account",
             "debug": true
         }))
@@ -1410,11 +2048,11 @@ mod tests {
 
     #[test]
     fn config_accepts_default_and_custom_openrtb_endpoints() {
-        let default = ApsConfig {
+        let default = LegacyApsProviderConfig {
             account_id: "example-account".to_string(),
             ..Default::default()
         };
-        let custom: ApsConfig = serde_json::from_value(json!({
+        let custom: LegacyApsProviderConfig = serde_json::from_value(json!({
             "account_id": "example-account",
             "endpoint": "https://aps.example.com/custom/openrtb"
         }))
@@ -1435,7 +2073,7 @@ mod tests {
             "https://aps.example.com/e/dtb/bid/",
             "https://aps.example.com/custom/e/dtb/bid",
         ] {
-            let parsed: ApsConfig = serde_json::from_value(json!({
+            let parsed: LegacyApsProviderConfig = serde_json::from_value(json!({
                 "account_id": "example-account",
                 "endpoint": endpoint
             }))
@@ -1452,15 +2090,18 @@ mod tests {
 
     #[test]
     fn config_rejects_blank_duplicate_and_unsafe_endpoint() {
-        assert!(serde_json::from_value::<ApsConfig>(json!({"account_id": "   "})).is_err());
         assert!(
-            serde_json::from_value::<ApsConfig>(
+            serde_json::from_value::<LegacyApsProviderConfig>(json!({"account_id": "   "}))
+                .is_err()
+        );
+        assert!(
+            serde_json::from_value::<LegacyApsProviderConfig>(
                 json!({"account_id": "x".repeat(MAX_ACCOUNT_ID_BYTES + 1)})
             )
             .is_err()
         );
         assert!(
-            serde_json::from_value::<ApsConfig>(json!({
+            serde_json::from_value::<LegacyApsProviderConfig>(json!({
                 "account_id": "one",
                 "pub_id": "two"
             }))
@@ -1471,7 +2112,7 @@ mod tests {
             "https://",
             "https://user:password@aps.example/e/pb/bid",
         ] {
-            let parsed: ApsConfig = serde_json::from_value(json!({
+            let parsed: LegacyApsProviderConfig = serde_json::from_value(json!({
                 "account_id": "example-account",
                 "endpoint": endpoint
             }))
@@ -1512,7 +2153,7 @@ mod tests {
                 "inventory_page_origin": "https://unrelated.example"
             }),
         ] {
-            let parsed: ApsConfig =
+            let parsed: LegacyApsProviderConfig =
                 serde_json::from_value(value).expect("should deserialize before validation");
             assert!(
                 parsed.validate().is_err(),
@@ -1523,7 +2164,7 @@ mod tests {
 
     #[test]
     fn inventory_identity_override_rewrites_site_and_preserves_page_path() {
-        let config: ApsConfig = serde_json::from_value(json!({
+        let config: LegacyApsProviderConfig = serde_json::from_value(json!({
             "enabled": true,
             "account_id": "example-account",
             "inventory_domain": "publisher.example",
@@ -1552,6 +2193,7 @@ mod tests {
             settings: &settings,
             request: &downstream,
             timeout_ms: 321,
+            transport_timeout_ms: 321,
             provider_responses: None,
             services: &services,
         };
@@ -1581,54 +2223,7 @@ mod tests {
     #[test]
     fn builds_aps_openrtb_request_with_explicit_privacy_policy() {
         let provider = ApsAuctionProvider::new(config());
-        let mut auction_request = request();
-        auction_request.user.consent = Some(ConsentContext {
-            gdpr_applies: true,
-            raw_tc_string: Some("fictional-tcf".to_string()),
-            raw_us_privacy: Some("1YNN".to_string()),
-            raw_gpp_string: Some("fictional-gpp".to_string()),
-            gpp_section_ids: Some(vec![2, 6]),
-            ..Default::default()
-        });
-        auction_request.user.eids = Some(vec![Eid {
-            source: "identity.example".to_string(),
-            uids: vec![Uid {
-                id: "fictional-uid".to_string(),
-                atype: Some(1),
-                ext: None,
-            }],
-        }]);
-        auction_request.slots[0].formats.extend([
-            AdFormat {
-                media_type: MediaType::Video,
-                width: 640,
-                height: 480,
-            },
-            AdFormat {
-                media_type: MediaType::Banner,
-                width: u32::MAX,
-                height: 90,
-            },
-            AdFormat {
-                media_type: MediaType::Banner,
-                width: 728,
-                height: 90,
-            },
-        ]);
-        auction_request.device = Some(DeviceInfo {
-            user_agent: Some("Fictional Browser".to_string()),
-            ip: Some("192.0.2.10".to_string()),
-            geo: Some(GeoInfo {
-                city: "Example City".to_string(),
-                country: "US".to_string(),
-                continent: "NA".to_string(),
-                latitude: 12.34,
-                longitude: 56.78,
-                metro_code: 501,
-                region: Some("CA".to_string()),
-                asn: None,
-            }),
-        });
+        let auction_request = canonical_parity_auction_request();
         let settings = create_test_settings();
         let services = noop_services();
         let downstream = http::Request::builder()
@@ -1642,12 +2237,13 @@ mod tests {
             settings: &settings,
             request: &downstream,
             timeout_ms: 321,
+            transport_timeout_ms: 321,
             provider_responses: None,
             services: &services,
         };
 
         let openrtb = provider.build_openrtb_request(&auction_request, &context);
-        let serialized = serde_json::to_value(openrtb).expect("should serialize request");
+        let serialized = serde_json::to_value(&openrtb).expect("should serialize request");
 
         assert_eq!(serialized["id"], "fictional-auction");
         assert_eq!(serialized["tmax"], 321);
@@ -1706,6 +2302,19 @@ mod tests {
         assert!(serialized["ext"].get("prebid").is_none());
         assert!(serialized["ext"].get("trusted_server").is_none());
         assert!(serialized["imp"][0].get("ext").is_none());
+        assert!(
+            serialized["user"]["ext"].get("ConsentSettings").is_none(),
+            "should omit PBS-only Google Additional Consent placement"
+        );
+        assert!(
+            serialized["imp"][0].get("tagid").is_none(),
+            "should ignore shared trustedServer bidder parameters"
+        );
+        assert_eq!(
+            serde_json::to_string(&openrtb).expect("should serialize APS request"),
+            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}],"w":300,"h":250,"topframe":0},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"account":"example-account-id","sdk":{"source":"prebid","version":"2.2.0"}}}"#,
+            "should preserve the complete APS wire shape without a signing extension"
+        );
     }
 
     #[test]
@@ -1726,6 +2335,7 @@ mod tests {
                 settings: &settings,
                 request: &downstream,
                 timeout_ms: 321,
+                transport_timeout_ms: 321,
                 provider_responses: None,
                 services: &services,
             };
@@ -1742,13 +2352,17 @@ mod tests {
     fn parses_bid_and_builds_exact_minimized_envelope() {
         let provider = ApsAuctionProvider::new(config());
         let response = provider.parse_aps_response(
-            &json!({"cur": "USD", "seatbid": [{"seat": 42, "bid": [bid("fictional-selected-bid-id", 1.23, "iframe")]}], "ext": {"userSyncs": []}}),
+            &json!({"cur": "USD", "seatbid": [{"seat": "fictional-upstream-seat", "bid": [bid("fictional-selected-bid-id", 1.23, "iframe")]}], "ext": {"userSyncs": []}}),
             12,
             &request(),
         );
         assert_eq!(response.bids.len(), 1);
         let parsed = &response.bids[0];
         assert_eq!(parsed.bidder, "aps");
+        assert!(
+            parsed.returned_seat.is_none(),
+            "legacy APS parsing must not attach planned telemetry identity"
+        );
         assert_eq!(parsed.price, Some(1.23));
         assert!(parsed.creative.is_none());
         assert!(parsed.nurl.is_none());
@@ -1903,6 +2517,7 @@ mod tests {
             settings: &settings,
             request: &downstream,
             timeout_ms: 321,
+            transport_timeout_ms: 321,
             provider_responses: None,
             services: &services,
         };

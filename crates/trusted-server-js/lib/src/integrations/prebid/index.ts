@@ -134,7 +134,8 @@ interface InjectedPrebidConfig {
   accountId?: string;
   timeout?: number;
   debug?: boolean;
-  bidders?: string[];
+  /** Validated browser bidder route codes owned by the server auction plan. */
+  serverSideBidders?: string[];
   /** Bidders that run client-side via native Prebid.js adapters. */
   clientSideBidders?: string[];
   /** GAM ad-unit-path suffixes excluded from refresh auctions. */
@@ -154,6 +155,10 @@ export function getInjectedConfig(): InjectedPrebidConfig | undefined {
     return (window as any).__tsjs_prebid as InjectedPrebidConfig | undefined;
   }
   return undefined;
+}
+
+function injectedServerSideBidderCodes(config = getInjectedConfig()): string[] {
+  return config?.serverSideBidders ?? [];
 }
 
 /** Collect all unique bidder codes from the provided ad units. */
@@ -629,23 +634,27 @@ function copyParams(params: Record<string, unknown> | undefined): Record<string,
   return copyParamValue(params ?? {}) as Record<string, unknown>;
 }
 
-/** Copy bidder params previously folded into a `trustedServer` bid. */
+/** Copy only plan-owned bidder params previously folded into a `trustedServer` bid. */
 function foldedBidderParams(
-  bid: TrustedServerBid | undefined
+  bid: TrustedServerBid | undefined,
+  serverSideBidders: Set<string>
 ): Record<string, Record<string, unknown>> {
   const folded = (bid?.params?.[BIDDER_PARAMS_KEY] ?? {}) as Record<
     string,
     Record<string, unknown>
   >;
   return Object.fromEntries(
-    Object.entries(folded).map(([bidder, params]) => [bidder, copyParams(params)])
+    Object.entries(folded)
+      .filter(([bidder]) => serverSideBidders.has(bidder))
+      .map(([bidder, params]) => [bidder, copyParams(params)])
   );
 }
 
 /** Capture immutable request-scoped bidder and zone data before the shim mutates an ad unit. */
 function capturePublisherAdUnitSnapshot(
   unit: TrustedServerAdUnit,
-  clientSideBidders: Set<string>
+  clientSideBidders: Set<string>,
+  serverSideBidders: Set<string>
 ): PublisherAdUnitSnapshot | undefined {
   if (typeof unit.code !== 'string' || unit.code.length === 0) return undefined;
 
@@ -660,15 +669,19 @@ function capturePublisherAdUnitSnapshot(
       existingTsBid ??= bid;
       continue;
     }
-    if (clientSideBidders.has(bid.bidder)) {
-      clientSideBids.push({ bidder: bid.bidder, params: copyParams(bid.params) });
+    if (!serverSideBidders.has(bid.bidder)) {
+      if (clientSideBidders.has(bid.bidder)) {
+        clientSideBids.push({ bidder: bid.bidder, params: copyParams(bid.params) });
+      }
       continue;
     }
     rawBidderParams[bid.bidder] = copyParams(bid.params);
   }
 
   const bidderParams =
-    Object.keys(rawBidderParams).length > 0 ? rawBidderParams : foldedBidderParams(existingTsBid);
+    Object.keys(rawBidderParams).length > 0
+      ? rawBidderParams
+      : foldedBidderParams(existingTsBid, serverSideBidders);
   const zone = unit.mediaTypes?.banner?.name;
 
   return {
@@ -733,16 +746,16 @@ function serverSideBidderParamsForRefresh(
   if (match) {
     if (!Array.isArray(match.bids)) return {};
 
-    const clientSideBidders = new Set(getInjectedConfig()?.clientSideBidders ?? []);
+    const serverSideBidders = new Set(injectedServerSideBidderCodes());
     const params: Record<string, Record<string, unknown>> = {};
 
     for (const bid of match.bids) {
       if (!bid?.bidder) continue;
       if (bid.bidder === ADAPTER_CODE) {
-        Object.assign(params, foldedBidderParams(bid));
+        Object.assign(params, foldedBidderParams(bid, serverSideBidders));
         continue;
       }
-      if (clientSideBidders.has(bid.bidder)) continue;
+      if (!serverSideBidders.has(bid.bidder)) continue;
       params[bid.bidder] = copyParams(bid.params);
     }
 
@@ -1126,16 +1139,20 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
 
   const originalRequestBids = pbjs.requestBids.bind(pbjs);
 
-  // Bidders that should run client-side via their native Prebid.js adapters.
-  // Read once from the server-injected config.
+  // Browser demand ownership is explicit. Only validated auction-plan route
+  // codes are folded; every other publisher bidder entry remains in Prebid.js.
   const clientSideBidders = new Set(injected?.clientSideBidders ?? []);
+  const serverSideBidders = new Set(injectedServerSideBidderCodes(injected));
   if (clientSideBidders.size > 0) {
     log.info('[tsjs-prebid] client-side bidders:', [...clientSideBidders]);
   }
+  if (serverSideBidders.size > 0) {
+    log.info('[tsjs-prebid] server-side bidders:', [...serverSideBidders]);
+  }
 
   // Shim requestBids to inject the trustedServer bidder into every ad unit
-  // so server-side bids flow through the /auction orchestrator while
-  // client-side bidders are left untouched.
+  // so plan-owned server-side bids flow through the /auction orchestrator while
+  // every unowned bidder is left untouched.
   pbjs.requestBids = function (requestObj?: Parameters<typeof originalRequestBids>[0]) {
     log.debug('[tsjs-prebid] requestBids called');
     recordUserIdModuleDiagnostics();
@@ -1155,7 +1172,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     // Ensure every ad unit has a trustedServer bid entry
     for (const unit of adUnits) {
       if (!syntheticRefreshAdUnits.has(unit)) {
-        const snapshot = capturePublisherAdUnitSnapshot(unit, clientSideBidders);
+        const snapshot = capturePublisherAdUnitSnapshot(unit, clientSideBidders, serverSideBidders);
         if (snapshot && unit.code) {
           storePublisherAdUnitSnapshot(unit.code, snapshot);
         }
@@ -1165,24 +1182,21 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
         unit.bids = [];
       }
 
-      // Preserve per-bidder params for server-side expansion.
-      // Skip client-side bidders — they remain as standalone bids and run
-      // via their native Prebid.js adapters in the browser.
+      // Preserve params only for bidder codes owned by the validated auction
+      // plan. Provider IDs, returned seat aliases, APS renderer identity, and
+      // ordinary browser demand cannot enter the trustedServer envelope.
       const bidderParams: Record<string, Record<string, unknown>> = {};
       for (const bid of unit.bids) {
-        if (!bid?.bidder || bid.bidder === ADAPTER_CODE) {
-          continue;
-        }
-        if (clientSideBidders.has(bid.bidder)) {
+        if (!bid?.bidder || !serverSideBidders.has(bid.bidder)) {
           continue;
         }
         bidderParams[bid.bidder] = bid.params ?? {};
       }
 
-      // Keep only bids that should still execute in the browser. All other
-      // bidders are routed through the trustedServer adapter.
+      // Keep every unowned bid in browser demand, including configured native
+      // adapters and standard entries not claimed by the plan.
       unit.bids = unit.bids.filter(
-        (bid) => bid?.bidder === ADAPTER_CODE || clientSideBidders.has(bid?.bidder ?? '')
+        (bid) => bid?.bidder === ADAPTER_CODE || !serverSideBidders.has(bid?.bidder ?? '')
       );
 
       // WORKAROUND: Read the zone from mediaTypes.banner.name. This is NOT a
@@ -1203,10 +1217,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
         // by the prior call, so `bidderParams` is now empty. Retain the
         // params captured on the first call instead of overwriting them with
         // `{}`, which would drop the publisher's inline PBS params on refresh.
-        const prevBidderParams = (prevParams[BIDDER_PARAMS_KEY] ?? {}) as Record<
-          string,
-          Record<string, unknown>
-        >;
+        const prevBidderParams = foldedBidderParams(existingTsBid, serverSideBidders);
         const effectiveBidderParams =
           Object.keys(bidderParams).length > 0 ? bidderParams : prevBidderParams;
 

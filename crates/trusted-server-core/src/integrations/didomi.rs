@@ -412,7 +412,14 @@ mod tests {
             .insert_config(DIDOMI_INTEGRATION_ID, &config(true))
             .expect("should insert config");
 
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
         assert!(registry.has_route(&Method::GET, "/integrations/didomi/consent/loader.js"));
         assert!(registry.has_route(&Method::POST, "/integrations/didomi/consent/api/events"));
         assert!(!registry.has_route(&Method::GET, "/other"));
@@ -505,7 +512,14 @@ mod tests {
             .insert_config(DIDOMI_INTEGRATION_ID, &custom_config)
             .expect("should insert config");
 
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
         assert!(registry.has_route(&Method::GET, "/my-custom-consent/loader.js"));
         assert!(registry.has_route(&Method::POST, "/my-custom-consent/api/events"));
         assert!(!registry.has_route(&Method::GET, "/integrations/didomi/consent/loader.js"));

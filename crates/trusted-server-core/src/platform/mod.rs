@@ -32,6 +32,7 @@
 
 use std::time::Duration;
 
+mod backend_naming;
 mod error;
 mod http;
 mod image_optimizer;
@@ -41,6 +42,10 @@ pub(crate) mod test_support;
 mod traits;
 mod types;
 
+pub use backend_naming::{
+    AuctionTargetCapabilities, AuctionTargetDescriptor, AuctionTargetId, BackendNamingError,
+    BackendNamingPolicy, PredictedBackend,
+};
 pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformKvStore};
 pub use error::PlatformError;
 pub use http::{

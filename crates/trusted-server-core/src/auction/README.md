@@ -410,77 +410,70 @@ Manages the execution of an auction flow, coordinates providers, and collects re
 
 ## Auction Strategies
 
-### 1. Parallel + Mediation (Recommended)
-**Use case:** Header bidding with ad server mediation
+### 1. Parallel + Mediation
 
 ```toml
 [auction]
 enabled = true
-providers = ["prebid", "aps"]
-mediator = "adserver_mock"  # Setting mediator enables parallel mediation strategy
 timeout_ms = 2000
+mediator = "adserver_mock"
+
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://prebid.example.com/openrtb2/auction"
+routing = "explicit"
+
+[auction.providers.aps-main]
+protocol = "openrtb-2.6"
+profile = "aps"
+endpoint = "https://aps.example.com/e/pb/bid"
+routing = "all_eligible"
+profile_config = { account_id = "example-aps-account" }
 ```
 
-**Flow:**
-1. Prebid and APS run in parallel
-2. Both return their bids simultaneously
-3. Bids are sent to the mediator for final decision
-4. Mediator competes house inventory and returns winning creative
+Providers run in parallel, then the separately registered mediator chooses from
+decoded-price bids.
 
 ### 2. Parallel Only
-**Use case:** Client-side auction, no mediation
 
-```toml
-[auction]
-enabled = true
-providers = ["prebid", "aps"]
-# No mediator = parallel only strategy (highest CPM wins)
-timeout_ms = 2000
-```
-
-**Flow:**
-1. All providers run in parallel
-2. Highest bid wins
-3. No mediation server involved
+Omit `mediator` from the same map-shaped configuration. The orchestrator selects
+the highest decoded CPM per slot and applies floors locally.
 
 ## Configuration
 
-### Configuration
-
-All auction settings are configured directly under `[auction]`:
+`[auction.providers.<provider-id>]` is the only bidder-provider inventory.
+`[auction.bidders.<bidder-id>]` maps a client-visible bidder to exactly one
+provider. The mediator is selected separately by `[auction].mediator`.
 
 ```toml
 [auction]
-enabled = true                      # Enable/disable auction orchestration
-providers = ["prebid", "aps"]        # List of bidder providers
-mediator = "adserver_mock"          # Optional: if set, uses mediation; if omitted, highest bid wins
-timeout_ms = 2000                   # Overall auction timeout
+enabled = true
+timeout_ms = 2000
+
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://prebid.example.com/openrtb2/auction"
+timeout_ms = 900
+routing = "explicit"
+
+[auction.providers.pbs-main.profile_config]
+debug = false
+test_mode = false
+consent_forwarding = "both"
+
+[auction.providers.pbs-main.notifications]
+suppress_all = false
+suppress_seats = ["example-seat"]
+
+[auction.bidders.example-server]
+provider = "pbs-main"
 ```
 
-**Strategy Auto-Detection:**
-- When `mediator` is configured → Runs **parallel mediation** (providers in parallel, mediator decides winner)
-- When `mediator` is omitted → Runs **parallel only** (providers in parallel, highest CPM wins)
-
-### Provider Configuration
-
-Each provider has its own configuration section:
-
-```toml
-[integrations.prebid]
-enabled = true
-server_url = "https://prebid-server.example.com"
-timeout_ms = 1000
-
-[integrations.aps]
-enabled = true
-mock = true  # Set to false for real integration
-timeout_ms = 800
-
-[integrations.adserver_mock]
-enabled = true
-endpoint = "http://localhost:6767/adserver/mediate"
-timeout_ms = 500
-```
+Provider IDs own backend correlation and response identity. The configured
+profile supplies typed OpenRTB behavior. Common endpoint, timeout, routing, and
+notification policy do not belong to browser integration configuration.
 
 ## Adding a New Provider
 

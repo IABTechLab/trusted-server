@@ -7,7 +7,6 @@
 //! `EdgeZero`'s typed config push path.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
 
 use error_stack::Report;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -127,26 +126,16 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
 /// Returns [`TrustedServerError`] when the config should not be deployed.
 pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
     settings.reject_placeholder_secrets()?;
-    let enabled_auction_providers = validate_enabled_integrations(settings)?;
-    validate_auction_provider_names(settings, &enabled_auction_providers)?;
+    validate_enabled_integrations(settings)?;
+    crate::auction::compile_auction_plan(settings)?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
     Ok(())
 }
 
-fn validate_enabled_integrations(
-    settings: &Settings,
-) -> Result<HashSet<&'static str>, Report<TrustedServerError>> {
-    let mut enabled_auction_providers = HashSet::new();
-
-    if validate_prebid(settings)? {
-        enabled_auction_providers.insert("prebid");
-    }
-    if validate_integration::<ApsConfig>(settings, "aps")? {
-        enabled_auction_providers.insert("aps");
-    }
-    if validate_integration::<AdServerMockConfig>(settings, "adserver_mock")? {
-        enabled_auction_providers.insert("adserver_mock");
-    }
+fn validate_enabled_integrations(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    validate_prebid(settings)?;
+    validate_integration::<ApsConfig>(settings, "aps")?;
+    validate_integration::<AdServerMockConfig>(settings, "adserver_mock")?;
     validate_integration::<TestlightConfig>(settings, "testlight")?;
     validate_integration::<NextJsIntegrationConfig>(settings, "nextjs")?;
     validate_integration::<PermutiveConfig>(settings, "permutive")?;
@@ -159,11 +148,15 @@ fn validate_enabled_integrations(
     validate_integration::<GptConfig>(settings, "gpt")?;
     validate_integration::<GptDiagnosticsConfig>(settings, "gpt_diagnostics")?;
 
-    Ok(enabled_auction_providers)
+    Ok(())
 }
 
-fn validate_prebid(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
-    prebid::validate_config_for_startup(settings).map(|config| config.is_some())
+fn validate_prebid(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    let Some(config) = settings.integration_config::<prebid::PrebidIntegrationConfig>("prebid")?
+    else {
+        return Ok(());
+    };
+    prebid::validate_browser_config_for_startup(&config, &settings.proxy.allowed_domains)
 }
 
 fn validate_integration<T>(
@@ -178,32 +171,6 @@ where
         .map(|config| config.is_some())
 }
 
-fn validate_auction_provider_names(
-    settings: &Settings,
-    enabled_auction_providers: &HashSet<&'static str>,
-) -> Result<(), Report<TrustedServerError>> {
-    if !settings.auction.enabled {
-        return Ok(());
-    }
-
-    for provider_name in settings
-        .auction
-        .providers
-        .iter()
-        .chain(settings.auction.mediator.iter())
-    {
-        if !enabled_auction_providers.contains(provider_name.as_str()) {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "auction provider `{provider_name}` is listed in [auction] but no enabled integration provides it"
-                ),
-            }));
-        }
-    }
-
-    Ok(())
-}
-
 fn report_to_validation_errors(report: &Report<TrustedServerError>) -> ValidationErrors {
     let mut error = ValidationError::new("trusted_server_deploy_validation");
     error.message = Some(Cow::Owned(report.to_string()));
@@ -215,6 +182,8 @@ fn report_to_validation_errors(report: &Report<TrustedServerError>) -> Validatio
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use crate::test_support::tests::crate_test_settings_str;
 
@@ -370,6 +339,33 @@ password = "production-admin-password-32-bytes"
     }
 
     #[test]
+    fn deploy_validation_requires_external_bundle_url_for_enabled_prebid() {
+        let mut settings = valid_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &serde_json::json!({
+                    "enabled": true,
+                    "bundle": { "adapters": ["exampleBidder"] }
+                }),
+            )
+            .expect("should insert enabled Prebid config");
+
+        let error = validate_settings_for_deploy(&settings)
+            .expect_err("should require enabled Prebid external bundle URL");
+        assert!(error.to_string().contains("external_bundle_url"));
+    }
+
+    #[test]
+    fn deploy_validation_accepts_typed_prebid_bundle_build_table() {
+        let settings = valid_settings();
+
+        validate_settings_for_deploy(&settings)
+            .expect("test config with typed Prebid bundle build table should validate");
+    }
+
+    #[test]
     fn deploy_validation_covers_registered_integration_builders() {
         let validated_ids: HashSet<&'static str> =
             DEPLOY_VALIDATED_INTEGRATION_IDS.iter().copied().collect();
@@ -408,7 +404,15 @@ password = "production-admin-password-32-bytes"
     fn validate_trait_reports_deploy_errors() {
         let mut settings = valid_settings();
         settings.auction.enabled = true;
-        settings.auction.providers = vec!["missing-provider".to_string()];
+        settings.auction.providers =
+            crate::auction::AuctionConfig::legacy_provider_map(&["missing-provider"]);
+        settings
+            .auction
+            .providers
+            .values_mut()
+            .next()
+            .expect("should have provider")
+            .protocol = "unsupported".to_string();
         let app_config = TrustedServerAppConfig { settings };
 
         let err = app_config
