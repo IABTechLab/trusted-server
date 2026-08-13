@@ -1,3 +1,5 @@
+import { TSJS_MESSAGE_PROTOCOL_V1 } from '../kernel/contracts/message_protocol';
+
 const MAX_GLOBAL_MESSAGE_BYTES = 4_096;
 const setDeleteIntrinsic = Set.prototype.delete;
 const setValuesIntrinsic = Set.prototype.values;
@@ -26,7 +28,7 @@ function snapshotSetValues<T>(set: Set<T>): readonly T[] {
   }
 }
 
-export { TSJS_MESSAGE_PROTOCOL_V1 } from '../kernel/contracts/message_protocol';
+export { TSJS_MESSAGE_PROTOCOL_V1 };
 
 interface ProtocolMessageSchema {
   readonly transport: 'global-json' | 'structured';
@@ -1402,4 +1404,3 @@ export function createNoopMessagingAdapter(): MessagingAdapter {
     inspectTransferredPorts,
   });
 }
-import { TSJS_MESSAGE_PROTOCOL_V1 } from '../kernel/contracts/message_protocol';

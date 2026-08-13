@@ -267,6 +267,19 @@ test('generated critical transport owns branded render operations without GPT du
   }
 });
 
+test('messaging protocol binding is declared before schema initialization', () => {
+  const source = fs.readFileSync(path.resolve(libDirectory, 'src/adapters/messaging.ts'), 'utf8');
+  const binding =
+    "import { TSJS_MESSAGE_PROTOCOL_V1 } from '../kernel/contracts/message_protocol';";
+  const initialization = 'export const PROTOCOL_MESSAGE_SCHEMAS_V1';
+
+  assert.ok(source.indexOf(binding) >= 0, 'the messaging protocol must have a local binding');
+  assert.ok(
+    source.indexOf(binding) < source.indexOf(initialization),
+    'the messaging protocol binding must precede schema initialization'
+  );
+});
+
 test('co-bundled render_runtime and independent GPT start one branded display flow', async () => {
   const release = JSON.parse(
     fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-release-v1.json'), 'utf8')
