@@ -5,10 +5,11 @@ cross-reference point at it. The subject moved, the path did not._
 
 **Issue:** IABTechLab/trusted-server#1009 · **Date:** 2026-08-08 ·
 
-> **Superseded for implementation, 2026-08-12.** This remains the measurement and
-> feasibility history. The final branch removes the general ESI parser and client-fill arm,
-> retaining `assembly_mode = "esi"` as the operator spelling for Fastly C2 plus exact
-> byte-seam assembly. See
+> **HISTORICAL RECORD — NOT THE CURRENT IMPLEMENTATION.** This document preserves the
+> measurement and feasibility investigation. Every executable ESI tag, parser, and
+> subrequest described below belongs to a rejected spike; do not use those sections to
+> infer current runtime behavior. The final branch retains `assembly_mode = "esi"` only as
+> the operator spelling for Fastly C2 plus exact byte-seam assembly. See
 > [the merge-hardening design](./2026-08-12-1009-esi-merge-hardening-design.md).
 
 **Revised:** 2026-08-10
@@ -34,8 +35,8 @@ cross-reference point at it. The subject moved, the path did not._
 >   read-through cache (C1) that Stage 0 turns on — purging that needs origin-supplied
 >   keys or the HTTP cache's own surrogate-key surface.
 > - **The original pipeline ordering was backwards.** It said "order esi → lol*html,
->   never the reverse." `lol_html` \_emits* the `esi:include` tags, so ESI must run after
->   it. Correct order is in [§6.6](#66-the-esi-pipeline-corrected).
+>   never the reverse." `lol_html` \_emits* the ESI include tags, so ESI must run after it.
+>   Correct order is in [§6.6](#66-the-esi-pipeline-corrected).
 >
 > The error was inspecting what this repository does and reporting it as what the
 > platform permits — the same mistake this document criticises #1009 for making in the
@@ -103,9 +104,9 @@ detail than the work it recommends.
 
 ## 2. Why — the three findings
 
-**ESI is buildable on the pinned SDK, and unvalidated.** `lol_html` emits
-`esi:include` tags into a shared template; `fastly::cache::core` stores that template;
-the `esi` crate assembles per request on the way out. Everything that requires is
+**ESI is buildable on the pinned SDK, and unvalidated.** `lol_html` emits executable ESI
+include tags into a shared template; `fastly::cache::core` stores that template; the
+`esi` crate assembles per request on the way out. Everything that requires is
 already a dependency. The real open questions are empirical, not architectural: does it
 beat a plain client fetch by enough to justify a Fastly-only rendering path, and can
 per-user leakage be excluded under cold MISS, warm HIT, stale revalidation, and fragment
@@ -116,7 +117,7 @@ Two constraints stay true regardless. ESI is **Fastly-only at every API level**,
 is a per-platform accelerator rather than the architecture, and its maintenance cost
 belongs in the decision. And its Dynamic Content Assembly must be **explicitly disabled**
 — bid payloads carry partner-controlled creative markup, so under `DcaMode::Esi` an SSP
-could embed `<esi:include src="…">` and make the edge fetch an arbitrary URL. Details in
+could embed an ESI include targeting an arbitrary URL and make the edge fetch it. Details in
 [Appendix E](#appendix-e--esi-notes-condensed).
 
 **The auction is already out of band; the hold is ~free.** It is dispatched _before_
@@ -444,7 +445,7 @@ for it.
 ### 6.6 The ESI pipeline, corrected
 
 An earlier revision of this document said "order esi → lol*html, never the reverse."
-That is backwards. `lol_html` is what \_emits* the `esi:include` tags; ESI cannot process
+That is backwards. `lol_html` is what \_emits* the ESI include tags; ESI cannot process
 tags that do not exist yet. The correct order:
 
 ```

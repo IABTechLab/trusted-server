@@ -30,7 +30,7 @@ use crate::creative_opportunities::AssemblyMode;
 ///
 /// | Version | Transform |
 /// | ------- | --------- |
-/// | 1       | `</body>` seam marker was `<esi:include src="/_ts/page-bids?format=fragment"/>` |
+/// | 1       | `</body>` seam used an executable ESI include tag targeting the old fragment endpoint |
 /// | 2       | Marker became the inert comment `<!--ts-seam-bids-->`; the seam hands slots to `scheduleInitialAdInit` instead of assigning them |
 /// | 3       | Marker became `<!--ts-c2-v3-seam-7f4c9e2d-bids-->`; canonical collision-safe key, explicit origin freshness, and complete repeated document-policy metadata |
 /// | 4       | Marker is the shorter, accurate [`AD_ASSEMBLY_SEAM`](crate::publisher::AD_ASSEMBLY_SEAM) |

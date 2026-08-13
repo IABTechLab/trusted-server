@@ -190,9 +190,9 @@ capturing it means plumbing the writer position into a `lol_html` end-tag handle
 does not survive re-encoding. A `find` over a ~100 KB buffered template is free by
 comparison.
 
-**Why a comment rather than `esi:include`.** An HTML comment is inert. If assembly ever
-fails to substitute, the reader sees nothing; an unresolved `esi:include` renders as
-visible text. Failure degrades to "no ads" instead of "broken page".
+**Why a comment rather than executable ESI markup.** An HTML comment is inert. If
+assembly ever fails to substitute, the reader sees nothing; an unresolved ESI include
+tag renders as visible text. Failure degrades to "no ads" instead of "broken page".
 
 **Why not re-run `lol_html` over the cached template.** It would inject a second tsjs
 `<script>` at `<head>` and re-rewrite already-rewritten URLs. The hit path must do the
@@ -229,7 +229,7 @@ Next.js page demonstrated parser truncation.
 
 ## 7. Sequencing
 
-1. Emit the schema-bound comment sentinel instead of `esi:include`.
+1. Emit the schema-bound comment sentinel instead of an executable ESI include tag.
 2. Add the seam split to the C2 hit path, returning `PublisherResponse::Stream` rather than
    `Buffered`. Strip `Content-Length`.
 3. Store decoded identity; negotiate and encode the assembled response per reader.

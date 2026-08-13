@@ -409,7 +409,7 @@ nothing tracked was modified. Served document:
 </script>
 ```
 
-No `esi:include`. One origin fetch for two requests. `private, no-store` on the hit.
+No executable ESI tag. One origin fetch for two requests. `private, no-store` on the hit.
 Cached template 353 bytes against 467 served, so the cache holds the pre-assembly
 template. All three fragment formats behave: script, JSON, and `400` on a typo. `Inline`
 unaffected — two fetches for two requests, no C2 activity, no markers.

@@ -308,7 +308,7 @@ check "second request returns 200" "$CODE2" "200"
 # read as "the fixture never bids" rather than "the seam drops bids".
 WINNING_BID='\"hb_pb\":\"4.25\"'
 # Must stay in step with `AD_ASSEMBLY_SEAM` in publisher.rs. An inert HTML comment,
-# not an esi:include — nothing parses ESI on the render path any more.
+# not executable ESI markup — nothing parses ESI on the render path any more.
 SEAM_MARKER='<!--ts-ad-seam-->'
 
 c2_state() {

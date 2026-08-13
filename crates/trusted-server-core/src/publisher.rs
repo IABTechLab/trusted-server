@@ -1191,13 +1191,14 @@ pub(crate) fn template_gpt_diagnostics(
 /// The marker emitted at the `</body>` seam under [`AssemblyMode::Esi`], reserving the
 /// place this reader's slots and bids are spliced into.
 ///
-/// An inert HTML comment, deliberately. It used to be an `<esi:include>`, from when the
-/// `esi` crate resolved it at the edge — but that crate was removed from the render path
-/// because it truncates any element larger than its 16 KB chunk size, and nothing has
-/// parsed ESI since. What remained was a tag that *looked* executable, would have been
-/// executed by any ESI-enabled layer in front of us, and renders as text in a browser if
-/// assembly is ever skipped. A comment cannot do any of those things: an unassembled
-/// template degrades to a page with no ads rather than a page with a visible tag.
+/// An inert HTML comment, deliberately. Template schema v1 used an executable ESI include
+/// tag here, when the `esi` crate resolved it at the edge. That crate was removed from the
+/// render path because it truncates any element larger than its 16 KB chunk size, and
+/// nothing has parsed ESI since. What remained was a tag that *looked* executable, would
+/// have been executed by any ESI-enabled layer in front of us, and renders as text in a
+/// browser if assembly is ever skipped. A comment cannot do any of those things: an
+/// unassembled template degrades to a page with no ads rather than a page with a visible
+/// tag.
 ///
 /// Carries no URL. Every byte here is a byte every reader of the shared template
 /// receives, so nothing request-scoped may appear, and keeping a URL out also removes
@@ -1243,9 +1244,9 @@ fn mode_emits_seam_marker(mode: AssemblyMode) -> bool {
 ///
 /// When that happens the request falls back to [`AssemblyMode::Inline`] **entirely**,
 /// at every seam. Falling back at one seam and not another is what produced the failure
-/// this function exists to prevent: the `</body>` seam emitted an `esi:include` because
-/// the mode was `Esi`, while assembly was skipped because there was no key, so the
-/// reader received a document with a raw `<esi:include>` in it and no bids at all.
+/// this function exists to prevent: the `</body>` seam emitted a legacy ESI tag because
+/// the mode was `Esi`, while assembly was skipped because there was no key, so the reader
+/// received a document with unresolved executable ESI markup in it and no bids at all.
 ///
 /// Bypassing is the *normal* case against a real origin, not an edge case, so this path
 /// runs far more often than the shared one.
@@ -4271,8 +4272,8 @@ pub async fn handle_publisher_request(
 
     // Both seams resolve the mode the same way, from the gate's verdict rather than
     // from configuration. Deciding them independently is what produced a document with
-    // a raw `<esi:include>` and no bids: the body seam saw `Esi` and emitted a marker,
-    // the head seam emitted no `adSlots`, and nothing assembled either.
+    // unresolved executable ESI markup and no bids: the body seam saw `Esi` and emitted
+    // a marker, the head seam emitted no `adSlots`, and nothing assembled either.
     let assembly_mode = effective_assembly_mode(settings, template_cache_key.is_some());
 
     let ad_slots_script = template_ad_slots_script(
@@ -8415,19 +8416,22 @@ mod tests {
             );
         }
 
-        /// The schema version whose templates carried an `<esi:include/>` at the seam.
+        /// The schema version whose templates carried an executable ESI tag at the seam.
         ///
         /// Pinned as a literal rather than derived from [`TEMPLATE_SCHEMA_VERSION`]: the
         /// point is that the current version is *not* this one, and a derived value
         /// would move with it and assert nothing.
         const ESI_INCLUDE_SCHEMA_VERSION: u32 = 1;
 
+        /// The exact schema-v1 marker retained only as a cache-compatibility fixture.
+        const LEGACY_ESI_INCLUDE: &str = "<esi:include src=\"/_ts/page-bids?format=fragment\"/>";
+
         #[tokio::test]
         async fn a_template_written_under_the_previous_schema_version_is_never_read() {
-            // v1 put `<esi:include src="/_ts/page-bids?format=fragment"/>` at the seam.
-            // v2 puts an inert comment there and hands slots to the scheduler, so a v1
-            // entry has no marker this binary can find. `schema_version` is the only
-            // thing keeping the two apart — nothing purges C2 on deploy.
+            // v1 put an executable ESI include at the seam. v2 puts an inert comment
+            // there and hands slots to the scheduler, so a v1 entry has no marker this
+            // binary can find. `schema_version` is the only thing keeping the two apart
+            // — nothing purges C2 on deploy.
             assert_ne!(
                 crate::platform::TEMPLATE_SCHEMA_VERSION,
                 ESI_INCLUDE_SCHEMA_VERSION,
@@ -8459,9 +8463,9 @@ mod tests {
                     .get(&stored_key.to_cache_key())
                     .cloned()
                     .expect("the stored template should be readable");
-                predecessor.body = b"<html><head></head><body>origin\
-                      <esi:include src=\"/_ts/page-bids?format=fragment\"/></body></html>"
-                    .to_vec();
+                predecessor.body =
+                    format!("<html><head></head><body>origin{LEGACY_ESI_INCLUDE}</body></html>")
+                        .into_bytes();
                 predecessor.metadata.schema_version = ESI_INCLUDE_SCHEMA_VERSION;
                 let mut old_key = stored_key;
                 old_key.schema_version = ESI_INCLUDE_SCHEMA_VERSION;
@@ -8484,7 +8488,7 @@ mod tests {
                  assemble"
             );
             assert!(
-                !served.contains("esi:include"),
+                !served.contains("<esi:"),
                 "a predecessor's template must never reach a reader: {served}"
             );
         }
@@ -8706,7 +8710,7 @@ mod tests {
         async fn the_marker_never_reaches_the_browser_on_either_path() {
             // The user-visible failure this whole chain exists to avoid: a page that
             // returns 200, parses fine, renders no ads, and reports no error, because
-            // the `esi:include` was served literally.
+            // the legacy executable ESI tag was served literally.
             //
             // Both paths are checked. The miss path assembles after the transform; the
             // hit path assembles after reading the cache. They are separate call sites
@@ -9491,9 +9495,9 @@ mod tests {
         #[tokio::test]
         async fn a_bypassed_response_falls_back_to_inline_at_every_seam() {
             // Observed against a real origin: a page arrived with a raw
-            // `<esi:include>` in it and no bids at all. The `</body>` seam emitted the
-            // marker because the mode was `Esi`, while assembly was skipped because the
-            // gate had refused a key — a fallback at one seam and not the other.
+            // executable ESI markup in it and no bids at all. The `</body>` seam emitted
+            // the marker because the mode was `Esi`, while assembly was skipped because
+            // the gate had refused a key — a fallback at one seam and not the other.
             //
             // Bypassing is the *normal* case against a real origin, so this path runs
             // far more often than the shared one. It has to produce a working page.
