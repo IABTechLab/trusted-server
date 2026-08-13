@@ -19,7 +19,7 @@
     "@types/node": "^24.10",
     "eslint": "^10",
     "mermaid": "^11.12.3",
-    "prettier": "^3.4.2",
+    "prettier": "^3.9.6",
     "typescript-eslint": "8.57",
     "vitepress": "^1.5.0",
     "vitepress-plugin-mermaid": "^2.0.17"
