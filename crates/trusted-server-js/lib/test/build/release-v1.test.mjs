@@ -617,7 +617,7 @@ test('reduced remediation capture appends provenance without changing earlier ev
   );
   assert.deepEqual(baseline.reviewRemediationTransfer.source, {
     ref: 'spec/aps-tsjs-resilience-design',
-    sha: '5d4e4d72f3894219c52ca679e3ed9dbdcaf553c8',
+    sha: 'de7e8381f7662005b75a4b1817741f6981f180e6',
   });
   assert.equal(
     baseline.reviewRemediationTransfer.originalTopLevelSha256,

@@ -1025,7 +1025,7 @@
     "schemaVersion": 1,
     "source": {
       "ref": "spec/aps-tsjs-resilience-design",
-      "sha": "5d4e4d72f3894219c52ca679e3ed9dbdcaf553c8"
+      "sha": "de7e8381f7662005b75a4b1817741f6981f180e6"
     },
     "originalTopLevelSha256": "53f762603ad49239f1756171440be422e190cc231efafc56cf37a11e1a38ddf4",
     "roleCorrectTransferSha256": "f1d73d517e4888ef4dc3a84b34166e9aeb6a2bde99dec1c835f151f4e070f64a",
@@ -1485,6 +1485,10 @@
       "src/core/index.ts": [
         "core"
       ],
+      "src/kernel/contracts/message_protocol.ts": [
+        "core",
+        "gpt"
+      ],
       "src/adapters/messaging.ts": [
         "core"
       ],
@@ -1547,10 +1551,6 @@
       ],
       "src/kernel/runtime.ts": [
         "core"
-      ],
-      "src/core/contracts/message_protocol.ts": [
-        "core",
-        "gpt"
       ],
       "src/composition/browser.ts": [
         "core"
@@ -1750,9 +1750,6 @@
       "src/integrations/prebid/startup.ts": [
         "prebid"
       ],
-      "src/integrations/prebid/refresh.ts": [
-        "prebid_later"
-      ],
       "src/integrations/prebid/module.ts": [
         "prebid"
       ],
@@ -1788,6 +1785,9 @@
       ],
       "src/integrations/permutive/lifecycle.ts": [
         "permutive_lifecycle"
+      ],
+      "src/integrations/prebid/refresh.ts": [
+        "prebid_later"
       ],
       "src/integrations/prebid/later.ts": [
         "prebid_later"
@@ -1962,13 +1962,6 @@
           ]
         },
         {
-          "source": "src/core/contracts/message_protocol.ts",
-          "owners": [
-            "core",
-            "gpt"
-          ]
-        },
-        {
           "source": "src/core/contracts/request_ads.ts",
           "owners": [
             "bootstrap",
@@ -2039,6 +2032,13 @@
           "owners": [
             "core",
             "gpt_diagnostics"
+          ]
+        },
+        {
+          "source": "src/kernel/contracts/message_protocol.ts",
+          "owners": [
+            "core",
+            "gpt"
           ]
         },
         {
