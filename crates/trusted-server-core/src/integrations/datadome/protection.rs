@@ -58,14 +58,21 @@ impl DataDomeIntegration {
             return RequestFilterDecision::Continue(RequestFilterEffects::default());
         }
 
+        let request_method = input.request.method().clone();
         match self.filter_protection_request_inner(input).await {
             Ok(decision) => decision,
             Err(ProtectionRequestError::Setup(err)) => {
-                log::error!("[datadome] Protection setup failed open: {err:?}");
+                log::error!(
+                    "[datadome] protection decision=failed_open api_status=none datadome_status=unavailable method={} route=continue failure=setup error={err:?}",
+                    request_method,
+                );
                 RequestFilterDecision::Continue(RequestFilterEffects::default())
             }
             Err(ProtectionRequestError::Runtime(err)) => {
-                log::warn!("[datadome] Protection API failed open: {err:?}");
+                log::warn!(
+                    "[datadome] protection decision=failed_open api_status=none datadome_status=unavailable method={} route=continue failure=runtime error={err:?}",
+                    request_method,
+                );
                 RequestFilterDecision::Continue(RequestFilterEffects::default())
             }
         }
@@ -183,15 +190,15 @@ impl DataDomeIntegration {
         if supplied_values.is_empty() {
             return false;
         }
+        let Some(bypass) = self.active_protection_test_bypass() else {
+            return false;
+        };
         if supplied_values.len() != 1 {
             log::warn!(
                 "[datadome] Multiple DataDome test bypass headers supplied; ignoring bypass"
             );
             return false;
         }
-        let Some(bypass) = self.active_protection_test_bypass() else {
-            return false;
-        };
 
         let store_name = StoreName::from(bypass.credential_secret_store.as_str());
         let credential = match services
@@ -522,31 +529,21 @@ fn log_protection_skip(
     reason: ProtectionSkipReason,
     suppress_client_tag: bool,
 ) {
-    let reason = reason.as_str();
-    if suppression_skip_log_level(suppress_client_tag, is_navigation_request(input.request))
-        == log::Level::Info
-    {
-        log::info!(
-            "[datadome] protection decision=skipped rule={} reason={} client_tag=omitted method={}",
-            rule_id,
-            reason,
-            input.request.method(),
-        );
-    } else if suppress_client_tag {
-        log::debug!(
-            "[datadome] protection decision=skipped rule={} reason={} client_tag=omitted method={}",
-            rule_id,
-            reason,
-            input.request.method(),
-        );
+    let level =
+        suppression_skip_log_level(suppress_client_tag, is_navigation_request(input.request));
+    let client_tag = if suppress_client_tag {
+        " client_tag=omitted"
     } else {
-        log::debug!(
-            "[datadome] protection decision=skipped rule={} reason={} method={}",
-            rule_id,
-            reason,
-            input.request.method(),
-        );
-    }
+        ""
+    };
+    log::log!(
+        level,
+        "[datadome] protection decision=skipped rule={} reason={}{} method={}",
+        rule_id,
+        reason.as_str(),
+        client_tag,
+        input.request.method(),
+    );
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -839,7 +836,7 @@ fn truncate_utf8(value: &str, limit: i32) -> String {
 mod tests {
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use crate::integrations::datadome::{
         DataDomeConfig, ProtectionExclusionRuleConfig, ProtectionMatcherConfig,
@@ -854,6 +851,8 @@ mod tests {
     use crate::settings::Settings;
 
     use super::*;
+
+    static FASTLY_IS_STAGING_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn protection_integration() -> Arc<DataDomeIntegration> {
         let config = DataDomeConfig {
@@ -878,6 +877,9 @@ mod tests {
         services: &RuntimeServices,
         request: &mut Request<EdgeBody>,
     ) -> RequestFilterDecision {
+        let _guard = FASTLY_IS_STAGING_ENV_LOCK
+            .lock()
+            .expect("should lock staging environment test guard");
         temp_env::with_var(crate::constants::ENV_FASTLY_IS_STAGING, Some("1"), || {
             futures::executor::block_on(integration.filter_protection_request(RequestFilterInput {
                 settings,
@@ -1098,6 +1100,9 @@ mod tests {
             edgezero_core::http::HeaderValue::from_static("temporary-test-credential-32-bytes!"),
         );
 
+        let _guard = FASTLY_IS_STAGING_ENV_LOCK
+            .lock()
+            .expect("should lock staging environment test guard");
         let decision = temp_env::with_var(
             crate::constants::ENV_FASTLY_IS_STAGING,
             None::<&str>,
