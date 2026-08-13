@@ -105,15 +105,18 @@ function readBuildEvidence() {
   };
 }
 
-function executeGeneratedArtifact(window, file, registrations) {
+function executeGeneratedArtifact(window, file, registrations, { preserveTarget = false } = {}) {
+  const target = preserveTarget
+    ? window.tsjs
+    : Object.freeze({
+        _registerIntegration: (registration) => {
+          registrations.push(registration);
+          return true;
+        },
+      });
   Object.defineProperty(window, 'tsjs', {
     configurable: true,
-    value: Object.freeze({
-      _registerIntegration: (registration) => {
-        registrations.push(registration);
-        return true;
-      },
-    }),
+    value: target,
   });
   window.eval(fs.readFileSync(path.resolve(libDirectory, '../dist', file), 'utf8'));
 }
@@ -145,7 +148,33 @@ test('generated release inventory pins the server bundle order', () => {
   }
 });
 
-test('generated maximal integration artifacts execute their real catalog entrypoints', () => {
+test('critical transport co-bundles core and render ownership within the approved ceiling', () => {
+  const metrics = JSON.parse(
+    fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-build-metrics-v1.json'), 'utf8')
+  );
+  const core = metrics.modules.find(({ file }) => file === 'tsjs-core.js');
+  const renderRuntime = metrics.modules.find(({ file }) => file === 'tsjs-render_runtime.js');
+
+  assert.ok(core, 'core metrics must exist');
+  assert.ok(renderRuntime, 'render_runtime metrics must exist');
+  assert.ok(
+    core.sources.some(({ file }) => file === 'src/integrations/render_runtime/module.ts'),
+    'the core transport must co-bundle the mandatory render owner once'
+  );
+  assert.deepEqual(
+    renderRuntime.sources.map(({ file }) => file),
+    ['src/integrations/render_runtime/transport_marker.ts'],
+    'the logical render artifact must not duplicate the co-bundled implementation'
+  );
+  assert.ok(metrics.sets.minimal.rawBytes <= 220_000, 'minimal raw bytes exceed the ceiling');
+  assert.ok(metrics.sets.minimal.gzipBytes <= 59_000, 'minimal gzip bytes exceed the ceiling');
+  assert.ok(
+    metrics.sets.minimal.brotliBytes < 51_645,
+    'minimal Brotli bytes must improve on the oversized intermediate capture'
+  );
+});
+
+test('generated integration artifacts execute their release-bound catalog entrypoints', () => {
   const release = JSON.parse(
     fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-release-v1.json'), 'utf8')
   );
@@ -155,7 +184,16 @@ test('generated maximal integration artifacts execute their real catalog entrypo
   });
   const registrations = [];
   try {
-    for (const artifact of release.artifacts.filter(({ role }) => role === 'integration')) {
+    executeGeneratedArtifact(dom.window, 'tsjs-render_runtime.js', registrations);
+    assert.equal(
+      registrations.length,
+      0,
+      'the catalog marker must not publish a duplicate render owner'
+    );
+    registrations.push({ id: 'render_runtime', phase: 'critical' });
+    for (const artifact of release.artifacts.filter(
+      ({ role, id }) => role === 'integration' && id !== 'render_runtime'
+    )) {
       executeGeneratedArtifact(dom.window, artifact.file, registrations);
     }
     assert.deepEqual(
@@ -171,7 +209,7 @@ test('generated maximal integration artifacts execute their real catalog entrypo
   }
 });
 
-test('generated GPT consumes branded render operations without inlining their private store', () => {
+test('generated critical transport owns branded render operations without GPT duplication', () => {
   const metrics = JSON.parse(
     fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-build-metrics-v1.json'), 'utf8')
   );
@@ -181,17 +219,55 @@ test('generated GPT consumes branded render operations without inlining their pr
   assert.ok(renderRuntime, 'render_runtime metrics must exist');
   assert.ok(gpt, 'GPT metrics must exist');
   assert.ok(
-    renderRuntime.sources.some(({ file }) => file === 'src/services/render.ts'),
-    'render_runtime must own the branded render implementation'
+    metrics.modules
+      .find(({ file }) => file === 'tsjs-core.js')
+      ?.sources.some(({ file }) => file === 'src/services/render.ts'),
+    'the co-bundled critical transport must own the branded render implementation'
   );
   assert.equal(
     gpt.sources.some(({ file }) => file === 'src/services/render.ts'),
     false,
     'GPT must invoke branded operations through render.v1'
   );
+  assert.equal(
+    gpt.sources.some(({ file }) => file === 'src/core/render.ts'),
+    false,
+    'GPT must obtain the core-owned iframe constructor through render.v1'
+  );
+  assert.equal(
+    gpt.sources.some(({ file }) => file === 'src/adapters/messaging.ts'),
+    false,
+    'GPT must consume the core-owned messaging boundary without recompiling it'
+  );
+  assert.equal(
+    metrics.modules
+      .find(({ file }) => file === 'tsjs-core.js')
+      ?.sources.some(({ file }) => file === 'src/core/puc_shell.ts'),
+    false,
+    'the GPT-owned PUC shell helper must not inflate the always-on core transport'
+  );
+  assert.equal(
+    gpt.sources.some(({ file }) => file === 'src/core/puc_shell.ts'),
+    true,
+    'the sole PUC owner must carry its guarded collapsed-shell resize helper'
+  );
+  for (const source of [
+    'src/core/contracts/auction_projection.ts',
+    'src/core/contracts/generated/renderer_validator_v1.ts',
+    'src/core/contracts/aps_renderer.ts',
+    'src/core/config.ts',
+    'src/services/projections.ts',
+    'src/kernel/identity.ts',
+  ]) {
+    assert.equal(
+      gpt.sources.some(({ file }) => file === source),
+      false,
+      `GPT must consume core-owned ${source} behavior through capabilities`
+    );
+  }
 });
 
-test('independently generated render_runtime and GPT bundles start one branded display flow', async () => {
+test('co-bundled render_runtime and independent GPT start one branded display flow', async () => {
   const release = JSON.parse(
     fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-release-v1.json'), 'utf8')
   );
@@ -245,6 +321,11 @@ test('independently generated render_runtime and GPT bundles start one branded d
       pubads: () => pubads,
       setConfig: () => undefined,
     };
+    const criticalBody = fs.readFileSync(
+      path.resolve(libDirectory, '../dist/tsjs-core.js'),
+      'utf8'
+    );
+    const criticalHash = createHash('sha256').update(criticalBody).digest('hex');
     const boot = dom.window.eval(`(() => {
       const freeze = Object.freeze;
       const placement = freeze({
@@ -272,6 +353,8 @@ test('independently generated render_runtime and GPT bundles start one branded d
         })
       });
       return freeze({
+        abi: 1,
+        releaseId: '${release.releaseId}',
         auctionProjection: freeze({
           version: 1,
           auction: freeze({
@@ -286,6 +369,12 @@ test('independently generated render_runtime and GPT bundles start one branded d
           slots: freeze([placement]),
           bids: freeze([bid])
         }),
+        creative: freeze({
+          version: 1,
+          enabled: false,
+          clickGuard: false,
+          renderGuard: false
+        }),
         diagnostics: freeze({
           version: 1,
           renderTraceOverlay: false,
@@ -294,7 +383,7 @@ test('independently generated render_runtime and GPT bundles start one branded d
         manifest: freeze({
           version: 1,
           releaseId: '${release.releaseId}',
-          criticalSrc: '/static/tsjs=tsjs-unified.min.js?v=${release.releaseId}',
+          criticalSrc: '/static/tsjs=tsjs-unified.min.js?v=${criticalHash}',
           integrations: freeze([
             freeze({ id: 'render_runtime', phase: 'critical' }),
             freeze({ id: 'gpt', phase: 'critical' })
@@ -302,54 +391,26 @@ test('independently generated render_runtime and GPT bundles start one branded d
         })
       });
     })()`);
-    const runtime = dom.window.Object.freeze({
-      attachAuctionContextService: () => () => undefined,
-      boot: () => boot,
-      document: dom.window.document,
-      enqueue: () => true,
-      generation: dom.window.Object.freeze({}),
-      protectFirstDisplayAttemptBatch: () => true,
-      registerAuctionContext: () => () => undefined,
+    const criticalScript = dom.window.document.createElement('script');
+    criticalScript.id = 'trustedserver-js';
+    criticalScript.src = `/static/tsjs=tsjs-unified.min.js?v=${criticalHash}`;
+    dom.window.document.head.append(criticalScript);
+    Object.defineProperty(dom.window, 'tsjs', { configurable: true, value: {} });
+    Object.defineProperties(dom.window.tsjs, {
+      boot: { configurable: true, enumerable: true, value: boot, writable: true },
+      que: { configurable: true, enumerable: true, value: [], writable: true },
     });
-
-    executeGeneratedArtifact(dom.window, 'tsjs-render_runtime.js', registrations);
-    executeGeneratedArtifact(dom.window, 'tsjs-gpt.js', registrations);
-    const renderRegistration = registrations.find(({ id }) => id === 'render_runtime');
-    const gptRegistration = registrations.find(({ id }) => id === 'gpt');
-    assert.ok(renderRegistration);
-    assert.ok(gptRegistration);
-    const renderPrepared = renderRegistration.prepare(
-      dom.window.Object.freeze({
-        config: undefined,
-        interfaces: dom.window.Object.freeze({ 'runtime.v1': runtime }),
-        onDispose: (callback) => preparationDisposers.push(callback),
-        signal: new dom.window.AbortController().signal,
-      })
-    );
-    renderPrepared.activate(
-      dom.window.Object.freeze({
-        afterCommit: () => undefined,
-        onDispose: (callback) => activationDisposers.push(callback),
-        signal: new dom.window.AbortController().signal,
-      })
-    );
-    const gptPrepared = gptRegistration.prepare(
-      dom.window.Object.freeze({
-        config: undefined,
-        interfaces: dom.window.Object.freeze({
-          'runtime.v1': runtime,
-          ...renderPrepared.interfaces,
-        }),
-        onDispose: (callback) => preparationDisposers.push(callback),
-        signal: new dom.window.AbortController().signal,
-      })
-    );
-    gptPrepared.activate(
-      dom.window.Object.freeze({
-        afterCommit: (callback) => callback(),
-        onDispose: (callback) => activationDisposers.push(callback),
-        signal: new dom.window.AbortController().signal,
-      })
+    Object.defineProperty(dom.window.document, 'currentScript', {
+      configurable: true,
+      value: criticalScript,
+    });
+    dom.window.eval(criticalBody);
+    executeGeneratedArtifact(dom.window, 'tsjs-gpt.js', registrations, { preserveTarget: true });
+    await new Promise((resolve) => queueMicrotask(resolve));
+    assert.equal(
+      dom.window.tsjs?._internal?.state,
+      'kernel',
+      `critical transport should commit: ${JSON.stringify(dom.window.tsjs?._internal)}`
     );
     for (let index = 0; index < 10 && displayCalls.length === 0; index += 1) {
       await new Promise((resolve) => setTimeout(resolve, 0));
@@ -520,7 +581,7 @@ test('release build has one bundle aggregation and compression measurement owner
   assert.doesNotMatch(buildSource, /MINIMAL_CRITICAL_IDS|REFERENCE_CRITICAL_IDS/);
 });
 
-test('role-correct capture appends provenance without changing historical evidence', () => {
+test('reduced remediation capture appends provenance without changing earlier evidence', () => {
   const baseline = JSON.parse(
     fs.readFileSync(
       path.join(libDirectory, 'test/fixtures/performance/aps-tsjs-prechange.json'),
@@ -528,7 +589,9 @@ test('role-correct capture appends provenance without changing historical eviden
     )
   );
   const original = Object.fromEntries(
-    Object.entries(baseline).filter(([key]) => key !== 'roleCorrectTransfer')
+    Object.entries(baseline).filter(
+      ([key]) => key !== 'roleCorrectTransfer' && key !== 'reviewRemediationTransfer'
+    )
   );
 
   assert.ok(baseline.roleCorrectTransfer, 'role-correct capture must be appended');
@@ -548,6 +611,38 @@ test('role-correct capture appends provenance without changing historical eviden
     baseline.roleCorrectTransfer.compression.concatenationSeparator,
     bundleMetrics.BUNDLE_SEPARATOR.toString('utf8')
   );
+  assert.ok(
+    baseline.reviewRemediationTransfer,
+    'review remediation capture must be appended after the immutable intermediate capture'
+  );
+  assert.deepEqual(baseline.reviewRemediationTransfer.source, {
+    ref: 'spec/aps-tsjs-resilience-design',
+    sha: '5d4e4d72f3894219c52ca679e3ed9dbdcaf553c8',
+  });
+  assert.equal(
+    baseline.reviewRemediationTransfer.originalTopLevelSha256,
+    baseline.roleCorrectTransfer.originalTopLevelSha256
+  );
+  assert.equal(
+    baseline.reviewRemediationTransfer.roleCorrectTransferSha256,
+    bundleBudgets.canonicalJsonSha256(baseline.roleCorrectTransfer)
+  );
+  assert.ok(baseline.reviewRemediationTransfer.sets.minimal.rawBytes <= 220_000);
+  assert.ok(baseline.reviewRemediationTransfer.sets.minimal.gzipBytes <= 59_000);
+  assert.ok(
+    baseline.reviewRemediationTransfer.sets.minimal.brotliBytes <
+      baseline.roleCorrectTransfer.sets.minimal.brotliBytes
+  );
+  for (const size of ['rawBytes', 'gzipBytes', 'brotliBytes']) {
+    assert.ok(
+      baseline.reviewRemediationTransfer.sets.reference[size] <
+        baseline.roleCorrectTransfer.sets.reference[size]
+    );
+    assert.ok(
+      baseline.reviewRemediationTransfer.sets.maximal[size] <=
+        baseline.roleCorrectTransfer.sets.maximal[size]
+    );
+  }
 });
 
 test('bundle budget membership rejects every noncanonical release inventory shape', () => {
@@ -605,7 +700,7 @@ test('bundle budget membership rejects every noncanonical release inventory shap
 
 test('critical bundle graphs exclude deferred entries and transitive presentation sources', () => {
   const { baseline, metrics, release } = readBuildEvidence();
-  const sourceOwners = baseline.roleCorrectTransfer.sourceOwners;
+  const sourceOwners = baseline.reviewRemediationTransfer.sourceOwners;
   const cleanMetrics = structuredClone(metrics);
   assert.deepEqual(findCriticalDeferredSourceViolations(cleanMetrics, release, sourceOwners), []);
 
@@ -684,6 +779,40 @@ test('permanent comparator pins every historical and role-correct evidence subtr
       `${subtree} mutation must fail`
     );
   }
+
+  const remediationMutations = {
+    source: (candidate) => (candidate.source.sha = 'b'.repeat(40)),
+    roleCorrectTransferSha256: (candidate) =>
+      (candidate.roleCorrectTransferSha256 = 'b'.repeat(64)),
+    release: (candidate) => (candidate.release.artifacts[1].bytes += 1),
+    sourceOwners: (candidate) => candidate.sourceOwners['src/core/index.ts'].push('gpt'),
+    logicalProviderSources: (candidate) => candidate.logicalProviderSources.render_runtime.pop(),
+    physicalMarkerOwners: (candidate) => (candidate.physicalMarkerOwners.render_runtime = 'gpt'),
+    graphReport: (candidate) => (candidate.graphReport.largestContributions[0].renderedBytes += 1),
+    sets: (candidate) => (candidate.sets.minimal.gzipBytes += 1),
+  };
+  for (const [subtree, mutate] of Object.entries(remediationMutations)) {
+    const candidate = structuredClone(evidence);
+    mutate(candidate.baseline.reviewRemediationTransfer);
+    assert.throws(
+      () => bundleBudgets.validateRoleCorrectTransfer(candidate),
+      /review-remediation capture digest/,
+      `${subtree} remediation mutation must fail`
+    );
+  }
+});
+
+test('bundle check verifies the capture source commit reproduces artifact inputs', () => {
+  const evidence = readBuildEvidence();
+
+  assert.doesNotThrow(() =>
+    bundleBudgets.validateRoleCorrectTransfer({ ...evidence, verifyGitProvenance: true })
+  );
+  evidence.baseline.reviewRemediationTransfer.source.sha = '0'.repeat(40);
+  assert.throws(
+    () => bundleBudgets.validateRoleCorrectTransfer({ ...evidence, verifyGitProvenance: true }),
+    /review-remediation capture digest/
+  );
 });
 
 test('capture-exact validation is phase-aware while current bytes stay authoritative', () => {
@@ -701,7 +830,7 @@ test('capture-exact validation is phase-aware while current bytes stay authorita
     })
   );
   const isCleanCaptureRelease =
-    evidence.release.releaseId === evidence.baseline.roleCorrectTransfer.release.releaseId;
+    evidence.release.releaseId === evidence.baseline.reviewRemediationTransfer.release.releaseId;
   const validateExactCapture = () =>
     bundleBudgets.validateRoleCorrectTransfer({
       ...evidence,
@@ -816,7 +945,7 @@ test('source ownership capture rejects cleared current bootstrap sources', () =>
 
 test('source ownership capture pins artifact-owner order', () => {
   const { baseline, metrics, release } = readBuildEvidence();
-  const reorderedOwners = structuredClone(baseline.roleCorrectTransfer.sourceOwners);
+  const reorderedOwners = structuredClone(baseline.reviewRemediationTransfer.sourceOwners);
   reorderedOwners['src/core/release.ts'].reverse();
   assert.match(
     bundleBudgets.findProductionGraphViolations(metrics, release, reorderedOwners).join('\n'),
@@ -835,12 +964,12 @@ test('source ownership graph rejects duplicate bootstrap sources and captured ow
       bundleBudgets.findProductionGraphViolations(
         duplicateBootstrapSource,
         release,
-        baseline.roleCorrectTransfer.sourceOwners
+        baseline.reviewRemediationTransfer.sourceOwners
       ),
     /gpt-bootstrap-fallback\.js\.sources\[.*\] is invalid/
   );
 
-  const duplicateCapturedOwner = structuredClone(baseline.roleCorrectTransfer.sourceOwners);
+  const duplicateCapturedOwner = structuredClone(baseline.reviewRemediationTransfer.sourceOwners);
   duplicateCapturedOwner['src/kernel/runtime.ts'].push('core');
   assert.throws(
     () => bundleBudgets.findProductionGraphViolations(metrics, release, duplicateCapturedOwner),
@@ -882,9 +1011,18 @@ test('transfer ceilings use ceil at a fractional five-percent boundary', () => {
 
 test('production bundle graphs reject every frozen forbidden edge', () => {
   const { baseline, metrics, release } = readBuildEvidence();
-  const sourceOwners = baseline.roleCorrectTransfer.sourceOwners;
+  const sourceOwners = baseline.reviewRemediationTransfer.sourceOwners;
   assert.equal(typeof bundleBudgets.findProductionGraphViolations, 'function');
-  assert.deepEqual(bundleBudgets.findProductionGraphViolations(metrics, release, sourceOwners), []);
+  assert.deepEqual(
+    bundleBudgets.findProductionGraphViolations(
+      metrics,
+      release,
+      sourceOwners,
+      baseline.reviewRemediationTransfer.logicalProviderSources,
+      baseline.reviewRemediationTransfer.physicalMarkerOwners
+    ),
+    []
+  );
   const rejectSource = (artifactId, file, pattern) => {
     const candidate = structuredClone(metrics);
     const artifactIndex = release.artifacts
@@ -897,7 +1035,7 @@ test('production bundle graphs reject every frozen forbidden edge', () => {
     );
   };
 
-  rejectSource('gpt', 'src/integrations/render_runtime/index.ts', /inlines provider/);
+  rejectSource('gpt', 'src/integrations/render_runtime/module.ts', /inlines provider core/);
   rejectSource('aps', 'src/kernel/runtime.ts', /inlines provider core/);
   rejectSource('gpt', 'src/adapters/prebid.ts', /owned by prebid/);
   rejectSource('aps', 'src/shared/dom_insertion_dispatcher.ts', /owned by .*gpt/);
@@ -919,7 +1057,11 @@ test('production bundle graphs scan bootstrap sources for test and fake seams', 
 
   assert.match(
     bundleBudgets
-      .findProductionGraphViolations(metrics, release, baseline.roleCorrectTransfer.sourceOwners)
+      .findProductionGraphViolations(
+        metrics,
+        release,
+        baseline.reviewRemediationTransfer.sourceOwners
+      )
       .join('\n'),
     /bootstrap reaches production test\/fake\/no-op seam src\/test\/fake_adapter\.ts/
   );
@@ -937,10 +1079,55 @@ test('production bundle graphs reject provider implementation modules, not only 
 
   assert.match(
     bundleBudgets
-      .findProductionGraphViolations(metrics, release, baseline.roleCorrectTransfer.sourceOwners)
+      .findProductionGraphViolations(
+        metrics,
+        release,
+        baseline.reviewRemediationTransfer.sourceOwners
+      )
       .join('\n'),
-    /gpt inlines provider render_runtime.*src\/integrations\/render_runtime\/module\.ts/
+    /gpt inlines provider core.*src\/integrations\/render_runtime\/module\.ts/
   );
+});
+
+test('logical provider ownership cannot be authorized by a duplicated source capture', () => {
+  const { baseline, metrics, release } = readBuildEvidence();
+  const capture = baseline.reviewRemediationTransfer;
+  const providerSource = 'src/services/render.ts';
+  const gptIndex = release.artifacts
+    .filter(({ role }) => role !== 'bootstrap')
+    .findIndex(({ id }) => id === 'gpt');
+  metrics.modules[gptIndex].sources.push({ file: providerSource, renderedBytes: 1 });
+  const permissiveOwners = structuredClone(capture.sourceOwners);
+  permissiveOwners[providerSource] = ['core', 'gpt'];
+  const logicalProviderSources = {
+    ...capture.logicalProviderSources,
+    render_runtime: capture.logicalProviderSources.render_runtime.filter(
+      (source) => source !== providerSource
+    ),
+    core: [...capture.logicalProviderSources.core, providerSource],
+  };
+
+  assert.match(
+    bundleBudgets
+      .findProductionGraphViolations(
+        metrics,
+        release,
+        permissiveOwners,
+        logicalProviderSources,
+        capture.physicalMarkerOwners
+      )
+      .join('\n'),
+    /gpt inlines provider core.*src\/services\/render\.ts/
+  );
+});
+
+test('bundle graph report freezes largest contributions and repeated attributions', () => {
+  const { metrics, release } = readBuildEvidence();
+  const report = bundleBudgets.buildProductionGraphReport(metrics, release);
+
+  assert.equal(report.largestContributions.length, 20);
+  assert.equal(report.largestContributions[0].source, 'src/services/slots.ts');
+  assert.ok(report.repeatedAttributions.some(({ source }) => source === 'src/core/release.ts'));
 });
 
 for (const [consumerId, providerId, providerSource] of [
@@ -961,7 +1148,11 @@ for (const [consumerId, providerId, providerSource] of [
 
     assert.match(
       bundleBudgets
-        .findProductionGraphViolations(metrics, release, baseline.roleCorrectTransfer.sourceOwners)
+        .findProductionGraphViolations(
+          metrics,
+          release,
+          baseline.reviewRemediationTransfer.sourceOwners
+        )
         .join('\n'),
       new RegExp(
         `${consumerId} inlines provider ${providerId}.*${providerSource.replaceAll('.', '\\.')}`
@@ -982,7 +1173,11 @@ test('critical bundle graph rejects deferred-presentation-only source ownership'
 
   assert.match(
     bundleBudgets
-      .findProductionGraphViolations(metrics, release, baseline.roleCorrectTransfer.sourceOwners)
+      .findProductionGraphViolations(
+        metrics,
+        release,
+        baseline.reviewRemediationTransfer.sourceOwners
+      )
       .join('\n'),
     /core reaches deferred-owned source src\/integrations\/gpt_diagnostics\/exhaustive\.ts/
   );
@@ -1000,7 +1195,11 @@ test('production bundle graphs reject actual underscore-named test seams', () =>
 
   assert.match(
     bundleBudgets
-      .findProductionGraphViolations(metrics, release, baseline.roleCorrectTransfer.sourceOwners)
+      .findProductionGraphViolations(
+        metrics,
+        release,
+        baseline.reviewRemediationTransfer.sourceOwners
+      )
       .join('\n'),
     /aps reaches production test\/fake\/no-op seam src\/composition\/browser_test\.ts/
   );
@@ -1009,7 +1208,8 @@ test('production bundle graphs reject actual underscore-named test seams', () =>
 test('role-correct bundle check reports historical deltas and enforces transfer ceilings', () => {
   const result = checkBundleBudgets();
 
-  assert.equal(result.roleCorrectStatus, 'frozen');
+  assert.equal(result.roleCorrectStatus, 'immutable-intermediate');
+  assert.equal(result.reviewRemediationStatus, 'frozen-release-baseline');
   assert.equal(result.transferCeilingsEnforced, true);
   assert.deepEqual(Object.keys(result.historicalDeltas), [
     'bootstrap',
@@ -1025,7 +1225,7 @@ test('role-correct bundle check reports historical deltas and enforces transfer 
       );
     }
   }
-  for (const [setName, report] of Object.entries(result.roleCorrectTransfer)) {
+  for (const [setName, report] of Object.entries(result.reviewRemediationTransfer)) {
     for (const size of ['rawBytes', 'gzipBytes', 'brotliBytes']) {
       assert.equal(report[size].ceilingBytes, Math.ceil(report[size].capturedBytes * 1.05));
       assert.ok(report[size].currentBytes <= report[size].ceilingBytes, `${setName}.${size}`);
