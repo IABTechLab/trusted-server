@@ -40,9 +40,7 @@ secret_store_id = "secrets"
 
 [integrations.prebid]
 enabled = false
-server_url = "https://prebid.example.com/openrtb2/auction"
 timeout_ms = 1000
-bidders = []
 debug = false
 client_side_bidders = []
 # Keep selected GAM inventory out of Trusted Server's Prebid refresh auctions.
@@ -146,6 +144,8 @@ enabled = false
 # immutable = true
 
 [auction]
+# Keep disabled until provider endpoints, routes, and profile values below are
+# replaced with deployment-specific settings.
 enabled = false
 # Defaults to true. Keep this leaf present when using the EdgeZero v0.0.4
 # environment override. Set false to return unre-written winning-bid adm,
@@ -156,37 +156,57 @@ rewrite_creatives = true
 # Strip executable markup (script/object/embed/form/...) from winning-bid adm,
 # removing those elements together with their inner content.
 #
-# Defaults to false: executable markup is preserved rather than stripped. Note
-# this is not "untouched" — with the default `rewrite_creatives = true` above,
-# eligible URLs are still rewritten to first-party endpoints, bidder `<base>`
-# elements are removed, and the creative TSJS runtime is injected.
+# Defaults to false: executable markup is preserved rather than stripped. With
+# the default `rewrite_creatives = true` above, eligible URLs are still rewritten
+# to first-party endpoints and bidder `<base>` elements are removed.
 #
-# Enable whenever creatives can render in a context that shares the publisher's
-# origin — it is the primary defence there.
-#
-# Leave disabled when creatives render in a foreign-origin frame (for example the
-# Prebid Universal Creative inside the ad server's iframe), where the markup cannot
-# reach the publisher origin. Sanitization removes script-based creatives entirely,
-# so enabling it on a script-heavy demand stack silently blanks those slots.
+# Enable this when creatives can render in a context that shares the publisher's
+# origin. Leave it disabled for script-based creatives rendered in a
+# foreign-origin frame, where sanitization would blank the creative.
 sanitize_creatives = false
-providers = []
 timeout_ms = 2000
 allowed_context_keys = []
 
-[integrations.aps]
-enabled = false
-account_id = "example-aps-account-id"
-timeout_ms = 1000
-# Include raw APS request/response data in /auction metadata on test sites only.
+# Example server-side provider declarations. Remove or customize before enabling auctions.
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://prebid.example.com/openrtb2/auction"
+# `prebid-server` defaults to 1000 ms when omitted.
+routing = "explicit"
+
+[auction.providers.pbs-main.profile_config]
 debug = false
-# Set both when the deployment hostname differs from APS-authorized inventory.
+test_mode = false
+consent_forwarding = "both"
+
+[auction.providers.pbs-main.notifications]
+suppress_all = false
+suppress_seats = []
+
+[auction.bidders.example-bidder]
+provider = "pbs-main"
+
+# APS server behavior is also provider/profile-owned. Use routing = "all_eligible"
+# when every banner-compatible slot should be eligible. The APS profile timeout
+# defaults to 800 ms; debug and script creatives default to false.
+# [auction.providers.aps-main]
+# protocol = "openrtb-2.6"
+# profile = "aps"
+# endpoint = "https://aps.example.com/e/pb/bid"
+# routing = "all_eligible"
+#
+# [auction.providers.aps-main.profile_config]
+# account_id = "example-aps-account-id"
+# debug = false
+# allow_script_creatives = false
 # inventory_domain = "publisher.example"
 # inventory_page_origin = "https://www.publisher.example"
-# Script creatives require separate security validation before opt-in.
-allow_script_creatives = false
-# Default: Trusted Server's opaque static renderer route. Set publisher_native only
-# for the controlled publisher-origin friendly-frame experiment.
-rendering_mode = "trusted_server"
+#
+# Browser renderer ownership is configured separately from APS server behavior.
+# [integrations.aps]
+# enabled = true
+# rendering_mode = "trusted_server" # Or "publisher_native" for a controlled cohort.
 
 [integrations.google_tag_manager]
 enabled = false

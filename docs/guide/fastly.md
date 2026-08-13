@@ -108,11 +108,12 @@ Create it:
 fastly kv-store create --name ec_identity_store
 ```
 
-Configure in `trusted-server.toml`:
+Generate a passphrase with `openssl rand -base64 32`, then configure it in
+`trusted-server.toml`. The value below is an intentionally rejected placeholder:
 
 ```toml
 [ec]
-passphrase = "replace-with-32-plus-byte-random-secret"
+passphrase = "replace-with-random-ec-passphrase"
 ec_store = "ec_identity_store"
 ```
 

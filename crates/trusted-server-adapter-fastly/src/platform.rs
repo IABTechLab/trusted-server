@@ -15,11 +15,12 @@ use fastly::{ConfigStore, Request, SecretStore};
 use crate::backend::BackendConfig;
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
-    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformImageOptimizerCrop,
-    PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions, PlatformImageOptimizerParams,
-    PlatformImageOptimizerRegion, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
-    PlatformSecretStore, PlatformSelectResult, StoreId, StoreName,
+    BackendNamingPolicy, ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec,
+    PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
+    PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions,
+    PlatformImageOptimizerParams, PlatformImageOptimizerRegion, PlatformKvStore,
+    PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult, StoreId,
+    StoreName,
 };
 
 // ---------------------------------------------------------------------------
@@ -149,6 +150,11 @@ impl PlatformSecretStore for FastlyPlatformSecretStore {
 /// timeout → unique name).
 pub struct FastlyPlatformBackend;
 
+#[cfg(test)]
+const TRANSPORT_TIMEOUT_QUANTUM_MS: u32 = 250;
+#[cfg(test)]
+const SUB_QUANTUM_LADDER_MS: [u32; 4] = [200, 150, 100, 50];
+
 fn backend_config_from_spec(spec: &PlatformBackendSpec) -> BackendConfig<'_> {
     BackendConfig::new(&spec.scheme, &spec.host)
         .port(spec.port)
@@ -159,85 +165,15 @@ fn backend_config_from_spec(spec: &PlatformBackendSpec) -> BackendConfig<'_> {
         .discriminator(spec.discriminator.as_deref())
 }
 
-/// Transport-timeout quantum for auction backends (see
-/// [`FastlyPlatformBackend::canonicalize_transport_timeout_ms`]).
-const TRANSPORT_TIMEOUT_QUANTUM_MS: u32 = 250;
-
-/// Upper bound of the fine-grained quantum range.
-///
-/// Budget-bound values below this ceiling are floored to a
-/// [`TRANSPORT_TIMEOUT_QUANTUM_MS`] multiple (the issue #847 behavior for the
-/// default 2000 ms auction). At or above it, values snap to the coarse
-/// [`TRANSPORT_TIMEOUT_COARSE_LADDER_MS`] instead so the total number of
-/// distinct budget-derived buckets stays globally bounded regardless of how
-/// large the configured ceiling is.
-const TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS: u32 = 2000;
-
-/// Coarse rungs for budget-bound transport timeouts below one quantum,
-/// ordered high to low.
-///
-/// Below one quantum, passing the exact wall-clock remainder through would mint
-/// a distinct backend name for every millisecond in `1..250`, so the
-/// near-exhausted tail alone could exceed Fastly's per-service dynamic backend
-/// limit. Snapping to this finite ladder instead bounds the number of
-/// budget-derived names an origin can produce. Budgets below the smallest rung
-/// round to zero, which callers treat as "budget exhausted — skip the launch".
-const SUB_QUANTUM_LADDER_MS: [u32; 4] = [200, 150, 100, 50];
-
-/// Coarse rungs for budget-bound transport timeouts at or above the quantum
-/// ceiling, ascending. Every rung is a [`TRANSPORT_TIMEOUT_QUANTUM_MS`]
-/// multiple.
-///
-/// Above [`TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS`], flooring to a 250 ms multiple
-/// would let a large configured ceiling (e.g. 60,000 ms) mint hundreds of
-/// distinct backend names — recreating the per-service dynamic backend
-/// exhaustion this quantization exists to prevent. This fixed, globally finite
-/// ladder caps the number of high-budget buckets instead: values are floored to
-/// the greatest rung no larger than the remaining budget, and anything above
-/// the top rung clamps to it. Rounding down never extends a transport cap past
-/// the remaining budget.
-///
-/// The rung spacing trades transport window for cardinality: just below a rung
-/// the haircut approaches the gap to the rung beneath (worst case ~50%, e.g. a
-/// remaining budget of 9,999 ms snaps to 5,000 ms). This is accepted — on the
-/// mediator path this value is the effective bound, but a denser ladder would
-/// buy back at most half a bucket of transport time at the cost of
-/// proportionally more backend names.
-const TRANSPORT_TIMEOUT_COARSE_LADDER_MS: [u32; 8] =
-    [2000, 3000, 5000, 10000, 20000, 30000, 45000, 60000];
-
-/// Round a budget-bound transport timeout down to a stable, globally bounded
-/// bucket.
-///
-/// - At or above [`TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS`], floors to the
-///   greatest [`TRANSPORT_TIMEOUT_COARSE_LADDER_MS`] rung no larger than
-///   `remaining_ms` (clamping to the top rung above it).
-/// - Within the quantum range, floors to a [`TRANSPORT_TIMEOUT_QUANTUM_MS`]
-///   multiple.
-/// - Below one quantum, snaps down to the greatest [`SUB_QUANTUM_LADDER_MS`]
-///   rung no larger than `remaining_ms` (or zero).
-fn quantize_transport_timeout_ms(remaining_ms: u32) -> u32 {
-    if remaining_ms >= TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS {
-        return TRANSPORT_TIMEOUT_COARSE_LADDER_MS
-            .into_iter()
-            .rev()
-            .find(|&rung| rung <= remaining_ms)
-            .unwrap_or(TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS);
-    }
-    let floored = (remaining_ms / TRANSPORT_TIMEOUT_QUANTUM_MS) * TRANSPORT_TIMEOUT_QUANTUM_MS;
-    if floored > 0 {
-        return floored;
-    }
-    SUB_QUANTUM_LADDER_MS
-        .into_iter()
-        .find(|&rung| rung <= remaining_ms)
-        .unwrap_or(0)
-}
-
 impl PlatformBackend for FastlyPlatformBackend {
+    fn naming_policy(&self) -> BackendNamingPolicy {
+        BackendNamingPolicy::Fastly
+    }
+
     fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-        backend_config_from_spec(spec)
-            .predict_name()
+        self.naming_policy()
+            .predict(spec)
+            .map(|prediction| prediction.name)
             .change_context(PlatformError::Backend)
     }
 
@@ -245,28 +181,6 @@ impl PlatformBackend for FastlyPlatformBackend {
         backend_config_from_spec(spec)
             .ensure()
             .change_context(PlatformError::Backend)
-    }
-
-    /// Quantize the transport timeout so budget-derived values do not mint a
-    /// new dynamic backend name on every request.
-    ///
-    /// Fastly embeds the first-byte and between-bytes timeouts in the dynamic
-    /// backend name (see [`BackendConfig`]) and pools connections per backend
-    /// name. A per-request wall-clock budget would otherwise defeat that
-    /// pooling and accumulate registrations toward the per-service dynamic
-    /// backend limit.
-    ///
-    /// A provider's own configured timeout is a constant, so when it is the
-    /// binding constraint it is returned verbatim — including sub-quantum
-    /// configured values, which must not be rounded away or the provider could
-    /// never launch. Only the budget-bound value is snapped to a stable bucket
-    /// via [`quantize_transport_timeout_ms`]. Rounding down never extends a
-    /// transport cap past the remaining budget.
-    fn canonicalize_transport_timeout_ms(&self, remaining_ms: u32, configured_ms: u32) -> u32 {
-        if remaining_ms >= configured_ms {
-            return configured_ms;
-        }
-        quantize_transport_timeout_ms(remaining_ms)
     }
 }
 
@@ -543,6 +457,14 @@ fn apply_fastly_cache_bypass(request: &mut fastly::Request, bypass_cache: bool) 
 /// - [`select`](PlatformHttpClient::select) downcasts each
 ///   [`PlatformPendingRequest`] back to `fastly::PendingRequest` and calls
 ///   `fastly::http::request::select()`.
+///
+/// Fastly's Compute HTTP API sends one request to the named backend and returns
+/// the origin response; it has no client-side redirect-follow mode. Consequently
+/// each trait call below performs exactly one underlying `.send()` or
+/// `.send_async()`, and an original 3xx remains visible to core. The host test
+/// environment cannot register a real Fastly backend, so the common
+/// `StubHttpClient` driver test records the one-send 3xx behavior while adapter
+/// tests cover request conversion and the single-send boundary.
 pub struct FastlyPlatformHttpClient;
 
 #[async_trait::async_trait(?Send)]
@@ -912,6 +834,40 @@ mod tests {
     }
 
     // --- FastlyPlatformHttpClient -------------------------------------------
+
+    #[test]
+    fn auction_http_capabilities_are_explicit() {
+        let client = FastlyPlatformHttpClient;
+        let capabilities = trusted_server_core::platform::AuctionTargetId::Fastly
+            .descriptor()
+            .capabilities();
+        assert!(client.supports_concurrent_fanout());
+        assert!(capabilities.supports_concurrent_provider_fanout());
+        assert!(!client.has_enforceable_total_request_deadline());
+        assert!(
+            !capabilities.has_enforceable_total_request_deadline(),
+            "first-byte and between-byte timers are not a hard total request deadline"
+        );
+    }
+
+    #[test]
+    fn response_conversion_preserves_original_redirect_at_single_send_boundary() {
+        let mut response = fastly::Response::from_status(fastly::http::StatusCode::FOUND);
+        response.set_header("location", "https://redirect.example/next");
+
+        let platform = fastly_response_to_platform(response, "origin", false, false)
+            .expect("should convert redirect response");
+
+        assert_eq!(platform.response.status().as_u16(), 302);
+        assert_eq!(
+            platform
+                .response
+                .headers()
+                .get("location")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://redirect.example/next")
+        );
+    }
 
     #[test]
     fn apply_fastly_cache_bypass_sets_pass_when_enabled() {

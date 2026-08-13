@@ -100,7 +100,9 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::endpoints::handle_auction;
-use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::auction::{
+    AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
+};
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::EcContext;
@@ -182,8 +184,10 @@ pub(crate) fn build_state_from_settings(
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     warn_if_certificate_check_disabled(&settings);
 
-    let orchestrator = build_orchestrator(&settings)?;
-    let registry = IntegrationRegistry::new(&settings)?;
+    let plan = Arc::new(compile_auction_plan(&settings)?);
+    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Fastly)?;
+    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
+    let registry = IntegrationRegistry::with_plan(&settings, plan)?;
 
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
@@ -1365,7 +1369,6 @@ mod tests {
 
                 [integrations.prebid]
                 enabled = true
-                server_url = "https://test-prebid.com/openrtb2/auction"
                 external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
 
                 [integrations.datadome]
@@ -1373,7 +1376,10 @@ mod tests {
 
                 [auction]
                 enabled = true
-                providers = ["prebid"]
+                [auction.providers.prebid]
+                protocol = "openrtb-2.6"
+                profile = "prebid-server"
+                endpoint = "https://test-prebid.com/openrtb2/auction"
                 timeout_ms = 2000
             "#,
         )
@@ -1431,12 +1437,14 @@ mod tests {
 
             [integrations.prebid]
             enabled = true
-            server_url = "https://test-prebid.com/openrtb2/auction"
             external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
 
             [auction]
             enabled = true
-            providers = ["prebid"]
+            [auction.providers.prebid]
+            protocol = "openrtb-2.6"
+            profile = "prebid-server"
+            endpoint = "https://test-prebid.com/openrtb2/auction"
             timeout_ms = 2000
             "#,
         )
@@ -1485,8 +1493,13 @@ mod tests {
         filters: Vec<Arc<dyn IntegrationRequestFilter>>,
     ) -> RouterService {
         let settings = test_settings();
-        let orchestrator = trusted_server_core::auction::build_orchestrator(&settings)
-            .expect("should build orchestrator");
+        let plan = Arc::new(
+            trusted_server_core::auction::compile_auction_plan(&settings)
+                .expect("should compile auction plan"),
+        );
+        let orchestrator =
+            trusted_server_core::auction::build_orchestrator_with_plan(plan, &settings)
+                .expect("should build orchestrator");
         let registry = IntegrationRegistry::from_request_filters(filters);
         let default_kv_store =
             Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
@@ -1570,6 +1583,34 @@ mod tests {
                 response_headers: Vec::new(),
             }))
         }
+    }
+
+    #[test]
+    fn startup_registers_aps_renderer_route() {
+        let mut settings = test_settings();
+        settings.auction.providers.clear();
+        settings.auction.providers.insert(
+            "aps-main".parse().expect("should parse APS provider ID"),
+            trusted_server_core::auction::ProviderConfig {
+                protocol: "openrtb-2.6".to_string(),
+                profile: "aps".to_string(),
+                endpoint: "https://aps.example/e/pb/bid".to_string(),
+                timeout_ms: None,
+                routing: trusted_server_core::auction::RoutingMode::AllEligible,
+                notifications: trusted_server_core::auction::NotificationConfig::default(),
+                profile_config: serde_json::json!({"account_id":"example-account"}),
+            },
+        );
+
+        let state = build_state_from_settings(settings)
+            .expect("Fastly startup should register APS renderer");
+        assert!(
+            state.registry.has_route(
+                &edgezero_core::http::Method::GET,
+                "/integrations/aps/renderer"
+            ),
+            "Fastly startup registry should expose the APS renderer"
+        );
     }
 
     #[test]
@@ -2532,6 +2573,10 @@ mod tests {
     struct FixedBackend;
 
     impl PlatformBackend for FixedBackend {
+        fn naming_policy(&self) -> trusted_server_core::platform::BackendNamingPolicy {
+            trusted_server_core::platform::BackendNamingPolicy::Fastly
+        }
+
         fn predict_name(
             &self,
             spec: &PlatformBackendSpec,
