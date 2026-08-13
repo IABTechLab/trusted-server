@@ -1462,6 +1462,25 @@ global `postMessage` acknowledgement.
 
 ## 4. Render lifecycle protocol
 
+The **ActiveRenderOwner** is one logical owner with non-overlapping agent and
+persistent epochs. On an eligible initial page, the agent epoch instantiates the
+§4 dispatcher, reservation/ticket/nonce registries, terminal latches, provisional
+GPT adapter/listeners, and APS/ADM channels for only the immutable projected batch.
+Every “kernel” or “runtime” action in this section is performed by that active epoch.
+At §5.2.1 takeover, all attempts and ports are terminal, tombstones/counters/facts
+cross in the exact handoff, live physical/committed objects cross only in the
+one-use capsule, and fresh persistent dispatcher/GPT listeners become the sole
+active epoch. On a no-agent page, persistent core is the first and only epoch.
+
+The agent records the correctness-required GPT `slotRequested` and
+`slotRenderEnded` facts before issuing the initial request. When diagnostics are
+enabled it also records all six bounded §5.8 observations, trace tokens/cycles, and
+overflow counters into the handoff; persistent diagnostics adopts and replays those
+facts before live delivery. No diagnostic listener is counted twice and loss of a
+diagnostic fact cannot change lifecycle authority. Any §4 wording that assigns the
+initial dispatcher/channel exclusively to “core” means the current
+`ActiveRenderOwner`, not necessarily the post-paint persistent artifact.
+
 ### 4.1 State machine
 
 ```text
@@ -1987,7 +2006,7 @@ immutable batch; it does not authorize later work from the same product:
 | Slice id                     | Include iff                                            | Bounded obligation before transfer                                                                |
 | ---------------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
 | `first_display`              | an eligible initial batch exists                       | manifest/projection validation, provisional lifetime, timing, queue ingress, transfer coordinator |
-| `aps_initial`                | the initial batch can contain APS                      | reservation, PUC/direct owner protocol, APS document channel                                      |
+| `aps_initial`                | the initial GPT batch can contain APS                  | reservation, PUC owner protocol, APS document channel                                             |
 | `creative_initial`           | an enabled creative guard has a parser-time obligation | current guard defaults and initial creative observation only                                      |
 | `datadome_initial`           | DataDome is enabled                                    | initial script/preload route guard                                                                |
 | `didomi_initial`             | Didomi is enabled                                      | initial configured SDK-path installation                                                          |
@@ -2020,9 +2039,35 @@ element identity, `document.currentScript`, CSP nonce, and Trusted Types rules
 defined below. Independent ordinary deferred modules remain later than persistent
 runtime commit.
 
-The runtime bundle first performs an effect-inert **takeover preparation** against
-an immutable `FirstDisplayHandoffV1`. The record is an exact-shaped, recursively
-frozen data tree containing:
+If the initial batch has no accepted artifact—every slot is `no_bid`, failed, or
+cancelled—the same terminal/paint gate applies and takeover may proceed with an empty
+committed-artifact set. The candidate performance fixture continues to require an
+actual request action; an empty batch cannot manufacture `tsjs:first-display` or be
+included in the timing distribution.
+
+The runtime bundle first performs an effect-inert **static takeover preparation**
+against only immutable boot configuration and a frozen `TakeoverOutlineV1`: exact
+release/generation, projection digest, selected slice ids, counts, and the
+capabilities/object kinds that final adoption must support. The outline contains no
+slot outcome, mutable publisher/GPT state, artifact object, wrapper, observer, or
+time-sensitive expiry. Preparation constructs generic inert persistent owners and
+validates capacity; it cannot snapshot or depend on live agent state.
+
+The agent increments one unsigned 32-bit `mutationRevision` after every admitted
+publisher GPT/Prebid call, GPT event, DOM mutation/rebind, targeting or ownership
+change, parser-guard observation, consent/segment update, and terminal/tombstone
+change while runtime bytes download and prepare. It continues handling publisher and
+external activity normally; no call is held, replayed, or allowed to act through a
+prepared persistent owner. Revision exhaustion fails takeover instead of wrapping.
+When static preparation is ready, the agent enters the synchronous task below,
+closes its own work ingress, records the final revision, drains all already-running
+synchronous mutations, and only then mints the final immutable
+`FirstDisplayHandoffV1` plus one-use capsule. Because JavaScript is run-to-completion,
+no GPT/Prebid/DOM/publisher task can mutate between that final snapshot and owner
+activation. The persistent owner validates the snapshot and revision during the same
+task; any mutation callback that arrives afterward sees only the new epoch.
+
+`FirstDisplayHandoffV1` is an exact-shaped, recursively frozen data tree containing:
 
 - release/generation identity and the canonical initial projection digest;
 - each slot's canonical id, aliases, DOM id, GAM path, normalized formats,
@@ -2031,7 +2076,14 @@ frozen data tree containing:
   bounded expiry, without descriptor, ADM, capability, or creative payload bytes;
 - committed-artifact kind and ownership metadata; parser-time integration snapshot
   data needed for its persistent owner; and
-- the exact once-only first-display timing/paint facts.
+- the exact once-only first-display timing/paint facts;
+- the navigation attempt-prefix and next attempt ordinal, slot-registration-order
+  next ordinal, reservation/ticket monotonic-clock epoch and remaining expiries;
+- the next global GPT trace-slot ordinal; for each adopted object, its token, next
+  cycle ordinal, `unknownPriorCycle`, and all retained open/completed/retired cycle
+  records and quarantines permitted by the existing ten-record cap; and
+- the next trace sequence, per-slot impression counters, retained trace bindings,
+  and the final `mutationRevision`.
 
 It contains no function, accessor, custom prototype, Promise, listener, timer,
 observer, `MessagePort`, `WindowProxy`, network handle, or mutable collection. A
@@ -2044,30 +2096,41 @@ once by the authenticated prepared runtime, and is cleared by agent rollback,
 fallback, or successful adoption. It is never stored on `window.tsjs`, `_internal`,
 boot data, diagnostics, a log, or an analytics event.
 
-The handoff contains at most the existing 256 initial slots/outcomes. Each
+The handoff contains at most the existing 256 initial slots/outcomes. Every `next`
+counter is strictly above every value ever minted in that generation, including a
+retired/pruned value absent from retained rows; adoption never derives a high-water
+mark from visible rows. Each
 reservation/ticket entry is already terminal and retains only the opaque value and
 expiry required to suppress replay; no live authority, descriptor, ADM, or creative
 payload survives. Each copied string/targeting collection retains its source grammar
-and capacity, the canonical data-tree encoding is at most 1 MiB, and the capsule has
+and capacity, the canonical data-tree encoding is at most the existing 8 MiB boot
+projection cap, and the capsule has
 at most one physical GPT identity and one committed artifact identity per slot.
 Overflow or any nonterminal attempt/port makes takeover preparation fail; it cannot
 truncate, evict a live fact, or silently lose replay suppression.
 
-Takeover is one non-yielding JavaScript task after preparation succeeds:
+Takeover is one non-yielding JavaScript task after static preparation succeeds:
 
-1. Revalidate the current generation, exact runtime script, handoff digest, terminal
-   batch, paint gate, one-use capsule, and prepared runtime.
-2. Close agent work ingress, synchronously quiesce its event handlers, and restore
-   every compare-restorable wrapper. The bootstrap callback Array remains the one
-   append-only ingress until step 5; no publisher callback is invoked in this interval.
+1. Revalidate the current generation, exact runtime script, outline, terminal batch,
+   paint gate, and prepared runtime; close agent work ingress and record the final
+   mutation revision.
+2. Mint and validate the final handoff/capsule from current state. Synchronously
+   quiesce agent handlers and compare-restore every provisional wrapper. The
+   bootstrap callback Array remains the one append-only ingress until step 5; no
+   publisher callback is invoked in this interval.
 3. Detach committed artifacts from agent disposal, then dispose every remaining
    agent listener, timer, observer, port, readiness waiter, registry entry, and
    uncommitted node in reverse order.
-4. Activate persistent owners in catalog order, adopting the capsule objects and
-   handoff facts. `adoptInitialDisplay:true` forbids parsing the projection as new
+4. Activate fresh persistent wrappers/listeners/observers and owners in catalog
+   order, adopting capsule objects and handoff facts. A parser guard transfers only
+   bounded data such as installed configuration and seen-node identifiers, never its
+   wrapper/listener/observer. The new owner performs one bounded post-commit rescan
+   so records discarded while the old observer disconnects cannot be lost.
+   `adoptInitialDisplay:true` forbids parsing the projection as new
    work, redefining an adopted GPT slot, reinstalling accepted targeting, issuing
    `display`/`refresh`, creating a render iframe, or emitting any first-display mark.
-5. Commit the complete `TsjsApi`, permanently close both private registration sinks,
+5. Revalidate that the generation/revision did not change, commit the complete
+   `TsjsApi`, permanently close both private registration sinks,
    transfer committed artifacts to persistent slot/navigation ownership, run
    persistent `afterCommit` work, and drain the single bootstrap queue exactly once.
 
@@ -2088,6 +2151,16 @@ not resurrect the agent, and commits that same terminal shell. It never replays 
 projection, requests GAM again, removes an accepted publisher-owned ad, or constructs
 a degraded runtime. Failed takeover therefore sacrifices later TSJS behavior, not
 the correctness or exactly-once status of the completed first display.
+
+Every installed effect is a repository-owned primitive with a synchronous,
+nonthrowing, identity-checked disposer. Rollback attempts physical removal/restoration
+for every effect even after an earlier disposer reports failure. The mandatory
+security/correctness postcondition is generation-latched inertness: a publisher who
+replaced a global after agent installation may prevent literal restoration, but the
+old wrapper/listener/observer cannot authorize, request, render, or mutate TS state.
+Tests require literal removal where the platform operation succeeds and zero
+surviving authority in every case; “no second listener/wrapper survives” means no
+live TSJS authority, not control over publisher replacements.
 
 All “critical” persistent-module language below means the atomic **takeover**
 transaction on an agent page and the ordinary bootstrap transaction on a page where
@@ -2129,16 +2202,19 @@ This is a release-internal bundle handshake, not a publisher extension API. An
 that integration's transactional TSJS implementation unit. The design introduces
 no separately installed or third-party plugin system.
 
-The build first emits the bootstrap controller, core, and every production
-integration module with the same fixed release sentinel,
+The build first emits the bootstrap controller, first-display base, every
+first-display slice, core, and every production integration module with the same
+fixed release sentinel,
 then computes one `releaseId`: 64 lowercase hexadecimal SHA-256 characters over a
 canonical ordered release inventory containing every artifact id, role, phase, and
 its sentinel-normalized
 bytes. It replaces exactly one sentinel in each bundle and verifies none remains.
 This avoids a self-referential hash while changing the id for any logical bundle or
-ordering/role/phase change. The same value is embedded in the bootstrap controller,
-core, and every integration bundle. The bootstrap controller and core use reserved
-artifact ids and never appear as integration entries.
+ordering/role/phase change. First-display base/slice role, order, mask bit, or byte
+changes therefore change the release identity. The same value is embedded in the
+bootstrap controller, every agent base/slice, core, and every integration bundle.
+The bootstrap controller, agent base/slices, and core use reserved artifact ids and
+never appear as persistent integration entries.
 Before core is injected, the server emits this exact manifest. This is the first and
 only `BootManifestV1` shape; the unreleased all-required draft has no compatibility
 status:
@@ -3576,10 +3652,11 @@ and `getConfig` are deleted, not aliased; changing guard policy requires a new b
 document generation.
 
 The initial slice installs the selected compare-restorable guard before publisher
-creative activity and transfers its exact wrapper/observer state through the
-handoff capsule. The creative takeover module prepares inertly and activates
-transactionally exactly once in the kernel barrier. Activation adopts rather than
-stacks that guard, and installs it directly only on a no-agent page. It enables the click guard when
+creative activity. It transfers only bounded configuration/seen-node facts; §5.2.1
+compare-restores the provisional wrapper/observer, installs one fresh persistent
+guard, and performs the bounded post-commit rescan. The creative takeover module
+prepares inertly and activates transactionally exactly once in the kernel barrier.
+Activation installs directly on a no-agent page and never stacks an agent guard. It enables the click guard when
 `clickGuard` is true and the image/iframe dynamic-source guards when `renderGuard` is
 true, but performs no baseline DOM rewrite. Only when
 `clickGuard || renderGuard` is true, activation gives a still-loading document one
@@ -3599,14 +3676,12 @@ sanitization remains explicit opt-in/default-off; rewriting retains its existing
 setting/default and still runs on every delivery path where that setting applies.
 When rewriting injects browser guards into an independent creative document, the
 server emits a complete document-local boot controller followed by exactly one
-content-addressed first-display artifact containing `first_display` plus
-`creative_initial`—and no publisher-page slice or deferred module. It loads the
-matching post-paint persistent artifact containing core, `render_runtime`, and
-`creative` through the same authenticated takeover. The first tag is the sole
-`script#trustedserver-js`; both artifacts use the same release identity as the page
-runtime. The opaque document never receives an APS/GPT/Prebid slice or ordinary
-deferred module. If creative is disabled or both guards are false, rewriting injects
-no TSJS boot or artifact. A body-less fragment receives the same pair once at its
+content-addressed direct persistent artifact containing core, `render_runtime`, and
+`creative`—and no publisher-page integration, agent slice, or deferred module. The
+tag is the sole `script#trustedserver-js` and uses the same release identity as the
+page runtime. Since no projected batch exists in that document, there is no agent,
+attempt, or synthetic paint trigger. If creative is disabled or both guards are
+false, rewriting injects no TSJS boot or artifact. A body-less fragment receives the same pair once at its
 start; a document body receives it once at the start of the body. Boot construction
 failure rejects rewriting rather than emitting a script-only or unauthenticated
 creative.
@@ -3735,6 +3810,13 @@ per-artifact hashes, and these semantic sets:
 - **reference first display** is the one served agent artifact for the semantic
   reference `[first_display, creative_initial, gpt_initial, prebid_initial,
 datadome_initial]`; it does not include core or any persistent takeover module;
+- **APS first display** is the served artifact for
+  `[first_display, creative_initial, aps_initial, gpt_initial]` and drives a real
+  fictional APS/PUC contract fixture through the first request action;
+- **largest permitted first display** is the largest raw, gzip, and Brotli body
+  among every mask that trusted configuration can serve (the maximizing mask may
+  differ per encoding); the capture enumerates all permitted masks, hashes, sizes,
+  and slice membership rather than checking only the two named examples;
 - **persistent runtime** is `[core]` plus all catalogued takeover modules for the
   reference configuration, served after protected paint; and
 - **maximal total** is every first-display base/slice, production core, takeover,
@@ -3759,11 +3841,12 @@ where transfer growth and shared-source duplication remain.
 The final capture is allowed only after the first-display graph contains no public
 runtime API, persistent broker/registry, diagnostics, refresh, SPA/navigation,
 programmatic/direct-auction work, test seam, duplicate adapter owner, or live object
-that cannot be disposed/transferred by §5.2.1. The reference first-display artifact
-must be at most **90,000 raw bytes**. This is an architecture ceiling selected from
+that cannot be disposed/transferred by §5.2.1. **Every permitted first-display
+mask**, including the reference and APS masks, must be at most **90,000 raw bytes**.
+The largest gzip and Brotli permitted-mask values must each be below the corresponding
+`reviewRemediationTransfer` reference value. This is an architecture ceiling selected from
 the 200,000-byte/s comparison profile, not a substitute for the measured gate; a
-candidate below 90 kB still blocks if p90 exceeds 1.10×. Minimal/reference gzip and
-Brotli must each be below their `reviewRemediationTransfer` counterpart. The
+candidate below 90 kB still blocks if p90 exceeds 1.10×. The
 persistent-runtime set may exceed first-display budgets because it is post-paint,
 but maximal-total raw/gzip/Brotli cannot exceed the reviewed mechanical-remediation
 capture. Any total growth requires a separate reviewed design rather than moving
@@ -3772,8 +3855,9 @@ bytes across phases.
 The build emits one canonical release inventory with each production bundle's id,
 role, phase, trigger, inputs, outputs, bytes, and hash. Budget membership is derived
 from that catalog rather than an obsolete exact filename list. The final reduced
-capture stores the exact raw, gzip, and Brotli values for bootstrap, minimal first
-display, reference first display, persistent runtime, and maximal. After review
+capture stores the exact raw, gzip, and Brotli values for bootstrap, every permitted
+first-display mask (with named minimal/reference/APS/largest summaries), persistent
+runtime, and maximal. After review
 accepts the first-display checkpoint, each value's
 ongoing blocking ceiling is `ceil(capturedBytes * 1.05)`; the comparator computes
 this formula from the frozen capture rather than accepting separately hand-entered
@@ -3791,7 +3875,7 @@ validation, generation/disposal, timing, and local logging primitives.
    historical deltas, never as pass/fail comparisons across different membership;
 2. the reviewed intermediate role-correct values and their digest are validated and
    printed, but cannot authorize the release candidate; and
-3. the final first-display bootstrap/minimal/reference/persistent/maximal values
+3. the final first-display bootstrap/all-permitted-masks/persistent/maximal values
    enforce the computed 5% transfer ceilings and the one-time architecture
    assertions above.
 
@@ -3813,8 +3897,10 @@ the server's first-display head sequence, so the measure includes required upstr
 and agent-artifact loading. The provisional owner records
 `tsjs:first-display`
 exactly once immediately before the first TS-owned request action in the protected
-first-display batch: the responsible GPT `display`/`refresh`, or direct-render iframe
-insertion. A page with no render attempt during the measurement is excluded
+first-display batch: the responsible GPT `display`/`refresh`. Direct `/auction`
+uses the no-agent persistent runtime and records the same mark immediately before
+its iframe insertion, but is a separate correctness/timing case rather than an agent
+mask. A page with no render attempt during the measurement is excluded
 explicitly rather than manufacturing a mark. The terminal latch for the attempt that produced that action records
 `tsjs:first-display-terminal`; after the complete immutable initial projection batch
 settles and the §5.2 paint gate passes, the agent records `tsjs:first-display-paint`.
@@ -3832,6 +3918,15 @@ the server controller or projection path, the browser fixture, the evidence
 validator, or the workflow itself. Its existing `workflow_dispatch` and
 `workflow_call` entrypoints remain available for named pre-switch and post-switch
 evidence.
+
+The job declares a paired GPT-reference case and a candidate-only APS first-display
+case. Both variants of the GPT pair use the same projection, enabled behavior,
+upstream fictional stubs, page markup, creative policy, warm/cold cache state, and
+browser profile. The APS case drives the fictional APS/PUC contract through its
+actual first action, terminal result, and paint, and must satisfy the size, mark,
+ordering, deadline, and heap contracts; current `main` has no semantically equivalent
+first-class APS action, so APS cannot be assigned a fabricated relative ratio. A GPT
+pass never masks an APS failure.
 
 Each run fetches `origin/main`, resolves its exact current 40-character commit SHA,
 creates a detached worktree at that SHA, and builds `main` and the candidate
@@ -3862,6 +3957,13 @@ on a candidate-only mark. Candidate runs additionally prove the real
 that no persistent or deferred TSJS request, preload, preparation, or execution
 precedes paint.
 
+The no-agent direct `/auction` correctness fixture records
+`tsjs:first-display-terminal` from its terminal latch and
+`tsjs:first-display-paint` through the same two-frame/hidden allowance. Ordinary
+deferred loading waits for that paint or the no-attempt guard exactly as specified
+for direct-to-runtime pages. It is not counted as an agent-mask sample or used to
+claim the agent's ≤90 kB transfer ceiling.
+
 The job alternates `main` then candidate / candidate then `main` in one Chromium
 process for every warmup and measured pair. Candidate p90 must be at most current
 `main` p90 × 1.10. GitHub-hosted absolute timing is not stable enough for a fixed
@@ -3875,6 +3977,13 @@ only in the Playwright sense: the run finishes all timing and heap collection an
 writes the complete schema-5 evidence before failing. Validation and upload run
 with `always()` so a failed gate retains its exact diagnostic artifact; neither the
 test nor the validator converts an exceeded budget into success.
+
+The historical blocking ratio remains request-action latency, so the gate and job
+call it **bids-script-to-first-action**, not paint latency. The same evidence records
+candidate terminal and paint distributions for GPT and APS. Every sample must remain
+inside the unchanged path-specific render deadline and §5.2 paint allowance; this
+prevents an agent from improving transfer latency by postponing completion or
+takeover without fabricating a non-equivalent current-`main` terminal/paint ratio.
 
 Retained heap uses Chromium CDP forced-GC checkpoints after boot, first render,
 refresh, and SPA navigation. After the display samples, the job opens one separate
@@ -4063,6 +4172,27 @@ Tests must cover at least:
   `requestAds`, callback throws, already-aborted signals, publisher/unsolicited
   integration registration refusal, and proof that no second runtime, listener,
   port, timer, request, script, wrapper, guard, or iframe survives fallback;
+- takeover download/preparation with interleaved publisher `defineSlot`, `display`,
+  explicit/global `refresh`, destroy, targeting mutation, GPT events, DOM
+  replacement, guard observations, Prebid queue activity, consent/segment changes,
+  and terminal/tombstone expiry proves that static preparation reads no live state;
+  the final same-task snapshot sees the last mutation revision, revision exhaustion
+  fails closed, and a callback queued after closure reaches only the persistent epoch;
+- final handoff boundaries for attempt/slot/GPT-token/cycle/trace ordinals at
+  maximum-minus-one/maximum/exhaustion; pruned prior cycles with
+  `unknownPriorCycle`, open/retired/quarantined GPT cycles, late old-cycle facts,
+  monotonic expiry translation, 255/256/257 adopted slots, data-tree cap, and one-use
+  capsule replay prove that no id/sequence is reused and no event is reattributed;
+- provisional creative/DataDome/GTM/Lockr/Testlight/consent guards mutate during
+  runtime preparation, then compare-restore and install fresh persistent effects in
+  one task; observer-record loss is covered by the bounded rescan, publisher-
+  replaced globals leave old effects generation-inert, and no function/listener/
+  wrapper/observer enters the handoff or capsule;
+- direct persistent boot for rewritten creative documents and direct `/auction`
+  proves neither path selects an agent or waits for a nonexistent projected-attempt
+  paint; direct timing/deferred release uses the persistent owner, while every
+  permitted agent mask—including GPT reference and APS—passes the exact size,
+  source-reachability, action, terminal, and paint assertions;
 - first-display-required live GPT/Prebid fetch starting after `tsjs:bids-script` and
   overlapping the first-display TSJS fetch, upstream success before/after adapter
   activation, and proof that no TS-owned display/request occurs before the sole
@@ -4447,16 +4577,18 @@ The design is complete when all of the following are true:
     exactly once in the release inventory, with the bootstrap role included once and
     every TSJS module included in maximal total.
 25. The oversized role-correct and mechanical-remediation captures remain immutable
-    intermediate evidence. Final reference first display is at most 90,000 raw
-    bytes, minimal/reference compression decreases, and maximal total does not grow.
+    intermediate evidence. Every permitted first-display mask, including the named
+    GPT-reference and APS masks, is at most 90,000 raw bytes; largest-mask gzip/
+    Brotli decreases, and maximal total does not grow.
     The separately frozen `firstDisplayTransfer` capture supplies subsequent 5%
     ceilings. Boot-to-first-display passes the automatic fixed-network-profile
     candidate-versus-current-`main` gate, including the candidate's real-mark and
     deferred-order assertions; retained-heap results remain within their ratio and
     hard ceilings. No gate permits disabled shaping, selective sample reruns,
     candidate self-baselining, or membership loopholes.
-    Handoff tests prove a data-only record, one-use capsule, exact physical-slot and
-    committed-artifact adoption, zero repeated `display`/`refresh`/iframe insertion,
+    Handoff tests prove a final same-task data snapshot after static preparation,
+    monotonic high-water/cycle/trace transfer, one-use capsule, exact physical-slot
+    and committed-artifact adoption, zero repeated `display`/`refresh`/iframe insertion,
     and no agent listener, timer, observer, port, wrapper, request authority, or
     strong reference after the synchronous takeover boundary.
 26. A deferred module can register only from the exact current core-created local
