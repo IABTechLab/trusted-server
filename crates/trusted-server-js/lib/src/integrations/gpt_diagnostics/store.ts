@@ -249,6 +249,7 @@ function copyCycle(cycle: MutableRequestCycle, nowMs: number): GptDiagnosticsReq
     ...cycle,
     durations: derivedDurations(cycle),
     size: cycle.size ? ([...cycle.size] as Size) : undefined,
+    observedSlotSize: cycle.observedSlotSize ? ([...cycle.observedSlotSize] as Size) : undefined,
     adManager: cycle.adManager
       ? {
           ...cycle.adManager,
@@ -664,6 +665,45 @@ export class GptDiagnosticsStore {
         }
       }
     );
+  }
+
+  /**
+   * Retain an outer CSS box only when this exact slot and request cycle still
+   * identify a filled render. Async DOM measurements use this guard so a prior
+   * render cannot alter a later refresh cycle.
+   */
+  recordObservedSlotSize(runtimeSlotNumber: number, requestNumber: number, size: Size): void {
+    if (
+      !Number.isSafeInteger(requestNumber) ||
+      requestNumber <= 0 ||
+      !Number.isFinite(size[0]) ||
+      !Number.isFinite(size[1]) ||
+      size[0] < 0 ||
+      size[1] < 0
+    ) {
+      return;
+    }
+
+    const record = this.slots.get(runtimeSlotNumber);
+    const cycle = record?.requests.find((candidate) => candidate.requestNumber === requestNumber);
+    if (
+      !cycle ||
+      record.requests[record.requests.length - 1] !== cycle ||
+      cycle.isEmpty !== false ||
+      cycle.renderAtMs === undefined
+    ) {
+      return;
+    }
+
+    const observedSlotSize: Size = [size[0], size[1]];
+    if (
+      cycle.observedSlotSize?.[0] === observedSlotSize[0] &&
+      cycle.observedSlotSize[1] === observedSlotSize[1]
+    ) {
+      return;
+    }
+    cycle.observedSlotSize = observedSlotSize;
+    this.notify();
   }
 
   recordSlotOnload(slot: GptDiagnosticsSlotLike): void {

@@ -519,6 +519,38 @@ describe('GptDiagnosticsStore', () => {
     expect(cycle.responseClass).toBe('reservation');
   });
 
+  it('retains an observed outer slot box separately from GPT reported size', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10 });
+    const slot = fakeSlot('ad-slot-outer-box');
+
+    store.recordSlotRequested(slot);
+    store.recordSlotResponseReceived(slot);
+    store.recordSlotRenderEnded(slot, { isEmpty: false, size: [1, 1] });
+    store.recordObservedSlotSize(1, 1, [728, 90]);
+
+    const cycle = store.snapshot().slots[0].requests[0];
+    expect(cycle.size).toEqual([1, 1]);
+    expect(cycle.observedSlotSize).toEqual([728, 90]);
+  });
+
+  it('rejects a stale prior-cycle outer-box measurement after a refresh', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10 });
+    const slot = fakeSlot('ad-slot-stale-outer-box');
+
+    store.recordSlotRequested(slot);
+    store.recordSlotResponseReceived(slot);
+    store.recordSlotRenderEnded(slot, { isEmpty: false });
+    store.recordSlotRequested(slot);
+    store.recordSlotResponseReceived(slot);
+    store.recordSlotRenderEnded(slot, { isEmpty: false });
+    store.recordObservedSlotSize(1, 1, [300, 250]);
+    store.recordObservedSlotSize(1, 2, [970, 250]);
+
+    const requests = store.snapshot().slots[0].requests;
+    expect(requests[0].observedSlotSize).toBeUndefined();
+    expect(requests[1].observedSlotSize).toEqual([970, 250]);
+  });
+
   it('separates a fill without Ad Manager identifiers from a reservation', () => {
     const store = new GptDiagnosticsStore({ now: () => 10 });
     const slot = fakeSlot('ad-slot-default');

@@ -348,6 +348,7 @@ describe('GptDiagnosticsApiController', () => {
       'incompleteSequence',
       'isBackfill',
       'isEmpty',
+      'observedSlotSize',
       'renderAtMs',
       'requestNumber',
       'requestPath',

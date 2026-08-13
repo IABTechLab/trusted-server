@@ -260,7 +260,7 @@ describe('GptDiagnosticsBadgeManager', () => {
           renderToViewableMs: 1000,
         },
       })
-    ).toBe('Filled · 728×90\nResponse 276 ms · Render 42 ms\nViewable after 1 s');
+    ).toBe('Filled · GPT 728×90\nResponse 276 ms · Render 42 ms\nViewable after 1 s');
     expect(
       gptDiagnosticsBadgeTextForTest({
         requestNumber: 1,

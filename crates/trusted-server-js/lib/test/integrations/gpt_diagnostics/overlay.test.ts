@@ -457,7 +457,7 @@ describe('GptDiagnosticsOverlay', () => {
     expect(root!.textContent).toContain('/example/site/filled-slot');
     expect(root!.textContent).toContain('Empty');
     expect(root!.textContent).toContain('Previous requests (1)');
-    expect(root!.textContent).toContain('Rendered size 300×250');
+    expect(root!.textContent).toContain('GPT reported size 300×250');
     expect(root!.textContent).toContain('Backfill yes');
     expect(root!.textContent).toContain('GPT slot onload observed');
     expect(root!.textContent).toContain('GPT impressionViewable observed');

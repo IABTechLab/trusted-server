@@ -277,7 +277,10 @@ function cycleFacts(cycle: GptDiagnosticsRequestCycle): string[] {
   if (cycle.loadAtMs !== undefined) facts.push('GPT slot onload observed');
   if (cycle.viewableAtMs !== undefined) facts.push('GPT impressionViewable observed');
   if (cycle.incompleteSequence) facts.push('Incomplete sequence');
-  if (cycle.size) facts.push(`Rendered size ${cycle.size[0]}×${cycle.size[1]}`);
+  if (cycle.size) facts.push(`GPT reported size ${cycle.size[0]}×${cycle.size[1]}`);
+  if (cycle.observedSlotSize) {
+    facts.push(`Observed slot box ${cycle.observedSlotSize[0]}×${cycle.observedSlotSize[1]}`);
+  }
   if (cycle.isBackfill !== undefined) facts.push(`Backfill ${cycle.isBackfill ? 'yes' : 'no'}`);
   if (cycle.slotContentChanged !== undefined) {
     facts.push(`Slot content changed ${cycle.slotContentChanged ? 'yes' : 'no'}`);

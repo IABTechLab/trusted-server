@@ -64,6 +64,7 @@ function cloneExportSnapshot(snapshot: GptDiagnosticsExportV1): GptDiagnosticsEx
         ...cycle,
         durations: { ...cycle.durations },
         size: cycle.size ? [...cycle.size] : undefined,
+        observedSlotSize: cycle.observedSlotSize ? [...cycle.observedSlotSize] : undefined,
         adManager: cycle.adManager
           ? {
               ...cycle.adManager,
@@ -192,6 +193,7 @@ export class GptDiagnosticsApiController {
           ...cycle,
           durations: { ...cycle.durations },
           size: cycle.size ? [...cycle.size] : undefined,
+          observedSlotSize: cycle.observedSlotSize ? [...cycle.observedSlotSize] : undefined,
           adManager: cycle.adManager
             ? {
                 ...cycle.adManager,

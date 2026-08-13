@@ -207,7 +207,13 @@ export interface GptDiagnosticsRequestCycle {
   viewableAtMs?: number;
   durations: GptDiagnosticsDurations;
   isEmpty?: boolean;
+  /** Exact size fact GPT reported in its `slotRenderEnded` callback. */
   size?: Size;
+  /**
+   * Outer CSS box observed on the uniquely bound, connected slot element after
+   * a filled GPT render. This is not an assertion about internal creative pixels.
+   */
+  observedSlotSize?: Size;
   isBackfill?: boolean;
   slotContentChanged?: boolean;
   incompleteSequence: boolean;
