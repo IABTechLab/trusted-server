@@ -1,7 +1,8 @@
 # APS Render Fix and TSJS Resilience Architecture — Design
 
-- **Status:** revision 35 — hard-cutover contract with phase-aware TSJS loading,
-  complete `rc/july` TSJS adoption, and merge-blocking critical-runtime remediation
+- **Status:** revision 36 — hard-cutover contract with a lean first-display owner,
+  atomic persistent-runtime takeover, complete `rc/july` TSJS adoption, and
+  merge-blocking load-time remediation
 - **Date:** 2026-08-04
 - **Baseline:** `origin/rc/july` @ `905984e62` ("Prevent APS renderer document
   clipping"), including `248fe9558` (PUC/MessageChannel and collapsed-shell
@@ -25,9 +26,11 @@
 2. Render ownership, identity, and completion are explicit. Races, stale SPA
    work, ambiguous GPT events, duplicate creative requests, and timeouts settle
    deterministically instead of failing silently.
-3. TSJS has one runtime kernel, bounded state, explicit lifetimes, and enforced
-   dependency boundaries. Integration bundles cannot accidentally create
-   independent copies of shared state.
+3. TSJS has one persistent runtime kernel, preceded only by the bounded
+   first-display agent in §5.2. The agent is not a second runtime: it publishes no
+   runtime API or capability broker, accepts only the immutable initial work selected
+   by the server, and retires through the one atomic ownership transfer. Integration
+   bundles cannot create independent copies of shared state.
 4. The Rust auction result, publisher projection, TypeScript parser, Prebid
    registration, GPT targeting, Universal Creative bridge, and direct renderer
    agree on one APS descriptor and identity contract.
@@ -40,14 +43,14 @@
    rebuilt behind the new architecture, or explicitly superseded by a named and
    tested replacement contract. No TSJS behavior may disappear silently merely
    because its old global, wrapper, bootstrap, or carrier is deleted.
-8. An initial display whose render attempt begins within the runtime's explicit
-   ten-second startup-protection window pays only for one server-composed critical
-   artifact. Optional integration behavior, diagnostics presentation, and later-
-   navigation work do not delay or compete with that protected critical path, while
-   the immutable transfer, browser-time, and retained-heap budgets remain release
-   gates. A page that creates no attempt during that window deliberately releases
-   later work; a first display initiated after release is not claimed to be
-   contention-free.
+8. A server-projected initial display pays only for one server-composed lean
+   first-display artifact. The persistent runtime is neither requested nor prepared
+   until that immutable batch is terminal and has received its paint opportunity.
+   Optional integration behavior, diagnostics presentation, programmatic/direct
+   auctions, and later navigation therefore do not delay or compete with the
+   protected path. A page without eligible server-projected initial work loads the
+   persistent runtime directly; a later programmatic first display remains correct
+   but is not claimed to have the lean transfer profile.
 
 ### 0.2 Non-goals
 
@@ -84,9 +87,11 @@ Any new analytics contract requires a separate design.
 - No correctness path waits for logging, telemetry, notification delivery, or any
   other side effect unrelated to rendering.
 - Code that is unnecessary for the initial projected render cannot be imported by
-  the production core entry. A deferred module may join only the already committed
-  runtime through its exact release-bound capability contract; it cannot construct
-  another runtime, adapter owner, slot registry, or message dispatcher.
+  the first-display entry. The production core is a post-paint takeover artifact,
+  not parser-blocking first-display code. A later module may join only the already
+  committed persistent runtime through its exact release-bound capability contract;
+  it cannot construct another runtime, adapter owner, slot registry, or message
+  dispatcher.
 
 ### 0.4 `rc/july` TSJS concept-adoption contract
 
@@ -119,31 +124,31 @@ architectural reason, and has boundary tests for the replacement contract. A sou
 deletion is complete only when its ledger entry has a passing replacement contract
 or that explicit supersession proof.
 
-| ID                | Baseline TSJS concept                                                                                                                                                                                         | Disposition and final owner                                                                                                                                                                                                                                                      |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `RCJ-CORE-01`     | Core config/context, callback queue, auction parsing, direct request/rendering, SPA generation checks, and shared helpers continue to serve every enabled integration.                                        | **Rebuild:** kernel, services, and composition root; exact behavioral corpus runs before and after the switch.                                                                                                                                                                   |
-| `RCJ-CORE-02`     | Programmatic ad-unit registration can drive direct `/auction`; core also exposes version/queue, placeholder render helpers, mutable generic config, and the local logger.                                     | **Preserve/supersede:** §5.4 defines the exact final API; typed registration/request APIs and immutable config replace placeholders/mutable config; logger methods/default remain, while invalid levels now throw without mutation instead of being retained with warn fallback. |
-| `RCJ-BOOT-01`     | The edge-injected `gpt_bootstrap.js` duplicates initial-load tracking, slot handoff, hydration scheduling, GPT definition/targeting/display/refresh, and can render initial ads without the main TSJS bundle. | **Rebuild/supersede:** the committed runtime owns all normal GPT behavior. Missing/partial bundles intentionally settle through the terminal non-rendering fallback in §5.3; no bootstrap may construct a degraded GPT runtime.                                                  |
-| `RCJ-TRACE-01`    | Render tracing records one honest impression timeline, bounded history, current-slot state, DOM stamps/badges, local overlay, no stale auction attribution, and emits `tsjs:adRendered`.                      | **Rebuild/supersede:** the core trace reducer, `tsjs.diagnostics.renderTrace`, and the separately authorized deferred presentation attachment; the public data subscription replaces the mutable globals and CustomEvent, and no integration writes trace state directly.        |
-| `RCJ-GPT-01`      | A TS fallback and a later publisher `defineSlot` share one physical GPT slot and one initial request; ownership transfer prevents later TS destruction.                                                       | **Rebuild:** GPT adapter plus slot service handoff record; no integration-owned function sentinels or duplicate wrappers.                                                                                                                                                        |
-| `RCJ-GPT-02`      | Responsive/hydrated slot resolution chooses the unique active placement, recovers DOM replacement, and never silently chooses an ambiguous sibling.                                                           | **Rebuild:** navigation-scoped aliases plus runtime-owned DOM binding/reconciliation.                                                                                                                                                                                            |
-| `RCJ-GPT-03`      | Native publisher GPT calls, service state, SRA, disabled initial load, refresh options, targeting cleanup, and publisher-owned slots retain their native semantics.                                           | **Preserve/Rebuild:** the sole GPT adapter owns interception and event fan-out; publisher activity never becomes TS-owned work.                                                                                                                                                  |
-| `RCJ-GPT-04`      | A TS-owned PUC response may resize only its authenticated still-collapsed ordinary 1×1 GAM shell, never unrelated, anchor, fixed, sticky, or already-expanded frames.                                         | **Preserve/Rebuild:** current render attempt owns one guarded resize after a response is successfully posted.                                                                                                                                                                    |
-| `RCJ-PREBID-01`   | The publisher-specific artifact is pure Prebid.js; the Trusted Server shim is a separate TSJS integration module, and the external bundle remains independently useful if that module fails.                  | **Preserve/Rebuild:** external artifact plus Prebid adapter/integration module; TS code is not vendored into the external Prebid artifact.                                                                                                                                       |
-| `RCJ-PREBID-02`   | Missing, late, duplicate, older, or partial Prebid artifacts fail safely: publisher queues drain, TS refresh handling is not installed without a real API, and installation is idempotent.                    | **Preserve/Rebuild:** artifact watchdog plus release-matched module transaction and bounded readiness queue.                                                                                                                                                                     |
-| `RCJ-PREBID-03`   | Adapter manifests distinguish module names from registered bidder codes/aliases; client-side bidder coverage, user-ID modules, EIDs, native bids, and publisher callbacks keep working.                       | **Preserve:** typed artifact contract and black-box artifact tests; TS-owned bid identities alone are replaced.                                                                                                                                                                  |
-| `RCJ-PREBID-04`   | Configured GAM-path exclusions remove only matching slots from the synthetic Prebid refresh auction while clearing stale TS keys and retaining every slot/options in the GPT refresh.                         | **Preserve/Rebuild:** one refresh policy in the Prebid integration module over the GPT adapter; global, explicit, mixed, all-excluded, and fail-open path cases remain exact.                                                                                                    |
-| `RCJ-APS-01`      | First-class APS OpenRTB admission, typed descriptor projection, direct rendering, Trusted Server Prebid-adapter rendering, and PUC rendering remain supported.                                                | **Preserve/Rebuild:** Rust admission plus the shared render lifecycle described in §§3–4.                                                                                                                                                                                        |
-| `RCJ-APS-02`      | `bid.meta`, generated Prebid `adId`, upstream bid-id fallback, and old `hb_adid` precedence carried APS identity through lossy boundaries.                                                                    | **Supersede:** the server-minted `r1_` reservation is the only TS PUC authority; native Prebid IDs and PBS Cache UUIDs remain byte-preserved for their own purposes.                                                                                                             |
-| `RCJ-APS-03`      | PUC uses one-use ports, APS callbacks—not script load—determine success, renderer tombstones are bounded, and lifecycle callbacks cannot corrupt later attempts.                                              | **Preserve/Rebuild:** bridge dispatcher, owner-control channel, reservation service, and terminal latch.                                                                                                                                                                         |
-| `RCJ-APS-04`      | The PUC document, renderer document, and descendant creative receive the winning dimensions without default margins, scrollbars, overflow, or clipping.                                                       | **Preserve:** exact CSS/DOM sizing contract in §4.4 and three-level browser assertions.                                                                                                                                                                                          |
-| `RCJ-CREATIVE-01` | Auction creative sanitization remains opt-in/default-off, rewriting retains its existing independent setting, and every delivery path observes the same configured processing boundary.                       | **Preserve:** creative integration module and server processing; this design does not silently enable sanitization or broaden rewriting.                                                                                                                                         |
-| `RCJ-CREATIVE-02` | Opaque-origin click recovery accepts only validated absolute HTTP(S) navigation, persists the validated URL, rejects non-network schemes, and keeps creative sandbox isolation.                               | **Preserve/Rebuild:** creative integration module over shared origin/DOM helpers, with unit and real-browser sandbox coverage.                                                                                                                                                   |
-| `RCJ-CREATIVE-03` | `tscreative.installGuards/setConfig/getConfig`, `tsCreativeConfig`, automatic install, click-guard default-on, and render-guard default-off control the creative browser guards.                              | **Preserve/supersede:** `CreativeBootV1` retains the defaults and the integration module auto-installs transactionally; mutable/install command globals are deleted and immutable `tsjs.boot.creative` is the only inspection/config surface.                                    |
-| `RCJ-DIAG-01`     | GPT runtime diagnostics reports raw GPT observations, exact slot binding/replacement, request cycles/timing, bounded export, overlay/badges, and no lifecycle interference.                                   | **Preserve/Rebuild:** diagnostics integration module consumes the GPT adapter event stream and exposes `tsjs.diagnostics.gpt`; it never installs a second GPT control wrapper.                                                                                                   |
-| `RCJ-INT-01`      | DataDome, Didomi, Google Tag Manager, Lockr, Osano, Permutive, Sourcepoint, and Testlight retain their current proxy guards, configuration, consent/segment, queue, and timing behavior.                      | **Preserve:** thin transactional integration modules plus complete pre/post-cutover black-box suites; internal feature behavior is otherwise unchanged.                                                                                                                          |
-| `RCJ-INT-02`      | Shared script, beacon, DOM-insertion, scheduling, origin, and async helpers retain per-integration matching and failure isolation.                                                                            | **Rebuild where shared:** helper factories with integration-owned configuration; one module failure cannot unwind another integration module or publisher code.                                                                                                                  |
-| `RCJ-QUAL-01`     | Lint covers production source, tests, scripts, diagnostics, and build code; TypeScript and artifact checks cover the actual shipped combinations.                                                             | **Preserve/strengthen:** full-package lint/typecheck plus architecture, maximal-bundle, generated-artifact, browser, and retained-heap gates.                                                                                                                                    |
+| ID                | Baseline TSJS concept                                                                                                                                                                                         | Disposition and final owner                                                                                                                                                                                                                                                                    |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RCJ-CORE-01`     | Core config/context, callback queue, auction parsing, direct request/rendering, SPA generation checks, and shared helpers continue to serve every enabled integration.                                        | **Rebuild:** kernel, services, and composition root; exact behavioral corpus runs before and after the switch.                                                                                                                                                                                 |
+| `RCJ-CORE-02`     | Programmatic ad-unit registration can drive direct `/auction`; core also exposes version/queue, placeholder render helpers, mutable generic config, and the local logger.                                     | **Preserve/supersede:** §5.4 defines the exact final API; typed registration/request APIs and immutable config replace placeholders/mutable config; logger methods/default remain, while invalid levels now throw without mutation instead of being retained with warn fallback.               |
+| `RCJ-BOOT-01`     | The edge-injected `gpt_bootstrap.js` duplicates initial-load tracking, slot handoff, hydration scheduling, GPT definition/targeting/display/refresh, and can render initial ads without the main TSJS bundle. | **Rebuild/supersede:** the bounded first-display agent owns only the immutable projected display and atomically transfers it to the persistent runtime; it publishes no degraded API/runtime. Missing/partial/takeover failure settles through §5.3 fallback without replay.                   |
+| `RCJ-TRACE-01`    | Render tracing records one honest impression timeline, bounded history, current-slot state, DOM stamps/badges, local overlay, no stale auction attribution, and emits `tsjs:adRendered`.                      | **Rebuild/supersede:** first-display facts cross the exact data-only handoff into the core trace reducer, `tsjs.diagnostics.renderTrace`, and deferred presentation attachment; public data subscription replaces mutable globals/CustomEvent, and no integration writes trace state directly. |
+| `RCJ-GPT-01`      | A TS fallback and a later publisher `defineSlot` share one physical GPT slot and one initial request; ownership transfer prevents later TS destruction.                                                       | **Rebuild:** the one-use first-display capsule transfers the exact physical object into the persistent GPT adapter/slot service, which then owns publisher handoff; no guessed reconstruction, function sentinel, duplicate wrapper, definition, or request.                                   |
+| `RCJ-GPT-02`      | Responsive/hydrated slot resolution chooses the unique active placement, recovers DOM replacement, and never silently chooses an ambiguous sibling.                                                           | **Rebuild:** navigation-scoped aliases plus runtime-owned DOM binding/reconciliation.                                                                                                                                                                                                          |
+| `RCJ-GPT-03`      | Native publisher GPT calls, service state, SRA, disabled initial load, refresh options, targeting cleanup, and publisher-owned slots retain their native semantics.                                           | **Preserve/Rebuild:** the sole GPT adapter owns interception and event fan-out; publisher activity never becomes TS-owned work.                                                                                                                                                                |
+| `RCJ-GPT-04`      | A TS-owned PUC response may resize only its authenticated still-collapsed ordinary 1×1 GAM shell, never unrelated, anchor, fixed, sticky, or already-expanded frames.                                         | **Preserve/Rebuild:** current render attempt owns one guarded resize after a response is successfully posted.                                                                                                                                                                                  |
+| `RCJ-PREBID-01`   | The publisher-specific artifact is pure Prebid.js; the Trusted Server shim is a separate TSJS integration module, and the external bundle remains independently useful if that module fails.                  | **Preserve/Rebuild:** external artifact plus Prebid adapter/integration module; TS code is not vendored into the external Prebid artifact.                                                                                                                                                     |
+| `RCJ-PREBID-02`   | Missing, late, duplicate, older, or partial Prebid artifacts fail safely: publisher queues drain, TS refresh handling is not installed without a real API, and installation is idempotent.                    | **Preserve/Rebuild:** artifact watchdog plus release-matched module transaction and bounded readiness queue.                                                                                                                                                                                   |
+| `RCJ-PREBID-03`   | Adapter manifests distinguish module names from registered bidder codes/aliases; client-side bidder coverage, user-ID modules, EIDs, native bids, and publisher callbacks keep working.                       | **Preserve:** typed artifact contract and black-box artifact tests; TS-owned bid identities alone are replaced.                                                                                                                                                                                |
+| `RCJ-PREBID-04`   | Configured GAM-path exclusions remove only matching slots from the synthetic Prebid refresh auction while clearing stale TS keys and retaining every slot/options in the GPT refresh.                         | **Preserve/Rebuild:** one refresh policy in the Prebid integration module over the GPT adapter; global, explicit, mixed, all-excluded, and fail-open path cases remain exact.                                                                                                                  |
+| `RCJ-APS-01`      | First-class APS OpenRTB admission, typed descriptor projection, direct rendering, Trusted Server Prebid-adapter rendering, and PUC rendering remain supported.                                                | **Preserve/Rebuild:** Rust admission plus the shared render lifecycle described in §§3–4.                                                                                                                                                                                                      |
+| `RCJ-APS-02`      | `bid.meta`, generated Prebid `adId`, upstream bid-id fallback, and old `hb_adid` precedence carried APS identity through lossy boundaries.                                                                    | **Supersede:** the server-minted `r1_` reservation is the only TS PUC authority; native Prebid IDs and PBS Cache UUIDs remain byte-preserved for their own purposes.                                                                                                                           |
+| `RCJ-APS-03`      | PUC uses one-use ports, APS callbacks—not script load—determine success, renderer tombstones are bounded, and lifecycle callbacks cannot corrupt later attempts.                                              | **Preserve/Rebuild:** bridge dispatcher, owner-control channel, reservation service, and terminal latch.                                                                                                                                                                                       |
+| `RCJ-APS-04`      | The PUC document, renderer document, and descendant creative receive the winning dimensions without default margins, scrollbars, overflow, or clipping.                                                       | **Preserve:** exact CSS/DOM sizing contract in §4.4 and three-level browser assertions.                                                                                                                                                                                                        |
+| `RCJ-CREATIVE-01` | Auction creative sanitization remains opt-in/default-off, rewriting retains its existing independent setting, and every delivery path observes the same configured processing boundary.                       | **Preserve:** creative integration module and server processing; this design does not silently enable sanitization or broaden rewriting.                                                                                                                                                       |
+| `RCJ-CREATIVE-02` | Opaque-origin click recovery accepts only validated absolute HTTP(S) navigation, persists the validated URL, rejects non-network schemes, and keeps creative sandbox isolation.                               | **Preserve/Rebuild:** creative integration module over shared origin/DOM helpers, with unit and real-browser sandbox coverage.                                                                                                                                                                 |
+| `RCJ-CREATIVE-03` | `tscreative.installGuards/setConfig/getConfig`, `tsCreativeConfig`, automatic install, click-guard default-on, and render-guard default-off control the creative browser guards.                              | **Preserve/supersede:** `CreativeBootV1` retains the defaults and the integration module auto-installs transactionally; mutable/install command globals are deleted and immutable `tsjs.boot.creative` is the only inspection/config surface.                                                  |
+| `RCJ-DIAG-01`     | GPT runtime diagnostics reports raw GPT observations, exact slot binding/replacement, request cycles/timing, bounded export, overlay/badges, and no lifecycle interference.                                   | **Preserve/Rebuild:** diagnostics integration module consumes the GPT adapter event stream and exposes `tsjs.diagnostics.gpt`; it never installs a second GPT control wrapper.                                                                                                                 |
+| `RCJ-INT-01`      | DataDome, Didomi, Google Tag Manager, Lockr, Osano, Permutive, Sourcepoint, and Testlight retain their current proxy guards, configuration, consent/segment, queue, and timing behavior.                      | **Preserve:** thin transactional integration modules plus complete pre/post-cutover black-box suites; internal feature behavior is otherwise unchanged.                                                                                                                                        |
+| `RCJ-INT-02`      | Shared script, beacon, DOM-insertion, scheduling, origin, and async helpers retain per-integration matching and failure isolation.                                                                            | **Rebuild where shared:** helper factories with integration-owned configuration; one module failure cannot unwind another integration module or publisher code.                                                                                                                                |
+| `RCJ-QUAL-01`     | Lint covers production source, tests, scripts, diagnostics, and build code; TypeScript and artifact checks cover the actual shipped combinations.                                                             | **Preserve/strengthen:** full-package lint/typecheck plus architecture, maximal-bundle, generated-artifact, browser, and retained-heap gates.                                                                                                                                                  |
 
 The commit clusters that exposed these concepts include the render-trace series
 starting at `966c8569c`; GPT recovery/handoff/responsive/native-behavior commits
@@ -425,12 +430,21 @@ every new, removed, or renamed path.
 
 The initial role-correct implementation exposed material first-display transfer and
 request-time work that its own post-change capture could not legitimately approve.
-That capture remains immutable evidence of the reviewed intermediate state, not a
-release baseline. Before merge, the implementation must remove code that is not
-required for the protected first display from the critical dependency graph,
-precompute finite TSJS transport identities outside request handling, and pass both
-the byte-accounting and network-shaped browser gates in §5.12. A gate captured from
-the oversized candidate cannot authorize that same candidate.
+The first mechanical remediation reduced the `[core, render_runtime, creative,
+gpt]` response to roughly 395 kB raw, but paired evidence at candidate
+`8ef8a40df` still measured 2,163.6 ms p90 against a 473.3 ms current-`main`
+baseline: about 4.57×, where the release gate permits 1.10×. Co-bundling the
+same full ownership graph saves only duplicated module bytes and cannot close that
+gap. Both captures remain immutable evidence of reviewed intermediate states, not
+release baselines.
+
+Before merge, the implementation therefore replaces the oversized parser-blocking
+runtime with the bounded first-display agent and atomic takeover in §5.2. It also
+precomputes finite TSJS transport identities outside request handling and passes
+both the byte-accounting and network-shaped browser gates in §5.12. The persistent
+runtime remains architecturally complete after takeover; the load-time fix neither
+deletes resilience behavior nor weakens the gate. A gate captured from an oversized
+candidate cannot authorize that same candidate.
 
 This remediation does not reopen the hard-cutover decision. `pub_id`, numeric APS
 identifiers, unknown fields, old routes, and old browser APIs remain rejected rather
@@ -1904,10 +1918,10 @@ composition/   small production core plus test-only composition seams
 - The capability broker admits one provider per exact key, rejects undeclared keys,
   validates frozen exact own-data-property interface objects with no accessors,
   unknown keys, or custom prototype, removes a provider on disposal, and
-  is never exposed on `window.tsjs` or `_internal`. A critical provider must exist
-  as a staged result of its provider's preparation before any critical consumer
+  is never exposed on `window.tsjs` or `_internal`. A takeover provider must exist
+  as a staged result of its provider's preparation before any takeover consumer
   prepares, and provider-before-consumer order is enforced by the catalog. A
-  deferred consumer may bind only an already committed critical provider.
+  deferred consumer may bind only an already committed takeover provider.
 - Production and test composition entries are separate. Production output cannot
   retain `*ForTest` accessors, injectable no-op adapters, corpus helpers, or fake
   scheduler branches merely because tests need them.
@@ -1918,10 +1932,177 @@ composition/   small production core plus test-only composition seams
 
 ### 5.2 One runtime across IIFE bundles
 
+#### 5.2.1 Two non-overlapping ownership epochs
+
+The browser lifecycle has two ordered ownership epochs, never two independently
+live runtimes:
+
+```text
+bootstrap installing
+  -> first-display agent -> transferring -> persistent runtime
+  |                     \-> failed -----------------> fallback
+  \-> persistent runtime (no eligible server-projected batch)
+  \-> failed ---------------------------------------> fallback
+```
+
+The **first-display agent** is a release-owned provisional owner, not the legacy
+`gpt_bootstrap.js` and not a reduced public runtime. It is one parser-blocking,
+server-composed artifact containing only the fixed slices selected for the
+immutable server projection and parser-time obligations on that page. It may:
+
+- validate the boot manifest and initial projection;
+- install the one provisional GPT/message/guard interception needed before the
+  initial action;
+- define, target, request, and settle only the server-projected initial GPT batch;
+- render an APS or ADM winner through the exact §4 protocols, including an
+  attributable empty-GAM fallback for that batch; and
+- record the first-action, terminal, and protected-paint marks.
+
+It cannot publish `TsjsApi`, expose a capability broker, accept programmatic ad
+units or direct-auction calls, process SPA/page-bids work outside the immutable
+initial batch, load deferred modules, present diagnostics, refresh an accepted ad,
+or start later navigation/reconciliation. Publisher callbacks remain in the one
+bootstrap-owned ingress Array until persistent-runtime or fallback commit. The old
+bootstrap renderer, legacy API, and any second fallback runtime remain deleted.
+
+The server selects the agent only when every member of the projected initial batch
+is representable by the first-display slices: no bid, GPT-mediated ADM, or
+GPT-mediated APS/PUC (including its attributable empty-GAM fallback). PBS Cache,
+programmatic/direct `/auction`, an unknown source, or any initial behavior outside
+that closed set selects direct persistent boot instead; this design adds no new cache
+implementation or cache-path phase split. A page with no projected initial batch also
+uses direct persistent boot. Parser-time obligations join the agent only when that
+agent is already selected; otherwise their takeover modules activate in the one
+parser-blocking runtime artifact before upstream publisher activity. This is a
+server-owned manifest choice derived from frozen
+configuration and projection, not a publisher switch, experiment, or compatibility
+path. A programmatic `requestAds` invoked on such a page becomes usable only after
+the persistent runtime commits. The protected load-time claim applies to the
+server-projected agent path; subsequent programmatic work remains correct but is not
+relabeled as that measurement.
+
+The agent artifact has one base entry plus only these build-catalogued slices. A
+slice absent from this table cannot enter the artifact. “Initial” means the exact
+immutable batch; it does not authorize later work from the same product:
+
+| Slice id                     | Include iff                                            | Bounded obligation before transfer                                                                |
+| ---------------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
+| `first_display`              | an eligible initial batch exists                       | manifest/projection validation, provisional lifetime, timing, queue ingress, transfer coordinator |
+| `aps_initial`                | the initial batch can contain APS                      | reservation, PUC/direct owner protocol, APS document channel                                      |
+| `creative_initial`           | an enabled creative guard has a parser-time obligation | current guard defaults and initial creative observation only                                      |
+| `datadome_initial`           | DataDome is enabled                                    | initial script/preload route guard                                                                |
+| `didomi_initial`             | Didomi is enabled                                      | initial configured SDK-path installation                                                          |
+| `google_tag_manager_initial` | Google Tag Manager is enabled                          | initial script/preload/beacon/fetch guards                                                        |
+| `gpt_initial`                | GPT owns or may receive the initial batch              | sole provisional GPT adapter, listeners, slot targeting/request, handoff capture                  |
+| `lockr_initial`              | Lockr is enabled                                       | initial script guard and bounded readiness needed before SDK use                                  |
+| `osano_initial`              | Osano is enabled                                       | initial consent mirrors required by the initial batch                                             |
+| `permutive_initial`          | Permutive is enabled                                   | initial guard/readiness and normalized segments                                                   |
+| `sourcepoint_initial`        | Sourcepoint is enabled                                 | initial SDK guard and GPP mirror                                                                  |
+| `prebid_initial`             | Prebid participates in the initial batch               | artifact admission, publisher queue, bidder/user-ID/EID setup, initial TS bid/PUC path            |
+| `testlight_initial`          | Testlight is enabled                                   | capture preexisting callbacks before publisher replacement/drain                                  |
+
+Every slice registers into the bootstrap's release-private first-display sink from
+the expected parser-inserted artifact and `document.currentScript`. The build fixes
+their order, interfaces, and allowed imports; there is no public service locator or
+third-party extension surface. The agent rejects an unknown, duplicate, omitted,
+misordered, wrong-release, accessor-backed, or late slice before effects. Agent
+activation is one synchronous transaction with reverse-order rollback, the same
+inert-prepare/effectful-activate discipline used by the persistent catalog, and the
+same ten-second bootstrap deadline. All agent-owned timers, listeners, wrappers,
+observers, ports, nodes, and provisional GPT objects have named exact-once
+disposers.
+
+The persistent artifact may be requested only after every attempt in the protected
+initial batch is terminal and the §5.2 paint gate has recorded
+`tsjs:first-display-paint`. On an agent page, no persistent/deferred TSJS preload,
+fetch, preparation, or evaluation may begin earlier. The bootstrap creates the one
+authenticated classic same-origin runtime script using the manifest URL, expected
+element identity, `document.currentScript`, CSP nonce, and Trusted Types rules
+defined below. Independent ordinary deferred modules remain later than persistent
+runtime commit.
+
+The runtime bundle first performs an effect-inert **takeover preparation** against
+an immutable `FirstDisplayHandoffV1`. The record is an exact-shaped, recursively
+frozen data tree containing:
+
+- release/generation identity and the canonical initial projection digest;
+- each slot's canonical id, aliases, DOM id, GAM path, normalized formats,
+  TS/publisher ownership, request-cycle outcome, and installed targeting snapshot;
+- every terminal attempt and reservation/ticket tombstone still inside its original
+  bounded expiry, without descriptor, ADM, capability, or creative payload bytes;
+- committed-artifact kind and ownership metadata; parser-time integration snapshot
+  data needed for its persistent owner; and
+- the exact once-only first-display timing/paint facts.
+
+It contains no function, accessor, custom prototype, Promise, listener, timer,
+observer, `MessagePort`, `WindowProxy`, network handle, or mutable collection. A
+release-private one-use `FirstDisplayOwnershipCapsuleV1` accompanies it only during
+the same synchronous takeover call. The capsule may carry the exact already-
+committed GPT slot and DOM artifact object identities that cannot be reconstructed
+from data. It carries no live port, timer, listener, observer, in-flight attempt, or
+callable publisher surface. The capsule is generation/release bound, can be consumed
+once by the authenticated prepared runtime, and is cleared by agent rollback,
+fallback, or successful adoption. It is never stored on `window.tsjs`, `_internal`,
+boot data, diagnostics, a log, or an analytics event.
+
+The handoff contains at most the existing 256 initial slots/outcomes. Each
+reservation/ticket entry is already terminal and retains only the opaque value and
+expiry required to suppress replay; no live authority, descriptor, ADM, or creative
+payload survives. Each copied string/targeting collection retains its source grammar
+and capacity, the canonical data-tree encoding is at most 1 MiB, and the capsule has
+at most one physical GPT identity and one committed artifact identity per slot.
+Overflow or any nonterminal attempt/port makes takeover preparation fail; it cannot
+truncate, evict a live fact, or silently lose replay suppression.
+
+Takeover is one non-yielding JavaScript task after preparation succeeds:
+
+1. Revalidate the current generation, exact runtime script, handoff digest, terminal
+   batch, paint gate, one-use capsule, and prepared runtime.
+2. Close agent work ingress, synchronously quiesce its event handlers, and restore
+   every compare-restorable wrapper. The bootstrap callback Array remains the one
+   append-only ingress until step 5; no publisher callback is invoked in this interval.
+3. Detach committed artifacts from agent disposal, then dispose every remaining
+   agent listener, timer, observer, port, readiness waiter, registry entry, and
+   uncommitted node in reverse order.
+4. Activate persistent owners in catalog order, adopting the capsule objects and
+   handoff facts. `adoptInitialDisplay:true` forbids parsing the projection as new
+   work, redefining an adopted GPT slot, reinstalling accepted targeting, issuing
+   `display`/`refresh`, creating a render iframe, or emitting any first-display mark.
+5. Commit the complete `TsjsApi`, permanently close both private registration sinks,
+   transfer committed artifacts to persistent slot/navigation ownership, run
+   persistent `afterCommit` work, and drain the single bootstrap queue exactly once.
+
+No task or microtask can observe the synchronous listener/wrapper transition.
+Momentary stack-local objects during that task do not constitute a second live
+owner; at every task boundary exactly one of agent, persistent runtime, or fallback
+owns ingress and side effects. Successful takeover leaves no agent timer, listener,
+port, observer, wrapper, registry, request authority, or strong reference except the
+committed objects now owned by the persistent runtime. Physical GPT identity and
+publisher handoff remain exact because the object itself, rather than a guessed
+path/DOM lookup, moves through the one-use capsule.
+
+Runtime download, authentication, or effect-inert preparation failure leaves the
+agent in control only until the bounded persistent-load deadline. It then settles
+the terminal fallback while preserving already committed ad DOM as inert publisher-
+visible output. A failure after step 2 rolls back partial persistent effects, does
+not resurrect the agent, and commits that same terminal shell. It never replays the
+projection, requests GAM again, removes an accepted publisher-owned ad, or constructs
+a degraded runtime. Failed takeover therefore sacrifices later TSJS behavior, not
+the correctness or exactly-once status of the completed first display.
+
+All “critical” persistent-module language below means the atomic **takeover**
+transaction on an agent page and the ordinary bootstrap transaction on a page where
+the agent is omitted. It does not authorize those module bytes to enter the
+first-display artifact. Where the older topology below describes core as creating
+the first protected attempt or waiting ten seconds before the first phase release,
+the agent path instead follows the terminal/paint/takeover sequence above; the
+ten-second no-attempt guard remains only for a direct-to-runtime page with no
+server-projected agent batch.
+
 Each shipped integration remains a separately built IIFE with imports inlined, so
 module singletons cannot be the shared-runtime mechanism. `tsjs-core` installs the
 only runtime and keeps the capability broker in its composition closure. During
-boot, `_registerIntegration` collects exact release-bound critical modules from the
+boot or takeover, `_registerIntegration` collects exact release-bound takeover modules from the
 same server-composed script. After kernel commit it accepts only a currently loading,
 manifest-declared deferred module from the exact core-created script element. It is
 permanently refusing for unknown, duplicate, wrong-release, wrong-phase, publisher-
@@ -1934,7 +2115,7 @@ Every integration module registers through:
 interface IntegrationRegistrationV1 {
   readonly abi: 1
   readonly id: string
-  readonly phase: 'critical' | 'deferred'
+  readonly phase: 'takeover' | 'deferred'
   readonly releaseId: string
   readonly prepare: (
     ctx: Readonly<IntegrationPrepareContextV1>
@@ -1967,7 +2148,7 @@ status:
 type BootManifestIntegrationV1 =
   | Readonly<{
       id: string
-      phase: 'critical'
+      phase: 'takeover'
     }>
   | Readonly<{
       id: string
@@ -1979,30 +2160,52 @@ type BootManifestIntegrationV1 =
 interface BootManifestV1 {
   readonly version: 1
   readonly releaseId: string
-  readonly criticalSrc: string
+  readonly firstDisplay: null | Readonly<{
+    src: string
+    slices: readonly string[]
+  }>
+  readonly runtimeSrc: string
   readonly integrations: readonly BootManifestIntegrationV1[]
 }
 ```
 
 Integration ids match `^[a-z0-9][a-z0-9_-]{0,63}$`, are unique, and appear in the actual
-server phase/injection order. Critical entries precede deferred entries, the list
-contains exactly the enabled runtime modules for that page, and there are at most 20.
-`criticalSrc` is the exact same-origin
+server phase/injection order. Takeover entries precede deferred entries, the list
+contains exactly the enabled persistent-runtime modules for that page, and there are
+at most 20. `firstDisplay` is either exact `null` or the server-selected agent
+artifact and its canonical ordered subset of the 13 slice ids in §5.2.1; ids are
+unique and a list contains at most 13. The list and encoded mask represent exactly
+the same set. Its `src` is the exact same-origin
+`/static/tsjs=tsjs-first-display.min.js?m=<sliceMask>&v=<firstDisplayHash>` URL.
+`sliceMask` is exactly four lowercase hexadecimal digits encoding the 13 catalog
+rows in order; bit 0 (`first_display`) is required and unused upper bits are zero.
+The server configuration resolver enumerates the finite masks permitted by its
+enabled integration set and precomputes each exact body identity outside request
+handling. Since APS/GPT/Prebid participation is projection-dependent, a mask may
+omit an enabled slice but cannot add a disabled one; `first_display` is always set.
+The hash names the exact uncompressed base agent plus selected slice bytes in catalog
+order. A mask not permitted by current trusted configuration is not served even when
+its hash is otherwise valid.
+`runtimeSrc` is the exact same-origin
 `/static/tsjs=tsjs-unified.min.js?v=<criticalHash>` URL emitted immediately after
-the bootstrap controller, where `criticalHash` is 64 lowercase hexadecimal
-characters equal to SHA-256 over the exact uncompressed UTF-8 response bytes. Those
-bytes are core followed by the manifest's critical IIFEs in manifest order with the
-build's exact `;\n` separator; their embedded registrations and `releaseId` bind the
+the bootstrap controller only when `firstDisplay` is `null`, and otherwise loaded by
+the controller after the agent's protected paint. `criticalHash` is 64 lowercase
+hexadecimal characters equal to SHA-256 over the exact uncompressed UTF-8 response
+bytes. Those bytes are core followed by the manifest's takeover IIFEs in manifest
+order with the build's exact `;\n` separator; their embedded registrations and `releaseId` bind the
 URL to the catalog, phase, order, and release. Manifest URLs are transported only as
 canonical root-relative strings. During validation, the bootstrap controller and
 then core resolve each once against the trusted document origin—never
 `document.baseURI`—require the same
 origin and exact path/query round-trip, and freeze one absolute URL per entry. All
 DOM, Trusted Types, and current-script comparisons use only those canonical absolute
-values. The controller accepts only the one parser-inserted
-`script#trustedserver-js` whose resolved `src` equals the absolute `criticalSrc`;
-an absent, duplicate, or mismatched tag fails the critical
-transaction. Redirect refusal is enforced by the local transport below.
+values. With an agent, the controller accepts only one parser-inserted
+`script#trustedserver-js` whose resolved `src` equals the absolute first-display
+`src`; without an agent it accepts only that element with absolute `runtimeSrc`.
+The dynamically inserted runtime node uses the reserved
+`trustedserver-js-runtime` id. An absent, duplicate, or mismatched expected node
+fails the owning transaction. Redirect refusal is enforced by the local transport
+below.
 For an ordinary publisher document, the trusted document origin is the captured
 exact HTTP(S) `window.location.origin`. A sandboxed `srcdoc` creative has the opaque
 origin `"null"`; its server-owned parent therefore defines one own, non-enumerable,
@@ -2018,7 +2221,7 @@ Every deferred `src` is an exact same-origin `/static/tsjs=tsjs-<id>.min.js?v=<h
 URL generated by the server for that release; accessors, arbitrary hosts, fragments,
 duplicate URLs, and mismatched ids/hashes fail manifest validation. That local
 static route must return the exact release artifact directly and never redirect.
-The registration value must be a non-null plain object with exactly those five own
+The persistent registration value must be a non-null plain object with exactly those five own
 enumerable data properties; accessors, unknown/missing/inherited keys, a custom
 prototype, wrong literals/types, or a non-callable `prepare` are rejected before the
 factory is retained. Registration requires exact id membership, phase, `releaseId` equality, expected script
@@ -2026,21 +2229,30 @@ element identity, and `document.currentScript` identity. Integrations obtain sta
 capabilities from the closure-private broker; they never construct a second runtime
 or replace an existing adapter, slot registry, dispatcher, or provider.
 
-The server emits one parser-blocking, server-concatenated critical artifact. Its
-bytes are exactly core followed by every `phase:'critical'` IIFE in manifest order,
-so the critical transaction incurs one request and no integration waterfall. The
-server emits no parser-time tag for a deferred module. Core alone creates deferred
-script elements later; `defer`, `async`, preload, or a post-commit callback attached
-to an already downloaded monolith does not satisfy this contract.
+The server emits exactly one parser-blocking TSJS artifact: the first-display agent
+when selected, otherwise the persistent runtime artifact. Agent bytes are its base
+followed by every selected slice in catalog order. Runtime bytes are core followed
+by every `phase:'takeover'` IIFE in manifest order. Each transaction therefore
+incurs one request and no integration waterfall. The server emits no parser-time tag
+for the other artifact or for a deferred module. The bootstrap alone creates the
+post-paint runtime node; after commit, core alone creates ordinary deferred nodes.
+`defer`, `async`, preload, or a post-commit callback attached to an already
+downloaded monolith does not satisfy this contract.
 
 The static transport is exact and shared by Fastly, Axum, Cloudflare, and Spin.
 Only `GET` and `HEAD` for
+`/static/tsjs=tsjs-first-display.min.js?m=<sliceMask>&v=<firstDisplayHash>`,
 `/static/tsjs=tsjs-unified.min.js?v=<criticalHash>` and
-`/static/tsjs=tsjs-<deferred-id>.min.js?v=<moduleHash>` are admitted; each query
-has exactly one `v` and no other field. `moduleHash` is SHA-256 over that deferred
+`/static/tsjs=tsjs-<deferred-id>.min.js?v=<moduleHash>` are admitted. The
+first-display query has exactly canonical `m` then `v`; the other routes have
+exactly one `v` and no other field. `firstDisplayHash` and `criticalHash` use
+the exact composition rules above; `moduleHash` is SHA-256 over that deferred
 artifact's exact uncompressed UTF-8 bytes. The handler derives the enabled ordered
-critical set or deferred catalog entry from trusted server configuration, recomputes
-the hash, and returns the current artifact only on an exact match. `HEAD` returns
+first-display set from the validated mask plus trusted configuration, or the
+takeover/deferred catalog entry, recomputes the hash, and returns the current
+artifact only on an exact match. HTML composition chooses only a precomputed
+permitted mask from the immutable projection; the later static request never needs
+request-local projection state or a dynamic artifact cache. `HEAD` returns
 the same status and metadata as `GET` with an empty body. An unconditional success
 is `200`, `Content-Type: application/javascript; charset=utf-8`, and
 `X-Content-Type-Options: nosniff`; the existing strong-ETag/static-cache behavior,
@@ -2052,20 +2264,20 @@ change transfer bytes but not the uncompressed bytes named by `v`.
 
 This hard cutover serves only artifacts embedded in the active binary. It does not
 add an N/N-1 asset store or retain a previous release's TSJS routes. A page carrying
-an old manifest across deployment can receive the typed critical/deferred failure
+an old manifest across deployment can receive the typed artifact/deferred failure
 defined here and must reload; the retained prior _binary_ in §8 is solely the whole-
 deployment rollback artifact. After rollback, that binary again serves its own
 release. This accepted stale-page break is not a cache or compatibility project.
 
 Upstream-library loading is orthogonal to TSJS bundling. After the bootstrap
 controller, the server may emit the existing fixed/configured live GPT tag as a non-
-parser-blocking fetch early enough to overlap the critical TSJS request when GPT is
+parser-blocking fetch early enough to overlap the first-display TSJS request when GPT is
 required for the first projected display. When Prebid integration is enabled, its
 external artifact tag is always emitted through that early overlap path because the
 baseline client readiness, bidder/user-ID/EID configuration, publisher queue, and
 initial auction contract are critical. It remains
 an external script, never a TSJS source input or TSJS generated artifact. Its adapter installs
-and owns all request-capable actions only after the critical transaction commits, so
+and owns all request-capable actions only after the agent transaction commits, so
 an early library load cannot race a TS-owned display before correctness listeners.
 An optional/later upstream script follows its owning deferred module's trigger and
 cannot be prefetched by this path. The APS runner is never boot-preloaded: only a
@@ -2073,65 +2285,65 @@ winning APS renderer document loads it through the live fixed-target proxy speci
 in §§3.6 and 4.4.
 
 Phase assignment is a release-catalog decision, not a publisher input or browser
-heuristic. Where one product supports both initial and later-only use, the catalog
-defines separate fixed-phase slice ids. The server selects the exact slice set from trusted
-static integration configuration and the server-owned initial projection; it never
-relabels one module id. If the server cannot prove that enabled behavior is
-irrelevant to the first projected display, that behavior is critical:
+heuristic. Where one product supports initial and persistent behavior, the build
+defines the fixed first-display slice from §5.2.1 and the catalogued takeover module
+below. The server selects an exact first-display subset from trusted configuration
+and the immutable initial projection; it never relabels a module id or moves an
+unbounded implementation into the agent:
 
-- **critical** contains only code required to validate boot/projection data, commit
-  the public kernel, and complete the enabled page's first projected display. This
-  includes the first-display GPT path when GPT owns that display, APS bridge/render
-  support when an initial APS bid can win, enabled creative guards that must observe
-  parser-time DOM activity, and an integration guard/consent/proxy hook only when
-  its preserved baseline contract must run before the corresponding publisher SDK;
-- **deferred** contains GPT refresh/reconciliation/navigation/hydration work that is
-  provably post-first-display, the Prebid synthetic-refresh/GAM-path-exclusion path,
-  diagnostics DOM presentation/overlay/export UI, and optional integration behavior
-  that has no parser-time correctness obligation. Prebid external-artifact readiness,
-  bidder aliases, user-ID/EID configuration, publisher queue behavior, and initial
-  TS-bid/PUC admission are always critical when Prebid is enabled. Initial GPT handoff, hydrated-slot resolution,
-  or reconciliation stays critical whenever the first projected display depends on
-  it; and
-- a product integration may therefore have a small critical module and a separate
-  deferred module. Those are release-owned implementation slices of one integration,
-  not separately configurable products. Shared state crosses the slice only through
-  an exact frozen capability from the one runtime broker.
+- **first display** contains only the agent/slices required before the initial
+  request action, terminal result, and protected paint. APS/ADM protocol handling,
+  initial GPT/Prebid admission, and parser-time guards live here only when selected;
+- **takeover** contains the complete persistent owner for enabled behavior, including
+  programmatic/direct auctions, ongoing lifecycle state, publisher APIs, refresh,
+  later navigation, reconciliation, diagnostics data, and exact `rc/july`
+  preservation. On an agent page it prepares after paint and adopts initial state;
+  on a no-agent page it is the ordinary critical boot transaction; and
+- **deferred** remains restricted to independently loadable behavior that has no
+  ownership or parser-time obligation at persistent-runtime commit, such as
+  presentation UI and a genuinely optional later lifecycle slice. A deferred
+  consumer binds only the already committed broker.
+
+A product integration may therefore have a first-display slice, one takeover module,
+and a deferred module. Those are release-owned implementation units of one product,
+not separately configurable products. The handoff record/capsule is the only bridge
+from the provisional slice; persistent/deferred sharing uses exact frozen broker
+capabilities from the one runtime.
 
 This is the canonical release catalog and its order. Capability lists use the exact
 keys shown; `—` means none. The inclusion predicate is server-owned and
 deny-unknown. A module id, phase, trigger, predicate, provider/consumer list, or
 obligation absent from this table is not a production module:
 
-| Order | Module id                  | Product     | Phase / trigger                    | Include iff                                         | Provides                                                                                               | Consumes                                                                           | Critical obligation or deferred scope                                                                                    |
-| ----: | -------------------------- | ----------- | ---------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-|     1 | `render_runtime`           | runtime     | critical                           | always                                              | `slots.v1`, `auction.v1`, `render.v1`, `messages.v1`, `trace.v1`, `trace.presentation.v1`, `direct.v1` | `runtime.v1`                                                                       | Public direct first display, projection, one lifecycle/dispatcher/trace owner                                            |
-|     2 | `aps`                      | APS         | critical                           | APS integration enabled                             | `aps.v1`                                                                                               | `runtime.v1`, `slots.v1`, `render.v1`, `messages.v1`, `trace.v1`                   | Any initial APS winner and PUC claim must render                                                                         |
-|     3 | `creative`                 | creative    | critical                           | `creative.enabled && (clickGuard \|\| renderGuard)` | —                                                                                                      | `runtime.v1`                                                                       | Guards must observe parser-time DOM/constructor activity                                                                 |
-|     4 | `datadome`                 | DataDome    | critical                           | DataDome enabled                                    | —                                                                                                      | `runtime.v1`                                                                       | Script/preload rewriting must precede publisher SDK insertion                                                            |
-|     5 | `didomi`                   | Didomi      | critical                           | Didomi enabled                                      | —                                                                                                      | `runtime.v1`                                                                       | `didomiConfig.sdkPath` must exist before SDK evaluation                                                                  |
-|     6 | `google_tag_manager`       | GTM/GA      | critical                           | Google Tag Manager enabled                          | —                                                                                                      | `runtime.v1`                                                                       | Script/preload/beacon/fetch guards must precede matching traffic                                                         |
-|     7 | `gpt`                      | GPT         | critical                           | GPT integration enabled                             | `gpt.v1`, `gpt.events.v1`, `pbs_cache.baseline.v1`                                                     | `runtime.v1`, `slots.v1`, `auction.v1`, `render.v1`, `messages.v1`, `trace.v1`     | Sole GPT adapter/listeners plus every initial handoff/hydration/reconciliation path                                      |
-|     8 | `gpt_diagnostics`          | diagnostics | critical                           | `diagnostics.gpt.active`                            | `gpt_diag.v1`                                                                                          | `runtime.v1`, `gpt.events.v1`                                                      | Consume the GPT-owned bounded fact stream and commit the final data-only public API                                      |
-|     9 | `lockr`                    | Lockr       | critical                           | Lockr enabled                                       | —                                                                                                      | `runtime.v1`                                                                       | Script guard/readiness/API-host rewrite may precede first display                                                        |
-|    10 | `osano_consent`            | Osano       | critical                           | Osano enabled                                       | `osano_consent.v1`                                                                                     | `runtime.v1`                                                                       | Initial USP/GPP/TCF mirror must precede consent-dependent auction work                                                   |
-|    11 | `permutive_context`        | Permutive   | critical                           | Permutive enabled                                   | `permutive_context.v1`                                                                                 | `runtime.v1`                                                                       | Guard/readiness and initial normalized segments feed first auction context                                               |
-|    12 | `sourcepoint_consent`      | Sourcepoint | critical                           | Sourcepoint enabled                                 | `sourcepoint_consent.v1`                                                                               | `runtime.v1`                                                                       | Initial GPP/localStorage mirror and optional SDK guard precede consent use                                               |
-|    13 | `prebid`                   | Prebid      | critical                           | Prebid integration enabled                          | `prebid.v1`                                                                                            | `runtime.v1`, `slots.v1`, `render.v1`, `messages.v1`, and `aps.v1` iff APS enabled | External-artifact readiness, bidder aliases, user-ID/EIDs, publisher queue, initial auction, and TS bidder/PUC admission |
-|    14 | `testlight`                | Testlight   | critical                           | Testlight enabled                                   | —                                                                                                      | `runtime.v1`                                                                       | Preexisting callbacks must bridge before publisher code can replace/drain them                                           |
-|    15 | `diagnostics_presentation` | diagnostics | deferred / `first_display_or_idle` | `renderTraceOverlay \|\| diagnostics.gpt.active`    | —                                                                                                      | `runtime.v1`, `trace.presentation.v1`, and `gpt_diag.v1` iff active                | DOM overlay, badges, formatting, clipboard/download interaction                                                          |
-|    16 | `gpt_later`                | GPT         | deferred / `first_display_or_idle` | GPT enabled                                         | —                                                                                                      | `runtime.v1`, `slots.v1`, `auction.v1`, `render.v1`, `gpt.v1`, `trace.v1`          | Post-first-display refresh, SPA navigation, and later reconciliation only                                                |
-|    17 | `osano_lifecycle`          | Osano       | deferred / `first_display_or_idle` | Osano enabled                                       | —                                                                                                      | `runtime.v1`, `osano_consent.v1`                                                   | Later retry/event/focus/visibility/clear maintenance                                                                     |
-|    18 | `permutive_lifecycle`      | Permutive   | deferred / `first_display_or_idle` | Permutive enabled                                   | —                                                                                                      | `runtime.v1`, `permutive_context.v1`                                               | Later SDK/segment refresh maintenance                                                                                    |
-|    19 | `prebid_later`             | Prebid      | deferred / `first_display_or_idle` | Prebid and GPT enabled                              | —                                                                                                      | `runtime.v1`, `slots.v1`, `gpt.v1`, `prebid.v1`                                    | Synthetic refresh and GAM-path exclusion; never initial admission                                                        |
-|    20 | `sourcepoint_lifecycle`    | Sourcepoint | deferred / `first_display_or_idle` | Sourcepoint enabled                                 | —                                                                                                      | `runtime.v1`, `sourcepoint_consent.v1`                                             | Later retry/visibility/focus/update/safe-clear maintenance                                                               |
+| Order | Module id                  | Product     | Phase / trigger                    | Include iff                                         | Provides                                                                                               | Consumes                                                                           | Takeover obligation or deferred scope                                                              |
+| ----: | -------------------------- | ----------- | ---------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+|     1 | `render_runtime`           | runtime     | takeover                           | always                                              | `slots.v1`, `auction.v1`, `render.v1`, `messages.v1`, `trace.v1`, `trace.presentation.v1`, `direct.v1` | `runtime.v1`                                                                       | Adopt initial facts/artifacts; own every later direct render, lifecycle, dispatcher, and trace     |
+|     2 | `aps`                      | APS         | takeover                           | APS integration enabled                             | `aps.v1`                                                                                               | `runtime.v1`, `slots.v1`, `render.v1`, `messages.v1`, `trace.v1`                   | Adopt initial APS tombstones/artifacts; own all later APS and PUC work                             |
+|     3 | `creative`                 | creative    | takeover                           | `creative.enabled && (clickGuard \|\| renderGuard)` | —                                                                                                      | `runtime.v1`                                                                       | Adopt parser-time guard state and own later creative behavior                                      |
+|     4 | `datadome`                 | DataDome    | takeover                           | DataDome enabled                                    | —                                                                                                      | `runtime.v1`                                                                       | Adopt the initial guard state and own later route rewriting                                        |
+|     5 | `didomi`                   | Didomi      | takeover                           | Didomi enabled                                      | —                                                                                                      | `runtime.v1`                                                                       | Adopt the configured SDK path and own later integration behavior                                   |
+|     6 | `google_tag_manager`       | GTM/GA      | takeover                           | Google Tag Manager enabled                          | —                                                                                                      | `runtime.v1`                                                                       | Adopt the initial guards and own later matching traffic                                            |
+|     7 | `gpt`                      | GPT         | takeover                           | GPT integration enabled                             | `gpt.v1`, `gpt.events.v1`, `pbs_cache.baseline.v1`                                                     | `runtime.v1`, `slots.v1`, `auction.v1`, `render.v1`, `messages.v1`, `trace.v1`     | Sole persistent GPT adapter/listeners; adopt initial physical slots and own handoff/reconciliation |
+|     8 | `gpt_diagnostics`          | diagnostics | takeover                           | `diagnostics.gpt.active`                            | `gpt_diag.v1`                                                                                          | `runtime.v1`, `gpt.events.v1`                                                      | Consume persistent GPT facts and commit the final data-only public API                             |
+|     9 | `lockr`                    | Lockr       | takeover                           | Lockr enabled                                       | —                                                                                                      | `runtime.v1`                                                                       | Adopt initial guard/readiness state and own later API-host rewriting                               |
+|    10 | `osano_consent`            | Osano       | takeover                           | Osano enabled                                       | `osano_consent.v1`                                                                                     | `runtime.v1`                                                                       | Adopt the initial consent mirror and own later consent-dependent work                              |
+|    11 | `permutive_context`        | Permutive   | takeover                           | Permutive enabled                                   | `permutive_context.v1`                                                                                 | `runtime.v1`                                                                       | Adopt initial normalized segments and own later context                                            |
+|    12 | `sourcepoint_consent`      | Sourcepoint | takeover                           | Sourcepoint enabled                                 | `sourcepoint_consent.v1`                                                                               | `runtime.v1`                                                                       | Adopt the initial GPP mirror/guard and own later consent work                                      |
+|    13 | `prebid`                   | Prebid      | takeover                           | Prebid integration enabled                          | `prebid.v1`                                                                                            | `runtime.v1`, `slots.v1`, `render.v1`, `messages.v1`, and `aps.v1` iff APS enabled | Adopt initial artifact/queue/bid state and own subsequent Prebid admission                         |
+|    14 | `testlight`                | Testlight   | takeover                           | Testlight enabled                                   | —                                                                                                      | `runtime.v1`                                                                       | Adopt initial callback capture and own later bridging                                              |
+|    15 | `diagnostics_presentation` | diagnostics | deferred / `first_display_or_idle` | `renderTraceOverlay \|\| diagnostics.gpt.active`    | —                                                                                                      | `runtime.v1`, `trace.presentation.v1`, and `gpt_diag.v1` iff active                | DOM overlay, badges, formatting, clipboard/download interaction                                    |
+|    16 | `gpt_later`                | GPT         | deferred / `first_display_or_idle` | GPT enabled                                         | —                                                                                                      | `runtime.v1`, `slots.v1`, `auction.v1`, `render.v1`, `gpt.v1`, `trace.v1`          | Post-first-display refresh, SPA navigation, and later reconciliation only                          |
+|    17 | `osano_lifecycle`          | Osano       | deferred / `first_display_or_idle` | Osano enabled                                       | —                                                                                                      | `runtime.v1`, `osano_consent.v1`                                                   | Later retry/event/focus/visibility/clear maintenance                                               |
+|    18 | `permutive_lifecycle`      | Permutive   | deferred / `first_display_or_idle` | Permutive enabled                                   | —                                                                                                      | `runtime.v1`, `permutive_context.v1`                                               | Later SDK/segment refresh maintenance                                                              |
+|    19 | `prebid_later`             | Prebid      | deferred / `first_display_or_idle` | Prebid and GPT enabled                              | —                                                                                                      | `runtime.v1`, `slots.v1`, `gpt.v1`, `prebid.v1`                                    | Synthetic refresh and GAM-path exclusion; never initial admission                                  |
+|    20 | `sourcepoint_lifecycle`    | Sourcepoint | deferred / `first_display_or_idle` | Sourcepoint enabled                                 | —                                                                                                      | `runtime.v1`, `sourcepoint_consent.v1`                                             | Later retry/visibility/focus/update/safe-clear maintenance                                         |
 
 `runtime.v1` is the kernel's only built-in capability: generation, disposal,
 clock/scheduler, queue, logger, validated boot data, capability access, and phase
 loading. All other keys have exactly the provider above. Optional consumption is
 allowed only where the table says `iff active`; absence in that case is never
-silently substituted. The maximal manifest therefore has 14 critical plus six
-deferred entries: `MAX_CRITICAL_MODULES = 14` and `MAX_MANIFEST_MODULES = 20`.
+silently substituted. The maximal manifest therefore has 14 takeover plus six
+deferred entries: `MAX_TAKEOVER_MODULES = 14` and `MAX_MANIFEST_MODULES = 20`.
 The serializer, parser, registry, callback staging, tests, and fuzz/capacity fixtures
 derive 13/14/15 and 19/20/21 boundaries from this table rather than retaining a
 hand-written 16. The kernel diagnostics ingress has no integration-module
@@ -2147,14 +2359,14 @@ trigger, provided/consumed capability keys, and whether parser-time activation i
 proved baseline obligation. The build rejects dependency cycles, a deferred
 provider consumed by another module, two providers for one key, a phase override
 from server or publisher data, provider-after-consumer manifest order, and any
-critical entry that imports a catalogued deferred source area. GPT, the APS runner,
+takeover entry that imports a catalogued deferred source area. GPT, the APS runner,
 the external Prebid artifact, PUC, and all
 other upstream script bytes remain remote/live and are never copied into a TSJS
 bundle; only Trusted Server-owned adapters, contracts, and lifecycle code may be in
 these artifacts.
 
-Both phases use the same module-transaction rules. Registration stores code but does
-not execute it. During the critical transaction, core calls `prepare(ctx)` in
+Both persistent phases use the same module-transaction rules. Registration stores
+code but does not execute it. During the takeover transaction, core calls `prepare(ctx)` in
 manifest order. Each deferred transaction calls its own `prepare(ctx)` independently
 after that module's accepted registration and `load` checkpoint, without awaiting or
 ordering against a deferred sibling. `prepare(ctx)` may be synchronous or asynchronous;
@@ -2171,32 +2383,32 @@ function and its declared frozen capability interfaces. Core validates and stage
 provider's interfaces immediately after that provider prepares, so later consumers
 can receive them in their preparation context; the interfaces remain effect-inert
 until provider activation and are removed during rollback. Preparation code cannot
-call a staged stateful capability. Critical activation order is the same
+call a staged stateful capability. Takeover activation order is the same
 provider-before-consumer order, so no consumer becomes live first.
 
-After every critical module prepares, core enters one synchronous critical
+After every takeover module prepares, core enters one synchronous takeover
 activation barrier in manifest order. `activate(ctx)` may install only synchronously
 compare-restorable wrappers, listeners, observers, guards, provider live-state
 transitions, and service subscriptions. It registers the disposer before each mutation and may stage bounded
 post-commit work through `ctx.afterCommit(fn)`, but cannot inject/load a script,
 start network/timers, schedule work, drain a publisher queue, or invoke publisher
-callbacks directly. The critical message-dispatcher and GPT-adapter provider
+callbacks directly. The persistent message-dispatcher and GPT-adapter provider
 modules occupy the catalogued provider positions before their consumers, and their
 correctness listeners are activated there rather than left live during asynchronous
-preparation. If any critical activation throws, core synchronously
+preparation. If any takeover activation throws, core synchronously
 runs every activated and prepared disposer once in reverse order before committing
 fallback. Since the barrier never yields and activation cannot call publisher code,
-no publisher task can observe a partial critical generation.
+no publisher task can observe a partial persistent generation.
 
-The critical activation barrier checks the same monotonic boot deadline immediately
+The takeover activation barrier checks its monotonic deadline immediately
 before and after every `activate` call and once more before kernel handoff. Elapsed
 time greater than or equal to 10,000 ms synchronously unwinds and commits fallback
 even when the timer task has not run. JavaScript cannot preempt an activation
 function that never returns; a malicious/nonreturning same-realm module can freeze
 the page and is an accepted platform limitation, not a second-runtime recovery case.
 
-After all critical activations succeed, core commits the kernel API, runs critical
-`afterCommit` callbacks in manifest order, and only then drains the preload queue.
+After all takeover activations succeed, core commits the kernel API, runs takeover
+`afterCommit` callbacks in manifest order, and only then drains the bootstrap queue.
 Those callbacks may synchronously start required upstream scripts, timers, readiness
 work, and baseline DOM scans; publisher code they intentionally invoke therefore
 sees the complete kernel. A callback throw is isolated to its module, runs that
@@ -2215,7 +2427,7 @@ therefore exceed ten seconds without a deferred race. The guard fires only when 
 server-projected or programmatic attempt was created by its boundary. Firing is the
 explicit runtime decision that no _startup-protected_ display exists; it releases the
 deferred phase even though publisher code may create a later first attempt. That
-post-window attempt uses the same correct critical owners but may overlap already
+post-window attempt uses the same correct persistent owners but may overlap already
 released later work. The design makes no absolute load-contention guarantee for a
 first display initiated after 10,000 ms.
 
@@ -2229,7 +2441,7 @@ deferred loading in `requestIdleCallback({timeout:2_000})`. The
 non-idle fallback is one owned 50 ms timer created after the paint/hidden gate, never
 a zero-delay task before paint.
 
-The catalog has no on-demand network trigger. A critical provider may expose a
+The catalog has no on-demand network trigger. A takeover provider may expose a
 bounded readiness facade for behavior implemented by a deferred slice. Each caller's
 existing deadline begins at its original enqueue time and may expire while the phase
 gate is closed. The shared module receives a separate ten-second load/transaction
@@ -2251,10 +2463,11 @@ consume another module's deadline or delay its fetch, preparation, or activation
 Deferred insertion preserves the publisher's script policy; it never rewrites a
 Content-Security-Policy header or meta element and never adds `unsafe-inline`,
 `unsafe-eval`, a source host, or a default Trusted Types policy. The parser-inserted
-bootstrap and critical tags remain subject to the publisher's existing CSP and are
+bootstrap and parser-inserted first-display/runtime tags remain subject to the publisher's existing CSP and are
 a deployment precondition just as TSJS injection is on the baseline. When those
 tags carry a CSP nonce, they must carry the same response-local value, and core
-copies the critical element's `nonce` IDL value to every deferred script before
+copies the authenticated parser-inserted element's `nonce` IDL value to the runtime
+and every deferred script before
 insertion. This supports nonce-only policies and preserves the trusted-root chain
 under `strict-dynamic`; an absent nonce is never synthesized or copied from an
 unrelated publisher element.
@@ -2326,25 +2539,29 @@ provider needed by the next `NavigationSession`.
 `ctx.signal` aborts pending preparation. `ctx.onDispose(fn)` is the only disposal
 registration mechanism; a disposer registered after disposal runs immediately, and
 one failing disposer does not prevent the rest. Each module may call
-`ctx.afterCommit` at most once. A second call by a critical module unwinds the
-critical barrier and commits `bundle_partial`; a second call by a deferred module
-marks only that module unavailable. The critical phase shares the bootstrap
-deadline; deferred modules do not start another global boot clock.
+`ctx.afterCommit` at most once. A second call by a takeover module unwinds the
+takeover barrier and commits `bundle_partial`; a second call by a deferred module
+marks only that module unavailable. Direct-to-runtime takeover shares the bootstrap
+deadline; post-paint agent takeover owns the separate deadline in §5.2.1. Deferred
+modules do not start another global boot clock.
 
 ### 5.3 Bootstrap ownership
 
 Bootstrap uses a generation-scoped state machine:
 
 ```text
-unclaimed -> installing -> kernel
-                     \-> failed -> fallback
+unclaimed -> installing -> agent -> transferring -> kernel
+                     |                         \-> fallback
+                     |-> kernel (no agent)
+                     \-> failed --------------------> fallback
 ```
 
 Initial namespace capture is field-wise and does not replace a publisher-created
 `window.tsjs` object: `window.tsjs ||= {}; tsjs.que ||= []; tsjs.boot ||= {}`. The
-kernel remains externally inert and commits ownership only after all critical
-integration modules prepare and synchronously activate in order. Deferred modules
-are not part of the bootstrap transaction. Before critical module work, bootstrap
+kernel remains externally inert and commits ownership only after all takeover
+integration modules prepare and synchronously activate in order. The agent also
+leaves the public runtime surface uncommitted. Deferred modules are not part of the
+bootstrap/takeover transaction. Before first-display or takeover module work, bootstrap
 normalizes `que` to one actual Array and defines the `tsjs.que` data
 property as writable false/configurable true for the installing generation. It keeps
 the ingress Array's native `push`
@@ -2365,7 +2582,7 @@ JavaScript task. Its order is exact:
 4. redefine `tsjs.que` as the final executor with a writable-false,
    configurable-false descriptor while installing all other complete committed
    `tsjs` fields;
-5. for a kernel commit, run every staged critical `afterCommit` callback in critical
+5. for a kernel commit, run every staged takeover `afterCommit` callback in takeover
    manifest order; fallback has none; and
 6. drain the snapshot FIFO.
 
@@ -2378,32 +2595,34 @@ one throw is isolated. Both ingress and final values satisfy
 `Array.isArray(...) === true`. The old ingress identity remains a live forwarding
 queue; the public `tsjs.que` identity changes exactly once at commit.
 
-One ten-second watchdog begins immediately before critical-artifact injection and
-covers core, critical registration, critical preparation, and the synchronous
-critical activation barrier. A critical preparation throw/rejection, activation
-throw, ABI mismatch, or deadline aborts the installing generation, synchronously
-unwinds registered critical disposers in reverse order, and then commits the
-generated no-bundle fallback. A critical bundle continuation that arrives after
+One ten-second watchdog begins immediately before the parser-blocking artifact and
+covers agent registration/activation plus initial-action start, or direct-to-runtime
+registration, preparation, and synchronous takeover activation when no agent is
+selected. A preparation/activation failure, ABI mismatch, or deadline aborts the
+installing generation, synchronously unwinds registered disposers in reverse order,
+and then commits fallback. The completed agent batch uses the bounded per-attempt
+deadlines in §4; persistent loading/takeover has its own fixed ten-second deadline
+starting only after protected paint. A late artifact continuation that arrives after
 fallback is rejected and quarantined. Deferred loading never starts before kernel
 commit, so a deferred failure cannot select or replace fallback. Every late
 continuation verifies its owner generation and self-discards.
 
 The server-owned inline bootstrap controller is deliberately smaller than a runtime.
 It installs only the queue ingress, immutable boot/manifest inputs, generation latch,
-critical-artifact error/watchdog observation, release-internal registration sink,
+artifact error/watchdog observation, both release-internal registration sinks,
 User Timing start mark, and terminal fallback commit. It owns no adapter, slot,
 auction, renderer, integration feature, upstream loader, DOM scan, or publisher
-callback execution before handoff. The server follows it with only critical
+callback execution before handoff. The server follows it with only first-display
 configuration transports, any first-display-required live upstream tags described
-in §5.2, and the one parser-blocking critical-artifact tag.
+in §5.2, and the one parser-blocking agent-or-runtime tag.
 
 The old `gpt_bootstrap.js` asset and its initial-load hooks, handoff wrappers,
 hydration scheduler, slot definition, targeting, display, and refresh are deleted
 rather than retained as another runtime. The minimal controller/fallback is generated
 from one TypeScript source, embedded by the server, included in the release hash and
 its own §5.12 budget, and pinned by a staleness test; behavior is not hand-maintained
-in both ES5 and TypeScript. Normal GPT/render behaviors run only after the critical
-runtime commits. This intentionally changes the missing/partial-critical-artifact
+in both ES5 and TypeScript. On an agent page, later GPT/render behaviors run only after the persistent
+runtime commits. This intentionally changes the missing/partial-artifact
 case: it no longer attempts a best-effort GPT render through a duplicated degraded
 runtime, and instead settles every known slot through the terminal fallback below.
 
@@ -2411,22 +2630,23 @@ The fallback is a terminal, non-rendering shell, not a reduced second runtime. I
 commit atomically records one immutable boot failure reason:
 
 - `abi_mismatch` for invalid manifest shape, duplicate/unknown integration id, wrong
-  release, invalid phase/catalog/source binding, duplicate critical registration,
+  release, invalid phase/catalog/source binding, duplicate registration,
   or incompatible ABI; or
-- `bundle_partial` for a missing critical integration module, critical preparation
-  throw/rejection, critical activation throw, or the shared boot deadline.
+- `bundle_partial` for a missing first-display/takeover module, preparation
+  throw/rejection, activation/takeover throw, or the owning deadline.
 
 Before draining user work it installs `version:'1.0.0'`, the embedded `releaseId`, a
 safe frozen `TsjsBootV1`, the final `tsjs.requestAds` input validator, the
 validating-then-refusing `tsjs.addAdUnits`, the local `tsjs.log`, the
 immediate-executor `tsjs.que`, a permanently refusing internal
 `_registerIntegration`, and a frozen
-`tsjs._internal` value containing only `{state:'fallback',releaseId,reason}`. It
+`tsjs._internal` value containing only
+`{state:'fallback',releaseId,reason,initialDisplayCommitted}`. It
 constructs no runtime session, slot registry, GPT/Prebid adapter, bridge dispatcher,
 timer, listener, port, or iframe. It never exposes a compatibility API.
 
-The safe fallback boot uses the independently embedded release and exact critical
-URL in `manifest:{version:1,releaseId,criticalSrc,integrations:[]}`. It retains the
+The safe fallback boot uses the independently embedded release and exact selected
+URLs in `manifest:{version:1,releaseId,firstDisplay,runtimeSrc,integrations:[]}`. It retains the
 server auction projection only when that projection passes its exact shape, full ordered
 placement coverage, 256-slot bounds,
 field grammars, render limits, and 8 MiB aggregate cap from §§3.1–3.2, and otherwise substitutes exactly
@@ -2525,6 +2745,7 @@ interface TsjsFallbackApi extends TsjsApiBase {
     state: 'fallback'
     releaseId: string
     reason: 'abi_mismatch' | 'bundle_partial'
+    initialDisplayCommitted: boolean
   }>
 }
 
@@ -2541,9 +2762,15 @@ its preparation/activation contexts. `_internal` is a frozen, non-enumerable sta
 value; the service registry remains in the composition closure and is available to
 integration modules only through those contexts during startup.
 
+Fallback `initialDisplayCommitted` is `true` only when takeover failed after the
+agent had already accepted at least one initial artifact; the fallback still reports
+later TSJS operations unavailable and owns no artifact control. It is `false` for
+every pre-display/bootstrap failure. This local status does not change a render
+result, remove accepted DOM, or create a recovery path.
+
 `_registerIntegration` is deliberately present only because separately downloaded
-release-owned IIFEs need one handshake. During critical installation it accepts the
-next critical registration from the server-concatenated artifact. After kernel
+release-owned IIFEs need one handshake. During takeover installation it accepts the
+next takeover registration from the server-composed runtime artifact. After kernel
 commit it returns `true` only while an expected deferred script element created by
 that kernel is the exact `document.currentScript`, and only for that element's
 declared id, phase, and `releaseId`. It returns `false` without invoking supplied code
@@ -3017,7 +3244,7 @@ the counter. Runtime disposal clears the weak/map state and makes every old publ
 inert before a later runtime may begin again at one.
 
 The adapter's `gpt.events.v1` facts retain their separate frozen opaque object token
-because that direct bounded stream never crosses the generic ingress and critical
+because that direct bounded stream never crosses the generic ingress and takeover
 GPT diagnostics needs same-object identity. Before publishing a GPT fact to
 `trace.v1`, the GPT integration creates a data-only projection that replaces the
 opaque token with the exact own-data field
@@ -3087,7 +3314,7 @@ the map. Exhaustion, collision, stability, handoff, repeated refresh, replacemen
 retirement, late-event, and navigation behavior remain diagnostics-only and never
 participate in GPT lifecycle authority.
 
-The critical `gpt_diagnostics` module does not subscribe to that ingress. It consumes
+The takeover `gpt_diagnostics` module does not subscribe to that ingress. It consumes
 only the separately bounded GPT-owned `gpt.events.v1` fact stream. The broker values
 for `trace.v1` and `trace.presentation.v1` are different frozen exact interfaces:
 `trace.v1` contains correctness fact operations and ingress publication but no
@@ -3161,11 +3388,7 @@ subscription methods. The final schema is:
 ```ts
 type RenderTracePathV1 = 'auction' | 'ssat' | 'gam-refresh'
 type RenderTraceServedFromV1 =
-  | 'inline'
-  | 'gam'
-  | 'debug-adm'
-  | 'pbs-cache'
-  | 'prebid'
+  'inline' | 'gam' | 'debug-adm' | 'pbs-cache' | 'prebid'
 
 interface RenderTraceRecord {
   readonly slotId: string
@@ -3233,7 +3456,8 @@ argument must be callable or `subscribe` throws `TypeError` before the capacity
 check. The production core commits and freezes one stable `tsjs.diagnostics` facade
 with the kernel. Correctness facts required from the first display, bounded snapshot
 state, subscriptions, and the final public diagnostics APIs are produced by the
-critical lifecycle/GPT path. DOM presentation, badges, overlay, formatting, and
+takeover lifecycle/GPT path after adopting initial facts from the handoff. DOM
+presentation, badges, overlay, formatting, and
 clipboard/download interaction may attach behind that facade after its deferred
 module commits. Deferred diagnostics failure leaves the facade safe and bounded and
 cannot affect rendering. Fallback exposes no diagnostics namespace because it
@@ -3269,10 +3493,10 @@ The server always emits this complete value, defaulting to
 `{version:1,renderTraceOverlay:false,gpt:{active:false}}`. Both objects must be
 non-null plain objects with exactly the shown own enumerable data properties;
 accessors, unknown/missing keys, or wrong prototypes/literals/types are
-`abi_mismatch`, not silent diagnostics disablement. The kernel copies the validated
-data and recursively freezes that copy before module preparation; copy/freeze
+`abi_mismatch`, not silent diagnostics disablement. The bootstrap copies the validated
+data and recursively freezes that copy before agent/takeover preparation; copy/freeze
 failure is also `abi_mismatch`. `gpt.active:true` requires exactly one catalogued
-critical GPT-diagnostics collector/public API in `BootManifestV1`; `false` requires
+takeover GPT-diagnostics collector/public API in `BootManifestV1`; `false` requires
 that collector to be absent. Exactly one catalogued deferred diagnostics-presentation
 module is required iff `renderTraceOverlay || gpt.active`; it replays bounded facts
 into the enabled overlay/badge/export-interaction model. The inverse mismatch is also
@@ -3341,9 +3565,9 @@ disabled integration is exactly
 `{version:1,enabled:false,clickGuard:false,renderGuard:false}` and has no `creative`
 manifest member. When enabled but its config is absent, the server emits
 `{version:1,enabled:true,clickGuard:true,renderGuard:false}`; explicit configuration
-replaces the two guard booleans. Exactly one `phase:'critical'` creative module is
-required iff `enabled && (clickGuard || renderGuard)`; an enabled configuration with
-both guards false has no browser module because it has no browser work. `enabled:false`
+replaces the two guard booleans. The `creative_initial` slice and `phase:'takeover'`
+creative module are required iff `enabled && (clickGuard || renderGuard)`; an enabled
+configuration with both guards false has no browser module because it has no browser work. `enabled:false`
 also requires its absence. An accessor, non-plain
 prototype, missing/unknown key, wrong literal/version/type, disabled non-false guard,
 or manifest mismatch is an `abi_mismatch` before any creative guard installs. The recursively
@@ -3352,8 +3576,11 @@ frozen `tsjs.boot.creative` is the only final inspection/configuration surface.
 and `getConfig` are deleted, not aliased; changing guard policy requires a new boot/
 document generation.
 
-The creative integration module prepares inertly and activates transactionally
-exactly once in the kernel barrier. Activation installs the click guard when
+The initial slice installs the selected compare-restorable guard before publisher
+creative activity and transfers its exact wrapper/observer state through the
+handoff capsule. The creative takeover module prepares inertly and activates
+transactionally exactly once in the kernel barrier. Activation adopts rather than
+stacks that guard, and installs it directly only on a no-agent page. It enables the click guard when
 `clickGuard` is true and the image/iframe dynamic-source guards when `renderGuard` is
 true, but performs no baseline DOM rewrite. Only when
 `clickGuard || renderGuard` is true, activation gives a still-loading document one
@@ -3373,12 +3600,14 @@ sanitization remains explicit opt-in/default-off; rewriting retains its existing
 setting/default and still runs on every delivery path where that setting applies.
 When rewriting injects browser guards into an independent creative document, the
 server emits a complete document-local boot controller followed by exactly one
-content-addressed critical artifact containing core, `render_runtime`, and
-`creative`—and no publisher-page integration or deferred module. The manifest
-contains `render_runtime` then `creative`, the tag is the sole
-`script#trustedserver-js`, and both use the same release identity as the page
-runtime. If creative is disabled or both guards are false, rewriting injects no
-TSJS boot or artifact. A body-less fragment receives the same pair once at its
+content-addressed first-display artifact containing `first_display` plus
+`creative_initial`—and no publisher-page slice or deferred module. It loads the
+matching post-paint persistent artifact containing core, `render_runtime`, and
+`creative` through the same authenticated takeover. The first tag is the sole
+`script#trustedserver-js`; both artifacts use the same release identity as the page
+runtime. The opaque document never receives an APS/GPT/Prebid slice or ordinary
+deferred module. If creative is disabled or both guards are false, rewriting injects
+no TSJS boot or artifact. A body-less fragment receives the same pair once at its
 start; a document body receives it once at the start of the body. Boot construction
 failure rejects rewriting rather than emitting a script-only or unauthenticated
 creative.
@@ -3408,7 +3637,7 @@ proves:
 
 The shared script/beacon/DOM-insertion guards keep integration-owned matchers and
 routes. A shared helper may centralize interception, but it cannot broaden one
-integration's matcher, reorder another integration's critical startup, stack interception,
+integration's matcher, reorder another integration's first-display/takeover startup, stack interception,
 or leave a timer/listener after module disposal. Maximal-bundle tests load every
 server-declared integration module through its real phase/trigger and deterministic
 catalog-order initiation. They allow independent deferred completion order and
@@ -3430,28 +3659,37 @@ late continuation behavior with fake timers.
 The implementation extracts cohesive behavior rather than mechanically splitting
 by line count:
 
-| Current area                         | Target responsibility                                                                                                                                                                 |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| production `composition/browser`     | deleted as a catch-all root; the production core constructs only kernel/session/broker, boot validation, queue/logger, diagnostics facade, and minimum direct-auction API             |
-| test composition seams               | separate unshipped entry containing fake/no-op adapters, schedulers, corpus hooks, and `*ForTest` accessors                                                                           |
-| `gpt/index.ts`                       | a first-display slice over GPT adapter/slot/render plus any initial handoff/hydration/reconciliation it needs; only provably post-display refresh and SPA/navigation work is deferred |
-| `prebid/index.ts`                    | critical external-artifact readiness, bidder aliases, user-ID/EIDs, publisher queue, initial auction, and PUC/TS-bid admission whenever Prebid is enabled                             |
-| `prebid/later.ts`                    | deferred synthetic refresh and GAM-path exclusion only; it owns no initial admission, artifact-readiness, bidder, user-ID, EID, or publisher-queue behavior                           |
-| `core/request.ts`                    | public validation, immutable selection, and thin `AuctionBatch` coordination; path implementations live behind injected capabilities                                                  |
-| `core/render.ts`                     | only minimum path-independent first-display DOM/lifecycle helpers; APS/ADM live with their owner, while cache stays the baseline GPT-integration implementation                       |
-| `kernel/diagnostics.ts`              | bounded data-tree snapshot ingress and one closure-private reducer callback; no integration subscriptions, pending queue, scheduler, timer, or presentation authority                 |
-| `core/trace.ts`                      | bounded correctness-fact reducer/store, public snapshots/subscriptions, and separately attenuated `trace.presentation.v1`; no DOM presentation code                                   |
-| APS maps in globals                  | runtime-owned bounded reservation capability supplied by the APS integration module                                                                                                   |
-| diagnostics overlay/UI               | deferred owner of the sole private `trace.presentation.v1` attachment; never imported by production core or correctness producers                                                     |
-| duplicated `script_guard.ts`         | small per-integration factory compiled into the owning module; no central production root imports every matcher                                                                       |
-| optional integration implementations | remain in their integration IIFEs and register inert factories; they are absent from core bytes                                                                                       |
+| Current area                         | Target responsibility                                                                                                                                                                                  |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| production `composition/browser`     | deleted as a catch-all root; a new first-display composition owns only §5.2.1 slices, while persistent core constructs kernel/session/broker, API, diagnostics facade, and direct-auction coordination |
+| `first_display/**`                   | fixed agent coordinator plus exact initial APS/GPT/Prebid/creative/parser-time slices, handoff serializer/capsule, protected paint, and no public runtime API                                          |
+| test composition seams               | separate unshipped entry containing fake/no-op adapters, schedulers, corpus hooks, and `*ForTest` accessors                                                                                            |
+| `gpt/index.ts`                       | persistent GPT owner that can adopt exact initial slot/cycle identities; the separate `gpt_initial` slice owns only the immutable projected request and transfer facts                                 |
+| `prebid/index.ts`                    | persistent Prebid owner that adopts initial artifact/queue/admission facts; the separate `prebid_initial` slice owns only initial readiness, bidder/user-ID/EID setup, and PUC admission               |
+| `prebid/later.ts`                    | deferred synthetic refresh and GAM-path exclusion only; it owns no initial admission, artifact-readiness, bidder, user-ID, EID, or publisher-queue behavior                                            |
+| `core/request.ts`                    | public validation, immutable selection, and thin `AuctionBatch` coordination; path implementations live behind injected capabilities                                                                   |
+| `core/render.ts`                     | only minimum path-independent first-display DOM/lifecycle helpers; APS/ADM live with their owner, while cache stays the baseline GPT-integration implementation                                        |
+| `kernel/diagnostics.ts`              | bounded data-tree snapshot ingress and one closure-private reducer callback; no integration subscriptions, pending queue, scheduler, timer, or presentation authority                                  |
+| `core/trace.ts`                      | bounded correctness-fact reducer/store, public snapshots/subscriptions, and separately attenuated `trace.presentation.v1`; no DOM presentation code                                                    |
+| APS maps in globals                  | runtime-owned bounded reservation capability supplied by the APS integration module                                                                                                                    |
+| diagnostics overlay/UI               | deferred owner of the sole private `trace.presentation.v1` attachment; never imported by production core or correctness producers                                                                      |
+| duplicated `script_guard.ts`         | small per-integration factory compiled into the owning module; no central production root imports every matcher                                                                                        |
+| optional integration implementations | remain in their integration IIFEs and register inert factories; they are absent from core bytes                                                                                                        |
 
 The first-display and later slices of one product integration must retain the same
 observable ownership and disposal contract. Splitting files or artifacts cannot
-move a correctness-critical listener behind first display, duplicate an adapter,
+omit a correctness-required listener from its first-display slice, duplicate an adapter,
 or turn a bounded typed failure into a readiness hang. Conversely, code used only
 for refresh, later navigation, diagnostics presentation, test injection, or an
-optional integration cannot remain in the critical dependency graph for convenience.
+optional integration cannot remain in the first-display dependency graph for convenience.
+
+Source may be shared at authoring time only through effect-free leaf contracts whose
+metafile contribution fits the agent budget. The first-display build must not import
+the persistent core, capability broker, generic slot/auction/trace registries, later
+GPT/Prebid module, or any deferred entry. It may use a dedicated compact parser and
+state machine generated from the same neutral schema/corpus; parity tests, rather
+than a production import from the persistent implementation, prevent drift. The
+persistent build likewise imports no agent coordinator or provisional singleton.
 
 ### 5.12 TypeScript and performance gates
 
@@ -3485,20 +3723,23 @@ The existing `roleCorrectTransfer` subtree records the first role-correct captur
 from the exact clean, pushed parent after Task 18D. Review established that this was
 an oversized intermediate implementation, so its provenance and bytes stay
 immutable but its self-derived 5% ceilings are not release acceptance. After
-critical-runtime remediation, the implementation appends a distinct
+mechanical critical-runtime remediation, the implementation appended a distinct
 `reviewRemediationTransfer` subtree to the same JSON without changing either earlier
-subtree. It records its own clean pushed source ref/SHA, toolchain and compression
-identity, release inventory, per-artifact hashes, and the same semantic sets:
+subtree. That second immutable checkpoint proves graph de-duplication but does not
+authorize release because its 395 kB reference response fails the paired timing gate.
+After first-display-agent remediation, implementation appends a third distinct
+`firstDisplayTransfer` subtree without changing any earlier subtree. It records its
+own clean pushed source ref/SHA, toolchain/compression identity, release inventory,
+per-artifact hashes, and these semantic sets:
 
-- **minimal critical** is the server-composed artifact for
-  `[core, render_runtime]`; `render_runtime` is mandatory even when no product
-  integration is enabled because it owns programmatic direct rendering and the
-  shared lifecycle services;
-- **reference critical** is the one server-composed first-display artifact for the
-  semantic reference configuration
-  `[core, render_runtime, creative, gpt, prebid, datadome]`, but contains only the
-  catalogued critical slices required by that configuration; and
-- **maximal total** is every production core, critical, and deferred TSJS module in
+- **minimal first display** is `first_display` plus no optional slice;
+- **reference first display** is the one served agent artifact for the semantic
+  reference `[first_display, creative_initial, gpt_initial, prebid_initial,
+datadome_initial]`; it does not include core or any persistent takeover module;
+- **persistent runtime** is `[core]` plus all catalogued takeover modules for the
+  reference configuration, served after protected paint; and
+- **maximal total** is every first-display base/slice, production core, takeover,
+  and deferred TSJS module in
   the release, each exactly once. This gate prevents phase splitting from hiding
   total growth.
 
@@ -3516,24 +3757,25 @@ to authorize the duplicate. It also freezes the twenty largest rendered-source
 contributions and every repeated attribution so review can see, rather than infer,
 where transfer growth and shared-source duplication remain.
 
-The reduced capture is allowed only after the critical graph contains no diagnostics
-presentation, post-paint trace UI, refresh-only work, SPA/later-navigation work,
-optional integration implementation, test seam, or duplicated runtime/adapter
-owner. Minimal critical must be at most **220,000 raw bytes** and **59,000 gzip
-bytes**, and its Brotli value must be strictly below the corresponding reviewed
-intermediate value. Reference-critical raw, gzip, and Brotli values must each be
-strictly below the reviewed intermediate values; maximal total cannot grow. These
-raw/gzip limits are the initial mechanical-deduplication ceiling, based on a
-58,503-gzip / 214,538-raw prototype before release stamping. They are not a claim of
-equivalence to the much smaller legacy artifact. The release review records the
-residual deltas against the original pre-change values explicitly. Missing reduction
-or missing owner acceptance of that residual delta blocks merge.
+The final capture is allowed only after the first-display graph contains no public
+runtime API, persistent broker/registry, diagnostics, refresh, SPA/navigation,
+programmatic/direct-auction work, test seam, duplicate adapter owner, or live object
+that cannot be disposed/transferred by §5.2.1. The reference first-display artifact
+must be at most **90,000 raw bytes**. This is an architecture ceiling selected from
+the 200,000-byte/s comparison profile, not a substitute for the measured gate; a
+candidate below 90 kB still blocks if p90 exceeds 1.10×. Minimal/reference gzip and
+Brotli must each be below their `reviewRemediationTransfer` counterpart. The
+persistent-runtime set may exceed first-display budgets because it is post-paint,
+but maximal-total raw/gzip/Brotli cannot exceed the reviewed mechanical-remediation
+capture. Any total growth requires a separate reviewed design rather than moving
+bytes across phases.
 
 The build emits one canonical release inventory with each production bundle's id,
 role, phase, trigger, inputs, outputs, bytes, and hash. Budget membership is derived
 from that catalog rather than an obsolete exact filename list. The final reduced
-capture stores the exact raw, gzip, and Brotli values for bootstrap, minimal,
-reference, and maximal. After review accepts the reduced checkpoint, each value's
+capture stores the exact raw, gzip, and Brotli values for bootstrap, minimal first
+display, reference first display, persistent runtime, and maximal. After review
+accepts the first-display checkpoint, each value's
 ongoing blocking ceiling is `ceil(capturedBytes * 1.05)`; the comparator computes
 this formula from the frozen capture rather than accepting separately hand-entered
 numbers.
@@ -3550,13 +3792,15 @@ validation, generation/disposal, timing, and local logging primitives.
    historical deltas, never as pass/fail comparisons across different membership;
 2. the reviewed intermediate role-correct values and their digest are validated and
    printed, but cannot authorize the release candidate; and
-3. the final reduced bootstrap/minimal/reference/maximal values enforce the computed
-   5% transfer ceilings and the one-time reduction assertions above.
+3. the final first-display bootstrap/minimal/reference/persistent/maximal values
+   enforce the computed 5% transfer ceilings and the one-time architecture
+   assertions above.
 
 The gate also rejects an unclassified or multiply counted artifact, a missing
 production artifact, a test artifact, a maximal inventory that omits any split
-module, critical reachability to a deferred source, a consumer that inlines a
-catalogued provider implementation, a second adapter/runtime/listener owner, and
+module, first-display reachability to a persistent/deferred source, takeover
+reachability to a deferred source, a consumer that inlines a catalogued provider
+implementation, overlapping agent/persistent side-effect ownership, and
 production reachability to fake/no-op/test or `*ForTest` sources. It reports the
 largest source contributions and repeated production attributions so later work
 cannot hide growth inside a passing aggregate. Changing either earlier evidence
@@ -3566,17 +3810,17 @@ hatch.
 
 Boot-to-first-display uses real User Timing marks, not `__tsjsPerf` or a test-only
 placeholder. The bootstrap controller records `tsjs:bids-script` immediately before
-the server's critical head sequence, so the measure includes required upstream and
-critical-artifact loading. The one runtime records
+the server's first-display head sequence, so the measure includes required upstream
+and agent-artifact loading. The provisional owner records
 `tsjs:first-display`
 exactly once immediately before the first TS-owned request action in the protected
 first-display batch: the responsible GPT `display`/`refresh`, or direct-render iframe
 insertion. A page with no render attempt during the measurement is excluded
 explicitly rather than manufacturing a mark. The terminal latch for the attempt that produced that action records
 `tsjs:first-display-terminal`; after the complete immutable initial projection batch
-settles and the §5.2 paint gate passes, core records `tsjs:first-display-paint`.
+settles and the §5.2 paint gate passes, the agent records `tsjs:first-display-paint`.
 Each mark is emitted at most once per document runtime. The reference fixture asserts
-that no deferred request, preload, preparation, or execution precedes
+that no persistent or deferred TSJS request, preload, preparation, or execution precedes
 `tsjs:first-display-paint`; p90 remains the exact `tsjs:bids-script` to
 `tsjs:first-display` request-action measure so the historical metric does not change
 meaning.
@@ -3598,10 +3842,10 @@ that commit actually produced. While current `main` emits the legacy `tsjs-core.
 the harness concatenates and serves those real built bytes, enables the same default
 creative policy, and drives their real legacy `adInit` surface. After the cutover
 reaches `main`, the same loader consumes that commit's release-v1 inventory/controller
-and `[core, render_runtime, creative, gpt]` critical selection instead. It does not relabel an older phase-aware
+and that commit's real server-selected first-display artifact instead. It does not relabel an older phase-aware
 capture as `main` or require unavailable candidate-only metadata from a legacy
 commit. The candidate side consumes its generated server controller and release-v1
-critical/deferred artifacts. One in-process `node:http` server per variant on an
+first-display/takeover/deferred artifacts. One in-process `node:http` server per variant on an
 ephemeral `127.0.0.1` port serves that variant's exact page and bytes. Playwright
 request interception or fulfillment is outside the instrument.
 
@@ -3609,14 +3853,15 @@ Before either variant navigates, its page receives the same checked-in Chromium 
 `Network.emulateNetworkConditions` profile: 150 ms latency, 1.6 Mbit/s download
 (200,000 bytes/second), 750 kbit/s upload (93,750 bytes/second), and zero packet
 loss. The profile is not selectable by environment input. A common comparison mark
-runs immediately before the external critical-script element, and the GPT fixture
+runs immediately before the external first-display script element, and the GPT fixture
 records the common terminal mark at its first observable `display` or `refresh`
 action. A direct-render comparison records the equivalent iframe insertion. The
-interval therefore includes critical-script transfer, parse, evaluation, and
+interval therefore includes first-display transfer, parse, evaluation, and
 runtime work through the first observable request/render action without depending
 on a candidate-only mark. Candidate runs additionally prove the real
 `tsjs:bids-script`, `tsjs:first-display`, and `tsjs:first-display-paint` marks and
-that no deferred request, preload, preparation, or execution precedes paint.
+that no persistent or deferred TSJS request, preload, preparation, or execution
+precedes paint.
 
 The job alternates `main` then candidate / candidate then `main` in one Chromium
 process for every warmup and measured pair. Candidate p90 must be at most current
@@ -3624,7 +3869,7 @@ process for every warmup and measured pair. Candidate p90 must be at most curren
 millisecond ceiling, and a historical fixed comparison SHA is not an honest stand-in
 for current `main`; neither remains in the active gate. The schema-5 artifact records
 the exact main and candidate SHAs, each actual artifact model, each exact served
-critical byte count, both full distributions and p90s, the alternating order, and
+first-display byte count, both full distributions and p90s, the alternating order, and
 the exact network profile. The workflow runs each declared pair once and never
 selectively reruns, drops, or reclassifies slow samples. Budget assertions are soft
 only in the Playwright sense: the run finishes all timing and heap collection and
@@ -3664,7 +3909,13 @@ performance pass.
    capability.
 5. Native Prebid messages with non-TS ids continue to native listeners. Any message
    carrying a live or tombstoned TS id is suppressed before later validation.
-6. The upstream APS runner URL, every creative URL, and production renderer/proxy
+6. The first-display handoff is not a public trust boundary. Its data record is
+   exact-shaped, bounded, recursively frozen, and descriptor/creative-free; its
+   object capsule is closure-private, same-task, release/generation-bound, and
+   one-use. No agent capability reaches `window.tsjs`, DOM attributes, messages,
+   logs, diagnostics, storage, or analytics. A forged/replayed/stale capsule fails
+   before persistent activation and cannot claim committed DOM or a GPT object.
+7. The upstream APS runner URL, every creative URL, and production renderer/proxy
    routes must be HTTPS. HTTP is permitted only for loopback hermetic adapters; their
    fixed local proxy route remains covered by CSP `'self'`. The runner executes only
    through the fixed-target, anonymous-CORS Trusted Server proxy. The proxy relays the
@@ -3672,36 +3923,36 @@ performance pass.
    accepts a caller-selected target, or executes a fallback. Runner-created APS-origin
    resources may use their own origin cookies under browser policy. The renderer
    document accepts no cookie as authority.
-7. Script creatives remain opt-in because they materially broaden executable
+8. Script creatives remain opt-in because they materially broaden executable
    behavior. Enabling them requires a documented security review of the fixed
    renderer CSP.
-8. Deferred module URLs are generated from the local immutable release inventory,
+9. Persistent/deferred module URLs are generated from the local immutable release inventory,
    are same-origin exact content-hash paths, and are authenticated by
    release/id/source plus the core-created element and `document.currentScript`.
    The narrowly scoped Trusted Types policy accepts only those frozen manifest URLs,
-   CSP nonces are copied only from the authenticated critical tag, and policy
+   CSP nonces are copied only from the authenticated parser-inserted tag, and policy
    failure cannot select another sink or source. Publisher-created tags and calls
    cannot load or register code, and no deferred URL can select an upstream script
    target.
-9. Static TSJS hash mismatches and unknown paths fail locally on every adapter; a
-   stale URL never aliases current bytes or falls through to publisher origin.
-10. The design adds no persistent identifier and no external event pipeline.
+10. Static TSJS hash mismatches and unknown paths fail locally on every adapter; a
+    stale URL never aliases current bytes or falls through to publisher origin.
+11. The design adds no persistent identifier and no external event pipeline.
 
 ## 7. Verification and acceptance
 
 ### 7.1 Required test layers
 
-| Layer                 | Required proof                                                                                                                                                                                                                                                                                                                                                             |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Rust unit             | APS parsing/admission, dimensions, scripts, AAX projection, mediation provenance/order/timeouts, targeting identity, descriptor serialization, endpoint headers/body                                                                                                                                                                                                       |
-| `rc/july` parity      | executable `905984e62` TSJS source/test/browser inventory; every `RCJ-*` row maps to pre-cutover evidence, a final owner, focused tests, and either retained or deliberately replaced observable behavior                                                                                                                                                                  |
-| Cross-language corpus | every positive/adversarial descriptor has the same Rust, TS, and embedded ES5 result; stale generation fails                                                                                                                                                                                                                                                               |
-| TS unit               | kernel ownership, critical/deferred registration and transactions, critical fallback versus isolated deferred failure, trigger/disposal races, sessions, registries, selection/cycle/batch/latch APIs, adapter readiness, GPT handoff/reconciliation, Prebid artifact/refresh, creative security, diagnostics, and every remaining integration parity corpus               |
-| Hermetic browser      | one critical request, no pre-display deferred traffic, authenticated later module loading into the same runtime, all render paths, PUC bridge, three-level APS sizing, direct iframe races, owner/port/runner behavior, fallback, SafeFrame-shaped nesting, GPT handoff/hydration, creative clicks, diagnostics, and duplicate/replay/wrong-source/stale cases             |
-| Real-GAM test network | SSAT APS-PUC, Prebid-adapter APS-PUC, page-bids APS-PUC, direct APS, direct ADM plus baseline PBS Cache regression, fallback after attributable empty GAM, SRA, refresh, SPA, handoff, hydrated DOM replacement, and collapsed shell                                                                                                                                       |
-| Adapter parity        | exact renderer sandbox/CSP/header bytes plus runner-proxy routing, five-second deadline, closed response parsing, bounded relay, header filtering, and failures match on all adapters                                                                                                                                                                                      |
-| Regression            | non-APS Cache/ADM and notifications, pure external Prebid/native bids/EIDs/user IDs/refresh exclusions, publisher GPT/handoff/SRA/SPA, creative processing/click recovery, render trace/GPT diagnostics, and every remaining integration remain correct                                                                                                                    |
-| Quality               | full-package TypeScript/lint including tests/scripts/build code, ESLint and release-catalog dependency boundaries, production-metafile/test-hook exclusions, format, clippy, Rust adapter suites, Vitest, artifact integration, Playwright, immutable historical bundle reporting, role-correct transfer budgets, performance/heap budgets, and complete maximal inventory |
+| Layer                 | Required proof                                                                                                                                                                                                                                                                                                                                                                                    |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Rust unit             | APS parsing/admission, dimensions, scripts, AAX projection, mediation provenance/order/timeouts, targeting identity, descriptor serialization, endpoint headers/body                                                                                                                                                                                                                              |
+| `rc/july` parity      | executable `905984e62` TSJS source/test/browser inventory; every `RCJ-*` row maps to pre-cutover evidence, a final owner, focused tests, and either retained or deliberately replaced observable behavior                                                                                                                                                                                         |
+| Cross-language corpus | every positive/adversarial descriptor has the same Rust, TS, and embedded ES5 result; stale generation fails                                                                                                                                                                                                                                                                                      |
+| TS unit               | agent/takeover ownership, exact handoff/capsule admission, takeover/deferred transactions, fallback versus isolated deferred failure, trigger/disposal races, sessions, registries, selection/cycle/batch/latch APIs, adapter readiness, GPT handoff/reconciliation, Prebid artifact/refresh, creative security, diagnostics, and every remaining integration parity corpus                       |
+| Hermetic browser      | one parser-blocking first-display request, no pre-paint persistent/deferred traffic, authenticated atomic takeover into the one persistent runtime, all render paths, PUC bridge, three-level APS sizing, direct iframe races, owner/port/runner behavior, fallback, SafeFrame-shaped nesting, GPT handoff/hydration, creative clicks, diagnostics, and duplicate/replay/wrong-source/stale cases |
+| Real-GAM test network | SSAT APS-PUC, Prebid-adapter APS-PUC, page-bids APS-PUC, direct APS, direct ADM plus baseline PBS Cache regression, fallback after attributable empty GAM, SRA, refresh, SPA, handoff, hydrated DOM replacement, and collapsed shell                                                                                                                                                              |
+| Adapter parity        | exact renderer sandbox/CSP/header bytes plus runner-proxy routing, five-second deadline, closed response parsing, bounded relay, header filtering, and failures match on all adapters                                                                                                                                                                                                             |
+| Regression            | non-APS Cache/ADM and notifications, pure external Prebid/native bids/EIDs/user IDs/refresh exclusions, publisher GPT/handoff/SRA/SPA, creative processing/click recovery, render trace/GPT diagnostics, and every remaining integration remain correct                                                                                                                                           |
+| Quality               | full-package TypeScript/lint including tests/scripts/build code, ESLint and release-catalog dependency boundaries, production-metafile/test-hook exclusions, format, clippy, Rust adapter suites, Vitest, artifact integration, Playwright, immutable historical bundle reporting, role-correct transfer budgets, performance/heap budgets, and complete maximal inventory                        |
 
 ### 7.2 Mandatory race matrix
 
@@ -3792,29 +4043,29 @@ Tests must cover at least:
   PBS Cache black-box corpus for ADM-over-cache precedence, cache-only fetch/parse/
   macro/PUC response, collapsed resize, failure, and stale-navigation disposal with
   no new cache input, result, deadline, or identity semantics;
-- release-catalog cycles, duplicate providers, undeclared capabilities, critical
+- release-catalog cycles, duplicate providers, undeclared capabilities, takeover
   consumption of a deferred provider, phase overrides, unknown/missing/multiply
   counted production artifacts, deferred/test source pulled into core, and a module
-  classified critical without its named parser-time or first-display obligation;
+  classified into the agent without its named parser-time or first-display obligation;
   exact per-consumer capability projection proves `attachPresentation` is absent
   from `trace.v1` and denied to APS, GPT, and `gpt_later`, while only
   `diagnostics_presentation` can consume `trace.presentation.v1`;
-- exactly one critical network request and manifest-order registration; critical
-  module missing/wrong-release/duplicate/prepare throw/reject/abort/activation throw
-  at each checkpoint, late critical continuation after fallback, and critical
+- exactly one parser-blocking network request and manifest-order registration;
+  first-display/takeover module missing/wrong-release/duplicate/prepare
+  throw/reject/abort/activation throw at each checkpoint, late continuation after fallback, and takeover
   `afterCommit` throw; 9,999/10,000/10,001 ms synchronous activation returns plus
   the pre/post-call and pre-handoff monotonic checks; nonreturning activation
   documented as unpreemptable; duplicate `afterCommit` registration,
-  catalog-derived 13/14/15 critical-callback staging, and 19/20/21 total-manifest
+  catalog-derived 13/14/15 takeover-callback staging, and 19/20/21 total-manifest
   capacity; publisher GPT activity and
-  script/creative DOM activity before/during/after a later critical failure prove
+  script/creative DOM activity before/during/after a later takeover failure prove
   preparation is inert, activation cannot yield, rollback is same-task, and
-  post-commit work sees only the full critical kernel; queued and later
+  post-commit work sees only the full persistent kernel; queued and later
   `requestAds`, callback throws, already-aborted signals, publisher/unsolicited
   integration registration refusal, and proof that no second runtime, listener,
   port, timer, request, script, wrapper, guard, or iframe survives fallback;
 - first-display-required live GPT/Prebid fetch starting after `tsjs:bids-script` and
-  overlapping the critical TSJS fetch, upstream success before/after adapter
+  overlapping the first-display TSJS fetch, upstream success before/after adapter
   activation, and proof that no TS-owned display/request occurs before the sole
   adapter's correctness listeners; optional upstream and APS runner traffic is
   absent from boot, TSJS generated-source scans contain no upstream library bytes,
@@ -3827,14 +4078,14 @@ Tests must cover at least:
   concurrent readiness waiters keep their original deadlines while sharing one
   module Promise/script after the gate; all deferred transactions start after the
   common gate without waiting for one another, and a hung/failed first catalog entry
-  cannot delay another module's fetch or deadline; no deferred request/preload/evaluation
+  cannot delay another module's fetch or deadline; no persistent/deferred request/preload/evaluation
   precedes `tsjs:first-display-paint`; exact script-node/currentScript/source/id/
   phase/release authentication rejects publisher tags, replaced nodes, redirects,
   duplicates, and stale generations; deferred prepare/activate/afterCommit/load/
   timeout failures leave the same kernel/adapter/listener/slot/dispatcher identities
   live, settle dependent work with its typed reason, leak no node/listener/timer,
   and neither install fallback nor start a second runtime;
-- critical and deferred static routes across Fastly, Axum, Cloudflare, and Spin:
+- first-display, takeover, and deferred static routes across Fastly, Axum, Cloudflare, and Spin:
   exact path, one-field hash query, response-byte hash, enabled catalog membership,
   MIME/nosniff headers, conditional `304`, local `404 no-store`, no publisher
   fallthrough, and no redirect; stale-release URLs fail instead of receiving current
@@ -3934,7 +4185,7 @@ Tests must cover at least:
   recovery; absolute HTTP(S), credentials, malformed and non-network schemes;
   dynamic URLs; replaced elements; and redirect/browser navigation failure; and
 - every remaining integration alone and in the maximal manifest, including each
-  catalogued critical/deferred split, parser-time interception when required,
+  catalogued first-display/takeover/deferred split, parser-time interception when required,
   missing globals, readiness/timeouts, malformed consent/storage, matcher false
   positives, callback throws, startup failure, reverse-order disposal, and
   cross-integration isolation; and
@@ -3965,10 +4216,11 @@ analytics row:
   missing document acknowledgement, and runner failure each reach the specified
   terminal reason within the specified timeout.
 - After SPA replacement, no old attempt mutates the current slot or targeting.
-- The initial page loads one same-origin critical TSJS artifact. Network evidence
-  shows no deferred TSJS request/preload before `tsjs:first-display-paint`;
-  later refresh/navigation/diagnostics behavior joins the same runtime after its
-  declared trigger without replacing the GPT/Prebid adapter or lifecycle owners.
+- The initial page loads one same-origin first-display TSJS artifact. Network
+  evidence shows no persistent/deferred TSJS request/preload before
+  `tsjs:first-display-paint`; takeover transfers exact physical/ad ownership without
+  another display, and later refresh/navigation/diagnostics behavior joins the same
+  persistent runtime without replacing its GPT/Prebid adapter or lifecycle owners.
 
 The suite records browser console, network metadata, DOM, and GPT-event evidence as
 CI artifacts. Network capture excludes APS runner and creative response bodies so a
@@ -3995,16 +4247,15 @@ of this cutover.
    test-only construction.
 3. **Server APS path:** make admission, mediation, descriptor projection, targeting,
    and renderer route conform to the contract.
-4. **Critical-path extraction:** build the one server-composed critical artifact,
-   move optional/later behavior out of its dependency graph, add authenticated
-   deferred loading into the same runtime, and make inventory and production-
-   metafile gates green. After resolving current-base conflicts, capture the one
-   role-correct transfer baseline from that exact clean Task 18D parent commit;
-   historical bundle deltas remain report-only, and the new transfer, timing, and
-   heap gates must be green before production wiring.
+4. **First-display extraction:** preserve the two immutable intermediate captures,
+   build the server-composed first-display artifact plus authenticated post-paint
+   takeover, move persistent/later behavior out of its graph, and make inventory,
+   ownership, and production-metafile gates green. Capture `firstDisplayTransfer`
+   from its exact clean pushed parent; all historical deltas remain report-only, and
+   transfer, timing, and heap gates must be green before production wiring.
 5. **Browser integrations:** migrate APS, GPT, Prebid, direct auction, fallback,
    local diagnostics, creative processing, every remaining TSJS integration, and
-   bootstrap to the catalogued critical/deferred modules while their `RCJ-*` parity
+   bootstrap to the catalogued first-display/takeover/deferred modules while their `RCJ-*` parity
    corpus stays green.
 6. **Delete legacy paths:** remove expandos, duplicate bridge branches, old
    `requestAds`, legacy globals, duplicated bootstrap behavior, and unused flags
@@ -4064,7 +4315,7 @@ adding a hidden analytics subsystem here.
 12. **Keep every enabled integration in one atomic boot barrier:** rejected. It makes
     first display pay for refresh, later navigation, diagnostics UI, and optional
     integrations that cannot affect that display. Atomicity remains mandatory for
-    the critical transaction and for each deferred module's local transaction.
+    the takeover transaction and for each deferred module's local transaction.
 13. **Download a monolith early and merely postpone its callbacks:** rejected. It
     preserves transfer/parse contention and does not solve load time; deferred code
     is a separately requested release-owned artifact after its trigger.
@@ -4075,36 +4326,50 @@ adding a hidden analytics subsystem here.
 15. **Give each deferred bundle its own runtime or service locator:** rejected. A
     later module can join only the committed session through catalogued frozen
     capabilities and cannot replace an owner.
+16. **Keep optimizing the 395 kB full-runtime first-display graph:** rejected by
+    measured evidence. Co-bundling removed duplicate emission but still produced a
+    4.57× p90 against current `main`; no credible local minification or shared-chunk
+    change closes that gap under the fixed network profile.
+17. **Create provider-specific independent mini-runtimes:** rejected. They reduce
+    bytes per path but multiply queue, adapter, message, slot, and fallback ownership.
+    The one bounded agent has a single exact transfer into the one persistent runtime.
+18. **Relax the 1.10× gate or accept the 220 kB mechanical ceiling:** rejected. The
+    automated paired gate is the user-visible load-time acceptance criterion; the
+    90 kB agent ceiling is an additional architecture guard, not permission to
+    self-baseline or waive the measured result.
 
 ## 10. Risks and mitigations
 
-| Risk                                                                 | Mitigation                                                                                                                                                                                                                                                                                                                                                    |
-| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| PUC behavior differs from the local contract harness                 | keep the harness limited to the public message/helper contract, exercise `h.sendMessage`, and gate the actual externally hosted PUC release on real GAM; do not vendor PUC bytes                                                                                                                                                                              |
-| Same-realm publisher code can interfere                              | explicitly trust TS-authored owner code; capability checks defend unrelated frames, replays, and stale work, not arbitrary same-realm compromise                                                                                                                                                                                                              |
-| A module activation never returns                                    | activation is generated first-party code with boundary tests; elapsed returning calls fail through monotonic checks, but JavaScript cannot preempt a nonreturning same-thread function                                                                                                                                                                        |
-| Strict parsing rejects a future APS field                            | descriptor is versioned; outer transport remains tolerant; add a reviewed version/corpus update rather than silently accepting new semantics                                                                                                                                                                                                                  |
-| CSP blocks a legitimate APS creative                                 | three-browser real-GAM suite; script creatives remain opt-in; CSP changes are explicit security work                                                                                                                                                                                                                                                          |
-| Hard cutover breaks stale pages                                      | accepted compatibility stance; a stale hash fails locally and reload is required; retain the prior deployable binary for whole-release rollback, not N/N-1 routes in the active binary                                                                                                                                                                        |
-| Kernel extraction changes unrelated integrations                     | per-integration pre/post behavior corpus, adapter fakes, current full suites, behavioral maximal-bundle test, and exact disposal assertions                                                                                                                                                                                                                   |
-| Optional code drifts back into the critical artifact                 | release-catalog phase/dependency validation, production metafile deny paths, semantic critical-set budgets, and reviewable named parser-time obligations                                                                                                                                                                                                      |
-| A deferred feature is called before its module is ready              | caller deadlines start at original enqueue and may expire while gated; after the paint gate, live waiters share one independently bounded module load with no duplicate/fallback/runtime                                                                                                                                                                      |
-| First display never occurs, so deferred work starves                 | the owned 10-second post-kernel no-display guard becomes the trigger, followed by bounded idle scheduling or the owned timer fallback                                                                                                                                                                                                                         |
-| A page waits past 10 seconds before its first display                | accepted explicit boundary: correctness still uses critical owners, but the post-window display may contend with already released later work and is excluded from the protected-load claim                                                                                                                                                                    |
-| A forged/replaced script registers into the runtime                  | exact same-origin catalog URL, release/id/phase match, core-created element identity, `document.currentScript`, single terminal registration, and generation checks                                                                                                                                                                                           |
-| Publisher CSP or Trusted Types blocks a deferred module              | preserve the publisher policy; copy only the authenticated critical nonce, use one exact-manifest Trusted Types policy when allowed, validate default-policy output, and isolate `policy_blocked` without a second sink/runtime                                                                                                                               |
-| Phase splitting duplicates product ownership                         | one broker provider per capability, immutable interfaces, critical-before-deferred dependency rule, identity/disposal tests, and no public service locator                                                                                                                                                                                                    |
-| Deferred loading reduces critical bytes but grows total release size | independent immutable maximal-total raw/gzip/Brotli budget and complete release inventory; splitting alone cannot make the gate pass                                                                                                                                                                                                                          |
-| One deferred module stalls unrelated later behavior                  | start every independent deferred transaction after the common gate without awaiting siblings; separate deadlines and no deferred-to-deferred capability edges prevent head-of-line blocking                                                                                                                                                                   |
-| `rc/july` moves after the design is approved                         | pin `905984e62`; stop before code changes, diff all inventoried TSJS/bootstrap/browser paths, and update the ledger/tests explicitly                                                                                                                                                                                                                          |
-| Diagnostics change ad behavior or overclaim a render                 | bounded core-only snapshot ingress, separately bounded GPT fact replay, consumer-specific private presentation capability, isolated public subscribers, honest `gam-only`/`ok` rules, inactive zero-side-effect tests, and no correctness dependency                                                                                                          |
-| Bounded registries refuse traffic under extreme churn                | explicit reservation `registry_full` and slot `registry_capacity`, lifecycle pruning, capacity stress tests; never trade correctness for eviction                                                                                                                                                                                                             |
-| GPT event attribution remains ambiguous                              | adapter-minted non-reused physical-slot plus per-object cycle identity joins diagnostics only after exact current-slot and unique-cycle resolution; unresolved, stale, or multi-cycle-ambiguous facts are dropped, while lifecycle authority still fails the TS attempt deterministically and never triggers fallback from ambiguous/publisher-owned activity |
-| Late async work mutates new SPA state                                | generation checks, owned disposers, terminal latch, and adversarial reversed-order tests                                                                                                                                                                                                                                                                      |
-| Browser tests report iframe load but not APS success                 | require the bound APS render-completion callback and inspect network/DOM evidence                                                                                                                                                                                                                                                                             |
-| APS runner becomes unavailable or stops the callback                 | load/rejection/silence fail the attempt; real-browser conformance blocks release and APS disablement is the emergency containment path                                                                                                                                                                                                                        |
-| APS runner reports completion incorrectly                            | accepted external trust risk; protected conformance checks DOM/network behavior, but cannot prove future mutable bytes; suspect behavior disables APS                                                                                                                                                                                                         |
-| Existing operational signals are weak                                | do not invent telemetry in this spec; hold deployment or write a separate observability design                                                                                                                                                                                                                                                                |
+| Risk                                                               | Mitigation                                                                                                                                                                                                                                                                                                                                                    |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| PUC behavior differs from the local contract harness               | keep the harness limited to the public message/helper contract, exercise `h.sendMessage`, and gate the actual externally hosted PUC release on real GAM; do not vendor PUC bytes                                                                                                                                                                              |
+| Same-realm publisher code can interfere                            | explicitly trust TS-authored owner code; capability checks defend unrelated frames, replays, and stale work, not arbitrary same-realm compromise                                                                                                                                                                                                              |
+| A module activation never returns                                  | activation is generated first-party code with boundary tests; elapsed returning calls fail through monotonic checks, but JavaScript cannot preempt a nonreturning same-thread function                                                                                                                                                                        |
+| Strict parsing rejects a future APS field                          | descriptor is versioned; outer transport remains tolerant; add a reviewed version/corpus update rather than silently accepting new semantics                                                                                                                                                                                                                  |
+| CSP blocks a legitimate APS creative                               | three-browser real-GAM suite; script creatives remain opt-in; CSP changes are explicit security work                                                                                                                                                                                                                                                          |
+| Hard cutover breaks stale pages                                    | accepted compatibility stance; a stale hash fails locally and reload is required; retain the prior deployable binary for whole-release rollback, not N/N-1 routes in the active binary                                                                                                                                                                        |
+| Kernel extraction changes unrelated integrations                   | per-integration pre/post behavior corpus, adapter fakes, current full suites, behavioral maximal-bundle test, and exact disposal assertions                                                                                                                                                                                                                   |
+| Optional code drifts back into the first-display artifact          | release-catalog phase/dependency validation, production metafile deny paths, semantic first-display budgets, and reviewable named parser-time obligations                                                                                                                                                                                                     |
+| Agent and persistent runtime overlap ownership                     | no runtime request before protected paint; effect-inert preparation; one non-yielding quiesce/adopt/commit transaction; exact disposer inventory; browser proof of zero duplicate display/listener/timer/port/wrapper                                                                                                                                         |
+| Takeover cannot reconstruct a live GPT slot safely                 | transfer the exact physical object only in the one-use closure-private capsule; validate generation/release and adopt without define/target/display; never serialize or publish that identity                                                                                                                                                                 |
+| Persistent takeover fails after a successful first display         | keep accepted DOM inert, reverse partial persistent effects, commit terminal fallback, and never replay the projection or resurrect the provisional agent                                                                                                                                                                                                     |
+| A deferred feature is called before its module is ready            | caller deadlines start at original enqueue and may expire while gated; after the paint gate, live waiters share one independently bounded module load with no duplicate/fallback/runtime                                                                                                                                                                      |
+| First display never occurs, so deferred work starves               | the owned 10-second post-kernel no-display guard becomes the trigger, followed by bounded idle scheduling or the owned timer fallback                                                                                                                                                                                                                         |
+| A page waits past 10 seconds before its first programmatic display | accepted explicit boundary on a no-agent page: correctness still uses persistent owners, but that display may contend with already released later work and is excluded from the protected-load claim                                                                                                                                                          |
+| A forged/replaced script registers into the runtime                | exact same-origin catalog URL, release/id/phase match, core-created element identity, `document.currentScript`, single terminal registration, and generation checks                                                                                                                                                                                           |
+| Publisher CSP or Trusted Types blocks a later module               | preserve publisher policy; copy only the authenticated parser-inserted nonce, use exact-manifest Trusted Types URLs, and fail to the defined takeover shell or isolated deferred `policy_blocked` state without another sink/runtime                                                                                                                          |
+| Phase splitting duplicates product ownership                       | one broker provider per capability, immutable interfaces, takeover-before-deferred dependency rule, agent capsule identity/disposal tests, and no public service locator                                                                                                                                                                                      |
+| Phase splitting reduces initial bytes but grows total release size | independent immutable maximal-total raw/gzip/Brotli budget and complete release inventory; splitting alone cannot make the gate pass                                                                                                                                                                                                                          |
+| One deferred module stalls unrelated later behavior                | start every independent deferred transaction after the common gate without awaiting siblings; separate deadlines and no deferred-to-deferred capability edges prevent head-of-line blocking                                                                                                                                                                   |
+| `rc/july` moves after the design is approved                       | pin `905984e62`; stop before code changes, diff all inventoried TSJS/bootstrap/browser paths, and update the ledger/tests explicitly                                                                                                                                                                                                                          |
+| Diagnostics change ad behavior or overclaim a render               | bounded core-only snapshot ingress, separately bounded GPT fact replay, consumer-specific private presentation capability, isolated public subscribers, honest `gam-only`/`ok` rules, inactive zero-side-effect tests, and no correctness dependency                                                                                                          |
+| Bounded registries refuse traffic under extreme churn              | explicit reservation `registry_full` and slot `registry_capacity`, lifecycle pruning, capacity stress tests; never trade correctness for eviction                                                                                                                                                                                                             |
+| GPT event attribution remains ambiguous                            | adapter-minted non-reused physical-slot plus per-object cycle identity joins diagnostics only after exact current-slot and unique-cycle resolution; unresolved, stale, or multi-cycle-ambiguous facts are dropped, while lifecycle authority still fails the TS attempt deterministically and never triggers fallback from ambiguous/publisher-owned activity |
+| Late async work mutates new SPA state                              | generation checks, owned disposers, terminal latch, and adversarial reversed-order tests                                                                                                                                                                                                                                                                      |
+| Browser tests report iframe load but not APS success               | require the bound APS render-completion callback and inspect network/DOM evidence                                                                                                                                                                                                                                                                             |
+| APS runner becomes unavailable or stops the callback               | load/rejection/silence fail the attempt; real-browser conformance blocks release and APS disablement is the emergency containment path                                                                                                                                                                                                                        |
+| APS runner reports completion incorrectly                          | accepted external trust risk; protected conformance checks DOM/network behavior, but cannot prove future mutable bytes; suspect behavior disables APS                                                                                                                                                                                                         |
+| Existing operational signals are weak                              | do not invent telemetry in this spec; hold deployment or write a separate observability design                                                                                                                                                                                                                                                                |
 
 ## 11. Success criteria
 
@@ -4168,29 +4433,33 @@ The design is complete when all of the following are true:
 21. The external Prebid artifact remains free of TS auction/render behavior, exposes
     only its exact own frozen 10.26.0 build stamp, and the TS-owned adapter admits a
     fully prepared bid without partial publication.
-22. The initial page requests exactly one server-composed critical TSJS artifact;
-    an attempt created within the ten-second startup window protects its entire
-    immutable batch through terminal settlement and paint, and the reference fixture
-    requests, preloads, prepares, and executes no deferred module before the real
-    `tsjs:first-display-paint` mark. Its manifest URL hash is
-    the SHA-256 of the exact served critical bytes and stale or malformed hashes
-    fail locally on every adapter.
-23. Critical module absence, mismatch, timeout, or transaction failure commits the
-    terminal fallback; deferred module failure leaves the same committed kernel and
-    owners alive and settles only dependent work through its exact typed contract.
+22. A page with an eligible server projection requests exactly one parser-blocking,
+    server-composed first-display artifact. The immutable batch remains agent-owned
+    through terminal settlement and paint, and the reference fixture requests,
+    preloads, prepares, and executes no persistent/deferred TSJS artifact before the
+    real `tsjs:first-display-paint` mark. The manifest URL hash names the exact
+    served agent bytes and stale or malformed hashes fail locally on every adapter.
+23. Agent/runtime absence, mismatch, timeout, preparation, or takeover failure
+    commits the terminal fallback without replaying or removing an accepted first
+    display. A deferred module failure leaves the same committed persistent kernel
+    and owners alive and settles only dependent work through its typed contract.
 24. No production-core import graph contains deferred integration/service/UI code,
     no-op/fake/test seams, or `*ForTest` accessors. Every production artifact appears
     exactly once in the release inventory, with the bootstrap role included once and
     every TSJS module included in maximal total.
-25. The oversized role-correct capture remains immutable intermediate evidence.
-    Final minimal critical is at most 220,000 raw and 59,000 gzip bytes with lower
-    Brotli, reference-critical is lower in raw/gzip/Brotli, and maximal total does
-    not grow. The separately frozen reduced capture supplies the subsequent 5%
+25. The oversized role-correct and mechanical-remediation captures remain immutable
+    intermediate evidence. Final reference first display is at most 90,000 raw
+    bytes, minimal/reference compression decreases, and maximal total does not grow.
+    The separately frozen `firstDisplayTransfer` capture supplies subsequent 5%
     ceilings. Boot-to-first-display passes the automatic fixed-network-profile
     candidate-versus-current-`main` gate, including the candidate's real-mark and
     deferred-order assertions; retained-heap results remain within their ratio and
     hard ceilings. No gate permits disabled shaping, selective sample reruns,
     candidate self-baselining, or membership loopholes.
+    Handoff tests prove a data-only record, one-use capsule, exact physical-slot and
+    committed-artifact adoption, zero repeated `display`/`refresh`/iframe insertion,
+    and no agent listener, timer, observer, port, wrapper, request authority, or
+    strong reference after the synchronous takeover boundary.
 26. A deferred module can register only from the exact current core-created local
     release script and can obtain only catalogued frozen capabilities from the one
     runtime. It cannot replace an adapter, slot registry, dispatcher, provider, or
@@ -4237,7 +4506,7 @@ architecture:
 
 The `RCJ-*` ledger membership, behavioral dispositions, public diagnostics
 namespace, Prebid artifact independence, integration parity requirement, one-runtime
-rule, immutable budgets, and critical/deferred semantic boundaries are not open
+rule, immutable budgets, and first-display/takeover/deferred semantic boundaries are not open
 implementation decisions. The implementation plan must map every canonical release-
 catalog row above to exact source/build/test steps and preserve each concrete
 first-display, parser-time, or later-only obligation; it cannot add, remove, reorder,
