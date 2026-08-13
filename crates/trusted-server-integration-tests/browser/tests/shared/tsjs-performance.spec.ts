@@ -1077,7 +1077,7 @@ test.describe("TSJS first-display performance gate", () => {
     // The shaped comparison performs 110 cold navigations before four paired
     // heap checkpoints. Keep enough time to write the complete evidence even
     // when a candidate fails the soft p90 assertion by a wide margin.
-    test.setTimeout(1_200_000);
+    test.setTimeout(1_500_000);
     const mode = process.env.TSJS_PERF_MODE;
     test.skip(
       mode !== "preswitch" && mode !== "postswitch" && mode !== "pull-request",
