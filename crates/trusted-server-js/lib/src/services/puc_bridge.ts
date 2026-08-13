@@ -1,7 +1,12 @@
 import type { MessagingAdapter, MessagingPort } from '../adapters/messaging';
-import { TSJS_MESSAGE_PROTOCOL_V1 } from '../core/contracts/message_protocol';
+import { TSJS_MESSAGE_PROTOCOL_V1 } from '../kernel/contracts/message_protocol';
 import type { IdentityGenerationResult } from '../kernel/identity';
-import type { CollapsedPucShellResizeInput } from '../core/puc_shell';
+
+interface CollapsedPucShellResizeInput {
+  readonly source: object;
+  readonly width: number;
+  readonly height: number;
+}
 
 import type {
   CacheAdmSource,

@@ -1,6 +1,7 @@
-import type { RenderAttemptScope, WinnerContext } from '../kernel/sessions';
 import { mintBrowserRendererNonce } from '../kernel/identity';
 import type { IdentityGenerationResult } from '../kernel/identity';
+import type { RenderAttemptScope, WinnerContext } from '../kernel/sessions';
+
 import { isReservationService } from './reservations';
 import type {
   ReservationClaimAdmission,
