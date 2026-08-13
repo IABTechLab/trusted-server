@@ -1,6 +1,6 @@
 # APS Render Fix and TSJS Resilience Architecture — Design
 
-- **Status:** revision 36 — hard-cutover contract with a lean first-display owner,
+- **Status:** revision 37 — hard-cutover contract with a lean first-display owner,
   atomic persistent-runtime takeover, complete `rc/july` TSJS adoption, and
   merge-blocking load-time remediation
 - **Date:** 2026-08-04
@@ -2040,6 +2040,24 @@ element identity, `document.currentScript`, CSP nonce, and Trusted Types rules
 defined below. Independent ordinary deferred modules remain later than persistent
 runtime commit.
 
+Recording protected paint also **seals first-display TS admission** before the
+persistent request begins. From that boundary until persistent or fallback commit,
+the agent accepts no new TS bidder invocation, admission lease, render reservation,
+attempt, direct-auction request, refresh, or navigation work. A later invocation of
+the Trusted Server Prebid bidder fails before minting authority, invokes its bidder
+completion exactly once with no bid, and records the internal terminal reason
+`prebid_admission_failed`; it is never held for or replayed into the persistent
+runtime. Native publisher Prebid/GPT calls and non-TS bidder traffic remain immediate
+pass-through and may update the agent's bounded observational handoff facts, but
+cannot create TS authority. Because the immutable initial batch is the only TS work
+the agent may ever admit and every member is terminal before sealing, the seal must
+leave zero live TS admission lease, live render reservation, unconsumed ticket,
+attempt, port, or request-capable callback. Consumed/expired/stale entries that §2.3
+has already converted to unexpired terminal tombstones are required suppress-only
+state, not live authority: they remain until their original expiry and cross only as
+the bounded terminal tombstones below. Discovery of any other live TS entry is
+`bundle_partial`, not transferable state.
+
 If the initial batch has no accepted artifact—every slot is `no_bid`, failed, or
 cancelled—the same terminal/paint gate applies and takeover may proceed with an empty
 committed-artifact set. The candidate performance fixture continues to require an
@@ -2057,8 +2075,9 @@ validates capacity; it cannot snapshot or depend on live agent state.
 The agent increments one unsigned 32-bit `mutationRevision` after every admitted
 publisher GPT/Prebid call, GPT event, DOM mutation/rebind, targeting or ownership
 change, parser-guard observation, consent/segment update, and terminal/tombstone
-change while runtime bytes download and prepare. It continues handling publisher and
-external activity normally; no call is held, replayed, or allowed to act through a
+change while runtime bytes download and prepare. It continues passing through and
+observing native publisher/external activity normally, subject to the sealed TS
+admission boundary above; no call is held, replayed, or allowed to act through a
 prepared persistent owner. Revision exhaustion fails takeover instead of wrapping.
 When static preparation is ready, the agent enters the synchronous task below,
 closes its own work ingress, records the final revision, drains all already-running
@@ -2076,7 +2095,8 @@ task; any mutation callback that arrives afterward sees only the new epoch.
 - every terminal attempt and reservation/ticket tombstone still inside its original
   bounded expiry, without descriptor, ADM, capability, or creative payload bytes;
 - committed-artifact kind and ownership metadata; parser-time integration snapshot
-  data needed for its persistent owner; and
+  data needed for its persistent owner; the ordered bounded GPT-diagnostics fact
+  buffer and its overflow count when diagnostics are active; and
 - the exact once-only first-display timing/paint facts;
 - the navigation attempt-prefix and next attempt ordinal, slot-registration-order
   next ordinal, reservation/ticket monotonic-clock epoch and remaining expiries;
@@ -2100,12 +2120,14 @@ boot data, diagnostics, a log, or an analytics event.
 The handoff contains at most the existing 256 initial slots/outcomes. Every `next`
 counter is strictly above every value ever minted in that generation, including a
 retired/pruned value absent from retained rows; adoption never derives a high-water
-mark from visible rows. Each
-reservation/ticket entry is already terminal and retains only the opaque value and
+mark from visible rows. Each reservation/ticket entry is an unexpired terminal
+tombstone and retains only the opaque value and
 expiry required to suppress replay; no live authority, descriptor, ADM, or creative
 payload survives. Each copied string/targeting collection retains its source grammar
-and capacity, the canonical data-tree encoding is at most the existing 8 MiB boot
-projection cap, and the capsule has
+and capacity. The canonical non-diagnostics data-tree encoding is at most the
+existing 8 MiB boot-projection cap; the normalized diagnostics-fact subsection has
+its separate 512 KiB cap from §5.8, so the complete canonical handoff is at most
+8.5 MiB. The capsule has
 at most one physical GPT identity and one committed artifact identity per slot.
 Overflow or any nonterminal attempt/port makes takeover preparation fail; it cannot
 truncate, evict a live fact, or silently lose replay suppression.
@@ -2152,6 +2174,26 @@ not resurrect the agent, and commits that same terminal shell. It never replays 
 projection, requests GAM again, removes an accepted publisher-owned ad, or constructs
 a degraded runtime. Failed takeover therefore sacrifices later TSJS behavior, not
 the correctness or exactly-once status of the completed first display.
+
+During this post-paint load window the bootstrap Array remains the only TSJS
+publisher-work ingress. Callable pushes are appended and run against neither owner;
+they are drained once only after persistent or fallback commit. The provisional
+transport intentionally has no `requestAds` or `addAdUnits`, so an attempted direct
+call before commit is ordinary use-before-ready and creates no accepted operation or
+Promise. On successful takeover, queued callbacks run against the complete kernel.
+On authentication, load, preparation, activation, or ten-second-deadline failure,
+fallback first classifies and freezes the exact `fallbackReason` under §5.3 and
+freezes `initialDisplayCommitted` to whether the completed protected batch contained
+at least one `accepted` result, then drains those same callbacks. Wrong
+release/source/manifest/ABI identity is `abi_mismatch`; transport/load/deadline,
+preparation/activation failure, or a live TS entry at the seal is `bundle_partial`.
+Every `requestAds` made by a drained or later callback is a new post-paint call and
+settles under the fallback membership rules below with `reason:fallbackReason`; it
+does not re-report, remove, or replay the completed initial display. Every such
+`addAdUnits` throws `TsjsUnavailableError{code:'runtime_unavailable',
+reason:fallbackReason}` before mutation, and `_internal.reason` is that same frozen
+value. No queued callback or API call remains pending, and no post-paint transient
+failure retries the runtime artifact in that document generation.
 
 Every installed effect is a repository-owned primitive with a synchronous,
 nonthrowing, identity-checked disposer. Rollback attempts physical removal/restoration
@@ -2709,7 +2751,8 @@ commit atomically records one immutable boot failure reason:
   release, invalid phase/catalog/source binding, duplicate registration,
   or incompatible ABI; or
 - `bundle_partial` for a missing first-display/takeover module, preparation
-  throw/rejection, activation/takeover throw, or the owning deadline.
+  throw/rejection, activation/takeover throw, nonterminal TS state at the admission
+  seal, or the owning deadline.
 
 Before draining user work it installs `version:'1.0.0'`, the embedded `releaseId`, a
 safe frozen `TsjsBootV1`, the final `tsjs.requestAds` input validator, the
@@ -3595,17 +3638,117 @@ The GPT diagnostics integration module preserves the behavioral contract in
 this design explicitly changes ownership or activation transport. It consumes raw
 facts from the sole GPT adapter rather than registering another control wrapper.
 
-When `gpt.active` is true, core installs the six documented GPT observations
-(`slotRequested`, `slotResponseReceived`, `slotRenderEnded`, `slotOnload`,
-`impressionViewable`, and `slotVisibilityChanged`) before any TS-owned GPT request.
-It starts a 512-entry FIFO pre-module fact buffer and replays it in order when the
-diagnostics module activates. Overflow evicts the oldest fact and increments one
-diagnostics-only counter; after replay, live facts fan out directly and the buffer is
-released. When inactive, no diagnostics buffer or four diagnostics-only listeners
-exist. The GPT adapter may still own `slotRequested` and `slotRenderEnded` listeners
-required for ordinary ad correctness under §5.7; inactive zero-side-effect tests
-measure that baseline and require zero diagnostics-added listeners, DOM, timers,
-observers, API, or network work.
+The buffer does not retain GPT event objects or arbitrary publisher data. Before
+admission, the current owner normalizes each observation to one exact ordinary-data
+`FirstDisplayGptFactV1` record:
+
+```ts
+type GptDiagnosticEventV1 =
+  | 'slotRequested'
+  | 'slotResponseReceived'
+  | 'slotRenderEnded'
+  | 'slotOnload'
+  | 'impressionViewable'
+  | 'slotVisibilityChanged'
+
+type GptDiagnosticDispositionV1 = 'matched' | 'unmatched' | 'ambiguous'
+
+type GptDiagnosticIssueReasonV1 =
+  | 'no_request_cycle'
+  | 'overlapping_request_cycles'
+  | 'unknown_prior_cycle'
+  | 'invalid_event_order'
+
+interface FirstDisplayGptFactV1 {
+  readonly version: 1
+  readonly event: GptDiagnosticEventV1
+  readonly token: GptSlotTokenV1
+  readonly runtimeSlotNumber: number
+  readonly cycleOrdinal: GptTraceCycleOrdinalV1 | null
+  readonly disposition: GptDiagnosticDispositionV1
+  readonly issueReason: GptDiagnosticIssueReasonV1 | null
+  readonly capturedAtMs: number
+  readonly elementId: string | null
+  readonly adUnitPath: string | null
+  readonly isEmpty: boolean | null
+  readonly renderedSize: readonly [number, number] | null
+  readonly isBackfill: boolean | null
+  readonly slotContentChanged: boolean | null
+  readonly visibilityPercent: number | null
+}
+
+const MAX_FIRST_DISPLAY_GPT_FACTS = 512
+const MAX_FIRST_DISPLAY_GPT_FACT_BYTES = 1000
+const MAX_FIRST_DISPLAY_GPT_FACT_SECTION_BYTES = 524_288
+const MAX_FIRST_DISPLAY_GPT_FACT_COUNTER = 4_294_967_295
+```
+
+All shown keys are required and no other own key is permitted. The GPT adapter mints
+`runtimeSlotNumber` once per exact physical slot from the global unsigned 32-bit
+trace-slot ordinal already transferred in `FirstDisplayHandoffV1`; it is nonzero,
+never reused, and remains paired with that physical token through takeover.
+`capturedAtMs` is a finite nonnegative `performance.now()` value; `elementId` and
+`adUnitPath` are null or the adapter's copied own 1–256-UTF-8-byte values with no
+NUL/control characters. GPT getter throws, nonstrings, empty values, and oversized
+values normalize to null. Rendered dimensions are null or integral 1–4096 values;
+visibility is null or finite 0–100. Event-inapplicable fields are null. A matched
+request fact has its newly minted cycle ordinal; later cycle-bound facts use the exact
+uniquely attributed ordinal. A matched
+`slotVisibilityChanged` fact may use `cycleOrdinal:null` because visibility is
+slot-level; any deliberately unmatched/ambiguous fact uses `cycleOrdinal:null`.
+`disposition` is exclusively the callback-coverage dimension. `issueReason` is null
+when the fact adds no issue; otherwise it is the exact independent sequence/matching
+reason, so a uniquely correlated invalid-order callback remains `matched` with
+`issueReason:'invalid_event_order'`. Unmatched and ambiguous facts use the applicable
+`no_request_cycle`, `overlapping_request_cycles`, or `unknown_prior_cycle` reason.
+The token and cycle retain the grammars/caps above.
+The canonical UTF-8 encoding of the complete normalized record must be at most 1,000
+bytes. The handoff subsection is exactly
+`{facts:readonly FirstDisplayGptFactV1[],overflowCount:number,dropCount:number}`;
+both counters are unsigned 32-bit integers that saturate at their maximum. Its
+complete canonical UTF-8 encoding, including array/object punctuation, keys, and
+counters, must be at most 524,288 bytes. Invalid, oversized, accessor-backed, or
+unnormalizable observations are diagnostics-only drops and never enter the buffer or
+affect GPT/render authority. A valid observation that would exceed the 512-entry
+FIFO evicts the oldest fact and increments `overflowCount`; any normalization or
+section-byte-cap refusal increments `dropCount`. Counter saturation does not affect
+admission or takeover.
+
+When `gpt.active` is true, the current `ActiveRenderOwner` installs the six
+documented GPT observations (`slotRequested`, `slotResponseReceived`,
+`slotRenderEnded`, `slotOnload`, `impressionViewable`, and
+`slotVisibilityChanged`) before any TS-owned GPT request. It owns one 512-entry FIFO
+pre-collector fact buffer. Overflow evicts the oldest fact and increments one
+diagnostics-only counter. On a direct-to-runtime page, persistent core creates this
+buffer and replays it in order when the takeover diagnostics collector activates.
+On an agent page, the agent creates it before the protected batch, maps every fact to
+the canonical trace token/cycle owned by that epoch, and includes the final ordered
+normalized `FirstDisplayGptFactV1` records plus overflow/drop counts in
+`FirstDisplayHandoffV1`. That complete at-most-524,288-byte subsection occupies the
+separate 512 KiB diagnostics allowance of the handoff's 8.5 MiB total cap.
+Normalization and the FIFO enforce that bound before handoff; a fact that cannot fit is a counted
+diagnostics-only drop and cannot consume replay-suppression or correctness space.
+During the non-yielding takeover task, the agent disconnects its six listeners; the
+persistent GPT adapter adopts the exact physical slot identities from the capsule,
+reconstructs its private identity map from the transferred canonical tokens,
+runtime-slot numbers, ad-unit paths, cycles, and next ordinal, replays the bounded
+facts into the collector in original order, and installs one fresh six-listener set
+before the task ends. Replay updates the same slot/cycle facts, callback-coverage
+counters, and separately reasoned issue rows that continuous ownership would have
+produced; it cannot renumber a slot or reinterpret a disposition as an issue. A GPT
+callback can therefore run before or after, but never inside, the
+owner transition. It is processed once by one epoch and no diagnostic fact is
+duplicated. After replay, live facts fan out directly and the pre-collector buffer is
+released. The later presentation module consumes the already bounded collector/store;
+it never registers GPT listeners or recreates the raw-fact buffer.
+
+When inactive, neither epoch creates a diagnostics buffer or the four
+diagnostics-only listeners. The sole current GPT adapter may still own
+`slotRequested` and `slotRenderEnded` listeners required for ordinary ad correctness
+under §5.7; inactive zero-side-effect tests measure that baseline and require zero
+diagnostics-added listeners, DOM, timers, observers, API, or network work. At every
+task boundary, active and inactive pages alike have listener ownership in exactly one
+epoch.
 
 The GPT diagnostics store retains at most 64 observed GPT slot objects, ten request
 cycles per slot, and 128 callback-issue records. It evicts the
@@ -3929,6 +4072,30 @@ ordering, deadline, and heap contracts; current `main` has no semantically equiv
 first-class APS action, so APS cannot be assigned a fabricated relative ratio. A GPT
 pass never masks an APS failure.
 
+The candidate-only APS case is nevertheless a blocking quantitative gate, not only
+a protocol-deadline check. Its checked-in fictional GPT, GAM creative, proxy, runner,
+and PUC bodies and schedules are invariant test inputs; the fictional runner invokes
+the real queued `prebid/creative/render` callback 50 ms after its API call. Across the
+same five warmups and 50 measured samples, APS must meet all of these ceilings:
+
+| APS metric                                                             | Ceiling                      |
+| ---------------------------------------------------------------------- | ---------------------------- |
+| `tsjs:bids-script` to first responsible GPT `display`/`refresh` action | p90 ≤ 900 ms                 |
+| first action to accepted APS completion                                | p90 ≤ 1,500 ms               |
+| accepted APS completion to `tsjs:first-display-paint`                  | p90 ≤ 250 ms                 |
+| `tsjs:bids-script` to `tsjs:first-display-paint`                       | p90 ≤ 2,500 ms               |
+| forced-GC `usedSize` immediately after protected paint                 | ≤ 3,145,728 bytes (3 MiB)    |
+| forced-GC `usedSize` after persistent takeover and queue drain         | ≤ 3,932,160 bytes (3.75 MiB) |
+
+Every timing row is computed from the named real marks/action, never a test-created
+substitute. Every sample—not only p90—must still satisfy the narrower applicable
+correctness deadline. Changing a fictional dependency body/schedule, a ceiling, a
+mark endpoint, or the network profile is a performance-contract change requiring
+review rather than a way to recapture a passing baseline. These deliberately broad
+absolute guardrails cover the candidate-only behavior that has no honest `main`
+ratio; the paired GPT current-`main` × 1.10 comparison remains the regression gate
+for shared first-action and persistent-runtime costs.
+
 Each run fetches `origin/main`, resolves its exact current 40-character commit SHA,
 creates a detached worktree at that SHA, and builds `main` and the candidate
 independently. The main-side loader feature-detects and consumes the artifact shape
@@ -3966,10 +4133,11 @@ for direct-to-runtime pages. It is not counted as an agent-mask sample or used t
 claim the agent's ≤90 kB transfer ceiling.
 
 The job alternates `main` then candidate / candidate then `main` in one Chromium
-process for every warmup and measured pair. Candidate p90 must be at most current
-`main` p90 × 1.10. GitHub-hosted absolute timing is not stable enough for a fixed
-millisecond ceiling, and a historical fixed comparison SHA is not an honest stand-in
-for current `main`; neither remains in the active gate. The schema-5 artifact records
+process for every warmup and measured GPT pair. GPT candidate p90 must be at most
+current `main` p90 × 1.10. GitHub-hosted absolute timing is not stable enough for a
+tight fixed shared-regression ceiling, and a historical fixed comparison SHA is not
+an honest stand-in for current `main`; neither replaces that paired gate. The APS
+absolute ceilings above are separate fixture guardrails. The schema-5 artifact records
 the exact main and candidate SHAs, each actual artifact model, each exact served
 first-display byte count, both full distributions and p90s, the alternating order, and
 the exact network profile. The workflow runs each declared pair once and never
@@ -3979,17 +4147,18 @@ writes the complete schema-5 evidence before failing. Validation and upload run
 with `always()` so a failed gate retains its exact diagnostic artifact; neither the
 test nor the validator converts an exceeded budget into success.
 
-The historical blocking ratio remains request-action latency, so the gate and job
+The historical GPT blocking ratio remains request-action latency, so the gate and job
 call it **bids-script-to-first-action**, not paint latency. The same evidence records
 candidate terminal and paint distributions for GPT and APS. Every sample must remain
 inside the unchanged path-specific render deadline and §5.2 paint allowance; this
 prevents an agent from improving transfer latency by postponing completion or
 takeover without fabricating a non-equivalent current-`main` terminal/paint ratio.
 
-Retained heap uses Chromium CDP forced-GC checkpoints after boot, first render,
-refresh, and SPA navigation. After the display samples, the job opens one separate
-fresh browser context per variant and executes the equivalent lifecycle supported by
-that variant's real artifact shape. At each checkpoint it sends
+Retained heap for the paired GPT case uses Chromium CDP forced-GC checkpoints after
+boot, first render, refresh, and SPA navigation. After the display samples, the job
+opens one separate fresh browser context per variant and executes the equivalent
+lifecycle supported by that variant's real artifact shape. The APS case uses its two
+candidate-only checkpoints in the table above. At each checkpoint the job sends
 `HeapProfiler.collectGarbage` once followed immediately by `Runtime.getHeapUsage`;
 the single `usedSize` is the checkpoint statistic, with no hidden averaging,
 maximum selection, or rerun. Candidate must be at most current `main` × 1.10 at each
@@ -4179,10 +4348,23 @@ Tests must cover at least:
   and terminal/tombstone expiry proves that static preparation reads no live state;
   the final same-task snapshot sees the last mutation revision, revision exhaustion
   fails closed, and a callback queued after closure reaches only the persistent epoch;
+- protected-paint admission sealing immediately before/at/after the boundary proves
+  a late TS Prebid bidder call completes once with no bid and no minted lease,
+  reservation, ticket, attempt, port, or callback; native publisher GPT/Prebid and
+  non-TS bidder calls remain pass-through; discovery of deliberately injected live
+  TS authority commits `bundle_partial` rather than transferring or replaying it;
+- persistent download/authentication/preparation success, failure, and the exact
+  9,999/10,000/10,001 ms post-paint deadline prove callback pushes remain queued
+  until one commit; success drains against the full kernel, while failure freezes the
+  exact true/false `initialDisplayCommitted`, drains once against fallback, makes
+  every new `requestAds` and `addAdUnits` propagate the same classified
+  `abi_mismatch`/`bundle_partial` fallback reason, preserves accepted DOM, and leaves
+  no pending work or artifact retry;
 - final handoff boundaries for attempt/slot/GPT-token/cycle/trace ordinals at
   maximum-minus-one/maximum/exhaustion; pruned prior cycles with
   `unknownPriorCycle`, open/retired/quarantined GPT cycles, late old-cycle facts,
-  monotonic expiry translation, 255/256/257 adopted slots, data-tree cap, and one-use
+  monotonic expiry translation, 255/256/257 adopted slots, 8 MiB
+  non-diagnostics/512 KiB diagnostics/8.5 MiB total data-tree caps, and one-use
   capsule replay prove that no id/sequence is reused and no event is reattributed;
 - provisional creative/DataDome/GTM/Lockr/Testlight/consent guards mutate during
   runtime preparation, then compare-restore and install fresh persistent effects in
@@ -4302,7 +4484,16 @@ Tests must cover at least:
   replay, exact `tsjs.boot.diagnostics` schema, query/session enable-disable and
   fail-closed inputs, accessor/prototype/unknown/missing/version rejection and
   manifest-activation mismatch, active six-listener versus inactive correctness-listener counts,
-  511/512/513 fact-buffer bounds, 63/64/65 slots, 9/10/11 cycles, 127/128/129 issues,
+  exact `FirstDisplayGptFactV1` key/event/type/nullability rules, physical-token/
+  runtime-slot-number/ad-unit-path preservation, separate matched/unmatched/ambiguous
+  coverage disposition and nullable no-cycle/overlap/unknown-prior/invalid-order issue
+  reason, and byte-for-byte equivalent initial slot/cycle/coverage/issue export before
+  versus after takeover,
+  maximum-size 999/1,000/1,001-byte facts and 511/512/513 maximum-sized fact
+  admissions against the exact 512-entry FIFO, 512 KiB diagnostics subsection, and
+  8.5 MiB total caps, including eviction versus byte-cap drops and saturated
+  overflow/drop counters,
+  63/64/65 slots, 9/10/11 cycles, 127/128/129 issues,
   32/33 public subscribers, 0/1/2-update latest-snapshot coalescing,
   subscribe/unsubscribe/disposal races and slow/throwing listeners, slot element
   replacement, timing/frozen-export bounds, overlay disposal, inactive
@@ -4571,8 +4762,11 @@ The design is complete when all of the following are true:
     served agent bytes and stale or malformed hashes fail locally on every adapter.
 23. Agent/runtime absence, mismatch, timeout, preparation, or takeover failure
     commits the terminal fallback without replaying or removing an accepted first
-    display. A deferred module failure leaves the same committed persistent kernel
-    and owners alive and settles only dependent work through its typed contract.
+    display. Protected paint seals new TS admission; the post-paint callback queue
+    drains exactly once against persistent or fallback, with exact
+    `initialDisplayCommitted` and no pending/retried work. A deferred module failure
+    leaves the same committed persistent kernel and owners alive and settles only
+    dependent work through its typed contract.
 24. No production-core import graph contains deferred integration/service/UI code,
     no-op/fake/test seams, or `*ForTest` accessors. Every production artifact appears
     exactly once in the release inventory, with the bootstrap role included once and
@@ -4584,8 +4778,10 @@ The design is complete when all of the following are true:
     The separately frozen `firstDisplayTransfer` capture supplies subsequent 5%
     ceilings. Boot-to-first-display passes the automatic fixed-network-profile
     candidate-versus-current-`main` gate, including the candidate's real-mark and
-    deferred-order assertions; retained-heap results remain within their ratio and
-    hard ceilings. No gate permits disabled shaping, selective sample reruns,
+    deferred-order assertions; the candidate-only APS fixture passes every named
+    action/completion/paint and 3/3.75 MiB heap ceiling; paired retained-heap results
+    remain within their ratio and hard ceiling. No gate permits disabled shaping,
+    selective sample reruns,
     candidate self-baselining, or membership loopholes.
     Handoff tests prove a final same-task data snapshot after static preparation,
     monotonic high-water/cycle/trace transfer, one-use capsule, exact physical-slot
