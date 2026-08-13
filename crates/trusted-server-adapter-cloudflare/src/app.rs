@@ -440,7 +440,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
     {
         let state = Arc::clone(state);
 
-        // Shared fallback dispatch: routes to tsjs (GET only), integration proxy, or publisher.
+        // Shared fallback dispatch: routes to tsjs (GET/HEAD), integration proxy, or publisher.
         async fn dispatch(
             state: Arc<AppState>,
             ctx: RequestContext,

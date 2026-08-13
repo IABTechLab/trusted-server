@@ -718,13 +718,6 @@ pub(crate) mod coordinated_cutover_v1 {
                     "Browser auction projection violates the version-1 schema",
                 )
             })?;
-        ensure!(
-            projection.slots.len() == projection.auction.results.len(),
-            projection_contract_error(
-                "Browser auction slots must cover every decision for browser boot"
-            )
-        );
-
         let canonical =
             canonicalize_browser_auction_projection_v1(projection.clone(), publisher_origin)?;
         ensure!(

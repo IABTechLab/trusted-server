@@ -2979,6 +2979,12 @@ impl Settings {
         settings.validate_admin_coverage()?;
         settings.validate_admin_handler_passwords()?;
 
+        for pattern in settings.reserved_aps_handler_patterns()? {
+            log::warn!(
+                "Basic Auth handler `{pattern}` matches the reserved /integrations/aps route family; reserved APS renderer and live-runner requests bypass configured handlers"
+            );
+        }
+
         if settings.auction.enabled && !settings.auction.rewrite_creatives {
             log::warn!(
                 "Auction creative rewriting disabled; creative assets and clicks may contact third-party hosts directly"
@@ -3045,14 +3051,13 @@ impl Settings {
         Ok(())
     }
 
-    /// Returns compiled creative opportunity slots when template delivery is enabled.
+    /// Returns compiled creative opportunity slots.
     #[must_use]
     pub fn creative_opportunity_slots(
         &self,
     ) -> &[crate::creative_opportunities::CreativeOpportunitySlot] {
         self.creative_opportunities
             .as_ref()
-            .filter(|co| co.enabled)
             .map(|co| co.slot.as_slice())
             .unwrap_or(&[])
     }
@@ -3190,11 +3195,37 @@ impl Settings {
         Ok(None)
     }
 
-    /// Returns whether `path` is within the reserved Trusted Server admin
-    /// namespace.
-    #[must_use]
-    pub(crate) fn is_admin_path(path: &str) -> bool {
-        path == "/_ts/admin" || path.starts_with("/_ts/admin/")
+    /// Return handler patterns that match a representative reserved APS path.
+    ///
+    /// Reserved APS resources are dispatched before configured Basic Auth
+    /// handlers. This startup-only check makes that precedence visible without
+    /// attempting undecidable general regex-intersection analysis.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if a handler regex does not compile.
+    pub(crate) fn reserved_aps_handler_patterns(
+        &self,
+    ) -> Result<Vec<&str>, Report<TrustedServerError>> {
+        const REPRESENTATIVE_PATHS: &[&str] = &[
+            "/integrations/aps",
+            "/integrations/aps/renderer/v1",
+            "/integrations/aps/runner.js",
+        ];
+        let mut patterns = Vec::new();
+        for handler in &self.handlers {
+            let mut overlaps = false;
+            for path in REPRESENTATIVE_PATHS {
+                if handler.matches_path(path)? {
+                    overlaps = true;
+                    break;
+                }
+            }
+            if overlaps {
+                patterns.push(handler.path.as_str());
+            }
+        }
+        Ok(patterns)
     }
 
     /// Known admin endpoint paths that must be covered by a handler.
@@ -4478,6 +4509,23 @@ mod tests {
         );
 
         settings.validate().expect("Failed to validate settings");
+    }
+
+    #[test]
+    fn settings_identifies_handlers_shadowed_by_reserved_aps_routes() {
+        let toml = format!(
+            "{}\n[[handlers]]\npath = \"^/integrations/aps\"\nusername = \"aps-user\"\npassword = \"aps-pass\"\n",
+            crate_test_settings_str()
+        );
+
+        let settings = Settings::from_toml(&toml).expect("should parse APS-overlapping handler");
+
+        assert_eq!(
+            settings
+                .reserved_aps_handler_patterns()
+                .expect("should inspect compiled handler patterns"),
+            vec!["^/integrations/aps"]
+        );
     }
 
     #[test]
@@ -7420,10 +7468,6 @@ formats = [{ width = 300, height = 250 }]
         let co = settings
             .creative_opportunities
             .expect("should have creative_opportunities");
-        assert!(
-            co.enabled,
-            "creative-opportunity templates should default to enabled"
-        );
         assert_eq!(co.gam_network_id, "21765378893");
         assert_eq!(co.auction_timeout_ms, Some(500));
         assert_eq!(
@@ -7431,45 +7475,6 @@ formats = [{ width = 300, height = 250 }]
             Some(0),
             "startup finalization should materialize the dynamic-template compatibility marker"
         );
-    }
-
-    #[test]
-    fn settings_disables_creative_opportunity_slots_when_configured_off() {
-        let toml = format!(
-            "{}\n[creative_opportunities]\nenabled = false\ngam_network_id = \"21765378893\"\n\n[[creative_opportunities.slot]]\nid = \"atf\"\npage_patterns = [\"/\"]\nformats = [{{ width = 300, height = 250 }}]\n",
-            crate_test_settings_str()
-        );
-        let settings = Settings::from_toml(&toml).expect("should parse disabled templates");
-        assert!(
-            settings.creative_opportunity_slots().is_empty(),
-            "disabled template delivery should expose no runtime slots"
-        );
-    }
-
-    #[test]
-    fn settings_creative_opportunity_enabled_flag_supports_environment_override() {
-        let toml = format!(
-            "{}\n[creative_opportunities]\nenabled = true\ngam_network_id = \"21765378893\"\n",
-            crate_test_settings_str()
-        );
-        let env_key = format!(
-            "{}{}CREATIVE_OPPORTUNITIES{}ENABLED",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        temp_env::with_var(env_key, Some("false"), || {
-            let settings = Settings::from_toml_and_env(&toml)
-                .expect("should parse template enabled environment override");
-            assert!(
-                !settings
-                    .creative_opportunities
-                    .expect("should have creative opportunities")
-                    .enabled,
-                "environment override should disable template delivery"
-            );
-        });
     }
 
     #[test]

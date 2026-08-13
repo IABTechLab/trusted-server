@@ -121,6 +121,10 @@ impl ReservedApsDispatcher {
     /// Returns an error when settings, the orchestrator, or the integration
     /// registry cannot be initialized.
     pub fn from_startup_settings() -> Result<Self, Report<TrustedServerError>> {
+        // The outer Axum router cannot share EdgeZero's private application
+        // state, so the dev adapter builds one additional immutable startup
+        // snapshot for only the two reserved APS browser resources. Production
+        // adapters do not take this native development path.
         Ok(Self {
             state: build_state()?,
         })

@@ -359,11 +359,6 @@ export function createPrebidIntegrationRegistration(releaseId: string): Integrat
   });
 }
 
-export {
-  createPrebidRefreshPolicy,
-  createPrebidSyntheticRefreshRunner,
-  preparePrebidRegisteredRefreshAuction,
-} from './refresh';
 export type {
   PrebidRefreshAuctionOperation,
   PrebidRefreshAuctionPreparation,

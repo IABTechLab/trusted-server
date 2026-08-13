@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use lol_html::{Settings as RewriterSettings, element, html_content::ContentType, text};
 
-use crate::integrations::datadome::{DATADOME_INTEGRATION_ID, DataDomeClientTagSuppressed};
 use crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision;
 use crate::integrations::{
     AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationDocumentState,
@@ -197,13 +196,6 @@ pub struct HtmlProcessorConfig {
     pub gpt_diagnostics: Option<GptDiagnosticsRequestDecision>,
     /// Server-owned request-scoped render-trace overlay decision.
     pub render_trace_overlay: bool,
-    /// Whether to omit Trusted Server's automatic `DataDome` client-side tag.
-    pub suppress_datadome_client_side_tag: bool,
-    /// Set when the document delivers a response-bound CSP nonce in its own markup.
-    ///
-    /// `None` on every path that cannot store a shared template, so an ordinary inline
-    /// request does not pay for handlers whose only consumer is the template-cache gate.
-    pub csp_nonce_observed: Option<Arc<AtomicBool>>,
 }
 
 impl HtmlProcessorConfig {
@@ -226,8 +218,6 @@ impl HtmlProcessorConfig {
             max_buffered_body_bytes: settings.publisher.max_buffered_body_bytes,
             gpt_diagnostics: None,
             render_trace_overlay: false,
-            suppress_datadome_client_side_tag: false,
-            csp_nonce_observed: None,
         }
     }
 
@@ -273,13 +263,6 @@ impl HtmlProcessorConfig {
         self.render_trace_overlay = active;
         self
     }
-
-    /// Attach the request-scoped `DataDome` client-tag suppression decision.
-    #[must_use]
-    pub fn with_datadome_client_tag_suppression(mut self, suppress: bool) -> Self {
-        self.suppress_datadome_client_side_tag = suppress;
-        self
-    }
 }
 
 /// Create an HTML processor with URL replacement and integration hooks.
@@ -292,9 +275,6 @@ impl HtmlProcessorConfig {
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
     let post_processors = config.integrations.html_post_processors();
     let document_state = IntegrationDocumentState::default();
-    if config.suppress_datadome_client_side_tag {
-        document_state.get_or_insert_with(DATADOME_INTEGRATION_ID, || DataDomeClientTagSuppressed);
-    }
 
     // Simplified URL patterns structure - stores only core data and generates variants on-demand
     struct UrlPatterns {
@@ -425,7 +405,10 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         render_trace_overlay,
                     };
                     let manifest_ids = integrations.tsjs_catalog_module_ids(selection);
-                    let critical_ids = integrations.tsjs_critical_module_ids(selection);
+                    let critical_src = integrations
+                        .tsjs_critical_artifact(selection)
+                        .expect("should precompute selected critical artifact")
+                        .src();
                     let diagnostics_active = manifest_ids.contains(&"gpt_diagnostics");
                     let state = ad_bids_state
                         .lock()
@@ -445,22 +428,31 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         snippet.push_str(debug_comment);
                         snippet.push('\n');
                     }
-                    let boot = tsjs::tsjs_boot_script_v1(tsjs::TsjsBootScriptConfigV1 {
-                        module_ids: &manifest_ids,
-                        auction_projection_json: projection_json,
-                        creative,
-                        render_trace_overlay,
-                        gpt_diagnostics_active: diagnostics_active,
-                    })
-                    .or_else(|error| {
-                        log::error!("invalid TSJS document boot projection: {error:?}");
-                        tsjs::tsjs_boot_script_v1(tsjs::TsjsBootScriptConfigV1 {
+                    let publisher_origin = patterns.replacement_url();
+                    let boot = tsjs::tsjs_boot_script_with_critical_src_v1(
+                        tsjs::TsjsBootScriptConfigV1 {
                             module_ids: &manifest_ids,
-                            auction_projection_json: EMPTY_AUCTION_PROJECTION_JSON,
+                            auction_projection_json: projection_json,
                             creative,
                             render_trace_overlay,
                             gpt_diagnostics_active: diagnostics_active,
-                        })
+                        },
+                        critical_src,
+                        &publisher_origin,
+                    )
+                    .or_else(|error| {
+                        log::error!("invalid TSJS document boot projection: {error:?}");
+                        tsjs::tsjs_boot_script_with_critical_src_v1(
+                            tsjs::TsjsBootScriptConfigV1 {
+                                module_ids: &manifest_ids,
+                                auction_projection_json: EMPTY_AUCTION_PROJECTION_JSON,
+                                creative,
+                                render_trace_overlay,
+                                gpt_diagnostics_active: diagnostics_active,
+                            },
+                            critical_src,
+                            &publisher_origin,
+                        )
                     })
                     .unwrap_or_default();
                     snippet.push_str(&boot);
@@ -471,7 +463,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     }
                     // Exactly one parser-time TSJS tag: core plus selected critical modules.
                     // Deferred modules are authenticated and loaded by the committed runtime.
-                    snippet.push_str(&tsjs::tsjs_script_tag(&critical_ids));
+                    snippet.push_str(&tsjs::tsjs_script_tag_from_src(critical_src));
                     el.prepend(&snippet, ContentType::Html);
                     injected_tsjs.set(true);
                 }
@@ -799,7 +791,6 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             render_trace_overlay: false,
-            suppress_datadome_client_side_tag: false,
         }
     }
 
@@ -1080,62 +1071,6 @@ mod tests {
         assert_eq!(config.origin_host, "origin.test-publisher.com");
         assert_eq!(config.request_host, "proxy.example.com");
         assert_eq!(config.request_scheme, "https");
-    }
-
-    #[test]
-    fn suppressed_datadome_tag_preserves_and_rewrites_publisher_tag() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "datadome",
-                &json!({
-                    "enabled": true,
-                    "client_side_key": "test-client-key",
-                }),
-            )
-            .expect("should configure DataDome integration");
-        let registry = IntegrationRegistry::new(&settings)
-            .expect("should create integration registry with DataDome");
-        let config = HtmlProcessorConfig::from_settings(
-            &settings,
-            &registry,
-            "origin.example.com",
-            "test.example.com",
-            "https",
-        )
-        .with_datadome_client_tag_suppression(true);
-        let mut processor = create_html_processor(config);
-
-        let output = processor
-            .process_chunk(
-                br#"<html><head><script id="publisher-datadome" src="https://js.datadome.co/tags.js"></script></head><body>content</body></html>"#,
-                true,
-            )
-            .expect("should process HTML");
-        let html = String::from_utf8(output).expect("should produce UTF-8 HTML");
-
-        assert!(
-            !html.contains("window.ddjskey"),
-            "should omit the DataDome client configuration"
-        );
-        assert!(
-            html.contains("id=\"publisher-datadome\""),
-            "should preserve the publisher-originated DataDome tag"
-        );
-        assert!(
-            html.contains("src=\"/integrations/datadome/tags.js\""),
-            "should rewrite the publisher-originated DataDome tag"
-        );
-        assert!(
-            !html.contains("https://js.datadome.co/tags.js"),
-            "should remove the original third-party DataDome URL"
-        );
-        assert_eq!(
-            html.matches("/integrations/datadome/tags.js").count(),
-            1,
-            "should leave exactly one publisher-originated DataDome tag"
-        );
     }
 
     #[test]
@@ -1737,7 +1672,6 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             render_trace_overlay: false,
-            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1799,7 +1733,7 @@ mod tests {
 
     #[test]
     fn injects_exact_boot_projection_before_core_without_legacy_slot_or_bid_surfaces() {
-        let projection = r#"{"version":1,"auction":{"version":1,"auctionId":"auction-1","results":[{"slot":"slot-a","outcome":"no_bid"}]},"bids":[]}"#;
+        let projection = r#"{"version":1,"auction":{"version":1,"auctionId":"auction-1","results":[{"slot":"slot-a","outcome":"no_bid"}]},"slots":[],"bids":[]}"#;
         let config = HtmlProcessorConfig {
             origin_host: "origin.example.com".to_owned(),
             request_host: "example.com".to_owned(),
@@ -1812,7 +1746,6 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             render_trace_overlay: false,
-            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1842,7 +1775,7 @@ mod tests {
 
     #[test]
     fn injects_projection_in_boot_before_core_instead_of_bids_at_body_close() {
-        let projection = r#"{"version":1,"auction":{"version":1,"auctionId":"auction-body","results":[]},"bids":[]}"#;
+        let projection = r#"{"version":1,"auction":{"version":1,"auctionId":"auction-body","results":[]},"slots":[],"bids":[]}"#;
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(projection.to_owned())));
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
@@ -1858,7 +1791,6 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             render_trace_overlay: false,
-            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1895,7 +1827,6 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             render_trace_overlay: false,
-            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         // Malformed HTML with two <body> elements (common in CMS template pages)
@@ -1938,7 +1869,6 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             render_trace_overlay: false,
-            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1993,7 +1923,6 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             render_trace_overlay: false,
-            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -2022,7 +1951,6 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             render_trace_overlay: false,
-            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         let output = processor

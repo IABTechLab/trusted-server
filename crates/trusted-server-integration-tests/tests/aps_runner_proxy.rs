@@ -84,7 +84,7 @@ fn fixed(status: &str, headers: &[(&str, &str)], body: impl AsRef<[u8]>) -> Fict
     FictionalResponse::fixed(status, headers, body)
 }
 
-fn corpus() -> Vec<CorpusCase> {
+fn corpus(runtime_id: &str) -> Vec<CorpusCase> {
     let exact_body = b"/* fictional runner: \xCE\xBB */".to_vec();
     let exact_length = exact_body.len().to_string();
     let cap_body = vec![b'x'; APS_RUNNER_MAX_RESPONSE_BYTES];
@@ -100,8 +100,26 @@ fn corpus() -> Vec<CorpusCase> {
         ));
     }
     slow_writes.push(ResponseWrite::now(b"0\r\n\r\n".to_vec()));
+    let near_deadline_body = vec![b'n'; 24];
+    let near_deadline_headers = format!(
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\n\r\n",
+        near_deadline_body.len()
+    )
+    .into_bytes();
+    let mut near_deadline_writes = vec![ResponseWrite::now(near_deadline_headers)];
+    for byte in &near_deadline_body {
+        near_deadline_writes.push(ResponseWrite::after(
+            Duration::from_millis(195),
+            vec![*byte],
+        ));
+    }
+    let over_total_headers = b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/javascript\r\nContent-Length: 26\r\n\r\n".to_vec();
+    let mut over_total_writes = vec![ResponseWrite::now(over_total_headers)];
+    for _ in 0..26 {
+        over_total_writes.push(ResponseWrite::after(Duration::from_millis(195), vec![b't']));
+    }
 
-    vec![
+    let mut cases = vec![
         CorpusCase::success(
             "byte-preserving JavaScript with identity evidence",
             fixed(
@@ -278,6 +296,11 @@ fn corpus() -> Vec<CorpusCase> {
                 vec![(Duration::ZERO, one_over)],
             ),
         ),
+        CorpusCase::success(
+            "sub-250ms drip completing after 4.5 seconds preserves the full deadline",
+            FictionalResponse::raw(near_deadline_writes),
+            near_deadline_body,
+        ),
         CorpusCase::deadline(
             "first-byte stall",
             FictionalResponse::raw(vec![ResponseWrite::after(
@@ -298,6 +321,10 @@ fn corpus() -> Vec<CorpusCase> {
             "slow drip exceeds total deadline",
             FictionalResponse::raw(slow_writes),
         ),
+        CorpusCase::deadline(
+            "sub-250ms drip exceeds the true total deadline",
+            FictionalResponse::raw(over_total_writes),
+        ),
         CorpusCase::success(
             "late bytes cannot contaminate the next request",
             fixed(
@@ -310,7 +337,25 @@ fn corpus() -> Vec<CorpusCase> {
             ),
             b"next".to_vec(),
         ),
-    ]
+    ];
+    if runtime_id == "cloudflare" {
+        cases.insert(
+            cases.len() - 1,
+            CorpusCase {
+                maximum_elapsed: Some(
+                    Duration::from_secs(4) + Duration::from_millis(750),
+                ),
+                ..CorpusCase::failure(
+                    "Cloudflare first-byte timeout is distinct from the total timeout",
+                    FictionalResponse::raw(vec![ResponseWrite::after(
+                        Duration::from_millis(4_500),
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+                    )]),
+                )
+            },
+        );
+    }
+    cases
 }
 
 fn assert_outbound_request(
@@ -451,7 +496,7 @@ fn actual_adapter_proxy_corpus() {
     );
     fixture.assert_no_proxy_observation(0, Duration::from_millis(150));
 
-    for (observation_index, case) in corpus().into_iter().enumerate() {
+    for (observation_index, case) in corpus(runtime_id).into_iter().enumerate() {
         fixture.enqueue(case.upstream);
         let started = Instant::now();
         let response = client

@@ -872,6 +872,13 @@ If an older deployment used a different SPA auction path, update its handler
 rules at the same time as the TSJS cutover. `/_ts/page-bids` is the only SPA
 auction endpoint; older path spellings are unknown routes.
 
+The `/integrations/aps/*` family is different: its renderer and live-runner
+routes are reserved before `[[handlers]]` is evaluated. They are browser-facing
+resources and are intentionally anonymous, so a handler pattern that matches
+`/integrations/aps/` does **not** add Basic Auth. Apply any admission control,
+rate limiting, or request shielding for those routes in the deployment platform,
+not through `[[handlers]]`.
+
 :::
 
 ### Security Considerations
@@ -1810,37 +1817,8 @@ Defines the ad slots the trusted server offers on a page: which pages each slot
 appears on (`page_patterns`), its supported sizes (`formats`), and the GAM ad
 unit it maps to (`gam_unit_path`).
 
-`enabled` is the dedicated server-side ad-template switch. It defaults to `true`
-for compatibility with existing configurations. Set it to `false` to stop
-publisher HTML and SPA page-bids template delivery while retaining the slot
-configuration and direct `POST /auction` endpoint.
-
-#### Publisher document cache policy
-
-For a successful GET publisher document, Trusted Server applies the
-browser-only `Cache-Control: private, max-age=60` policy from
-[#1007](https://github.com/IABTechLab/trusted-server/issues/1007) when the
-server-side ad stack is structurally inactive. Trusted Server also applies this
-policy to a subsequent `304 Not Modified` response so revalidation cannot
-restore the origin freshness policy. This includes an absent
-`[creative_opportunities]` section, `enabled = false`, no slot matching the
-path, or a disabled auction. The `private` directive prevents shared caches
-that use `Cache-Control` from storing the document. The policy replaces the
-origin browser cache policy except when the origin sends `private` or
-`no-store`, which are preserved. Bot, prefetch, and consent-denied requests
-also retain the origin policy because they can produce a request-specific
-representation for the same URL. Error responses and non-document requests
-retain the origin policy.
-
-Trusted Server leaves origin validators and CDN-specific cache headers
-unchanged. Those headers continue to control supporting CDNs independently of
-the browser-only policy. If a response using the generated inactive-stack
-policy later carries `Set-Cookie`, cookie privacy finalization replaces it with
-`Cache-Control: private, max-age=0` and removes the CDN-specific cache headers.
-
 ```toml
 [creative_opportunities]
-enabled = true # set to false to disable server-side ad templates
 gam_network_id = "123456789"
 price_granularity = "dense"
 
@@ -1858,151 +1836,6 @@ gam_unit_path = "/{network_id}/example/{section}"
 page_patterns = ["/", "/news", "/news/*", "/reviews", "/reviews/*"]
 formats = [{ width = 728, height = 90 }]
 ```
-
-The same switch can be overridden through the typed CLI environment overlay.
-Because EdgeZero only replaces TOML leaves that already exist, first add
-`enabled = true` to the `[creative_opportunities]` block in the base config
-before using this override. See [Environment Variable Overrides (Typed
-CLI)](#environment-variable-overrides-typed-cli) for the general overlay rules.
-
-```bash
-TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED=false
-```
-
-> [!WARNING]
-> Setting `enabled = false` writes this field into the pushed configuration blob.
-> Binaries released before this setting reject the unknown field and fail to load
-> settings, which makes every request fail. Before rolling back to an older binary,
-> restore `enabled` to its default, re-push and finalize the configuration, then
-> roll back the binary.
-
-### Shared template assembly (`assembly_mode = "esi"`)
-
-This configuration is an experimental validation spike scoped to
-[IABTechLab/trusted-server#1009](https://github.com/IABTechLab/trusted-server/issues/1009),
-not a settled production cache interface.
-
-`assembly_mode` controls how initial-page slot and bid state is delivered:
-
-- `inline` (default) transforms every origin response and injects the current
-  reader's slots and bids directly.
-- `esi` opts into a reader-neutral transformed-template cache on Fastly. The
-  cache stores identity bytes containing one inert, versioned comment. On an
-  authorized cold miss, Fastly replaces that comment in a private working copy
-  with one synthetic ESI include and resolves it from the already-built reader
-  state using the pinned `stackpop/esi` parser. No HTTP fragment request occurs.
-  Warm hits use an exact byte split instead, preserving the fast article-prefix
-  stream while the auction finishes.
-
-This is deliberately not general publisher-controlled ESI. A transformed origin
-document containing any `<esi:` directive bypasses the template cache and the parser, while the
-ordinary byte seam still produces the reader's complete response. The stored shared template
-object never contains executable ESI markup.
-
-Only Fastly currently supplies the Core Cache backend used by the shared template cache. Other adapters accept
-the mode but safely fall back to the inline transform on every request. This is
-not a top-level HTTP cache hit: Compute still runs and the final assembled
-response is always `Cache-Control: private, no-store`.
-
-All four keys below belong directly under `[creative_opportunities]`. They are
-one feature contract: `assembly_mode` selects how creative-opportunity state is
-delivered, while the other three constrain when and how long that mode may share
-its template.
-They are not a general top-level HTTP-cache configuration.
-
-```toml
-[creative_opportunities]
-assembly_mode = "esi"
-
-# Every request header, except Accept-Encoding, that the publisher origin can
-# name in Vary for these documents. Names are validated and de-duplicated.
-template_cache_vary = [
-  "rsc",
-  "next-router-state-tree",
-  "next-router-prefetch",
-  "next-router-segment-prefetch",
-]
-
-# Safety ceiling for the shared template. Defaults to 60; valid range 1–86400.
-# The origin's remaining edge freshness may make the actual lifetime shorter.
-template_cache_max_age_seconds = 1200
-
-# Default false. Enable only after proving publisher HTML ignores Cookie.
-origin_is_cookie_independent = true
-```
-
-The cache fails closed. A template is stored only for a `GET` with a processable
-`200 text/html` origin response, a supported content encoding, and explicit
-positive shared freshness. `private`, `no-store`, `no-cache`, exhausted or
-malformed freshness, `Set-Cookie`, `Vary: *`, `Vary: Cookie`, uncovered `Vary`
-names, response-bound CSP nonces, authorization, diagnostics sessions, range or
-conditional requests, positive or malformed request `max-age`, `min-fresh`, and
-unsupported CDN-specific cache policy fields all bypass the template cache. Fastly
-`Surrogate-Control` is the narrow exception: the template cache accepts exactly one positive
-`max-age` plus optional valid `stale-while-revalidate` and `stale-if-error`
-delta-seconds. Restrictive, duplicated, malformed, or unknown directives fail
-closed. Stale windows never extend template-cache freshness. Freshness follows Fastly edge
-precedence: `Surrogate-Control: max-age`, then `Cache-Control: s-maxage`,
-`Cache-Control: max-age`, then `Expires`. Restrictive directives in either policy
-still refuse sharing. Origin `Age` and apparent age from `Date` are deducted, time
-spent transforming the page continues consuming freshness, and the remaining
-lifetime is capped by `template_cache_max_age_seconds`.
-
-A browser reload commonly sends `Cache-Control: max-age=0`. TS may reuse a fresh
-reader-neutral shared template for that reload, but it still builds a new private
-response and runs a new per-reader auction. Explicit `no-cache`, `no-store`,
-positive or malformed request `max-age`, range, and conditional requests still bypass the template cache.
-Check `X-TS-Template-Cache: hit` to verify template reuse.
-
-`template_cache_vary` is necessary because lookup occurs before the origin can
-return `Vary`. Presence, empty values, repeated raw field values, host/scheme,
-origin identity, complete template-shaping settings, TSJS content, and schema
-version all participate in an opaque SHA-256 cache key. `Accept-Encoding` does
-not: the stored template is decoded identity and the assembled result is encoded
-for each reader with `Vary: Accept-Encoding`. This assumes the origin's
-`Accept-Encoding` variants differ only by HTTP content coding, as normal
-compression negotiation does. Do not enable ESI for an origin that changes the
-document's meaning based on `Accept-Encoding`. Never put `Cookie` in
-`template_cache_vary`; startup rejects it because a per-cookie object is not a
-reader-neutral template. With `origin_is_cookie_independent = false` (the safe
-default), all cookie-bearing requests bypass. With it set to `true`, an origin
-`Vary: Cookie` still overrides the assertion and refuses storage.
-Every other name the origin emits in `Vary` must appear in the configured list;
-an uncovered name safely refuses template storage.
-
-For a canary, inspect `X-TS-Template-Cache`. Its bounded values are `hit`,
-`miss-stored`, `miss-store-error`, `miss-reserved`, `bypass-request`,
-`bypass-response`, `unsupported`, `invalid`, and `backend-error`. No URL, header
-value, or cache key is exposed. `invalid` and `backend-error` fail open to a
-fresh origin response; they do not fail the page. The corresponding
-`template_cache` logs provide server-side observability for this path.
-
-`X-TS-Assembly` identifies how the private response was assembled:
-
-- `esi-parser` — authorized cold miss assembled by the repaired parser;
-- `byte-seam` — warm template-cache hit using the streaming byte seam;
-- `byte-seam-fallback` — cold response safely assembled by byte seam because
-  the platform parser was unavailable or rejected the document.
-
-The two headers together are the reliable verification signal. Timing alone can
-vary with the origin, auction, compression, browser connection reuse, and local
-proxy buffering.
-
-Rollback must preserve configuration compatibility:
-
-1. Change `assembly_mode` to `inline` and deploy/push that configuration.
-2. Before rolling back to a binary that predates these fields, remove
-   `assembly_mode`, `template_cache_vary`, `template_cache_max_age_seconds`, and
-   `origin_is_cookie_independent`, then push the cleaned configuration. Older binaries
-   use `deny_unknown_fields` and intentionally reject unknown keys.
-3. Purge the Fastly surrogate key `ts-template` using the service's normal purge
-   tooling, or wait for the bounded origin-derived lifetime to expire.
-
-Run `scripts/template-cache-local-test.sh esi` before a rollout and
-`scripts/template-cache-local-test.sh inline` as its control. The harness uses a temporary
-manifest, never edits the tracked `fastly.toml`, verifies cold/warm origin
-counts and response integrity, and executes the generated GPT module against
-the served seam to require a real `defineSlot` call.
 
 ### `gam_unit_path` templating
 
@@ -2057,9 +1890,8 @@ publisher-specific. Startup fails if `{section}` is used without a valid
 `section_root`. Startup rejects a blank `gam_network_id` only when an absent
 path/default or a `{network_id}` template consumes it; static paths and
 templates without `{network_id}` do not consume it. A
-`[creative_opportunities]` block with `enabled = false` or no slots is
-inactive, so no publisher templates are delivered and its `gam_network_id` is
-not checked when no slot uses it.
+`[creative_opportunities]` block with no slots is disabled, so its
+`gam_network_id` is not checked.
 
 Both knobs are config-driven, so the URL→section convention stays with the
 publisher: `section_segment` selects which segment names the section, and

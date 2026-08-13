@@ -5,22 +5,28 @@ import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 const EXPECTED = Object.freeze({
-  schemaVersion: 4,
+  schemaVersion: 5,
   chromium: "145.0.7632.6",
   machineClass: "github-hosted:ubuntu-24.04",
   runnerImage: "ubuntu-24.04",
-  fixture: "tsjs-generated-loopback-paired-v2",
-  controller: "generated-server-v1",
+  fixture: "tsjs-main-paired-network-v2",
+  controller: "generated-server-v1+production-main-v1",
   node: "v24.12.0",
   npm: "11.6.2",
   typescript: "6.0.3",
   warmupsPerVariant: 5,
   samplesPerVariant: 50,
   percentile: 90,
-  interleaving: "alternating-reference-current",
-  referenceSha: "62421ee44c62f24534ea8782a46dfa5bfbcea950",
+  interleaving: "alternating-main-candidate",
+  networkProfile: Object.freeze({
+    mechanism: "cdp-Network.emulateNetworkConditions",
+    appliedBeforeNavigation: true,
+    latencyMs: 150,
+    downloadThroughputBytesPerSecond: 200_000,
+    uploadThroughputBytesPerSecond: 93_750,
+    packetLossPercent: 0,
+  }),
   maximumRatio: 1.1,
-  hardCeilingMs: 100,
   heapCheckpoints: Object.freeze([
     "afterBoot",
     "afterFirstRender",
@@ -84,14 +90,20 @@ function nearestRank(values, percentile) {
 
 export function validateEvidence(evidence, expected) {
   const expectedMode = expected.mode;
-  if (expectedMode !== "preswitch" && expectedMode !== "postswitch") {
-    fail("expected mode must be preswitch or postswitch");
+  if (
+    expectedMode !== "preswitch" &&
+    expectedMode !== "postswitch" &&
+    expectedMode !== "pull-request"
+  ) {
+    fail("expected mode must be preswitch, postswitch, or pull-request");
   }
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/.test(expected.evidenceId ?? "")) {
     fail("expected evidence id is invalid");
   }
   if (!/^[0-9a-f]{40}$/.test(expected.headSha ?? ""))
     fail("expected head SHA is invalid");
+  if (!/^[0-9a-f]{40}$/.test(expected.mainSha ?? ""))
+    fail("expected main SHA is invalid");
 
   exactKeys(
     evidence,
@@ -102,6 +114,7 @@ export function validateEvidence(evidence, expected) {
       "headSha",
       "environment",
       "sampling",
+      "networkProfile",
       "marks",
       "performance",
       "heap",
@@ -180,46 +193,92 @@ export function validateEvidence(evidence, expected) {
   }
 
   exactKeys(
+    evidence.networkProfile,
+    [
+      "mechanism",
+      "appliedBeforeNavigation",
+      "latencyMs",
+      "downloadThroughputBytesPerSecond",
+      "uploadThroughputBytesPerSecond",
+      "packetLossPercent",
+    ],
+    "networkProfile",
+  );
+  for (const [name, expectedValue] of Object.entries(EXPECTED.networkProfile)) {
+    if (evidence.networkProfile[name] !== expectedValue)
+      fail(`networkProfile.${name} drifted`);
+  }
+
+  exactKeys(
     evidence.marks,
-    ["source", "bidsScript", "firstDisplay", "firstDisplayPaint"],
+    [
+      "source",
+      "comparisonStart",
+      "firstObservableAction",
+      "candidateBidsScript",
+      "candidateFirstDisplay",
+      "candidateFirstDisplayPaint",
+    ],
     "marks",
   );
-  exactString(evidence.marks.source, "performance-entry", "marks.source");
-  boolean(evidence.marks.bidsScript, true, "marks.bidsScript");
-  boolean(evidence.marks.firstDisplay, true, "marks.firstDisplay");
-  boolean(evidence.marks.firstDisplayPaint, true, "marks.firstDisplayPaint");
+  exactString(
+    evidence.marks.source,
+    "fixture-first-observable-action",
+    "marks.source",
+  );
+  for (const name of [
+    "comparisonStart",
+    "firstObservableAction",
+    "candidateBidsScript",
+    "candidateFirstDisplay",
+    "candidateFirstDisplayPaint",
+  ]) {
+    boolean(evidence.marks[name], true, `marks.${name}`);
+  }
 
-  exactKeys(evidence.performance, ["bootToFirstDisplayMs"], "performance");
-  const timing = evidence.performance.bootToFirstDisplayMs;
+  exactKeys(evidence.performance, ["requestToFirstActionMs"], "performance");
+  const timing = evidence.performance.requestToFirstActionMs;
   exactKeys(
     timing,
-    [
-      "reference",
-      "current",
-      "percentile",
-      "maximumRatio",
-      "observedRatio",
-      "hardCeilingMs",
-    ],
+    ["main", "candidate", "percentile", "maximumRatio", "observedRatio"],
     "performance timing",
   );
   if (timing.percentile !== EXPECTED.percentile)
     fail("performance percentile drifted");
   if (timing.maximumRatio !== EXPECTED.maximumRatio)
     fail("performance ratio limit drifted");
-  if (timing.hardCeilingMs !== EXPECTED.hardCeilingMs)
-    fail("performance hard ceiling drifted");
   exactKeys(
-    timing.reference,
-    ["sha", "samples", "p90"],
-    "reference performance timing",
+    timing.main,
+    ["sha", "artifactModel", "criticalTransferBytes", "samples", "p90"],
+    "main performance timing",
+  );
+  exactString(timing.main.sha, expected.mainSha, "performance main SHA");
+  if (
+    timing.main.artifactModel !== "legacy-main-v1" &&
+    timing.main.artifactModel !== "release-v1"
+  ) {
+    fail("performance main artifact model is invalid");
+  }
+  finiteNumber(
+    timing.main.criticalTransferBytes,
+    "main critical transfer bytes",
+    { integer: true, minimum: 1 },
+  );
+  exactKeys(
+    timing.candidate,
+    ["artifactModel", "criticalTransferBytes", "samples", "p90"],
+    "candidate performance timing",
   );
   exactString(
-    timing.reference.sha,
-    EXPECTED.referenceSha,
-    "performance reference SHA",
+    timing.candidate.artifactModel,
+    "release-v1",
+    "performance candidate artifact model",
   );
-  exactKeys(timing.current, ["samples", "p90"], "current performance timing");
+  finiteNumber(
+    timing.candidate.criticalTransferBytes,
+    "candidate critical transfer bytes",
+    { integer: true, minimum: 1 },
+  );
   const validateVariant = (variant, path) => {
     if (
       !Array.isArray(variant.samples) ||
@@ -234,26 +293,24 @@ export function validateEvidence(evidence, expected) {
     if (!Object.is(variantP90, nearestRank(samples, EXPECTED.percentile))) {
       fail(`${path} performance p90 is inconsistent with the samples`);
     }
-    if (variantP90 > EXPECTED.hardCeilingMs)
-      fail(`${path} performance p90 exceeds the hard ceiling`);
     return variantP90;
   };
-  const referenceP90 = validateVariant(timing.reference, "reference");
-  const currentP90 = validateVariant(timing.current, "current");
-  if (referenceP90 <= 0) fail("reference performance p90 must be positive");
+  const mainP90 = validateVariant(timing.main, "main");
+  const candidateP90 = validateVariant(timing.candidate, "candidate");
+  if (mainP90 <= 0) fail("main performance p90 must be positive");
   const observedRatio = finiteNumber(
     timing.observedRatio,
     "performance observed ratio",
   );
-  if (Math.abs(observedRatio - currentP90 / referenceP90) > Number.EPSILON) {
+  if (Math.abs(observedRatio - candidateP90 / mainP90) > Number.EPSILON) {
     fail("performance observed ratio is inconsistent with the p90 values");
   }
-  if (currentP90 > referenceP90 * EXPECTED.maximumRatio)
-    fail("current performance p90 exceeds the paired 10% limit");
+  if (candidateP90 > mainP90 * EXPECTED.maximumRatio)
+    fail("candidate performance p90 exceeds the paired 10% limit");
 
   exactKeys(
     evidence.heap,
-    ["collection", "maximumRatio", "hardCeilingBytes", "reference", "current"],
+    ["collection", "maximumRatio", "hardCeilingBytes", "main", "candidate"],
     "heap",
   );
   exactString(
@@ -265,41 +322,37 @@ export function validateEvidence(evidence, expected) {
     fail("heap ratio limit drifted");
   if (evidence.heap.hardCeilingBytes !== EXPECTED.heapHardCeilingBytes)
     fail("heap hard ceiling drifted");
-  exactKeys(evidence.heap.reference, ["sha", "checkpoints"], "heap.reference");
-  exactString(
-    evidence.heap.reference.sha,
-    EXPECTED.referenceSha,
-    "heap reference SHA",
-  );
-  exactKeys(evidence.heap.current, ["checkpoints"], "heap.current");
+  exactKeys(evidence.heap.main, ["sha", "checkpoints"], "heap.main");
+  exactString(evidence.heap.main.sha, expected.mainSha, "heap main SHA");
+  exactKeys(evidence.heap.candidate, ["checkpoints"], "heap.candidate");
   exactKeys(
-    evidence.heap.reference.checkpoints,
+    evidence.heap.main.checkpoints,
     EXPECTED.heapCheckpoints,
-    "heap.reference.checkpoints",
+    "heap.main.checkpoints",
   );
   exactKeys(
-    evidence.heap.current.checkpoints,
+    evidence.heap.candidate.checkpoints,
     EXPECTED.heapCheckpoints,
-    "heap.current.checkpoints",
+    "heap.candidate.checkpoints",
   );
   for (const name of EXPECTED.heapCheckpoints) {
-    const referenceUsedSize = finiteNumber(
-      evidence.heap.reference.checkpoints[name],
-      `heap.reference.checkpoints.${name}`,
+    const mainUsedSize = finiteNumber(
+      evidence.heap.main.checkpoints[name],
+      `heap.main.checkpoints.${name}`,
       { integer: true, minimum: 1 },
     );
-    const currentUsedSize = finiteNumber(
-      evidence.heap.current.checkpoints[name],
-      `heap.current.checkpoints.${name}`,
+    const candidateUsedSize = finiteNumber(
+      evidence.heap.candidate.checkpoints[name],
+      `heap.candidate.checkpoints.${name}`,
       { integer: true, minimum: 1 },
     );
     if (
-      referenceUsedSize > EXPECTED.heapHardCeilingBytes ||
-      currentUsedSize > EXPECTED.heapHardCeilingBytes
+      mainUsedSize > EXPECTED.heapHardCeilingBytes ||
+      candidateUsedSize > EXPECTED.heapHardCeilingBytes
     ) {
       fail(`${name} retained heap exceeds the hard ceiling`);
     }
-    if (currentUsedSize > referenceUsedSize * EXPECTED.heapMaximumRatio) {
+    if (candidateUsedSize > mainUsedSize * EXPECTED.heapMaximumRatio) {
       fail(`${name} retained heap exceeds the paired 10% limit`);
     }
   }
@@ -396,21 +449,22 @@ export function validateEvidence(evidence, expected) {
 function validFixture() {
   const evidenceId = "aps-tsjs-preswitch-12345678";
   const headSha = "a".repeat(40);
-  const referenceSamples = Array.from({ length: 50 }, () => 20);
-  const currentSamples = Array.from({ length: 50 }, () => 21);
+  const mainSha = "c".repeat(40);
+  const mainSamples = Array.from({ length: 50 }, () => 200);
+  const candidateSamples = Array.from({ length: 50 }, () => 210);
   return {
-    expected: { evidenceId, headSha, mode: "preswitch" },
+    expected: { evidenceId, headSha, mainSha, mode: "preswitch" },
     evidence: {
-      schemaVersion: 4,
+      schemaVersion: 5,
       evidenceId,
       mode: "preswitch",
       headSha,
       environment: {
         chromium: "145.0.7632.6",
-        controller: "generated-server-v1",
+        controller: "generated-server-v1+production-main-v1",
         machineClass: "github-hosted:ubuntu-24.04",
         runnerImage: "ubuntu-24.04",
-        fixture: "tsjs-generated-loopback-paired-v2",
+        fixture: "tsjs-main-paired-network-v2",
         node: "v24.12.0",
         npm: "11.6.2",
         typescript: "6.0.3",
@@ -419,39 +473,55 @@ function validFixture() {
         warmupsPerVariant: 5,
         samplesPerVariant: 50,
         percentile: 90,
-        interleaving: "alternating-reference-current",
+        interleaving: "alternating-main-candidate",
+      },
+      networkProfile: {
+        mechanism: "cdp-Network.emulateNetworkConditions",
+        appliedBeforeNavigation: true,
+        latencyMs: 150,
+        downloadThroughputBytesPerSecond: 200_000,
+        uploadThroughputBytesPerSecond: 93_750,
+        packetLossPercent: 0,
       },
       marks: {
-        source: "performance-entry",
-        bidsScript: true,
-        firstDisplay: true,
-        firstDisplayPaint: true,
+        source: "fixture-first-observable-action",
+        comparisonStart: true,
+        firstObservableAction: true,
+        candidateBidsScript: true,
+        candidateFirstDisplay: true,
+        candidateFirstDisplayPaint: true,
       },
       performance: {
-        bootToFirstDisplayMs: {
-          reference: {
-            sha: EXPECTED.referenceSha,
-            samples: referenceSamples,
-            p90: 20,
+        requestToFirstActionMs: {
+          main: {
+            sha: mainSha,
+            artifactModel: "legacy-main-v1",
+            criticalTransferBytes: 82_000,
+            samples: mainSamples,
+            p90: 200,
           },
-          current: { samples: currentSamples, p90: 21 },
+          candidate: {
+            artifactModel: "release-v1",
+            criticalTransferBytes: 220_000,
+            samples: candidateSamples,
+            p90: 210,
+          },
           percentile: 90,
           maximumRatio: 1.1,
-          observedRatio: 21 / 20,
-          hardCeilingMs: 100,
+          observedRatio: 210 / 200,
         },
       },
       heap: {
         collection: "one-collectGarbage-then-immediate-getHeapUsage",
         maximumRatio: 1.1,
         hardCeilingBytes: 4 * 1024 * 1024,
-        reference: {
-          sha: EXPECTED.referenceSha,
+        main: {
+          sha: mainSha,
           checkpoints: Object.fromEntries(
             EXPECTED.heapCheckpoints.map((name) => [name, 1_600_000]),
           ),
         },
-        current: {
+        candidate: {
           checkpoints: Object.fromEntries(
             EXPECTED.heapCheckpoints.map((name) => [name, 1_650_000]),
           ),
@@ -498,68 +568,83 @@ function runSelfTest() {
     ["typescript", (value) => (value.environment.typescript = "6.0.2")],
     ["warmups", (value) => (value.sampling.warmupsPerVariant = 4)],
     ["interleaving", (value) => (value.sampling.interleaving = "sequential")],
+    ["network latency", (value) => (value.networkProfile.latencyMs = 0)],
     [
-      "current sample count",
-      (value) => value.performance.bootToFirstDisplayMs.current.samples.pop(),
+      "network ordering",
+      (value) => (value.networkProfile.appliedBeforeNavigation = false),
     ],
     [
-      "reference sample count",
-      (value) => value.performance.bootToFirstDisplayMs.reference.samples.pop(),
+      "candidate sample count",
+      (value) =>
+        value.performance.requestToFirstActionMs.candidate.samples.pop(),
+    ],
+    [
+      "candidate transfer bytes",
+      (value) =>
+        (value.performance.requestToFirstActionMs.candidate.criticalTransferBytes = 0),
+    ],
+    [
+      "main sample count",
+      (value) => value.performance.requestToFirstActionMs.main.samples.pop(),
+    ],
+    [
+      "main transfer bytes",
+      (value) =>
+        (value.performance.requestToFirstActionMs.main.criticalTransferBytes = 0),
     ],
     ["percentile", (value) => (value.sampling.percentile = 95)],
     ["real marks", (value) => (value.marks.source = "synthetic")],
-    ["missing mark", (value) => (value.marks.firstDisplay = false)],
+    ["missing mark", (value) => (value.marks.firstObservableAction = false)],
     [
       "paired p90 limit",
       (value) => {
-        value.performance.bootToFirstDisplayMs.current.samples.fill(23);
-        value.performance.bootToFirstDisplayMs.current.p90 = 23;
-        value.performance.bootToFirstDisplayMs.observedRatio = 23 / 20;
-      },
-    ],
-    [
-      "hard p90 limit",
-      (value) => {
-        value.performance.bootToFirstDisplayMs.reference.samples.fill(101);
-        value.performance.bootToFirstDisplayMs.reference.p90 = 101;
-        value.performance.bootToFirstDisplayMs.current.samples.fill(101);
-        value.performance.bootToFirstDisplayMs.current.p90 = 101;
-        value.performance.bootToFirstDisplayMs.observedRatio = 1;
+        value.performance.requestToFirstActionMs.candidate.samples.fill(221);
+        value.performance.requestToFirstActionMs.candidate.p90 = 221;
+        value.performance.requestToFirstActionMs.observedRatio = 221 / 200;
       },
     ],
     [
       "p90 consistency",
-      (value) => (value.performance.bootToFirstDisplayMs.current.p90 = 19),
+      (value) => (value.performance.requestToFirstActionMs.candidate.p90 = 19),
     ],
     [
       "finite sample",
       (value) =>
-        (value.performance.bootToFirstDisplayMs.current.samples[0] = null),
+        (value.performance.requestToFirstActionMs.candidate.samples[0] = null),
     ],
     [
-      "reference SHA",
+      "main SHA",
       (value) =>
-        (value.performance.bootToFirstDisplayMs.reference.sha = "b".repeat(40)),
+        (value.performance.requestToFirstActionMs.main.sha = "b".repeat(40)),
+    ],
+    [
+      "main artifact model",
+      (value) =>
+        (value.performance.requestToFirstActionMs.main.artifactModel =
+          "unknown-v1"),
+    ],
+    [
+      "candidate artifact model",
+      (value) =>
+        (value.performance.requestToFirstActionMs.candidate.artifactModel =
+          "legacy-main-v1"),
     ],
     [
       "observed ratio",
-      (value) => (value.performance.bootToFirstDisplayMs.observedRatio = 1),
+      (value) => (value.performance.requestToFirstActionMs.observedRatio = 1),
     ],
     [
       "heap ratio",
-      (value) => (value.heap.current.checkpoints.afterBoot = 1_800_000),
+      (value) => (value.heap.candidate.checkpoints.afterBoot = 1_800_000),
     ],
     [
       "heap hard ceiling",
       (value) => {
-        value.heap.reference.checkpoints.afterBoot = 4 * 1024 * 1024 + 1;
-        value.heap.current.checkpoints.afterBoot = 4 * 1024 * 1024 + 1;
+        value.heap.main.checkpoints.afterBoot = 4 * 1024 * 1024 + 1;
+        value.heap.candidate.checkpoints.afterBoot = 4 * 1024 * 1024 + 1;
       },
     ],
-    [
-      "heap reference SHA",
-      (value) => (value.heap.reference.sha = "b".repeat(40)),
-    ],
+    ["heap main SHA", (value) => (value.heap.main.sha = "b".repeat(40))],
     ["critical count", (value) => (value.requests.critical.count = 2)],
     ["deferred count", (value) => (value.requests.deferred.count = 1)],
     ["excess deferred count", (value) => (value.requests.deferred.count = 3)],
@@ -632,6 +717,13 @@ function runSelfTest() {
     new URL(".github/workflows/tsjs-performance-gate.yml", repositoryRoot),
     "utf8",
   );
+  const generatorSource = readFileSync(
+    new URL(
+      "crates/trusted-server-integration-tests/src/bin/generate-tsjs-prospective-fixture.rs",
+      repositoryRoot,
+    ),
+    "utf8",
+  );
   const integrationWorkflow = readFileSync(
     new URL(".github/workflows/integration-tests.yml", repositoryRoot),
     "utf8",
@@ -675,23 +767,69 @@ function runSelfTest() {
   );
   assert.match(
     performanceTest,
-    /FIXTURE_ID = "tsjs-generated-loopback-paired-v2"/u,
-    "the browser gate must identify the paired generated loopback fixture",
+    /FIXTURE_ID = "tsjs-main-paired-network-v2"/u,
+    "the browser gate must identify the paired network-shaped fixture",
+  );
+  assert.doesNotMatch(
+    performanceTest,
+    /62421ee44c62f24534ea8782a46dfa5bfbcea950/u,
+    "the browser gate must not retain the obsolete frozen reference SHA",
   );
   assert.match(
     performanceTest,
-    /REFERENCE_SHA = "62421ee44c62f24534ea8782a46dfa5bfbcea950"/u,
-    "the browser gate must bind the frozen pre-switch reference SHA",
+    /Network\.emulateNetworkConditions[\s\S]*latency: 150[\s\S]*downloadThroughput: 200_000[\s\S]*uploadThroughput: 93_750/u,
+    "the browser gate must apply the fixed CDP network profile before navigation",
+  );
+  assert.ok(
+    performanceTest.indexOf(
+      'networkSession.send("Network.emulateNetworkConditions"',
+    ) < performanceTest.indexOf("await page.goto(fixtureUrl"),
+    "the browser gate must install network shaping before either variant navigates",
   );
   assert.match(
     performanceTest,
-    /index % 2 === 0[\s\S]*referenceServer[\s\S]*currentServer/u,
-    "the browser gate must alternate reference/current order",
+    /loadLegacyMainFixtureResources[\s\S]*tsjs-core\.js[\s\S]*tsjs-creative\.js[\s\S]*tsjs-gpt\.js/u,
+    "the browser gate must consume main's actual legacy core, creative, and GPT artifact shape",
+  );
+  assert.match(
+    performanceTest,
+    /CRITICAL_IDS = \["render_runtime", "creative", "gpt"\]/u,
+    "the release-v1 comparison must use the same core, render, creative, and GPT shape",
+  );
+  assert.match(
+    generatorSource,
+    /creative:[\s\S]*enabled: true/u,
+    "the generated candidate controller must enable main's default creative policy",
+  );
+  assert.match(
+    performanceTest,
+    /loadMainFixtureResources[\s\S]*tsjs-release-v1\.json[\s\S]*loadReleaseFixtureResources[\s\S]*loadLegacyMainFixtureResources/u,
+    "the browser gate must detect main's actual legacy or release-v1 artifact shape",
+  );
+  assert.match(
+    performanceTest,
+    /performance\.mark\("tsjs:first-observable-action"\)[\s\S]*display\(target:[\s\S]*markFirstObservableAction\(\)/u,
+    "the cross-version endpoint must be the first observable GPT display or refresh action",
+  );
+  assert.match(
+    performanceTest,
+    /criticalTransferBytes: mainResources\.criticalTransferBytes[\s\S]*criticalTransferBytes: candidateResources\.criticalTransferBytes/u,
+    "the evidence must record each variant's exact served critical bytes",
   );
   assert.match(
     performanceWorkflow,
-    /git worktree add --detach "\$reference_root" "\$reference_sha"/u,
-    "the performance workflow must build the frozen reference in a detached worktree",
+    /git fetch origin main[\s\S]*main_sha="\$\(git rev-parse origin\/main\)"[\s\S]*TSJS_PERF_MAIN_SHA/u,
+    "the performance workflow must resolve and export the exact current main SHA",
+  );
+  assert.match(
+    performanceWorkflow,
+    /pull_request:[\s\S]*paths:/u,
+    "the performance workflow must run automatically for relevant PR changes",
+  );
+  assert.doesNotMatch(
+    performanceWorkflow,
+    /62421ee44c62f24534ea8782a46dfa5bfbcea950/u,
+    "the performance workflow must never build a frozen reference instead of current main",
   );
   assert.doesNotMatch(
     performanceTest,
@@ -840,10 +978,16 @@ function parseArguments(arguments_) {
     if (values.has(name)) fail(`duplicate ${name}`);
     values.set(name, value);
   }
-  for (const name of ["--file", "--evidence-id", "--head-sha", "--mode"]) {
+  for (const name of [
+    "--file",
+    "--evidence-id",
+    "--head-sha",
+    "--main-sha",
+    "--mode",
+  ]) {
     if (!values.has(name)) fail(`missing ${name}`);
   }
-  if (values.size !== 4) fail("unknown or duplicate CLI arguments");
+  if (values.size !== 5) fail("unknown or duplicate CLI arguments");
   return values;
 }
 
@@ -864,6 +1008,7 @@ function main() {
   validateEvidence(evidence, {
     evidenceId: arguments_.get("--evidence-id"),
     headSha: arguments_.get("--head-sha"),
+    mainSha: arguments_.get("--main-sha"),
     mode: arguments_.get("--mode"),
   });
   console.log("TSJS performance evidence is valid");

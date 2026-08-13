@@ -1,7 +1,9 @@
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use error_stack::Report;
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 use trusted_server_js::{
     MAX_MANIFEST_MODULES, TsjsModulePhase, all_integration_metadata, all_module_ids,
     concatenated_hash, release_id, single_module_hash,
@@ -22,6 +24,13 @@ use crate::settings::{IntegrationConfig, Settings};
 /// Returns an error when the integration inventory exceeds the bounded capacity,
 /// contains an invalid module ID, or cannot be serialized.
 pub fn tsjs_boot_manifest_v1(module_ids: &[&str]) -> Result<String, Report<TrustedServerError>> {
+    tsjs_boot_manifest_with_critical_src_v1(module_ids, None)
+}
+
+fn tsjs_boot_manifest_with_critical_src_v1(
+    module_ids: &[&str],
+    precomputed_critical_src: Option<&str>,
+) -> Result<String, Report<TrustedServerError>> {
     if module_ids.len() > MAX_MANIFEST_MODULES {
         return Err(boot_manifest_error(
             "integration inventory exceeds catalog capacity",
@@ -89,7 +98,8 @@ pub fn tsjs_boot_manifest_v1(module_ids: &[&str]) -> Result<String, Report<Trust
             "integration inventory must begin with render_runtime",
         ));
     }
-    let critical_src = tsjs_script_src(&critical_ids);
+    let critical_src =
+        precomputed_critical_src.map_or_else(|| tsjs_script_src(&critical_ids), ToOwned::to_owned);
     Ok(format!(
         r#"{{"version":1,"releaseId":"{}","criticalSrc":"{}","integrations":[{}]}}"#,
         release_id(),
@@ -373,17 +383,40 @@ pub struct TsjsBootScriptConfigV1<'a> {
 ///
 /// # Errors
 ///
-/// Returns an error for an invalid manifest, non-object projection JSON, or a
-/// creative/diagnostics enabled bit that disagrees with manifest membership.
+/// Returns an error for an invalid manifest, a projection that is not the exact
+/// canonical browser contract for `publisher_origin`, or a creative/diagnostics
+/// enabled bit that disagrees with manifest membership.
 pub fn tsjs_boot_script_v1(
     config: TsjsBootScriptConfigV1<'_>,
+    publisher_origin: &str,
 ) -> Result<String, Report<TrustedServerError>> {
     let manifest = tsjs_boot_manifest_v1(config.module_ids)?;
-    let projection = serde_json::from_str::<serde_json::Value>(config.auction_projection_json)
-        .map_err(|_| boot_manifest_error("auction projection is not valid JSON"))?;
-    if !projection.is_object() {
-        return Err(boot_manifest_error("auction projection must be an object"));
-    }
+    tsjs_boot_script_with_manifest_v1(config, &manifest, publisher_origin)
+}
+
+/// Serialize boot transport while reusing a registry-owned critical URL.
+///
+/// The registry derives this URL from the same selected catalog inventory at
+/// construction, so HTML processing does not concatenate or hash bundles.
+pub(crate) fn tsjs_boot_script_with_critical_src_v1(
+    config: TsjsBootScriptConfigV1<'_>,
+    critical_src: &str,
+    publisher_origin: &str,
+) -> Result<String, Report<TrustedServerError>> {
+    let manifest = tsjs_boot_manifest_with_critical_src_v1(config.module_ids, Some(critical_src))?;
+    tsjs_boot_script_with_manifest_v1(config, &manifest, publisher_origin)
+}
+
+fn tsjs_boot_script_with_manifest_v1(
+    config: TsjsBootScriptConfigV1<'_>,
+    manifest: &str,
+    publisher_origin: &str,
+) -> Result<String, Report<TrustedServerError>> {
+    let projection = crate::auction::formats::coordinated_cutover_v1::canonicalize_browser_auction_projection_json_v1(
+        config.auction_projection_json,
+        publisher_origin,
+    )
+    .map_err(|_| boot_manifest_error("auction projection violates the version-1 contract"))?;
 
     let creative_in_manifest = config.module_ids.contains(&"creative");
     let creative_required =
@@ -403,8 +436,8 @@ pub fn tsjs_boot_script_v1(
         ));
     }
 
-    let manifest = escape_json_for_inline_script(&manifest);
-    let projection = escape_json_for_inline_script(config.auction_projection_json);
+    let manifest = escape_json_for_inline_script(manifest);
+    let projection = escape_json_for_inline_script(&projection);
     Ok(format!(
         "<script>(function(){{var t=window.tsjs=window.tsjs||{{}};t.boot={{\"abi\":1,\"releaseId\":\"{}\",\"manifest\":{},\"auctionProjection\":{},\"creative\":{{\"version\":1,\"enabled\":{},\"clickGuard\":{},\"renderGuard\":{}}},\"diagnostics\":{{\"version\":1,\"renderTraceOverlay\":{},\"gpt\":{{\"active\":{}}}}}}};(function(){{try{{window.performance.mark(\"tsjs:bids-script\");}}catch(_){{}}}})();}})();</script>",
         release_id(),
@@ -419,11 +452,18 @@ pub fn tsjs_boot_script_v1(
 }
 
 fn escape_json_for_inline_script(json: &str) -> String {
-    json.replace('&', "\\u0026")
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
-        .replace('\u{2028}', "\\u2028")
-        .replace('\u{2029}', "\\u2029")
+    let mut escaped = String::with_capacity(json.len());
+    for character in json.chars() {
+        match character {
+            '&' => escaped.push_str("\\u0026"),
+            '<' => escaped.push_str("\\u003c"),
+            '>' => escaped.push_str("\\u003e"),
+            '\u{2028}' => escaped.push_str("\\u2028"),
+            '\u{2029}' => escaped.push_str("\\u2029"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 fn valid_integration_id(id: &str) -> bool {
@@ -453,39 +493,50 @@ pub fn tsjs_script_src(module_ids: &[&str]) -> String {
 /// `<script>` tag for injecting the tsjs bundle.
 #[must_use]
 pub fn tsjs_script_tag(module_ids: &[&str]) -> String {
-    tsjs_script_tag_with_attributes(module_ids, &[])
+    tsjs_script_tag_from_src(&tsjs_script_src(module_ids))
 }
 
-/// Publisher `<script>` tag for the tsjs bundle with trusted static attributes.
+/// `<script>` tag for a precomputed exact TSJS artifact URL.
 #[must_use]
-pub fn tsjs_script_tag_with_attributes(
-    module_ids: &[&str],
-    attributes: &[(&'static str, &'static str)],
-) -> String {
-    let attributes = attributes
-        .iter()
-        .map(|(name, value)| {
-            debug_assert!(
-                !name.is_empty()
-                    && name.bytes().all(|byte| {
-                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
-                    }),
-                "attribute name should contain only lowercase ASCII letters, digits, and hyphens"
-            );
-            debug_assert!(
-                !value
-                    .bytes()
-                    .any(|byte| matches!(byte, b'"' | b'&' | b'<' | b'>')),
-                "attribute value should not contain HTML-sensitive characters"
-            );
-            format!(" {name}=\"{value}\"")
-        })
-        .collect::<String>();
+pub(crate) fn tsjs_script_tag_from_src(src: &str) -> String {
+    format!(r#"<script src="{src}" id="trustedserver-js"></script>"#)
+}
 
-    format!(
-        "<script src=\"{}\" id=\"trustedserver-js\"{attributes}></script>",
-        tsjs_script_src(module_ids),
-    )
+/// Exact in-memory bytes and content identity for a unified TSJS artifact.
+#[derive(Clone, Debug)]
+pub(crate) struct TsjsStaticArtifactV1 {
+    body: bytes::Bytes,
+    hash: String,
+    src: String,
+}
+
+impl TsjsStaticArtifactV1 {
+    /// Build one exact content-addressed artifact from its canonical modules.
+    #[must_use]
+    pub(crate) fn new(module_ids: &[&str]) -> Self {
+        let body = bytes::Bytes::from(trusted_server_js::concatenate_modules(module_ids));
+        let hash = hex::encode(Sha256::digest(&body));
+        let src = format!("/static/tsjs=tsjs-unified.min.js?v={hash}");
+        Self { body, hash, src }
+    }
+
+    /// Return immutable response bytes; cloning [`bytes::Bytes`] shares storage.
+    #[must_use]
+    pub(crate) const fn body(&self) -> &bytes::Bytes {
+        &self.body
+    }
+
+    /// Return the SHA-256 identity of the exact response bytes.
+    #[must_use]
+    pub(crate) fn hash(&self) -> &str {
+        &self.hash
+    }
+
+    /// Return the exact content-addressed static URL.
+    #[must_use]
+    pub(crate) fn src(&self) -> &str {
+        &self.src
+    }
 }
 
 const CREATIVE_TSJS_MODULE_IDS: &[&str] = &["render_runtime", "creative"];
@@ -508,16 +559,21 @@ pub(crate) fn creative_tsjs_bootstrap_v1(
     if !creative.enabled || (!creative.click_guard && !creative.render_guard) {
         return Ok(None);
     }
-    let controller = tsjs_boot_script_v1(TsjsBootScriptConfigV1 {
-        module_ids: CREATIVE_TSJS_MODULE_IDS,
-        auction_projection_json: EMPTY_CREATIVE_AUCTION_PROJECTION_JSON,
-        creative,
-        render_trace_overlay: false,
-        gpt_diagnostics_active: false,
-    })?;
+    let artifact = creative_tsjs_static_artifact_v1();
+    let controller = tsjs_boot_script_with_critical_src_v1(
+        TsjsBootScriptConfigV1 {
+            module_ids: CREATIVE_TSJS_MODULE_IDS,
+            auction_projection_json: EMPTY_CREATIVE_AUCTION_PROJECTION_JSON,
+            creative,
+            render_trace_overlay: false,
+            gpt_diagnostics_active: false,
+        },
+        artifact.src(),
+        "https://creative.invalid",
+    )?;
     Ok(Some(format!(
         "{controller}{}",
-        tsjs_script_tag(CREATIVE_TSJS_MODULE_IDS)
+        tsjs_script_tag_from_src(artifact.src())
     )))
 }
 
@@ -525,6 +581,13 @@ pub(crate) fn creative_tsjs_bootstrap_v1(
 #[must_use]
 pub(crate) const fn creative_tsjs_module_ids() -> &'static [&'static str] {
     CREATIVE_TSJS_MODULE_IDS
+}
+
+/// Return the process-wide exact artifact used by rewritten creative documents.
+#[must_use]
+pub(crate) fn creative_tsjs_static_artifact_v1() -> &'static TsjsStaticArtifactV1 {
+    static ARTIFACT: OnceLock<TsjsStaticArtifactV1> = OnceLock::new();
+    ARTIFACT.get_or_init(|| TsjsStaticArtifactV1::new(CREATIVE_TSJS_MODULE_IDS))
 }
 
 /// `/static` URL for the unified bundle with a conservative cache-busting hash.
@@ -644,6 +707,49 @@ mod tests {
             }],
         })
         .expect("should serialize a canonical APS projection")
+    }
+
+    fn projection_with_adm(adm: &str) -> String {
+        use crate::auction::types::{
+            AdmRenderSourceV1, AuctionDecisionSetV1, BidRenderSourceV1, BrowserAuctionBidV1,
+            BrowserAuctionProjectionV1, BrowserAuctionSlotV1, SlotAuctionDecisionV1,
+        };
+
+        serde_json::to_string(&BrowserAuctionProjectionV1 {
+            version: 1,
+            auction: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: "initial".to_string(),
+                results: vec![SlotAuctionDecisionV1::Winner {
+                    slot: "slot-1".to_string(),
+                    candidate_id: "AAAAAAAAAAAA".to_string(),
+                }],
+            },
+            slots: vec![BrowserAuctionSlotV1 {
+                slot: "slot-1".to_string(),
+                gam_unit_path: "/123/slot-1".to_string(),
+                div_id: "slot-1".to_string(),
+                formats: vec![[300, 250]],
+                targeting: Default::default(),
+            }],
+            bids: vec![BrowserAuctionBidV1 {
+                candidate_id: "AAAAAAAAAAAA".to_string(),
+                slot: "slot-1".to_string(),
+                provider: "test".to_string(),
+                upstream_bid_id: "bid-1".to_string(),
+                cpm: 1.0,
+                currency: "USD".to_string(),
+                targeting: Default::default(),
+                renderer_reservation_id: "r1_aaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                render_source: BidRenderSourceV1::Adm(AdmRenderSourceV1 {
+                    version: 1,
+                    adm: adm.to_string(),
+                    width: 300,
+                    height: 250,
+                }),
+            }],
+        })
+        .expect("should serialize a canonical ADM projection")
     }
 
     fn hash_query_value(src: &str) -> &str {
@@ -927,7 +1033,7 @@ mod tests {
             },
             render_trace_overlay: true,
             gpt_diagnostics_active: true,
-        })
+        }, "https://publisher.example")
         .expect("should serialize boot transport");
 
         assert!(script.starts_with("<script>(function(){var t=window.tsjs=window.tsjs||{};"));
@@ -944,34 +1050,40 @@ mod tests {
 
     #[test]
     fn boot_script_rejects_manifest_diagnostics_mismatch_and_escapes_projection_markup() {
-        let mismatched = tsjs_boot_script_v1(TsjsBootScriptConfigV1 {
-            module_ids: &["render_runtime", "creative"],
-            auction_projection_json: r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"slots":[],"bids":[]}"#,
-            creative: CreativeBootConfigV1 {
-                enabled: true,
-                click_guard: true,
-                render_guard: false,
+        let mismatched = tsjs_boot_script_v1(
+            TsjsBootScriptConfigV1 {
+                module_ids: &["render_runtime", "creative"],
+                auction_projection_json: r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"slots":[],"bids":[]}"#,
+                creative: CreativeBootConfigV1 {
+                    enabled: true,
+                    click_guard: true,
+                    render_guard: false,
+                },
+                render_trace_overlay: false,
+                gpt_diagnostics_active: true,
             },
-            render_trace_overlay: false,
-            gpt_diagnostics_active: true,
-        });
+            "https://publisher.example",
+        );
         assert!(
             mismatched.is_err(),
             "should reject an active diagnostics bit without its module"
         );
 
-        let script = tsjs_boot_script_v1(TsjsBootScriptConfigV1 {
-            module_ids: &["render_runtime", "creative"],
-            auction_projection_json:
-                r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"slots":[],"bids":[],"probe":"</ScRiPt><script>&\u2028"}"#,
-            creative: CreativeBootConfigV1 {
-                enabled: true,
-                click_guard: true,
-                render_guard: false,
+        let projection = projection_with_adm("</ScRiPt><script>&");
+        let script = tsjs_boot_script_v1(
+            TsjsBootScriptConfigV1 {
+                module_ids: &["render_runtime", "creative"],
+                auction_projection_json: &projection,
+                creative: CreativeBootConfigV1 {
+                    enabled: true,
+                    click_guard: true,
+                    render_guard: false,
+                },
+                render_trace_overlay: false,
+                gpt_diagnostics_active: false,
             },
-            render_trace_overlay: false,
-            gpt_diagnostics_active: false,
-        })
+            "https://publisher.example",
+        )
         .expect("should escape valid projection JSON");
         let inner = script
             .trim_start_matches("<script>")
@@ -980,7 +1092,39 @@ mod tests {
         assert!(!inner.contains('<'));
         assert!(!inner.contains('>'));
         assert!(!inner.contains('&'));
-        assert!(inner.contains(r#"\u003c/ScRiPt\u003e\u003cscript\u003e\u0026\u2028"#));
+        assert!(inner.contains(r#"\u003c/ScRiPt\u003e\u003cscript\u003e\u0026"#));
+    }
+
+    #[test]
+    fn production_boot_rejects_a_noncanonical_browser_projection() {
+        let script = tsjs_boot_script_v1(
+            TsjsBootScriptConfigV1 {
+                module_ids: &["render_runtime"],
+                auction_projection_json: r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"slots":[],"bids":[],"unexpected":true}"#,
+                creative: CreativeBootConfigV1 {
+                    enabled: false,
+                    click_guard: false,
+                    render_guard: false,
+                },
+                render_trace_overlay: false,
+                gpt_diagnostics_active: false,
+            },
+            "https://publisher.example",
+        );
+
+        assert!(
+            script.is_err(),
+            "production boot must enforce the same canonical projection contract as fixtures"
+        );
+    }
+
+    #[test]
+    fn inline_script_json_escaping_is_byte_exact_for_every_guarded_character() {
+        assert_eq!(
+            escape_json_for_inline_script("plain &<>\u{2028}\u{2029} tail"),
+            r"plain \u0026\u003c\u003e\u2028\u2029 tail",
+            "should preserve plain UTF-8 while escaping every script-significant character"
+        );
     }
 
     #[test]
@@ -1116,17 +1260,20 @@ mod tests {
     #[test]
     fn boot_script_accepts_enabled_creative_with_no_guards_and_no_module() {
         assert!(
-            tsjs_boot_script_v1(TsjsBootScriptConfigV1 {
-                module_ids: &["render_runtime"],
-                auction_projection_json: EMPTY_CREATIVE_AUCTION_PROJECTION_JSON,
-                creative: CreativeBootConfigV1 {
-                    enabled: true,
-                    click_guard: false,
-                    render_guard: false,
+            tsjs_boot_script_v1(
+                TsjsBootScriptConfigV1 {
+                    module_ids: &["render_runtime"],
+                    auction_projection_json: EMPTY_CREATIVE_AUCTION_PROJECTION_JSON,
+                    creative: CreativeBootConfigV1 {
+                        enabled: true,
+                        click_guard: false,
+                        render_guard: false,
+                    },
+                    render_trace_overlay: false,
+                    gpt_diagnostics_active: false,
                 },
-                render_trace_overlay: false,
-                gpt_diagnostics_active: false,
-            })
+                "https://publisher.example"
+            )
             .is_ok(),
             "creative membership is required only when a guard has browser work"
         );

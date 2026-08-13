@@ -32,11 +32,20 @@ adapters.
 
 **Source of truth:**
 `docs/superpowers/specs/2026-08-04-aps-render-fix-and-tsjs-resilience-design.md`
-revision 33, frozen review SHA
+revision 35. The prior revision-33 frozen review SHA is
 `958a79ccbbfe70c24a1529f6a4a469e15217cf5da799342a13d122fee4cdc99e`. This is the
 only implementation-plan document for the work. APS render
 and the runtime architecture are one coupled cutover: neither subsystem is useful or
 safe to release independently, so they remain in this one plan.
+
+Revision 34 adds the approved PR-review remediation in Task 23A. The revision-33
+hash remains provenance for the previously reviewed contract; it is not represented
+as approval of the oversized intermediate critical artifact.
+
+Revision 35 makes Task 23A's performance remediation authoritative: the active gate
+compares against the exact current `origin/main` SHA under one fixed CDP network
+profile and honestly supports main's legacy artifact shape. It replaces, rather than
+supplements, Task 23's frozen-reference timing instrument.
 
 ## Scope guardrails
 
@@ -58,7 +67,9 @@ safe to release independently, so they remain in this one plan.
   an updater, or an offline runner fallback into source, tests, evidence, or release
   artifacts. The only positive runner route is the live fixed-target proxy at
   `/integrations/aps/runner.js`; `/integrations/aps/runner/v1.js` is negative-only.
-  This plan defines no runner cache behavior.
+  Trusted Server does not cache the live runner or add a successful-response
+  `Cache-Control` requirement. Platform admission control, rate limiting, and
+  request shielding remain operator concerns.
 - Do not introduce a cache redesign. Preserve the pinned PBS Cache behavior through
   a thin `pbs_cache` carrier plus its pre/post-cutover black-box corpus; do not add a
   cache policy, URL/response contract, direct-cache path, reservation identity,
@@ -68,6 +79,13 @@ safe to release independently, so they remain in this one plan.
   The baseline's separately generated pure Prebid.js 10.26.0 artifact remains the
   explicit exception: it is independently built and purity-scanned, contains no
   TSJS behavior, and is never concatenated into a TSJS runtime artifact.
+- Reserved `/integrations/aps/*` browser routes intentionally bypass
+  `[[handlers]]` and remain anonymous. Documentation and startup warnings must say
+  so; do not add an in-process Basic Auth gate that would break browser loading.
+- DataDome and the other `RCJ-INT-01` integrations remain only because this plan
+  adopts all TSJS concepts from the frozen `rc/july` baseline. Preserve their
+  behavior behind the common runtime; do not treat that adoption as authority for a
+  separate server-side redesign.
 
 Every task ends with `git status --short`, focused verification, and one intentional
 commit before the next task. Stage only the exact paths from that task's **Files**
@@ -1582,7 +1600,8 @@ collapse those checkpoints or carry unverified behavior between them.
       public trace/GPT subscriber limits remain owned by their respective data APIs.
 
 - [ ] **Step 4: Write failing Rust and adapter tests for exact static transport.** Cover
-      only `GET /static/tsjs=tsjs-unified.min.js?v=<criticalHash>` and exact enabled
+      only `GET` and bodyless metadata-equivalent `HEAD` for
+      `/static/tsjs=tsjs-unified.min.js?v=<criticalHash>` and exact enabled
       deferred paths; one `v`, no extra query; lowercase 64-hex SHA-256 over exact
       uncompressed response bytes; current catalog membership; `200` JavaScript MIME
       plus `nosniff`; existing conditional `304`; and local `404 no-store` for wrong
@@ -4630,6 +4649,11 @@ change invalidates the pre-switch evidence and must return to Task 18E under sep
 design review. Production-only route selection is part of Task 19 and cannot alter
 sampling or comparison logic.
 
+Task 23A is that separately approved review amendment. It preserves this evidence as
+an immutable intermediate checkpoint, then extends the comparator and measurement
+with a reduced capture and candidate-versus-`main` network profile. Nothing in Task
+23 may be cited to skip Task 23A or self-approve the oversized capture.
+
 - [ ] **Step 1: Consume, but do not regenerate, both immutable subtrees captured in
       Task 0 and Task 18E.** Build the canonical release inventory fresh. Print the
       original `bundles` values and current deltas as report-only historical evidence;
@@ -4652,8 +4676,8 @@ sampling or comparison logic.
 
 - [ ] **Step 2: Rerun the exact pre-switch browser-time gate after the production
       switch.** On Chromium 145.0.7632.6, `github-hosted:ubuntu-24.04`, and fixture
-      `tsjs-generated-loopback-paired-v2`, alternate the frozen pre-switch reference
-      and post-switch current variant for five warmups and 50 samples per variant.
+      `tsjs-main-paired-network-v2`, alternate current `main` and the candidate
+      for five warmups and 50 samples per variant.
       Require current p90 ≤ reference p90 × 1.10 and p90 ≤100 ms for each side. Do
       not rerun selectively to turn a failed sample into a pass. The post-switch
       sample reads the real `tsjs:bids-script`
@@ -4749,6 +4773,136 @@ sampling or comparison logic.
   workflow. The post-switch prefix selects only the performance job; the rollback
   artifact input is required by the wrapper schema but is not consumed by this
   non-deployment evidence run.
+
+### Task 23A: Close PR-review blockers before final release evidence
+
+This is an approved remediation checkpoint. It supersedes any conclusion that the
+first `roleCorrectTransfer` capture made the current critical payload acceptable,
+but does not alter its bytes or provenance. Complete every step before Task 24; do
+not create another design, plan, cache specification, or evidence document.
+
+**Files:**
+
+- Modify: finite TSJS transport/catalog implementation and focused Rust tests
+- Modify: Fastly and Cloudflare raw-proxy implementations and focused parity tests
+- Modify: TSJS critical entry/slices, bundle comparator, existing performance JSON,
+  release tests, browser performance fixture, evidence validator, and standalone
+  performance workflow
+- Modify: `crates/trusted-server-core/src/settings.rs`
+- Modify: `crates/trusted-server-core/src/trace_cookie.rs`
+- Modify: `crates/trusted-server-integration-tests/browser/helpers/gam-test-network.ts`
+- Modify: `crates/trusted-server-integration-tests/browser/tests/shared/aps-real-gam.spec.ts`
+- Modify: `.github/workflows/aps-real-gam.yml`
+- Modify: `docs/guide/configuration.md`
+- Modify: `docs/guide/integrations/aps.md`
+- Modify: this specification and plan
+
+- [ ] **Step A1: Test-drive finite TSJS transport resolution.** Construct and hash
+      every supported critical selection once during registry construction. Store
+      exact hash-to-selection and selection-to-critical-URL mappings, resolve misses
+      without concatenating or hashing module bodies, and reuse the precomputed URL
+      for boot metadata and the critical script tag. A hit may assemble the response
+      body once. Add focused tests that reject unknown hashes and prove page assembly
+      reuses the registered identity. Remove the unconditional APS auction-body clone
+      before provider-enabled dispatch.
+
+- [ ] **Step A2: Test-drive raw-proxy timeout parity.** Cloudflare must race initial
+      response against `first_byte_timeout`, every body read against
+      `blocking_read_timeout`, and the complete operation against
+      `total_timeout`, aborting and discarding on every losing branch. Fastly must
+      wait on its pending request rather than sleep-polling while retaining the
+      backend and total deadlines. Run the focused adapter corpus for header stall,
+      inter-chunk stall, total slow drip, redirect, oversize, invalid evidence, and
+      success before the four-runtime runner-proxy suite.
+
+- [ ] **Step A3: Make the anonymous route boundary operationally explicit.** Add one
+      startup warning when a `[[handlers]]` expression overlaps a reserved APS
+      browser route. Keep routing before Basic Auth: renderer and live-runner requests
+      are intentionally anonymous. Document platform admission control, rate
+      limiting, and shielding without adding an in-process auth gate, runner cache,
+      successful-response `Cache-Control`, vendor bytes, digest, version, or pin.
+
+- [ ] **Step A4: Reduce the critical runtime before accepting a new budget.** Remove
+      diagnostics presentation, post-paint trace UI, refresh-only behavior,
+      SPA/later-navigation behavior, optional integration implementations, duplicated
+      helpers, and test seams from the parser-blocking graph. Keep first-display
+      correctness owners and one runtime. Build from a clean pushed SHA and require:
+
+  Co-bundle the mandatory render provider with the sole core runtime so shared
+  dependencies are emitted once. Keep `tsjs-render_runtime.js` as a release-stamped
+  catalog marker only: it preserves logical provider membership and ordering but
+  must contain no implementation, listener, timer, port, or second runtime.
+  Capture logical-provider sources separately from physical marker ownership and
+  fail if any provider source appears outside its one physical owner, regardless of
+  the captured general source-owner list. Freeze a report of the twenty largest
+  rendered-source contributions and all repeated source attributions.
+  - minimal critical ≤ 220,000 raw bytes and ≤59,000 gzip bytes;
+  - minimal-critical Brotli < the corresponding `roleCorrectTransfer` value;
+  - reference-critical raw/gzip/Brotli < their `roleCorrectTransfer` values; and
+  - maximal total does not grow.
+
+  The raw/gzip limits are an initial mechanical-deduplication ceiling informed by a
+  214,538-raw / 58,503-gzip prototype before release stamping, not equivalence to the
+  legacy artifact. Preserve `roleCorrectTransfer` as immutable intermediate
+  evidence, append `reviewRemediationTransfer` with its own full provenance, and
+  enforce future 5% ceilings only from the reviewed reduced capture. Keep the
+  original historical values visible as deltas.
+
+- [ ] **Step A5: Add a network-shaped candidate-versus-`main` gate.** Fetch and
+      attest the exact current `origin/main` SHA, build `main` and the candidate
+      independently, and serve each actual page shape and critical bytes over HTTP.
+      Feature-detect main's artifact shape. For legacy main, consume its real built
+      `tsjs-core.js`, `tsjs-creative.js`, and `tsjs-gpt.js`, enable the same default
+      creative policy, and drive its legacy `adInit` contract instead of relabeling an
+      older phase-aware capture as main. For release-v1 main and the candidate,
+      compare the same `[core, render_runtime, creative, gpt]` critical selection and
+      enabled creative policy. Keep the main loader forward-valid: after
+      cutover reaches `main`, it must consume that SHA's release-v1 inventory and
+      controller rather than failing or treating release-v1 bytes as legacy.
+      Apply Chromium CDP `Network.emulateNetworkConditions` before either variant's
+      navigation with checked-in 150 ms latency, 1.6 Mbit/s download, 750 kbit/s
+      upload, and zero packet loss. In one Chromium process, alternate five warmups
+      and 50 samples per side. Measure through a common cross-version first-display
+      action, not a candidate-only mark, so critical transfer, parse, evaluation, and
+      work through first GPT display/refresh or direct insertion are included;
+      require candidate p90 ≤ `main` p90 × 1.10. Record exact SHAs, artifact models,
+      exact served critical byte counts, profile, pair order, and distributions in
+      schema-5 evidence. Use soft Playwright budget assertions only so every timing
+      and heap checkpoint is collected and written before the run fails; validation
+      and artifact upload run with `always()` and still fail the job on any exceeded
+      budget. The same run retains the candidate's real User Timing and
+      deferred-order checks plus the main-paired retained-heap checkpoints. Request
+      interception, an environment-selected profile, a fixed historical SHA, or an
+      unshaped loopback comparison cannot satisfy this step. Wire the standalone
+      workflow to relevant pull-request paths while preserving its dispatch and
+      reusable-workflow modes.
+
+- [ ] **Step A6: Close workflow and evidence hygiene.** Pass every workflow-dispatch
+      input through `env`; never interpolate it directly into a `run` script. The
+      real-GAM classifier recognizes renderer/runner routes only when `url.origin`
+      equals the page origin, with negative third-party lookalike tests. Keep
+      protected real-GAM outside ordinary untrusted PR events. Clarify that the trace
+      cookie is host-only with no `Domain` attribute. Resolve only technically valid
+      review threads. Apply the CodeQL-proven removal of the unreachable second
+      disposed check immediately after `options.signal`; retain the earlier
+      pre-getter guard and the later guards around individual signal-member access,
+      where a hostile getter can still re-enter disposal.
+
+- [ ] **Step A7: Document hard-cutover deployment order.** Replace `pub_id` with
+      quoted `account_id`, quote numeric IDs, remove legacy/unknown APS keys, run
+      `ts config validate`, and push canonical config while the old binary accepts
+      it; deploy the new binary afterward. Do not add aliases or coercion. Retain
+      DataDome as an adopted `rc/july` TSJS concept without changing its server-side
+      behavior. Do not modify the separate ad-template cache-control proposal.
+
+- [ ] **Step A8: Verify and freeze the remediation checkpoint.** Run focused tests
+      after every red/green change, then the complete Task 24 matrix. From a clean
+      pushed SHA, run `check:bundle` and the automatic network-shaped
+      candidate-versus-current-`main` workflow, including candidate real-mark,
+      deferred-order, and paired retained-heap assertions. Download and validate each
+      named schema-5 artifact before treating Task 24 as release evidence. A failed
+      ratio is a release blocker to remediate, not permission to relabel main,
+      restore the frozen-reference gate, or loosen the threshold.
 
 ### Task 24: Run final repository verification and assemble the cutover evidence
 
@@ -5057,8 +5211,10 @@ The plan is complete only when:
     maximal manifest.
 12. Static renderer and live fixed-target runner-proxy status, exact headers,
     bounded/deadline behavior, and fail-closed evidence parsing are proven through
-    all four actual adapter transports; no APS runner bytes/version/digest/license/
-    SRI/updater/fallback/cache requirement exists in TS source or release evidence.
+    all four actual adapter transports. The runner remains anonymous, live,
+    unversioned, unvendored, unpinned, and uncached by Trusted Server; no runner
+    bytes/version/digest/license/SRI/updater/fallback or successful-response cache
+    requirement exists in TS source or release evidence.
 13. Legacy globals, expandos, sentinels, duplicate listeners/wrappers, mutable
     creative/diagnostics surfaces, old routes, old declarations, and compatibility
     shape detection are absent after the hard cutover.
@@ -5067,9 +5223,13 @@ The plan is complete only when:
     unrelated feature rewrite.
 15. Format, lint, typecheck, adoption/architecture/absence checks, all adapter tests
     and clippy targets, Vitest, bundle/artifact builds, Playwright, immutable
-    historical bundle reporting, role-correct transfer ceilings, browser-time, and
-    retained-heap gates pass in attested clean-checkout quality, integration, and
-    real-GAM runs for the exact release SHA and release id.
+    historical/intermediate evidence validation, reduced transfer ceilings, the
+    automatic network-shaped candidate-versus-current-`main` browser-time gate, its
+    candidate real-mark/deferred-order assertions, and paired retained-heap gates
+    pass in attested clean-checkout quality, integration, and real-GAM runs for the
+    exact release SHA and release id. Minimal critical is no more than 220,000
+    raw / 59,000 gzip bytes and reference critical is smaller in every compression
+    metric than the reviewed intermediate capture.
 16. The binary cutover and 24-hour monitor complete or the exact prior immutable
     deployable binary is restored cleanly; the active binary retains no N/N-1 TSJS
     routes, runtime selector, percentage router, or dual protocol.
@@ -5084,3 +5244,9 @@ The plan is complete only when:
     independently in the same runtime. Exact absolute URL, nonce, CSP, Trusted Types,
     stale-hash, isolated failure, and head-of-line tests pass without vendoring GPT,
     APS runner, PUC, or other upstream bytes.
+20. Canonical APS config is validated and pushed before binary deployment, with no
+    alias/coercion compatibility path.
+21. Reserved APS route anonymity and `[[handlers]]` bypass are prominent in operator
+    docs and startup diagnostics. Real-GAM evidence rejects third-party route
+    lookalikes, and shell scripts consume dispatch inputs only through environment
+    variables.

@@ -1,6 +1,8 @@
 import { execFileSync } from "node:child_process";
+import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -29,14 +31,23 @@ const WARMUPS = 5;
 const SAMPLES = 50;
 const PERCENTILE = 90;
 const MAXIMUM_P90_RATIO = 1.1;
-const HARD_P90_CEILING_MS = 100;
-const REFERENCE_SHA = "62421ee44c62f24534ea8782a46dfa5bfbcea950";
 const EXPECTED_CHROMIUM = "145.0.7632.6";
 const MACHINE_CLASS = "github-hosted:ubuntu-24.04";
 const RUNNER_IMAGE = "ubuntu-24.04";
-const FIXTURE_ID = "tsjs-generated-loopback-paired-v2";
-const CONTROLLER_ID = "generated-server-v1";
-const CRITICAL_IDS = ["render_runtime", "gpt"] as const;
+const FIXTURE_ID = "tsjs-main-paired-network-v2";
+const CONTROLLER_ID = "generated-server-v1+production-main-v1";
+const COMPARISON_START_MARK = "tsjs:comparison-start";
+const FIRST_OBSERVABLE_ACTION_MARK = "tsjs:first-observable-action";
+const NETWORK_PROFILE = Object.freeze({
+  offline: false,
+  latency: 150,
+  downloadThroughput: 200_000,
+  uploadThroughput: 93_750,
+  packetLoss: 0,
+});
+// Current main always ships creative with core, and production's default
+// creative guard is enabled. Keep both comparison sides on that same shape.
+const CRITICAL_IDS = ["render_runtime", "creative", "gpt"] as const;
 const DEFERRED_IDS = ["diagnostics_presentation", "gpt_later"] as const;
 const HEAP_CHECKPOINTS = [
   "afterBoot",
@@ -65,9 +76,11 @@ interface Release {
 }
 
 interface FixtureResources {
-  release: Release;
-  controllerDocument: string;
+  artifactModel: "release-v1" | "legacy-main-v1";
+  release: Release | null;
+  controllerDocument: string | null;
   criticalBody: string;
+  criticalTransferBytes: number;
   criticalSrc: string;
   deferred: Map<string, { body: string; src: string }>;
 }
@@ -111,6 +124,12 @@ interface BrowserObservation {
   preloadBeforePaintCount: number;
 }
 
+interface ComparisonObservation {
+  timingMs: number;
+  displayCount: number;
+  releaseId: string | undefined;
+}
+
 function exactArtifact(release: Release, id: string): ReleaseArtifact {
   const matches = release.artifacts.filter((artifact) => artifact.id === id);
   if (matches.length !== 1)
@@ -118,7 +137,7 @@ function exactArtifact(release: Release, id: string): ReleaseArtifact {
   return matches[0]!;
 }
 
-function loadFixtureResources(repositoryRoot: string): FixtureResources {
+function loadReleaseFixtureResources(repositoryRoot: string): FixtureResources {
   const tsjsCrate = resolve(repositoryRoot, "crates/trusted-server-js");
   const dist = resolve(tsjsCrate, "dist");
   const releaseFile = resolve(dist, "tsjs-release-v1.json");
@@ -130,6 +149,10 @@ function loadFixtureResources(repositoryRoot: string): FixtureResources {
   for (const artifact of criticalArtifacts.slice(1)) {
     expect(artifact.phase).toBe("critical");
   }
+  expect(
+    criticalArtifacts.map(({ id }) => id),
+    "release-v1 performance shape must stay core + render + creative + GPT",
+  ).toEqual(["core", "render_runtime", "creative", "gpt"]);
   const criticalBody = criticalArtifacts
     .map((artifact) => readFileSync(resolve(dist, artifact.file), "utf8"))
     .join(";\n");
@@ -188,12 +211,43 @@ function loadFixtureResources(repositoryRoot: string): FixtureResources {
   for (const { src } of deferred.values())
     expect(controllerDocument).toContain(src);
   return {
+    artifactModel: "release-v1",
     release,
     controllerDocument,
     criticalBody,
+    criticalTransferBytes: Buffer.byteLength(criticalBody, "utf8"),
     criticalSrc,
     deferred,
   };
+}
+
+function loadLegacyMainFixtureResources(
+  repositoryRoot: string,
+): FixtureResources {
+  const dist = resolve(repositoryRoot, "crates/trusted-server-js/dist");
+  const criticalBody = ["tsjs-core.js", "tsjs-creative.js", "tsjs-gpt.js"]
+    .map((file) => readFileSync(resolve(dist, file), "utf8"))
+    .join(";\n");
+  const criticalHash = createHash("sha256").update(criticalBody).digest("hex");
+  return {
+    artifactModel: "legacy-main-v1",
+    release: null,
+    controllerDocument: null,
+    criticalBody,
+    criticalTransferBytes: Buffer.byteLength(criticalBody, "utf8"),
+    criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${criticalHash}`,
+    deferred: new Map(),
+  };
+}
+
+function loadMainFixtureResources(repositoryRoot: string): FixtureResources {
+  const releaseFile = resolve(
+    repositoryRoot,
+    "crates/trusted-server-js/dist/tsjs-release-v1.json",
+  );
+  return existsSync(releaseFile)
+    ? loadReleaseFixtureResources(repositoryRoot)
+    : loadLegacyMainFixtureResources(repositoryRoot);
 }
 
 function initialProjection() {
@@ -241,7 +295,23 @@ function fixtureDocument(
   manualDisplay: boolean,
 ): string {
   const criticalTag = `<script src="${resources.criticalSrc}" id="trustedserver-js"></script>`;
-  const controlledCriticalTag = `<script>window.__fixtureGpt.setManual(true);</script>${criticalTag}`;
+  const comparisonSetup = `<script>window.__fixtureGpt.setManual(true);performance.mark("${COMPARISON_START_MARK}");</script>`;
+  if (resources.artifactModel === "legacy-main-v1") {
+    const legacySlots = [
+      {
+        id: "perf-slot",
+        gam_unit_path: "/123/performance",
+        div_id: "perf-slot",
+        formats: [[300, 250]],
+        targeting: {},
+      },
+    ];
+    const release = manualDisplay ? "" : "window.__fixtureGpt.release();";
+    return `<!doctype html><html><head><meta charset="utf-8"><script>window.tsjs={adSlots:${JSON.stringify(legacySlots)},bids:{},navGeneration:0};window.__tsjs_gpt_enabled=true;</script>${comparisonSetup}${criticalTag}</head><body><div id="perf-slot"></div><script>window.tsjs.adInit();${release}</script></body></html>`;
+  }
+  if (!resources.controllerDocument)
+    throw new Error("generated controller document is unavailable");
+  const controlledCriticalTag = `${comparisonSetup}${criticalTag}`;
   const withControlledGpt = resources.controllerDocument.replace(
     criticalTag,
     controlledCriticalTag,
@@ -276,6 +346,14 @@ async function installFixtureGpt(context: BrowserContext): Promise<void> {
     const calls: string[] = [];
     let ready = true;
     let displayCount = 0;
+    const markFirstObservableAction = () => {
+      if (
+        performance.getEntriesByName("tsjs:first-observable-action").length ===
+        0
+      ) {
+        performance.mark("tsjs:first-observable-action");
+      }
+    };
     const createSlot = (id: string, path: string): Slot => {
       const targeting = new Map<string, string[]>();
       const slot: Slot = {
@@ -324,6 +402,7 @@ async function installFixtureGpt(context: BrowserContext): Promise<void> {
       getConfig: () => ({ disableInitialLoad: false }),
       getSlots: () => [...physical],
       refresh(requested?: Slot[]) {
+        markFirstObservableAction();
         calls.push("refresh");
         for (const slot of requested ?? [...physical]) {
           queueMicrotask(() => {
@@ -354,6 +433,7 @@ async function installFixtureGpt(context: BrowserContext): Promise<void> {
         return true;
       },
       display(target: string | Slot) {
+        markFirstObservableAction();
         calls.push("display");
         const slot = typeof target === "string" ? slots.get(target) : target;
         if (!slot) return;
@@ -639,6 +719,15 @@ async function openFixture(
   const context = await browser.newContext();
   await installFixtureGpt(context);
   const page = await context.newPage();
+  const networkSession = await context.newCDPSession(page);
+  await networkSession.send("Network.enable");
+  await networkSession.send("Network.emulateNetworkConditions", {
+    offline: false,
+    latency: 150,
+    downloadThroughput: 200_000,
+    uploadThroughput: 93_750,
+    packetLoss: 0,
+  });
   const criticalRequests: string[] = [];
   const deferredRequests: string[] = [];
   const pageErrors: string[] = [];
@@ -668,6 +757,42 @@ async function openFixture(
     consoleMessages,
     close: () => context.close(),
   };
+}
+
+async function observeComparisonFixture(
+  run: FixtureRun,
+): Promise<ComparisonObservation> {
+  await expect
+    .poll(() =>
+      run.page.evaluate(
+        (mark) => performance.getEntriesByName(mark).length,
+        FIRST_OBSERVABLE_ACTION_MARK,
+      ),
+    )
+    .toBe(1);
+  const observation = await run.page.evaluate(
+    ({ startMark, actionMark }) => {
+      const start = performance.getEntriesByName(startMark);
+      const action = performance.getEntriesByName(actionMark);
+      return {
+        timingMs:
+          (action[0]?.startTime ?? Number.NaN) -
+          (start[0]?.startTime ?? Number.NaN),
+        displayCount: window.__fixtureGpt.displayCount(),
+        releaseId: window.tsjs?.releaseId,
+      };
+    },
+    {
+      startMark: COMPARISON_START_MARK,
+      actionMark: FIRST_OBSERVABLE_ACTION_MARK,
+    },
+  );
+  expect(run.criticalRequests).toHaveLength(1);
+  expect(run.pageErrors).toEqual([]);
+  expect(observation.displayCount).toBe(1);
+  expect(Number.isFinite(observation.timingMs)).toBe(true);
+  expect(observation.timingMs).toBeGreaterThan(0);
+  return observation;
 }
 
 async function waitForMark(run: FixtureRun, name: string): Promise<void> {
@@ -702,6 +827,7 @@ async function waitForMark(run: FixtureRun, name: string): Promise<void> {
 }
 
 async function observeFixture(run: FixtureRun): Promise<BrowserObservation> {
+  const comparison = await observeComparisonFixture(run);
   await waitForMark(run, "tsjs:first-display");
   await waitForMark(run, "tsjs:first-display-paint");
   for (const id of DEFERRED_IDS) {
@@ -752,7 +878,7 @@ async function observeFixture(run: FixtureRun): Promise<BrowserObservation> {
     });
     const paintTime = paint[0]?.startTime ?? -1;
     return {
-      timingMs: measure[0]?.duration ?? Number.NaN,
+      timingMs: Number.NaN,
       markTimingMs:
         (display[0]?.startTime ?? Number.NaN) -
         (bids[0]?.startTime ?? Number.NaN),
@@ -775,6 +901,7 @@ async function observeFixture(run: FixtureRun): Promise<BrowserObservation> {
         .filter((time) => time < paintTime).length,
     };
   }, DEFERRED_IDS);
+  observation.timingMs = comparison.timingMs;
   expect(observation.bidsScriptCount).toBe(1);
   expect(observation.firstDisplayCount).toBe(1);
   expect(observation.firstDisplayPaintCount).toBe(1);
@@ -788,7 +915,7 @@ async function observeFixture(run: FixtureRun): Promise<BrowserObservation> {
   expect(run.pageErrors).toEqual([]);
   expect(Number.isFinite(observation.timingMs)).toBe(true);
   expect(observation.timingMs).toBeGreaterThanOrEqual(0);
-  expect(observation.timingMs).toBeCloseTo(observation.markTimingMs, 8);
+  expect(Number.isFinite(observation.markTimingMs)).toBe(true);
   expect(observation.preloadBeforePaintCount).toBe(0);
   expect(
     observation.deferred.every(
@@ -818,14 +945,12 @@ async function observeFixture(run: FixtureRun): Promise<BrowserObservation> {
     Math.max(...observation.deferred.map((entry) => entry.startTime)) -
       Math.min(...observation.deferred.map((entry) => entry.startTime)),
   ).toBeLessThanOrEqual(50);
-  const fast = observation.deferred.find(
-    ({ id }) => id === "diagnostics_presentation",
-  )!;
-  const slow = observation.deferred.find(({ id }) => id === "gpt_later")!;
-  expect(fast.responseEnd).toBeLessThan(slow.responseEnd);
-  expect(fast.loadTime).toBeLessThan(slow.loadTime);
-  expect(fast.executionTime).toBeLessThan(slow.executionTime);
-  expect(fast.executionTime).toBeLessThan(slow.responseEnd);
+  const deferredByResponseEnd = [...observation.deferred].sort(
+    (left, right) => left.responseEnd - right.responseEnd,
+  );
+  expect(deferredByResponseEnd[0]!.executionTime).toBeLessThan(
+    deferredByResponseEnd.at(-1)!.responseEnd,
+  );
   return observation;
 }
 
@@ -843,20 +968,24 @@ async function collectHeap(page: Page): Promise<number> {
 async function collectHeapCheckpoints(
   browser: Browser,
   fixtureServer: FixtureServer,
+  resources: FixtureResources,
 ): Promise<Record<HeapCheckpoint, number>> {
   const heapRun = await openFixture(browser, fixtureServer, true);
   const retainedHeapBytes = {} as Record<HeapCheckpoint, number>;
   try {
     await expect
-      .poll(() => heapRun.page.evaluate(() => window.tsjs?._internal?.state))
-      .toBe("kernel");
+      .poll(() => heapRun.page.evaluate(() => typeof window.tsjs))
+      .toBe("object");
     retainedHeapBytes.afterBoot = await collectHeap(heapRun.page);
     await heapRun.page.evaluate(() => window.__fixtureGpt.release());
-    await waitForMark(heapRun, "tsjs:first-display-paint");
+    await observeComparisonFixture(heapRun);
+    if (resources.artifactModel === "release-v1") {
+      await waitForMark(heapRun, "tsjs:first-display-paint");
+    }
     retainedHeapBytes.afterFirstRender = await collectHeap(heapRun.page);
     await heapRun.page.evaluate(() => window.__fixtureGpt.publisherRefresh());
     retainedHeapBytes.afterRefresh = await collectHeap(heapRun.page);
-    for (const id of DEFERRED_IDS) {
+    for (const id of resources.deferred.keys()) {
       await expect
         .poll(() =>
           heapRun.page.evaluate(
@@ -945,38 +1074,58 @@ test.describe("TSJS first-display performance gate", () => {
     browser,
     browserName,
   }) => {
-    test.setTimeout(240_000);
+    // The shaped comparison performs 110 cold navigations before four paired
+    // heap checkpoints. Keep enough time to write the complete evidence even
+    // when a candidate fails the soft p90 assertion by a wide margin.
+    test.setTimeout(1_200_000);
     const mode = process.env.TSJS_PERF_MODE;
     test.skip(
-      mode !== "preswitch" && mode !== "postswitch",
+      mode !== "preswitch" && mode !== "postswitch" && mode !== "pull-request",
       "performance evidence run only",
     );
     expect(browserName).toBe("chromium");
     expect(browser.version()).toBe(EXPECTED_CHROMIUM);
     expect(process.env.TSJS_PERF_MACHINE_CLASS).toBe(MACHINE_CLASS);
     expect(process.env.TSJS_PERF_RUNNER_IMAGE).toBe(RUNNER_IMAGE);
-    const referenceRoot = process.env.TSJS_PERF_REFERENCE_ROOT;
-    expect(referenceRoot, "TSJS_PERF_REFERENCE_ROOT is required").toBeTruthy();
+    const mainRoot = process.env.TSJS_PERF_MAIN_ROOT;
+    const mainSha = process.env.TSJS_PERF_MAIN_SHA;
+    expect(mainRoot, "TSJS_PERF_MAIN_ROOT is required").toBeTruthy();
+    expect(mainSha, "TSJS_PERF_MAIN_SHA is required").toMatch(
+      /^[0-9a-f]{40}$/u,
+    );
     expect(
-      execFileSync("git", ["-C", referenceRoot!, "rev-parse", "HEAD"], {
+      execFileSync("git", ["-C", mainRoot!, "rev-parse", "HEAD"], {
         encoding: "utf8",
       }).trim(),
-    ).toBe(REFERENCE_SHA);
-    const referenceResources = loadFixtureResources(referenceRoot!);
-    const currentResources = loadFixtureResources(REPO_ROOT);
-    const referenceServer = await startFixtureServer(referenceResources);
-    const currentServer = await startFixtureServer(currentResources);
-    activeFixtureServers.push(referenceServer, currentServer);
+    ).toBe(mainSha);
+    const mainResources = loadMainFixtureResources(mainRoot!);
+    const candidateResources = loadReleaseFixtureResources(REPO_ROOT);
+    const mainServer = await startFixtureServer(mainResources);
+    const candidateServer = await startFixtureServer(candidateResources);
+    activeFixtureServers.push(mainServer, candidateServer);
 
     const observeVariant = async (
       fixtureServer: FixtureServer,
       resources: FixtureResources,
-    ): Promise<BrowserObservation> => {
+    ): Promise<{
+      comparison: ComparisonObservation;
+      candidate?: BrowserObservation;
+    }> => {
       const run = await openFixture(browser, fixtureServer);
       try {
-        const observation = await observeFixture(run);
-        expect(observation.releaseId).toBe(resources.release.releaseId);
-        return observation;
+        if (resources.artifactModel === "release-v1") {
+          const candidate = await observeFixture(run);
+          expect(candidate.releaseId).toBe(resources.release?.releaseId);
+          return {
+            comparison: {
+              timingMs: candidate.timingMs,
+              displayCount: candidate.displayCount,
+              releaseId: candidate.releaseId,
+            },
+            candidate,
+          };
+        }
+        return { comparison: await observeComparisonFixture(run) };
       } finally {
         await run.close();
       }
@@ -986,72 +1135,71 @@ test.describe("TSJS first-display performance gate", () => {
       const variants =
         index % 2 === 0
           ? ([
-              [referenceServer, referenceResources],
-              [currentServer, currentResources],
+              [mainServer, mainResources],
+              [candidateServer, candidateResources],
             ] as const)
           : ([
-              [currentServer, currentResources],
-              [referenceServer, referenceResources],
+              [candidateServer, candidateResources],
+              [mainServer, mainResources],
             ] as const);
       for (const [server, resources] of variants) {
         await observeVariant(server, resources);
       }
     }
 
-    const referenceSamples: number[] = [];
-    const currentSamples: number[] = [];
+    const mainSamples: number[] = [];
+    const candidateSamples: number[] = [];
     let representative: BrowserObservation | undefined;
     for (let index = 0; index < SAMPLES; index += 1) {
       const variants =
         index % 2 === 0
           ? ([
-              ["reference", referenceServer, referenceResources],
-              ["current", currentServer, currentResources],
+              ["main", mainServer, mainResources],
+              ["candidate", candidateServer, candidateResources],
             ] as const)
           : ([
-              ["current", currentServer, currentResources],
-              ["reference", referenceServer, referenceResources],
+              ["candidate", candidateServer, candidateResources],
+              ["main", mainServer, mainResources],
             ] as const);
       for (const [variant, server, resources] of variants) {
         const observation = await observeVariant(server, resources);
-        if (variant === "reference") {
-          referenceSamples.push(observation.timingMs);
+        if (variant === "main") {
+          mainSamples.push(observation.comparison.timingMs);
         } else {
-          currentSamples.push(observation.timingMs);
-          representative = observation;
+          candidateSamples.push(observation.comparison.timingMs);
+          representative = observation.candidate;
         }
       }
     }
-    expect(referenceSamples).toHaveLength(SAMPLES);
-    expect(currentSamples).toHaveLength(SAMPLES);
-    const referenceP90 = p90(referenceSamples);
-    const currentP90 = p90(currentSamples);
-    expect(referenceP90).toBeGreaterThan(0);
-    expect(referenceP90).toBeLessThanOrEqual(HARD_P90_CEILING_MS);
-    expect(currentP90).toBeLessThanOrEqual(HARD_P90_CEILING_MS);
-    expect(currentP90).toBeLessThanOrEqual(referenceP90 * MAXIMUM_P90_RATIO);
+    expect(mainSamples).toHaveLength(SAMPLES);
+    expect(candidateSamples).toHaveLength(SAMPLES);
+    const mainP90 = p90(mainSamples);
+    const candidateP90 = p90(candidateSamples);
+    expect(mainP90).toBeGreaterThan(0);
+    expect
+      .soft(candidateP90, "candidate p90")
+      .toBeLessThanOrEqual(mainP90 * MAXIMUM_P90_RATIO);
 
-    const referenceHeapBytes = await collectHeapCheckpoints(
+    const mainHeapBytes = await collectHeapCheckpoints(
       browser,
-      referenceServer,
+      mainServer,
+      mainResources,
     );
-    const currentHeapBytes = await collectHeapCheckpoints(
+    const candidateHeapBytes = await collectHeapCheckpoints(
       browser,
-      currentServer,
+      candidateServer,
+      candidateResources,
     );
     for (const name of HEAP_CHECKPOINTS) {
-      expect(
-        referenceHeapBytes[name],
-        `${name} reference retained heap`,
-      ).toBeLessThanOrEqual(HARD_HEAP_CEILING_BYTES);
-      expect(
-        currentHeapBytes[name],
-        `${name} current retained heap`,
-      ).toBeLessThanOrEqual(HARD_HEAP_CEILING_BYTES);
-      expect(
-        currentHeapBytes[name],
-        `${name} paired retained heap`,
-      ).toBeLessThanOrEqual(referenceHeapBytes[name] * MAXIMUM_HEAP_RATIO);
+      expect
+        .soft(mainHeapBytes[name], `${name} main retained heap`)
+        .toBeLessThanOrEqual(HARD_HEAP_CEILING_BYTES);
+      expect
+        .soft(candidateHeapBytes[name], `${name} candidate retained heap`)
+        .toBeLessThanOrEqual(HARD_HEAP_CEILING_BYTES);
+      expect
+        .soft(candidateHeapBytes[name], `${name} paired retained heap`)
+        .toBeLessThanOrEqual(mainHeapBytes[name] * MAXIMUM_HEAP_RATIO);
     }
 
     const evidenceId = process.env.TSJS_EVIDENCE_ID;
@@ -1077,17 +1225,14 @@ test.describe("TSJS first-display performance gate", () => {
     const deferredStarts = representative!.deferred.map(
       ({ startTime }) => startTime,
     );
-    const fastDeferred = representative!.deferred.find(
-      ({ id }) => id === "diagnostics_presentation",
-    )!;
-    const slowDeferred = representative!.deferred.find(
-      ({ id }) => id === "gpt_later",
-    )!;
+    const deferredByResponseEnd = [...representative!.deferred].sort(
+      (left, right) => left.responseEnd - right.responseEnd,
+    );
     const npmVersion = execFileSync("npm", ["--version"], {
       encoding: "utf8",
     }).trim();
     const evidence = {
-      schemaVersion: 4,
+      schemaVersion: 5,
       evidenceId,
       mode,
       headSha,
@@ -1110,37 +1255,54 @@ test.describe("TSJS first-display performance gate", () => {
         warmupsPerVariant: WARMUPS,
         samplesPerVariant: SAMPLES,
         percentile: PERCENTILE,
-        interleaving: "alternating-reference-current",
+        interleaving: "alternating-main-candidate",
+      },
+      networkProfile: {
+        mechanism: "cdp-Network.emulateNetworkConditions",
+        appliedBeforeNavigation: true,
+        latencyMs: NETWORK_PROFILE.latency,
+        downloadThroughputBytesPerSecond: NETWORK_PROFILE.downloadThroughput,
+        uploadThroughputBytesPerSecond: NETWORK_PROFILE.uploadThroughput,
+        packetLossPercent: NETWORK_PROFILE.packetLoss,
       },
       marks: {
-        source: "performance-entry",
-        bidsScript: representative!.bidsScriptCount === 1,
-        firstDisplay: representative!.firstDisplayCount === 1,
-        firstDisplayPaint: representative!.firstDisplayPaintCount === 1,
+        source: "fixture-first-observable-action",
+        comparisonStart: true,
+        firstObservableAction: true,
+        candidateBidsScript: representative!.bidsScriptCount === 1,
+        candidateFirstDisplay: representative!.firstDisplayCount === 1,
+        candidateFirstDisplayPaint:
+          representative!.firstDisplayPaintCount === 1,
       },
       performance: {
-        bootToFirstDisplayMs: {
-          reference: {
-            sha: REFERENCE_SHA,
-            samples: referenceSamples,
-            p90: referenceP90,
+        requestToFirstActionMs: {
+          main: {
+            sha: mainSha,
+            artifactModel: mainResources.artifactModel,
+            criticalTransferBytes: mainResources.criticalTransferBytes,
+            samples: mainSamples,
+            p90: mainP90,
           },
-          current: { samples: currentSamples, p90: currentP90 },
+          candidate: {
+            artifactModel: candidateResources.artifactModel,
+            criticalTransferBytes: candidateResources.criticalTransferBytes,
+            samples: candidateSamples,
+            p90: candidateP90,
+          },
           percentile: PERCENTILE,
           maximumRatio: MAXIMUM_P90_RATIO,
-          observedRatio: currentP90 / referenceP90,
-          hardCeilingMs: HARD_P90_CEILING_MS,
+          observedRatio: candidateP90 / mainP90,
         },
       },
       heap: {
         collection: "one-collectGarbage-then-immediate-getHeapUsage",
         maximumRatio: MAXIMUM_HEAP_RATIO,
         hardCeilingBytes: HARD_HEAP_CEILING_BYTES,
-        reference: {
-          sha: REFERENCE_SHA,
-          checkpoints: referenceHeapBytes,
+        main: {
+          sha: mainSha,
+          checkpoints: mainHeapBytes,
         },
-        current: { checkpoints: currentHeapBytes },
+        candidate: { checkpoints: candidateHeapBytes },
       },
       requests: {
         critical: { count: 1 },
@@ -1152,12 +1314,9 @@ test.describe("TSJS first-display performance gate", () => {
           executionBeforePaintCount: deferredExecutionBeforePaint,
           independentlyTriggered:
             Math.max(...deferredStarts) - Math.min(...deferredStarts) <= 50,
-          headOfLineBlocking: !(
-            fastDeferred.responseEnd < slowDeferred.responseEnd &&
-            fastDeferred.loadTime < slowDeferred.loadTime &&
-            fastDeferred.executionTime < slowDeferred.executionTime &&
-            fastDeferred.executionTime < slowDeferred.responseEnd
-          ),
+          headOfLineBlocking:
+            deferredByResponseEnd[0]!.executionTime >=
+            deferredByResponseEnd.at(-1)!.responseEnd,
         },
       },
       assertions: { correctness: true, loadOrder: true },

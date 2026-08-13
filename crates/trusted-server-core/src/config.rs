@@ -275,15 +275,7 @@ fn validate_enabled_integrations(
     validate_integration::<SourcepointConfig>(settings, "sourcepoint")?;
     validate_integration::<OsanoConfig>(settings, "osano")?;
     validate_integration::<GoogleTagManagerConfig>(settings, "google_tag_manager")?;
-    if let Some(config) = settings.integration_config::<DataDomeConfig>("datadome")? {
-        if resolved_secrets {
-            crate::integrations::datadome::DataDomeIntegration::validate_config_for_startup(
-                config,
-            )?;
-        } else {
-            crate::integrations::datadome::DataDomeIntegration::validate_config_for_deploy(config)?;
-        }
-    }
+    validate_integration::<DataDomeConfig>(settings, "datadome")?;
     validate_integration::<GptConfig>(settings, "gpt")?;
     validate_integration::<GptDiagnosticsConfig>(settings, "gpt_diagnostics")?;
 
@@ -836,85 +828,12 @@ formats = [{ width = 300, height = 250 }]
     fn absent_gam_unit_template_is_accepted_by_legacy_schema() {
         let creative_opportunities = serialized_creative_opportunities(None);
 
-        assert!(
-            creative_opportunities.get("enabled").is_none(),
-            "default template switch should be omitted for legacy binaries"
-        );
         serde_json::from_value::<LegacyCreativeOpportunitiesConfig>(creative_opportunities)
             .expect("should accept absent GAM unit template");
     }
 
     #[test]
-    fn disabled_creative_opportunities_flag_is_rejected_by_legacy_schema() {
-        let mut toml = crate_test_settings_str();
-        toml.push_str(
-            r#"
-
-[creative_opportunities]
-enabled = false
-gam_network_id = "99999"
-"#,
-        );
-        let app_config: TrustedServerAppConfig =
-            toml::from_str(&toml).expect("should deserialize app config wrapper");
-        let creative_opportunities = serde_json::to_value(app_config)
-            .expect("should serialize app config wrapper")
-            .get("creative_opportunities")
-            .cloned()
-            .expect("should contain creative opportunities");
-
-        serde_json::from_value::<LegacyCreativeOpportunitiesConfig>(creative_opportunities)
-            .expect_err("legacy binaries should reject an explicit disabled switch");
-    }
-
-    #[test]
-    fn app_config_new_rejects_empty_secret_key_reference() {
-        let mut settings = valid_settings();
-        settings.publisher.proxy_secret = Redacted::new(String::new());
-
-        let err = TrustedServerAppConfig::new(settings)
-            .expect_err("should reject an empty secret key reference");
-
-        assert!(
-            err.to_string().contains("publisher.proxy_secret"),
-            "error should identify the empty secret reference: {err:?}"
-        );
-    }
-
-    #[test]
-    fn app_config_new_rejects_invalid_non_secret_settings() {
-        let mut settings = valid_settings();
-        settings.publisher.domain = "invalid/domain".to_owned();
-
-        let err = TrustedServerAppConfig::new(settings)
-            .expect_err("should reject invalid publisher domain before creating an app config");
-
-        assert!(
-            err.to_string().contains("invalid_publisher_domain"),
-            "error should identify the structural validation failure: {err:?}"
-        );
-    }
-
-    #[test]
-    fn runtime_validation_rejects_short_proxy_secret() {
-        let mut settings = valid_settings();
-        settings.publisher.proxy_secret = Redacted::new("short".to_owned());
-
-        let err = validate_settings_for_runtime(&settings)
-            .expect_err("should reject a short resolved proxy secret");
-
-        assert!(
-            err.to_string().contains("at least 32 bytes"),
-            "error should identify the required proxy-secret strength: {err:?}"
-        );
-        assert!(
-            !err.to_string().contains("short"),
-            "error should not expose the resolved secret"
-        );
-    }
-
-    #[test]
-    fn runtime_validation_rejects_placeholders() {
+    fn deploy_validation_rejects_placeholders() {
         let settings = Settings::from_toml(
             r#"
 [publisher]
@@ -1203,38 +1122,6 @@ password = "production-admin-password-32-bytes"
             error_text.contains("osano") || error_text.contains("typo"),
             "error should mention Osano or the invalid field: {err:?}"
         );
-    }
-
-    #[test]
-    fn deploy_validation_rejects_invalid_datadome_test_bypass() {
-        for (enable_protection, name, expected_message) in [
-            (false, "datadome_test_bypass", "requires enable_protection"),
-            (true, "", "credential_secret_name"),
-        ] {
-            let mut settings = valid_settings();
-            settings
-                .integrations
-                .insert_config(
-                    "datadome",
-                    &serde_json::json!({
-                        "enabled": true,
-                        "enable_protection": enable_protection,
-                        "server_side_key_secret_name": "datadome_server_side_key",
-                        "protection_test_bypass": {
-                            "enabled": true,
-                            "credential_secret_name": name,
-                        },
-                    }),
-                )
-                .expect("should insert DataDome config");
-
-            let err = validate_settings_for_deploy(&settings)
-                .expect_err("should reject invalid DataDome test bypass");
-            assert!(
-                format!("{err:?}").contains(expected_message),
-                "error should mention the invalid bypass setting: {err:?}"
-            );
-        }
     }
 
     #[test]

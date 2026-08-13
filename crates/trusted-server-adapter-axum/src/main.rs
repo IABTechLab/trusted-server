@@ -30,6 +30,10 @@ async fn main() {
     let reserved = any(move |request: axum::http::Request<axum::body::Body>| {
         let dispatcher = dispatcher.clone();
         async move {
+            // The core reserved dispatcher is intentionally `?Send`, while this
+            // native-only development adapter runs on Tokio's multi-threaded
+            // executor. Keep that bridge explicit: a runner request can occupy
+            // this blocking-pool thread for its bounded five-second budget.
             let response = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async move {
                     let request =

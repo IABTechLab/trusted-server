@@ -89,6 +89,8 @@ pub fn is_aps_family_path(path: &str) -> bool {
 }
 const APS_RENDERER_V1_CSP: &str = "default-src 'none'; sandbox allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline' 'self' https:; connect-src https:; frame-src https: data: blob:; img-src https: data: blob:; media-src https: data: blob:; style-src 'unsafe-inline' https:; font-src https: data:; worker-src https: blob:; form-action https:;";
 
+// This document is served with an immutable v1 URL. Any semantic change must
+// ship at a new versioned route so cached v1 bytes retain their contract.
 const APS_RENDERER_V1_DOCUMENT: &str = concat!(
     r#"<!doctype html>
 <meta charset="utf-8">
@@ -2173,11 +2175,11 @@ impl IntegrationProxy for ApsV1Integration {
         if !path.starts_with("/integrations/aps/") {
             return Self::local_status(StatusCode::NOT_FOUND, false);
         }
-        if request.method() != Method::GET {
-            return Self::local_status(StatusCode::METHOD_NOT_ALLOWED, true);
-        }
         if !self.enabled {
             return Self::local_status(StatusCode::NOT_FOUND, false);
+        }
+        if request.method() != Method::GET {
+            return Self::local_status(StatusCode::METHOD_NOT_ALLOWED, true);
         }
         match path {
             APS_RENDERER_V1_ROUTE => Self::renderer_response(),
@@ -4079,8 +4081,19 @@ mod tests {
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
             assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
 
+            let disabled_post = http::Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .body(EdgeBody::empty())
+                .expect("should build disabled APS POST request");
+            let response =
+                futures::executor::block_on(disabled.handle(&settings, &services, disabled_post))
+                    .expect("disabled APS family should remain absent for every method");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert!(!response.headers().contains_key(header::ALLOW));
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+
             for method in [
-                Method::POST,
                 Method::HEAD,
                 Method::OPTIONS,
                 Method::PUT,

@@ -7,15 +7,17 @@ import {
   type PrebidFacade,
 } from '../../../src/adapters/prebid';
 import {
-  createPrebidRefreshPolicy,
   createPrebidIntegrationRegistration,
   createPrebidSelectionCoordinator,
-  createPrebidSyntheticRefreshRunner,
-  preparePrebidRegisteredRefreshAuction,
   publishPrebidBid,
   type PrebidBidPublicationInput,
   type PreparedTrustedBidV1,
 } from '../../../src/integrations/prebid/module';
+import {
+  createPrebidRefreshPolicy,
+  createPrebidSyntheticRefreshRunner,
+  preparePrebidRegisteredRefreshAuction,
+} from '../../../src/integrations/prebid/refresh';
 import { createTestNavigationIdentityIssuer } from '../../../src/kernel/identity';
 import {
   createIntegrationRegistry,

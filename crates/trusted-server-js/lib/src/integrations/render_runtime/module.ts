@@ -14,7 +14,10 @@ import { prepareAdmIframe } from '../../core/render';
 import { createRenderTraceStore } from '../../core/trace';
 import type { BootManifestV1, BrowserAuctionProjectionV1 } from '../../core/types';
 import { DisposableStack } from '../../kernel/disposable';
-import { createBrowserNavigationIdentityIssuer } from '../../kernel/identity';
+import {
+  createBrowserNavigationIdentityIssuer,
+  mintBrowserLifecycleTicket,
+} from '../../kernel/identity';
 import type {
   IntegrationActivationContext,
   IntegrationPrepareContext,
@@ -26,7 +29,11 @@ import type {
   RuntimeCapabilityV1,
 } from '../../kernel/runtime';
 import { createDiagnosticsIngress } from '../../kernel/diagnostics';
-import { createRuntimeSession, type RuntimeSession } from '../../kernel/sessions';
+import {
+  createRuntimeSession,
+  type NavigationSession,
+  type RuntimeSession,
+} from '../../kernel/sessions';
 import {
   AdUnitRegistrationError,
   addAdUnitsResult,
@@ -40,7 +47,11 @@ import {
   type AuctionContextRegistry,
   type ContextContributorOwner,
 } from '../../services/context';
-import { prepareInitialAuctionProjection } from '../../services/projections';
+import {
+  createPageBidsController,
+  prepareInitialAuctionProjection,
+  type ProjectionSlotRegistry,
+} from '../../services/projections';
 import { createReservationService } from '../../services/reservations';
 import type { PucGamAttemptInput } from '../../services/puc_bridge';
 import {
@@ -727,9 +738,21 @@ export function createRenderRuntimeIntegrationRegistration(
         cachePolicy,
         createAttempt,
         createSlotOperation,
+        commitPageBids: (
+          owner: NavigationSession,
+          slotRegistry: ProjectionSlotRegistry,
+          candidate: unknown
+        ): boolean =>
+          createPageBidsController({
+            navigation: owner,
+            parseProjection: (value) => parseBrowserAuctionProjectionV1(value, cachePolicy),
+            slotRegistry,
+          }).commit(candidate).status === 'committed',
         navigation,
+        mintLifecycleTicket: mintBrowserLifecycleTicket,
         projection,
         renderDirectCacheAttempt,
+        prepareAdmIframe,
         renderWinner,
         rendererNonces,
         reservations,

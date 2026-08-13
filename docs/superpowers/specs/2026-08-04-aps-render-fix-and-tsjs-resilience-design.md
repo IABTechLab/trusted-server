@@ -1,7 +1,7 @@
 # APS Render Fix and TSJS Resilience Architecture — Design
 
-- **Status:** revision 33 — hard-cutover contract with phase-aware TSJS loading,
-  complete `rc/july` TSJS adoption, and role-correct transfer budgets
+- **Status:** revision 35 — hard-cutover contract with phase-aware TSJS loading,
+  complete `rc/july` TSJS adoption, and merge-blocking critical-runtime remediation
 - **Date:** 2026-08-04
 - **Baseline:** `origin/rc/july` @ `905984e62` ("Prevent APS renderer document
   clipping"), including `248fe9558` (PUC/MessageChannel and collapsed-shell
@@ -420,6 +420,31 @@ every new, removed, or renamed path.
   ]
 }
 ```
+
+### 0.6 Approved review remediation
+
+The initial role-correct implementation exposed material first-display transfer and
+request-time work that its own post-change capture could not legitimately approve.
+That capture remains immutable evidence of the reviewed intermediate state, not a
+release baseline. Before merge, the implementation must remove code that is not
+required for the protected first display from the critical dependency graph,
+precompute finite TSJS transport identities outside request handling, and pass both
+the byte-accounting and network-shaped browser gates in §5.12. A gate captured from
+the oversized candidate cannot authorize that same candidate.
+
+This remediation does not reopen the hard-cutover decision. `pub_id`, numeric APS
+identifiers, unknown fields, old routes, and old browser APIs remain rejected rather
+than aliased. It also does not create an APS runner artifact or cache design: the
+runner stays live, unversioned, unvendored, unpinned, and uncached by Trusted Server.
+Reserved APS browser routes remain intentionally anonymous and are dispatched before
+publisher `[[handlers]]`; operators place admission control, rate limiting, or
+request shielding at the platform boundary.
+
+DataDome and the other integrations in `RCJ-INT-01` remain in scope only because the
+approved goal adopts every TSJS concept from the frozen `rc/july` baseline. This is
+preservation behind the common runtime, not permission to redesign their server-side
+behavior. The unrelated server-side ad-template cache-control proposal is excluded
+from this design.
 
 ## 1. Problem statement and evidence
 
@@ -1072,6 +1097,12 @@ entry points. This is not a new external telemetry contract.
 APS configuration accepts only canonical `account_id`; the `pub_id` deserialization
 alias and its integer coercion are deleted at the hard cutover.
 
+Deployment is ordered so the old serving binary receives the canonical configuration
+first: replace `pub_id` with quoted string `account_id`, quote numeric identifiers,
+remove legacy and unknown APS keys, run `ts config validate`, and push while the old
+binary that accepts `account_id` is still active. Only then deploy the new binary.
+No alias or coercion is added to make an out-of-order deployment succeed.
+
 ### 3.4 Mediation provenance
 
 This work preserves the configured mediator's existing candidate selection and
@@ -1249,6 +1280,12 @@ semantics. Unsupported methods return local `405` with `Allow: GET`; unknown
 renderer versions and the abandoned `/integrations/aps/runner/v1.js` shape return a
 local `404 no-store`.
 
+Because the two routes are loaded by browser documents, they are intentionally
+anonymous. A configured `[[handlers]]` pattern that matches
+`/integrations/aps/*` does not apply and must never be represented as protecting the
+renderer or runner. Operator-required admission control, rate limiting, and request
+shielding live at the deployment platform.
+
 The renderer v1 body and headers are immutable and served with a long-lived immutable
 cache policy; a renderer-body or CSP semantic change requires a new renderer route
 version. The document is static and contains no descriptor data. Its iframe
@@ -1350,9 +1387,11 @@ enable APS and blocks the release.
 
 No APS runner bytes, digest, vendor-version record, redistribution license, update
 script, generated artifact, or offline fallback is stored in Trusted Server source or
-release artifacts. This design does not define runner caching behavior. The runner
-route is intentionally unversioned because it represents a live APS-owned dependency,
-not immutable TS-owned bytes.
+release artifacts. The runner route is live, unversioned, unvendored, unpinned, and
+uncached by Trusted Server because it represents a mutable APS-owned dependency, not
+immutable TS-owned bytes. A successful relay adds no Trusted Server `Cache-Control`
+requirement. Platform shielding may bound upstream exposure operationally, but it
+cannot turn the runner into a repository or release artifact.
 
 Proxying does not make the runner trusted TS code or prove that it rendered. APS
 remains the runtime owner of those executable bytes and its resolve/reject semantics
@@ -1994,17 +2033,19 @@ script elements later; `defer`, `async`, preload, or a post-commit callback atta
 to an already downloaded monolith does not satisfy this contract.
 
 The static transport is exact and shared by Fastly, Axum, Cloudflare, and Spin.
-Only `GET /static/tsjs=tsjs-unified.min.js?v=<criticalHash>` and
-`GET /static/tsjs=tsjs-<deferred-id>.min.js?v=<moduleHash>` are admitted; each query
+Only `GET` and `HEAD` for
+`/static/tsjs=tsjs-unified.min.js?v=<criticalHash>` and
+`/static/tsjs=tsjs-<deferred-id>.min.js?v=<moduleHash>` are admitted; each query
 has exactly one `v` and no other field. `moduleHash` is SHA-256 over that deferred
 artifact's exact uncompressed UTF-8 bytes. The handler derives the enabled ordered
 critical set or deferred catalog entry from trusted server configuration, recomputes
-the hash, and returns the current artifact only on an exact match. An unconditional
-success is `200`, `Content-Type: application/javascript; charset=utf-8`, and
+the hash, and returns the current artifact only on an exact match. `HEAD` returns
+the same status and metadata as `GET` with an empty body. An unconditional success
+is `200`, `Content-Type: application/javascript; charset=utf-8`, and
 `X-Content-Type-Options: nosniff`; the existing strong-ETag/static-cache behavior,
 including a valid conditional `304`, is preserved without adding a new cache
 requirement. A missing/malformed/stale hash, unknown or disabled id, wrong method,
-legacy filename, or extra query field receives the adapter-local `404 no-store` and
+unsupported method, legacy filename, or extra query field receives the adapter-local `404 no-store` and
 never falls through to publisher origin. Redirects are forbidden. Compression may
 change transfer bytes but not the uncompressed bytes named by `v`.
 
@@ -3435,18 +3476,18 @@ The checked-in pre-change fixture is immutable historical evidence and is never
 regenerated or rewritten. Its original `bundles` values measured a different
 artifact model: minimal contained only the old core, reference omitted the now-
 mandatory render owner, and maximal contained thirteen unsplit files. Those values
-remain the report-only historical comparison for this cutover. They are not applied
-as byte ceilings to semantically different post-split membership: either mandatory
-`core` or mandatory `render_runtime` alone is larger than the old entire minimal
-ceiling, and even a one-pass deduplicated build of the required pair cannot fit it.
+cannot be used as like-for-like ceilings, but their raw, gzip, and Brotli deltas are
+still a merge-blocking signal. A semantic-membership explanation does not by itself
+authorize a multi-fold increase in parser-blocking JavaScript.
 
-Transfer regression gates therefore use a second, role-correct baseline stored in
-the same performance JSON without altering the historical fields. It is captured
-once from the exact clean, pushed parent commit after Task 18D is behaviorally green
-and conflicts with the current `main` and PR base are resolved, but before the
-coordinated Task 19 production-wiring switch. The capture records its own source
-ref/SHA, toolchain and compression identity, release inventory, per-artifact hashes,
-and these semantic sets:
+The existing `roleCorrectTransfer` subtree records the first role-correct capture
+from the exact clean, pushed parent after Task 18D. Review established that this was
+an oversized intermediate implementation, so its provenance and bytes stay
+immutable but its self-derived 5% ceilings are not release acceptance. After
+critical-runtime remediation, the implementation appends a distinct
+`reviewRemediationTransfer` subtree to the same JSON without changing either earlier
+subtree. It records its own clean pushed source ref/SHA, toolchain and compression
+identity, release inventory, per-artifact hashes, and the same semantic sets:
 
 - **minimal critical** is the server-composed artifact for
   `[core, render_runtime]`; `render_runtime` is mandatory even when no product
@@ -3460,26 +3501,56 @@ and these semantic sets:
   the release, each exactly once. This gate prevents phase splitting from hiding
   total growth.
 
+The mandatory render implementation is physically co-bundled into `tsjs-core.js`
+with the sole runtime so their shared dependency graph is emitted once. The
+catalogued `tsjs-render_runtime.js` transport member is a release-stamped marker:
+it preserves the logical provider row, manifest ordering, inventory accounting, and
+capability contract but contains no second implementation, listener, timer, port,
+or runtime. Servers still compose the catalogued `[core, render_runtime]` sequence;
+the marker is not a second request and does not create a compatibility path.
+The evidence capture records logical provider sources separately from physical
+artifact ownership (`render_runtime` is physically owned by `core`) and rejects a
+provider source in every other artifact even if a stale source-owner inventory tries
+to authorize the duplicate. It also freezes the twenty largest rendered-source
+contributions and every repeated attribution so review can see, rather than infer,
+where transfer growth and shared-source duplication remain.
+
+The reduced capture is allowed only after the critical graph contains no diagnostics
+presentation, post-paint trace UI, refresh-only work, SPA/later-navigation work,
+optional integration implementation, test seam, or duplicated runtime/adapter
+owner. Minimal critical must be at most **220,000 raw bytes** and **59,000 gzip
+bytes**, and its Brotli value must be strictly below the corresponding reviewed
+intermediate value. Reference-critical raw, gzip, and Brotli values must each be
+strictly below the reviewed intermediate values; maximal total cannot grow. These
+raw/gzip limits are the initial mechanical-deduplication ceiling, based on a
+58,503-gzip / 214,538-raw prototype before release stamping. They are not a claim of
+equivalence to the much smaller legacy artifact. The release review records the
+residual deltas against the original pre-change values explicitly. Missing reduction
+or missing owner acceptance of that residual delta blocks merge.
+
 The build emits one canonical release inventory with each production bundle's id,
 role, phase, trigger, inputs, outputs, bytes, and hash. Budget membership is derived
-from that catalog rather than an obsolete exact filename list. The role-correct
+from that catalog rather than an obsolete exact filename list. The final reduced
 capture stores the exact raw, gzip, and Brotli values for bootstrap, minimal,
-reference, and maximal. For each value, the blocking ceiling is
-`ceil(capturedBytes * 1.05)`; the comparator computes this formula from the frozen
-capture rather than accepting separately hand-entered numbers.
+reference, and maximal. After review accepts the reduced checkpoint, each value's
+ongoing blocking ceiling is `ceil(capturedBytes * 1.05)`; the comparator computes
+this formula from the frozen capture rather than accepting separately hand-entered
+numbers.
 
 The inline bootstrap-controller/fallback cannot be used to hide code outside those
-sets. It receives its own role-correct captured value and 5% ceiling, appears exactly
-once under the `bootstrap` role, and is not counted again in maximal TSJS total. Its
+sets. It receives its own final reduced captured value and 5% ceiling, appears
+exactly once under the `bootstrap` role, and is not counted again in maximal TSJS total. Its
 production metafile/import allowlist permits only boot-manifest/queue/fallback
 validation, generation/disposal, timing, and local logging primitives.
 
-`npm run check:bundle` builds fresh metrics and runs both parts in CI:
+`npm run check:bundle` builds fresh metrics and runs all three parts in CI:
 
 1. the original pre-change values and their old 5% figures are printed as immutable
    historical deltas, never as pass/fail comparisons across different membership;
-2. the role-correct bootstrap/minimal/reference/maximal values enforce the computed
-   5% transfer ceilings.
+2. the reviewed intermediate role-correct values and their digest are validated and
+   printed, but cannot authorize the release candidate; and
+3. the final reduced bootstrap/minimal/reference/maximal values enforce the computed
+   5% transfer ceilings and the one-time reduction assertions above.
 
 The gate also rejects an unclassified or multiply counted artifact, a missing
 production artifact, a test artifact, a maximal inventory that omits any split
@@ -3487,9 +3558,9 @@ module, critical reachability to a deferred source, a consumer that inlines a
 catalogued provider implementation, a second adapter/runtime/listener owner, and
 production reachability to fake/no-op/test or `*ForTest` sources. It reports the
 largest source contributions and repeated production attributions so later work
-cannot hide growth inside a passing aggregate. Changing historical evidence,
-recapturing the role-correct baseline, changing membership, or raising its 5%
-formula requires a separate reviewed design; it is not an implementation escape
+cannot hide growth inside a passing aggregate. Changing either earlier evidence
+subtree, recapturing the final reduced baseline, changing membership, or raising its
+5% formula requires a separate reviewed design; it is not an implementation escape
 hatch.
 
 Boot-to-first-display uses real User Timing marks, not `__tsjsPerf` or a test-only
@@ -3509,43 +3580,69 @@ that no deferred request, preload, preparation, or execution precedes
 `tsjs:first-display` request-action measure so the historical metric does not change
 meaning.
 
-The performance job uses pinned Chromium 145.0.7632.6, the
+The standalone performance job uses pinned Chromium 145.0.7632.6, the
 `github-hosted:ubuntu-24.04` runner class, fixture
-`tsjs-generated-loopback-paired-v2`, five warmups per variant, and 50 measured
-samples per variant. One in-process `node:http` server per variant on an ephemeral
-`127.0.0.1` port serves that variant's exact generated server controller and exact
-built critical/deferred bytes; Playwright request interception or fulfillment is
-outside the instrument. The fixture exercises the real server boot/controller,
-critical artifact, runtime, and first-display adapter path and cannot retain a
-bespoke `__tsjsPerf` simulator.
+`tsjs-main-paired-network-v2`, five warmups per variant, and 50 measured samples per
+variant. It runs automatically when a pull request changes the TSJS build/runtime,
+the server controller or projection path, the browser fixture, the evidence
+validator, or the workflow itself. Its existing `workflow_dispatch` and
+`workflow_call` entrypoints remain available for named pre-switch and post-switch
+evidence.
 
-GitHub-hosted absolute timing is not stable enough to be an immutable gate. The
-corrected pre-switch commit `62421ee44c62f24534ea8782a46dfa5bfbcea950` measured
-30.5 ms p90 in workflow run `31598415675`, while the unchanged instrument and
-production artifact measured 40.8 ms in run `31599101515`. Therefore the former
-33.6 ms absolute ceiling is retired. The job checks out that exact pre-switch commit
-as a detached frozen reference, builds it independently, and alternates reference
-then current / current then reference within the same Chromium process for every
-warmup and measured pair. Current p90 must be at most reference p90 × 1.10, and both
-p90 values must also be at most the 100 ms catastrophic-regression ceiling. The job
-runs each declared sample pair once and never selectively reruns, drops, or
-reclassifies slow samples. This same frozen reference and comparator are used before
-and after cutover, so host contention is normalized without letting the current
-implementation redefine its baseline. Retained heap uses Chromium CDP forced-GC
-checkpoints after boot, first render, refresh, and SPA navigation. After the display
-samples, the job opens one separate fresh browser context per variant and executes
-the exact same lifecycle. At each checkpoint it sends
+Each run fetches `origin/main`, resolves its exact current 40-character commit SHA,
+creates a detached worktree at that SHA, and builds `main` and the candidate
+independently. The main-side loader feature-detects and consumes the artifact shape
+that commit actually produced. While current `main` emits the legacy `tsjs-core.js`,
+`tsjs-creative.js`, plus `tsjs-gpt.js` model and no release-v1 inventory/controller,
+the harness concatenates and serves those real built bytes, enables the same default
+creative policy, and drives their real legacy `adInit` surface. After the cutover
+reaches `main`, the same loader consumes that commit's release-v1 inventory/controller
+and `[core, render_runtime, creative, gpt]` critical selection instead. It does not relabel an older phase-aware
+capture as `main` or require unavailable candidate-only metadata from a legacy
+commit. The candidate side consumes its generated server controller and release-v1
+critical/deferred artifacts. One in-process `node:http` server per variant on an
+ephemeral `127.0.0.1` port serves that variant's exact page and bytes. Playwright
+request interception or fulfillment is outside the instrument.
+
+Before either variant navigates, its page receives the same checked-in Chromium CDP
+`Network.emulateNetworkConditions` profile: 150 ms latency, 1.6 Mbit/s download
+(200,000 bytes/second), 750 kbit/s upload (93,750 bytes/second), and zero packet
+loss. The profile is not selectable by environment input. A common comparison mark
+runs immediately before the external critical-script element, and the GPT fixture
+records the common terminal mark at its first observable `display` or `refresh`
+action. A direct-render comparison records the equivalent iframe insertion. The
+interval therefore includes critical-script transfer, parse, evaluation, and
+runtime work through the first observable request/render action without depending
+on a candidate-only mark. Candidate runs additionally prove the real
+`tsjs:bids-script`, `tsjs:first-display`, and `tsjs:first-display-paint` marks and
+that no deferred request, preload, preparation, or execution precedes paint.
+
+The job alternates `main` then candidate / candidate then `main` in one Chromium
+process for every warmup and measured pair. Candidate p90 must be at most current
+`main` p90 × 1.10. GitHub-hosted absolute timing is not stable enough for a fixed
+millisecond ceiling, and a historical fixed comparison SHA is not an honest stand-in
+for current `main`; neither remains in the active gate. The schema-5 artifact records
+the exact main and candidate SHAs, each actual artifact model, each exact served
+critical byte count, both full distributions and p90s, the alternating order, and
+the exact network profile. The workflow runs each declared pair once and never
+selectively reruns, drops, or reclassifies slow samples. Budget assertions are soft
+only in the Playwright sense: the run finishes all timing and heap collection and
+writes the complete schema-5 evidence before failing. Validation and upload run
+with `always()` so a failed gate retains its exact diagnostic artifact; neither the
+test nor the validator converts an exceeded budget into success.
+
+Retained heap uses Chromium CDP forced-GC checkpoints after boot, first render,
+refresh, and SPA navigation. After the display samples, the job opens one separate
+fresh browser context per variant and executes the equivalent lifecycle supported by
+that variant's real artifact shape. At each checkpoint it sends
 `HeapProfiler.collectGarbage` once followed immediately by `Runtime.getHeapUsage`;
-the single `usedSize` is the checkpoint statistic (there is no hidden averaging,
-maximum selection, or rerun). The prior absolute values came from the obsolete
-synthetic fixture, and the corrected real fixture first reached this assertion in
-run `31600763735`, measuring 1,620,848 bytes after first render. Therefore all four
-heap checkpoints use the same frozen-reference design as time: current must be at
-most reference × 1.10, and both variants must remain below the immutable 4 MiB hard
-ceiling. Any checkpoint over either limit fails the one declared run; the job cannot
-replace only that measurement or rerun only the heap fixture.
-Correctness runs independently in Chromium, Firefox, and WebKit. Correctness
-failures are never waived by a performance pass.
+the single `usedSize` is the checkpoint statistic, with no hidden averaging,
+maximum selection, or rerun. Candidate must be at most current `main` × 1.10 at each
+checkpoint, and both variants must remain below the immutable 4 MiB hard ceiling.
+Any checkpoint over either limit fails the one declared run; the job cannot replace
+only that measurement or rerun only the heap fixture. Correctness runs independently
+in Chromium, Firefox, and WebKit. Correctness failures are never waived by a
+performance pass.
 
 ## 6. Security and privacy
 
@@ -3884,6 +3981,11 @@ over once through the existing APS/TSJS release mechanism. No runtime flag,
 old/new selector, compatibility branch, or dual protocol is introduced in any
 deployable artifact.
 
+Operator configuration moves before the binary cutover. Canonical APS
+`account_id` is validated and pushed while the old binary still accepts it, as
+specified in §3.3. No unrelated creative-opportunity configuration switch is part
+of this cutover.
+
 1. **Contract first:** land descriptor corpus, lifecycle types, adapter interfaces,
    and failing tests without changing production behavior.
 2. **Kernel and release catalog:** introduce runtime/integration-module ownership,
@@ -4079,13 +4181,15 @@ The design is complete when all of the following are true:
     no-op/fake/test seams, or `*ForTest` accessors. Every production artifact appears
     exactly once in the release inventory, with the bootstrap role included once and
     every TSJS module included in maximal total.
-25. Bootstrap-controller, minimal-critical, reference-critical, and maximal-total
-    remain within 5% of the one immutable role-correct §5.12 capture; the original
-    pre-change values remain unchanged and are reported as historical deltas.
-    Boot-to-first-display current p90 remains within 10% of the same-run frozen
-    pre-switch reference p90 and both remain below the immutable hard ceiling;
-    retained-heap results remain within their original immutable ceilings. Neither
-    gate permits recapture, selective sample reruns, or membership loopholes.
+25. The oversized role-correct capture remains immutable intermediate evidence.
+    Final minimal critical is at most 220,000 raw and 59,000 gzip bytes with lower
+    Brotli, reference-critical is lower in raw/gzip/Brotli, and maximal total does
+    not grow. The separately frozen reduced capture supplies the subsequent 5%
+    ceilings. Boot-to-first-display passes the automatic fixed-network-profile
+    candidate-versus-current-`main` gate, including the candidate's real-mark and
+    deferred-order assertions; retained-heap results remain within their ratio and
+    hard ceilings. No gate permits disabled shaping, selective sample reruns,
+    candidate self-baselining, or membership loopholes.
 26. A deferred module can register only from the exact current core-created local
     release script and can obtain only catalogued frozen capabilities from the one
     runtime. It cannot replace an adapter, slot registry, dispatcher, provider, or

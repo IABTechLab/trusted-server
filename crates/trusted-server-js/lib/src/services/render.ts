@@ -1,7 +1,6 @@
 import type { RenderAttemptScope, WinnerContext } from '../kernel/sessions';
 import { mintBrowserRendererNonce } from '../kernel/identity';
 import type { IdentityGenerationResult } from '../kernel/identity';
-
 import { isReservationService } from './reservations';
 import type {
   ReservationClaimAdmission,
@@ -19,34 +18,6 @@ const MAX_CACHE_URL_BYTES = 4096;
 const CACHE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const reflectApplyIntrinsic = Reflect.apply;
 const directAdmDocument = typeof document === 'undefined' ? undefined : document;
-const pucShellWindow = directAdmDocument?.defaultView ?? undefined;
-const documentQuerySelectorAllIntrinsic =
-  typeof Document === 'undefined' ? undefined : Document.prototype.querySelectorAll;
-const nodeIsConnectedGetter =
-  typeof Node === 'undefined'
-    ? undefined
-    : Object.getOwnPropertyDescriptor(Node.prototype, 'isConnected')?.get;
-const nodeParentElementGetter =
-  typeof Node === 'undefined'
-    ? undefined
-    : Object.getOwnPropertyDescriptor(Node.prototype, 'parentElement')?.get;
-const iframeContentWindowGetter =
-  typeof HTMLIFrameElement === 'undefined'
-    ? undefined
-    : Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow')?.get;
-const elementGetAttributeIntrinsic =
-  typeof Element === 'undefined' ? undefined : Element.prototype.getAttribute;
-const elementClosestIntrinsic =
-  typeof Element === 'undefined' ? undefined : Element.prototype.closest;
-const htmlElementStyleGetter =
-  typeof HTMLElement === 'undefined'
-    ? undefined
-    : Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'style')?.get;
-const cssSetPropertyIntrinsic =
-  typeof CSSStyleDeclaration === 'undefined'
-    ? undefined
-    : CSSStyleDeclaration.prototype.setProperty;
-const windowGetComputedStyleIntrinsic = pucShellWindow?.getComputedStyle;
 const directAdmOwnerDocumentGetter =
   typeof Node === 'undefined'
     ? undefined
@@ -169,144 +140,6 @@ const ignoreAsyncDisposal = (): void => undefined;
 
 function frozen<const Value extends object>(value: Value): Readonly<Value> {
   return reflectApplyIntrinsic(objectFreezeIntrinsic, Object, [value]) as Readonly<Value>;
-}
-
-export interface CollapsedPucShellResizeInput {
-  readonly source: object;
-  readonly width: number;
-  readonly height: number;
-}
-
-function nativeAttribute(element: Element, name: string): string | null | undefined {
-  if (!elementGetAttributeIntrinsic) return undefined;
-  try {
-    return reflectApplyIntrinsic(elementGetAttributeIntrinsic, element, [name]) as string | null;
-  } catch {
-    return undefined;
-  }
-}
-
-function onePixelAttribute(element: Element, name: 'width' | 'height'): boolean {
-  const value = nativeAttribute(element, name);
-  if (value === undefined || value === null || !/^\d+(?:\.\d+)?$/.test(value)) return false;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed <= 1;
-}
-
-function nativeComputedStyle(element: Element): CSSStyleDeclaration | undefined {
-  if (!pucShellWindow || !windowGetComputedStyleIntrinsic) return undefined;
-  try {
-    return reflectApplyIntrinsic(windowGetComputedStyleIntrinsic, pucShellWindow, [
-      element,
-    ]) as CSSStyleDeclaration;
-  } catch {
-    return undefined;
-  }
-}
-
-function onePixelComputed(style: CSSStyleDeclaration, dimension: 'width' | 'height'): boolean {
-  const value = dimension === 'width' ? style.width : style.height;
-  const match = /^(\d+(?:\.\d+)?)px$/.exec(value);
-  return match !== null && Number(match[1]) <= 1;
-}
-
-function ordinaryCollapsedElement(element: HTMLElement): boolean {
-  const style = nativeComputedStyle(element);
-  return (
-    style !== undefined &&
-    style.position !== 'fixed' &&
-    style.position !== 'sticky' &&
-    onePixelComputed(style, 'width') &&
-    onePixelComputed(style, 'height')
-  );
-}
-
-/**
- * Resize one authenticated Universal Creative shell after its response posts.
- *
- * The caller owns attempt currentness. This helper owns only DOM identity and
- * geometry: it fails closed unless exactly one connected iframe has the source
- * window and both that frame and its immediate ordinary wrapper are still 1x1.
- */
-export function resizeCollapsedPucShell(input: CollapsedPucShellResizeInput): boolean {
-  if (
-    !directAdmDocument ||
-    !documentQuerySelectorAllIntrinsic ||
-    !nodeIsConnectedGetter ||
-    !nodeParentElementGetter ||
-    !iframeContentWindowGetter ||
-    !elementClosestIntrinsic ||
-    !htmlElementStyleGetter ||
-    !cssSetPropertyIntrinsic ||
-    typeof input !== 'object' ||
-    input === null ||
-    typeof input.source !== 'object' ||
-    input.source === null ||
-    !Number.isFinite(input.width) ||
-    !Number.isFinite(input.height) ||
-    input.width <= 0 ||
-    input.height <= 0
-  ) {
-    return false;
-  }
-
-  try {
-    const candidates = reflectApplyIntrinsic(documentQuerySelectorAllIntrinsic, directAdmDocument, [
-      'iframe',
-    ]) as NodeListOf<HTMLIFrameElement>;
-    let frame: HTMLIFrameElement | undefined;
-    for (let index = 0; index < candidates.length; index += 1) {
-      const candidate = candidates.item(index);
-      if (
-        candidate &&
-        reflectApplyIntrinsic(nodeIsConnectedGetter, candidate, []) === true &&
-        reflectApplyIntrinsic(iframeContentWindowGetter, candidate, []) === input.source
-      ) {
-        if (frame) return false;
-        frame = candidate;
-      }
-    }
-    if (
-      !frame ||
-      !onePixelAttribute(frame, 'width') ||
-      !onePixelAttribute(frame, 'height') ||
-      !ordinaryCollapsedElement(frame) ||
-      reflectApplyIntrinsic(elementClosestIntrinsic, frame, ['a,[data-anchor-status]']) !== null
-    ) {
-      return false;
-    }
-
-    const wrapper = reflectApplyIntrinsic(nodeParentElementGetter, frame, []) as HTMLElement | null;
-    if (
-      !wrapper ||
-      wrapper === directAdmDocument.body ||
-      wrapper === directAdmDocument.documentElement ||
-      wrapper instanceof HTMLAnchorElement ||
-      reflectApplyIntrinsic(nodeIsConnectedGetter, wrapper, []) !== true ||
-      !ordinaryCollapsedElement(wrapper) ||
-      reflectApplyIntrinsic(elementClosestIntrinsic, wrapper, ['a,[data-anchor-status]']) !== null
-    ) {
-      return false;
-    }
-
-    const frameStyle = reflectApplyIntrinsic(
-      htmlElementStyleGetter,
-      frame,
-      []
-    ) as CSSStyleDeclaration;
-    const wrapperStyle = reflectApplyIntrinsic(
-      htmlElementStyleGetter,
-      wrapper,
-      []
-    ) as CSSStyleDeclaration;
-    reflectApplyIntrinsic(cssSetPropertyIntrinsic, frameStyle, ['width', `${input.width}px`]);
-    reflectApplyIntrinsic(cssSetPropertyIntrinsic, frameStyle, ['height', `${input.height}px`]);
-    reflectApplyIntrinsic(cssSetPropertyIntrinsic, wrapperStyle, ['width', `${input.width}px`]);
-    reflectApplyIntrinsic(cssSetPropertyIntrinsic, wrapperStyle, ['height', `${input.height}px`]);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function arrayPush<Value>(array: Value[], value: Value): number {

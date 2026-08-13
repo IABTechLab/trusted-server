@@ -9,12 +9,6 @@ import {
   type GoogletagAdapter,
   type GoogletagFacade,
 } from '../../adapters/googletag';
-import type { MessagingAdapter } from '../../adapters/messaging';
-import {
-  parseBrowserAuctionProjectionV1,
-  isAuctionCandidateIdV1,
-  isRendererReservationIdV1,
-} from '../../core/contracts/auction_projection';
 import type {
   BrowserAuctionBidV1,
   BrowserAuctionProjectionV1,
@@ -22,13 +16,14 @@ import type {
   CacheFetchPolicyV1,
 } from '../../core/types';
 import { log } from '../../core/log';
-import { prepareAdmIframe } from '../../core/render';
 import { DisposableStack } from '../../kernel/disposable';
 import type { RuntimeCapabilityV1 } from '../../kernel/runtime';
 import type { NavigationSession, RenderAttemptScope, RuntimeSession } from '../../kernel/sessions';
+import type { IdentityGenerationResult } from '../../kernel/identity';
 import type {
   CacheAdmResolutionOptions,
   CommittedRenderArtifact,
+  DirectAdmIframeConstructor,
   DirectCacheAttemptOptions,
   RenderAttempt,
   RenderAttemptCreationResult,
@@ -37,13 +32,13 @@ import type {
   SlotOperationCreationResult,
   SlotOperationOptions,
 } from '../../services/render';
+import { resizeCollapsedPucShell } from '../../core/puc_shell';
 import {
   createPucBridge,
   type PucBridge,
   type PucGamAttemptInput,
 } from '../../services/puc_bridge';
 import type { ReservationService } from '../../services/reservations';
-import { createPageBidsController } from '../../services/projections';
 import {
   createBrowserSlotReconciliationBoundary,
   createSlotService,
@@ -128,7 +123,14 @@ interface ProductionRenderCapability {
     parentAttemptId?: string
   ) => RenderAttemptCreationResult;
   readonly createSlotOperation: (options: SlotOperationOptions) => SlotOperationCreationResult;
+  readonly commitPageBids: (
+    owner: NavigationSession,
+    slotRegistry: ReturnType<SlotService['projectionRegistry']>,
+    candidate: unknown
+  ) => boolean;
+  readonly mintLifecycleTicket: () => IdentityGenerationResult<string>;
   readonly publisherOrigin: string;
+  readonly prepareAdmIframe: DirectAdmIframeConstructor;
   readonly registerRenderer: (
     type: 'cache',
     renderer: (attempt: RenderAttempt, container: HTMLElement) => boolean
@@ -141,7 +143,7 @@ interface ProductionRenderCapability {
 }
 
 interface ProductionMessagesCapability {
-  readonly messaging: MessagingAdapter;
+  readonly messaging: Parameters<typeof createPucBridge>[0]['messaging'];
 }
 
 interface ProductionTraceCapability {
@@ -217,8 +219,6 @@ function currentProjectedWinner(input: GptWinnerPublicationInput): boolean {
       !objectIsFrozenIntrinsic(placement) ||
       !objectIsFrozenIntrinsic(placement.formats) ||
       !objectIsFrozenIntrinsic(placement.targeting) ||
-      !isAuctionCandidateIdV1(bid.candidateId) ||
-      !isRendererReservationIdV1(bid.rendererReservationId) ||
       bid.slot !== input.attempt.slot ||
       placement.slot !== bid.slot ||
       input.attempt.navigationGeneration !== input.navigation.generation ||
@@ -974,6 +974,9 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
     typeof render.attachPucGamAttemptRegistrar !== 'function' ||
     typeof render.createAttempt !== 'function' ||
     typeof render.createSlotOperation !== 'function' ||
+    typeof render.commitPageBids !== 'function' ||
+    typeof render.mintLifecycleTicket !== 'function' ||
+    typeof render.prepareAdmIframe !== 'function' ||
     typeof render.registerRenderer !== 'function' ||
     typeof render.renderDirectCacheAttempt !== 'function' ||
     typeof render.renderWinner !== 'function' ||
@@ -1030,7 +1033,7 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
       cachePolicy,
       container,
       fetcher: (input, init) => fetchCache(input, init),
-      prepareIframe: prepareAdmIframe,
+      prepareIframe: render.prepareAdmIframe,
       publisherOrigin: render.publisherOrigin,
     });
   };
@@ -1134,13 +1137,15 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
             }
             const candidate = await response.json();
             if (!ownerActive || !active || !navigation.isCurrent()) return rejected(navigation);
-            const pageBids = createPageBidsController({
-              navigation,
-              parseProjection: (value) =>
-                parseBrowserAuctionProjectionV1(value, render.cachePolicy),
-              slotRegistry: slots.projectionRegistry(navigation),
-            });
-            if (pageBids.commit(candidate).status !== 'committed') return rejected(navigation);
+            if (
+              !render.commitPageBids(
+                navigation,
+                slots.projectionRegistry(navigation),
+                candidate
+              )
+            ) {
+              return rejected(navigation);
+            }
             const projection = navigation.currentAuctionProjection as
               Readonly<BrowserAuctionProjectionV1> | undefined;
             if (!projection || !ownerActive || !active || !navigation.isCurrent()) {
@@ -1246,11 +1251,13 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
       criticalReconciliationRelease = slots.activateReconciliation();
       const bridge = createPucBridge({
         messaging: messages.messaging,
+        mintLifecycleTicket: render.mintLifecycleTicket,
         publisherOrigin: render.publisherOrigin,
         rendererNonces: render.rendererNonces,
         rendererUrl,
         reservations: render.reservations,
         resolveCacheAdm,
+        resizeCollapsedShell: resizeCollapsedPucShell,
       });
       pucBridge = bridge;
       bridgeRelease.current = () => {

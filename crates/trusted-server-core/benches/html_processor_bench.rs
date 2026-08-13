@@ -17,7 +17,6 @@ fn make_config() -> HtmlProcessorConfig {
         max_buffered_body_bytes: 16 * 1024 * 1024,
         gpt_diagnostics: None,
         render_trace_overlay: false,
-        suppress_datadome_client_side_tag: false,
     }
 }
 

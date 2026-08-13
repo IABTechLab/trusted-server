@@ -46,6 +46,14 @@ timeout_ms = 2000
 
 `account_id` is required. It accepts a non-empty string or integer account identifier; no alternate field name is supported.
 
+This is a hard config cutover. Before deploying the new binary, rename the former
+APS publisher-identifier field to the canonical `account_id`, quote any numeric
+identifier so it is a TOML string, and remove legacy or unknown APS keys. Run
+`ts config validate`, then push the canonical configuration while the old binary
+that accepts `account_id` is still serving. Deploy the new binary only after that
+push succeeds. The new binary has no legacy field alias, numeric-ID coercion, or
+compatibility parser.
+
 `debug` defaults to `false`. Enable it only on controlled test sites because it includes the raw APS request and response, including identity, consent, device, page, account, bid, and creative data, in the client-visible `/auction` response.
 
 `allow_script_creatives` defaults to `false`. While disabled, APS script bids are rejected before per-impression reduction, floors, mediation, and winner selection. Enable it only for a controlled cohort after the browser-security checks in [Rollout](#rollout) pass.
@@ -242,6 +250,17 @@ Seats, `impid`, markup, notifications, user-sync data, sibling bids, losing seat
 
 Both rendering paths use `GET /integrations/aps/renderer/v1`, a versioned static Trusted Server document with its own restrictive CSP. The document initializes the account-keyed APS queue and then loads the live runner through the fixed first-party proxy at `GET /integrations/aps/runner.js`. Trusted Server neither vendors nor pins the upstream runner bytes.
 
+Both paths are reserved before configured `[[handlers]]` are evaluated. They are
+browser-facing and intentionally anonymous; Basic Auth handler patterns do not
+protect `/integrations/aps/*`. Apply any operator-required admission control or
+rate limiting at the deployment platform.
+
+The runner is a live, unversioned proxy dependency. Trusted Server does not vendor,
+pin, archive, or cache its bytes, and the successful runner response adds no
+`Cache-Control` requirement. Platform admission control, rate limiting, and request
+shielding are operator concerns; they must not turn the runner into TS-owned source
+or a pinned release artifact.
+
 The outer iframe uses these sandbox permissions:
 
 ```text
@@ -295,11 +314,16 @@ If script rendering requires weakening the outer sandbox, leave `allow_script_cr
 
 This release is a direct configuration and protocol cutover:
 
-1. Replace the legacy `/e/dtb/bid` endpoint with `/e/pb/bid`.
-2. Configure the required `account_id` field.
-3. Remove APS-specific slot ID configuration and remove `aps` from Prebid Server bidder lists. Trusted Server also filters APS from PBS requests for this path.
-4. Prepare GAM line items and Universal Creative for `hb_bidder=aps` and the selected APS `hb_adid`.
-5. Disable publisher-native APS demand for the Trusted Server test cohort.
+1. In the operator configuration, rename the former APS publisher-identifier field
+   to `account_id`, quote numeric identifiers, and remove legacy or unknown APS keys.
+2. Run `ts config validate`, then push that canonical configuration while the old
+   binary that accepts `account_id` is still serving.
+3. Deploy the new binary. It rejects the former field, numeric IDs, aliases, mixed
+   legacy shapes, and unknown APS keys; there is no compatibility parser.
+4. Replace the legacy `/e/dtb/bid` endpoint with `/e/pb/bid`.
+5. Remove APS-specific slot ID configuration and remove `aps` from Prebid Server bidder lists. Trusted Server also filters APS from PBS requests for this path.
+6. Prepare GAM line items and Universal Creative for `hb_bidder=aps` and the selected APS `hb_adid`.
+7. Disable publisher-native APS demand for the Trusted Server test cohort.
 
 There is no legacy runtime switch. Roll back by disabling `[auction]` or
 removing the APS provider, restoring native APS for the cohort, or deploying

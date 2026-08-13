@@ -383,7 +383,7 @@ pub fn handle_tsjs_dynamic(
     const PREFIX: &str = "/static/tsjs=";
 
     let path = req.uri().path();
-    if req.method() != Method::GET || !path.starts_with(PREFIX) {
+    if (req.method() != Method::GET && req.method() != Method::HEAD) || !path.starts_with(PREFIX) {
         return Ok(tsjs_not_found_response());
     }
     let filename = &path[PREFIX.len()..];
@@ -395,21 +395,11 @@ pub fn handle_tsjs_dynamic(
     }
 
     if filename == "tsjs-unified.min.js" {
-        let creative_ids = crate::tsjs::creative_tsjs_module_ids();
-        let module_ids = (trusted_server_js::concatenated_hash(creative_ids) == requested_hash)
-            .then_some(creative_ids.to_vec())
-            .or_else(|| {
-                integration_registry
-                    .tsjs_static_transport_selections(false)
-                    .into_iter()
-                    .map(|selection| integration_registry.tsjs_critical_module_ids(selection))
-                    .find(|ids| trusted_server_js::concatenated_hash(ids) == requested_hash)
-            });
-        let Some(module_ids) = module_ids else {
+        let Some(artifact) = integration_registry.tsjs_static_artifact(requested_hash) else {
             return Ok(tsjs_not_found_response());
         };
-        let body = trusted_server_js::concatenate_modules(&module_ids);
-        let mut resp = serve_static_with_etag(&body, req, "application/javascript; charset=utf-8");
+        let mut resp = serve_precomputed_tsjs_artifact(artifact, req);
+        strip_tsjs_head_body(&mut resp, req.method());
         apply_tsjs_success_headers(&mut resp);
         return Ok(resp);
     }
@@ -430,12 +420,19 @@ pub fn handle_tsjs_dynamic(
         {
             let mut resp =
                 serve_static_with_etag(content, req, "application/javascript; charset=utf-8");
+            strip_tsjs_head_body(&mut resp, req.method());
             apply_tsjs_success_headers(&mut resp);
             return Ok(resp);
         }
     }
 
     Ok(tsjs_not_found_response())
+}
+
+fn strip_tsjs_head_body(response: &mut Response<EdgeBody>, method: &Method) {
+    if method == Method::HEAD {
+        *response.body_mut() = EdgeBody::empty();
+    }
 }
 
 fn valid_lowercase_sha256(value: &str) -> bool {
@@ -453,6 +450,41 @@ fn apply_tsjs_success_headers(response: &mut Response<EdgeBody>) {
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
+}
+
+fn serve_precomputed_tsjs_artifact(
+    artifact: &crate::tsjs::TsjsStaticArtifactV1,
+    req: &Request<EdgeBody>,
+) -> Response<EdgeBody> {
+    let etag = format!("\"sha256-{}\"", artifact.hash());
+    let not_modified = req
+        .headers()
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == etag);
+    let builder = Response::builder()
+        .header(
+            header::CACHE_CONTROL,
+            "public, max-age=300, s-maxage=300, stale-while-revalidate=60, stale-if-error=86400",
+        )
+        .header("surrogate-control", "max-age=300")
+        .header(header::ETAG, etag)
+        .header(header::VARY, "Accept-Encoding");
+    if not_modified {
+        return builder
+            .status(StatusCode::NOT_MODIFIED)
+            .body(EdgeBody::empty())
+            .expect("should build 304 TSJS response");
+    }
+
+    builder
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )
+        .body(EdgeBody::from_bytes(artifact.body().clone()))
+        .expect("should build TSJS response")
 }
 
 /// Extract a catalogued deferred module ID from its only admitted filename.
@@ -487,7 +519,6 @@ struct ProcessResponseParams<'a> {
     integration_registry: &'a IntegrationRegistry,
     ad_slots_script: Option<&'a str>,
     ad_bids_state: &'a Arc<Mutex<Option<String>>>,
-    suppress_datadome_client_side_tag: bool,
     gpt_diagnostics:
         Option<&'a crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
     render_trace_overlay: bool,
@@ -514,8 +545,7 @@ impl PublisherBodyProcessor {
                 settings,
                 integration_registry,
                 ad_slots_script: params.ad_slots_script.as_deref().map(str::to_string),
-                ad_bids_state: Arc::clone(params.ad_bids_state.script_cell()),
-                suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
+                ad_bids_state: Arc::clone(&params.ad_bids_state),
                 gpt_diagnostics: params.gpt_diagnostics.clone(),
                 render_trace_overlay: params.render_trace_overlay,
             })?)
@@ -595,7 +625,6 @@ fn process_response_streaming<W: Write>(
             integration_registry: params.integration_registry,
             ad_slots_script: params.ad_slots_script.map(str::to_string),
             ad_bids_state: params.ad_bids_state.clone(),
-            suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
             gpt_diagnostics: params.gpt_diagnostics.cloned(),
             render_trace_overlay: params.render_trace_overlay,
         })?;
@@ -843,7 +872,6 @@ struct HtmlStreamProcessorParams<'a> {
     integration_registry: &'a IntegrationRegistry,
     ad_slots_script: Option<String>,
     ad_bids_state: Arc<Mutex<Option<String>>>,
-    suppress_datadome_client_side_tag: bool,
     gpt_diagnostics: Option<crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
     render_trace_overlay: bool,
 }
@@ -862,8 +890,7 @@ fn create_html_stream_processor(
     )
     .with_ad_state(params.ad_slots_script, params.ad_bids_state)
     .with_gpt_diagnostics(params.gpt_diagnostics)
-    .with_render_trace_overlay(params.render_trace_overlay)
-    .with_datadome_client_tag_suppression(params.suppress_datadome_client_side_tag);
+    .with_render_trace_overlay(params.render_trace_overlay);
 
     Ok(create_html_processor(config))
 }
@@ -1054,8 +1081,6 @@ pub struct OwnedProcessResponseParams {
     pub(crate) dispatched_auction: Option<DispatchedAuction>,
     /// Price granularity used to bucket bids when building `tsjs.bids`.
     pub(crate) price_granularity: PriceGranularity,
-    /// Whether to omit Trusted Server's automatic `DataDome` client-side tag.
-    pub(crate) suppress_datadome_client_side_tag: bool,
     /// Request-scoped conditional diagnostics delivery decision.
     pub(crate) gpt_diagnostics:
         Option<crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
@@ -1991,21 +2016,6 @@ fn response_carries_body(method: &Method, status: StatusCode) -> bool {
         && status != StatusCode::NOT_MODIFIED
 }
 
-/// Prevent shared caches from replaying tag-suppressed HTML to other clients.
-fn apply_datadome_client_tag_cache_privacy(
-    response: &mut Response<EdgeBody>,
-    method: &Method,
-    suppress_datadome_client_side_tag: bool,
-    content_type: &str,
-) {
-    if suppress_datadome_client_side_tag
-        && response_carries_body(method, response.status())
-        && is_html_content_type(content_type)
-    {
-        enforce_synthesized_html_cache_privacy(response);
-    }
-}
-
 /// Drop a bodiless response's body and correct its framing headers.
 ///
 /// The response keeps no body, and its `Content-Length` is corrected where the
@@ -2121,8 +2131,7 @@ pub fn stream_publisher_body<W: Write>(
         content_type: &params.content_type,
         integration_registry,
         ad_slots_script: params.ad_slots_script.as_deref(),
-        ad_bids_state: params.ad_bids_state.script_cell(),
-        suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
+        ad_bids_state: &params.ad_bids_state,
         gpt_diagnostics: params.gpt_diagnostics.as_ref(),
         render_trace_overlay: params.render_trace_overlay,
     };
@@ -2287,46 +2296,24 @@ pub(crate) fn is_prefetch_request(req: &Request<EdgeBody>) -> bool {
     header("sec-purpose") || header("purpose")
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ServerSideAdStackConfig {
-    /// Dedicated `[creative_opportunities].enabled` switch.
-    ad_templates_enabled: bool,
-    /// Global `[auction].enabled` gate used by publisher/page-bids flows.
-    auction_enabled: bool,
-}
-
-/// Returns whether request-scoped signals permit an ad-eligible navigation.
-fn is_server_side_ad_eligible_navigation(
-    is_get: bool,
-    is_navigation: bool,
-    is_prefetch: bool,
-    is_bot: bool,
-    consent_allows_auction: bool,
-) -> bool {
-    is_get && is_navigation && !is_prefetch && !is_bot && consent_allows_auction
-}
-
-/// Returns true only when the publisher should inject and run server-side ad templates.
-///
-/// This includes auction dispatch plus initial ad-slot injection.
-fn should_run_server_side_ad_stack(
+/// Returns true only when the publisher request should run the full
+/// server-side ad stack: auction dispatch plus initial ad-slot injection.
+pub(crate) fn should_run_server_side_ad_stack(
     is_get: bool,
     is_navigation: bool,
     is_prefetch: bool,
     is_bot: bool,
     has_matched_slots: bool,
     consent_allows_auction: bool,
-    config: ServerSideAdStackConfig,
+    auction_enabled: bool,
 ) -> bool {
-    is_server_side_ad_eligible_navigation(
-        is_get,
-        is_navigation,
-        is_prefetch,
-        is_bot,
-        consent_allows_auction,
-    ) && config.ad_templates_enabled
+    is_get
+        && is_navigation
+        && !is_prefetch
+        && !is_bot
         && has_matched_slots
-        && config.auction_enabled
+        && consent_allows_auction
+        && auction_enabled
 }
 /// Write winning bids from an auction result into the shared `ad_bids_state` lock.
 /// Build the request origin (`scheme://host`, where `host` includes any port)
@@ -2999,13 +2986,13 @@ pub async fn handle_publisher_request(
     let is_prefetch = is_prefetch_request(&req);
     let is_bot = is_bot_user_agent(&req);
 
-    let creative_opportunities = settings.creative_opportunities.as_ref();
-    let ad_templates_enabled = creative_opportunities.is_some_and(|co_config| co_config.enabled);
-    let ad_templates_disabled = creative_opportunities.is_some_and(|co_config| !co_config.enabled);
-    let matched_slots = if is_get && ad_templates_enabled {
-        creative_opportunities.map_or_else(Vec::new, |co_config| {
-            match_renderable_slots(auction.slots, co_config, &request_path)
-        })
+    let matched_slots = if is_get {
+        settings
+            .creative_opportunities
+            .as_ref()
+            .map_or_else(Vec::new, |co_config| {
+                match_renderable_slots(auction.slots, co_config, &request_path)
+            })
     } else {
         Vec::new()
     };
@@ -3022,10 +3009,7 @@ pub async fn handle_publisher_request(
         is_bot,
         !matched_slots.is_empty(),
         consent_allows_auction,
-        ServerSideAdStackConfig {
-            ad_templates_enabled,
-            auction_enabled: auction.orchestrator.is_enabled(),
-        },
+        auction.orchestrator.is_enabled(),
     );
     let should_run_auction = should_run_ad_stack;
     // Diagnostic: shows which gate suppresses the server-side auction. Pair with
@@ -3033,16 +3017,14 @@ pub async fn handle_publisher_request(
     // when `consent_allows_auction=false`.
     log::debug!(
         "server-side ad-stack gate: is_get={is_get} is_navigation={is_navigation} \
-         is_prefetch={is_prefetch} is_bot={is_bot} ad_templates_enabled={ad_templates_enabled} \
-         matched_slots={} consent_allows_auction={consent_allows_auction} \
+         is_prefetch={is_prefetch} is_bot={is_bot} matched_slots={} \
+         consent_allows_auction={consent_allows_auction} \
          orchestrator_enabled={} -> should_run_auction={should_run_auction}",
         matched_slots.len(),
         auction.orchestrator.is_enabled(),
     );
 
-    if ad_templates_disabled {
-        log::debug!("Server-side ad templates are disabled by configuration");
-    } else if matched_slots.is_empty() && settings.creative_opportunities.is_some() {
+    if matched_slots.is_empty() && settings.creative_opportunities.is_some() {
         log::debug!(
             "No creative opportunity slots matched path '{}' — skipping auction and injection",
             request_path
@@ -3180,9 +3162,7 @@ pub async fn handle_publisher_request(
                 }
             }
         } else {
-            let skip_reason = if ad_templates_disabled {
-                "ad_templates_disabled"
-            } else if !auction.orchestrator.is_enabled() {
+            let skip_reason = if !auction.orchestrator.is_enabled() {
                 "auction_disabled"
             } else if !consent_allows_auction {
                 "consent_denied"
@@ -3459,7 +3439,6 @@ pub async fn handle_publisher_request(
     // sets the flag unconditionally and tolerates buffered fallback): adapters
     // without streaming support may reject the flag outright rather than
     // silently buffering, which would fail every publisher fetch.
-    let request_method = req.method().clone();
     let mut platform_request = PlatformHttpRequest::new(req, backend_name);
     if services.http_client().supports_streaming_responses() {
         platform_request = platform_request.with_stream_response();
@@ -3741,7 +3720,6 @@ pub async fn handle_publisher_request(
                     content_type,
                     ad_slots_script: ad_slots_script.clone(),
                     ad_bids_state: ad_bids_state.clone(),
-                    suppress_datadome_client_side_tag,
                     auction_observation,
                     auction_request: auction_request_for_telemetry,
                     dispatched_auction,
@@ -4430,11 +4408,9 @@ pub async fn handle_page_bids(
     let matched_slots = match_renderable_slots(auction.slots, co_config, &path_param);
     let browser_slots = build_browser_slots_v1(&matched_slots, co_config, &path_param);
 
-    let matched_slots = if co_config.enabled {
-        match_renderable_slots(auction.slots, co_config, &path_param)
-    } else {
-        Vec::new()
-    };
+    let matched_slots = match_renderable_slots(auction.slots, co_config, &path_param);
+    let browser_slots = build_browser_slots_v1(&matched_slots, co_config, &path_param);
+
     let request_info = crate::http_util::RequestInfo::from_request(&req, services.client_info());
     let ec_id = ec_context.ec_value().filter(|_| ec_context.ec_allowed());
     let consent_context = ec_context.consent();
@@ -4452,10 +4428,7 @@ pub async fn handle_page_bids(
     let is_bot = is_bot_user_agent(&req);
 
     let auction_enabled = auction.orchestrator.is_enabled();
-    let ad_templates_enabled = co_config.enabled;
-    if !ad_templates_enabled {
-        log::debug!("page-bids: [creative_opportunities].enabled is false — skipping templates");
-    } else if !auction_enabled {
+    if !auction_enabled {
         log::debug!("page-bids: [auction].enabled is false — skipping auction");
     } else if matched_slots.is_empty() {
         log::debug!(
@@ -4471,8 +4444,8 @@ pub async fn handle_page_bids(
         );
     }
 
-    // The [auction].enabled kill switch and a consent denial disable the entire
-    // server-side ad stack. In those states the endpoint must return no slots,
+    // The [auction].enabled switch and a consent denial disable the
+    // entire server-side ad stack. In those states the endpoint returns no slots,
     // so the coordinated runtime cannot create or refresh GPT placements.
     // Bot/prefetch requests, by contrast,
     // keep their slot definitions (the placement structure is unchanged) but
@@ -4601,9 +4574,7 @@ pub async fn handle_page_bids(
                 }
             }
         } else {
-            let skip_reason = if !ad_templates_enabled {
-                "ad_templates_disabled"
-            } else if !auction_enabled {
+            let skip_reason = if !auction_enabled {
                 "auction_disabled"
             } else if !consent_allows_auction {
                 "consent_denied"
@@ -5892,7 +5863,6 @@ mod tests {
             price_granularity: Default::default(),
             gpt_diagnostics: None,
             render_trace_overlay: false,
-            suppress_datadome_client_side_tag: false,
         }
     }
 
@@ -8026,162 +7996,6 @@ mod tests {
     }
 
     #[test]
-    fn suppressed_datadome_tag_reaches_publisher_html_pipeline() {
-        let mut settings = create_test_settings();
-        settings
-            .integrations
-            .insert_config(
-                "datadome",
-                &serde_json::json!({
-                    "enabled": true,
-                    "client_side_key": "test-client-key",
-                }),
-            )
-            .expect("should configure DataDome integration");
-        let registry = IntegrationRegistry::new(&settings)
-            .expect("should create integration registry with DataDome");
-        let mut params = make_stream_params(&settings, "identity");
-        params.content_type = "text/html; charset=utf-8".to_string();
-        params.suppress_datadome_client_side_tag = true;
-        let mut output = Vec::new();
-
-        stream_publisher_body(
-            EdgeBody::from(b"<html><head></head><body>content</body></html>".to_vec()),
-            &mut output,
-            &params,
-            &settings,
-            &registry,
-        )
-        .expect("should process suppressed HTML");
-
-        let html = String::from_utf8(output).expect("should produce UTF-8 HTML");
-        assert!(
-            !html.contains("window.ddjskey"),
-            "publisher processing should omit the DataDome client configuration"
-        );
-        assert!(
-            !html.contains("/integrations/datadome/tags.js"),
-            "publisher processing should omit the DataDome client tag URL"
-        );
-    }
-
-    #[test]
-    fn suppressed_datadome_html_is_private_and_not_shared_cached() {
-        let mut response = Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CACHE_CONTROL, "public, max-age=600")
-            .header("surrogate-control", "max-age=600")
-            .header("fastly-surrogate-control", "max-age=600")
-            .header("cloudflare-cdn-cache-control", "max-age=600")
-            .header("cdn-cache-control", "max-age=600")
-            .header(header::ETAG, "\"origin-tag\"")
-            .header(header::LAST_MODIFIED, "Wed, 21 Oct 2015 07:28:00 GMT")
-            .body(EdgeBody::empty())
-            .expect("should build cacheable HTML response");
-
-        super::apply_datadome_client_tag_cache_privacy(
-            &mut response,
-            &Method::GET,
-            true,
-            "text/html; charset=utf-8",
-        );
-
-        assert_eq!(
-            response
-                .headers()
-                .get(header::CACHE_CONTROL)
-                .and_then(|value| value.to_str().ok()),
-            Some("private, no-store"),
-            "suppressed HTML should be private and non-storable"
-        );
-        assert!(
-            response.headers().get("surrogate-control").is_none(),
-            "suppressed HTML should not retain Surrogate-Control"
-        );
-        assert!(
-            response.headers().get("fastly-surrogate-control").is_none(),
-            "suppressed HTML should not retain Fastly-Surrogate-Control"
-        );
-        assert!(
-            response
-                .headers()
-                .get("cloudflare-cdn-cache-control")
-                .is_none(),
-            "suppressed HTML should not retain Cloudflare-CDN-Cache-Control"
-        );
-        assert!(
-            response.headers().get("cdn-cache-control").is_none(),
-            "suppressed HTML should not retain CDN-Cache-Control"
-        );
-        for header_name in [header::ETAG, header::LAST_MODIFIED] {
-            assert!(
-                !response.headers().contains_key(&header_name),
-                "suppressed HTML should not retain {header_name}"
-            );
-        }
-
-        let mut no_store_response = Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CACHE_CONTROL, "no-store")
-            .body(EdgeBody::empty())
-            .expect("should build no-store HTML response");
-        super::apply_datadome_client_tag_cache_privacy(
-            &mut no_store_response,
-            &Method::GET,
-            true,
-            "text/html; charset=utf-8",
-        );
-        assert_eq!(
-            no_store_response
-                .headers()
-                .get(header::CACHE_CONTROL)
-                .and_then(|value| value.to_str().ok()),
-            Some("private, no-store"),
-            "suppressed HTML should use the exact synthesized-HTML policy"
-        );
-    }
-
-    #[test]
-    fn datadome_cache_privacy_does_not_change_non_html_or_unsuppressed_responses() {
-        let mut response = Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CACHE_CONTROL, "public, max-age=600")
-            .header("surrogate-control", "max-age=600")
-            .body(EdgeBody::empty())
-            .expect("should build cacheable response");
-
-        super::apply_datadome_client_tag_cache_privacy(
-            &mut response,
-            &Method::GET,
-            false,
-            "text/html; charset=utf-8",
-        );
-        assert_eq!(
-            response
-                .headers()
-                .get(header::CACHE_CONTROL)
-                .and_then(|value| value.to_str().ok()),
-            Some("public, max-age=600"),
-            "unsuppressed HTML should retain its existing cache policy"
-        );
-
-        super::apply_datadome_client_tag_cache_privacy(
-            &mut response,
-            &Method::GET,
-            true,
-            "text/css",
-        );
-        assert_eq!(
-            response
-                .headers()
-                .get(header::CACHE_CONTROL)
-                .and_then(|value| value.to_str().ok()),
-            Some("public, max-age=600"),
-            "non-HTML should retain its existing cache policy"
-        );
-    }
-
-    #[test]
     fn response_carries_body_preserves_bodiless_metadata() {
         // A processable GET 200 buffers a body and recomputes Content-Length.
         assert!(
@@ -8308,68 +8122,38 @@ mod tests {
 
     #[test]
     fn server_side_ad_stack_runs_only_when_all_auction_gates_pass() {
-        let enabled_config = ServerSideAdStackConfig {
-            ad_templates_enabled: true,
-            auction_enabled: true,
-        };
         assert!(
-            should_run_server_side_ad_stack(true, true, false, false, true, true, enabled_config,),
-            "GET, real navigation, enabled templates, matched slots, and consent should run TS ad stack"
+            should_run_server_side_ad_stack(true, true, false, false, true, true, true),
+            "GET, real navigation, matched slots, and consent should run TS ad stack"
         );
 
         assert!(
-            !should_run_server_side_ad_stack(false, true, false, false, true, true, enabled_config,),
+            !should_run_server_side_ad_stack(false, true, false, false, true, true, true),
             "non-GET requests should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, false, false, false, true, true, enabled_config,),
+            !should_run_server_side_ad_stack(true, false, false, false, true, true, true),
             "non-document requests should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, true, false, true, true, enabled_config,),
+            !should_run_server_side_ad_stack(true, true, true, false, true, true, true),
             "prefetch requests should skip TS ad stack and injection"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, true, true, true, enabled_config,),
+            !should_run_server_side_ad_stack(true, true, false, true, true, true, true),
             "bot requests should skip TS ad stack and injection"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, false, true, enabled_config,),
+            !should_run_server_side_ad_stack(true, true, false, false, false, true, true),
             "requests with no matching slots should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, true, false, enabled_config,),
+            !should_run_server_side_ad_stack(true, true, false, false, true, false, true),
             "requests without required consent should skip TS ad stack and injection"
         );
         assert!(
-            !should_run_server_side_ad_stack(
-                true,
-                true,
-                false,
-                false,
-                true,
-                true,
-                ServerSideAdStackConfig {
-                    ad_templates_enabled: true,
-                    auction_enabled: false,
-                },
-            ),
+            !should_run_server_side_ad_stack(true, true, false, false, true, true, false),
             "disabled [auction].enabled kill switch should skip TS ad stack and injection"
-        );
-        assert!(
-            !should_run_server_side_ad_stack(
-                true,
-                true,
-                false,
-                false,
-                true,
-                true,
-                ServerSideAdStackConfig {
-                    ad_templates_enabled: false,
-                    auction_enabled: true,
-                },
-            ),
-            "disabled [creative_opportunities].enabled switch should skip TS ad stack and injection"
         );
     }
 
@@ -8840,8 +8624,10 @@ mod tests {
             .tsjs_static_transport_selections(false)
             .pop()
             .expect("should expose one transport selection");
-        let module_ids = registry.tsjs_critical_module_ids(selection);
-        let src = crate::tsjs::tsjs_script_src(&module_ids);
+        let src = registry
+            .tsjs_critical_artifact(selection)
+            .expect("should precompute selected critical artifact")
+            .src();
         let req = build_request(Method::GET, &format!("https://publisher.example{src}"));
 
         let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)
@@ -8861,11 +8647,43 @@ mod tests {
     }
 
     #[test]
+    fn tsjs_dynamic_head_matches_get_metadata_without_a_body() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let selection = registry
+            .tsjs_static_transport_selections(false)
+            .pop()
+            .expect("should expose one transport selection");
+        let src = registry
+            .tsjs_critical_artifact(selection)
+            .expect("should precompute selected critical artifact")
+            .src();
+        let get = build_request(Method::GET, &format!("https://publisher.example{src}"));
+        let head = build_request(Method::HEAD, &format!("https://publisher.example{src}"));
+
+        let get_response = handle_tsjs_dynamic(&get, &registry).expect("should serve GET metadata");
+        let head_response =
+            handle_tsjs_dynamic(&head, &registry).expect("should serve HEAD metadata");
+
+        assert_eq!(head_response.status(), get_response.status());
+        assert_eq!(head_response.headers(), get_response.headers());
+        assert!(
+            matches!(head_response.body(), EdgeBody::Once(bytes) if bytes.is_empty()),
+            "HEAD must not return embedded TSJS bytes"
+        );
+    }
+
+    #[test]
     fn tsjs_dynamic_serves_the_exact_rewritten_creative_bundle() {
         let settings = create_test_settings();
         let registry =
             IntegrationRegistry::new(&settings).expect("should create integration registry");
-        let src = crate::tsjs::tsjs_script_src(&["render_runtime", "creative"]);
+        let creative_hash = trusted_server_js::concatenated_hash(&["render_runtime", "creative"]);
+        let src = registry
+            .tsjs_static_artifact(&creative_hash)
+            .expect("should precompute rewritten creative artifact")
+            .src();
         let req = build_request(Method::GET, &format!("https://publisher.example{src}"));
 
         let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
@@ -8925,7 +8743,6 @@ mod tests {
         let ids = registry.tsjs_critical_module_ids(selection);
         let hash = trusted_server_js::concatenated_hash(&ids);
         let cases = [
-            (Method::HEAD, format!("tsjs-unified.min.js?v={hash}")),
             (Method::OPTIONS, format!("tsjs-unified.min.js?v={hash}")),
             (Method::POST, format!("tsjs-unified.min.js?v={hash}")),
             (Method::GET, "tsjs-unified.min.js".to_owned()),
@@ -9332,7 +9149,6 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
             render_trace_overlay: false,
-            suppress_datadome_client_side_tag: false,
         };
 
         let mut output = Vec::new();
@@ -9392,7 +9208,6 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
             render_trace_overlay: false,
-            suppress_datadome_client_side_tag: false,
         };
 
         let mut output = Vec::new();
@@ -9441,7 +9256,6 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
             render_trace_overlay: false,
-            suppress_datadome_client_side_tag: false,
         };
         let body = EdgeBody::from_stream(futures::stream::iter(vec![Ok::<_, io::Error>(
             bytes::Bytes::from_static(b"<html><body>live</body></html>"),
@@ -9568,7 +9382,6 @@ mod tests {
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
                 render_trace_overlay: false,
-                suppress_datadome_client_side_tag: false,
             };
             let body = EdgeBody::stream(futures::stream::iter(vec![
                 bytes::Bytes::from_static(b"body{background:url('https://origin.example.com/"),
@@ -9633,7 +9446,6 @@ mod tests {
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
                 render_trace_overlay: false,
-                suppress_datadome_client_side_tag: false,
             };
             let compressed =
                 gzip_encode(b"body{background:url('https://origin.example.com/asset.png')}");
@@ -9701,7 +9513,6 @@ mod tests {
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
                 render_trace_overlay: false,
-                suppress_datadome_client_side_tag: false,
             };
             let compressed =
                 deflate_encode(b"body{background:url('https://origin.example.com/asset.png')}");
@@ -9769,7 +9580,6 @@ mod tests {
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
                 render_trace_overlay: false,
-                suppress_datadome_client_side_tag: false,
             };
             let compressed =
                 brotli_encode(b"body{background:url('https://origin.example.com/asset.png')}");
@@ -9837,7 +9647,6 @@ mod tests {
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
                 render_trace_overlay: false,
-                suppress_datadome_client_side_tag: false,
             };
             let compressed =
                 brotli_encode(b"body{background:url('https://origin.example.com/asset.png')}");
@@ -9887,7 +9696,6 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
             render_trace_overlay: false,
-            suppress_datadome_client_side_tag: false,
         }
     }
 
@@ -10112,7 +9920,6 @@ mod tests {
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
                 render_trace_overlay: false,
-                suppress_datadome_client_side_tag: false,
             };
             let body = EdgeBody::stream(futures::stream::iter(vec![
                 bytes::Bytes::from_static(b"<html><head></head><body>hello"),
@@ -10190,7 +9997,6 @@ mod tests {
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
                 render_trace_overlay: false,
-                suppress_datadome_client_side_tag: false,
             };
             // The document tail lives in the SECOND gzip member. This buffered
             // `Body::Once` body proves the hard-cutover pipeline preserves every
@@ -10265,7 +10071,6 @@ mod tests {
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
                 render_trace_overlay: false,
-                suppress_datadome_client_side_tag: false,
             };
             let body = EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from_static(
                 b"body{background:url('https://origin.example.com/asset.png')}",
@@ -10334,7 +10139,6 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
             render_trace_overlay: false,
-            suppress_datadome_client_side_tag: false,
         };
         let publisher_response = PublisherResponse::Stream {
             response,
@@ -10491,7 +10295,6 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
             render_trace_overlay: false,
-            suppress_datadome_client_side_tag: false,
         }
     }
 
@@ -10903,7 +10706,6 @@ mod tests {
                 price_granularity: PriceGranularity::default(),
                 gpt_diagnostics: None,
                 render_trace_overlay: false,
-                suppress_datadome_client_side_tag: false,
             }
         };
         let make_stream_response = || PublisherResponse::Stream {
@@ -11093,7 +10895,6 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
             render_trace_overlay: false,
-            suppress_datadome_client_side_tag: false,
         };
         let publisher_response = PublisherResponse::Stream {
             response,
@@ -11173,7 +10974,6 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
             render_trace_overlay: false,
-            suppress_datadome_client_side_tag: false,
         };
         let mut output = Vec::new();
 
@@ -11235,7 +11035,6 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
             render_trace_overlay: false,
-            suppress_datadome_client_side_tag: false,
         };
 
         let bogus_body = EdgeBody::from(b"<html>not gzip</html>".to_vec());
@@ -11355,7 +11154,6 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
             render_trace_overlay: false,
-            suppress_datadome_client_side_tag: false,
         };
         let mut output = Vec::new();
         stream_publisher_body(body, &mut output, &params, &settings, &registry)
@@ -11424,7 +11222,6 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
             render_trace_overlay: false,
-            suppress_datadome_client_side_tag: false,
         };
 
         let mut output = Vec::new();
@@ -11465,7 +11262,6 @@ mod tests {
 
         fn make_config() -> CreativeOpportunitiesConfig {
             CreativeOpportunitiesConfig {
-                enabled: true,
                 gam_network_id: "21765378893".to_string(),
                 auction_timeout_ms: Some(500),
                 price_granularity: PriceGranularity::Dense,
@@ -11838,14 +11634,6 @@ mod tests {
                 crate_test_settings_str()
             );
             Settings::from_toml(&toml).expect("should parse settings with creative_opportunities")
-        }
-
-        fn settings_with_co_templates_disabled() -> Settings {
-            let toml = format!(
-                "{}\n[auction]\nenabled = true\n\n[creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
-                crate_test_settings_str()
-            );
-            Settings::from_toml(&toml).expect("should parse settings with disabled templates")
         }
 
         async fn run_page_bids(
