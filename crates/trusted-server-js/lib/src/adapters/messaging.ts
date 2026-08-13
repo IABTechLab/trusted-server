@@ -26,7 +26,7 @@ function snapshotSetValues<T>(set: Set<T>): readonly T[] {
   }
 }
 
-export { TSJS_MESSAGE_PROTOCOL_V1 } from '../core/contracts/message_protocol';
+export { TSJS_MESSAGE_PROTOCOL_V1 } from '../kernel/contracts/message_protocol';
 
 interface ProtocolMessageSchema {
   readonly transport: 'global-json' | 'structured';
@@ -1402,4 +1402,4 @@ export function createNoopMessagingAdapter(): MessagingAdapter {
     inspectTransferredPorts,
   });
 }
-import { TSJS_MESSAGE_PROTOCOL_V1 } from '../core/contracts/message_protocol';
+import { TSJS_MESSAGE_PROTOCOL_V1 } from '../kernel/contracts/message_protocol';
