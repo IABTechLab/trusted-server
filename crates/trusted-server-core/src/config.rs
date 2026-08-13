@@ -332,7 +332,7 @@ formats = [{ width = 300, height = 250 }]
     }
 
     #[test]
-    fn disabled_creative_opportunities_flag_is_visible_to_legacy_schema() {
+    fn disabled_creative_opportunities_flag_is_rejected_by_legacy_schema() {
         let mut toml = crate_test_settings_str();
         toml.push_str(
             r#"

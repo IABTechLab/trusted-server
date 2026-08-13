@@ -575,10 +575,7 @@ mod tests {
         NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, StubHttpClient,
         noop_services,
     };
-    use crate::platform::{
-        ClientInfo, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
-        PlatformResponse,
-    };
+    use crate::platform::{ClientInfo, PlatformHttpClient, PlatformHttpRequest, PlatformResponse};
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
@@ -680,7 +677,7 @@ mod tests {
             &self,
             _request: &AuctionRequest,
             context: &AuctionContext<'_>,
-        ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
             *self.calls.lock().expect("should lock provider call count") += 1;
             let request = Request::builder()
                 .method("POST")
@@ -698,6 +695,7 @@ mod tests {
                 .change_context(TrustedServerError::Auction {
                     message: "probe provider launch failed".to_string(),
                 })
+                .map(ProviderRequestOutcome::pending)
         }
 
         async fn parse_response(

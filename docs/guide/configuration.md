@@ -1487,9 +1487,12 @@ unit it maps to (`gam_unit_path`).
 `enabled` is the dedicated server-side ad-template switch. It defaults to `true`
 for compatibility with existing configurations. Set it to `false` to stop
 publisher HTML and SPA page-bids template delivery while retaining the slot
-configuration and direct `POST /auction` endpoint. The browser-facing cache
-policy for a disabled template stack is `Cache-Control: max-age=60`, unless the
-origin already sends `private` or `no-store`.
+configuration and direct `POST /auction` endpoint. For a successful GET
+publisher document with an inactive template stack, Trusted Server intentionally
+sets the browser-facing policy to `Cache-Control: max-age=60`, replacing the
+origin `Cache-Control` value as specified by
+[#1007](https://github.com/IABTechLab/trusted-server/issues/1007). Error
+responses and non-document requests retain the origin policy.
 
 ```toml
 [creative_opportunities]
@@ -1518,6 +1521,13 @@ loader:
 ```bash
 TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED=false
 ```
+
+> [!WARNING]
+> Setting `enabled = false` writes this field into the pushed configuration blob.
+> Binaries released before this setting reject the unknown field and fail to load
+> settings, which makes every request fail. Before rolling back to an older binary,
+> restore `enabled` to its default, re-push and finalize the configuration, then
+> roll back the binary.
 
 ### Shared template assembly (`assembly_mode = "esi"`)
 

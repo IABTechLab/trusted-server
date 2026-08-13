@@ -7,8 +7,10 @@
 retaining the browser-facing cache policy from issue #1007:
 
 - Server-side ad templates active: `Cache-Control: private, no-store`.
-- Server-side ad templates inactive: `Cache-Control: max-age=60`, unless the
-  origin already sends `private` or `no-store`.
+- Server-side ad templates inactive: successful GET document HTML uses exactly
+  `Cache-Control: max-age=60`, replacing the origin browser cache policy.
+- Non-200, non-GET, and non-document responses keep the origin browser cache
+  policy.
 - CDN-specific cache headers must not change when templates are inactive.
 
 **Issue context:** The current cache-policy change uses the runtime
@@ -53,15 +55,16 @@ consistent with the current issue #952 behavior:
    - Remove `ETag` and `Last-Modified`.
    - Remove `Surrogate-Control`, `Fastly-Surrogate-Control`, `CDN-Cache-Control`,
      and `Cloudflare-CDN-Cache-Control`.
-2. For HTML where the server-side ad stack does not run, including an explicit
-   template disable:
-   - Read the browser-facing `Cache-Control` header.
-   - If its value contains `private` or `no-store`, case-insensitively, preserve
-     the origin value exactly.
-   - Otherwise set exactly `Cache-Control: max-age=60`.
+2. For a `200 OK` GET document HTML response where the server-side ad stack
+   does not run, including an explicit template disable:
+   - Set exactly `Cache-Control: max-age=60`, intentionally replacing any origin
+     browser cache policy as specified by issue #1007.
    - Leave validators and all CDN-specific cache headers untouched.
-3. Preserve the later adapter response-privacy finalization for cookie-bearing
-   responses; this plan does not refactor that behavior.
+3. For non-200, non-GET, and non-document responses, preserve the origin browser
+   cache policy.
+4. Apply request-scoped privacy finalization after this policy so GPT diagnostics
+   and cookie-bearing responses can still require `private, no-store`; this plan
+   does not otherwise refactor that behavior.
 
 ## File map
 
@@ -172,11 +175,13 @@ semantics:
 - [ ] Keep the active-SSAT `private, no-store` behavior and validator/CDN header
       removal unchanged.
 - [ ] Keep the inactive-HTML `max-age=60` behavior from issue #1007.
-- [ ] Verify that explicit template disable changes only browser-facing
-      `Cache-Control` for cacheable HTML; preserve `ETag`, `Last-Modified`, and
-      every CDN-specific header.
-- [ ] Verify that origin `private`, `PRIVATE`, `no-store`, and `No-Store` values
-      remain unchanged.
+- [ ] Verify that explicit template disable replaces the browser-facing
+      `Cache-Control` for `200 OK` GET document HTML, including origin
+      `private`, `no-store`, `no-cache`, and zero-age policies.
+- [ ] Preserve `ETag`, `Last-Modified`, and every CDN-specific header.
+- [ ] Verify that non-200, non-GET, and non-document responses retain the origin
+      browser cache policy.
+- [ ] Verify that request-scoped GPT diagnostics privacy overrides this policy.
 
 ### Task 4: Gate SPA page-bids/template delivery
 
