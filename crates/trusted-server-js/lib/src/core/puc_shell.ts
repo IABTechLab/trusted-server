@@ -1,7 +1,6 @@
 const shellDocument = typeof document === 'undefined' ? undefined : document;
 const shellWindow = shellDocument?.defaultView ?? undefined;
-const queryAll =
-  typeof Document === 'undefined' ? undefined : Document.prototype.querySelectorAll;
+const queryAll = typeof Document === 'undefined' ? undefined : Document.prototype.querySelectorAll;
 const connected =
   typeof Node === 'undefined'
     ? undefined
@@ -21,7 +20,9 @@ const style =
     ? undefined
     : Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'style')?.get;
 const setProperty =
-  typeof CSSStyleDeclaration === 'undefined' ? undefined : CSSStyleDeclaration.prototype.setProperty;
+  typeof CSSStyleDeclaration === 'undefined'
+    ? undefined
+    : CSSStyleDeclaration.prototype.setProperty;
 const getComputedStyle = shellWindow?.getComputedStyle;
 
 export interface CollapsedPucShellResizeInput {
@@ -95,7 +96,9 @@ export function resizeCollapsedPucShell(input: CollapsedPucShellResizeInput): bo
   }
 
   try {
-    const candidates = Reflect.apply(queryAll, shellDocument, ['iframe']) as NodeListOf<HTMLIFrameElement>;
+    const candidates = Reflect.apply(queryAll, shellDocument, [
+      'iframe',
+    ]) as NodeListOf<HTMLIFrameElement>;
     let frame: HTMLIFrameElement | undefined;
     for (let index = 0; index < candidates.length; index += 1) {
       const candidate = candidates.item(index);

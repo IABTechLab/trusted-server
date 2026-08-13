@@ -1138,11 +1138,7 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
             const candidate = await response.json();
             if (!ownerActive || !active || !navigation.isCurrent()) return rejected(navigation);
             if (
-              !render.commitPageBids(
-                navigation,
-                slots.projectionRegistry(navigation),
-                candidate
-              )
+              !render.commitPageBids(navigation, slots.projectionRegistry(navigation), candidate)
             ) {
               return rejected(navigation);
             }
