@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
@@ -18,6 +19,7 @@ import { computeReleaseId, RELEASE_SENTINEL } from './release-v1.mjs';
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const libDir = path.resolve(scriptDir, '..');
+const repositoryRoot = path.resolve(libDir, '../../..');
 const defaultBaselinePath = path.join(
   libDir,
   'test',
@@ -35,6 +37,8 @@ const HISTORICAL_EVIDENCE_SHA256 =
   '53f762603ad49239f1756171440be422e190cc231efafc56cf37a11e1a38ddf4';
 const ROLE_CORRECT_CAPTURE_SHA256 =
   'f1d73d517e4888ef4dc3a84b34166e9aeb6a2bde99dec1c835f151f4e070f64a';
+const REVIEW_REMEDIATION_CAPTURE_SHA256 =
+  '75fac68d18c66393521cbe8d5fdcb1f86d0c7978a2f466737849fb18178eb501';
 const BOOTSTRAP_BASELINE = Object.freeze({
   rawBytes: 19_101,
   gzipBytes: 5_468,
@@ -42,6 +46,14 @@ const BOOTSTRAP_BASELINE = Object.freeze({
 });
 const PRODUCTION_SEAM_PATTERN =
   /(?:^|\/)(?:tests?|fixtures?|fakes?|no-?op)(?:\/|$)|(?:^|[/_.-])(?:test|fake|no-?op)(?=[/_.-]|$)|ForTest/u;
+const CAPTURE_BUILD_INPUTS = Object.freeze([
+  'crates/trusted-server-js/lib/src',
+  'crates/trusted-server-js/lib/build-all.mjs',
+  'crates/trusted-server-js/lib/package.json',
+  'crates/trusted-server-js/lib/package-lock.json',
+  'crates/trusted-server-js/lib/tsconfig.json',
+  'crates/trusted-server-js/lib/vite.config.ts',
+]);
 
 function fail(message) {
   throw new Error(`[bundle-budgets] ${message}`);
@@ -74,6 +86,34 @@ function canonicalJson(value) {
 /** Hash JSON with recursive key ordering while preserving array order and values. */
 export function canonicalJsonSha256(value) {
   return createHash('sha256').update(canonicalJson(value)).digest('hex');
+}
+
+function validateCleanCaptureSource(capture) {
+  const sha = capture?.source?.sha;
+  if (typeof sha !== 'string' || !/^[0-9a-f]{40}$/u.test(sha)) {
+    fail('review-remediation source SHA is invalid');
+  }
+  try {
+    if (
+      execFileSync('git', ['cat-file', '-t', sha], {
+        cwd: repositoryRoot,
+        encoding: 'utf8',
+      }).trim() !== 'commit'
+    ) {
+      fail('review-remediation source SHA does not identify a commit');
+    }
+    execFileSync('git', ['merge-base', '--is-ancestor', sha, 'HEAD'], {
+      cwd: repositoryRoot,
+      stdio: 'ignore',
+    });
+    execFileSync('git', ['diff', '--quiet', `${sha}..HEAD`, '--', ...CAPTURE_BUILD_INPUTS], {
+      cwd: repositoryRoot,
+      stdio: 'ignore',
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('[bundle-budgets]')) throw error;
+    fail('review-remediation source cannot reproduce current artifact-generating inputs');
+  }
 }
 
 function validateBudgetSets(sets, label) {
@@ -222,6 +262,50 @@ function validateSourceOwners(sourceOwners, release) {
   return ownersBySource;
 }
 
+function validateLogicalProviderSources(logicalProviderSources, physicalMarkerOwners, release) {
+  if (
+    !logicalProviderSources ||
+    typeof logicalProviderSources !== 'object' ||
+    Array.isArray(logicalProviderSources) ||
+    !physicalMarkerOwners ||
+    typeof physicalMarkerOwners !== 'object' ||
+    Array.isArray(physicalMarkerOwners)
+  ) {
+    fail('logical provider sources and physical marker owners must be objects');
+  }
+  const artifactIds = new Set(release.artifacts.map(({ id }) => id));
+  const providerBySource = new Map();
+  for (const [provider, sources] of Object.entries(logicalProviderSources)) {
+    if (
+      !artifactIds.has(provider) ||
+      !Array.isArray(sources) ||
+      sources.length === 0 ||
+      new Set(sources).size !== sources.length
+    ) {
+      fail(`logical provider source inventory is invalid: ${provider}`);
+    }
+    const physicalOwner = physicalMarkerOwners[provider] ?? provider;
+    if (!artifactIds.has(physicalOwner)) {
+      fail(`physical marker owner is invalid: ${provider}`);
+    }
+    for (const source of sources) {
+      if (source !== canonicalSourcePath(source) || !source.startsWith('src/')) {
+        fail(`logical provider source is invalid: ${provider}:${source}`);
+      }
+      if (providerBySource.has(source)) {
+        fail(`logical provider source has multiple providers: ${source}`);
+      }
+      providerBySource.set(source, { provider, physicalOwner });
+    }
+  }
+  for (const [provider, physicalOwner] of Object.entries(physicalMarkerOwners)) {
+    if (!Object.hasOwn(logicalProviderSources, provider) || !artifactIds.has(physicalOwner)) {
+      fail(`physical marker ownership is invalid: ${provider}`);
+    }
+  }
+  return providerBySource;
+}
+
 function readCurrentSourceGraph(metrics, release) {
   if (!Array.isArray(metrics?.modules) || !Array.isArray(release?.artifacts)) {
     fail('build metrics module graph or release inventory is missing');
@@ -242,6 +326,7 @@ function readCurrentSourceGraph(metrics, release) {
   ];
   const graphEntries = [];
   const ownersBySource = new Map();
+  const contributions = [];
   for (const [index, { artifact, module }] of rawEntries.entries()) {
     if (
       !artifact ||
@@ -272,6 +357,11 @@ function readCurrentSourceGraph(metrics, release) {
       }
       owners.push(artifact.id);
       ownersBySource.set(sourceFile, owners);
+      contributions.push({
+        artifact: artifact.id,
+        source: sourceFile,
+        renderedBytes: source.renderedBytes,
+      });
     }
     if (artifact.role !== 'bootstrap' && (sources.size === 0 || !sources.has(entry))) {
       fail(`build metrics module graph ${module.file} does not contain its entry source`);
@@ -281,7 +371,26 @@ function readCurrentSourceGraph(metrics, release) {
   return {
     graphEntries,
     sourceOwners: Object.fromEntries(ownersBySource),
+    contributions,
   };
+}
+
+/** Build the frozen attribution report used to review production bundle growth. */
+export function buildProductionGraphReport(metrics, release) {
+  const currentGraph = readCurrentSourceGraph(metrics, release);
+  const largestContributions = [...currentGraph.contributions]
+    .sort(
+      (left, right) =>
+        right.renderedBytes - left.renderedBytes ||
+        left.source.localeCompare(right.source) ||
+        left.artifact.localeCompare(right.artifact)
+    )
+    .slice(0, 20);
+  const repeatedAttributions = Object.entries(currentGraph.sourceOwners)
+    .filter(([, owners]) => owners.length > 1)
+    .map(([source, owners]) => ({ source, owners }))
+    .sort((left, right) => left.source.localeCompare(right.source));
+  return { largestContributions, repeatedAttributions };
 }
 
 function findCriticalDeferredViolations(graphEntries, ownersBySource, release) {
@@ -307,9 +416,28 @@ export function findCriticalDeferredSourceViolations(metrics, release, sourceOwn
 }
 
 /** Return all frozen production graph ownership and seam violations. */
-export function findProductionGraphViolations(metrics, release, sourceOwners) {
+export function findProductionGraphViolations(
+  metrics,
+  release,
+  sourceOwners,
+  logicalProviderSources = {
+    core: ['src/kernel/runtime.ts'],
+    render_runtime: ['src/integrations/render_runtime/module.ts', 'src/services/render.ts'],
+    gpt: ['src/integrations/gpt/module.ts', 'src/integrations/gpt/startup.ts'],
+    gpt_diagnostics: ['src/integrations/gpt_diagnostics/store.ts'],
+    osano_consent: ['src/integrations/osano/consent.ts'],
+    prebid: ['src/integrations/prebid/module.ts', 'src/integrations/prebid/startup.ts'],
+    sourcepoint_consent: ['src/integrations/sourcepoint/consent.ts'],
+  },
+  physicalMarkerOwners = {}
+) {
   const currentGraph = readCurrentSourceGraph(metrics, release);
   const ownersBySource = validateSourceOwners(sourceOwners, release);
+  const providerBySource = validateLogicalProviderSources(
+    logicalProviderSources,
+    physicalMarkerOwners,
+    release
+  );
   const violations = findCriticalDeferredViolations(
     currentGraph.graphEntries,
     ownersBySource,
@@ -339,6 +467,13 @@ export function findProductionGraphViolations(metrics, release, sourceOwners) {
     for (const source of sources) {
       const canonicalOwners = ownersBySource.get(source);
       let hasSpecificOwnerViolation = false;
+      const logicalProvider = providerBySource.get(source);
+      if (logicalProvider && artifact.id !== logicalProvider.physicalOwner) {
+        violations.push(
+          `${artifact.id} inlines provider ${logicalProvider.provider} implementation ${source}`
+        );
+        hasSpecificOwnerViolation = true;
+      }
       for (const { artifact: providerArtifact } of requiredProviders.values()) {
         if (canonicalOwners?.has(providerArtifact.id) && !canonicalOwners.has(artifact.id)) {
           violations.push(
@@ -503,7 +638,7 @@ function validateCurrentReleaseMetadata(current, captured) {
   }
 }
 
-function validateCapturedMembership(capture, catalog) {
+function validateCapturedMembership(capture, catalog, label = 'capturedTransfer') {
   const expectedFiles = deriveInventorySetFiles(capture.release.artifacts, catalog.modules);
   const idsByFile = new Map(capture.release.artifacts.map(({ id, file }) => [file, id]));
   const expected = {
@@ -525,13 +660,34 @@ function validateCapturedMembership(capture, catalog) {
       JSON.stringify(set.artifactIds) !== JSON.stringify(expected[setName].artifactIds) ||
       JSON.stringify(set.files) !== JSON.stringify(expected[setName].files)
     ) {
-      fail(`role-correct ${setName} semantic membership is invalid`);
+      fail(`${label} ${setName} semantic membership is invalid`);
     }
     for (const sizeName of SIZE_NAMES) {
-      assertPositiveInteger(set[sizeName], `roleCorrectTransfer.sets.${setName}.${sizeName}`);
+      assertPositiveInteger(set[sizeName], `${label}.sets.${setName}.${sizeName}`);
     }
     if (!/^[0-9a-f]{64}$/.test(set.sha256)) {
-      fail(`roleCorrectTransfer.sets.${setName}.sha256 is invalid`);
+      fail(`${label}.sets.${setName}.sha256 is invalid`);
+    }
+  }
+}
+
+function validateReductionCheckpoint(capture, intermediate) {
+  const minimal = capture.sets.minimal;
+  if (minimal.rawBytes > 220_000) {
+    fail(`review remediation minimal.rawBytes exceeds 220000: ${minimal.rawBytes}`);
+  }
+  if (minimal.gzipBytes > 59_000) {
+    fail(`review remediation minimal.gzipBytes exceeds 59000: ${minimal.gzipBytes}`);
+  }
+  if (minimal.brotliBytes >= intermediate.sets.minimal.brotliBytes) {
+    fail('review remediation minimal.brotliBytes must improve on the intermediate capture');
+  }
+  for (const sizeName of SIZE_NAMES) {
+    if (capture.sets.reference[sizeName] >= intermediate.sets.reference[sizeName]) {
+      fail(`review remediation reference.${sizeName} must improve on the intermediate capture`);
+    }
+    if (capture.sets.maximal[sizeName] > intermediate.sets.maximal[sizeName]) {
+      fail(`review remediation maximal.${sizeName} must not grow from the intermediate capture`);
     }
   }
 }
@@ -564,29 +720,53 @@ export function validateRoleCorrectTransfer({
   release,
   currentArtifactContents,
   requireExactCapture = false,
+  verifyGitProvenance = false,
 }) {
-  const capture = baseline?.roleCorrectTransfer;
-  if (!capture || typeof capture !== 'object') fail('role-correct capture is missing');
+  const intermediate = baseline?.roleCorrectTransfer;
+  if (!intermediate || typeof intermediate !== 'object') fail('role-correct capture is missing');
+  const capture = baseline?.reviewRemediationTransfer;
+  if (!capture || typeof capture !== 'object') fail('review-remediation capture is missing');
   const historical = Object.fromEntries(
-    Object.entries(baseline).filter(([key]) => key !== 'roleCorrectTransfer')
+    Object.entries(baseline).filter(
+      ([key]) => key !== 'roleCorrectTransfer' && key !== 'reviewRemediationTransfer'
+    )
   );
   const historicalDigest = canonicalJsonSha256(historical);
   if (historicalDigest !== HISTORICAL_EVIDENCE_SHA256) {
     fail('historical evidence digest does not match the immutable original top-level fields');
   }
-  if (canonicalJsonSha256(capture) !== ROLE_CORRECT_CAPTURE_SHA256) {
+  if (canonicalJsonSha256(intermediate) !== ROLE_CORRECT_CAPTURE_SHA256) {
     fail('role-correct capture digest does not match the immutable capture');
   }
-  if (capture.originalTopLevelSha256 !== HISTORICAL_EVIDENCE_SHA256) {
+  if (canonicalJsonSha256(capture) !== REVIEW_REMEDIATION_CAPTURE_SHA256) {
+    fail('review-remediation capture digest does not match the immutable capture');
+  }
+  if (
+    capture.originalTopLevelSha256 !== HISTORICAL_EVIDENCE_SHA256 ||
+    intermediate.originalTopLevelSha256 !== HISTORICAL_EVIDENCE_SHA256
+  ) {
     fail('historical evidence digest linkage is invalid');
   }
+  if (capture.roleCorrectTransferSha256 !== ROLE_CORRECT_CAPTURE_SHA256) {
+    fail('review-remediation linkage to the immutable intermediate capture is invalid');
+  }
+  if (verifyGitProvenance) validateCleanCaptureSource(capture);
 
+  validateReleaseInventoryShape(intermediate.release, 'role-correct intermediate');
   validateReleaseInventoryShape(capture.release, 'captured');
   validateReleaseInventoryShape(release, 'current');
-  validateCapturedMembership(capture, catalog);
+  validateCapturedMembership(intermediate, catalog, 'roleCorrectTransfer');
+  validateCapturedMembership(capture, catalog, 'reviewRemediationTransfer');
+  validateReductionCheckpoint(capture, intermediate);
   validateCurrentReleaseMetadata(release, capture.release);
   validateSemanticBundleSets(metrics, release, catalog);
-  const graphViolations = findProductionGraphViolations(metrics, release, capture.sourceOwners);
+  const graphViolations = findProductionGraphViolations(
+    metrics,
+    release,
+    capture.sourceOwners,
+    capture.logicalProviderSources,
+    capture.physicalMarkerOwners
+  );
   if (graphViolations.length > 0)
     fail(`production graph failed:\n- ${graphViolations.join('\n- ')}`);
   if (requireExactCapture && JSON.stringify(release) !== JSON.stringify(capture.release)) {
@@ -595,6 +775,12 @@ export function validateRoleCorrectTransfer({
   if (currentArtifactContents !== undefined) {
     validateArtifactContents(release, currentArtifactContents);
     validateCurrentMeasurements(metrics, release, catalog, currentArtifactContents);
+  }
+  if (
+    canonicalJson(buildProductionGraphReport(metrics, release)) !==
+    canonicalJson(capture.graphReport)
+  ) {
+    fail('production graph report differs from immutable capture');
   }
 
   const currentSets = { bootstrap: metrics.bootstrap, ...metrics.sets };
@@ -638,7 +824,9 @@ export function checkBundleBudgets({
   const failures = findProductionGraphViolations(
     metrics,
     release,
-    baseline.roleCorrectTransfer?.sourceOwners
+    baseline.reviewRemediationTransfer?.sourceOwners,
+    baseline.reviewRemediationTransfer?.logicalProviderSources,
+    baseline.reviewRemediationTransfer?.physicalMarkerOwners
   );
   const historicalDeltas = {};
   const historicalSets = {
@@ -688,6 +876,7 @@ export function checkBundleBudgets({
     catalog,
     release,
     currentArtifactContents,
+    verifyGitProvenance: true,
   });
 
   if (failures.length > 0) fail(`budget check failed:\n- ${failures.join('\n- ')}`);
@@ -695,10 +884,11 @@ export function checkBundleBudgets({
   return {
     baselineOnly,
     baselinePath,
-    roleCorrectStatus: 'frozen',
+    roleCorrectStatus: 'immutable-intermediate',
+    reviewRemediationStatus: 'frozen-release-baseline',
     transferCeilingsEnforced: true,
     historicalDeltas,
-    roleCorrectTransfer: roleCorrect.reports,
+    reviewRemediationTransfer: roleCorrect.reports,
     sets: metrics.sets,
   };
 }
