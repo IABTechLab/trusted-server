@@ -135,8 +135,11 @@ gh pr view "$NUMBER" --json \
 MODE=PR
 # Exactly one worktree per PR: keyed on $NUMBER, reused across passes on the
 # same PR (the idempotent setup below resets it to $HEAD_REF rather than adding
-# a second worktree).
-WT=.claude/worktrees/pr-${NUMBER}-review
+# a second worktree). Anchored to the repo root so a drifted cwd can't create
+# the worktree somewhere else (a relative path would resolve against wherever
+# the shell happens to be, and a stray copy outside root-level `.claude/`
+# wouldn't even be gitignored).
+WT="$(git rev-parse --show-toplevel)/.claude/worktrees/pr-${NUMBER}-review"
 BASE_BRANCH="<baseRefName>"
 BASE_REF=origin/$BASE_BRANCH
 HEAD_REF=refs/review/pr-${NUMBER}/head             # private, agent-owned
@@ -152,7 +155,7 @@ SLUG=$(printf '%s' "$HEAD_BRANCH" | tr -c 'A-Za-z0-9._-' '_')
 SLUG="${SLUG}-${BRANCH_HASH}"
 MODE=BRANCH-REMOTE
 NUMBER=                                            # no PR → empty
-WT=.claude/worktrees/branch-${SLUG}-review
+WT="$(git rev-parse --show-toplevel)/.claude/worktrees/branch-${SLUG}-review"
 BASE_BRANCH="<base>"                               # `main` if the user didn't specify
 BASE_REF=origin/$BASE_BRANCH
 HEAD_REF=refs/review/branch-${SLUG}/head           # private, agent-owned
@@ -301,7 +304,7 @@ if [ -n "$WT" ]; then
     # form. `realpath` only runs when the directory exists (it errors on a
     # missing path), so gate it behind the existence check.
     if [ -e "$WT" ] && git worktree list --porcelain \
-            | grep -qx "worktree $(realpath "$WT")"; then
+            | grep -Fqx "worktree $(realpath "$WT")"; then
         # Registered worktree from a prior invocation — reuse it, don't add a
         # second. The parent repo already ran the shared fetch above and
         # verified $HEAD_OID_EXPECTED; linked worktrees share `.git`, so
@@ -446,7 +449,9 @@ fi
 If the PR has passing CI checks, report them as PASS in the review. Only run
 CI locally if checks haven't run yet or if you need to verify a specific
 failure. Note any CI failures in the review but continue with the code review
-regardless.
+regardless. (This governs CI *status reporting* only — the suggestion
+scratch-verification in step 7e is independent and runs regardless of what
+GitHub's checks say.)
 
 Classify CI by `bucket`, not by the `gh pr checks` exit code, over the
 **full** check set captured above:
@@ -462,15 +467,22 @@ Classify CI by `bucket`, not by the `gh pr checks` exit code, over the
   through to `APPROVE`. Do not offer this finding as optional during triage
   unless the user shows the check is irrelevant, obsolete, or not required for
   the PR.
-- `bucket == "pending"` → record the check as pending in CI Status. If the
-  pending result blocks completing the review, use ❓; otherwise it is not a
-  failed-CI 🔧 finding.
+- `bucket == "pending"` → record the check as pending in CI Status. It is not
+  a failed-CI 🔧 finding. If the pending result genuinely blocks completing
+  the review, surface that to the user during triage (step 6) and let them
+  decide whether to wait — do not convert it into a ❓ finding, which would
+  force `REQUEST_CHANGES` for a check that may pass minutes later.
 - `bucket == "pass"` / `bucket == "skipping"` → record the check status; no
   finding by itself.
 - Pending with no JSON (`pr_checks_pending` set) → record a CI Status note. Do
   not call it failed CI.
-- Command/API/auth failure (`pr_checks_error` set) → record a diagnostic ❓ or
-  CI Status note. Do not call it failed CI.
+- Command/API/auth failure (`pr_checks_error` set) → record the diagnostic in
+  the CI Status section **only**. Do not call it failed CI, and do **not**
+  express it as a ❓ finding — step 8a's verdict rules turn any ❓ into
+  `REQUEST_CHANGES`, and a reviewer-side network hiccup or expired `gh` token
+  must never block the author's PR. The same applies to any other
+  reviewer-tooling failure: ❓ findings are reserved for questions about the
+  diff itself.
 
 ### 4. Deep analysis
 
@@ -698,11 +710,13 @@ approved. Before displaying or submitting any suggestion:
 3. If `N >= 3`, open and close the block with a fence of `N + 1` backticks
    (e.g. ` ````suggestion ` for an inner ```` ``` ````), so the outer fence is
    strictly longer than any inner run — GitHub follows the CommonMark rule that
-   a fence closes only on a run of **at least** as many backticks. Verify in
-   step 7e's scratch pass that the rendered suggestion still applies as one
-   click; if the longer-fence form does not render as an applicable suggestion,
-   **demote the finding to prose-only** (a plain fenced block plus the
-   "Apply manually …" sentence) rather than posting a malformed suggestion.
+   a fence closes only on a run of **at least** as many backticks. This rule is
+   deterministic; whether GitHub renders the widened fence as a one-click
+   suggestion is a server-side property that cannot be checked locally (7e's
+   scratch pass verifies replacement *bytes*, not rendering). When in doubt —
+   e.g. an unusually exotic replacement — **demote the finding to prose-only**
+   (a plain fenced block plus the "Apply manually …" sentence) rather than
+   risk posting a malformed suggestion.
 
 Apply this identically to the triage preview (step 6) and the final inline
 comment body (step 7b) — the user must approve the exact fence and bytes that
@@ -835,7 +849,7 @@ prev_iteration_ran_js_build=0
 for suggestion in "${approved_suggestions[@]}"; do
     # 1. Reset to a clean head so the previous iteration's suggestion is
     #    gone — each suggestion verifies alone. `clean -fd` removes
-    #    untracked tracked-by-git-but-untracked files, but it does NOT
+    #    untracked non-ignored files, but it does NOT
     #    touch `.gitignore`'d paths like `crates/trusted-server-js/dist/` — those are
     #    consumed by `crates/trusted-server-js/build.rs` via `include_str!()`, so a stale
     #    bundle from suggestion A would otherwise leak into suggestion B's
@@ -846,7 +860,6 @@ for suggestion in "${approved_suggestions[@]}"; do
     if [ "$prev_iteration_ran_js_build" = 1 ]; then
         git -C "$WT" clean -fdx crates/trusted-server-js/dist
     fi
-    prev_iteration_ran_js_build=0
     # Reset the per-iteration flag to a known value BEFORE the verification
     # commands run. Otherwise a previous iteration that set ran_js_build=1
     # would leak into this one if the current suggestion's verification
@@ -908,10 +921,11 @@ pure-renaming suggestions don't need that disclaimer.
 
 The targeted preflight above narrows clippy to the touched adapter. That's
 deliberately cheap so verification stays fast for one-line edits. But
-CLAUDE.md's required CI gate is the full target-matched clippy alias chain
-plus all four adapter test aliases, and the targeted run won't catch issues
-that appear only under another adapter's target or feature set, in `--tests`,
-or in a downstream crate. Use the full gate when **any** of these is true:
+CLAUDE.md's required CI gates include the full target-matched clippy alias
+chain, all four adapter test aliases, and the cross-adapter parity suite, and
+the targeted run won't catch issues that appear only under another adapter's
+target or feature set, in `--tests`, or in a downstream crate. Use the full
+gate when **any** of these is true:
 
 - The suggestion touches a public / `pub(crate)` API or signature.
 - The suggestion touches a `#[cfg(test)]` module, a test, or a feature gate.
@@ -926,6 +940,9 @@ or in a downstream crate. Use the full gate when **any** of these is true:
 (cd "$WT" && cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare \
           && cargo clippy-cloudflare-wasm && cargo clippy-spin-native && cargo clippy-spin-wasm)
 (cd "$WT" && cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin)
+# Parity suite — catches cross-adapter behavioural drift, which is the
+# likeliest failure mode when a suggestion touches trusted-server-core.
+(cd "$WT" && cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity)
 ```
 
 **JS/TS suggestions** (run from the package root in a subshell so the
@@ -1049,7 +1066,7 @@ rendered into the chat instead.
 
 #### 8a. Determine the verdict and compose the review artifact (all modes)
 
-#### Determine the review verdict
+##### Determine the review verdict
 
 A suggestion is a **proposal**, not a fix — until the author commits it, the
 finding is still open. Verdict logic therefore does not change based on
@@ -1066,7 +1083,7 @@ that matches wins:
 2. Otherwise, any non-blocking findings (🤔 ♻️ 🌱 📝 ⛏ 🏕 📌) → `COMMENT`.
 3. Otherwise (no findings, or only 👍 praise) → `APPROVE`.
 
-#### Build the review body
+##### Build the review body
 
 The body carries the **summary, index, and cross-cutting findings** — the
 inline comments carry the per-line detail and any `suggestion` blocks. Don't
@@ -1206,7 +1223,32 @@ step 10, and do not run any of the `gh api` submit/delete commands below.
 
 Use the GitHub API to submit. Handle these known issues:
 
-1. **"User can only have one pending review"**: GitHub allows exactly one
+1. **Self-review rejection**: GitHub rejects `event: "APPROVE"` and
+   `event: "REQUEST_CHANGES"` with HTTP 422 when the authenticated user is
+   the PR's author ("Can not approve your own pull request"). The agent's
+   GitHub identity is the same user, so this fires whenever the user runs
+   the agent on a PR they opened. Check **before** the pending-review
+   handling in item 2 — otherwise the user can consent to deleting their
+   draft in service of a POST that then 422s, destroying the draft with
+   nothing submitted in its place:
+
+   ```bash
+   pr_author=$(gh api "repos/IABTechLab/trusted-server/pulls/$NUMBER" \
+       --jq '.user.login')
+   viewer=$(gh api user --jq '.login')
+   if [ "$pr_author" = "$viewer" ] && [ "$EVENT" != "COMMENT" ]; then
+       ORIGINAL_EVENT="$EVENT"
+       EVENT=COMMENT
+   fi
+   ```
+
+   When downgrading, keep the signal: state the would-have-been verdict at
+   the top of the review body, e.g.
+   "**Verdict: `REQUEST_CHANGES`** _(submitted as `COMMENT` — GitHub rejects
+   self-review verdicts, and the PR author is the authenticated user)_". The
+   findings and their blocking/non-blocking grouping are unchanged.
+
+2. **"User can only have one pending review"**: GitHub allows exactly one
    draft per user per PR. Before deleting, **always check whether the pending
    review belongs to the agent's invocation or to the human running the
    agent** — the agent's GitHub identity is the same user, so a draft the
@@ -1242,6 +1284,7 @@ Use the GitHub API to submit. Handle these known issues:
        # Ask the user. Do not auto-delete — the agent's GitHub identity is
        # the same user, so a draft started in the UI is indistinguishable
        # from one a prior agent run left behind.
+       user_choice="<delete|keep>"        # from the user's answer, never defaulted
 
        case "$user_choice" in
            delete)
@@ -1282,11 +1325,11 @@ Use the GitHub API to submit. Handle these known issues:
    report `submission skipped: $SKIP_REASON` in step 10, and skip the JSON
    assembly / submit call below.
 
-2. **"Position could not be resolved"**: Use `line` + `side: "RIGHT"` instead
+3. **"Position could not be resolved"**: Use `line` + `side: "RIGHT"` instead
    of the `position` field. The `line` value is the line number in the file
    (not the diff position).
 
-3. **Large reviews**: GitHub limits inline comments. If you have more than 30
+4. **Large reviews**: GitHub limits inline comments. If you have more than 30
    comments, consolidate lower-severity findings into the review body.
 
 Submit the review in a single API call. `gh api --input <file>` reads the
