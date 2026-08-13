@@ -826,6 +826,16 @@ function runSelfTest() {
     /pull_request:[\s\S]*paths:/u,
     "the performance workflow must run automatically for relevant PR changes",
   );
+  assert.match(
+    performanceWorkflow,
+    /TSJS_PERF_HEAD_SHA: \$\{\{ github\.event_name == 'pull_request' && github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}/u,
+    "the performance workflow must bind PR evidence to the head commit rather than the synthetic merge commit",
+  );
+  assert.doesNotMatch(
+    performanceWorkflow,
+    /GITHUB_SHA: \$\{\{ github\.sha \}\}|--head-sha "\$\{\{ github\.sha \}\}"/u,
+    "the performance workflow must not attest a pull-request merge SHA as the source commit",
+  );
   assert.doesNotMatch(
     performanceWorkflow,
     /62421ee44c62f24534ea8782a46dfa5bfbcea950/u,
@@ -840,6 +850,11 @@ function runSelfTest() {
     performanceTest,
     /server\.closeAllConnections\(\)/u,
     "the browser gate must force-close Chromium keepalive connections during cleanup",
+  );
+  assert.match(
+    performanceTest,
+    /test\.setTimeout\(1_500_000\)/u,
+    "the browser gate must leave enough time to collect and write failure evidence after the 20-minute sample",
   );
   assert.match(
     performanceTest,

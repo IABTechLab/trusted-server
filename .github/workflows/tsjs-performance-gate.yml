@@ -48,6 +48,7 @@ env:
   TSJS_PERF_RUNNER_IMAGE: ubuntu-24.04
   TSJS_PERF_WORKFLOW_NAME: TSJS Performance Gate
   TSJS_PERF_WORKFLOW_FILE: .github/workflows/tsjs-performance-gate.yml
+  TSJS_PERF_HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   measure:
@@ -135,7 +136,7 @@ jobs:
         working-directory: crates/trusted-server-integration-tests/browser
         env:
           CI: "true"
-          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_SHA: ${{ env.TSJS_PERF_HEAD_SHA }}
         run: |
           config_file="$RUNNER_TEMP/tsjs-performance-playwright.config.mjs"
           printf "%s\n" \
@@ -161,7 +162,7 @@ jobs:
           node scripts/validate-tsjs-performance-evidence.mjs
           --file "$TSJS_PERF_OUTPUT"
           --evidence-id "$TSJS_EVIDENCE_ID"
-          --head-sha "${{ github.sha }}"
+          --head-sha "$TSJS_PERF_HEAD_SHA"
           --main-sha "$TSJS_PERF_MAIN_SHA"
           --mode "$TSJS_PERF_MODE"
 
