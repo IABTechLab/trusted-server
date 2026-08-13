@@ -1025,7 +1025,7 @@
     "schemaVersion": 1,
     "source": {
       "ref": "spec/aps-tsjs-resilience-design",
-      "sha": "1e783348e408bd1e4a9017ea3428ed19a67e488d"
+      "sha": "91b3533ae7c07e03fa77441e0d94f27e31965d9e"
     },
     "originalTopLevelSha256": "53f762603ad49239f1756171440be422e190cc231efafc56cf37a11e1a38ddf4",
     "roleCorrectTransferSha256": "f1d73d517e4888ef4dc3a84b34166e9aeb6a2bde99dec1c835f151f4e070f64a",
