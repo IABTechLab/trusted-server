@@ -5,7 +5,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 use trusted_server_core::tsjs::{
-    CreativeBootConfigV1, TsjsBootScriptConfigV1, prospective_tsjs_boot_controller_fragment_v1,
+    CreativeBootConfigV1, TsjsBootScriptConfigV1, prospective_tsjs_first_display_fragment_v1,
 };
 
 type DynError = Box<dyn Error + Send + Sync + 'static>;
@@ -34,7 +34,7 @@ fn run(args: &Args) -> Result<String, DynError> {
         ))
     })?;
     let ids = args.ids.iter().map(String::as_str).collect::<Vec<_>>();
-    let controller = prospective_tsjs_boot_controller_fragment_v1(
+    let controller = prospective_tsjs_first_display_fragment_v1(
         TsjsBootScriptConfigV1 {
             module_ids: &ids,
             auction_projection_json: &projection,
@@ -155,7 +155,7 @@ mod tests {
 }"#;
 
     #[test]
-    fn fixture_uses_the_prospective_controller_without_parser_time_deferred_tags() {
+    fn fixture_uses_the_size_admitted_agent_before_the_post_paint_runtime() {
         let mut projection = NamedTempFile::new().expect("should create canonical projection");
         projection
             .write_all(CANONICAL_PROJECTION.as_bytes())
@@ -179,7 +179,14 @@ mod tests {
         assert!(html.contains(r#""renderTraceOverlay":true"#));
         assert!(html.contains(r#""id":"diagnostics_presentation","phase":"deferred""#));
         assert!(html.contains(r#""id":"gpt_later","phase":"deferred""#));
+        assert!(html.contains(
+            r#""firstDisplay":{"src":"/static/tsjs=tsjs-first-display.min.js?m=0045\u0026v="#
+        ));
+        assert!(html.contains(r#""slices":["first_display","creative_initial","gpt_initial"]"#));
+        assert!(html.contains(r#""runtimeSrc":"/static/tsjs=tsjs-unified.min.js?v="#));
         assert_eq!(html.matches("<script").count(), 2);
+        assert!(html.contains(r#"<script src="/static/tsjs=tsjs-first-display.min.js?m=0045&v="#));
+        assert!(!html.contains(r#"<script src="/static/tsjs=tsjs-unified.min.js"#));
         assert!(!html.contains(r#"<script src="/static/tsjs=tsjs-gpt_later"#));
     }
 

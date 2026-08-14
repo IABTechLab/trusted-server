@@ -88,6 +88,100 @@ function nearestRank(values, percentile) {
   return ordered[Math.ceil((percentile / 100) * ordered.length) - 1];
 }
 
+function validateReferenceTransfer(value, expectedSha, expectedModel, path) {
+  exactKeys(
+    value,
+    ["sha", "artifactModel", "sources", "rawBytes", "gzipBytes", "brotliBytes"],
+    path,
+  );
+  exactString(value.sha, expectedSha, `${path}.sha`);
+  exactString(value.artifactModel, expectedModel, `${path}.artifactModel`);
+  if (!Array.isArray(value.sources)) fail(`${path}.sources must be an array`);
+  const expectedInlineEndpoints =
+    expectedModel === "legacy-main-v1"
+      ? ["inline:legacy-boot", "inline:legacy-ad-init"]
+      : ["inline:boot-controller"];
+  if (value.sources.length !== expectedInlineEndpoints.length + 1) {
+    fail(`${path}.sources has an unexpected semantic count`);
+  }
+  const endpoints = new Set();
+  const sums = { rawBytes: 0, gzipBytes: 0, brotliBytes: 0 };
+  let externalRawBytes;
+  for (const [index, source] of value.sources.entries()) {
+    const sourcePath = `${path}.sources[${index}]`;
+    exactKeys(
+      source,
+      [
+        "semanticEndpoint",
+        "delivery",
+        "rawBytes",
+        "gzipBytes",
+        "brotliBytes",
+        "sha256",
+      ],
+      sourcePath,
+    );
+    if (
+      typeof source.semanticEndpoint !== "string" ||
+      source.semanticEndpoint.length === 0 ||
+      endpoints.has(source.semanticEndpoint)
+    ) {
+      fail(`${sourcePath}.semanticEndpoint must be unique`);
+    }
+    endpoints.add(source.semanticEndpoint);
+    if (!/^[0-9a-f]{64}$/.test(source.sha256)) {
+      fail(`${sourcePath}.sha256 is invalid`);
+    }
+    if (source.delivery === "inline") {
+      if (!source.semanticEndpoint.startsWith("inline:")) {
+        fail(`${sourcePath} has a mismatched inline endpoint`);
+      }
+    } else if (source.delivery === "external") {
+      const expectedExternalEndpoint =
+        expectedModel === "release-v1"
+          ? `external:/static/tsjs=tsjs-first-display.min.js?m=0045&v=${source.sha256}`
+          : `external:/static/tsjs=tsjs-unified.min.js?v=${source.sha256}`;
+      if (source.semanticEndpoint !== expectedExternalEndpoint) {
+        fail(`${sourcePath} has a mismatched external endpoint`);
+      }
+      if (externalRawBytes !== undefined) {
+        fail(`${path} contains duplicate external transfer`);
+      }
+      externalRawBytes = source.rawBytes;
+    } else {
+      fail(`${sourcePath}.delivery is invalid`);
+    }
+    for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"]) {
+      sums[metric] += finiteNumber(source[metric], `${sourcePath}.${metric}`, {
+        integer: true,
+        minimum: 1,
+      });
+    }
+  }
+  const inlineEndpoints = [...endpoints]
+    .filter((endpoint) => endpoint.startsWith("inline:"))
+    .sort();
+  if (
+    inlineEndpoints.length !== expectedInlineEndpoints.length ||
+    inlineEndpoints.some(
+      (endpoint, index) =>
+        endpoint !== [...expectedInlineEndpoints].sort()[index],
+    )
+  ) {
+    fail(`${path} omits or mislabels an inline semantic source`);
+  }
+  if (externalRawBytes === undefined)
+    fail(`${path} omits the external transfer`);
+  for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"]) {
+    const total = finiteNumber(value[metric], `${path}.${metric}`, {
+      integer: true,
+      minimum: 1,
+    });
+    if (total !== sums[metric]) fail(`${path}.${metric} total is inconsistent`);
+  }
+  return { externalRawBytes };
+}
+
 export function validateEvidence(evidence, expected) {
   const expectedMode = expected.mode;
   if (
@@ -117,6 +211,7 @@ export function validateEvidence(evidence, expected) {
       "networkProfile",
       "marks",
       "performance",
+      "transfer",
       "heap",
       "requests",
       "assertions",
@@ -309,6 +404,46 @@ export function validateEvidence(evidence, expected) {
     fail("candidate performance p90 exceeds the paired 10% limit");
 
   exactKeys(
+    evidence.transfer,
+    ["algorithm", "mainReferenceTransfer", "candidateReferenceTransfer"],
+    "transfer",
+  );
+  exactString(
+    evidence.transfer.algorithm,
+    "semantic-tsjs-transfer-v1",
+    "transfer.algorithm",
+  );
+  const mainTransfer = validateReferenceTransfer(
+    evidence.transfer.mainReferenceTransfer,
+    expected.mainSha,
+    timing.main.artifactModel,
+    "transfer.mainReferenceTransfer",
+  );
+  const candidateTransfer = validateReferenceTransfer(
+    evidence.transfer.candidateReferenceTransfer,
+    expected.headSha,
+    timing.candidate.artifactModel,
+    "transfer.candidateReferenceTransfer",
+  );
+  if (timing.main.criticalTransferBytes !== mainTransfer.externalRawBytes) {
+    fail("main critical transfer bytes disagree with semantic transfer");
+  }
+  if (
+    timing.candidate.criticalTransferBytes !==
+    candidateTransfer.externalRawBytes
+  ) {
+    fail("candidate critical transfer bytes disagree with semantic transfer");
+  }
+  for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"]) {
+    if (
+      evidence.transfer.candidateReferenceTransfer[metric] >
+      evidence.transfer.mainReferenceTransfer[metric]
+    ) {
+      fail(`candidate reference ${metric} exceeds current main`);
+    }
+  }
+
+  exactKeys(
     evidence.heap,
     ["collection", "maximumRatio", "hardCeilingBytes", "main", "candidate"],
     "heap",
@@ -496,19 +631,80 @@ function validFixture() {
           main: {
             sha: mainSha,
             artifactModel: "legacy-main-v1",
-            criticalTransferBytes: 82_000,
+            criticalTransferBytes: 80_000,
             samples: mainSamples,
             p90: 200,
           },
           candidate: {
             artifactModel: "release-v1",
-            criticalTransferBytes: 220_000,
+            criticalTransferBytes: 79_000,
             samples: candidateSamples,
             p90: 210,
           },
           percentile: 90,
           maximumRatio: 1.1,
           observedRatio: 210 / 200,
+        },
+      },
+      transfer: {
+        algorithm: "semantic-tsjs-transfer-v1",
+        mainReferenceTransfer: {
+          sha: mainSha,
+          artifactModel: "legacy-main-v1",
+          sources: [
+            {
+              semanticEndpoint: "inline:legacy-boot",
+              delivery: "inline",
+              rawBytes: 1_000,
+              gzipBytes: 400,
+              brotliBytes: 300,
+              sha256: "1".repeat(64),
+            },
+            {
+              semanticEndpoint: "inline:legacy-ad-init",
+              delivery: "inline",
+              rawBytes: 200,
+              gzipBytes: 100,
+              brotliBytes: 80,
+              sha256: "2".repeat(64),
+            },
+            {
+              semanticEndpoint: `external:/static/tsjs=tsjs-unified.min.js?v=${"3".repeat(64)}`,
+              delivery: "external",
+              rawBytes: 80_000,
+              gzipBytes: 20_000,
+              brotliBytes: 15_000,
+              sha256: "3".repeat(64),
+            },
+          ],
+          rawBytes: 81_200,
+          gzipBytes: 20_500,
+          brotliBytes: 15_380,
+        },
+        candidateReferenceTransfer: {
+          sha: headSha,
+          artifactModel: "release-v1",
+          sources: [
+            {
+              semanticEndpoint: "inline:boot-controller",
+              delivery: "inline",
+              rawBytes: 1_000,
+              gzipBytes: 400,
+              brotliBytes: 300,
+              sha256: "4".repeat(64),
+            },
+            {
+              semanticEndpoint: `external:/static/tsjs=tsjs-first-display.min.js?m=0045&v=${"5".repeat(64)}`,
+              delivery: "external",
+              rawBytes: 79_000,
+              gzipBytes: 19_000,
+              brotliBytes: 14_000,
+              sha256: "5".repeat(64),
+            },
+          ],
+          rawBytes: 80_000,
+          gzipBytes: 19_400,
+          brotliBytes: 14_300,
         },
       },
       heap: {
@@ -556,6 +752,21 @@ function validFixture() {
 function runSelfTest() {
   const fixture = validFixture();
   validateEvidence(fixture.evidence, fixture.expected);
+  const releaseMainFixture = structuredClone(fixture.evidence);
+  releaseMainFixture.performance.requestToFirstActionMs.main.artifactModel =
+    "release-v1";
+  releaseMainFixture.transfer.mainReferenceTransfer.artifactModel =
+    "release-v1";
+  const removedLegacyInit =
+    releaseMainFixture.transfer.mainReferenceTransfer.sources.splice(1, 1)[0];
+  releaseMainFixture.transfer.mainReferenceTransfer.sources[0].semanticEndpoint =
+    "inline:boot-controller";
+  releaseMainFixture.transfer.mainReferenceTransfer.sources[1].semanticEndpoint = `external:/static/tsjs=tsjs-first-display.min.js?m=0045&v=${"3".repeat(64)}`;
+  for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"]) {
+    releaseMainFixture.transfer.mainReferenceTransfer[metric] -=
+      removedLegacyInit[metric];
+  }
+  validateEvidence(releaseMainFixture, fixture.expected);
   const mutations = [
     ["evidence id", (value) => (value.evidenceId = "wrong-evidence")],
     ["head SHA", (value) => (value.headSha = "b".repeat(40))],
@@ -591,6 +802,90 @@ function runSelfTest() {
       "main transfer bytes",
       (value) =>
         (value.performance.requestToFirstActionMs.main.criticalTransferBytes = 0),
+    ],
+    [
+      "stale transfer main SHA",
+      (value) => (value.transfer.mainReferenceTransfer.sha = "b".repeat(40)),
+    ],
+    [
+      "stale transfer candidate SHA",
+      (value) =>
+        (value.transfer.candidateReferenceTransfer.sha = "b".repeat(40)),
+    ],
+    [
+      "omitted inline source",
+      (value) => {
+        const removed =
+          value.transfer.candidateReferenceTransfer.sources.shift();
+        for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"]) {
+          value.transfer.candidateReferenceTransfer[metric] -= removed[metric];
+        }
+      },
+    ],
+    [
+      "duplicate transfer source",
+      (value) => {
+        const duplicate = structuredClone(
+          value.transfer.candidateReferenceTransfer.sources[0],
+        );
+        value.transfer.candidateReferenceTransfer.sources.push(duplicate);
+        for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"]) {
+          value.transfer.candidateReferenceTransfer[metric] +=
+            duplicate[metric];
+        }
+      },
+    ],
+    [
+      "mismatched semantic endpoint",
+      (value) => {
+        value.transfer.candidateReferenceTransfer.sources[1].semanticEndpoint = `external:/wrong?v=${"5".repeat(64)}`;
+      },
+    ],
+    [
+      "mismatched first-display mask",
+      (value) => {
+        value.transfer.candidateReferenceTransfer.sources[1].semanticEndpoint = `external:/static/tsjs=tsjs-first-display.min.js?m=0047&v=${"5".repeat(64)}`;
+      },
+    ],
+    [
+      "inconsistent transfer total",
+      (value) => (value.transfer.candidateReferenceTransfer.rawBytes += 1),
+    ],
+    [
+      "one-byte raw regression",
+      (value) => {
+        const transfer = value.transfer.candidateReferenceTransfer;
+        const increase =
+          value.transfer.mainReferenceTransfer.rawBytes - transfer.rawBytes + 1;
+        transfer.sources[1].rawBytes += increase;
+        transfer.rawBytes += increase;
+        value.performance.requestToFirstActionMs.candidate.criticalTransferBytes +=
+          increase;
+      },
+    ],
+    [
+      "one-byte gzip regression",
+      (value) => {
+        const transfer = value.transfer.candidateReferenceTransfer;
+        const increase =
+          value.transfer.mainReferenceTransfer.gzipBytes -
+          transfer.gzipBytes +
+          1;
+        transfer.sources[1].gzipBytes += increase;
+        transfer.gzipBytes += increase;
+      },
+    ],
+    [
+      "one-byte Brotli regression",
+      (value) => {
+        const transfer = value.transfer.candidateReferenceTransfer;
+        const increase =
+          value.transfer.mainReferenceTransfer.brotliBytes -
+          transfer.brotliBytes +
+          1;
+        transfer.sources[1].brotliBytes += increase;
+        transfer.brotliBytes += increase;
+      },
     ],
     ["percentile", (value) => (value.sampling.percentile = 95)],
     ["real marks", (value) => (value.marks.source = "synthetic")],
@@ -705,6 +1000,15 @@ function runSelfTest() {
     /invalid TSJS performance evidence/u,
     "duplicate CLI bindings must be rejected rather than overwritten",
   );
+  assert.throws(
+    () =>
+      validateEvidence(fixture.evidence, {
+        ...fixture.expected,
+        mainSha: undefined,
+      }),
+    /invalid TSJS performance evidence/u,
+    "missing current-main identity must make the relative comparison unavailable",
+  );
   const repositoryRoot = new URL("../", import.meta.url);
   const performanceTest = readFileSync(
     new URL(
@@ -744,6 +1048,16 @@ function runSelfTest() {
     performanceTest,
     /generate-tsjs-prospective-fixture/u,
     "the browser gate must consume the generated prospective server controller",
+  );
+  assert.match(
+    performanceTest,
+    /tsjs-first-display\.min\.js\?m=0045&v=/u,
+    "the release-v1 semantic transfer must measure the exact admitted reference agent",
+  );
+  assert.match(
+    generatorSource,
+    /prospective_tsjs_first_display_fragment_v1/u,
+    "the prospective server fixture must emit the admitted first-display transport",
   );
   assert.match(
     performanceTest,
@@ -813,8 +1127,29 @@ function runSelfTest() {
   );
   assert.match(
     performanceTest,
-    /criticalTransferBytes: mainResources\.criticalTransferBytes[\s\S]*criticalTransferBytes: candidateResources\.criticalTransferBytes/u,
-    "the evidence must record each variant's exact served critical bytes",
+    /mainReferenceTransfer:[\s\S]*mainResources\.referenceTransfer[\s\S]*candidateReferenceTransfer:[\s\S]*candidateResources\.referenceTransfer/u,
+    "the evidence must record both exact semantic reference transfers",
+  );
+  assert.match(
+    performanceTest,
+    /import \{ measureBytes \} from "\.\.\/\.\.\/\.\.\/\.\.\/trusted-server-js\/lib\/scripts\/bundle-metrics\.mjs"/u,
+    "the browser gate must share the bundle gate's frozen compression implementation",
+  );
+  for (const endpoint of [
+    "inline:legacy-boot",
+    "inline:legacy-ad-init",
+    "inline:boot-controller",
+    "external:${criticalSrc}",
+  ]) {
+    assert.ok(
+      performanceTest.includes(endpoint),
+      `the browser gate must count semantic endpoint ${endpoint}`,
+    );
+  }
+  assert.match(
+    performanceTest,
+    /candidateResources\.referenceTransfer\[metric\][\s\S]*mainResources\.referenceTransfer\[metric\]/u,
+    "the browser gate must softly collect all evidence while enforcing every transfer encoding",
   );
   assert.match(
     performanceWorkflow,
@@ -825,6 +1160,23 @@ function runSelfTest() {
     performanceWorkflow,
     /pull_request:[\s\S]*paths:/u,
     "the performance workflow must run automatically for relevant PR changes",
+  );
+  for (const path of [
+    "crates/trusted-server-core/src/auction/**",
+    "crates/trusted-server-core/src/html_processor.rs",
+    "crates/trusted-server-core/src/publisher.rs",
+    "crates/trusted-server-core/src/tsjs.rs",
+    "crates/trusted-server-integration-tests/src/bin/generate-tsjs-prospective-fixture.rs",
+  ]) {
+    assert.ok(
+      performanceWorkflow.includes(`- \"${path}\"`),
+      `the performance workflow must run when ${path} changes`,
+    );
+  }
+  assert.match(
+    performanceWorkflow,
+    /validate-tsjs-performance-evidence\.mjs --self-test/u,
+    "the performance workflow must execute transfer/schema negative fixtures before measurement",
   );
   assert.match(
     performanceWorkflow,
