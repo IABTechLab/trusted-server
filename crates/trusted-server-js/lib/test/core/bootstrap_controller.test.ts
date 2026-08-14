@@ -161,9 +161,7 @@ describe('first-display bootstrap controller', () => {
     expect(
       Reflect.apply(sink, target, [
         Object.freeze({
-          ...component('first_display', 1, () =>
-            Object.freeze({ activate: () => undefined })
-          ),
+          ...component('first_display', 1, () => Object.freeze({ activate: () => undefined })),
           releaseId: 'b'.repeat(64),
         }),
         script,

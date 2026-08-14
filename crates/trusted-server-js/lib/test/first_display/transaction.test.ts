@@ -84,11 +84,7 @@ describe('release-private first-display transaction', () => {
     transaction.register({
       ...registration('first_display', 1),
       prepare: () => ({
-        activate: ({
-          afterActivate,
-        }: {
-          afterActivate: (callback: () => void) => void;
-        }) => {
+        activate: ({ afterActivate }: { afterActivate: (callback: () => void) => void }) => {
           events.push('activate-base');
           afterActivate(() => events.push('start-action'));
         },

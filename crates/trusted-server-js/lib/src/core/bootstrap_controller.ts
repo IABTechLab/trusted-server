@@ -29,11 +29,7 @@ export interface BootstrapController {
   readonly fail: (reason: BootFailureReason) => boolean;
 }
 
-export type FirstDisplayArtifactControllerState =
-  | 'collecting'
-  | 'active'
-  | 'failed'
-  | 'disposed';
+export type FirstDisplayArtifactControllerState = 'collecting' | 'active' | 'failed' | 'disposed';
 
 export interface FirstDisplayArtifactControllerOptions {
   readonly bootstrap: BootstrapController;

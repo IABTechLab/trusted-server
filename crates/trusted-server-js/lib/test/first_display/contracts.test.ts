@@ -217,10 +217,7 @@ describe('first-display immutable contracts', () => {
   });
 
   it('enforces the exact 512 KiB diagnostics subsection boundary', () => {
-    const exactFacts = [
-      ...Array.from({ length: 127 }, () => 'x'.repeat(4096)),
-      'x'.repeat(3711),
-    ];
+    const exactFacts = [...Array.from({ length: 127 }, () => 'x'.repeat(4096)), 'x'.repeat(3711)];
     expect(new TextEncoder().encode(JSON.stringify(exactFacts))).toHaveLength(MAX_GPT_FACT_BYTES);
     expect(snapshotFirstDisplayHandoffV1(handoff({ gptFacts: exactFacts }))).toBeDefined();
     exactFacts[127] += 'x';
@@ -251,10 +248,7 @@ describe('first-display immutable contracts', () => {
       aliases: [],
       domId: `div-${slotIndex}`,
       gptToken: null,
-      targeting: Array.from({ length: 32 }, (_, targetingIndex) => [
-        `k${targetingIndex}`,
-        '',
-      ]),
+      targeting: Array.from({ length: 32 }, (_, targetingIndex) => [`k${targetingIndex}`, '']),
     }));
     const encoder = new TextEncoder();
     let remaining =
@@ -275,7 +269,9 @@ describe('first-display immutable contracts', () => {
     );
     expect(snapshotFirstDisplayHandoffV1(base)).toBeDefined();
 
-    const firstPair = ((base.slots as Array<Record<string, unknown>>)[0]!.targeting as string[][])[0]!;
+    const firstPair = (
+      (base.slots as Array<Record<string, unknown>>)[0]!.targeting as string[][]
+    )[0]!;
     firstPair[1] += 'x';
     expect(snapshotFirstDisplayHandoffV1(base)).toBeUndefined();
     firstPair[1] = firstPair[1]!.slice(0, -2);

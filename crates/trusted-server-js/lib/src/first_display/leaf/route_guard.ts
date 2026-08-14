@@ -1,11 +1,6 @@
 import type { FirstDisplaySliceActivationContext } from '../transaction';
 
-export type FirstDisplayRouteKindV1 =
-  | 'script'
-  | 'preload'
-  | 'prefetch'
-  | 'beacon'
-  | 'fetch';
+export type FirstDisplayRouteKindV1 = 'script' | 'preload' | 'prefetch' | 'beacon' | 'fetch';
 
 export interface FirstDisplayRouteRuleV1 {
   readonly id: 'datadome' | 'google_tag_manager' | 'lockr';
@@ -44,7 +39,10 @@ const GTM_KINDS = new Set<FirstDisplayRouteKindV1>([
   'fetch',
 ]);
 
-function exactBindings(candidate: unknown, keys: readonly string[]): Record<string, unknown> | undefined {
+function exactBindings(
+  candidate: unknown,
+  keys: readonly string[]
+): Record<string, unknown> | undefined {
   try {
     if (
       typeof candidate !== 'object' ||
@@ -163,9 +161,7 @@ function isLockrUrl(url: string): boolean {
   const lower = url.toLowerCase();
   return (
     lower.includes('aim.loc.kr') ||
-    (lower.includes('identity.loc.kr') &&
-      lower.includes('identity-lockr') &&
-      lower.endsWith('.js'))
+    (lower.includes('identity.loc.kr') && lower.includes('identity-lockr') && lower.endsWith('.js'))
   );
 }
 

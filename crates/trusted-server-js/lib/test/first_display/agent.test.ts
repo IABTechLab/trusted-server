@@ -148,10 +148,7 @@ describe('bounded first-display agent', () => {
     let action: (() => boolean) | undefined;
     const events: string[] = [];
     const ownedDriver: FirstDisplayDriver = Object.freeze({
-      start: (
-        _outcomes: readonly FirstDisplayBatchOutcomeV1[],
-        onFirstAction: () => boolean
-      ) => {
+      start: (_outcomes: readonly FirstDisplayBatchOutcomeV1[], onFirstAction: () => boolean) => {
         events.push('driver:prepared');
         action = onFirstAction;
       },
@@ -183,10 +180,7 @@ describe('bounded first-display agent', () => {
       batch: batch(['aps']),
       bootstrap: late.bootstrap,
       driver: Object.freeze({
-        start: (
-          _outcomes: readonly FirstDisplayBatchOutcomeV1[],
-          onFirstAction: () => boolean
-        ) => {
+        start: (_outcomes: readonly FirstDisplayBatchOutcomeV1[], onFirstAction: () => boolean) => {
           lateAction = onFirstAction;
         },
         sealTsAdmission: () => undefined,

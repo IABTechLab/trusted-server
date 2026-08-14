@@ -43,7 +43,9 @@ function validHost(host: FirstDisplaySliceHost): boolean {
     const keys = Reflect.ownKeys(host);
     if (keys.length !== 1 || keys[0] !== 'activate') return false;
     const descriptor = Object.getOwnPropertyDescriptor(host, 'activate');
-    return Boolean(descriptor?.enumerable && 'value' in descriptor && typeof descriptor.value === 'function');
+    return Boolean(
+      descriptor?.enumerable && 'value' in descriptor && typeof descriptor.value === 'function'
+    );
   } catch {
     return false;
   }

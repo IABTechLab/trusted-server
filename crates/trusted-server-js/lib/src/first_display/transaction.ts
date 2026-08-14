@@ -1,7 +1,4 @@
-import {
-  FIRST_DISPLAY_CATALOG,
-  type FirstDisplaySliceId,
-} from '../kernel/release_catalog';
+import { FIRST_DISPLAY_CATALOG, type FirstDisplaySliceId } from '../kernel/release_catalog';
 
 const HASH = /^[0-9a-f]{64}$/;
 const FIRST_DISPLAY_SRC =

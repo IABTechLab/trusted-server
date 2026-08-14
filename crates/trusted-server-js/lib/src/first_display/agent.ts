@@ -5,9 +5,7 @@ import {
   firstDisplayComponentRegistration,
   registerCurrentFirstDisplayComponent,
 } from './registration';
-import type {
-  FirstDisplaySliceActivationContext,
-} from './transaction';
+import type { FirstDisplaySliceActivationContext } from './transaction';
 import type {
   FirstDisplaySliceHost,
   InitialSliceInstaller,

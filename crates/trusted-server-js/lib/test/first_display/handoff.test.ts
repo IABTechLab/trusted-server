@@ -4,7 +4,10 @@ import { createFirstDisplayHandoffOwner } from '../../src/first_display/handoff'
 
 const RELEASE_ID = 'a'.repeat(64);
 
-function handoff(revision: number, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+function handoff(
+  revision: number,
+  overrides: Record<string, unknown> = {}
+): Record<string, unknown> {
   return {
     version: 1,
     releaseId: RELEASE_ID,
