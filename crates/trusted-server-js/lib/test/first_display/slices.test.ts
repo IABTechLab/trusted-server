@@ -20,9 +20,18 @@ import { TESTLIGHT_INITIAL_SLICE } from '../../src/first_display/slices/testligh
 import type { FirstDisplayRouteRuleV1 } from '../../src/first_display/leaf/route_guard';
 import { installDidomiInitial } from '../../src/first_display/leaf/config_guard';
 import type { FirstDisplayCreativeGuardV1 } from '../../src/first_display/leaf/creative_guard';
-import type { FirstDisplayApsProtocolV1 } from '../../src/first_display/leaf/aps_protocol';
-import type { FirstDisplayGptProtocolV1 } from '../../src/first_display/leaf/gpt_protocol';
-import type { FirstDisplayPrebidProtocolV1 } from '../../src/first_display/leaf/prebid_protocol';
+import {
+  installApsInitial,
+  type FirstDisplayApsProtocolV1,
+} from '../../src/first_display/leaf/aps_protocol';
+import {
+  installGptInitial,
+  type FirstDisplayGptProtocolV1,
+} from '../../src/first_display/leaf/gpt_protocol';
+import {
+  installPrebidInitial,
+  type FirstDisplayPrebidProtocolV1,
+} from '../../src/first_display/leaf/prebid_protocol';
 import {
   installPermutiveInitial,
   snapshotPermutiveInitialSegments,
@@ -70,6 +79,40 @@ function componentRegistration(): FirstDisplayComponentRegistrationV1 {
 }
 
 describe('first-display initial slice definitions', () => {
+  it('returns exact protocol activation receipts while registering full protocols', () => {
+    const own = vi.fn();
+    const register = vi.fn((_protocol: object) => () => undefined);
+    const observe = vi.fn();
+
+    const receipts = [
+      installApsInitial(
+        Object.freeze({
+          observe,
+          publisherOrigin: 'https://publisher.example',
+          register,
+        }),
+        own
+      ),
+      installGptInitial(Object.freeze({ observe, register }), own),
+      installPrebidInitial(Object.freeze({ observe, register }), own),
+    ];
+
+    expect(receipts).toEqual([
+      { version: 1, id: 'aps' },
+      { version: 1, id: 'gpt' },
+      { version: 1, id: 'prebid' },
+    ]);
+    for (const receipt of receipts) {
+      expect(Reflect.ownKeys(receipt)).toEqual(['version', 'id']);
+      expect(Object.isFrozen(receipt)).toBe(true);
+    }
+    expect(register).toHaveBeenCalledTimes(3);
+    for (const [protocol] of register.mock.calls) {
+      expect(Reflect.ownKeys(protocol).length).toBeGreaterThan(2);
+      expect(Object.isFrozen(protocol)).toBe(true);
+    }
+  });
+
   it('pins the exact twelve optional slices in build order', () => {
     expect(INITIAL_SLICE_DEFINITIONS.map(({ id }) => id)).toEqual([
       'aps_initial',

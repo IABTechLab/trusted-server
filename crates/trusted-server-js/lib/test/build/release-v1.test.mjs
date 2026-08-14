@@ -293,6 +293,96 @@ test('generated first-display components self-register through one authenticated
       assert.deepEqual(Reflect.ownKeys(prepared), ['activate']);
       assert.equal(Object.isFrozen(prepared), true);
     }
+
+    dom.window.eval(`
+      window.__firstDisplayEvents = [];
+      window.__firstDisplayDisposers = [];
+      window.__firstDisplayAfterActivate = undefined;
+      window.__firstDisplayBaseHost = Object.freeze({
+        options: Object.freeze({
+          batch: Object.freeze({
+            version: 1,
+            projectionDigest: '${'c'.repeat(64)}',
+            requiredProtocols: Object.freeze(['aps', 'gpt']),
+            outcomes: Object.freeze([Object.freeze({slotId: 'slot-1', kind: 'aps'})])
+          }),
+          bootstrap: Object.freeze({
+            get state() { return 'agent_registered'; },
+            registerAgent: function() {
+              window.__firstDisplayEvents.push('bootstrap:register');
+              return true;
+            },
+            startAction: function() {
+              window.__firstDisplayEvents.push('bootstrap:action');
+              return true;
+            },
+            settle: function() { return true; },
+            fail: function() { return true; }
+          }),
+          driver: Object.freeze({
+            start: function(_outcomes, onFirstAction) {
+              window.__firstDisplayEvents.push('driver:start');
+              onFirstAction();
+            },
+            sealTsAdmission: function() {},
+            dispose: function() {}
+          }),
+          performance: Object.freeze({mark: function() {}}),
+          paint: Object.freeze({
+            hidden: function() { return false; },
+            requestFrame: function() {},
+            scheduleHidden: function() {}
+          }),
+          onProtectedPaint: function() {},
+          onFailure: function() {}
+        }),
+        sliceBindings: function(id) {
+          if (id === 'aps_initial') {
+            return Object.freeze({
+              observe: function() {},
+              publisherOrigin: 'https://publisher.example',
+              register: function(protocol) {
+                window.__firstDisplayEvents.push('aps:' + protocol.id);
+                return function() {};
+              }
+            });
+          }
+          if (id === 'gpt_initial') {
+            return Object.freeze({
+              observe: function() {},
+              register: function(protocol) {
+                window.__firstDisplayEvents.push('gpt:' + protocol.id);
+                return function() {};
+              }
+            });
+          }
+          return undefined;
+        }
+      });
+      window.__firstDisplayActivation = Object.freeze({
+        own: function(dispose) { window.__firstDisplayDisposers.push(dispose); },
+        afterActivate: function(callback) { window.__firstDisplayAfterActivate = callback; }
+      });
+      window.__firstDisplaySliceActivation = Object.freeze({
+        own: function(dispose) { window.__firstDisplayDisposers.push(dispose); },
+        afterActivate: function() { throw new Error('optional slice cannot start the agent'); }
+      });
+    `);
+    const activatedBase = registrations[0].prepare(dom.window.__firstDisplayBaseHost);
+    const activatedAps = registrations
+      .find(({ id }) => id === 'aps_initial')
+      .prepare(activatedBase.sliceHost);
+    const activatedGpt = registrations
+      .find(({ id }) => id === 'gpt_initial')
+      .prepare(activatedBase.sliceHost);
+    activatedBase.activate(dom.window.__firstDisplayActivation);
+    activatedAps.activate(dom.window.__firstDisplaySliceActivation);
+    activatedGpt.activate(dom.window.__firstDisplaySliceActivation);
+    dom.window.__firstDisplayAfterActivate();
+    assert.deepEqual(
+      [...dom.window.__firstDisplayEvents],
+      ['aps:aps', 'gpt:gpt', 'bootstrap:register', 'driver:start', 'bootstrap:action']
+    );
   } finally {
     dom.window.close();
   }
