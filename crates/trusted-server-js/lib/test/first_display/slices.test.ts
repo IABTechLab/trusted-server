@@ -6,7 +6,11 @@ import {
   selectInitialSliceDefinitions,
 } from '../../src/first_display/composition';
 import { DIDOMI_INITIAL_SLICE } from '../../src/first_display/slices/didomi';
+import { DATADOME_INITIAL_SLICE } from '../../src/first_display/slices/datadome';
+import { GOOGLE_TAG_MANAGER_INITIAL_SLICE } from '../../src/first_display/slices/google_tag_manager';
+import { LOCKR_INITIAL_SLICE } from '../../src/first_display/slices/lockr';
 import { TESTLIGHT_INITIAL_SLICE } from '../../src/first_display/slices/testlight';
+import type { FirstDisplayRouteRuleV1 } from '../../src/first_display/leaf/route_guard';
 import { installDidomiInitial } from '../../src/first_display/leaf/config_guard';
 import {
   registerFirstDisplayComponent,
@@ -353,5 +357,130 @@ describe('first-display initial slice definitions', () => {
 
     disposers.reverse().forEach((dispose) => dispose());
     expect(target.testlight).toEqual({ publisher: true, que: original });
+  });
+
+  it('registers exact DataDome and GTM route matchers with first-party path preservation', () => {
+    const cases = [
+      {
+        definition: DATADOME_INITIAL_SLICE,
+        id: 'datadome',
+        accepted: [
+          ['script', 'https://js.datadome.co/tags.js?x=1'],
+          ['preload', '//js.datadome.co/js/check'],
+        ],
+        rejected: [
+          ['script', 'https://cdn.example/js.datadome.co.js'],
+          ['beacon', 'https://js.datadome.co/tags.js'],
+        ],
+        rewritten:
+          'https://publisher.example/integrations/datadome/tags.js?x=1',
+      },
+      {
+        definition: GOOGLE_TAG_MANAGER_INITIAL_SLICE,
+        id: 'google_tag_manager',
+        accepted: [
+          ['script', 'https://www.googletagmanager.com/gtm.js?id=GTM-1'],
+          ['fetch', 'https://www.google-analytics.com/g/collect?v=2'],
+          ['beacon', 'https://analytics.google.com/collect?v=2'],
+        ],
+        rejected: [
+          ['script', 'https://googletagmanager.com/gtm.js'],
+          ['script', 'https://www.googletagmanager.com/ns.html'],
+        ],
+        rewritten:
+          'https://publisher.example/integrations/google_tag_manager/gtm.js?id=GTM-1',
+      },
+    ] as const;
+
+    for (const fixture of cases) {
+      let rule: FirstDisplayRouteRuleV1 | undefined;
+      const dispose = vi.fn();
+      const disposers: Array<() => void> = [];
+      const host = Object.freeze({
+        activate: (
+          _id: string,
+          own: (release: () => void) => void,
+          install?: (candidate: unknown, ownEffect: (release: () => void) => void) => void
+        ) =>
+          install?.(
+            Object.freeze({
+              observe: () => undefined,
+              origin: 'https://publisher.example',
+              register: (candidate: FirstDisplayRouteRuleV1) => {
+                rule = candidate;
+                return dispose;
+              },
+            }),
+            own
+          ),
+      });
+      fixture.definition.prepare(host).activate(
+        Object.freeze({
+          own: (release: () => void) => disposers.push(release),
+          afterActivate: () => undefined,
+        })
+      );
+      expect(rule?.id).toBe(fixture.id);
+      for (const [kind, url] of fixture.accepted) expect(rule?.matches(kind, url)).toBe(true);
+      for (const [kind, url] of fixture.rejected) expect(rule?.matches(kind, url)).toBe(false);
+      expect(rule?.rewrite(fixture.accepted[0][1])).toBe(fixture.rewritten);
+      disposers.reverse().forEach((release) => release());
+      expect(dispose).toHaveBeenCalledOnce();
+    }
+  });
+
+  it('owns Lockr route matching and the bounded initial SDK host rewrite', () => {
+    const sdk = { host: 'https://identity.loc.kr' };
+    const timers: Array<() => void> = [];
+    const disposers: Array<() => void> = [];
+    let rule: FirstDisplayRouteRuleV1 | undefined;
+    const unregister = vi.fn();
+    const observations: Array<readonly [string, string | number]> = [];
+    const bindings = Object.freeze({
+      clearTimer: (handle: unknown) => {
+        const index = timers.indexOf(handle as () => void);
+        if (index >= 0) timers.splice(index, 1);
+      },
+      getSdk: () => sdk,
+      host: 'publisher.example',
+      observe: (name: string, value: string | number) => observations.push([name, value]),
+      origin: 'https://publisher.example',
+      protocol: 'https:',
+      register: (candidate: FirstDisplayRouteRuleV1) => {
+        rule = candidate;
+        return unregister;
+      },
+      setTimer: (callback: () => void) => {
+        timers.push(callback);
+        return callback;
+      },
+    });
+    const host = Object.freeze({
+      activate: (
+        _id: string,
+        own: (release: () => void) => void,
+        install?: (candidate: unknown, ownEffect: (release: () => void) => void) => void
+      ) => install?.(bindings, own),
+    });
+
+    LOCKR_INITIAL_SLICE.prepare(host).activate(
+      Object.freeze({
+        own: (release: () => void) => disposers.push(release),
+        afterActivate: () => undefined,
+      })
+    );
+    expect(rule?.matches('script', 'https://aim.loc.kr/sdk.js')).toBe(true);
+    expect(rule?.matches('preload', 'https://identity.loc.kr/identity-lockr.js')).toBe(true);
+    expect(rule?.matches('script', 'https://identity.loc.kr/other.js')).toBe(false);
+    expect(rule?.rewrite('https://aim.loc.kr/sdk.js')).toBe(
+      'https://publisher.example/integrations/lockr/sdk'
+    );
+    expect(sdk.host).toBe('https://publisher.example/integrations/lockr/api');
+    expect(observations).toContainEqual(['sdk_host', sdk.host]);
+
+    disposers.reverse().forEach((release) => release());
+    expect(sdk.host).toBe('https://identity.loc.kr');
+    expect(unregister).toHaveBeenCalledOnce();
+    expect(timers).toEqual([]);
   });
 });
