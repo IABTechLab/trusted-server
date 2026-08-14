@@ -39,8 +39,6 @@ const CLASSIFICATION_KEYS = [
 const RETIRED_SOURCE_REFERENCE = /(?:rc[/-]july|905984e62a0858c53d9f0ff6dd3a1bf190cf311d)/i;
 const EXECUTABLE_SHELL_FENCE =
   /^ {0,3}```(?:bash|sh|shell)(?:[ \t][^\n]*)?\r?\n([\s\S]*?)^ {0,3}```[ \t]*$/gim;
-const OUTPUT_ONLY_INFORMATIONAL_COMMAND =
-  /^(?:echo\b|printf\s+(?:'[^']*'|"(?:[^"\\]|\\.)*")(?=\s|$))/i;
 const ALLOWED_RETIRED_RENAMES = new Set([
   'git mv crates/trusted-server-js/lib/scripts/check-rc-july-adoption.mjs crates/trusted-server-js/lib/scripts/check-retired-concept-audit.mjs',
   'git mv crates/trusted-server-js/lib/test/contract/rc-july-adoption.test.mjs crates/trusted-server-js/lib/test/contract/retired-concept-audit.test.mjs',
@@ -65,27 +63,15 @@ function isAllowedRetiredRename(command) {
   return ALLOWED_RETIRED_RENAMES.has(command.trim().replace(/\s+/g, ' '));
 }
 
-function isNonExecutingInformationalCommand(command) {
-  return (
-    OUTPUT_ONLY_INFORMATIONAL_COMMAND.test(command) &&
-    !/\$\(|`|[|<>&;]|\b(?:eval|bash|sh|shell|zsh)\b/i.test(command)
-  );
-}
-
-/** Return executable shell commands that attempt to resolve the retired source. */
+/** Return shell-fence logical lines containing a retired source reference. */
 export function auditRetiredPlanCommands(planSource) {
   const violations = [];
   for (const [fenceIndex, match] of [...planSource.matchAll(EXECUTABLE_SHELL_FENCE)].entries()) {
-    const executable = match[1]
-      .split('\n')
-      .filter((line) => !/^\s*#/.test(line))
-      .join('\n')
-      .replace(/\\\r?\n/g, ' ');
+    const executable = match[1].replace(/\\\r?\n/g, ' ');
     for (const command of executable.split(/\r?\n/)) {
       const trimmed = command.trim();
       if (
         trimmed.length === 0 ||
-        isNonExecutingInformationalCommand(trimmed) ||
         !RETIRED_SOURCE_REFERENCE.test(trimmed) ||
         isAllowedRetiredRename(trimmed)
       ) {
