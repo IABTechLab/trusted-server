@@ -10,6 +10,7 @@ import { createFirstDisplayProjectedDriver, type FirstDisplayRenderBridgeV1 } fr
 import type { FirstDisplayApsProtocolV1 } from './leaf/aps_protocol';
 import type { FirstDisplayGptProtocolV1 } from './leaf/gpt_protocol';
 import {
+  captureMutationObservedBindings,
   firstDisplayComponentRegistration,
   registerCurrentFirstDisplayComponent,
 } from './registration';
@@ -97,6 +98,7 @@ export interface FirstDisplayAgentOptions {
   readonly onProtectedPaint: () => void;
   readonly onFailure: (reason: BootFailureReason) => void;
   readonly onPrebidAdmissionFailure?: (reason: 'prebid_admission_failed') => void;
+  readonly mutationDocument?: Document;
   readonly initialMutationRevision?: number;
   readonly now?: () => number;
   readonly handoff?: Readonly<{
@@ -110,7 +112,7 @@ export interface FirstDisplayAgentOptions {
 export interface FirstDisplayAgentRegistrationHostV1 {
   readonly options: Omit<FirstDisplayAgentOptions, 'driver'> &
     Readonly<{
-      gptInput: Omit<FirstDisplayGoogletagBatchInput, 'projection'>;
+      gptInput: Omit<FirstDisplayGoogletagBatchInput, 'onNativeMutation' | 'projection'>;
       onAgentReady?: (agent: FirstDisplayAgent) => void;
     }>;
   readonly sliceBindings: (id: string) => unknown;
@@ -298,6 +300,7 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
   private readonly pending = new Set<string>();
   private readonly handoffOwner: FirstDisplayHandoffOwner | undefined;
   private stateValue: FirstDisplayAgentState = 'ready';
+  private mutationObserver: MutationObserver | undefined;
   private mutationRevision: number;
   private initialDisplayCommitted = false;
   private sealed = false;
@@ -327,12 +330,14 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
             if (!this.options.driver.closeIngress()) {
               throw new TypeError('first-display ingress did not close');
             }
+            this.closeNativeMutationIngress();
           },
           onFailure: (reason) => {
             this.fail(reason);
           },
         })
       : undefined;
+    this.installNativeMutationIngress();
   }
 
   public get state(): FirstDisplayAgentState {
@@ -725,10 +730,72 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
   private disposeDriver(): void {
     if (this.disposedDriver) return;
     this.disposedDriver = true;
+    this.disposeNativeMutationIngress();
     try {
       this.options.driver.dispose();
     } catch {
       // Disposal is generation-latched; physical cleanup failure cannot restore authority.
+    }
+  }
+
+  private installNativeMutationIngress(): void {
+    if (!this.handoffOwner || !this.options.mutationDocument) return;
+    try {
+      const document = this.options.mutationDocument;
+      const Observer = document.defaultView?.MutationObserver;
+      if (!Observer || !document.documentElement)
+        throw new TypeError('MutationObserver unavailable');
+      const observer = new Observer((records) => this.observeDomMutations(records));
+      observer.observe(document.documentElement, {
+        attributes: true,
+        childList: true,
+        subtree: true,
+      });
+      this.mutationObserver = observer;
+    } catch {
+      this.fail('bundle_partial');
+    }
+  }
+
+  private observeDomMutations(records: readonly MutationRecord[]): void {
+    for (const record of records) {
+      if (this.isOwnedRuntimeInsertion(record)) continue;
+      if (!this.observeNativeMutation()) return;
+    }
+  }
+
+  private isOwnedRuntimeInsertion(record: MutationRecord): boolean {
+    if (record.type !== 'childList' || record.removedNodes.length !== 0) return false;
+    const added = [...record.addedNodes];
+    return (
+      added.length === 1 &&
+      added[0]?.nodeType === 1 &&
+      (added[0] as Element).tagName === 'SCRIPT' &&
+      (added[0] as Element).id === 'trustedserver-js-runtime'
+    );
+  }
+
+  private closeNativeMutationIngress(): void {
+    const observer = this.mutationObserver;
+    this.mutationObserver = undefined;
+    if (!observer) return;
+    try {
+      const records = observer.takeRecords();
+      observer.disconnect();
+      this.observeDomMutations(records);
+    } catch {
+      throw new TypeError('first-display DOM mutation ingress did not close');
+    }
+  }
+
+  private disposeNativeMutationIngress(): void {
+    const observer = this.mutationObserver;
+    this.mutationObserver = undefined;
+    if (!observer) return;
+    try {
+      observer.disconnect();
+    } catch {
+      // Generation latching makes a failed physical observer removal inert.
     }
   }
 }
@@ -782,6 +849,7 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
     const sliceBindings = bindingsDescriptor.value as (id: string) => unknown;
     const auctionProtocols = new Map<FirstDisplayAuctionProtocolId, unknown>();
     const fullProtocols = new Map<FirstDisplayAuctionProtocolId, unknown>();
+    let agent: FirstDisplayAgent | undefined;
     const sliceHost: FirstDisplaySliceHost = Object.freeze({
       activate: (
         id: OptionalFirstDisplaySliceId,
@@ -794,7 +862,10 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
         const protocolId = id.endsWith('_initial')
           ? (id.slice(0, -'_initial'.length) as FirstDisplayAuctionProtocolId)
           : undefined;
-        const candidate = sliceBindings(id);
+        const candidate = captureMutationObservedBindings(
+          sliceBindings(id),
+          () => agent?.observeNativeMutation() === true
+        );
         const installed = install(
           protocolId && AUCTION_PROTOCOLS.includes(protocolId)
             ? captureProtocolRegistration(candidate, protocolId, fullProtocols)
@@ -811,7 +882,6 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
     });
     return Object.freeze({
       activate: (context: FirstDisplaySliceActivationContext): void => {
-        let agent: FirstDisplayAgent | undefined;
         const rendererOwner: { value: FirstDisplayRenderBridgeV1 | undefined } = {
           value: undefined,
         };
@@ -832,6 +902,7 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
               : undefined;
           },
           now: () => readBrowserNow(options.gptInput.browser),
+          onNativeMutation: () => agent?.observeNativeMutation() === true,
           setTimer: options.gptInput.setTimer,
         });
         rendererOwner.value = renderer;
@@ -849,10 +920,17 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
           const driver = createFirstDisplayProjectedDriver({
             batch,
             ...(gpt ? { gpt: gpt as FirstDisplayGptProtocolV1 } : {}),
-            gptInput: options.gptInput,
+            gptInput: {
+              ...options.gptInput,
+              onNativeMutation: () => agent?.observeNativeMutation() === true,
+            },
             renderer,
           });
-          agent = createFirstDisplayAgent({ ...options, driver });
+          agent = createFirstDisplayAgent({
+            ...options,
+            driver,
+            mutationDocument: options.gptInput.document,
+          });
           if (!agent.coversProtocols(auctionProtocols)) {
             throw new TypeError('first-display protocol coverage is incomplete');
           }

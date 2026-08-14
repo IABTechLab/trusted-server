@@ -418,6 +418,38 @@ describe('bounded first-display agent', () => {
     expect(agent.snapshot().mutationRevision).toBe(1);
   });
 
+  it('drains pending DOM mutation records into the final handoff revision', () => {
+    const h = harness();
+    const host = document.createElement('div');
+    document.body.append(host);
+    const agent = createFirstDisplayAgent({
+      batch: batch(['no_bid']),
+      bootstrap: h.bootstrap,
+      driver: driver([]),
+      performance: h.performance,
+      paint: h.paint,
+      mutationDocument: document,
+      handoff: {
+        releaseId: 'a'.repeat(64),
+        generation: 1,
+        slices: ['first_display'],
+      },
+      onProtectedPaint: () => undefined,
+      onFailure: (reason) => h.failures.push(reason),
+    });
+    expect(agent.start()).toBe(true);
+    h.frames.shift()?.();
+    h.frames.shift()?.();
+
+    host.append(document.createElement('span'));
+    const finalized = agent.finalizeHandoff();
+    expect(finalized?.handoff.mutationRevision).toBe(1);
+    expect(h.failures).toEqual([]);
+
+    agent.dispose();
+    host.remove();
+  });
+
   it('fails closed on malformed batches, driver throws, replay, and revision exhaustion', () => {
     const malformed = harness();
     const invalidAgent = createFirstDisplayAgent({

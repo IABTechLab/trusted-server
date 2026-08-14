@@ -159,10 +159,10 @@ function readBootField(boot: unknown, key: string): unknown {
   return record?.[key];
 }
 
-/** Capture the canonical source owned by one connected exact critical-artifact tag. */
-export function captureTrustedCriticalSrc(
+function captureTrustedArtifactSrc(
   runtimeDocument: Document,
-  script: HTMLScriptElement
+  script: HTMLScriptElement,
+  expectedId: 'trustedserver-js' | 'trustedserver-js-runtime'
 ): string | undefined {
   try {
     const Script = runtimeDocument.defaultView?.HTMLScriptElement;
@@ -172,12 +172,12 @@ export function captureTrustedCriticalSrc(
       !origin ||
       !(script instanceof Script) ||
       script.ownerDocument !== runtimeDocument ||
-      script.id !== 'trustedserver-js' ||
+      script.id !== expectedId ||
       !script.isConnected
     ) {
       return undefined;
     }
-    const matches = runtimeDocument.querySelectorAll('script#trustedserver-js');
+    const matches = runtimeDocument.querySelectorAll(`script#${expectedId}`);
     if (matches.length !== 1 || matches[0] !== script) return undefined;
     const absolute = new URL(script.src);
     const criticalSrc = `${absolute.pathname}${absolute.search}`;
@@ -193,6 +193,22 @@ export function captureTrustedCriticalSrc(
   } catch {
     return undefined;
   }
+}
+
+/** Capture the canonical source owned by one parser-inserted persistent artifact tag. */
+export function captureTrustedCriticalSrc(
+  runtimeDocument: Document,
+  script: HTMLScriptElement
+): string | undefined {
+  return captureTrustedArtifactSrc(runtimeDocument, script, 'trustedserver-js');
+}
+
+/** Capture the canonical source owned by the one post-paint runtime artifact tag. */
+export function captureTrustedRuntimeSrc(
+  runtimeDocument: Document,
+  script: HTMLScriptElement
+): string | undefined {
+  return captureTrustedArtifactSrc(runtimeDocument, script, 'trustedserver-js-runtime');
 }
 
 /** Validate and freeze the complete boot snapshot used by a committed kernel. */

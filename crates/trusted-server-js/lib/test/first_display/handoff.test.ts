@@ -80,6 +80,30 @@ describe('first-display final handoff owner', () => {
     expect(h.failures).toEqual([]);
   });
 
+  it('drains a synchronous native mutation while closing ingress before final capture', () => {
+    const failures: string[] = [];
+    const value = createFirstDisplayHandoffOwner({
+      releaseId: RELEASE_ID,
+      generation: 1,
+      isCurrentGeneration: () => true,
+      isTerminal: () => true,
+      isPainted: () => true,
+      closeIngress: () => {
+        expect(value.observeMutation()).toBe(true);
+      },
+      onFailure: (reason) => failures.push(reason),
+    });
+
+    expect(
+      value.finalize(() => ({
+        candidate: handoff(1),
+        identities: [],
+      }))
+    ).toBeDefined();
+    expect(value.mutationRevision).toBe(1);
+    expect(failures).toEqual([]);
+  });
+
   it('clears the capsule and fails closed on duplicate finalization or stale revision', () => {
     const duplicate = owner();
     const identity = {};

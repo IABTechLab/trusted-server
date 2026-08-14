@@ -90,7 +90,7 @@ function fixture(kind: 'adm' | 'aps' = 'adm') {
   return { cycle, dom, element };
 }
 
-function harness(kind: 'adm' | 'aps' = 'adm') {
+function harness(kind: 'adm' | 'aps' = 'adm', onNativeMutation?: () => boolean) {
   const value = fixture(kind);
   let listener: ((event: Record<string, unknown>) => void) | undefined;
   const target = {
@@ -169,6 +169,7 @@ function harness(kind: 'adm' | 'aps' = 'adm') {
       bytes.fill(randomByte);
       randomByte += 1;
     },
+    ...(onNativeMutation ? { onNativeMutation } : {}),
     setTimer: (callback, delayMs) => {
       const handle = {};
       timers.set(handle, Object.freeze({ callback, delayMs }));
@@ -258,6 +259,29 @@ function registerOwner(h: ReturnType<typeof harness>) {
 }
 
 describe('bounded first-display render bridge', () => {
+  it('observes admitted bridge activity and terminal tombstone expiry', () => {
+    const mutations = vi.fn(() => true);
+    const h = harness('adm', mutations);
+    const shell = collapsedShell(h);
+    const owner = registerOwner(h);
+    h.channels[0]?.port1.dispatch({
+      message: 'TS Owner Inserted',
+      version: 1,
+      lifecycleTicket: owner.ticket,
+    });
+    h.channels[0]?.port1.dispatch({
+      message: 'TS ADM Loaded',
+      version: 1,
+      lifecycleTicket: owner.ticket,
+    });
+    expect(h.terminals).toEqual(['accepted']);
+    expect(shell.frame.isConnected).toBe(true);
+
+    mutations.mockClear();
+    h.fire(3_000);
+    expect(mutations).toHaveBeenCalledOnce();
+  });
+
   it('passes native ids through and suppresses malformed recognized TS requests', () => {
     const h = harness();
     const nativePort = new FakePort();

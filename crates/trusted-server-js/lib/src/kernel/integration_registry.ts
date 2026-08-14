@@ -108,6 +108,7 @@ export interface IntegrationRegistryOptions {
   readonly runtimeCapability?: Readonly<Record<string, unknown>>;
   /** Captured parser-inserted critical script; required by production runtime. */
   readonly criticalScript?: HTMLScriptElement;
+  readonly criticalScriptId?: 'trustedserver-js' | 'trustedserver-js-runtime';
   readonly document?: Document;
   readonly startedAtMs: number;
   readonly now?: () => number;
@@ -511,6 +512,7 @@ class IntegrationRegistryOwner {
   private readonly manifestValue: BootManifestV1 | undefined;
   private readonly catalog: readonly IntegrationCatalogEntry[];
   private readonly criticalScript: HTMLScriptElement | undefined;
+  private readonly criticalScriptId: 'trustedserver-js' | 'trustedserver-js-runtime';
   private readonly document: Document | undefined;
   private readonly registrations = new Map<string, IntegrationRegistration>();
   private readonly capabilities = new Map<string, Readonly<Record<string, unknown>>>();
@@ -540,6 +542,7 @@ class IntegrationRegistryOwner {
   public constructor(options: IntegrationRegistryOptions) {
     this.releaseId = options.releaseId;
     this.criticalScript = options.criticalScript;
+    this.criticalScriptId = options.criticalScriptId ?? 'trustedserver-js';
     this.document = options.document;
     this.startedAtMs = options.startedAtMs;
     this.now = options.now ?? (() => performance.now());
@@ -690,10 +693,13 @@ class IntegrationRegistryOwner {
       const origin = trustedCriticalOrigin(document);
       if (!origin) return false;
       const expected = new URL(manifest.criticalSrc, origin);
+      const matches = document.querySelectorAll(`script#${this.criticalScriptId}`);
       return (
         script instanceof Script &&
-        script.id === 'trustedserver-js' &&
+        script.id === this.criticalScriptId &&
         script.isConnected &&
+        matches.length === 1 &&
+        matches[0] === script &&
         document.currentScript === script &&
         expected.origin === origin &&
         expected.hash === '' &&

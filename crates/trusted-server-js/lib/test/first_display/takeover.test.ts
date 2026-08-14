@@ -211,6 +211,31 @@ describe('atomic first-display takeover', () => {
     }
   });
 
+  it('revalidates runtime authentication immediately before persistent commit', () => {
+    let authenticated = true;
+    const events: string[] = [];
+    expect(
+      performFirstDisplayTakeoverV1({
+        finalized: finalized(),
+        outline: outline(),
+        isCurrentGeneration: () => true,
+        authenticateRuntimeScript: () => authenticated,
+        currentMutationRevision: () => 0,
+        quiesceAgent: () => events.push('quiesce'),
+        detachCommittedArtifacts: () => events.push('detach'),
+        disposeAgent: () => events.push('dispose'),
+        activatePersistent: (_snapshot, _identities, own) => {
+          own(() => events.push('rollback'));
+          events.push('activate');
+          authenticated = false;
+        },
+        commitPersistent: () => events.push('commit'),
+        onFailure: () => events.push('fallback'),
+      })
+    ).toBe(false);
+    expect(events).toEqual(['quiesce', 'detach', 'dispose', 'activate', 'rollback', 'fallback']);
+  });
+
   it('fails before quiesce for a stale outline, generation, or runtime script', () => {
     for (const failure of ['outline', 'generation', 'script'] as const) {
       const events: string[] = [];

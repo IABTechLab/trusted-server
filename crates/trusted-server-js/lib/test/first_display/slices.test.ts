@@ -43,6 +43,7 @@ import {
   type FirstDisplayConsentRouteRuleV1,
 } from '../../src/first_display/leaf/consent_snapshot';
 import {
+  captureMutationObservedBindings,
   registerFirstDisplayComponent,
   type FirstDisplayComponentRegistrationV1,
 } from '../../src/first_display/registration';
@@ -79,6 +80,24 @@ function componentRegistration(): FirstDisplayComponentRegistrationV1 {
 }
 
 describe('first-display initial slice definitions', () => {
+  it('preserves exact frozen bindings while observing each successful parser update', () => {
+    const events: string[] = [];
+    const candidate = Object.freeze({
+      observe: (name: string, value: unknown) => events.push(`observe:${name}:${String(value)}`),
+      register: () => () => undefined,
+    });
+    const captured = captureMutationObservedBindings(candidate, () => {
+      events.push('mutation');
+      return true;
+    }) as typeof candidate;
+
+    expect(captured).not.toBe(candidate);
+    expect(Object.isFrozen(captured)).toBe(true);
+    expect(Reflect.ownKeys(captured)).toEqual(['observe', 'register']);
+    captured.observe('segment_count', 2);
+    expect(events).toEqual(['observe:segment_count:2', 'mutation']);
+  });
+
   it('returns exact protocol activation receipts while registering full protocols', () => {
     const own = vi.fn();
     const register = vi.fn((_protocol: object) => () => undefined);

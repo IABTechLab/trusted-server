@@ -46,6 +46,7 @@ export interface FirstDisplayRenderBridgeOptionsV1 {
   readonly fillRandom: (bytes: Uint8Array) => void;
   readonly getAps: () => FirstDisplayApsProtocolV1 | undefined;
   readonly now: () => number;
+  readonly onNativeMutation?: () => boolean;
   readonly setTimer: (callback: () => void, delayMs: number) => unknown;
 }
 
@@ -601,6 +602,14 @@ export function createFirstDisplayRenderBridge(
     }
   };
 
+  const notifyNativeMutation = (): void => {
+    try {
+      options.onNativeMutation?.();
+    } catch {
+      // Mutation observation cannot alter the admitted publisher or browser event.
+    }
+  };
+
   const clearOwnedTimer = (handle: unknown): void => {
     if (handle === undefined || !timers.delete(handle)) return;
     try {
@@ -653,6 +662,7 @@ export function createFirstDisplayRenderBridge(
       ordinal: entry.ordinal,
       timer: entry.timer,
     });
+    notifyNativeMutation();
   };
 
   const releaseAttempt = (attempt: Attempt, removeFrame: boolean): void => {
@@ -729,6 +739,7 @@ export function createFirstDisplayRenderBridge(
     } catch {
       // A consumer callback cannot restore released render authority.
     }
+    notifyNativeMutation();
     return true;
   };
 
@@ -1031,11 +1042,13 @@ export function createFirstDisplayRenderBridge(
           current.expiresAt <= observedAt
         ) {
           tickets.delete(ticket);
+          notifyNativeMutation();
         }
         return;
       }
       tickets.delete(ticket);
       attempt.ticket = undefined;
+      notifyNativeMutation();
       fail(attempt, 'owner_registration_timeout');
     }, TICKET_TTL_MS);
     if (entry.timer === undefined) {
@@ -1231,12 +1244,14 @@ export function createFirstDisplayRenderBridge(
     const data = eventField(event, 'data', messageEventPrototype);
     const routing = routingMessage(data);
     if (routing.message === 'TS Render Owner Register') {
+      notifyNativeMutation();
       handleOwnerRegistration(event, data, routing);
       return;
     }
     if (routing.message !== 'Prebid Request' || !routing.adId) return;
     const reservationState = reservations.get(routing.adId);
     if (!reservationState || !suppress(event)) return;
+    notifyNativeMutation();
     const inspection = inspectPorts(event, messageEventPrototype);
     const responsePort = inspection?.ports[0];
     const exact = exactPrebidRequest(data);

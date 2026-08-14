@@ -6,6 +6,7 @@ import {
   buildFallbackBoot,
   buildKernelBoot,
   captureTrustedCriticalSrc,
+  captureTrustedRuntimeSrc,
   createFallbackFields,
   publicLog,
   type BootFailureReason,
@@ -271,9 +272,12 @@ class RuntimeOwner implements Runtime {
       const Script = runtimeDocument?.defaultView?.HTMLScriptElement;
       const currentScript = runtimeDocument?.currentScript;
       this.criticalScript = Script && currentScript instanceof Script ? currentScript : undefined;
+      const takeoverMode = this.options.coordinateTakeover !== undefined;
       const capturedCriticalSrc =
         runtimeDocument && this.criticalScript
-          ? captureTrustedCriticalSrc(runtimeDocument, this.criticalScript)
+          ? takeoverMode
+            ? captureTrustedRuntimeSrc(runtimeDocument, this.criticalScript)
+            : captureTrustedCriticalSrc(runtimeDocument, this.criticalScript)
           : undefined;
       if (!capturedCriticalSrc) return false;
       this.trustedCriticalSrc = capturedCriticalSrc;
@@ -395,7 +399,13 @@ class RuntimeOwner implements Runtime {
           return undefined;
         },
         ...(this.criticalScript && runtimeDocument
-          ? { criticalScript: this.criticalScript, document: runtimeDocument }
+          ? {
+              criticalScript: this.criticalScript,
+              criticalScriptId: takeoverMode
+                ? ('trustedserver-js-runtime' as const)
+                : ('trustedserver-js' as const),
+              document: runtimeDocument,
+            }
           : {}),
         startedAtMs,
         ...(this.options.now ? { now: this.options.now } : {}),

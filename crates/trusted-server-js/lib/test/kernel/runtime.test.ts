@@ -13,10 +13,10 @@ import { createLifecycleIntegrationRegistration } from '../../src/kernel/lifecyc
 const RELEASE = 'a'.repeat(64);
 const TRUSTED_CRITICAL_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
 
-function installTestCriticalScript(runtimeDocument: Document): void {
+function installTestCriticalScript(runtimeDocument: Document, takeover = false): void {
   if (runtimeDocument.currentScript) return;
   const script = runtimeDocument.createElement('script');
-  script.id = 'trustedserver-js';
+  script.id = takeover ? 'trustedserver-js-runtime' : 'trustedserver-js';
   script.src = new URL(TRUSTED_CRITICAL_SRC, runtimeDocument.location.origin).href;
   runtimeDocument.head.insertBefore(script, null);
   Object.defineProperty(runtimeDocument, 'currentScript', {
@@ -26,7 +26,7 @@ function installTestCriticalScript(runtimeDocument: Document): void {
 }
 
 function createRuntime(options: RuntimeOptions) {
-  installTestCriticalScript(options.document ?? document);
+  installTestCriticalScript(options.document ?? document, options.coordinateTakeover !== undefined);
   return createRuntimeOwner(options);
 }
 
