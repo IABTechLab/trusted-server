@@ -1,4 +1,3 @@
-import { parseCacheFetchPolicyV1 } from '../core/config';
 import { parseBrowserAuctionProjectionV1 } from '../core/contracts/auction_projection';
 import { validateRequestAdsOptions } from '../core/contracts/request_ads';
 import { log } from '../core/log';
@@ -160,14 +159,6 @@ function readBootField(boot: unknown, key: string): unknown {
   return record?.[key];
 }
 
-function parseCachePolicy(candidate: unknown): ReturnType<typeof parseCacheFetchPolicyV1> {
-  try {
-    return parseCacheFetchPolicyV1(candidate);
-  } catch {
-    return undefined;
-  }
-}
-
 /** Capture the canonical source owned by one connected exact critical-artifact tag. */
 export function captureTrustedCriticalSrc(
   runtimeDocument: Document,
@@ -213,8 +204,6 @@ export function buildKernelBoot(
   const record = ownDataRecord(candidate);
   if (!record) return undefined;
   const transportKeys = ['auctionProjection', 'creative', 'diagnostics'];
-  if (Object.prototype.hasOwnProperty.call(record, 'cachePolicy'))
-    transportKeys.push('cachePolicy');
   const completeKeys = ['abi', 'releaseId', 'manifest', ...transportKeys];
   if (!exactKeys(record, transportKeys) && !exactKeys(record, completeKeys)) return undefined;
   if (
@@ -225,10 +214,7 @@ export function buildKernelBoot(
   ) {
     return undefined;
   }
-  const cachePolicy =
-    record.cachePolicy === undefined ? undefined : parseCachePolicy(record.cachePolicy);
-  if (record.cachePolicy !== undefined && !cachePolicy) return undefined;
-  const auctionProjection = parseBrowserAuctionProjectionV1(record.auctionProjection, cachePolicy);
+  const auctionProjection = parseBrowserAuctionProjectionV1(record.auctionProjection);
   const creative = ownPlainDataRecord(record.creative);
   const diagnostics = ownPlainDataRecord(record.diagnostics);
   const gptDiagnostics = ownPlainDataRecord(diagnostics?.gpt);
@@ -272,7 +258,6 @@ export function buildKernelBoot(
     releaseId,
     manifest,
     auctionProjection,
-    ...(cachePolicy ? { cachePolicy } : {}),
     creative: {
       version: 1,
       enabled: creative.enabled,
@@ -296,10 +281,8 @@ export function buildFallbackBoot(
   if (!CRITICAL_SRC_PATTERN.test(trustedCriticalSrc)) {
     return undefined;
   }
-  const cacheCandidate = readBootField(candidate, 'cachePolicy');
-  const cachePolicy = cacheCandidate === undefined ? undefined : parseCachePolicy(cacheCandidate);
   const projection =
-    parseBrowserAuctionProjectionV1(readBootField(candidate, 'auctionProjection'), cachePolicy) ??
+    parseBrowserAuctionProjectionV1(readBootField(candidate, 'auctionProjection')) ??
     SAFE_PROJECTION;
   const manifest: BootManifestV1 = {
     version: 1,
@@ -312,7 +295,6 @@ export function buildFallbackBoot(
     releaseId,
     manifest,
     auctionProjection: projection,
-    ...(cachePolicy ? { cachePolicy } : {}),
     creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
     diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
   });

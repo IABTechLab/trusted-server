@@ -692,7 +692,7 @@ mod tests {
                 cpm: 1.23,
                 currency: "USD".to_string(),
                 targeting: Default::default(),
-                renderer_reservation_id: "r1_aaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                renderer_reservation_id: Some("r1_aaaaaaaaaaaaaaaaaaaaaa".to_string()),
                 render_source: BidRenderSourceV1::Aps(ApsRendererV1 {
                     version: 1,
                     account_id: "example-account-id".to_string(),
@@ -740,7 +740,7 @@ mod tests {
                 cpm: 1.0,
                 currency: "USD".to_string(),
                 targeting: Default::default(),
-                renderer_reservation_id: "r1_aaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                renderer_reservation_id: Some("r1_aaaaaaaaaaaaaaaaaaaaaa".to_string()),
                 render_source: BidRenderSourceV1::Adm(AdmRenderSourceV1 {
                     version: 1,
                     adm: adm.to_string(),

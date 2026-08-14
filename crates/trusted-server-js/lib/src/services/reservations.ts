@@ -177,10 +177,7 @@ function copyTaggedRenderSource(value: unknown): ReservationRenderSource | undef
         writable: true,
       });
     }
-    if (
-      (output.type !== 'aps' && output.type !== 'adm' && output.type !== 'cache') ||
-      output.version !== 1
-    ) {
+    if ((output.type !== 'aps' && output.type !== 'adm') || output.version !== 1) {
       return undefined;
     }
     return frozenResult(output) as ReservationRenderSource;
@@ -210,7 +207,7 @@ export interface ReservationServiceOptions {
 
 /** Tagged browser render source copied after an injected exact parser accepts it. */
 export type ReservationRenderSource = Readonly<{
-  type: 'aps' | 'adm' | 'cache';
+  type: 'aps' | 'adm';
   version: 1;
 }> &
   Readonly<object>;

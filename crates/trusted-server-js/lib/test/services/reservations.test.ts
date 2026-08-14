@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { parseCacheFetchPolicyV1 } from '../../src/core/config';
 import { parseBidRenderSourceV1 } from '../../src/core/contracts/auction_projection';
 import { createTestNavigationIdentityIssuer } from '../../src/kernel/identity';
 import {
@@ -17,8 +16,6 @@ import {
   type ReservationOwner,
   type ReservationRenderSource,
 } from '../../src/services/reservations';
-
-const CACHE_ID = '123e4567-e89b-42d3-a456-426614174000';
 
 function reservationId(index = 0): string {
   return `r1_${index.toString(36).padStart(22, '0')}`;
@@ -54,17 +51,6 @@ function admSource(markup = '<div>fictional creative</div>') {
   return { type: 'adm', version: 1, adm: markup, width: 300, height: 250 } as const;
 }
 
-function cacheSource() {
-  return {
-    type: 'cache',
-    version: 1,
-    cacheId: CACHE_ID,
-    fetchUrl: `https://cache.example/render?uuid=${CACHE_ID}`,
-    width: 300,
-    height: 250,
-  } as const;
-}
-
 function apsSource() {
   const creativeUrl = 'https://creative.example/render';
   const envelope = {
@@ -97,14 +83,12 @@ function apsSource() {
 }
 
 function serviceAt(readNow: () => number) {
-  const cachePolicy = parseCacheFetchPolicyV1({
-    version: 1,
-    baseUrl: 'https://cache.example/render',
-  });
-  if (!cachePolicy) throw new Error('Expected cache policy');
   return createReservationService({
     now: readNow,
-    prepareRenderSource: (candidate) => parseBidRenderSourceV1(candidate, cachePolicy),
+    prepareRenderSource: (candidate) => {
+      const source = parseBidRenderSourceV1(candidate);
+      return source?.type === 'pbs_cache' ? undefined : source;
+    },
   });
 }
 
@@ -177,9 +161,9 @@ describe('renderer reservation identity and registration', () => {
     expect(isRendererReservationId(candidate)).toBe(expected);
   });
 
-  it('copies and freezes one exact APS, ADM, or cache source without retaining projection input', () => {
+  it('copies and freezes one exact APS or ADM source without retaining projection input', () => {
     const { navigation } = runtimeNavigation();
-    const sources = [apsSource(), admSource(), cacheSource()];
+    const sources = [apsSource(), admSource()];
 
     for (const [index, source] of sources.entries()) {
       const service = serviceAt(() => 5);
@@ -1502,7 +1486,7 @@ describe('Prebid admission leases and selection', () => {
     expect(service.recognize('native')).toEqual({ recognized: false });
   });
 
-  it('promotes one selected cache lease from ten seconds to 15 minutes', () => {
+  it('promotes one selected ADM lease from ten seconds to 15 minutes', () => {
     let now = 10;
     const { navigation } = runtimeNavigation();
     const service = serviceAt(() => now);
@@ -1512,7 +1496,7 @@ describe('Prebid admission leases and selection', () => {
       navigation,
       auctionId: 'fictional-auction',
       adUnitCode: 'fictional-slot',
-      renderSource: cacheSource(),
+      renderSource: admSource(),
       winnerContext: { selectedCpm: 1.25 },
       prebidBid: bid,
     };
@@ -1552,7 +1536,7 @@ describe('Prebid admission leases and selection', () => {
     const selected = claim(service, navigation, attempt, reservationId(1));
     const winnerContext = attempt.winnerContext;
     if (!selected.recognized || !selected.claimed || !winnerContext) {
-      throw new Error('Expected the promoted cache lease to remain claimable');
+      throw new Error('Expected the promoted ADM lease to remain claimable');
     }
     expect(
       service.consumeClaim(selected, {
@@ -1562,7 +1546,7 @@ describe('Prebid admission leases and selection', () => {
         navigationGeneration: navigation.generation,
         winnerContext,
       })
-    ).toEqual({ renderSource: cacheSource(), winnerContext });
+    ).toEqual({ renderSource: admSource(), winnerContext });
   });
 
   it('promotes only before the admission boundary and prunes at and after ten seconds', () => {
@@ -1908,11 +1892,11 @@ describe('atomic claims and disposal', () => {
     expect(attempt.winnerContext).toBeUndefined();
     expect(service.snapshotInventoryForTest().entriesWithPucSource).toBe(0);
   });
-  it('preserves one cache source and immutable context after registration input mutation', () => {
+  it('preserves one ADM source and immutable context after registration input mutation', () => {
     const { navigation } = runtimeNavigation();
     const attempt = renderAttempt(navigation);
     const service = serviceAt(() => 0);
-    const source = cacheSource();
+    const source = admSource();
     const context = { selectedCpm: 7.5 };
     service.registerRender({
       reservationId: reservationId(),
@@ -1953,7 +1937,7 @@ describe('atomic claims and disposal', () => {
     expect(service.recognize(reservationId())).toMatchObject({ state: 'consumed' });
     const winnerContext = attempt.winnerContext;
     if (!result.recognized || !result.claimed || !winnerContext) {
-      throw new Error('Expected one claimed cache winner');
+      throw new Error('Expected one claimed ADM winner');
     }
     expect(
       service.consumeClaim(result, {

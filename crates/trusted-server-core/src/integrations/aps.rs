@@ -1546,7 +1546,6 @@ impl ApsAuctionProvider {
         request: &AuctionRequest,
     ) -> AuctionResponse {
         if !value.is_object()
-            || value.get("contextual").is_some()
             || value
                 .get("cur")
                 .is_some_and(|currency| !currency.is_string())
@@ -1576,6 +1575,13 @@ impl ApsAuctionProvider {
         let mut reasons = AuctionDropReasons::new();
         let mut selected: HashMap<String, Bid> = HashMap::new();
         let mut dropped = 0_u64;
+        let mut invalid_slots = HashSet::new();
+        let mut global_invalid = false;
+        if value.get("contextual").is_some() {
+            dropped += 1;
+            global_invalid = true;
+            record_auction_drop(&mut reasons, AuctionDropReason::InvalidProviderResponse);
+        }
 
         let mut id_counts = HashMap::<&str, usize>::new();
         for candidate in seatbids
@@ -1641,6 +1647,15 @@ impl ApsAuctionProvider {
                     }
                     Err(reason) => {
                         dropped += 1;
+                        if let Some(slot_id) = value
+                            .get("impid")
+                            .and_then(Json::as_str)
+                            .filter(|slot_id| slots.contains_key(*slot_id))
+                        {
+                            invalid_slots.insert(slot_id.to_string());
+                        } else {
+                            global_invalid = true;
+                        }
                         record_auction_drop(&mut reasons, reason);
                     }
                 }
@@ -1655,8 +1670,23 @@ impl ApsAuctionProvider {
             ("seatbid_count".to_string(), json!(seatbid_count)),
             ("accepted_bid_count".to_string(), json!(accepted)),
             ("dropped_bid_count".to_string(), json!(dropped)),
+            (
+                "invalid_slots".to_string(),
+                json!(
+                    invalid_slots
+                        .into_iter()
+                        .map(|slot| (slot, "invalid_provider_response"))
+                        .collect::<HashMap<_, _>>()
+                ),
+            ),
+            (
+                "global_invalid_provider_response".to_string(),
+                json!(global_invalid),
+            ),
         ];
-        let mut response = if selected.is_empty() {
+        let mut response = if selected.is_empty() && global_invalid {
+            AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms)
+        } else if selected.is_empty() {
             AuctionResponse::no_bid(APS_INTEGRATION_ID, response_time_ms)
         } else {
             let bids = request
@@ -3400,12 +3430,24 @@ mod tests {
     }
 
     #[test]
-    fn contextual_currency_and_nonfinite_json_are_invalid_provider_responses() {
+    fn contextual_isolated_from_valid_bids_while_currency_and_nonfinite_json_are_global() {
         let provider = ApsAuctionProvider::new(config());
-        for value in [
-            json!({"contextual": {"slots": []}, "seatbid": [{"bid": [bid("valid", 1.0, "iframe")]}]}),
-            json!({"cur": "EUR", "seatbid": [{"bid": [bid("eur", 1.0, "iframe")]}]}),
-        ] {
+        let contextual = provider.parse_aps_response(
+            &json!({"contextual": {"slots": []}, "seatbid": [{"bid": [bid("valid", 1.0, "iframe")]}]}),
+            12,
+            &request(),
+        );
+        assert_eq!(contextual.status, BidStatus::Success);
+        assert_eq!(contextual.bids.len(), 1);
+        assert_eq!(
+            drop_count(&contextual, AuctionDropReason::InvalidProviderResponse),
+            1
+        );
+
+        for value in [json!({
+            "cur": "EUR",
+            "seatbid": [{"bid": [bid("eur", 1.0, "iframe")]}]
+        })] {
             let response = provider.parse_aps_response(&value, 12, &request());
             assert_eq!(response.status, BidStatus::Error);
             assert_eq!(
@@ -3434,6 +3476,22 @@ mod tests {
         assert_eq!(
             drop_count(&response, AuctionDropReason::InvalidProviderResponse),
             1
+        );
+    }
+
+    #[test]
+    fn invalid_only_bid_retains_its_attributable_slot_failure() {
+        let provider = ApsAuctionProvider::new(config());
+        let mut invalid = bid("invalid", 1.0, "iframe");
+        invalid["ext"]["creativeurl"] = json!("http://creative.example/render");
+
+        let response =
+            provider.parse_aps_response(&json!({"seatbid": [{"bid": [invalid]}]}), 12, &request());
+
+        assert_eq!(response.status, BidStatus::NoBid);
+        assert_eq!(
+            response.metadata["invalid_slots"]["fictional-slot"],
+            "invalid_provider_response"
         );
     }
 

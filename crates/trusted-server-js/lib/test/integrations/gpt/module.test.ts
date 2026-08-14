@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  installPbsCacheBridge,
   publishGptWinner,
   publishInitialGptProjection,
   startGptSlotOperation,
   type GptWinnerPublicationInput,
   type GptSlotOperationInput,
 } from '../../../src/integrations/gpt/module';
+import type { BrowserAuctionProjectionV1 } from '../../../src/core/types';
 import { createLegacyGptRegistrationForTest as createGptIntegrationRegistration } from '../../helpers/legacy_gpt_registration';
 import { createGptIntegrationRegistration as createProductionGptRegistration } from '../../../src/integrations/gpt/module';
 import { createRenderRuntimeIntegrationRegistration } from '../../../src/integrations/render_runtime/module';
@@ -56,7 +58,7 @@ function createAttemptHarness() {
       Object.isFrozen(candidate) &&
       'type' in candidate &&
       'version' in candidate
-        ? (candidate as Readonly<{ type: 'aps' | 'adm' | 'cache'; version: 1 }>)
+        ? (candidate as Readonly<{ type: 'aps' | 'adm'; version: 1 }>)
         : undefined,
   });
   const createAttemptWithOwner = (parentAttemptId?: string) => {
@@ -71,7 +73,7 @@ function createAttemptHarness() {
         Object.isFrozen(candidate) &&
         'type' in candidate &&
         'version' in candidate
-          ? (candidate as Readonly<{ type: 'aps' | 'adm' | 'cache'; version: 1 }>)
+          ? (candidate as Readonly<{ type: 'aps' | 'adm'; version: 1 }>)
           : undefined,
       reservations,
       ...(parentAttemptId === undefined ? {} : { parentAttemptId }),
@@ -136,6 +138,318 @@ function callbacks(order: string[]): IntegrationInstallCallbacks {
     drainPreload: () => order.push('drain'),
   };
 }
+
+function pbsCacheProjection(
+  sources: readonly Readonly<{
+    cacheHost: string;
+    cacheId: string;
+    cachePath: string;
+    divId: string;
+    slot: string;
+  }>[]
+): Readonly<BrowserAuctionProjectionV1> {
+  return Object.freeze({
+    version: 1 as const,
+    auction: Object.freeze({
+      version: 1 as const,
+      auctionId: 'pbs-cache-auction',
+      results: Object.freeze(
+        sources.map((source, index) =>
+          Object.freeze({
+            slot: source.slot,
+            outcome: 'winner' as const,
+            candidateId: `CACHEBID${String(index).padStart(4, '0')}`,
+          })
+        )
+      ),
+    }),
+    slots: Object.freeze(
+      sources.map((source) =>
+        Object.freeze({
+          slot: source.slot,
+          gamUnitPath: `/123/${source.slot}`,
+          divId: source.divId,
+          formats: Object.freeze([Object.freeze([300, 250] as const)]),
+          targeting: Object.freeze({}),
+        })
+      )
+    ),
+    bids: Object.freeze(
+      sources.map((source, index) =>
+        Object.freeze({
+          candidateId: `CACHEBID${String(index).padStart(4, '0')}`,
+          slot: source.slot,
+          provider: 'prebid',
+          upstreamBidId: `upstream-${index}`,
+          cpm: 1.25,
+          currency: 'USD' as const,
+          targeting: Object.freeze({}),
+          renderSource: Object.freeze({
+            type: 'pbs_cache' as const,
+            version: 1 as const,
+            cacheId: source.cacheId,
+            cacheHost: source.cacheHost,
+            cachePath: source.cachePath,
+            width: 300,
+            height: 250,
+          }),
+        })
+      )
+    ),
+  }) as unknown as Readonly<BrowserAuctionProjectionV1>;
+}
+
+function pbsCacheSourceFrame(divId: string): HTMLIFrameElement {
+  const root = document.createElement('div');
+  root.id = divId;
+  root.style.width = '1px';
+  root.style.height = '1px';
+  const frame = document.createElement('iframe');
+  frame.setAttribute('width', '1');
+  frame.setAttribute('height', '1');
+  frame.style.width = '1px';
+  frame.style.height = '1px';
+  root.appendChild(frame);
+  document.body.appendChild(root);
+  return frame;
+}
+
+function startPbsCacheBridge(projection: Readonly<BrowserAuctionProjectionV1>) {
+  const runtime = createRuntimeSession({
+    createIdentityIssuer: () =>
+      createTestNavigationIdentityIssuer({
+        getRandomValues: (target) => {
+          target.fill(3);
+          return target;
+        },
+      }),
+  });
+  const navigation = runtime.startInitialNavigation(projection);
+  if (!navigation.ok) throw new Error('Expected PBS Cache test navigation');
+  const observe = vi.fn(() => true);
+  const release = installPbsCacheBridge(
+    document,
+    Object.freeze({
+      navigation: navigation.value,
+      projection,
+      session: runtime,
+    }),
+    () => true,
+    observe
+  );
+  return { navigation: navigation.value, observe, release, runtime };
+}
+
+function dispatchPbsCacheRequest(
+  source: Window,
+  adId: string,
+  postMessage: ReturnType<typeof vi.fn>
+): ReturnType<typeof vi.spyOn> {
+  const event = new MessageEvent('message', {
+    data: JSON.stringify({ message: 'Prebid Request', adId }),
+    ports: [Object.freeze({ postMessage }) as unknown as MessagePort],
+    source,
+  });
+  const stopped = vi.spyOn(event, 'stopImmediatePropagation');
+  window.dispatchEvent(event);
+  return stopped;
+}
+
+describe('GPT-owned PBS Cache bridge', () => {
+  const sharedCacheId = 'shared cache/id';
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    document.getElementById('cache-slot-one')?.remove();
+    document.getElementById('cache-slot-two')?.remove();
+    document.getElementById('foreign-cache-slot')?.remove();
+  });
+
+  it('binds duplicate cache ids to the requesting slot and preserves current-main parse, macro, and resize behavior', async () => {
+    const projection = pbsCacheProjection([
+      {
+        cacheId: sharedCacheId,
+        cacheHost: 'first-cache.example',
+        cachePath: '/first',
+        divId: 'cache-slot-one',
+        slot: 'slot-one',
+      },
+      {
+        cacheId: sharedCacheId,
+        cacheHost: 'second-cache.example:8443',
+        cachePath: '/opaque%2Fpath',
+        divId: 'cache-slot-two',
+        slot: 'slot-two',
+      },
+    ]);
+    const first = pbsCacheSourceFrame('cache-slot-one');
+    const second = pbsCacheSourceFrame('cache-slot-two');
+    const foreign = pbsCacheSourceFrame('foreign-cache-slot');
+    const fetchCache = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () =>
+        JSON.stringify({
+          adm: '<main data-price="${AUCTION_PRICE}" data-b64="${AUCTION_PRICE:B64}">cached</main>',
+          width: 320,
+          height: 100,
+          price: 2.75,
+        }),
+    }));
+    vi.stubGlobal('fetch', fetchCache);
+    const bridge = startPbsCacheBridge(projection);
+    const foreignPost = vi.fn();
+    const foreignStopped = dispatchPbsCacheRequest(
+      foreign.contentWindow!,
+      sharedCacheId,
+      foreignPost
+    );
+    expect(foreignStopped).not.toHaveBeenCalled();
+    expect(fetchCache).not.toHaveBeenCalled();
+
+    const postMessage = vi.fn();
+    const stopped = dispatchPbsCacheRequest(second.contentWindow!, sharedCacheId, postMessage);
+    await vi.waitFor(() => expect(postMessage).toHaveBeenCalledOnce());
+    expect(stopped).toHaveBeenCalledOnce();
+    expect(fetchCache).toHaveBeenCalledExactlyOnceWith(
+      'https://second-cache.example:8443/opaque%2Fpath?uuid=shared%20cache%2Fid',
+      { mode: 'cors' }
+    );
+    expect(JSON.parse(String(postMessage.mock.calls[0]?.[0]))).toEqual({
+      message: 'Prebid Response',
+      adId: sharedCacheId,
+      ad: '<main data-price="2.75" data-b64="${AUCTION_PRICE:B64}">cached</main>',
+      renderer: expect.any(String),
+      width: 320,
+      height: 100,
+    });
+    expect(second.style.width).toBe('320px');
+    expect(second.style.height).toBe('100px');
+    expect(first.style.width).toBe('1px');
+    expect(bridge.observe).not.toHaveBeenCalled();
+    bridge.release();
+    bridge.runtime.dispose();
+  });
+
+  it('keeps fetch, payload, and response-post failures typed and suppresses duplicate in-flight work', async () => {
+    const projection = pbsCacheProjection([
+      {
+        cacheId: sharedCacheId,
+        cacheHost: 'cache.example',
+        cachePath: '/pbc/v1/cache',
+        divId: 'cache-slot-one',
+        slot: 'slot-one',
+      },
+    ]);
+    const frame = pbsCacheSourceFrame('cache-slot-one');
+    let resolveResponse!: (
+      response: Readonly<{ ok: boolean; status: number; text: () => Promise<string> }>
+    ) => void;
+    const fetchCache = vi.fn(
+      () =>
+        new Promise<Readonly<{ ok: boolean; status: number; text: () => Promise<string> }>>(
+          (resolve) => {
+            resolveResponse = resolve;
+          }
+        )
+    );
+    vi.stubGlobal('fetch', fetchCache);
+    const bridge = startPbsCacheBridge(projection);
+    const firstPost = vi.fn();
+    dispatchPbsCacheRequest(frame.contentWindow!, sharedCacheId, firstPost);
+    dispatchPbsCacheRequest(frame.contentWindow!, sharedCacheId, vi.fn());
+    expect(fetchCache).toHaveBeenCalledOnce();
+    resolveResponse({ ok: true, status: 200, text: async () => '{"not_adm":true}' });
+    await vi.waitFor(() =>
+      expect(bridge.observe).toHaveBeenCalledWith(
+        Object.freeze({
+          kind: 'pbs_cache_bridge',
+          slotId: 'slot-one',
+          reason: 'invalid_cache_payload',
+        })
+      )
+    );
+    expect(firstPost).not.toHaveBeenCalled();
+
+    fetchCache.mockResolvedValueOnce({ ok: false, status: 503, text: async () => '' });
+    dispatchPbsCacheRequest(frame.contentWindow!, sharedCacheId, vi.fn());
+    await vi.waitFor(() =>
+      expect(bridge.observe).toHaveBeenCalledWith(
+        Object.freeze({
+          kind: 'pbs_cache_bridge',
+          slotId: 'slot-one',
+          reason: 'cache_fetch_failed',
+        })
+      )
+    );
+
+    fetchCache.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      text: async () => '<main>raw cached creative</main>',
+    });
+    const throwingPost = vi.fn(() => {
+      throw new Error('closed port');
+    });
+    dispatchPbsCacheRequest(frame.contentWindow!, sharedCacheId, throwingPost);
+    await vi.waitFor(() =>
+      expect(bridge.observe).toHaveBeenCalledWith(
+        Object.freeze({
+          kind: 'pbs_cache_bridge',
+          slotId: 'slot-one',
+          reason: 'response_post_failed',
+        })
+      )
+    );
+    expect(frame.style.width).toBe('1px');
+    bridge.release();
+    bridge.runtime.dispose();
+  });
+
+  it('makes late cache completion and post-disposal messages inert', async () => {
+    const projection = pbsCacheProjection([
+      {
+        cacheId: sharedCacheId,
+        cacheHost: 'cache.example',
+        cachePath: '/pbc/v1/cache',
+        divId: 'cache-slot-one',
+        slot: 'slot-one',
+      },
+    ]);
+    const frame = pbsCacheSourceFrame('cache-slot-one');
+    let resolveResponse!: (
+      response: Readonly<{ ok: boolean; status: number; text: () => Promise<string> }>
+    ) => void;
+    const fetchCache = vi.fn(
+      () =>
+        new Promise<Readonly<{ ok: boolean; status: number; text: () => Promise<string> }>>(
+          (resolve) => {
+            resolveResponse = resolve;
+          }
+        )
+    );
+    vi.stubGlobal('fetch', fetchCache);
+    const bridge = startPbsCacheBridge(projection);
+    const postMessage = vi.fn();
+    dispatchPbsCacheRequest(frame.contentWindow!, sharedCacheId, postMessage);
+    expect(fetchCache).toHaveBeenCalledOnce();
+    expect(bridge.runtime.replaceNavigation()).toMatchObject({ ok: true });
+    resolveResponse({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ adm: '<main>late</main>' }),
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(postMessage).not.toHaveBeenCalled();
+    expect(bridge.observe).not.toHaveBeenCalled();
+
+    bridge.release();
+    dispatchPbsCacheRequest(frame.contentWindow!, sharedCacheId, vi.fn());
+    expect(fetchCache).toHaveBeenCalledOnce();
+    bridge.runtime.dispose();
+  });
+});
 
 describe('transactional GPT integration module', () => {
   afterEach(() => {
@@ -397,15 +711,11 @@ describe('transactional GPT integration module', () => {
         'gpt.events.v1',
         'pbs_cache.baseline.v1',
       ]);
-      expect(Reflect.ownKeys(providerFacades.get('pbs_cache.baseline.v1') ?? {})).toEqual([
-        'render',
-      ]);
+      expect(Reflect.ownKeys(providerFacades.get('pbs_cache.baseline.v1') ?? {})).toEqual([]);
       const render = providerFacades.get('render.v1') as {
         attachPucGamAttemptRegistrar: (registrar: (input: unknown) => boolean) => () => void;
-        registerRenderer: (type: 'cache', renderer: () => boolean) => () => void;
       };
       expect(() => render.attachPucGamAttemptRegistrar(() => true)).toThrow('duplicated');
-      expect(() => render.registerRenderer('cache', () => false)).toThrow('duplicated');
       expect(protect).not.toHaveBeenCalled();
       expect([...listenerTypes].sort()).toEqual(
         (diagnosticsActive
@@ -437,11 +747,12 @@ describe('transactional GPT integration module', () => {
         cpm: 2,
         currency: 'USD',
         targeting: { hb_bidder: 'trusted' },
-        rendererReservationId: `r1_${'s'.repeat(22)}`,
         renderSource: {
-          type: 'adm',
+          type: 'pbs_cache',
           version: 1,
-          adm: '<main>spa winner</main>',
+          cacheId: 'cache id/with reserved bytes',
+          cacheHost: 'cache.example:8443',
+          cachePath: '/pbc/v1/cache',
           width: 300,
           height: 250,
         },
@@ -488,6 +799,52 @@ describe('transactional GPT integration module', () => {
         [publisherSlot],
         Object.freeze({ changeCorrelator: false })
       );
+      expect(publisherSlot.setTargeting).toHaveBeenCalledWith('hb_adid', bid.renderSource.cacheId);
+      expect(publisherSlot.setTargeting).toHaveBeenCalledWith(
+        'hb_cache_host',
+        bid.renderSource.cacheHost
+      );
+      expect(publisherSlot.setTargeting).toHaveBeenCalledWith(
+        'hb_cache_path',
+        bid.renderSource.cachePath
+      );
+
+      const sourceFrame = document.createElement('iframe');
+      slotElement.appendChild(sourceFrame);
+      const responsePort = Object.freeze({ postMessage: vi.fn() });
+      fetchPageBids.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({
+            adm: '<main data-price="${AUCTION_PRICE}" data-b64="${AUCTION_PRICE:B64}">cached</main>',
+            w: 320,
+            h: 100,
+            price: 2.75,
+          }),
+      } as Response);
+      const requestEvent = new MessageEvent('message', {
+        data: JSON.stringify({ message: 'Prebid Request', adId: bid.renderSource.cacheId }),
+        ports: [responsePort as unknown as MessagePort],
+        source: sourceFrame.contentWindow,
+      });
+      const stopImmediatePropagation = vi.spyOn(requestEvent, 'stopImmediatePropagation');
+      window.dispatchEvent(requestEvent);
+      await vi.waitFor(() => expect(responsePort.postMessage).toHaveBeenCalledOnce());
+      expect(stopImmediatePropagation).toHaveBeenCalledOnce();
+      expect(fetchPageBids).toHaveBeenNthCalledWith(
+        2,
+        'https://cache.example:8443/pbc/v1/cache?uuid=cache%20id%2Fwith%20reserved%20bytes',
+        { mode: 'cors' }
+      );
+      expect(JSON.parse(String(responsePort.postMessage.mock.calls[0]?.[0]))).toEqual({
+        message: 'Prebid Response',
+        adId: bid.renderSource.cacheId,
+        ad: '<main data-price="2.75" data-b64="${AUCTION_PRICE:B64}">cached</main>',
+        renderer: expect.any(String),
+        width: 320,
+        height: 100,
+      });
 
       let resolveStaleResponse!: (response: Response) => void;
       const concurrentPageBids = {
@@ -511,7 +868,7 @@ describe('transactional GPT integration module', () => {
           json: async () => concurrentPageBids,
         } as Response);
       const staleNavigation = later.navigate('/stale-generation');
-      await vi.waitFor(() => expect(fetchPageBids).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(fetchPageBids).toHaveBeenCalledTimes(3));
       const currentNavigation = later.navigate('/current-generation');
       await expect(currentNavigation).resolves.toEqual({
         status: 'committed',
@@ -531,8 +888,9 @@ describe('transactional GPT integration module', () => {
       later.release();
       expect(activeMutationObservers.size).toBe(1);
       await later.navigate('/disposed-owner');
-      expect(fetchPageBids).toHaveBeenCalledTimes(3);
+      expect(fetchPageBids).toHaveBeenCalledTimes(4);
       fetchPageBids.mockRestore();
+      sourceFrame.remove();
       slotElement.remove();
 
       if (result.state === 'kernel') result.dispose();
@@ -540,7 +898,6 @@ describe('transactional GPT integration module', () => {
       expect(removedTypes.sort()).toEqual([...listenerTypes].sort());
       expect(providerFacades.size).toBe(0);
       expect(() => render.attachPucGamAttemptRegistrar(() => true)).toThrow('unavailable');
-      expect(() => render.registerRenderer('cache', () => false)).toThrow('inactive');
     }
   );
 

@@ -19,7 +19,6 @@ import {
   type PrebidGlobalTarget,
   type PrebidTrustedServerAuctionV1,
 } from '../adapters/prebid';
-import { parseCacheFetchPolicyV1 } from '../core/config';
 import { parseTrustedServerAuctionResponseV1 } from '../core/auction';
 import type {
   BootManifestV1,
@@ -128,8 +127,6 @@ import {
   createRenderAttempt,
   createRendererNonceRegistry,
   createSlotOperation,
-  resolveCacheAdmAttempt,
-  renderDirectCacheAttempt,
   renderDirectAdmAttempt,
   type RenderAttempt,
   type CommittedArtifactStore,
@@ -204,7 +201,6 @@ export interface BrowserServices {
   readonly rendererNonces: RendererNonceRegistry;
   readonly renderDirectAdm: (attempt: RenderAttempt, container: HTMLElement) => boolean;
   readonly renderDirectAps: (attempt: RenderAttempt, container: HTMLElement) => boolean;
-  readonly renderDirectCache: (attempt: RenderAttempt, container: HTMLElement) => boolean;
   readonly slots: SlotService;
   readonly targeting: TargetingService;
 }
@@ -283,7 +279,6 @@ export interface TestBrowserRuntimeCompositionOptions extends BrowserComposition
 
 interface AcceptedBrowserBoot {
   readonly auctionProjection: object;
-  readonly cachePolicy?: unknown;
   readonly creative: Readonly<CreativeBootV1>;
   readonly diagnostics: Readonly<DiagnosticsBootV1>;
   readonly manifest: Readonly<BootManifestV1>;
@@ -297,7 +292,6 @@ interface PreparedBrowserServices {
   readonly publisherOrigin: string;
   readonly renderProjectedFallback: (attempt: RenderAttempt) => boolean;
   readonly rendererUrl: string;
-  readonly resolveCacheAdm: NonNullable<PucBridgeOptions['resolveCacheAdm']>;
   readonly services: Readonly<Omit<BrowserServices, 'pucBridge'>>;
 }
 
@@ -1154,6 +1148,7 @@ export function createTestBrowserRuntimeComposition(
       const bid = projection.bids[winnerIndex];
       winnerIndex += 1;
       if (!bid || !navigation.isCurrent()) continue;
+      if (!('rendererReservationId' in bid)) continue;
       const owner = batch.createRenderAttempt(decision.slot);
       if (!owner.ok) continue;
       const created = prepared.createAttempt(owner.value);
@@ -1410,10 +1405,8 @@ export function createTestBrowserRuntimeComposition(
       const boot = context.boot as unknown as AcceptedBrowserBoot;
       creativeBoot = boot.creative;
       diagnosticsBoot = boot.diagnostics;
-      const cachePolicy =
-        boot.cachePolicy === undefined ? undefined : parseCacheFetchPolicyV1(boot.cachePolicy);
       const parseProjection = (candidate: unknown): object | undefined =>
-        parseBrowserAuctionProjectionV1(candidate, boot.cachePolicy);
+        parseBrowserAuctionProjectionV1(candidate);
       const initialProjection = prepareInitialAuctionProjection(
         boot.auctionProjection,
         parseProjection
@@ -1463,7 +1456,10 @@ export function createTestBrowserRuntimeComposition(
       });
       const targetingService = createTargetingService();
       const reservationService = createReservationService({
-        prepareRenderSource: (candidate) => parseBidRenderSourceV1(candidate, cachePolicy),
+        prepareRenderSource: (candidate) => {
+          const source = parseBidRenderSourceV1(candidate);
+          return source?.type === 'pbs_cache' ? undefined : source;
+        },
       });
       const rendererNonces = createRendererNonceRegistry();
       // A real document origin is authoritative. Only an opaque srcdoc may
@@ -1471,7 +1467,6 @@ export function createTestBrowserRuntimeComposition(
       // to redirect the APS endpoint by predefining that creative-only stamp.
       const publisherOrigin = trustedDocumentHttpOrigin(window.location.origin);
       if (!publisherOrigin) throw new Error('Trusted publisher origin is unavailable');
-      const fetchCache = globalThis.fetch;
       const rendererUrl = new URL(APS_RENDERER_V1_PATH, publisherOrigin).href;
       const renderDirectAdm = Object.freeze(
         (attempt: RenderAttempt, container: HTMLElement): boolean => {
@@ -1479,38 +1474,6 @@ export function createTestBrowserRuntimeComposition(
             return renderDirectAdmAttempt({
               attempt,
               container,
-              prepareIframe: prepareAdmIframe,
-              publisherOrigin,
-            });
-          } catch {
-            return false;
-          }
-        }
-      );
-      const renderDirectCache = Object.freeze(
-        (attempt: RenderAttempt, container: HTMLElement): boolean => {
-          if (!cachePolicy) {
-            try {
-              attempt.fail('descriptor_invalid');
-            } catch {
-              // The admitted attempt remains the only terminal authority.
-            }
-            return false;
-          }
-          if (typeof fetchCache !== 'function') {
-            try {
-              attempt.fail('cache_network_error');
-            } catch {
-              // The admitted attempt remains the only terminal authority.
-            }
-            return false;
-          }
-          try {
-            return renderDirectCacheAttempt({
-              attempt,
-              cachePolicy,
-              container,
-              fetcher: (input, init) => fetchCache(input, init),
               prepareIframe: prepareAdmIframe,
               publisherOrigin,
             });
@@ -1534,37 +1497,6 @@ export function createTestBrowserRuntimeComposition(
           }
         }
       );
-      const resolveCacheAdm: NonNullable<PucBridgeOptions['resolveCacheAdm']> = (
-        attempt,
-        onResolved
-      ): boolean => {
-        if (!cachePolicy) {
-          try {
-            attempt.fail('descriptor_invalid');
-          } catch {
-            // The admitted attempt remains the only terminal authority.
-          }
-          return false;
-        }
-        if (typeof fetchCache !== 'function') {
-          try {
-            attempt.fail('cache_network_error');
-          } catch {
-            // The admitted attempt remains the only terminal authority.
-          }
-          return false;
-        }
-        try {
-          return resolveCacheAdmAttempt({
-            attempt: attempt as RenderAttempt,
-            cachePolicy,
-            fetcher: (input, init) => fetchCache(input, init),
-            onResolved,
-          });
-        } catch {
-          return false;
-        }
-      };
       const resolveDirectContainer = (record: SlotRecord): HTMLElement | undefined => {
         try {
           if (typeof document === 'undefined') return undefined;
@@ -1593,8 +1525,8 @@ export function createTestBrowserRuntimeComposition(
           owner,
           ...(parentAttemptId === undefined ? {} : { parentAttemptId }),
           prepareRenderSource: (candidate) => {
-            const source = parseBidRenderSourceV1(candidate, cachePolicy);
-            return source ? Object.freeze(source) : undefined;
+            const source = parseBidRenderSourceV1(candidate);
+            return source && source.type !== 'pbs_cache' ? Object.freeze(source) : undefined;
           },
           publishDiagnostics: preparedDiagnosticsIngress.publish,
           reservations: reservationService,
@@ -1608,12 +1540,10 @@ export function createTestBrowserRuntimeComposition(
         }
         if (attempt.renderSource?.type === 'aps') return renderDirectAps(attempt, container);
         if (attempt.renderSource?.type === 'adm') return renderDirectAdm(attempt, container);
-        if (attempt.renderSource?.type === 'cache') return renderDirectCache(attempt, container);
         attempt.fail('winner_not_renderable');
         return false;
       };
       const batchCoordinator = createAuctionBatchService({
-        ...(cachePolicy ? { cachePolicy } : {}),
         createAttempt: createOwnedAttempt,
         fetcher: (input, init) => {
           if (typeof fetchAuction !== 'function') return Promise.reject(new Error('unavailable'));
@@ -1629,7 +1559,6 @@ export function createTestBrowserRuntimeComposition(
         rendererNonces,
         renderDirectAdm,
         renderDirectAps,
-        renderDirectCache,
         slots: slotService,
         targeting: targetingService,
       });
@@ -1638,7 +1567,6 @@ export function createTestBrowserRuntimeComposition(
         publisherOrigin,
         renderProjectedFallback,
         rendererUrl,
-        resolveCacheAdm,
         services,
       });
       const session = createRuntimeSession({
@@ -1758,7 +1686,6 @@ export function createTestBrowserRuntimeComposition(
         rendererUrl: prepared.rendererUrl,
         reservations: prepared.services.reservations,
         resizeCollapsedShell: resizeCollapsedPucShell,
-        resolveCacheAdm: prepared.resolveCacheAdm,
       });
       context.onDispose(() => pucBridge.dispose());
       browserServices = Object.freeze({ ...prepared.services, pucBridge });

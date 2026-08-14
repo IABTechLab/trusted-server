@@ -510,8 +510,9 @@ pub struct BrowserAuctionBidV1 {
     pub currency: String,
     /// Lexically ordered publisher targeting, excluding runtime-owned `hb_adid`.
     pub targeting: BTreeMap<String, String>,
-    /// Server-minted renderer capability identity.
-    pub renderer_reservation_id: String,
+    /// Server-minted renderer capability identity for APS/ADM only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renderer_reservation_id: Option<String>,
     /// Sole tagged render authority for the winner.
     pub render_source: BidRenderSourceV1,
 }
@@ -616,42 +617,34 @@ pub struct AdmRenderSourceV1 {
     pub height: u32,
 }
 
-/// Version 1 trusted cache render source shared with browser clients.
+/// Thin version 1 carrier for the current GPT-owned PBS Cache behavior.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CacheRenderSourceV1 {
+pub struct BaselinePbsCacheSourceV1 {
     /// Render-source contract version.
     pub version: u8,
-    /// Exact validated PBS Cache UUID.
+    /// Exact native PBS Cache identity.
     pub cache_id: String,
-    /// Server-constructed trusted cache fetch URL.
-    pub fetch_url: String,
-    /// Creative width.
+    /// Exact current-main `hb_cache_host` value.
+    pub cache_host: String,
+    /// Exact current-main `hb_cache_path` value.
+    pub cache_path: String,
+    /// Winning width transported without cache-specific validation.
     pub width: u32,
-    /// Creative height.
+    /// Winning height transported without cache-specific validation.
     pub height: u32,
-}
-
-/// Immutable trusted base used to construct and admit PBS Cache fetches.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CacheFetchPolicyV1 {
-    /// Cache-policy contract version.
-    pub version: u8,
-    /// Canonical configured HTTPS cache endpoint without query or fragment.
-    pub base_url: String,
 }
 
 /// Typed browser render source carried by a bid.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum BidRenderSourceV1 {
     /// APS renderer version 1.
     Aps(ApsRendererV1),
     /// Inline ADM version 1.
     Adm(AdmRenderSourceV1),
-    /// Trusted cache fetch version 1.
-    Cache(CacheRenderSourceV1),
+    /// Current-main GPT-owned PBS Cache carrier.
+    PbsCache(BaselinePbsCacheSourceV1),
 }
 
 impl BidRenderSourceV1 {
@@ -660,7 +653,7 @@ impl BidRenderSourceV1 {
     pub fn as_aps(&self) -> Option<&ApsRendererV1> {
         match self {
             Self::Aps(renderer) => Some(renderer),
-            Self::Adm(_) | Self::Cache(_) => None,
+            Self::Adm(_) | Self::PbsCache(_) => None,
         }
     }
 }

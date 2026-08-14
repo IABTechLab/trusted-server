@@ -63,31 +63,6 @@ struct ProviderLaunchState {
     parse_state: Option<ProviderParseState>,
 }
 
-/// Outcome of attempting to dispatch split-phase auction provider requests.
-#[allow(clippy::large_enum_variant)]
-pub enum DispatchAuctionOutcome {
-    /// No provider request was started and no provider failure was observed.
-    NotStarted,
-    /// No provider request could be launched, but launch failures were observed.
-    DispatchFailed {
-        /// Original auction request.
-        request: AuctionRequest,
-        /// Provider launch-failure responses.
-        provider_responses: Vec<AuctionResponse>,
-        /// Fatal admission error that synchronous execution must propagate.
-        ///
-        /// Split publisher dispatch records the failure and continues without
-        /// attempting provider network I/O.
-        fatal_admission_error: Option<Report<TrustedServerError>>,
-        /// Auction-level metadata materialized before the failure.
-        metadata: HashMap<String, serde_json::Value>,
-        /// Elapsed dispatch time.
-        elapsed_ms: u64,
-    },
-    /// One or more providers produced an immediate response or started a request.
-    Dispatched(DispatchedAuction),
-}
-
 impl DispatchedAuction {
     /// Consume the dispatch token without collecting provider responses.
     #[must_use]
@@ -1001,8 +976,27 @@ impl AuctionOrchestrator {
                 }
             }
 
-            let mut invalid_slots = HashMap::<String, AuctionSlotFailureReason>::new();
-            let mut global_invalid = false;
+            let mut invalid_slots = response
+                .metadata
+                .get("invalid_slots")
+                .and_then(serde_json::Value::as_object)
+                .map(|slots| {
+                    slots
+                        .iter()
+                        .filter_map(|(slot, reason)| {
+                            (reason.as_str() == Some("invalid_provider_response")).then_some((
+                                slot.clone(),
+                                AuctionSlotFailureReason::InvalidProviderResponse,
+                            ))
+                        })
+                        .collect::<HashMap<_, _>>()
+                })
+                .unwrap_or_default();
+            let mut global_invalid = response
+                .metadata
+                .get("global_invalid_provider_response")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
             let mut accepted = Vec::new();
             for mut bid in core::mem::take(&mut response.bids) {
                 let requested_slot = requested_slots.get(bid.slot_id.as_str()).copied();
@@ -1947,42 +1941,31 @@ impl AuctionOrchestrator {
     /// [`DispatchedAuction`] token. The Fastly host begins the SSP round-trips
     /// while WASM continues to `pending_origin.wait()`.
     ///
-    /// Returns [`DispatchAuctionOutcome::NotStarted`] when no providers are configured or
-    /// all providers are disabled / over budget. Returns
-    /// [`DispatchAuctionOutcome::DispatchFailed`] when provider launch attempts
-    /// happened but none could be started.
+    /// The token is returned even when no transport starts. Collection then
+    /// routes zero-budget, launch-failure, disabled, and unconfigured-provider
+    /// cases through the same exhaustive terminal decision builder as ordinary
+    /// responses instead of silently dropping their slot outcomes.
     #[must_use]
     pub async fn dispatch_auction(
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
-    ) -> DispatchAuctionOutcome {
-        if !self.enabled {
-            return DispatchAuctionOutcome::NotStarted;
-        }
-        if !cfg!(test) || self.plan_backed {
-            return self.dispatch_planned_auction(request, context).await;
-        }
-        #[cfg(test)]
-        let provider_names = self
-            .config
-            .providers
-            .keys()
-            .map(super::plan::ProviderId::as_str)
-            .collect::<Vec<_>>();
-        #[cfg(test)]
-        if provider_names.is_empty() {
-            return DispatchAuctionOutcome::NotStarted;
-        }
+    ) -> DispatchedAuction {
+        let provider_names = self.config.provider_names();
+        let auction_start = Instant::now();
+        let mut backend_to_provider: HashMap<String, ProviderLaunchState> = HashMap::new();
+        let mut pending_requests: Vec<PlatformPendingRequest> = Vec::new();
+        let mut completed_responses: Vec<AuctionResponse> = Vec::new();
+        let mut immediate_response_count = 0usize;
 
         // Mirror run_providers_parallel: reject multi-provider fan-out before
         // any request launches when the platform executes `send_async` eagerly
         // (e.g. Cloudflare Workers, Spin). Sequential execution would accrue
         // the sum of provider latencies before the origin fetch and then fail
         // collection with empty bids.
-        #[cfg(test)]
-        if provider_names.len() > 1 && !context.services.http_client().supports_concurrent_fanout()
-        {
+        let fanout_supported = provider_names.len() <= 1
+            || context.services.http_client().supports_concurrent_fanout();
+        if !fanout_supported {
             log::warn!(
                 "{} auction providers configured, but this platform's HTTP client \
                  executes requests sequentially — skipping initial-page auction \
@@ -1990,30 +1973,15 @@ impl AuctionOrchestrator {
                  concurrent fan-out support",
                 provider_names.len(),
             );
-            return DispatchAuctionOutcome::NotStarted;
+            completed_responses.extend(
+                provider_names
+                    .iter()
+                    .map(|provider| provider_launch_failed_response(provider, 0)),
+            );
         }
 
-        let auction_start = Instant::now();
-        #[cfg(test)]
-        let mut backend_to_provider: HashMap<String, ProviderLaunchState> = HashMap::new();
-        #[cfg(not(test))]
-        let backend_to_provider: HashMap<String, ProviderLaunchState> = HashMap::new();
-        #[cfg(test)]
-        let mut pending_requests: Vec<PlatformPendingRequest> = Vec::new();
-        #[cfg(not(test))]
-        let pending_requests: Vec<PlatformPendingRequest> = Vec::new();
-        #[cfg(test)]
-        let mut completed_responses: Vec<AuctionResponse> = Vec::new();
-        #[cfg(not(test))]
-        let completed_responses: Vec<AuctionResponse> = Vec::new();
-        #[cfg(test)]
-        let mut immediate_response_count = 0usize;
-        #[cfg(not(test))]
-        let immediate_response_count = 0usize;
-
-        #[cfg(test)]
-        for provider_name in &provider_names {
-            let provider = match self.providers.get(*provider_name) {
+        for provider_name in provider_names.iter().filter(|_| fanout_supported) {
+            let provider = match self.providers.get(provider_name) {
                 Some(p) => p,
                 None => {
                     // lgtm[rust/cleartext-logging]
@@ -2045,6 +2013,10 @@ impl AuctionOrchestrator {
                     context.timeout_ms,
                     provider.provider_name()
                 );
+                completed_responses.push(provider_timeout_response(
+                    provider.provider_name(),
+                    auction_start.elapsed().as_millis() as u64,
+                ));
                 continue;
             }
 
@@ -2153,20 +2125,6 @@ impl AuctionOrchestrator {
             }
         }
 
-        if pending_requests.is_empty() && immediate_response_count == 0 {
-            return if completed_responses.is_empty() {
-                DispatchAuctionOutcome::NotStarted
-            } else {
-                DispatchAuctionOutcome::DispatchFailed {
-                    request: request.clone(),
-                    provider_responses: completed_responses,
-                    fatal_admission_error: None,
-                    metadata: HashMap::new(),
-                    elapsed_ms: auction_start.elapsed().as_millis() as u64,
-                }
-            };
-        }
-
         log::info!(
             "Dispatched {} SSP request(s) with {} immediate response(s) (timeout: {}ms)",
             pending_requests.len(),
@@ -2174,7 +2132,7 @@ impl AuctionOrchestrator {
             context.timeout_ms
         );
 
-        DispatchAuctionOutcome::Dispatched(DispatchedAuction {
+        DispatchedAuction {
             pending_requests,
             backend_to_provider,
             planned_backend_to_provider: HashMap::new(),
@@ -2184,10 +2142,7 @@ impl AuctionOrchestrator {
             floor_prices: self.floor_prices_by_slot(request),
             provider_request_context: Box::new(snapshot_context_request(context.request)),
             request: request.clone(),
-            planned_unused_bidder_params: HashMap::new(),
-            planned_unroutable_bidder_count: 0,
-            planned_provider_order: HashMap::new(),
-        })
+        }
     }
 
     /// Collect bid responses from a previously-dispatched auction.
@@ -2588,7 +2543,6 @@ mod tests {
     use web_time::Instant;
 
     use crate::auction::config::AuctionConfig;
-    use crate::auction::orchestrator::DispatchAuctionOutcome;
     use crate::auction::provider::{
         AuctionProvider, ProviderRequestOutcome, ProviderSlotDisposition,
     };
@@ -3401,11 +3355,7 @@ mod tests {
             };
 
             let result = if split {
-                let DispatchAuctionOutcome::Dispatched(dispatched) =
-                    orchestrator.dispatch_auction(&request, &context).await
-                else {
-                    panic!("bidder request should dispatch");
-                };
+                let dispatched = orchestrator.dispatch_auction(&request, &context).await;
                 orchestrator
                     .collect_dispatched_auction(dispatched, &services, &context)
                     .await
@@ -3797,6 +3747,18 @@ mod tests {
         assert!(matches!(
             normalized.outcomes[0].disposition,
             ProviderSlotDisposition::Failed(AuctionSlotFailureReason::ProviderTimeout)
+        ));
+
+        let mut attributable_invalid = vec![AuctionResponse::no_bid("alpha", 10)];
+        attributable_invalid[0].metadata.insert(
+            "invalid_slots".to_string(),
+            serde_json::json!({"slot-1": "invalid_provider_response"}),
+        );
+        let normalized =
+            orchestrator.normalize_provider_responses(&request, &mut attributable_invalid);
+        assert!(matches!(
+            normalized.outcomes[0].disposition,
+            ProviderSlotDisposition::Failed(AuctionSlotFailureReason::InvalidProviderResponse)
         ));
     }
 
@@ -4231,12 +4193,9 @@ mod tests {
         let downstream = http::Request::new(edgezero_core::body::Body::empty());
         let context = immediate_test_context(&settings, &downstream, &services);
 
-        let DispatchAuctionOutcome::Dispatched(dispatched) = orchestrator
+        let dispatched = orchestrator
             .dispatch_auction(&create_test_auction_request(), &context)
-            .await
-        else {
-            panic!("enabled immediate provider should dispatch");
-        };
+            .await;
         let result = orchestrator
             .collect_dispatched_auction(dispatched, &services, &context)
             .await;
@@ -4281,11 +4240,7 @@ mod tests {
             let request = create_test_auction_request();
 
             let result = if split {
-                let DispatchAuctionOutcome::Dispatched(dispatched) =
-                    orchestrator.dispatch_auction(&request, &context).await
-                else {
-                    panic!("mixed immediate/pending auction should dispatch");
-                };
+                let dispatched = orchestrator.dispatch_auction(&request, &context).await;
                 orchestrator
                     .collect_dispatched_auction(dispatched, &services, &context)
                     .await
@@ -4604,11 +4559,7 @@ mod tests {
             let request = create_test_auction_request();
 
             let result = if split {
-                let DispatchAuctionOutcome::Dispatched(dispatched) =
-                    orchestrator.dispatch_auction(&request, &context).await
-                else {
-                    panic!("should dispatch the first provider");
-                };
+                let dispatched = orchestrator.dispatch_auction(&request, &context).await;
                 orchestrator
                     .collect_dispatched_auction(dispatched, &services, &context)
                     .await
@@ -4781,6 +4732,61 @@ mod tests {
     }
 
     #[test]
+    fn zero_canonical_timeout_is_attributable_in_split_dispatch() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let services = build_services_with_backend_and_http_client(
+                Arc::new(CanonicalTimeoutBackend {
+                    canonical_ms: 0,
+                    calls,
+                }),
+                stub,
+            );
+            let predicted = Arc::new(Mutex::new(Vec::new()));
+            let requested = Arc::new(Mutex::new(Vec::new()));
+            let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+                enabled: true,
+                providers: vec!["bidder".to_string()],
+                timeout_ms: 2000,
+                ..Default::default()
+            });
+            orchestrator.register_provider(Arc::new(recording_provider(
+                "bidder",
+                "bidder-backend",
+                1000,
+                &predicted,
+                &requested,
+            )));
+            let settings = create_test_settings();
+            let downstream = http::Request::new(edgezero_core::body::Body::empty());
+            let context = immediate_test_context(&settings, &downstream, &services);
+            let request = create_test_auction_request();
+
+            let dispatched = orchestrator.dispatch_auction(&request, &context).await;
+            let result = orchestrator
+                .collect_dispatched_auction(dispatched, &services, &context)
+                .await;
+
+            assert!(predicted.lock().expect("should lock predicted").is_empty());
+            assert!(requested.lock().expect("should lock requested").is_empty());
+            assert_eq!(
+                result.decision_set.results,
+                vec![
+                    SlotAuctionDecisionV1::Failed {
+                        slot: "header-banner".to_string(),
+                        reason: AuctionSlotFailureReason::ProviderTimeout,
+                    },
+                    SlotAuctionDecisionV1::Failed {
+                        slot: "sidebar".to_string(),
+                        reason: AuctionSlotFailureReason::ProviderTimeout,
+                    },
+                ]
+            );
+        });
+    }
+
+    #[test]
     fn synchronous_mediation_applies_canonical_timeout_to_mediator() {
         futures::executor::block_on(async {
             let stub = Arc::new(StubHttpClient::new());
@@ -4872,11 +4878,7 @@ mod tests {
             let context = immediate_test_context(&settings, &downstream, &services);
             let request = create_test_auction_request();
 
-            let DispatchAuctionOutcome::Dispatched(dispatched) =
-                orchestrator.dispatch_auction(&request, &context).await
-            else {
-                panic!("should dispatch bidder request");
-            };
+            let dispatched = orchestrator.dispatch_auction(&request, &context).await;
             orchestrator
                 .collect_dispatched_auction(dispatched, &services, &context)
                 .await;
@@ -4982,11 +4984,7 @@ mod tests {
             let context = immediate_test_context(&settings, &downstream, &services);
             let request = create_test_auction_request();
 
-            let DispatchAuctionOutcome::Dispatched(dispatched) =
-                orchestrator.dispatch_auction(&request, &context).await
-            else {
-                panic!("should dispatch provider");
-            };
+            let dispatched = orchestrator.dispatch_auction(&request, &context).await;
             let result = orchestrator
                 .collect_dispatched_auction(dispatched, &services, &context)
                 .await;
@@ -5025,11 +5023,7 @@ mod tests {
             let context = immediate_test_context(&settings, &downstream, &services);
             let request = create_test_auction_request();
 
-            let DispatchAuctionOutcome::Dispatched(dispatched) =
-                orchestrator.dispatch_auction(&request, &context).await
-            else {
-                panic!("should dispatch first provider");
-            };
+            let dispatched = orchestrator.dispatch_auction(&request, &context).await;
             let result = orchestrator
                 .collect_dispatched_auction(dispatched, &services, &context)
                 .await;
@@ -5225,13 +5219,9 @@ mod tests {
                 provider_responses: None,
                 services: &services,
             };
-            let dispatched = match orchestrator
+            let dispatched = orchestrator
                 .dispatch_auction(&request, &dispatch_context)
-                .await
-            {
-                DispatchAuctionOutcome::Dispatched(dispatched) => dispatched,
-                _ => panic!("should dispatch provider request"),
-            };
+                .await;
             let placeholder = http::Request::builder()
                 .uri("https://placeholder.invalid/")
                 .body(edgezero_core::body::Body::empty())
@@ -5390,15 +5380,27 @@ mod tests {
             // Act
             let dispatched = orchestrator.dispatch_auction(&request, &context).await;
 
-            // Assert: no dispatch and no provider request launched.
-            assert!(
-                matches!(dispatched, DispatchAuctionOutcome::NotStarted),
-                "should skip initial-page dispatch on sequential platforms"
-            );
+            // Assert: no network request launches, but every configured provider
+            // remains attributable through the normal terminal decision path.
             assert!(
                 stub_for_assertion.recorded_backend_names().is_empty(),
                 "should not launch any provider request on a sequential platform"
             );
+            let result = orchestrator
+                .collect_dispatched_auction(dispatched, services, &context)
+                .await;
+            assert!(result.winning_bids.is_empty());
+            assert!(result.provider_responses.iter().all(|response| {
+                response.status == BidStatus::Error
+                    && response.metadata["error_type"] == "launch_failed"
+            }));
+            assert!(result.decision_set.results.iter().all(|decision| matches!(
+                decision,
+                SlotAuctionDecisionV1::Failed {
+                    reason: AuctionSlotFailureReason::ProviderError,
+                    ..
+                }
+            )));
         });
     }
 

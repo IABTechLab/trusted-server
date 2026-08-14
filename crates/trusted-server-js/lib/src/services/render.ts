@@ -14,9 +14,7 @@ const ATTEMPT_ID = /^a1_[A-Za-z0-9_-]{22}$/;
 const RENDERER_NONCE = /^n1_[A-Za-z0-9_-]{22}$/;
 const MAX_RENDERER_NONCES = 256;
 const MAX_RENDERER_NONCE_DRAWS = 8;
-const MAX_CACHE_BODY_BYTES = 512 * 1024;
-const MAX_CACHE_URL_BYTES = 4096;
-const CACHE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const MAX_ADM_BODY_BYTES = 512 * 1024;
 const reflectApplyIntrinsic = Reflect.apply;
 const directAdmDocument = typeof document === 'undefined' ? undefined : document;
 const directAdmOwnerDocumentGetter =
@@ -30,9 +28,6 @@ const objectGetOwnPropertyNamesIntrinsic = Object.getOwnPropertyNames;
 const objectGetOwnPropertySymbolsIntrinsic = Object.getOwnPropertySymbols;
 const objectGetOwnPropertyDescriptorIntrinsic = Object.getOwnPropertyDescriptor;
 const objectCreateIntrinsic = Object.create;
-const objectToStringIntrinsic = Object.prototype.toString;
-const objectHasOwnIntrinsic = Object.prototype.hasOwnProperty;
-const arrayIsArrayIntrinsic = Array.isArray;
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayPushIntrinsic = Array.prototype.push;
 const arraySliceIntrinsic = Array.prototype.slice;
@@ -74,69 +69,12 @@ const weakSetDeleteIntrinsic = WeakSet.prototype.delete;
 const promiseThenIntrinsic = Promise.prototype.then;
 const numberIsFiniteIntrinsic = Number.isFinite;
 const numberIsIntegerIntrinsic = Number.isInteger;
-const regexpTestIntrinsic = RegExp.prototype.test;
-const stringCharCodeAtIntrinsic = String.prototype.charCodeAt;
-const stringIndexOfIntrinsic = String.prototype.indexOf;
-const stringSliceIntrinsic = String.prototype.slice;
 const stringTrimIntrinsic = String.prototype.trim;
-const stringIntrinsic = String;
-const jsonParseIntrinsic = JSON.parse;
-const urlIntrinsic = URL;
-type UrlTextProperty =
-  | 'href'
-  | 'protocol'
-  | 'hostname'
-  | 'username'
-  | 'password'
-  | 'origin'
-  | 'port'
-  | 'pathname'
-  | 'search'
-  | 'hash';
-
-function captureUrlGetter(name: UrlTextProperty): ((this: URL) => string) | undefined {
-  let prototype: object | null = URL.prototype;
-  while (prototype) {
-    const getter = Object.getOwnPropertyDescriptor(prototype, name)?.get;
-    if (typeof getter === 'function') return getter as (this: URL) => string;
-    prototype = Object.getPrototypeOf(prototype) as object | null;
-  }
-  return undefined;
-}
-
-const urlGetters: Readonly<Record<UrlTextProperty, ((this: URL) => string) | undefined>> =
-  Object.freeze({
-    href: captureUrlGetter('href'),
-    protocol: captureUrlGetter('protocol'),
-    hostname: captureUrlGetter('hostname'),
-    username: captureUrlGetter('username'),
-    password: captureUrlGetter('password'),
-    origin: captureUrlGetter('origin'),
-    port: captureUrlGetter('port'),
-    pathname: captureUrlGetter('pathname'),
-    search: captureUrlGetter('search'),
-    hash: captureUrlGetter('hash'),
-  });
-const encodeURIComponentIntrinsic = encodeURIComponent;
 const textEncoder = new TextEncoder();
 const textEncoderEncodeIntrinsic = TextEncoder.prototype.encode;
-const fatalTextDecoder = new TextDecoder('utf-8', { fatal: true });
-const textDecoderDecodeIntrinsic = TextDecoder.prototype.decode;
-const abortControllerIntrinsic = AbortController;
-const abortControllerAbortIntrinsic = AbortController.prototype.abort;
-const abortControllerSignalGetter = Object.getOwnPropertyDescriptor(
-  AbortController.prototype,
-  'signal'
-)?.get as (this: AbortController) => AbortSignal;
-const abortSignalAbortedGetter = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted')
-  ?.get as (this: AbortSignal) => boolean;
 const artifactDisposals = new WeakMap<object, boolean>();
 const committedArtifactStores = new WeakSet<object>();
 const renderAttempts = new WeakSet<object>();
-const cacheAttemptControls = new WeakMap<
-  object,
-  Readonly<{ begin: () => boolean; complete: () => boolean }>
->();
 const ignoreAsyncDisposal = (): void => undefined;
 
 function frozen<const Value extends object>(value: Value): Readonly<Value> {
@@ -160,14 +98,6 @@ function isInteger(value: number): boolean {
   return reflectApplyIntrinsic(numberIsIntegerIntrinsic, Number, [value]) as boolean;
 }
 
-function regexpTest(pattern: RegExp, value: string): boolean {
-  return reflectApplyIntrinsic(regexpTestIntrinsic, pattern, [value]) as boolean;
-}
-
-function hasOwn(value: object, name: PropertyKey): boolean {
-  return reflectApplyIntrinsic(objectHasOwnIntrinsic, value, [name]) as boolean;
-}
-
 function objectIsFrozen(value: object): boolean {
   return reflectApplyIntrinsic(objectIsFrozenIntrinsic, Object, [value]) as boolean;
 }
@@ -189,26 +119,8 @@ function ownPropertyDescriptor(value: object, name: PropertyKey): PropertyDescri
     PropertyDescriptor | undefined;
 }
 
-function isArray(value: unknown): value is unknown[] {
-  return reflectApplyIntrinsic(arrayIsArrayIntrinsic, Array, [value]) as boolean;
-}
-
 function sortedStrings(values: string[]): string[] {
   return reflectApplyIntrinsic(arraySortIntrinsic, values, []) as string[];
-}
-
-function urlPart(url: URL, name: UrlTextProperty): string {
-  const getter = urlGetters[name];
-  if (typeof getter !== 'function') throw new TypeError('missing URL accessor');
-  return reflectApplyIntrinsic(getter, url, []) as string;
-}
-
-function isUint8Array(value: unknown): value is Uint8Array {
-  return (
-    (typeof value === 'object' || typeof value === 'function') &&
-    value !== null &&
-    reflectApplyIntrinsic(objectToStringIntrinsic, value, []) === '[object Uint8Array]'
-  );
 }
 
 function arraySlice<Value>(array: Value[]): Value[] {
@@ -377,9 +289,6 @@ export const RENDER_FAILURE_REASONS = frozen([
   'renderer_document_no_load',
   'runner_no_load',
   'runner_failed',
-  'cache_network_error',
-  'cache_http_error',
-  'cache_invalid_response',
   'adm_document_no_load',
   'abi_mismatch',
   'bundle_partial',
@@ -460,11 +369,6 @@ export const RENDER_STATE_DEADLINES: Readonly<
   waiting_for_adm: frozen({ milliseconds: 5_000, reason: 'adm_document_no_load' }),
 });
 
-const CACHE_FETCH_DEADLINE = frozen({
-  milliseconds: 5_000,
-  reason: 'cache_network_error' as const,
-});
-
 export interface RenderAttemptOptions {
   readonly owner: RenderAttemptScope;
   readonly artifacts: CommittedArtifactStore;
@@ -535,43 +439,12 @@ export interface DirectAdmAttemptOptions {
   readonly publisherOrigin: string;
 }
 
-interface CacheFetchReader {
-  readonly cancel?: () => Promise<unknown> | unknown;
-  readonly read: () => Promise<Readonly<{ done: boolean; value: Uint8Array | undefined }>>;
-  readonly releaseLock?: () => void;
-}
-
-interface CacheFetchResponse {
-  readonly body: Readonly<{ getReader: () => CacheFetchReader }> | null;
-  readonly ok: boolean;
-  readonly type: Response['type'];
-}
-
-type CacheFetcher = (input: string, init: RequestInit) => Promise<unknown>;
-
-export interface CacheAdmSource {
+interface DirectAdmSource {
   readonly adm: string;
   readonly height: number;
   readonly type: 'adm';
   readonly version: 1;
   readonly width: number;
-}
-
-export interface CacheFetchPolicy {
-  readonly baseUrl: string;
-  readonly version: 1;
-}
-
-export interface CacheAdmResolutionOptions {
-  readonly attempt: RenderAttempt;
-  readonly cachePolicy: Readonly<CacheFetchPolicy>;
-  readonly fetcher: CacheFetcher;
-  readonly onResolved: (source: Readonly<CacheAdmSource>) => boolean;
-}
-
-export interface DirectCacheAttemptOptions extends DirectAdmAttemptOptions {
-  readonly cachePolicy: Readonly<CacheFetchPolicy>;
-  readonly fetcher: CacheFetcher;
 }
 
 export interface DirectAdmIframeHandle {
@@ -1160,7 +1033,6 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
   let pendingArtifact: CommittedRenderArtifact | undefined;
   let admittedRenderSource: ReservationRenderSource | undefined;
   let admittedWinnerContext: WinnerContext | undefined;
-  let cacheFetchStarted = false;
   let deadlineHandle: unknown;
   let deadlineState: RenderAttemptActiveState | undefined;
   let settlingInternally = false;
@@ -1174,7 +1046,7 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
       if (
         !type ||
         !('value' in type) ||
-        (type.value !== 'aps' && type.value !== 'adm' && type.value !== 'cache') ||
+        (type.value !== 'aps' && type.value !== 'adm') ||
         !version ||
         !('value' in version) ||
         version.value !== 1
@@ -1225,7 +1097,7 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
       if (
         !type ||
         !('value' in type) ||
-        (type.value !== 'aps' && type.value !== 'adm' && type.value !== 'cache') ||
+        (type.value !== 'aps' && type.value !== 'adm') ||
         !version ||
         !('value' in version) ||
         version.value !== 1
@@ -1396,12 +1268,7 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
     }
     if (publishDiagnostics) {
       const accepted = terminal.outcome === 'accepted';
-      const servedFrom =
-        accepted && terminalRenderSource?.type === 'cache'
-          ? ('pbs-cache' as const)
-          : accepted
-            ? ('inline' as const)
-            : undefined;
+      const servedFrom = accepted ? ('inline' as const) : undefined;
       let sourceIdentity: Readonly<{ adId?: string; bidId?: string; creativeId?: string }> =
         Object.freeze({});
       if (accepted && terminalRenderSource) {
@@ -1415,9 +1282,7 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
           const bidId = terminalRenderSource.type === 'aps' ? readString('bidId') : undefined;
           const creativeId =
             terminalRenderSource.type === 'aps' ? readString('creativeId') : undefined;
-          const adId = terminalRenderSource.type === 'cache' ? readString('cacheId') : undefined;
           sourceIdentity = frozen({
-            ...(adId === undefined ? {} : { adId }),
             ...(bidId === undefined ? {} : { bidId }),
             ...(creativeId === undefined ? {} : { creativeId }),
           });
@@ -1506,9 +1371,7 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
   ): boolean => {
     const sourceType = admittedRenderSource?.type;
     const sourceMatches =
-      next === 'waiting_for_document'
-        ? sourceType === 'aps'
-        : sourceType === 'adm' || sourceType === 'cache';
+      next === 'waiting_for_document' ? sourceType === 'aps' : sourceType === 'adm';
     const artifactKind = state === 'rendering_direct' ? 'direct_iframe' : 'puc';
     if (
       pendingArtifact !== undefined ||
@@ -1525,29 +1388,6 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
     if (enter(allowed, next)) return true;
     pendingArtifact = undefined;
     return false;
-  };
-
-  const beginCacheFetch = (): boolean => {
-    if (
-      cacheFetchStarted ||
-      outcome !== undefined ||
-      admittedRenderSource?.type !== 'cache' ||
-      admittedWinnerContext === undefined ||
-      !ownerIsCurrent()
-    ) {
-      return false;
-    }
-    if (state === 'created') {
-      cacheFetchStarted = true;
-      return enter(['created'], 'rendering_direct', CACHE_FETCH_DEADLINE);
-    }
-    if (state !== 'waiting_for_insertion') return false;
-    cacheFetchStarted = true;
-    clearDeadline();
-    if (outcome === undefined && state === 'waiting_for_insertion') {
-      armDeadline('waiting_for_insertion', CACHE_FETCH_DEADLINE);
-    }
-    return outcome === undefined && state === 'waiting_for_insertion';
   };
 
   const lifecycle: RenderAttempt = {
@@ -1707,391 +1547,7 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
   }
   const exposedLifecycle = frozen(lifecycle);
   weakSetAdd(renderAttempts, exposedLifecycle);
-  weakMapSet(
-    cacheAttemptControls,
-    exposedLifecycle,
-    frozen({
-      begin: beginCacheFetch,
-      complete: () => {
-        const cacheState = state;
-        if (
-          admittedRenderSource?.type !== 'cache' ||
-          !admittedWinnerContext ||
-          outcome !== undefined ||
-          (cacheState !== 'rendering_direct' && cacheState !== 'waiting_for_insertion') ||
-          deadlineState !== cacheState ||
-          !ownerIsCurrent()
-        ) {
-          return false;
-        }
-        clearDeadline();
-        if (cacheState === 'waiting_for_insertion' && outcome === undefined) {
-          armDeadline(cacheState);
-        }
-        return outcome === undefined && state === cacheState && ownerIsCurrent();
-      },
-    })
-  );
   return frozen({ ok: true, value: exposedLifecycle });
-}
-
-type DirectAdmSource = Readonly<CacheAdmSource>;
-
-type DirectCacheSource = Readonly<{
-  cacheId: string;
-  fetchUrl: string;
-  height: number;
-  type: 'cache';
-  version: 1;
-  width: number;
-}>;
-
-type CacheBodyResult =
-  | Readonly<{ ok: true; text: string }>
-  | Readonly<{ ok: false; reason: 'cache_network_error' | 'cache_invalid_response' }>;
-
-function exactFrozenDataRecord(
-  value: unknown,
-  expectedNames: readonly string[]
-): Record<string, unknown> | undefined {
-  try {
-    if (
-      typeof value !== 'object' ||
-      value === null ||
-      !objectIsFrozen(value) ||
-      objectPrototype(value) !== Object.prototype ||
-      ownPropertySymbols(value).length !== 0
-    ) {
-      return undefined;
-    }
-    const names = sortedStrings(ownPropertyNames(value));
-    if (names.length !== expectedNames.length) return undefined;
-    const fields = reflectApplyIntrinsic(objectCreateIntrinsic, Object, [null]) as Record<
-      string,
-      unknown
-    >;
-    for (let index = 0; index < expectedNames.length; index += 1) {
-      const name = expectedNames[index];
-      if (!name || names[index] !== name) return undefined;
-      const descriptor = ownPropertyDescriptor(value, name);
-      if (
-        !descriptor ||
-        !('value' in descriptor) ||
-        descriptor.enumerable !== true ||
-        descriptor.configurable !== false ||
-        descriptor.writable !== false
-      ) {
-        return undefined;
-      }
-      fields[name] = descriptor.value;
-    }
-    return fields;
-  } catch {
-    return undefined;
-  }
-}
-
-function readCachePolicyBase(value: unknown): URL | undefined {
-  try {
-    const fields = exactFrozenDataRecord(value, ['baseUrl', 'version']);
-    const baseUrl = fields?.['baseUrl'];
-    if (
-      !fields ||
-      fields['version'] !== 1 ||
-      typeof baseUrl !== 'string' ||
-      baseUrl.length === 0 ||
-      utf8Length(baseUrl) > MAX_CACHE_URL_BYTES
-    ) {
-      return undefined;
-    }
-    for (let index = 0; index < baseUrl.length; index += 1) {
-      const code = reflectApplyIntrinsic(stringCharCodeAtIntrinsic, baseUrl, [index]) as number;
-      if (code <= 0x1f || code === 0x7f) return undefined;
-      if (code >= 0xd800 && code <= 0xdbff) {
-        const next = reflectApplyIntrinsic(stringCharCodeAtIntrinsic, baseUrl, [
-          index + 1,
-        ]) as number;
-        if (next < 0xdc00 || next > 0xdfff) return undefined;
-        index += 1;
-      } else if (code >= 0xdc00 && code <= 0xdfff) {
-        return undefined;
-      }
-    }
-    const base = Reflect.construct(urlIntrinsic, [baseUrl]) as URL;
-    if (
-      urlPart(base, 'protocol') !== 'https:' ||
-      urlPart(base, 'hostname') === '' ||
-      urlPart(base, 'username') !== '' ||
-      urlPart(base, 'password') !== '' ||
-      urlPart(base, 'search') !== '' ||
-      urlPart(base, 'hash') !== '' ||
-      urlPart(base, 'pathname') === '/'
-    ) {
-      return undefined;
-    }
-    return base;
-  } catch {
-    return undefined;
-  }
-}
-
-function readDirectCacheSource(
-  value: unknown,
-  cachePolicy: unknown
-): DirectCacheSource | undefined {
-  try {
-    const base = readCachePolicyBase(cachePolicy);
-    if (!base) return undefined;
-    const fields = exactFrozenDataRecord(value, [
-      'cacheId',
-      'fetchUrl',
-      'height',
-      'type',
-      'version',
-      'width',
-    ]);
-    if (
-      !fields ||
-      fields['type'] !== 'cache' ||
-      fields['version'] !== 1 ||
-      typeof fields['cacheId'] !== 'string' ||
-      !regexpTest(CACHE_ID, fields['cacheId']) ||
-      typeof fields['fetchUrl'] !== 'string' ||
-      fields['fetchUrl'].length === 0 ||
-      utf8Length(fields['fetchUrl']) > MAX_CACHE_URL_BYTES ||
-      typeof fields['width'] !== 'number' ||
-      !isInteger(fields['width']) ||
-      fields['width'] < 1 ||
-      fields['width'] > 4096 ||
-      typeof fields['height'] !== 'number' ||
-      !isInteger(fields['height']) ||
-      fields['height'] < 1 ||
-      fields['height'] > 4096
-    ) {
-      return undefined;
-    }
-    const sourceFetchUrl = fields['fetchUrl'] as string;
-    for (let index = 0; index < sourceFetchUrl.length; index += 1) {
-      const code = reflectApplyIntrinsic(stringCharCodeAtIntrinsic, sourceFetchUrl, [
-        index,
-      ]) as number;
-      if (code <= 0x1f || code === 0x7f) return undefined;
-      if (code >= 0xd800 && code <= 0xdbff) {
-        const next = reflectApplyIntrinsic(stringCharCodeAtIntrinsic, sourceFetchUrl, [
-          index + 1,
-        ]) as number;
-        if (next < 0xdc00 || next > 0xdfff) return undefined;
-        index += 1;
-      } else if (code >= 0xdc00 && code <= 0xdfff) {
-        return undefined;
-      }
-    }
-    const fetchUrl = Reflect.construct(urlIntrinsic, [sourceFetchUrl]) as URL;
-    const canonicalSearch = `?uuid=${
-      reflectApplyIntrinsic(encodeURIComponentIntrinsic, undefined, [fields['cacheId']]) as string
-    }`;
-    const expectedHref = `${urlPart(base, 'href')}${canonicalSearch}`;
-    if (
-      urlPart(fetchUrl, 'protocol') !== 'https:' ||
-      urlPart(fetchUrl, 'username') !== '' ||
-      urlPart(fetchUrl, 'password') !== '' ||
-      urlPart(fetchUrl, 'hash') !== '' ||
-      urlPart(fetchUrl, 'origin') !== urlPart(base, 'origin') ||
-      urlPart(fetchUrl, 'port') !== urlPart(base, 'port') ||
-      urlPart(fetchUrl, 'pathname') !== urlPart(base, 'pathname') ||
-      urlPart(fetchUrl, 'search') !== canonicalSearch ||
-      urlPart(fetchUrl, 'href') !== fields['fetchUrl'] ||
-      urlPart(fetchUrl, 'href') !== expectedHref
-    ) {
-      return undefined;
-    }
-    return value as DirectCacheSource;
-  } catch {
-    return undefined;
-  }
-}
-
-function readSelectedCpm(value: unknown): number | undefined {
-  const fields = exactFrozenDataRecord(value, ['selectedCpm']);
-  const selectedCpm = fields?.['selectedCpm'];
-  return typeof selectedCpm === 'number' && isFiniteNumber(selectedCpm) && selectedCpm >= 0
-    ? selectedCpm
-    : undefined;
-}
-
-function expandAuctionPrice(adm: string, selectedCpm: number): string {
-  const token = '${AUCTION_PRICE}';
-  const replacement = stringIntrinsic(selectedCpm);
-  let cursor = 0;
-  let output = '';
-  while (true) {
-    const next = reflectApplyIntrinsic(stringIndexOfIntrinsic, adm, [token, cursor]) as number;
-    if (next < 0) {
-      return output + (reflectApplyIntrinsic(stringSliceIntrinsic, adm, [cursor]) as string);
-    }
-    output +=
-      (reflectApplyIntrinsic(stringSliceIntrinsic, adm, [cursor, next]) as string) + replacement;
-    cursor = next + token.length;
-  }
-}
-
-function parseCacheAdm(
-  text: string,
-  source: DirectCacheSource,
-  selectedCpm: number
-): DirectAdmSource | undefined {
-  try {
-    const value = reflectApplyIntrinsic(jsonParseIntrinsic, JSON, [text]) as unknown;
-    if (
-      typeof value !== 'object' ||
-      value === null ||
-      isArray(value) ||
-      objectPrototype(value) !== Object.prototype ||
-      ownPropertySymbols(value).length !== 0
-    ) {
-      return undefined;
-    }
-    const record = value as Record<string, unknown>;
-    const names = ownPropertyNames(record);
-    for (let index = 0; index < names.length; index += 1) {
-      const name = names[index];
-      if (!name) return undefined;
-      const descriptor = ownPropertyDescriptor(record, name);
-      if (!descriptor || !('value' in descriptor) || descriptor.enumerable !== true) {
-        return undefined;
-      }
-    }
-    const recordHasOwn = (name: string): boolean => hasOwn(record, name);
-    if (recordHasOwn('width') || recordHasOwn('height')) return undefined;
-    const admDescriptor = ownPropertyDescriptor(record, 'adm');
-    if (
-      !admDescriptor ||
-      !('value' in admDescriptor) ||
-      typeof admDescriptor.value !== 'string' ||
-      (reflectApplyIntrinsic(stringTrimIntrinsic, admDescriptor.value, []) as string).length ===
-        0 ||
-      utf8Length(admDescriptor.value) > MAX_CACHE_BODY_BYTES
-    ) {
-      return undefined;
-    }
-    const hasWidth = recordHasOwn('w');
-    const hasHeight = recordHasOwn('h');
-    if (hasWidth !== hasHeight) return undefined;
-    if (
-      hasWidth &&
-      (typeof record['w'] !== 'number' ||
-        !isInteger(record['w']) ||
-        record['w'] < 1 ||
-        record['w'] > 4096 ||
-        record['w'] !== source.width ||
-        typeof record['h'] !== 'number' ||
-        !isInteger(record['h']) ||
-        record['h'] < 1 ||
-        record['h'] > 4096 ||
-        record['h'] !== source.height)
-    ) {
-      return undefined;
-    }
-    if (
-      recordHasOwn('price') &&
-      (typeof record['price'] !== 'number' ||
-        !isFiniteNumber(record['price']) ||
-        record['price'] < 0)
-    ) {
-      return undefined;
-    }
-    const adm = expandAuctionPrice(admDescriptor.value, selectedCpm);
-    if (utf8Length(adm) > MAX_CACHE_BODY_BYTES) return undefined;
-    return frozen({
-      adm,
-      height: source.height,
-      type: 'adm',
-      version: 1,
-      width: source.width,
-    });
-  } catch {
-    return undefined;
-  }
-}
-
-interface CacheBodyReadHooks {
-  readonly active: () => boolean;
-  readonly retain: (
-    reader: CacheFetchReader,
-    cancel: NonNullable<CacheFetchReader['cancel']>
-  ) => boolean;
-  readonly cancel: () => void;
-  readonly release: (reader: CacheFetchReader) => void;
-}
-
-async function readCacheBody(
-  response: CacheFetchResponse,
-  hooks: CacheBodyReadHooks
-): Promise<CacheBodyResult> {
-  let reader: CacheFetchReader | undefined;
-  let releaseLock: (() => void) | undefined;
-  try {
-    if (!response.ok) return frozen({ ok: false, reason: 'cache_invalid_response' });
-    if (!response.body) return frozen({ ok: true, text: '' });
-    reader = response.body.getReader();
-    const cancel = reader.cancel;
-    const read = reader.read;
-    releaseLock = reader.releaseLock;
-    if (
-      typeof read !== 'function' ||
-      typeof cancel !== 'function' ||
-      !hooks.active() ||
-      !hooks.retain(reader, cancel)
-    ) {
-      return frozen({ ok: false, reason: 'cache_network_error' });
-    }
-    const chunks: Uint8Array[] = [];
-    let total = 0;
-    while (true) {
-      if (!hooks.active()) return frozen({ ok: false, reason: 'cache_network_error' });
-      const step = await reflectApplyIntrinsic(read, reader, []);
-      if (!hooks.active()) return frozen({ ok: false, reason: 'cache_network_error' });
-      if (step.done) break;
-      if (!isUint8Array(step.value)) {
-        return frozen({ ok: false, reason: 'cache_network_error' });
-      }
-      total += step.value.byteLength;
-      if (total > MAX_CACHE_BODY_BYTES) {
-        hooks.cancel();
-        return frozen({ ok: false, reason: 'cache_invalid_response' });
-      }
-      arrayPush(chunks, step.value);
-    }
-    const bytes = new Uint8Array(total);
-    let offset = 0;
-    for (let index = 0; index < chunks.length; index += 1) {
-      const chunk = chunks[index];
-      if (!chunk) return frozen({ ok: false, reason: 'cache_network_error' });
-      bytes.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    try {
-      return frozen({
-        ok: true,
-        text: reflectApplyIntrinsic(textDecoderDecodeIntrinsic, fatalTextDecoder, [
-          bytes,
-        ]) as string,
-      });
-    } catch {
-      return frozen({ ok: false, reason: 'cache_invalid_response' });
-    }
-  } catch {
-    return frozen({ ok: false, reason: 'cache_network_error' });
-  } finally {
-    if (reader) hooks.release(reader);
-    if (reader && typeof releaseLock === 'function') {
-      try {
-        reflectApplyIntrinsic(releaseLock, reader, []);
-      } catch {
-        // The bounded result remains authoritative if stream lock release is hostile.
-      }
-    }
-  }
 }
 
 function readDirectAdmSource(value: unknown): DirectAdmSource | undefined {
@@ -2133,7 +1589,7 @@ function readDirectAdmSource(value: unknown): DirectAdmSource | undefined {
       fields['version'] !== 1 ||
       typeof fields['adm'] !== 'string' ||
       (reflectApplyIntrinsic(stringTrimIntrinsic, fields['adm'], []) as string).length === 0 ||
-      utf8Length(fields['adm']) > MAX_CACHE_BODY_BYTES ||
+      utf8Length(fields['adm']) > MAX_ADM_BODY_BYTES ||
       typeof fields['width'] !== 'number' ||
       !isInteger(fields['width']) ||
       fields['width'] < 1 ||
@@ -2151,10 +1607,7 @@ function readDirectAdmSource(value: unknown): DirectAdmSource | undefined {
   }
 }
 
-function renderAdmAttempt(
-  options: DirectAdmAttemptOptions,
-  admittedCacheAdm?: DirectAdmSource
-): boolean {
+function renderAdmAttempt(options: DirectAdmAttemptOptions): boolean {
   let attempt: RenderAttempt;
   let container: HTMLElement;
   let prepareIframe: DirectAdmIframeConstructor;
@@ -2184,12 +1637,12 @@ function renderAdmAttempt(
     return false;
   }
 
-  const source = admittedCacheAdm ?? readDirectAdmSource(attempt.renderSource);
+  const source = readDirectAdmSource(attempt.renderSource);
   if (!source) {
     attempt.fail('winner_not_renderable');
     return false;
   }
-  if (admittedCacheAdm === undefined && !attempt.beginDirect()) return false;
+  if (!attempt.beginDirect()) return false;
   try {
     if (attempt.snapshot().state !== 'rendering_direct') return false;
   } catch {
@@ -2333,280 +1786,6 @@ function renderAdmAttempt(
 /** Drive one admitted direct ADM attempt through the shared iframe constructor. */
 export function renderDirectAdmAttempt(options: DirectAdmAttemptOptions): boolean {
   return renderAdmAttempt(options);
-}
-
-/** Resolve one admitted cache source without assuming direct or PUC DOM ownership. */
-export function resolveCacheAdmAttempt(options: CacheAdmResolutionOptions): boolean {
-  let attempt: RenderAttempt;
-  let cachePolicy: CacheAdmResolutionOptions['cachePolicy'];
-  let fetchCache: CacheAdmResolutionOptions['fetcher'];
-  let onResolved: CacheAdmResolutionOptions['onResolved'];
-  try {
-    attempt = options.attempt;
-    cachePolicy = options.cachePolicy;
-    fetchCache = options.fetcher;
-    onResolved = options.onResolved;
-  } catch {
-    return false;
-  }
-  if (
-    !weakSetHas(renderAttempts, attempt) ||
-    typeof fetchCache !== 'function' ||
-    typeof onResolved !== 'function'
-  ) {
-    return false;
-  }
-  const cacheControls = weakMapGet(cacheAttemptControls, attempt);
-  if (!cacheControls) return false;
-
-  const source = readDirectCacheSource(attempt.renderSource, cachePolicy);
-  const winnerContext = attempt.winnerContext;
-  const selectedCpm = readSelectedCpm(winnerContext);
-  if (!source || selectedCpm === undefined) {
-    attempt.fail('descriptor_invalid');
-    return false;
-  }
-  if (reflectApplyIntrinsic(cacheControls.begin, cacheControls, []) !== true) return false;
-
-  let controller: AbortController;
-  let signal: AbortSignal;
-  try {
-    controller = Reflect.construct(abortControllerIntrinsic, []) as AbortController;
-    signal = reflectApplyIntrinsic(abortControllerSignalGetter, controller, []) as AbortSignal;
-  } catch {
-    attempt.fail('cache_network_error');
-    return false;
-  }
-
-  let pending = true;
-  let activeReader: CacheFetchReader | undefined;
-  let activeReaderCancel: NonNullable<CacheFetchReader['cancel']> | undefined;
-  let activeReaderCancelled = false;
-  const retainBodyReader = (
-    reader: CacheFetchReader,
-    cancel: NonNullable<CacheFetchReader['cancel']>
-  ): boolean => {
-    if (!pending || activeReader !== undefined) return false;
-    activeReader = reader;
-    activeReaderCancel = cancel;
-    activeReaderCancelled = false;
-    return true;
-  };
-  const releaseBodyReader = (reader: CacheFetchReader): void => {
-    if (activeReader !== reader) return;
-    activeReader = undefined;
-    activeReaderCancel = undefined;
-    activeReaderCancelled = false;
-  };
-  const cancelBodyReader = (): void => {
-    const reader = activeReader;
-    const cancel = activeReaderCancel;
-    if (!reader || !cancel || activeReaderCancelled) return;
-    activeReaderCancelled = true;
-    try {
-      const cancellation = reflectApplyIntrinsic(cancel, reader, []) as unknown;
-      if (
-        (typeof cancellation === 'object' || typeof cancellation === 'function') &&
-        cancellation !== null
-      ) {
-        try {
-          reflectApplyIntrinsic(promiseThenIntrinsic, cancellation, [
-            ignoreAsyncDisposal,
-            ignoreAsyncDisposal,
-          ]);
-        } catch {
-          // Cancellation authority is exact-once even for a hostile promise boundary.
-        }
-      }
-    } catch {
-      // Terminal settlement remains authoritative if reader cancellation throws.
-    }
-  };
-  const abortFetch = (): void => {
-    cancelBodyReader();
-    try {
-      if (reflectApplyIntrinsic(abortSignalAbortedGetter, signal, []) === true) return;
-      reflectApplyIntrinsic(abortControllerAbortIntrinsic, controller, []);
-    } catch {
-      // Abort is best-effort after the attempt has already settled.
-    }
-  };
-  const failCache = (reason: RenderFailureReason): void => {
-    if (!pending) return;
-    pending = false;
-    abortFetch();
-    try {
-      attempt.fail(reason);
-    } catch {
-      // A hostile attempt boundary cannot replay the already-closed cache phase.
-    }
-  };
-  if (
-    !attempt.onSettled(() => {
-      pending = false;
-      abortFetch();
-    })
-  ) {
-    failCache('cache_network_error');
-    return false;
-  }
-  if (!pending) return false;
-
-  let responsePromise: Promise<unknown>;
-  try {
-    responsePromise = reflectApplyIntrinsic(fetchCache, undefined, [
-      source.fetchUrl,
-      {
-        credentials: 'omit',
-        method: 'GET',
-        mode: 'cors',
-        redirect: 'error',
-        referrer: '',
-        referrerPolicy: 'no-referrer',
-        signal,
-      } satisfies RequestInit,
-    ]) as Promise<unknown>;
-  } catch {
-    failCache('cache_network_error');
-    return false;
-  }
-
-  const complete = async (): Promise<void> => {
-    let fetched: unknown;
-    try {
-      fetched = await responsePromise;
-    } catch {
-      failCache('cache_network_error');
-      return;
-    }
-    if (!pending) return;
-    let response: CacheFetchResponse;
-    let responseOk: boolean;
-    let responseType: Response['type'];
-    try {
-      if ((typeof fetched !== 'object' && typeof fetched !== 'function') || fetched === null) {
-        throw new TypeError('invalid cache response');
-      }
-      response = fetched as CacheFetchResponse;
-      responseOk = response.ok;
-      responseType = response.type;
-      if (typeof responseOk !== 'boolean' || typeof responseType !== 'string') {
-        throw new TypeError('invalid cache response metadata');
-      }
-    } catch {
-      failCache('cache_network_error');
-      return;
-    }
-    if (responseType !== 'cors') {
-      failCache('cache_network_error');
-      return;
-    }
-    if (!responseOk) {
-      failCache('cache_http_error');
-      return;
-    }
-    const body = await readCacheBody(response, {
-      active: () => pending,
-      cancel: cancelBodyReader,
-      release: releaseBodyReader,
-      retain: retainBodyReader,
-    });
-    if (!pending) return;
-    if (!body.ok) {
-      failCache(body.reason);
-      return;
-    }
-    if (reflectApplyIntrinsic(cacheControls.complete, cacheControls, []) !== true) {
-      failCache('cache_network_error');
-      return;
-    }
-    const admSource = parseCacheAdm(body.text, source, selectedCpm);
-    if (!admSource) {
-      failCache('cache_invalid_response');
-      return;
-    }
-    if (attempt.renderSource !== source || attempt.winnerContext !== winnerContext) {
-      failCache('cache_invalid_response');
-      return;
-    }
-    pending = false;
-    let resolved: boolean;
-    try {
-      resolved = reflectApplyIntrinsic(onResolved, undefined, [admSource]) === true;
-    } catch {
-      resolved = false;
-    }
-    if (!resolved) {
-      try {
-        if (attempt.snapshot().outcome === undefined) attempt.fail('internal_error');
-      } catch {
-        // The terminal latch remains authoritative across a hostile consumer boundary.
-      }
-    }
-  };
-  const completion = complete();
-  try {
-    reflectApplyIntrinsic(promiseThenIntrinsic, completion, [
-      ignoreAsyncDisposal,
-      ignoreAsyncDisposal,
-    ]);
-  } catch {
-    failCache('cache_network_error');
-    return false;
-  }
-  return true;
-}
-
-/** Fetch and render one admitted direct cache source through the shared ADM constructor. */
-export function renderDirectCacheAttempt(options: DirectCacheAttemptOptions): boolean {
-  let attempt: RenderAttempt;
-  let cachePolicy: DirectCacheAttemptOptions['cachePolicy'];
-  let container: HTMLElement;
-  let fetcher: DirectCacheAttemptOptions['fetcher'];
-  let prepareIframe: DirectAdmIframeConstructor;
-  let publisherOrigin: string;
-  try {
-    attempt = options.attempt;
-    cachePolicy = options.cachePolicy;
-    container = options.container;
-    fetcher = options.fetcher;
-    prepareIframe = options.prepareIframe;
-    publisherOrigin = options.publisherOrigin;
-  } catch {
-    return false;
-  }
-  if (!weakSetHas(renderAttempts, attempt) || typeof prepareIframe !== 'function') return false;
-
-  let created = false;
-  let exactDirectContainer: boolean;
-  try {
-    created = attempt.snapshot().state === 'created';
-    exactDirectContainer =
-      created &&
-      !!directAdmDocument &&
-      typeof directAdmOwnerDocumentGetter === 'function' &&
-      reflectApplyIntrinsic(directAdmOwnerDocumentGetter, container, []) === directAdmDocument &&
-      directAdmDocument.defaultView?.location.origin === publisherOrigin;
-  } catch {
-    exactDirectContainer = false;
-  }
-  if (!created) return false;
-  if (!exactDirectContainer) {
-    try {
-      attempt.fail('winner_not_renderable');
-    } catch {
-      // The exact direct-container boundary fails closed.
-    }
-    return false;
-  }
-
-  return resolveCacheAdmAttempt({
-    attempt,
-    cachePolicy,
-    fetcher,
-    onResolved: (source) =>
-      renderAdmAttempt({ attempt, container, prepareIframe, publisherOrigin }, source),
-  });
 }
 
 interface RendererNonceBinding {

@@ -685,7 +685,7 @@ describe('browser composition', () => {
         owner: owner.value,
         prepareRenderSource: (candidate) =>
           typeof candidate === 'object' && candidate !== null && Object.isFrozen(candidate)
-            ? (candidate as Readonly<{ type: 'aps' | 'adm' | 'cache'; version: 1 }>)
+            ? (candidate as Readonly<{ type: 'aps' | 'adm'; version: 1 }>)
             : undefined,
         reservations,
         ...(parentAttemptId === undefined ? {} : { parentAttemptId }),
@@ -728,7 +728,9 @@ describe('browser composition', () => {
     const projectedBid = (
       navigation.currentAuctionProjection as Readonly<{ bids: readonly BrowserAuctionBidV1[] }>
     ).bids[0];
-    if (!projectedBid) throw new Error('Expected the parsed projected winner');
+    if (!projectedBid || !('rendererReservationId' in projectedBid)) {
+      throw new Error('Expected the parsed owned projected winner');
+    }
     const projectedPlacement = (
       navigation.currentAuctionProjection as Readonly<Pick<BrowserAuctionProjectionV1, 'slots'>>
     ).slots[0];
@@ -2944,7 +2946,7 @@ describe('browser composition', () => {
     expect(session?.interfaces['rendererNonces']).toBe(rendererNonces);
     expect(session?.interfaces['renderDirectAps']).toBeTypeOf('function');
     expect(session?.interfaces['renderDirectAdm']).toBeTypeOf('function');
-    expect(session?.interfaces['renderDirectCache']).toBeTypeOf('function');
+    expect(session?.interfaces['renderDirectCache']).toBeUndefined();
     expect(session?.currentNavigation?.interfaces).toBe(session?.interfaces);
     expect(session?.currentNavigation?.currentAuctionProjection).toEqual(projection);
     expect(Object.isFrozen(session?.currentNavigation?.currentAuctionProjection)).toBe(true);
@@ -3525,66 +3527,6 @@ describe('browser composition', () => {
 
     expect(composition.runtimeSessionForTest()?.replaceNavigation()).toMatchObject({ ok: true });
     expect(composition.projectionSlotsForTest()).toEqual([]);
-  });
-
-  it('fails an admitted cache attempt when owner activation captured no fetch authority', async () => {
-    const fetchDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
-    Object.defineProperty(globalThis, 'fetch', {
-      configurable: true,
-      value: undefined,
-      writable: true,
-    });
-    const composition = createTestBrowserRuntimeComposition(
-      {
-        target: {},
-        releaseId: 'a'.repeat(64),
-        manifest: runtimeManifest('a'.repeat(64), []),
-        knownIntegrationIds: Object.freeze([]),
-        boot: {
-          auctionProjection: {
-            version: 1,
-            auction: { version: 1, auctionId: 'initial', results: [] },
-            slots: [],
-            bids: [],
-          },
-          cachePolicy: {
-            version: 1,
-            baseUrl: 'https://cache.example/pbc/v1/cache',
-          },
-          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
-          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
-        },
-        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
-      },
-      {
-        adapters: {
-          googletag: fakeGoogletagAdapter(),
-          messaging: fakeMessagingAdapter(),
-          prebid: fakePrebidAdapter(),
-        },
-        coreActivations: {
-          correctnessGptListeners: vi.fn(),
-        },
-      }
-    );
-
-    try {
-      expect(composition.runtime.start()).toBe(true);
-      await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
-      const renderCache = composition.runtimeSessionForTest()?.interfaces['renderDirectCache'] as
-        ((attempt: RenderAttempt, container: HTMLElement) => boolean) | undefined;
-      const fail = vi.fn(() => true);
-      expect(renderCache).toBeTypeOf('function');
-      expect(
-        renderCache?.(Object.freeze({ fail }) as unknown as RenderAttempt, document.body)
-      ).toBe(false);
-      expect(fail).toHaveBeenCalledOnce();
-      expect(fail).toHaveBeenCalledWith('cache_network_error');
-    } finally {
-      composition.runtime.dispose();
-      if (fetchDescriptor) Object.defineProperty(globalThis, 'fetch', fetchDescriptor);
-      else Reflect.deleteProperty(globalThis, 'fetch');
-    }
   });
 
   it('constructs or activates nothing after a terminal fallback', async () => {

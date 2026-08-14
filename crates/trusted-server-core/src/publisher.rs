@@ -39,19 +39,17 @@ use crate::auction::endpoints::{
 use crate::auction::formats::{
     coordinated_cutover_v1::CanonicalBrowserAuctionProjectionV1, sanitize_publisher_page_url,
 };
-use crate::auction::orchestrator::{
-    AuctionOrchestrator, DispatchAuctionOutcome, DispatchedAuction, OrchestrationResult,
-};
+use crate::auction::orchestrator::{AuctionOrchestrator, DispatchedAuction, OrchestrationResult};
 use crate::auction::telemetry::{
     AuctionObservationContext, AuctionSource, AuctionTerminalOutcome, build_auction_events,
     emit_auction_events_best_effort_lazy,
 };
 use crate::auction::types::{
     AdmRenderSourceV1, AuctionContext, AuctionDecisionSetV1, AuctionIdentityGenerator,
-    AuctionRequest, AuctionSlotFailureReason, Bid, BidRenderSourceV1, BrowserAuctionBidV1,
-    BrowserAuctionProjectionV1, BrowserAuctionSlotV1, CacheFetchPolicyV1, CacheRenderSourceV1,
-    DeviceInfo, PublisherInfo, SiteInfo, SlotAuctionDecisionV1, SystemAuctionIdentityGenerator,
-    UserInfo, mint_response_unique_base64url_identity,
+    AuctionRequest, AuctionSlotFailureReason, BaselinePbsCacheSourceV1, Bid, BidRenderSourceV1,
+    BrowserAuctionBidV1, BrowserAuctionProjectionV1, BrowserAuctionSlotV1, DeviceInfo,
+    PublisherInfo, SiteInfo, SlotAuctionDecisionV1, SystemAuctionIdentityGenerator, UserInfo,
+    mint_response_unique_base64url_identity,
 };
 use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
@@ -2337,12 +2335,25 @@ pub(crate) fn write_projection_to_state(
     request_origin: &str,
     browser_slots_json: Option<&str>,
 ) -> HashSet<String> {
+    let browser_auction_id = match mint_browser_auction_id(&SystemAuctionIdentityGenerator) {
+        Ok(auction_id) => auction_id,
+        Err(error) => {
+            log::error!("initial browser auction identity failed closed: {error:?}");
+            *ad_bids_state.lock().expect("should lock projection state") = Some(
+                r#"{"version":1,"auction":{"version":1,"auctionId":"a1_unavailable","results":[]},"slots":[],"bids":[]}"#
+                    .to_string(),
+            );
+            return HashSet::new();
+        }
+    };
+    let fallback_slots = browser_slots_json
+        .and_then(|json| serde_json::from_str::<Vec<BrowserAuctionSlotV1>>(json).ok());
     let projected = coordinated_cutover_v1::build_browser_auction_projection_v1(
         result,
         price_granularity,
         settings,
         request_origin,
-        None,
+        Some(&browser_auction_id),
         &SystemAuctionIdentityGenerator,
     )
     .and_then(|projection| {
@@ -2386,27 +2397,40 @@ pub(crate) fn write_projection_to_state(
         }
         Err(error) => {
             log::error!("initial browser auction projection failed closed: {error:?}");
+            let mut fallback_results: Vec<SlotAuctionDecisionV1> = result
+                .decision_set
+                .results
+                .iter()
+                .map(|decision| match decision {
+                    SlotAuctionDecisionV1::Winner { slot, .. } => SlotAuctionDecisionV1::Failed {
+                        slot: slot.clone(),
+                        reason: AuctionSlotFailureReason::WinnerNotRenderable,
+                    },
+                    decision => decision.clone(),
+                })
+                .collect();
+            let fallback_slots = fallback_slots
+                .filter(|slots| {
+                    slots.len() == fallback_results.len()
+                        && slots
+                            .iter()
+                            .zip(&fallback_results)
+                            .all(|(slot, decision)| slot.slot == decision.slot())
+                })
+                .unwrap_or_else(|| {
+                    // Without exact server-generated placement coverage, the
+                    // only valid browser-boot fallback is the empty projection.
+                    fallback_results.clear();
+                    Vec::new()
+                });
             let projection = BrowserAuctionProjectionV1 {
                 version: 1,
                 auction: AuctionDecisionSetV1 {
                     version: 1,
-                    auction_id: result.decision_set.auction_id.clone(),
-                    results: result
-                        .decision_set
-                        .results
-                        .iter()
-                        .map(|decision| match decision {
-                            SlotAuctionDecisionV1::Winner { slot, .. } => {
-                                SlotAuctionDecisionV1::Failed {
-                                    slot: slot.clone(),
-                                    reason: AuctionSlotFailureReason::WinnerNotRenderable,
-                                }
-                            }
-                            decision => decision.clone(),
-                        })
-                        .collect(),
+                    auction_id: browser_auction_id,
+                    results: fallback_results,
                 },
-                slots: Vec::new(),
+                slots: fallback_slots,
                 bids: Vec::new(),
             };
             (
@@ -3105,62 +3129,13 @@ pub async fn handle_publisher_request(
                 provider_responses: None,
                 services,
             };
-            match auction
+            let dispatched = auction
                 .orchestrator
                 .dispatch_auction(&auction_request, &auction_context)
-                .await
-            {
-                DispatchAuctionOutcome::Dispatched(dispatched) => {
-                    auction_request_for_telemetry = Some(auction_request);
-                    auction_observation = Some(observation);
-                    Some(dispatched)
-                }
-                DispatchAuctionOutcome::DispatchFailed {
-                    request,
-                    provider_responses,
-                    fatal_admission_error,
-                    metadata,
-                    elapsed_ms,
-                } => {
-                    if let Some(error) = fatal_admission_error {
-                        log::warn!(
-                            "Auction admission failed before publisher dispatch; continuing without bids: {error:?}"
-                        );
-                    }
-                    if !metadata.is_empty() {
-                        log::info!("Auction dispatch failure metadata: {metadata:?}");
-                    }
-                    emit_auction_events_best_effort_lazy(services, || {
-                        build_auction_events(
-                            observation,
-                            AuctionTerminalOutcome::DispatchFailed {
-                                request: &request,
-                                provider_responses: &provider_responses,
-                                reason: "dispatch_failed",
-                                elapsed_ms,
-                            },
-                        )
-                    })
-                    .await;
-                    None
-                }
-                DispatchAuctionOutcome::NotStarted => {
-                    let elapsed_ms = observation.elapsed_ms();
-                    emit_auction_events_best_effort_lazy(services, || {
-                        build_auction_events(
-                            observation,
-                            AuctionTerminalOutcome::DispatchFailed {
-                                request: &auction_request,
-                                provider_responses: &[],
-                                reason: "no_provider_dispatched",
-                                elapsed_ms,
-                            },
-                        )
-                    })
-                    .await;
-                    None
-                }
-            }
+                .await;
+            auction_request_for_telemetry = Some(auction_request);
+            auction_observation = Some(observation);
+            Some(dispatched)
         } else {
             let skip_reason = if !auction.orchestrator.is_enabled() {
                 "auction_disabled"
@@ -3865,71 +3840,43 @@ pub(crate) mod coordinated_cutover_v1 {
     const RENDERER_RESERVATION_BYTES: usize = 16;
     const RENDERER_RESERVATION_COLLISION_RETRIES: usize = 8;
 
-    fn cache_policy_base(policy: &CacheFetchPolicyV1) -> Option<url::Url> {
-        if policy.version != 1 {
-            return None;
-        }
-        let canonical =
-            crate::auction::formats::coordinated_cutover_v1::canonicalize_cache_fetch_policy_v1(
-                &policy.base_url,
-            )
-            .ok()?;
-        url::Url::parse(&canonical.base_url).ok()
-    }
-
-    fn cache_source_from_legacy_bid(
-        bid: &Bid,
-        policy: Option<&CacheFetchPolicyV1>,
-    ) -> Option<BidRenderSourceV1> {
-        let policy = policy?;
-        let mut base = cache_policy_base(policy)?;
-        let cache_id = bid.cache_id.as_deref()?;
-        if bid.cache_host.as_deref() != base.host_str()
-            || bid.cache_path.as_deref() != Some(base.path())
-        {
-            return None;
-        }
-        base.query_pairs_mut().append_pair("uuid", cache_id);
-        Some(BidRenderSourceV1::Cache(CacheRenderSourceV1 {
+    fn cache_source_from_legacy_bid(bid: &Bid) -> Option<BidRenderSourceV1> {
+        Some(BidRenderSourceV1::PbsCache(BaselinePbsCacheSourceV1 {
             version: 1,
-            cache_id: cache_id.to_string(),
-            fetch_url: base.to_string(),
+            cache_id: bid
+                .cache_id
+                .as_deref()
+                .filter(|value| !value.is_empty())?
+                .to_string(),
+            cache_host: bid
+                .cache_host
+                .as_deref()
+                .filter(|value| !value.is_empty())?
+                .to_string(),
+            cache_path: bid
+                .cache_path
+                .as_deref()
+                .filter(|value| !value.is_empty())?
+                .to_string(),
             width: bid.width,
             height: bid.height,
         }))
-    }
-
-    fn typed_source_matches_cache_policy(
-        source: &BidRenderSourceV1,
-        policy: Option<&CacheFetchPolicyV1>,
-    ) -> bool {
-        let BidRenderSourceV1::Cache(source) = source else {
-            return true;
-        };
-        let Some(mut expected) = policy.and_then(cache_policy_base) else {
-            return false;
-        };
-        expected
-            .query_pairs_mut()
-            .append_pair("uuid", &source.cache_id);
-        source.fetch_url == expected.as_str()
     }
 
     fn project_render_source(
         bid: &Bid,
         settings: &Settings,
         request_origin: &str,
-        cache_policy: Option<&CacheFetchPolicyV1>,
     ) -> Option<BidRenderSourceV1> {
         match (&bid.renderer, &bid.creative, &bid.cache_id) {
             (Some(source), None, None)
                 if bid.cache_host.is_none()
                     && bid.cache_path.is_none()
-                    && typed_source_matches_cache_policy(source, cache_policy) =>
+                    && !matches!(source, BidRenderSourceV1::PbsCache(_)) =>
             {
                 Some(source.clone())
             }
-            (None, Some(raw_creative), None) => {
+            (None, Some(raw_creative), _) => {
                 let priced = crate::creative::expand_auction_price_macro(
                     raw_creative,
                     bid.price
@@ -3947,7 +3894,7 @@ pub(crate) mod coordinated_cutover_v1 {
                     height: bid.height,
                 }))
             }
-            (None, None, Some(_)) => cache_source_from_legacy_bid(bid, cache_policy),
+            (None, None, Some(_)) => cache_source_from_legacy_bid(bid),
             _ => None,
         }
     }
@@ -3969,7 +3916,7 @@ pub(crate) mod coordinated_cutover_v1 {
         granularity: PriceGranularity,
         settings: &Settings,
         request_origin: &str,
-        cache_policy: Option<&CacheFetchPolicyV1>,
+        browser_auction_id: Option<&str>,
         identity_generator: &dyn AuctionIdentityGenerator,
     ) -> Result<CanonicalBrowserAuctionProjectionV1, Report<TrustedServerError>> {
         let mut reservation_ids = HashSet::new();
@@ -4011,27 +3958,31 @@ pub(crate) mod coordinated_cutover_v1 {
                 });
                 continue;
             };
-            let Some(render_source) =
-                project_render_source(bid, settings, request_origin, cache_policy)
-            else {
+            let Some(render_source) = project_render_source(bid, settings, request_origin) else {
                 projected_results.push(SlotAuctionDecisionV1::Failed {
                     slot: slot.clone(),
                     reason: AuctionSlotFailureReason::WinnerNotRenderable,
                 });
                 continue;
             };
-            let Some(renderer_reservation_id) = mint_response_unique_base64url_identity(
-                identity_generator,
-                &mut reservation_ids,
-                "r1_",
-                RENDERER_RESERVATION_BYTES,
-                RENDERER_RESERVATION_COLLISION_RETRIES,
-            ) else {
-                projected_results.push(SlotAuctionDecisionV1::Failed {
-                    slot: slot.clone(),
-                    reason: AuctionSlotFailureReason::IdentityGenerationFailed,
-                });
-                continue;
+            let renderer_reservation_id = match &render_source {
+                BidRenderSourceV1::Aps(_) | BidRenderSourceV1::Adm(_) => {
+                    let Some(id) = mint_response_unique_base64url_identity(
+                        identity_generator,
+                        &mut reservation_ids,
+                        "r1_",
+                        RENDERER_RESERVATION_BYTES,
+                        RENDERER_RESERVATION_COLLISION_RETRIES,
+                    ) else {
+                        projected_results.push(SlotAuctionDecisionV1::Failed {
+                            slot: slot.clone(),
+                            reason: AuctionSlotFailureReason::IdentityGenerationFailed,
+                        });
+                        continue;
+                    };
+                    Some(id)
+                }
+                BidRenderSourceV1::PbsCache(_) => None,
             };
 
             projected_results.push(decision.clone());
@@ -4069,6 +4020,11 @@ pub(crate) mod coordinated_cutover_v1 {
         slots: Vec<BrowserAuctionSlotV1>,
         request_origin: &str,
     ) -> Result<CanonicalBrowserAuctionProjectionV1, Report<TrustedServerError>> {
+        if slots.len() != canonical.projection.auction.results.len() {
+            return Err(Report::new(TrustedServerError::Auction {
+                message: "Browser auction slots must cover every decision".to_string(),
+            }));
+        }
         canonical.projection.slots = slots;
         crate::auction::formats::coordinated_cutover_v1::canonicalize_browser_auction_projection_v1(
             canonical.projection,
@@ -4519,7 +4475,7 @@ pub async fn handle_page_bids(
                         co_config.price_granularity,
                         settings,
                         &page_bids_request_origin,
-                        None,
+                        Some(&browser_auction_id),
                         &SystemAuctionIdentityGenerator,
                     )?;
                     let projection = coordinated_cutover_v1::attach_browser_slots_v1(
@@ -4683,8 +4639,7 @@ mod tests {
         use super::*;
         use crate::auction::types::{
             AdmRenderSourceV1, ApsRendererV1, ApsTagType, AuctionIdentityGenerator,
-            AuctionSlotFailureReason, BidRenderSourceV1, CacheFetchPolicyV1, CacheRenderSourceV1,
-            SlotAuctionDecisionV1,
+            AuctionSlotFailureReason, BidRenderSourceV1, SlotAuctionDecisionV1,
         };
         use crate::price_bucket::PriceGranularity;
         use base64::Engine as _;
@@ -4825,7 +4780,10 @@ mod tests {
             assert_eq!(bid.candidate_id, "AAAAAAAAAAAA");
             assert_eq!(bid.cpm, 2.75);
             assert_eq!(bid.render_source, source);
-            assert_eq!(bid.renderer_reservation_id, "r1_BwcHBwcHBwcHBwcHBwcHBw");
+            assert_eq!(
+                bid.renderer_reservation_id.as_deref(),
+                Some("r1_BwcHBwcHBwcHBwcHBwcHBw")
+            );
             assert!(
                 !serde_json::to_value(&bid.render_source)
                     .expect("render source should serialize")
@@ -4844,6 +4802,8 @@ mod tests {
             assert_eq!(
                 direct["seatbid"][0]["bid"][0]["id"],
                 bid.renderer_reservation_id
+                    .as_deref()
+                    .expect("ADM bid should have reservation")
             );
         }
 
@@ -4887,6 +4847,69 @@ mod tests {
             assert!(!stored.contains("<script"));
             assert!(!stored.contains(".bids"));
             assert!(!stored.contains("adSlots"));
+        }
+
+        #[test]
+        fn browser_boot_attachment_requires_slots_for_every_decision() {
+            let result = result_with_winners(vec![tagged_adm_bid("slot-1", "AAAAAAAAAAAA", 2.75)]);
+            let canonical = coordinated_cutover_v1::build_browser_auction_projection_v1(
+                &result,
+                PriceGranularity::Dense,
+                &Settings::default(),
+                "https://publisher.example",
+                Some("a1_AAAAAAAAAAAA"),
+                &SystemAuctionIdentityGenerator,
+            )
+            .expect("direct projection should be canonical before boot slots attach");
+
+            let error = coordinated_cutover_v1::attach_browser_slots_v1(
+                canonical,
+                Vec::new(),
+                "https://publisher.example",
+            )
+            .expect_err("browser boot must never pair decisions with an empty slot list");
+            assert!(error.to_string().contains("cover every decision"));
+        }
+
+        #[test]
+        fn initial_projection_failure_preserves_exact_slot_coverage() {
+            let result = result_with_winners(vec![tagged_adm_bid("slot-1", "AAAAAAAAAAAA", 2.75)]);
+            let state: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            let slots = serde_json::to_string(&vec![BrowserAuctionSlotV1 {
+                slot: "slot-1".to_string(),
+                gam_unit_path: "/123/slot-1".to_string(),
+                div_id: "div-slot-1".to_string(),
+                formats: vec![[300, 250]],
+                targeting: BTreeMap::new(),
+            }])
+            .expect("slot projection should serialize");
+
+            let delivered = write_projection_to_state(
+                &result,
+                PriceGranularity::Dense,
+                &state,
+                &Settings::default(),
+                "not-an-origin",
+                Some(&slots),
+            );
+
+            assert!(delivered.is_empty());
+            let stored = state
+                .lock()
+                .expect("should lock projection state")
+                .clone()
+                .expect("should store fail-closed projection JSON");
+            let projection: BrowserAuctionProjectionV1 =
+                serde_json::from_str(&stored).expect("fallback should remain contract-shaped");
+            assert_eq!(projection.slots.len(), projection.auction.results.len());
+            assert_eq!(projection.slots[0].slot, "slot-1");
+            assert!(matches!(
+                projection.auction.results[0],
+                SlotAuctionDecisionV1::Failed {
+                    reason: AuctionSlotFailureReason::WinnerNotRenderable,
+                    ..
+                }
+            ));
         }
 
         #[test]
@@ -4954,61 +4977,64 @@ mod tests {
         }
 
         #[test]
-        fn cache_projection_uses_only_the_frozen_policy_and_preserves_the_uuid() {
+        fn cache_projection_preserves_native_coordinates_without_policy_or_reservation() {
             let mut bid = tagged_adm_bid("slot-1", "AAAAAAAAAAAA", 1.5);
             bid.renderer = None;
             bid.cache_id = Some("f47447a0-b759-4f2f-9887-af458b79b570".to_string());
-            bid.cache_host = Some("cache.example".to_string());
-            bid.cache_path = Some("/pbc/v1/cache".to_string());
+            bid.cache_host = Some("cache.example:8443".to_string());
+            bid.cache_path = Some("/pbc/v1/cache/opaque%2Fpath".to_string());
             let result = result_with_winners(vec![bid]);
-            let policy = CacheFetchPolicyV1 {
-                version: 1,
-                base_url: "https://cache.example/pbc/v1/cache".to_string(),
-            };
-            let generator = ScriptedIdentityGenerator::new([vec![4; 16]]);
+            let generator = ScriptedIdentityGenerator::new([]);
 
             let canonical = coordinated_cutover_v1::build_browser_auction_projection_v1(
                 &result,
                 PriceGranularity::Dense,
                 &Settings::default(),
                 "https://publisher.example",
-                Some(&policy),
+                None,
                 &generator,
             )
             .expect("valid cache winner should project");
 
+            assert_eq!(generator.count.load(Ordering::SeqCst), 0);
             assert_eq!(
-                canonical.projection.bids[0].render_source,
-                BidRenderSourceV1::Cache(CacheRenderSourceV1 {
-                    version: 1,
-                    cache_id: "f47447a0-b759-4f2f-9887-af458b79b570".to_string(),
-                    fetch_url: "https://cache.example/pbc/v1/cache?uuid=f47447a0-b759-4f2f-9887-af458b79b570".to_string(),
-                    width: 300,
-                    height: 250,
+                serde_json::to_value(&canonical.projection.bids[0])
+                    .expect("cache projection should serialize"),
+                serde_json::json!({
+                    "candidateId": "AAAAAAAAAAAA",
+                    "slot": "slot-1",
+                    "provider": "prebid",
+                    "upstreamBidId": "upstream-slot-1",
+                    "cpm": 1.5,
+                    "currency": "USD",
+                    "targeting": {"hb_bidder": "example_bidder", "hb_pb": "1.50"},
+                    "renderSource": {
+                        "type": "pbs_cache",
+                        "version": 1,
+                        "cacheId": "f47447a0-b759-4f2f-9887-af458b79b570",
+                        "cacheHost": "cache.example:8443",
+                        "cachePath": "/pbc/v1/cache/opaque%2Fpath",
+                        "width": 300,
+                        "height": 250
+                    }
                 })
             );
 
-            let without_policy = coordinated_cutover_v1::build_browser_auction_projection_v1(
-                &result,
-                PriceGranularity::Dense,
-                &Settings::default(),
-                "https://publisher.example",
-                None,
-                &ScriptedIdentityGenerator::new([]),
+            let direct: serde_json::Value = serde_json::from_slice(
+                &crate::auction::formats::coordinated_cutover_v1::serialize_trusted_server_auction_response_v1(
+                    &canonical,
+                )
+                .expect("direct wire should serialize"),
             )
-            .expect("missing policy should remain an explicit winner failure");
-            assert!(without_policy.projection.bids.is_empty());
+            .expect("direct wire should be JSON");
             assert_eq!(
-                without_policy.projection.auction.results[0],
-                SlotAuctionDecisionV1::Failed {
-                    slot: "slot-1".to_string(),
-                    reason: AuctionSlotFailureReason::WinnerNotRenderable,
-                }
+                direct["seatbid"][0]["bid"][0]["id"],
+                "f47447a0-b759-4f2f-9887-af458b79b570"
             );
         }
 
         #[test]
-        fn projection_rejects_an_adm_with_a_coexisting_cache_pointer() {
+        fn projection_preserves_current_main_adm_over_cache_precedence() {
             let mut bid = tagged_adm_bid("slot-1", "AAAAAAAAAAAA", 1.5);
             bid.renderer = None;
             bid.creative = Some("<div>creative</div>".to_string());
@@ -5016,20 +5042,39 @@ mod tests {
             bid.cache_host = Some("cache.example".to_string());
             bid.cache_path = Some("/pbc/v1/cache".to_string());
             let result = result_with_winners(vec![bid]);
-            let policy = CacheFetchPolicyV1 {
-                version: 1,
-                base_url: "https://cache.example/pbc/v1/cache".to_string(),
-            };
-
             let canonical = coordinated_cutover_v1::build_browser_auction_projection_v1(
                 &result,
                 PriceGranularity::Dense,
                 &Settings::default(),
                 "https://publisher.example",
-                Some(&policy),
+                None,
                 &ScriptedIdentityGenerator::new([vec![8; 16]]),
             )
-            .expect("ambiguous source should remain an explicit winner failure");
+            .expect("accepted ADM should take precedence over cache coordinates");
+
+            assert!(matches!(
+                canonical.projection.bids[0].render_source,
+                BidRenderSourceV1::Adm(_)
+            ));
+        }
+
+        #[test]
+        fn rejected_adm_does_not_fall_through_to_coexisting_cache_coordinates() {
+            let mut bid = tagged_adm_bid("slot-1", "AAAAAAAAAAAA", 1.5);
+            bid.renderer = None;
+            bid.creative = Some("x".repeat(1024 * 1024 + 1));
+            bid.cache_id = Some("cache-id".to_string());
+            bid.cache_host = Some("cache.example".to_string());
+            bid.cache_path = Some("/pbc/v1/cache".to_string());
+            let canonical = coordinated_cutover_v1::build_browser_auction_projection_v1(
+                &result_with_winners(vec![bid]),
+                PriceGranularity::Dense,
+                &Settings::default(),
+                "https://publisher.example",
+                None,
+                &ScriptedIdentityGenerator::new([]),
+            )
+            .expect("rejected ADM should remain an attributable slot failure");
 
             assert!(canonical.projection.bids.is_empty());
             assert_eq!(
@@ -5039,6 +5084,101 @@ mod tests {
                     reason: AuctionSlotFailureReason::WinnerNotRenderable,
                 }
             );
+        }
+
+        #[test]
+        fn cache_projection_requires_all_three_native_coordinates() {
+            for missing in ["id", "host", "path"] {
+                let mut bid = tagged_adm_bid("slot-1", "AAAAAAAAAAAA", 1.5);
+                bid.renderer = None;
+                bid.creative = None;
+                bid.cache_id = (missing != "id").then(|| "cache-id".to_string());
+                bid.cache_host = (missing != "host").then(|| "cache.example".to_string());
+                bid.cache_path = (missing != "path").then(|| "/pbc/v1/cache".to_string());
+                let canonical = coordinated_cutover_v1::build_browser_auction_projection_v1(
+                    &result_with_winners(vec![bid]),
+                    PriceGranularity::Dense,
+                    &Settings::default(),
+                    "https://publisher.example",
+                    None,
+                    &ScriptedIdentityGenerator::new([]),
+                )
+                .expect("incomplete cache coordinates should remain attributable");
+
+                assert!(canonical.projection.bids.is_empty(), "missing {missing}");
+                assert!(matches!(
+                    canonical.projection.auction.results[0],
+                    SlotAuctionDecisionV1::Failed {
+                        reason: AuctionSlotFailureReason::WinnerNotRenderable,
+                        ..
+                    }
+                ));
+            }
+        }
+
+        #[test]
+        fn duplicate_cache_ids_remain_slot_scoped_and_never_enter_reservation_identity() {
+            let mut first = tagged_adm_bid("slot-1", "AAAAAAAAAAAA", 2.0);
+            first.renderer = None;
+            first.creative = None;
+            first.cache_id = Some("shared-cache-id".to_string());
+            first.cache_host = Some("Cache.EXAMPLE:443".to_string());
+            first.cache_path = Some("/opaque//path%2Fsegment".to_string());
+            let mut second = tagged_adm_bid("slot-2", "BBBBBBBBBBBB", 1.0);
+            second.renderer = None;
+            second.creative = None;
+            second.cache_id = first.cache_id.clone();
+            second.cache_host = Some("other-cache.example".to_string());
+            second.cache_path = Some("/another/path".to_string());
+
+            let canonical = coordinated_cutover_v1::build_browser_auction_projection_v1(
+                &result_with_winners(vec![first, second]),
+                PriceGranularity::Dense,
+                &Settings::default(),
+                "https://publisher.example",
+                None,
+                &ScriptedIdentityGenerator::new([]),
+            )
+            .expect("duplicate native cache ids should not collide as renderer reservations");
+
+            assert_eq!(canonical.projection.bids.len(), 2);
+            assert!(
+                canonical
+                    .projection
+                    .bids
+                    .iter()
+                    .all(|bid| bid.renderer_reservation_id.is_none())
+            );
+            let encoded = serde_json::to_value(&canonical.projection)
+                .expect("cache projection should serialize");
+            assert_eq!(
+                encoded["bids"][0]["renderSource"]["cacheHost"],
+                "Cache.EXAMPLE:443"
+            );
+            assert_eq!(
+                encoded["bids"][0]["renderSource"]["cachePath"],
+                "/opaque//path%2Fsegment"
+            );
+
+            let direct: serde_json::Value = serde_json::from_slice(
+                &crate::auction::formats::coordinated_cutover_v1::serialize_trusted_server_auction_response_v1(
+                    &canonical,
+                )
+                .expect("direct wire should serialize"),
+            )
+            .expect("direct wire should be JSON");
+            let direct_bids = direct["seatbid"]
+                .as_array()
+                .expect("direct response should contain seats")
+                .iter()
+                .flat_map(|seat| {
+                    seat["bid"]
+                        .as_array()
+                        .expect("each direct seat should contain bids")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(direct_bids.len(), 2);
+            assert!(direct_bids.iter().all(|bid| bid["id"] == "shared-cache-id"));
         }
 
         #[test]
@@ -5068,6 +5208,32 @@ mod tests {
                 !String::from_utf8(canonical.json)
                     .expect("canonical projection should be UTF-8")
                     .contains(&"x".repeat(40))
+            );
+        }
+
+        #[test]
+        fn blank_upstream_bid_id_fails_only_the_affected_winner() {
+            let mut bid = tagged_adm_bid("slot-1", "AAAAAAAAAAAA", 1.5);
+            bid.bid_id = Some(String::new());
+            let result = result_with_winners(vec![bid]);
+
+            let canonical = coordinated_cutover_v1::build_browser_auction_projection_v1(
+                &result,
+                PriceGranularity::Dense,
+                &Settings::default(),
+                "https://publisher.example",
+                None,
+                &ScriptedIdentityGenerator::new([]),
+            )
+            .expect("blank upstream identity should remain an explicit slot failure");
+
+            assert!(canonical.projection.bids.is_empty());
+            assert_eq!(
+                canonical.projection.auction.results[0],
+                SlotAuctionDecisionV1::Failed {
+                    slot: "slot-1".to_string(),
+                    reason: AuctionSlotFailureReason::WinnerNotRenderable,
+                }
             );
         }
 

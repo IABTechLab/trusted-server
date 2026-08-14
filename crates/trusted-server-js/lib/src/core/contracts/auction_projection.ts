@@ -1,14 +1,12 @@
-import { parseCacheFetchPolicyV1 } from '../config';
 import type {
   AdmRenderSourceV1,
   AuctionDecisionSetV1,
   AuctionSlotFailureReason,
+  BaselinePbsCacheSourceV1,
   BidRenderSourceV1,
   BrowserAuctionBidV1,
   BrowserAuctionProjectionV1,
   BrowserAuctionSlotV1,
-  CacheFetchPolicyV1,
-  CacheRenderSourceV1,
   SlotAuctionDecisionV1,
 } from '../types';
 
@@ -32,7 +30,6 @@ const reservationIdPattern = /^r1_[A-Za-z0-9_-]{22}$/;
 const auctionIdPattern = /^[A-Za-z0-9._:-]{1,128}$/;
 const providerPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const targetingKeyPattern = /^[A-Za-z0-9_]{1,20}$/;
-const cacheIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const auctionFailureReasons = new Set<AuctionSlotFailureReason>([
   'auction_disabled',
   'consent_denied',
@@ -307,10 +304,7 @@ export function isRendererReservationIdV1(value: unknown): value is string {
 }
 
 /** Validate and copy one exact browser render-source contract. */
-export function parseBidRenderSourceV1(
-  value: unknown,
-  cachePolicy?: Readonly<CacheFetchPolicyV1>
-): BidRenderSourceV1 | undefined {
+export function parseBidRenderSourceV1(value: unknown): BidRenderSourceV1 | undefined {
   const record = ownDataObject(value);
   if (!record || typeof record.type !== 'string') return undefined;
 
@@ -376,68 +370,42 @@ export function parseBidRenderSourceV1(
     } satisfies AdmRenderSourceV1;
   }
 
-  if (record.type === 'cache') {
+  if (record.type === 'pbs_cache') {
     const source = ownDataObject(value, [
       'type',
       'version',
       'cacheId',
-      'fetchUrl',
+      'cacheHost',
+      'cachePath',
       'width',
       'height',
     ]);
     if (
       !source ||
       source.version !== 1 ||
-      typeof source.cacheId !== 'string' ||
-      !matches(cacheIdPattern, source.cacheId) ||
-      !validBoundedString(source.fetchUrl, MAX_URL_BYTES) ||
-      !validDimension(source.width) ||
-      !validDimension(source.height) ||
-      !cachePolicy
-    ) {
-      return undefined;
-    }
-    let fetchUrl: URL;
-    try {
-      fetchUrl = new URL(source.fetchUrl);
-    } catch {
-      return undefined;
-    }
-    if (
-      fetchUrl.protocol !== 'https:' ||
-      fetchUrl.username !== '' ||
-      fetchUrl.password !== '' ||
-      fetchUrl.hash !== '' ||
-      [...fetchUrl.searchParams.keys()].length !== 1 ||
-      fetchUrl.searchParams.get('uuid') !== source.cacheId ||
-      fetchUrl.search !== `?uuid=${encodeURIComponent(source.cacheId)}`
-    ) {
-      return undefined;
-    }
-    let policyBase: URL;
-    try {
-      policyBase = new URL(cachePolicy.baseUrl);
-    } catch {
-      return undefined;
-    }
-    const expected = new URL(policyBase.href);
-    expected.search = `?uuid=${encodeURIComponent(source.cacheId)}`;
-    if (
-      fetchUrl.origin !== policyBase.origin ||
-      fetchUrl.port !== policyBase.port ||
-      fetchUrl.pathname !== policyBase.pathname ||
-      fetchUrl.href !== expected.href
+      !validBoundedString(source.cacheId, 4096, { allowControls: true }) ||
+      !validBoundedString(source.cacheHost, MAX_URL_BYTES, { allowControls: true }) ||
+      !validBoundedString(source.cachePath, MAX_URL_BYTES, { allowControls: true }) ||
+      typeof source.width !== 'number' ||
+      !Number.isInteger(source.width) ||
+      source.width < 0 ||
+      source.width > 0xffff_ffff ||
+      typeof source.height !== 'number' ||
+      !Number.isInteger(source.height) ||
+      source.height < 0 ||
+      source.height > 0xffff_ffff
     ) {
       return undefined;
     }
     return {
-      type: 'cache',
+      type: 'pbs_cache',
       version: 1,
       cacheId: source.cacheId,
-      fetchUrl: fetchUrl.href,
+      cacheHost: source.cacheHost,
+      cachePath: source.cachePath,
       width: source.width,
       height: source.height,
-    } satisfies CacheRenderSourceV1;
+    } satisfies BaselinePbsCacheSourceV1;
   }
 
   return undefined;
@@ -528,21 +496,35 @@ function parseTargeting(value: unknown): Record<string, string> | undefined {
   return targeting;
 }
 
-function parseBrowserBid(
-  value: unknown,
-  cachePolicy?: Readonly<CacheFetchPolicyV1>
-): BrowserAuctionBidV1 | undefined {
-  const bid = ownDataObject(value, [
-    'candidateId',
-    'slot',
-    'provider',
-    'upstreamBidId',
-    'cpm',
-    'currency',
-    'targeting',
-    'rendererReservationId',
-    'renderSource',
-  ]);
+function parseBrowserBid(value: unknown): BrowserAuctionBidV1 | undefined {
+  const rawBid = ownDataObject(value);
+  if (!rawBid) return undefined;
+  const hasReservation = Object.prototype.hasOwnProperty.call(rawBid, 'rendererReservationId');
+  const bid = ownDataObject(
+    value,
+    hasReservation
+      ? [
+          'candidateId',
+          'slot',
+          'provider',
+          'upstreamBidId',
+          'cpm',
+          'currency',
+          'targeting',
+          'rendererReservationId',
+          'renderSource',
+        ]
+      : [
+          'candidateId',
+          'slot',
+          'provider',
+          'upstreamBidId',
+          'cpm',
+          'currency',
+          'targeting',
+          'renderSource',
+        ]
+  );
   if (
     !bid ||
     !isAuctionCandidateIdV1(bid.candidateId) ||
@@ -552,25 +534,28 @@ function parseBrowserBid(
     typeof bid.cpm !== 'number' ||
     !Number.isFinite(bid.cpm) ||
     bid.cpm < 0 ||
-    bid.currency !== 'USD' ||
-    !isRendererReservationIdV1(bid.rendererReservationId)
+    bid.currency !== 'USD'
   ) {
     return undefined;
   }
   const targeting = parseTargeting(bid.targeting);
-  const renderSource = parseBidRenderSourceV1(bid.renderSource, cachePolicy);
+  const renderSource = parseBidRenderSourceV1(bid.renderSource);
   if (!targeting || !renderSource) return undefined;
-  return {
+  const base = {
     candidateId: bid.candidateId,
     slot: bid.slot,
     provider: bid.provider,
     upstreamBidId: bid.upstreamBidId,
     cpm: bid.cpm,
-    currency: 'USD',
+    currency: 'USD' as const,
     targeting,
-    rendererReservationId: bid.rendererReservationId,
-    renderSource,
   };
+  if (renderSource.type === 'pbs_cache') {
+    if (hasReservation) return undefined;
+    return { ...base, renderSource };
+  }
+  if (!hasReservation || !isRendererReservationIdV1(bid.rendererReservationId)) return undefined;
+  return { ...base, rendererReservationId: bid.rendererReservationId, renderSource };
 }
 
 function parseBrowserSlot(value: unknown): BrowserAuctionSlotV1 | undefined {
@@ -606,13 +591,9 @@ function parseBrowserSlot(value: unknown): BrowserAuctionSlotV1 | undefined {
 
 /** Validate, canonicalize, and deep-copy a complete browser auction projection. */
 export function parseBrowserAuctionProjectionV1(
-  value: unknown,
-  cachePolicyValue?: unknown
+  value: unknown
 ): BrowserAuctionProjectionV1 | undefined {
   try {
-    const cachePolicy =
-      cachePolicyValue === undefined ? undefined : parseCacheFetchPolicyV1(cachePolicyValue);
-    if (cachePolicyValue !== undefined && !cachePolicy) return undefined;
     const record = ownDataObject(value, ['version', 'auction', 'slots', 'bids']);
     if (!record || record.version !== 1) return undefined;
     const auction = parseAuctionDecisionSetV1(record.auction);
@@ -636,16 +617,16 @@ export function parseBrowserAuctionProjectionV1(
     const reservationIds = new Set<string>();
     for (let index = 0; index < rawBids.length; index += 1) {
       const raw = rawBids[index];
-      const bid = parseBrowserBid(raw, cachePolicy);
+      const bid = parseBrowserBid(raw);
       if (
         !bid ||
         candidateIds.has(bid.candidateId) ||
-        reservationIds.has(bid.rendererReservationId)
+        ('rendererReservationId' in bid && reservationIds.has(bid.rendererReservationId))
       ) {
         return undefined;
       }
       candidateIds.add(bid.candidateId);
-      reservationIds.add(bid.rendererReservationId);
+      if ('rendererReservationId' in bid) reservationIds.add(bid.rendererReservationId);
       bids.push(bid);
     }
 

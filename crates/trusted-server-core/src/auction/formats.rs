@@ -31,7 +31,7 @@ use super::orchestrator::OrchestrationResult;
 use super::types::{
     AdFormat, AdSlot, AuctionDecisionSetV1, AuctionDropReason, AuctionDropReasons, AuctionRequest,
     AuctionSlotFailureReason, BidRenderSourceV1, BrowserAuctionBidV1, BrowserAuctionProjectionV1,
-    BrowserAuctionSlotV1, CacheFetchPolicyV1, DeviceInfo, MAX_BROWSER_AUCTION_PROJECTION_BYTES,
+    BrowserAuctionSlotV1, DeviceInfo, MAX_BROWSER_AUCTION_PROJECTION_BYTES,
     MAX_BROWSER_AUCTION_RESULTS, MAX_BROWSER_AUCTION_TARGETING_ENTRIES, MediaType, OrchestratorExt,
     ProviderSummary, PublisherInfo, RENDER_DIMENSION_MAX, RENDER_DIMENSION_MIN, SiteInfo,
     SlotAuctionDecisionV1, UserInfo, classify_aps_renderer_v1, record_auction_drop,
@@ -338,36 +338,6 @@ pub(crate) mod coordinated_cutover_v1 {
         })
     }
 
-    /// Validate and deep-own the immutable cache fetch base used by projection.
-    pub(crate) fn canonicalize_cache_fetch_policy_v1(
-        base_url: &str,
-    ) -> Result<CacheFetchPolicyV1, Report<TrustedServerError>> {
-        ensure!(
-            !base_url.is_empty()
-                && base_url.len() <= 4096
-                && !base_url
-                    .chars()
-                    .any(|character| matches!(character, '\0'..='\u{1f}' | '\u{7f}')),
-            projection_contract_error("Cache policy base URL violates the byte grammar")
-        );
-        let parsed = Url::parse(base_url)
-            .map_err(|_| projection_contract_error("Cache policy base URL is invalid"))?;
-        ensure!(
-            parsed.scheme() == "https"
-                && parsed.host_str().is_some()
-                && parsed.username().is_empty()
-                && parsed.password().is_none()
-                && parsed.query().is_none()
-                && parsed.fragment().is_none()
-                && parsed.path() != "/",
-            projection_contract_error("Cache policy base URL is not a trusted fixed endpoint")
-        );
-        Ok(CacheFetchPolicyV1 {
-            version: 1,
-            base_url: base_url.to_string(),
-        })
-    }
-
     fn is_base64url_byte(byte: u8) -> bool {
         byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
     }
@@ -429,66 +399,20 @@ pub(crate) mod coordinated_cutover_v1 {
         (RENDER_DIMENSION_MIN..=RENDER_DIMENSION_MAX).contains(&u64::from(value))
     }
 
-    fn valid_cache_id(value: &str) -> bool {
-        let Ok(uuid) = Uuid::parse_str(value) else {
-            return false;
-        };
-        uuid.hyphenated().to_string().eq_ignore_ascii_case(value)
-            && matches!(uuid.get_version_num(), 1..=5)
-            && uuid.get_variant() == uuid::Variant::RFC4122
-    }
-
-    fn valid_cache_fetch_url(fetch_url: &str, cache_id: &str) -> bool {
-        if fetch_url.len() > 4096 {
-            return false;
-        }
-        let Ok(url) = Url::parse(fetch_url) else {
-            return false;
-        };
-        let query = format!("uuid={cache_id}");
-        url.scheme() == "https"
-            && url.host_str().is_some()
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.fragment().is_none()
-            && url.query() == Some(query.as_str())
-            && url
-                .query_pairs()
-                .exactly_one()
-                .is_ok_and(|(key, value)| key == "uuid" && value == cache_id)
-    }
-
-    trait ExactlyOne: Iterator + Sized {
-        fn exactly_one(mut self) -> Result<Self::Item, ()> {
-            let Some(value) = self.next() else {
-                return Err(());
-            };
-            if self.next().is_some() {
-                return Err(());
-            }
-            Ok(value)
-        }
-    }
-
-    impl<I: Iterator> ExactlyOne for I {}
-
     fn render_source_dimensions(source: &BidRenderSourceV1) -> (u32, u32) {
         match source {
             BidRenderSourceV1::Aps(source) => (source.width, source.height),
             BidRenderSourceV1::Adm(source) => (source.width, source.height),
-            BidRenderSourceV1::Cache(source) => (source.width, source.height),
+            BidRenderSourceV1::PbsCache(source) => (source.width, source.height),
         }
     }
 
     fn valid_render_source(source: &BidRenderSourceV1, publisher_origin: &str) -> bool {
-        let (width, height) = render_source_dimensions(source);
-        if !valid_render_dimension(width) || !valid_render_dimension(height) {
-            return false;
-        }
-
         match source {
             BidRenderSourceV1::Aps(source) => {
-                source.version == 1
+                valid_render_dimension(source.width)
+                    && valid_render_dimension(source.height)
+                    && source.version == 1
                     && serde_json::to_value(BidRenderSourceV1::Aps(source.clone())).is_ok_and(
                         |value| {
                             classify_aps_renderer_v1(&value, publisher_origin)
@@ -497,12 +421,17 @@ pub(crate) mod coordinated_cutover_v1 {
                     )
             }
             BidRenderSourceV1::Adm(source) => {
-                source.version == 1 && !source.adm.is_empty() && source.adm.len() <= 512 * 1024
+                valid_render_dimension(source.width)
+                    && valid_render_dimension(source.height)
+                    && source.version == 1
+                    && !source.adm.is_empty()
+                    && source.adm.len() <= 512 * 1024
             }
-            BidRenderSourceV1::Cache(source) => {
+            BidRenderSourceV1::PbsCache(source) => {
                 source.version == 1
-                    && valid_cache_id(&source.cache_id)
-                    && valid_cache_fetch_url(&source.fetch_url, &source.cache_id)
+                    && !source.cache_id.is_empty()
+                    && !source.cache_host.is_empty()
+                    && !source.cache_path.is_empty()
             }
         }
     }
@@ -516,8 +445,14 @@ pub(crate) mod coordinated_cutover_v1 {
             && bid.cpm >= 0.0
             && bid.currency == "USD"
             && valid_targeting(&bid.targeting)
-            && valid_renderer_reservation_id(&bid.renderer_reservation_id)
             && valid_render_source(&bid.render_source, publisher_origin)
+            && match &bid.render_source {
+                BidRenderSourceV1::Aps(_) | BidRenderSourceV1::Adm(_) => bid
+                    .renderer_reservation_id
+                    .as_deref()
+                    .is_some_and(valid_renderer_reservation_id),
+                BidRenderSourceV1::PbsCache(_) => bid.renderer_reservation_id.is_none(),
+            }
     }
 
     fn valid_browser_slot(slot: &BrowserAuctionSlotV1) -> bool {
@@ -634,7 +569,10 @@ pub(crate) mod coordinated_cutover_v1 {
                     if let Some(bid) = bid.filter(|bid| {
                         bid.slot == slot
                             && valid_browser_bid(bid, &publisher_origin)
-                            && reservation_ids.insert(bid.renderer_reservation_id.clone())
+                            && bid
+                                .renderer_reservation_id
+                                .as_ref()
+                                .is_none_or(|id| reservation_ids.insert(id.clone()))
                     }) {
                         canonical_results
                             .push(SlotAuctionDecisionV1::Winner { slot, candidate_id });
@@ -789,10 +727,17 @@ pub(crate) mod coordinated_cutover_v1 {
             .iter()
             .map(|bid| {
                 let (width, height) = render_source_dimensions(&bid.render_source);
+                let wire_id = match &bid.render_source {
+                    BidRenderSourceV1::Aps(_) | BidRenderSourceV1::Adm(_) => bid
+                        .renderer_reservation_id
+                        .as_deref()
+                        .expect("should retain the validated APS/ADM reservation"),
+                    BidRenderSourceV1::PbsCache(source) => source.cache_id.as_str(),
+                };
                 TrustedServerSeatBidV1 {
                     seat: &bid.provider,
                     bid: vec![TrustedServerOpenRtbBidV1 {
-                        id: &bid.renderer_reservation_id,
+                        id: wire_id,
                         impid: &bid.slot,
                         price: bid.cpm,
                         // `render_source` is the sole browser authority. Standard
@@ -830,8 +775,7 @@ pub(crate) mod coordinated_cutover_v1 {
 
 #[cfg(test)]
 use coordinated_cutover_v1::{
-    canonicalize_browser_auction_projection_v1, canonicalize_cache_fetch_policy_v1,
-    serialize_trusted_server_auction_response_v1,
+    canonicalize_browser_auction_projection_v1, serialize_trusted_server_auction_response_v1,
 };
 
 /// Convert `OrchestrationResult` to `OpenRTB` response format.
@@ -2618,7 +2562,7 @@ mod convert_tests {
                 ("z_key".to_string(), "last".to_string()),
                 ("a_key".to_string(), "first".to_string()),
             ]),
-            renderer_reservation_id: projection_reservation_id(index),
+            renderer_reservation_id: Some(projection_reservation_id(index)),
             render_source: BidRenderSourceV1::Adm(AdmRenderSourceV1 {
                 version: 1,
                 adm,
@@ -2686,38 +2630,34 @@ mod convert_tests {
     }
 
     #[test]
-    fn cache_policy_requires_one_exact_trusted_https_base() {
-        let policy = canonicalize_cache_fetch_policy_v1("https://cache.example:8443/pbc/v1/cache")
-            .expect("valid cache policy should canonicalize");
-        assert_eq!(policy.version, 1);
-        assert_eq!(policy.base_url, "https://cache.example:8443/pbc/v1/cache");
+    fn pbs_cache_wire_is_the_exact_thin_deny_unknown_carrier() {
+        let value = serde_json::json!({
+            "type": "pbs_cache",
+            "version": 1,
+            "cacheId": "f47447a0-b759-4f2f-9887-af458b79b570",
+            "cacheHost": "cache.example:8443",
+            "cachePath": "/pbc/v1/cache/opaque%2Fpath",
+            "width": 0,
+            "height": u32::MAX
+        });
+        let source: BidRenderSourceV1 = serde_json::from_value(value.clone())
+            .expect("the final tagged union should admit the thin pbs_cache carrier");
         assert_eq!(
-            serde_json::to_value(&policy).expect("cache policy should serialize"),
-            serde_json::json!({
-                "version": 1,
-                "baseUrl": "https://cache.example:8443/pbc/v1/cache"
-            }),
-            "the pure policy must be ready for the exact tsjs.boot.cachePolicy member"
+            serde_json::to_value(source).expect("cache carrier should serialize"),
+            value
         );
 
-        for invalid in [
-            "http://cache.example/pbc/v1/cache",
-            "https://user@cache.example/pbc/v1/cache",
-            "https://cache.example/",
-            "https://cache.example/pbc/v1/cache?existing=1",
-            "https://cache.example/pbc/v1/cache#fragment",
-        ] {
-            assert!(
-                canonicalize_cache_fetch_policy_v1(invalid).is_err(),
-                "should reject {invalid}"
-            );
-        }
+        let mut unknown = value;
+        unknown["fetchUrl"] = serde_json::Value::String(
+            "https://cache.example/pbc/v1/cache?uuid=not-authoritative".to_string(),
+        );
+        assert!(serde_json::from_value::<BidRenderSourceV1>(unknown).is_err());
     }
 
     #[test]
     fn invalid_selected_winner_becomes_winner_not_renderable() {
         let mut input = projection_with_adm_lengths(&[1]);
-        input.bids[0].renderer_reservation_id = "not-a-reservation".to_string();
+        input.bids[0].renderer_reservation_id = Some("not-a-reservation".to_string());
 
         let canonical =
             canonicalize_browser_auction_projection_v1(input, "https://publisher.example")

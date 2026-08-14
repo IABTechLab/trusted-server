@@ -181,7 +181,7 @@ function abortablePendingFetcher(): {
 }
 
 describe('auction batch service', () => {
-  it('uses one fetch and applies reversed decisions in immutable request order', async () => {
+  it('rejects a response whose decisions reverse immutable request order', async () => {
     const attempts = new Map<string, AttemptHarness>();
     const fetcher = successfulFetcher(
       response([
@@ -208,8 +208,8 @@ describe('auction batch service', () => {
 
     await expect(batch.result).resolves.toEqual({
       slots: [
-        { slot: 'slot-b', path: 'primary', outcome: 'accepted' },
-        { slot: 'slot-a', path: 'primary', outcome: 'no_bid' },
+        { slot: 'slot-b', path: 'primary', outcome: 'failed', reason: 'invalid_response' },
+        { slot: 'slot-a', path: 'primary', outcome: 'failed', reason: 'invalid_response' },
       ],
     });
     expect(fetcher).toHaveBeenCalledOnce();
@@ -221,7 +221,8 @@ describe('auction batch service', () => {
         signal: expect.any(AbortSignal),
       })
     );
-    expect(attempts.get('slot-b')?.attempt.admitDirectWinner).toHaveBeenCalledOnce();
+    expect(attempts.size).toBe(2);
+    expect(attempts.get('slot-b')?.attempt.admitDirectWinner).not.toHaveBeenCalled();
     expect(Object.isFrozen(await batch.result)).toBe(true);
     expect(Object.isFrozen((await batch.result).slots)).toBe(true);
   });

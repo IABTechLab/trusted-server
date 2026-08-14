@@ -9,7 +9,6 @@ import {
   sendAuction,
 } from '../../src/core/auction';
 import envelope from '../fixtures/aps-renderer-v1.json';
-import { parseCacheFetchPolicyV1 } from '../../src/core/config';
 import type { BrowserAuctionProjectionV1 } from '../../src/core/types';
 
 function apsRenderer(creativeId?: string) {
@@ -766,44 +765,35 @@ describe('auction/parseBrowserAuctionProjectionV1', () => {
     expect(calls).toEqual({ encode: 0, every: 0, includes: 0, iterator: 0, some: 0, test: 0 });
   });
 
-  it('requires cache sources to match one frozen cache policy exactly', () => {
+  it('accepts only the exact opaque pbs_cache carrier without a reservation identity', () => {
     const cacheId = 'f47447a0-b759-4f2f-9887-af458b79b570';
-    const policy = parseCacheFetchPolicyV1({
-      version: 1,
-      baseUrl: 'https://cache.example:8443/pbc/v1/cache',
-    });
-    expect(policy).toBeDefined();
-
     const cacheProjection = () => {
-      const value = browserProjection() as unknown as BrowserAuctionProjectionV1;
-      value.bids[0]!.renderSource = {
-        type: 'cache',
+      const value = structuredClone(browserProjection());
+      const bid = value.bids[0]!;
+      delete (bid as { rendererReservationId?: string }).rendererReservationId;
+      (bid as { renderSource: unknown }).renderSource = {
+        type: 'pbs_cache',
         version: 1,
         cacheId,
-        fetchUrl: `https://cache.example:8443/pbc/v1/cache?uuid=${cacheId}`,
-        width: 300,
-        height: 250,
+        cacheHost: 'cache.example:8443',
+        cachePath: '/pbc/v1/cache',
+        width: 0,
+        height: 0xffff_ffff,
       };
       return value;
     };
 
-    expect(parseBrowserAuctionProjectionV1(cacheProjection())).toBeUndefined();
-    expect(parseBrowserAuctionProjectionV1(cacheProjection(), policy)).toBeDefined();
+    const parsed = parseBrowserAuctionProjectionV1(cacheProjection());
+    expect(parsed?.bids[0]).toEqual(cacheProjection().bids[0]);
+    expect(parsed?.bids[0]).not.toHaveProperty('rendererReservationId');
 
-    for (const fetchUrl of [
-      `https://other.example:8443/pbc/v1/cache?uuid=${cacheId}`,
-      `https://cache.example/pbc/v1/cache?uuid=${cacheId}`,
-      `https://cache.example:8443/other?uuid=${cacheId}`,
-      `https://user@cache.example:8443/pbc/v1/cache?uuid=${cacheId}`,
-      `https://cache.example:8443/pbc/v1/cache?uuid=${cacheId}&uuid=${cacheId}`,
-      `https://cache.example:8443/pbc/v1/cache?uuid=${cacheId}&extra=1`,
-      `https://cache.example:8443/pbc/v1/cache?uuid=${cacheId}#fragment`,
-    ]) {
-      const value = cacheProjection();
-      if (value.bids[0]!.renderSource.type !== 'cache') throw new Error('expected cache source');
-      value.bids[0]!.renderSource.fetchUrl = fetchUrl;
-      expect(parseBrowserAuctionProjectionV1(value, policy)).toBeUndefined();
-    }
+    const withReservation = cacheProjection();
+    Object.assign(withReservation.bids[0]!, { rendererReservationId: reservationId() });
+    expect(parseBrowserAuctionProjectionV1(withReservation)).toBeUndefined();
+
+    const withExtraSourceField = cacheProjection();
+    Object.assign(withExtraSourceField.bids[0]!.renderSource, { fetchUrl: 'https://forbidden' });
+    expect(parseBrowserAuctionProjectionV1(withExtraSourceField)).toBeUndefined();
   });
 });
 
@@ -867,10 +857,10 @@ describe('auction/parseTrustedServerAuctionResponseV1', () => {
       version: 1,
       auction: projected.auction,
       slots: [],
-      bids: projected.bids.map((bid) => ({
-        ...bid,
-        upstreamBidId: bid.rendererReservationId,
-      })),
+      bids: projected.bids.map((bid) => {
+        if (!('rendererReservationId' in bid)) throw new Error('expected owned ADM bid');
+        return { ...bid, upstreamBidId: bid.rendererReservationId };
+      }),
     };
     return {
       canonical,
@@ -881,7 +871,9 @@ describe('auction/parseTrustedServerAuctionResponseV1', () => {
           {
             seat: 'prebid',
             bid: canonical.bids.map((bid) => {
-              if (bid.renderSource.type !== 'adm') throw new Error('expected ADM source');
+              if (bid.renderSource.type !== 'adm' || !('rendererReservationId' in bid)) {
+                throw new Error('expected owned ADM source');
+              }
               return {
                 id: bid.rendererReservationId,
                 impid: bid.slot,
@@ -1086,32 +1078,28 @@ describe('auction/parseTrustedServerAuctionResponseV1', () => {
     expect(parseTrustedServerAuctionResponseV1(apsWithAdm)).toBeUndefined();
   });
 
-  it('binds direct cache winners to the same frozen boot policy', () => {
+  it('binds direct pbs_cache winners to the exact cache id and opaque host/path carrier', () => {
     const cacheId = 'f47447a0-b759-4f2f-9887-af458b79b570';
-    const policy = parseCacheFetchPolicyV1({
-      version: 1,
-      baseUrl: 'https://cache.example:8443/pbc/v1/cache',
-    });
     const value = response();
     const bid = value.seatbid[0]!.bid[0]!;
+    bid.id = cacheId;
     bid.ext.trusted_server.render_source = {
-      type: 'cache',
+      type: 'pbs_cache',
       version: 1,
       cacheId,
-      fetchUrl: `https://cache.example:8443/pbc/v1/cache?uuid=${cacheId}`,
+      cacheHost: 'cache.example:8443',
+      cachePath: '/pbc/v1/cache',
       width: bid.w,
       height: bid.h,
     };
 
-    expect(parseTrustedServerAuctionResponseV1(value)).toBeUndefined();
-    expect(parseTrustedServerAuctionResponseV1(value, policy)).toBeDefined();
+    const parsed = parseTrustedServerAuctionResponseV1(value);
+    expect(parsed?.bids[0]).not.toHaveProperty('rendererReservationId');
+    expect(parsed?.bids[0]?.renderSource).toEqual(bid.ext.trusted_server.render_source);
 
     const mismatched = structuredClone(value);
-    const source = mismatched.seatbid[0]!.bid[0]!.ext.trusted_server.render_source as {
-      fetchUrl: string;
-    };
-    source.fetchUrl = `https://cache.example:9443/pbc/v1/cache?uuid=${cacheId}`;
-    expect(parseTrustedServerAuctionResponseV1(mismatched, policy)).toBeUndefined();
+    mismatched.seatbid[0]!.bid[0]!.id = 'different-cache-id';
+    expect(parseTrustedServerAuctionResponseV1(mismatched)).toBeUndefined();
   });
 });
 

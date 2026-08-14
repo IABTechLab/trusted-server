@@ -25,21 +25,17 @@ export interface AdmRenderSourceV1 {
   height: number;
 }
 
-export interface CacheRenderSourceV1 {
-  type: 'cache';
+export interface BaselinePbsCacheSourceV1 {
+  type: 'pbs_cache';
   version: 1;
   cacheId: string;
-  fetchUrl: string;
+  cacheHost: string;
+  cachePath: string;
   width: number;
   height: number;
 }
 
-export interface CacheFetchPolicyV1 {
-  version: 1;
-  baseUrl: string;
-}
-
-export type BidRenderSourceV1 = ApsRendererV1 | AdmRenderSourceV1 | CacheRenderSourceV1;
+export type BidRenderSourceV1 = ApsRendererV1 | AdmRenderSourceV1 | BaselinePbsCacheSourceV1;
 
 export type AuctionSlotFailureReason =
   | 'auction_disabled'
@@ -64,7 +60,7 @@ export interface AuctionDecisionSetV1 {
   results: SlotAuctionDecisionV1[];
 }
 
-export interface BrowserAuctionBidV1 {
+interface BrowserAuctionBidBaseV1 {
   candidateId: string;
   slot: string;
   provider: string;
@@ -72,9 +68,16 @@ export interface BrowserAuctionBidV1 {
   cpm: number;
   currency: 'USD';
   targeting: Record<string, string>;
-  rendererReservationId: string;
-  renderSource: BidRenderSourceV1;
 }
+
+export type BrowserAuctionBidV1 =
+  | (BrowserAuctionBidBaseV1 & {
+      rendererReservationId: string;
+      renderSource: ApsRendererV1 | AdmRenderSourceV1;
+    })
+  | (BrowserAuctionBidBaseV1 & {
+      renderSource: BaselinePbsCacheSourceV1;
+    });
 
 /** Exact GAM placement metadata required to publish one server-projected slot. */
 export interface BrowserAuctionSlotV1 {
@@ -375,9 +378,9 @@ export type RenderFailureReason =
   | 'renderer_document_no_load'
   | 'runner_no_load'
   | 'runner_failed'
-  | 'cache_network_error'
-  | 'cache_http_error'
-  | 'cache_invalid_response'
+  | 'cache_fetch_failed'
+  | 'invalid_cache_payload'
+  | 'response_post_failed'
   | 'adm_document_no_load'
   | 'abi_mismatch'
   | 'bundle_partial';
@@ -436,7 +439,6 @@ export interface TsjsBootV1 {
   readonly releaseId: string;
   readonly manifest: Readonly<BootManifestV1>;
   readonly auctionProjection: Readonly<BrowserAuctionProjectionV1>;
-  readonly cachePolicy?: Readonly<CacheFetchPolicyV1>;
   readonly creative: Readonly<CreativeBootV1>;
   readonly diagnostics: Readonly<DiagnosticsBootV1>;
 }

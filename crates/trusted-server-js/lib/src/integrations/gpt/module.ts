@@ -10,10 +10,10 @@ import {
   type GoogletagFacade,
 } from '../../adapters/googletag';
 import type {
+  BaselinePbsCacheSourceV1,
   BrowserAuctionBidV1,
   BrowserAuctionProjectionV1,
   BrowserAuctionSlotV1,
-  CacheFetchPolicyV1,
 } from '../../core/types';
 import { log } from '../../core/log';
 import { DisposableStack } from '../../kernel/disposable';
@@ -21,10 +21,7 @@ import type { RuntimeCapabilityV1 } from '../../kernel/runtime';
 import type { NavigationSession, RenderAttemptScope, RuntimeSession } from '../../kernel/sessions';
 import type { IdentityGenerationResult } from '../../kernel/identity';
 import type {
-  CacheAdmResolutionOptions,
   CommittedRenderArtifact,
-  DirectAdmIframeConstructor,
-  DirectCacheAttemptOptions,
   RenderAttempt,
   RenderAttemptCreationResult,
   RenderFailureReason,
@@ -96,8 +93,47 @@ const objectGetOwnPropertyNamesIntrinsic = Object.getOwnPropertyNames;
 const objectGetOwnPropertySymbolsIntrinsic = Object.getOwnPropertySymbols;
 const objectGetPrototypeOfIntrinsic = Object.getPrototypeOf;
 const objectIsFrozenIntrinsic = Object.isFrozen;
+const jsonParseIntrinsic = JSON.parse;
 const promiseThenIntrinsic = Promise.prototype.then;
 const reflectApplyIntrinsic = Reflect.apply;
+const stringIncludesIntrinsic = String.prototype.includes;
+const stringJoinIntrinsic = Array.prototype.join;
+const stringSplitIntrinsic = String.prototype.split;
+const stringTrimIntrinsic = String.prototype.trim;
+const stringCharCodeAtIntrinsic = String.prototype.charCodeAt;
+const textEncoder = new TextEncoder();
+const textEncoderEncodeIntrinsic = TextEncoder.prototype.encode;
+
+type OwnedBrowserAuctionBidV1 = Extract<
+  BrowserAuctionBidV1,
+  { readonly rendererReservationId: string }
+>;
+type PbsCacheBrowserAuctionBidV1 = Extract<
+  BrowserAuctionBidV1,
+  { readonly renderSource: BaselinePbsCacheSourceV1 }
+>;
+
+function validGptTargetingValue(value: string): boolean {
+  if (value.length === 0) return false;
+  let scalars = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = reflectApplyIntrinsic(stringCharCodeAtIntrinsic, value, [index]) as number;
+    if (code <= 0x1f || code === 0x7f) return false;
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = reflectApplyIntrinsic(stringCharCodeAtIntrinsic, value, [index + 1]) as number;
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false;
+    }
+    scalars += 1;
+    if (scalars > 40) return false;
+  }
+  return (
+    (reflectApplyIntrinsic(textEncoderEncodeIntrinsic, textEncoder, [value]) as Uint8Array)
+      .byteLength <= 160
+  );
+}
 
 interface ProductionAuctionCapability {
   readonly navigation: NavigationSession;
@@ -117,7 +153,6 @@ interface ProductionRenderCapability {
     current: (slot: string) => CommittedRenderArtifact | undefined;
     release: (artifact: CommittedRenderArtifact) => boolean;
   }>;
-  readonly cachePolicy?: Readonly<CacheFetchPolicyV1>;
   readonly createAttempt: (
     owner: RenderAttemptScope,
     parentAttemptId?: string
@@ -130,16 +165,9 @@ interface ProductionRenderCapability {
   ) => boolean;
   readonly mintLifecycleTicket: () => IdentityGenerationResult<string>;
   readonly publisherOrigin: string;
-  readonly prepareAdmIframe: DirectAdmIframeConstructor;
-  readonly registerRenderer: (
-    type: 'cache',
-    renderer: (attempt: RenderAttempt, container: HTMLElement) => boolean
-  ) => () => void;
   readonly rendererNonces: RendererNonceRegistry;
-  readonly renderDirectCacheAttempt: (options: DirectCacheAttemptOptions) => boolean;
   readonly renderWinner: (attempt: RenderAttempt) => boolean;
   readonly reservations: ReservationService;
-  readonly resolveCacheAdmAttempt: (options: CacheAdmResolutionOptions) => boolean;
 }
 
 interface ProductionMessagesCapability {
@@ -193,7 +221,7 @@ export interface GptWinnerPublicationInput extends Omit<
   'artifact' | 'pucBridge' | 'reservationId' | 'slots'
 > {
   readonly artifact: CommittedRenderArtifact;
-  readonly bid: BrowserAuctionBidV1;
+  readonly bid: OwnedBrowserAuctionBidV1;
   readonly googletag: GoogletagAdapter;
   readonly navigation: NavigationSession;
   readonly placement: BrowserAuctionSlotV1;
@@ -291,7 +319,9 @@ function targetingEntries(
     const insertNames = (source: readonly string[]): boolean => {
       for (let index = 0; index < source.length; index += 1) {
         const name = source[index];
-        if (!name || name === 'hb_adid') return false;
+        if (!name || name === 'hb_adid' || name === 'hb_cache_host' || name === 'hb_cache_path') {
+          return false;
+        }
         let insertion = 0;
         while (insertion < names.length && (names[insertion] as string) < name) insertion += 1;
         if (names[insertion] === name) continue;
@@ -303,9 +333,17 @@ function targetingEntries(
       return true;
     };
     if (!insertNames(placementNames) || !insertNames(bidNames)) return undefined;
-    const entries: Array<readonly [string, string]> = [
-      Object.freeze(['hb_adid', bid.rendererReservationId]),
-    ];
+    const entries: Array<readonly [string, string]> = !('rendererReservationId' in bid)
+      ? [
+          Object.freeze(['hb_adid', bid.renderSource.cacheId]),
+          Object.freeze(['hb_cache_host', bid.renderSource.cacheHost]),
+          Object.freeze(['hb_cache_path', bid.renderSource.cachePath]),
+        ]
+      : [Object.freeze(['hb_adid', bid.rendererReservationId])];
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index];
+      if (!entry || !validGptTargetingValue(entry[1])) return undefined;
+    }
     for (let index = 0; index < names.length; index += 1) {
       const key = names[index];
       if (!key) return undefined;
@@ -548,6 +586,117 @@ export async function publishGptWinner(
   return operation;
 }
 
+interface PbsCacheGptPublicationInput {
+  readonly bid: PbsCacheBrowserAuctionBidV1;
+  readonly binding: Readonly<{ operation: 'display' | 'refresh'; slot: object }>;
+  readonly googletag: GoogletagAdapter;
+  readonly navigation: NavigationSession;
+  readonly placement: BrowserAuctionSlotV1;
+  readonly requestClass: string;
+  readonly slots: Pick<SlotService, 'isBoundGptSlot' | 'request'>;
+  readonly targeting: Pick<TargetingService, 'observePublisherMutations' | 'own'>;
+}
+
+async function publishPbsCacheGptWinner(input: PbsCacheGptPublicationInput): Promise<void> {
+  const projection = input.navigation.currentAuctionProjection as
+    Readonly<BrowserAuctionProjectionV1> | undefined;
+  if (!projection) return;
+  const current = (): boolean => {
+    try {
+      if (
+        !input.navigation.isCurrent() ||
+        input.navigation.currentAuctionProjection !== projection
+      ) {
+        return false;
+      }
+      let bids = 0;
+      let slots = 0;
+      let winners = 0;
+      for (let index = 0; index < projection.bids.length; index += 1) {
+        if (projection.bids[index] === input.bid) bids += 1;
+      }
+      for (let index = 0; index < projection.slots.length; index += 1) {
+        if (projection.slots[index] === input.placement) slots += 1;
+      }
+      for (let index = 0; index < projection.auction.results.length; index += 1) {
+        const decision = projection.auction.results[index];
+        if (
+          decision?.outcome === 'winner' &&
+          decision.slot === input.bid.slot &&
+          decision.candidateId === input.bid.candidateId
+        ) {
+          winners += 1;
+        }
+      }
+      return (
+        bids === 1 &&
+        slots === 1 &&
+        winners === 1 &&
+        input.slots.isBoundGptSlot(input.navigation.generation, input.bid.slot, input.binding.slot)
+      );
+    } catch {
+      return false;
+    }
+  };
+  if (!current()) return;
+  const entries = targetingEntries(input.bid, input.placement);
+  if (!entries) return;
+
+  const ownerId = `pbs-cache:${projection.auction.auctionId}:${input.bid.candidateId}`;
+  const owners: TargetingOwnership[] = [];
+  let observation: ReturnType<TargetingService['observePublisherMutations']> | undefined;
+  let handle: ReturnType<SlotService['request']> | undefined;
+  try {
+    observation = input.targeting.observePublisherMutations(input.binding.slot, input.googletag);
+    await observation.result;
+    if (!current()) return;
+    const boundary = synchronousTargetingBoundary(input.googletag, input.binding.slot);
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index];
+      if (!entry) return;
+      const ownership = input.targeting.own(
+        input.binding.slot,
+        entry[0],
+        entry[1],
+        ownerId,
+        boundary
+      );
+      if (!ownership) return;
+      owners.push(ownership);
+    }
+    if (!current()) return;
+    handle = input.slots.request({
+      expectedSlot: input.binding.slot,
+      intentId: ownerId,
+      navigationGeneration: input.navigation.generation,
+      operation: input.binding.operation,
+      registeredSlotId: input.bid.slot,
+      requestClass: input.requestClass,
+    });
+    await handle.result;
+  } catch (error) {
+    if (input.navigation.isCurrent()) log.warn('GPT PBS Cache publication failed', error);
+  } finally {
+    try {
+      handle?.dispose();
+    } catch {
+      // Request settlement remains authoritative.
+    }
+    for (let index = owners.length - 1; index >= 0; index -= 1) {
+      try {
+        owners[index]?.release();
+      } catch {
+        // One targeting cleanup cannot suppress the remaining rollback.
+      }
+    }
+    try {
+      observation?.dispose();
+    } catch {
+      // The adapter owns final wrapper restoration.
+    }
+  }
+}
+
 function settleFromSlotOutcome(
   attempt: RenderAttempt,
   bridge: GptSlotOperationInput['pucBridge'],
@@ -708,6 +857,236 @@ function resolveProjectedSlotElement(
   }
 }
 
+const TS_DISPLAY_RENDERER =
+  '(function(){window.render=function(d,h,w){' +
+  'var f=h.mkFrame(w.document,{width:d.width||"100%",height:d.height||"100%"});' +
+  'if(d.adUrl&&!d.ad){f.src=d.adUrl;}else{f.srcdoc=d.ad;}' +
+  'w.document.body.appendChild(f);};})();';
+
+const AUCTION_PRICE_MACRO = '${AUCTION_PRICE}';
+
+interface CachedPbsBid {
+  readonly adm: string;
+  readonly width?: number;
+  readonly height?: number;
+  readonly price?: number;
+}
+
+function expandCachedAuctionPriceMacro(markup: string, cpm: number): string {
+  if (!(reflectApplyIntrinsic(stringIncludesIntrinsic, markup, [AUCTION_PRICE_MACRO]) as boolean)) {
+    return markup;
+  }
+  const pieces = reflectApplyIntrinsic(stringSplitIntrinsic, markup, [
+    AUCTION_PRICE_MACRO,
+  ]) as string[];
+  return reflectApplyIntrinsic(stringJoinIntrinsic, pieces, [String(cpm)]) as string;
+}
+
+/** Preserve current-main PBS Cache decoding inside GPT without publishing a cache service. */
+function parseCachedPbsBid(body: string): CachedPbsBid | undefined {
+  let parsed: unknown;
+  try {
+    parsed = reflectApplyIntrinsic(jsonParseIntrinsic, JSON, [body]) as unknown;
+  } catch {
+    const trimmed = reflectApplyIntrinsic(stringTrimIntrinsic, body, []) as string;
+    return trimmed.length > 0 ? Object.freeze({ adm: body }) : undefined;
+  }
+  if (!parsed || typeof parsed !== 'object' || arrayIsArrayIntrinsic(parsed)) return undefined;
+  const record = parsed as Record<string, unknown>;
+  if (typeof record.adm !== 'string' || record.adm.length === 0) return undefined;
+  const finite = (value: unknown): number | undefined =>
+    typeof value === 'number' && numberIsFiniteIntrinsic(value) ? value : undefined;
+  const dimension = (value: unknown): number | undefined => {
+    const numeric = finite(value);
+    return numeric !== undefined && numeric > 0 ? numeric : undefined;
+  };
+  const width = dimension(record.w) ?? dimension(record.width);
+  const height = dimension(record.h) ?? dimension(record.height);
+  const price = finite(record.price);
+  return Object.freeze({
+    adm: record.adm,
+    ...(width === undefined ? {} : { width }),
+    ...(height === undefined ? {} : { height }),
+    ...(price === undefined ? {} : { price }),
+  });
+}
+
+type PbsCacheBridgeFailure =
+  'cache_fetch_failed' | 'invalid_cache_payload' | 'response_post_failed';
+
+/** Install the activation-scoped current-main PBS Cache bridge owned only by GPT. */
+export function installPbsCacheBridge(
+  document: Document,
+  auction: ProductionAuctionCapability,
+  isActive: () => boolean,
+  observe: (observation: Readonly<Record<string, unknown>>) => boolean
+): () => void {
+  const view = document.defaultView;
+  if (!view) throw new TypeError('GPT PBS Cache bridge requires a browser window');
+  const inFlight = new WeakMap<object, Set<string>>();
+  let listening = true;
+
+  const publishFailure = (slot: string, reason: PbsCacheBridgeFailure): void => {
+    try {
+      observe(Object.freeze({ kind: 'pbs_cache_bridge', slotId: slot, reason }));
+    } catch {
+      // Diagnostics cannot alter cache bridge ownership.
+    }
+  };
+  const parseRequest = (candidate: unknown): Readonly<{ adId: string }> | undefined => {
+    try {
+      const value =
+        typeof candidate === 'string'
+          ? (reflectApplyIntrinsic(jsonParseIntrinsic, JSON, [candidate]) as unknown)
+          : candidate;
+      if (typeof value !== 'object' || value === null || arrayIsArrayIntrinsic(value)) {
+        return undefined;
+      }
+      const record = value as Record<string, unknown>;
+      return record.message === 'Prebid Request' &&
+        typeof record.adId === 'string' &&
+        record.adId !== ''
+        ? Object.freeze({ adId: record.adId })
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const sourceOwnsPlacement = (
+    source: MessageEventSource | null,
+    placement: Readonly<BrowserAuctionSlotV1>
+  ): boolean => {
+    if (!source) return false;
+    try {
+      const exact = document.getElementById(placement.divId);
+      const configuredContainer = document.getElementById(`${placement.divId}-container`);
+      const owns = (root: HTMLElement): boolean => {
+        const frames = root.querySelectorAll('iframe');
+        for (let index = 0; index < frames.length; index += 1) {
+          if (frames.item(index)?.contentWindow === source) return true;
+        }
+        return false;
+      };
+      return (
+        (exact instanceof HTMLElement && owns(exact)) ||
+        (configuredContainer instanceof HTMLElement &&
+          configuredContainer !== exact &&
+          owns(configuredContainer))
+      );
+    } catch {
+      return false;
+    }
+  };
+  const listener = (event: MessageEvent): void => {
+    if (!listening || !isActive()) return;
+    const request = parseRequest(event.data);
+    const port = event.ports?.[0];
+    if (!request || !port || typeof port.postMessage !== 'function') return;
+    const navigation = auction.session.currentNavigation;
+    const projection = navigation?.currentAuctionProjection as
+      Readonly<BrowserAuctionProjectionV1> | undefined;
+    if (!navigation?.isCurrent() || !projection) return;
+    let placement: BrowserAuctionSlotV1 | undefined;
+    for (let index = 0; index < projection.slots.length; index += 1) {
+      const candidate = projection.slots[index];
+      if (!candidate || !sourceOwnsPlacement(event.source, candidate)) continue;
+      if (placement) return;
+      placement = candidate;
+    }
+    if (!placement) return;
+    let bid: PbsCacheBrowserAuctionBidV1 | undefined;
+    for (let index = 0; index < projection.bids.length; index += 1) {
+      const candidate = projection.bids[index];
+      if (
+        !candidate ||
+        candidate.slot !== placement.slot ||
+        candidate.renderSource.type !== 'pbs_cache' ||
+        candidate.renderSource.cacheId !== request.adId
+      ) {
+        continue;
+      }
+      if (bid) return;
+      bid = candidate as PbsCacheBrowserAuctionBidV1;
+    }
+    if (!bid) return;
+
+    event.stopImmediatePropagation();
+    const key = `${bid.slot}\u0000${request.adId}`;
+    let generationFlights = inFlight.get(navigation.generation);
+    if (!generationFlights) {
+      generationFlights = new Set<string>();
+      inFlight.set(navigation.generation, generationFlights);
+    }
+    if (generationFlights.has(key)) return;
+    generationFlights.add(key);
+
+    const remainsCurrent = (): boolean =>
+      listening &&
+      isActive() &&
+      navigation.isCurrent() &&
+      auction.session.currentNavigation === navigation &&
+      navigation.currentAuctionProjection === projection &&
+      (() => {
+        for (let index = 0; index < projection.bids.length; index += 1) {
+          if (projection.bids[index] === bid) return true;
+        }
+        return false;
+      })();
+    const cacheUrl = `https://${bid.renderSource.cacheHost}${bid.renderSource.cachePath}?uuid=${encodeURIComponent(request.adId)}`;
+    const complete = async (): Promise<void> => {
+      try {
+        const fetcher = globalThis.fetch;
+        if (typeof fetcher !== 'function') throw new Error('fetch unavailable');
+        const response = await fetcher(cacheUrl, { mode: 'cors' });
+        if (!response.ok) throw new Error(`cache HTTP ${response.status}`);
+        const body = await response.text();
+        if (!remainsCurrent()) return;
+        const cached = parseCachedPbsBid(body);
+        if (!cached) {
+          publishFailure(bid.slot, 'invalid_cache_payload');
+          return;
+        }
+        const width = cached.width ?? (bid.renderSource.width || placement.formats[0]?.[0] || 728);
+        const height =
+          cached.height ?? (bid.renderSource.height || placement.formats[0]?.[1] || 90);
+        const adm =
+          cached.price === undefined
+            ? cached.adm
+            : expandCachedAuctionPriceMacro(cached.adm, cached.price);
+        try {
+          port.postMessage(
+            JSON.stringify({
+              message: 'Prebid Response',
+              adId: request.adId,
+              ad: adm,
+              renderer: TS_DISPLAY_RENDERER,
+              width,
+              height,
+            })
+          );
+        } catch {
+          publishFailure(bid.slot, 'response_post_failed');
+          return;
+        }
+        if (!remainsCurrent()) return;
+        resizeCollapsedPucShell({ source: event.source as object, width, height });
+      } catch {
+        if (remainsCurrent()) publishFailure(bid.slot, 'cache_fetch_failed');
+      } finally {
+        generationFlights?.delete(key);
+      }
+    };
+    void complete();
+  };
+
+  view.addEventListener('message', listener);
+  return (): void => {
+    if (!listening) return;
+    listening = false;
+    view.removeEventListener('message', listener);
+  };
+}
+
 function terminalLatch(attempt: RenderAttempt): Promise<unknown> {
   return new Promise((resolve) => {
     if (!attempt.onSettled(resolve)) resolve(attempt.snapshot().outcome);
@@ -716,7 +1095,7 @@ function terminalLatch(attempt: RenderAttempt): Promise<unknown> {
 
 interface PreparedInitialGptWinner {
   readonly attempt: RenderAttempt;
-  readonly bid: BrowserAuctionBidV1;
+  readonly bid: OwnedBrowserAuctionBidV1;
   readonly binding: Readonly<{ operation: 'display' | 'refresh'; slot: object }> | undefined;
   readonly decision: Readonly<{ slot: string; outcome: 'winner'; candidateId: string }>;
   readonly owner: RenderAttemptScope;
@@ -809,6 +1188,7 @@ export async function publishInitialGptProjection(
   const batch = navigation.createAuctionBatch(`gpt:${projection.auction.auctionId}`);
   if (!batch) return;
   const prepared: PreparedInitialGptWinner[] = [];
+  const cachePublications: Promise<void>[] = [];
   let winnerIndex = 0;
   for (let index = 0; index < projection.auction.results.length; index += 1) {
     const decision = projection.auction.results[index];
@@ -817,6 +1197,24 @@ export async function publishInitialGptProjection(
     const bid = projection.bids[winnerIndex];
     winnerIndex += 1;
     if (!bid || !navigation.isCurrent()) continue;
+    const binding = physicalBySlot.get(decision.slot);
+    if (!('rendererReservationId' in bid)) {
+      if (binding) {
+        cachePublications.push(
+          publishPbsCacheGptWinner({
+            bid,
+            binding,
+            googletag,
+            navigation,
+            placement,
+            requestClass: input.requestClass ?? 'initial',
+            slots,
+            targeting: input.targeting,
+          })
+        );
+      }
+      continue;
+    }
     const owner = batch.createRenderAttempt(decision.slot);
     if (!owner.ok) continue;
     const created = render.createAttempt(owner.value);
@@ -825,7 +1223,7 @@ export async function publishInitialGptProjection(
       Object.freeze({
         attempt: created.value,
         bid,
-        binding: physicalBySlot.get(decision.slot),
+        binding,
         decision,
         owner: owner.value,
         placement,
@@ -833,11 +1231,12 @@ export async function publishInitialGptProjection(
       })
     );
   }
-  if (prepared.length === 0) return;
-  input.protect(Object.freeze(prepared.map(({ terminal }) => terminal)));
+  if (prepared.length === 0 && cachePublications.length === 0) return;
+  input.protect(Object.freeze([...prepared.map(({ terminal }) => terminal), ...cachePublications]));
 
-  await Promise.all(
-    prepared.map(async ({ attempt, bid, binding, decision, owner, placement }) => {
+  await Promise.all([
+    ...cachePublications,
+    ...prepared.map(async ({ attempt, bid, binding, decision, owner, placement }) => {
       if (!binding) {
         attempt.fail('slot_unresolved');
         return;
@@ -896,8 +1295,8 @@ export async function publishInitialGptProjection(
       if (!published.ok && navigation.isCurrent()) {
         log.warn('GPT projection winner publication failed', published.reason);
       }
-    })
-  );
+    }),
+  ]);
 }
 
 function validFrozenConfig(candidate: unknown): boolean {
@@ -976,11 +1375,7 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
     typeof render.createSlotOperation !== 'function' ||
     typeof render.commitPageBids !== 'function' ||
     typeof render.mintLifecycleTicket !== 'function' ||
-    typeof render.prepareAdmIframe !== 'function' ||
-    typeof render.registerRenderer !== 'function' ||
-    typeof render.renderDirectCacheAttempt !== 'function' ||
     typeof render.renderWinner !== 'function' ||
-    typeof render.resolveCacheAdmAttempt !== 'function' ||
     typeof render.publisherOrigin !== 'string' ||
     typeof trace.observations?.publish !== 'function'
   ) {
@@ -1016,47 +1411,6 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
   scope.onDispose(() => slots.dispose());
   const targeting = createTargetingService();
   scope.onDispose(() => targeting.dispose());
-  const fetchCache = globalThis.fetch;
-  const cacheRenderer = (attempt: RenderAttempt, container: HTMLElement): boolean => {
-    if (!active) return false;
-    const cachePolicy = render.cachePolicy;
-    if (!cachePolicy) {
-      attempt.fail('descriptor_invalid');
-      return false;
-    }
-    if (typeof fetchCache !== 'function') {
-      attempt.fail('cache_network_error');
-      return false;
-    }
-    return render.renderDirectCacheAttempt({
-      attempt,
-      cachePolicy,
-      container,
-      fetcher: (input, init) => fetchCache(input, init),
-      prepareIframe: render.prepareAdmIframe,
-      publisherOrigin: render.publisherOrigin,
-    });
-  };
-  const resolveCacheAdm = (
-    attempt: Parameters<NonNullable<Parameters<typeof createPucBridge>[0]['resolveCacheAdm']>>[0],
-    onResolved: Parameters<NonNullable<Parameters<typeof createPucBridge>[0]['resolveCacheAdm']>>[1]
-  ): boolean => {
-    const cachePolicy = render.cachePolicy;
-    if (!cachePolicy) {
-      attempt.fail('descriptor_invalid');
-      return false;
-    }
-    if (typeof fetchCache !== 'function') {
-      attempt.fail('cache_network_error');
-      return false;
-    }
-    return render.resolveCacheAdmAttempt({
-      attempt: attempt as RenderAttempt,
-      cachePolicy,
-      fetcher: (input, init) => fetchCache(input, init),
-      onResolved,
-    });
-  };
   const rendererUrl = new URL('/integrations/aps/renderer/v1', render.publisherOrigin).href;
   const startup = createGptStartup({ googletag, slots: () => slots });
   const diagnosticsEnabled = gptDiagnosticsActive(runtime);
@@ -1212,22 +1566,22 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
       return release;
     },
   });
-  const cacheCapability = Object.freeze({ render: cacheRenderer });
+  const cacheCapability = Object.freeze({});
 
   return Object.freeze({
     activate: ({ afterCommit, onDispose }: IntegrationActivationContext) => {
       if (active) throw new Error('GPT already activated');
-      const cacheRelease: { current?: () => void } = {};
       const diagnosticsEventRelease: { current?: () => void } = {};
       const diagnosticsRelease: { current?: () => void } = {};
+      const pbsCacheBridgeRelease: { current?: () => void } = {};
       const publisherRelease: { current?: () => void } = {};
       const slotServiceRelease: { current?: () => void } = {};
       const bridgeRelease: { current?: () => void } = {};
       const pucRegistrarRelease: { current?: () => void } = {};
       onDispose(resetGuardState);
-      onDispose(() => cacheRelease.current?.());
       onDispose(() => diagnosticsEventRelease.current?.());
       onDispose(() => diagnosticsRelease.current?.());
+      onDispose(() => pbsCacheBridgeRelease.current?.());
       onDispose(() => publisherRelease.current?.());
       onDispose(() => slotServiceRelease.current?.());
       onDispose(() => bridgeRelease.current?.());
@@ -1252,7 +1606,6 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
         rendererNonces: render.rendererNonces,
         rendererUrl,
         reservations: render.reservations,
-        resolveCacheAdm,
         resizeCollapsedShell: resizeCollapsedPucShell,
       });
       pucBridge = bridge;
@@ -1277,8 +1630,13 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
         }
         diagnosticsEventRelease.current = releaseDiagnosticEvents;
       }
+      pbsCacheBridgeRelease.current = installPbsCacheBridge(
+        document,
+        auction,
+        () => active,
+        trace.observations.publish
+      );
       publisherRelease.current = startup.activate();
-      cacheRelease.current = render.registerRenderer('cache', cacheRenderer);
       installGptGuard();
       active = true;
       afterCommit(() => {

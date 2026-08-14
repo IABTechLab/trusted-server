@@ -8,7 +8,6 @@ import {
   parseBrowserAuctionProjectionV1,
 } from '../../core/contracts/auction_projection';
 import { validateRequestAdsOptions } from '../../core/contracts/request_ads';
-import { parseCacheFetchPolicyV1 } from '../../core/config';
 import { log } from '../../core/log';
 import { prepareAdmIframe } from '../../core/render';
 import { createRenderTraceStore } from '../../core/trace';
@@ -59,9 +58,7 @@ import {
   createRenderAttempt,
   createRendererNonceRegistry,
   createSlotOperation,
-  renderDirectCacheAttempt,
   renderDirectAdmAttempt,
-  resolveCacheAdmAttempt,
   type RenderAttempt,
 } from '../../services/render';
 import type { SlotRecord, SlotService } from '../../services/slots';
@@ -69,7 +66,6 @@ import { trustedDocumentHttpOrigin } from '../../shared/origin';
 
 interface AcceptedBoot {
   readonly auctionProjection: unknown;
-  readonly cachePolicy?: unknown;
   readonly diagnostics: Readonly<{
     version: 1;
     renderTraceOverlay: boolean;
@@ -77,7 +73,7 @@ interface AcceptedBoot {
   readonly manifest: Readonly<BootManifestV1>;
 }
 
-export type RegisteredRenderSource = 'aps' | 'cache';
+export type RegisteredRenderSource = 'aps';
 export type RegisteredRenderer = (attempt: RenderAttempt, container: HTMLElement) => boolean;
 
 interface LocalSlotRecord {
@@ -363,10 +359,8 @@ export function createRenderRuntimeIntegrationRegistration(
       if (!document || !view) throw new TypeError('render_runtime requires a browser document');
       const origin = trustedDocumentHttpOrigin(view.location.origin);
       if (!origin) throw new TypeError('render_runtime requires a trusted HTTP origin');
-      const cachePolicy =
-        boot.cachePolicy === undefined ? undefined : parseCacheFetchPolicyV1(boot.cachePolicy);
       const projection = prepareInitialAuctionProjection(boot.auctionProjection, (candidate) =>
-        parseBrowserAuctionProjectionV1(candidate, boot.cachePolicy)
+        parseBrowserAuctionProjectionV1(candidate)
       ) as Readonly<BrowserAuctionProjectionV1> | undefined;
       if (!projection) throw new TypeError('render_runtime projection is invalid');
 
@@ -481,7 +475,10 @@ export function createRenderRuntimeIntegrationRegistration(
         apsValidation = undefined;
       });
       const reservations = createReservationService({
-        prepareRenderSource: (candidate) => parseBidRenderSourceV1(candidate, cachePolicy),
+        prepareRenderSource: (candidate) => {
+          const source = parseBidRenderSourceV1(candidate);
+          return source?.type === 'pbs_cache' ? undefined : source;
+        },
       });
       scope.onDispose(() => reservations.dispose());
       const rendererNonces = createRendererNonceRegistry();
@@ -539,7 +536,10 @@ export function createRenderRuntimeIntegrationRegistration(
           artifacts,
           owner,
           ...(parentAttemptId === undefined ? {} : { parentAttemptId }),
-          prepareRenderSource: (candidate) => parseBidRenderSourceV1(candidate, cachePolicy),
+          prepareRenderSource: (candidate) => {
+            const source = parseBidRenderSourceV1(candidate);
+            return source?.type === 'pbs_cache' ? undefined : source;
+          },
           publishDiagnostics: diagnostics.publish,
           reservations,
         });
@@ -569,15 +569,14 @@ export function createRenderRuntimeIntegrationRegistration(
             publisherOrigin: origin,
           });
         }
-        if (attempt.renderSource?.type === 'aps' || attempt.renderSource?.type === 'cache') {
-          const renderer = registeredRenderers.get(attempt.renderSource.type);
+        if (attempt.renderSource?.type === 'aps') {
+          const renderer = registeredRenderers.get('aps');
           if (renderer) return renderer(attempt, container);
         }
         attempt.fail('descriptor_invalid');
         return false;
       };
       const batches = createAuctionBatchService({
-        ...(cachePolicy ? { cachePolicy } : {}),
         createAttempt,
         fetcher: (input, init) => globalThis.fetch(input, init),
         parseResponse: parseTrustedServerAuctionResponseV1,
@@ -735,7 +734,6 @@ export function createRenderRuntimeIntegrationRegistration(
           };
         },
         artifacts,
-        cachePolicy,
         createAttempt,
         createSlotOperation,
         commitPageBids: (
@@ -745,26 +743,20 @@ export function createRenderRuntimeIntegrationRegistration(
         ): boolean =>
           createPageBidsController({
             navigation: owner,
-            parseProjection: (value) => parseBrowserAuctionProjectionV1(value, cachePolicy),
+            parseProjection: (value) => parseBrowserAuctionProjectionV1(value),
             slotRegistry,
           }).commit(candidate).status === 'committed',
         navigation,
         mintLifecycleTicket: mintBrowserLifecycleTicket,
         projection,
-        renderDirectCacheAttempt,
         prepareAdmIframe,
         renderWinner,
         rendererNonces,
         reservations,
-        resolveCacheAdmAttempt,
         publisherOrigin: origin,
         registerRenderer: (type: RegisteredRenderSource, renderer: RegisteredRenderer) => {
           if (!active) throw new TypeError('render source provider is inactive');
-          if (
-            (type !== 'aps' && type !== 'cache') ||
-            typeof renderer !== 'function' ||
-            registeredRenderers.has(type)
-          ) {
+          if (type !== 'aps' || typeof renderer !== 'function' || registeredRenderers.has(type)) {
             throw new TypeError('render source provider is invalid or duplicated');
           }
           registeredRenderers.set(type, renderer);
