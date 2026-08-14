@@ -6,6 +6,7 @@ import {
   selectInitialSliceDefinitions,
 } from '../../src/first_display/composition';
 import { DIDOMI_INITIAL_SLICE } from '../../src/first_display/slices/didomi';
+import { CREATIVE_INITIAL_SLICE } from '../../src/first_display/slices/creative';
 import { DATADOME_INITIAL_SLICE } from '../../src/first_display/slices/datadome';
 import { GOOGLE_TAG_MANAGER_INITIAL_SLICE } from '../../src/first_display/slices/google_tag_manager';
 import { LOCKR_INITIAL_SLICE } from '../../src/first_display/slices/lockr';
@@ -15,6 +16,7 @@ import { SOURCEPOINT_INITIAL_SLICE } from '../../src/first_display/slices/source
 import { TESTLIGHT_INITIAL_SLICE } from '../../src/first_display/slices/testlight';
 import type { FirstDisplayRouteRuleV1 } from '../../src/first_display/leaf/route_guard';
 import { installDidomiInitial } from '../../src/first_display/leaf/config_guard';
+import type { FirstDisplayCreativeGuardV1 } from '../../src/first_display/leaf/creative_guard';
 import {
   installPermutiveInitial,
   snapshotPermutiveInitialSegments,
@@ -30,6 +32,7 @@ import {
   type FirstDisplayComponentRegistrationV1,
 } from '../../src/first_display/registration';
 import { createDidomiRuntime } from '../../src/integrations/didomi/module';
+import { shouldProxyExternalUrl } from '../../src/integrations/creative/proxy_sign';
 import { getPermutiveSegments } from '../../src/integrations/permutive/segments';
 import { mirrorSourcepointConsent } from '../../src/integrations/sourcepoint/consent_mirror';
 
@@ -824,5 +827,115 @@ describe('first-display initial slice definitions', () => {
     disposers.reverse().forEach((release) => release());
     expect(timers.size).toBe(0);
     expect(document.cookie).toBe('');
+  });
+
+  it('registers the exact creative parser guard policy and owns its rollback', () => {
+    const release = vi.fn();
+    const observations: Array<readonly [string, number]> = [];
+    let guard: FirstDisplayCreativeGuardV1 | undefined;
+    const disposers: Array<() => void> = [];
+    const bindings = Object.freeze({
+      config: Object.freeze({
+        version: 1,
+        enabled: true,
+        clickGuard: true,
+        renderGuard: true,
+      }),
+      location: Object.freeze({
+        href: 'https://publisher.example/page',
+        origin: 'https://publisher.example',
+      }),
+      observe: (name: string, value: number) => observations.push([name, value]),
+      register: (candidate: FirstDisplayCreativeGuardV1) => {
+        guard = candidate;
+        return release;
+      },
+    });
+    const host = Object.freeze({
+      activate: (
+        id: string,
+        own: (dispose: () => void) => void,
+        install?: (candidate: unknown, ownEffect: (dispose: () => void) => void) => void
+      ) => {
+        expect(id).toBe('creative_initial');
+        install?.(bindings, own);
+      },
+    });
+
+    CREATIVE_INITIAL_SLICE.prepare(host).activate(
+      Object.freeze({
+        own: (dispose: () => void) => disposers.push(dispose),
+        afterActivate: () => undefined,
+      })
+    );
+    expect(guard).toBeDefined();
+    expect(guard).toMatchObject({
+      clickGuard: true,
+      id: 'creative',
+      renderGuard: true,
+      version: 1,
+    });
+    expect(Object.isFrozen(guard)).toBe(true);
+    expect(guard?.normalizeNavigation('/landing')).toBe('https://publisher.example/landing');
+    expect(guard?.normalizeNavigation('javascript:alert(1)')).toBeUndefined();
+    expect(guard?.normalizeNavigation('https://user:pass@example.com/')).toBeUndefined();
+    expect(guard?.shouldProxyResource('https://cdn.example/pixel.gif')).toBe(true);
+    expect(guard?.shouldProxyResource('/publisher.png')).toBe(false);
+    expect(guard?.shouldProxyResource('data:image/gif;base64,a')).toBe(false);
+    for (const url of [
+      'https://cdn.example/pixel.gif',
+      'https://user:pass@cdn.example/pixel.gif',
+      'data:image/gif;base64,a',
+      'javascript:alert(1)',
+      'blob:https://publisher.example/id',
+      'not a valid URL',
+    ]) {
+      expect(guard?.shouldProxyResource(url)).toBe(shouldProxyExternalUrl(url));
+    }
+    expect(observations).toEqual([['guard_count', 3]]);
+
+    disposers.reverse().forEach((dispose) => dispose());
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('rejects malformed creative config before installing any initial guard', () => {
+    for (const config of [
+      { version: 1, enabled: true, clickGuard: true, renderGuard: false },
+      Object.freeze({ version: 1, enabled: false, clickGuard: true, renderGuard: false }),
+      Object.freeze({
+        version: 1,
+        enabled: true,
+        clickGuard: true,
+        renderGuard: false,
+        extra: true,
+      }),
+    ]) {
+      const register = vi.fn();
+      const host = Object.freeze({
+        activate: (
+          _id: string,
+          own: (dispose: () => void) => void,
+          install?: (candidate: unknown, ownEffect: (dispose: () => void) => void) => void
+        ) =>
+          install?.(
+            Object.freeze({
+              config,
+              location: Object.freeze({
+                href: 'https://publisher.example/page',
+                origin: 'https://publisher.example',
+              }),
+              observe: () => undefined,
+              register,
+            }),
+            own
+          ),
+      });
+      expect(() =>
+        CREATIVE_INITIAL_SLICE.prepare(host).activate(
+          Object.freeze({ own: () => undefined, afterActivate: () => undefined })
+        )
+      ).toThrow();
+      expect(register).not.toHaveBeenCalled();
+    }
   });
 });
