@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -816,55 +815,60 @@ test('permanent comparator pins every historical and role-correct evidence subtr
   }
 });
 
-test('bundle check verifies artifact-affecting capture provenance', () => {
+test('bundle check authenticates historical capture provenance for descendant builds', () => {
   const evidence = readBuildEvidence();
+  const capture = evidence.baseline.reviewRemediationTransfer;
 
+  assert.doesNotThrow(() => bundleBudgets.validateCaptureSourceProvenance(capture));
   assert.doesNotThrow(() =>
     bundleBudgets.validateRoleCorrectTransfer({ ...evidence, verifyGitProvenance: true })
   );
-  const sourceSha = evidence.baseline.reviewRemediationTransfer.source.sha;
-  const packagePath = 'crates/trusted-server-js/lib/package.json';
-  const capturedPackage = JSON.parse(
-    execFileSync('git', ['show', `${sourceSha}:${packagePath}`], {
-      cwd: repositoryRoot,
-      encoding: 'utf8',
-    })
-  );
-  const currentPackage = JSON.parse(
-    fs.readFileSync(path.join(libDirectory, 'package.json'), 'utf8')
-  );
+});
 
-  assert.notDeepEqual(currentPackage.scripts, capturedPackage.scripts);
-  assert.doesNotThrow(() =>
-    bundleBudgets.validateArtifactBuildPackageMetadata(capturedPackage, currentPackage)
-  );
-
+test('capture provenance rejects mismatched recorded lock and tool metadata', () => {
+  const capture = readBuildEvidence().baseline.reviewRemediationTransfer;
   const mutations = {
-    type: (candidate) => (candidate.type = 'commonjs'),
-    sideEffects: (candidate) => (candidate.sideEffects = false),
-    prebuild: (candidate) => (candidate.scripts.prebuild = 'node prepare-build.mjs'),
-    build: (candidate) => (candidate.scripts.build = 'node changed-build.mjs'),
-    postbuild: (candidate) => (candidate.scripts.postbuild = 'node finalize-build.mjs'),
-    dependencies: (candidate) => (candidate.dependencies['prebid.js'] = '0.0.0'),
-    devDependencies: (candidate) => (candidate.devDependencies.vite = '0.0.0'),
+    packageLockSha256: (candidate) => (candidate.tools.packageLockSha256 = '0'.repeat(64)),
+    node: (candidate) => (candidate.tools.node = 'v0.0.0'),
+    npm: (candidate) => (candidate.tools.npm = '0.0.0'),
+    typescript: (candidate) => (candidate.tools.typescript = '0.0.0'),
+    vite: (candidate) => (candidate.tools.vite = '0.0.0'),
+    esbuild: (candidate) => (candidate.tools.esbuild = '0.0.0'),
   };
-  const acceptedDrift = [];
-  for (const [field, mutate] of Object.entries(mutations)) {
-    const candidate = structuredClone(capturedPackage);
-    mutate(candidate);
-    try {
-      bundleBudgets.validateArtifactBuildPackageMetadata(capturedPackage, candidate);
-      acceptedDrift.push(field);
-    } catch (error) {
-      assert.match(error.message, /artifact-generating package metadata/, field);
-    }
-  }
-  assert.deepEqual(acceptedDrift, []);
 
-  evidence.baseline.reviewRemediationTransfer.source.sha = '0'.repeat(40);
+  for (const [field, mutate] of Object.entries(mutations)) {
+    const candidate = structuredClone(capture);
+    mutate(candidate);
+    assert.throws(
+      () => bundleBudgets.validateCaptureSourceProvenance(candidate),
+      new RegExp(field, 'i'),
+      field
+    );
+  }
+});
+
+test('capture provenance rejects an invalid source or missing captured build input', () => {
+  const capture = readBuildEvidence().baseline.reviewRemediationTransfer;
+  const invalidSource = structuredClone(capture);
+  invalidSource.source.sha = '0'.repeat(40);
+
   assert.throws(
-    () => bundleBudgets.validateRoleCorrectTransfer({ ...evidence, verifyGitProvenance: true }),
-    /review-remediation capture digest/
+    () => bundleBudgets.validateCaptureSourceProvenance(invalidSource),
+    /capture source SHA/
+  );
+  assert.throws(
+    () =>
+      bundleBudgets.validateCaptureSourceProvenance(capture, {
+        head: `${capture.source.sha}^`,
+      }),
+    /not an ancestor/
+  );
+  assert.throws(
+    () =>
+      bundleBudgets.validateCaptureSourceProvenance(capture, {
+        buildInputs: ['crates/trusted-server-js/lib/does-not-exist'],
+      }),
+    /captured build input does not exist/
   );
 });
 

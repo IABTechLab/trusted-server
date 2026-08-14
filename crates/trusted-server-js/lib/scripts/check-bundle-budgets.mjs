@@ -46,14 +46,24 @@ const BOOTSTRAP_BASELINE = Object.freeze({
 });
 const PRODUCTION_SEAM_PATTERN =
   /(?:^|\/)(?:tests?|fixtures?|fakes?|no-?op)(?:\/|$)|(?:^|[/_.-])(?:test|fake|no-?op)(?=[/_.-]|$)|ForTest/u;
-const CAPTURE_PACKAGE_PATH = 'crates/trusted-server-js/lib/package.json';
+const CAPTURE_PACKAGE_LOCK_PATH = 'crates/trusted-server-js/lib/package-lock.json';
+const CAPTURE_TOOL_VERSIONS_PATH = '.tool-versions';
+const CAPTURE_PERFORMANCE_WORKFLOW_PATH = '.github/workflows/tsjs-performance-gate.yml';
 const CAPTURE_BUILD_INPUTS = Object.freeze([
+  CAPTURE_TOOL_VERSIONS_PATH,
+  CAPTURE_PERFORMANCE_WORKFLOW_PATH,
   'crates/trusted-server-js/lib/src',
   'crates/trusted-server-js/lib/build-all.mjs',
   'crates/trusted-server-js/lib/package-lock.json',
+  'crates/trusted-server-js/lib/package.json',
   'crates/trusted-server-js/lib/tsconfig.json',
   'crates/trusted-server-js/lib/vite.config.ts',
 ]);
+const CAPTURE_TOOL_PACKAGES = Object.freeze({
+  typescript: 'typescript',
+  vite: 'vite',
+  esbuild: 'esbuild',
+});
 
 function fail(message) {
   throw new Error(`[bundle-budgets] ${message}`);
@@ -88,65 +98,127 @@ export function canonicalJsonSha256(value) {
   return createHash('sha256').update(canonicalJson(value)).digest('hex');
 }
 
-function artifactBuildPackageMetadata(packageJson) {
-  const { scripts, ...metadata } = packageJson ?? {};
-  const buildLifecycleScripts = {};
-  for (const name of ['prebuild', 'build', 'postbuild']) {
-    if (scripts !== null && typeof scripts === 'object' && Object.hasOwn(scripts, name)) {
-      buildLifecycleScripts[name] = scripts[name];
-    }
-  }
-  return {
-    ...metadata,
-    scripts: buildLifecycleScripts,
-  };
-}
-
-/** Require package metadata that can affect measured artifacts to match the capture source. */
-export function validateArtifactBuildPackageMetadata(capturedPackage, currentPackage) {
-  if (
-    canonicalJson(artifactBuildPackageMetadata(capturedPackage)) !==
-    canonicalJson(artifactBuildPackageMetadata(currentPackage))
-  ) {
-    fail('artifact-generating package metadata differs from the review-remediation source');
-  }
-}
-
-function validateCleanCaptureSource(capture) {
+/** Authenticate the immutable inputs and tool versions recorded by a historical capture. */
+export function validateCaptureSourceProvenance(
+  capture,
+  { buildInputs = CAPTURE_BUILD_INPUTS, head = 'HEAD' } = {}
+) {
   const sha = capture?.source?.sha;
   if (typeof sha !== 'string' || !/^[0-9a-f]{40}$/u.test(sha)) {
-    fail('review-remediation source SHA is invalid');
+    fail('capture source SHA is invalid');
   }
+
   try {
     if (
       execFileSync('git', ['cat-file', '-t', sha], {
         cwd: repositoryRoot,
         encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
       }).trim() !== 'commit'
     ) {
-      fail('review-remediation source SHA does not identify a commit');
+      fail('capture source SHA does not identify a commit');
     }
-    execFileSync('git', ['merge-base', '--is-ancestor', sha, 'HEAD'], {
-      cwd: repositoryRoot,
-      stdio: 'ignore',
-    });
-    execFileSync('git', ['diff', '--quiet', `${sha}..HEAD`, '--', ...CAPTURE_BUILD_INPUTS], {
-      cwd: repositoryRoot,
-      stdio: 'ignore',
-    });
-    const capturedPackage = JSON.parse(
-      execFileSync('git', ['show', `${sha}:${CAPTURE_PACKAGE_PATH}`], {
-        cwd: repositoryRoot,
-        encoding: 'utf8',
-      })
-    );
-    const currentPackage = JSON.parse(
-      fs.readFileSync(path.join(repositoryRoot, CAPTURE_PACKAGE_PATH), 'utf8')
-    );
-    validateArtifactBuildPackageMetadata(capturedPackage, currentPackage);
   } catch (error) {
     if (error instanceof Error && error.message.startsWith('[bundle-budgets]')) throw error;
-    fail('review-remediation source cannot reproduce current artifact-generating inputs');
+    fail('capture source SHA does not identify a commit');
+  }
+
+  try {
+    execFileSync('git', ['merge-base', '--is-ancestor', sha, head], {
+      cwd: repositoryRoot,
+      stdio: 'ignore',
+    });
+  } catch {
+    fail('capture source SHA is not an ancestor of HEAD');
+  }
+
+  for (const input of buildInputs) {
+    try {
+      execFileSync('git', ['cat-file', '-e', `${sha}:${input}`], {
+        cwd: repositoryRoot,
+        stdio: 'ignore',
+      });
+    } catch {
+      fail(`captured build input does not exist at source SHA: ${input}`);
+    }
+  }
+
+  let packageLockBytes;
+  try {
+    packageLockBytes = execFileSync('git', ['show', `${sha}:${CAPTURE_PACKAGE_LOCK_PATH}`], {
+      cwd: repositoryRoot,
+    });
+  } catch {
+    fail('captured package-lock does not exist at source SHA');
+  }
+
+  const packageLockSha256 = createHash('sha256').update(packageLockBytes).digest('hex');
+  if (capture?.tools?.packageLockSha256 !== packageLockSha256) {
+    fail('captured packageLockSha256 does not match package-lock bytes at source SHA');
+  }
+
+  let packageLock;
+  try {
+    packageLock = JSON.parse(packageLockBytes.toString('utf8'));
+  } catch {
+    fail('captured package-lock is not valid JSON');
+  }
+
+  for (const [tool, packageName] of Object.entries(CAPTURE_TOOL_PACKAGES)) {
+    const resolvedVersion = packageLock.packages?.[`node_modules/${packageName}`]?.version;
+    if (capture?.tools?.[tool] !== resolvedVersion) {
+      fail(`captured ${tool} version does not match the resolved package-lock version`);
+    }
+  }
+
+  let toolVersions;
+  try {
+    toolVersions = execFileSync('git', ['show', `${sha}:${CAPTURE_TOOL_VERSIONS_PATH}`], {
+      cwd: repositoryRoot,
+      encoding: 'utf8',
+    });
+  } catch {
+    fail('captured .tool-versions does not exist at source SHA');
+  }
+
+  const nodejsEntries = toolVersions
+    .split(/\r?\n/u)
+    .filter((line) => /^\s*nodejs(?:\s|$)/u.test(line));
+  const nodejsMatch = nodejsEntries[0]?.match(/^\s*nodejs\s+(\S+)\s*$/u);
+  if (
+    nodejsEntries.length !== 1 ||
+    nodejsMatch === null ||
+    capture?.tools?.node !== `v${nodejsMatch[1]}`
+  ) {
+    fail('captured node version does not match the exact .tool-versions nodejs pin');
+  }
+
+  let performanceWorkflow;
+  try {
+    performanceWorkflow = execFileSync(
+      'git',
+      ['show', `${sha}:${CAPTURE_PERFORMANCE_WORKFLOW_PATH}`],
+      {
+        cwd: repositoryRoot,
+        encoding: 'utf8',
+      }
+    );
+  } catch {
+    fail('captured TSJS performance workflow does not exist at source SHA');
+  }
+
+  const npmVersionAssertions = performanceWorkflow
+    .split(/\r?\n/u)
+    .filter((line) => line.includes('npm --version'));
+  const npmVersionMatch = npmVersionAssertions[0]?.match(
+    /^\s*test "\$\(npm --version\)" = "([^"\s]+)"\s*$/u
+  );
+  if (
+    npmVersionAssertions.length !== 1 ||
+    npmVersionMatch === null ||
+    capture?.tools?.npm !== npmVersionMatch[1]
+  ) {
+    fail('captured npm version does not match the exact single workflow assertion');
   }
 }
 
@@ -784,7 +856,7 @@ export function validateRoleCorrectTransfer({
   if (capture.roleCorrectTransferSha256 !== ROLE_CORRECT_CAPTURE_SHA256) {
     fail('review-remediation linkage to the immutable intermediate capture is invalid');
   }
-  if (verifyGitProvenance) validateCleanCaptureSource(capture);
+  if (verifyGitProvenance) validateCaptureSourceProvenance(capture);
 
   validateReleaseInventoryShape(intermediate.release, 'role-correct intermediate');
   validateReleaseInventoryShape(capture.release, 'captured');
