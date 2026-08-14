@@ -80,6 +80,7 @@ function harness() {
       events.push(`render:gam:${result}`);
       return true;
     }),
+    recordFailure: vi.fn(() => true),
     sealTsAdmission: vi.fn(() => events.push('render:seal')),
     dispose: vi.fn(() => events.push('render:dispose')),
   };
@@ -105,6 +106,7 @@ function harness() {
   );
   const cycle = Object.freeze({
     bid: value.projection.bids[0]!,
+    element: document.createElement('div'),
     ownership: 'trusted_server' as const,
     physicalSlot: {},
     placement: value.projection.slots[0]!,
@@ -184,6 +186,7 @@ describe('projected first-display driver', () => {
       renderer: {
         bind: () => true,
         recordGam: () => true,
+        recordFailure: () => true,
         sealTsAdmission: () => undefined,
         dispose: () => undefined,
       },

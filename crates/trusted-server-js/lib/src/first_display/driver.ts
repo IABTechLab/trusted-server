@@ -19,6 +19,7 @@ export interface FirstDisplayRenderBridgeV1 {
     cycle: FirstDisplayGptBoundCycleV1,
     result: FirstDisplayGptRenderResult
   ) => boolean;
+  readonly recordFailure: (cycle: FirstDisplayGptBoundCycleV1) => boolean;
   readonly sealTsAdmission: () => void;
   readonly dispose: () => void;
 }
@@ -37,6 +38,7 @@ function sameCycle(
   return (
     candidate.slotId === expected.slotId &&
     candidate.bid === expected.bid &&
+    candidate.element === expected.element &&
     candidate.placement === expected.placement &&
     candidate.physicalSlot === expected.physicalSlot &&
     candidate.ownership === expected.ownership
@@ -122,6 +124,8 @@ export function createFirstDisplayProjectedDriver(
           }
         },
         onFailure: (slotId): void => {
+          const cycle = bound.get(slotId);
+          if (cycle) options.renderer.recordFailure(cycle);
           settle(slotId, 'failed');
         },
         onFirstAction: (): boolean => {

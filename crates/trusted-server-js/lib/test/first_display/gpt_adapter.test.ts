@@ -138,7 +138,10 @@ describe('first-display GPT adapter', () => {
 
     expect(
       adapter.start({
-        onBound: ({ slotId, ownership }) => events.push(`bound:${slotId}:${ownership}`),
+        onBound: ({ element, slotId, ownership }) => {
+          expect(element).toBe(dom.window.document.getElementById('slot-1'));
+          events.push(`bound:${slotId}:${ownership}`);
+        },
         onFailure: (slotId, reason) => failures.push([slotId, reason]),
         onFirstAction: () => {
           events.push('first-action');

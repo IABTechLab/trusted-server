@@ -325,7 +325,7 @@ test('generated first-display components self-register through one authenticated
           window.__firstDisplayGptListeners.slotRequested({slot: window.__firstDisplaySlot});
           window.__firstDisplayGptListeners.slotRenderEnded({
             slot: window.__firstDisplaySlot,
-            isEmpty: false
+            isEmpty: true
           });
         },
         getConfig: function() { return {disableInitialLoad: false}; },
@@ -364,13 +364,9 @@ test('generated first-display components self-register through one authenticated
                 targeting: Object.freeze({hb_pb: '1.25'}),
                 rendererReservationId: 'r1_${'a'.repeat(22)}',
                 renderSource: Object.freeze({
-                  type: 'aps',
+                  type: 'adm',
                   version: 1,
-                  accountId: 'account-1',
-                  bidId: 'bid-1',
-                  tagType: 'iframe',
-                  creativeUrl: 'https://creative.example/render',
-                  aaxResponse: '',
+                  adm: '<main>fictional creative</main>',
                   width: 300,
                   height: 250
                 })
@@ -395,20 +391,6 @@ test('generated first-display components self-register through one authenticated
             clearTimer: function() {},
             document: document,
             setTimer: function(callback) { return callback; }
-          }),
-          renderer: Object.freeze({
-            bind: function(_cycle, onTerminal) {
-              window.__firstDisplayEvents.push('render:bind');
-              window.__firstDisplayTerminal = onTerminal;
-              return true;
-            },
-            recordGam: function(_cycle, result) {
-              window.__firstDisplayEvents.push('render:gam:' + result);
-              window.__firstDisplayTerminal('accepted');
-              return true;
-            },
-            sealTsAdmission: function() {},
-            dispose: function() {}
           }),
           performance: Object.freeze({mark: function() {}}),
           paint: Object.freeze({
@@ -452,27 +434,18 @@ test('generated first-display components self-register through one authenticated
       });
     `);
     const activatedBase = registrations[0].prepare(dom.window.__firstDisplayBaseHost);
-    const activatedAps = registrations
-      .find(({ id }) => id === 'aps_initial')
-      .prepare(activatedBase.sliceHost);
     const activatedGpt = registrations
       .find(({ id }) => id === 'gpt_initial')
       .prepare(activatedBase.sliceHost);
     activatedBase.activate(dom.window.__firstDisplayActivation);
-    activatedAps.activate(dom.window.__firstDisplaySliceActivation);
     activatedGpt.activate(dom.window.__firstDisplaySliceActivation);
     dom.window.__firstDisplayAfterActivate();
+    const directFrame = dom.window.document.querySelector('#slot-1 iframe');
+    assert.ok(directFrame, 'the generated bridge must stage the direct empty-GAM fallback');
+    directFrame.dispatchEvent(new dom.window.Event('load'));
     assert.deepEqual(
       [...dom.window.__firstDisplayEvents],
-      [
-        'aps:aps',
-        'gpt:gpt',
-        'bootstrap:register',
-        'render:bind',
-        'bootstrap:action',
-        'gpt:display',
-        'render:gam:nonempty_gam',
-      ]
+      ['gpt:gpt', 'bootstrap:register', 'bootstrap:action', 'gpt:display']
     );
   } finally {
     dom.window.close();
