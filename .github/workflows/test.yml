@@ -306,8 +306,8 @@ jobs:
       - name: Run embedded APS renderer contract
         run: node --test test/contract/aps-renderer-es5.test.mjs
 
-      - name: Verify rc/july adoption manifest
-        run: node --test test/contract/rc-july-adoption.test.mjs
+      - name: Verify retired concept audit
+        run: npm run check:concept-audit
 
       - name: Run unit tests
         run: npm test -- --run
@@ -385,7 +385,7 @@ jobs:
             npm --prefix crates/trusted-server-js/lib run check:aps-contract
             npm --prefix crates/trusted-server-js/lib run check:hard-cutover-absence
             npm --prefix crates/trusted-server-js/lib run check:bundle
-            node --test crates/trusted-server-js/lib/test/contract/rc-july-adoption.test.mjs
+            npm --prefix crates/trusted-server-js/lib run check:concept-audit
             npm --prefix docs run lint
             npm --prefix docs run build
             actual_release_id="$(npm --prefix crates/trusted-server-js/lib run --silent print:release-id)"

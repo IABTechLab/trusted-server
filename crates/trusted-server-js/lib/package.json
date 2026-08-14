@@ -13,6 +13,7 @@
     "check:architecture": "node scripts/check-hard-cutover-absence.mjs",
     "check:hard-cutover-absence": "node scripts/check-hard-cutover-absence.mjs",
     "check:bundle": "node scripts/check-bundle-budgets.mjs",
+    "check:concept-audit": "node scripts/check-retired-concept-audit.mjs",
     "dev": "vite build --watch",
     "test": "vitest run",
     "posttest": "npm run build && npm run test:release",
