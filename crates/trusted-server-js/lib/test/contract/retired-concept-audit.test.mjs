@@ -316,10 +316,8 @@ Never build rc/july or ${validManifest.retiredSnapshot}.
 \`\`\`
 
 \`\`\`bash
-echo 'rc/july is retired'
-echo 'Do not build rc/july'
-printf '%s\\n' 'Do not compare rc/july'
 git mv crates/trusted-server-js/lib/scripts/check-rc-july-adoption.mjs crates/trusted-server-js/lib/scripts/check-retired-concept-audit.mjs
+git mv crates/trusted-server-js/lib/test/contract/rc-july-adoption.test.mjs crates/trusted-server-js/lib/test/contract/retired-concept-audit.test.mjs
 \`\`\`
 `;
   assert.deepEqual(auditRetiredPlanCommands(safe), []);
@@ -332,6 +330,10 @@ git mv crates/trusted-server-js/lib/scripts/check-rc-july-adoption.mjs crates/tr
     `git cat-file -e ${validManifest.retiredSnapshot}`,
     'git ls-tree -r rc/july',
     'git mv scripts/check-rc-july-adoption.mjs scripts/check-retired-concept-audit.mjs',
+    "echo 'rc/july is retired'",
+    "echo 'Do not build rc/july'",
+    "printf '%s\\n' 'Do not compare rc/july'",
+    '# rc/july is retired',
     'echo "$(git fetch origin rc/july)"',
     'printf \'%s\\n\' "$(git -C repository fetch origin rc/july)"',
     'printf -v retired_ref rc/july',
@@ -342,6 +344,9 @@ git mv crates/trusted-server-js/lib/scripts/check-rc-july-adoption.mjs crates/tr
     'echo rc/july; true',
     'true && echo rc/july',
     'echo rc/july & wait',
+    'echo "${retired:=rc/july}"\ngit fetch "$retired"',
+    'printf \'%s\' "${retired:=rc/july}"\ngit fetch "$retired"',
+    'echo rc/july\ngit fetch "$_"',
     'git merge rc/july',
     'git rebase rc/july',
     'git cherry-pick 905984e62a0858c53d9f0ff6dd3a1bf190cf311d',
