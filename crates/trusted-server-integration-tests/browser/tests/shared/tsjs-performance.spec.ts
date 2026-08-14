@@ -23,6 +23,7 @@ import {
   type BrowserContext,
   type Page,
 } from "@playwright/test";
+import { measureBytes } from "../../../../trusted-server-js/lib/scripts/bundle-metrics.mjs";
 
 const REPO_ROOT = execFileSync("git", ["rev-parse", "--show-toplevel"], {
   encoding: "utf8",
@@ -49,6 +50,7 @@ const NETWORK_PROFILE = Object.freeze({
 // creative guard is enabled. Keep both comparison sides on that same shape.
 const CRITICAL_IDS = ["render_runtime", "creative", "gpt"] as const;
 const DEFERRED_IDS = ["diagnostics_presentation", "gpt_later"] as const;
+const LEGACY_AD_INIT_INLINE = "window.tsjs.adInit();";
 const HEAP_CHECKPOINTS = [
   "afterBoot",
   "afterFirstRender",
@@ -62,8 +64,13 @@ type HeapCheckpoint = (typeof HEAP_CHECKPOINTS)[number];
 
 interface ReleaseArtifact {
   id: string;
-  role: "bootstrap" | "core" | "integration";
-  phase: "critical" | "deferred" | null;
+  role:
+    | "bootstrap"
+    | "first_display_base"
+    | "first_display_slice"
+    | "core"
+    | "integration";
+  phase: "first_display" | "critical" | "deferred" | null;
   trigger: "first_display_or_idle" | null;
   file: string;
   hash: string;
@@ -82,13 +89,33 @@ interface FixtureResources {
   criticalBody: string;
   criticalTransferBytes: number;
   criticalSrc: string;
+  runtimeBody: string | null;
+  runtimeSrc: string | null;
   deferred: Map<string, { body: string; src: string }>;
+  referenceTransfer: ReferenceTransfer;
+}
+
+interface ReferenceTransferSource {
+  semanticEndpoint: string;
+  delivery: "inline" | "external";
+  rawBytes: number;
+  gzipBytes: number;
+  brotliBytes: number;
+  sha256: string;
+}
+
+interface ReferenceTransfer {
+  sources: ReferenceTransferSource[];
+  rawBytes: number;
+  gzipBytes: number;
+  brotliBytes: number;
 }
 
 interface FixtureRun {
   context: BrowserContext;
   page: Page;
   criticalRequests: string[];
+  runtimeRequests: string[];
   deferredRequests: string[];
   pageErrors: string[];
   consoleMessages: string[];
@@ -137,27 +164,108 @@ function exactArtifact(release: Release, id: string): ReleaseArtifact {
   return matches[0]!;
 }
 
+function legacyBootInline(): string {
+  const slots = [
+    {
+      id: "perf-slot",
+      gam_unit_path: "/123/performance",
+      div_id: "perf-slot",
+      formats: [[300, 250]],
+      targeting: {},
+    },
+  ];
+  return `window.tsjs={adSlots:${JSON.stringify(slots)},bids:{},navGeneration:0};window.__tsjs_gpt_enabled=true;`;
+}
+
+function exactControllerInline(document: string): string {
+  const inline = [
+    ...document.matchAll(/<script([^>]*)>([\s\S]*?)<\/script>/giu),
+  ]
+    .filter((match) => !/\bsrc\s*=/iu.test(match[1] ?? ""))
+    .map((match) => match[2] ?? "");
+  if (
+    inline.length !== 1 ||
+    !inline[0]?.includes('performance.mark("tsjs:bids-script")')
+  ) {
+    throw new Error(
+      "production controller must contain one TSJS bids-script inline source",
+    );
+  }
+  return inline[0];
+}
+
+function measureReferenceTransfer(
+  sources: ReadonlyArray<{
+    semanticEndpoint: string;
+    delivery: "inline" | "external";
+    body: string;
+  }>,
+): ReferenceTransfer {
+  if (sources.length === 0)
+    throw new Error("semantic transfer must not be empty");
+  const endpoints = new Set<string>();
+  const measured = sources.map(({ semanticEndpoint, delivery, body }) => {
+    if (
+      !semanticEndpoint ||
+      endpoints.has(semanticEndpoint) ||
+      body.length === 0
+    ) {
+      throw new Error("semantic transfer source is empty or duplicated");
+    }
+    endpoints.add(semanticEndpoint);
+    return {
+      semanticEndpoint,
+      delivery,
+      ...measureBytes(Buffer.from(body, "utf8")),
+    };
+  });
+  return {
+    sources: measured,
+    rawBytes: measured.reduce((total, source) => total + source.rawBytes, 0),
+    gzipBytes: measured.reduce((total, source) => total + source.gzipBytes, 0),
+    brotliBytes: measured.reduce(
+      (total, source) => total + source.brotliBytes,
+      0,
+    ),
+  };
+}
+
 function loadReleaseFixtureResources(repositoryRoot: string): FixtureResources {
   const tsjsCrate = resolve(repositoryRoot, "crates/trusted-server-js");
   const dist = resolve(tsjsCrate, "dist");
   const releaseFile = resolve(dist, "tsjs-release-v1.json");
   const release = JSON.parse(readFileSync(releaseFile, "utf8")) as Release;
   expect(release.version).toBe(1);
-  const criticalArtifacts = [exactArtifact(release, "core")].concat(
+  const runtimeArtifacts = [exactArtifact(release, "core")].concat(
     CRITICAL_IDS.map((id) => exactArtifact(release, id)),
   );
-  for (const artifact of criticalArtifacts.slice(1)) {
+  for (const artifact of runtimeArtifacts.slice(1)) {
     expect(artifact.phase).toBe("critical");
   }
   expect(
-    criticalArtifacts.map(({ id }) => id),
+    runtimeArtifacts.map(({ id }) => id),
     "release-v1 performance shape must stay core + render + creative + GPT",
   ).toEqual(["core", "render_runtime", "creative", "gpt"]);
-  const criticalBody = criticalArtifacts
+  const runtimeBody = runtimeArtifacts
+    .map((artifact) => readFileSync(resolve(dist, artifact.file), "utf8"))
+    .join(";\n");
+  const runtimeHash = createHash("sha256").update(runtimeBody).digest("hex");
+  const runtimeSrc = `/static/tsjs=tsjs-unified.min.js?v=${runtimeHash}`;
+  const firstDisplayIds = [
+    "first_display",
+    "creative_initial",
+    "gpt_initial",
+  ] as const;
+  const firstDisplayArtifacts = firstDisplayIds.map((id) =>
+    exactArtifact(release, id),
+  );
+  for (const artifact of firstDisplayArtifacts)
+    expect(artifact.phase).toBe("first_display");
+  const criticalBody = firstDisplayArtifacts
     .map((artifact) => readFileSync(resolve(dist, artifact.file), "utf8"))
     .join(";\n");
   const criticalHash = createHash("sha256").update(criticalBody).digest("hex");
-  const criticalSrc = `/static/tsjs=tsjs-unified.min.js?v=${criticalHash}`;
+  const criticalSrc = `/static/tsjs=tsjs-first-display.min.js?m=0045&v=${criticalHash}`;
   const deferred = new Map<string, { body: string; src: string }>();
   for (const id of DEFERRED_IDS) {
     const artifact = exactArtifact(release, id);
@@ -208,8 +316,24 @@ function loadReleaseFixtureResources(repositoryRoot: string): FixtureResources {
   expect(controllerDocument.match(/id="trustedserver-js"/gu)).toHaveLength(1);
   expect(controllerDocument).toContain(criticalTag);
   expect(controllerDocument).toContain(`"releaseId":"${release.releaseId}"`);
+  expect(controllerDocument).toContain(`"runtimeSrc":"${runtimeSrc}"`);
+  expect(controllerDocument).not.toContain(
+    `<script src="${runtimeSrc}" id="trustedserver-js"></script>`,
+  );
   for (const { src } of deferred.values())
     expect(controllerDocument).toContain(src);
+  const referenceTransfer = measureReferenceTransfer([
+    {
+      semanticEndpoint: "inline:boot-controller",
+      delivery: "inline",
+      body: exactControllerInline(controllerDocument),
+    },
+    {
+      semanticEndpoint: `external:${criticalSrc}`,
+      delivery: "external",
+      body: criticalBody,
+    },
+  ]);
   return {
     artifactModel: "release-v1",
     release,
@@ -217,7 +341,10 @@ function loadReleaseFixtureResources(repositoryRoot: string): FixtureResources {
     criticalBody,
     criticalTransferBytes: Buffer.byteLength(criticalBody, "utf8"),
     criticalSrc,
+    runtimeBody,
+    runtimeSrc,
     deferred,
+    referenceTransfer,
   };
 }
 
@@ -229,14 +356,35 @@ function loadLegacyMainFixtureResources(
     .map((file) => readFileSync(resolve(dist, file), "utf8"))
     .join(";\n");
   const criticalHash = createHash("sha256").update(criticalBody).digest("hex");
+  const criticalSrc = `/static/tsjs=tsjs-unified.min.js?v=${criticalHash}`;
+  const referenceTransfer = measureReferenceTransfer([
+    {
+      semanticEndpoint: "inline:legacy-boot",
+      delivery: "inline",
+      body: legacyBootInline(),
+    },
+    {
+      semanticEndpoint: "inline:legacy-ad-init",
+      delivery: "inline",
+      body: LEGACY_AD_INIT_INLINE,
+    },
+    {
+      semanticEndpoint: `external:${criticalSrc}`,
+      delivery: "external",
+      body: criticalBody,
+    },
+  ]);
   return {
     artifactModel: "legacy-main-v1",
     release: null,
     controllerDocument: null,
     criticalBody,
     criticalTransferBytes: Buffer.byteLength(criticalBody, "utf8"),
-    criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${criticalHash}`,
+    criticalSrc,
+    runtimeBody: null,
+    runtimeSrc: null,
     deferred: new Map(),
+    referenceTransfer,
   };
 }
 
@@ -297,17 +445,8 @@ function fixtureDocument(
   const criticalTag = `<script src="${resources.criticalSrc}" id="trustedserver-js"></script>`;
   const comparisonSetup = `<script>window.__fixtureGpt.setManual(true);performance.mark("${COMPARISON_START_MARK}");</script>`;
   if (resources.artifactModel === "legacy-main-v1") {
-    const legacySlots = [
-      {
-        id: "perf-slot",
-        gam_unit_path: "/123/performance",
-        div_id: "perf-slot",
-        formats: [[300, 250]],
-        targeting: {},
-      },
-    ];
     const release = manualDisplay ? "" : "window.__fixtureGpt.release();";
-    return `<!doctype html><html><head><meta charset="utf-8"><script>window.tsjs={adSlots:${JSON.stringify(legacySlots)},bids:{},navGeneration:0};window.__tsjs_gpt_enabled=true;</script>${comparisonSetup}${criticalTag}</head><body><div id="perf-slot"></div><script>window.tsjs.adInit();${release}</script></body></html>`;
+    return `<!doctype html><html><head><meta charset="utf-8"><script>${legacyBootInline()}</script>${comparisonSetup}${criticalTag}</head><body><div id="perf-slot"></div><script>${LEGACY_AD_INIT_INLINE}${release}</script></body></html>`;
   }
   if (!resources.controllerDocument)
     throw new Error("generated controller document is unavailable");
@@ -607,6 +746,20 @@ async function serveFixtureRequest(
     );
     return;
   }
+  if (
+    resources.runtimeBody !== null &&
+    resources.runtimeSrc !== null &&
+    `${url.pathname}${url.search}` === resources.runtimeSrc
+  ) {
+    sendResponse(
+      response,
+      200,
+      "application/javascript; charset=utf-8",
+      resources.runtimeBody,
+      true,
+    );
+    return;
+  }
   for (const [id, artifact] of resources.deferred) {
     if (`${url.pathname}${url.search}` !== artifact.src) continue;
     if (id === "gpt_later")
@@ -729,13 +882,15 @@ async function openFixture(
     packetLoss: 0,
   });
   const criticalRequests: string[] = [];
+  const runtimeRequests: string[] = [];
   const deferredRequests: string[] = [];
   const pageErrors: string[] = [];
   const consoleMessages: string[] = [];
   page.on("request", (request) => {
     const url = request.url();
-    if (url.includes("/static/tsjs=tsjs-unified.min.js"))
-      criticalRequests.push(url);
+    if (url.endsWith(resources.criticalSrc)) criticalRequests.push(url);
+    if (resources.runtimeSrc && url.endsWith(resources.runtimeSrc))
+      runtimeRequests.push(url);
     if (
       DEFERRED_IDS.some((id) => url.includes(`/static/tsjs=tsjs-${id}.min.js`))
     ) {
@@ -752,6 +907,7 @@ async function openFixture(
     context,
     page,
     criticalRequests,
+    runtimeRequests,
     deferredRequests,
     pageErrors,
     consoleMessages,
@@ -761,6 +917,7 @@ async function openFixture(
 
 async function observeComparisonFixture(
   run: FixtureRun,
+  resources: FixtureResources,
 ): Promise<ComparisonObservation> {
   await expect
     .poll(() =>
@@ -788,6 +945,10 @@ async function observeComparisonFixture(
     },
   );
   expect(run.criticalRequests).toHaveLength(1);
+  const criticalRequest = new URL(run.criticalRequests[0]!);
+  expect(`${criticalRequest.pathname}${criticalRequest.search}`).toBe(
+    resources.criticalSrc,
+  );
   expect(run.pageErrors).toEqual([]);
   expect(observation.displayCount).toBe(1);
   expect(Number.isFinite(observation.timingMs)).toBe(true);
@@ -826,8 +987,11 @@ async function waitForMark(run: FixtureRun, name: string): Promise<void> {
   }
 }
 
-async function observeFixture(run: FixtureRun): Promise<BrowserObservation> {
-  const comparison = await observeComparisonFixture(run);
+async function observeFixture(
+  run: FixtureRun,
+  resources: FixtureResources,
+): Promise<BrowserObservation> {
+  const comparison = await observeComparisonFixture(run, resources);
   await waitForMark(run, "tsjs:first-display");
   await waitForMark(run, "tsjs:first-display-paint");
   for (const id of DEFERRED_IDS) {
@@ -978,7 +1142,7 @@ async function collectHeapCheckpoints(
       .toBe("object");
     retainedHeapBytes.afterBoot = await collectHeap(heapRun.page);
     await heapRun.page.evaluate(() => window.__fixtureGpt.release());
-    await observeComparisonFixture(heapRun);
+    await observeComparisonFixture(heapRun, resources);
     if (resources.artifactModel === "release-v1") {
       await waitForMark(heapRun, "tsjs:first-display-paint");
     }
@@ -1060,6 +1224,81 @@ declare global {
   }
 }
 
+test("measures each distinct semantic transfer source exactly once", () => {
+  const inlineBody = 'performance.mark("tsjs:bids-script");';
+  const externalBody = "window.tsjs={};";
+  const inline = measureBytes(Buffer.from(inlineBody, "utf8"));
+  const external = measureBytes(Buffer.from(externalBody, "utf8"));
+  const transfer = measureReferenceTransfer([
+    {
+      semanticEndpoint: "inline:boot-controller",
+      delivery: "inline",
+      body: inlineBody,
+    },
+    {
+      semanticEndpoint: `external:/static/tsjs=tsjs-unified.min.js?v=${external.sha256}`,
+      delivery: "external",
+      body: externalBody,
+    },
+  ]);
+
+  expect(transfer.sources).toHaveLength(2);
+  for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"] as const) {
+    expect(transfer[metric]).toBe(inline[metric] + external[metric]);
+  }
+  expect(() =>
+    measureReferenceTransfer([
+      {
+        semanticEndpoint: "inline:boot-controller",
+        delivery: "inline",
+        body: inlineBody,
+      },
+      {
+        semanticEndpoint: "inline:boot-controller",
+        delivery: "inline",
+        body: inlineBody,
+      },
+    ]),
+  ).toThrow("semantic transfer source is empty or duplicated");
+});
+
+test("gates semantic reference transfer against the exact current main build", () => {
+  const mode = process.env.TSJS_PERF_MODE;
+  const mainRoot = process.env.TSJS_PERF_MAIN_ROOT;
+  const mainSha = process.env.TSJS_PERF_MAIN_SHA;
+  if (!mainRoot || !mainSha) {
+    if (
+      mode === "preswitch" ||
+      mode === "postswitch" ||
+      mode === "pull-request"
+    ) {
+      throw new Error(
+        "fresh-main semantic transfer comparison is required in CI and release modes",
+      );
+    }
+    test.skip(
+      true,
+      "fresh-main semantic transfer comparison unavailable; check:bundle still enforces candidate ceilings",
+    );
+    return;
+  }
+  expect(mainSha).toMatch(/^[0-9a-f]{40}$/u);
+  expect(
+    execFileSync("git", ["-C", mainRoot, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim(),
+  ).toBe(mainSha);
+  const mainResources = loadMainFixtureResources(mainRoot);
+  const candidateResources = loadReleaseFixtureResources(REPO_ROOT);
+
+  for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"] as const) {
+    expect(
+      candidateResources.referenceTransfer[metric],
+      `candidate ${metric} semantic transfer`,
+    ).toBeLessThanOrEqual(mainResources.referenceTransfer[metric]);
+  }
+});
+
 test.describe("TSJS first-display performance gate", () => {
   test.describe.configure({ retries: 0, mode: "serial" });
   const activeFixtureServers: FixtureServer[] = [];
@@ -1114,7 +1353,7 @@ test.describe("TSJS first-display performance gate", () => {
       const run = await openFixture(browser, fixtureServer);
       try {
         if (resources.artifactModel === "release-v1") {
-          const candidate = await observeFixture(run);
+          const candidate = await observeFixture(run, resources);
           expect(candidate.releaseId).toBe(resources.release?.releaseId);
           return {
             comparison: {
@@ -1125,7 +1364,9 @@ test.describe("TSJS first-display performance gate", () => {
             candidate,
           };
         }
-        return { comparison: await observeComparisonFixture(run) };
+        return {
+          comparison: await observeComparisonFixture(run, resources),
+        };
       } finally {
         await run.close();
       }
@@ -1179,6 +1420,14 @@ test.describe("TSJS first-display performance gate", () => {
     expect
       .soft(candidateP90, "candidate p90")
       .toBeLessThanOrEqual(mainP90 * MAXIMUM_P90_RATIO);
+    for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"] as const) {
+      expect
+        .soft(
+          candidateResources.referenceTransfer[metric],
+          `candidate ${metric} semantic transfer`,
+        )
+        .toBeLessThanOrEqual(mainResources.referenceTransfer[metric]);
+    }
 
     const mainHeapBytes = await collectHeapCheckpoints(
       browser,
@@ -1292,6 +1541,19 @@ test.describe("TSJS first-display performance gate", () => {
           percentile: PERCENTILE,
           maximumRatio: MAXIMUM_P90_RATIO,
           observedRatio: candidateP90 / mainP90,
+        },
+      },
+      transfer: {
+        algorithm: "semantic-tsjs-transfer-v1",
+        mainReferenceTransfer: {
+          sha: mainSha,
+          artifactModel: mainResources.artifactModel,
+          ...mainResources.referenceTransfer,
+        },
+        candidateReferenceTransfer: {
+          sha: headSha,
+          artifactModel: candidateResources.artifactModel,
+          ...candidateResources.referenceTransfer,
         },
       },
       heap: {

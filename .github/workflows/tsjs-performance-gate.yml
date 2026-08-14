@@ -14,6 +14,9 @@ on:
       - "Cargo.lock"
       - "crates/trusted-server-core/**"
       - "crates/trusted-server-core/src/auction/**"
+      - "crates/trusted-server-core/src/html_processor.rs"
+      - "crates/trusted-server-core/src/publisher.rs"
+      - "crates/trusted-server-core/src/tsjs.rs"
       - "crates/trusted-server-integration-tests/Cargo.toml"
       - "crates/trusted-server-integration-tests/browser/**"
       - "crates/trusted-server-integration-tests/src/bin/generate-tsjs-prospective-fixture.rs"
@@ -110,6 +113,7 @@ jobs:
           npm ci
           npm run build
           npm run check:bundle
+          node ../../../scripts/validate-tsjs-performance-evidence.mjs --self-test
 
       - name: Build the exact current main artifacts
         shell: bash

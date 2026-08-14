@@ -266,6 +266,152 @@ pub fn prospective_tsjs_boot_controller_fragment_v1(
     ))
 }
 
+/// Serialize the dormant size-admitted first-display transport used by browser gates.
+///
+/// Production HTML remains on its existing transport until the atomic cutover. This
+/// helper nevertheless uses the real generated agent bytes, exact selection logic,
+/// release identity, and post-paint runtime URL so pre-switch evidence cannot measure
+/// the persistent runtime as if it were the provisional artifact.
+///
+/// # Errors
+///
+/// Returns an error when the projection, catalog inventory, boot bits, or selected
+/// first-display mask is invalid or not admitted by the generated release catalog.
+pub fn prospective_tsjs_first_display_fragment_v1(
+    config: TsjsBootScriptConfigV1<'_>,
+    publisher_origin: &str,
+) -> Result<String, Report<TrustedServerError>> {
+    let selected = prospective_selected_metadata(config.module_ids)?;
+    let contains = |id: &str| selected.iter().any(|metadata| metadata.id == id);
+    let creative_required =
+        config.creative.enabled && (config.creative.click_guard || config.creative.render_guard);
+    if contains("creative") != creative_required
+        || (!config.creative.enabled
+            && (config.creative.click_guard || config.creative.render_guard))
+    {
+        return Err(boot_manifest_error(
+            "creative boot bits disagree with prospective manifest membership",
+        ));
+    }
+    if contains("gpt_diagnostics") != config.gpt_diagnostics_active
+        || contains("diagnostics_presentation")
+            != (config.render_trace_overlay || config.gpt_diagnostics_active)
+    {
+        return Err(boot_manifest_error(
+            "diagnostics membership disagrees with prospective boot bits",
+        ));
+    }
+
+    let projection = crate::auction::formats::coordinated_cutover_v1::canonicalize_browser_auction_projection_json_v1(
+        config.auction_projection_json,
+        publisher_origin,
+    )
+    .map_err(|_| boot_manifest_error("auction projection violates the version-1 contract"))?;
+    let projection_value = serde_json::from_str::<BrowserAuctionProjectionV1>(&projection)
+        .map_err(|_| boot_manifest_error("canonical auction projection is unavailable"))?;
+    let enabled_integrations = selected
+        .iter()
+        .filter_map(|metadata| match metadata.id {
+            "render_runtime"
+            | "diagnostics_presentation"
+            | "gpt_later"
+            | "osano_lifecycle"
+            | "permutive_lifecycle"
+            | "prebid_later"
+            | "sourcepoint_lifecycle" => None,
+            "osano_consent" => Some("osano"),
+            "permutive_context" => Some("permutive"),
+            "sourcepoint_consent" => Some("sourcepoint"),
+            id => Some(id),
+        })
+        .collect::<Vec<_>>();
+    let first_display = select_first_display_slices_v1(
+        &projection_value,
+        FirstDisplaySelectionConfigV1 {
+            enabled_integrations: &enabled_integrations,
+            creative: config.creative,
+        },
+    )
+    .ok_or_else(|| boot_manifest_error("first-display projection is not size admitted"))?;
+    let agent =
+        TsjsStaticArtifactV1::new_first_display(first_display.mask(), first_display.slices())
+            .ok_or_else(|| {
+                boot_manifest_error("first-display artifact composition is unavailable")
+            })?;
+    let critical_ids = selected
+        .iter()
+        .filter_map(|metadata| {
+            (metadata.phase == Some(TsjsModulePhase::Critical)).then_some(metadata.id)
+        })
+        .collect::<Vec<_>>();
+    let runtime_src = tsjs_script_src(&critical_ids);
+    let slice_ids = first_display
+        .slices()
+        .iter()
+        .map(|id| {
+            serde_json::to_string(id)
+                .map_err(|_| boot_manifest_error("first-display slice serialization failed"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let integrations = selected
+        .iter()
+        .map(|metadata| {
+            let id = serde_json::to_string(metadata.id)
+                .map_err(|_| boot_manifest_error("integration id serialization failed"))?;
+            match metadata.phase {
+                Some(TsjsModulePhase::Critical) => {
+                    Ok(format!(r#"{{"id":{id},"phase":"takeover"}}"#))
+                }
+                Some(TsjsModulePhase::Deferred) => {
+                    let trigger = metadata.trigger.ok_or_else(|| {
+                        boot_manifest_error("deferred catalog trigger is unavailable")
+                    })?;
+                    let src = tsjs_single_module_script_src(metadata.id).ok_or_else(|| {
+                        boot_manifest_error("deferred module source is unavailable")
+                    })?;
+                    Ok(format!(
+                        r#"{{"id":{id},"phase":"deferred","trigger":{},"src":{}}}"#,
+                        serde_json::to_string(trigger).map_err(|_| {
+                            boot_manifest_error("deferred trigger serialization failed")
+                        })?,
+                        serde_json::to_string(&src).map_err(|_| {
+                            boot_manifest_error("deferred source serialization failed")
+                        })?
+                    ))
+                }
+                _ => Err(boot_manifest_error(
+                    "catalog integration phase is unavailable",
+                )),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let manifest = format!(
+        r#"{{"version":1,"releaseId":"{}","firstDisplay":{{"src":"{}","slices":[{}]}},"runtimeSrc":"{}","integrations":[{}]}}"#,
+        release_id(),
+        agent.src(),
+        slice_ids.join(","),
+        runtime_src,
+        integrations.join(",")
+    );
+    let manifest = escape_json_for_inline_script(&manifest);
+    let projection = escape_json_for_inline_script(&projection);
+    let controller = format!(
+        "<script>(function(){{var t=window.tsjs=window.tsjs||{{}};t.boot={{\"abi\":1,\"releaseId\":\"{}\",\"manifest\":{},\"auctionProjection\":{},\"creative\":{{\"version\":1,\"enabled\":{},\"clickGuard\":{},\"renderGuard\":{}}},\"diagnostics\":{{\"version\":1,\"renderTraceOverlay\":{},\"gpt\":{{\"active\":{}}}}}}};try{{window.performance.mark(\"tsjs:bids-script\");}}catch(_){{}}}})();</script>",
+        release_id(),
+        manifest,
+        projection,
+        config.creative.enabled,
+        config.creative.click_guard,
+        config.creative.render_guard,
+        config.render_trace_overlay,
+        config.gpt_diagnostics_active,
+    );
+    Ok(format!(
+        r#"{controller}<script src="{}" id="trustedserver-js"></script>"#,
+        agent.src()
+    ))
+}
+
 fn prospective_selected_metadata(
     module_ids: &[&str],
 ) -> Result<Vec<trusted_server_js::TsjsArtifactMetadata>, Report<TrustedServerError>> {
