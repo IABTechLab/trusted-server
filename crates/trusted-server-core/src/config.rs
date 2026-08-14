@@ -126,14 +126,17 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
 /// Returns [`TrustedServerError`] when the config should not be deployed.
 pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
     settings.reject_placeholder_secrets()?;
-    validate_enabled_integrations(settings)?;
-    crate::auction::compile_auction_plan(settings)?;
+    let plan = crate::auction::compile_auction_plan(settings)?;
+    validate_enabled_integrations(settings, &plan)?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
     Ok(())
 }
 
-fn validate_enabled_integrations(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
-    validate_prebid(settings)?;
+fn validate_enabled_integrations(
+    settings: &Settings,
+    plan: &crate::auction::AuctionPlan,
+) -> Result<(), Report<TrustedServerError>> {
+    validate_prebid(settings, plan)?;
     validate_integration::<ApsConfig>(settings, "aps")?;
     validate_integration::<AdServerMockConfig>(settings, "adserver_mock")?;
     validate_integration::<TestlightConfig>(settings, "testlight")?;
@@ -153,12 +156,16 @@ fn validate_enabled_integrations(settings: &Settings) -> Result<(), Report<Trust
     Ok(())
 }
 
-fn validate_prebid(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+fn validate_prebid(
+    settings: &Settings,
+    plan: &crate::auction::AuctionPlan,
+) -> Result<(), Report<TrustedServerError>> {
     let Some(config) = settings.integration_config::<prebid::PrebidIntegrationConfig>("prebid")?
     else {
         return Ok(());
     };
-    prebid::validate_browser_config_for_startup(&config, &settings.proxy.allowed_domains)
+    prebid::validate_browser_config_for_startup(&config, &settings.proxy.allowed_domains)?;
+    prebid::validate_browser_bidder_ownership(&config, plan)
 }
 
 fn validate_integration<T>(
@@ -384,6 +391,66 @@ password = "production-admin-password-32-bytes"
         let error = validate_settings_for_deploy(&settings)
             .expect_err("should require enabled Prebid external bundle URL");
         assert!(error.to_string().contains("external_bundle_url"));
+    }
+
+    #[test]
+    fn deploy_validation_rejects_conflicting_prebid_browser_bidder_ownership() {
+        let mut settings = valid_settings();
+        settings.auction.enabled = true;
+        settings.auction.providers = crate::auction::AuctionConfig::legacy_provider_map(&["pbs"]);
+        settings.auction.bidders.insert(
+            "exampleBidder"
+                .parse()
+                .expect("should parse server-side bidder"),
+            crate::auction::BidderRouteConfig {
+                provider: "pbs".parse().expect("should parse provider"),
+            },
+        );
+        let mut prebid = settings
+            .integration_config::<prebid::PrebidIntegrationConfig>("prebid")
+            .expect("should parse Prebid config")
+            .expect("should have enabled Prebid config");
+        prebid.client_side_bidders = vec!["exampleBidder".to_string()];
+        settings
+            .integrations
+            .insert_config("prebid", &prebid)
+            .expect("should replace Prebid config");
+
+        let error = validate_settings_for_deploy(&settings)
+            .expect_err("should reject conflicting browser bidder ownership");
+        assert!(error.to_string().contains("exampleBidder"));
+        assert!(
+            error
+                .to_string()
+                .contains("both client-side and server-side")
+        );
+    }
+
+    #[test]
+    fn deploy_validation_accepts_dormant_prebid_browser_bidder_overlap() {
+        let mut settings = valid_settings();
+        settings.auction.enabled = false;
+        settings.auction.providers = crate::auction::AuctionConfig::legacy_provider_map(&["pbs"]);
+        settings.auction.bidders.insert(
+            "exampleBidder"
+                .parse()
+                .expect("should parse server-side bidder"),
+            crate::auction::BidderRouteConfig {
+                provider: "pbs".parse().expect("should parse provider"),
+            },
+        );
+        let mut prebid = settings
+            .integration_config::<prebid::PrebidIntegrationConfig>("prebid")
+            .expect("should parse Prebid config")
+            .expect("should have enabled Prebid config");
+        prebid.client_side_bidders = vec!["exampleBidder".to_string()];
+        settings
+            .integrations
+            .insert_config("prebid", &prebid)
+            .expect("should replace Prebid config");
+
+        validate_settings_for_deploy(&settings)
+            .expect("disabled plan overlap should remain deployable");
     }
 
     #[test]

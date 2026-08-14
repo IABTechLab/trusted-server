@@ -764,6 +764,7 @@ fn parse_planned_aps_value(
             .is_some_and(|seatbids| !seatbids.is_array())
     {
         return AuctionResponse::error(policy.provider_id, response_time_ms)
+            .with_metadata("error_type", json!("parse_response"))
             .with_metadata("drop_reasons", json!({"unexpected_response_shape": 1}));
     }
     if value
@@ -917,7 +918,9 @@ pub(crate) async fn parse_planned_aps_response(
             None
         };
         return Ok(attach_planned_aps_metadata(
-            AuctionResponse::error(provider_id, response_time_ms),
+            AuctionResponse::error(provider_id, response_time_ms)
+                .with_metadata("error_type", json!("http_status"))
+                .with_metadata("http_status", json!(status.as_u16())),
             &policy,
             input,
             debug_request,
@@ -940,6 +943,7 @@ pub(crate) async fn parse_planned_aps_response(
         Err(error) => {
             log::warn!("Failed to parse APS profile {provider_id} response JSON: {error}");
             let parsed = AuctionResponse::error(provider_id, response_time_ms)
+                .with_metadata("error_type", json!("parse_response"))
                 .with_metadata("drop_reasons", json!({"unexpected_response_shape": 1}));
             return Ok(attach_planned_aps_metadata(
                 parsed,

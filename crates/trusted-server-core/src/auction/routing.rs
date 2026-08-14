@@ -496,7 +496,7 @@ fn normalize_envelope(envelope: &Value) -> Option<NormalizedSlotDemand> {
     let mut bidder_params = BTreeMap::new();
     for (raw_bidder, value) in params {
         let bidder = raw_bidder.parse::<BidderId>().ok()?;
-        if bidder.as_str() == TRUSTED_SERVER_ENVELOPE || !is_usable_params(value) {
+        if bidder.as_str() == TRUSTED_SERVER_ENVELOPE || !value.is_object() {
             return None;
         }
         bidder_params.insert(bidder, value.clone());
@@ -744,7 +744,6 @@ mod tests {
                 "reserved key",
                 envelope(Some(json!({"trustedServer": {"x": 1}}))),
             ),
-            ("empty value", envelope(Some(json!({"alpha": {}})))),
             ("nonobject value", envelope(Some(json!({"alpha": 1})))),
             (
                 "partial",
@@ -794,6 +793,30 @@ mod tests {
                 "{name} should preserve independent all-eligible participation"
             );
         }
+    }
+
+    #[test]
+    fn envelope_preserves_empty_bidder_params_without_rejecting_valid_siblings() {
+        let normalized = normalize_envelope(&envelope(Some(json!({
+            "alpha": {},
+            "beta": {"placement": 42}
+        }))))
+        .expect("should preserve object-valued bidder params");
+
+        assert_eq!(
+            normalized
+                .bidder_params
+                .get(&BidderId::from_str("alpha").expect("should parse bidder")),
+            Some(&json!({})),
+            "should preserve empty params for profile overrides"
+        );
+        assert_eq!(
+            normalized
+                .bidder_params
+                .get(&BidderId::from_str("beta").expect("should parse bidder")),
+            Some(&json!({"placement": 42})),
+            "should preserve valid sibling params"
+        );
     }
 
     #[test]

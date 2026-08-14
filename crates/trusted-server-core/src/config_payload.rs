@@ -43,7 +43,10 @@ pub fn settings_from_config_blob(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::integrations::IntegrationRegistry;
     use crate::redacted::Redacted;
     use crate::test_support::tests::crate_test_settings_str;
 
@@ -55,6 +58,31 @@ mod tests {
         let data = serde_json::to_value(settings).expect("should serialize settings to JSON");
         let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_string());
         serde_json::to_string(&envelope).expect("should serialize envelope")
+    }
+
+    fn settings_with_browser_bidder_overlap(auction_enabled: bool) -> Settings {
+        let mut settings = test_settings();
+        settings.proxy.allowed_domains = vec!["*.example".to_string()];
+        settings.auction.enabled = auction_enabled;
+        settings.auction.providers = crate::auction::AuctionConfig::legacy_provider_map(&["pbs"]);
+        settings.auction.bidders.insert(
+            "exampleBidder"
+                .parse()
+                .expect("should parse server-side bidder"),
+            crate::auction::BidderRouteConfig {
+                provider: "pbs".parse().expect("should parse provider"),
+            },
+        );
+        let mut prebid = settings
+            .integration_config::<crate::integrations::prebid::PrebidIntegrationConfig>("prebid")
+            .expect("should parse Prebid config")
+            .expect("should have enabled Prebid config");
+        prebid.client_side_bidders = vec!["exampleBidder".to_string()];
+        settings
+            .integrations
+            .insert_config("prebid", &prebid)
+            .expect("should replace Prebid config");
+        settings
     }
 
     #[test]
@@ -141,6 +169,42 @@ mod tests {
             original.handlers[0].password.expose(),
             "boolean-looking handler password should remain a string"
         );
+    }
+
+    #[test]
+    fn runtime_blob_rejects_enabled_browser_bidder_ownership_conflict() {
+        let original = settings_with_browser_bidder_overlap(true);
+        let reconstructed = settings_from_config_blob(&envelope_json(&original))
+            .expect("should decode conflicting runtime blob before registry construction");
+        let plan = Arc::new(
+            crate::auction::compile_auction_plan(&reconstructed)
+                .expect("should compile decoded enabled auction plan"),
+        );
+
+        let error = match IntegrationRegistry::with_plan(&reconstructed, plan) {
+            Ok(_) => panic!("runtime registry should reject enabled ownership conflict"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("exampleBidder"));
+        assert!(
+            error
+                .to_string()
+                .contains("both client-side and server-side")
+        );
+    }
+
+    #[test]
+    fn runtime_blob_accepts_disabled_browser_bidder_ownership_overlap() {
+        let original = settings_with_browser_bidder_overlap(false);
+        let reconstructed = settings_from_config_blob(&envelope_json(&original))
+            .expect("should decode dormant conflicting runtime blob");
+        let plan = Arc::new(
+            crate::auction::compile_auction_plan(&reconstructed)
+                .expect("should compile decoded disabled auction plan"),
+        );
+
+        IntegrationRegistry::with_plan(&reconstructed, plan)
+            .expect("runtime registry should accept disabled ownership overlap");
     }
 
     #[test]

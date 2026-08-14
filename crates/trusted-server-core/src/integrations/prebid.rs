@@ -784,6 +784,35 @@ pub(crate) fn validate_browser_config_for_startup(
     validate_external_bundle_url_allowed(config.external_bundle_url.as_deref(), allowed_domains)
 }
 
+pub(crate) fn validate_browser_bidder_ownership(
+    config: &PrebidIntegrationConfig,
+    plan: &AuctionPlan,
+) -> Result<(), Report<TrustedServerError>> {
+    if !plan.enabled() {
+        return Ok(());
+    }
+
+    let server_side = plan
+        .browser_bidder_codes()
+        .collect::<std::collections::BTreeSet<_>>();
+    let conflicts = config
+        .client_side_bidders
+        .iter()
+        .filter(|bidder| server_side.contains(bidder.as_str()))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+
+    Err(Report::new(TrustedServerError::Configuration {
+        message: format!(
+            "Prebid bidders must have exactly one browser owner; configured as both client-side and server-side: {}",
+            conflicts.into_iter().collect::<Vec<_>>().join(", ")
+        ),
+    }))
+}
+
 #[cfg(test)]
 fn validate_external_bundle_config(
     config: &LegacyPrebidServerConfig,
@@ -1205,6 +1234,7 @@ pub fn register_for_plan(
     }
     config.excluded_gam_ad_unit_path_suffixes = canonical;
     validate_browser_config_for_startup(&config, &settings.proxy.allowed_domains)?;
+    validate_browser_bidder_ownership(&config, plan)?;
     let integration = PrebidIntegration::for_browser_plan(&config, plan);
     Ok(Some(
         IntegrationRegistration::builder(PREBID_INTEGRATION_ID)
@@ -2009,6 +2039,23 @@ fn parse_planned_prebid_openrtb(
     response_json: &Json,
     response_time_ms: u64,
 ) -> AuctionResponse {
+    let Some(response) = response_json.as_object() else {
+        return AuctionResponse::error(provider_id, response_time_ms)
+            .with_metadata("error_type", serde_json::json!("parse_response"));
+    };
+    match response.get("cur") {
+        None => {}
+        Some(Json::String(currency)) if currency.eq_ignore_ascii_case(DEFAULT_CURRENCY) => {}
+        Some(Json::String(currency)) => {
+            return AuctionResponse::no_bid(provider_id, response_time_ms)
+                .with_metadata("unsupported_currency", serde_json::json!(currency));
+        }
+        Some(_) => {
+            return AuctionResponse::error(provider_id, response_time_ms)
+                .with_metadata("error_type", serde_json::json!("parse_response"));
+        }
+    }
+
     let mut bids = Vec::new();
     if let Some(seatbids) = response_json.get("seatbid").and_then(Json::as_array) {
         for seatbid in seatbids {
@@ -8236,6 +8283,122 @@ set = { networkId = 42 }
             no_content.is_err(),
             "PBS must attempt JSON parsing for every successful status including 204"
         );
+    }
+
+    #[test]
+    fn planned_parser_validates_top_level_currency_and_preserves_debug_metadata() {
+        let profile = planned_prebid_profile(true);
+        let input = planned_prebid_input(&["fictional-slot"]);
+        let cases = [
+            (
+                "omitted",
+                None,
+                crate::auction::types::BidStatus::Success,
+                None,
+                None,
+            ),
+            (
+                "usd",
+                Some(json!("USD")),
+                crate::auction::types::BidStatus::Success,
+                None,
+                None,
+            ),
+            (
+                "lowercase-usd",
+                Some(json!("usd")),
+                crate::auction::types::BidStatus::Success,
+                None,
+                None,
+            ),
+            (
+                "eur",
+                Some(json!("EUR")),
+                crate::auction::types::BidStatus::NoBid,
+                Some("EUR"),
+                None,
+            ),
+            (
+                "malformed",
+                Some(json!(["USD"])),
+                crate::auction::types::BidStatus::Error,
+                None,
+                Some("parse_response"),
+            ),
+        ];
+
+        for (name, currency, expected_status, unsupported_currency, error_type) in cases {
+            let mut body = json!({
+                "seatbid": [{
+                    "seat": "exampleBidder",
+                    "bid": [{
+                        "impid": "fictional-slot",
+                        "price": 1.25,
+                        "w": 300,
+                        "h": 250
+                    }]
+                }],
+                "ext": {
+                    "responsetimemillis": {"exampleBidder": 12},
+                    "errors": {"fictional": []},
+                    "warnings": {"fictional": ["warning"]},
+                    "debug": {"httpcalls": {"exampleBidder": []}},
+                    "prebid": {"bidstatus": [{"bidder": "exampleBidder"}]}
+                }
+            });
+            if let Some(currency) = currency {
+                body.as_object_mut()
+                    .expect("should build response object")
+                    .insert("cur".to_string(), currency);
+            }
+            let parsed = futures::executor::block_on(parse_planned_prebid_response(
+                "pbs-instance",
+                &profile,
+                &input,
+                prebid_platform_response(
+                    StatusCode::OK,
+                    Some("application/json"),
+                    serde_json::to_vec(&body).expect("should serialize planned PBS response"),
+                ),
+                9,
+                name,
+            ))
+            .expect("currency classification should return a materialized provider response");
+
+            assert_eq!(parsed.status, expected_status, "{name}");
+            assert_eq!(
+                parsed
+                    .metadata
+                    .get("unsupported_currency")
+                    .and_then(Json::as_str),
+                unsupported_currency,
+                "{name}"
+            );
+            assert_eq!(
+                parsed.metadata.get("error_type").and_then(Json::as_str),
+                error_type,
+                "{name}"
+            );
+            assert_eq!(parsed.metadata["responsetimemillis"]["exampleBidder"], 12);
+            assert!(parsed.metadata.contains_key("errors"), "{name}");
+            assert!(parsed.metadata.contains_key("warnings"), "{name}");
+            assert_eq!(
+                parsed.metadata["debug"]["httpcalls"]["exampleBidder"],
+                json!([]),
+                "{name}"
+            );
+            assert_eq!(
+                parsed.metadata["bidstatus"][0]["bidder"], "exampleBidder",
+                "{name}"
+            );
+
+            if expected_status == crate::auction::types::BidStatus::Success {
+                assert_eq!(parsed.bids.len(), 1, "{name}");
+                assert_eq!(parsed.bids[0].currency, DEFAULT_CURRENCY, "{name}");
+            } else {
+                assert!(parsed.bids.is_empty(), "{name}");
+            }
+        }
     }
 
     #[test]

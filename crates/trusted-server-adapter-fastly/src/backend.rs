@@ -22,6 +22,44 @@ fn default_port_for_scheme(scheme: &str) -> u16 {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct NormalizedBackendHost {
+    identity: String,
+    authority: String,
+    is_ip_literal: bool,
+}
+
+/// Normalize URL-derived and direct hosts for transport and TLS use.
+///
+/// `url::Url::host_str()` preserves brackets around IPv6 literals. Fastly's
+/// backend target and HTTP authority require those brackets, while certificate
+/// identity matching requires the bare address and SNI must not be sent for IP
+/// literals.
+#[inline]
+fn normalize_backend_host(host: &str) -> NormalizedBackendHost {
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    match unbracketed.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(_)) => NormalizedBackendHost {
+            identity: unbracketed.to_owned(),
+            authority: format!("[{unbracketed}]"),
+            is_ip_literal: true,
+        },
+        Ok(std::net::IpAddr::V4(_)) => NormalizedBackendHost {
+            identity: unbracketed.to_owned(),
+            authority: unbracketed.to_owned(),
+            is_ip_literal: true,
+        },
+        Err(_) => NormalizedBackendHost {
+            identity: host.to_owned(),
+            authority: host.to_owned(),
+            is_ip_literal: false,
+        },
+    }
+}
+
 /// Compute the Host header value for a backend request.
 ///
 /// For standard ports (443 for HTTPS, 80 for HTTP), returns just the hostname.
@@ -32,8 +70,9 @@ fn default_port_for_scheme(scheme: &str) -> u16 {
 /// would generate URLs without the port when the Host header didn't include it.
 #[inline]
 fn compute_host_header(scheme: &str, host: &str, port: u16) -> String {
+    let host = normalize_backend_host(host).authority;
     if port == default_port_for_scheme(scheme) {
-        host.to_owned()
+        host
     } else {
         format!("{host}:{port}")
     }
@@ -138,7 +177,7 @@ impl<'a> BackendConfig<'a> {
     fn platform_spec(&self) -> PlatformBackendSpec {
         PlatformBackendSpec {
             scheme: self.scheme.to_owned(),
-            host: self.host.to_owned(),
+            host: normalize_backend_host(self.host).identity,
             port: self.port,
             host_header_override: self.host_header_override.map(str::to_owned),
             certificate_check: self.certificate_check,
@@ -187,11 +226,12 @@ impl<'a> BackendConfig<'a> {
         let prediction = self.predict_backend()?;
         let backend_name = prediction.name;
         let target_port = prediction.port;
+        let host = normalize_backend_host(self.host);
 
-        let host_with_port = format!("{}:{}", self.host, target_port);
+        let host_with_port = format!("{}:{target_port}", host.authority);
 
         let host_header = self.host_header_override.map_or_else(
-            || compute_host_header(self.scheme, self.host, target_port),
+            || compute_host_header(self.scheme, &host.identity, target_port),
             str::to_owned,
         );
 
@@ -202,9 +242,12 @@ impl<'a> BackendConfig<'a> {
             .first_byte_timeout(self.first_byte_timeout)
             .between_bytes_timeout(self.between_bytes_timeout);
         if self.scheme.eq_ignore_ascii_case("https") {
-            builder = builder.enable_ssl().sni_hostname(self.host);
+            builder = builder.enable_ssl();
+            if !host.is_ip_literal {
+                builder = builder.sni_hostname(&host.identity);
+            }
             if self.certificate_check {
-                builder = builder.check_certificate(self.host);
+                builder = builder.check_certificate(&host.identity);
             } else {
                 log::warn!("INSECURE: certificate check disabled for backend: {backend_name}");
             }
@@ -324,7 +367,10 @@ impl<'a> BackendConfig<'a> {
 mod tests {
     use trusted_server_core::platform::BackendNamingError;
 
-    use super::{BackendConfig, MAX_BACKEND_NAME_LEN, SPEC_DIGEST_HEX_LEN, compute_host_header};
+    use super::{
+        BackendConfig, MAX_BACKEND_NAME_LEN, SPEC_DIGEST_HEX_LEN, compute_host_header,
+        normalize_backend_host,
+    };
 
     /// Assert a computed name is `backend_<body>_<hex digest>` and stays within
     /// Fastly's length limit. The digest is what makes the name injective, so
@@ -353,6 +399,63 @@ mod tests {
     }
 
     // Tests for compute_host_header - the fix for port preservation in Host header
+    #[test]
+    fn ipv6_hosts_are_bracketed_only_for_authority_values() {
+        let bare = normalize_backend_host("2001:db8::1");
+        let bracketed = normalize_backend_host("[2001:db8::1]");
+        assert_eq!(bare, bracketed);
+        assert_eq!(bare.identity, "2001:db8::1");
+        assert_eq!(bare.authority, "[2001:db8::1]");
+        assert!(bare.is_ip_literal, "IPv6 must not be sent as TLS SNI");
+        assert_eq!(
+            normalize_backend_host("cdn.example.com"),
+            super::NormalizedBackendHost {
+                identity: "cdn.example.com".to_string(),
+                authority: "cdn.example.com".to_string(),
+                is_ip_literal: false,
+            }
+        );
+        assert_eq!(
+            compute_host_header("https", "[2001:db8::1]", 443),
+            "[2001:db8::1]"
+        );
+        assert_eq!(
+            compute_host_header("https", "[2001:db8::1]", 8443),
+            "[2001:db8::1]:8443"
+        );
+    }
+
+    #[test]
+    fn url_derived_ipv6_host_uses_bare_tls_identity_without_sni() {
+        let (scheme, url_host, port) =
+            BackendConfig::parse_origin("https://[2001:db8::7]:8443/openrtb")
+                .expect("should parse IPv6 provider URL");
+        assert_eq!(scheme, "https");
+        assert_eq!(url_host, "[2001:db8::7]");
+        assert_eq!(port, Some(8443));
+
+        let normalized = normalize_backend_host(&url_host);
+        assert_eq!(normalized.identity, "2001:db8::7");
+        assert_eq!(normalized.authority, "[2001:db8::7]");
+        assert!(
+            normalized.is_ip_literal,
+            "IP literals must omit TLS SNI while retaining a bare certificate identity"
+        );
+
+        let from_url_name = BackendConfig::new(&scheme, &url_host)
+            .port(port)
+            .predict_name()
+            .expect("should predict URL-derived IPv6 backend name");
+        let from_bare_name = BackendConfig::new(&scheme, "2001:db8::7")
+            .port(port)
+            .predict_name()
+            .expect("should predict bare IPv6 backend name");
+        assert_eq!(
+            from_url_name, from_bare_name,
+            "URL and direct IPv6 paths must preserve backend naming parity"
+        );
+    }
+
     #[test]
     fn host_header_includes_port_for_non_standard_https() {
         assert_eq!(

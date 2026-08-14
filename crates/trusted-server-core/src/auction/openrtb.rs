@@ -281,17 +281,20 @@ fn apply_prebid(
         let bidder = slot
             .bidder_params()
             .iter()
-            .map(|(bidder, params)| {
+            .filter_map(|(bidder, params)| {
                 let mut params = params.clone();
                 plan.override_engine
                     .apply_routed(bidder.as_str(), slot.prebid_zone(), &mut params);
-                (bidder.as_str().to_string(), params)
+                params
+                    .as_object()
+                    .is_some_and(|params| !params.is_empty())
+                    .then(|| (bidder.as_str().to_string(), params))
             })
             .collect::<Map<_, _>>();
         let mut prebid = Map::new();
         if !bidder.is_empty() {
             prebid.insert("bidder".to_string(), Value::Object(bidder));
-        } else if slot.has_trusted_stored_request() {
+        } else if slot.has_trusted_stored_request() || !slot.bidder_params().is_empty() {
             prebid.insert("storedrequest".to_string(), json!({"id": slot.slot().id}));
         }
         imp.ext = Some(Map::from_iter([(
@@ -543,8 +546,21 @@ pub(crate) fn extract_standard_response(
     response_time_ms: u64,
 ) -> AuctionResponse {
     let Some(response) = value.as_object() else {
-        return AuctionResponse::error(provider_id, response_time_ms);
+        return AuctionResponse::error(provider_id, response_time_ms)
+            .with_metadata("error_type", json!("parse_response"));
     };
+    match response.get("cur") {
+        None => {}
+        Some(Value::String(currency)) if currency.eq_ignore_ascii_case(DEFAULT_CURRENCY) => {}
+        Some(Value::String(currency)) => {
+            return AuctionResponse::no_bid(provider_id, response_time_ms)
+                .with_metadata("unsupported_currency", json!(currency));
+        }
+        Some(_) => {
+            return AuctionResponse::error(provider_id, response_time_ms)
+                .with_metadata("error_type", json!("parse_response"));
+        }
+    }
     let allowed_impressions = input
         .slots()
         .iter()

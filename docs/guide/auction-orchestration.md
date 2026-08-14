@@ -790,9 +790,12 @@ UTF-8 bytes each.
 
 Target-independent `ts config validate` compiles profiles, defaults, routes,
 endpoints, bounds, signing structure, and mediator selection. Every adapter
-startup compiles the same plan and then validates backend-name prediction and
-fan-out capability. Fastly and Axum allow multi-provider fan-out; Cloudflare and
-Spin currently reject enabled auctions with more than one provider.
+startup compiles the same plan and then validates backend-name prediction,
+fan-out capability, and target resource limits. Fastly and Axum allow
+multi-provider fan-out; Cloudflare and Spin currently reject enabled auctions
+with more than one provider. Fastly reserves 40 of its default 200 dynamic
+backend names for non-auction traffic and rejects auction plans whose provider
+IDs and reachable timeout buckets could require more than the remaining 160.
 
 This tree does not yet have the EdgeZero callback required to run target-aware
 validation before `ts config push --adapter <target>` performs remote work.

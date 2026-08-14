@@ -457,6 +457,10 @@ impl AuctionOrchestratorHarness {
                 .services
                 .backend()
                 .canonicalize_transport_timeout_ms(logical_budget_ms, provider.timeout_ms());
+            if transport_timeout_ms == 0 {
+                responses.push(provider_timeout_response(provider.provider_name(), 0));
+                continue;
+            }
             let started_at = Instant::now();
             match provider
                 .request_bids_routed(
@@ -637,6 +641,19 @@ impl AuctionOrchestratorHarness {
                     .services
                     .backend()
                     .canonicalize_transport_timeout_ms(logical_budget_ms, mediator.timeout_ms());
+                if transport_timeout_ms == 0 {
+                    log::warn!(
+                        "Planned mediator transport budget canonicalized to zero; using local ranking"
+                    );
+                    let winning_bids = local_winners();
+                    return Ok(OrchestrationResult {
+                        provider_responses: responses,
+                        mediator_response: None,
+                        winning_bids,
+                        total_time_ms: auction_start.elapsed().as_millis() as u64,
+                        metadata: routing_metadata(routed.diagnostics().unroutable_bidder_count()),
+                    });
+                }
                 let mediator_context = AuctionContext {
                     settings: context.settings,
                     request: context.request,
@@ -1627,11 +1644,17 @@ impl AuctionOrchestrator {
             })
             .collect::<HashMap<_, _>>();
         let planned_unroutable_bidder_count = routed.diagnostics().unroutable_bidder_count();
-        let signer = match plan
-            .signing_enabled()
-            .then(|| RequestSigner::from_services(context.services))
-            .transpose()
-        {
+        // A zero request budget is terminal before signing admission. In the
+        // split path, signer initialization would otherwise read config and
+        // secret stores even though every provider is materialized as timeout.
+        let signer_result = if context.timeout_ms == 0 {
+            Ok(None)
+        } else {
+            plan.signing_enabled()
+                .then(|| RequestSigner::from_services(context.services))
+                .transpose()
+        };
+        let signer = match signer_result {
             Ok(signer) => signer,
             Err(error) => {
                 log::warn!("Planned auction signer initialization failed: {error:?}");
@@ -1712,6 +1735,10 @@ impl AuctionOrchestrator {
                 .services
                 .backend()
                 .canonicalize_transport_timeout_ms(logical_budget_ms, provider.timeout_ms());
+            if transport_timeout_ms == 0 {
+                completed_responses.push(provider_timeout_response(provider.provider_name(), 0));
+                continue;
+            }
             let started_at = Instant::now();
             match provider
                 .request_bids_routed(
@@ -2093,6 +2120,30 @@ impl AuctionOrchestrator {
                 Ok(r) => r,
                 Err(e) => {
                     log::warn!("select() failed during auction collection: {:?}", e);
+                    // An outer select failure means the platform could not poll
+                    // any outstanding handle. Attribute every tracked launch as
+                    // a transport failure rather than later relabeling it as a
+                    // timeout. Drain through a sorted buffer because HashMap
+                    // iteration order is intentionally nondeterministic.
+                    let mut transport_failures = backend_to_provider
+                        .drain()
+                        .map(|(_, state)| {
+                            let response_time_ms = state.started_at.elapsed().as_millis() as u64;
+                            provider_transport_failed_response(
+                                &state.provider_name,
+                                response_time_ms,
+                            )
+                        })
+                        .chain(planned_backend_to_provider.drain().map(|(_, state)| {
+                            let response_time_ms = state.started_at.elapsed().as_millis() as u64;
+                            provider_transport_failed_response(
+                                state.provider.provider_name(),
+                                response_time_ms,
+                            )
+                        }))
+                        .collect::<Vec<_>>();
+                    transport_failures.sort_by(|left, right| left.provider.cmp(&right.provider));
+                    responses.extend(transport_failures);
                     break;
                 }
             };
@@ -2300,6 +2351,21 @@ impl AuctionOrchestrator {
                 let transport_timeout_ms = services
                     .backend()
                     .canonicalize_transport_timeout_ms(logical_budget_ms, mediator.timeout_ms());
+                if transport_timeout_ms == 0 {
+                    log::warn!(
+                        "Mediator '{}' transport budget canonicalized to zero — returning {} SSP bids without mediation",
+                        mediator.provider_name(),
+                        responses.len(),
+                    );
+                    let winning = self.select_winning_bids(&responses, &floor_prices);
+                    return OrchestrationResult {
+                        provider_responses: responses,
+                        mediator_response: None,
+                        winning_bids: winning,
+                        total_time_ms: auction_start.elapsed().as_millis() as u64,
+                        metadata: routing_metadata(planned_unroutable_bidder_count),
+                    };
+                }
                 let mediator_start = Instant::now();
                 log::info!(
                     "Running mediator '{}' with {}ms logical budget and {}ms transport timeout (A_deadline remaining: {}ms, configured: {}ms)",
@@ -2512,8 +2578,9 @@ mod tests {
     };
     use crate::platform::{
         BackendNamingPolicy, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
-        PlatformError, PlatformHttpRequest, PlatformResponse, PlatformSecretStore, RuntimeServices,
-        StoreId, StoreName,
+        PlatformError, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
+        PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
+        StoreName,
     };
     use crate::test_support::tests::crate_test_settings_str;
     use error_stack::{Report, ResultExt};
@@ -2833,6 +2900,47 @@ mod tests {
         }
     }
 
+    struct ZeroCanonicalBackend {
+        predicted: AtomicUsize,
+        ensured: AtomicUsize,
+    }
+
+    impl ZeroCanonicalBackend {
+        fn new() -> Self {
+            Self {
+                predicted: AtomicUsize::new(0),
+                ensured: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl PlatformBackend for ZeroCanonicalBackend {
+        fn naming_policy(&self) -> BackendNamingPolicy {
+            BackendNamingPolicy::Fastly
+        }
+
+        fn predict_name(
+            &self,
+            _spec: &PlatformBackendSpec,
+        ) -> Result<String, Report<PlatformError>> {
+            self.predicted.fetch_add(1, Ordering::Relaxed);
+            Ok("zero-canonical-backend".to_string())
+        }
+
+        fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+            self.ensured.fetch_add(1, Ordering::Relaxed);
+            Ok("zero-canonical-backend".to_string())
+        }
+
+        fn canonicalize_transport_timeout_ms(
+            &self,
+            _remaining_ms: u32,
+            _configured_ms: u32,
+        ) -> u32 {
+            0
+        }
+    }
+
     struct CollidingBackend;
 
     impl PlatformBackend for CollidingBackend {
@@ -2937,6 +3045,50 @@ mod tests {
 
         fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
             Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    struct OuterSelectErrorHttpClient {
+        inner: StubHttpClient,
+        selected_pending: AtomicUsize,
+    }
+
+    impl OuterSelectErrorHttpClient {
+        fn new() -> Self {
+            Self {
+                inner: StubHttpClient::new(),
+                selected_pending: AtomicUsize::new(0),
+            }
+        }
+
+        fn push_response(&self, status: u16, body: Vec<u8>) {
+            self.inner.push_response(status, body);
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformHttpClient for OuterSelectErrorHttpClient {
+        async fn send(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            self.inner.send(request).await
+        }
+
+        async fn send_async(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            self.inner.send_async(request).await
+        }
+
+        async fn select(
+            &self,
+            pending_requests: Vec<PlatformPendingRequest>,
+        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+            self.selected_pending
+                .store(pending_requests.len(), Ordering::Relaxed);
+            Err(Report::new(PlatformError::HttpClient))
         }
     }
 
@@ -4718,7 +4870,7 @@ mod tests {
     }
 
     #[test]
-    fn planned_collect_launches_mediator_with_positive_sub_quantum_logical_budget() {
+    fn planned_collect_skips_mediator_with_zero_canonical_transport_budget() {
         futures::executor::block_on(async {
             let calls = Arc::new(Mutex::new(Vec::new()));
             let services = build_services_with_backend_and_http_client(
@@ -4763,16 +4915,15 @@ mod tests {
                 .collect_dispatched_auction(dispatched, &services, &context)
                 .await;
 
-            assert_eq!(launches.load(Ordering::Relaxed), 1);
-            let budgets = budgets.lock().expect("should lock mediator budgets");
-            assert_eq!(budgets.len(), 1);
+            assert_eq!(launches.load(Ordering::Relaxed), 0);
             assert!(
-                (1..50).contains(&budgets[0].0),
-                "logical budget should remain positive and below the Fastly quantum"
+                budgets
+                    .lock()
+                    .expect("should lock mediator budgets")
+                    .is_empty()
             );
-            assert_eq!(budgets[0].1, 0);
             assert_eq!(calls.lock().expect("should lock calls").len(), 1);
-            assert!(result.mediator_response.is_some());
+            assert!(result.mediator_response.is_none());
         });
     }
 
@@ -4943,6 +5094,69 @@ mod tests {
                 "provider-b should succeed — error was correctly isolated to provider-a"
             );
         });
+    }
+
+    #[tokio::test]
+    async fn outer_select_error_materializes_all_planned_launches_as_transport_failures() {
+        let http = Arc::new(OuterSelectErrorHttpClient::new());
+        http.push_response(204, Vec::new());
+        http.push_response(204, Vec::new());
+        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let services = build_services_with_backend_and_http_client(
+            Arc::clone(&backend) as Arc<_>,
+            Arc::clone(&http) as Arc<_>,
+        );
+        let plan = Arc::new(
+            AuctionPlan::compile(planned_config(
+                &[
+                    ("provider-b", RoutingMode::AllEligible),
+                    ("provider-a", RoutingMode::AllEligible),
+                ],
+                false,
+            ))
+            .expect("should compile planned auction"),
+        );
+        let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+        let request = planned_request();
+        let settings = create_test_settings();
+        let inbound = http::Request::new(edgezero_core::body::Body::empty());
+        let context = AuctionContext {
+            settings: &settings,
+            request: &inbound,
+            timeout_ms: 777,
+            transport_timeout_ms: 777,
+            provider_responses: None,
+            services: &services,
+        };
+
+        let DispatchAuctionOutcome::Dispatched(dispatched) =
+            orchestrator.dispatch_auction(&request, &context).await
+        else {
+            panic!("should dispatch both planned providers");
+        };
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let result = orchestrator
+            .collect_dispatched_auction(dispatched, &services, &context)
+            .await;
+
+        assert_eq!(http.selected_pending.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            result
+                .provider_responses
+                .iter()
+                .map(|response| response.provider.as_str())
+                .collect::<Vec<_>>(),
+            vec!["provider-a", "provider-b"],
+            "outer select errors should retain deterministic plan order"
+        );
+        for response in &result.provider_responses {
+            assert_eq!(response.status, BidStatus::Error);
+            assert_eq!(response.metadata["error_type"], "transport");
+            assert!(
+                response.response_time_ms >= 5,
+                "transport failure should preserve launch elapsed time"
+            );
+        }
     }
 
     #[test]
@@ -5945,34 +6159,38 @@ mod tests {
         );
         let provider = GenericOpenRtbProvider::new(plan.providers()[0].clone());
         let cases = [
-            (204, Vec::new(), BidStatus::NoBid, None),
-            (400, Vec::new(), BidStatus::Error, None),
+            (204, Vec::new(), BidStatus::NoBid, None, None),
+            (400, Vec::new(), BidStatus::Error, None, Some("http_status")),
             (
                 200,
                 b"not-json".to_vec(),
                 BidStatus::Error,
                 Some("unexpected_response_shape"),
+                Some("parse_response"),
             ),
             (
                 200,
                 b"[]".to_vec(),
                 BidStatus::Error,
                 Some("unexpected_response_shape"),
+                Some("parse_response"),
             ),
             (
                 200,
                 br#"{"contextual":true}"#.to_vec(),
                 BidStatus::Error,
                 Some("unexpected_response_shape"),
+                Some("parse_response"),
             ),
             (
                 200,
                 br#"{"cur":"EUR","seatbid":[]}"#.to_vec(),
                 BidStatus::NoBid,
                 Some("unsupported_currency"),
+                None,
             ),
         ];
-        for (status, body, expected, reason) in cases {
+        for (status, body, expected, reason, error_type) in cases {
             let state = provider.parse_state_for_test(routed.inputs()[0].clone());
             let response = PlatformResponse::new(
                 edgezero_core::http::response_builder()
@@ -5990,6 +6208,9 @@ mod tests {
                     parsed.metadata["drop_reasons"][reason], 1,
                     "status {status}"
                 );
+            }
+            if let Some(error_type) = error_type {
+                assert_eq!(parsed.metadata["error_type"], error_type, "status {status}");
             }
         }
     }
@@ -6048,6 +6269,14 @@ mod tests {
                 .await
                 .expect("should classify provider matrix response");
             assert_eq!(parsed.status, expected, "status {status}");
+            if expected == BidStatus::Error {
+                let expected_error_type = if (200..300).contains(&status) {
+                    "parse_response"
+                } else {
+                    "http_status"
+                };
+                assert_eq!(parsed.metadata["error_type"], expected_error_type);
+            }
             assert_eq!(
                 parsed.metadata["routing"],
                 serde_json::json!({"unused_bidder_params_count": 0})
@@ -6573,6 +6802,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_canonical_timeout_skips_plan_backed_direct_and_split_launches() {
+        for split in [false, true] {
+            let http = Arc::new(StubHttpClient::new());
+            let backend = Arc::new(ZeroCanonicalBackend::new());
+            let services = build_services_with_backend_and_http_client(
+                Arc::clone(&backend) as Arc<_>,
+                Arc::clone(&http) as Arc<_>,
+            );
+            let mut config = planned_config(&[("provider", RoutingMode::AllEligible)], false);
+            config.mediator = Some("adserver_mock".to_string());
+            let plan = AuctionPlan::compile(config).expect("should compile planned auction");
+            let mediator_predicted = Arc::new(Mutex::new(Vec::new()));
+            let mediator_requested = Arc::new(Mutex::new(Vec::new()));
+            let mediator = Arc::new(recording_provider(
+                "adserver_mock",
+                "mediator-backend",
+                777,
+                &mediator_predicted,
+                &mediator_requested,
+            ));
+            let orchestrator = AuctionOrchestrator::from_plan(Arc::new(plan), Some(mediator));
+            let request = planned_request();
+            let settings = create_test_settings();
+            let inbound = http::Request::new(edgezero_core::body::Body::empty());
+            let context = AuctionContext {
+                settings: &settings,
+                request: &inbound,
+                timeout_ms: 777,
+                transport_timeout_ms: 777,
+                provider_responses: None,
+                services: &services,
+            };
+
+            let result = if split {
+                let DispatchAuctionOutcome::Dispatched(dispatched) =
+                    orchestrator.dispatch_auction(&request, &context).await
+                else {
+                    panic!("zero canonical timeout should materialize a split response");
+                };
+                orchestrator
+                    .collect_dispatched_auction(dispatched, &services, &context)
+                    .await
+            } else {
+                orchestrator
+                    .run_auction(&request, &context)
+                    .await
+                    .expect("should materialize direct timeout response")
+            };
+
+            assert_eq!(result.provider_responses.len(), 1);
+            assert_eq!(
+                result.provider_responses[0].metadata["error_type"],
+                "timeout"
+            );
+            assert_eq!(backend.predicted.load(Ordering::Relaxed), 0);
+            assert_eq!(backend.ensured.load(Ordering::Relaxed), 0);
+            assert!(http.recorded_backend_names().is_empty());
+            assert!(
+                mediator_predicted
+                    .lock()
+                    .expect("should lock mediator predictions")
+                    .is_empty()
+            );
+            assert!(
+                mediator_requested
+                    .lock()
+                    .expect("should lock mediator requests")
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn planned_launch_transport_parse_failures_are_isolated_from_valid_winner_and_floor() {
         let http = Arc::new(StubHttpClient::new());
         // BTreeMap plan order is alphabetical: below-floor, parse-fail,
@@ -6679,6 +6981,7 @@ mod tests {
             )
         });
         assert_eq!(parse_failure.status, BidStatus::Error);
+        assert_eq!(parse_failure.metadata["error_type"], "parse_response");
         assert_eq!(
             parse_failure.metadata["routing"]["unused_bidder_params_count"],
             0
@@ -7030,15 +7333,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planned_zero_logical_budget_does_no_signer_backend_or_network_work() {
-        let config_store = Arc::new(FailingCountingConfigStore {
+    async fn from_plan_split_zero_budget_does_no_signer_backend_or_network_work() {
+        let config_store = Arc::new(CountingConfigStore {
             reads: AtomicUsize::new(0),
+            current_kid: "unused-kid".to_string(),
+            delay: Duration::ZERO,
+        });
+        let secret_store = Arc::new(CountingSecretStore {
+            reads: AtomicUsize::new(0),
+            key: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [13_u8; 32])
+                .into_bytes(),
         });
         let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
         let http = Arc::new(StubHttpClient::new());
         let services = RuntimeServices::builder()
             .config_store(Arc::clone(&config_store) as Arc<_>)
-            .secret_store(Arc::new(UnusedSecretStore))
+            .secret_store(Arc::clone(&secret_store) as Arc<_>)
             .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
             .backend(Arc::clone(&backend) as Arc<_>)
             .http_client(Arc::clone(&http) as Arc<_>)
@@ -7048,13 +7358,15 @@ mod tests {
             ))
             .client_info(crate::platform::ClientInfo::default())
             .build();
-        let plan = AuctionPlan::compile(planned_config(
-            &[("signed", RoutingMode::AllEligible)],
-            true,
-        ))
-        .expect("should compile signed plan");
+        let plan = Arc::new(
+            AuctionPlan::compile(planned_config(
+                &[("signed", RoutingMode::AllEligible)],
+                true,
+            ))
+            .expect("should compile signed plan"),
+        );
         let mediator_launches = Arc::new(AtomicUsize::new(0));
-        let orchestrator = AuctionOrchestratorHarness::new(
+        let orchestrator = AuctionOrchestrator::from_plan(
             plan,
             Some(Arc::new(DeadlineRecordingMediator {
                 launches: Arc::clone(&mediator_launches),
@@ -7073,10 +7385,14 @@ mod tests {
             services: &services,
         };
 
+        let DispatchAuctionOutcome::Dispatched(dispatched) =
+            orchestrator.dispatch_auction(&request, &context).await
+        else {
+            panic!("zero budget should materialize a completed split dispatch");
+        };
         let result = orchestrator
-            .run_auction(&request, &context)
-            .await
-            .expect("should return zero-budget outcomes");
+            .collect_dispatched_auction(dispatched, &services, &context)
+            .await;
 
         assert_eq!(result.provider_responses.len(), 1);
         assert_eq!(
@@ -7084,6 +7400,7 @@ mod tests {
             "timeout"
         );
         assert_eq!(config_store.reads.load(Ordering::Relaxed), 0);
+        assert_eq!(secret_store.reads.load(Ordering::Relaxed), 0);
         assert_eq!(backend.predicted.load(Ordering::Relaxed), 0);
         assert_eq!(backend.ensured.load(Ordering::Relaxed), 0);
         assert!(http.recorded_backend_names().is_empty());
