@@ -12,12 +12,14 @@
 page-bids, direct auction, and fallback paths while replacing TSJS's duplicated
 global state with one bounded, lifecycle-owned runtime.
 
-**Architecture:** one minimal core entry constructs the sole runtime and
-closure-private capability broker. Provider IIFEs register their owned adapters and
-services; production core never imports or inlines every concrete layer. One parser-
-blocking, server-composed critical artifact commits that runtime and the exact
-modules needed for first display; catalogued later-only IIFEs join the same broker
-after the protected first-display paint gate.
+**Architecture:** one parser-blocking, server-composed lean first-display agent owns
+only the immutable initial projected batch and publishes no runtime API or capability
+broker. After that batch settles and receives its protected paint opportunity, one
+minimal persistent core is requested and atomically adopts the exact transferable
+objects before constructing the sole runtime and closure-private broker. Provider
+IIFEs register their owned adapters and services into that runtime; production core
+never imports or inlines every concrete layer, and catalogued later-only IIFEs start
+independently only after the same paint gate.
 Rust emits one bounded tagged APS/ADM render-source contract and one exact per-slot
 auction decision set, while the existing PBS Cache path remains a black-box
 regression surface. Universal Creative 1.17.2 supplies the outer response and
@@ -32,20 +34,18 @@ adapters.
 
 **Source of truth:**
 `docs/superpowers/specs/2026-08-04-aps-render-fix-and-tsjs-resilience-design.md`
-revision 35. The prior revision-33 frozen review SHA is
-`958a79ccbbfe70c24a1529f6a4a469e15217cf5da799342a13d122fee4cdc99e`. This is the
-only implementation-plan document for the work. APS render
+revision 38. This is the only implementation-plan document for the work. APS render
 and the runtime architecture are one coupled cutover: neither subsystem is useful or
 safe to release independently, so they remain in this one plan.
 
-Revision 34 adds the approved PR-review remediation in Task 23A. The revision-33
-hash remains provenance for the previously reviewed contract; it is not represented
-as approval of the oversized intermediate critical artifact.
-
-Revision 35 makes Task 23A's performance remediation authoritative: the active gate
-compares against the exact current `origin/main` SHA under one fixed CDP network
-profile and honestly supports main's legacy artifact shape. It replaces, rather than
-supplements, Task 23's frozen-reference timing instrument.
+Current `origin/main` is the sole implementation, behavior, API, dependency, CI, and
+performance authority. The revision-38 review-provenance SHA is
+`5a76e59cd7939efd28b742eda4166bf53f10bb10`, but every execution refreshes and
+integrates the then-current `origin/main` before resuming work and again before the
+coordinated switch. The immutable retired snapshot
+`905984e62a0858c53d9f0ff6dd3a1bf190cf311d` is only the self-contained concept
+checklist embedded in the specification. Never fetch, merge, rebase, cherry-pick,
+build, or performance-test `rc/july`.
 
 ## Scope guardrails
 
@@ -76,16 +76,23 @@ supplements, Task 23's frozen-reference timing instrument.
   deadline, error taxonomy, or price-authority rule.
 - GPT, the APS runner, PUC, and other upstream bytes remain live external
   dependencies and are never bundled or copied into TSJS source/output/fixtures.
-  The baseline's separately generated pure Prebid.js 10.26.0 artifact remains the
+  The current-main separately generated pure Prebid.js 10.26.0 artifact remains the
   explicit exception: it is independently built and purity-scanned, contains no
   TSJS behavior, and is never concatenated into a TSJS runtime artifact.
 - Reserved `/integrations/aps/*` browser routes intentionally bypass
   `[[handlers]]` and remain anonymous. Documentation and startup warnings must say
   so; do not add an in-process Basic Auth gate that would break browser loading.
-- DataDome and the other `RCJ-INT-01` integrations remain only because this plan
-  adopts all TSJS concepts from the frozen `rc/july` baseline. Preserve their
-  behavior behind the common runtime; do not treat that adoption as authority for a
-  separate server-side redesign.
+- DataDome and the other `RCJ-INT-01` integrations keep their current-main behavior
+  behind the common runtime. The retired checklist can expose a missing concept, but
+  it is never authority for source shape or a separate server-side redesign.
+
+Before changing production code for any `RCJ-*` row, Task 0 must classify that row
+against untouched current `main` as `main-owned` or `implementation-gap`. A missing
+focused test is `coverage-gap`, and a setup failure remains `proof-pending`; neither
+authorizes production work. Later tasks always run the focused contract, but they
+modify production files only for rows recorded as demonstrated implementation gaps.
+This conditional execution is how the plan preserves the substantial TSJS work that
+already exists on `main` instead of reimplementing it.
 
 Every task ends with `git status --short`, focused verification, and one intentional
 commit before the next task. Stage only the exact paths from that task's **Files**
@@ -101,6 +108,13 @@ owners and dependency directions.
 
 ```text
 crates/trusted-server-js/lib/src/
+  first_display/
+    contracts.ts        exact outline/handoff/capsule data contracts and validators
+    transaction.ts      inert slice preparation, synchronous activation, rollback
+    agent.ts            immutable-batch owner, seal, paint, mutation revision, disposal
+    handoff.ts          bounded final snapshot and one-use ownership capsule
+    composition.ts      sole parser-blocking agent entry; no persistent/runtime imports
+    slices/*.ts         exact APS/GPT/Prebid/creative/parser-time initial obligations
   kernel/
     identity.ts         navigation-prefix + u64 attempts; 128-bit CSPRNG tickets/nonces
     disposable.ts       owned disposer stack and terminal latch primitives
@@ -130,22 +144,23 @@ crates/trusted-server-js/lib/src/
     gpt_diagnostics/{data_api,presentation}.ts  data-only API + deferred UI owners
     */lifecycle.ts      catalogued later-only Osano/Permutive/Sourcepoint slices
   core/
-    index.ts            final public API installation
+    index.ts            post-paint persistent entry and final public API installation
     bootstrap_controller.ts  generated minimal queue/watchdog/fallback controller
     trace.ts            trace reducer/store, public API, private presentation attach
     types.ts            public and wire types
   composition/
-    browser.ts          production core entry; no deferred/test imports
     browser_test.ts     test-only concrete composition and injection seams
 ```
 
 Test files mirror source ownership under `crates/trusted-server-js/lib/test/`.
 Do not make `kernel/` depend on `adapters/`, `services/`, or `integrations/`.
 Only test-only `composition/browser_test.ts` may import every concrete layer and
-construct all dependencies. Production `composition/browser.ts` is the minimal core
-entry and may import only kernel, immutable boot/projection contracts, queue/logger,
-and the minimum direct-public-API setup; catalogued provider IIFEs own and register
-their adapter/service implementations.
+construct all dependencies. Production `first_display/composition.ts` may import only
+the agent contracts and selected initial slices; production `core/index.ts` may
+import only kernel, immutable boot/projection contracts, queue/logger, takeover, and
+minimum direct-public-API setup. Catalogued provider IIFEs own and register their
+adapter/service implementations. The old production `composition/browser.ts`
+catch-all is deleted at cutover.
 
 ## Dependency order
 
@@ -161,7 +176,7 @@ kernel primitives
   -> slot/reservation services
   -> lifecycle + auction batch
   -> GPT/Prebid/direct/fallback migration
-  -> critical/deferred product slicing
+  -> first-display/takeover/deferred product slicing
 
 server path + browser path
   -> hermetic browser matrix
@@ -193,180 +208,191 @@ flag, deployment router, or operator-visible old/new selector is introduced. Tas
 22 removes the now-unreachable old surfaces before any release candidate is built.
 Every task's regression suite therefore remains green in task order.
 
-## Phase 0 — pin the contract and baseline
+## Phase 0 — establish current-main ownership and executable contracts
 
-### Task 0: Establish the focused baseline and scope checks
+### Task 0: Integrate current main and classify every retained TSJS concept
+
+No production behavior is implemented in this task. Its output is an executable,
+reviewable proof of what current `main` already owns and the exact residual gaps this
+branch is allowed to implement.
 
 **Files:**
 
+- Move: `crates/trusted-server-js/lib/scripts/check-rc-july-adoption.mjs` to
+  `crates/trusted-server-js/lib/scripts/check-retired-concept-audit.mjs`
+- Move: `crates/trusted-server-js/lib/test/contract/rc-july-adoption.test.mjs` to
+  `crates/trusted-server-js/lib/test/contract/retired-concept-audit.test.mjs`
+- Create: `crates/trusted-server-js/lib/test/fixtures/contracts/current-main-concept-audit.json`
 - Modify: `crates/trusted-server-js/lib/package.json`
-- Modify: `crates/trusted-server-js/lib/tsconfig.json`
-- Modify: `crates/trusted-server-js/lib/build-all.mjs`
-- Create: `crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs`
-- Create: `crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json`
-- Create: `crates/trusted-server-integration-tests/browser/tests/shared/tsjs-performance.spec.ts`
-- Modify: `scripts/integration-tests-browser.sh`
-- Create: `scripts/dispatch-workflow-run.mjs`
-- Create: `crates/trusted-server-js/lib/scripts/check-rc-july-adoption.mjs`
-- Create: `crates/trusted-server-js/lib/test/contract/rc-july-adoption.test.mjs`
 - Modify: `.github/workflows/test.yml`
-- Modify: `.github/workflows/integration-tests.yml`
-- Test: existing Rust, Vitest, and APS Playwright suites
+- Test: focused existing or new test-only proof for each of the 23 `RCJ-*` rows
 
-- [ ] **Step 1: Write and run the failing executable adoption-manifest test.** Extract
-      the `rcjuly-tsjs-manifest-v1` JSON block from the revision-33 spec, enumerate
-      every `includeRoot` and exact file at
-      `905984e62a0858c53d9f0ff6dd3a1bf190cf311d` with `git ls-tree`, and fail for an
-      unmapped pinned file, a `lib/src` file mapped only to `RCJ-QUAL-01`, a dead
-      mapping, or a manifest/ledger id mismatch. Pin the expected audit result at 144
-      files, 38 mapping rows, and 23 ledger/manifest ids so a moving baseline cannot
-      enter implementation silently:
+- [ ] **Step 1: Refresh and integrate only current `main`.** Start clean and pushed,
+      fetch `origin/main`, record its exact 40-character SHA, and merge it. Resolve
+      conflicts from the reviewed spec and current-main behavior; never fetch or
+      merge the retired branch. If `main` is already an ancestor, record the no-op
+      instead of creating an empty commit.
 
   ```bash
-  node --test crates/trusted-server-js/lib/test/contract/rc-july-adoption.test.mjs
+  test -z "$(git status --porcelain)"
+  AUDIT_BRANCH="$(git branch --show-current)"
+  AUDIT_PARENT="$(git rev-parse HEAD)"
+  git fetch origin main "$AUDIT_BRANCH"
+  test "$AUDIT_PARENT" = "$(git rev-parse "origin/$AUDIT_BRANCH")"
+  MAIN_AUDIT_SHA="$(git rev-parse origin/main)"
+  git merge --no-ff --no-commit origin/main
+  # Resolve any conflicts deliberately and stage only their exact paths.
+  test -z "$(git ls-files -u)"
+  git diff --check
+  git diff --cached --check
+  if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+    git commit -m "Integrate current main into the TSJS cutover"
+  fi
+  git merge-base --is-ancestor "$MAIN_AUDIT_SHA" HEAD
   ```
 
-  Expected before the script exists: FAIL. Expected after the minimal extractor and
-  checker: PASS with zero unmapped/dead/gap arrays. Add the same command to CI and run
-  it before every phase exit.
-
-- [ ] **Step 2: Record baseline results before behavior changes:**
+- [ ] **Step 2: Build an untouched detached-main test environment and run its
+      existing gates.** Create the worktree from `MAIN_AUDIT_SHA`, install from its
+      lockfile, and run the repository's current adapter and TSJS suites before any
+      candidate production edit. A setup or infrastructure failure is recorded as
+      `proof-pending`, never as an implementation gap.
 
   ```bash
-  cargo test-fastly
-  cargo test-axum
-  cargo test-cloudflare
-  cargo test-spin
-  npm --prefix crates/trusted-server-js/lib ci
-  npm --prefix crates/trusted-server-js/lib test
-  npm --prefix crates/trusted-server-js/lib run build
+  MAIN_AUDIT_DIR="$(mktemp -d)"
+  rmdir "$MAIN_AUDIT_DIR"
+  git worktree add --detach "$MAIN_AUDIT_DIR" "$MAIN_AUDIT_SHA"
+  cargo test-fastly --manifest-path "$MAIN_AUDIT_DIR/Cargo.toml"
+  cargo test-axum --manifest-path "$MAIN_AUDIT_DIR/Cargo.toml"
+  cargo test-cloudflare --manifest-path "$MAIN_AUDIT_DIR/Cargo.toml"
+  cargo test-spin --manifest-path "$MAIN_AUDIT_DIR/Cargo.toml"
+  npm --prefix "$MAIN_AUDIT_DIR/crates/trusted-server-js/lib" ci
+  npm --prefix "$MAIN_AUDIT_DIR/crates/trusted-server-js/lib" test
+  npm --prefix "$MAIN_AUDIT_DIR/crates/trusted-server-js/lib" run build
   ```
 
-  Any pre-existing failure is recorded in the execution notes; it is not silently
-  attributed to this work.
+- [ ] **Step 3: Write the failing retired-concept manifest contract.** Rename the
+      old adoption files and remove all `child_process`, `git cat-file`, and
+      `git ls-tree` use. Extract exactly one
+      `retired-rcjuly-tsjs-concept-manifest-v1` fenced JSON object from the reviewed
+      specification. Require `authority == "concept-audit-only"`, the recorded
+      retired snapshot, 144 sorted unique inventory paths, the recorded SHA-256 over
+      exact UTF-8 path lines with one LF per path, 38 live mapping rows, and the same
+      23 ids in the manifest and ledger. Reject an unmapped path, a dead exact/prefix
+      mapping, and any `lib/src` path mapped only to `RCJ-QUAL-01`.
 
-- [ ] **Step 3: Keep the lockfile-resolved compiler unchanged only while capturing the**
-      pre-change baseline. Task 0A performs the intentional package and TypeScript
-      upgrade before the remaining TSJS runtime is built. Add the checked-in
-      `typecheck` script:
+  ```bash
+  git mv crates/trusted-server-js/lib/scripts/check-rc-july-adoption.mjs \
+    crates/trusted-server-js/lib/scripts/check-retired-concept-audit.mjs
+  git mv crates/trusted-server-js/lib/test/contract/rc-july-adoption.test.mjs \
+    crates/trusted-server-js/lib/test/contract/retired-concept-audit.test.mjs
+  node --test \
+    crates/trusted-server-js/lib/test/contract/retired-concept-audit.test.mjs
+  ```
+
+  Expected before implementation: FAIL because the old checker resolves Git objects
+  and expects the obsolete manifest shape. Implement only the in-spec parser and
+  deterministic checks, then rerun and expect PASS without requiring the retired
+  commit to exist locally.
+
+- [ ] **Step 4: Write the failing current-main classification contract.** The audit
+      fixture has one exact row for every ledger id with this shape:
 
   ```json
-  "typecheck": "tsc -p tsconfig.json --noEmit"
+  {
+    "id": "RCJ-CORE-01",
+    "mainSha": "40 lowercase hexadecimal characters",
+    "classification": "main-owned | implementation-gap",
+    "ownerPaths": ["exact/current-main/path"],
+    "testPath": "exact/focused/test/path",
+    "command": "one exact reproducible command",
+    "result": "pass | fail",
+    "disposition": "preserve | rebuild | supersede | exclude"
+  }
   ```
 
-  Enable `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`,
-  `verbatimModuleSyntax`, `noImplicitOverride`, and
-  `useUnknownInCatchVariables`. Add the CI invocation with the lockfile-resolved
-  compiler. Add both `typecheck` and the existing architectural `lint` command to
-  CI.
-
-- [ ] **Step 4: Before behavior changes, make bundle measurement deterministic and record the**
-      minimal/reference/maximal raw, gzip, and Brotli bytes, Node/npm/TypeScript versions,
-      Chromium version, CI machine class, fixture, five warmups, 50 samples, p90
-      boot-to-first-display, and forced-GC CDP heap checkpoints. Commit these values to
-      `aps-tsjs-prechange.json`; later tasks may compare against it but must not
-      regenerate it from the completed implementation.
-
-  For this pre-change capture, define the sets exactly as minimal `[core]`, reference
-  `[core, creative, gpt, prebid, datadome]`, and maximal core plus every built
-  integration. Record 23,317 / 8,687 / 7,686; 113,756 / 35,163 / 26,051; and
-  187,224 / 53,799 / 37,790 bytes respectively. These original fields are immutable
-  historical measurements of the old artifact membership. After the split they are
-  printed as deltas only: they are not byte ceilings for the different post-split
-  semantic sets. Task 18E appends one separately identified role-correct capture to
-  this same JSON without changing these fields. Expose the comparator as
-  `npm run check:bundle` and run it in the TypeScript CI job immediately after
-  `npm run build`; before Task 18E it validates inventory/graph integrity and reports
-  historical deltas, and after Task 18E it also enforces the role-correct ceilings.
-  A generated metrics file that is not consumed by CI is not a gate.
-
-  Extend `scripts/integration-tests-browser.sh` with
-  `TS_BROWSER_FRAMEWORKS=nextjs` and use `npm --prefix ... exec -- playwright` for
-  argument-safe invocation. The script remains the clean-checkout fixture builder:
-  it builds release Fastly WASM with the integration environment, generates
-  Viceroy configuration, builds/loads the framework image, installs browser
-  dependencies, and builds both TSJS fixture variants. Run the new performance
-  test itself—not only the bundle script—and write its 50-sample/heap output to the
-  exact baseline path:
+  The contract rejects duplicate/missing ids, a SHA other than
+  `MAIN_AUDIT_SHA`, empty owner/test/command fields, `proof-pending`,
+  `coverage-gap`, a `main-owned` row whose result is not `pass`, or an
+  `implementation-gap` row whose result is not `fail`. It also rejects a command,
+  owner path, or test path that names `rc/july` or resolves historical source.
 
   ```bash
-  TASK0_EVIDENCE_ID="aps-tsjs-baseline-$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%dT%H%M%SZ)"
-  TS_BROWSER_FRAMEWORKS=nextjs \
-  TSJS_PERF_MODE=baseline \
-  TSJS_PERF_EVIDENCE_ID="$TASK0_EVIDENCE_ID" \
-  TSJS_PERF_OUTPUT=crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json \
-    ./scripts/integration-tests-browser.sh \
-      tests/shared/tsjs-performance.spec.ts --project=chromium
-  node crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs --baseline-only
+  node --test \
+    crates/trusted-server-js/lib/test/contract/retired-concept-audit.test.mjs
   ```
 
-  The integration workflow runs the same focused command on its pinned CI image and
-  uploads the resulting JSON. Add required manual input `evidence_id` and include it
-  in `run-name`. Map that input directly into the focused job as
-  `TSJS_PERF_EVIDENCE_ID: ${{ inputs.evidence_id }}` and upload the resulting baseline
-  JSON as `aps-tsjs-baseline-${{ github.run_id }}`. The performance test writes that
-  exact environment value into top-level string field `evidenceId`.
-  `dispatch-workflow-run.mjs` validates that the ref is a pushed
-  branch/tag, dispatches with a unique evidence id, polls for exactly that run, and
-  prints its numeric run id. Record the unique evidence id—not the later GitHub
-  numeric run id—in the baseline JSON so the checked-in capture and remote workflow
-  artifact can be joined without a self-referential post-commit edit.
+  Expected initially: FAIL because classifications are absent or pending.
 
-- [ ] **Step 5: Run:**
+- [ ] **Step 5: Resolve coverage gaps with tests only.** For each ledger row, locate
+      the current-main owner and focused test. If no focused contract exists, author
+      only the smallest test against the reviewed observable outcome, retain that
+      test in the candidate, and apply the test-only patch to the detached main
+      worktree. Before running it, prove detached main has no production diff:
 
   ```bash
-  npm --prefix crates/trusted-server-js/lib run typecheck
-  npm --prefix crates/trusted-server-js/lib run lint
-  node --test crates/trusted-server-js/lib/test/contract/rc-july-adoption.test.mjs
-  test -s crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json
-  jq -e '.evidenceId | type == "string" and length > 0' \
-    crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json
+  git -C "$MAIN_AUDIT_DIR" diff --name-only -- \
+    ':(exclude)**/test/**' ':(exclude)**/tests/**' ':(exclude)**/*test*' \
+    ':(exclude)**/fixtures/**'
+  ```
+
+  Expected: no output. If that proof cannot be made, keep the row `coverage-gap` and
+  stop; do not modify production code.
+
+- [ ] **Step 6: Classify all 23 rows against detached current main.** Run each exact
+      focused command from the fixture. Record `main-owned/pass` when current main
+      satisfies it and `implementation-gap/fail` only when the assertion reaches the
+      behavior and fails because it is absent or incomplete. Compilation, dependency,
+      browser-startup, credential, timeout, or fixture failures remain
+      `proof-pending`. The fixture records the main SHA, current owner paths, test
+      path/command/result, and reviewed disposition for every row.
+
+  Re-run the manifest/classification contract after every row. At task exit it must
+  report exactly 23 final rows, zero proof-pending rows, and zero coverage gaps:
+
+  ```bash
+  MAIN_AUDIT_SHA="$MAIN_AUDIT_SHA" node --test \
+    crates/trusted-server-js/lib/test/contract/retired-concept-audit.test.mjs
+  jq -e \
+    --arg sha "$MAIN_AUDIT_SHA" \
+    'length == 23 and all(.[];
+       .mainSha == $sha and
+       (.classification == "main-owned" or
+        .classification == "implementation-gap"))' \
+    crates/trusted-server-js/lib/test/fixtures/contracts/current-main-concept-audit.json
+  ```
+
+- [ ] **Step 7: Make the audit a CI and plan-integrity gate.** Add
+      `check:concept-audit` to `package.json` and the TypeScript CI job. The checker
+      scans this plan's executable release/performance commands and fails if they
+      fetch, merge, build, or compare `rc/july`; prose that identifies the retired
+      checklist remains allowed. CI validates the embedded inventory and evidence
+      schema without requiring a retired Git object.
+
+- [ ] **Step 8: Run the Phase-0 gate, remove the detached worktree, and commit only
+      audit artifacts.** Do not delete the immutable historical performance fixture;
+      validate its digest and label it report-only. Task 18H installs the fresh-main
+      semantic transfer and timing gates.
+
+  ```bash
+  npm --prefix crates/trusted-server-js/lib run check:concept-audit
+  npm --prefix crates/trusted-server-js/lib test
+  npm --prefix crates/trusted-server-js/lib run build
   git diff --check
-  ```
-
-- [ ] **Step 6: Commit and push the complete Task 0 gate before dispatching it.** Stage
-      only the Task 0 files, create the baseline-gate commit, push the current branch,
-      and then dispatch the workflow from that exact pushed SHA using the evidence id
-      already recorded in the baseline. The numeric run id remains external workflow
-      evidence; do not edit or recommit the baseline after the run:
-
-  ```bash
+  test -n "$MAIN_AUDIT_DIR"
+  test "$(git -C "$MAIN_AUDIT_DIR" rev-parse HEAD)" = "$MAIN_AUDIT_SHA"
+  git worktree remove --force "$MAIN_AUDIT_DIR"
   git add \
     crates/trusted-server-js/lib/package.json \
-    crates/trusted-server-js/lib/tsconfig.json \
-    crates/trusted-server-js/lib/build-all.mjs \
-    crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs \
-    crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json \
-    crates/trusted-server-integration-tests/browser/tests/shared/tsjs-performance.spec.ts \
-    scripts/integration-tests-browser.sh \
-    scripts/dispatch-workflow-run.mjs \
-    crates/trusted-server-js/lib/scripts/check-rc-july-adoption.mjs \
-    crates/trusted-server-js/lib/test/contract/rc-july-adoption.test.mjs \
-    .github/workflows/test.yml \
-    .github/workflows/integration-tests.yml
+    crates/trusted-server-js/lib/scripts/check-retired-concept-audit.mjs \
+    crates/trusted-server-js/lib/test/contract/retired-concept-audit.test.mjs \
+    crates/trusted-server-js/lib/test/fixtures/contracts/current-main-concept-audit.json \
+    .github/workflows/test.yml
   git diff --cached --check
-  git commit -m "Pin the APS TSJS baseline gates"
-  TASK0_REF="$(git branch --show-current)"
-  git push origin "$TASK0_REF"
-  TASK0_SHA="$(git rev-parse HEAD)"
-  TASK0_EVIDENCE_ID="$(jq -er .evidenceId \
-    crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json)"
-  test -n "$TASK0_REF"
-  git fetch origin "$TASK0_REF"
-  test "$TASK0_SHA" = "$(git rev-parse "origin/$TASK0_REF")"
-  TASK0_RUN_ID="$(node scripts/dispatch-workflow-run.mjs \
-    integration-tests.yml "$TASK0_REF" \
-    evidence_id="$TASK0_EVIDENCE_ID")"
-  gh run watch "$TASK0_RUN_ID" --exit-status
-  test "$TASK0_SHA" = "$(gh run view "$TASK0_RUN_ID" --json headSha --jq .headSha)"
-  TASK0_REMOTE_EVIDENCE_DIR="$(mktemp -d)"
-  gh run download "$TASK0_RUN_ID" \
-    --name "aps-tsjs-baseline-$TASK0_RUN_ID" \
-    --dir "$TASK0_REMOTE_EVIDENCE_DIR"
-  jq -e --arg evidence "$TASK0_EVIDENCE_ID" \
-    '.evidenceId == $evidence' \
-    "$TASK0_REMOTE_EVIDENCE_DIR/aps-tsjs-prechange.json"
+  git commit -m "Classify TSJS concepts against current main"
   ```
+
+  `--force` is limited to the validated disposable detached worktree because it may
+  contain the test-only proof patches from Step 5; no production edit is discarded.
 
 ### Task 0A: Upgrade the TSJS package and TypeScript toolchain
 
@@ -423,7 +449,7 @@ Every task's regression suite therefore remains green in task order.
   npm --prefix crates/trusted-server-js/lib run format
   npm --prefix crates/trusted-server-js/lib test -- --run
   npm --prefix crates/trusted-server-js/lib run build
-  node --test crates/trusted-server-js/lib/test/contract/rc-july-adoption.test.mjs
+  npm --prefix crates/trusted-server-js/lib run check:concept-audit
   ```
 
   Also print the resolved Node, npm, TypeScript, ESLint, Vite, Vitest, and jsdom
@@ -490,16 +516,19 @@ Every task's regression suite therefore remains green in task order.
       the neutral schema/corpus and writes both named generated validator files. The
       check runs the generator in staleness mode and fails on any diff. The Node test
       executes the exact ES5 file embedded by `aps.rs` in a `vm` for every corpus
-      vector; it is not allowed to substitute the TypeScript validator.
+      vector; it is not allowed to substitute the TypeScript validator. Document in
+      `aps-renderer-v1.schema.json` that `x-*` semantic markers are descriptive only:
+      the generator's hard-coded checks are authoritative, so editing a marker alone
+      cannot change enforcement.
 
 - [ ] **Step 4: Implement `BidRenderSourceV1`/the equivalent Rust enum with exactly `aps`, `adm`,**
-      and baseline `pbs_cache` members. Ensure APS has only `ApsRendererV1`; delete alternate APS
+      and current-main `pbs_cache` members. Ensure APS has only `ApsRendererV1`; delete alternate APS
       `adm`, `meta`, or debug reconstruction. Align upstream and descriptor bid ids to
       1–64 UTF-8 bytes with no NUL/control. Define shared
       `RENDER_DIMENSION_MIN = 1` and `RENDER_DIMENSION_MAX = 4096`; apply the same
       noninteger/nonpositive versus out-of-range distinction in Rust, TS, generated
       ES5, APS/ADM sources, programmatic sizes, and later DOM construction. The
-      baseline cache carrier does not add a new dimension validator. No
+      current-main cache carrier does not add a new dimension validator. No
       validator or adapter may clamp.
 
 - [ ] **Step 5: Rerun the focused commands plus:**
@@ -536,7 +565,11 @@ Every task's regression suite therefore remains green in task order.
 
 ### Phase 0 exit
 
-- The baseline is known.
+- The current-main ownership audit records the exact refreshed SHA and all 23 rows
+  are final `main-owned` or demonstrated `implementation-gap`; none is
+  proof-pending or coverage-gap.
+- The retired 144-path checklist is validated entirely from the one reviewed spec;
+  no historical Git object is fetched, resolved, built, or merged.
 - Strict TypeScript is a checked-in CI command.
 - Rust, TypeScript, and embedded ES5 agree on every APS descriptor vector.
 - No external observability or experiment artifact is planned or created.
@@ -562,7 +595,9 @@ Every task's regression suite therefore remains green in task order.
 
 - [ ] **Step 2: Replace stringly ad-hoc reasons with one typed APS/auction drop-reason enum used**
       exhaustively by provider response parsing and publisher debug projection. Do not
-      add a persistence or external-event failure reason.
+      add a persistence or external-event failure reason. Keep `Ord` and `as_str`
+      hand-written and document that this intentionally freezes alphabetical
+      serialized-map order rather than relying on declaration order.
 
 - [ ] **Step 3: Validate per bid before constructing `ApsRendererV1`. Preserve the exact accepted**
       AAX bid in the encoded projection and cross-check it against the descriptor.
@@ -661,7 +696,7 @@ Every task's regression suite therefore remains green in task order.
       and prove opaque ids/arrival order never break ties.
 
 - [ ] **Step 5: Define and test the exact `/auction` winner wire. For APS/ADM, standard `bid.id` is the**
-      `r1_` renderer reservation; baseline `pbs_cache` retains its native cache id;
+      `r1_` renderer reservation; current-main `pbs_cache` retains its native cache id;
       `bid.impid` maps exactly to the server slot; and
       `bid.ext.trusted_server` has only `candidate_id`, `slot_id`, and
       `render_source`. Require the four-way decision/candidate/impid/slot join. Reject
@@ -726,7 +761,7 @@ Every task's regression suite therefore remains green in task order.
       one server-minted renderer reservation plus the finite nonnegative selected CPM
       that later becomes the internal `WinnerContext`; browser projection exposes
       `rendererReservationId` and `/auction` uses it as standard OpenRTB `bid.id`.
-      Baseline `pbs_cache` carries only `cacheId/cacheHost/cachePath`, has no
+      Current-main `pbs_cache` carries only `cacheId/cacheHost/cachePath`, has no
       reservation, and retains its native id. CPM is never copied into an APS/ADM
       render descriptor or capability.
 
@@ -1212,7 +1247,11 @@ collapse those checkpoints or carry unverified behavior between them.
 
 - [ ] **Step 1: Add failing lint-rule tests for direct and aliased access through `window`,**
       `globalThis`, and `self`, plus aliases of `googletag`/`pbjs`. Add allowed cases
-      inside adapters and kernel `window.tsjs`/messaging code.
+      inside adapters and kernel `window.tsjs`/messaging code. Document the rule's
+      known AST blind spots—dynamic computed keys such as
+      `globalThis['goog' + 'letag']` and function-returned roots such as
+      `getWindow().googletag`—and keep the production metafile/global-absence checks
+      as the required defense in depth.
 
 - [ ] **Step 2: Configure `import/no-restricted-paths` for the dependency direction in the**
       source-shape diagram. Resolve imports with the package's TypeScript bundler
@@ -1271,7 +1310,7 @@ collapse those checkpoints or carry unverified behavior between them.
 - [ ] **Step 1: Write failing fake-timer tests for reverse-order exactly-once disposal, disposer**
       failure isolation, registration after disposal, first-terminal-wins, duplicate
       integration id, malformed/unknown manifest id, wrong 64-hex release, pending
-      catalog-derived 14-critical/20-total capacity, prepare throw/async rejection/abort, detached continuation,
+      catalog-derived 14-takeover/20-total capacity, prepare throw/async rejection/abort, detached continuation,
       activation throw, duplicate `afterCommit`, shared deadline abort, and late
       continuation.
 
@@ -1280,10 +1319,10 @@ collapse those checkpoints or carry unverified behavior between them.
       work can observe its signal but cannot delay terminal disposal.
 
 - [ ] **Step 3: Implement the exact phase-aware `BootManifestV1` contract and release-internal**
-      `_registerIntegration({abi:1,id,phase,releaseId,prepare})` collection. Critical
-      entries participate in the atomic bootstrap; deferred entries have only the
+      `_registerIntegration({abi:1,id,phase,releaseId,prepare})` collection. Takeover
+      entries participate in the atomic persistent bootstrap; deferred entries have only the
       fixed `first_display_or_idle` trigger and independent later transactions.
-      Registration executes no module code. In critical manifest order, core awaits
+      Registration executes no module code. In takeover manifest order, core awaits
       each returned preparation Promise. A deferred module prepares independently
       only after its own accepted registration plus load checkpoint and never awaits
       a sibling. Preparation may validate frozen config,
@@ -1376,18 +1415,18 @@ collapse those checkpoints or carry unverified behavior between them.
       integration refusal without invoking module code; and zero runtime/service/adapter/
       listener/timer/port/iframe construction after the fallback commits. The
       bootstrap owns only queue ingress, immutable boot/manifest inputs, generation,
-      the ten-second critical watchdog, the registration sink, the
+      the ten-second selected-artifact watchdog, the private registration sinks, the
       `tsjs:bids-script` mark, and fallback; assert it has no adapter, service,
       renderer, DOM scan, upstream loader, or publisher-callback execution path.
 
-  Add exact critical-tag authentication cases. The server emits one parser-inserted
+  Add exact selected-artifact tag authentication cases. The server emits one parser-inserted
   `script#trustedserver-js` immediately after the controller. The controller resolves
-  root-relative `criticalSrc` exactly once against its trusted document origin,
+  root-relative `firstDisplay.src` or `runtimeSrc` exactly once against its trusted document origin,
   never `document.baseURI`, requires same origin plus exact
   path/query round-trip, and compares that canonical absolute value to the unique
   element's resolved `src`. Missing/duplicate id, publisher-created replacement,
   detached node, changed `src`, base-element influence, origin/path/query mismatch,
-  and any redirected local route fail the critical transaction as `abi_mismatch`;
+  and any redirected local route fail the selected transaction as `abi_mismatch`;
   no module registration or fallback runtime construction may occur first.
 
   For an ordinary document the trusted origin is the captured exact HTTP(S)
@@ -1396,7 +1435,7 @@ collapse those checkpoints or carry unverified behavior between them.
   accept the exact own non-enumerable/non-configurable/non-writable data stamp
   `window.__tsCreativeOrigin` written before bidder markup. Reject missing,
   inherited, accessor-backed, mutable, enumerable, credentialed, and non-origin
-  stamps. Use this same helper for critical-source capture and registry
+  stamps. Use this same helper for selected-artifact source capture and registry
   current-script ownership; move the shared failure-reason type to that boundary so
   the registry imports it without a fallback/registry module cycle. Do not create a
   new uncaptured production-source ownership entry.
@@ -1408,15 +1447,20 @@ collapse those checkpoints or carry unverified behavior between them.
   index/length assignment, deletion, and property definition in strict/sloppy callers
   cannot retain work or change length.
 
-- [ ] **Step 2: Implement `unclaimed → installing → kernel` and**
-      `installing → failed → fallback`. Start the only ten-second watchdog immediately
-      before core injection; it covers registration, preparation, and activation for
-      every enabled critical integration only. Combine the timer with `performance.now()`/the
-      injected monotonic clock checks before/after every activation and before
-      handoff. Abort completes synchronous reverse-order unwind before fallback.
-      Deferred bundles after fallback are rejected and cannot replace that generation.
-      Exercise this through the test-only composition harness; do not yet replace the
-      production bootstrap.
+- [ ] **Step 2: Implement the exact bootstrap ownership skeleton:**
+      `unclaimed → installing → agent → transferring → kernel`, direct
+      `installing → kernel` when `firstDisplay` is null, and every failed branch to
+      terminal fallback. Start the ten-second watchdog immediately before the one
+      selected parser-blocking artifact; it covers agent registration/activation or
+      direct persistent takeover registration/preparation/activation. For a selected
+      agent, registration, activation, **and the initial responsible action starting**
+      must all occur before expiry; activation without a started action still commits
+      terminal fallback. Post-paint agent takeover owns the separate §5.2.1 deadline.
+      Combine timers with monotonic checks at every synchronous barrier. Abort
+      completes reverse-order unwind before fallback. Deferred bundles after fallback
+      are rejected and cannot replace that generation. Exercise the dormant state
+      machine through test composition; Tasks 18E–18G supply the agent and handoff
+      behavior before production wiring.
 
   Normalize `tsjs.que` to an actual ingress Array with a writable-false,
   configurable-true property during preparation. After successful activation (or
@@ -1463,13 +1507,16 @@ collapse those checkpoints or carry unverified behavior between them.
       64-hex id. Extend `build.rs` generated metadata to include
       the sentinel-normalized all-bundle `release_id`; expose it through `bundle.rs` and
       the crate API beside bundle bytes/content hashes. Add Rust tests proving generated
-      metadata and every bundle carry the same id. Implement the pure exact
-      `BootManifestV1` serializer as
-      `{version:1,releaseId,criticalSrc,integrations:[{id,phase:'critical'} | {id,phase:'deferred',trigger:'first_display_or_idle',src}]}`
-      in canonical injection order, but do not emit it into production HTML yet.
-      Test changed logical bytes, role/phase/order changes, sentinel multiplicity,
-      wrong release, missing integration, bad `criticalSrc`, and server/bundle
-      disagreement.
+      metadata and every bundle carry the same id. Implement the first and only exact
+      `BootManifestV1` serializer:
+      `{version:1,releaseId,firstDisplay:null|{src,slices},runtimeSrc,integrations}`,
+      where integrations are exact `phase:'takeover'` entries followed by exact
+      `phase:'deferred',trigger:'first_display_or_idle',src` entries. Validate at most
+      13 ordered unique first-display slice ids, exact mask/list agreement, at most 20
+      persistent entries, and canonical root-relative URLs. Do not emit it into
+      production HTML yet. Test changed logical bytes, role/phase/order/mask changes,
+      sentinel multiplicity, wrong release, missing integration, bad selected URL,
+      and server/bundle disagreement.
 
 - [ ] **Step 4: Install one `Runtime`; its closure keeps the mutable capability broker**
       and owner tokens, provider IIFEs register owned implementations, and consumers
@@ -1481,8 +1528,8 @@ collapse those checkpoints or carry unverified behavior between them.
   reversible core effect, followed by correctness GPT listeners and prepared modules.
   Production bootstrap and manifest emission remain unchanged until Task 19.
 
-  Implement the critical-tag lookup/capture before arming its load/error handlers,
-  store that exact node identity for every critical registration, and reject a
+  Implement the selected-tag lookup/capture before arming its load/error handlers,
+  store that exact node identity for the agent or direct-runtime registration, and reject a
   different `document.currentScript` or node that no longer matches the authenticated
   id/source. Pair these browser tests with Task 8B's no-redirect local transport test;
   do not infer redirect safety from `script.src` alone.
@@ -1492,9 +1539,9 @@ collapse those checkpoints or carry unverified behavior between them.
       behavior-bearing `gpt_bootstrap.js` at the production switch. Pin the generated
       artifact with a staleness assertion. Report 19,101 raw / 5,468 gzip / 4,632
       Brotli and their former 5% figures as historical old-artifact evidence only;
-      Task 18E captures and gates the generated post-split bootstrap artifact with the
-      role-correct formula. There is never a hand-maintained second fallback or a
-      degraded GPT runtime.
+      Task 18H gates the generated post-split bootstrap against the reviewed absolute
+      ceiling. There is never a hand-maintained second fallback or a degraded GPT
+      runtime.
 
 - [ ] **Step 6: Run:**
 
@@ -1564,11 +1611,11 @@ collapse those checkpoints or carry unverified behavior between them.
 - [ ] **Step 1: Write the failing catalog and inventory tests.** Encode the 20 rows
       and exact order from spec §5.2, including all inclusion predicates, provided and
       consumed capability keys, phase/trigger, and named obligation. Assert
-      `MAX_CRITICAL_MODULES = 14`, `MAX_MANIFEST_MODULES = 20`, boundary cases
+      `MAX_TAKEOVER_MODULES = 14`, `MAX_MANIFEST_MODULES = 20`, boundary cases
       13/14/15 and 19/20/21, exactly one provider per non-kernel capability,
       provider-before-consumer order, no deferred provider, no cycle, no unknown
-      production artifact, and no phase override. The mandatory minimal critical set
-      is `[core, render_runtime]`; the reference set is
+      production artifact, and no phase override. The mandatory minimal persistent
+      set is `[core, render_runtime]`; the persistent reference set is
       `[core, render_runtime, creative, gpt, prebid, datadome]`.
 
   Assert the exact diagnostics edges rather than a generic bus relationship:
@@ -1582,8 +1629,8 @@ collapse those checkpoints or carry unverified behavior between them.
   diagnostics subscription capability or capacity is generated.
 
 - [ ] **Step 2: Run the new catalog/release tests and verify they fail** because the
-      existing generated inventory has no roles/phases/capabilities and still uses
-      the old all-required/deferred convention.
+      existing generated inventory has no roles/phases/capabilities and does not
+      distinguish takeover from deferred entries.
 
   ```bash
   npm --prefix crates/trusted-server-js/lib test -- --run test/kernel/release_catalog.test.ts
@@ -1591,28 +1638,39 @@ collapse those checkpoints or carry unverified behavior between them.
   ```
 
 - [ ] **Step 3: Implement the catalog as the single build/server/browser authority.**
-      Generate bootstrap, core, 14 possible critical modules, and six deferred slices
-      from it. Reject test/fake/no-op outputs, missing or multiply counted artifacts,
-      undeclared capability edges, a deferred source in a critical metafile, and any
-      server list that is not the catalog-filtered order. Derive manifest capacities
-      from the catalog rather than a hand-written 16. Generate no internal diagnostics
-      subscriber constant: the core ingress has no module subscription surface, while
-      public trace/GPT subscriber limits remain owned by their respective data APIs.
+      Generate bootstrap, core, 14 possible takeover modules, and six deferred slices;
+      reserve the closed agent base/slice artifact roles and manifest fields that Task
+      18E fills without emitting placeholder agent bytes. Reject test/fake/no-op outputs,
+      missing or multiply counted artifacts, undeclared capability edges, a deferred
+      source in a takeover metafile, any persistent source in an agent metafile, and
+      any server list that is not catalog-filtered order. Derive manifest capacities
+      from the catalog rather than a hand-written constant. Generate no internal
+      diagnostics subscriber constant: core ingress has no module subscription
+      surface, while public trace/GPT subscriber limits remain owned by their data
+      APIs.
 
 - [ ] **Step 4: Write failing Rust and adapter tests for exact static transport.** Cover
       only `GET` and bodyless metadata-equivalent `HEAD` for
-      `/static/tsjs=tsjs-unified.min.js?v=<criticalHash>` and exact enabled
-      deferred paths; one `v`, no extra query; lowercase 64-hex SHA-256 over exact
-      uncompressed response bytes; current catalog membership; `200` JavaScript MIME
-      plus `nosniff`; existing conditional `304`; and local `404 no-store` for wrong
-      method, aliases, unknown/disabled ids, malformed/stale hash, or extra query.
-      Assert no redirect and no publisher-origin fallthrough on all four adapters.
+      `/static/tsjs=tsjs-first-display.min.js?m=<four-lowercase-hex>&v=<firstDisplayHash>`,
+      `/static/tsjs=tsjs-unified.min.js?v=<runtimeHash>`, and exact enabled deferred
+      paths. First-display accepts exact `m` then `v`, bit 0 set, unused bits zero, a
+      configuration-permitted mask, exact selected slices, and exact body hash; other
+      routes accept one `v` only. Cover lowercase 64-hex SHA-256 over exact
+      uncompressed response bytes, `GET`/`HEAD` parity, JavaScript MIME plus
+      `nosniff`, conditional `304`, and local `404 no-store` for wrong method,
+      aliases, unknown/disabled ids, invalid/disallowed mask, malformed/stale hash,
+      reordered/extra query, or mismatched selection. Assert no redirect and no
+      publisher-origin fallthrough on all four adapters.
 
-- [ ] **Step 5: Implement hash-validating unified/deferred handlers and manifest
-      emission.** `criticalSrc` names core plus critical IIFEs in catalog order with
-      the exact `;\n` separator. A successful request returns only bytes embedded in
-      the active binary; do not add N/N-1 storage, a cache redesign, or a source-map/
-      upstream fallback. Preserve the existing strong-ETag/static-cache behavior.
+- [ ] **Step 5: Implement hash-validating agent/unified/deferred handler machinery and dormant
+      manifest emission.** Exercise the agent route through the test-only registry;
+      production has no permitted agent selection until Task 18E registers real
+      artifacts. `firstDisplay.src` names agent base plus selected slices;
+      `runtimeSrc` names core plus takeover IIFEs in catalog order; both use the exact
+      `;\n` separator and precomputed identities. A successful request returns only
+      bytes embedded in the active binary. Do not add N/N-1 storage, a cache redesign,
+      or a source-map/upstream fallback. Preserve existing strong-ETag/static-cache
+      behavior. Production HTML does not select the new manifest until Task 19.
 
 - [ ] **Step 6: Run the focused release and four-adapter route gates, then commit.**
 
@@ -1648,12 +1706,14 @@ collapse those checkpoints or carry unverified behavior between them.
       `{abi:1,id,phase,releaseId,prepare}`. Reject accessors, inherited/unknown/missing
       keys, custom prototypes, wrong literals/types, unknown/cross-phase ids,
       duplicate/late calls, the wrong core-created element, and a different
-      `document.currentScript`. Stage declared frozen provider interfaces after
+      `document.currentScript`. Phase is exactly `takeover | deferred`; there is no
+      `critical` compatibility value. Stage declared frozen provider interfaces after
       provider preparation, make them effect-inert until activation, and expose no
       broker/readiness object through public or `_internal` surfaces.
 
 - [ ] **Step 2: Write failing scheduler tests for the only phase gate.** At kernel
-      commit arm a 10,000 ms attempt-creation guard on every page. The first attempt-
+      commit arm a 10,000 ms attempt-creation guard on every direct-to-runtime page.
+      Task 18F owns the already-terminal agent-batch paint path. The first attempt-
       creating batch becomes immutable; cancel the guard and wait without another
       cutoff for every member's terminal latch. After terminal/no-attempt, require two
       owned animation frames when visible, or visibility plus two frames versus a
@@ -1677,7 +1737,8 @@ collapse those checkpoints or carry unverified behavior between them.
       edges, and a deferred failure never selects fallback or a second runtime.
 
 - [ ] **Step 4: Add and implement CSP/Trusted Types fixtures.** Copy only the exact
-      critical script's nonempty `nonce` IDL value. Create at most one closure-private
+      authenticated selected agent/direct-runtime script's nonempty `nonce` IDL
+      value. Create at most one closure-private
       `trusted-server#tsjs-v1` policy whose `createScriptURL` accepts only frozen exact
       canonical absolute URLs derived once from the validated root-relative manifest
       against captured `window.location.origin`, never `document.baseURI`. Use that
@@ -1994,7 +2055,7 @@ collapse those checkpoints or carry unverified behavior between them.
 
 - [ ] **Step 3: Use one reservation type for every TS-owned APS and ADM PUC source.**
       Validate the supplied server id but never generate it in the browser. Cache UUID
-      remains baseline `pbs_cache` transport state and never enters this store;
+      remains current-main `pbs_cache` transport state and never enters this store;
       upstream bid id remains provenance and native Prebid ids remain native. Reject
       an `r1_` collision against any live/tombstoned entry; lookup recognizes a TS id
       before detailed validation.
@@ -2179,7 +2240,7 @@ one.
       map to `adm_document_no_load`.
 
   Do not route `pbs_cache` through `RenderAttempt`, this ADM constructor, or a new
-  direct path. The GPT integration retains the pinned baseline cache implementation
+  direct path. The GPT integration retains the current-main PBS Cache implementation
   behind only the runtime generation/disposal boundary. Its existing request, parse,
   macro, PUC response, collapsed-resize, failure, and stale-navigation behavior is
   proven by a black-box pre/post corpus; no new cache inputs, outputs, identity,
@@ -2480,7 +2541,7 @@ with an earlier one.
 
   Snapshot the runtime-owned auction-context contributors exactly once before request
   serialization. Contributors are invoked in manifest registration order; later keys
-  retain the baseline precedence, one throw is locally logged/isolated, and module or
+  retain the current-main precedence, one throw is locally logged/isolated, and module or
   runtime disposal removes the contributor before the next batch. Navigation changes
   do not duplicate or discard a document-scoped contributor. No integration imports
   or mutates a module-global provider map.
@@ -2654,7 +2715,7 @@ with an earlier one.
 
 - [ ] **Step 8: Implement and test the prospective real performance marks before the switch.**
       Make the generated bootstrap controller execute
-      `performance.mark('tsjs:bids-script')` immediately before the critical head
+      `performance.mark('tsjs:bids-script')` immediately before the selected parser-blocking head
       sequence but leave its production call site unchanged. In the shared render/
       GPT owners, implement exactly-once `performance.mark('tsjs:first-display')`
       immediately before the first protected TS-owned GPT display/refresh or direct
@@ -2666,7 +2727,7 @@ with an earlier one.
       batch completion, post-window attempts, stale generation, and
       missing/throwing Performance API cases, and assert
       `performance.measure('tsjs:boot-to-first-display', 'tsjs:bids-script', 'tsjs:first-display')`
-      uses those exact marks. `window.__tsjsPerf` is baseline-only scaffolding and is
+      uses those exact marks. `window.__tsjsPerf` is historical test scaffolding and is
       rejected by the prospective post-switch test.
 
 - [ ] **Step 9: Run the entire GPT suite and prospective boot-mark tests, not only new files:**
@@ -2732,7 +2793,7 @@ with an earlier one.
       composition. `prepare(ctx)` is inert; `activate(ctx)` synchronously installs
       only reversible adapter state and contributes at most one `afterCommit`
       callback. Use the Prebid adapter for every global call and the RuntimeSession
-      reservation service for APS and ADM PUC entries. Baseline `pbs_cache` stays in
+      reservation service for APS and ADM PUC entries. Current-main `pbs_cache` stays in
       the GPT integration and never enters this reservation service. The adapter binds one
       exact `pbjs` object plus its own recursively frozen artifact-stamp identity and
       rechecks both on every operation. Missing or invalid bindings report
@@ -2973,7 +3034,7 @@ them as one implementation change.
   ```
 
 - [ ] **Step A3: Convert only creative into a thin integration module.** Its
-      `_registerIntegration({abi:1,id,phase:'critical',releaseId,prepare})` call is pure registration;
+      `_registerIntegration({abi:1,id,phase:'takeover',releaseId,prepare})` call is pure registration;
       `prepare(ctx)` is inert and Promise-returning; `activate(ctx)` is synchronous,
       pre-registers disposal before every reversible mutation, and contributes at
       most one `afterCommit` callback. Keep shipped entry-point side effects unchanged
@@ -2983,7 +3044,7 @@ them as one implementation change.
       the complete plain-object shape, defaults, disabled/manifest mismatch, unknown
       keys, accessors, prototypes, and literals before preparation. Activation installs
       the click guard when `clickGuard` is true and dynamic image/iframe guards when
-      `renderGuard` is true, with no baseline DOM rewrite. A still-loading document
+      `renderGuard` is true, with no unrelated DOM rewrite. A still-loading document
       receives one owned `DOMContentLoaded` rescan; an already-ready document stages
       that scan in the module's single `afterCommit`. Disabled creative and
       enabled-with-both-guards-false perform zero wrappers, observers, listeners,
@@ -2996,9 +3057,12 @@ them as one implementation change.
   recovery through `/first-party/proxy-rebuild`, validated absolute HTTP(S), and
   rejection of credentials, malformed values, and non-network schemes. For each
   rewritten independent creative document that needs a guard, emit the complete
-  document-local boot controller plus exactly one authenticated critical tag for
-  core + `render_runtime` + `creative`, with no other critical or deferred module.
-  Cover body and body-less insertion, exact tag identity/source/manifest/release,
+  document-local boot controller plus exactly one authenticated selected tag: an
+  eligible projection uses `first_display + creative_initial` and its required
+  action slices; otherwise direct persistent boot uses core plus takeover
+  `render_runtime + creative`. Emit no tag/preload for the other artifact or for a
+  deferred module. Cover body and body-less insertion, exact tag
+  identity/source/mask/manifest/release,
   the immutable opaque-origin stamp, and zero TSJS injection when creative is
   disabled or both guards are false. Delete the
   mutable/install creative globals only in Task 22.
@@ -3194,7 +3258,7 @@ Unlabelled paths inherit their create/modify status from the Task 18 umbrella;
       numbers, callback truth/timing, frozen exports, Shadow DOM overlay, badges, SPA,
       privacy, and non-interference.
 
-  The critical module consumes only `runtime.v1` and `gpt.events.v1`; remove every
+  The takeover module consumes only `runtime.v1` and `gpt.events.v1`; remove every
   `trace.v1` lookup and ingress subscription. GPT owns the bounded early fact buffer
   in `integrations/gpt/diagnostics_facts.ts`. Its facts retain the frozen opaque
   per-physical-object token because this direct stream does not cross the generic
@@ -3341,7 +3405,7 @@ labelled `module.ts` paths are created here before Task 18D modifies them.
 - `crates/trusted-server-core/src/integrations/mod.rs`
 
 - [ ] **Step C1: Add the failing remaining-integration and maximal-manifest corpus.** Preserve
-      each `rc/july` integration behavior exactly. Cover DataDome
+      each current-main behavior and every retained ledger outcome. Cover DataDome
       script/preload path rewriting; Didomi absolute SDK path without config clobber;
       GTM script/preload and GA beacon/fetch rewriting; Lockr bounded readiness and API
       host; Osano USP/GPP/TCF marker ownership and lifecycle; Permutive bounded
@@ -3383,8 +3447,8 @@ labelled `module.ts` paths are created here before Task 18D modifies them.
       enabled bundle list. Embed the same release id in core and every integration
       IIFE. Add failures for integration before core, unknown/missing/duplicate member,
       malformed/unsorted/oversized manifest, wrong release, preparation or activation
-      failure, duplicate `afterCommit`, and catalog-derived 13/14/15 critical plus
-      19/20/21 total capacity. Deferred entries do not share the critical watchdog.
+      failure, duplicate `afterCommit`, and catalog-derived 13/14/15 takeover plus
+      19/20/21 total capacity. Deferred entries do not share the takeover watchdog.
       Production manifest emission starts only in Task 19.
 
 - [ ] **Step C5: Run the complete remaining-integration and maximal-manifest gate:**
@@ -3413,7 +3477,7 @@ labelled `module.ts` paths are created here before Task 18D modifies them.
   git commit -m "Prepare the remaining integration modules"
   ```
 
-#### Task 18D: Extract the canonical critical and later-only product slices
+#### Task 18D: Extract the persistent takeover and later-only product slices
 
 **Task 18D files:**
 
@@ -3439,13 +3503,14 @@ labelled `module.ts` paths are created here before Task 18D modifies them.
 - Modify: `crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs`
 
 - [ ] **Step D1: Write failing phase-membership and behavior tests.** Map all spec
-      §5.2 catalog rows to these exact artifacts: critical `render_runtime`, `aps`,
+      §5.2 catalog rows to these exact persistent artifacts: takeover
+      `render_runtime`, `aps`,
       `creative`, `datadome`, `didomi`, `google_tag_manager`, `gpt`,
       `gpt_diagnostics`, `lockr`, `osano_consent`, `permutive_context`,
       `sourcepoint_consent`, `prebid`, `testlight`; deferred
       `diagnostics_presentation`, `gpt_later`, `osano_lifecycle`,
       `permutive_lifecycle`, `prebid_later`, `sourcepoint_lifecycle`. Assert each
-      inclusion predicate, capability edge, named critical/later obligation, build
+      inclusion predicate, capability edge, named takeover/later obligation, build
       role, and exactly-once maximal-inventory membership.
 
   Assert `render_runtime` provides distinct `trace.v1` and
@@ -3455,7 +3520,7 @@ labelled `module.ts` paths are created here before Task 18D modifies them.
   broker must deny `attachPresentation` to APS, GPT, `gpt_later`, and every public
   facade rather than relying on naming or consumer convention.
 
-- [ ] **Step D2: Add failing production-metafile tests.** The core entry may import
+- [ ] **Step D2: Add failing production-metafile tests.** The persistent core entry may import
       only kernel, boot/projection contracts, queue/logger, and minimum direct public-
       API setup. Reject every deferred integration/service/UI path, test/no-op/fake
       seam, and `*ForTest` export. Reject a consumer artifact that inlines its
@@ -3463,8 +3528,8 @@ labelled `module.ts` paths are created here before Task 18D modifies them.
       access outside the adapters.
 
 - [ ] **Step D3: Run the new tests and record the expected failures and current
-      critical/reference/maximal size deltas.** Do not regenerate the immutable
-      baseline.
+      persistent-reference/maximal size deltas.** Do not regenerate any immutable
+      historical capture.
 
   ```bash
   npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/phase-slices.test.ts test/composition/browser.test.ts test/composition/maximal-runtime.test.ts
@@ -3472,14 +3537,15 @@ labelled `module.ts` paths are created here before Task 18D modifies them.
   npm --prefix crates/trusted-server-js/lib run check:bundle
   ```
 
-- [ ] **Step D4: Extract the mandatory critical providers and product obligations.**
+- [ ] **Step D4: Extract the mandatory takeover providers and product obligations.**
       `render_runtime` alone provides slots/auction/render/messages/trace/direct over
       kernel `runtime.v1`, with presentation authority attenuated into the separate
       `trace.presentation.v1` broker value. `aps`, GPT, diagnostics, consent/context,
-      and all guard modules consume only catalogued frozen interfaces. Keep creative critical only
-      for `enabled && (clickGuard || renderGuard)`. Prebid is always critical when
-      enabled and retains external-artifact readiness, bidder aliases, user-ID/EIDs,
-      publisher queue behavior, initial auction, and TS bid/PUC admission. It remains
+      and all guard modules consume only catalogued frozen interfaces. Keep creative in takeover only
+      for `enabled && (clickGuard || renderGuard)`. Prebid is always takeover when
+      enabled and adopts external-artifact readiness, publisher queue, bidder,
+      user-ID/EID, initial-auction, and TS bid/PUC facts from `prebid_initial` when an
+      agent ran; on direct boot it owns those obligations itself. It remains
       a separately generated pure external Prebid artifact plus TS-owned adapter—not
       vendored bytes.
 
@@ -3488,11 +3554,13 @@ labelled `module.ts` paths are created here before Task 18D modifies them.
       presentation attachments; GPT post-first-display refresh/navigation/later
       reconciliation; Osano retry/event/focus/visibility/clear; Permutive later SDK/
       segment refresh; Prebid synthetic refresh plus RCJ-PREBID-04 GAM-path exclusion;
-      and Sourcepoint later retry/visibility/focus/update/safe-clear. Keep initial GPT
-      handoff/hydration/reconciliation critical. A deferred slice consumes only
-      critical providers, creates no adapter/runtime, and preserves exact disposer
-      ownership. The baseline PBS Cache implementation stays inside the GPT product
-      behind generation/disposal only and receives no new protocol.
+      and Sourcepoint later retry/visibility/focus/update/safe-clear. Keep GPT
+      adoption/hydration/reconciliation in takeover; Task 18F separately supplies the
+      provisional `gpt_initial` obligation without importing this persistent owner. A
+      deferred slice consumes only takeover providers, creates no adapter/runtime,
+      and preserves exact disposer ownership. The current-main PBS Cache
+      implementation stays inside the GPT product behind generation/disposal only and
+      receives no new protocol.
 
 - [ ] **Step D6: Prove parity and independent deferred loading.** Run every `RCJ-*`
       fixture against the final owner, including EID/user-ID behavior before first
@@ -3501,18 +3569,16 @@ labelled `module.ts` paths are created here before Task 18D modifies them.
       turn and prove every sibling starts immediately with its own deadline and the
       one runtime/adapter/listener identities remain unchanged.
 
-- [ ] **Step D7: Make the production import and inventory gates green, report the
-      historical size deltas, then commit and push.** Minimal critical means `[core,render_runtime]`; reference
-      critical means `[core,render_runtime,creative,gpt,prebid,datadome]`; maximal
-      TSJS total counts core and every production integration module exactly once.
-      The release inventory also counts bootstrap exactly once under its separate
-      bootstrap role/budget; it is not added to maximal TSJS total. Splitting never
-      excuses later maximal-total growth. At this pre-capture checkpoint,
-      `check:bundle` must validate the immutable historical subtree, semantic
-      membership, graph integrity, and artifact accounting, print the old-membership
-      values as deltas, and report `roleCorrectStatus: "pending-capture"`; it must not
-      compare the new semantic sets to the old membership's byte ceilings. Task 18E
-      closes that temporary pre-production state before Task 19.
+- [ ] **Step D7: Make persistent import and inventory gates green, report historical
+      deltas, then commit and push.** Persistent reference is core plus its catalogued
+      takeover modules, and persistent maximal includes every takeover/deferred
+      artifact exactly once. Bootstrap and the reserved first-display roles are
+      inventory members but no placeholder agent bytes are emitted or budgeted here;
+      Tasks 18E–18G make those roles concrete. `check:bundle` validates immutable
+      historical subtrees as report-only, persistent semantic membership, graph
+      integrity, and artifact accounting. It must not compare new semantic sets to old
+      candidate captures. Task 18H adds the complete agent/persistent/maximal absolute
+      and fresh-current-main gates before Task 19.
 
   ```bash
   npm --prefix crates/trusted-server-js/lib test
@@ -3532,327 +3598,515 @@ labelled `module.ts` paths are created here before Task 18D modifies them.
   git push origin "$(git branch --show-current)"
   ```
 
-#### Task 18E: Resolve current-base conflicts and freeze role-correct transfer budgets
+#### Task 18E: Define the lean first-display catalog and closed contracts
 
-This is an integration and measurement checkpoint, not production wiring. The PR
-targets `main`; `rc/july` remains the frozen behavior/adoption source. Resolve the
-current PR base first, then merge the adoption source so its complete TSJS behavior
-ledger remains represented. Do not use a blanket `ours` or `theirs` strategy:
-preserve upstream fixes and the revision-33 runtime/APS contracts file-by-file.
+This task creates only pure contracts, validators, catalog selection, and a dormant
+agent artifact. It does not switch production HTML or construct the persistent
+runtime.
 
 **Task 18E files:**
 
-- Modify as required: files conflicted by merging `origin/main`
-- Modify as required: files conflicted by merging `origin/rc/july`
-- Modify: `crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json`
+- Create: `crates/trusted-server-js/lib/src/first_display/contracts.ts`
+- Create: `crates/trusted-server-js/lib/src/first_display/transaction.ts`
+- Create: `crates/trusted-server-js/lib/test/first_display/contracts.test.ts`
+- Create: `crates/trusted-server-js/lib/test/first_display/transaction.test.ts`
+- Modify: `crates/trusted-server-js/lib/src/kernel/release_catalog.ts`
+- Modify: `crates/trusted-server-js/lib/test/kernel/release_catalog.test.ts`
+- Modify: `crates/trusted-server-js/lib/build-all.mjs`
+- Modify: `crates/trusted-server-js/lib/test/build/release-v1.test.mjs`
+- Modify: `crates/trusted-server-core/src/tsjs.rs`
+- Modify: `crates/trusted-server-core/src/publisher.rs`
+- Test: focused Rust agent-selection tests beside the modified server owners
+
+- [ ] **Step E1: Write failing catalog and server-selection tests.** Encode the exact
+      base `first_display` row and twelve optional `*_initial` slices from spec
+      §5.2.1 in their fixed order, inclusion predicates, allowed imports, inputs,
+      outputs, and parser-time obligation names. Given frozen configuration and the
+      complete initial projection, select the agent only when every result is no-bid,
+      GPT-mediated ADM, or GPT-mediated APS/PUC (including attributable empty-GAM
+      fallback). PBS Cache, direct/programmatic `/auction`, an unknown source, an
+      unrepresentable obligation, or no projected batch must select direct persistent
+      boot. Publisher data cannot override the decision.
+
+  ```bash
+  npm --prefix crates/trusted-server-js/lib test -- --run \
+    test/kernel/release_catalog.test.ts \
+    test/build/release-v1.test.mjs
+  cargo test-fastly first_display_selection
+  ```
+
+  Expected: FAIL because no first-display catalog or closed eligibility decision
+  exists.
+
+- [ ] **Step E2: Implement and test exact immutable contracts.** Define and reject
+      unknown/accessor/inherited/missing fields for `TakeoverOutlineV1`,
+      `FirstDisplayHandoffV1`, slice registrations, terminal tombstones, slot/cycle/
+      trace high-water state, and the release-private capsule handle. Enforce 256
+      slots/outcomes, the existing per-field string/collection bounds, 8 MiB canonical
+      non-diagnostics data, a separately normalized 512 KiB GPT-fact subsection, and
+      8.5 MiB total. Handoff data contains no function, Promise, custom prototype,
+      listener, timer, observer, `MessagePort`, `WindowProxy`, network handle,
+      mutable collection, descriptor/ADM/creative payload, or live authority.
+
+  Add mutation tests at minus-one/exact/plus-one for every count and byte boundary.
+  Counters are unsigned, nonwrapping, and strictly above every value ever minted,
+  including pruned entries; never infer a high-water mark from visible rows.
+
+- [ ] **Step E3: Implement the release-private slice transaction.** Accept exactly
+      one expected parser-inserted artifact and `document.currentScript`, exact
+      release/generation/order, and one registration per selected slice. Preparation
+      may validate and allocate inert closure data only. Activation is one
+      non-yielding transaction, registers each disposer before mutation, and rolls
+      back synchronously in reverse order. Reject unknown, duplicate, omitted,
+      misordered, late, wrong-release, or accessor-backed registrations before
+      effects. The sink is closure-private and exposes no public service locator,
+      `TsjsApi`, broker, or extension point.
+
+- [ ] **Step E4: Build the dormant agent artifact and architecture gate.** Generate
+      exactly one server-composed artifact for each permitted slice mask; precompute
+      selection-to-URL and hash-to-selection at registry construction. The build
+      rejects imports from persistent core, capability broker, generic slot/auction/
+      trace registries, later GPT/Prebid code, deferred entries, test/fake/no-op code,
+      and `*ForTest` exports. Persistent artifacts reject imports from
+      `first_display/**`. A hit assembles response bytes at most once; a miss performs
+      no concatenation or hashing. Do not emit the agent from production HTML yet.
+
+- [ ] **Step E5: Run, commit, and keep the artifact dormant.**
+
+  ```bash
+  npm --prefix crates/trusted-server-js/lib test -- --run \
+    test/first_display/contracts.test.ts \
+    test/first_display/transaction.test.ts \
+    test/kernel/release_catalog.test.ts \
+    test/build/release-v1.test.mjs
+  npm --prefix crates/trusted-server-js/lib run build
+  npm --prefix crates/trusted-server-js/lib run test:architecture
+  npm --prefix crates/trusted-server-js/lib run typecheck
+  cargo test-fastly first_display_selection
+  git diff --check
+  git add \
+    crates/trusted-server-js/lib/src/first_display/contracts.ts \
+    crates/trusted-server-js/lib/src/first_display/transaction.ts \
+    crates/trusted-server-js/lib/test/first_display/contracts.test.ts \
+    crates/trusted-server-js/lib/test/first_display/transaction.test.ts \
+    crates/trusted-server-js/lib/src/kernel/release_catalog.ts \
+    crates/trusted-server-js/lib/test/kernel/release_catalog.test.ts \
+    crates/trusted-server-js/lib/build-all.mjs \
+    crates/trusted-server-js/lib/test/build/release-v1.test.mjs \
+    crates/trusted-server-core/src/tsjs.rs \
+    crates/trusted-server-core/src/publisher.rs
+  git diff --cached --check
+  git commit -m "Define the lean first-display artifact"
+  ```
+
+#### Task 18F: Implement the bounded first-display agent and initial slices
+
+**Task 18F files:**
+
+- Create: `crates/trusted-server-js/lib/src/first_display/agent.ts`
+- Create: `crates/trusted-server-js/lib/src/first_display/composition.ts`
+- Create: `crates/trusted-server-js/lib/src/first_display/slices/aps.ts`
+- Create: `crates/trusted-server-js/lib/src/first_display/slices/creative.ts`
+- Create: `crates/trusted-server-js/lib/src/first_display/slices/datadome.ts`
+- Create: `crates/trusted-server-js/lib/src/first_display/slices/didomi.ts`
+- Create: `crates/trusted-server-js/lib/src/first_display/slices/google_tag_manager.ts`
+- Create: `crates/trusted-server-js/lib/src/first_display/slices/gpt.ts`
+- Create: `crates/trusted-server-js/lib/src/first_display/slices/lockr.ts`
+- Create: `crates/trusted-server-js/lib/src/first_display/slices/osano.ts`
+- Create: `crates/trusted-server-js/lib/src/first_display/slices/permutive.ts`
+- Create: `crates/trusted-server-js/lib/src/first_display/slices/prebid.ts`
+- Create: `crates/trusted-server-js/lib/src/first_display/slices/sourcepoint.ts`
+- Create: `crates/trusted-server-js/lib/src/first_display/slices/testlight.ts`
+- Create: `crates/trusted-server-js/lib/test/first_display/agent.test.ts`
+- Create: `crates/trusted-server-js/lib/test/first_display/slices.test.ts`
+- Modify: `crates/trusted-server-js/lib/src/core/bootstrap_controller.ts`
+- Modify: `crates/trusted-server-js/lib/test/core/bootstrap_controller.test.ts`
+- Modify: `crates/trusted-server-js/lib/build-all.mjs`
+- Modify: `crates/trusted-server-js/lib/test/build/release-v1.test.mjs`
+
+- [ ] **Step F1: Write the failing immutable-batch lifecycle tests.** The agent may
+      validate the manifest/projection, install only provisional GPT/message/guard
+      interception, define/target/request/settle the exact projected GPT batch,
+      execute APS/ADM §4 protocols and attributable empty-GAM fallback, and emit the
+      agent-owned first-action, terminal, and paint timing facts so the combined
+      controller-plus-agent flow emits all four named marks; the controller alone
+      owns the preceding `tsjs:bids-script` mark. It cannot publish `TsjsApi`, accept
+      programmatic units or direct auctions, process SPA/page-bids/later refresh, load
+      persistent or deferred code, present diagnostics, or invoke publisher queue
+      callbacks. Exercise no-bid, APS, ADM, mixed SRA, disabled-initial-load,
+      empty-GAM fallback, invalid projection, and every failure/timeout/replay edge.
+
+- [ ] **Step F2: Implement one bounded provisional lifetime.** Start the bootstrap's
+      ten-second deadline before agent registration. Registration, activation, and
+      the initial responsible action starting must all complete before that same
+      deadline; an activated agent that has not started the action falls back. Every
+      timer, listener, wrapper, observer, readiness waiter, port, node, provisional
+      GPT object, attempt, reservation, ticket, and tombstone has one named exact-once
+      disposer and the §2.3 capacity/expiry rules. The controller records
+      `tsjs:bids-script`; the agent records `tsjs:first-display` immediately before
+      the first responsible GPT action, terminal at the producing latch, and paint
+      only after the complete immutable batch settles plus the two-frame/hidden
+      allowance. An empty batch emits no fabricated first-action mark.
+
+- [ ] **Step F3: Implement and test every exact initial slice obligation.** Share only
+      effect-free leaf contracts small enough for the agent budget; do not import a
+      persistent implementation to force parity. Use corpus tests to prove parity for
+      APS reservation/PUC/document channels; GPT adapter/listeners/targeting/handoff
+      capture; Prebid artifact/queue/bidder/user-ID/EID/TS-bid admission; creative
+      parser-time guards; and the DataDome, Didomi, GTM, Lockr, Osano, Permutive,
+      Sourcepoint, and Testlight initial obligations. Later refresh, navigation,
+      diagnostics presentation, retry/focus/visibility maintenance, direct auction,
+      and public API code are forbidden from every slice.
+
+- [ ] **Step F4: Seal TS admission at protected paint.** After paint, reject every new
+      TS bidder invocation before authority minting, complete it exactly once with no
+      bid and `prebid_admission_failed`, and admit no TS attempt, lease, reservation,
+      ticket, port, request callback, refresh, navigation, or direct auction. Native
+      publisher GPT/Prebid and non-TS bidder traffic remain pass-through and may only
+      update bounded handoff observations. Any live TS authority at seal is
+      `bundle_partial`; unexpired terminal tombstones are transferable suppression
+      state, not live authority.
+
+- [ ] **Step F5: Prove bootstrap queue and load order.** Publisher callbacks remain in
+      the one bootstrap-owned actual Array. On agent pages, no persistent/deferred
+      request, preload, preparation, or evaluation occurs before protected paint. On
+      ineligible or empty pages, bootstrap loads persistent core directly and the
+      ordinary 10-second attempt-creation guard remains authoritative. Parser-time
+      integration obligations activate in the direct persistent transaction when no
+      agent is selected.
+
+- [ ] **Step F6: Run and commit the dormant agent behavior.**
+
+  ```bash
+  npm --prefix crates/trusted-server-js/lib test -- --run \
+    test/first_display/agent.test.ts \
+    test/first_display/slices.test.ts \
+    test/core/bootstrap_controller.test.ts
+  npm --prefix crates/trusted-server-js/lib run build
+  npm --prefix crates/trusted-server-js/lib run test:architecture
+  npm --prefix crates/trusted-server-js/lib run typecheck
+  git diff --check
+  git add crates/trusted-server-js/lib/src/first_display
+  git add crates/trusted-server-js/lib/test/first_display
+  git add \
+    crates/trusted-server-js/lib/src/core/bootstrap_controller.ts \
+    crates/trusted-server-js/lib/test/core/bootstrap_controller.test.ts \
+    crates/trusted-server-js/lib/build-all.mjs \
+    crates/trusted-server-js/lib/test/build/release-v1.test.mjs
+  git diff --cached --check
+  git commit -m "Implement the bounded first-display agent"
+  ```
+
+#### Task 18G: Implement atomic post-paint takeover or terminal fallback
+
+**Task 18G files:**
+
+- Create: `crates/trusted-server-js/lib/src/first_display/handoff.ts`
+- Create: `crates/trusted-server-js/lib/test/first_display/handoff.test.ts`
+- Create: `crates/trusted-server-js/lib/test/first_display/takeover.test.ts`
+- Modify: `crates/trusted-server-js/lib/src/first_display/agent.ts`
+- Modify: `crates/trusted-server-js/lib/src/core/bootstrap_controller.ts`
+- Modify: `crates/trusted-server-js/lib/src/core/index.ts`
+- Modify: `crates/trusted-server-js/lib/src/kernel/runtime.ts`
+- Modify: `crates/trusted-server-js/lib/src/kernel/sessions.ts`
+- Modify: `crates/trusted-server-js/lib/src/services/slots.ts`
+- Modify: `crates/trusted-server-js/lib/src/services/reservations.ts`
+- Modify: `crates/trusted-server-js/lib/src/services/render.ts`
+- Modify: `crates/trusted-server-js/lib/src/core/trace.ts`
+- Modify: `crates/trusted-server-js/lib/src/integrations/gpt/module.ts`
+- Modify: `crates/trusted-server-js/lib/src/integrations/prebid/module.ts`
+- Modify: `crates/trusted-server-js/lib/test/composition/browser.test.ts`
+- Modify: `crates/trusted-server-js/lib/build-all.mjs`
+
+- [ ] **Step G1: Write failing static-preparation and final-snapshot tests.** Runtime
+      download begins only after agent terminal/paint/seal. Static preparation accepts
+      immutable boot plus exact `TakeoverOutlineV1`, constructs generic inert owners,
+      validates capacity, and reads no live agent object or time-sensitive expiry.
+      While bytes download/prepare, increment one u32 `mutationRevision` after every
+      admitted native publisher GPT/Prebid call, GPT event, DOM rebind/mutation,
+      targeting/ownership change, guard observation, consent/segment update, and
+      terminal/tombstone change. Exhaustion fails instead of wrapping.
+
+- [ ] **Step G2: Implement the final handoff and one-use capsule.** In one JavaScript
+      task close agent ingress, record the final revision, drain current synchronous
+      mutation, recursively freeze the exact data handoff, and mint the release/
+      generation-bound capsule carrying only exact committed GPT slot/DOM artifact
+      identities. The capsule is closure-private, consumable once, cleared on every
+      outcome, and never stored in API, `_internal`, boot, diagnostics, logs, or
+      evidence. Add wrong generation/release, duplicate consume, overflow,
+      nonterminal authority, stale mutation, and hostile-shape tests.
+
+- [ ] **Step G3: Implement the five-step non-yielding takeover.** Revalidate outline,
+      terminal batch, paint, authenticated script, generation, and revision; quiesce
+      agent handlers and compare-restore wrappers; detach accepted artifacts; dispose
+      all remaining agent effects in reverse order; activate fresh persistent owners
+      in catalog order while adopting exact objects/facts/high-water values; revalidate
+      the generation and exact `mutationRevision` again immediately before commit;
+      then commit `TsjsApi`, close both private sinks, transfer artifact ownership,
+      run `afterCommit`, and drain the one queue. A revision change during quiesce,
+      disposal, or activation rolls back partial persistent effects and commits the
+      terminal shell without resurrecting the agent. `adoptInitialDisplay:true`
+      forbids reparsing the projection as new work, redefining the slot, reinstalling
+      targeting, issuing GPT action, inserting an iframe, or repeating any mark.
+
+- [ ] **Step G4: Test success and every failure boundary.** At each task boundary
+      exactly one of agent, persistent runtime, or fallback owns ingress/effects. A
+      pre-final-snapshot load/preparation failure leaves the agent only until the
+      bounded persistent deadline, then commits fallback. Failure after quiesce rolls
+      back partial persistent effects, never resurrects the agent, preserves accepted
+      DOM inertly, and commits the terminal shell with exact reason and
+      `initialDisplayCommitted`. Queued callbacks drain once against persistent or
+      fallback; there is no replay, retry, second request, degraded runtime, pending
+      Promise, or accepted-ad removal.
+
+  Browser tests must prove after synchronous commit that no agent listener, timer,
+  observer, port, wrapper, iframe/request authority, registry, disposer, capsule, or
+  strong reference survives; publisher replacements may prevent literal restoration
+  but cannot preserve TS authority. Race native publisher calls and DOM/GPT events
+  immediately before snapshot and immediately after commit to prove final-revision
+  capture and new-epoch handling.
+
+- [ ] **Step G5: Prove direct-to-runtime and deferred behavior remain exact.** An
+      ineligible/no-batch page performs the ordinary persistent bootstrap with no
+      provisional agent. On an agent page, ordinary deferred transactions remain
+      later than persistent commit and start independently after the common gate. A
+      takeover/deferred failure creates no second runtime or head-of-line blocking.
+
+- [ ] **Step G6: Run and commit the prospective takeover without switching production
+      HTML.**
+
+  ```bash
+  npm --prefix crates/trusted-server-js/lib test -- --run \
+    test/first_display/handoff.test.ts \
+    test/first_display/takeover.test.ts \
+    test/first_display/agent.test.ts \
+    test/kernel/runtime.test.ts \
+    test/composition/browser.test.ts
+  npm --prefix crates/trusted-server-js/lib run build
+  npm --prefix crates/trusted-server-js/lib run test:architecture
+  npm --prefix crates/trusted-server-js/lib run typecheck
+  git diff --check
+  git add \
+    crates/trusted-server-js/lib/src/first_display/handoff.ts \
+    crates/trusted-server-js/lib/test/first_display/handoff.test.ts \
+    crates/trusted-server-js/lib/test/first_display/takeover.test.ts \
+    crates/trusted-server-js/lib/src/first_display/agent.ts \
+    crates/trusted-server-js/lib/src/core/bootstrap_controller.ts \
+    crates/trusted-server-js/lib/src/core/index.ts \
+    crates/trusted-server-js/lib/src/kernel/runtime.ts \
+    crates/trusted-server-js/lib/src/kernel/sessions.ts \
+    crates/trusted-server-js/lib/src/services/slots.ts \
+    crates/trusted-server-js/lib/src/services/reservations.ts \
+    crates/trusted-server-js/lib/src/services/render.ts \
+    crates/trusted-server-js/lib/src/core/trace.ts \
+    crates/trusted-server-js/lib/src/integrations/gpt/module.ts \
+    crates/trusted-server-js/lib/src/integrations/prebid/module.ts \
+    crates/trusted-server-js/lib/test/composition/browser.test.ts \
+    crates/trusted-server-js/lib/build-all.mjs
+  git diff --cached --check
+  git commit -m "Adopt first-display ownership after paint"
+  ```
+
+#### Task 18H: Refresh current main and install the blocking performance gates
+
+This is the second current-main checkpoint and a measurement-instrument task, not
+production wiring. It integrates only `origin/main`, reruns the proof ledger, and
+creates gates whose relative side is rebuilt from fresh main in the same job. The
+three checked-in historical candidate captures remain immutable diagnostics and
+never define a ceiling.
+
+**Task 18H files:**
+
+- Modify as required: files conflicted by integrating `origin/main`
+- Modify: `crates/trusted-server-js/lib/test/fixtures/contracts/current-main-concept-audit.json`
+- Modify: `crates/trusted-server-js/lib/scripts/check-retired-concept-audit.mjs`
+- Modify: `crates/trusted-server-js/lib/test/contract/retired-concept-audit.test.mjs`
+- Read only: `crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json`
 - Modify: `crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs`
-- Create: `crates/trusted-server-js/lib/scripts/bundle-metrics.mjs`
+- Modify: `crates/trusted-server-js/lib/scripts/bundle-metrics.mjs`
 - Modify: `crates/trusted-server-js/lib/test/build/release-v1.test.mjs`
 - Modify: `crates/trusted-server-integration-tests/browser/tests/shared/tsjs-performance.spec.ts`
-- Create: `scripts/validate-tsjs-performance-evidence.mjs`
-- Create: `.github/workflows/tsjs-performance-gate.yml`
+- Modify: `scripts/validate-tsjs-performance-evidence.mjs`
+- Modify: `.github/workflows/tsjs-performance-gate.yml`
 - Modify: `.github/workflows/test.yml`
 - Modify: `.github/workflows/integration-tests.yml`
 
-- [ ] **Step E1: Prove Task 18D is committed, pushed, and clean before integrating.**
+- [ ] **Step H1: Prove Task 18G is clean and pushed, then integrate fresh main.**
+      Fetch only the feature ref and `main`. Resolve every conflict deliberately,
+      retain current-main security/build/test fixes, and preserve the reviewed
+      hard-cutover contracts. If `main` is already contained, verify that fact
+      without manufacturing a commit.
 
   ```bash
   test -z "$(git status --porcelain)"
-  TASK18D_SHA="$(git rev-parse HEAD)"
-  git fetch origin "$(git branch --show-current)" main rc/july
-  test "$TASK18D_SHA" = "$(git rev-parse "origin/$(git branch --show-current)")"
-  ```
-
-- [ ] **Step E2: Merge current `origin/main` and resolve every conflict
-      deliberately.** For each conflict, compare the merge base, upstream side, and
-      Task 18D side. Retain upstream security/build/test fixes while preserving one
-      runtime, the 14-critical/6-deferred catalog, live APS proxying, external GPT/
-      Prebid bytes, and the hard-cutover contract. `git merge` may report conflicts;
-      resolve them before running any test, stage each resolved path explicitly, and
-      assert there is no unresolved, unstaged, or untracked residue. If `main` is
-      already contained, verify the no-op instead of manufacturing an empty commit.
-      Then run the focused suites for every conflicted subsystem plus the full JS
-      gate before completing the merge:
-
-  ```bash
-  MAIN_SHA="$(git rev-parse origin/main)"
+  TASK18G_REF="$(git branch --show-current)"
+  TASK18G_SHA="$(git rev-parse HEAD)"
+  git fetch origin "$TASK18G_REF" main
+  test "$TASK18G_SHA" = "$(git rev-parse "origin/$TASK18G_REF")"
+  PRESWITCH_MAIN_SHA="$(git rev-parse origin/main)"
   git merge --no-ff --no-commit origin/main
-  # If Git reports conflicts: inspect all three stages, edit deliberately, and
-  # git add each exact resolved path before continuing.
-  test -z "$(git ls-files -u)"
-  git diff --quiet
-  test -z "$(git ls-files --others --exclude-standard)"
-  git diff --check
-  git diff --cached --check
-  npm --prefix crates/trusted-server-js/lib test
-  npm --prefix crates/trusted-server-js/lib run build
-  npm --prefix crates/trusted-server-js/lib run test:release
-  npm --prefix crates/trusted-server-js/lib run test:architecture
-  npm --prefix crates/trusted-server-js/lib run lint
-  npm --prefix crates/trusted-server-js/lib run typecheck
-  cargo test-fastly
-  cargo test-axum
-  cargo test-cloudflare
-  cargo test-spin
-  test -z "$(git ls-files -u)"
-  git diff --check
-  git diff --cached --check
-  git status --short
-  if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
-    git commit -m "Merge current main into the TSJS cutover"
-  fi
-  git merge-base --is-ancestor "$MAIN_SHA" HEAD
-  ```
-
-- [ ] **Step E3: Merge current `origin/rc/july`, resolve the adoption-source conflicts with
-      the same three-way discipline, and rerun the complete E2 verification.** Also
-      run the adoption ledger because `rc/july` is its source branch. As in E2,
-      resolve and stage before testing and commit only when `MERGE_HEAD` exists. List
-      and run the complete verification explicitly; do not treat “same as E2” as an
-      executable gate. Push only when the worktree is clean:
-
-  ```bash
-  RC_JULY_SHA="$(git rev-parse origin/rc/july)"
-  git merge --no-ff --no-commit origin/rc/july
-  # If Git reports conflicts: inspect all three stages, edit deliberately, and
-  # git add each exact resolved path before continuing.
-  test -z "$(git ls-files -u)"
-  git diff --quiet
-  test -z "$(git ls-files --others --exclude-standard)"
-  git diff --check
-  git diff --cached --check
-  node --test crates/trusted-server-js/lib/test/contract/rc-july-adoption.test.mjs
-  npm --prefix crates/trusted-server-js/lib test
-  npm --prefix crates/trusted-server-js/lib run build
-  npm --prefix crates/trusted-server-js/lib run test:release
-  npm --prefix crates/trusted-server-js/lib run test:architecture
-  npm --prefix crates/trusted-server-js/lib run lint
-  npm --prefix crates/trusted-server-js/lib run typecheck
-  cargo test-fastly
-  cargo test-axum
-  cargo test-cloudflare
-  cargo test-spin
+  # Resolve conflicts, then stage each exact path.
   test -z "$(git ls-files -u)"
   git diff --check
   git diff --cached --check
   if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
-    git commit -m "Merge current rc/july into the TSJS cutover"
+    git commit -m "Integrate current main before the TSJS cutover"
   fi
-  git merge-base --is-ancestor "$RC_JULY_SHA" HEAD
-  test -z "$(git status --porcelain)"
-  git push origin "$(git branch --show-current)"
+  git merge-base --is-ancestor "$PRESWITCH_MAIN_SHA" HEAD
   ```
 
-- [ ] **Step E4: From that exact clean, pushed, post-conflict parent commit, build
-      once and append the role-correct capture to the existing JSON.** Never rewrite
-      any original top-level field. Add `roleCorrectTransfer` containing the capture
-      ref/SHA; exact Node/npm/TypeScript/Vite/esbuild identities (or the immutable
-      package-lock digest that covers Vite/esbuild); gzip/Brotli implementation,
-      version, and parameters; release id; the canonical release inventory with every
-      artifact's exact `id`, `role`, `phase`, `trigger`, `inputs`, `outputs`, `file`,
-      `bytes`, and `hash`; and exact raw/gzip/Brotli values for:
-  - bootstrap: the generated controller/fallback exactly once;
-  - minimal: `[core,render_runtime]`;
-  - reference: `[core,render_runtime,creative,gpt,prebid,datadome]`;
-  - maximal: core plus all twenty catalogued modules, excluding bootstrap.
-
-  Run exactly:
+- [ ] **Step H2: Re-run all 23 concept proofs against the refreshed main SHA.** Use a
+      fresh detached worktree and the Task-0 test-only procedure. Update each row's
+      SHA, current owner paths, exact command, result, and classification. A concept
+      newly supplied by main becomes `main-owned`; an infrastructure failure remains
+      proof-pending and blocks Task 19. The final checker must report 23 final rows,
+      zero coverage gaps, and no production/build/performance command that consumes
+      retired source.
 
   ```bash
-  CAPTURE_REF="$(git branch --show-current)"
-  CAPTURE_SHA="$(git rev-parse HEAD)"
-  git fetch origin "$CAPTURE_REF"
-  test "$CAPTURE_SHA" = "$(git rev-parse "origin/$CAPTURE_REF")"
-  test -z "$(git status --porcelain)"
-  npm --prefix crates/trusted-server-js/lib run build
-  npm --prefix crates/trusted-server-js/lib run test:release
+  npm --prefix crates/trusted-server-js/lib run check:concept-audit
+  jq -e --arg sha "$PRESWITCH_MAIN_SHA" \
+    'length == 23 and all(.[];
+       .mainSha == $sha and
+       (.classification == "main-owned" or
+        .classification == "implementation-gap"))' \
+    crates/trusted-server-js/lib/test/fixtures/contracts/current-main-concept-audit.json
   ```
 
-  Recompute every generated artifact hash from its current bytes and assert the
-  release id, inventory, and metrics agree before copying only those generated values
-  into the new object with `apply_patch`. Do not add a recapture command or mutable
-  update mode to the comparator.
-
-- [ ] **Step E5: Test-drive the permanent comparator.** Pin one canonical digest over
-      every original top-level field except the newly appended
-      `roleCorrectTransfer`; this protects source, environment, sampling, bundles,
-      performance samples/ceilings, and evidence linkage together. Validate every
-      role-correct evidence field and exact semantic membership. At the freeze point,
-      prove the capture's release id, inventory, artifact hashes, and bytes equal the
-      exact clean capture parent. For bootstrap/minimal/reference/maximal and each
-      size kind, enforce `current <= ceil(captured * 1.05)`. Preserve all graph-
-      integrity blockers: no missing/unclassified/multiply counted artifact, omitted
-      maximal module, critical-to-deferred reachability, provider inlining, duplicate
-      adapter/runtime/listener owner, or production test/fake/no-op seam. Add negative
-      mutations for every original subtree and each forbidden edge. Add a fractional
-      boundary fixture proving exactly `ceil(captured * 1.05)` passes and
-      `ceil(captured * 1.05) + 1` fails; this must reject a `floor` implementation.
-      Extract deterministic inventory-set aggregation and raw/gzip/Brotli measurement
-      into pure `scripts/bundle-metrics.mjs`. The build calls that helper; Task 19 may
-      change production entry wiring in `build-all.mjs`, but cannot alter the frozen
-      measurement helper or comparator.
+- [ ] **Step H3: Test-drive immutable historical-evidence validation.** Recompute and
+      validate the recorded digests and provenance of the original `bundles`,
+      `roleCorrectTransfer`, and `reviewRemediationTransfer` subtrees. Print their
+      values and fresh-candidate deltas, but add negative tests proving none can
+      supply a pass/fail ceiling, a comparison SHA, or semantic membership. Do not
+      modify the JSON.
 
   ```bash
-  npm --prefix crates/trusted-server-js/lib test -- --run test/build/release-v1.test.mjs
+  git diff --exit-code -- \
+    crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json
+  npm --prefix crates/trusted-server-js/lib test -- \
+    --run test/build/release-v1.test.mjs
+  ```
+
+- [ ] **Step H4: Test-drive the fresh-main semantic transfer gate.** In the
+      standalone job, fetch `origin/main`, resolve its exact 40-character SHA, and
+      build it in a detached worktree independently from the candidate. Serve each
+      real production page and measure every Trusted Server JavaScript byte delivered
+      or embedded from `tsjs:bids-script` through the first responsible GPT
+      `display`/`refresh` action under the same reference configuration and default
+      creative behavior. Feature-detect the actual main artifact model; never
+      relabel artifacts to create false membership parity. Record raw/gzip/Brotli as
+      `mainReferenceTransfer` and `candidateReferenceTransfer`, and fail unless the
+      candidate is no larger in every encoding.
+
+  Add unit fixtures for legacy-main and release-v1-main shapes, missing/stale main,
+  omitted inline bytes, duplicate counting, mismatched semantic endpoints, and one-
+  byte raw/gzip/Brotli regressions. A local main-less run reports the comparison as
+  unavailable while still enforcing Step H5; CI and release modes fail when the
+  comparison is unavailable or not reproducible.
+
+- [ ] **Step H5: Test-drive independent candidate architecture and size ceilings.**
+      Build the canonical release inventory and calculate exact raw/gzip/Brotli for
+      the inline bootstrap, every permitted first-display mask, the reference
+      persistent runtime after paint, and maximal total with each production role
+      once. Enforce these reviewed constants directly:
+
+  | Semantic set                              | Raw        | Gzip     | Brotli   |
+  | ----------------------------------------- | ---------- | -------- | -------- |
+  | inline bootstrap controller/fallback      | ≤ 48,000   | ≤16,000  | ≤14,000  |
+  | every permitted first-display agent mask  | ≤ 90,000   | ≤30,000  | ≤26,000  |
+  | reference persistent runtime after paint  | ≤524,288   | ≤163,840 | ≤131,072 |
+  | maximal total, every production role once | ≤1,048,576 | ≤327,680 | ≤262,144 |
+
+  Enumerate and hash every permitted mask; the maximizing mask may differ by
+  encoding. Keep the named minimal, reference, APS, and largest summaries. Reject an
+  unclassified/multiply counted artifact, missing production role, test artifact,
+  omitted split module, first-display reachability to persistent/deferred code,
+  takeover reachability to deferred code, provider implementation outside its one
+  physical owner, overlapping agent/runtime side-effect ownership, or production
+  fake/no-op/`*ForTest` reachability. Freeze the twenty largest rendered-source
+  contributions and every repeated attribution for review.
+
+  ```bash
   npm --prefix crates/trusted-server-js/lib run build
   npm --prefix crates/trusted-server-js/lib run check:bundle
   npm --prefix crates/trusted-server-js/lib run test:release
   npm --prefix crates/trusted-server-js/lib run test:architecture
-  npm --prefix crates/trusted-server-js/lib run lint
-  npm --prefix crates/trusted-server-js/lib run typecheck
-  git diff --check
   ```
 
-- [ ] **Step E6: Commit only the frozen capture/comparator checkpoint, push it, and
-      re-run `check:bundle` from a clean tree.** The capture's source SHA intentionally
-      names this commit's clean parent; its release id and artifact hashes must match
-      the files measured at that parent. Any future recapture or membership/formula
-      change requires a separate reviewed design.
+- [ ] **Step H6: Test-drive the fresh-main browser timing, heap, and load-order
+      instrument.** Use Chromium 145.0.7632.6 on
+      `github-hosted:ubuntu-24.04`, fixture `tsjs-main-paired-network-v2`, and one
+      checked-in CDP profile: 150 ms latency, 1.6 Mbit/s download, 750 kbit/s upload,
+      zero loss. Serve each variant from its own ephemeral `127.0.0.1` HTTP server;
+      request interception/fulfillment is forbidden. Alternate main/candidate order
+      for five warmups and 50 measured GPT-reference samples in one Chromium process.
+      Measure the common pre-script-to-first-action interval and require candidate
+      p90 ≤ current-main p90 × 1.10.
+
+  Candidate samples must additionally contain the real `tsjs:bids-script`,
+  `tsjs:first-display`, `tsjs:first-display-terminal`, and
+  `tsjs:first-display-paint` marks, with no persistent/deferred request, preload,
+  preparation, or execution before paint. Run every included deferred transaction
+  independently after the gate and prove one stalled module does not block another.
+  Do not accept `window.__tsjsPerf` or any test-created timing substitute.
+
+  In separate fresh contexts, collect forced-GC paired GPT heap checkpoints after
+  boot, first render, refresh, and SPA navigation. Candidate must be ≤ main ×1.10 at
+  each checkpoint and both sides ≤4 MiB. Run the candidate-only fictional APS/PUC
+  case with five warmups/50 samples and enforce the exact §5.12 action/completion/
+  paint limits plus 3 MiB post-paint and 3.75 MiB post-takeover heap ceilings. A GPT
+  pass never masks an APS failure.
+
+- [ ] **Step H7: Make the gates blocking and collect pre-switch evidence.** The
+      standalone workflow retains `workflow_dispatch` and `workflow_call`, runs
+      automatically for relevant pull-request paths, obtains inputs through `env`,
+      and uploads schema-5 evidence with `always()` after validation. The validator
+      checks exact candidate/main SHAs, artifact models, served byte counts, profile,
+      pair order, all distributions, mark/order/correctness results, and every size/
+      timing/heap outcome. There is no fixed reference tag or candidate-derived
+      baseline.
 
   ```bash
+  npm --prefix crates/trusted-server-js/lib run typecheck
+  npm --prefix crates/trusted-server-js/lib run lint
+  npm --prefix crates/trusted-server-js/lib test
+  npm --prefix crates/trusted-server-js/lib run build
+  npm --prefix crates/trusted-server-js/lib run check:bundle
+  git diff --check
   git add \
-    crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json \
+    crates/trusted-server-js/lib/test/fixtures/contracts/current-main-concept-audit.json \
+    crates/trusted-server-js/lib/scripts/check-retired-concept-audit.mjs \
+    crates/trusted-server-js/lib/test/contract/retired-concept-audit.test.mjs \
     crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs \
     crates/trusted-server-js/lib/scripts/bundle-metrics.mjs \
     crates/trusted-server-js/lib/test/build/release-v1.test.mjs \
-    .github/workflows/test.yml
-  git diff --cached --check
-  git commit -m "Freeze role-correct TSJS transfer budgets"
-  git push origin "$(git branch --show-current)"
-  test -z "$(git status --porcelain)"
-  npm --prefix crates/trusted-server-js/lib run build
-  npm --prefix crates/trusted-server-js/lib run check:bundle
-  ```
-
-- [ ] **Step E7: Implement and run the real browser-time, retained-heap, and request-
-      ordering gate before production wiring.** The browser fixture must exercise the
-      generated server controller, real critical artifact, one runtime, and real
-      first-display adapter through test-only prospective routes/composition; it may
-      not switch any production emitter or use `window.__tsjsPerf`. On Chromium
-      145.0.7632.6, `github-hosted:ubuntu-24.04`, and fixture
-      `tsjs-generated-loopback-paired-v2`, use exactly five warmups and 50 samples per
-      variant, require the real `tsjs:bids-script` and `tsjs:first-display` marks,
-      alternate a frozen reference and current variant in one runner process, and
-      enforce current p90 ≤ reference p90 × 1.10 plus p90 ≤100 ms on both variants
-      without selective reruns.
-
-  **Corrected-instrument amendment (2026-08-12).** The earlier E7 run used
-  Playwright request interception and is invalid evidence: `page.route()` /
-  `route.fulfill()` did not measure a real browser-to-server transport. The corrected
-  instrument serves the exact generated controller document and exact built critical
-  and deferred bytes from one in-process `node:http` server bound to an ephemeral
-  `127.0.0.1` port for the Playwright test. Auction POST and page-bids use that same
-  loopback origin; delayed `gpt_later`, request counts, resource timing, mark timing,
-  manual heap lifecycle, and cleanup remain part of the instrument. Its fixture
-  provenance is `tsjs-generated-loopback-paired-v2`; the unchanged generator remains
-  `generated-server-v1`.
-
-  This transport and provenance correction invalidates commit
-  `a7a9bab36c4eee6bc180e9206ca6c6879303d37a` as the frozen E7 instrument, along
-  with its run, evidence tuple, and any instrument tag. The workflow must extract
-  non-empty repository pins with valid quoting and verify Node.js `v24.12.0`, npm
-  `11.6.2`, and Rust `1.95.0` before measurement. The first corrected pinned capture
-  at `62421ee44c62f24534ea8782a46dfa5bfbcea950` (run `31598415675`) measured p90
-  30.5 ms, but the unchanged artifact/instrument measured 40.8 ms in run
-  `31599101515`. That host-load variance invalidates the attempted 33.6 ms absolute
-  ceiling. Use commit `62421ee44c62f24534ea8782a46dfa5bfbcea950` as the immutable
-  detached reference and pair it against current in the same job, alternating order
-  for each warmup/sample. Freeze the 1.10 ratio and 100 ms per-side hard ceiling; do
-  not infer or raise either from a later run. Record and review any capture-derived
-  heap constant change before tagging; after that checkpoint, the corrected
-  instrument bytes, reference SHA, ratio, hard ceiling, and heap thresholds are
-  immutable and the normal pre-switch validation/tag sequence below applies.
-
-  In one separate fresh Chromium context per variant, run the real fixture once. At
-  each heap checkpoint, send `HeapProfiler.collectGarbage` exactly once and
-  immediately read the single `Runtime.getHeapUsage.usedSize`. The obsolete
-  synthetic-fixture absolute ceilings are retired: the corrected fixture first
-  reached this assertion in run `31600763735` and measured 1,620,848 bytes after
-  first render. Enforce current ≤ frozen reference × 1.10 and a 4 MiB hard ceiling
-  for each side at boot, first render, refresh, and SPA navigation. Also assert
-  exactly one critical TSJS request; no deferred request,
-  preload, preparation, or execution before `tsjs:first-display-paint`; independent
-  deferred starts after the gate; and no head-of-line blocking. Performance cannot
-  waive a correctness failure.
-
-  Put the entire measurement job—pinned runner/image, fixture preparation, commands,
-  environment, and named artifact upload—in standalone
-  `.github/workflows/tsjs-performance-gate.yml`, with `workflow_dispatch` and reusable
-  `workflow_call` inputs for evidence id and `preswitch | postswitch` mode. Other
-  workflows may call this file but cannot duplicate or redefine its measurement
-  steps.
-
-  ```bash
-  TS_BROWSER_FRAMEWORKS=nextjs \
-  TS_BROWSER_PROJECTS=chromium \
-  TSJS_PERF_MODE=gate \
-  TSJS_PERF_OUTPUT=crates/trusted-server-integration-tests/browser/test-results/tsjs-performance-preswitch.json \
-    ./scripts/integration-tests-browser.sh \
-      tests/shared/tsjs-performance.spec.ts --project=chromium
-  npm --prefix crates/trusted-server-js/lib run build
-  npm --prefix crates/trusted-server-js/lib run check:bundle
-  ```
-
-  Stage only the performance test and workflow wiring, commit and push, then dispatch
-  the focused integration workflow for that exact pushed SHA with a unique evidence
-  id and wait for its named pre-switch performance job to succeed. Upload the non-
-  baseline result as immutable pre-switch evidence; never overwrite the Task 0
-  fixture or Task 18E capture. Any pre-Task19 change to a production artifact or its
-  build inputs invalidates the role-correct capture and must receive separate design
-  review; E7 changes only the browser gate and workflow wiring.
-
-  ```bash
-  git add \
     crates/trusted-server-integration-tests/browser/tests/shared/tsjs-performance.spec.ts \
     scripts/validate-tsjs-performance-evidence.mjs \
     .github/workflows/tsjs-performance-gate.yml \
     .github/workflows/test.yml \
     .github/workflows/integration-tests.yml
   git diff --cached --check
-  git commit -m "Gate TSJS first-display performance before cutover"
+  git commit -m "Gate the TSJS cutover against current main"
   git push origin "$(git branch --show-current)"
-  test -z "$(git status --porcelain)"
-  PRESWITCH_REF="$(git branch --show-current)"
   PRESWITCH_SHA="$(git rev-parse HEAD)"
-  PRESWITCH_EVIDENCE_ID="aps-tsjs-preswitch-${PRESWITCH_SHA}"
+  PRESWITCH_EVIDENCE_ID="aps-tsjs-preswitch-$PRESWITCH_SHA"
   PRESWITCH_RUN_ID="$(node scripts/dispatch-workflow-run.mjs \
-    tsjs-performance-gate.yml \
-    "$PRESWITCH_REF" \
-    evidence_id="$PRESWITCH_EVIDENCE_ID" \
-    mode=preswitch)"
+    tsjs-performance-gate.yml "$(git branch --show-current)" \
+    evidence_id="$PRESWITCH_EVIDENCE_ID" mode=preswitch)"
   gh run watch "$PRESWITCH_RUN_ID" --exit-status
-  PRESWITCH_EVIDENCE_DIR="$(mktemp -d)"
-  gh run download "$PRESWITCH_RUN_ID" \
-    --name "tsjs-performance-$PRESWITCH_EVIDENCE_ID" \
-    --dir "$PRESWITCH_EVIDENCE_DIR"
-  node scripts/validate-tsjs-performance-evidence.mjs \
-    --file "$PRESWITCH_EVIDENCE_DIR/tsjs-performance-preswitch.json" \
-    --evidence-id "$PRESWITCH_EVIDENCE_ID" \
-    --head-sha "$PRESWITCH_SHA" \
-    --mode preswitch
-  PRESWITCH_TAG="tsjs-performance-instrument-${PRESWITCH_SHA}"
-  test -z "$(git ls-remote --tags origin "refs/tags/$PRESWITCH_TAG")"
-  git tag -a "$PRESWITCH_TAG" "$PRESWITCH_SHA" \
-    -m "Freeze validated TSJS performance instrument"
-  git push origin "refs/tags/$PRESWITCH_TAG"
-  test "$PRESWITCH_SHA" = "$(git rev-parse "$PRESWITCH_TAG^{commit}")"
   ```
 
-  The validator rejects a wrong evidence id/head/reference SHA, environment or
-  fixture drift, anything other than five warmups/50 samples per variant or
-  alternating pair order, missing real marks, relative/hard p90 or heap overflow, a
-  failed correctness/load-order assertion, or an incomplete result. Record the
-  immutable `{sha,tag,evidenceId,runId,artifactName}` tuple in the PR execution
-  evidence, not in either baseline object. The annotated tag is created only after
-  the evidence validates and is never moved, deleted, or force-pushed; its SHA is the
-  sole later byte-identity baseline.
+  Download and validate the named artifact for the exact pushed candidate SHA. Its
+  recorded main SHA must equal the SHA freshly resolved inside that run. The
+  pre-switch artifact is evidence for this checkpoint only; Task 23 performs a new
+  current-main comparison after production wiring.
 
 ### Task 19: Perform the coordinated production wiring switch
 
 **Files:**
 
 - Modify: `crates/trusted-server-js/lib/src/core/index.ts`
-- Modify: `crates/trusted-server-js/lib/src/composition/browser.ts`
+- Delete: `crates/trusted-server-js/lib/src/composition/browser.ts`
 - Modify: `crates/trusted-server-js/lib/src/integrations/gpt/index.ts`
 - Modify: `crates/trusted-server-js/lib/src/integrations/prebid/index.ts`
 - Modify: `crates/trusted-server-js/lib/src/integrations/creative/index.ts`
@@ -3888,7 +4142,7 @@ preserve upstream fixes and the revision-33 runtime/APS contracts file-by-file.
       The atomic switch is allowed to flip wiring only after every behavior suite
       below is already green against the test-only composition and prospective
       routes/artifacts:
-  - render attempt, direct APS, direct ADM, baseline PBS Cache black-box parity, PUC claim/channel, artifact
+  - render attempt, direct APS, direct ADM, current-main PBS Cache black-box parity, PUC claim/channel, artifact
     store, reservations, slots, targeting, projections, auction batching, context,
     navigation sessions, runtime transaction, queue handoff, and integration registry;
   - GPT including RCJ-GPT-04, Prebid including RCJ-PREBID-04 and the rebuilt pure
@@ -3901,40 +4155,37 @@ preserve upstream fixes and the revision-33 runtime/APS contracts file-by-file.
     `gpt.events.v1` delivery;
   - generated release/fallback/absence contracts, architecture/lint/typecheck, all
     Rust projection/config/route tests, adapter parity, and the four actual-adapter
-    runner-proxy corpora; exact critical/deferred hash routes; canonical 20-module
-    catalog; protected paint gate; independent deferred deadlines; canonical absolute
+    runner-proxy corpora; exact first-display mask/hash, runtime hash, and deferred
+    hash routes; canonical 13-slice and 20-module catalogs; protected paint/admission
+    seal; atomic handoff/capsule; independent deferred deadlines; canonical absolute
     URL authentication; and CSP/Trusted Types cases; and
   - old-surface rejection plus new-surface fixture tests, proving the cutover commit
     contains no new behavior implementation or test repair.
 
-  Keep the immutable historical-reporting and role-correct bundle gates wired and
-  green. Task 18D must already have
-  removed old-plus-new production membership; do not rebase the pre-change artifact
-  or defer a failing critical/maximal budget until after the atomic switch.
+  Keep immutable historical reporting and the fresh-main/absolute bundle gates wired
+  and green. Task 18G must already have removed old-plus-new ownership membership;
+  do not rewrite a historical capture or defer a failing transfer/agent/persistent/maximal
+  gate until after the atomic switch.
 
-  Verify the prospective performance-mark tests from Task 16/18D are already green: the
+  Verify the prospective performance-mark tests from Tasks 16/18F/18G are already green: the
   unit-tested server fragment names `tsjs:bids-script`, the adapter names exactly one
   authoritative `tsjs:first-display`, the protected attempt records
   `tsjs:first-display-terminal`, the shared paint gate records
   `tsjs:first-display-paint`, and the historical measure uses the first two exact
   start/action marks. Task 19
   may connect only their already-tested production call sites; it may not add or
-  repair mark behavior. `window.__tsjsPerf` remains baseline-capture scaffolding and
-  cannot satisfy the post-switch gate.
+  repair mark behavior. `window.__tsjsPerf` is test-only historical scaffolding and
+  cannot satisfy any release gate.
 
   ```bash
   test -z "$(git status --porcelain)"
   test "$(gh pr view --json baseRefName --jq .baseRefName)" = "main"
   PRESWITCH_REF="$(git branch --show-current)"
-  git fetch origin \
-    'refs/tags/tsjs-performance-instrument-*:refs/tags/tsjs-performance-instrument-*'
-  PRESWITCH_TAGS="$(git tag --list 'tsjs-performance-instrument-*' \
-    --merged HEAD)"
-  test "$(printf '%s\n' "$PRESWITCH_TAGS" | sed '/^$/d' | wc -l | tr -d ' ')" -eq 1
-  PRESWITCH_TAG="$(printf '%s\n' "$PRESWITCH_TAGS" | sed '/^$/d')"
-  PRESWITCH_SHA="$(git rev-parse "$PRESWITCH_TAG^{commit}")"
-  test "$PRESWITCH_TAG" = "tsjs-performance-instrument-$PRESWITCH_SHA"
-  git merge-base --is-ancestor "$PRESWITCH_SHA" HEAD
+  PRESWITCH_SHA="$(git rev-parse HEAD)"
+  git fetch origin "$PRESWITCH_REF" main
+  test "$PRESWITCH_SHA" = "$(git rev-parse "origin/$PRESWITCH_REF")"
+  CUTOVER_MAIN_SHA="$(git rev-parse origin/main)"
+  git merge-base --is-ancestor "$CUTOVER_MAIN_SHA" HEAD
   PRESWITCH_EVIDENCE_ID="aps-tsjs-preswitch-${PRESWITCH_SHA}"
   PRESWITCH_RUNS="$(gh run list \
     --workflow tsjs-performance-gate.yml \
@@ -3953,11 +4204,16 @@ preserve upstream fixes and the revision-33 runtime/APS contracts file-by-file.
   gh run download "$PRESWITCH_RUN_ID" \
     --name "tsjs-performance-$PRESWITCH_EVIDENCE_ID" \
     --dir "$PRESWITCH_EVIDENCE_DIR"
+  PRESWITCH_EVIDENCE_MAIN_SHA="$(jq -er \
+    .performance.requestToFirstActionMs.main.sha \
+    "$PRESWITCH_EVIDENCE_DIR/tsjs-performance-preswitch.json")"
   node scripts/validate-tsjs-performance-evidence.mjs \
     --file "$PRESWITCH_EVIDENCE_DIR/tsjs-performance-preswitch.json" \
     --evidence-id "$PRESWITCH_EVIDENCE_ID" \
     --head-sha "$PRESWITCH_SHA" \
+    --main-sha "$PRESWITCH_EVIDENCE_MAIN_SHA" \
     --mode preswitch
+  test "$CUTOVER_MAIN_SHA" = "$PRESWITCH_EVIDENCE_MAIN_SHA"
   npm --prefix crates/trusted-server-js/lib run build
   npm --prefix crates/trusted-server-js/lib run check:bundle
   npm --prefix crates/trusted-server-js/lib run test:release
@@ -3998,13 +4254,16 @@ preserve upstream fixes and the revision-33 runtime/APS contracts file-by-file.
     GPT/PUC lifecycle. Cover responsive-prefix ambiguity, stale candidate
     destruction, publisher refresh versus TS display, attributable empty-GAM direct
     fallback, and page-bids alias registration;
-  - preserve rc/july SPA route semantics in that composition: pathname-plus-query
+  - preserve the reviewed SPA route contract in that composition:
+    pathname-plus-query
     identity across push/replace/pop, same-route suppression, stale-response
     inertness, and rollback to the last committed path after a current failure so an
     identical route can retry;
-  - keep production `composition/browser.ts` as the already-tested minimal core graph:
-    controller handoff, one kernel/runtime, immutable boot/projection parsing, queue,
-    logger, catalog registrar, and minimum direct public API only. Each critical or
+  - delete production `composition/browser.ts`; use the already-tested
+    `first_display/composition.ts` for the provisional selected batch and
+    `core/index.ts` for the minimal persistent graph: controller handoff, one
+    kernel/runtime, immutable boot/projection parsing, queue, logger, takeover
+    registrar, and minimum direct public API only. Each takeover or
     deferred provider IIFE owns and registers its already-tested adapter/service
     implementation through that registrar; production core must not import or inline
     those implementations. Only test-only `composition/browser_test.ts` may import
@@ -4012,10 +4271,12 @@ preserve upstream fixes and the revision-33 runtime/APS contracts file-by-file.
     its owned module without retaining a second registry or behavior branch;
   - switch generated release/manifest/config/bootstrap emission and the independently
     built pure Prebid 10.26.0 artifact to those already-tested entry points; emit the
-    inline minimal controller followed by the one parser-blocking critical artifact,
-    no parser-time deferred tags, and the early live external Prebid tag whenever
-    Prebid is enabled; let core independently start catalogued later modules only
-    after the protected paint/idle gate; and
+    inline minimal controller followed by exactly one parser-blocking artifact: the
+    selected first-display agent or, when `firstDisplay` is null, the persistent
+    runtime. Emit no parser-time tag/preload for the other artifact or for deferred
+    modules, and retain the early live external Prebid tag whenever Prebid is enabled.
+    The controller alone loads post-paint runtime; core alone starts catalogued later
+    modules after commit; and
   - register the already-tested versioned APS renderer and live unversioned runner
     proxy in the production registry and pre-router entry points of all four adapters,
     preserving exact response headers and the negative routes before auth, generic
@@ -4092,8 +4353,10 @@ preserve upstream fixes and the revision-33 runtime/APS contracts file-by-file.
 
 ### Phase 4 exit
 
-- GPT, Prebid, APS, and all integration entry points use one kernel/integration-module
-  surface.
+- Eligible initial pages use only the bounded first-display agent until terminal
+  paint, then transfer once into the one persistent kernel; ineligible/no-batch pages
+  enter that kernel directly. GPT, Prebid, APS, and all persistent integration entry
+  points use its one integration-module surface.
 - The old registries, sentinels, expandos, refresh wrappers, and bridge branches are
   unreachable behind production wiring; after the switch deletes `gpt_bootstrap.js`,
   Task 22 physically deletes the remaining legacy surfaces.
@@ -4103,8 +4366,8 @@ preserve upstream fixes and the revision-33 runtime/APS contracts file-by-file.
 
 ### Task 20: Build the hermetic browser race matrix
 
-Task 20 is an umbrella only. Execute 20A bootstrap/phase-loader/CSP, 20B render/PUC,
-and 20C GPT/Prebid/diagnostics/integration behavior as separate
+Task 20 is an umbrella only. Execute 20A bootstrap/agent/takeover/phase-loader/CSP,
+20B render/PUC, and 20C GPT/Prebid/diagnostics/integration behavior as separate
 red-to-green-to-commit checkpoints. Execute 20D as a green re-attestation and CI-
 gating checkpoint for Task 5B's already-complete four-adapter transport corpus.
 Shared helpers may be extended by later checkpoints, but no checkpoint may stage a
@@ -4147,12 +4410,14 @@ later group's spec files or workflow changes.
       first checkpoint that consumes it; do not leave 20B/20C fixture changes dirty
       across the 20A commit.
 
-  Build all synthetic critical-runtime pages from one shared helper that reads the
-  generated release manifest, concatenates exact core plus selected critical
-  artifact bytes with the production separator, hashes those response bytes, emits
-  the exact `BootManifestV1`, serves only that canonical content-addressed URL, and
-  always uses `script#trustedserver-js`. Do not execute anonymous inline/path
-  bundles or hand-maintain abbreviated manifests in browser tests.
+  Build all synthetic pages from one shared helper that reads the generated release
+  manifest. It must support both production shapes: agent base plus selected initial
+  slices at exact `m`/`v`, followed only after terminal paint by controller-loaded
+  core plus takeover artifacts; or direct core plus takeover artifacts when
+  `firstDisplay` is null. Hash exact response bytes with the production separator,
+  emit exact `BootManifestV1`, serve only canonical content-addressed URLs, and always
+  use `script#trustedserver-js` for the selected parser-blocking node. Do not execute
+  anonymous inline/path bundles or hand-maintain abbreviated manifests.
 
 - [ ] **Step 3: Implement every spec §7.2 browser-observable race as grouped tables with exact**
       terminal, DOM, targeting, listener, port, timer, and network assertions:
@@ -4172,9 +4437,11 @@ later group's spec files or workflow changes.
     the current intended navigation can accept. Run the pinned PBS Cache request/
     parse/macro/PUC/collapsed-resize/failure/navigation corpus only as pre/post black-
     box parity, with no new cache path or semantics;
-  - runtime/bootstrap: prepare reject/abort, activation throw at every checkpoint,
+  - runtime/bootstrap: agent slice prepare/activation failure, admission seal,
+    static takeover preparation, final revision snapshot, one-use capsule,
+    prepare reject/abort, persistent activation throw at every checkpoint,
     9,999/10,000/10,001 ms boundaries, duplicate `afterCommit`, catalog-derived
-    13/14/15 critical and 19/20/21 manifest capacity,
+    12/13/14 first-display slice and 13/14/15 takeover plus 19/20/21 manifest capacity,
     late continuation after fallback, publisher work during startup, exact same-task
     rollback, full/fallback `TsjsApi` own surfaces, malformed boot, actual-Array queue
     swap/retained references/native mutators/nested pushes/callback throws, and
@@ -4226,7 +4493,7 @@ later group's spec files or workflow changes.
     actual adapters, including Cloudflare and Spin wasm evidence.
 
   Do not implement these groups as one batch. Allocate runtime/bootstrap and phase
-  loading to 20A; PUC capability/channel ownership, APS/ADM documents, baseline
+  loading to 20A; PUC capability/channel ownership, APS/ADM documents, current-main
   cache parity, and creative sandbox behavior to 20B; navigation/projection/API,
   GPT/targeting, Prebid, diagnostics, and the remaining integrations to 20C; and the
   complete actual-adapter transport/protocol corpus to Task 5B, with only
@@ -4358,7 +4625,7 @@ later group's spec files or workflow changes.
   `TS_REAL_GAM_PAGE_URL`; importing the shared local config is forbidden by a test.
 
 - [ ] **Step 2: Cover SSAT APS-PUC, Trusted Server Prebid APS-PUC, page-bids APS-PUC, direct APS,**
-      direct ADM plus baseline PBS Cache regression, attributable empty fallback, SRA, refresh, SPA navigation, and
+      direct ADM plus current-main PBS Cache regression, attributable empty fallback, SRA, refresh, SPA navigation, and
       collapsed-shell resize. Require the protected page's exact frozen API to report
       `pucRelease: "1.17.2"`; missing, `latest`, or any other value fails before a case
       runs. The browser package and lockfile contain no PUC dependency; this gate
@@ -4520,7 +4787,7 @@ later group's spec files or workflow changes.
   Scope the executable search to shipped source, current guides, tests, scripts,
   and workflows; exclude historical `docs/superpowers` designs/plans because this
   work does not rewrite separate completed specifications. The enumerated file list
-  above is the current baseline hit inventory and must be updated if Task 0 or the
+  above is the current legacy-surface hit inventory and must be updated if Task 0 or the
   Task 22 RED absence run finds another in-scope hit. The performance fixture is one
   such discovered hit: migrate only its legacy API use here; Task 23 still owns its
   measurements and budgets.
@@ -4629,7 +4896,7 @@ later group's spec files or workflow changes.
   git commit -m "Enforce hard-cutover surface absence"
   ```
 
-### Task 23: Add deterministic bundle, browser-time, and retained-heap gates
+### Task 23: Test-drive deterministic bundle, browser-time, and retained-heap gates
 
 **Files:**
 
@@ -4641,153 +4908,161 @@ later group's spec files or workflow changes.
 - Read: `scripts/validate-tsjs-performance-evidence.mjs`
 - Read: `.github/workflows/tsjs-performance-gate.yml`
 
-The E5/E7 bundle-metrics helper, comparator, browser test, evidence validator, and
-standalone workflow are the frozen measurement instrument. Task 23 changes none of
-them. Later general workflow composition may change, but never this standalone job or
-its called instrument paths. Any measurement-logic, membership, ceiling, or sampling
-change invalidates the pre-switch evidence and must return to Task 18E under separate
-design review. Production-only route selection is part of Task 19 and cannot alter
-sampling or comparison logic.
+The Task-18H comparator, browser test, validator, and standalone workflow are the
+reviewed instrument. Task 23 exercises them against production wiring and fresh
+current main. The first post-switch run is the RED proof for the remediation work in
+Task 23A: an honest size, architecture, transport, timing, or heap failure is retained
+as diagnostic evidence and cannot be relabeled as release success. A change to
+measurement endpoints, semantic membership, CDP profile, sampling, or ceilings
+requires design review; no checked-in candidate capture or tag can replace current
+main.
 
-Task 23A is that separately approved review amendment. It preserves this evidence as
-an immutable intermediate checkpoint, then extends the comparator and measurement
-with a reduced capture and candidate-versus-`main` network profile. Nothing in Task
-23 may be cited to skip Task 23A or self-approve the oversized capture.
-
-- [ ] **Step 1: Consume, but do not regenerate, both immutable subtrees captured in
-      Task 0 and Task 18E.** Build the canonical release inventory fresh. Print the
-      original `bundles` values and current deltas as report-only historical evidence;
-      never apply those old-membership numbers as post-split ceilings. For
-      `roleCorrectTransfer`, independently enforce bootstrap, minimal critical,
-      reference critical, and maximal total with
-      `ceil(capturedBytes * 1.05)` for raw/gzip/Brotli. Revalidate the recorded source
-      parent, tool/compression identities, exact semantic membership,
-      historical-evidence digest, and release inventory. Validate every current
-      artifact hash against its current bytes; do not require current post-switch
-      hashes or release id to equal the frozen pre-switch capture. Captured hashes and
-      release id are immutable provenance reproducible by checking out the capture
-      source SHA, while current transfer bytes alone are compared to the frozen
-      ceilings. Reject missing/unclassified/
-      multiply counted output, reference reachability to deferred source, provider
-      inlining, duplicate adapter/runtime/listener ownership, production test/fake/
-      no-op seams, and a maximal inventory that omits any split module. A separate
-      reviewed design is required to alter historical evidence, recapture the
-      role-correct values, change membership, or change the 5% formula.
-
-- [ ] **Step 2: Rerun the exact pre-switch browser-time gate after the production
-      switch.** On Chromium 145.0.7632.6, `github-hosted:ubuntu-24.04`, and fixture
-      `tsjs-main-paired-network-v2`, alternate current `main` and the candidate
-      for five warmups and 50 samples per variant.
-      Require current p90 ≤ reference p90 × 1.10 and p90 ≤100 ms for each side. Do
-      not rerun selectively to turn a failed sample into a pass. The post-switch
-      sample reads the real `tsjs:bids-script`
-      and `tsjs:first-display` performance marks and the
-      `tsjs:boot-to-first-display` measure installed in Task 19; fail if any sample
-      falls back to the pre-change `window.__tsjsPerf` placeholder or lacks either
-      mark. The fixture must use the production-wired server controller, critical
-      artifact, runtime, and first-display adapter path.
-
-- [ ] **Step 3: Rerun the identical Chromium CDP retained-heap protocol after the
-      switch.** After the display samples, open one separate fresh context per
-      variant and execute the real fixture once. At each checkpoint send
-      `HeapProfiler.collectGarbage` exactly once, immediately call
-      `Runtime.getHeapUsage`, and compare that single `usedSize` without averaging,
-      max selection, or rerun. At boot, first render, refresh, and SPA navigation,
-      require current ≤ frozen reference × 1.10 and both variants ≤4 MiB.
-      Firefox/WebKit remain correctness-only.
-
-- [ ] **Step 4: Assert the load-time behavior, not only the numbers.** The reference
-      page makes exactly one critical TSJS request; no deferred request, preload,
-      preparation, or execution occurs before `tsjs:first-display-paint`; all
-      included deferred requests start independently after the gate; and a blocked
-      first deferred module does not delay another. Keep these gates separate from
-      render correctness: performance cannot convert a failed conformance test to a
-      pass.
-
-- [ ] **Step 5: Run the gate from a clean checkout through the same fixture-preparation script**
-      and write a separate measured artifact; never overwrite the Task 0 baseline:
+- [ ] **Step 1: Validate historical evidence as diagnostics only.** Recompute the
+      digests and provenance of `bundles`, `roleCorrectTransfer`, and
+      `reviewRemediationTransfer`; print their current deltas and assert that none is
+      consulted by a pass/fail branch. Build the candidate inventory fresh and run
+      all architecture/source-ownership blockers from Task 18H.
 
   ```bash
-  TS_BROWSER_FRAMEWORKS=nextjs \
-  TS_BROWSER_PROJECTS=chromium \
-  TSJS_PERF_MODE=gate \
-  TSJS_PERF_OUTPUT=crates/trusted-server-integration-tests/browser/test-results/tsjs-performance-current.json \
-    ./scripts/integration-tests-browser.sh \
-      tests/shared/tsjs-performance.spec.ts --project=chromium
-  node crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs
+  npm --prefix crates/trusted-server-js/lib run build
+  npm --prefix crates/trusted-server-js/lib run check:bundle
+  npm --prefix crates/trusted-server-js/lib run test:release
+  npm --prefix crates/trusted-server-js/lib run test:architecture
+  git diff --exit-code -- \
+    crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json
   ```
 
-- [ ] **Step 6: Prove the frozen post-switch instrument and its CI run without a gate-
-      code commit.** Dispatch the exact E7 workflow for the pushed post-switch SHA,
-      wait for success, download the uniquely named artifact, and validate its head
-      SHA, evidence id, environment/fixture, sample/heap counts, values, load ordering,
-      and pass status with the unchanged E7 validator. `git diff --exit-code` over all
-      instrument paths must remain byte-identical to the E7 commit as well as clean in
-      the worktree. Push and verify the exact post-switch SHA before dispatch:
+- [ ] **Step 2: Enforce the final absolute and fresh-main transfer gates.** Require
+      bootstrap ≤48,000/16,000/14,000, every permitted agent mask
+      ≤90,000/30,000/26,000, persistent reference
+      ≤524,288/163,840/131,072, and maximal total
+      ≤1,048,576/327,680/262,144 raw/gzip/Brotli. In the same blocking job, freshly
+      fetch and build `origin/main`, measure the exact semantic pre-action transfer
+      for both real page shapes, and require the candidate reference transfer to be
+      no larger in every encoding. Missing, stale, or unreproducible main evidence is
+      a failure in CI/release mode.
+
+- [ ] **Step 3: Run the production-wired paired timing and heap gate.** On Chromium
+      145.0.7632.6 and `github-hosted:ubuntu-24.04`, alternate five warmups and 50
+      samples per variant under the fixed CDP profile. Require candidate GPT p90 ≤
+      current-main p90 ×1.10. In separate contexts require candidate heap ≤ main
+      ×1.10 at boot, first render, refresh, and SPA navigation, with both sides ≤4
+      MiB. Never rerun or drop only a slow sample.
+
+- [ ] **Step 4: Run the candidate-only APS quantitative gate.** Drive the invariant
+      fictional APS/PUC fixture through its real first action, accepted completion,
+      terminal latch, paint, and persistent takeover. Enforce the §5.12 p90 limits
+      (900 ms action, 1,500 ms action-to-completion, 250 ms completion-to-paint,
+      2,500 ms total-to-paint), every narrower correctness deadline, and the 3 MiB /
+      3.75 MiB heap ceilings. A GPT comparison pass cannot mask this result.
+
+- [ ] **Step 5: Assert ownership and load order after the real switch.** The reference
+      page makes exactly one server-composed first-display request; no persistent or
+      deferred request, preload, preparation, or execution precedes
+      `tsjs:first-display-paint`. Every included deferred transaction starts
+      independently afterward. After takeover commit, assert the agent has no live
+      listener, timer, observer, port, iframe authority, wrapper, request authority,
+      or strong reference and cannot produce a second display/refresh/insertion. The
+      four named User Timing marks must be real production marks; reject
+      `window.__tsjsPerf` and test-created substitutes.
+
+- [ ] **Step 6: Produce the complete post-switch RED evidence from a clean pushed
+      SHA.** Upload runs with `always()`. The workflow may conclude failure here only
+      for a fully collected, validator-confirmed budget/architecture result that Task
+      23A is assigned to fix; setup, stale-main, missing-data, or incomplete-evidence
+      errors must be repaired in this task before proceeding.
 
   ```bash
-  git fetch origin \
-    'refs/tags/tsjs-performance-instrument-*:refs/tags/tsjs-performance-instrument-*'
-  PRESWITCH_TAGS="$(git tag --list 'tsjs-performance-instrument-*' \
-    --merged HEAD)"
-  test "$(printf '%s\n' "$PRESWITCH_TAGS" | sed '/^$/d' | wc -l | tr -d ' ')" -eq 1
-  PRESWITCH_TAG="$(printf '%s\n' "$PRESWITCH_TAGS" | sed '/^$/d')"
-  PRESWITCH_SHA="$(git rev-parse "$PRESWITCH_TAG^{commit}")"
-  test "$PRESWITCH_TAG" = "tsjs-performance-instrument-$PRESWITCH_SHA"
-  git merge-base --is-ancestor "$PRESWITCH_SHA" HEAD
-  git diff --exit-code "$PRESWITCH_SHA" -- \
-    crates/trusted-server-js/lib/scripts/bundle-metrics.mjs \
-    crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs \
-    crates/trusted-server-integration-tests/browser/tests/shared/tsjs-performance.spec.ts \
-    scripts/validate-tsjs-performance-evidence.mjs \
-    .github/workflows/tsjs-performance-gate.yml
   test -z "$(git status --porcelain)"
   POSTSWITCH_REF="$(git branch --show-current)"
   POSTSWITCH_SHA="$(git rev-parse HEAD)"
   git push origin "$POSTSWITCH_REF"
-  git fetch origin "$POSTSWITCH_REF"
+  git fetch origin "$POSTSWITCH_REF" main
   test "$POSTSWITCH_SHA" = "$(git rev-parse "origin/$POSTSWITCH_REF")"
-  POSTSWITCH_EVIDENCE_ID="aps-tsjs-postswitch-${POSTSWITCH_SHA}"
-  POSTSWITCH_RELEASE_ID="$(npm --prefix crates/trusted-server-js/lib run --silent print:release-id)"
+  POSTSWITCH_EVIDENCE_ID="aps-tsjs-postswitch-$POSTSWITCH_SHA"
   POSTSWITCH_RUN_ID="$(node scripts/dispatch-workflow-run.mjs \
-    integration-tests.yml \
-    "$POSTSWITCH_REF" \
-    evidence_id="$POSTSWITCH_EVIDENCE_ID" \
-    release_id="$POSTSWITCH_RELEASE_ID" \
-    previous_artifact_id=not-applicable-performance-only)"
-  gh run watch "$POSTSWITCH_RUN_ID" --exit-status
+    tsjs-performance-gate.yml "$POSTSWITCH_REF" \
+    evidence_id="$POSTSWITCH_EVIDENCE_ID" mode=postswitch)"
+  gh run watch "$POSTSWITCH_RUN_ID"
   POSTSWITCH_EVIDENCE_DIR="$(mktemp -d)"
   gh run download "$POSTSWITCH_RUN_ID" \
     --name "tsjs-performance-$POSTSWITCH_EVIDENCE_ID" \
     --dir "$POSTSWITCH_EVIDENCE_DIR"
+  POSTSWITCH_MAIN_SHA="$(jq -er \
+    .performance.requestToFirstActionMs.main.sha \
+    "$POSTSWITCH_EVIDENCE_DIR/tsjs-performance-postswitch.json")"
+  git fetch origin main
+  test "$POSTSWITCH_MAIN_SHA" = "$(git rev-parse origin/main)"
   node scripts/validate-tsjs-performance-evidence.mjs \
     --file "$POSTSWITCH_EVIDENCE_DIR/tsjs-performance-postswitch.json" \
     --evidence-id "$POSTSWITCH_EVIDENCE_ID" \
     --head-sha "$POSTSWITCH_SHA" \
+    --main-sha "$POSTSWITCH_MAIN_SHA" \
     --mode postswitch
   ```
 
-  Dispatch through `integration-tests.yml` while the reusable performance workflow
-  exists only on the PR branch: GitHub resolves `workflow_dispatch` entrypoints from
-  the default branch, but the wrapper can invoke the exact branch-local reusable
-  workflow. The post-switch prefix selects only the performance job; the rollback
-  artifact input is required by the wrapper schema but is not consumed by this
-  non-deployment evidence run.
+  The schema-5 artifact must contain the exact candidate SHA and the main SHA
+  freshly resolved within that run, both artifact models, semantic transfer values,
+  full timing/heap distributions, pair order, load-order/ownership assertions, and
+  all pass/fail outcomes. Record each failing assertion as the RED input to the exact
+  Task-23A step that owns it. A passing RED run does not skip the non-performance
+  remediation items in Task 23A. Expected before Task 23A when a measured blocker is
+  live: the final validator command exits nonzero after preserving complete evidence.
 
 ### Task 23A: Close PR-review blockers before final release evidence
 
 This is an approved remediation checkpoint. It supersedes any conclusion that the
-first `roleCorrectTransfer` capture made the current critical payload acceptable,
+first `roleCorrectTransfer` capture made the current parser-blocking payload acceptable,
 but does not alter its bytes or provenance. Complete every step before Task 24; do
 not create another design, plan, cache specification, or evidence document.
 
 **Files:**
 
-- Modify: finite TSJS transport/catalog implementation and focused Rust tests
-- Modify: Fastly and Cloudflare raw-proxy implementations and focused parity tests
-- Modify: TSJS critical entry/slices, bundle comparator, existing performance JSON,
-  release tests, browser performance fixture, evidence validator, and standalone
-  performance workflow
+- Modify: `crates/trusted-server-core/src/tsjs.rs`
+- Modify: `crates/trusted-server-core/src/publisher.rs`
+- Modify: `crates/trusted-server-js/src/bundle.rs`
+- Modify: `crates/trusted-server-js/lib/build-all.mjs`
+- Modify: `crates/trusted-server-js/lib/src/kernel/release_catalog.ts`
+- Modify: `crates/trusted-server-js/lib/test/build/release-v1.test.mjs`
+- Modify as proven by the RED attribution:
+  `crates/trusted-server-js/lib/src/first_display/agent.ts`,
+  `crates/trusted-server-js/lib/src/first_display/contracts.ts`,
+  `crates/trusted-server-js/lib/src/first_display/transaction.ts`,
+  `crates/trusted-server-js/lib/src/first_display/handoff.ts`, or
+  `crates/trusted-server-js/lib/src/first_display/composition.ts`
+- Modify as proven by the RED attribution:
+  `crates/trusted-server-js/lib/src/first_display/slices/aps.ts`,
+  `crates/trusted-server-js/lib/src/first_display/slices/creative.ts`,
+  `crates/trusted-server-js/lib/src/first_display/slices/datadome.ts`,
+  `crates/trusted-server-js/lib/src/first_display/slices/didomi.ts`,
+  `crates/trusted-server-js/lib/src/first_display/slices/google_tag_manager.ts`,
+  `crates/trusted-server-js/lib/src/first_display/slices/gpt.ts`,
+  `crates/trusted-server-js/lib/src/first_display/slices/lockr.ts`,
+  `crates/trusted-server-js/lib/src/first_display/slices/osano.ts`,
+  `crates/trusted-server-js/lib/src/first_display/slices/permutive.ts`,
+  `crates/trusted-server-js/lib/src/first_display/slices/prebid.ts`,
+  `crates/trusted-server-js/lib/src/first_display/slices/sourcepoint.ts`, or
+  `crates/trusted-server-js/lib/src/first_display/slices/testlight.ts`
+- Modify as proven by the RED attribution:
+  `crates/trusted-server-js/lib/test/first_display/agent.test.ts`,
+  `crates/trusted-server-js/lib/test/first_display/contracts.test.ts`,
+  `crates/trusted-server-js/lib/test/first_display/transaction.test.ts`,
+  `crates/trusted-server-js/lib/test/first_display/handoff.test.ts`,
+  `crates/trusted-server-js/lib/test/first_display/takeover.test.ts`, or
+  `crates/trusted-server-js/lib/test/first_display/slices.test.ts`
+- Modify: `crates/trusted-server-js/lib/src/core/index.ts`
+- Modify: `crates/trusted-server-js/lib/src/integrations/render_runtime/module.ts`
+- Modify: `crates/trusted-server-js/lib/src/integrations/gpt/module.ts`
+- Modify: `crates/trusted-server-js/lib/scripts/bundle-metrics.mjs`
+- Modify: `crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs`
+- Modify: `crates/trusted-server-adapter-fastly/src/platform.rs`
+- Modify: `crates/trusted-server-adapter-cloudflare/src/platform.rs`
+- Modify: `crates/trusted-server-integration-tests/tests/aps_runner_proxy.rs`
+- Modify: `crates/trusted-server-integration-tests/browser/tests/shared/tsjs-performance.spec.ts`
+- Modify: `crates/trusted-server-integration-tests/src/bin/generate-tsjs-prospective-fixture.rs`
+- Modify: `scripts/validate-tsjs-performance-evidence.mjs`
+- Modify: `.github/workflows/tsjs-performance-gate.yml`
+- Read only: `crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json`
 - Modify: `crates/trusted-server-core/src/settings.rs`
 - Modify: `crates/trusted-server-core/src/trace_cookie.rs`
 - Modify: `crates/trusted-server-integration-tests/browser/helpers/gam-test-network.ts`
@@ -4795,25 +5070,54 @@ not create another design, plan, cache specification, or evidence document.
 - Modify: `.github/workflows/aps-real-gam.yml`
 - Modify: `docs/guide/configuration.md`
 - Modify: `docs/guide/integrations/aps.md`
-- Modify: this specification and plan
 
 - [ ] **Step A1: Test-drive finite TSJS transport resolution.** Construct and hash
-      every supported critical selection once during registry construction. Store
-      exact hash-to-selection and selection-to-critical-URL mappings, resolve misses
+      every permitted first-display mask and persistent takeover selection once during
+      registry construction. Store exact hash-to-selection and
+      selection-to-canonical-URL mappings, resolve misses
       without concatenating or hashing module bodies, and reuse the precomputed URL
-      for boot metadata and the critical script tag. A hit may assemble the response
+      for boot metadata and the selected script tag. A hit may assemble the response
       body once. Add focused tests that reject unknown hashes and prove page assembly
       reuses the registered identity. Remove the unconditional APS auction-body clone
       before provider-enabled dispatch.
+
+  ```bash
+  cargo test-fastly tsjs
+  npm --prefix crates/trusted-server-js/lib test -- --run \
+    test/build/release-v1.test.mjs
+  ```
+
+  Expected RED: an unknown mask/hash or repeated page lookup reaches body
+  concatenation/hashing, or the APS provider path clones an unused request body.
+  Expected GREEN: misses allocate no body/hash work and page assembly reuses the
+  precomputed identity.
 
 - [ ] **Step A2: Test-drive raw-proxy timeout parity.** Cloudflare must race initial
       response against `first_byte_timeout`, every body read against
       `blocking_read_timeout`, and the complete operation against
       `total_timeout`, aborting and discarding on every losing branch. Fastly must
-      wait on its pending request rather than sleep-polling while retaining the
-      backend and total deadlines. Run the focused adapter corpus for header stall,
-      inter-chunk stall, total slow drip, redirect, oversize, invalid evidence, and
-      success before the four-runtime runner-proxy suite.
+      wait on its pending request rather than sleep-polling while preserving the full
+      exact five-second dispatch-through-final-byte window; remove any 250 ms safety
+      subtraction or other 4.5-second effective deadline. Make the implementation and
+      tests use the shared 5,000 ms constant rather than duplicate literals. Add a
+      near-deadline success whose final byte arrives after 4.5 seconds but before five
+      seconds and a true total-slow-drip failure after five seconds whose every
+      inter-chunk gap remains below the 250 ms blocking-read timeout, then run that
+      corpus through all four adapters. Also cover header stall, inter-chunk stall,
+      redirect, oversize, invalid evidence, and ordinary success.
+
+  ```bash
+  cargo test-fastly aps_runner_proxy
+  cargo test-cloudflare aps_runner_proxy
+  cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml \
+    --test aps_runner_proxy
+  ./scripts/integration-tests-aps-runner-proxy.sh --runtime fastly
+  ./scripts/integration-tests-aps-runner-proxy.sh --runtime cloudflare
+  ```
+
+  Run the new near-five-second and true-total-drip cases first and observe the Fastly
+  RED failure before changing its wait/read implementation; rerun the complete
+  four-runtime script after GREEN.
 
 - [ ] **Step A3: Make the anonymous route boundary operationally explicit.** Add one
       startup warning when a `[[handlers]]` expression overlaps a reserved APS
@@ -4822,11 +5126,20 @@ not create another design, plan, cache specification, or evidence document.
       limiting, and shielding without adding an in-process auth gate, runner cache,
       successful-response `Cache-Control`, vendor bytes, digest, version, or pin.
 
-- [ ] **Step A4: Reduce the critical runtime before accepting a new budget.** Remove
+  ```bash
+  cargo test-fastly reserved_aps
+  cargo test-axum reserved_aps
+  cargo test-cloudflare reserved_aps
+  cargo test-spin reserved_aps
+  npm --prefix docs run lint
+  ```
+
+- [ ] **Step A4: Reduce parser-blocking work before accepting release evidence.** Remove
       diagnostics presentation, post-paint trace UI, refresh-only behavior,
       SPA/later-navigation behavior, optional integration implementations, duplicated
-      helpers, and test seams from the parser-blocking graph. Keep first-display
-      correctness owners and one runtime. Build from a clean pushed SHA and require:
+      helpers, and test seams from the first-display graph. Keep only the provisional
+      immutable-batch owners there, publish no runtime/broker/API, and keep one
+      persistent runtime after paint. Build from a clean pushed SHA and require:
 
   Co-bundle the mandatory render provider with the sole core runtime so shared
   dependencies are emitted once. Keep `tsjs-render_runtime.js` as a release-stamped
@@ -4835,47 +5148,106 @@ not create another design, plan, cache specification, or evidence document.
   Capture logical-provider sources separately from physical marker ownership and
   fail if any provider source appears outside its one physical owner, regardless of
   the captured general source-owner list. Freeze a report of the twenty largest
-  rendered-source contributions and all repeated source attributions.
-  - minimal critical ≤ 220,000 raw bytes and ≤59,000 gzip bytes;
-  - minimal-critical Brotli < the corresponding `roleCorrectTransfer` value;
-  - reference-critical raw/gzip/Brotli < their `roleCorrectTransfer` values; and
-  - maximal total does not grow.
+  rendered-source contributions and all repeated source attributions. Enforce the
+  reviewed independent limits: bootstrap 48,000/16,000/14,000; every permitted
+  first-display mask 90,000/30,000/26,000; reference persistent runtime
+  524,288/163,840/131,072; and maximal total
+  1,048,576/327,680/262,144 raw/gzip/Brotli. Preserve `roleCorrectTransfer` and
+  `reviewRemediationTransfer` byte-for-byte as report-only diagnostics; neither a
+  5% formula nor a candidate recapture is an acceptance gate.
 
-  The raw/gzip limits are an initial mechanical-deduplication ceiling informed by a
-  214,538-raw / 58,503-gzip prototype before release stamping, not equivalence to the
-  legacy artifact. Preserve `roleCorrectTransfer` as immutable intermediate
-  evidence, append `reviewRemediationTransfer` with its own full provenance, and
-  enforce future 5% ceilings only from the reviewed reduced capture. Keep the
-  original historical values visible as deltas.
+  ```bash
+  npm --prefix crates/trusted-server-js/lib test -- --run \
+    test/first_display \
+    test/build/release-v1.test.mjs \
+    test/composition/browser.test.ts
+  npm --prefix crates/trusted-server-js/lib run build
+  npm --prefix crates/trusted-server-js/lib run check:bundle
+  npm --prefix crates/trusted-server-js/lib run test:architecture
+  ```
+
+  Record the initial RED assertion and its source-attribution evidence before moving
+  code. GREEN requires all four absolute sets, fresh-main semantic transfer, and the
+  no-duplicate-provider/source ownership checks; shrinking one aggregate while
+  retaining duplicate ownership is not green.
 
 - [ ] **Step A5: Add a network-shaped candidate-versus-`main` gate.** Fetch and
       attest the exact current `origin/main` SHA, build `main` and the candidate
-      independently, and serve each actual page shape and critical bytes over HTTP.
+      independently, and serve each actual page shape and pre-action bytes over HTTP.
       Feature-detect main's artifact shape. For legacy main, consume its real built
       `tsjs-core.js`, `tsjs-creative.js`, and `tsjs-gpt.js`, enable the same default
       creative policy, and drive its legacy `adInit` contract instead of relabeling an
       older phase-aware capture as main. For release-v1 main and the candidate,
-      compare the same `[core, render_runtime, creative, gpt]` critical selection and
-      enabled creative policy. Keep the main loader forward-valid: after
+      consume each revision's real server-selected page shape for the same reference
+      configuration and enabled creative policy; do not force candidate membership
+      onto main. Keep the main loader forward-valid: after
       cutover reaches `main`, it must consume that SHA's release-v1 inventory and
       controller rather than failing or treating release-v1 bytes as legacy.
       Apply Chromium CDP `Network.emulateNetworkConditions` before either variant's
       navigation with checked-in 150 ms latency, 1.6 Mbit/s download, 750 kbit/s
       upload, and zero packet loss. In one Chromium process, alternate five warmups
       and 50 samples per side. Measure through a common cross-version first-display
-      action, not a candidate-only mark, so critical transfer, parse, evaluation, and
+      action, not a candidate-only mark, so pre-action transfer, parse, evaluation, and
       work through first GPT display/refresh or direct insertion are included;
       require candidate p90 ≤ `main` p90 × 1.10. Record exact SHAs, artifact models,
-      exact served critical byte counts, profile, pair order, and distributions in
-      schema-5 evidence. Use soft Playwright budget assertions only so every timing
+      exact served pre-action byte counts, profile, pair order, and distributions in
+      schema-5 evidence. In that same run, record `mainReferenceTransfer` and
+      `candidateReferenceTransfer` as the exact raw/gzip/Brotli sum of every Trusted
+      Server JavaScript byte delivered or embedded from bids-script through the
+      first GPT action; require candidate ≤ main in every encoding. Use soft Playwright budget assertions only so every timing
       and heap checkpoint is collected and written before the run fails; validation
       and artifact upload run with `always()` and still fail the job on any exceeded
       budget. The same run retains the candidate's real User Timing and
       deferred-order checks plus the main-paired retained-heap checkpoints. Request
       interception, an environment-selected profile, a fixed historical SHA, or an
       unshaped loopback comparison cannot satisfy this step. Wire the standalone
-      workflow to relevant pull-request paths while preserving its dispatch and
-      reusable-workflow modes.
+      workflow to the exact generator path
+      `crates/trusted-server-integration-tests/src/bin/generate-tsjs-prospective-fixture.rs`,
+      `crates/trusted-server-core/src/auction/**`, `publisher.rs`, `tsjs.rs`,
+      `html_processor.rs`, the TSJS build/runtime tree, browser performance fixture,
+      evidence validator, and workflow itself while preserving dispatch and
+      reusable-workflow modes. Add a workflow contract test that rejects the obsolete
+      underscore-spelled generator path and omission of any named projection input.
+
+  ```bash
+  git fetch origin main
+  TASK23A_HEAD_SHA="$(git rev-parse HEAD)"
+  TASK23A_MAIN_SHA="$(git rev-parse origin/main)"
+  TASK23A_MAIN_ROOT="$(mktemp -d)"
+  rmdir "$TASK23A_MAIN_ROOT"
+  git worktree add --detach "$TASK23A_MAIN_ROOT" "$TASK23A_MAIN_SHA"
+  trap 'git worktree remove --force "$TASK23A_MAIN_ROOT"' EXIT
+  npm --prefix "$TASK23A_MAIN_ROOT/crates/trusted-server-js/lib" ci
+  npm --prefix "$TASK23A_MAIN_ROOT/crates/trusted-server-js/lib" run build
+  TASK23A_EVIDENCE_ID="aps-tsjs-postswitch-$TASK23A_HEAD_SHA"
+  TASK23A_OUTPUT="crates/trusted-server-integration-tests/browser/test-results/tsjs-performance-current.json"
+  export TSJS_EVIDENCE_ID="$TASK23A_EVIDENCE_ID"
+  export GITHUB_SHA="$TASK23A_HEAD_SHA"
+  export TSJS_PERF_MAIN_SHA="$TASK23A_MAIN_SHA"
+  export TSJS_PERF_MAIN_ROOT="$TASK23A_MAIN_ROOT"
+  export TSJS_PERF_OUTPUT="$TASK23A_OUTPUT"
+  export TSJS_PERF_MACHINE_CLASS="github-hosted:ubuntu-24.04"
+  export TSJS_PERF_RUNNER_IMAGE="ubuntu-24.04"
+  export TSJS_PERF_WORKFLOW_NAME="TSJS Performance Gate"
+  export TSJS_PERF_WORKFLOW_FILE=".github/workflows/tsjs-performance-gate.yml"
+  TS_BROWSER_FRAMEWORKS=nextjs \
+  TS_BROWSER_PROJECTS=chromium \
+  TSJS_PERF_MODE=postswitch \
+    ./scripts/integration-tests-browser.sh \
+      tests/shared/tsjs-performance.spec.ts --project=chromium
+  node scripts/validate-tsjs-performance-evidence.mjs \
+    --file "$TASK23A_OUTPUT" \
+    --evidence-id "$TASK23A_EVIDENCE_ID" \
+    --head-sha "$TASK23A_HEAD_SHA" \
+    --main-sha "$TASK23A_MAIN_SHA" \
+    --mode postswitch
+  git worktree remove --force "$TASK23A_MAIN_ROOT"
+  trap - EXIT
+  ```
+
+  Expected RED is the honest measured ratio/transfer/heap/load-order violation, never
+  a fixture or stale-main failure. Make the smallest first-display/persistent graph
+  correction, then rerun the one declared 50-pair sample without selective retries.
 
 - [ ] **Step A6: Close workflow and evidence hygiene.** Pass every workflow-dispatch
       input through `env`; never interpolate it directly into a `run` script. The
@@ -4892,12 +5264,14 @@ not create another design, plan, cache specification, or evidence document.
       quoted `account_id`, quote numeric IDs, remove legacy/unknown APS keys, run
       `ts config validate`, and push canonical config while the old binary accepts
       it; deploy the new binary afterward. Do not add aliases or coercion. Retain
-      DataDome as an adopted `rc/july` TSJS concept without changing its server-side
-      behavior. Do not modify the separate ad-template cache-control proposal.
+      current-main DataDome behavior behind the shared runtime without changing its
+      server-side behavior. Do not modify the separate ad-template cache-control
+      proposal.
 
 - [ ] **Step A8: Verify and freeze the remediation checkpoint.** Run focused tests
-      after every red/green change, then the complete Task 24 matrix. From a clean
-      pushed SHA, run `check:bundle` and the automatic network-shaped
+      after every red/green change, then rerun every Task-23 gate and proceed to the
+      Task-24 matrix only after they pass. From a clean pushed SHA, run `check:bundle`
+      and the automatic network-shaped
       candidate-versus-current-`main` workflow, including candidate real-mark,
       deferred-order, and paired retained-heap assertions. Download and validate each
       named schema-5 artifact before treating Task 24 as release evidence. A failed
@@ -4953,7 +5327,7 @@ not create another design, plan, cache specification, or evidence document.
   npm --prefix crates/trusted-server-js/lib run build:prebid-external
   npm --prefix crates/trusted-server-js/lib run check:aps-contract
   npm --prefix crates/trusted-server-js/lib run check:architecture
-  node --test crates/trusted-server-js/lib/test/contract/rc-july-adoption.test.mjs
+  npm --prefix crates/trusted-server-js/lib run check:concept-audit
   node crates/trusted-server-js/lib/scripts/check-bundle-budgets.mjs
   npm --prefix docs run lint
   npm --prefix docs run build
@@ -5056,8 +5430,10 @@ not create another design, plan, cache specification, or evidence document.
   - no new external observability, persistence, billing, or experiment artifact;
   - no descriptor/capability/account/creative payload is logged;
   - no empty catch or unowned timer/listener/port/iframe in migrated paths;
-  - every one of the 144 pinned `rc/july` files maps through all 38 live rows to the
-    same 23 ledger ids, with no unmapped/dead/gap result;
+  - the embedded 144-path retired checklist maps through all 38 live rows to the same
+    23 ledger ids without Git-object resolution, and every ledger row has a final
+    `main-owned` or demonstrated `implementation-gap` classification for the exact
+    refreshed main SHA;
   - no integration-module preparation performs observable work, no activation yields,
     and no post-fallback callback can revive the kernel;
   - the public surface is `TsjsApi` only; numeric suffixes remain only on serialized
@@ -5105,11 +5481,16 @@ not create another design, plan, cache specification, or evidence document.
 Use the existing deployment mechanism; this plan adds no router or experiment
 infrastructure.
 
-1. Deploy to pre-production and rerun renderer-route, direct, PUC, refresh, SRA, and
+1. Refresh `origin/main` immediately before pre-production. Require the attested
+   release commit to contain that exact SHA and the final concept-audit/performance
+   evidence to name it. If main advanced, return to Task 18H, integrate it, rerun the
+   affected contracts and Task 23/24 evidence, and produce a new release commit. Do
+   not waive the refresh or compare against retired source.
+2. Deploy to pre-production and rerun renderer-route, direct, PUC, refresh, SRA, and
    SPA smoke tests.
-2. Confirm the final artifact contains only the new runtime/API and that server and
+3. Confirm the final artifact contains only the new runtime/API and that server and
    TSJS bundles belong to the same ordinary release.
-3. Hold an exclusive production deployment window from Task 24 evidence capture
+4. Hold an exclusive production deployment window from Task 24 evidence capture
    through cutover. Immediately before deployment, re-query the active Fastly
    version with the same exact command and require it to equal the attested
    `PREVIOUS_FASTLY_VERSION`:
@@ -5129,14 +5510,14 @@ infrastructure.
    Any mismatch blocks deployment and requires fresh evidence for the new prior
    artifact; never roll back to a stale attestation.
 
-4. Perform one binary production cutover. Immediately verify:
+5. Perform one binary production cutover. Immediately verify:
    - existing service availability/error/latency health is normal;
    - APS renderer endpoint smoke passes;
    - direct APS and one GAM/PUC APS smoke pass;
    - no CSP/security console regression;
    - no non-APS cache/ADM, native Prebid, refresh, SRA, or SPA regression.
 
-5. Hold before cutover if evidence is missing. After cutover, roll back the complete
+6. Hold before cutover if evidence is missing. After cutover, roll back the complete
    artifact immediately on a TS code, request, CSP/security, or non-APS regression;
    do not add percentage routing or dual-pool infrastructure. For Fastly, rollback
    reactivates the exact attested prior immutable version:
@@ -5147,16 +5528,16 @@ infrastructure.
      --version "$PREVIOUS_FASTLY_VERSION"
    ```
 
-6. Treat a live-runner incident separately because binary rollback cannot restore
+7. Treat a live-runner incident separately because binary rollback cannot restore
    older APS-owned bytes. If the proxied runner is unavailable, incompatible, or
    produces suspect completion behavior, disable `[integrations.aps]` using the
    existing configuration mechanism. Verify that new APS bids are not admitted and
    both reserved APS routes return local `404 no-store` without publisher fallback.
    Keep APS disabled until the controlled Chromium/Firefox/WebKit real-browser
    conformance gate passes again; do not vendor or pin a runner as containment.
-7. Monitor existing operational signals for 24 hours and rerun the focused
+8. Monitor existing operational signals for 24 hours and rerun the focused
    real-browser smoke suite.
-8. Confirm again that the deployed artifact contains no development selector or
+9. Confirm again that the deployed artifact contains no development selector or
    compatibility path; Task 22 made this a pre-release absence gate.
 
 ## Completion criteria
@@ -5176,7 +5557,7 @@ The plan is complete only when:
 4. APS/ADM server reservations are the sole TS PUC authority, attempt/ticket/nonce issuers are
    bounded as specified, and every live reservation/attempt retains the immutable
    `WinnerContext` from its exact selected winner. Native PBS Cache UUIDs remain
-   separate baseline transport identities and never enter the reservation registry.
+   separate current-main transport identities and never enter the reservation registry.
 5. GPT physical-cycle ownership, exact handoff, two-success DOM reconciliation,
    transactional destroy/redefine, and the owner-and-value targeting journal pass all
    publisher-mutation and same-string generation races without a second physical
@@ -5205,10 +5586,12 @@ The plan is complete only when:
     correctness callback runs publisher diagnostics code, no legacy event or alias
     remains, inactive GPT diagnostics has zero incremental side effects, and creative
     guards auto-install from exact frozen boot data with both-false zero DOM effects.
-11. Every one of the 144 pinned `rc/july` files maps through 38 live mappings to all
-    23 ledger ids, and the complete GPT, Prebid, APS, creative, diagnostics, shared-
-    helper, remaining-integration, and browser parity corpora pass alone and in the
-    maximal manifest.
+11. The embedded 144-path retired checklist maps through 38 live mappings to all 23
+    ledger ids without loading retired source. Every row is finally classified
+    `main-owned` or demonstrated `implementation-gap` against the recorded refreshed
+    main SHA, and the complete GPT, Prebid, APS, creative, diagnostics, shared-helper,
+    remaining-integration, and browser parity corpora pass alone and in the maximal
+    manifest.
 12. Static renderer and live fixed-target runner-proxy status, exact headers,
     bounded/deadline behavior, and fail-closed evidence parsing are proven through
     all four actual adapter transports. The runner remains anonymous, live,
@@ -5221,15 +5604,16 @@ The plan is complete only when:
 14. Non-APS cache/ADM, native Prebid, publisher GPT, SRA, refresh, SPA, creative,
     notification, and every other integration regression suite passes without an
     unrelated feature rewrite.
-15. Format, lint, typecheck, adoption/architecture/absence checks, all adapter tests
+15. Format, lint, typecheck, concept-audit/architecture/absence checks, all adapter tests
     and clippy targets, Vitest, bundle/artifact builds, Playwright, immutable
-    historical/intermediate evidence validation, reduced transfer ceilings, the
-    automatic network-shaped candidate-versus-current-`main` browser-time gate, its
-    candidate real-mark/deferred-order assertions, and paired retained-heap gates
-    pass in attested clean-checkout quality, integration, and real-GAM runs for the
-    exact release SHA and release id. Minimal critical is no more than 220,000
-    raw / 59,000 gzip bytes and reference critical is smaller in every compression
-    metric than the reviewed intermediate capture.
+    historical/intermediate evidence validation as report-only, all four independent
+    candidate size ceilings, the fresh-main semantic transfer comparison, the
+    automatic network-shaped candidate-versus-current-main browser-time gate,
+    candidate APS quantitative gate, real-mark/deferred-order/takeover-absence
+    assertions, and paired retained-heap gates pass in attested clean-checkout
+    quality, integration, and real-GAM runs for the exact release SHA and release id.
+    Candidate reference pre-action transfer is no larger than fresh main in raw,
+    gzip, or Brotli; no candidate-derived historical capture defines acceptance.
 16. The binary cutover and 24-hour monitor complete or the exact prior immutable
     deployable binary is restored cleanly; the active binary retains no N/N-1 TSJS
     routes, runtime selector, percentage router, or dual protocol.
@@ -5238,12 +5622,14 @@ The plan is complete only when:
     mutable upstream runner bytes.
 18. No analytics, persistence, billing, experimentation, deployment-routing, or new
     external observability requirement was introduced.
-19. The canonical 14-critical/20-total catalog emits one content-verified critical
-    request, protects every attempt created within the ten-second startup window
-    through terminal settlement and paint, then starts all included deferred modules
-    independently in the same runtime. Exact absolute URL, nonce, CSP, Trusted Types,
-    stale-hash, isolated failure, and head-of-line tests pass without vendoring GPT,
-    APS runner, PUC, or other upstream bytes.
+19. The canonical 13-slice first-display catalog and 14-takeover/20-total persistent
+    catalog emit exactly one content-verified parser-blocking request, protect the
+    selected initial agent batch or direct-runtime startup batch through terminal
+    settlement and paint, perform one non-overlapping ownership transfer when an agent
+    exists, and then start included deferred modules independently in the same
+    persistent runtime. Exact mask/hash/URL, nonce, CSP, Trusted Types, stale-hash,
+    isolated failure, and head-of-line tests pass without vendoring GPT, APS runner,
+    PUC, or other upstream bytes.
 20. Canonical APS config is validated and pushed before binary deployment, with no
     alias/coercion compatibility path.
 21. Reserved APS route anonymity and `[[handlers]]` bypass are prominent in operator
