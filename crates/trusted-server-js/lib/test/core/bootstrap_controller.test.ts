@@ -4,7 +4,14 @@ import { JSDOM } from 'jsdom';
 import {
   createBootstrapController,
   createFirstDisplayArtifactController,
+  createFirstDisplayTakeoverCoordinator,
 } from '../../src/core/bootstrap_controller';
+import { createFirstDisplayHandoffOwner } from '../../src/first_display/handoff';
+import type { FirstDisplayAgent } from '../../src/first_display/agent';
+import {
+  consumeFirstDisplayTakeoverTransport,
+  installFirstDisplayTakeoverTransport,
+} from '../../src/shared/takeover';
 import type { FirstDisplayComponentRegistrationV1 } from '../../src/first_display/registration';
 import type { FirstDisplaySliceActivationContext } from '../../src/first_display/transaction';
 
@@ -35,6 +42,126 @@ function component(
 }
 
 describe('first-display bootstrap controller', () => {
+  it('moves the private takeover callback between IIFEs exactly once', () => {
+    const target = {};
+    const coordinate = vi.fn();
+    const release = installFirstDisplayTakeoverTransport(target, coordinate);
+    expect(release).toBeTypeOf('function');
+    expect(Object.keys(target)).toEqual([]);
+    expect(consumeFirstDisplayTakeoverTransport(target)).toEqual({
+      status: 'accepted',
+      coordinate,
+    });
+    expect(consumeFirstDisplayTakeoverTransport(target)).toEqual({ status: 'absent' });
+    release?.();
+  });
+
+  it('joins the bound painted agent to one prepared persistent transaction and drops it', () => {
+    const events: string[] = [];
+    const owner = createFirstDisplayHandoffOwner({
+      releaseId: RELEASE_ID,
+      generation: 1,
+      isCurrentGeneration: () => true,
+      isTerminal: () => true,
+      isPainted: () => true,
+      closeIngress: () => events.push('close'),
+      onFailure: () => events.push('owner:failure'),
+    });
+    const finalized = owner.finalize(() => ({
+      candidate: {
+        version: 1,
+        releaseId: RELEASE_ID,
+        generation: 1,
+        projectionDigest: 'b'.repeat(64),
+        slices: ['first_display'],
+        slots: [
+          {
+            id: 'slot-1',
+            aliases: [],
+            domId: 'div-1',
+            gamPath: '/123/slot-1',
+            formats: [[300, 250]],
+            owner: 'trusted_server',
+            outcome: 'failed',
+            targeting: [],
+            committedArtifact: 'none',
+            gptToken: null,
+          },
+        ],
+        attempts: [],
+        tombstones: [],
+        artifacts: [],
+        parserState: [],
+        gptFacts: [],
+        gptFactOverflow: 0,
+        timing: { bidsScriptMs: 1, firstDisplayMs: null, terminalMs: 2, paintMs: 3 },
+        highWater: {
+          navigationAttemptPrefix: 'nav1',
+          nextNavigationAttemptOrdinal: 1,
+          nextAttemptOrdinal: 1,
+          nextSlotRegistrationOrdinal: 2,
+          reservationClockEpochMs: 0,
+          nextReservationOrdinal: 1,
+          nextTicketOrdinal: 1,
+        },
+        cycles: [],
+        trace: {
+          nextSequence: 1,
+          nextGlobalSlotOrdinal: 2,
+          slots: [{ slotId: 'slot-1', impressions: 0, bindings: [] }],
+        },
+        mutationRevision: 0,
+      },
+      identities: [],
+    }));
+    expect(finalized).toBeDefined();
+    const agent = Object.freeze({
+      state: 'painted' as const,
+      finalizeHandoff: () => {
+        events.push('finalize');
+        return finalized;
+      },
+      detachCommittedArtifacts: () => {
+        events.push('detach');
+        return true;
+      },
+      snapshot: () => ({ mutationRevision: 0 }),
+      dispose: () => events.push('dispose'),
+    }) as unknown as FirstDisplayAgent;
+    const coordinator = createFirstDisplayTakeoverCoordinator({
+      outline: {
+        version: 1,
+        releaseId: RELEASE_ID,
+        generation: 1,
+        projectionDigest: 'b'.repeat(64),
+        slices: ['first_display'],
+        slotCount: 1,
+        outcomeCount: 1,
+        capabilities: [],
+        objectKinds: [],
+      },
+      isCurrentGeneration: () => true,
+      authenticateRuntimeScript: () => true,
+      onFailure: () => events.push('fallback'),
+    });
+    expect(coordinator.bindAgent(agent)).toBe(true);
+    coordinator.coordinateTakeover(
+      Object.freeze({
+        activate: (adoption?: unknown) => {
+          expect(adoption).toMatchObject({ adoptInitialDisplay: true });
+          events.push('activate');
+        },
+        commit: () => events.push('commit'),
+        rollback: () => events.push('rollback'),
+      })
+    );
+
+    expect(coordinator.state).toBe('committed');
+    expect(events).toEqual(['close', 'finalize', 'detach', 'dispose', 'activate', 'commit']);
+    coordinator.dispose();
+    expect(events.filter((event) => event === 'dispose')).toHaveLength(1);
+  });
+
   it('owns the bids mark, one deadline, and exact registration/action transitions', () => {
     let now = 0;
     const marks: string[] = [];

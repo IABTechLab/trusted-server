@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  adoptInitialGptSlotsFromHandoff,
   installPbsCacheBridge,
   publishGptWinner,
   publishInitialGptProjection,
@@ -461,9 +462,51 @@ describe('transactional GPT integration module', () => {
     document.getElementById('spa-winner')?.remove();
   });
 
-  it.each([false, true])(
-    'uses only catalog capabilities and conditions diagnostics-only GPT listeners (active=%s)',
-    async (diagnosticsActive) => {
+  it('adopts exact first-display GPT identities without issuing a second GPT action', () => {
+    const physicalSlot = {};
+    const frame = {};
+    const navigationGeneration = {};
+    const adoptGptSlot = vi.fn(() => Object.freeze({ ok: true as const }));
+    const adoption = Object.freeze({
+      version: 1 as const,
+      adoptInitialDisplay: true as const,
+      handoff: Object.freeze({
+        slots: Object.freeze([
+          Object.freeze({
+            id: 'slot-1',
+            owner: 'trusted_server',
+            domId: 'div-1',
+            gamPath: '/123/slot-1',
+            formats: Object.freeze([Object.freeze([300, 250])]),
+          }),
+        ]),
+        cycles: Object.freeze([Object.freeze({ slotId: 'slot-1' })]),
+        artifacts: Object.freeze([Object.freeze({ slotId: 'slot-1' })]),
+      }),
+      identities: Object.freeze([physicalSlot, frame]),
+    });
+
+    expect(adoptInitialGptSlotsFromHandoff(adoption, navigationGeneration, { adoptGptSlot })).toBe(
+      adoption
+    );
+    expect(adoptGptSlot).toHaveBeenCalledExactlyOnceWith(navigationGeneration, 'slot-1', {
+      definition: {
+        adUnitPath: '/123/slot-1',
+        elementId: 'div-1',
+        sizes: [[300, 250]],
+      },
+      ownership: 'trusted_server',
+      slot: physicalSlot,
+    });
+  });
+
+  it.each([
+    { diagnosticsActive: false, adoptInitialDisplay: false },
+    { diagnosticsActive: true, adoptInitialDisplay: false },
+    { diagnosticsActive: false, adoptInitialDisplay: true },
+  ])(
+    'uses only catalog capabilities without replaying adopted display (diagnostics=$diagnosticsActive, adoption=$adoptInitialDisplay)',
+    async ({ diagnosticsActive, adoptInitialDisplay }) => {
       vi.useFakeTimers();
       const NativeMutationObserver = window.MutationObserver;
       const activeMutationObservers = new Set<MutationObserver>();
@@ -658,7 +701,41 @@ describe('transactional GPT integration module', () => {
       expect(registry.register(createRenderRuntimeIntegrationRegistration(RELEASE_ID))).toBe(true);
       expect(registry.register(createProductionGptRegistration(RELEASE_ID))).toBe(true);
 
-      const result = await registry.install(callbacks([]));
+      const installCallbacks: IntegrationInstallCallbacks = {
+        ...callbacks([]),
+        ...(adoptInitialDisplay
+          ? {
+              coordinateTakeover: (
+                prepared: Parameters<
+                  NonNullable<IntegrationInstallCallbacks['coordinateTakeover']>
+                >[0]
+              ) => {
+                prepared.activate(
+                  Object.freeze({
+                    version: 1 as const,
+                    adoptInitialDisplay: true as const,
+                    handoff: Object.freeze({
+                      slots: Object.freeze([
+                        Object.freeze({
+                          id: 'critical-slot',
+                          owner: 'publisher',
+                          domId: 'critical-slot',
+                          gamPath: '/123/critical-slot',
+                          formats: Object.freeze([Object.freeze([300, 250])]),
+                        }),
+                      ]),
+                      cycles: Object.freeze([Object.freeze({ slotId: 'critical-slot' })]),
+                      artifacts: Object.freeze([]),
+                    }),
+                    identities: Object.freeze([publisherSlot]),
+                  })
+                );
+                prepared.commit();
+              },
+            }
+          : {}),
+      };
+      const result = await registry.install(installCallbacks);
       expect(result.state).toBe('kernel');
       const gpt = providerFacades.get('gpt.v1') as {
         activateLaterLifecycle: () => Readonly<{
@@ -673,6 +750,16 @@ describe('transactional GPT integration module', () => {
           request: (input: Readonly<Record<string, unknown>>) => unknown;
         };
       };
+      if (adoptInitialDisplay) {
+        await Promise.resolve();
+        expect(defineSlot).not.toHaveBeenCalled();
+        expect(display).not.toHaveBeenCalled();
+        expect(refresh).not.toHaveBeenCalled();
+        expect(protect).not.toHaveBeenCalled();
+        if (result.state === 'kernel') result.dispose();
+        expect(providerFacades.size).toBe(0);
+        return;
+      }
       await vi.waitFor(() => expect(definedSlots).toHaveLength(1));
       const criticalNavigation = gpt.navigation();
       gpt.slots.request({

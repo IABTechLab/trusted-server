@@ -1,4 +1,5 @@
 import type { BootFailureReason } from '../kernel/fallback';
+import type { PreparedKernelTakeover } from '../kernel/integration_registry';
 
 import {
   createFirstDisplayOwnershipCapsuleV1,
@@ -57,6 +58,13 @@ export interface FirstDisplayTakeoverOptions {
   ) => void;
   readonly commitPersistent: () => void;
   readonly onFailure: (reason: BootFailureReason) => void;
+}
+
+export interface PreparedFirstDisplayTakeoverOptions extends Omit<
+  FirstDisplayTakeoverOptions,
+  'activatePersistent' | 'commitPersistent'
+> {
+  readonly prepared: PreparedKernelTakeover;
 }
 
 /**
@@ -240,4 +248,33 @@ export function performFirstDisplayTakeoverV1(options: FirstDisplayTakeoverOptio
   } catch {
     return fail();
   }
+}
+
+/** Bind the validated old-epoch snapshot to one prepared persistent activation transaction. */
+export function coordinatePreparedFirstDisplayTakeoverV1(
+  options: PreparedFirstDisplayTakeoverOptions
+): boolean {
+  return performFirstDisplayTakeoverV1({
+    finalized: options.finalized,
+    outline: options.outline,
+    isCurrentGeneration: options.isCurrentGeneration,
+    authenticateRuntimeScript: options.authenticateRuntimeScript,
+    currentMutationRevision: options.currentMutationRevision,
+    quiesceAgent: options.quiesceAgent,
+    detachCommittedArtifacts: options.detachCommittedArtifacts,
+    disposeAgent: options.disposeAgent,
+    activatePersistent: (handoff, identities, own) => {
+      own(options.prepared.rollback);
+      options.prepared.activate(
+        Object.freeze({
+          version: 1 as const,
+          adoptInitialDisplay: true as const,
+          handoff,
+          identities,
+        })
+      );
+    },
+    commitPersistent: options.prepared.commit,
+    onFailure: options.onFailure,
+  });
 }

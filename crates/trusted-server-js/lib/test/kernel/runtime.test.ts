@@ -994,6 +994,42 @@ describe('Runtime bootstrap owner', () => {
     expect(order.slice(-2)).toEqual(['module:dispose', 'owner:dispose']);
   });
 
+  it('keeps persistent activation and publication inside the supplied takeover call stack', async () => {
+    const order: string[] = [];
+    const runtime = createRuntime({
+      target: { que: [() => order.push('drain')] },
+      releaseId: RELEASE,
+      manifest: manifest([]),
+      knownIntegrationIds: Object.freeze([]),
+      boot: boot(),
+      prepareOwner: () => order.push('prepare'),
+      activateOwner: () => order.push('activate'),
+      coordinateTakeover: (prepared) => {
+        order.push('takeover:begin');
+        prepared.activate();
+        order.push('takeover:activated');
+        prepared.commit();
+        order.push('takeover:committed');
+      },
+      kernel: {
+        addAdUnits: vi.fn(),
+        diagnostics: Object.freeze({}),
+        requestAds: vi.fn(),
+      },
+    });
+
+    expect(runtime.start()).toBe(true);
+    await expect(runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+    expect(order).toEqual([
+      'prepare',
+      'takeover:begin',
+      'activate',
+      'takeover:activated',
+      'drain',
+      'takeover:committed',
+    ]);
+  });
+
   it('stops activation when owner activation disposes the installing runtime', async () => {
     const activateCore = vi.fn();
     const activateModule = vi.fn();

@@ -111,6 +111,7 @@ export interface FirstDisplayAgentRegistrationHostV1 {
   readonly options: Omit<FirstDisplayAgentOptions, 'driver'> &
     Readonly<{
       gptInput: Omit<FirstDisplayGoogletagBatchInput, 'projection'>;
+      onAgentReady?: (agent: FirstDisplayAgent) => void;
     }>;
   readonly sliceBindings: (id: string) => unknown;
 }
@@ -656,6 +657,7 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
         };
       });
     const cycles = captured.cycles.map((cycle, index) => ({
+      slotId: cycle.slotId,
       token: `gt1_${index + 1}`,
       nextCycleOrdinal: 2,
       unknownPriorCycle: cycle.ownership === 'publisher',
@@ -855,6 +857,7 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
             throw new TypeError('first-display protocol coverage is incomplete');
           }
           if (!agent.start()) throw new TypeError('first-display agent did not start');
+          options.onAgentReady?.(agent);
         });
       },
       sliceHost,

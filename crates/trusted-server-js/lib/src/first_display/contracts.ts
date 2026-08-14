@@ -513,6 +513,7 @@ function snapshotHighWater(value: unknown): Readonly<Record<string, number | str
 
 function snapshotCycle(value: unknown): Readonly<Record<string, unknown>> | undefined {
   const fields = exactRecord(value, [
+    'slotId',
     'token',
     'nextCycleOrdinal',
     'unknownPriorCycle',
@@ -523,6 +524,7 @@ function snapshotCycle(value: unknown): Readonly<Record<string, unknown>> | unde
   const quarantines = uniqueStrings(fields?.quarantines, 10);
   if (
     !fields ||
+    !boundedString(fields.slotId) ||
     !boundedString(fields.token) ||
     !isU32(fields.nextCycleOrdinal, false) ||
     typeof fields.unknownPriorCycle !== 'boolean' ||
@@ -547,6 +549,7 @@ function snapshotCycle(value: unknown): Readonly<Record<string, unknown>> | unde
   }
   if (fields.nextCycleOrdinal <= maximum) return undefined;
   return freezeRecord({
+    slotId: fields.slotId,
     token: fields.token,
     nextCycleOrdinal: fields.nextCycleOrdinal,
     unknownPriorCycle: fields.unknownPriorCycle,
@@ -670,7 +673,8 @@ export function snapshotFirstDisplayHandoffV1(
     if (
       slotIds.size !== slots.length ||
       attempts.some((attempt) => !slotIds.has(attempt.slotId as string)) ||
-      artifacts.some((artifact) => !slotIds.has(artifact.slotId as string))
+      artifacts.some((artifact) => !slotIds.has(artifact.slotId as string)) ||
+      cycles.some((cycle) => !slotIds.has(cycle.slotId as string))
     ) {
       return undefined;
     }

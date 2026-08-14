@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  coordinatePreparedFirstDisplayTakeoverV1,
   createFirstDisplayHandoffOwner,
   performFirstDisplayTakeoverV1,
   type FinalizedFirstDisplayHandoffV1,
@@ -82,6 +83,43 @@ function finalized(identity: object = {}): FinalizedFirstDisplayHandoffV1 {
 }
 
 describe('atomic first-display takeover', () => {
+  it('binds the exact handoff and one-use identities to the prepared persistent barrier', () => {
+    const identity = {};
+    const events: string[] = [];
+    let adoption: unknown;
+    const prepared = Object.freeze({
+      activate: (candidate?: unknown) => {
+        adoption = candidate;
+        events.push('activate');
+      },
+      commit: () => events.push('commit'),
+      rollback: () => events.push('rollback'),
+    });
+
+    expect(
+      coordinatePreparedFirstDisplayTakeoverV1({
+        prepared,
+        finalized: finalized(identity),
+        outline: outline(),
+        isCurrentGeneration: () => true,
+        authenticateRuntimeScript: () => true,
+        currentMutationRevision: () => 0,
+        quiesceAgent: () => events.push('quiesce'),
+        detachCommittedArtifacts: () => events.push('detach'),
+        disposeAgent: () => events.push('dispose'),
+        onFailure: () => events.push('fallback'),
+      })
+    ).toBe(true);
+    expect(adoption).toMatchObject({
+      version: 1,
+      adoptInitialDisplay: true,
+      identities: [identity],
+      handoff: { releaseId: RELEASE_ID, generation: 1 },
+    });
+    expect(Object.isFrozen(adoption)).toBe(true);
+    expect(events).toEqual(['quiesce', 'detach', 'dispose', 'activate', 'commit']);
+  });
+
   it('transfers one-use identities and commits in the exact non-yielding order', () => {
     const events: string[] = [];
     const identity = {};

@@ -7,6 +7,7 @@ import {
   type IntegrationRegistration,
   type IntegrationRegistryOptions,
 } from '../../src/kernel/integration_registry';
+import { snapshotPersistentFirstDisplayAdoptionV1 } from '../../src/shared/takeover';
 
 const RELEASE_ID = 'a'.repeat(64);
 const OTHER_RELEASE_ID = 'b'.repeat(64);
@@ -88,6 +89,95 @@ afterEach(() => {
 });
 
 describe('integration manifest and registration admission', () => {
+  it('offers one synchronous activation/commit barrier after every preparation completes', async () => {
+    const order: string[] = [];
+    const adoption = Object.freeze({
+      version: 1 as const,
+      adoptInitialDisplay: true as const,
+      handoff: Object.freeze({}),
+      identities: Object.freeze([{}]),
+    });
+    expect(snapshotPersistentFirstDisplayAdoptionV1(adoption)).toBe(adoption);
+    const registry = createIntegrationRegistry({
+      manifest: manifest(['gpt']),
+      releaseId: RELEASE_ID,
+      startedAtMs: 0,
+      now: () => 0,
+    });
+    registry.register(
+      registration('gpt', {
+        prepare: () => {
+          order.push('module:prepare');
+          return {
+            activate: ({ adoption: received, afterCommit }) => {
+              expect(received).toBe(adoption);
+              order.push('module:activate');
+              afterCommit(() => order.push('after-commit'));
+            },
+          };
+        },
+      })
+    );
+
+    const result = await registry.install({
+      prepareCore: () => order.push('core:prepare'),
+      activateCore: () => order.push('core:activate'),
+      publish: () => order.push('publish'),
+      drainPreload: () => order.push('drain'),
+      coordinateTakeover: (prepared) => {
+        expect(Object.isFrozen(prepared)).toBe(true);
+        expect(order).toEqual(['core:prepare', 'module:prepare']);
+        prepared.activate(adoption);
+        expect(() => prepared.activate()).toThrow();
+        expect(order).toEqual([
+          'core:prepare',
+          'module:prepare',
+          'core:activate',
+          'module:activate',
+        ]);
+        prepared.commit();
+      },
+    });
+
+    expect(result).toMatchObject({ state: 'kernel' });
+    expect(order).toEqual([
+      'core:prepare',
+      'module:prepare',
+      'core:activate',
+      'module:activate',
+      'publish',
+      'after-commit',
+      'drain',
+    ]);
+  });
+
+  it('fails closed when a takeover coordinator returns without committing', async () => {
+    const activate = vi.fn();
+    const publish = vi.fn();
+    const registry = createIntegrationRegistry({
+      manifest: manifest(['gpt']),
+      releaseId: RELEASE_ID,
+      startedAtMs: 0,
+      now: () => 0,
+    });
+    registry.register(
+      registration('gpt', {
+        prepare: () => ({ activate }),
+      })
+    );
+
+    await expect(
+      registry.install({
+        activateCore: () => undefined,
+        publish,
+        drainPreload: () => undefined,
+        coordinateTakeover: () => undefined,
+      })
+    ).resolves.toEqual({ state: 'fallback', reason: 'bundle_partial' });
+    expect(activate).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
+  });
+
   it('accepts only the exact five-field release-bound registrar ABI', () => {
     const registry = createIntegrationRegistry({
       manifest: manifest(['gpt']),
