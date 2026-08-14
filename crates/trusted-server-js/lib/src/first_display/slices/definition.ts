@@ -10,9 +10,15 @@ export type OptionalFirstDisplaySliceId = Exclude<FirstDisplaySliceId, 'first_di
 export interface FirstDisplaySliceHost {
   readonly activate: (
     id: OptionalFirstDisplaySliceId,
-    own: FirstDisplaySliceActivationContext['own']
+    own: FirstDisplaySliceActivationContext['own'],
+    install?: InitialSliceInstaller
   ) => void;
 }
+
+export type InitialSliceInstaller = (
+  bindings: unknown,
+  own: FirstDisplaySliceActivationContext['own']
+) => void;
 
 export interface PreparedInitialSlice {
   readonly activate: (context: FirstDisplaySliceActivationContext) => void;
@@ -44,14 +50,17 @@ function validHost(host: FirstDisplaySliceHost): boolean {
 }
 
 /** Define one release-owned initial slice without importing a persistent product owner. */
-export function defineInitialSlice(id: OptionalFirstDisplaySliceId): InitialSliceDefinition {
+export function defineInitialSlice(
+  id: OptionalFirstDisplaySliceId,
+  install?: InitialSliceInstaller
+): InitialSliceDefinition {
   return Object.freeze({
     id,
     prepare: (host: FirstDisplaySliceHost): PreparedInitialSlice => {
       if (!validHost(host)) throw new TypeError(`Invalid ${id} host`);
       return Object.freeze({
         activate: (context: FirstDisplaySliceActivationContext): void => {
-          host.activate(id, context.own);
+          host.activate(id, context.own, install);
         },
       });
     },
