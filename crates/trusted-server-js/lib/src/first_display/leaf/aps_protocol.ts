@@ -1,4 +1,8 @@
 import type { FirstDisplaySliceActivationContext } from '../transaction';
+import {
+  createFirstDisplayRenderBridge,
+  type FirstDisplayRenderBridgeOptionsV1,
+} from '../render_bridge';
 
 export type FirstDisplayApsDocumentMessageV1 =
   | Readonly<{ kind: 'document_accepted' }>
@@ -28,6 +32,9 @@ export interface FirstDisplayApsProtocolV1 {
     candidate: unknown,
     expectedNonce: string
   ) => FirstDisplayApsDocumentMessageV1 | undefined;
+  readonly createRenderBridge: (
+    options: Omit<FirstDisplayRenderBridgeOptionsV1, 'getAps'>
+  ) => ReturnType<typeof createFirstDisplayRenderBridge>;
 }
 
 interface ApsInitialBindings {
@@ -156,7 +163,8 @@ export function installApsInitial(
   const value = bindings(candidate);
   if (!value || typeof own !== 'function') throw new TypeError('tsjs');
   const rendererUrl = new URL('/integrations/aps/renderer/v1', value.publisherOrigin).href;
-  const protocol: FirstDisplayApsProtocolV1 = Object.freeze({
+  let protocol: FirstDisplayApsProtocolV1;
+  protocol = Object.freeze({
     version: 1,
     id: 'aps',
     publisherOrigin: value.publisherOrigin,
@@ -172,6 +180,8 @@ export function installApsInitial(
     isLifecycleTicket: (input: unknown): input is string => exactOpaqueId(input, 't1_'),
     isRendererNonce: (input: unknown): input is string => exactOpaqueId(input, 'n1_'),
     parseDocumentMessage,
+    createRenderBridge: (options: Omit<FirstDisplayRenderBridgeOptionsV1, 'getAps'>) =>
+      createFirstDisplayRenderBridge({ ...options, getAps: () => protocol }),
   });
   const release = value.register(protocol);
   if (typeof release !== 'function') throw new TypeError('tsjs');

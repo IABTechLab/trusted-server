@@ -12,6 +12,7 @@ import type {
   FirstDisplayGptBoundCycleV1,
   FirstDisplayGptDiagnosticCycleV1,
 } from './adapters/googletag';
+import { createFirstDisplayAdmRenderBridge } from './adm_render_bridge';
 import { createFirstDisplayProjectedDriver, type FirstDisplayRenderBridgeV1 } from './driver';
 import type { FirstDisplayApsProtocolV1 } from './leaf/aps_protocol';
 import type { FirstDisplayGptProtocolV1 } from './leaf/gpt_protocol';
@@ -32,10 +33,7 @@ import {
   type FirstDisplayBatchOutcomeV1,
   type FirstDisplayBatchV1,
 } from './leaf/projection';
-import {
-  createFirstDisplayRenderBridge,
-  type FirstDisplayRenderBridgeOptionsV1,
-} from './render_bridge';
+import type { FirstDisplayRenderBridgeOptionsV1 } from './render_bridge';
 import {
   createFirstDisplayHandoffOwner,
   type FinalizedFirstDisplayHandoffV1,
@@ -991,23 +989,6 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
           if (agent) agent.dispose();
           else rendererOwner.value?.dispose();
         });
-        const renderer = createFirstDisplayRenderBridge({
-          browser: options.gptInput.browser,
-          clearTimer: options.gptInput.clearTimer,
-          createChannel: () => createBrowserMessageChannel(options.gptInput.browser),
-          document: options.gptInput.document,
-          fillRandom: (bytes) => fillBrowserRandom(options.gptInput.browser, bytes),
-          getAps: () => {
-            const protocol = fullProtocols.get('aps');
-            return fullProtocolIdentity(protocol, 'aps')
-              ? (protocol as FirstDisplayApsProtocolV1)
-              : undefined;
-          },
-          now: () => readBrowserNow(options.gptInput.browser),
-          onNativeMutation: () => agent?.observeNativeMutation() === true,
-          setTimer: options.gptInput.setTimer,
-        });
-        rendererOwner.value = renderer;
         context.afterActivate(() => {
           const batch = snapshotFirstDisplayBatchV1(options.batch);
           if (!batch) throw new TypeError('tsjs');
@@ -1019,6 +1000,23 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
           if (batch.requiredProtocols.includes('aps') && !fullProtocolIdentity(aps, 'aps')) {
             throw new TypeError('tsjs');
           }
+          const renderOptions: Omit<FirstDisplayRenderBridgeOptionsV1, 'getAps'> = {
+            browser: options.gptInput.browser,
+            clearTimer: options.gptInput.clearTimer,
+            createChannel: () => createBrowserMessageChannel(options.gptInput.browser),
+            document: options.gptInput.document,
+            fillRandom: (bytes) => fillBrowserRandom(options.gptInput.browser, bytes),
+            now: () => readBrowserNow(options.gptInput.browser),
+            onNativeMutation: () => agent?.observeNativeMutation() === true,
+            setTimer: options.gptInput.setTimer,
+          };
+          const apsProtocol = fullProtocolIdentity(aps, 'aps')
+            ? (aps as FirstDisplayApsProtocolV1)
+            : undefined;
+          const renderer = apsProtocol
+            ? apsProtocol.createRenderBridge(renderOptions)
+            : createFirstDisplayAdmRenderBridge(renderOptions);
+          rendererOwner.value = renderer;
           const driver = createFirstDisplayProjectedDriver({
             batch,
             ...(gpt ? { gpt: gpt as FirstDisplayGptProtocolV1 } : {}),

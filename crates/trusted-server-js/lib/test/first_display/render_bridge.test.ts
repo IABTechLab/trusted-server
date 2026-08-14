@@ -130,6 +130,9 @@ function harness(kind: 'adm' | 'aps' = 'adm', onNativeMutation?: () => boolean) 
               typeof candidate === 'string' && /^t1_[A-Za-z0-9_-]{22}$/.test(candidate),
             isRendererNonce: (candidate: unknown): candidate is string =>
               typeof candidate === 'string' && /^n1_[A-Za-z0-9_-]{22}$/.test(candidate),
+            createRenderBridge: () => {
+              throw new Error('the full bridge fixture already owns construction');
+            },
             parseDocumentMessage: (candidate: unknown, nonce: string) => {
               const message = candidate as Record<string, unknown>;
               if (message.version !== 1 || message.nonce !== nonce) return undefined;
