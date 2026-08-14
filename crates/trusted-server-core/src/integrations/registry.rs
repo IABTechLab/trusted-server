@@ -575,6 +575,11 @@ pub trait IntegrationHeadInjector: Send + Sync {
     fn integration_id(&self) -> &'static str;
     /// Return HTML snippets to insert at the start of `<head>`.
     fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String>;
+
+    /// Return attributes to add to the publisher TSJS bundle tag.
+    fn tsjs_script_tag_attributes(&self) -> Vec<(&'static str, &'static str)> {
+        Vec::new()
+    }
 }
 
 /// Registration payload returned by integration builders.
