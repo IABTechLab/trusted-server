@@ -19,6 +19,7 @@ fn make_config() -> HtmlProcessorConfig {
         // `ad_slots_script` is `None` here — matching the previous behaviour,
         // which inferred no body-close work from that.
         body_close: BodyCloseInjection::None,
+        suppress_datadome_client_side_tag: false,
     }
 }
 

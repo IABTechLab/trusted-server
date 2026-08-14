@@ -63,7 +63,7 @@ use crate::platform::{
     GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices, VarySpec,
 };
 use crate::price_bucket::{PriceGranularity, price_bucket};
-use crate::response_privacy::enforce_private_no_store;
+use crate::response_privacy::{enforce_private_no_store, enforce_synthesized_html_cache_privacy};
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{
@@ -581,6 +581,7 @@ struct ProcessResponseParams<'a> {
     integration_registry: &'a IntegrationRegistry,
     ad_slots_script: Option<&'a str>,
     ad_bids_state: &'a Arc<Mutex<Option<String>>>,
+    suppress_datadome_client_side_tag: bool,
     gpt_diagnostics:
         Option<&'a crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
     /// See [`HtmlStreamProcessorParams::shared_template_authorized`].
@@ -609,6 +610,7 @@ impl PublisherBodyProcessor {
                 integration_registry,
                 ad_slots_script: params.ad_slots_script.as_deref().map(str::to_string),
                 ad_bids_state: Arc::clone(params.ad_bids_state.script_cell()),
+                suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
                 gpt_diagnostics: params.gpt_diagnostics.clone(),
                 shared_template_authorized: params.template_cache_key.is_some(),
             })?)
@@ -688,6 +690,7 @@ fn process_response_streaming<W: Write>(
             integration_registry: params.integration_registry,
             ad_slots_script: params.ad_slots_script.map(str::to_string),
             ad_bids_state: params.ad_bids_state.clone(),
+            suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
             gpt_diagnostics: params.gpt_diagnostics.cloned(),
             shared_template_authorized: params.shared_template_authorized,
         })?;
@@ -1182,6 +1185,7 @@ struct HtmlStreamProcessorParams<'a> {
     integration_registry: &'a IntegrationRegistry,
     ad_slots_script: Option<String>,
     ad_bids_state: Arc<Mutex<Option<String>>>,
+    suppress_datadome_client_side_tag: bool,
     gpt_diagnostics: Option<crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
     /// Whether a shared template was authorized for this response.
     ///
@@ -1337,7 +1341,8 @@ fn create_html_stream_processor(
     let config = config
         .with_ad_state(params.ad_slots_script, params.ad_bids_state)
         .with_gpt_diagnostics(gpt_diagnostics)
-        .with_body_close(body_close);
+        .with_body_close(body_close)
+        .with_datadome_client_tag_suppression(params.suppress_datadome_client_side_tag);
 
     Ok(create_html_processor(config))
 }
@@ -1493,6 +1498,8 @@ pub struct OwnedProcessResponseParams {
     pub(crate) dispatched_auction: Option<DispatchedAuction>,
     /// Price granularity used to bucket bids when building `tsjs.bids`.
     pub(crate) price_granularity: PriceGranularity,
+    /// Whether to omit Trusted Server's automatic `DataDome` client-side tag.
+    pub(crate) suppress_datadome_client_side_tag: bool,
     /// Request-scoped conditional diagnostics delivery decision.
     pub(crate) gpt_diagnostics:
         Option<crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
@@ -1899,6 +1906,7 @@ fn build_template_assembly_params(
         dispatched_auction: None,
         price_granularity,
         gpt_diagnostics: None,
+        suppress_datadome_client_side_tag: false,
     }
 }
 
@@ -2455,6 +2463,30 @@ pub async fn publisher_response_into_streaming_response(
     }
 }
 
+/// Returns whether a request can render an HTML document context.
+fn is_html_document_request(req: &Request<EdgeBody>) -> bool {
+    if let Some(destination) = req
+        .headers()
+        .get("sec-fetch-dest")
+        .and_then(|value| value.to_str().ok())
+    {
+        return matches!(
+            destination.trim().to_ascii_lowercase().as_str(),
+            "document" | "embed" | "fencedframe" | "frame" | "iframe" | "object"
+        );
+    }
+
+    is_navigation_request(req)
+}
+
+/// Removes request headers that can produce a bodyless or partial origin response.
+fn strip_conditional_and_range_headers(req: &mut Request<EdgeBody>) {
+    req.headers_mut().remove(header::IF_NONE_MATCH);
+    req.headers_mut().remove(header::IF_MODIFIED_SINCE);
+    req.headers_mut().remove(header::RANGE);
+    req.headers_mut().remove(header::IF_RANGE);
+}
+
 /// Returns `true` when a buffered publisher response should carry a body and a
 /// recomputed `Content-Length`.
 ///
@@ -2468,6 +2500,21 @@ fn response_carries_body(method: &Method, status: StatusCode) -> bool {
         && status != StatusCode::NO_CONTENT
         && status != StatusCode::RESET_CONTENT
         && status != StatusCode::NOT_MODIFIED
+}
+
+/// Prevent shared caches from replaying tag-suppressed HTML to other clients.
+fn apply_datadome_client_tag_cache_privacy(
+    response: &mut Response<EdgeBody>,
+    method: &Method,
+    suppress_datadome_client_side_tag: bool,
+    content_type: &str,
+) {
+    if suppress_datadome_client_side_tag
+        && response_carries_body(method, response.status())
+        && is_html_content_type(content_type)
+    {
+        enforce_synthesized_html_cache_privacy(response);
+    }
 }
 
 /// Drop a bodiless response's body and correct its framing headers.
@@ -2586,6 +2633,7 @@ pub fn stream_publisher_body<W: Write>(
         integration_registry,
         ad_slots_script: params.ad_slots_script.as_deref(),
         ad_bids_state: params.ad_bids_state.script_cell(),
+        suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
         gpt_diagnostics: params.gpt_diagnostics.as_ref(),
         shared_template_authorized: params.template_cache_key.is_some(),
     };
@@ -2686,6 +2734,7 @@ pub async fn stream_publisher_body_async<W: Write>(
         integration_registry,
         ad_slots_script: params.ad_slots_script.as_deref().map(str::to_string),
         ad_bids_state: Arc::clone(params.ad_bids_state.script_cell()),
+        suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
         gpt_diagnostics: params.gpt_diagnostics.clone(),
         shared_template_authorized: params.template_cache_key.is_some(),
     }) {
@@ -4032,8 +4081,19 @@ pub async fn handle_publisher_request(
             .creative_opportunities
             .as_ref()
             .is_some_and(CreativeOpportunitiesConfig::origin_is_cookie_independent);
-    let request_requires_origin =
-        request_bypasses_c2(req.headers()) || gpt_diagnostics.requires_private_no_store();
+    let suppress_datadome_client_side_tag = req
+        .extensions()
+        .get::<crate::integrations::datadome::DataDomeClientTagSuppressed>()
+        .is_some();
+    // Tag suppression is request-scoped (for example, an IP exclusion), while a C2
+    // template is shared across readers. A shared template can represent neither the
+    // suppressed nor unsuppressed variant safely for the other population.
+    let datadome_suppression_requires_origin = suppress_datadome_client_side_tag;
+    let datadome_suppression_requires_full_body =
+        suppress_datadome_client_side_tag && is_html_document_request(&req);
+    let request_requires_origin = request_bypasses_c2(req.headers())
+        || gpt_diagnostics.requires_private_no_store()
+        || datadome_suppression_requires_origin;
     let reader_compression = negotiate_reader_compression(req.headers());
     let reader_supports_assembly = reader_compression.is_ok();
     // A failed negotiation bypasses C2 below, so this value is used only on an
@@ -4041,11 +4101,11 @@ pub async fn handle_publisher_request(
     // a panic-prone invariant in the public request handler.
     let reader_compression = reader_compression.unwrap_or(Compression::None);
 
-    if should_run_ad_stack {
-        req.headers_mut().remove(header::IF_NONE_MATCH);
-        req.headers_mut().remove(header::IF_MODIFIED_SINCE);
-        req.headers_mut().remove(header::RANGE);
-        req.headers_mut().remove(header::IF_RANGE);
+    if should_run_ad_stack || datadome_suppression_requires_full_body {
+        // HTML document contexts whose output may be synthesized must not
+        // receive a cached 304 or partial 206. Non-document subresources contain
+        // no executable injected tag, so retain their validators and ranges.
+        strip_conditional_and_range_headers(&mut req);
     }
 
     let method_is_cacheable = req.method() == Method::GET;
@@ -4239,6 +4299,7 @@ pub async fn handle_publisher_request(
     // sets the flag unconditionally and tolerates buffered fallback): adapters
     // without streaming support may reject the flag outright rather than
     // silently buffering, which would fail every publisher fetch.
+    let request_method = req.method().clone();
     let mut platform_request = PlatformHttpRequest::new(req, backend_name);
     if services.http_client().supports_streaming_responses() {
         platform_request = platform_request.with_stream_response();
@@ -4409,7 +4470,7 @@ pub async fn handle_publisher_request(
     if (should_run_ad_stack || assembled_response_must_be_private)
         && is_html_content_type(origin_content_type)
     {
-        enforce_private_no_store(&mut response);
+        enforce_synthesized_html_cache_privacy(&mut response);
     }
 
     let content_type = response
@@ -4506,6 +4567,12 @@ pub async fn handle_publisher_request(
                 content_encoding
             );
 
+            apply_datadome_client_tag_cache_privacy(
+                &mut response,
+                &request_method,
+                suppress_datadome_client_side_tag,
+                &content_type,
+            );
             let body = std::mem::replace(response.body_mut(), EdgeBody::empty());
             response.headers_mut().remove(header::CONTENT_LENGTH);
 
@@ -4524,6 +4591,7 @@ pub async fn handle_publisher_request(
                     content_type,
                     ad_slots_script: ad_slots_script.clone(),
                     ad_bids_state: ad_bids_state.clone(),
+                    suppress_datadome_client_side_tag,
                     auction_observation,
                     auction_request: auction_request_for_telemetry,
                     dispatched_auction,
@@ -6297,7 +6365,8 @@ mod tests {
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
     use crate::integrations::IntegrationRegistry;
     use crate::platform::test_support::{
-        StubHttpClient, build_services_with_http_client, noop_services,
+        NoopSecretStore, StubHttpClient, build_services_with_http_client,
+        build_services_with_secret_http_client_and_client_ip, noop_services,
         noop_services_with_telemetry_sink,
     };
     use crate::test_support::tests::create_test_settings;
@@ -6614,6 +6683,7 @@ mod tests {
             dispatched_auction: None,
             price_granularity: Default::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
         }
     }
 
@@ -6884,6 +6954,7 @@ mod tests {
                 max_buffered_body_bytes: 16 * 1024 * 1024,
                 gpt_diagnostics,
                 body_close,
+                suppress_datadome_client_side_tag: false,
             };
 
             let mut processor = create_html_processor(config);
@@ -9677,6 +9748,68 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn datadome_suppressed_request_bypasses_a_warm_shared_template() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let mut raw = settings_with_mode("esi");
+            raw.integrations
+                .insert_config(
+                    "datadome",
+                    &serde_json::json!({
+                        "enabled": true,
+                        "client_side_key": "test-client-key",
+                    }),
+                )
+                .expect("should configure DataDome integration");
+            let settings = Arc::new(raw);
+            let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_shareable_html(&stub);
+            queue_shareable_html(&stub);
+
+            let ordinary = run(&settings, &services, navigation_request()).await;
+            let ordinary_document = String::from_utf8(body_of(ordinary).await)
+                .expect("ordinary document should be UTF-8");
+            assert!(
+                ordinary_document.contains("/integrations/datadome/tags.js"),
+                "the warm template fixture must contain the ordinary DataDome tag"
+            );
+
+            let mut suppressed_request = navigation_request();
+            suppressed_request
+                .headers_mut()
+                .insert("sec-fetch-dest", HeaderValue::from_static("script"));
+            suppressed_request
+                .extensions_mut()
+                .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+            let suppressed = run(&settings, &services, suppressed_request).await;
+            assert_eq!(
+                suppressed
+                    .headers()
+                    .get(HEADER_X_TS_C2_CACHE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("bypass-request"),
+                "request-scoped tag suppression must not read a shared template"
+            );
+            let suppressed_document = String::from_utf8(body_of(suppressed).await)
+                .expect("suppressed document should be UTF-8");
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "the suppressed navigation must reach the origin even when C2 is warm"
+            );
+            assert_eq!(
+                cache.lookups.lock().expect("should lock lookups").len(),
+                1,
+                "the suppressed request must bypass C2 before lookup"
+            );
+            assert!(
+                !suppressed_document.contains("/integrations/datadome/tags.js"),
+                "the request-scoped suppression decision must survive origin processing"
+            );
+        }
+
+        #[tokio::test]
         async fn real_diagnostics_query_bypasses_c2_and_keeps_its_private_bootstrap() {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
@@ -11857,6 +11990,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn suppressed_navigation_removes_conditional_and_range_headers() {
+        let settings = create_test_settings();
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"<html><body>origin</body></html>".to_vec(),
+            vec![("content-type", "text/html; charset=utf-8")],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let mut req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/page")
+            .header(header::HOST, "publisher.example")
+            .header("sec-fetch-dest", "document")
+            .header(header::IF_NONE_MATCH, "\"cached-page\"")
+            .header(header::IF_MODIFIED_SINCE, "Wed, 21 Oct 2015 07:28:00 GMT")
+            .header(header::RANGE, "bytes=0-18")
+            .header(header::IF_RANGE, "\"cached-page\"")
+            .body(EdgeBody::empty())
+            .expect("should build conditional request");
+        req.extensions_mut()
+            .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+
+        let _response = run_publisher_proxy(&settings, &services, req).await;
+
+        let headers = stub
+            .recorded_request_headers()
+            .into_iter()
+            .next()
+            .expect("should record one outbound request");
+        for header_name in [
+            header::IF_NONE_MATCH,
+            header::IF_MODIFIED_SINCE,
+            header::RANGE,
+            header::IF_RANGE,
+        ] {
+            assert!(
+                headers
+                    .iter()
+                    .all(|(name, _)| !name.eq_ignore_ascii_case(header_name.as_str())),
+                "suppressed navigations must not forward {header_name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn suppressed_iframe_removes_conditional_and_range_headers() {
+        let settings = create_test_settings();
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"<html><body>frame</body></html>".to_vec(),
+            vec![("content-type", "text/html; charset=utf-8")],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let mut req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/frame")
+            .header(header::HOST, "publisher.example")
+            .header("sec-fetch-dest", "iframe")
+            .header(header::IF_NONE_MATCH, "\"cached-frame\"")
+            .header(header::IF_MODIFIED_SINCE, "Wed, 21 Oct 2015 07:28:00 GMT")
+            .header(header::RANGE, "bytes=0-18")
+            .header(header::IF_RANGE, "\"cached-frame\"")
+            .body(EdgeBody::empty())
+            .expect("should build conditional iframe request");
+        req.extensions_mut()
+            .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+
+        let _response = run_publisher_proxy(&settings, &services, req).await;
+
+        let headers = stub
+            .recorded_request_headers()
+            .into_iter()
+            .next()
+            .expect("should record one outbound request");
+        for header_name in [
+            header::IF_NONE_MATCH,
+            header::IF_MODIFIED_SINCE,
+            header::RANGE,
+            header::IF_RANGE,
+        ] {
+            assert!(
+                headers
+                    .iter()
+                    .all(|(name, _)| !name.eq_ignore_ascii_case(header_name.as_str())),
+                "suppressed iframe documents must not forward {header_name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn suppressed_subresource_preserves_conditional_and_range_headers() {
+        let settings = create_test_settings();
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"video".to_vec(),
+            vec![("content-type", "video/mp4")],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let mut req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/video.mp4")
+            .header(header::HOST, "publisher.example")
+            .header("sec-fetch-dest", "video")
+            .header(header::IF_NONE_MATCH, "\"cached-video\"")
+            .header(header::IF_MODIFIED_SINCE, "Wed, 21 Oct 2015 07:28:00 GMT")
+            .header(header::RANGE, "bytes=0-18")
+            .header(header::IF_RANGE, "\"cached-video\"")
+            .body(EdgeBody::empty())
+            .expect("should build conditional subresource request");
+        req.extensions_mut()
+            .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+
+        let _response = run_publisher_proxy(&settings, &services, req).await;
+
+        let headers = stub
+            .recorded_request_headers()
+            .into_iter()
+            .next()
+            .expect("should record one outbound request");
+        for (header_name, expected) in [
+            (header::IF_NONE_MATCH, "\"cached-video\""),
+            (header::IF_MODIFIED_SINCE, "Wed, 21 Oct 2015 07:28:00 GMT"),
+            (header::RANGE, "bytes=0-18"),
+            (header::IF_RANGE, "\"cached-video\""),
+        ] {
+            assert_eq!(
+                headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(header_name.as_str()))
+                    .map(|(_, value)| value.as_str()),
+                Some(expected),
+                "suppressed subresources should preserve {header_name}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn publisher_origin_fetch_leaves_stream_response_disabled_when_unsupported() {
         let settings = create_test_settings();
         let stub = Arc::new(StubHttpClient::new());
@@ -11968,6 +12247,233 @@ mod tests {
             ec_context.ec_value(),
             None,
             "handler must not self-generate an EC ID; generation is the adapter's real-browser-gated responsibility",
+        );
+    }
+
+    #[tokio::test]
+    async fn datadome_filter_marker_survives_into_publisher_html_pipeline() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "datadome",
+                &serde_json::json!({
+                    "enabled": true,
+                    "enable_protection": true,
+                    "protection_excluded_ip_cidrs": ["192.0.2.0/24"],
+                    "client_side_key": "test-client-key",
+                }),
+            )
+            .expect("should configure DataDome integration");
+        let registry = IntegrationRegistry::new(&settings)
+            .expect("should create integration registry with DataDome");
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"<html><head></head><body>content</body></html>".to_vec(),
+            vec![("content-type", "text/html; charset=utf-8")],
+        );
+        let services = build_services_with_secret_http_client_and_client_ip(
+            NoopSecretStore,
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+            Some("192.0.2.10".parse().expect("should parse client IP")),
+        );
+        let mut req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/page")
+            .header(header::HOST, "publisher.example")
+            .header("sec-fetch-dest", "document")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let filter_outcome = registry
+            .filter_request(crate::integrations::RequestFilterRegistryInput {
+                settings: &settings,
+                services: &services,
+                req: &mut req,
+                geo_info: None,
+            })
+            .await
+            .expect("should run DataDome filter");
+        assert!(matches!(
+            filter_outcome,
+            crate::integrations::RequestFilterRegistryOutcome::Continue(_)
+        ));
+        let publisher_response = run_publisher_proxy(&settings, &services, req).await;
+        let response = buffer_publisher_response_async(
+            publisher_response,
+            &Method::GET,
+            &settings,
+            &registry,
+            &AuctionOrchestrator::new(settings.auction.clone()),
+            &services,
+        )
+        .await
+        .expect("should buffer publisher response");
+        let html = response_body_string(response);
+
+        assert!(!html.contains("window.ddjskey"));
+        assert!(!html.contains("/integrations/datadome/tags.js"));
+        assert_eq!(
+            stub.recorded_backend_names().len(),
+            1,
+            "only the publisher origin should be called"
+        );
+    }
+
+    #[test]
+    fn suppressed_datadome_tag_reaches_publisher_html_pipeline() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "datadome",
+                &serde_json::json!({
+                    "enabled": true,
+                    "client_side_key": "test-client-key",
+                }),
+            )
+            .expect("should configure DataDome integration");
+        let registry = IntegrationRegistry::new(&settings)
+            .expect("should create integration registry with DataDome");
+        let mut params = make_stream_params(&settings, "identity");
+        params.content_type = "text/html; charset=utf-8".to_string();
+        params.suppress_datadome_client_side_tag = true;
+        let mut output = Vec::new();
+
+        stream_publisher_body(
+            EdgeBody::from(b"<html><head></head><body>content</body></html>".to_vec()),
+            &mut output,
+            &params,
+            &settings,
+            &registry,
+        )
+        .expect("should process suppressed HTML");
+
+        let html = String::from_utf8(output).expect("should produce UTF-8 HTML");
+        assert!(
+            !html.contains("window.ddjskey"),
+            "publisher processing should omit the DataDome client configuration"
+        );
+        assert!(
+            !html.contains("/integrations/datadome/tags.js"),
+            "publisher processing should omit the DataDome client tag URL"
+        );
+    }
+
+    #[test]
+    fn suppressed_datadome_html_is_private_and_not_shared_cached() {
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CACHE_CONTROL, "public, max-age=600")
+            .header("surrogate-control", "max-age=600")
+            .header("fastly-surrogate-control", "max-age=600")
+            .header("cloudflare-cdn-cache-control", "max-age=600")
+            .header("cdn-cache-control", "max-age=600")
+            .header(header::ETAG, "\"origin-tag\"")
+            .header(header::LAST_MODIFIED, "Wed, 21 Oct 2015 07:28:00 GMT")
+            .body(EdgeBody::empty())
+            .expect("should build cacheable HTML response");
+
+        super::apply_datadome_client_tag_cache_privacy(
+            &mut response,
+            &Method::GET,
+            true,
+            "text/html; charset=utf-8",
+        );
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("private, no-store"),
+            "suppressed HTML should be private and non-storable"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "suppressed HTML should not retain Surrogate-Control"
+        );
+        assert!(
+            response.headers().get("fastly-surrogate-control").is_none(),
+            "suppressed HTML should not retain Fastly-Surrogate-Control"
+        );
+        assert!(
+            response
+                .headers()
+                .get("cloudflare-cdn-cache-control")
+                .is_none(),
+            "suppressed HTML should not retain Cloudflare-CDN-Cache-Control"
+        );
+        assert!(
+            response.headers().get("cdn-cache-control").is_none(),
+            "suppressed HTML should not retain CDN-Cache-Control"
+        );
+        for header_name in [header::ETAG, header::LAST_MODIFIED] {
+            assert!(
+                !response.headers().contains_key(&header_name),
+                "suppressed HTML should not retain {header_name}"
+            );
+        }
+
+        let mut no_store_response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(EdgeBody::empty())
+            .expect("should build no-store HTML response");
+        super::apply_datadome_client_tag_cache_privacy(
+            &mut no_store_response,
+            &Method::GET,
+            true,
+            "text/html; charset=utf-8",
+        );
+        assert_eq!(
+            no_store_response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("private, no-store"),
+            "suppressed HTML should use the exact synthesized-HTML policy"
+        );
+    }
+
+    #[test]
+    fn datadome_cache_privacy_does_not_change_non_html_or_unsuppressed_responses() {
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CACHE_CONTROL, "public, max-age=600")
+            .header("surrogate-control", "max-age=600")
+            .body(EdgeBody::empty())
+            .expect("should build cacheable response");
+
+        super::apply_datadome_client_tag_cache_privacy(
+            &mut response,
+            &Method::GET,
+            false,
+            "text/html; charset=utf-8",
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("public, max-age=600"),
+            "unsuppressed HTML should retain its existing cache policy"
+        );
+
+        super::apply_datadome_client_tag_cache_privacy(
+            &mut response,
+            &Method::GET,
+            true,
+            "text/css",
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("public, max-age=600"),
+            "non-HTML should retain its existing cache policy"
         );
     }
 
@@ -12984,6 +13490,7 @@ mod tests {
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
         };
 
         let mut output = Vec::new();
@@ -13035,6 +13542,7 @@ mod tests {
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
         };
 
         let mut output = Vec::new();
@@ -13075,6 +13583,7 @@ mod tests {
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
         };
         let body = EdgeBody::from_stream(futures::stream::iter(vec![Ok::<_, io::Error>(
             bytes::Bytes::from_static(b"<html><body>live</body></html>"),
@@ -13193,6 +13702,7 @@ mod tests {
                 dispatched_auction: None,
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
+                suppress_datadome_client_side_tag: false,
             };
             let body = EdgeBody::stream(futures::stream::iter(vec![
                 bytes::Bytes::from_static(b"body{background:url('https://origin.example.com/"),
@@ -13249,6 +13759,7 @@ mod tests {
                 dispatched_auction: None,
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
+                suppress_datadome_client_side_tag: false,
             };
             let compressed =
                 gzip_encode(b"body{background:url('https://origin.example.com/asset.png')}");
@@ -13308,6 +13819,7 @@ mod tests {
                 dispatched_auction: None,
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
+                suppress_datadome_client_side_tag: false,
             };
             let compressed =
                 deflate_encode(b"body{background:url('https://origin.example.com/asset.png')}");
@@ -13367,6 +13879,7 @@ mod tests {
                 dispatched_auction: None,
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
+                suppress_datadome_client_side_tag: false,
             };
             let compressed =
                 brotli_encode(b"body{background:url('https://origin.example.com/asset.png')}");
@@ -13426,6 +13939,7 @@ mod tests {
                 dispatched_auction: None,
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
+                suppress_datadome_client_side_tag: false,
             };
             let compressed =
                 brotli_encode(b"body{background:url('https://origin.example.com/asset.png')}");
@@ -13473,6 +13987,7 @@ mod tests {
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
         }
     }
 
@@ -13670,6 +14185,7 @@ mod tests {
                 )),
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
+                suppress_datadome_client_side_tag: false,
             };
             let body = EdgeBody::stream(futures::stream::iter(vec![
                 bytes::Bytes::from_static(b"<html><head></head><body>hello"),
@@ -13737,6 +14253,7 @@ mod tests {
                 )),
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
+                suppress_datadome_client_side_tag: false,
             };
             // The `</body>` that triggers bid injection lives in the SECOND gzip
             // member. `flate2::read::GzDecoder` decodes only the first member, so
@@ -13803,6 +14320,7 @@ mod tests {
                 )),
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
                 gpt_diagnostics: None,
+                suppress_datadome_client_side_tag: false,
             };
             let body = EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from_static(
                 b"body{background:url('https://origin.example.com/asset.png')}",
@@ -13862,6 +14380,7 @@ mod tests {
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
         };
         let publisher_response = PublisherResponse::Stream {
             response,
@@ -14001,6 +14520,7 @@ mod tests {
             dispatched_auction,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
         }
     }
 
@@ -14355,6 +14875,7 @@ mod tests {
                 )),
                 price_granularity: PriceGranularity::default(),
                 gpt_diagnostics: None,
+                suppress_datadome_client_side_tag: false,
             }
         };
         let make_stream_response = || PublisherResponse::Stream {
@@ -14537,6 +15058,7 @@ mod tests {
             )),
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
         };
         let publisher_response = PublisherResponse::Stream {
             response,
@@ -14607,6 +15129,7 @@ mod tests {
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
         };
         let mut output = Vec::new();
 
@@ -14660,6 +15183,7 @@ mod tests {
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
         };
 
         let bogus_body = EdgeBody::from(b"<html>not gzip</html>".to_vec());
@@ -14771,6 +15295,7 @@ mod tests {
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
         };
         let mut output = Vec::new();
         stream_publisher_body(body, &mut output, &params, &settings, &registry)
@@ -14831,6 +15356,7 @@ mod tests {
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
         };
 
         let mut output = Vec::new();

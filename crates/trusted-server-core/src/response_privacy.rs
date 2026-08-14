@@ -24,6 +24,12 @@ pub const CDN_CACHE_HEADERS: &[&str] = &[
     "cloudflare-cdn-cache-control",
 ];
 
+fn strip_cdn_cache_headers(response: &mut Response) {
+    for name in CDN_CACHE_HEADERS {
+        response.headers_mut().remove(*name);
+    }
+}
+
 /// Whether `Cache-Control` already forbids shared caching.
 ///
 /// Extracted because both arms of the cookie-privacy net below need it.
@@ -73,9 +79,16 @@ pub fn enforce_private_no_store(response: &mut Response) {
     ] {
         response.headers_mut().remove(name);
     }
-    for name in CDN_CACHE_HEADERS {
-        response.headers_mut().remove(*name);
-    }
+    strip_cdn_cache_headers(response);
+}
+
+/// Forces synthesized HTML to be private and non-storable.
+///
+/// Use this exact policy whenever Trusted Server changes an origin HTML
+/// representation with request-specific content: force `private, no-store`,
+/// remove origin validators, and remove all CDN-targeted cache directives.
+pub(crate) fn enforce_synthesized_html_cache_privacy(response: &mut Response) {
+    enforce_private_no_store(response);
 }
 
 /// Forces cookie-bearing responses to stay private to shared caches.
@@ -91,13 +104,11 @@ pub fn enforce_set_cookie_cache_privacy(response: &mut Response) {
     if !response.headers().contains_key(header::SET_COOKIE) {
         return;
     }
-    // Surrogate cache headers must come off every cookie-bearing response, even
+    // Shared-cache control headers must come off every cookie-bearing response, even
     // one already carrying a stricter `no-store`/`private` directive — they are
     // independent of Cache-Control and would otherwise let a shared cache store
     // and replay one visitor's Set-Cookie.
-    for name in CDN_CACHE_HEADERS {
-        response.headers_mut().remove(*name);
-    }
+    strip_cdn_cache_headers(response);
     let already_uncacheable = is_private_or_no_store(response.headers());
     if !already_uncacheable {
         response.headers_mut().insert(
@@ -189,6 +200,37 @@ mod tests {
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
         s
+    }
+
+    #[test]
+    fn synthesized_html_is_forced_no_store_without_validators_or_cdn_headers() {
+        let mut response = response_builder()
+            .header(header::CACHE_CONTROL, "private, max-age=600")
+            .header(header::ETAG, "\"origin\"")
+            .header(header::LAST_MODIFIED, "Wed, 21 Oct 2015 07:28:00 GMT")
+            .header("surrogate-control", "max-age=600")
+            .header("fastly-surrogate-control", "max-age=600")
+            .header("cdn-cache-control", "max-age=600")
+            .header("cloudflare-cdn-cache-control", "max-age=600")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build response");
+
+        enforce_synthesized_html_cache_privacy(&mut response);
+
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-store",
+            "synthesized HTML should always be non-storable"
+        );
+        for header_name in [header::ETAG.as_str(), header::LAST_MODIFIED.as_str()]
+            .into_iter()
+            .chain(CDN_CACHE_HEADERS.iter().copied())
+        {
+            assert!(
+                !response.headers().contains_key(header_name),
+                "synthesized HTML should remove {header_name}"
+            );
+        }
     }
 
     #[test]
