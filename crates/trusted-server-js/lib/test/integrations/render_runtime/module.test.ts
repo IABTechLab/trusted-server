@@ -304,8 +304,6 @@ describe('render_runtime provider', () => {
             }
           | undefined;
       };
-      renderDirectCacheAttempt: (input: unknown) => boolean;
-      resolveCacheAdmAttempt: (input: unknown) => boolean;
       registerPucGamAttempt: (input: unknown) => boolean;
       registerRenderer: (
         type: 'aps',
@@ -364,8 +362,6 @@ describe('render_runtime provider', () => {
     expect(render.createSlotOperation({ primary: attempt.value as RenderAttempt })).toMatchObject({
       ok: true,
     });
-    expect(typeof render.renderDirectCacheAttempt).toBe('function');
-    expect(typeof render.resolveCacheAdmAttempt).toBe('function');
     const hostileCause = new Error('publisher-owned validation trap');
     const hostileValidation = new Proxy(Object.freeze({}), {
       getPrototypeOf: () => {

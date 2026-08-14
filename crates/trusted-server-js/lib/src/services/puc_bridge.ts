@@ -9,7 +9,6 @@ interface CollapsedPucShellResizeInput {
 }
 
 import type {
-  CacheAdmSource,
   CommittedRenderArtifact,
   RenderAttempt,
   RenderFailureReason,
@@ -111,9 +110,6 @@ function installPucDynamicOwner(): void {
     'renderer_document_no_load',
     'runner_no_load',
     'runner_failed',
-    'cache_network_error',
-    'cache_http_error',
-    'cache_invalid_response',
     'adm_document_no_load',
     'abi_mismatch',
     'bundle_partial',
@@ -964,10 +960,6 @@ export interface PucBridgeOptions {
   readonly resizeCollapsedShell?: (input: CollapsedPucShellResizeInput) => boolean;
   readonly rendererNonces?: Pick<RendererNonceRegistry, 'consume' | 'issue'>;
   readonly rendererUrl?: string;
-  readonly resolveCacheAdm?: (
-    attempt: PucRenderAttempt,
-    onResolved: (source: Readonly<CacheAdmSource>) => boolean
-  ) => boolean;
   readonly scheduler?: PucBridgeScheduler;
 }
 
@@ -1360,7 +1352,6 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
   let publisherOrigin: string | undefined;
   let rendererNonces: PucBridgeOptions['rendererNonces'];
   let rendererUrl: string | undefined;
-  let resolveCacheAdm: PucBridgeOptions['resolveCacheAdm'];
   let resizeCollapsedShell: PucBridgeOptions['resizeCollapsedShell'];
   let scheduler: PucBridgeScheduler;
   try {
@@ -1371,7 +1362,6 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
     publisherOrigin = options.publisherOrigin;
     rendererNonces = options.rendererNonces;
     rendererUrl = options.rendererUrl;
-    resolveCacheAdm = options.resolveCacheAdm;
     resizeCollapsedShell = options.resizeCollapsedShell;
     scheduler = options.scheduler ?? defaultScheduler();
   } catch {
@@ -1382,7 +1372,6 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
     publisherOrigin = undefined;
     rendererNonces = undefined;
     rendererUrl = undefined;
-    resolveCacheAdm = undefined;
     resizeCollapsedShell = undefined;
     scheduler = defaultScheduler();
   }
@@ -1864,7 +1853,7 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
       try {
         const sourceType = binding.attempt.renderSource?.type;
         if (sourceType === 'aps') kind = 'aps';
-        else if (sourceType === 'adm' || sourceType === 'cache') kind = 'adm';
+        else if (sourceType === 'adm') kind = 'adm';
         else throw new Error('claimed source is unavailable');
       } catch {
         failBinding(binding, 'bridge_id_mismatch', true);
@@ -1960,16 +1949,12 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
     return true;
   };
 
-  const startAdmOwner = (
-    binding: GamAttemptBinding,
-    lifecycleTicket: string,
-    resolvedSource?: Readonly<CacheAdmSource>
-  ): boolean => {
+  const startAdmOwner = (binding: GamAttemptBinding, lifecycleTicket: string): boolean => {
     const controlPort = binding.controlPort;
     if (!controlPort || binding.controlStarted || !binding.active) return false;
     let source: unknown;
     try {
-      source = resolvedSource ?? binding.attempt.renderSource;
+      source = binding.attempt.renderSource;
     } catch {
       source = undefined;
     }
@@ -2047,40 +2032,6 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
       failBinding(binding, 'internal_error', false);
       return false;
     }
-  };
-
-  const resolveCacheOwner = (binding: GamAttemptBinding, lifecycleTicket: string): boolean => {
-    if (!binding.active || binding.controlStarted || typeof resolveCacheAdm !== 'function') {
-      failBinding(binding, 'winner_not_renderable', false);
-      return false;
-    }
-    const resolutionStarted = (() => {
-      try {
-        return (
-          Reflect.apply(resolveCacheAdm, undefined, [
-            binding.attempt,
-            (source: Readonly<CacheAdmSource>): boolean => {
-              if (
-                !binding.active ||
-                binding.controlStarted ||
-                binding.attempt.renderSource?.type !== 'cache' ||
-                !currentBindingState(binding, 'waiting_for_insertion')
-              ) {
-                return false;
-              }
-              return startAdmOwner(binding, lifecycleTicket, source);
-            },
-          ]) === true
-        );
-      } catch {
-        return false;
-      }
-    })();
-    if (!resolutionStarted && binding.active) {
-      failBinding(binding, 'internal_error', false);
-      return false;
-    }
-    return resolutionStarted;
   };
 
   const startApsOwner = (binding: GamAttemptBinding, lifecycleTicket: string): boolean => {
@@ -2485,8 +2436,6 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
     }
     if (sourceType === 'adm') {
       startAdmOwner(binding, ticket);
-    } else if (sourceType === 'cache') {
-      resolveCacheOwner(binding, ticket);
     } else if (sourceType === 'aps') {
       startApsOwner(binding, ticket);
     } else {

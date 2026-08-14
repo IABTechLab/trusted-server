@@ -1480,7 +1480,7 @@ describe('Prebid selection coordination', () => {
       now: () => now,
       prepareRenderSource: (candidate) =>
         typeof candidate === 'object' && candidate !== null && Object.isFrozen(candidate)
-          ? (candidate as Readonly<{ type: 'aps' | 'adm' | 'cache'; version: 1 }>)
+          ? (candidate as Readonly<{ type: 'aps' | 'adm'; version: 1 }>)
           : undefined,
     });
     const artifacts = createCommittedArtifactStore();
@@ -1500,7 +1500,7 @@ describe('Prebid selection coordination', () => {
           owner,
           prepareRenderSource: (candidate) =>
             typeof candidate === 'object' && candidate !== null && Object.isFrozen(candidate)
-              ? (candidate as Readonly<{ type: 'aps' | 'adm' | 'cache'; version: 1 }>)
+              ? (candidate as Readonly<{ type: 'aps' | 'adm'; version: 1 }>)
               : undefined,
           reservations,
         });

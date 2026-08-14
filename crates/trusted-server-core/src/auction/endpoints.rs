@@ -69,7 +69,6 @@ fn exact_auction_response_v1(
         settings,
         request_origin,
         None,
-        None,
         &SystemAuctionIdentityGenerator,
     )?;
     let body = crate::auction::formats::coordinated_cutover_v1::serialize_trusted_server_auction_response_v1(

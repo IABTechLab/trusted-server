@@ -402,7 +402,24 @@ export interface PrebidBidPublicationInput {
   ) => boolean;
 }
 
-function isCurrentProjectedWinner(input: PrebidBidPublicationInput): boolean {
+type OwnedBrowserAuctionBidV1 = Extract<
+  BrowserAuctionBidV1,
+  { readonly rendererReservationId: string }
+>;
+
+function isOwnedBrowserAuctionBidV1(bid: BrowserAuctionBidV1): bid is OwnedBrowserAuctionBidV1 {
+  return 'rendererReservationId' in bid;
+}
+
+type OwnedPrebidBidPublicationInput = PrebidBidPublicationInput & {
+  readonly bid: OwnedBrowserAuctionBidV1;
+};
+
+function isCurrentProjectedWinner(
+  input: PrebidBidPublicationInput
+): input is OwnedPrebidBidPublicationInput {
+  const bid = input.bid;
+  if (!isOwnedBrowserAuctionBidV1(bid)) return false;
   try {
     const projection = input.navigation.currentAuctionProjection as
       Readonly<BrowserAuctionProjectionV1> | undefined;
@@ -412,20 +429,20 @@ function isCurrentProjectedWinner(input: PrebidBidPublicationInput): boolean {
       !objectIsFrozenIntrinsic(projection.auction) ||
       !objectIsFrozenIntrinsic(projection.auction.results) ||
       !objectIsFrozenIntrinsic(projection.bids) ||
-      !objectIsFrozenIntrinsic(input.bid) ||
-      !objectIsFrozenIntrinsic(input.bid.targeting) ||
-      !objectIsFrozenIntrinsic(input.bid.renderSource) ||
+      !objectIsFrozenIntrinsic(bid) ||
+      !objectIsFrozenIntrinsic(bid.targeting) ||
+      !objectIsFrozenIntrinsic(bid.renderSource) ||
       !input.navigation.isCurrent() ||
       input.auctionId !== projection.auction.auctionId ||
-      input.adUnitCode !== input.bid.slot ||
-      !isRendererReservationIdV1(input.bid.rendererReservationId)
+      input.adUnitCode !== bid.slot ||
+      !isRendererReservationIdV1(bid.rendererReservationId)
     ) {
       return false;
     }
 
     let bidMatches = 0;
     for (let index = 0; index < projection.bids.length; index += 1) {
-      if (projection.bids[index] === input.bid) bidMatches += 1;
+      if (projection.bids[index] === bid) bidMatches += 1;
     }
     if (bidMatches !== 1) return false;
 
@@ -434,8 +451,8 @@ function isCurrentProjectedWinner(input: PrebidBidPublicationInput): boolean {
       const result = projection.auction.results[index];
       if (
         result?.outcome === 'winner' &&
-        result.slot === input.bid.slot &&
-        result.candidateId === input.bid.candidateId
+        result.slot === bid.slot &&
+        result.candidateId === bid.candidateId
       ) {
         winnerMatches += 1;
       }
@@ -447,7 +464,7 @@ function isCurrentProjectedWinner(input: PrebidBidPublicationInput): boolean {
 }
 
 function prepareTrustedBid(
-  input: PrebidBidPublicationInput
+  input: OwnedPrebidBidPublicationInput
 ): Readonly<PreparedTrustedBidV1> | undefined {
   try {
     const generated = ownDataObject(input.generatedBid);
@@ -516,6 +533,9 @@ function registrationFailure(reason: string): PrebidBidPublicationFailureReason 
 
 /** Register before exposing one TS-owned bid through the version-pinned Prebid boundary. */
 export function publishPrebidBid(input: PrebidBidPublicationInput): PrebidBidPublicationResult {
+  if (input.bid.renderSource.type === 'pbs_cache') {
+    return Object.freeze({ ok: false, reason: 'winner_not_renderable' });
+  }
   if (!isCurrentProjectedWinner(input)) {
     return Object.freeze({ ok: false, reason: 'winner_not_renderable' });
   }

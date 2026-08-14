@@ -2,7 +2,6 @@
 // and parses OpenRTB seatbid responses. Used by both the core requestAds flow
 // and the Prebid.js trustedServer adapter.
 
-import { parseCacheFetchPolicyV1 } from './config';
 import { parseApsRendererDescriptor } from './contracts/aps_renderer';
 import {
   MAX_AUCTION_RESULTS,
@@ -94,17 +93,24 @@ export interface AuctionBid {
   admHash?: string | undefined;
 }
 
-export interface TrustedServerAuctionBidV1 {
+interface TrustedServerAuctionBidBaseV1 {
   candidateId: string;
-  rendererReservationId: string;
   impid: string;
   provider: string;
   price: number;
   width: number;
   height: number;
-  renderSource: BidRenderSourceV1;
-  adm?: string | undefined;
 }
+
+export type TrustedServerAuctionBidV1 =
+  | (TrustedServerAuctionBidBaseV1 & {
+      rendererReservationId: string;
+      renderSource: Exclude<BidRenderSourceV1, { type: 'pbs_cache' }>;
+      adm?: string | undefined;
+    })
+  | (TrustedServerAuctionBidBaseV1 & {
+      renderSource: Extract<BidRenderSourceV1, { type: 'pbs_cache' }>;
+    });
 
 export interface TrustedServerAuctionResponseV1 {
   auction: AuctionDecisionSetV1;
@@ -115,12 +121,8 @@ export interface TrustedServerAuctionResponseV1 {
 
 /** Parse the coordinated-cutover `/auction` wire without activating it in production yet. */
 export function parseTrustedServerAuctionResponseV1(
-  value: unknown,
-  cachePolicyValue?: unknown
+  value: unknown
 ): TrustedServerAuctionResponseV1 | undefined {
-  const cachePolicy =
-    cachePolicyValue === undefined ? undefined : parseCacheFetchPolicyV1(cachePolicyValue);
-  if (cachePolicyValue !== undefined && !cachePolicy) return undefined;
   const body = ownDataObject(value, ['id', 'seatbid', 'cur', 'ext']);
   if (!body || typeof body.id !== 'string' || body.cur !== 'USD') return undefined;
   const responseExt = ownDataObject(body.ext, ['trusted_server']);
@@ -156,20 +158,26 @@ export function parseTrustedServerAuctionResponseV1(
       if (
         !bid ||
         !trusted ||
-        !isRendererReservationIdV1(bid.id) ||
         !validBoundedString(bid.impid, 256) ||
         !isAuctionCandidateIdV1(trusted.candidate_id) ||
         trusted.slot_id !== bid.impid ||
         typeof bid.price !== 'number' ||
         !Number.isFinite(bid.price) ||
         bid.price < 0 ||
-        !validDimension(bid.w) ||
-        !validDimension(bid.h)
+        typeof bid.w !== 'number' ||
+        typeof bid.h !== 'number'
       ) {
         return undefined;
       }
-      const renderSource = parseRenderSource(trusted.render_source, cachePolicy);
+      const renderSource = parseRenderSource(trusted.render_source);
       if (!renderSource || renderSource.width !== bid.w || renderSource.height !== bid.h) {
+        return undefined;
+      }
+      if (
+        (renderSource.type === 'pbs_cache' && bid.id !== renderSource.cacheId) ||
+        (renderSource.type !== 'pbs_cache' &&
+          (!isRendererReservationIdV1(bid.id) || !validDimension(bid.w) || !validDimension(bid.h)))
+      ) {
         return undefined;
       }
       if (
@@ -180,17 +188,24 @@ export function parseTrustedServerAuctionResponseV1(
       ) {
         return undefined;
       }
-      bids.push({
+      const base = {
         candidateId: trusted.candidate_id,
-        rendererReservationId: bid.id,
         impid: bid.impid,
         provider: seat.seat,
         price: bid.price,
         width: bid.w,
         height: bid.h,
-        renderSource,
-        ...(renderSource.type === 'adm' ? { adm: renderSource.adm } : {}),
-      });
+      };
+      if (renderSource.type === 'pbs_cache') {
+        bids.push({ ...base, renderSource });
+      } else {
+        bids.push({
+          ...base,
+          rendererReservationId: bid.id as string,
+          renderSource,
+          ...(renderSource.type === 'adm' ? { adm: renderSource.adm } : {}),
+        });
+      }
     }
   }
 
@@ -203,11 +218,14 @@ export function parseTrustedServerAuctionResponseV1(
   if (
     winners.length !== bids.length ||
     bids.some((bid) => {
-      if (candidates.has(bid.candidateId) || reservations.has(bid.rendererReservationId)) {
+      if (
+        candidates.has(bid.candidateId) ||
+        ('rendererReservationId' in bid && reservations.has(bid.rendererReservationId))
+      ) {
         return true;
       }
       candidates.add(bid.candidateId);
-      reservations.add(bid.rendererReservationId);
+      if ('rendererReservationId' in bid) reservations.add(bid.rendererReservationId);
       const winner = winners.find((entry) => entry.candidateId === bid.candidateId);
       return !winner || winner.slot !== bid.impid;
     }) ||
@@ -228,18 +246,29 @@ export function parseTrustedServerAuctionResponseV1(
   for (let index = 0; index < orderedBids.length; index += 1) {
     const bid = orderedBids[index];
     if (!bid) return undefined;
-    canonicalBids.push({
+    const base = {
       candidateId: bid.candidateId,
       slot: bid.impid,
       provider: bid.provider,
-      upstreamBidId:
-        bid.renderSource.type === 'aps' ? bid.renderSource.bidId : bid.rendererReservationId,
       cpm: bid.price,
-      currency: 'USD',
+      currency: 'USD' as const,
       targeting: {},
-      rendererReservationId: bid.rendererReservationId,
-      renderSource: bid.renderSource,
-    });
+    };
+    if (!('rendererReservationId' in bid)) {
+      canonicalBids.push({
+        ...base,
+        upstreamBidId: bid.renderSource.cacheId,
+        renderSource: bid.renderSource,
+      });
+    } else {
+      canonicalBids.push({
+        ...base,
+        upstreamBidId:
+          bid.renderSource.type === 'aps' ? bid.renderSource.bidId : bid.rendererReservationId,
+        rendererReservationId: bid.rendererReservationId,
+        renderSource: bid.renderSource,
+      });
+    }
   }
   const canonicalProjection: BrowserAuctionProjectionV1 = {
     version: 1,

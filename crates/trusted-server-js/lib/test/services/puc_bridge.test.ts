@@ -53,7 +53,6 @@ interface HarnessOptions {
   readonly resizeCollapsedShell?: PucBridgeOptions['resizeCollapsedShell'];
   readonly rendererNonces?: PucBridgeOptions['rendererNonces'];
   readonly rendererUrl?: string;
-  readonly resolveCacheAdm?: PucBridgeOptions['resolveCacheAdm'];
   readonly scheduler?: PucBridgeOptions['scheduler'];
 }
 
@@ -89,7 +88,6 @@ function createHarness(
     ...(options.resizeCollapsedShell ? { resizeCollapsedShell: options.resizeCollapsedShell } : {}),
     ...(options.rendererNonces ? { rendererNonces: options.rendererNonces } : {}),
     ...(options.rendererUrl ? { rendererUrl: options.rendererUrl } : {}),
-    ...(options.resolveCacheAdm ? { resolveCacheAdm: options.resolveCacheAdm } : {}),
     ...(options.scheduler ? { scheduler: options.scheduler } : {}),
   };
   const bridge = createPucBridge(bridgeOptions);
@@ -100,7 +98,7 @@ function createHarness(
   return { bridge, dispatch, target };
 }
 
-function createGamAttempt(kind: 'aps' | 'adm' | 'cache' = 'aps', index = 0) {
+function createGamAttempt(kind: 'aps' | 'adm' = 'aps', index = 0) {
   const suffix = index.toString(36).padStart(22, '0').slice(-22);
   const id = `a1_${suffix}`;
   const reservationId = `r1_${suffix}`;
@@ -155,23 +153,13 @@ function createGamAttempt(kind: 'aps' | 'adm' | 'cache' = 'aps', index = 0) {
               height: 250,
               aaxResponse: 'renderer-envelope',
             }
-          : kind === 'adm'
-            ? {
-                type: 'adm',
-                version: 1,
-                adm: '<main>fictional creative</main>',
-                width: 300,
-                height: 250,
-              }
-            : {
-                type: 'cache',
-                version: 1,
-                cacheId: '12345678-1234-4123-8123-123456789012',
-                fetchUrl:
-                  'https://cache.example/pbc/v1/cache?uuid=12345678-1234-4123-8123-123456789012',
-                width: 300,
-                height: 250,
-              }
+          : {
+              type: 'adm',
+              version: 1,
+              adm: '<main>fictional creative</main>',
+              width: 300,
+              height: 250,
+            }
       ) as ReservationRenderSource;
       return true;
     }),
@@ -2077,7 +2065,7 @@ describe('Universal Creative bridge dispatcher', () => {
 
   it('clears a GAM-first claim deadline when the exact request completes the join', () => {
     const clock = createClock();
-    const gam = createGamAttempt('cache');
+    const gam = createGamAttempt('adm');
     const claim = vi.fn(({ pucSource }: { pucSource: unknown }): ReservationClaimResult => ({
       recognized: true,
       claimed: true,
@@ -2122,7 +2110,7 @@ describe('Universal Creative bridge dispatcher', () => {
     });
 
     expect(port.postMessage).toHaveBeenCalledOnce();
-    expect(gam.attempt.renderSource).toMatchObject({ type: 'cache', version: 1 });
+    expect(gam.attempt.renderSource).toMatchObject({ type: 'adm', version: 1 });
     expect(JSON.parse(String(port.postMessage.mock.calls[0]?.[0])).tsOwner.kind).toBe('adm');
     expect(clock.scheduler.clear).toHaveBeenCalledOnce();
     staleClaimDeadline();
@@ -2778,88 +2766,6 @@ describe('Universal Creative bridge dispatcher', () => {
     expect(gam.attempt.fail).toHaveBeenCalledWith('internal_error');
     expect(controlRetained.close).toHaveBeenCalledOnce();
     expect(gam.artifact.dispose).toHaveBeenCalledOnce();
-  });
-
-  it('resolves cache privately and sends only the resulting ADM source to the owner', () => {
-    const gam = createGamAttempt('cache', 1_013);
-    const pucSource = Object.freeze({ frame: 'authoritative' });
-    const controlRetained = createPort();
-    const controlTransferred = createPort();
-    let completeResolution:
-      | ((
-          source: Readonly<{ adm: string; height: number; type: 'adm'; version: 1; width: number }>
-        ) => boolean)
-      | undefined;
-    const resolveCacheAdm = vi.fn((_attempt, onResolved) => {
-      completeResolution = onResolved;
-      return true;
-    });
-    const harness = createHarness(
-      () => ({ recognized: true, state: 'renderable', expiresAt: 10_000 }),
-      {
-        claim: ({ pucSource: claimedSource }) => ({
-          recognized: true,
-          claimed: true,
-          pucSource: claimedSource as object,
-          expiresAt: 10_000,
-        }),
-        messageChannel: class {
-          readonly port1 = controlRetained;
-          readonly port2 = controlTransferred;
-        },
-        mintLifecycleTicket: () => Object.freeze({ ok: true, value: LIFECYCLE_TICKET }),
-        resolveCacheAdm,
-      }
-    );
-    issueReadyTicket(harness, gam, pucSource);
-
-    harness.dispatch({
-      data: exactOwnerRegistration(gam.reservationId),
-      ports: [createPort()],
-      source: pucSource,
-      stopImmediatePropagation: vi.fn(),
-    });
-
-    expect(resolveCacheAdm).toHaveBeenCalledWith(gam.attempt, expect.any(Function));
-    expect(controlRetained.postMessage).not.toHaveBeenCalled();
-    expect(
-      completeResolution?.(
-        Object.freeze({
-          type: 'adm',
-          version: 1,
-          adm: '<main>resolved cache creative</main>',
-          width: 300,
-          height: 250,
-        })
-      )
-    ).toBe(true);
-    expect(controlRetained.postMessage.mock.calls[0]).toEqual([
-      {
-        message: 'TS ADM Start',
-        version: 1,
-        lifecycleTicket: LIFECYCLE_TICKET,
-        source: {
-          type: 'adm',
-          version: 1,
-          adm: '<main>resolved cache creative</main>',
-          width: 300,
-          height: 250,
-        },
-      },
-      [],
-    ]);
-    expect(JSON.stringify(controlRetained.postMessage.mock.calls[0])).not.toContain('cacheId');
-    expect(
-      completeResolution?.(
-        Object.freeze({
-          type: 'adm',
-          version: 1,
-          adm: '<main>duplicate</main>',
-          width: 300,
-          height: 250,
-        })
-      )
-    ).toBe(false);
   });
 
   it('sends exact APS start with one document port and accepts exact document completion', () => {

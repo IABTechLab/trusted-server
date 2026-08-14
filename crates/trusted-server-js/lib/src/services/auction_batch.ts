@@ -29,17 +29,24 @@ const abortSignalRemoveEventListener = captureAbortSignalMethod('removeEventList
 
 export type AuctionBatchFetcher = (input: string, init: RequestInit) => Promise<unknown>;
 
-export interface AuctionBatchBid {
+interface AuctionBatchBidBase {
   readonly candidateId: string;
-  readonly rendererReservationId: string;
   readonly impid: string;
   readonly provider: string;
   readonly price: number;
   readonly width: number;
   readonly height: number;
-  readonly renderSource: unknown;
-  readonly adm?: string | undefined;
 }
+
+export type AuctionBatchBid =
+  | (AuctionBatchBidBase & {
+      readonly rendererReservationId: string;
+      readonly renderSource: Readonly<{ readonly type: 'aps' | 'adm' }>;
+      readonly adm?: string | undefined;
+    })
+  | (AuctionBatchBidBase & {
+      readonly renderSource: Readonly<{ readonly type: 'pbs_cache' }>;
+    });
 
 export type AuctionBatchDecision =
   | Readonly<{ slot: string; outcome: 'winner'; candidateId: string }>
@@ -78,14 +85,10 @@ export interface AuctionBatchInput {
 }
 
 export interface AuctionBatchServiceOptions {
-  readonly cachePolicy?: unknown;
   readonly createAttempt: (owner: RenderAttemptScope) => RenderAttemptCreationResult;
   readonly endpoint?: string;
   readonly fetcher: AuctionBatchFetcher;
-  readonly parseResponse: (
-    value: unknown,
-    cachePolicy?: unknown
-  ) => ParsedAuctionBatchResponse | undefined;
+  readonly parseResponse: (value: unknown) => ParsedAuctionBatchResponse | undefined;
   readonly renderWinner: (attempt: RenderAttempt, bid: AuctionBatchBid) => boolean;
   readonly scheduler?: AuctionBatchScheduler;
 }
@@ -167,13 +170,11 @@ function responseMembershipIsExact(
   if (decisions.length !== slots.length) return false;
   const membership = new Set(slots);
   if (membership.size !== slots.length) return false;
-  const observed = new Set<string>();
   for (let index = 0; index < decisions.length; index += 1) {
     const slot = decisions[index]?.slot;
-    if (!slot || !membership.has(slot) || observed.has(slot)) return false;
-    observed.add(slot);
+    if (!slot || slot !== slots[index]) return false;
   }
-  return observed.size === membership.size;
+  return true;
 }
 
 /** Runtime-owned coordinator for navigation-scoped one-fetch auction batches. */
@@ -475,6 +476,10 @@ export function createAuctionBatchService(
           continue;
         }
         const bid = bids.get(decision.candidateId);
+        if (bid?.renderSource.type === 'pbs_cache') {
+          containFailure(child, 'winner_not_renderable');
+          continue;
+        }
         const context: WinnerContext | undefined = bid
           ? frozen({ selectedCpm: bid.price })
           : undefined;
@@ -544,7 +549,7 @@ export function createAuctionBatchService(
       if (finished) return;
       let parsed: ParsedAuctionBatchResponse | undefined;
       try {
-        parsed = parseResponse(body, options.cachePolicy);
+        parsed = parseResponse(body);
       } catch {
         parsed = undefined;
       }
