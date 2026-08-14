@@ -3,26 +3,88 @@ import { describe, expect, it, vi } from 'vitest';
 import { createBootstrapController } from '../../src/core/bootstrap_controller';
 import {
   createFirstDisplayAgent,
-  firstDisplayProtocolCoverage,
   type FirstDisplayAuctionProtocolId,
   type FirstDisplayBatchOutcomeV1,
-  type FirstDisplayBatchV1,
   type FirstDisplayDriver,
   type FirstDisplayTerminalResult,
 } from '../../src/first_display/agent';
 
-function batch(kinds: FirstDisplayBatchV1['outcomes'][number]['kind'][]): FirstDisplayBatchV1 {
-  const requiredProtocols = Object.freeze([
-    ...(kinds.includes('aps') ? (['aps'] as const) : []),
-    ...(kinds.some((kind) => kind === 'aps' || kind === 'gpt_adm') ? (['gpt'] as const) : []),
-  ]);
+function batch(
+  kinds: readonly ('no_bid' | 'failed' | 'gpt_adm' | 'aps')[]
+): Readonly<Record<string, unknown>> {
+  const decisions: object[] = [];
+  const slots: object[] = [];
+  const bids: object[] = [];
+  let winner = 0;
+  for (let index = 0; index < kinds.length; index += 1) {
+    const kind = kinds[index];
+    const slot = `slot-${index}`;
+    slots.push(
+      Object.freeze({
+        slot,
+        gamUnitPath: `/123/example-${index}`,
+        divId: slot,
+        formats: Object.freeze([Object.freeze([300, 250])]),
+        targeting: Object.freeze({ placement: `article-${index}` }),
+      })
+    );
+    if (kind === 'no_bid') {
+      decisions.push(Object.freeze({ slot, outcome: 'no_bid' }));
+      continue;
+    }
+    if (kind === 'failed') {
+      decisions.push(Object.freeze({ slot, outcome: 'failed', reason: 'internal_error' }));
+      continue;
+    }
+    const candidateId = `c${String(winner).padStart(11, '0')}`;
+    winner += 1;
+    decisions.push(Object.freeze({ slot, outcome: 'winner', candidateId }));
+    bids.push(
+      Object.freeze({
+        candidateId,
+        slot,
+        provider: 'example',
+        upstreamBidId: `upstream-${index}`,
+        cpm: 1.25,
+        currency: 'USD',
+        targeting: Object.freeze({ hb_pb: '1.25' }),
+        rendererReservationId: `r1_${String(index).padStart(22, 'a')}`,
+        renderSource:
+          kind === 'aps'
+            ? Object.freeze({
+                type: 'aps',
+                version: 1,
+                accountId: 'account-1',
+                bidId: `bid-${index}`,
+                tagType: 'iframe',
+                creativeUrl: 'https://creative.example/render',
+                aaxResponse: '',
+                width: 300,
+                height: 250,
+              })
+            : Object.freeze({
+                type: 'adm',
+                version: 1,
+                adm: '<div>example</div>',
+                width: 300,
+                height: 250,
+              }),
+      })
+    );
+  }
   return Object.freeze({
     version: 1,
-    projectionDigest: 'a'.repeat(64),
-    requiredProtocols,
-    outcomes: Object.freeze(
-      kinds.map((kind, index) => Object.freeze({ slotId: `slot-${index}`, kind }))
-    ),
+    projectionDigest: 'b'.repeat(64),
+    projection: Object.freeze({
+      version: 1,
+      auction: Object.freeze({
+        version: 1,
+        auctionId: 'initial',
+        results: Object.freeze(decisions),
+      }),
+      slots: Object.freeze(slots),
+      bids: Object.freeze(bids),
+    }),
   });
 }
 
@@ -86,13 +148,62 @@ function driver(events: string[]): FirstDisplayDriver & {
 }
 
 describe('bounded first-display agent', () => {
+  it('derives the protected action from the immutable projection and rejects outcome summaries', () => {
+    const accepted = harness();
+    const received: FirstDisplayBatchOutcomeV1[][] = [];
+    const projectionAgent = createFirstDisplayAgent({
+      batch: batch(['gpt_adm']),
+      bootstrap: accepted.bootstrap,
+      driver: Object.freeze({
+        start: (outcomes: readonly FirstDisplayBatchOutcomeV1[]) => {
+          received.push([...outcomes]);
+        },
+        sealTsAdmission: () => undefined,
+        dispose: () => undefined,
+      }),
+      performance: accepted.performance,
+      paint: accepted.paint,
+      onProtectedPaint: () => undefined,
+      onFailure: (reason) => accepted.failures.push(reason),
+    });
+
+    expect(projectionAgent.start()).toBe(true);
+    expect(received).toEqual([[{ slotId: 'slot-0', kind: 'gpt_adm' }]]);
+
+    const rejected = harness();
+    const summaryAgent = createFirstDisplayAgent({
+      batch: Object.freeze({
+        version: 1,
+        projectionDigest: 'b'.repeat(64),
+        requiredProtocols: Object.freeze(['gpt']),
+        outcomes: Object.freeze([Object.freeze({ slotId: 'slot-0', kind: 'gpt_adm' })]),
+      }),
+      bootstrap: rejected.bootstrap,
+      driver: driver([]),
+      performance: rejected.performance,
+      paint: rejected.paint,
+      onProtectedPaint: () => undefined,
+      onFailure: (reason) => rejected.failures.push(reason),
+    });
+    expect(summaryAgent.start()).toBe(false);
+    expect(rejected.failures).toEqual(['abi_mismatch']);
+  });
+
   it('requires exact activated protocol coverage for the immutable batch', () => {
+    const h = harness();
+    const coverage = createFirstDisplayAgent({
+      batch: batch(['aps']),
+      bootstrap: h.bootstrap,
+      driver: driver([]),
+      performance: h.performance,
+      paint: h.paint,
+      onProtectedPaint: () => undefined,
+      onFailure: () => undefined,
+    });
     const aps = Object.freeze({ version: 1, id: 'aps' });
     const gpt = Object.freeze({ version: 1, id: 'gpt' });
-    const required = batch(['aps']);
     expect(
-      firstDisplayProtocolCoverage(
-        required,
+      coverage.coversProtocols(
         new Map<FirstDisplayAuctionProtocolId, unknown>([
           ['aps', aps],
           ['gpt', gpt],
@@ -100,14 +211,10 @@ describe('bounded first-display agent', () => {
       )
     ).toBe(true);
     expect(
-      firstDisplayProtocolCoverage(
-        required,
-        new Map<FirstDisplayAuctionProtocolId, unknown>([['aps', aps]])
-      )
+      coverage.coversProtocols(new Map<FirstDisplayAuctionProtocolId, unknown>([['aps', aps]]))
     ).toBe(false);
     expect(
-      firstDisplayProtocolCoverage(
-        required,
+      coverage.coversProtocols(
         new Map<FirstDisplayAuctionProtocolId, unknown>([
           ['aps', aps],
           ['gpt', Object.freeze({ version: 1, id: 'prebid' })],
@@ -115,19 +222,9 @@ describe('bounded first-display agent', () => {
       )
     ).toBe(false);
     expect(
-      firstDisplayProtocolCoverage(
-        required,
+      coverage.coversProtocols(
         new Map<FirstDisplayAuctionProtocolId, unknown>([
           ['aps', Object.freeze({ version: 1, id: 'aps', extra: true })],
-          ['gpt', gpt],
-        ])
-      )
-    ).toBe(false);
-    expect(
-      firstDisplayProtocolCoverage(
-        { ...required, requiredProtocols: Object.freeze(['gpt', 'aps']) },
-        new Map<FirstDisplayAuctionProtocolId, unknown>([
-          ['aps', aps],
           ['gpt', gpt],
         ])
       )
@@ -176,7 +273,7 @@ describe('bounded first-display agent', () => {
     const h = harness({ hidden: true });
     const events: string[] = [];
     const agent = createFirstDisplayAgent({
-      batch: batch(['no_bid', 'failed', 'cancelled']),
+      batch: batch(['no_bid', 'failed', 'failed']),
       bootstrap: h.bootstrap,
       driver: driver(events),
       performance: h.performance,

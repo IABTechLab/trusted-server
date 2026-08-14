@@ -11,33 +11,27 @@ import type {
   InitialSliceInstaller,
   OptionalFirstDisplaySliceId,
 } from './slices/definition';
+import {
+  snapshotFirstDisplayBatchV1,
+  type FirstDisplayAuctionProtocolId,
+  type FirstDisplayBatchOutcomeV1,
+  type FirstDisplayBatchV1,
+} from './leaf/projection';
 
-const HASH = /^[0-9a-f]{64}$/;
-const MAX_OUTCOMES = 256;
 const MAX_U32 = 4_294_967_295;
 const AUCTION_PROTOCOLS = ['aps', 'gpt', 'prebid'] as const;
 const ACTION_KINDS = new Set(['gpt_adm', 'aps']);
-const OUTCOME_KINDS = new Set(['no_bid', 'failed', 'cancelled', ...ACTION_KINDS]);
 const TERMINAL_RESULTS = new Set(['accepted', 'failed', 'cancelled']);
 
-export type FirstDisplayProjectedKind = 'no_bid' | 'failed' | 'cancelled' | 'gpt_adm' | 'aps';
+export type {
+  FirstDisplayAuctionProtocolId,
+  FirstDisplayBatchOutcomeV1,
+  FirstDisplayBatchV1,
+  FirstDisplayProjectedKind,
+} from './leaf/projection';
 export type FirstDisplayTerminalResult = 'accepted' | 'failed' | 'cancelled';
 export type FirstDisplayAgentState =
   'ready' | 'active' | 'terminal' | 'painted' | 'failed' | 'disposed';
-
-export interface FirstDisplayBatchOutcomeV1 {
-  readonly slotId: string;
-  readonly kind: FirstDisplayProjectedKind;
-}
-
-export interface FirstDisplayBatchV1 {
-  readonly version: 1;
-  readonly projectionDigest: string;
-  readonly requiredProtocols: readonly FirstDisplayAuctionProtocolId[];
-  readonly outcomes: readonly FirstDisplayBatchOutcomeV1[];
-}
-
-export type FirstDisplayAuctionProtocolId = (typeof AUCTION_PROTOCOLS)[number];
 
 export interface FirstDisplayDriver {
   readonly start: (
@@ -90,112 +84,14 @@ export interface FirstDisplayAgentSnapshotV1 {
 
 export interface FirstDisplayAgent {
   readonly state: FirstDisplayAgentState;
+  readonly coversProtocols: (
+    protocols: ReadonlyMap<FirstDisplayAuctionProtocolId, unknown>
+  ) => boolean;
   readonly start: () => boolean;
   readonly admitTsBid: (complete: () => void) => boolean;
   readonly observeNativeMutation: () => boolean;
   readonly snapshot: () => FirstDisplayAgentSnapshotV1;
   readonly dispose: () => void;
-}
-
-function exactRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | undefined {
-  if (
-    typeof value !== 'object' ||
-    value === null ||
-    Array.isArray(value) ||
-    Object.getPrototypeOf(value) !== Object.prototype ||
-    !Object.isFrozen(value)
-  ) {
-    return undefined;
-  }
-  const ownKeys = Reflect.ownKeys(value);
-  if (
-    ownKeys.length !== keys.length ||
-    !ownKeys.every((key) => typeof key === 'string' && keys.includes(key))
-  ) {
-    return undefined;
-  }
-  const result: Record<string, unknown> = {};
-  for (const key of keys) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor?.enumerable || !('value' in descriptor)) return undefined;
-    result[key] = descriptor.value;
-  }
-  return result;
-}
-
-function snapshotBatch(value: unknown): FirstDisplayBatchV1 | undefined {
-  try {
-    const fields = exactRecord(value, [
-      'version',
-      'projectionDigest',
-      'requiredProtocols',
-      'outcomes',
-    ]);
-    if (
-      !fields ||
-      fields.version !== 1 ||
-      typeof fields.projectionDigest !== 'string' ||
-      !HASH.test(fields.projectionDigest) ||
-      !Array.isArray(fields.requiredProtocols) ||
-      !Object.isFrozen(fields.requiredProtocols) ||
-      !Array.isArray(fields.outcomes) ||
-      !Object.isFrozen(fields.outcomes) ||
-      fields.outcomes.length === 0 ||
-      fields.outcomes.length > MAX_OUTCOMES
-    ) {
-      return undefined;
-    }
-    const requiredProtocols: FirstDisplayAuctionProtocolId[] = [];
-    if (Reflect.ownKeys(fields.requiredProtocols).length !== fields.requiredProtocols.length + 1) {
-      return undefined;
-    }
-    let previousProtocol = -1;
-    for (const candidate of fields.requiredProtocols) {
-      const order = AUCTION_PROTOCOLS.indexOf(candidate as FirstDisplayAuctionProtocolId);
-      if (order < 0 || order <= previousProtocol) return undefined;
-      previousProtocol = order;
-      requiredProtocols.push(candidate as FirstDisplayAuctionProtocolId);
-    }
-    const seen = new Set<string>();
-    const outcomes: FirstDisplayBatchOutcomeV1[] = [];
-    for (const candidate of fields.outcomes) {
-      const outcome = exactRecord(candidate, ['slotId', 'kind']);
-      if (
-        !outcome ||
-        typeof outcome.slotId !== 'string' ||
-        outcome.slotId.length === 0 ||
-        outcome.slotId.length > 1024 ||
-        seen.has(outcome.slotId) ||
-        typeof outcome.kind !== 'string' ||
-        !OUTCOME_KINDS.has(outcome.kind)
-      ) {
-        return undefined;
-      }
-      seen.add(outcome.slotId);
-      outcomes.push(
-        Object.freeze({
-          slotId: outcome.slotId,
-          kind: outcome.kind as FirstDisplayProjectedKind,
-        })
-      );
-    }
-    if (
-      (outcomes.some(({ kind }) => kind === 'aps') &&
-        (!requiredProtocols.includes('aps') || !requiredProtocols.includes('gpt'))) ||
-      (outcomes.some(({ kind }) => kind === 'gpt_adm') && !requiredProtocols.includes('gpt')) ||
-      (requiredProtocols.includes('prebid') && !requiredProtocols.includes('gpt'))
-    ) {
-      return undefined;
-    }
-    return Object.freeze({
-      version: 1,
-      projectionDigest: fields.projectionDigest,
-      requiredProtocols: Object.freeze(requiredProtocols),
-      outcomes: Object.freeze(outcomes),
-    });
-  } catch {
-    return undefined;
-  }
 }
 
 function protocolIdentity(candidate: unknown, expected: FirstDisplayAuctionProtocolId): boolean {
@@ -225,16 +121,6 @@ function protocolIdentity(candidate: unknown, expected: FirstDisplayAuctionProto
   }
 }
 
-/** Prove every protocol declared by the immutable batch was activated exactly once. */
-export function firstDisplayProtocolCoverage(
-  batch: unknown,
-  protocols: ReadonlyMap<FirstDisplayAuctionProtocolId, unknown>
-): boolean {
-  const snapshot = snapshotBatch(batch);
-  if (!snapshot || protocols.size !== snapshot.requiredProtocols.length) return false;
-  return snapshot.requiredProtocols.every((id) => protocolIdentity(protocols.get(id), id));
-}
-
 class FirstDisplayAgentOwner implements FirstDisplayAgent {
   private readonly batch: FirstDisplayBatchV1 | undefined;
   private readonly results = new Map<
@@ -251,12 +137,20 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
   private actionStarted = false;
 
   public constructor(private readonly options: FirstDisplayAgentOptions) {
-    this.batch = snapshotBatch(options.batch);
+    this.batch = snapshotFirstDisplayBatchV1(options.batch);
     this.mutationRevision = options.initialMutationRevision ?? 0;
   }
 
   public get state(): FirstDisplayAgentState {
     return this.stateValue;
+  }
+
+  public coversProtocols(protocols: ReadonlyMap<FirstDisplayAuctionProtocolId, unknown>): boolean {
+    return Boolean(
+      this.batch &&
+      protocols.size === this.batch.requiredProtocols.length &&
+      this.batch.requiredProtocols.every((id) => protocolIdentity(protocols.get(id), id))
+    );
   }
 
   public start(): boolean {
@@ -453,6 +347,8 @@ export function createFirstDisplayAgent(options: FirstDisplayAgentOptions): Firs
     get state() {
       return owner.state;
     },
+    coversProtocols: (protocols: ReadonlyMap<FirstDisplayAuctionProtocolId, unknown>) =>
+      owner.coversProtocols(protocols),
     start: () => owner.start(),
     admitTsBid: (complete: () => void) => owner.admitTsBid(complete),
     observeNativeMutation: () => owner.observeNativeMutation(),
@@ -516,7 +412,7 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
         const agent = createFirstDisplayAgent(options);
         context.own(() => agent.dispose());
         context.afterActivate(() => {
-          if (!firstDisplayProtocolCoverage(options.batch, auctionProtocols)) {
+          if (!agent.coversProtocols(auctionProtocols)) {
             throw new TypeError('first-display protocol coverage is incomplete');
           }
           if (!agent.start()) throw new TypeError('first-display agent did not start');
