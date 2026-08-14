@@ -65,9 +65,11 @@ function driver(events: string[]): FirstDisplayDriver & {
   return Object.freeze({
     start: (
       _outcomes: readonly FirstDisplayBatchOutcomeV1[],
+      onFirstAction: () => boolean,
       onTerminal: (slotId: string, result: FirstDisplayTerminalResult) => void
     ) => {
       events.push('driver:start');
+      onFirstAction();
       settle = onTerminal;
     },
     settleForTest: (slotId: string, result: FirstDisplayTerminalResult) => settle?.(slotId, result),
@@ -139,6 +141,67 @@ describe('bounded first-display agent', () => {
       'tsjs:first-display-paint',
     ]);
     expect(events).toEqual(['driver:seal', 'protected:paint']);
+  });
+
+  it('records first-display only at the responsible action and rejects a late or replayed action', () => {
+    const h = harness();
+    let action: (() => boolean) | undefined;
+    const events: string[] = [];
+    const ownedDriver: FirstDisplayDriver = Object.freeze({
+      start: (
+        _outcomes: readonly FirstDisplayBatchOutcomeV1[],
+        onFirstAction: () => boolean
+      ) => {
+        events.push('driver:prepared');
+        action = onFirstAction;
+      },
+      sealTsAdmission: () => undefined,
+      dispose: () => events.push('driver:dispose'),
+    });
+    const agent = createFirstDisplayAgent({
+      batch: batch(['gpt_adm']),
+      bootstrap: h.bootstrap,
+      driver: ownedDriver,
+      performance: h.performance,
+      paint: h.paint,
+      onProtectedPaint: () => undefined,
+      onFailure: (reason) => h.failures.push(reason),
+    });
+
+    expect(agent.start()).toBe(true);
+    expect(events).toEqual(['driver:prepared']);
+    expect(h.marks).toEqual(['tsjs:bids-script']);
+    expect(action?.()).toBe(true);
+    expect(h.marks).toEqual(['tsjs:bids-script', 'tsjs:first-display']);
+    expect(action?.()).toBe(false);
+    expect(agent.state).toBe('failed');
+    expect(h.failures).toEqual(['bundle_partial']);
+
+    const late = harness();
+    let lateAction: (() => boolean) | undefined;
+    const lateAgent = createFirstDisplayAgent({
+      batch: batch(['aps']),
+      bootstrap: late.bootstrap,
+      driver: Object.freeze({
+        start: (
+          _outcomes: readonly FirstDisplayBatchOutcomeV1[],
+          onFirstAction: () => boolean
+        ) => {
+          lateAction = onFirstAction;
+        },
+        sealTsAdmission: () => undefined,
+        dispose: () => undefined,
+      }),
+      performance: late.performance,
+      paint: late.paint,
+      onProtectedPaint: () => undefined,
+      onFailure: (reason) => late.failures.push(reason),
+    });
+    expect(lateAgent.start()).toBe(true);
+    late.setNow(10_000);
+    expect(lateAction?.()).toBe(false);
+    expect(late.failures).toEqual(['bundle_partial']);
+    expect(late.marks).toEqual(['tsjs:bids-script']);
   });
 
   it('uses the same 10-second deadline for registration, activation, and action start', () => {

@@ -15,6 +15,7 @@ const MAX_OUTCOMES = 256;
 const MAX_U32 = 4_294_967_295;
 const ACTION_KINDS = new Set(['gpt_adm', 'aps']);
 const OUTCOME_KINDS = new Set(['no_bid', 'failed', 'cancelled', ...ACTION_KINDS]);
+const TERMINAL_RESULTS = new Set(['accepted', 'failed', 'cancelled']);
 
 export type FirstDisplayProjectedKind = 'no_bid' | 'failed' | 'cancelled' | 'gpt_adm' | 'aps';
 export type FirstDisplayTerminalResult = 'accepted' | 'failed' | 'cancelled';
@@ -35,6 +36,7 @@ export interface FirstDisplayBatchV1 {
 export interface FirstDisplayDriver {
   readonly start: (
     outcomes: readonly FirstDisplayBatchOutcomeV1[],
+    onFirstAction: () => boolean,
     onTerminal: (slotId: string, result: FirstDisplayTerminalResult) => void
   ) => void;
   readonly sealTsAdmission: () => void;
@@ -170,6 +172,7 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
   private sealed = false;
   private disposedDriver = false;
   private failed = false;
+  private actionStarted = false;
 
   public constructor(private readonly options: FirstDisplayAgentOptions) {
     this.batch = snapshotBatch(options.batch);
@@ -202,15 +205,14 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
       this.recordTerminal();
       return true;
     }
-    if (!this.options.bootstrap.startAction()) {
-      this.stateValue = 'failed';
-      return false;
-    }
-    this.mark('tsjs:first-display');
     try {
-      this.options.driver.start(Object.freeze(actions), (slotId, result) => {
-        this.settle(slotId, result);
-      });
+      this.options.driver.start(
+        Object.freeze(actions),
+        () => this.recordFirstAction(),
+        (slotId, result) => {
+          this.settle(slotId, result);
+        }
+      );
       return true;
     } catch {
       return this.fail('bundle_partial');
@@ -262,7 +264,19 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
   }
 
   private settle(slotId: string, result: FirstDisplayTerminalResult): void {
-    if (this.stateValue !== 'active' || !this.pending.delete(slotId)) return;
+    if (!this.actionStarted) {
+      this.fail('bundle_partial');
+      return;
+    }
+    if (this.stateValue !== 'active') return;
+    if (typeof result !== 'string' || !TERMINAL_RESULTS.has(result)) {
+      this.fail('bundle_partial');
+      return;
+    }
+    if (!this.pending.delete(slotId)) {
+      if (!this.results.has(slotId)) this.fail('bundle_partial');
+      return;
+    }
     this.results.set(slotId, result);
     if (result === 'accepted') this.initialDisplayCommitted = true;
     if (this.pending.size === 0) this.recordTerminal();
@@ -274,6 +288,21 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
     this.options.bootstrap.settle();
     this.mark('tsjs:first-display-terminal');
     this.scheduleProtectedPaint(2);
+  }
+
+  private recordFirstAction(): boolean {
+    if (this.stateValue !== 'active' || this.actionStarted) return this.fail('bundle_partial');
+    if (!this.options.bootstrap.startAction()) {
+      if (this.options.bootstrap.state !== 'failed') return this.fail('bundle_partial');
+      this.failed = true;
+      this.stateValue = 'failed';
+      this.disposeDriver();
+      this.pending.clear();
+      return false;
+    }
+    this.actionStarted = true;
+    this.mark('tsjs:first-display');
+    return true;
   }
 
   private scheduleProtectedPaint(remaining: number): void {
