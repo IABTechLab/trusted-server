@@ -93,7 +93,9 @@ describe('first-display initial slice definitions', () => {
         }),
         own
       ),
-      installGptInitial(Object.freeze({ observe, register }), own),
+      installGptInitial(Object.freeze({ observe, register }), own, () =>
+        Object.freeze({ start: () => true, dispose: () => undefined })
+      ),
       installPrebidInitial(Object.freeze({ observe, register }), own),
     ];
 
@@ -1104,6 +1106,7 @@ describe('first-display initial slice definitions', () => {
       requestStartMs: 3_000,
       completionMs: 10_000,
     });
+    expect(protocol?.createBatch).toBeTypeOf('function');
     expect(
       protocol?.requestPlan(
         Object.freeze({ initialLoadDisabled: false, ownership: 'trusted_server' })

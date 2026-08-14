@@ -205,7 +205,12 @@ test('permits external-global ownership only in adapter source files', () => {
     lint('const root = window; root.googletag; globalThis.pbjs;', 'src/adapters/googletag.js'),
     []
   );
+  assert.deepEqual(
+    lint('const root = window; root.googletag;', 'src/first_display/adapters/googletag.ts'),
+    []
+  );
   assertRejected('window.googletag;', 'src/adapters-pretender/googletag.js');
+  assertRejected('window.googletag;', 'src/first_display/leaf/gpt_protocol.ts');
 });
 
 test('integration entrypoints have no ad-tech-global exemption', () => {
@@ -290,8 +295,8 @@ test('restricted paths enforce dependency direction and exact target-file exempt
   );
 
   assert.ok(
-    (await restrictedMessages("import '../integrations/aps/render';", 'src/core/request.ts')).length >
-      0
+    (await restrictedMessages("import '../integrations/aps/render';", 'src/core/request.ts'))
+      .length > 0
   );
   assert.ok(
     (await restrictedMessages("import '../integrations/aps/render';", 'src/kernel/request.ts'))

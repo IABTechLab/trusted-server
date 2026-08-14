@@ -199,6 +199,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
       'first_display/contracts',
       'first_display/registration',
       'first_display/slices/definition',
+      'first_display/adapters/googletag',
       'first_display/leaf/gpt_protocol',
     ],
     inputs: ['first_display.control.v1'],
