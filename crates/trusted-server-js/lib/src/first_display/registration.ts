@@ -90,10 +90,7 @@ function authenticatedCurrentScript(browser: Window): HTMLScriptElement | undefi
     const { document } = browser;
     const candidate = document.currentScript;
     const Script = document.defaultView?.HTMLScriptElement;
-    if (
-      !Script ||
-      !(candidate instanceof Script)
-    ) {
+    if (!Script || !(candidate instanceof Script)) {
       return undefined;
     }
     const script = candidate as HTMLScriptElement;

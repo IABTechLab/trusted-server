@@ -16,7 +16,10 @@ interface DidomiInitialBindings {
   readonly target: DidomiTarget;
 }
 
-function exactDataRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | undefined {
+function exactDataRecord(
+  value: unknown,
+  keys: readonly string[]
+): Record<string, unknown> | undefined {
   try {
     if (
       typeof value !== 'object' ||
@@ -96,7 +99,8 @@ export function installDidomiInitial(
   own: FirstDisplaySliceActivationContext['own']
 ): void {
   const bindings = snapshotBindings(candidate);
-  if (!bindings || typeof own !== 'function') throw new TypeError('invalid Didomi initial bindings');
+  if (!bindings || typeof own !== 'function')
+    throw new TypeError('invalid Didomi initial bindings');
   const { config, observe, target } = bindings;
   const origin = new URL(target.location.origin).origin;
   const parsed = new URL(config.proxyPath, origin);
@@ -133,7 +137,12 @@ export function installDidomiInitial(
     active = false;
     try {
       if (target.didomiConfig !== publisherConfig) return;
-      if (!sameDescriptor(Object.getOwnPropertyDescriptor(publisherConfig, 'sdkPath'), installedSdkDescriptor)) {
+      if (
+        !sameDescriptor(
+          Object.getOwnPropertyDescriptor(publisherConfig, 'sdkPath'),
+          installedSdkDescriptor
+        )
+      ) {
         return;
       }
       if (previousSdkDescriptor) {

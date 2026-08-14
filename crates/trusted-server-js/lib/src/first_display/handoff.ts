@@ -12,11 +12,7 @@ const HASH = /^[0-9a-f]{64}$/;
 const MAX_U32 = 4_294_967_295;
 
 export type FirstDisplayHandoffOwnerState =
-  | 'observing'
-  | 'sealing'
-  | 'finalized'
-  | 'failed'
-  | 'disposed';
+  'observing' | 'sealing' | 'finalized' | 'failed' | 'disposed';
 
 export interface FirstDisplayHandoffOwnerOptions {
   readonly releaseId: string;
@@ -126,11 +122,7 @@ export function createFirstDisplayHandoffOwner(
     ): FinalizedFirstDisplayHandoffV1 | undefined => {
       if (state !== 'observing') return publishFailure();
       try {
-        if (
-          !options.isCurrentGeneration() ||
-          !options.isTerminal() ||
-          !options.isPainted()
-        ) {
+        if (!options.isCurrentGeneration() || !options.isTerminal() || !options.isPainted()) {
           return publishFailure();
         }
         state = 'sealing';

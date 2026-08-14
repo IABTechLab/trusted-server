@@ -260,9 +260,7 @@ test('generated first-display components self-register through one authenticated
   try {
     dom.window.eval(
       firstDisplay
-        .map(({ file }) =>
-          fs.readFileSync(path.resolve(libDirectory, '../dist', file), 'utf8')
-        )
+        .map(({ file }) => fs.readFileSync(path.resolve(libDirectory, '../dist', file), 'utf8'))
         .join(';\n')
     );
     assert.deepEqual(
