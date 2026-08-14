@@ -2,11 +2,14 @@ import { describe, expect, it } from 'vitest';
 
 import * as releaseCatalog from '../../src/kernel/release_catalog';
 import {
+  FIRST_DISPLAY_CATALOG,
+  MAX_FIRST_DISPLAY_SLICES,
   MAX_CRITICAL_MODULES,
   MAX_MANIFEST_MODULES,
   MINIMAL_CRITICAL_IDS,
   REFERENCE_CRITICAL_IDS,
   RELEASE_CATALOG,
+  selectFirstDisplayCatalog,
   selectReleaseCatalog,
   validateReleaseCatalog,
   type ReleaseCatalogEntry,
@@ -54,6 +57,45 @@ const EXPECTED = [
 ] as const;
 
 describe('canonical release catalog', () => {
+  it('pins the exact thirteen first-display rows and closed server-owned selection', () => {
+    expect(FIRST_DISPLAY_CATALOG.map(({ order, id }) => [order, id])).toEqual([
+      [1, 'first_display'],
+      [2, 'aps_initial'],
+      [3, 'creative_initial'],
+      [4, 'datadome_initial'],
+      [5, 'didomi_initial'],
+      [6, 'google_tag_manager_initial'],
+      [7, 'gpt_initial'],
+      [8, 'lockr_initial'],
+      [9, 'osano_initial'],
+      [10, 'permutive_initial'],
+      [11, 'sourcepoint_initial'],
+      [12, 'prebid_initial'],
+      [13, 'testlight_initial'],
+    ]);
+    expect(MAX_FIRST_DISPLAY_SLICES).toBe(13);
+    expect(
+      selectFirstDisplayCatalog({
+        eligibleBatch: true,
+        integrations: ['aps', 'gpt', 'prebid'],
+        apsParticipates: true,
+        prebidParticipates: true,
+      }).map(({ id }) => id)
+    ).toEqual(['first_display', 'aps_initial', 'gpt_initial', 'prebid_initial']);
+    expect(selectFirstDisplayCatalog({ eligibleBatch: false, integrations: [] })).toEqual([]);
+    expect(() =>
+      selectFirstDisplayCatalog({ eligibleBatch: true, integrations: ['unknown'] })
+    ).toThrow(/unknown/i);
+    expect(
+      FIRST_DISPLAY_CATALOG.every(
+        ({ allowedImports, inputs, outputs, obligation }) =>
+          allowedImports.length > 0 &&
+          inputs.length > 0 &&
+          outputs.length > 0 &&
+          obligation.length > 0
+      )
+    ).toBe(true);
+  });
   it('pins the exact twenty rows, phases, triggers, products, predicates, and order', () => {
     expect(
       RELEASE_CATALOG.map(({ id, product, phase, trigger, include }) => [

@@ -43,6 +43,241 @@ export interface ReleaseCatalogSelection {
   readonly renderTraceOverlay?: boolean;
 }
 
+export type FirstDisplaySliceId =
+  | 'first_display'
+  | 'aps_initial'
+  | 'creative_initial'
+  | 'datadome_initial'
+  | 'didomi_initial'
+  | 'google_tag_manager_initial'
+  | 'gpt_initial'
+  | 'lockr_initial'
+  | 'osano_initial'
+  | 'permutive_initial'
+  | 'sourcepoint_initial'
+  | 'prebid_initial'
+  | 'testlight_initial';
+
+export type FirstDisplayIncludePredicate =
+  | 'eligible_batch'
+  | 'aps_participates'
+  | 'creative_guard'
+  | 'gpt_initial'
+  | 'prebid_participates'
+  | `integration:${
+      | 'datadome'
+      | 'didomi'
+      | 'google_tag_manager'
+      | 'lockr'
+      | 'osano'
+      | 'permutive'
+      | 'sourcepoint'
+      | 'testlight'}`;
+
+export interface FirstDisplayCatalogEntry {
+  readonly order: number;
+  readonly id: FirstDisplaySliceId;
+  readonly include: FirstDisplayIncludePredicate;
+  readonly allowedImports: readonly string[];
+  readonly inputs: readonly string[];
+  readonly outputs: readonly string[];
+  readonly obligation: string;
+}
+
+export interface FirstDisplayCatalogSelection {
+  readonly eligibleBatch: boolean;
+  readonly integrations: readonly string[];
+  readonly apsParticipates?: boolean;
+  readonly prebidParticipates?: boolean;
+  readonly creative?: Readonly<{
+    enabled: boolean;
+    clickGuard: boolean;
+    renderGuard: boolean;
+  }>;
+}
+
+const firstDisplayRow = (entry: FirstDisplayCatalogEntry): FirstDisplayCatalogEntry =>
+  Object.freeze({
+    ...entry,
+    allowedImports: Object.freeze([...entry.allowedImports]),
+    inputs: Object.freeze([...entry.inputs]),
+    outputs: Object.freeze([...entry.outputs]),
+  });
+
+/** Closed build catalog for the one provisional first-display artifact. */
+export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object.freeze([
+  firstDisplayRow({
+    order: 1,
+    id: 'first_display',
+    include: 'eligible_batch',
+    allowedImports: ['first_display/contracts', 'first_display/transaction'],
+    inputs: ['boot.v1', 'projection.v1'],
+    outputs: ['first_display.control.v1'],
+    obligation:
+      'Validate the immutable batch and own provisional lifetime, timing, ingress, and transfer',
+  }),
+  firstDisplayRow({
+    order: 2,
+    id: 'aps_initial',
+    include: 'aps_participates',
+    allowedImports: ['first_display/contracts', 'first_display/leaf/aps_protocol'],
+    inputs: ['first_display.control.v1'],
+    outputs: ['aps.initial.v1'],
+    obligation: 'Own initial reservation, PUC, and APS document protocols',
+  }),
+  firstDisplayRow({
+    order: 3,
+    id: 'creative_initial',
+    include: 'creative_guard',
+    allowedImports: ['first_display/contracts', 'first_display/leaf/creative_guard'],
+    inputs: ['first_display.control.v1'],
+    outputs: ['creative.initial.v1'],
+    obligation: 'Install current parser-time creative guards and record initial observations only',
+  }),
+  firstDisplayRow({
+    order: 4,
+    id: 'datadome_initial',
+    include: 'integration:datadome',
+    allowedImports: ['first_display/contracts', 'first_display/leaf/route_guard'],
+    inputs: ['first_display.control.v1'],
+    outputs: ['datadome.initial.v1'],
+    obligation: 'Install the initial DataDome script and preload route guard',
+  }),
+  firstDisplayRow({
+    order: 5,
+    id: 'didomi_initial',
+    include: 'integration:didomi',
+    allowedImports: ['first_display/contracts', 'first_display/leaf/config_guard'],
+    inputs: ['first_display.control.v1'],
+    outputs: ['didomi.initial.v1'],
+    obligation: 'Install the configured Didomi SDK path before SDK evaluation',
+  }),
+  firstDisplayRow({
+    order: 6,
+    id: 'google_tag_manager_initial',
+    include: 'integration:google_tag_manager',
+    allowedImports: ['first_display/contracts', 'first_display/leaf/route_guard'],
+    inputs: ['first_display.control.v1'],
+    outputs: ['google_tag_manager.initial.v1'],
+    obligation: 'Install initial GTM script, preload, beacon, and fetch guards',
+  }),
+  firstDisplayRow({
+    order: 7,
+    id: 'gpt_initial',
+    include: 'gpt_initial',
+    allowedImports: ['first_display/contracts', 'first_display/leaf/gpt_protocol'],
+    inputs: ['first_display.control.v1'],
+    outputs: ['gpt.initial.v1'],
+    obligation: 'Sole provisional GPT adapter, listeners, targeting, request, and handoff capture',
+  }),
+  firstDisplayRow({
+    order: 8,
+    id: 'lockr_initial',
+    include: 'integration:lockr',
+    allowedImports: ['first_display/contracts', 'first_display/leaf/route_guard'],
+    inputs: ['first_display.control.v1'],
+    outputs: ['lockr.initial.v1'],
+    obligation: 'Install the initial Lockr script guard and bounded readiness observation',
+  }),
+  firstDisplayRow({
+    order: 9,
+    id: 'osano_initial',
+    include: 'integration:osano',
+    allowedImports: ['first_display/contracts', 'first_display/leaf/consent_snapshot'],
+    inputs: ['first_display.control.v1'],
+    outputs: ['osano.initial.v1'],
+    obligation: 'Capture the initial consent mirrors required by the protected batch',
+  }),
+  firstDisplayRow({
+    order: 10,
+    id: 'permutive_initial',
+    include: 'integration:permutive',
+    allowedImports: ['first_display/contracts', 'first_display/leaf/context_snapshot'],
+    inputs: ['first_display.control.v1'],
+    outputs: ['permutive.initial.v1'],
+    obligation: 'Install initial guard/readiness and capture normalized segments',
+  }),
+  firstDisplayRow({
+    order: 11,
+    id: 'sourcepoint_initial',
+    include: 'integration:sourcepoint',
+    allowedImports: ['first_display/contracts', 'first_display/leaf/consent_snapshot'],
+    inputs: ['first_display.control.v1'],
+    outputs: ['sourcepoint.initial.v1'],
+    obligation: 'Install the initial SDK guard and capture the GPP mirror',
+  }),
+  firstDisplayRow({
+    order: 12,
+    id: 'prebid_initial',
+    include: 'prebid_participates',
+    allowedImports: ['first_display/contracts', 'first_display/leaf/prebid_protocol'],
+    inputs: ['first_display.control.v1', 'gpt.initial.v1'],
+    outputs: ['prebid.initial.v1'],
+    obligation:
+      'Own initial artifact admission, queue, bidder, identity, EID, TS bid, and PUC setup',
+  }),
+  firstDisplayRow({
+    order: 13,
+    id: 'testlight_initial',
+    include: 'integration:testlight',
+    allowedImports: ['first_display/contracts', 'first_display/leaf/callback_capture'],
+    inputs: ['first_display.control.v1'],
+    outputs: ['testlight.initial.v1'],
+    obligation: 'Capture preexisting callbacks before publisher replacement or drain',
+  }),
+]);
+
+const FIRST_DISPLAY_KNOWN_INTEGRATIONS = new Set([
+  'aps',
+  'creative',
+  'datadome',
+  'didomi',
+  'google_tag_manager',
+  'gpt',
+  'lockr',
+  'osano',
+  'permutive',
+  'prebid',
+  'sourcepoint',
+  'testlight',
+]);
+
+/** Select the exact ordered provisional slices from trusted server-owned facts. */
+export function selectFirstDisplayCatalog(
+  selection: FirstDisplayCatalogSelection
+): readonly FirstDisplayCatalogEntry[] {
+  const integrations = new Set<string>();
+  for (const id of selection.integrations) {
+    if (!FIRST_DISPLAY_KNOWN_INTEGRATIONS.has(id)) {
+      throw new TypeError(`Unknown first-display integration: ${id}`);
+    }
+    integrations.add(id);
+  }
+  if (!selection.eligibleBatch) return Object.freeze([]);
+
+  const include = (predicate: FirstDisplayIncludePredicate): boolean => {
+    if (predicate === 'eligible_batch') return true;
+    if (predicate === 'aps_participates') {
+      return selection.apsParticipates === true && integrations.has('aps');
+    }
+    if (predicate === 'prebid_participates') {
+      return selection.prebidParticipates === true && integrations.has('prebid');
+    }
+    if (predicate === 'gpt_initial') return integrations.has('gpt');
+    if (predicate === 'creative_guard') {
+      const creative = selection.creative;
+      return Boolean(creative?.enabled && (creative.clickGuard || creative.renderGuard));
+    }
+    return integrations.has(predicate.slice('integration:'.length));
+  };
+
+  const selected = FIRST_DISPLAY_CATALOG.filter((entry) => include(entry.include));
+  if (!selected.some(({ id }) => id === 'gpt_initial')) return Object.freeze([]);
+  return Object.freeze(selected);
+}
+
+export const MAX_FIRST_DISPLAY_SLICES = FIRST_DISPLAY_CATALOG.length;
+
 const row = (entry: ReleaseCatalogEntry): ReleaseCatalogEntry =>
   Object.freeze({
     ...entry,

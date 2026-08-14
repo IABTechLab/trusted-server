@@ -10,6 +10,7 @@ use trusted_server_js::{
 };
 use validator::Validate;
 
+use crate::auction::types::{BidRenderSourceV1, BrowserAuctionProjectionV1, SlotAuctionDecisionV1};
 use crate::error::TrustedServerError;
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -305,6 +306,159 @@ pub struct CreativeBootConfigV1 {
     pub click_guard: bool,
     /// Whether automatic render interception activates after kernel commit.
     pub render_guard: bool,
+}
+
+/// Trusted server-owned inputs for selecting the closed provisional artifact.
+#[derive(Clone, Copy, Debug)]
+pub struct FirstDisplaySelectionConfigV1<'a> {
+    /// Enabled browser integration products; never publisher supplied.
+    pub enabled_integrations: &'a [&'a str],
+    /// Exact server-resolved parser-time creative guard policy.
+    pub creative: CreativeBootConfigV1,
+}
+
+/// Exact ordered first-display slice mask selected for one immutable projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FirstDisplaySelectionV1 {
+    mask: u16,
+    slices: Vec<&'static str>,
+}
+
+impl FirstDisplaySelectionV1 {
+    /// Return the four-hex-digit transport mask value.
+    #[must_use]
+    pub const fn mask(&self) -> u16 {
+        self.mask
+    }
+
+    /// Return selected slice ids in the fixed build order.
+    #[must_use]
+    pub fn slices(&self) -> &[&'static str] {
+        &self.slices
+    }
+}
+
+const FIRST_DISPLAY_SLICE_CATALOG: &[(&str, &str)] = &[
+    ("first_display", "eligible_batch"),
+    ("aps_initial", "aps_participates"),
+    ("creative_initial", "creative_guard"),
+    ("datadome_initial", "integration:datadome"),
+    ("didomi_initial", "integration:didomi"),
+    (
+        "google_tag_manager_initial",
+        "integration:google_tag_manager",
+    ),
+    ("gpt_initial", "integration:gpt"),
+    ("lockr_initial", "integration:lockr"),
+    ("osano_initial", "integration:osano"),
+    ("permutive_initial", "integration:permutive"),
+    ("sourcepoint_initial", "integration:sourcepoint"),
+    ("prebid_initial", "prebid_participates"),
+    ("testlight_initial", "integration:testlight"),
+];
+
+const FIRST_DISPLAY_KNOWN_INTEGRATIONS: &[&str] = &[
+    "aps",
+    "creative",
+    "datadome",
+    "didomi",
+    "google_tag_manager",
+    "gpt",
+    "gpt_diagnostics",
+    "lockr",
+    "osano",
+    "permutive",
+    "prebid",
+    "sourcepoint",
+    "testlight",
+];
+
+/// Select the agent only for a complete, closed GPT-mediated initial projection.
+///
+/// An absent selection means the page must boot the persistent runtime directly.
+/// PBS Cache, direct/programmatic projections, unknown obligations, incomplete
+/// joins, and non-GPT configurations fail closed here.
+#[must_use]
+pub fn select_first_display_slices_v1(
+    projection: &BrowserAuctionProjectionV1,
+    config: FirstDisplaySelectionConfigV1<'_>,
+) -> Option<FirstDisplaySelectionV1> {
+    if projection.version != 1
+        || projection.auction.version != 1
+        || projection.auction.results.is_empty()
+        || projection.auction.results.len() > crate::auction::types::MAX_BROWSER_AUCTION_RESULTS
+        || projection.slots.len() != projection.auction.results.len()
+    {
+        return None;
+    }
+
+    let mut enabled = HashSet::new();
+    for integration in config.enabled_integrations {
+        if !FIRST_DISPLAY_KNOWN_INTEGRATIONS.contains(integration) || !enabled.insert(*integration)
+        {
+            return None;
+        }
+    }
+    if !enabled.contains("gpt") {
+        return None;
+    }
+
+    let mut winner_count = 0_usize;
+    let mut aps_participates = false;
+    let mut seen_slots = HashSet::new();
+    for (index, decision) in projection.auction.results.iter().enumerate() {
+        let slot = projection.slots.get(index)?;
+        if slot.slot != decision.slot() || !seen_slots.insert(slot.slot.as_str()) {
+            return None;
+        }
+        if let SlotAuctionDecisionV1::Winner { candidate_id, slot } = decision {
+            let mut matching = projection
+                .bids
+                .iter()
+                .filter(|bid| bid.candidate_id == *candidate_id && bid.slot == *slot);
+            let bid = matching.next()?;
+            if matching.next().is_some() {
+                return None;
+            }
+            match &bid.render_source {
+                BidRenderSourceV1::Aps(_) => {
+                    if !enabled.contains("aps") {
+                        return None;
+                    }
+                    aps_participates = true;
+                }
+                BidRenderSourceV1::Adm(_) => {}
+                BidRenderSourceV1::PbsCache(_) => return None,
+            }
+            winner_count += 1;
+        }
+    }
+    if winner_count != projection.bids.len() {
+        return None;
+    }
+
+    let creative_guard = enabled.contains("creative")
+        && config.creative.enabled
+        && (config.creative.click_guard || config.creative.render_guard);
+    let prebid_participates = enabled.contains("prebid");
+    let mut mask = 0_u16;
+    let mut slices = Vec::new();
+    for (index, (id, predicate)) in FIRST_DISPLAY_SLICE_CATALOG.iter().enumerate() {
+        let selected = match *predicate {
+            "eligible_batch" => true,
+            "aps_participates" => aps_participates,
+            "creative_guard" => creative_guard,
+            "prebid_participates" => prebid_participates,
+            predicate => predicate
+                .strip_prefix("integration:")
+                .is_some_and(|integration| enabled.contains(integration)),
+        };
+        if selected {
+            mask |= 1_u16 << index;
+            slices.push(*id);
+        }
+    }
+    Some(FirstDisplaySelectionV1 { mask, slices })
 }
 
 impl Default for CreativeBootConfigV1 {
@@ -1380,5 +1534,192 @@ mod tests {
     #[test]
     fn tsjs_deferred_script_src_rejects_unknown_module() {
         assert_eq!(tsjs_deferred_script_src("does-not-exist"), None);
+    }
+
+    fn first_display_projection(source: Option<BidRenderSourceV1>) -> BrowserAuctionProjectionV1 {
+        use crate::auction::types::{
+            AuctionDecisionSetV1, BrowserAuctionBidV1, BrowserAuctionSlotV1, SlotAuctionDecisionV1,
+        };
+
+        let slot = BrowserAuctionSlotV1 {
+            slot: "slot-1".to_string(),
+            gam_unit_path: "/123/home".to_string(),
+            div_id: "div-1".to_string(),
+            formats: vec![[300, 250]],
+            targeting: std::collections::BTreeMap::new(),
+        };
+        let (results, bids) = source.map_or_else(
+            || {
+                (
+                    vec![SlotAuctionDecisionV1::NoBid {
+                        slot: "slot-1".to_string(),
+                    }],
+                    vec![],
+                )
+            },
+            |render_source| {
+                (
+                    vec![SlotAuctionDecisionV1::Winner {
+                        slot: "slot-1".to_string(),
+                        candidate_id: "candidate-1".to_string(),
+                    }],
+                    vec![BrowserAuctionBidV1 {
+                        candidate_id: "candidate-1".to_string(),
+                        slot: "slot-1".to_string(),
+                        provider: "prebid".to_string(),
+                        upstream_bid_id: "bid-1".to_string(),
+                        cpm: 1.0,
+                        currency: "USD".to_string(),
+                        targeting: std::collections::BTreeMap::new(),
+                        renderer_reservation_id: match render_source {
+                            BidRenderSourceV1::Aps(_) | BidRenderSourceV1::Adm(_) => {
+                                Some("reservation-1".to_string())
+                            }
+                            BidRenderSourceV1::PbsCache(_) => None,
+                        },
+                        render_source,
+                    }],
+                )
+            },
+        );
+        BrowserAuctionProjectionV1 {
+            version: 1,
+            auction: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: "initial".to_string(),
+                results,
+            },
+            slots: vec![slot],
+            bids,
+        }
+    }
+
+    fn adm_source() -> BidRenderSourceV1 {
+        use crate::auction::types::AdmRenderSourceV1;
+        BidRenderSourceV1::Adm(AdmRenderSourceV1 {
+            version: 1,
+            adm: "<div>creative</div>".to_string(),
+            width: 300,
+            height: 250,
+        })
+    }
+
+    fn cache_source() -> BidRenderSourceV1 {
+        use crate::auction::types::BaselinePbsCacheSourceV1;
+        BidRenderSourceV1::PbsCache(BaselinePbsCacheSourceV1 {
+            version: 1,
+            cache_id: "cache-1".to_string(),
+            cache_host: "cache.example".to_string(),
+            cache_path: "/cache".to_string(),
+            width: 300,
+            height: 250,
+        })
+    }
+
+    #[test]
+    fn first_display_selection_admits_only_the_closed_projected_batch() {
+        let no_bid = first_display_projection(None);
+        let adm = first_display_projection(Some(adm_source()));
+        let enabled = ["gpt"];
+
+        for projection in [&no_bid, &adm] {
+            let selected = select_first_display_slices_v1(
+                projection,
+                FirstDisplaySelectionConfigV1 {
+                    enabled_integrations: &enabled,
+                    creative: CreativeBootConfigV1::default(),
+                },
+            )
+            .expect("closed GPT batch should select the agent");
+            assert_eq!(selected.mask(), 0x0041);
+            assert_eq!(selected.slices(), &["first_display", "gpt_initial"]);
+        }
+
+        assert!(
+            select_first_display_slices_v1(
+                &first_display_projection(Some(cache_source())),
+                FirstDisplaySelectionConfigV1 {
+                    enabled_integrations: &enabled,
+                    creative: CreativeBootConfigV1::default(),
+                },
+            )
+            .is_none(),
+            "PBS Cache must stay on the direct persistent GPT path"
+        );
+        let mut direct = no_bid.clone();
+        direct.slots.clear();
+        assert!(
+            select_first_display_slices_v1(
+                &direct,
+                FirstDisplaySelectionConfigV1 {
+                    enabled_integrations: &enabled,
+                    creative: CreativeBootConfigV1::default(),
+                },
+            )
+            .is_none(),
+            "direct/programmatic projection must not select the agent"
+        );
+    }
+
+    #[test]
+    fn first_display_selection_derives_exact_slices_only_from_trusted_configuration() {
+        let enabled = [
+            "aps",
+            "creative",
+            "datadome",
+            "didomi",
+            "google_tag_manager",
+            "gpt",
+            "lockr",
+            "osano",
+            "permutive",
+            "prebid",
+            "sourcepoint",
+            "testlight",
+        ];
+        let selected = select_first_display_slices_v1(
+            &first_display_projection(Some(adm_source())),
+            FirstDisplaySelectionConfigV1 {
+                enabled_integrations: &enabled,
+                creative: CreativeBootConfigV1 {
+                    enabled: true,
+                    click_guard: false,
+                    render_guard: true,
+                },
+            },
+        )
+        .expect("complete closed configuration should select the agent");
+
+        assert_eq!(
+            selected.slices(),
+            &[
+                "first_display",
+                "creative_initial",
+                "datadome_initial",
+                "didomi_initial",
+                "google_tag_manager_initial",
+                "gpt_initial",
+                "lockr_initial",
+                "osano_initial",
+                "permutive_initial",
+                "sourcepoint_initial",
+                "prebid_initial",
+                "testlight_initial",
+            ]
+        );
+        assert_eq!(selected.mask(), 0x1ffd);
+
+        let unknown = ["gpt", "publisher_supplied"];
+        assert!(
+            select_first_display_slices_v1(
+                &first_display_projection(None),
+                FirstDisplaySelectionConfigV1 {
+                    enabled_integrations: &unknown,
+                    creative: CreativeBootConfigV1::default(),
+                },
+            )
+            .is_none(),
+            "an unknown obligation must force direct persistent boot"
+        );
     }
 }
