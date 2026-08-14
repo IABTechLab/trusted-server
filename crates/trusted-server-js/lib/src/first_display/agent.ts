@@ -7,8 +7,12 @@ import {
 } from './registration';
 import type {
   FirstDisplaySliceActivationContext,
-  PreparedFirstDisplaySliceV1,
 } from './transaction';
+import type {
+  FirstDisplaySliceHost,
+  InitialSliceInstaller,
+  OptionalFirstDisplaySliceId,
+} from './slices/definition';
 
 const HASH = /^[0-9a-f]{64}$/;
 const MAX_OUTCOMES = 256;
@@ -64,6 +68,12 @@ export interface FirstDisplayAgentOptions {
 /** Bootstrap-owned dependencies supplied only to the release-bound base component. */
 export interface FirstDisplayAgentRegistrationHostV1 {
   readonly options: FirstDisplayAgentOptions;
+  readonly sliceBindings: (id: string) => unknown;
+}
+
+interface PreparedFirstDisplayBaseV1 {
+  readonly activate: (context: FirstDisplaySliceActivationContext) => void;
+  readonly sliceHost: FirstDisplaySliceHost;
 }
 
 export interface FirstDisplayAgentSnapshotV1 {
@@ -385,7 +395,7 @@ export function createFirstDisplayAgent(options: FirstDisplayAgentOptions): Firs
   });
 }
 
-function prepareRegisteredAgent(host: unknown): PreparedFirstDisplaySliceV1 {
+function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
   try {
     if (
       typeof host !== 'object' ||
@@ -393,21 +403,38 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplaySliceV1 {
       Array.isArray(host) ||
       Object.getPrototypeOf(host) !== Object.prototype ||
       !Object.isFrozen(host) ||
-      Reflect.ownKeys(host).length !== 1
+      Reflect.ownKeys(host).length !== 2
     ) {
       throw new TypeError('invalid first-display base host');
     }
     const descriptor = Object.getOwnPropertyDescriptor(host, 'options');
+    const bindingsDescriptor = Object.getOwnPropertyDescriptor(host, 'sliceBindings');
     if (
       !descriptor?.enumerable ||
       !('value' in descriptor) ||
       typeof descriptor.value !== 'object' ||
       descriptor.value === null ||
-      !Object.isFrozen(descriptor.value)
+      !Object.isFrozen(descriptor.value) ||
+      !bindingsDescriptor?.enumerable ||
+      !('value' in bindingsDescriptor) ||
+      typeof bindingsDescriptor.value !== 'function'
     ) {
       throw new TypeError('invalid first-display base options');
     }
     const options = descriptor.value as FirstDisplayAgentOptions;
+    const sliceBindings = bindingsDescriptor.value as (id: string) => unknown;
+    const sliceHost: FirstDisplaySliceHost = Object.freeze({
+      activate: (
+        id: OptionalFirstDisplaySliceId,
+        own: FirstDisplaySliceActivationContext['own'],
+        install?: InitialSliceInstaller
+      ): void => {
+        if (typeof install !== 'function') {
+          throw new TypeError(`unimplemented first-display slice: ${id}`);
+        }
+        install(sliceBindings(id), own);
+      },
+    });
     return Object.freeze({
       activate: (context: FirstDisplaySliceActivationContext): void => {
         const agent = createFirstDisplayAgent(options);
@@ -416,6 +443,7 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplaySliceV1 {
           if (!agent.start()) throw new TypeError('first-display agent did not start');
         });
       },
+      sliceHost,
     });
   } catch {
     throw new TypeError('invalid first-display base host');
