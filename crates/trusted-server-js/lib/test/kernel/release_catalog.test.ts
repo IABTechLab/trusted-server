@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { FIRST_DISPLAY_CONTRACT_IDS } from '../../src/first_display/contracts';
 import * as releaseCatalog from '../../src/kernel/release_catalog';
 import {
   FIRST_DISPLAY_CATALOG,
@@ -58,6 +59,7 @@ const EXPECTED = [
 
 describe('canonical release catalog', () => {
   it('pins the exact thirteen first-display rows and closed server-owned selection', () => {
+    expect(FIRST_DISPLAY_CONTRACT_IDS).toEqual(FIRST_DISPLAY_CATALOG.map(({ id }) => id));
     expect(FIRST_DISPLAY_CATALOG.map(({ order, id }) => [order, id])).toEqual([
       [1, 'first_display'],
       [2, 'aps_initial'],

@@ -36,8 +36,7 @@ export interface FirstDisplayHandoffOwner {
   readonly mutationRevision: number;
   readonly observeMutation: () => boolean;
   readonly finalize: (
-    candidate: unknown,
-    identities: readonly object[]
+    capture: () => Readonly<{ candidate: unknown; identities: readonly object[] }> | undefined
   ) => FinalizedFirstDisplayHandoffV1 | undefined;
   readonly dispose: () => void;
 }
@@ -117,17 +116,23 @@ export function createFirstDisplayHandoffOwner(
       return true;
     },
     finalize: (
-      candidate: unknown,
-      identities: readonly object[]
+      capture: () => Readonly<{ candidate: unknown; identities: readonly object[] }> | undefined
     ): FinalizedFirstDisplayHandoffV1 | undefined => {
       if (state !== 'observing') return publishFailure();
       try {
-        if (!options.isCurrentGeneration() || !options.isTerminal() || !options.isPainted()) {
+        if (
+          typeof capture !== 'function' ||
+          !options.isCurrentGeneration() ||
+          !options.isTerminal() ||
+          !options.isPainted()
+        ) {
           return publishFailure();
         }
         state = 'sealing';
         options.closeIngress();
-        const handoff = snapshotFirstDisplayHandoffV1(candidate);
+        const captured = capture();
+        if (!captured) return publishFailure();
+        const handoff = snapshotFirstDisplayHandoffV1(captured.candidate);
         if (
           !handoff ||
           handoff.releaseId !== options.releaseId ||
@@ -139,7 +144,7 @@ export function createFirstDisplayHandoffOwner(
         const capsule = createFirstDisplayOwnershipCapsuleV1(
           options.releaseId,
           options.generation,
-          identities
+          captured.identities
         );
         if (!capsule) return publishFailure();
         liveCapsule = capsule;

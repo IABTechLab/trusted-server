@@ -375,6 +375,7 @@ test('generated first-display components self-register through one authenticated
           }),
           bootstrap: Object.freeze({
             get state() { return 'agent_registered'; },
+            startedAtMs: 0,
             registerAgent: function() {
               window.__firstDisplayEvents.push('bootstrap:register');
               return true;

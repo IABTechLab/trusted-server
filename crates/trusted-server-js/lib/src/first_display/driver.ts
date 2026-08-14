@@ -21,7 +21,29 @@ export interface FirstDisplayRenderBridgeV1 {
   ) => boolean;
   readonly recordFailure: (cycle: FirstDisplayGptBoundCycleV1) => boolean;
   readonly sealTsAdmission: () => void;
+  readonly closeIngress: () => boolean;
+  readonly captureHandoff: () => FirstDisplayRenderHandoffV1 | undefined;
+  readonly detachCommittedArtifacts: () => boolean;
   readonly dispose: () => void;
+}
+
+export interface FirstDisplayRenderHandoffArtifactV1 {
+  readonly identity: object;
+  readonly kind: 'gpt_adm' | 'aps';
+  readonly owner: 'trusted_server' | 'publisher';
+  readonly slotId: string;
+  readonly token: string;
+}
+
+export interface FirstDisplayRenderHandoffV1 {
+  readonly artifacts: readonly FirstDisplayRenderHandoffArtifactV1[];
+  readonly nextTicketOrdinal: number;
+  readonly tombstones: readonly Readonly<{
+    kind: 'ticket';
+    value: string;
+    expiresAtMs: number;
+    ordinal: number;
+  }>[];
 }
 
 export interface FirstDisplayProjectedDriverOptionsV1 {
@@ -53,6 +75,7 @@ export function createFirstDisplayProjectedDriver(
   const expectedBySlot = new Map(expected.map((outcome) => [outcome.slotId, outcome]));
   const bound = new Map<string, FirstDisplayGptBoundCycleV1>();
   const settled = new Set<string>();
+  const settledResults = new Map<string, FirstDisplayTerminalResult>();
   const gptBatch =
     expected.length === 0
       ? undefined
@@ -67,6 +90,9 @@ export function createFirstDisplayProjectedDriver(
   let disposed = false;
   let sealed = false;
   let actionStarted = false;
+  let ingressClosed = false;
+  let handoffCaptured = false;
+  let committedArtifactsDetached = false;
   let onTerminal: ((slotId: string, result: FirstDisplayTerminalResult) => void) | undefined;
 
   const settle = (slotId: string, result: FirstDisplayTerminalResult): boolean => {
@@ -79,6 +105,7 @@ export function createFirstDisplayProjectedDriver(
       return false;
     }
     settled.add(slotId);
+    settledResults.set(slotId, result);
     onTerminal?.(slotId, result);
     return true;
   };
@@ -151,12 +178,63 @@ export function createFirstDisplayProjectedDriver(
       sealed = true;
       options.renderer.sealTsAdmission();
     },
+    closeIngress: (): boolean => {
+      if (disposed || !sealed || ingressClosed) return false;
+      if (gptBatch && !gptBatch.closeIngress()) return false;
+      if (!options.renderer.closeIngress()) return false;
+      ingressClosed = true;
+      return true;
+    },
+    captureHandoff: () => {
+      if (disposed || !ingressClosed || handoffCaptured) return undefined;
+      const gptCycles = gptBatch?.captureHandoff() ?? Object.freeze([]);
+      const render = options.renderer.captureHandoff();
+      if (!render) return undefined;
+      const acceptedIds = new Set(
+        [...settledResults.entries()]
+          .filter(([, result]) => result === 'accepted')
+          .map(([slotId]) => slotId)
+      );
+      const cycles = gptCycles.filter(({ slotId }) => acceptedIds.has(slotId));
+      if (
+        cycles.length !== acceptedIds.size ||
+        render.artifacts.some(({ slotId }) => !acceptedIds.has(slotId))
+      ) {
+        return undefined;
+      }
+      const identities = [
+        ...cycles.map(({ physicalSlot }) => physicalSlot),
+        ...render.artifacts.map(({ identity }) => identity),
+      ];
+      if (new Set(identities).size !== identities.length) return undefined;
+      handoffCaptured = true;
+      return Object.freeze({
+        artifacts: render.artifacts,
+        cycles: Object.freeze(cycles),
+        identities: Object.freeze(identities),
+        nextTicketOrdinal: render.nextTicketOrdinal,
+        tombstones: render.tombstones,
+      });
+    },
+    detachCommittedArtifacts: (): boolean => {
+      if (disposed || !ingressClosed || !handoffCaptured || committedArtifactsDetached) {
+        return false;
+      }
+      const acceptedIds = [...settledResults.entries()]
+        .filter(([, result]) => result === 'accepted')
+        .map(([slotId]) => slotId);
+      if (gptBatch && !gptBatch.detachCommittedSlots(acceptedIds)) return false;
+      if (!options.renderer.detachCommittedArtifacts()) return false;
+      committedArtifactsDetached = true;
+      return true;
+    },
     dispose: (): void => {
       if (disposed) return;
       disposed = true;
       gptBatch?.dispose();
       options.renderer.dispose();
       bound.clear();
+      settledResults.clear();
       onTerminal = undefined;
     },
   });

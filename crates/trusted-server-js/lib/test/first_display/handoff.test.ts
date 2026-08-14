@@ -67,7 +67,10 @@ describe('first-display final handoff owner', () => {
     expect(h.value.observeMutation()).toBe(true);
     expect(h.value.observeMutation()).toBe(true);
 
-    const final = h.value.finalize(handoff(2), [physicalSlot, artifact]);
+    const final = h.value.finalize(() => ({
+      candidate: handoff(2),
+      identities: [physicalSlot, artifact],
+    }));
     expect(final?.handoff.mutationRevision).toBe(2);
     expect(Object.isFrozen(final?.handoff)).toBe(true);
     expect(final?.capsule.consume(RELEASE_ID, 1)).toEqual([physicalSlot, artifact]);
@@ -80,15 +83,22 @@ describe('first-display final handoff owner', () => {
   it('clears the capsule and fails closed on duplicate finalization or stale revision', () => {
     const duplicate = owner();
     const identity = {};
-    const final = duplicate.value.finalize(handoff(0), [identity]);
+    const final = duplicate.value.finalize(() => ({
+      candidate: handoff(0),
+      identities: [identity],
+    }));
     expect(final).toBeDefined();
-    expect(duplicate.value.finalize(handoff(0), [identity])).toBeUndefined();
+    expect(
+      duplicate.value.finalize(() => ({ candidate: handoff(0), identities: [identity] }))
+    ).toBeUndefined();
     expect(final?.capsule.consume(RELEASE_ID, 1)).toBeUndefined();
     expect(duplicate.failures).toEqual(['bundle_partial']);
 
     const stale = owner();
     stale.value.observeMutation();
-    expect(stale.value.finalize(handoff(0), [{}])).toBeUndefined();
+    expect(
+      stale.value.finalize(() => ({ candidate: handoff(0), identities: [{}] }))
+    ).toBeUndefined();
     expect(stale.value.state).toBe('failed');
     expect(stale.failures).toEqual(['bundle_partial']);
   });
@@ -96,8 +106,8 @@ describe('first-display final handoff owner', () => {
   it('rejects nonterminal/live-authority data, wrong identity, and revision exhaustion', () => {
     const nonterminal = owner();
     expect(
-      nonterminal.value.finalize(
-        handoff(0, {
+      nonterminal.value.finalize(() => ({
+        candidate: handoff(0, {
           slots: [
             {
               id: 'slot-1',
@@ -121,13 +131,18 @@ describe('first-display final handoff owner', () => {
             nextSlotRegistrationOrdinal: 2,
           },
         }),
-        []
-      )
+        identities: [],
+      }))
     ).toBeUndefined();
     expect(nonterminal.failures).toEqual(['bundle_partial']);
 
     const badIdentity = owner();
-    expect(badIdentity.value.finalize(handoff(0), [null as unknown as object])).toBeUndefined();
+    expect(
+      badIdentity.value.finalize(() => ({
+        candidate: handoff(0),
+        identities: [null as unknown as object],
+      }))
+    ).toBeUndefined();
     expect(badIdentity.failures).toEqual(['bundle_partial']);
 
     const exhausted = owner({ initialRevision: 4_294_967_295 });
@@ -149,7 +164,7 @@ describe('first-display final handoff owner', () => {
         closeIngress,
         onFailure: (reason) => failures.push(reason),
       });
-      expect(value.finalize(handoff(0), [])).toBeUndefined();
+      expect(value.finalize(() => ({ candidate: handoff(0), identities: [] }))).toBeUndefined();
       expect(closeIngress).not.toHaveBeenCalled();
       expect(failures).toEqual(['bundle_partial']);
     }

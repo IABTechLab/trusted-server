@@ -1,4 +1,20 @@
-import { FIRST_DISPLAY_CATALOG, type FirstDisplaySliceId } from '../kernel/release_catalog';
+import type { FirstDisplaySliceId } from '../kernel/release_catalog';
+
+export const FIRST_DISPLAY_CONTRACT_IDS: readonly FirstDisplaySliceId[] = Object.freeze([
+  'first_display',
+  'aps_initial',
+  'creative_initial',
+  'datadome_initial',
+  'didomi_initial',
+  'google_tag_manager_initial',
+  'gpt_initial',
+  'lockr_initial',
+  'osano_initial',
+  'permutive_initial',
+  'sourcepoint_initial',
+  'prebid_initial',
+  'testlight_initial',
+]);
 
 export const MAX_FIRST_DISPLAY_SLOTS = 256;
 export const MAX_FIRST_DISPLAY_NON_DIAGNOSTICS_BYTES = 8 * 1024 * 1024;
@@ -29,7 +45,7 @@ const FORBIDDEN_DATA_KEYS = new Set([
   'networkHandle',
 ]);
 const FIRST_DISPLAY_ORDER = new Map(
-  FIRST_DISPLAY_CATALOG.map(({ id, order }) => [id, order] as const)
+  FIRST_DISPLAY_CONTRACT_IDS.map((id, index) => [id, index + 1] as const)
 );
 
 export type TerminalAttemptState = 'accepted' | 'no_bid' | 'failed' | 'cancelled';
@@ -165,7 +181,7 @@ function uniqueStrings(
 }
 
 function snapshotSlices(value: unknown): readonly FirstDisplaySliceId[] | undefined {
-  const slices = uniqueStrings(value, FIRST_DISPLAY_CATALOG.length, (candidate) =>
+  const slices = uniqueStrings(value, FIRST_DISPLAY_CONTRACT_IDS.length, (candidate) =>
     FIRST_DISPLAY_ORDER.has(candidate as FirstDisplaySliceId)
   );
   if (!slices || slices[0] !== 'first_display') return undefined;
@@ -618,7 +634,7 @@ export function snapshotFirstDisplayHandoffV1(
     const artifacts = snapshotList(fields.artifacts, MAX_FIRST_DISPLAY_SLOTS, snapshotArtifact);
     const parserState = snapshotList(
       fields.parserState,
-      FIRST_DISPLAY_CATALOG.length,
+      FIRST_DISPLAY_CONTRACT_IDS.length,
       snapshotParserState
     );
     const factValues = exactArray(fields.gptFacts, MAX_FACTS);

@@ -36,6 +36,12 @@ export interface FirstDisplayGoogletagBatchCallbacks {
 
 export interface FirstDisplayGoogletagBatch {
   readonly start: (callbacks: FirstDisplayGoogletagBatchCallbacks) => boolean;
+  /** Stop provisional GPT ingress after every physical cycle is terminal. */
+  readonly closeIngress: () => boolean;
+  /** Capture exact terminal physical identities without changing disposal ownership. */
+  readonly captureHandoff: () => readonly FirstDisplayGptBoundCycleV1[] | undefined;
+  /** Exempt exactly the accepted slot identities from provisional destruction/restoration. */
+  readonly detachCommittedSlots: (slotIds: readonly string[]) => boolean;
   readonly dispose: () => void;
 }
 
@@ -179,6 +185,9 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
   private service: ExternalObject | undefined;
   private started = false;
   private disposed = false;
+  private ingressClosed = false;
+  private committedSlotsDetached = false;
+  private readonly detachedSlots = new Set<object>();
   private firstAction = false;
   private targetingWriteDepth = 0;
 
@@ -228,6 +237,61 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     return true;
   }
 
+  public closeIngress(): boolean {
+    if (
+      this.disposed ||
+      this.ingressClosed ||
+      !this.started ||
+      [...this.cycles.values()].some((cycle) => !cycle.settled)
+    ) {
+      return false;
+    }
+    this.ingressClosed = true;
+    this.removePendingCommand();
+    for (const handle of [...this.timers]) this.clearOwnedTimer(handle);
+    this.removeListener();
+    for (const restoreObserver of this.targetingObservers.values()) {
+      try {
+        restoreObserver();
+      } catch {
+        // The closed generation cannot regain authority through a publisher replacement.
+      }
+    }
+    this.targetingObservers.clear();
+    return true;
+  }
+
+  public captureHandoff(): readonly FirstDisplayGptBoundCycleV1[] | undefined {
+    if (this.disposed || !this.ingressClosed) return undefined;
+    return Object.freeze(
+      [...this.cycles.values()].map((cycle) =>
+        Object.freeze({
+          bid: cycle.bid,
+          element: cycle.element,
+          ownership: cycle.ownership,
+          physicalSlot: cycle.physicalSlot,
+          placement: cycle.placement,
+          slotId: cycle.slotId,
+        })
+      )
+    );
+  }
+
+  public detachCommittedSlots(slotIds: readonly string[]): boolean {
+    if (this.disposed || !this.ingressClosed || this.committedSlotsDetached) return false;
+    const requested = new Set(slotIds);
+    if (requested.size !== slotIds.length) return false;
+    const selected: object[] = [];
+    for (const slotId of requested) {
+      const matches = [...this.cycles.values()].filter((cycle) => cycle.slotId === slotId);
+      if (matches.length !== 1 || !matches[0]?.settled) return false;
+      selected.push(matches[0].physicalSlot);
+    }
+    this.committedSlotsDetached = true;
+    for (const slot of selected) this.detachedSlots.add(slot);
+    return true;
+  }
+
   public dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
@@ -235,6 +299,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     for (const handle of [...this.timers]) this.clearOwnedTimer(handle);
     this.removeListener();
     for (const restoration of this.targetingRestorers.reverse()) {
+      if (this.detachedSlots.has(restoration.slot)) continue;
       try {
         this.restorePublisherTargeting(restoration);
       } catch {
@@ -250,16 +315,19 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       }
     }
     this.targetingObservers.clear();
-    if (this.binding && this.createdSlots.size > 0) {
+    const destroyableSlots = [...this.createdSlots].filter((slot) => !this.detachedSlots.has(slot));
+    if (this.binding && destroyableSlots.length > 0) {
       try {
-        call(this.binding, 'destroySlots', [[...this.createdSlots]]);
+        call(this.binding, 'destroySlots', [destroyableSlots]);
       } catch {
         // Generation latching keeps failed physical cleanup inert.
       }
     }
     this.createdSlots.clear();
     this.cycles.clear();
-    this.restoreCreatedBinding();
+    if (this.detachedSlots.size === 0) this.restoreCreatedBinding();
+    else this.createdBinding = undefined;
+    this.detachedSlots.clear();
     this.binding = undefined;
     this.service = undefined;
   }
@@ -656,6 +724,9 @@ export function createFirstDisplayGoogletagBatch(
   const owner = new FirstDisplayGoogletagBatchOwner(options);
   return Object.freeze({
     start: (callbacks: FirstDisplayGoogletagBatchCallbacks) => owner.start(callbacks),
+    closeIngress: () => owner.closeIngress(),
+    captureHandoff: () => owner.captureHandoff(),
+    detachCommittedSlots: (slotIds: readonly string[]) => owner.detachCommittedSlots(slotIds),
     dispose: () => owner.dispose(),
   });
 }

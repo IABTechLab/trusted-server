@@ -464,4 +464,62 @@ describe('first-display GPT adapter', () => {
     expect(defineSlot).toHaveBeenCalledWith('/123/example', [[300, 250]], 'slot-1-hydrated');
     expect(display).toHaveBeenCalledWith('slot-1-hydrated');
   });
+
+  it('captures exact terminal slots, closes ingress, and detaches only committed identities', () => {
+    const dom = new JSDOM('<!doctype html><div id="slot-1"></div>', {
+      url: 'https://publisher.example/',
+    });
+    const listeners = new Map<string, (event: unknown) => void>();
+    const slot = {
+      addService: () => slot,
+      getSlotElementId: () => 'slot-1',
+      setTargeting: () => slot,
+    };
+    const destroySlots = vi.fn(() => true);
+    const service = {
+      addEventListener: (name: string, listener: (event: unknown) => void) =>
+        listeners.set(name, listener),
+      getSlots: () => [],
+      removeEventListener: vi.fn(),
+    };
+    Object.defineProperty(dom.window, 'googletag', {
+      configurable: true,
+      value: {
+        cmd: { push: (command: () => void) => command() },
+        defineSlot: () => slot,
+        destroySlots,
+        display: () => undefined,
+        getConfig: () => ({ disableInitialLoad: false }),
+        pubads: () => service,
+      },
+    });
+    const value = snapshotFirstDisplayBatchV1(fixture())!;
+    const adapter = createFirstDisplayGoogletagBatch({
+      browser: dom.window as unknown as Window,
+      document: dom.window.document,
+      projection: value.projection,
+      protocol: protocol(),
+      setTimer: (callback) => callback,
+      clearTimer: () => undefined,
+    });
+    adapter.start({
+      onBound: () => undefined,
+      onFailure: () => undefined,
+      onFirstAction: () => true,
+      onRenderEnded: () => undefined,
+    });
+    listeners.get('slotRequested')?.({ slot });
+    listeners.get('slotRenderEnded')?.({ slot, isEmpty: false });
+
+    expect(adapter.closeIngress()).toBe(true);
+    expect(adapter.captureHandoff()).toEqual([
+      expect.objectContaining({ slotId: 'slot-1', physicalSlot: slot }),
+    ]);
+    expect(adapter.detachCommittedSlots(['slot-1'])).toBe(true);
+    expect(adapter.detachCommittedSlots(['slot-1'])).toBe(false);
+    adapter.dispose();
+
+    expect(service.removeEventListener).toHaveBeenCalledTimes(2);
+    expect(destroySlots).not.toHaveBeenCalled();
+  });
 });

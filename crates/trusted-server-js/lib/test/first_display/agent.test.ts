@@ -8,6 +8,7 @@ import {
   type FirstDisplayDriver,
   type FirstDisplayTerminalResult,
 } from '../../src/first_display/agent';
+import { snapshotFirstDisplayBatchV1 } from '../../src/first_display/leaf/projection';
 
 function batch(
   kinds: readonly ('no_bid' | 'failed' | 'gpt_adm' | 'aps')[]
@@ -132,6 +133,16 @@ function driver(events: string[]): FirstDisplayDriver & {
 } {
   let settle: ((slotId: string, result: 'accepted' | 'failed' | 'cancelled') => void) | undefined;
   return Object.freeze({
+    captureHandoff: () =>
+      Object.freeze({
+        artifacts: Object.freeze([]),
+        cycles: Object.freeze([]),
+        identities: Object.freeze([]),
+        nextTicketOrdinal: 1,
+        tombstones: Object.freeze([]),
+      }),
+    closeIngress: () => true,
+    detachCommittedArtifacts: () => true,
     start: (
       _outcomes: readonly FirstDisplayBatchOutcomeV1[],
       onFirstAction: () => boolean,
@@ -155,6 +166,9 @@ describe('bounded first-display agent', () => {
       batch: batch(['gpt_adm']),
       bootstrap: accepted.bootstrap,
       driver: Object.freeze({
+        captureHandoff: () => undefined,
+        closeIngress: () => true,
+        detachCommittedArtifacts: () => true,
         start: (outcomes: readonly FirstDisplayBatchOutcomeV1[]) => {
           received.push([...outcomes]);
         },
@@ -299,6 +313,9 @@ describe('bounded first-display agent', () => {
     let action: (() => boolean) | undefined;
     const events: string[] = [];
     const ownedDriver: FirstDisplayDriver = Object.freeze({
+      captureHandoff: () => undefined,
+      closeIngress: () => true,
+      detachCommittedArtifacts: () => true,
       start: (_outcomes: readonly FirstDisplayBatchOutcomeV1[], onFirstAction: () => boolean) => {
         events.push('driver:prepared');
         action = onFirstAction;
@@ -331,6 +348,9 @@ describe('bounded first-display agent', () => {
       batch: batch(['aps']),
       bootstrap: late.bootstrap,
       driver: Object.freeze({
+        captureHandoff: () => undefined,
+        closeIngress: () => true,
+        detachCommittedArtifacts: () => true,
         start: (_outcomes: readonly FirstDisplayBatchOutcomeV1[], onFirstAction: () => boolean) => {
           lateAction = onFirstAction;
         },
@@ -414,6 +434,9 @@ describe('bounded first-display agent', () => {
 
     const throwing = harness();
     const throwingDriver: FirstDisplayDriver = Object.freeze({
+      captureHandoff: () => undefined,
+      closeIngress: () => true,
+      detachCommittedArtifacts: () => true,
       start: () => {
         throw new Error('boom');
       },
@@ -449,5 +472,94 @@ describe('bounded first-display agent', () => {
     revision.frames.shift()?.();
     expect(revisionAgent.observeNativeMutation()).toBe(false);
     expect(revision.failures).toEqual(['bundle_partial']);
+  });
+
+  it('mints the final immutable handoff only after paint and closes ingress before capture', () => {
+    const h = harness();
+    const events: string[] = [];
+    const physicalSlot = {};
+    const artifact = {};
+    const projectedBatch = snapshotFirstDisplayBatchV1(batch(['gpt_adm']))!;
+    const element = document.createElement('div');
+    element.id = 'slot-0';
+    const ownedDriver: FirstDisplayDriver = Object.freeze({
+      start: (
+        _outcomes: readonly FirstDisplayBatchOutcomeV1[],
+        onFirstAction: () => boolean,
+        onTerminal: (slotId: string, result: FirstDisplayTerminalResult) => void
+      ) => {
+        onFirstAction();
+        onTerminal('slot-0', 'accepted');
+      },
+      sealTsAdmission: () => events.push('seal'),
+      closeIngress: () => {
+        events.push('close');
+        return true;
+      },
+      captureHandoff: () => {
+        events.push('capture');
+        return Object.freeze({
+          artifacts: Object.freeze([
+            Object.freeze({
+              identity: artifact,
+              kind: 'gpt_adm' as const,
+              owner: 'trusted_server' as const,
+              slotId: 'slot-0',
+              token: projectedBatch.projection.bids[0]!.rendererReservationId,
+            }),
+          ]),
+          cycles: Object.freeze([
+            Object.freeze({
+              bid: projectedBatch.projection.bids[0]!,
+              element,
+              ownership: 'trusted_server' as const,
+              physicalSlot,
+              placement: projectedBatch.projection.slots[0]!,
+              slotId: 'slot-0',
+            }),
+          ]),
+          identities: Object.freeze([physicalSlot, artifact]),
+          nextTicketOrdinal: 1,
+          tombstones: Object.freeze([]),
+        });
+      },
+      detachCommittedArtifacts: () => {
+        events.push('detach');
+        return true;
+      },
+      dispose: () => events.push('dispose'),
+    });
+    const agent = createFirstDisplayAgent({
+      batch: batch(['gpt_adm']),
+      bootstrap: h.bootstrap,
+      driver: ownedDriver,
+      performance: h.performance,
+      paint: h.paint,
+      onProtectedPaint: () => undefined,
+      onFailure: (reason) => h.failures.push(reason),
+      handoff: Object.freeze({
+        releaseId: 'a'.repeat(64),
+        generation: 1,
+        slices: Object.freeze(['first_display', 'gpt_initial'] as const),
+      }),
+    });
+    expect(agent.start()).toBe(true);
+    expect(agent.finalizeHandoff()).toBeUndefined();
+    h.frames.shift()?.();
+    h.frames.shift()?.();
+
+    const finalized = agent.finalizeHandoff();
+    expect(events.slice(-2)).toEqual(['close', 'capture']);
+    expect(finalized?.handoff).toMatchObject({
+      releaseId: 'a'.repeat(64),
+      generation: 1,
+      projectionDigest: 'b'.repeat(64),
+      slices: ['first_display', 'gpt_initial'],
+      mutationRevision: 0,
+    });
+    expect(finalized?.capsule.consume('a'.repeat(64), 1)).toEqual([physicalSlot, artifact]);
+    expect(agent.detachCommittedArtifacts()).toBe(true);
+    agent.dispose();
+    expect(events).toContain('detach');
   });
 });

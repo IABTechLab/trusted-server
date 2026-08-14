@@ -94,7 +94,13 @@ describe('first-display initial slice definitions', () => {
         own
       ),
       installGptInitial(Object.freeze({ observe, register }), own, () =>
-        Object.freeze({ start: () => true, dispose: () => undefined })
+        Object.freeze({
+          start: () => true,
+          closeIngress: () => true,
+          captureHandoff: () => Object.freeze([]),
+          detachCommittedSlots: () => true,
+          dispose: () => undefined,
+        })
       ),
       installPrebidInitial(Object.freeze({ observe, register }), own),
     ];
