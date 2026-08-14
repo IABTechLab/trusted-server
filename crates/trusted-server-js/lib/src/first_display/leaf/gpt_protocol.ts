@@ -125,7 +125,7 @@ function classifyRenderEnded(candidate: unknown): 'gam_empty' | 'nonempty_gam' |
 export function installGptInitial(
   candidate: unknown,
   own: FirstDisplaySliceActivationContext['own']
-): void {
+): FirstDisplayGptProtocolV1 {
   const value = bindings(candidate);
   if (!value || typeof own !== 'function') throw new TypeError('invalid GPT initial bindings');
   const protocol: FirstDisplayGptProtocolV1 = Object.freeze({
@@ -144,4 +144,5 @@ export function installGptInitial(
   if (typeof release !== 'function') throw new TypeError('invalid GPT protocol disposer');
   own(release);
   value.observe('protocol_version', 1);
+  return protocol;
 }

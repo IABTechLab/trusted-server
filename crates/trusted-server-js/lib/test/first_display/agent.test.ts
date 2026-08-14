@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { createBootstrapController } from '../../src/core/bootstrap_controller';
 import {
   createFirstDisplayAgent,
+  firstDisplayProtocolCoverage,
+  type FirstDisplayAuctionProtocolId,
   type FirstDisplayBatchOutcomeV1,
   type FirstDisplayBatchV1,
   type FirstDisplayDriver,
@@ -10,9 +12,14 @@ import {
 } from '../../src/first_display/agent';
 
 function batch(kinds: FirstDisplayBatchV1['outcomes'][number]['kind'][]): FirstDisplayBatchV1 {
+  const requiredProtocols = Object.freeze([
+    ...(kinds.includes('aps') ? (['aps'] as const) : []),
+    ...(kinds.some((kind) => kind === 'aps' || kind === 'gpt_adm') ? (['gpt'] as const) : []),
+  ]);
   return Object.freeze({
     version: 1,
     projectionDigest: 'a'.repeat(64),
+    requiredProtocols,
     outcomes: Object.freeze(
       kinds.map((kind, index) => Object.freeze({ slotId: `slot-${index}`, kind }))
     ),
@@ -79,6 +86,53 @@ function driver(events: string[]): FirstDisplayDriver & {
 }
 
 describe('bounded first-display agent', () => {
+  it('requires exact activated protocol coverage for the immutable batch', () => {
+    const aps = Object.freeze({ version: 1, id: 'aps' });
+    const gpt = Object.freeze({ version: 1, id: 'gpt' });
+    const required = batch(['aps']);
+    expect(
+      firstDisplayProtocolCoverage(
+        required,
+        new Map<FirstDisplayAuctionProtocolId, unknown>([
+          ['aps', aps],
+          ['gpt', gpt],
+        ])
+      )
+    ).toBe(true);
+    expect(
+      firstDisplayProtocolCoverage(
+        required,
+        new Map<FirstDisplayAuctionProtocolId, unknown>([['aps', aps]])
+      )
+    ).toBe(false);
+    expect(
+      firstDisplayProtocolCoverage(
+        required,
+        new Map<FirstDisplayAuctionProtocolId, unknown>([
+          ['aps', aps],
+          ['gpt', Object.freeze({ version: 1, id: 'prebid' })],
+        ])
+      )
+    ).toBe(false);
+    expect(
+      firstDisplayProtocolCoverage(
+        required,
+        new Map<FirstDisplayAuctionProtocolId, unknown>([
+          ['aps', Object.freeze({ version: 1, id: 'aps', extra: true })],
+          ['gpt', gpt],
+        ])
+      )
+    ).toBe(false);
+    expect(
+      firstDisplayProtocolCoverage(
+        { ...required, requiredProtocols: Object.freeze(['gpt', 'aps']) },
+        new Map<FirstDisplayAuctionProtocolId, unknown>([
+          ['aps', aps],
+          ['gpt', gpt],
+        ])
+      )
+    ).toBe(false);
+  });
   it('emits the four authoritative marks around one mixed protected batch', () => {
     const h = harness();
     const events: string[] = [];

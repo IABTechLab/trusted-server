@@ -15,6 +15,7 @@ import type {
 const HASH = /^[0-9a-f]{64}$/;
 const MAX_OUTCOMES = 256;
 const MAX_U32 = 4_294_967_295;
+const AUCTION_PROTOCOLS = ['aps', 'gpt', 'prebid'] as const;
 const ACTION_KINDS = new Set(['gpt_adm', 'aps']);
 const OUTCOME_KINDS = new Set(['no_bid', 'failed', 'cancelled', ...ACTION_KINDS]);
 const TERMINAL_RESULTS = new Set(['accepted', 'failed', 'cancelled']);
@@ -32,8 +33,11 @@ export interface FirstDisplayBatchOutcomeV1 {
 export interface FirstDisplayBatchV1 {
   readonly version: 1;
   readonly projectionDigest: string;
+  readonly requiredProtocols: readonly FirstDisplayAuctionProtocolId[];
   readonly outcomes: readonly FirstDisplayBatchOutcomeV1[];
 }
+
+export type FirstDisplayAuctionProtocolId = (typeof AUCTION_PROTOCOLS)[number];
 
 export interface FirstDisplayDriver {
   readonly start: (
@@ -121,18 +125,36 @@ function exactRecord(value: unknown, keys: readonly string[]): Record<string, un
 
 function snapshotBatch(value: unknown): FirstDisplayBatchV1 | undefined {
   try {
-    const fields = exactRecord(value, ['version', 'projectionDigest', 'outcomes']);
+    const fields = exactRecord(value, [
+      'version',
+      'projectionDigest',
+      'requiredProtocols',
+      'outcomes',
+    ]);
     if (
       !fields ||
       fields.version !== 1 ||
       typeof fields.projectionDigest !== 'string' ||
       !HASH.test(fields.projectionDigest) ||
+      !Array.isArray(fields.requiredProtocols) ||
+      !Object.isFrozen(fields.requiredProtocols) ||
       !Array.isArray(fields.outcomes) ||
       !Object.isFrozen(fields.outcomes) ||
       fields.outcomes.length === 0 ||
       fields.outcomes.length > MAX_OUTCOMES
     ) {
       return undefined;
+    }
+    const requiredProtocols: FirstDisplayAuctionProtocolId[] = [];
+    if (Reflect.ownKeys(fields.requiredProtocols).length !== fields.requiredProtocols.length + 1) {
+      return undefined;
+    }
+    let previousProtocol = -1;
+    for (const candidate of fields.requiredProtocols) {
+      const order = AUCTION_PROTOCOLS.indexOf(candidate as FirstDisplayAuctionProtocolId);
+      if (order < 0 || order <= previousProtocol) return undefined;
+      previousProtocol = order;
+      requiredProtocols.push(candidate as FirstDisplayAuctionProtocolId);
     }
     const seen = new Set<string>();
     const outcomes: FirstDisplayBatchOutcomeV1[] = [];
@@ -157,14 +179,60 @@ function snapshotBatch(value: unknown): FirstDisplayBatchV1 | undefined {
         })
       );
     }
+    if (
+      (outcomes.some(({ kind }) => kind === 'aps') &&
+        (!requiredProtocols.includes('aps') || !requiredProtocols.includes('gpt'))) ||
+      (outcomes.some(({ kind }) => kind === 'gpt_adm') && !requiredProtocols.includes('gpt')) ||
+      (requiredProtocols.includes('prebid') && !requiredProtocols.includes('gpt'))
+    ) {
+      return undefined;
+    }
     return Object.freeze({
       version: 1,
       projectionDigest: fields.projectionDigest,
+      requiredProtocols: Object.freeze(requiredProtocols),
       outcomes: Object.freeze(outcomes),
     });
   } catch {
     return undefined;
   }
+}
+
+function protocolIdentity(candidate: unknown, expected: FirstDisplayAuctionProtocolId): boolean {
+  try {
+    if (
+      typeof candidate !== 'object' ||
+      candidate === null ||
+      Array.isArray(candidate) ||
+      Object.getPrototypeOf(candidate) !== Object.prototype ||
+      !Object.isFrozen(candidate) ||
+      Reflect.ownKeys(candidate).length !== 2
+    ) {
+      return false;
+    }
+    const version = Object.getOwnPropertyDescriptor(candidate, 'version');
+    const id = Object.getOwnPropertyDescriptor(candidate, 'id');
+    return Boolean(
+      version?.enumerable &&
+      'value' in version &&
+      version.value === 1 &&
+      id?.enumerable &&
+      'value' in id &&
+      id.value === expected
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Prove every protocol declared by the immutable batch was activated exactly once. */
+export function firstDisplayProtocolCoverage(
+  batch: unknown,
+  protocols: ReadonlyMap<FirstDisplayAuctionProtocolId, unknown>
+): boolean {
+  const snapshot = snapshotBatch(batch);
+  if (!snapshot || protocols.size !== snapshot.requiredProtocols.length) return false;
+  return snapshot.requiredProtocols.every((id) => protocolIdentity(protocols.get(id), id));
 }
 
 class FirstDisplayAgentOwner implements FirstDisplayAgent {
@@ -421,6 +489,7 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
     }
     const options = descriptor.value as FirstDisplayAgentOptions;
     const sliceBindings = bindingsDescriptor.value as (id: string) => unknown;
+    const auctionProtocols = new Map<FirstDisplayAuctionProtocolId, unknown>();
     const sliceHost: FirstDisplaySliceHost = Object.freeze({
       activate: (
         id: OptionalFirstDisplaySliceId,
@@ -430,7 +499,16 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
         if (typeof install !== 'function') {
           throw new TypeError(`unimplemented first-display slice: ${id}`);
         }
-        install(sliceBindings(id), own);
+        const installed = install(sliceBindings(id), own);
+        const protocolId = id.endsWith('_initial')
+          ? (id.slice(0, -'_initial'.length) as FirstDisplayAuctionProtocolId)
+          : undefined;
+        if (protocolId && AUCTION_PROTOCOLS.includes(protocolId)) {
+          if (auctionProtocols.has(protocolId) || !protocolIdentity(installed, protocolId)) {
+            throw new TypeError(`invalid first-display protocol: ${protocolId}`);
+          }
+          auctionProtocols.set(protocolId, installed);
+        }
       },
     });
     return Object.freeze({
@@ -438,6 +516,9 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
         const agent = createFirstDisplayAgent(options);
         context.own(() => agent.dispose());
         context.afterActivate(() => {
+          if (!firstDisplayProtocolCoverage(options.batch, auctionProtocols)) {
+            throw new TypeError('first-display protocol coverage is incomplete');
+          }
           if (!agent.start()) throw new TypeError('first-display agent did not start');
         });
       },

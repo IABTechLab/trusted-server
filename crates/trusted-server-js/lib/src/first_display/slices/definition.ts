@@ -18,7 +18,7 @@ export interface FirstDisplaySliceHost {
 export type InitialSliceInstaller = (
   bindings: unknown,
   own: FirstDisplaySliceActivationContext['own']
-) => void;
+) => unknown;
 
 export interface PreparedInitialSlice {
   readonly activate: (context: FirstDisplaySliceActivationContext) => void;
