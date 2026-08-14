@@ -46,10 +46,10 @@ const BOOTSTRAP_BASELINE = Object.freeze({
 });
 const PRODUCTION_SEAM_PATTERN =
   /(?:^|\/)(?:tests?|fixtures?|fakes?|no-?op)(?:\/|$)|(?:^|[/_.-])(?:test|fake|no-?op)(?=[/_.-]|$)|ForTest/u;
+const CAPTURE_PACKAGE_PATH = 'crates/trusted-server-js/lib/package.json';
 const CAPTURE_BUILD_INPUTS = Object.freeze([
   'crates/trusted-server-js/lib/src',
   'crates/trusted-server-js/lib/build-all.mjs',
-  'crates/trusted-server-js/lib/package.json',
   'crates/trusted-server-js/lib/package-lock.json',
   'crates/trusted-server-js/lib/tsconfig.json',
   'crates/trusted-server-js/lib/vite.config.ts',
@@ -88,6 +88,30 @@ export function canonicalJsonSha256(value) {
   return createHash('sha256').update(canonicalJson(value)).digest('hex');
 }
 
+function artifactBuildPackageMetadata(packageJson) {
+  const { scripts, ...metadata } = packageJson ?? {};
+  const buildLifecycleScripts = {};
+  for (const name of ['prebuild', 'build', 'postbuild']) {
+    if (scripts !== null && typeof scripts === 'object' && Object.hasOwn(scripts, name)) {
+      buildLifecycleScripts[name] = scripts[name];
+    }
+  }
+  return {
+    ...metadata,
+    scripts: buildLifecycleScripts,
+  };
+}
+
+/** Require package metadata that can affect measured artifacts to match the capture source. */
+export function validateArtifactBuildPackageMetadata(capturedPackage, currentPackage) {
+  if (
+    canonicalJson(artifactBuildPackageMetadata(capturedPackage)) !==
+    canonicalJson(artifactBuildPackageMetadata(currentPackage))
+  ) {
+    fail('artifact-generating package metadata differs from the review-remediation source');
+  }
+}
+
 function validateCleanCaptureSource(capture) {
   const sha = capture?.source?.sha;
   if (typeof sha !== 'string' || !/^[0-9a-f]{40}$/u.test(sha)) {
@@ -110,6 +134,16 @@ function validateCleanCaptureSource(capture) {
       cwd: repositoryRoot,
       stdio: 'ignore',
     });
+    const capturedPackage = JSON.parse(
+      execFileSync('git', ['show', `${sha}:${CAPTURE_PACKAGE_PATH}`], {
+        cwd: repositoryRoot,
+        encoding: 'utf8',
+      })
+    );
+    const currentPackage = JSON.parse(
+      fs.readFileSync(path.join(repositoryRoot, CAPTURE_PACKAGE_PATH), 'utf8')
+    );
+    validateArtifactBuildPackageMetadata(capturedPackage, currentPackage);
   } catch (error) {
     if (error instanceof Error && error.message.startsWith('[bundle-budgets]')) throw error;
     fail('review-remediation source cannot reproduce current artifact-generating inputs');

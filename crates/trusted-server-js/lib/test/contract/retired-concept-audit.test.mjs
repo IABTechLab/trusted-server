@@ -34,14 +34,7 @@ const historicalPerformanceFixturePath = path.join(
 );
 const mainAuditSha = 'f6a2fb85ce623bf8a574e3941e1ee349acc3412d';
 const auditedClassifications = JSON.parse(readFileSync(auditFixturePath, 'utf8'));
-const validClassifications = auditedClassifications.map((row) => ({
-  ...row,
-  classification: 'main-owned',
-  ownerPaths: ['crates/trusted-server-js/lib/src/core/index.ts'],
-  testPath: 'crates/trusted-server-js/lib/test/core/index.test.ts',
-  command: 'npm --prefix crates/trusted-server-js/lib test -- --run test/core/index.test.ts',
-  result: 'pass',
-}));
+const validClassifications = auditedClassifications.map((row) => ({ ...row }));
 const pendingClassifications = validClassifications.map((row, index) =>
   index === 0 ? { ...row, classification: 'proof-pending', result: 'proof-pending' } : row
 );
@@ -247,6 +240,30 @@ test('classification rows reject missing, duplicate, pending, mismatched, or his
   );
 });
 
+test('classification rows pin the authoritative current-main pass and gap results', () => {
+  assertFixtureRejected(
+    validClassifications.map((row) => ({
+      ...row,
+      classification: 'main-owned',
+      result: 'pass',
+    })),
+    /authoritative classification/
+  );
+
+  assertFixtureRejected(
+    validClassifications.map((row) => {
+      if (row.id === 'RCJ-CORE-01') {
+        return { ...row, classification: 'implementation-gap', result: 'fail' };
+      }
+      if (row.id === 'RCJ-TRACE-01') {
+        return { ...row, classification: 'main-owned', result: 'pass' };
+      }
+      return row;
+    }),
+    /authoritative classification/
+  );
+});
+
 test('every retained concept has a final current-main classification and reproducible proof', () => {
   const result = auditRetiredConceptAudit({
     specPath,
@@ -256,6 +273,10 @@ test('every retained concept has a final current-main classification and reprodu
   assertRetiredConceptAudit(result);
 
   assert.equal(result.classifications.length, 23);
+  assert.deepEqual(result.classificationCounts, {
+    implementationGap: 5,
+    mainOwned: 18,
+  });
   assert.deepEqual(result.classifications.map(({ id }) => id).sort(), [...result.ledgerIds].sort());
   assert.ok(
     result.classifications.every(({ classification }) =>
@@ -298,7 +319,7 @@ Never build rc/july or ${validManifest.retiredSnapshot}.
 echo 'rc/july is retired'
 echo 'Do not build rc/july'
 printf '%s\\n' 'Do not compare rc/july'
-git mv scripts/check-rc-july-adoption.mjs scripts/check-retired-concept-audit.mjs
+git mv crates/trusted-server-js/lib/scripts/check-rc-july-adoption.mjs crates/trusted-server-js/lib/scripts/check-retired-concept-audit.mjs
 \`\`\`
 `;
   assert.deepEqual(auditRetiredPlanCommands(safe), []);
@@ -307,9 +328,18 @@ git mv scripts/check-rc-july-adoption.mjs scripts/check-retired-concept-audit.mj
     'git fetch origin RC/July',
     'git -C repository fetch origin rc/july',
     'git -c protocol.version=2 diff main...rc/july',
+    'git show rc/july:file',
+    `git cat-file -e ${validManifest.retiredSnapshot}`,
+    'git ls-tree -r rc/july',
+    'git mv scripts/check-rc-july-adoption.mjs scripts/check-retired-concept-audit.mjs',
     'echo "$(git fetch origin rc/july)"',
-    "printf '%s\\n' \"$(git -C repository fetch origin rc/july)\"",
+    'printf \'%s\\n\' "$(git -C repository fetch origin rc/july)"',
     'echo "`git fetch origin rc/july`"',
+    "echo 'git fetch origin rc/july' | sh",
+    'echo rc/july && true',
+    'echo rc/july; true',
+    'true && echo rc/july',
+    'echo rc/july & wait',
     'git merge rc/july',
     'git rebase rc/july',
     'git cherry-pick 905984e62a0858c53d9f0ff6dd3a1bf190cf311d',
