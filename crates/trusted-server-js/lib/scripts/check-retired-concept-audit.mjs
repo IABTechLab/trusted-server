@@ -18,6 +18,13 @@ const HISTORICAL_PERFORMANCE_SHA256 =
   'fe5d7f52dc47dc9608ca6b92b036c6b971845e6424b157768dc9403a62d2d6b4';
 const CLASSIFICATIONS = new Set(['main-owned', 'implementation-gap']);
 const RESULTS = new Set(['pass', 'fail']);
+const IMPLEMENTATION_GAP_IDS = new Set([
+  'RCJ-APS-03',
+  'RCJ-APS-04',
+  'RCJ-GPT-04',
+  'RCJ-QUAL-01',
+  'RCJ-TRACE-01',
+]);
 const DISPOSITIONS = new Set(['preserve', 'rebuild', 'supersede', 'exclude']);
 const CLASSIFICATION_KEYS = [
   'classification',
@@ -32,10 +39,11 @@ const CLASSIFICATION_KEYS = [
 const RETIRED_SOURCE_REFERENCE = /(?:rc[/-]july|905984e62a0858c53d9f0ff6dd3a1bf190cf311d)/i;
 const EXECUTABLE_SHELL_FENCE =
   /^ {0,3}```(?:bash|sh|shell)(?:[ \t][^\n]*)?\r?\n([\s\S]*?)^ {0,3}```[ \t]*$/gim;
-const RETIRED_OPERATION =
-  /(?:\bgit\b[^\r\n]*\b(?:fetch|merge|rebase|cherry-pick|checkout|worktree|archive|diff)\b|\b(?:build|bench(?:mark)?|compare|hyperfine|perf(?:ormance)?|time)\b)/i;
-const RETIRED_RENAME_SOURCE = /(?:check-rc-july-adoption\.mjs|rc-july-adoption\.test\.mjs)/gi;
 const INFORMATIONAL_SHELL_COMMAND = /^(?:echo|printf)\b/i;
+const ALLOWED_RETIRED_RENAMES = new Set([
+  'git mv crates/trusted-server-js/lib/scripts/check-rc-july-adoption.mjs crates/trusted-server-js/lib/scripts/check-retired-concept-audit.mjs',
+  'git mv crates/trusted-server-js/lib/test/contract/rc-july-adoption.test.mjs crates/trusted-server-js/lib/test/contract/retired-concept-audit.test.mjs',
+]);
 
 function codePointCompare(left, right) {
   if (left < right) return -1;
@@ -53,20 +61,14 @@ function inventorySha256(inventory) {
 }
 
 function isAllowedRetiredRename(command) {
-  if (!/^\s*git\s+mv\b/i.test(command)) return false;
-  const argumentsAfterMove = command.replace(/^\s*git\s+mv\s+(?:--\s+)?/i, '');
-  if (
-    !/^(?:['"])?\S*(?:check-rc-july-adoption\.mjs|rc-july-adoption\.test\.mjs)(?:['"])?\s+/i.test(
-      argumentsAfterMove
-    )
-  ) {
-    return false;
-  }
-  return !RETIRED_SOURCE_REFERENCE.test(command.replace(RETIRED_RENAME_SOURCE, ''));
+  return ALLOWED_RETIRED_RENAMES.has(command.trim().replace(/\s+/g, ' '));
 }
 
 function isNonExecutingInformationalCommand(command) {
-  return INFORMATIONAL_SHELL_COMMAND.test(command) && !/\$\(|`/.test(command);
+  return (
+    INFORMATIONAL_SHELL_COMMAND.test(command) &&
+    !/\$\(|`|[|<>&;]|\b(?:eval|bash|sh|shell|zsh)\b/i.test(command)
+  );
 }
 
 /** Return executable shell commands that attempt to resolve the retired source. */
@@ -78,13 +80,12 @@ export function auditRetiredPlanCommands(planSource) {
       .filter((line) => !/^\s*#/.test(line))
       .join('\n')
       .replace(/\\\r?\n/g, ' ');
-    for (const command of executable.split(/\r?\n|&&|\|\||;/)) {
+    for (const command of executable.split(/\r?\n/)) {
       const trimmed = command.trim();
       if (
         trimmed.length === 0 ||
         isNonExecutingInformationalCommand(trimmed) ||
         !RETIRED_SOURCE_REFERENCE.test(trimmed) ||
-        !RETIRED_OPERATION.test(trimmed) ||
         isAllowedRetiredRename(trimmed)
       ) {
         continue;
@@ -316,6 +317,15 @@ function auditClassifications({ auditFixturePath, ledgerIds, mainAuditSha }) {
     if (!RESULTS.has(row.result)) {
       failures.push(`${label} result must be pass or fail, not ${JSON.stringify(row.result)}`);
     }
+    const expectedClassification = IMPLEMENTATION_GAP_IDS.has(row.id)
+      ? 'implementation-gap'
+      : 'main-owned';
+    const expectedResult = IMPLEMENTATION_GAP_IDS.has(row.id) ? 'fail' : 'pass';
+    if (row.classification !== expectedClassification || row.result !== expectedResult) {
+      failures.push(
+        `${label} authoritative classification/result must be ${expectedClassification}/${expectedResult}`
+      );
+    }
     if (!DISPOSITIONS.has(row.disposition)) {
       failures.push(`${label} disposition is invalid`);
     }
@@ -335,7 +345,18 @@ function auditClassifications({ auditFixturePath, ledgerIds, mainAuditSha }) {
     }
   }
 
-  return { classifications, classificationFailures: failures };
+  const classificationCounts = {
+    implementationGap: classifications.filter((row) => row?.classification === 'implementation-gap')
+      .length,
+    mainOwned: classifications.filter((row) => row?.classification === 'main-owned').length,
+  };
+  if (classificationCounts.mainOwned !== 18 || classificationCounts.implementationGap !== 5) {
+    failures.push(
+      `authoritative classification counts must be main-owned=18 and implementation-gap=5, found ${classificationCounts.mainOwned}/${classificationCounts.implementationGap}`
+    );
+  }
+
+  return { classifications, classificationCounts, classificationFailures: failures };
 }
 
 export function auditRetiredConceptAudit({
