@@ -17,7 +17,8 @@ interface ApiStore {
     slot: GptDiagnosticsSlotHandle,
     auctionSlotId: string,
     opportunity: GptDiagnosticsTrustedServerOpportunity,
-    trustedServerAuctionId?: string
+    trustedServerAuctionId?: string,
+    requestedSlotSizes?: ReadonlyArray<readonly [number, number]>
   ): void;
   recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
   recordTrustedServerCreativeRequest(auctionSlotId: string): number | undefined;
@@ -63,6 +64,7 @@ function cloneExportSnapshot(snapshot: GptDiagnosticsExportV1): GptDiagnosticsEx
       requests: slot.requests.map((cycle) => ({
         ...cycle,
         durations: { ...cycle.durations },
+        requestedSlotSizes: cycle.requestedSlotSizes?.map((size) => [...size]),
         size: cycle.size ? [...cycle.size] : undefined,
         observedSlotSize: cycle.observedSlotSize ? [...cycle.observedSlotSize] : undefined,
         adManager: cycle.adManager
@@ -150,18 +152,21 @@ export class GptDiagnosticsApiController {
     };
 
     this.recorder = {
-      recordTrustedServerOpportunity: (slot, auctionSlotId, opportunity, trustedServerAuctionId) =>
+      recordTrustedServerOpportunity: (
+        slot,
+        auctionSlotId,
+        opportunity,
+        trustedServerAuctionId,
+        requestedSlotSizes
+      ) =>
         safelyRecord(() => {
-          if (trustedServerAuctionId === undefined) {
-            this.store.recordTrustedServerOpportunity(slot, auctionSlotId, opportunity);
-          } else {
-            this.store.recordTrustedServerOpportunity(
-              slot,
-              auctionSlotId,
-              opportunity,
-              trustedServerAuctionId
-            );
-          }
+          this.store.recordTrustedServerOpportunity(
+            slot,
+            auctionSlotId,
+            opportunity,
+            trustedServerAuctionId,
+            requestedSlotSizes
+          );
         }),
       recordPrebidRefresh: (slots) => safelyRecord(() => this.store.recordPrebidRefresh(slots)),
       recordTrustedServerCreativeRequest: (auctionSlotId) =>
@@ -192,6 +197,7 @@ export class GptDiagnosticsApiController {
         requests: slot.requests.map((cycle) => ({
           ...cycle,
           durations: { ...cycle.durations },
+          requestedSlotSizes: cycle.requestedSlotSizes?.map((size) => [...size]),
           size: cycle.size ? [...cycle.size] : undefined,
           observedSlotSize: cycle.observedSlotSize ? [...cycle.observedSlotSize] : undefined,
           adManager: cycle.adManager

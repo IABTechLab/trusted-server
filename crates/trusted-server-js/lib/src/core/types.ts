@@ -207,7 +207,9 @@ export interface GptDiagnosticsRequestCycle {
   viewableAtMs?: number;
   durations: GptDiagnosticsDurations;
   isEmpty?: boolean;
-  /** Exact size fact GPT reported in its `slotRenderEnded` callback. */
+  /** Configured sizes Trusted Server supplied to GPT for this request. */
+  requestedSlotSizes?: ReadonlyArray<Size>;
+  /** Exact fill size fact GPT reported in its `slotRenderEnded` callback. */
   size?: Size;
   /**
    * Outer CSS box observed on the uniquely bound, connected slot element after
@@ -324,12 +326,13 @@ export interface GptDiagnosticsApi {
  * and stops the writers from becoming part of the public contract.
  */
 export interface GptDiagnosticsRecorder {
-  /** Record Trusted Server's creative opportunity for an associated GPT slot. */
+  /** Record Trusted Server's creative opportunity and configured sizes for an associated GPT slot. */
   recordTrustedServerOpportunity(
     slot: GptDiagnosticsSlotHandle,
     auctionSlotId: string,
     opportunity: GptDiagnosticsTrustedServerOpportunity,
-    trustedServerAuctionId?: string
+    trustedServerAuctionId?: string,
+    requestedSlotSizes?: ReadonlyArray<Size>
   ): void;
   /** Mark slots whose next observed GPT request follows the Prebid refresh path. */
   recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;

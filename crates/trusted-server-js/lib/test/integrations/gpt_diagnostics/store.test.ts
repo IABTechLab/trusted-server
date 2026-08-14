@@ -7,6 +7,7 @@ import {
   MAX_CALLBACK_ISSUES,
   MAX_CREATIVE_ATTEMPTS,
   MAX_DIAGNOSTIC_SLOTS,
+  MAX_REQUESTED_SLOT_SIZES,
   MAX_REQUEST_CYCLES_PER_SLOT,
   MAX_TRUSTED_SERVER_ASSOCIATIONS,
   REQUEST_PATH_ATTRIBUTION_WINDOW_MS,
@@ -675,6 +676,62 @@ describe('GptDiagnosticsStore', () => {
       { requestPath: 'unattributed' },
     ]);
     expect(cycles[1].trustedServerOpportunity).toBeUndefined();
+  });
+
+  it('retains all configured requested slot sizes on only the correlated next request', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+    const slot = fakeSlot('requested-sizes');
+    const formats: Array<[number, number]> = [
+      [300, 250],
+      [728, 90],
+      [320, 50],
+    ];
+
+    store.recordTrustedServerOpportunity(
+      slot,
+      'auction-slot',
+      'renderable_candidate',
+      undefined,
+      formats
+    );
+    formats[0]![0] = 1;
+    formats.push([970, 250]);
+    store.recordSlotRequested(slot);
+    store.recordSlotRequested(slot);
+
+    const cycles = store.snapshot().slots[0]!.requests;
+    expect(cycles[0]?.requestedSlotSizes).toEqual([
+      [300, 250],
+      [728, 90],
+      [320, 50],
+    ]);
+    expect(cycles[1]?.requestedSlotSizes).toBeUndefined();
+  });
+
+  it('bounds and validates configured requested slot sizes before retaining them', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+    const slot = fakeSlot('validated-requested-sizes');
+    const formats: Array<[number, number]> = Array.from(
+      { length: MAX_REQUESTED_SLOT_SIZES + 2 },
+      (_, index) => [index + 1, 250]
+    );
+    formats[0] = [0, 250];
+    formats[1] = [300, Number.NaN];
+
+    store.recordTrustedServerOpportunity(
+      slot,
+      'auction-slot',
+      'renderable_candidate',
+      undefined,
+      formats
+    );
+    store.recordSlotRequested(slot);
+
+    const requested = store.snapshot().slots[0]!.requests[0]!.requestedSlotSizes;
+    expect(requested).toHaveLength(MAX_REQUESTED_SLOT_SIZES - 2);
+    expect(requested).not.toContainEqual([0, 250]);
+    expect(requested).not.toContainEqual([300, Number.NaN]);
+    expect(requested).not.toContainEqual([MAX_REQUESTED_SLOT_SIZES + 1, 250]);
   });
 
   it('consumes a combined request intent with independent source facts', () => {

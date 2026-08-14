@@ -206,7 +206,8 @@ describe('installTsAdInit', () => {
 
   function configureOpportunityDiagnostics(
     bid: AuctionBidData | undefined,
-    recordTrustedServerOpportunity: ReturnType<typeof vi.fn>
+    recordTrustedServerOpportunity: ReturnType<typeof vi.fn>,
+    formats: Array<[number, number]> = [[300, 250]]
   ) {
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),
@@ -232,7 +233,7 @@ describe('installTsAdInit', () => {
           id: 'atf_sidebar_ad',
           gam_unit_path: '/123/atf',
           div_id: 'div-atf-sidebar',
-          formats: [[300, 250]],
+          formats,
           targeting: {},
         },
       ],
@@ -293,7 +294,9 @@ describe('installTsAdInit', () => {
       expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
         mockSlot,
         'atf_sidebar_ad',
-        expectedOpportunity
+        expectedOpportunity,
+        undefined,
+        [[300, 250]]
       );
     }
   );
@@ -318,7 +321,34 @@ describe('installTsAdInit', () => {
       mockSlot,
       'atf_sidebar_ad',
       'unrenderable_candidate',
-      'auction-123'
+      'auction-123',
+      [[300, 250]]
+    );
+  });
+
+  it('captures every configured Trusted Server format when associating a GPT slot', async () => {
+    const recordTrustedServerOpportunity = vi.fn();
+    const formats: Array<[number, number]> = [
+      [300, 250],
+      [728, 90],
+      [320, 50],
+    ];
+    const { mockSlot } = configureOpportunityDiagnostics(
+      undefined,
+      recordTrustedServerOpportunity,
+      formats
+    );
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      mockSlot,
+      'atf_sidebar_ad',
+      'no_candidate',
+      undefined,
+      formats
     );
   });
 
@@ -334,7 +364,9 @@ describe('installTsAdInit', () => {
     expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
       mockSlot,
       'atf_sidebar_ad',
-      'no_candidate'
+      'no_candidate',
+      undefined,
+      [[300, 250]]
     );
   });
 
