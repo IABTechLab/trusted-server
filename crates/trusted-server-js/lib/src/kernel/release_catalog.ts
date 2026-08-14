@@ -112,6 +112,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     include: 'eligible_batch',
     allowedImports: [
       'first_display/contracts',
+      'first_display/leaf/projection',
       'first_display/registration',
       'first_display/transaction',
     ],

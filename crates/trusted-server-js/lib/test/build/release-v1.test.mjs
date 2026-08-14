@@ -303,8 +303,46 @@ test('generated first-display components self-register through one authenticated
           batch: Object.freeze({
             version: 1,
             projectionDigest: '${'c'.repeat(64)}',
-            requiredProtocols: Object.freeze(['aps', 'gpt']),
-            outcomes: Object.freeze([Object.freeze({slotId: 'slot-1', kind: 'aps'})])
+            projection: Object.freeze({
+              version: 1,
+              auction: Object.freeze({
+                version: 1,
+                auctionId: 'initial',
+                results: Object.freeze([Object.freeze({
+                  slot: 'slot-1',
+                  outcome: 'winner',
+                  candidateId: 'candidate001'
+                })])
+              }),
+              slots: Object.freeze([Object.freeze({
+                slot: 'slot-1',
+                gamUnitPath: '/123/example',
+                divId: 'slot-1',
+                formats: Object.freeze([Object.freeze([300, 250])]),
+                targeting: Object.freeze({placement: 'article'})
+              })]),
+              bids: Object.freeze([Object.freeze({
+                candidateId: 'candidate001',
+                slot: 'slot-1',
+                provider: 'example',
+                upstreamBidId: 'upstream-1',
+                cpm: 1.25,
+                currency: 'USD',
+                targeting: Object.freeze({hb_pb: '1.25'}),
+                rendererReservationId: 'r1_${'a'.repeat(22)}',
+                renderSource: Object.freeze({
+                  type: 'aps',
+                  version: 1,
+                  accountId: 'account-1',
+                  bidId: 'bid-1',
+                  tagType: 'iframe',
+                  creativeUrl: 'https://creative.example/render',
+                  aaxResponse: '',
+                  width: 300,
+                  height: 250
+                })
+              })])
+            })
           }),
           bootstrap: Object.freeze({
             get state() { return 'agent_registered'; },
