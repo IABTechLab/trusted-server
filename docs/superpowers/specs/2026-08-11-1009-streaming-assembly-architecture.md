@@ -6,14 +6,14 @@
 stands.
 **Issue:** IABTechLab/trusted-server#1009
 
-> **Implementation update, 2026-08-12.** Design C is now the only shared-template
-> render path. The operator-facing value remains `assembly_mode = "esi"`, but the
-> `esi` crate, native include/subrequest design, executable fragment, and
-> `client_fill` comparison arm were removed. Fastly supplies C2; other adapters
-> fall back to inline processing. Sections 2–2c and Design B below are retained as
-> the investigation history, not as descriptions of current code. The merged and
-> hardened contract is
-> [the implementation design](./2026-08-12-1009-esi-merge-hardening-design.md).
+> **Implementation update, 2026-08-14.** Warm C2 hits still use Design C exactly as
+> specified here. Authorized cold misses now also validate the repaired
+> `stackpop/esi` parser, pinned by commit: the inert C2 marker becomes one synthetic
+> include only in a private working copy, resolved from the already-built reader
+> fragment without an HTTP request. Parser failure falls back to the byte seam. See
+> [the hybrid implementation design](./2026-08-14-1009-esi-parser-assembly-design.md).
+> Sections 2–2c and Design B remain investigation history; the native self-subrequest
+> design is still not implemented.
 
 ---
 
@@ -214,18 +214,22 @@ it and must stop.
 The issue's gating decision is: _is Fastly-first acceptable for the flagship perf path,
 with a portable fallback?_
 
-Design C keeps assembly portable, but only Fastly currently supplies the shared C2 cache;
-the other adapters degrade to their existing inline origin transform. It removes the
-`esi` dependency from the critical render path, needs no self-referencing backend, and
-avoids a second rendering architecture.
+Design C keeps the latency-critical warm path portable, but only Fastly currently supplies
+the shared C2 cache; the other adapters degrade to their existing inline origin transform.
+No self-referencing backend or browser-visible fragment surface exists.
 
-**ESI is therefore sufficient but unnecessary.** For a single insertion point at a known
-location, its parsing generality buys nothing a byte split does not. That is a stronger
-answer than validating ESI, and it is the opposite of what the issue expected.
+The `esi` mode uses a hybrid implementation. A cold miss is already buffered for cache
+insertion, so Fastly runs the repaired ESI parser there to validate the issue's requested
+mechanism without adding a new TTFB hold. A warm hit uses Design C's exact byte split,
+because parsing the full cached document would buffer the response and expose the auction
+at first byte. `X-TS-Assembly: esi-parser` and `X-TS-Assembly: byte-seam` make those two
+paths observable.
 
-The existing `esi` mode now selects Design C. Design B is deliberately removed: retaining
-a parser and fragment surface for unused generality was not cheap once the real 1.4 MB
-Next.js page demonstrated parser truncation.
+The original parser truncation was real: its streaming loop discarded an incomplete
+element whenever that element crossed the 16 KiB read boundary. The pinned fork preserves
+the incomplete buffer, and an adapter test protects a 120 KiB Next.js-style script. The
+stored template remains an inert comment; executable ESI exists only in a request-private
+working copy and can dispatch only TS's synthetic completed fragment.
 
 ## 7. Sequencing
 

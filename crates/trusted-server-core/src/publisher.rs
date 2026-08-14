@@ -75,6 +75,7 @@ use crate::streaming_replacer::create_url_replacer;
 const SUPPORTED_ENCODING_VALUES: [&str; 3] = ["gzip", "deflate", "br"];
 const DEFAULT_PUBLISHER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 const HEADER_X_TS_C2_CACHE: &str = "x-ts-c2-cache";
+const HEADER_X_TS_ASSEMBLY: &str = "x-ts-assembly";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum C2ResponseState {
@@ -108,6 +109,30 @@ impl C2ResponseState {
 fn set_c2_response_state(response: &mut Response<EdgeBody>, state: C2ResponseState) {
     response.headers_mut().insert(
         HEADER_X_TS_C2_CACHE,
+        HeaderValue::from_static(state.as_str()),
+    );
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AssemblyResponseState {
+    EsiParser,
+    ByteSeamFallback,
+    ByteSeam,
+}
+
+impl AssemblyResponseState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::EsiParser => "esi-parser",
+            Self::ByteSeamFallback => "byte-seam-fallback",
+            Self::ByteSeam => "byte-seam",
+        }
+    }
+}
+
+fn set_assembly_response_state(response: &mut Response<EdgeBody>, state: AssemblyResponseState) {
+    response.headers_mut().insert(
+        HEADER_X_TS_ASSEMBLY,
         HeaderValue::from_static(state.as_str()),
     );
 }
@@ -1610,18 +1635,44 @@ pub async fn buffer_publisher_response_async(
                     }
                 })?;
             }
+            // Publisher-authored ESI is outside TS's template schema. If it entered C2,
+            // a warm hit would stream it without passing through the cold parser that
+            // rejects it. Revoke the reservation before storage and keep this response
+            // on the portable byte-seam path.
+            let contains_publisher_esi = was_authorized && contains_esi_directive(&bytes);
+            if contains_publisher_esi {
+                log::warn!(
+                    "c2_template_cache bypass: transformed response contains publisher-authored ESI"
+                );
+                params.template_cache_key.take();
+            }
             let store_outcome = store_template_if_authorized(services, &mut params, &bytes).await;
             if was_authorized {
                 set_c2_response_state(
                     &mut response,
-                    match store_outcome {
-                        Some(TemplateStoreOutcome::Stored) => C2ResponseState::MissStored,
-                        Some(TemplateStoreOutcome::Expired) => C2ResponseState::BypassResponse,
-                        Some(TemplateStoreOutcome::Error) | None => C2ResponseState::MissStoreError,
+                    match (contains_publisher_esi, store_outcome) {
+                        (true, _) => C2ResponseState::BypassResponse,
+                        (false, Some(TemplateStoreOutcome::Stored)) => C2ResponseState::MissStored,
+                        (false, Some(TemplateStoreOutcome::Expired)) => {
+                            C2ResponseState::BypassResponse
+                        }
+                        (false, Some(TemplateStoreOutcome::Error) | None) => {
+                            C2ResponseState::MissStoreError
+                        }
                     },
                 );
             }
-            let bytes = assemble_if_shared(was_authorized, settings, &params, bytes)?;
+            let (bytes, assembly_state) = assemble_if_shared(
+                was_authorized,
+                !contains_publisher_esi,
+                settings,
+                &params,
+                services,
+                bytes,
+            )?;
+            if let Some(state) = assembly_state {
+                set_assembly_response_state(&mut response, state);
+            }
             let bytes = if was_authorized {
                 encode_complete_body(bytes, response_compression(&response))?
             } else {
@@ -1689,13 +1740,9 @@ pub async fn buffer_publisher_response_async(
 
 /// Splices this visitor's slots and bids into the seam, if the mode assembles.
 ///
-/// Uses the same byte split as the hit path, and deliberately **not** the `esi` crate.
-/// That crate loses content inside any element larger than its 16 KB `chunk_size`: it
-/// empties its buffer before parsing and never restores those bytes when the parser
-/// returns `Incomplete`. Next.js streams its RSC payload as a few enormous
-/// `self.__next_f.push(...)` scripts, so a real 1.4 MB page came back at 697 KB and the
-/// browser showed an error boundary. Raising `chunk_size` moves the threshold rather
-/// than removing it.
+/// Gives the platform assembler the already-buffered cold document. Fastly resolves a
+/// synthetic ESI include with the repaired parser; adapters without an assembler and
+/// documents the parser rejects use the same validated byte split as the warm path.
 ///
 /// Called *after* [`store_template_if_authorized`], never before: what is stored must be
 /// the template every visitor shares.
@@ -1705,12 +1752,14 @@ pub async fn buffer_publisher_response_async(
 /// Returns an error if the seam marker is missing or repeated.
 fn assemble_if_shared(
     was_authorized: bool,
+    platform_assembly_allowed: bool,
     settings: &Settings,
     params: &OwnedProcessResponseParams,
+    services: &RuntimeServices,
     bytes: Vec<u8>,
-) -> Result<Vec<u8>, Report<crate::error::TrustedServerError>> {
+) -> Result<(Vec<u8>, Option<AssemblyResponseState>), Report<crate::error::TrustedServerError>> {
     if !response_carries_a_seam_marker(was_authorized, settings) {
-        return Ok(bytes);
+        return Ok((bytes, None));
     }
 
     let (head, tail) = split_template_at_seam(&bytes).change_context_lazy(|| {
@@ -1720,11 +1769,35 @@ fn assemble_if_shared(
     })?;
     let seam = seam_script_for(params);
 
+    let platform_result = platform_assembly_allowed.then(|| {
+        services
+            .template_assembler()
+            .assemble(&bytes, seam.as_bytes())
+    });
+    match platform_result {
+        Some(Ok(assembled))
+            if !assembled
+                .windows(AD_ASSEMBLY_SEAM.len())
+                .any(|window| window == AD_ASSEMBLY_SEAM.as_bytes()) =>
+        {
+            return Ok((assembled, Some(AssemblyResponseState::EsiParser)));
+        }
+        Some(Ok(_)) => {
+            log::warn!(
+                "platform template assembler left the shared seam unresolved; using byte-seam fallback"
+            );
+        }
+        Some(Err(err)) => {
+            log::warn!("platform template assembly failed: {err}; using byte-seam fallback");
+        }
+        None => {}
+    }
+
     let mut out = Vec::with_capacity(head.len() + seam.len() + tail.len());
     out.extend_from_slice(head);
     out.extend_from_slice(seam.as_bytes());
     out.extend_from_slice(tail);
-    Ok(out)
+    Ok((out, Some(AssemblyResponseState::ByteSeamFallback)))
 }
 
 /// Fingerprint of every configuration input plus the compiled browser bundle.
@@ -1764,6 +1837,17 @@ fn template_fingerprint(settings: &Settings) -> String {
 /// authorized response has one to find.
 fn response_carries_a_seam_marker(was_authorized: bool, settings: &Settings) -> bool {
     was_authorized && mode_emits_seam_marker(configured_assembly_mode(settings))
+}
+
+/// Whether bytes contain an ESI directive that came from publisher content.
+///
+/// TS's stored seam is an inert HTML comment, so any `<esi:` sequence is outside the
+/// cache schema. The conservative scan also rejects the sequence inside scripts and
+/// comments: bypassing an optimization is safer than sharing edge instructions.
+fn contains_esi_directive(bytes: &[u8]) -> bool {
+    bytes
+        .windows(b"<esi:".len())
+        .any(|window| window.eq_ignore_ascii_case(b"<esi:"))
 }
 
 /// What this request splices into the seam marker: a `<script>`, or nothing at all.
@@ -1958,6 +2042,7 @@ fn build_cached_template_response(
     enforce_private_no_store(&mut response);
     set_response_compression(&mut response, reader_compression);
     set_c2_response_state(&mut response, C2ResponseState::Hit);
+    set_assembly_response_state(&mut response, AssemblyResponseState::ByteSeam);
     Ok(response)
 }
 
@@ -7345,13 +7430,15 @@ mod tests {
         };
         use crate::test_support::tests::crate_test_settings_str;
         use std::collections::HashMap;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         /// A working cache, unlike the recorder above — this one has to actually return
         /// what it stored, or a hit proves nothing.
         #[derive(Default)]
         struct MemoryTemplateCache {
             entries: Arc<Mutex<HashMap<String, crate::platform::TemplateEntry>>>,
+            /// Set only after a reservation has committed its reader-neutral bytes.
+            insert_completed: Arc<AtomicBool>,
             /// Every key `get` was called with, so a test can assert what was *asked
             /// for* rather than only what came back. A lookup that names a schema
             /// version this binary cannot assemble is the bug; whether the entry
@@ -7369,9 +7456,62 @@ mod tests {
 
         struct MemoryTemplateReservation {
             entries: Arc<Mutex<HashMap<String, crate::platform::TemplateEntry>>>,
+            insert_completed: Arc<AtomicBool>,
             stored_keys: Arc<Mutex<Vec<crate::platform::TemplateCacheKey>>>,
             stored_max_ages: Arc<Mutex<Vec<Duration>>>,
             key: crate::platform::TemplateCacheKey,
+        }
+
+        #[derive(Default)]
+        struct RecordingTemplateAssembler {
+            calls: AtomicUsize,
+            fail: AtomicBool,
+            expected_store_completion: Mutex<Option<Arc<AtomicBool>>>,
+        }
+
+        impl RecordingTemplateAssembler {
+            fn require_store_before_call(&self, completed: Arc<AtomicBool>) {
+                *self
+                    .expected_store_completion
+                    .lock()
+                    .expect("should lock expected store completion") = Some(completed);
+            }
+        }
+
+        impl crate::platform::PlatformTemplateAssembler for RecordingTemplateAssembler {
+            fn assemble(
+                &self,
+                template: &[u8],
+                fragment: &[u8],
+            ) -> Result<Vec<u8>, crate::platform::TemplateAssemblyError> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                if self
+                    .expected_store_completion
+                    .lock()
+                    .expect("should lock expected store completion")
+                    .as_ref()
+                    .is_some_and(|completed| !completed.load(Ordering::Relaxed))
+                {
+                    return Err(crate::platform::TemplateAssemblyError::Failed {
+                        message: "assembler ran before cache insertion completed".to_string(),
+                    });
+                }
+                if self.fail.load(Ordering::Relaxed) {
+                    return Err(crate::platform::TemplateAssemblyError::Failed {
+                        message: "injected assembly failure".to_string(),
+                    });
+                }
+                let (head, tail) = split_template_at_seam(template).map_err(|error| {
+                    crate::platform::TemplateAssemblyError::Failed {
+                        message: error.to_string(),
+                    }
+                })?;
+                let mut assembled = Vec::with_capacity(head.len() + fragment.len() + tail.len());
+                assembled.extend_from_slice(head);
+                assembled.extend_from_slice(fragment);
+                assembled.extend_from_slice(tail);
+                Ok(assembled)
+            }
         }
 
         impl crate::platform::PlatformTemplateCacheReservation for MemoryTemplateReservation {
@@ -7396,6 +7536,7 @@ mod tests {
                         body,
                     },
                 );
+                self.insert_completed.store(true, Ordering::Relaxed);
                 Ok(())
             }
 
@@ -7433,6 +7574,7 @@ mod tests {
                     crate::platform::TemplateCacheReservation::new(Box::new(
                         MemoryTemplateReservation {
                             entries: Arc::clone(&self.entries),
+                            insert_completed: Arc::clone(&self.insert_completed),
                             stored_keys: Arc::clone(&self.stored_keys),
                             stored_max_ages: Arc::clone(&self.stored_max_ages),
                             key: key.clone(),
@@ -7480,6 +7622,7 @@ mod tests {
                         body,
                     },
                 );
+                self.insert_completed.store(true, Ordering::Relaxed);
                 Ok(())
             }
 
@@ -7552,6 +7695,14 @@ mod tests {
                 .client_info(ClientInfo::default())
                 .template_cache(cache)
                 .build()
+        }
+
+        fn services_with_assembler(
+            http_client: Arc<StubHttpClient>,
+            cache: Arc<MemoryTemplateCache>,
+            assembler: Arc<RecordingTemplateAssembler>,
+        ) -> RuntimeServices {
+            services(http_client, cache).with_template_assembler(assembler)
         }
 
         /// Shareable HTML: no `Set-Cookie`, no `Vary`, a public `Cache-Control`. Every
@@ -7924,6 +8075,203 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn only_the_cold_miss_uses_the_platform_assembler() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let assembler = Arc::new(RecordingTemplateAssembler::default());
+            assembler.require_store_before_call(Arc::clone(&cache.insert_completed));
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services_with_assembler(
+                Arc::clone(&stub),
+                Arc::clone(&cache),
+                Arc::clone(&assembler),
+            );
+            queue_shareable_html(&stub);
+
+            let cold = run(&settings, &services, navigation_request()).await;
+            assert_eq!(
+                header_of(&cold, header::HeaderName::from_static("x-ts-assembly")),
+                Some("esi-parser")
+            );
+            let cold_body = body_of(cold).await;
+            assert_eq!(assembler.calls.load(Ordering::Relaxed), 1);
+
+            let warm = run(&settings, &services, navigation_request()).await;
+            assert_eq!(
+                header_of(&warm, header::HeaderName::from_static("x-ts-assembly")),
+                Some("byte-seam")
+            );
+            let warm_body = body_of(warm).await;
+
+            assert_eq!(
+                assembler.calls.load(Ordering::Relaxed),
+                1,
+                "a warm hit must preserve the streaming byte-seam path"
+            );
+            assert_eq!(cold_body, warm_body);
+        }
+
+        #[tokio::test]
+        async fn a_platform_assembly_failure_falls_back_to_a_complete_byte_seam() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let assembler = Arc::new(RecordingTemplateAssembler::default());
+            assembler.fail.store(true, Ordering::Relaxed);
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services_with_assembler(
+                Arc::clone(&stub),
+                Arc::clone(&cache),
+                Arc::clone(&assembler),
+            );
+            queue_shareable_html(&stub);
+
+            let response = run(&settings, &services, navigation_request()).await;
+            assert_eq!(
+                header_of(&response, header::HeaderName::from_static("x-ts-assembly")),
+                Some("byte-seam-fallback")
+            );
+            let document = String::from_utf8(body_of(response).await)
+                .expect("served document should be UTF-8");
+
+            assert!(document.contains("origin"));
+            assert!(document.contains("scheduleInitialAdInit"));
+            assert!(!document.contains(AD_ASSEMBLY_SEAM));
+            assert_eq!(assembler.calls.load(Ordering::Relaxed), 1);
+        }
+
+        #[tokio::test]
+        async fn publisher_esi_is_never_stored_or_executed() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let assembler = Arc::new(RecordingTemplateAssembler::default());
+            let settings = Arc::new(settings_with_mode("esi"));
+            let services = services_with_assembler(
+                Arc::clone(&stub),
+                Arc::clone(&cache),
+                Arc::clone(&assembler),
+            );
+            stub.push_response_with_headers(
+                200,
+                b"<html><head></head><body><ESI:remove>publisher</ESI:remove></body></html>"
+                    .to_vec(),
+                vec![
+                    ("content-type", "text/html; charset=utf-8"),
+                    ("cache-control", "public, max-age=300"),
+                ],
+            );
+
+            let response = run(&settings, &services, navigation_request()).await;
+            assert_eq!(
+                header_of(&response, header::HeaderName::from_static("x-ts-c2-cache")),
+                Some("bypass-response")
+            );
+            assert_eq!(
+                header_of(&response, header::HeaderName::from_static("x-ts-assembly")),
+                Some("byte-seam-fallback")
+            );
+            let document = String::from_utf8(body_of(response).await)
+                .expect("served document should be UTF-8");
+
+            assert!(document.to_ascii_lowercase().contains("<esi:remove>"));
+            assert!(document.contains("scheduleInitialAdInit"));
+            assert!(
+                cache
+                    .entries
+                    .lock()
+                    .expect("should lock entries")
+                    .is_empty(),
+                "publisher-authored ESI must never enter the shared template cache"
+            );
+            assert_eq!(
+                assembler.calls.load(Ordering::Relaxed),
+                0,
+                "publisher-authored ESI must never reach the platform parser"
+            );
+        }
+
+        #[tokio::test]
+        async fn ineligible_requests_and_responses_never_use_the_platform_assembler() {
+            let inline_stub = Arc::new(StubHttpClient::new());
+            let inline_cache = Arc::new(MemoryTemplateCache::default());
+            let inline_assembler = Arc::new(RecordingTemplateAssembler::default());
+            let inline_settings = Arc::new(settings_with_mode("inline"));
+            let inline_services = services_with_assembler(
+                Arc::clone(&inline_stub),
+                Arc::clone(&inline_cache),
+                Arc::clone(&inline_assembler),
+            );
+            queue_shareable_html(&inline_stub);
+
+            let _ =
+                body_of(run(&inline_settings, &inline_services, navigation_request()).await).await;
+            assert_eq!(inline_assembler.calls.load(Ordering::Relaxed), 0);
+
+            let private_stub = Arc::new(StubHttpClient::new());
+            let private_cache = Arc::new(MemoryTemplateCache::default());
+            let private_assembler = Arc::new(RecordingTemplateAssembler::default());
+            let esi_settings = Arc::new(settings_with_mode("esi"));
+            let private_services = services_with_assembler(
+                Arc::clone(&private_stub),
+                Arc::clone(&private_cache),
+                Arc::clone(&private_assembler),
+            );
+            private_stub.push_response_with_headers(
+                200,
+                b"<html><head></head><body>private origin</body></html>".to_vec(),
+                vec![
+                    ("content-type", "text/html; charset=utf-8"),
+                    ("cache-control", "public, max-age=300"),
+                    ("set-cookie", "reader=personalized; Path=/"),
+                ],
+            );
+
+            let _ =
+                body_of(run(&esi_settings, &private_services, navigation_request()).await).await;
+            assert_eq!(private_assembler.calls.load(Ordering::Relaxed), 0);
+
+            let authenticated_stub = Arc::new(StubHttpClient::new());
+            let authenticated_cache = Arc::new(MemoryTemplateCache::default());
+            let authenticated_assembler = Arc::new(RecordingTemplateAssembler::default());
+            let authenticated_services = services_with_assembler(
+                Arc::clone(&authenticated_stub),
+                Arc::clone(&authenticated_cache),
+                Arc::clone(&authenticated_assembler),
+            );
+            queue_shareable_html(&authenticated_stub);
+            let mut authenticated_request = navigation_request();
+            authenticated_request.headers_mut().insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer example-token"),
+            );
+
+            let _ = body_of(
+                run(
+                    &esi_settings,
+                    &authenticated_services,
+                    authenticated_request,
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(authenticated_assembler.calls.load(Ordering::Relaxed), 0);
+
+            let failed_cache_stub = Arc::new(StubHttpClient::new());
+            let failed_cache = Arc::new(MemoryTemplateCache::default());
+            failed_cache.fail_lookup.store(true, Ordering::Relaxed);
+            let failed_cache_assembler = Arc::new(RecordingTemplateAssembler::default());
+            let failed_cache_services = services_with_assembler(
+                Arc::clone(&failed_cache_stub),
+                Arc::clone(&failed_cache),
+                Arc::clone(&failed_cache_assembler),
+            );
+            queue_shareable_html(&failed_cache_stub);
+
+            let _ = body_of(run(&esi_settings, &failed_cache_services, navigation_request()).await)
+                .await;
+            assert_eq!(failed_cache_assembler.calls.load(Ordering::Relaxed), 0);
+        }
+
+        #[tokio::test]
         async fn fastly_surrogate_control_still_allows_a_cold_fill_and_warm_hit() {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
@@ -8225,6 +8573,13 @@ mod tests {
                 normalized.ends_with(AD_ASSEMBLY_SEAM.as_bytes()),
                 "normalization must mint its own unambiguous terminal seam"
             );
+        }
+
+        #[test]
+        fn parser_validation_does_not_change_the_cached_schema() {
+            assert_eq!(crate::platform::TEMPLATE_SCHEMA_VERSION, 4);
+            assert_eq!(AD_ASSEMBLY_SEAM, "<!--ts-ad-seam-->");
+            assert!(!contains_esi_directive(AD_ASSEMBLY_SEAM.as_bytes()));
         }
 
         /// Shareable HTML that already contains the seam marker.

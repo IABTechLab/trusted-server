@@ -192,8 +192,10 @@ auction_timeout_ms = 500  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES_
 price_granularity = "dense"
 
 # Initial-page delivery mode. `inline` is the default and current production
-# behaviour. `esi` is an opt-in Fastly Core Cache experiment: despite the name,
-# it uses an inert comment plus exact byte-seam assembly, not an ESI parser.
+# behaviour. `esi` is an opt-in Fastly Core Cache experiment. C2 stores an inert
+# comment; a cold miss validates the repaired ESI parser in a private working
+# copy, while warm hits use the streaming byte seam. No fragment HTTP request or
+# publisher-controlled ESI is allowed.
 # This and the three cache-safety keys below belong in this
 # [creative_opportunities] table. See docs/guide/configuration.md before enabling.
 # assembly_mode = "inline"

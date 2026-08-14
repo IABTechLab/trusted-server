@@ -1374,11 +1374,17 @@ formats = [{ width = 728, height = 90 }]
 - `inline` (default) transforms every origin response and injects the current
   reader's slots and bids directly.
 - `esi` opts into a reader-neutral transformed-template cache on Fastly. The
-  public name is retained for operator continuity; the implementation does not
-  execute general ESI. It stores identity bytes containing one inert, versioned
-  comment and performs an exact byte split at that seam. Slots and structured
-  bids are inserted per request, with the article prefix streamed before the
-  auction finishes.
+  cache stores identity bytes containing one inert, versioned comment. On an
+  authorized cold miss, Fastly replaces that comment in a private working copy
+  with one synthetic ESI include and resolves it from the already-built reader
+  state using the pinned `stackpop/esi` parser. No HTTP fragment request occurs.
+  Warm hits use an exact byte split instead, preserving the fast article-prefix
+  stream while the auction finishes.
+
+This is deliberately not general publisher-controlled ESI. A transformed origin
+document containing any `<esi:` directive bypasses C2 and the parser, while the
+ordinary byte seam still produces the reader's complete response. The stored C2
+object never contains executable ESI markup.
 
 Only Fastly currently supplies the C2 Core Cache backend. Other adapters accept
 the mode but safely fall back to the inline transform on every request. This is
@@ -1449,6 +1455,17 @@ For a canary, inspect `X-TS-C2-Cache`. Its bounded values are `hit`,
 `bypass-response`, `unsupported`, `invalid`, and `backend-error`. No URL, header
 value, or cache key is exposed. `invalid` and `backend-error` fail open to a
 fresh origin response; they do not fail the page.
+
+`X-TS-Assembly` identifies how the private response was assembled:
+
+- `esi-parser` — authorized cold miss assembled by the repaired parser;
+- `byte-seam` — warm C2 hit using the streaming byte seam;
+- `byte-seam-fallback` — cold response safely assembled by byte seam because
+  the platform parser was unavailable or rejected the document.
+
+The two headers together are the reliable verification signal. Timing alone can
+vary with the origin, auction, compression, browser connection reuse, and local
+proxy buffering.
 
 Rollback must preserve configuration compatibility:
 

@@ -29,6 +29,7 @@ mod app;
 mod backend;
 mod compat;
 mod ec_kv;
+mod esi_assembly;
 mod logging;
 mod management_api;
 mod middleware;

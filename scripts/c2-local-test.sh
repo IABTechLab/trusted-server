@@ -141,6 +141,7 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        print(f"origin: received GET {self.path}", flush=True)
         # Compresses when asked, because a real origin does and because a plaintext-only
         # stub hid a bug that broke the feature end to end: a gzip template has no
         # findable seam marker, and splicing plaintext bids into a gzip stream gives the
@@ -159,6 +160,7 @@ class H(BaseHTTPRequestHandler):
             self._send(PAGE, "text/html; charset=utf-8", base)
 
     def do_POST(self):
+        print(f"origin: received POST {self.path}", flush=True)
         n = int(self.headers.get("Content-Length") or 0)
         if n:
             self.rfile.read(n)
@@ -261,7 +263,7 @@ req() { # req <output-file> [extra curl args...]
     "$@" "http://127.0.0.1:$TS_PORT/article"
 }
 
-origin_gets() { grep -c "GET /article" "$WORK/origin.log" || true; }
+origin_gets() { grep -cF "origin: received GET /article" "$WORK/origin.log" || true; }
 
 info "Running assertions (mode: $MODE)"
 BEFORE=$(origin_gets)
@@ -307,12 +309,17 @@ check "second request returns 200" "$CODE2" "200"
 # it. Asserted in both modes: a shared-mode failure that inline shares would otherwise
 # read as "the fixture never bids" rather than "the seam drops bids".
 WINNING_BID='\"hb_pb\":\"4.25\"'
-# Must stay in step with `AD_ASSEMBLY_SEAM` in publisher.rs. An inert HTML comment,
-# not executable ESI markup — nothing parses ESI on the render path any more.
+# Must stay in step with `AD_ASSEMBLY_SEAM` in publisher.rs. C2 stores this inert
+# comment. The cold response turns it into a synthetic ESI include only in a private
+# working copy; the warm response splits these bytes directly.
 SEAM_MARKER='<!--ts-ad-seam-->'
 
 c2_state() {
   awk 'tolower($1) == "x-ts-c2-cache:" { gsub(/\r/, "", $2); print $2 }' "$1" | tail -1
+}
+
+assembly_state() {
+  awk 'tolower($1) == "x-ts-assembly:" { gsub(/\r/, "", $2); print $2 }' "$1" | tail -1
 }
 
 # Shared by the ESI assertions below.
@@ -328,12 +335,12 @@ check_hit_is_private() {
 
 check_post_reaches_origin() {
   local before
-  before=$(grep -c "POST /article" "$WORK/origin.log" || true)
+  before=$(grep -cF "origin: received POST /article" "$WORK/origin.log" || true)
   curl -s -o /dev/null -X POST -d 'x=1' -H "Host: ts.example.com" \
     -H "Accept-Encoding: gzip" \
     "http://127.0.0.1:$TS_PORT/article"
   check "a POST still reaches the origin" \
-    "$(( $(grep -c "POST /article" "$WORK/origin.log" || true) - before ))" "1"
+    "$(( $(grep -cF "origin: received POST /article" "$WORK/origin.log" || true) - before ))" "1"
 }
 
 if [ "$MODE" = "inline" ]; then
@@ -346,6 +353,10 @@ else
   check "second request is served from cache" "$FETCHES" "1"
   check "cold request reports a stored miss" "$(c2_state "$WORK/r1.html.headers")" "miss-stored"
   check "warm request reports a cache hit" "$(c2_state "$WORK/r2.html.headers")" "hit"
+  check "cold response uses the repaired ESI parser" \
+    "$(assembly_state "$WORK/r1.html.headers")" "esi-parser"
+  check "warm response keeps the streaming byte seam" \
+    "$(assembly_state "$WORK/r2.html.headers")" "byte-seam"
   check "no unresolved seam marker reaches the browser" \
     "$(grep -cF "$SEAM_MARKER" "$SERVED" || true)" "0"
   check "a bids script is present" \
@@ -494,10 +505,10 @@ if [ "$MODE" = "esi" ]; then
     "$(grep -c 'window\.tsjs' "$SERVED" || true)"
   cat <<'EOF'
 
-  The marker is never visible in page source, in any mode. It exists only inside
-  the cache; assembly replaces it before the response is sent, on both the miss
-  and hit paths. `seam marker present: true` above is the evidence that the
-  stored copy is genuinely reader-agnostic rather than carrying someone's bids.
+  The marker is never visible in page source. It remains inert in C2. A cold miss
+  converts it to one synthetic ESI include in a private working copy; a warm hit
+  byte-splits it directly. Both replace it before sending the response.
+  `seam marker present: true` above proves the stored copy is reader-agnostic.
 EOF
 fi
 
