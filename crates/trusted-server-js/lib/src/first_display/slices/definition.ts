@@ -1,5 +1,9 @@
 import type { FirstDisplaySliceActivationContext } from '../transaction';
 import type { FirstDisplaySliceId } from '../../kernel/release_catalog';
+import {
+  firstDisplayComponentRegistration,
+  registerCurrentFirstDisplayComponent,
+} from '../registration';
 
 export type OptionalFirstDisplaySliceId = Exclude<FirstDisplaySliceId, 'first_display'>;
 
@@ -52,4 +56,16 @@ export function defineInitialSlice(id: OptionalFirstDisplaySliceId): InitialSlic
       });
     },
   });
+}
+
+/** Register one selected optional slice into the bootstrap-owned artifact transaction. */
+export function registerInitialSlice(
+  definition: InitialSliceDefinition,
+  absoluteCatalogOrder: number
+): boolean {
+  return registerCurrentFirstDisplayComponent(
+    firstDisplayComponentRegistration(definition.id, absoluteCatalogOrder, (host) =>
+      definition.prepare(host as FirstDisplaySliceHost)
+    )
+  );
 }

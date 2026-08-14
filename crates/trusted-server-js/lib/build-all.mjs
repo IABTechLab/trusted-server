@@ -262,6 +262,19 @@ for (const artifact of artifacts.filter(({ phase }) => phase === 'first_display'
   if (forbidden) {
     throw new Error(`[build-all] ${artifact.id} reaches persistent source ${forbidden}`);
   }
+  const catalogEntry = firstDisplayCatalog.find(({ id }) => id === artifact.id);
+  if (!catalogEntry) throw new Error(`[build-all] Missing first-display catalog row: ${artifact.id}`);
+  const ownEntry = path.normalize(`src/${artifact.entry}`);
+  const allowed = new Set(
+    catalogEntry.allowedImports.map((moduleId) => path.normalize(`src/${moduleId}.ts`))
+  );
+  const undeclared = artifact.moduleIds.find((moduleId) => {
+    const normalized = path.normalize(moduleId);
+    return normalized !== ownEntry && !allowed.has(normalized);
+  });
+  if (undeclared) {
+    throw new Error(`[build-all] ${artifact.id} reaches undeclared first-display source ${undeclared}`);
+  }
 }
 for (const artifact of artifacts.filter(
   ({ role, phase }) => role === 'core' || phase === 'critical' || phase === 'deferred'

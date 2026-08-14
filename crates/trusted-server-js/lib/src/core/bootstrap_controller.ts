@@ -1,4 +1,10 @@
 import type { BootFailureReason } from '../kernel/fallback';
+import type { FirstDisplaySliceId } from '../kernel/release_catalog';
+import {
+  FIRST_DISPLAY_REGISTRATION_FIELD,
+  snapshotFirstDisplayComponentRegistration,
+} from '../first_display/registration';
+import { createFirstDisplayTransaction } from '../first_display/transaction';
 
 const BOOT_DEADLINE_MS = 10_000;
 
@@ -21,6 +27,31 @@ export interface BootstrapController {
   readonly startAction: () => boolean;
   readonly settle: () => boolean;
   readonly fail: (reason: BootFailureReason) => boolean;
+}
+
+export type FirstDisplayArtifactControllerState =
+  | 'collecting'
+  | 'active'
+  | 'failed'
+  | 'disposed';
+
+export interface FirstDisplayArtifactControllerOptions {
+  readonly bootstrap: BootstrapController;
+  readonly target: object;
+  readonly document: Document;
+  readonly script: HTMLScriptElement;
+  readonly releaseId: string;
+  readonly generation: number;
+  readonly expectedSliceIds: readonly FirstDisplaySliceId[];
+  readonly isCurrentGeneration: () => boolean;
+  /** Supplies the closure-private base or optional-slice host after all records validate. */
+  readonly hostFor: (id: FirstDisplaySliceId) => unknown;
+  readonly onDisposalError?: (error: unknown) => void;
+}
+
+export interface FirstDisplayArtifactController {
+  readonly state: FirstDisplayArtifactControllerState;
+  readonly dispose: () => void;
 }
 
 /** Own the one protected bootstrap deadline and the preceding bids-script mark. */
@@ -88,5 +119,113 @@ export function createBootstrapController(
       return true;
     },
     fail,
+  });
+}
+
+/**
+ * Install the bootstrap-owned, ephemeral registration sink for one composed agent.
+ * The final component closes the sink before any preparation or effect is allowed.
+ */
+export function createFirstDisplayArtifactController(
+  options: FirstDisplayArtifactControllerOptions
+): FirstDisplayArtifactController | undefined {
+  let state: FirstDisplayArtifactControllerState = 'collecting';
+  let count = 0;
+  let sink: ((this: unknown, candidate: unknown, source: unknown) => boolean) | undefined;
+  const transaction = createFirstDisplayTransaction({
+    document: options.document,
+    script: options.script,
+    releaseId: options.releaseId,
+    generation: options.generation,
+    expectedSliceIds: options.expectedSliceIds,
+    isCurrentGeneration: options.isCurrentGeneration,
+    ...(options.onDisposalError ? { onDisposalError: options.onDisposalError } : {}),
+  });
+
+  const closeSink = (): boolean => {
+    if (!sink) return true;
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(
+        options.target,
+        FIRST_DISPLAY_REGISTRATION_FIELD
+      );
+      if (!descriptor || !('value' in descriptor) || descriptor.value !== sink) return false;
+      if (!Reflect.deleteProperty(options.target, FIRST_DISPLAY_REGISTRATION_FIELD)) return false;
+      sink = undefined;
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const fail = (reason: BootFailureReason): false => {
+    if (state === 'failed' || state === 'disposed') return false;
+    state = 'failed';
+    closeSink();
+    transaction.dispose();
+    options.bootstrap.fail(reason);
+    return false;
+  };
+
+  if (
+    options.expectedSliceIds.length === 0 ||
+    options.expectedSliceIds[0] !== 'first_display' ||
+    Object.getOwnPropertyDescriptor(options.target, FIRST_DISPLAY_REGISTRATION_FIELD)
+  ) {
+    fail('abi_mismatch');
+    return undefined;
+  }
+
+  sink = function (this: unknown, candidate: unknown, source: unknown): boolean {
+    if (state !== 'collecting' || this !== options.target || source !== options.script) {
+      return fail('abi_mismatch');
+    }
+    const registration = snapshotFirstDisplayComponentRegistration(candidate);
+    const expectedId = options.expectedSliceIds[count];
+    if (
+      !registration ||
+      registration.releaseId !== options.releaseId ||
+      registration.id !== expectedId
+    ) {
+      return fail('abi_mismatch');
+    }
+    const registered = transaction.register({
+      abi: 1,
+      id: registration.id,
+      releaseId: registration.releaseId,
+      generation: options.generation,
+      order: registration.order,
+      prepare: () => registration.prepare(options.hostFor(registration.id as FirstDisplaySliceId)),
+    });
+    if (!registered) return fail('abi_mismatch');
+    count += 1;
+    if (count !== options.expectedSliceIds.length) return true;
+    if (!closeSink()) return fail('bundle_partial');
+    if (!transaction.activate()) return fail('bundle_partial');
+    state = 'active';
+    return true;
+  };
+
+  try {
+    Object.defineProperty(options.target, FIRST_DISPLAY_REGISTRATION_FIELD, {
+      configurable: true,
+      enumerable: false,
+      value: sink,
+      writable: false,
+    });
+  } catch {
+    fail('abi_mismatch');
+    return undefined;
+  }
+
+  return Object.freeze({
+    get state() {
+      return state;
+    },
+    dispose: (): void => {
+      if (state === 'disposed') return;
+      state = 'disposed';
+      closeSink();
+      transaction.dispose();
+    },
   });
 }

@@ -1,8 +1,14 @@
-import type { FirstDisplaySliceId } from '../kernel/release_catalog';
+import {
+  FIRST_DISPLAY_CATALOG,
+  type FirstDisplaySliceId,
+} from '../kernel/release_catalog';
 
 const HASH = /^[0-9a-f]{64}$/;
 const FIRST_DISPLAY_SRC =
   /^\/static\/tsjs=tsjs-first-display\.min\.js\?m=[0-9a-f]{4}&v=[0-9a-f]{64}$/;
+const FIRST_DISPLAY_ORDER = new Map(
+  FIRST_DISPLAY_CATALOG.map(({ id, order }) => [id, order] as const)
+);
 
 export type FirstDisplayTransactionState =
   'collecting' | 'preparing' | 'activating' | 'active' | 'failed' | 'disposed';
@@ -15,6 +21,8 @@ export interface FirstDisplaySlicePrepareContext {
 
 export interface FirstDisplaySliceActivationContext {
   readonly own: (dispose: () => void) => void;
+  /** Base-only action that runs synchronously after every selected slice activates. */
+  readonly afterActivate: (callback: () => void) => void;
 }
 
 export interface PreparedFirstDisplaySliceV1 {
@@ -129,7 +137,7 @@ class FirstDisplayTransactionOwner implements FirstDisplayTransaction {
       !registration ||
       registration.releaseId !== this.options.releaseId ||
       registration.generation !== this.options.generation ||
-      registration.order !== expectedIndex + 1 ||
+      registration.order !== FIRST_DISPLAY_ORDER.get(registration.id) ||
       registration.id !== this.options.expectedSliceIds[expectedIndex]
     ) {
       return this.reject();
@@ -167,16 +175,34 @@ class FirstDisplayTransactionOwner implements FirstDisplayTransaction {
       if (!this.authenticated()) throw new TypeError('stale first-display owner');
       this.stateValue = 'activating';
       let ownershipOpen = true;
-      const context = Object.freeze({
-        own: (dispose: () => void): void => {
-          if (!ownershipOpen || typeof dispose !== 'function') {
-            throw new TypeError('first-display disposer registration is closed');
-          }
-          this.disposers.push(dispose);
-        },
-      });
-      for (const slice of prepared) slice.activate(context);
+      let afterActivation: (() => void) | undefined;
+      for (let index = 0; index < prepared.length; index += 1) {
+        const slice = prepared[index];
+        if (!slice) throw new TypeError('missing prepared first-display slice');
+        slice.activate(
+          Object.freeze({
+            own: (dispose: () => void): void => {
+              if (!ownershipOpen || typeof dispose !== 'function') {
+                throw new TypeError('first-display disposer registration is closed');
+              }
+              this.disposers.push(dispose);
+            },
+            afterActivate: (callback: () => void): void => {
+              if (
+                !ownershipOpen ||
+                index !== 0 ||
+                afterActivation !== undefined ||
+                typeof callback !== 'function'
+              ) {
+                throw new TypeError('invalid first-display post-activation callback');
+              }
+              afterActivation = callback;
+            },
+          })
+        );
+      }
       ownershipOpen = false;
+      afterActivation?.();
       if (!this.authenticated()) throw new TypeError('stale first-display activation');
       this.stateValue = 'active';
       return true;
