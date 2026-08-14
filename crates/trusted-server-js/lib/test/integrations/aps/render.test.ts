@@ -4,14 +4,18 @@ import envelope from '../../fixtures/aps-renderer-v1.json';
 import type { ApsRendererV1 } from '../../../src/core/types';
 import { log } from '../../../src/core/log';
 import {
+  APS_RENDERER_DATA_URL,
   APS_RENDERER_PATH,
   APS_RENDERER_SANDBOX,
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+  apsRendererBootstrapUrl,
   apsRendererUrl,
+  cancelPendingApsRender,
   getApsPrebidRenderer,
   parseApsRendererDescriptor,
   registerApsPrebidRenderer,
+  registerApsUniversalCreativeMount,
   renderApsCreative,
   validateApsRenderer,
 } from '../../../src/integrations/aps/render';
@@ -48,6 +52,76 @@ function descriptor(overrides: Partial<ApsRendererV1> = {}): ApsRendererV1 {
     height: bid.h,
     ...overrides,
   };
+}
+
+type FakeRendererChannel = MessagePort & {
+  close: ReturnType<typeof vi.fn>;
+  postMessage: ReturnType<typeof vi.fn>;
+  start: ReturnType<typeof vi.fn>;
+};
+
+function sendRendererMessage(channel: FakeRendererChannel, data: Record<string, unknown>): void {
+  channel.onmessage?.(new MessageEvent('message', { data }));
+}
+
+function advanceRendererToData(iframe: HTMLIFrameElement) {
+  const postMessage = vi.spyOn(iframe.contentWindow!, 'postMessage');
+  const nonce = new URL(iframe.src).hash.replace('#tsaps=', '');
+  window.dispatchEvent(
+    new MessageEvent('message', {
+      data: { message: 'trusted-server/aps/bootstrap-ready', nonce },
+      source: iframe.contentWindow,
+    })
+  );
+  expect(iframe.getAttribute('sandbox')).toBe(APS_RENDERER_SANDBOX);
+  const navigate = postMessage.mock.calls[0][0] as {
+    message: string;
+    nonce: string;
+    rendererUrl: string;
+  };
+  expect(navigate.message).toBe('trusted-server/aps/bootstrap-navigate');
+  expect(navigate.nonce).toBe(nonce);
+  expect(navigate.rendererUrl).toMatch(
+    /^data:text\/html;charset=utf-8,.+#tsaps=[A-Za-z0-9_-]{22}$/
+  );
+
+  const encodedDocument = navigate.rendererUrl
+    .slice('data:text/html;charset=utf-8,'.length)
+    .replace(/#tsaps=[A-Za-z0-9_-]{22}$/, '');
+  const containerDocument = decodeURIComponent(encodedDocument);
+  const innerNonce = containerDocument.match(
+    /data:text\/html;charset=utf-8,.+#tsaps=([A-Za-z0-9_-]{22})/
+  )?.[1];
+  expect(innerNonce).toMatch(/^[A-Za-z0-9_-]{22}$/);
+  expect(innerNonce).not.toBe(nonce);
+  expect(containerDocument).toContain('frame-src data: https://creative.example');
+  expect(containerDocument).not.toContain(descriptor().bidId);
+  expect(containerDocument).not.toContain(descriptor().aaxResponse);
+
+  const channel = {
+    close: vi.fn(),
+    onmessage: null,
+    postMessage: vi.fn(),
+    start: vi.fn(),
+  } as unknown as FakeRendererChannel;
+  window.dispatchEvent(
+    new MessageEvent('message', {
+      data: { message: 'trusted-server/aps/container-ready', nonce },
+      source: iframe.contentWindow,
+      ports: [channel],
+    })
+  );
+  expect(channel.start).toHaveBeenCalledOnce();
+  sendRendererMessage(channel, {
+    message: 'trusted-server/aps/channel-ready',
+    nonce: innerNonce,
+  });
+  const sent = channel.postMessage.mock.calls[0][0] as {
+    nonce: string;
+    publisherOrigin: string;
+    renderer: ApsRendererV1;
+  };
+  return { channel, innerNonce: innerNonce!, postMessage, sent };
 }
 
 describe('APS renderer validation', () => {
@@ -271,62 +345,58 @@ describe('direct APS rendering', () => {
     document.body.innerHTML = '';
   });
 
-  it('loads the static route with a fragment-bound 128-bit nonce and opaque sandbox', () => {
+  it('bootstraps the data renderer with a fragment-bound 128-bit nonce', () => {
     expect(renderApsCreative({ slotId: 'fictional-slot', renderer: descriptor() })).toBe(true);
 
     const slot = document.getElementById('fictional-slot')!;
     const iframe = slot.querySelector('iframe')!;
     const existing = slot.querySelector('span');
     expect(existing).not.toBeNull();
-    expect(iframe.src).toMatch(/\/integrations\/aps\/renderer#tsaps=[A-Za-z0-9_-]{22}$/);
-    expect(iframe.getAttribute('sandbox')).toBe(APS_RENDERER_SANDBOX);
+    expect(iframe.src.startsWith(`${apsRendererBootstrapUrl()}#tsaps=`)).toBe(true);
+    expect(iframe.src).toMatch(/\?mode=data-bootstrap#tsaps=[A-Za-z0-9_-]{22}$/);
     expect(iframe.getAttribute('sandbox')).not.toContain('allow-same-origin');
     expect(iframe.srcdoc).toBe('');
 
-    const postMessage = vi.spyOn(iframe.contentWindow!, 'postMessage');
-    iframe.dispatchEvent(new Event('load'));
-
+    const { channel, sent } = advanceRendererToData(iframe);
     expect(slot.querySelector('span')).not.toBeNull();
     expect(iframe.style.display).toBe('none');
-    expect(postMessage).toHaveBeenCalledTimes(1);
-    expect(postMessage).toHaveBeenCalledWith(
-      {
-        nonce: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/),
-        renderer: descriptor(),
-      },
-      '*'
-    );
+    expect(iframe.getAttribute('sandbox')).toContain('allow-same-origin');
+    expect(sent).toEqual({
+      nonce: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/),
+      publisherOrigin: window.location.origin,
+      renderer: descriptor(),
+    });
 
-    const message = postMessage.mock.calls[0][0] as { nonce: string };
-    window.dispatchEvent(
-      new MessageEvent('message', {
-        data: {
-          message: 'trusted-server/aps/renderer-ready',
-          nonce: `wrong-${message.nonce}`,
-        },
-        source: iframe.contentWindow,
-      })
-    );
+    sendRendererMessage(channel, {
+      message: 'trusted-server/aps/renderer-ready',
+      nonce: `wrong-${sent.nonce}`,
+    });
     expect(slot.querySelector('span')).not.toBeNull();
 
     window.dispatchEvent(
       new MessageEvent('message', {
-        data: { message: 'trusted-server/aps/renderer-ready', nonce: message.nonce },
+        data: { message: 'trusted-server/aps/renderer-ready', nonce: sent.nonce },
         source: iframe.contentWindow,
       })
     );
+    expect(slot.querySelector('span')).not.toBeNull();
+    expect(iframe.style.display).toBe('none');
+
+    sendRendererMessage(channel, {
+      message: 'trusted-server/aps/renderer-ready',
+      nonce: sent.nonce,
+    });
+    expect(iframe.getAttribute('sandbox')).toContain('allow-same-origin');
     expect(slot.querySelector('span')).toBeNull();
     expect(iframe.style.display).toBe('');
   });
 
-  it('rejects a ready message with the correct nonce from a foreign window', () => {
+  it('accepts readiness only through the transferred renderer channel', () => {
     expect(renderApsCreative({ slotId: 'fictional-slot', renderer: descriptor() })).toBe(true);
 
     const slot = document.getElementById('fictional-slot')!;
     const rendererFrame = slot.querySelector('iframe')!;
-    const postMessage = vi.spyOn(rendererFrame.contentWindow!, 'postMessage');
-    rendererFrame.dispatchEvent(new Event('load'));
-    const sent = postMessage.mock.calls[0][0] as { nonce: string };
+    const { channel, sent } = advanceRendererToData(rendererFrame);
     const foreignFrame = document.createElement('iframe');
     document.body.appendChild(foreignFrame);
 
@@ -336,10 +406,6 @@ describe('direct APS rendering', () => {
         source: foreignFrame.contentWindow,
       })
     );
-
-    expect(slot.querySelector('span')).not.toBeNull();
-    expect(rendererFrame.style.display).toBe('none');
-
     window.dispatchEvent(
       new MessageEvent('message', {
         data: { message: 'trusted-server/aps/renderer-ready', nonce: sent.nonce },
@@ -347,6 +413,13 @@ describe('direct APS rendering', () => {
       })
     );
 
+    expect(slot.querySelector('span')).not.toBeNull();
+    expect(rendererFrame.style.display).toBe('none');
+
+    sendRendererMessage(channel, {
+      message: 'trusted-server/aps/renderer-ready',
+      nonce: sent.nonce,
+    });
     expect(slot.querySelector('span')).toBeNull();
     expect(rendererFrame.style.display).toBe('');
   });
@@ -366,6 +439,16 @@ describe('direct APS rendering', () => {
     iframe.dispatchEvent(new Event('error'));
     expect(document.querySelector('#fictional-slot span')).not.toBeNull();
     expect(document.querySelector('#fictional-slot iframe')).toBeNull();
+  });
+
+  it('cancels a pending frame before another renderer replaces the slot', () => {
+    expect(renderApsCreative({ slotId: 'fictional-slot', renderer: descriptor() })).toBe(true);
+    const container = document.getElementById('fictional-slot')!;
+
+    cancelPendingApsRender(container);
+
+    expect(container.querySelector('span')).not.toBeNull();
+    expect(container.querySelector('iframe')).toBeNull();
   });
 
   it('removes an unacknowledged frame without clearing publisher content', () => {
@@ -391,9 +474,9 @@ describe('direct APS rendering', () => {
       const baselineTimers = vi.getTimerCount();
       expect(renderApsCreative({ slotId: 'fictional-slot', renderer: descriptor() })).toBe(true);
       const firstFrame = document.querySelector('#fictional-slot iframe')!;
-      const firstPostMessage = vi.spyOn(firstFrame.contentWindow!, 'postMessage');
-      firstFrame.dispatchEvent(new Event('load'));
-      const firstSent = firstPostMessage.mock.calls[0][0] as { nonce: string };
+      const { channel: firstChannel, sent: firstSent } = advanceRendererToData(
+        firstFrame as HTMLIFrameElement
+      );
       const timersAfterFirst = vi.getTimerCount();
       expect(timersAfterFirst).toBeGreaterThan(baselineTimers);
 
@@ -401,25 +484,21 @@ describe('direct APS rendering', () => {
       const secondFrame = document.querySelector('#fictional-slot iframe')!;
       expect(firstFrame.isConnected).toBe(false);
       expect(vi.getTimerCount()).toBe(timersAfterFirst);
-      const postMessage = vi.spyOn(secondFrame.contentWindow!, 'postMessage');
-      secondFrame.dispatchEvent(new Event('load'));
-      const sent = postMessage.mock.calls[0][0] as { nonce: string };
-
-      window.dispatchEvent(
-        new MessageEvent('message', {
-          data: { message: 'trusted-server/aps/renderer-ready', nonce: firstSent.nonce },
-          source: firstFrame.contentWindow,
-        })
+      const { channel: secondChannel, sent } = advanceRendererToData(
+        secondFrame as HTMLIFrameElement
       );
+
+      sendRendererMessage(firstChannel, {
+        message: 'trusted-server/aps/renderer-ready',
+        nonce: firstSent.nonce,
+      });
       expect(document.querySelector('#fictional-slot span')).not.toBeNull();
       expect((secondFrame as HTMLIFrameElement).style.display).toBe('none');
 
-      window.dispatchEvent(
-        new MessageEvent('message', {
-          data: { message: 'trusted-server/aps/renderer-ready', nonce: sent.nonce },
-          source: secondFrame.contentWindow,
-        })
-      );
+      sendRendererMessage(secondChannel, {
+        message: 'trusted-server/aps/renderer-ready',
+        nonce: sent.nonce,
+      });
 
       vi.advanceTimersByTime(10_000);
       expect(warnSpy).not.toHaveBeenCalled();
@@ -430,19 +509,21 @@ describe('direct APS rendering', () => {
 });
 
 describe('Universal Creative APS source', () => {
-  it('uses the deployed dynamic renderer protocol and only creates the opaque route frame', () => {
-    expect(APS_UNIVERSAL_CREATIVE_RENDERER_VERSION).toBeGreaterThanOrEqual(4);
+  it('uses the deployed dynamic renderer protocol to request a top-page mount', () => {
+    expect(APS_UNIVERSAL_CREATIVE_RENDERER_VERSION).toBeGreaterThanOrEqual(6);
     expect(APS_UNIVERSAL_CREATIVE_RENDERER).toContain('window.render=function');
-    expect(APS_UNIVERSAL_CREATIVE_RENDERER).toContain('d&&d.apsRenderer');
-    expect(APS_UNIVERSAL_CREATIVE_RENDERER).toContain('d&&d.rendererUrl');
-    expect(APS_UNIVERSAL_CREATIVE_RENDERER).toContain(APS_RENDERER_PATH);
-    expect(APS_UNIVERSAL_CREATIVE_RENDERER).toContain(APS_RENDERER_SANDBOX);
-    expect(APS_UNIVERSAL_CREATIVE_RENDERER).not.toContain('allow-same-origin');
+    expect(APS_UNIVERSAL_CREATIVE_RENDERER).toContain('d&&d.apsMountId');
+    expect(APS_UNIVERSAL_CREATIVE_RENDERER).toContain('d&&d.publisherOrigin');
+    expect(APS_UNIVERSAL_CREATIVE_RENDERER).toContain('trusted-server/aps/mount-request');
+    expect(APS_UNIVERSAL_CREATIVE_RENDERER).not.toContain('d&&d.apsRenderer');
+    expect(APS_UNIVERSAL_CREATIVE_RENDERER).not.toContain('d&&d.rendererUrl');
+    expect(APS_UNIVERSAL_CREATIVE_RENDERER).not.toContain(APS_RENDERER_DATA_URL);
+    expect(APS_UNIVERSAL_CREATIVE_RENDERER).not.toContain(APS_RENDERER_SANDBOX);
     expect(APS_UNIVERSAL_CREATIVE_RENDERER).not.toContain('srcdoc');
     expect(APS_UNIVERSAL_CREATIVE_RENDERER).not.toContain('document.write');
-    expect(APS_UNIVERSAL_CREATIVE_RENDERER).not.toContain('creativeUrl');
-    expect(APS_UNIVERSAL_CREATIVE_RENDERER).not.toContain('aaxResponse');
     expect(APS_UNIVERSAL_CREATIVE_RENDERER).not.toContain('example-account-id');
+    expect(APS_UNIVERSAL_CREATIVE_RENDERER).not.toContain(descriptor().creativeUrl);
+    expect(APS_UNIVERSAL_CREATIVE_RENDERER).not.toContain(descriptor().aaxResponse);
   });
 
   it('computes an absolute renderer URL from the publisher origin', () => {
@@ -453,31 +534,114 @@ describe('Universal Creative APS source', () => {
     expect(apsRendererUrl('not an origin')).toBeUndefined();
   });
 
-  it('creates the opaque route frame and resolves only after the bound acknowledgement', async () => {
+  it('consumes a top-page mount capability once and preserves the controller frame', () => {
+    document.body.innerHTML =
+      '<div id="fictional-puc-slot"><iframe class="puc-controller"></iframe></div>';
+    const container = document.getElementById('fictional-puc-slot')!;
+    const controller = container.querySelector<HTMLIFrameElement>('.puc-controller')!;
+    const requester = document.createElement('iframe');
+    document.body.appendChild(requester);
+    const resultPost = vi.spyOn(requester.contentWindow!, 'postMessage');
+    const mountId = registerApsUniversalCreativeMount(container, descriptor())!;
+    const requestNonce = 'ZYXWVUTSRQPONMLKJIHGFE';
+
+    const request = () =>
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          data: {
+            message: 'trusted-server/aps/mount-request',
+            mountId,
+            nonce: requestNonce,
+          },
+          source: requester.contentWindow,
+        })
+      );
+    request();
+    request();
+
+    const rendererFrame = container.querySelector<HTMLIFrameElement>(
+      'iframe[data-ts-aps-renderer="true"]'
+    )!;
+    expect(rendererFrame).not.toBeNull();
+    expect(container.querySelectorAll('iframe[data-ts-aps-renderer="true"]')).toHaveLength(1);
+    expect(controller.isConnected).toBe(true);
+
+    const { channel, sent } = advanceRendererToData(rendererFrame);
+    sendRendererMessage(channel, {
+      message: 'trusted-server/aps/renderer-ready',
+      nonce: sent.nonce,
+    });
+
+    expect(controller.isConnected).toBe(true);
+    expect(controller.style.display).toBe('none');
+    expect(rendererFrame.style.display).toBe('');
+    expect(resultPost).toHaveBeenCalledWith(
+      {
+        message: 'trusted-server/aps/mount-result',
+        mountId,
+        nonce: requestNonce,
+        status: 'ready',
+      },
+      '*'
+    );
+    document.body.innerHTML = '';
+  });
+
+  it('revokes an older mount capability when the same container is registered again', () => {
+    document.body.innerHTML = '<div id="fictional-refresh-slot"></div>';
+    const container = document.getElementById('fictional-refresh-slot')!;
+    const requester = document.createElement('iframe');
+    document.body.appendChild(requester);
+    const oldMountId = registerApsUniversalCreativeMount(container, descriptor())!;
+    const newMountId = registerApsUniversalCreativeMount(container, descriptor())!;
+    const request = (mountId: string) =>
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          data: {
+            message: 'trusted-server/aps/mount-request',
+            mountId,
+            nonce: 'ABCDEFGHIJKLMNOPQRSTUV',
+          },
+          source: requester.contentWindow,
+        })
+      );
+
+    request(oldMountId);
+    expect(container.querySelector('iframe[data-ts-aps-renderer="true"]')).toBeNull();
+    request(newMountId);
+    const rendererFrame = container.querySelector<HTMLIFrameElement>(
+      'iframe[data-ts-aps-renderer="true"]'
+    );
+    expect(rendererFrame).not.toBeNull();
+    rendererFrame!.dispatchEvent(new Event('error'));
+    document.body.innerHTML = '';
+  });
+
+  it('resolves only after the top page acknowledges its one-shot mount request', async () => {
     const dynamicWindow = window as unknown as {
-      render?: (data: Record<string, unknown>, helper: unknown, target: Window) => Promise<void>;
+      render?: (data: Record<string, unknown>) => Promise<void>;
     };
+    const postMessage = vi.spyOn(window.top, 'postMessage');
     window.eval(APS_UNIVERSAL_CREATIVE_RENDERER);
 
     try {
-      const renderer = descriptor();
-      const rendered = dynamicWindow.render!(
-        {
-          apsRenderer: renderer,
-          rendererUrl: apsRendererUrl(),
-        },
-        undefined,
-        window
-      );
-      const iframe = document.body.querySelector('iframe')!;
-      expect(iframe.src).toMatch(/\/integrations\/aps\/renderer#tsaps=[A-Za-z0-9_-]{22}$/);
-      expect(iframe.getAttribute('sandbox')).toBe(APS_RENDERER_SANDBOX);
-      expect(iframe.getAttribute('sandbox')).not.toContain('allow-same-origin');
-
-      const postMessage = vi.spyOn(iframe.contentWindow!, 'postMessage');
-      iframe.dispatchEvent(new Event('load'));
-      const sent = postMessage.mock.calls[0][0] as { nonce: string; renderer: ApsRendererV1 };
-      expect(sent.renderer).toEqual(renderer);
+      const mountId = 'ABCDEFGHIJKLMNOPQRSTUV';
+      const rendered = dynamicWindow.render!({
+        apsMountId: mountId,
+        publisherOrigin: window.location.origin,
+      });
+      expect(document.body.querySelector('iframe')).toBeNull();
+      expect(postMessage).toHaveBeenCalledTimes(1);
+      const sent = postMessage.mock.calls[0][0] as {
+        message: string;
+        mountId: string;
+        nonce: string;
+      };
+      expect(sent).toEqual({
+        message: 'trusted-server/aps/mount-request',
+        mountId,
+        nonce: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/),
+      });
 
       let settled = false;
       void rendered.then(() => {
@@ -488,12 +652,18 @@ describe('Universal Creative APS source', () => {
 
       window.dispatchEvent(
         new MessageEvent('message', {
-          data: { message: 'trusted-server/aps/renderer-ready', nonce: sent.nonce },
-          source: iframe.contentWindow,
+          data: {
+            message: 'trusted-server/aps/mount-result',
+            mountId,
+            nonce: sent.nonce,
+            status: 'ready',
+          },
+          source: window.top,
         })
       );
       await expect(rendered).resolves.toBeUndefined();
     } finally {
+      postMessage.mockRestore();
       delete dynamicWindow.render;
       document.body.innerHTML = '';
     }

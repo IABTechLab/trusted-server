@@ -1,10 +1,18 @@
 import { log } from '../../core/log';
 import type { ApsPrebidRendererEntry, ApsRendererV1, TsjsApi } from '../../core/types';
 
+import APS_RENDERER_CONTAINER_DOCUMENT from './renderer-container.html?raw';
+import APS_RENDERER_DOCUMENT from './renderer.html?raw';
+
 export const APS_RENDERER_PATH = '/integrations/aps/renderer';
-export const APS_RENDERER_SANDBOX =
+export const APS_RENDERER_DATA_URL = `data:text/html;charset=utf-8,${encodeURIComponent(
+  APS_RENDERER_DOCUMENT
+)}`;
+const APS_RENDERER_BOOTSTRAP_SANDBOX =
   'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation';
-export const APS_UNIVERSAL_CREATIVE_RENDERER_VERSION = 4;
+export const APS_RENDERER_SANDBOX =
+  'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts allow-top-navigation-by-user-activation';
+export const APS_UNIVERSAL_CREATIVE_RENDERER_VERSION = 6;
 
 const MAX_ACCOUNT_ID_BYTES = 1024;
 const MAX_CREATIVE_ID_BYTES = 1024;
@@ -32,12 +40,27 @@ const MAX_PREBID_RENDERER_ENTRIES = 256;
 const DEFAULT_PREBID_RENDERER_TTL_SECONDS = 300;
 const MAX_PREBID_RENDERER_TTL_SECONDS = 3600;
 const MAX_PREBID_ID_BYTES = 1024;
+const APS_BOOTSTRAP_READY_MESSAGE = 'trusted-server/aps/bootstrap-ready';
+const APS_BOOTSTRAP_NAVIGATE_MESSAGE = 'trusted-server/aps/bootstrap-navigate';
+const APS_CONTAINER_READY_MESSAGE = 'trusted-server/aps/container-ready';
+const APS_CHANNEL_READY_MESSAGE = 'trusted-server/aps/channel-ready';
+const APS_MOUNT_REQUEST_MESSAGE = 'trusted-server/aps/mount-request';
+const APS_MOUNT_RESULT_MESSAGE = 'trusted-server/aps/mount-result';
+const LEGACY_RENDERER_FALLBACK_MS = 100;
+const MAX_PENDING_UNIVERSAL_MOUNTS = 256;
 
 type ValidatedRendererCacheEntry = {
   publisherOrigin: string;
   renderer: ApsRendererV1;
 };
 const validatedRendererCache = new WeakMap<object, ValidatedRendererCacheEntry>();
+type PendingUniversalMount = {
+  container: HTMLElement;
+  expiresAt: number;
+  renderer: ApsRendererV1;
+};
+const pendingUniversalMounts = new Map<string, PendingUniversalMount>();
+let universalMountListenerInstalled = false;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -287,8 +310,292 @@ function createNonce(): string | undefined {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
+function apsRendererContainerDataUrl(
+  renderer: ApsRendererV1,
+  rendererDataUrl: string,
+  innerNonce: string
+): string | undefined {
+  try {
+    const creativeOrigin = new URL(renderer.creativeUrl).origin;
+    const document = APS_RENDERER_CONTAINER_DOCUMENT.replace(
+      '__TS_APS_CREATIVE_ORIGIN__',
+      creativeOrigin
+    )
+      .replace('__TS_APS_CREATIVE_ORIGIN_JSON__', JSON.stringify(creativeOrigin))
+      .replace('__TS_APS_INNER_NONCE__', JSON.stringify(innerNonce))
+      .replace('__TS_APS_RENDERER_SANDBOX__', JSON.stringify(APS_RENDERER_SANDBOX))
+      .replace('__TS_APS_RENDERER_URL__', JSON.stringify(rendererDataUrl));
+    if (document.includes('__TS_APS_')) return undefined;
+    return `data:text/html;charset=utf-8,${encodeURIComponent(document)}`;
+  } catch {
+    return undefined;
+  }
+}
+
+type MountApsRendererOptions = {
+  mode: 'replace' | 'universal-creative';
+  onFailed?: () => void;
+  onReady?: () => void;
+};
+
+function mountApsRendererFrame(
+  container: HTMLElement,
+  renderer: ApsRendererV1,
+  options: MountApsRendererOptions
+): boolean {
+  const publisherOrigin = window.location.origin;
+  const bootstrapUrl = apsRendererBootstrapUrl(publisherOrigin);
+  const nonce = createNonce();
+  const innerNonce = createNonce();
+  if (!bootstrapUrl || !nonce || !innerNonce) return false;
+  const rendererDataUrl = `${APS_RENDERER_DATA_URL}#tsaps=${innerNonce}`;
+  const rendererContainerDataUrl = apsRendererContainerDataUrl(
+    renderer,
+    rendererDataUrl,
+    innerNonce
+  );
+  if (!rendererContainerDataUrl) return false;
+  const rendererContainerUrl = `${rendererContainerDataUrl}#tsaps=${nonce}`;
+
+  const iframe = document.createElement('iframe');
+  iframe.title = 'Ad content';
+  iframe.width = String(renderer.width);
+  iframe.height = String(renderer.height);
+  iframe.style.border = '0';
+  iframe.style.display = 'none';
+  iframe.dataset.tsApsRenderer = 'true';
+  // The publisher-origin bootstrap starts under the stricter sandbox. It asks
+  // the parent to add allow-same-origin only for navigation to a naturally
+  // opaque data container whose CSP confines the nested renderer.
+  iframe.setAttribute('sandbox', APS_RENDERER_BOOTSTRAP_SANDBOX);
+  iframe.src = `${bootstrapUrl}#tsaps=${nonce}`;
+
+  // A replacement must cancel a pending frame, not merely detach it: its
+  // message listener and ready timeout would otherwise remain live until expiry.
+  pendingFrameCancels.get(container)?.();
+  activeFrames.set(container, iframe);
+
+  let phase: 'active' | 'bootstrap' | 'channel' | 'legacy' | 'renderer' = 'bootstrap';
+  let rendererChannel: MessagePort | undefined;
+  let settled = false;
+  let legacyFallbackId: number | undefined;
+  const cleanup = (): void => {
+    window.removeEventListener('message', receive);
+    iframe.removeEventListener('load', load);
+    rendererChannel?.close();
+    rendererChannel = undefined;
+    window.clearTimeout(timeoutId);
+    if (legacyFallbackId !== undefined) window.clearTimeout(legacyFallbackId);
+  };
+  const cancel = (): void => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    if (pendingFrameCancels.get(container) === cancel) pendingFrameCancels.delete(container);
+    if (activeFrames.get(container) === iframe) activeFrames.delete(container);
+    iframe.remove();
+  };
+  const fail = (): void => {
+    if (settled) return;
+    cancel();
+    options.onFailed?.();
+  };
+  const commit = (): void => {
+    if (settled || activeFrames.get(container) !== iframe || !iframe.isConnected) return;
+    settled = true;
+    cleanup();
+    if (pendingFrameCancels.get(container) === cancel) pendingFrameCancels.delete(container);
+
+    for (const child of Array.from(container.children)) {
+      if (child === iframe) continue;
+      if (options.mode === 'replace' || (child as HTMLElement).dataset.tsApsRenderer === 'true') {
+        child.remove();
+      } else if (child instanceof HTMLElement) {
+        // Keep Universal Creative connected long enough to receive the success
+        // acknowledgement, but never leave two visible rendering surfaces.
+        child.style.display = 'none';
+      }
+    }
+    iframe.style.display = '';
+    options.onReady?.();
+  };
+  const postLegacyDescriptor = (): void => {
+    const target = iframe.contentWindow;
+    if (!target) {
+      fail();
+      return;
+    }
+    target.postMessage({ nonce, publisherOrigin, renderer }, '*');
+  };
+  function receiveChannel(event: MessageEvent): void {
+    if (!hasExactKeys(event.data, ['message', 'nonce']) || event.data.nonce !== innerNonce) return;
+    if (event.data.message === APS_CHANNEL_READY_MESSAGE && phase === 'channel') {
+      phase = 'active';
+      rendererChannel?.postMessage({ nonce: innerNonce, publisherOrigin, renderer });
+    } else if (event.data.message === RENDERER_READY_MESSAGE && phase === 'active') {
+      commit();
+    } else if (event.data.message === RENDERER_FAILED_MESSAGE) {
+      fail();
+    }
+  }
+  function receive(event: MessageEvent): void {
+    if (event.source !== iframe.contentWindow || !hasExactKeys(event.data, ['message', 'nonce'])) {
+      return;
+    }
+    if (event.data.nonce !== nonce) return;
+    if (event.data.message === APS_BOOTSTRAP_READY_MESSAGE && phase === 'bootstrap') {
+      if (legacyFallbackId !== undefined) window.clearTimeout(legacyFallbackId);
+      phase = 'renderer';
+      iframe.setAttribute('sandbox', APS_RENDERER_SANDBOX);
+      iframe.contentWindow?.postMessage(
+        { message: APS_BOOTSTRAP_NAVIGATE_MESSAGE, nonce, rendererUrl: rendererContainerUrl },
+        '*'
+      );
+    } else if (event.data.message === APS_CONTAINER_READY_MESSAGE && phase === 'renderer') {
+      if (event.ports.length !== 1) {
+        fail();
+        return;
+      }
+      phase = 'channel';
+      rendererChannel = event.ports[0];
+      rendererChannel.onmessage = receiveChannel;
+      rendererChannel.start();
+    } else if (event.data.message === RENDERER_READY_MESSAGE && phase === 'legacy') {
+      commit();
+    } else if (event.data.message === RENDERER_FAILED_MESSAGE) {
+      fail();
+    }
+  }
+  function load(): void {
+    if (settled || activeFrames.get(container) !== iframe || !iframe.isConnected) return;
+    try {
+      if (phase === 'legacy') {
+        postLegacyDescriptor();
+      } else if (phase === 'bootstrap') {
+        legacyFallbackId = window.setTimeout(() => {
+          if (phase !== 'bootstrap' || settled) return;
+          phase = 'legacy';
+          postLegacyDescriptor();
+        }, LEGACY_RENDERER_FALLBACK_MS);
+      }
+    } catch {
+      fail();
+    }
+  }
+
+  window.addEventListener('message', receive);
+  iframe.addEventListener('load', load);
+  iframe.addEventListener('error', fail, { once: true });
+
+  const timeoutId = window.setTimeout(fail, RENDERER_READY_TIMEOUT_MS);
+  pendingFrameCancels.set(container, cancel);
+  container.appendChild(iframe);
+  return true;
+}
+
+/** Cancel pending APS work before another renderer replaces this container. */
+export function cancelPendingApsRender(container: HTMLElement): void {
+  pendingFrameCancels.get(container)?.();
+  for (const [mountId, entry] of pendingUniversalMounts) {
+    if (entry.container === container) pendingUniversalMounts.delete(mountId);
+  }
+}
+
+function prunePendingUniversalMounts(now: number): void {
+  for (const [mountId, entry] of pendingUniversalMounts) {
+    if (entry.expiresAt <= now || !entry.container.isConnected) {
+      pendingUniversalMounts.delete(mountId);
+    }
+  }
+}
+
 /**
- * Return the absolute same-publisher URL used by direct and Universal Creative rendering.
+ * Register a one-shot bearer capability for Universal Creative to request a top-page mount.
+ *
+ * Real PUC asks from a nested dynamic-renderer frame rather than the controller
+ * that received the authenticated bridge response, so source-window equality
+ * cannot survive the handoff. The 128-bit ID is disclosed only in that response,
+ * consumed once, and a newer registration revokes the same container's old ID.
+ */
+export function registerApsUniversalCreativeMount(
+  container: HTMLElement,
+  input: unknown
+): string | undefined {
+  const renderer = validateApsRenderer(input);
+  if (!renderer || !container.isConnected) return undefined;
+
+  const now = Date.now();
+  prunePendingUniversalMounts(now);
+  cancelPendingApsRender(container);
+  if (pendingUniversalMounts.size >= MAX_PENDING_UNIVERSAL_MOUNTS) return undefined;
+
+  const mountId = createNonce();
+  if (!mountId || pendingUniversalMounts.has(mountId)) return undefined;
+  pendingUniversalMounts.set(mountId, {
+    container,
+    expiresAt: now + RENDERER_READY_TIMEOUT_MS,
+    renderer,
+  });
+  if (!universalMountListenerInstalled) {
+    universalMountListenerInstalled = true;
+    window.addEventListener('message', receiveUniversalMountRequest);
+  }
+  return mountId;
+}
+
+function sendUniversalMountResult(
+  target: MessageEventSource,
+  mountId: string,
+  nonce: string,
+  status: 'failed' | 'ready'
+): void {
+  if (!('postMessage' in target)) return;
+  try {
+    (target as Window).postMessage(
+      { message: APS_MOUNT_RESULT_MESSAGE, mountId, nonce, status },
+      '*'
+    );
+  } catch {
+    // The requesting frame may have been detached while APS was loading.
+  }
+}
+
+function receiveUniversalMountRequest(event: MessageEvent): void {
+  if (
+    !hasExactKeys(event.data, ['message', 'mountId', 'nonce']) ||
+    event.data.message !== APS_MOUNT_REQUEST_MESSAGE ||
+    typeof event.data.mountId !== 'string' ||
+    typeof event.data.nonce !== 'string' ||
+    !/^[A-Za-z0-9_-]{22}$/.test(event.data.mountId) ||
+    !/^[A-Za-z0-9_-]{22}$/.test(event.data.nonce) ||
+    !event.source
+  ) {
+    return;
+  }
+
+  const entry = pendingUniversalMounts.get(event.data.mountId);
+  if (!entry) return;
+  pendingUniversalMounts.delete(event.data.mountId);
+
+  const { mountId, nonce } = event.data;
+  if (entry.expiresAt <= Date.now() || !entry.container.isConnected) {
+    sendUniversalMountResult(event.source, mountId, nonce, 'failed');
+    return;
+  }
+
+  if (
+    !mountApsRendererFrame(entry.container, entry.renderer, {
+      mode: 'universal-creative',
+      onFailed: () => sendUniversalMountResult(event.source!, mountId, nonce, 'failed'),
+      onReady: () => sendUniversalMountResult(event.source!, mountId, nonce, 'ready'),
+    })
+  ) {
+    sendUniversalMountResult(event.source, mountId, nonce, 'failed');
+  }
+}
+
+/**
+ * Return the absolute same-publisher URL retained for cached-client compatibility.
  *
  * This intentionally inherits the publisher page scheme for same-origin deployments,
  * including local development. APS endpoints and third-party creative URLs remain
@@ -312,17 +619,23 @@ export function apsRendererUrl(pageOrigin = window.location.origin): string | un
   }
 }
 
+export function apsRendererBootstrapUrl(pageOrigin = window.location.origin): string | undefined {
+  const rendererUrl = apsRendererUrl(pageOrigin);
+  if (!rendererUrl) return undefined;
+  const url = new URL(rendererUrl);
+  url.search = 'mode=data-bootstrap';
+  return url.href;
+}
+
 export interface RenderApsCreativeOptions {
   slotId: string;
   renderer: unknown;
 }
 
-/** Render APS through the static endpoint under an outer opaque-origin sandbox. */
+/** Render APS through nested, naturally opaque data documents under an outer sandbox. */
 export function renderApsCreative({ slotId, renderer: input }: RenderApsCreativeOptions): boolean {
   const renderer = validateApsRenderer(input);
-  const rendererUrl = apsRendererUrl();
-  const nonce = createNonce();
-  if (!renderer || !rendererUrl || !nonce) {
+  if (!renderer) {
     log.warn('APS renderer: rejected descriptor');
     return false;
   }
@@ -333,101 +646,29 @@ export function renderApsCreative({ slotId, renderer: input }: RenderApsCreative
     return false;
   }
 
-  const iframe = document.createElement('iframe');
-  iframe.title = 'Ad content';
-  iframe.width = String(renderer.width);
-  iframe.height = String(renderer.height);
-  iframe.style.border = '0';
-  iframe.style.display = 'none';
-  iframe.setAttribute('sandbox', APS_RENDERER_SANDBOX);
-  iframe.src = `${rendererUrl}#tsaps=${nonce}`;
-
-  // A replacement must cancel a pending frame, not merely detach it: its
-  // message listener and ready timeout would otherwise remain live until expiry.
-  pendingFrameCancels.get(container)?.();
-  activeFrames.set(container, iframe);
-
-  let settled = false;
-  const cleanup = (): void => {
-    window.removeEventListener('message', receive);
-    window.clearTimeout(timeoutId);
-  };
-  const cancel = (): void => {
-    if (settled) return;
-    settled = true;
-    cleanup();
-    if (pendingFrameCancels.get(container) === cancel) pendingFrameCancels.delete(container);
-    if (activeFrames.get(container) === iframe) activeFrames.delete(container);
-    iframe.remove();
-  };
-  const fail = (): void => {
-    if (settled) return;
-    cancel();
-    log.warn('APS renderer: frame load failed');
-  };
-  const commit = (): void => {
-    if (settled || activeFrames.get(container) !== iframe || !iframe.isConnected) return;
-    settled = true;
-    cleanup();
-    if (pendingFrameCancels.get(container) === cancel) pendingFrameCancels.delete(container);
-    for (const child of Array.from(container.children)) {
-      if (child !== iframe) child.remove();
-    }
-    iframe.style.display = '';
-  };
-  function receive(event: MessageEvent): void {
-    if (event.source !== iframe.contentWindow || !hasExactKeys(event.data, ['message', 'nonce'])) {
-      return;
-    }
-    if (event.data.nonce !== nonce) return;
-    if (event.data.message === RENDERER_READY_MESSAGE) commit();
-    else if (event.data.message === RENDERER_FAILED_MESSAGE) fail();
-  }
-
-  window.addEventListener('message', receive);
-  iframe.addEventListener(
-    'load',
-    () => {
-      if (settled || activeFrames.get(container) !== iframe || !iframe.isConnected) return;
-      try {
-        const target = iframe.contentWindow;
-        if (!target) {
-          fail();
-          return;
-        }
-        target.postMessage({ nonce, renderer }, '*');
-      } catch {
-        fail();
-      }
-    },
-    { once: true }
-  );
-  iframe.addEventListener('error', fail, { once: true });
-
-  const timeoutId = window.setTimeout(fail, RENDERER_READY_TIMEOUT_MS);
-  pendingFrameCancels.set(container, cancel);
-  container.appendChild(iframe);
-  return true;
+  const mounted = mountApsRendererFrame(container, renderer, {
+    mode: 'replace',
+    onFailed: () => log.warn('APS renderer: frame load failed'),
+  });
+  if (!mounted) log.warn('APS renderer: failed to initialize frame');
+  return mounted;
 }
 
 /**
- * Static source executed by Prebid Universal Creative's dynamic-renderer frame.
- * It reads only the validated descriptor and trusted absolute endpoint URL from data.
+ * Static source executed by Prebid Universal Creative's hidden dynamic-renderer frame.
+ * A one-shot capability asks trusted top-page TSJS to mount the actual data renderer
+ * outside inherited GAM and Universal Creative sandbox restrictions.
  */
-export const APS_UNIVERSAL_CREATIVE_RENDERER = String.raw`(function(){window.render=function(d,_h,w){return new Promise(function(resolve,reject){
-try{var r=d&&d.apsRenderer,u=d&&d.rendererUrl;if(!r||typeof u!=="string")throw new Error("invalid APS renderer data");
-var p=new URL(u);if((p.protocol!=="https:"&&p.protocol!=="http:")||p.username||p.password||p.pathname!=="${APS_RENDERER_PATH}"||p.search||p.hash)throw new Error("invalid APS renderer URL");
-var c=w.crypto;if(!c||typeof c.getRandomValues!=="function")throw new Error("APS renderer randomness unavailable");
-var b=new Uint8Array(16);c.getRandomValues(b);var s="";for(var i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);
-var n=w.btoa(s).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/g,"");
-var f=w.document.createElement("iframe"),done=false,t;
-function clean(){w.removeEventListener("message",receive);if(t)w.clearTimeout(t);}
-function fail(){if(done)return;done=true;clean();f.remove();reject(new Error("APS renderer frame failed"));}
-function receive(e){var m=e.data;if(e.source!==f.contentWindow||!m||m.nonce!==n)return;
-if(m.message==="${RENDERER_READY_MESSAGE}"){done=true;clean();resolve();}
-else if(m.message==="${RENDERER_FAILED_MESSAGE}")fail();}
-f.width=String(r.width);f.height=String(r.height);f.style.border="0";
-f.setAttribute("sandbox","${APS_RENDERER_SANDBOX}");
-f.src=p.href+"#tsaps="+n;f.onload=function(){if(!done&&f.contentWindow)f.contentWindow.postMessage({nonce:n,renderer:r},"*");};
-f.onerror=fail;w.addEventListener("message",receive);t=w.setTimeout(fail,${RENDERER_READY_TIMEOUT_MS});w.document.body.appendChild(f);
+export const APS_UNIVERSAL_CREATIVE_RENDERER = String.raw`(function(){window.render=function(d){return new Promise(function(resolve,reject){
+try{var i=d&&d.apsMountId,o=d&&d.publisherOrigin;if(typeof i!=="string"||!/^[A-Za-z0-9_-]{22}$/.test(i)||typeof o!=="string")throw new Error("invalid APS mount data");
+var p=new URL(o);if((p.protocol!=="https:"&&p.protocol!=="http:")||p.username||p.password||p.origin!==o||p.pathname!=="/"||p.search||p.hash)throw new Error("invalid publisher origin");
+var c=window.crypto;if(!c||typeof c.getRandomValues!=="function")throw new Error("APS renderer randomness unavailable");
+var b=new Uint8Array(16);c.getRandomValues(b);var s="";for(var j=0;j<b.length;j++)s+=String.fromCharCode(b[j]);
+var n=window.btoa(s).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/g,""),done=false,t;
+function clean(){window.removeEventListener("message",receive);if(t)window.clearTimeout(t);}
+function fail(){if(done)return;done=true;clean();reject(new Error("APS top-page mount failed"));}
+function receive(e){var m=e.data;if(e.source!==top||!m||m.message!=="${APS_MOUNT_RESULT_MESSAGE}"||m.mountId!==i||m.nonce!==n)return;
+if(m.status==="ready"){done=true;clean();resolve();}else if(m.status==="failed")fail();}
+window.addEventListener("message",receive);t=window.setTimeout(fail,${RENDERER_READY_TIMEOUT_MS});
+top.postMessage({message:"${APS_MOUNT_REQUEST_MESSAGE}",mountId:i,nonce:n},o);
 }catch(e){reject(e);}});};})();`;
