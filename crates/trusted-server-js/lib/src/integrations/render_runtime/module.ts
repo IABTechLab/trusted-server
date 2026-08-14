@@ -17,6 +17,10 @@ import {
   createBrowserNavigationIdentityIssuer,
   mintBrowserLifecycleTicket,
 } from '../../kernel/identity';
+import {
+  snapshotPersistentFirstDisplayAdoptionV1,
+  type PersistentFirstDisplayAdoptionV1,
+} from '../../shared/takeover';
 import type {
   IntegrationActivationContext,
   IntegrationPrepareContext,
@@ -59,6 +63,8 @@ import {
   createRendererNonceRegistry,
   createSlotOperation,
   renderDirectAdmAttempt,
+  type CommittedArtifactStore,
+  type CommittedRenderArtifact,
   type RenderAttempt,
 } from '../../services/render';
 import type { SlotRecord, SlotService } from '../../services/slots';
@@ -75,6 +81,88 @@ interface AcceptedBoot {
 
 export type RegisteredRenderSource = 'aps';
 export type RegisteredRenderer = (attempt: RenderAttempt, container: HTMLElement) => boolean;
+
+function adoptionArray(candidate: unknown): readonly unknown[] | undefined {
+  return Array.isArray(candidate) && Object.isFrozen(candidate) ? candidate : undefined;
+}
+
+function adoptionField(candidate: unknown, key: string): unknown {
+  if (typeof candidate !== 'object' || candidate === null || Array.isArray(candidate)) {
+    return undefined;
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(candidate, key);
+  return descriptor?.enumerable && 'value' in descriptor ? descriptor.value : undefined;
+}
+
+export interface AdoptedInitialRenderArtifactsV1 {
+  readonly adoption: PersistentFirstDisplayAdoptionV1;
+  readonly arm: () => void;
+}
+
+/** Stage transferred frames in the persistent artifact store without arming rollback disposal. */
+export function adoptInitialRenderArtifactsFromHandoff(
+  candidate: unknown,
+  navigation: NavigationSession,
+  store: CommittedArtifactStore,
+  document: Document
+): AdoptedInitialRenderArtifactsV1 | undefined {
+  const adoption = snapshotPersistentFirstDisplayAdoptionV1(candidate);
+  if (!adoption) return undefined;
+  const cycles = adoptionArray(adoptionField(adoption.handoff, 'cycles'));
+  const artifacts = adoptionArray(adoptionField(adoption.handoff, 'artifacts'));
+  if (!cycles || !artifacts || adoption.identities.length !== cycles.length + artifacts.length) {
+    return undefined;
+  }
+  if (artifacts.length === 0) {
+    return Object.freeze({ adoption, arm: () => undefined });
+  }
+  const Frame = document.defaultView?.HTMLIFrameElement;
+  const batch = navigation.createAuctionBatch('first-display-adoption');
+  if (!Frame || !batch) return undefined;
+  const promoted: CommittedRenderArtifact[] = [];
+  let armed = false;
+  try {
+    for (let index = 0; index < artifacts.length; index += 1) {
+      const record = artifacts[index];
+      const slotId = adoptionField(record, 'slotId');
+      const identity = adoption.identities[cycles.length + index];
+      if (typeof slotId !== 'string' || !(identity instanceof Frame)) return undefined;
+      const attempt = batch.createRenderAttempt(slotId);
+      if (!attempt.ok) return undefined;
+      const frame = identity;
+      const artifact: CommittedRenderArtifact = Object.freeze({
+        kind: 'direct_iframe' as const,
+        attemptId: attempt.value.id,
+        slot: slotId,
+        navigationGeneration: navigation.generation,
+        dispose: (): void => {
+          if (!armed) return;
+          try {
+            frame.remove();
+          } catch {
+            // A publisher DOM replacement wins over persistent artifact retirement.
+          }
+        },
+      });
+      if (!store.promote(artifact, () => navigation.isCurrent())) return undefined;
+      promoted.push(artifact);
+    }
+    return Object.freeze({
+      adoption,
+      arm: (): void => {
+        armed = true;
+      },
+    });
+  } finally {
+    batch.dispose();
+    if (promoted.length !== artifacts.length) {
+      for (let index = promoted.length - 1; index >= 0; index -= 1) {
+        const artifact = promoted[index];
+        if (artifact) store.release(artifact);
+      }
+    }
+  }
+}
 
 interface LocalSlotRecord {
   readonly directAuctionUnit?: Readonly<object>;
@@ -814,11 +902,24 @@ export function createRenderRuntimeIntegrationRegistration(
       return Object.freeze({
         activate: (activation: IntegrationActivationContext) => {
           if (active) throw new Error('render_runtime already activated');
+          const adopted =
+            activation.adoption === undefined
+              ? undefined
+              : adoptInitialRenderArtifactsFromHandoff(
+                  activation.adoption,
+                  navigation,
+                  artifacts,
+                  document
+                );
+          if (activation.adoption !== undefined && !adopted) {
+            throw new TypeError('render_runtime first-display adoption is invalid');
+          }
           const releaseAuctionContext = runtime.attachAuctionContextService(auctionContextService);
           if (!releaseAuctionContext) {
             throw new TypeError('render_runtime auction context service is duplicated');
           }
           active = true;
+          if (adopted) activation.afterCommit(adopted.arm);
           activation.onDispose(releaseAuctionContext);
           activation.onDispose(() => {
             active = false;

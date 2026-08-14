@@ -1,5 +1,8 @@
 import type { BootFailureReason } from '../kernel/fallback';
+import type { PreparedKernelTakeover } from '../kernel/integration_registry';
 import type { FirstDisplaySliceId } from '../kernel/release_catalog';
+import type { FirstDisplayAgent } from '../first_display/agent';
+import { coordinatePreparedFirstDisplayTakeoverV1 } from '../first_display/handoff';
 import {
   FIRST_DISPLAY_REGISTRATION_FIELD,
   snapshotFirstDisplayComponentRegistration,
@@ -48,6 +51,119 @@ export interface FirstDisplayArtifactControllerOptions {
 export interface FirstDisplayArtifactController {
   readonly state: FirstDisplayArtifactControllerState;
   readonly dispose: () => void;
+}
+
+export type FirstDisplayTakeoverCoordinatorState =
+  'waiting' | 'bound' | 'committed' | 'failed' | 'disposed';
+
+export interface FirstDisplayTakeoverCoordinatorOptions {
+  readonly outline: unknown;
+  readonly isCurrentGeneration: () => boolean;
+  readonly authenticateRuntimeScript: () => boolean;
+  readonly onFailure: (reason: BootFailureReason) => void;
+}
+
+export interface FirstDisplayTakeoverCoordinator {
+  readonly state: FirstDisplayTakeoverCoordinatorState;
+  readonly bindAgent: (agent: FirstDisplayAgent) => boolean;
+  readonly coordinateTakeover: (prepared: PreparedKernelTakeover) => void;
+  readonly dispose: () => void;
+}
+
+/** Join one provisional agent to one prepared persistent transaction without public state. */
+export function createFirstDisplayTakeoverCoordinator(
+  options: FirstDisplayTakeoverCoordinatorOptions
+): FirstDisplayTakeoverCoordinator {
+  let state: FirstDisplayTakeoverCoordinatorState = 'waiting';
+  let agent: FirstDisplayAgent | undefined;
+  let failurePublished = false;
+  const fail = (selected?: FirstDisplayAgent): void => {
+    if (state === 'committed' || state === 'disposed') return;
+    state = 'failed';
+    agent = undefined;
+    try {
+      selected?.dispose();
+    } catch {
+      // Failed provisional disposal cannot restore its closed ownership epoch.
+    }
+    if (failurePublished) return;
+    failurePublished = true;
+    try {
+      options.onFailure('bundle_partial');
+    } catch {
+      // Failure publication cannot retain either ownership epoch.
+    }
+  };
+
+  return Object.freeze({
+    get state() {
+      return state;
+    },
+    bindAgent: (candidate: FirstDisplayAgent): boolean => {
+      if (
+        state !== 'waiting' ||
+        !Object.isFrozen(candidate) ||
+        typeof candidate.finalizeHandoff !== 'function' ||
+        typeof candidate.detachCommittedArtifacts !== 'function' ||
+        typeof candidate.snapshot !== 'function' ||
+        typeof candidate.dispose !== 'function' ||
+        !options.isCurrentGeneration()
+      ) {
+        fail(candidate);
+        return false;
+      }
+      agent = candidate;
+      state = 'bound';
+      return true;
+    },
+    coordinateTakeover: (prepared: PreparedKernelTakeover): void => {
+      const selected = agent;
+      if (state !== 'bound' || !selected || selected.state !== 'painted') {
+        fail(selected);
+        throw new Error('First-display agent is unavailable for takeover');
+      }
+      const finalized = selected.finalizeHandoff();
+      if (!finalized) {
+        fail(selected);
+        throw new Error('First-display handoff did not finalize');
+      }
+      const succeeded = coordinatePreparedFirstDisplayTakeoverV1({
+        prepared,
+        finalized,
+        outline: options.outline,
+        isCurrentGeneration: options.isCurrentGeneration,
+        authenticateRuntimeScript: options.authenticateRuntimeScript,
+        currentMutationRevision: () => selected.snapshot().mutationRevision,
+        quiesceAgent: () => {
+          if (selected.state !== 'painted') throw new Error('First-display agent is not quiesced');
+        },
+        detachCommittedArtifacts: () => {
+          if (!selected.detachCommittedArtifacts()) {
+            throw new Error('First-display artifacts did not detach');
+          }
+        },
+        disposeAgent: () => selected.dispose(),
+        onFailure: () => fail(selected),
+      });
+      if (!succeeded) {
+        fail(selected);
+        throw new Error('First-display takeover failed');
+      }
+      agent = undefined;
+      state = 'committed';
+    },
+    dispose: (): void => {
+      if (state === 'disposed') return;
+      const selected = agent;
+      agent = undefined;
+      state = 'disposed';
+      try {
+        selected?.dispose();
+      } catch {
+        // Disposal is best-effort after generation invalidation.
+      }
+    },
+  });
 }
 
 /** Own the one protected bootstrap deadline and the preceding bids-script mark. */

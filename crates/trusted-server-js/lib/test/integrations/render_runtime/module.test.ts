@@ -9,9 +9,13 @@ import type {
   RuntimeAuctionContextService,
   RuntimeCapabilityV1,
 } from '../../../src/kernel/runtime';
-import { createRenderRuntimeIntegrationRegistration } from '../../../src/integrations/render_runtime/module';
+import {
+  adoptInitialRenderArtifactsFromHandoff,
+  createRenderRuntimeIntegrationRegistration,
+} from '../../../src/integrations/render_runtime/module';
 import { log } from '../../../src/core/log';
-import type { RenderAttempt } from '../../../src/services/render';
+import { createCommittedArtifactStore, type RenderAttempt } from '../../../src/services/render';
+import type { NavigationSession } from '../../../src/kernel/sessions';
 
 const RELEASE_ID = 'a'.repeat(64);
 
@@ -20,6 +24,59 @@ afterEach(() => {
 });
 
 describe('render_runtime provider', () => {
+  it('adopts transferred DOM artifacts without removing them on rollback, then arms commit ownership', () => {
+    const frame = document.createElement('iframe');
+    document.body.append(frame);
+    const adoption = Object.freeze({
+      version: 1 as const,
+      adoptInitialDisplay: true as const,
+      handoff: Object.freeze({
+        slots: Object.freeze([Object.freeze({ id: 'slot-1' })]),
+        cycles: Object.freeze([]),
+        artifacts: Object.freeze([Object.freeze({ slotId: 'slot-1' })]),
+      }),
+      identities: Object.freeze([frame]),
+    });
+    const navigationGeneration = {};
+    const batch = Object.freeze({
+      createRenderAttempt: vi.fn(() =>
+        Object.freeze({
+          ok: true as const,
+          value: Object.freeze({
+            id: `a1_${'A'.repeat(22)}`,
+            navigationGeneration,
+          }),
+        })
+      ),
+      dispose: vi.fn(),
+    });
+    const navigation = Object.freeze({
+      generation: navigationGeneration,
+      createAuctionBatch: vi.fn(() => batch),
+      isCurrent: () => true,
+    }) as unknown as NavigationSession;
+
+    const rollbackStore = createCommittedArtifactStore();
+    expect(
+      adoptInitialRenderArtifactsFromHandoff(adoption, navigation, rollbackStore, document)
+    ).toBeDefined();
+    rollbackStore.dispose();
+    expect(frame.isConnected).toBe(true);
+
+    const committedStore = createCommittedArtifactStore();
+    const committed = adoptInitialRenderArtifactsFromHandoff(
+      adoption,
+      navigation,
+      committedStore,
+      document
+    );
+    expect(committed?.adoption).toBe(adoption);
+    committed?.arm();
+    committedStore.dispose();
+    expect(frame.isConnected).toBe(false);
+    expect(batch.dispose).toHaveBeenCalledTimes(2);
+  });
+
   it('rolls back prepared resources without unbound disposer failures', () => {
     const release: Array<() => void> = [];
     const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);

@@ -18,6 +18,7 @@ import {
   type IntegrationCatalogEntry,
   type IntegrationInstallResult,
   type IntegrationRegistry,
+  type PreparedKernelTakeover,
 } from './integration_registry';
 import {
   createDeferredPhaseLoader,
@@ -105,6 +106,8 @@ export interface RuntimeOptions {
   readonly prepareOwner?: (context: RuntimeOwnerPreparationContext) => void;
   readonly activateOwner?: (context: RuntimeOwnerActivationContext) => void;
   readonly activateCore?: (context: CoreActivationContext) => void;
+  /** Runs the prepared persistent activation and publication inside an old-owner handoff. */
+  readonly coordinateTakeover?: (prepared: PreparedKernelTakeover) => void;
   readonly kernel: RuntimeKernel;
 }
 
@@ -518,6 +521,9 @@ class RuntimeOwner implements Runtime {
           this.startDeferredPhase();
         },
         drainPreload: () => published?.drain(),
+        ...(this.options.coordinateTakeover
+          ? { coordinateTakeover: this.options.coordinateTakeover }
+          : {}),
       })
       .then((result) => {
         if (result.state === 'kernel') {

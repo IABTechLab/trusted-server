@@ -1,3 +1,7 @@
+import {
+  snapshotPersistentFirstDisplayAdoptionV1,
+  type PersistentFirstDisplayAdoptionV1,
+} from '../../shared/takeover';
 import type {
   IntegrationActivationContext,
   IntegrationPrepareContext,
@@ -39,6 +43,7 @@ import type { ReservationService } from '../../services/reservations';
 import {
   createBrowserSlotReconciliationBoundary,
   createSlotService,
+  type GptSlotBinding,
   type SlotRequestOutcome,
   type SlotService,
 } from '../../services/slots';
@@ -58,6 +63,83 @@ import { installGptGuard, resetGuardState } from './script_guard';
 import { createGptStartup } from './startup';
 
 export const GPT_INTEGRATION_ID = 'gpt' as const;
+
+function frozenArray(candidate: unknown): readonly unknown[] | undefined {
+  return Array.isArray(candidate) && Object.isFrozen(candidate) ? candidate : undefined;
+}
+
+function dataField(candidate: unknown, key: string): unknown {
+  if (typeof candidate !== 'object' || candidate === null || Array.isArray(candidate)) {
+    return undefined;
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(candidate, key);
+  return descriptor?.enumerable && 'value' in descriptor ? descriptor.value : undefined;
+}
+
+/** Adopt the exact transferred GPT identities without defining, targeting, displaying, or refreshing. */
+export function adoptInitialGptSlotsFromHandoff(
+  candidate: unknown,
+  navigationGeneration: object,
+  service: Pick<SlotService, 'adoptGptSlot'>
+): PersistentFirstDisplayAdoptionV1 | undefined {
+  const adoption = snapshotPersistentFirstDisplayAdoptionV1(candidate);
+  if (!adoption) return undefined;
+  const slots = frozenArray(dataField(adoption.handoff, 'slots'));
+  const cycles = frozenArray(dataField(adoption.handoff, 'cycles'));
+  const artifacts = frozenArray(dataField(adoption.handoff, 'artifacts'));
+  if (
+    !slots ||
+    !cycles ||
+    !artifacts ||
+    adoption.identities.length !== cycles.length + artifacts.length
+  ) {
+    return undefined;
+  }
+  const slotById = new Map<string, unknown>();
+  for (const slot of slots) {
+    const id = dataField(slot, 'id');
+    if (typeof id !== 'string' || slotById.has(id)) return undefined;
+    slotById.set(id, slot);
+  }
+  const adopted = new Set<string>();
+  for (let index = 0; index < cycles.length; index += 1) {
+    const cycle = cycles[index];
+    const slotId = dataField(cycle, 'slotId');
+    const placement = typeof slotId === 'string' ? slotById.get(slotId) : undefined;
+    const identity = adoption.identities[index];
+    const owner = dataField(placement, 'owner');
+    const domId = dataField(placement, 'domId');
+    const gamPath = dataField(placement, 'gamPath');
+    const formats = frozenArray(dataField(placement, 'formats'));
+    if (
+      typeof slotId !== 'string' ||
+      adopted.has(slotId) ||
+      (owner !== 'publisher' && owner !== 'trusted_server') ||
+      typeof identity !== 'object' ||
+      identity === null ||
+      (owner === 'trusted_server' &&
+        (typeof domId !== 'string' || typeof gamPath !== 'string' || !formats))
+    ) {
+      return undefined;
+    }
+    const binding: GptSlotBinding =
+      owner === 'trusted_server'
+        ? {
+            definition: {
+              adUnitPath: gamPath as string,
+              elementId: domId as string,
+              sizes: formats as readonly unknown[],
+            },
+            ownership: owner,
+            slot: identity,
+          }
+        : { ownership: owner, slot: identity };
+    const result = service.adoptGptSlot(navigationGeneration, slotId, binding);
+    if (!result.ok) return undefined;
+    adopted.add(slotId);
+  }
+  return adoption;
+}
 
 export type GptLaterNavigationResult =
   | Readonly<{
@@ -1569,7 +1651,9 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
   const cacheCapability = Object.freeze({});
 
   return Object.freeze({
-    activate: ({ afterCommit, onDispose }: IntegrationActivationContext) => {
+    activate: (activation: IntegrationActivationContext) => {
+      const { afterCommit, onDispose } = activation;
+      const adoptionCandidate = activation.adoption;
       if (active) throw new Error('GPT already activated');
       const diagnosticsEventRelease: { current?: () => void } = {};
       const diagnosticsRelease: { current?: () => void } = {};
@@ -1598,6 +1682,17 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
 
       slotServiceRelease.current = slotCapability.attachPhysicalService(slots);
       slots.start();
+      const adoption =
+        adoptionCandidate === undefined
+          ? undefined
+          : adoptInitialGptSlotsFromHandoff(
+              adoptionCandidate,
+              auction.navigation.generation,
+              slots
+            );
+      if (adoptionCandidate !== undefined && !adoption) {
+        throw new TypeError('GPT first-display adoption is invalid');
+      }
       criticalReconciliationRelease = slots.activateReconciliation();
       const bridge = createPucBridge({
         messaging: messages.messaging,
@@ -1641,6 +1736,7 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
       active = true;
       afterCommit(() => {
         startup.start(context.config);
+        if (adoption) return;
         const currentBridge = pucBridge;
         if (!active || currentBridge !== bridge) return;
         void publishInitialGptProjection(document, {

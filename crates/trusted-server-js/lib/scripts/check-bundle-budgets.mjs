@@ -261,6 +261,7 @@ const CURRENT_SHARED_SOURCE_OWNER_POLICIES = Object.freeze({
     'permutive_context',
     'sourcepoint_consent',
   ]),
+  'src/shared/takeover.ts': Object.freeze(['bootstrap', 'first_display', 'core', 'gpt']),
 });
 const CAPABILITY_PATTERN = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*\.v[1-9][0-9]*$/u;
 const CAPABILITY_PREDICATE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/u;

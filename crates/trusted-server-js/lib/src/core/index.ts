@@ -14,6 +14,7 @@ export type {
 export type { Runtime, RuntimeOptions, RuntimeState } from '../kernel/runtime';
 
 import type { Runtime, RuntimeOptions } from '../kernel/runtime';
+import { consumeFirstDisplayTakeoverTransport } from '../shared/takeover';
 
 import { EMBEDDED_INTEGRATION_IDS, EMBEDDED_RELEASE_ID, EMBEDDED_RUNTIME_CATALOG } from './release';
 
@@ -184,6 +185,8 @@ function bootManifest(target: BootstrapTarget): unknown {
 export function startProductionRuntime(createComposition: BrowserRuntimeCompositionFactory): void {
   const target = bootstrapTarget();
   if (!target) return;
+  const takeover = consumeFirstDisplayTakeoverTransport(target);
+  if (takeover.status === 'invalid') return;
   const configs = consumeIntegrationConfig(target);
   // A malformed, accessor-backed, or undeletable transport must not survive
   // beneath either terminal namespace. Leave the namespace unclaimed.
@@ -200,6 +203,7 @@ export function startProductionRuntime(createComposition: BrowserRuntimeComposit
           config: configs?.[id],
           interfaces: Object.freeze({}),
         }),
+      ...(takeover.status === 'accepted' ? { coordinateTakeover: takeover.coordinate } : {}),
       kernel: {
         addAdUnits: () => Object.freeze({ registered: Object.freeze([]) }),
         diagnostics: Object.freeze({}),

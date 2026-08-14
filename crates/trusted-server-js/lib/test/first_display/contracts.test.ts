@@ -89,6 +89,7 @@ function handoff(overrides: Record<string, unknown> = {}): Record<string, unknow
     },
     cycles: [
       {
+        slotId: 'slot-1',
         token: 'gt1_1',
         nextCycleOrdinal: 2,
         unknownPriorCycle: false,

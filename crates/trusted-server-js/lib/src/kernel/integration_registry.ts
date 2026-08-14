@@ -1,4 +1,5 @@
 import type { BootManifestV1 } from '../core/types';
+import { snapshotPersistentFirstDisplayAdoptionV1 } from '../shared/takeover';
 
 import { DisposableStack, type DisposeCallback } from './disposable';
 import { trustedCriticalOrigin, type BootFailureReason } from './fallback';
@@ -28,6 +29,8 @@ export interface IntegrationActivationContext {
   readonly signal: AbortSignal;
   readonly onDispose: (callback: DisposeCallback) => void;
   readonly afterCommit: (callback: () => void) => void;
+  /** Closure-private first-display state, present only during an atomic takeover activation. */
+  readonly adoption?: unknown;
 }
 
 export interface CoreActivationContext {
@@ -61,6 +64,13 @@ export interface IntegrationRuntimeFailure {
   readonly phase: 'after_commit';
 }
 
+/** One-use, non-yielding barrier exposed only after every inert preparation succeeds. */
+export interface PreparedKernelTakeover {
+  readonly activate: (adoption?: unknown) => void;
+  readonly commit: () => void;
+  readonly rollback: () => void;
+}
+
 export interface IntegrationInstallCallbacks {
   /** Allocates inert composition-owned services before integration preparation. */
   readonly prepareCore?: (context: CorePreparationContext) => void;
@@ -70,6 +80,8 @@ export interface IntegrationInstallCallbacks {
   readonly publish: () => void;
   /** Drains the already-committed preload queue. Callback isolation belongs to the queue. */
   readonly drainPreload: () => void;
+  /** Coordinates an old-owner handoff around the synchronous activation and publication barrier. */
+  readonly coordinateTakeover?: (prepared: PreparedKernelTakeover) => void;
 }
 
 export interface IntegrationKernelResult {
@@ -708,6 +720,9 @@ class IntegrationRegistryOwner {
         activateCore: callbacks.activateCore,
         publish: callbacks.publish,
         drainPreload: callbacks.drainPreload,
+        ...(callbacks.coordinateTakeover
+          ? { coordinateTakeover: callbacks.coordinateTakeover }
+          : {}),
       });
     } catch {
       this.fail('bundle_partial');
@@ -1149,8 +1164,63 @@ class IntegrationRegistryOwner {
     }
 
     if (!this.canContinue('preparing')) return this.fallbackResult();
+
+    let activated = false;
+    let committed: IntegrationKernelResult | undefined;
+    const prepared: PreparedKernelTakeover = Object.freeze({
+      activate: (adoption?: unknown): void => {
+        if (activated || committed || !this.activatePrepared(callbacks, adoption)) {
+          throw new Error('Prepared kernel activation is unavailable');
+        }
+        activated = true;
+      },
+      commit: (): void => {
+        if (!activated || committed) throw new Error('Prepared kernel commit is unavailable');
+        const result = this.commitPrepared(callbacks);
+        if (!result) throw new Error('Prepared kernel commit failed');
+        committed = result;
+      },
+      rollback: (): void => {
+        if (committed) throw new Error('Committed kernel cannot be rolled back');
+        this.fail('bundle_partial');
+      },
+    });
+
+    try {
+      if (callbacks.coordinateTakeover) {
+        this.enterOwnedCallback();
+        try {
+          const returned = callbacks.coordinateTakeover(prepared);
+          if (isThenable(returned)) {
+            observeThenableRejection(returned);
+            throw new TypeError('Takeover coordination must be synchronous');
+          }
+        } finally {
+          this.leaveOwnedCallback();
+        }
+        if (!committed) throw new Error('Takeover coordinator did not commit');
+      } else {
+        prepared.activate();
+        prepared.commit();
+      }
+    } catch {
+      this.fail('bundle_partial');
+      return this.fallbackResult();
+    }
+
+    return committed ?? this.fallbackResult();
+  }
+
+  private activatePrepared(callbacks: IntegrationInstallCallbacks, adoption?: unknown): boolean {
+    if (this.registryState !== 'preparing') return false;
+    const acceptedAdoption =
+      adoption === undefined ? undefined : snapshotPersistentFirstDisplayAdoptionV1(adoption);
+    if (adoption !== undefined && !acceptedAdoption) {
+      this.fail('bundle_partial');
+      return false;
+    }
     this.registryState = 'activating';
-    if (!this.canContinue('activating')) return this.fallbackResult();
+    if (!this.canContinue('activating')) return false;
 
     let coreActivationOpen = true;
     const coreContext: CoreActivationContext = Object.freeze({
@@ -1171,17 +1241,15 @@ class IntegrationRegistryOwner {
       }
     } catch {
       this.fail('bundle_partial');
-      return this.fallbackResult();
+      return false;
     } finally {
       coreActivationOpen = false;
       this.leaveOwnedCallback();
     }
 
-    if (!this.canContinue('activating')) return this.fallbackResult();
-
+    if (!this.canContinue('activating')) return false;
     for (const record of this.prepared) {
-      if (!this.canContinue('activating')) return this.fallbackResult();
-
+      if (!this.canContinue('activating')) return false;
       let activationOpen = true;
       let afterCommitRegistered = false;
       let activationInvalid = false;
@@ -1203,6 +1271,7 @@ class IntegrationRegistryOwner {
           afterCommitRegistered = true;
           record.afterCommit = callback;
         },
+        ...(acceptedAdoption === undefined ? {} : { adoption: acceptedAdoption }),
       });
 
       this.enterOwnedCallback();
@@ -1217,19 +1286,24 @@ class IntegrationRegistryOwner {
         }
       } catch {
         this.fail('bundle_partial');
-        return this.fallbackResult();
+        return false;
       } finally {
         activationOpen = false;
         this.leaveOwnedCallback();
       }
 
-      if (!this.canContinue('activating')) return this.fallbackResult();
+      if (!this.canContinue('activating')) return false;
     }
 
     // This final monotonic check closes the timer-task delay gap. A same-thread
     // activation that never returns cannot be preempted by JavaScript.
-    if (!this.canContinue('activating')) return this.fallbackResult();
+    return this.canContinue('activating');
+  }
 
+  private commitPrepared(
+    callbacks: IntegrationInstallCallbacks
+  ): IntegrationKernelResult | undefined {
+    if (this.registryState !== 'activating' || !this.canContinue('activating')) return undefined;
     this.registryState = 'publishing';
     this.enterOwnedCallback();
     try {
@@ -1240,14 +1314,14 @@ class IntegrationRegistryOwner {
       }
     } catch {
       this.fail('bundle_partial');
-      return this.fallbackResult();
+      return undefined;
     } finally {
       this.leaveOwnedCallback();
     }
 
     if (this.registryState !== 'publishing') {
       this.fail('bundle_partial');
-      return this.fallbackResult();
+      return undefined;
     }
 
     this.registryState = 'committed';
