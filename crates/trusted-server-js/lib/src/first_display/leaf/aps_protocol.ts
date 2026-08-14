@@ -151,7 +151,7 @@ function parseDocumentMessage(
 export function installApsInitial(
   candidate: unknown,
   own: FirstDisplaySliceActivationContext['own']
-): void {
+): FirstDisplayApsProtocolV1 {
   const value = bindings(candidate);
   if (!value || typeof own !== 'function') throw new TypeError('invalid APS initial bindings');
   const rendererUrl = new URL('/integrations/aps/renderer/v1', value.publisherOrigin).href;
@@ -175,4 +175,5 @@ export function installApsInitial(
   if (typeof release !== 'function') throw new TypeError('invalid APS protocol disposer');
   own(release);
   value.observe('protocol_version', 1);
+  return protocol;
 }

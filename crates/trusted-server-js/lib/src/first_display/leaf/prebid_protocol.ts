@@ -225,7 +225,7 @@ function snapshotTrustedBid(candidate: unknown): FirstDisplayPreparedTrustedBidV
 export function installPrebidInitial(
   candidate: unknown,
   own: FirstDisplaySliceActivationContext['own']
-): void {
+): FirstDisplayPrebidProtocolV1 {
   const value = bindings(candidate);
   if (!value || typeof own !== 'function') throw new TypeError('invalid Prebid initial bindings');
   const protocol: FirstDisplayPrebidProtocolV1 = Object.freeze({
@@ -243,4 +243,5 @@ export function installPrebidInitial(
   if (typeof release !== 'function') throw new TypeError('invalid Prebid protocol disposer');
   own(release);
   value.observe('protocol_version', 1);
+  return protocol;
 }
