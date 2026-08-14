@@ -40,10 +40,23 @@ struct ReleaseArtifact {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct CatalogManifest {
     version: u8,
+    first_display: Vec<FirstDisplayCatalogModule>,
     modules: Vec<CatalogModule>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct FirstDisplayCatalogModule {
+    order: usize,
+    id: String,
+    include: String,
+    allowed_imports: Vec<String>,
+    inputs: Vec<String>,
+    outputs: Vec<String>,
+    obligation: String,
 }
 
 #[derive(Deserialize)]
@@ -135,7 +148,67 @@ fn read_and_validate_catalog(dist_dir: &Path, release: &ReleaseManifest) -> Cata
         20,
         "tsjs: catalog must contain twenty modules"
     );
-    for (module, artifact) in catalog.modules.iter().zip(release.artifacts.iter().skip(2)) {
+    let first_display_artifacts = release
+        .artifacts
+        .iter()
+        .filter(|artifact| {
+            artifact.role == "first_display_base" || artifact.role == "first_display_slice"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        catalog.first_display.len(),
+        13,
+        "tsjs: first-display catalog must contain base plus twelve slices"
+    );
+    assert_eq!(
+        first_display_artifacts.len(),
+        catalog.first_display.len(),
+        "tsjs: first-display catalog/release count mismatch"
+    );
+    for (index, (module, artifact)) in catalog
+        .first_display
+        .iter()
+        .zip(first_display_artifacts)
+        .enumerate()
+    {
+        assert_eq!(
+            module.order,
+            index + 1,
+            "tsjs: first-display order mismatch"
+        );
+        assert_eq!(module.id, artifact.id, "tsjs: first-display id mismatch");
+        assert_eq!(
+            artifact.role,
+            if index == 0 {
+                "first_display_base"
+            } else {
+                "first_display_slice"
+            },
+            "tsjs: first-display role mismatch"
+        );
+        assert_eq!(artifact.phase.as_deref(), Some("first_display"));
+        assert!(artifact.trigger.is_none());
+        assert_eq!(module.inputs, artifact.inputs);
+        assert_eq!(module.outputs, artifact.outputs);
+        assert!(!module.allowed_imports.is_empty());
+        assert!(!module.obligation.is_empty());
+        assert!(
+            module.include == "eligible_batch"
+                || module.include == "aps_participates"
+                || module.include == "creative_guard"
+                || module.include == "gpt_initial"
+                || module.include == "prebid_participates"
+                || module.include.starts_with("integration:"),
+            "tsjs: unknown first-display inclusion predicate"
+        );
+    }
+    let integration_artifacts = release
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.role == "integration")
+        .collect::<Vec<_>>();
+    assert_eq!(integration_artifacts.len(), catalog.modules.len());
+    for (module, artifact) in catalog.modules.iter().zip(integration_artifacts) {
         assert_eq!(module.id, artifact.id, "tsjs: catalog/release id mismatch");
         assert_eq!(
             Some(module.phase.as_str()),
@@ -175,35 +248,48 @@ fn read_and_validate_release(dist_dir: &Path) -> ReleaseManifest {
     );
     assert_eq!(
         manifest.artifacts.len(),
-        22,
-        "tsjs: release must contain bootstrap, core, and twenty integrations"
+        35,
+        "tsjs: release must contain bootstrap, thirteen first-display components, core, and twenty integrations"
     );
     assert_eq!(manifest.artifacts[0].id, "bootstrap");
     assert_eq!(manifest.artifacts[0].role, "bootstrap");
-    assert_eq!(manifest.artifacts[1].id, "core");
-    assert_eq!(manifest.artifacts[1].role, "core");
+    assert_eq!(manifest.artifacts[1].id, "first_display");
+    assert_eq!(manifest.artifacts[1].role, "first_display_base");
+    assert_eq!(manifest.artifacts[14].id, "core");
+    assert_eq!(manifest.artifacts[14].role, "core");
 
     let mut canonical = Vec::new();
     canonical.extend_from_slice(RELEASE_PREFIX);
     push_u64(&mut canonical, manifest.artifacts.len());
     let mut ids = std::collections::HashSet::new();
+    let mut integration_index = 0_usize;
     for (index, artifact) in manifest.artifacts.iter().enumerate() {
         assert!(ids.insert(&artifact.id), "tsjs: duplicate artifact id");
-        if index >= 2 {
-            assert_eq!(artifact.role, "integration");
-            if index < 16 {
-                assert_eq!(artifact.phase.as_deref(), Some("critical"));
-                assert!(artifact.trigger.is_none());
-            } else {
-                assert_eq!(artifact.phase.as_deref(), Some("deferred"));
-                assert_eq!(artifact.trigger.as_deref(), Some("first_display_or_idle"));
-                assert!(
-                    artifact.outputs.is_empty(),
-                    "tsjs: deferred provider is forbidden"
-                );
+        match artifact.role.as_str() {
+            "bootstrap" | "core" => {
+                assert!(artifact.phase.is_none() && artifact.trigger.is_none());
             }
-        } else {
-            assert!(artifact.phase.is_none() && artifact.trigger.is_none());
+            "first_display_base" | "first_display_slice" => {
+                assert!((1..=13).contains(&index));
+                assert_eq!(artifact.phase.as_deref(), Some("first_display"));
+                assert!(artifact.trigger.is_none());
+            }
+            "integration" => {
+                assert!(index >= 15);
+                if integration_index < 14 {
+                    assert_eq!(artifact.phase.as_deref(), Some("critical"));
+                    assert!(artifact.trigger.is_none());
+                } else {
+                    assert_eq!(artifact.phase.as_deref(), Some("deferred"));
+                    assert_eq!(artifact.trigger.as_deref(), Some("first_display_or_idle"));
+                    assert!(
+                        artifact.outputs.is_empty(),
+                        "tsjs: deferred provider is forbidden"
+                    );
+                }
+                integration_index += 1;
+            }
+            role => panic!("tsjs: unknown release artifact role {role}"),
         }
 
         let source = fs::read_to_string(dist_dir.join(&artifact.file))
@@ -280,13 +366,22 @@ fn generate_metadata(manifest: &ReleaseManifest, catalog: &CatalogManifest, out_
         manifest.artifacts.len()
     )
     .expect("should write generated artifact header");
-    for (index, artifact) in manifest.artifacts.iter().enumerate() {
+    for artifact in &manifest.artifacts {
         let inputs = rust_string_slice(&artifact.inputs);
         let outputs = rust_string_slice(&artifact.outputs);
-        let include = index
-            .checked_sub(2)
-            .and_then(|catalog_index| catalog.modules.get(catalog_index))
-            .map(|module| module.include.as_str());
+        let include = match artifact.role.as_str() {
+            "integration" => catalog
+                .modules
+                .iter()
+                .find(|module| module.id == artifact.id)
+                .map(|module| module.include.as_str()),
+            "first_display_base" | "first_display_slice" => catalog
+                .first_display
+                .iter()
+                .find(|module| module.id == artifact.id)
+                .map(|module| module.include.as_str()),
+            _ => None,
+        };
         writeln!(
             code,
             "    TsjsGeneratedArtifactMeta {{ id: {:?}, role: {:?}, phase: {}, trigger: {}, include: {}, inputs: {inputs}, outputs: {outputs}, file: {:?}, hash: {:?}, bundle: include_str!(concat!(env!(\"OUT_DIR\"), {:?})) }},",

@@ -43,8 +43,12 @@ const catalogModule = await import(
   `${pathToFileURL(path.join(distributionDirectory, catalogModuleFile)).href}?build=${Date.now()}`
 );
 const releaseCatalog = catalogModule.RELEASE_CATALOG;
+const firstDisplayCatalog = catalogModule.FIRST_DISPLAY_CATALOG;
 catalogModule.validateReleaseCatalog(releaseCatalog);
 if (releaseCatalog.length !== 20) throw new Error('[build-all] Catalog must contain 20 rows');
+if (firstDisplayCatalog.length !== 13 || firstDisplayCatalog[0]?.id !== 'first_display') {
+  throw new Error('[build-all] First-display catalog must contain its base and twelve slices');
+}
 const runtimeCatalog = releaseCatalog.map(({ id, phase, trigger, consumes, provides }) => ({
   id,
   phase,
@@ -77,6 +81,22 @@ const sourceById = Object.freeze({
   sourcepoint_lifecycle: 'integrations/sourcepoint/lifecycle.ts',
 });
 
+const firstDisplaySourceById = Object.freeze({
+  first_display: 'first_display/agent.ts',
+  aps_initial: 'first_display/slices/aps.ts',
+  creative_initial: 'first_display/slices/creative.ts',
+  datadome_initial: 'first_display/slices/datadome.ts',
+  didomi_initial: 'first_display/slices/didomi.ts',
+  google_tag_manager_initial: 'first_display/slices/google_tag_manager.ts',
+  gpt_initial: 'first_display/slices/gpt.ts',
+  lockr_initial: 'first_display/slices/lockr.ts',
+  osano_initial: 'first_display/slices/osano.ts',
+  permutive_initial: 'first_display/slices/permutive.ts',
+  sourcepoint_initial: 'first_display/slices/sourcepoint.ts',
+  prebid_initial: 'first_display/slices/prebid.ts',
+  testlight_initial: 'first_display/slices/testlight.ts',
+});
+
 const catalogIds = releaseCatalog.map(({ id }) => id);
 if (
   Object.keys(sourceById).length !== releaseCatalog.length ||
@@ -86,6 +106,13 @@ if (
 }
 if (new Set(Object.values(sourceById)).size !== releaseCatalog.length) {
   throw new Error('[build-all] Every catalog artifact must have one distinct source entry');
+}
+if (
+  Object.keys(firstDisplaySourceById).length !== firstDisplayCatalog.length ||
+  firstDisplayCatalog.some(({ id }) => !(id in firstDisplaySourceById)) ||
+  new Set(Object.values(firstDisplaySourceById)).size !== firstDisplayCatalog.length
+) {
+  throw new Error('[build-all] First-display catalog/source inventory mismatch');
 }
 
 const artifacts = [
@@ -99,6 +126,17 @@ const artifacts = [
     file: bootstrapFile,
     entry: 'integrations/gpt/bootstrap_fallback.ts',
   },
+  ...firstDisplayCatalog.map((entry, index) => ({
+    id: entry.id,
+    role: index === 0 ? 'first_display_base' : 'first_display_slice',
+    phase: 'first_display',
+    trigger: '',
+    inputs: [...entry.inputs],
+    outputs: [...entry.outputs],
+    file: `tsjs-${entry.id}.js`,
+    entry: firstDisplaySourceById[entry.id],
+    maskBit: index,
+  })),
   {
     id: 'core',
     role: 'core',
@@ -191,8 +229,7 @@ async function buildArtifact(artifact) {
 }
 
 await buildArtifact(artifacts[0]);
-await buildArtifact(artifacts[1]);
-await Promise.all(artifacts.slice(2).map(buildArtifact));
+await Promise.all(artifacts.slice(1).map(buildArtifact));
 
 const deferredEntries = new Set(
   artifacts
@@ -206,6 +243,34 @@ for (const artifact of artifacts) {
   );
   if (reachedDeferred) {
     throw new Error(`[build-all] ${artifact.id} reaches deferred source entry ${reachedDeferred}`);
+  }
+}
+const persistentEntryPrefixes = Object.freeze([
+  'src/core/',
+  'src/kernel/integration_registry.ts',
+  'src/kernel/runtime.ts',
+  'src/kernel/sessions.ts',
+  'src/services/',
+  'src/integrations/',
+]);
+for (const artifact of artifacts.filter(({ phase }) => phase === 'first_display')) {
+  const forbidden = artifact.moduleIds.find((moduleId) =>
+    persistentEntryPrefixes.some((prefix) =>
+      path.normalize(moduleId).startsWith(path.normalize(prefix))
+    )
+  );
+  if (forbidden) {
+    throw new Error(`[build-all] ${artifact.id} reaches persistent source ${forbidden}`);
+  }
+}
+for (const artifact of artifacts.filter(
+  ({ role, phase }) => role === 'core' || phase === 'critical' || phase === 'deferred'
+)) {
+  const forbidden = artifact.moduleIds.find((moduleId) =>
+    path.normalize(moduleId).startsWith(path.normalize('src/first_display/'))
+  );
+  if (forbidden) {
+    throw new Error(`[build-all] ${artifact.id} reaches first-display source ${forbidden}`);
   }
 }
 const generatedJavaScript = fs
@@ -256,6 +321,17 @@ fs.writeFileSync(
   path.join(distributionDirectory, catalogFile),
   `${JSON.stringify({
     version: 1,
+    firstDisplay: firstDisplayCatalog.map(
+      ({ order, id, include, allowedImports, inputs, outputs, obligation }) => ({
+        order,
+        id,
+        include,
+        allowedImports,
+        inputs,
+        outputs,
+        obligation,
+      })
+    ),
     modules: releaseCatalog.map(({ id, phase, trigger, include }) => ({
       id,
       phase,
@@ -298,6 +374,26 @@ const metrics = {
     entry: path.normalize(`src/${bootstrapArtifact.entry}`),
     ...measureBytes(bootstrapBytes),
     sources: bootstrapArtifact.moduleContributions,
+  },
+  firstDisplay: {
+    catalog: firstDisplayCatalog.map(({ id }, maskBit) => ({
+      id,
+      maskBit,
+      file: `tsjs-${id}.js`,
+    })),
+    components: Object.fromEntries(
+      artifacts
+        .filter(({ phase }) => phase === 'first_display')
+        .map((artifact) => [
+          artifact.id,
+          {
+            file: artifact.file,
+            entry: path.normalize(`src/${artifact.entry}`),
+            ...measureBytes(fs.readFileSync(path.join(distributionDirectory, artifact.file))),
+            sources: artifact.moduleContributions,
+          },
+        ])
+    ),
   },
   sets: Object.fromEntries(
     Object.entries(inventorySetFiles).map(([setName, setFiles]) => [

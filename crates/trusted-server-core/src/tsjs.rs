@@ -91,6 +91,11 @@ fn tsjs_boot_manifest_with_critical_src_v1(
                     r#"{{"id":{encoded},"phase":"deferred","trigger":"first_display_or_idle","src":{encoded_src}}}"#
                 ));
             }
+            Some(TsjsModulePhase::FirstDisplay) => {
+                return Err(boot_manifest_error(
+                    "integration cannot use the provisional first-display phase",
+                ));
+            }
             None => return Err(boot_manifest_error("integration phase is unavailable")),
         }
     }
@@ -164,6 +169,11 @@ pub fn prospective_tsjs_boot_manifest_v1(
                 .map_err(|_| boot_manifest_error("deferred source serialization failed"))?;
                 integrations.push(format!(
                     r#"{{"id":{id},"phase":"deferred","trigger":{trigger},"src":{src}}}"#
+                ));
+            }
+            Some(TsjsModulePhase::FirstDisplay) => {
+                return Err(boot_manifest_error(
+                    "catalog integration cannot use the provisional first-display phase",
                 ));
             }
             None => {
@@ -338,25 +348,6 @@ impl FirstDisplaySelectionV1 {
     }
 }
 
-const FIRST_DISPLAY_SLICE_CATALOG: &[(&str, &str)] = &[
-    ("first_display", "eligible_batch"),
-    ("aps_initial", "aps_participates"),
-    ("creative_initial", "creative_guard"),
-    ("datadome_initial", "integration:datadome"),
-    ("didomi_initial", "integration:didomi"),
-    (
-        "google_tag_manager_initial",
-        "integration:google_tag_manager",
-    ),
-    ("gpt_initial", "integration:gpt"),
-    ("lockr_initial", "integration:lockr"),
-    ("osano_initial", "integration:osano"),
-    ("permutive_initial", "integration:permutive"),
-    ("sourcepoint_initial", "integration:sourcepoint"),
-    ("prebid_initial", "prebid_participates"),
-    ("testlight_initial", "integration:testlight"),
-];
-
 const FIRST_DISPLAY_KNOWN_INTEGRATIONS: &[&str] = &[
     "aps",
     "creative",
@@ -440,22 +431,29 @@ pub fn select_first_display_slices_v1(
     let creative_guard = enabled.contains("creative")
         && config.creative.enabled
         && (config.creative.click_guard || config.creative.render_guard);
-    let prebid_participates = enabled.contains("prebid");
+    let gpt_participates = winner_count > 0;
+    let prebid_participates =
+        enabled.contains("prebid") && projection.bids.iter().any(|bid| bid.provider == "prebid");
     let mut mask = 0_u16;
     let mut slices = Vec::new();
-    for (index, (id, predicate)) in FIRST_DISPLAY_SLICE_CATALOG.iter().enumerate() {
-        let selected = match *predicate {
-            "eligible_batch" => true,
-            "aps_participates" => aps_participates,
-            "creative_guard" => creative_guard,
-            "prebid_participates" => prebid_participates,
-            predicate => predicate
+    for (index, metadata) in trusted_server_js::all_first_display_metadata()
+        .into_iter()
+        .enumerate()
+    {
+        let selected = match metadata.include {
+            Some("eligible_batch") => true,
+            Some("aps_participates") => aps_participates,
+            Some("creative_guard") => creative_guard,
+            Some("gpt_initial") => gpt_participates,
+            Some("prebid_participates") => prebid_participates,
+            Some(predicate) => predicate
                 .strip_prefix("integration:")
                 .is_some_and(|integration| enabled.contains(integration)),
+            None => false,
         };
         if selected {
             mask |= 1_u16 << index;
-            slices.push(*id);
+            slices.push(metadata.id);
         }
     }
     Some(FirstDisplaySelectionV1 { mask, slices })
@@ -672,6 +670,20 @@ impl TsjsStaticArtifactV1 {
         let hash = hex::encode(Sha256::digest(&body));
         let src = format!("/static/tsjs=tsjs-unified.min.js?v={hash}");
         Self { body, hash, src }
+    }
+
+    /// Build one exact dormant first-display composition for a validated mask.
+    #[must_use]
+    pub(crate) fn new_first_display(mask: u16, selected_ids: &[&str]) -> Option<Self> {
+        if selected_ids.first() != Some(&"first_display") {
+            return None;
+        }
+        let body = bytes::Bytes::from(trusted_server_js::concatenate_first_display_slices(
+            selected_ids.get(1..).unwrap_or_default(),
+        )?);
+        let hash = hex::encode(Sha256::digest(&body));
+        let src = format!("/static/tsjs=tsjs-first-display.min.js?m={mask:04x}&v={hash}");
+        Some(Self { body, hash, src })
     }
 
     /// Return immutable response bytes; cloning [`bytes::Bytes`] shares storage.
@@ -1622,18 +1634,27 @@ mod tests {
         let adm = first_display_projection(Some(adm_source()));
         let enabled = ["gpt"];
 
-        for projection in [&no_bid, &adm] {
-            let selected = select_first_display_slices_v1(
-                projection,
-                FirstDisplaySelectionConfigV1 {
-                    enabled_integrations: &enabled,
-                    creative: CreativeBootConfigV1::default(),
-                },
-            )
-            .expect("closed GPT batch should select the agent");
-            assert_eq!(selected.mask(), 0x0041);
-            assert_eq!(selected.slices(), &["first_display", "gpt_initial"]);
-        }
+        let no_bid_selected = select_first_display_slices_v1(
+            &no_bid,
+            FirstDisplaySelectionConfigV1 {
+                enabled_integrations: &enabled,
+                creative: CreativeBootConfigV1::default(),
+            },
+        )
+        .expect("closed no-bid batch should select the base agent");
+        assert_eq!(no_bid_selected.mask(), 0x0001);
+        assert_eq!(no_bid_selected.slices(), &["first_display"]);
+
+        let adm_selected = select_first_display_slices_v1(
+            &adm,
+            FirstDisplaySelectionConfigV1 {
+                enabled_integrations: &enabled,
+                creative: CreativeBootConfigV1::default(),
+            },
+        )
+        .expect("closed GPT ADM batch should select GPT initial ownership");
+        assert_eq!(adm_selected.mask(), 0x0041);
+        assert_eq!(adm_selected.slices(), &["first_display", "gpt_initial"]);
 
         assert!(
             select_first_display_slices_v1(
@@ -1677,8 +1698,10 @@ mod tests {
             "sourcepoint",
             "testlight",
         ];
+        let mut projection = first_display_projection(Some(adm_source()));
+        projection.bids[0].provider = "prebid".to_owned();
         let selected = select_first_display_slices_v1(
-            &first_display_projection(Some(adm_source())),
+            &projection,
             FirstDisplaySelectionConfigV1 {
                 enabled_integrations: &enabled,
                 creative: CreativeBootConfigV1 {
