@@ -334,6 +334,8 @@ git mv crates/trusted-server-js/lib/scripts/check-rc-july-adoption.mjs crates/tr
     'git mv scripts/check-rc-july-adoption.mjs scripts/check-retired-concept-audit.mjs',
     'echo "$(git fetch origin rc/july)"',
     'printf \'%s\\n\' "$(git -C repository fetch origin rc/july)"',
+    'printf -v retired_ref rc/july',
+    'printf -vretired_ref rc/july',
     'echo "`git fetch origin rc/july`"',
     "echo 'git fetch origin rc/july' | sh",
     'echo rc/july && true',

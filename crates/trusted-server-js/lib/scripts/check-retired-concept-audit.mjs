@@ -39,7 +39,8 @@ const CLASSIFICATION_KEYS = [
 const RETIRED_SOURCE_REFERENCE = /(?:rc[/-]july|905984e62a0858c53d9f0ff6dd3a1bf190cf311d)/i;
 const EXECUTABLE_SHELL_FENCE =
   /^ {0,3}```(?:bash|sh|shell)(?:[ \t][^\n]*)?\r?\n([\s\S]*?)^ {0,3}```[ \t]*$/gim;
-const INFORMATIONAL_SHELL_COMMAND = /^(?:echo|printf)\b/i;
+const OUTPUT_ONLY_INFORMATIONAL_COMMAND =
+  /^(?:echo\b|printf\s+(?:'[^']*'|"(?:[^"\\]|\\.)*")(?=\s|$))/i;
 const ALLOWED_RETIRED_RENAMES = new Set([
   'git mv crates/trusted-server-js/lib/scripts/check-rc-july-adoption.mjs crates/trusted-server-js/lib/scripts/check-retired-concept-audit.mjs',
   'git mv crates/trusted-server-js/lib/test/contract/rc-july-adoption.test.mjs crates/trusted-server-js/lib/test/contract/retired-concept-audit.test.mjs',
@@ -66,7 +67,7 @@ function isAllowedRetiredRename(command) {
 
 function isNonExecutingInformationalCommand(command) {
   return (
-    INFORMATIONAL_SHELL_COMMAND.test(command) &&
+    OUTPUT_ONLY_INFORMATIONAL_COMMAND.test(command) &&
     !/\$\(|`|[|<>&;]|\b(?:eval|bash|sh|shell|zsh)\b/i.test(command)
   );
 }
