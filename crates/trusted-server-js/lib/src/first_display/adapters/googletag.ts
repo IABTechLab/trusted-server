@@ -362,10 +362,6 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
         callbacks.onFailure(row.placement.slot, 'gpt_request_failed');
         continue;
       }
-      for (const [key, value] of targetingEntries(row.bid, row.placement)) {
-        if (publisherSlot) this.journalPublisherTargeting(slot, key, value);
-        this.writeTargeting(slot, 'setTargeting', [key, value]);
-      }
       const cycle: ActiveCycle = {
         bid: row.bid,
         elementId: element.id,
@@ -389,6 +385,10 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
           slotId: cycle.slotId,
         })
       );
+      for (const [key, value] of targetingEntries(row.bid, row.placement)) {
+        if (publisherSlot) this.journalPublisherTargeting(slot, key, value);
+        this.writeTargeting(slot, 'setTargeting', [key, value]);
+      }
     }
 
     for (const cycle of this.cycles.values()) {

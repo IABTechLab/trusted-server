@@ -298,6 +298,39 @@ test('generated first-display components self-register through one authenticated
       window.__firstDisplayEvents = [];
       window.__firstDisplayDisposers = [];
       window.__firstDisplayAfterActivate = undefined;
+      window.__firstDisplayGptListeners = {};
+      window.__firstDisplayTerminal = undefined;
+      var slotElement = document.createElement('div');
+      slotElement.id = 'slot-1';
+      document.body.appendChild(slotElement);
+      window.__firstDisplaySlot = {
+        addService: function() { return window.__firstDisplaySlot; },
+        getSlotElementId: function() { return 'slot-1'; },
+        setTargeting: function() { return window.__firstDisplaySlot; }
+      };
+      window.__firstDisplayPubads = {
+        addEventListener: function(name, listener) {
+          window.__firstDisplayGptListeners[name] = listener;
+        },
+        getSlots: function() { return []; },
+        refresh: function() {},
+        removeEventListener: function() {}
+      };
+      window.googletag = {
+        cmd: {push: function(command) { command(); }},
+        defineSlot: function() { return window.__firstDisplaySlot; },
+        destroySlots: function() { return true; },
+        display: function() {
+          window.__firstDisplayEvents.push('gpt:display');
+          window.__firstDisplayGptListeners.slotRequested({slot: window.__firstDisplaySlot});
+          window.__firstDisplayGptListeners.slotRenderEnded({
+            slot: window.__firstDisplaySlot,
+            isEmpty: false
+          });
+        },
+        getConfig: function() { return {disableInitialLoad: false}; },
+        pubads: function() { return window.__firstDisplayPubads; }
+      };
       window.__firstDisplayBaseHost = Object.freeze({
         options: Object.freeze({
           batch: Object.freeze({
@@ -357,10 +390,22 @@ test('generated first-display components self-register through one authenticated
             settle: function() { return true; },
             fail: function() { return true; }
           }),
-          driver: Object.freeze({
-            start: function(_outcomes, onFirstAction) {
-              window.__firstDisplayEvents.push('driver:start');
-              onFirstAction();
+          gptInput: Object.freeze({
+            browser: window,
+            clearTimer: function() {},
+            document: document,
+            setTimer: function(callback) { return callback; }
+          }),
+          renderer: Object.freeze({
+            bind: function(_cycle, onTerminal) {
+              window.__firstDisplayEvents.push('render:bind');
+              window.__firstDisplayTerminal = onTerminal;
+              return true;
+            },
+            recordGam: function(_cycle, result) {
+              window.__firstDisplayEvents.push('render:gam:' + result);
+              window.__firstDisplayTerminal('accepted');
+              return true;
             },
             sealTsAdmission: function() {},
             dispose: function() {}
@@ -419,7 +464,15 @@ test('generated first-display components self-register through one authenticated
     dom.window.__firstDisplayAfterActivate();
     assert.deepEqual(
       [...dom.window.__firstDisplayEvents],
-      ['aps:aps', 'gpt:gpt', 'bootstrap:register', 'driver:start', 'bootstrap:action']
+      [
+        'aps:aps',
+        'gpt:gpt',
+        'bootstrap:register',
+        'render:bind',
+        'bootstrap:action',
+        'gpt:display',
+        'render:gam:nonempty_gam',
+      ]
     );
   } finally {
     dom.window.close();
