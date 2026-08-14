@@ -115,7 +115,7 @@ export function createFirstDisplayHandoffOwner(
       return revision;
     },
     observeMutation: (): boolean => {
-      if (state !== 'observing') return false;
+      if (state !== 'observing' && state !== 'sealing') return false;
       if (revision >= MAX_U32) {
         publishFailure();
         return false;
@@ -238,6 +238,7 @@ export function performFirstDisplayTakeoverV1(options: FirstDisplayTakeoverOptio
     ownershipOpen = false;
     if (
       !options.isCurrentGeneration() ||
+      !options.authenticateRuntimeScript() ||
       options.currentMutationRevision() !== handoff.mutationRevision
     ) {
       return fail();

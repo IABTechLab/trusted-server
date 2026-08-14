@@ -20,6 +20,46 @@ type FirstDisplayBootstrapTarget = object & {
   readonly [FIRST_DISPLAY_REGISTRATION_FIELD]?: unknown;
 };
 
+/** Wrap one exact frozen slice observation channel with the final-revision ledger. */
+export function captureMutationObservedBindings(
+  candidate: unknown,
+  observeMutation: () => boolean
+): unknown {
+  try {
+    if (
+      typeof candidate !== 'object' ||
+      candidate === null ||
+      Array.isArray(candidate) ||
+      Object.getPrototypeOf(candidate) !== Object.prototype ||
+      !Object.isFrozen(candidate) ||
+      typeof observeMutation !== 'function'
+    ) {
+      return candidate;
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(candidate);
+    const observe = descriptors.observe;
+    if (!observe?.enumerable || !('value' in observe) || typeof observe.value !== 'function') {
+      return candidate;
+    }
+    const original = observe.value as (...arguments_: unknown[]) => unknown;
+    const captured = Object.create(Object.prototype) as Record<PropertyKey, unknown>;
+    Object.defineProperties(captured, {
+      ...descriptors,
+      observe: {
+        ...observe,
+        value: (...arguments_: unknown[]): unknown => {
+          const result = Reflect.apply(original, candidate, arguments_);
+          observeMutation();
+          return result;
+        },
+      },
+    });
+    return Object.freeze(captured);
+  } catch {
+    return candidate;
+  }
+}
+
 /** Copy one untrusted component record without invoking accessors or inherited hooks. */
 export function snapshotFirstDisplayComponentRegistration(
   candidate: unknown

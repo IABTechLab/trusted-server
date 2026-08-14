@@ -83,6 +83,69 @@ function protocol() {
 }
 
 describe('first-display GPT adapter', () => {
+  it('observes publisher GPT calls, events, and targeting until ingress closes', () => {
+    const dom = new JSDOM('<!doctype html><div id="slot-1"></div>', {
+      url: 'https://publisher.example/',
+    });
+    const listeners = new Map<string, (event: unknown) => void>();
+    const mutations = vi.fn(() => true);
+    const slot = {
+      clearTargeting: vi.fn(() => undefined),
+      getSlotElementId: () => 'slot-1',
+      getTargeting: () => [],
+      setTargeting: vi.fn((_key: string, _value: string) => slot),
+    };
+    const service = {
+      addEventListener: (name: string, listener: (event: unknown) => void) =>
+        listeners.set(name, listener),
+      getSlots: () => [slot],
+      refresh: vi.fn(),
+      removeEventListener: () => undefined,
+    };
+    const binding = {
+      cmd: { push: (command: () => void) => command() },
+      defineSlot: vi.fn(() => slot),
+      destroySlots: vi.fn(() => true),
+      display: vi.fn(),
+      getConfig: () => ({ disableInitialLoad: false }),
+      pubads: () => service,
+    };
+    Object.defineProperty(dom.window, 'googletag', { configurable: true, value: binding });
+    const batch = snapshotFirstDisplayBatchV1(fixture())!;
+    const adapter = createFirstDisplayGoogletagBatch({
+      browser: dom.window as unknown as Window,
+      document: dom.window.document,
+      projection: batch.projection,
+      protocol: protocol(),
+      onNativeMutation: mutations,
+      setTimer: (callback) => callback,
+      clearTimer: () => undefined,
+    });
+    adapter.start({
+      onBound: () => undefined,
+      onFailure: () => undefined,
+      onFirstAction: () => true,
+      onRenderEnded: () => undefined,
+    });
+    listeners.get('slotRequested')?.({ slot });
+    listeners.get('slotRenderEnded')?.({ slot, isEmpty: false });
+    mutations.mockClear();
+
+    slot.setTargeting('publisher', 'value');
+    service.refresh([slot]);
+    binding.display('publisher-slot');
+    listeners.get('slotRequested')?.({ slot });
+    expect(mutations).toHaveBeenCalledTimes(4);
+
+    expect(adapter.closeIngress()).toBe(true);
+    mutations.mockClear();
+    slot.setTargeting('publisher', 'later');
+    service.refresh([slot]);
+    binding.display('publisher-slot');
+    listeners.get('slotRequested')?.({ slot });
+    expect(mutations).not.toHaveBeenCalled();
+  });
+
   it('defines, targets, and starts one TS slot before attributing its render event', () => {
     const dom = new JSDOM('<!doctype html><div id="slot-1"></div>', {
       url: 'https://publisher.example/',
@@ -224,11 +287,12 @@ describe('first-display GPT adapter', () => {
       }),
     };
     const listeners = new Map<string, (event: unknown) => void>();
+    const refresh = vi.fn();
     const service = {
       addEventListener: (name: string, listener: (event: unknown) => void) =>
         listeners.set(name, listener),
       getSlots: () => [slot],
-      refresh: vi.fn(),
+      refresh,
       removeEventListener: vi.fn(),
     };
     const defineSlot = vi.fn();
@@ -262,7 +326,7 @@ describe('first-display GPT adapter', () => {
     });
     expect(defineSlot).not.toHaveBeenCalled();
     expect(display).not.toHaveBeenCalled();
-    expect(service.refresh).toHaveBeenCalledWith([slot], { changeCorrelator: false });
+    expect(refresh).toHaveBeenCalledWith([slot], { changeCorrelator: false });
     expect(firstAction).toHaveBeenCalledOnce();
 
     slot.setTargeting('placement', 'article');

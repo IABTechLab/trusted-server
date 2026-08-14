@@ -4,7 +4,9 @@ import { JSDOM } from 'jsdom';
 import {
   createBootstrapController,
   createFirstDisplayArtifactController,
+  createFirstDisplayBootstrapRuntimeBridge,
   createFirstDisplayTakeoverCoordinator,
+  createPersistentRuntimeLoader,
 } from '../../src/core/bootstrap_controller';
 import { createFirstDisplayHandoffOwner } from '../../src/first_display/handoff';
 import type { FirstDisplayAgent } from '../../src/first_display/agent';
@@ -42,6 +44,214 @@ function component(
 }
 
 describe('first-display bootstrap controller', () => {
+  it('loads and commits one post-paint runtime through the private takeover bridge', () => {
+    const { document, script } = artifactDocument();
+    const target = {};
+    const events: string[] = [];
+    const timers: Array<() => void> = [];
+    let now = 0;
+    let revision = 0;
+    const owner = createFirstDisplayHandoffOwner({
+      releaseId: RELEASE_ID,
+      generation: 1,
+      isCurrentGeneration: () => true,
+      isTerminal: () => true,
+      isPainted: () => true,
+      closeIngress: () => events.push('close'),
+      onFailure: () => events.push('owner:failure'),
+    });
+    const agent = Object.freeze({
+      state: 'painted' as const,
+      observeNativeMutation: () => {
+        const observed = owner.observeMutation();
+        revision = owner.mutationRevision;
+        return observed;
+      },
+      finalizeHandoff: () =>
+        owner.finalize(() => ({
+          candidate: {
+            version: 1,
+            releaseId: RELEASE_ID,
+            generation: 1,
+            projectionDigest: 'b'.repeat(64),
+            slices: ['first_display'],
+            slots: [
+              {
+                id: 'slot-1',
+                aliases: [],
+                domId: 'div-1',
+                gamPath: '/123/slot-1',
+                formats: [[300, 250]],
+                owner: 'trusted_server',
+                outcome: 'failed',
+                targeting: [],
+                committedArtifact: 'none',
+                gptToken: null,
+              },
+            ],
+            attempts: [],
+            tombstones: [],
+            artifacts: [],
+            parserState: [],
+            gptFacts: [],
+            gptFactOverflow: 0,
+            timing: { bidsScriptMs: 1, firstDisplayMs: null, terminalMs: 2, paintMs: 3 },
+            highWater: {
+              navigationAttemptPrefix: 'nav1',
+              nextNavigationAttemptOrdinal: 1,
+              nextAttemptOrdinal: 1,
+              nextSlotRegistrationOrdinal: 2,
+              reservationClockEpochMs: 0,
+              nextReservationOrdinal: 1,
+              nextTicketOrdinal: 1,
+            },
+            cycles: [],
+            trace: {
+              nextSequence: 1,
+              nextGlobalSlotOrdinal: 2,
+              slots: [{ slotId: 'slot-1', impressions: 0, bindings: [] }],
+            },
+            mutationRevision: revision,
+          },
+          identities: [],
+        })),
+      detachCommittedArtifacts: () => true,
+      snapshot: () => ({ mutationRevision: revision }),
+      dispose: () => events.push('dispose:agent'),
+    }) as unknown as FirstDisplayAgent;
+    const bridge = createFirstDisplayBootstrapRuntimeBridge({
+      target,
+      document,
+      agentScript: script,
+      runtimeSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
+      outline: {
+        version: 1,
+        releaseId: RELEASE_ID,
+        generation: 1,
+        projectionDigest: 'b'.repeat(64),
+        slices: ['first_display'],
+        slotCount: 1,
+        outcomeCount: 1,
+        capabilities: [],
+        objectKinds: [],
+      },
+      isCurrentGeneration: () => true,
+      now: () => now,
+      setTimer: (callback) => {
+        timers.push(callback);
+        return callback;
+      },
+      clearTimer: (handle) => {
+        const index = timers.indexOf(handle as () => void);
+        if (index >= 0) timers.splice(index, 1);
+      },
+      disposeAgentArtifact: () => {
+        events.push('dispose:artifact');
+        agent.dispose();
+      },
+      onFailure: (reason) => events.push(`fallback:${reason}`),
+    });
+
+    expect(bridge?.bindAgent(agent)).toBe(true);
+    expect(document.querySelector('#trustedserver-js-runtime')).toBeNull();
+    expect(bridge?.onProtectedPaint()).toBe(true);
+    expect(revision).toBe(1);
+    expect(timers).toHaveLength(1);
+    const transport = consumeFirstDisplayTakeoverTransport(target);
+    expect(transport.status).toBe('accepted');
+    if (transport.status !== 'accepted') throw new Error('should consume takeover transport');
+    transport.coordinate(
+      Object.freeze({
+        activate: () => events.push('activate'),
+        commit: () => events.push('commit'),
+        rollback: () => events.push('rollback'),
+      })
+    );
+
+    now = 10_000;
+    expect(bridge?.state).toBe('committed');
+    expect(timers).toEqual([]);
+    expect(document.querySelector('#trustedserver-js-runtime')).not.toBeNull();
+    expect(events).toEqual(['close', 'dispose:artifact', 'dispose:agent', 'activate', 'commit']);
+  });
+
+  it('fails the post-paint bridge once at the exact ten-second boundary', () => {
+    const { document, script } = artifactDocument();
+    const target = {};
+    const timers: Array<() => void> = [];
+    const failures: string[] = [];
+    let now = 0;
+    const dispose = vi.fn();
+    const agent = Object.freeze({
+      state: 'painted' as const,
+      observeNativeMutation: () => true,
+      finalizeHandoff: () => undefined,
+      detachCommittedArtifacts: () => false,
+      snapshot: () => ({ mutationRevision: 0 }),
+      dispose,
+    }) as unknown as FirstDisplayAgent;
+    const bridge = createFirstDisplayBootstrapRuntimeBridge({
+      target,
+      document,
+      agentScript: script,
+      runtimeSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
+      outline: {},
+      isCurrentGeneration: () => true,
+      now: () => now,
+      setTimer: (callback) => {
+        timers.push(callback);
+        return callback;
+      },
+      clearTimer: (handle) => {
+        const index = timers.indexOf(handle as () => void);
+        if (index >= 0) timers.splice(index, 1);
+      },
+      disposeAgentArtifact: dispose,
+      onFailure: (reason) => failures.push(reason),
+    });
+    expect(bridge?.bindAgent(agent)).toBe(true);
+    expect(bridge?.onProtectedPaint()).toBe(true);
+
+    now = 10_000;
+    timers[0]?.();
+    expect(bridge?.state).toBe('failed');
+    expect(document.querySelector('#trustedserver-js-runtime')).toBeNull();
+    expect(Object.prototype.hasOwnProperty.call(target, '_firstDisplayTakeover')).toBe(false);
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(failures).toEqual(['bundle_partial']);
+  });
+
+  it('does not request persistent bytes until invoked and authenticates the one runtime node', () => {
+    const { document, script } = artifactDocument();
+    script.nonce = 'server-nonce';
+    const mutations = vi.fn();
+    const failures = vi.fn();
+    const loader = createPersistentRuntimeLoader({
+      document,
+      agentScript: script,
+      runtimeSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
+      onMutation: mutations,
+      onFailure: failures,
+    });
+    expect(document.querySelector('#trustedserver-js-runtime')).toBeNull();
+
+    expect(loader.request()).toBe(true);
+    const runtime = document.querySelector('#trustedserver-js-runtime') as HTMLScriptElement;
+    expect(runtime).toBeInstanceOf(document.defaultView?.HTMLScriptElement);
+    expect(runtime.src).toBe(
+      `${document.location.origin}/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`
+    );
+    expect(runtime.nonce).toBe('server-nonce');
+    expect(runtime.async).toBe(true);
+    expect(loader.authenticate()).toBe(true);
+    expect(mutations).toHaveBeenCalledOnce();
+    expect(failures).not.toHaveBeenCalled();
+
+    const duplicate = runtime.cloneNode() as HTMLScriptElement;
+    document.head.append(duplicate);
+    expect(loader.authenticate()).toBe(false);
+  });
+
   it('moves the private takeover callback between IIFEs exactly once', () => {
     const target = {};
     const coordinate = vi.fn();

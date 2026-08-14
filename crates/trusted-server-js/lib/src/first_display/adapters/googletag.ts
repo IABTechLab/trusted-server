@@ -49,6 +49,7 @@ export interface FirstDisplayGoogletagBatchOptions {
   readonly browser: Window & { googletag?: unknown };
   readonly clearTimer: (handle: unknown) => void;
   readonly document: Document;
+  readonly onNativeMutation?: () => boolean;
   readonly projection: FirstDisplayProjectionV1;
   readonly protocol: Pick<
     FirstDisplayGptProtocolV1,
@@ -174,6 +175,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
   private readonly createdSlots = new Set<object>();
   private readonly targetingObservers = new Map<object, () => void>();
   private readonly targetingRestorers: TargetingRestorer[] = [];
+  private readonly publisherCallRestorers: Array<() => void> = [];
   private readonly timers = new Set<unknown>();
   private binding: ExternalObject | undefined;
   private command: (() => void) | undefined;
@@ -250,6 +252,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     this.removePendingCommand();
     for (const handle of [...this.timers]) this.clearOwnedTimer(handle);
     this.removeListener();
+    this.restorePublisherCalls();
     for (const restoreObserver of this.targetingObservers.values()) {
       try {
         restoreObserver();
@@ -298,6 +301,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     this.removePendingCommand();
     for (const handle of [...this.timers]) this.clearOwnedTimer(handle);
     this.removeListener();
+    this.restorePublisherCalls();
     for (const restoration of this.targetingRestorers.reverse()) {
       if (this.detachedSlots.has(restoration.slot)) continue;
       try {
@@ -380,6 +384,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     const service = externalObject(call(binding, 'pubads', []));
     if (!service) throw new TypeError('invalid GPT pubads service');
     this.service = service;
+    this.observePublisherCalls(binding, service);
     this.installListeners(service, callbacks);
     const existing = call(service, 'getSlots', []);
     if (!Array.isArray(existing)) throw new TypeError('invalid GPT slot inventory');
@@ -498,6 +503,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
   ): void {
     const requestedListener = (event: unknown): void => {
       if (this.disposed || this.requestedListener !== requestedListener) return;
+      this.notifyNativeMutation();
       const slot = physicalSlot(member(event, 'slot'));
       const cycle = slot ? this.cycles.get(slot) : undefined;
       if (!cycle || cycle.settled || !cycle.requestInvoked) return;
@@ -510,6 +516,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     };
     const renderListener = (event: unknown): void => {
       if (this.disposed || this.renderListener !== renderListener) return;
+      this.notifyNativeMutation();
       const slot = physicalSlot(member(event, 'slot'));
       const cycle = slot ? this.cycles.get(slot) : undefined;
       if (!cycle || cycle.settled || !cycle.requested) return;
@@ -596,10 +603,14 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
         const invalidateTargeting = (targetingKey: string | undefined): void =>
           this.invalidateTargeting(slot, targetingKey);
         const isTrustedServerWrite = (): boolean => this.targetingWriteDepth > 0;
+        const ownerMutation = (): void => this.notifyNativeMutation();
         const wrapper = function (this: unknown, ...arguments_: unknown[]): unknown {
           if (!isTrustedServerWrite() && this === slot) {
             const targetingKey = typeof arguments_[0] === 'string' ? arguments_[0] : undefined;
             invalidateTargeting(targetingKey);
+            const result = Reflect.apply(original, this, arguments_);
+            ownerMutation();
+            return result;
           }
           return Reflect.apply(original, this, arguments_);
         };
@@ -627,6 +638,67 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     this.targetingObservers.set(slot, () => {
       for (const restore of restorers.reverse()) restore();
     });
+  }
+
+  private observePublisherCalls(binding: ExternalObject, service: ExternalObject): void {
+    const installed: Array<() => void> = [];
+    try {
+      for (const [receiver, key] of [
+        [binding, 'defineSlot'],
+        [binding, 'destroySlots'],
+        [binding, 'display'],
+        [service, 'refresh'],
+      ] as const) {
+        const original = member(receiver, key);
+        if (typeof original !== 'function') continue;
+        const prior = Object.getOwnPropertyDescriptor(receiver, key);
+        const notify = (): void => this.notifyNativeMutation();
+        const wrapper = function (this: unknown, ...arguments_: unknown[]): unknown {
+          const result = Reflect.apply(original, this, arguments_);
+          if (this === receiver) notify();
+          return result;
+        };
+        if (
+          !Reflect.defineProperty(receiver, key, {
+            configurable: true,
+            enumerable: prior?.enumerable ?? false,
+            value: wrapper,
+            writable: true,
+          })
+        ) {
+          throw new TypeError(`cannot observe GPT method: ${key}`);
+        }
+        installed.push(() => {
+          const current = Object.getOwnPropertyDescriptor(receiver, key);
+          if (!current || !('value' in current) || current.value !== wrapper) return;
+          if (prior) Reflect.defineProperty(receiver, key, prior);
+          else Reflect.deleteProperty(receiver, key);
+        });
+      }
+    } catch (error) {
+      for (const restore of installed.reverse()) restore();
+      throw error;
+    }
+    this.publisherCallRestorers.push(...installed);
+  }
+
+  private restorePublisherCalls(): void {
+    for (const restore of this.publisherCallRestorers.reverse()) {
+      try {
+        restore();
+      } catch {
+        // Publisher replacement wins while the old wrapper loses all authority.
+      }
+    }
+    this.publisherCallRestorers.length = 0;
+  }
+
+  private notifyNativeMutation(): void {
+    try {
+      this.options.onNativeMutation?.();
+    } catch {
+      // Mutation observation failure cannot alter the publisher's admitted call.
+    }
   }
 
   private invalidateTargeting(slot: object, key: string | undefined): void {
