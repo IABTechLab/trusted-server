@@ -155,7 +155,9 @@ fn validate_enabled_integrations(
     validate_integration::<SourcepointConfig>(settings, "sourcepoint")?;
     validate_integration::<OsanoConfig>(settings, "osano")?;
     validate_integration::<GoogleTagManagerConfig>(settings, "google_tag_manager")?;
-    validate_integration::<DataDomeConfig>(settings, "datadome")?;
+    if let Some(config) = settings.integration_config::<DataDomeConfig>("datadome")? {
+        crate::integrations::datadome::DataDomeIntegration::validate_config_for_startup(config)?;
+    }
     validate_integration::<GptConfig>(settings, "gpt")?;
     validate_integration::<GptDiagnosticsConfig>(settings, "gpt_diagnostics")?;
 
@@ -402,6 +404,44 @@ password = "production-admin-password-32-bytes"
             error_text.contains("osano") || error_text.contains("typo"),
             "error should mention Osano or the invalid field: {err:?}"
         );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_invalid_datadome_test_bypass() {
+        for (enable_protection, store, name, expected_message) in [
+            (
+                false,
+                "ts_secrets",
+                "datadome_test_bypass",
+                "requires enable_protection",
+            ),
+            (true, "", "datadome_test_bypass", "credential_secret_store"),
+            (true, "ts_secrets", "", "credential_secret_name"),
+        ] {
+            let mut settings = valid_settings();
+            settings
+                .integrations
+                .insert_config(
+                    "datadome",
+                    &serde_json::json!({
+                        "enabled": true,
+                        "enable_protection": enable_protection,
+                        "protection_test_bypass": {
+                            "enabled": true,
+                            "credential_secret_store": store,
+                            "credential_secret_name": name,
+                        },
+                    }),
+                )
+                .expect("should insert DataDome config");
+
+            let err = validate_settings_for_deploy(&settings)
+                .expect_err("should reject invalid DataDome test bypass");
+            assert!(
+                format!("{err:?}").contains(expected_message),
+                "error should mention the invalid bypass setting: {err:?}"
+            );
+        }
     }
 
     #[test]
