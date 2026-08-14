@@ -1,5 +1,3 @@
-import type { PreparedFirstDisplaySliceV1 } from './transaction';
-
 declare const __TSJS_EMBEDDED_RELEASE_ID_V1__: string;
 
 const HASH = /^[0-9a-f]{64}$/;
@@ -15,7 +13,7 @@ export interface FirstDisplayComponentRegistrationV1 {
   readonly releaseId: string;
   /** Absolute catalog order, not the component's position in one selected mask. */
   readonly order: number;
-  readonly prepare: (host: unknown) => PreparedFirstDisplaySliceV1;
+  readonly prepare: (host: unknown) => unknown;
 }
 
 type FirstDisplayBootstrapTarget = object & {

@@ -44,8 +44,8 @@ export interface FirstDisplayArtifactControllerOptions {
   readonly generation: number;
   readonly expectedSliceIds: readonly FirstDisplaySliceId[];
   readonly isCurrentGeneration: () => boolean;
-  /** Supplies the closure-private base or optional-slice host after all records validate. */
-  readonly hostFor: (id: FirstDisplaySliceId) => unknown;
+  /** Supplies only base dependencies; the base creates the private optional-slice host. */
+  readonly baseHost: unknown;
   readonly onDisposalError?: (error: unknown) => void;
 }
 
@@ -131,6 +131,7 @@ export function createFirstDisplayArtifactController(
 ): FirstDisplayArtifactController | undefined {
   let state: FirstDisplayArtifactControllerState = 'collecting';
   let count = 0;
+  let sliceHost: unknown;
   let sink: ((this: unknown, candidate: unknown, source: unknown) => boolean) | undefined;
   const transaction = createFirstDisplayTransaction({
     document: options.document,
@@ -194,7 +195,38 @@ export function createFirstDisplayArtifactController(
       releaseId: registration.releaseId,
       generation: options.generation,
       order: registration.order,
-      prepare: () => registration.prepare(options.hostFor(registration.id as FirstDisplaySliceId)),
+      prepare: () => {
+        const prepared = registration.prepare(
+          registration.id === 'first_display' ? options.baseHost : sliceHost
+        );
+        if (registration.id !== 'first_display') return prepared as never;
+        if (
+          typeof prepared !== 'object' ||
+          prepared === null ||
+          Array.isArray(prepared) ||
+          Object.getPrototypeOf(prepared) !== Object.prototype ||
+          !Object.isFrozen(prepared) ||
+          Reflect.ownKeys(prepared).length !== 2
+        ) {
+          throw new TypeError('invalid first-display base preparation');
+        }
+        const activate = Object.getOwnPropertyDescriptor(prepared, 'activate');
+        const host = Object.getOwnPropertyDescriptor(prepared, 'sliceHost');
+        if (
+          !activate?.enumerable ||
+          !('value' in activate) ||
+          typeof activate.value !== 'function' ||
+          !host?.enumerable ||
+          !('value' in host) ||
+          typeof host.value !== 'object' ||
+          host.value === null ||
+          !Object.isFrozen(host.value)
+        ) {
+          throw new TypeError('invalid first-display slice host');
+        }
+        sliceHost = host.value;
+        return Object.freeze({ activate: activate.value });
+      },
     });
     if (!registered) return fail('abi_mismatch');
     count += 1;

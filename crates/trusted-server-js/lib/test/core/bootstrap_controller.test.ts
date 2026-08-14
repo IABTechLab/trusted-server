@@ -102,7 +102,7 @@ describe('first-display bootstrap controller', () => {
       generation: 1,
       expectedSliceIds: ['first_display', 'gpt_initial'],
       isCurrentGeneration: () => true,
-      hostFor: (id) => Object.freeze({ id }),
+      baseHost: Object.freeze({}),
     });
     const sink = Object.getOwnPropertyDescriptor(target, '_registerFirstDisplay');
     expect(sink).toMatchObject({ configurable: true, enumerable: false, writable: false });
@@ -115,6 +115,7 @@ describe('first-display bootstrap controller', () => {
               events.push('activate:base');
               afterActivate(() => events.push('start:action'));
             },
+            sliceHost: Object.freeze({ activate: () => undefined }),
           })
         ),
         script,
@@ -154,7 +155,7 @@ describe('first-display bootstrap controller', () => {
       generation: 1,
       expectedSliceIds: ['first_display'],
       isCurrentGeneration: () => true,
-      hostFor: () => Object.freeze({}),
+      baseHost: Object.freeze({}),
     });
     const sink = Object.getOwnPropertyDescriptor(target, '_registerFirstDisplay')?.value;
     expect(

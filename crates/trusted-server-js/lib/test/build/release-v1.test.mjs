@@ -282,6 +282,19 @@ test('generated first-display components self-register through one authenticated
       assert.equal(typeof registration.prepare, 'function');
       assert.equal(Object.isFrozen(registration), true);
     }
+    const baseHost = dom.window.eval(
+      'Object.freeze({options:Object.freeze({}),sliceBindings:function(){return undefined;}})'
+    );
+    const base = registrations[0].prepare(baseHost);
+    assert.deepEqual(Reflect.ownKeys(base), ['activate', 'sliceHost']);
+    assert.equal(Object.isFrozen(base), true);
+    assert.deepEqual(Reflect.ownKeys(base.sliceHost), ['activate']);
+    assert.equal(Object.isFrozen(base.sliceHost), true);
+    for (const registration of registrations.slice(1)) {
+      const prepared = registration.prepare(base.sliceHost);
+      assert.deepEqual(Reflect.ownKeys(prepared), ['activate']);
+      assert.equal(Object.isFrozen(prepared), true);
+    }
   } finally {
     dom.window.close();
   }
