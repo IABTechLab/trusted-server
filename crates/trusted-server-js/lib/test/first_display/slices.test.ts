@@ -7,6 +7,7 @@ import {
 } from '../../src/first_display/composition';
 import { DIDOMI_INITIAL_SLICE } from '../../src/first_display/slices/didomi';
 import { CREATIVE_INITIAL_SLICE } from '../../src/first_display/slices/creative';
+import { APS_INITIAL_SLICE } from '../../src/first_display/slices/aps';
 import { DATADOME_INITIAL_SLICE } from '../../src/first_display/slices/datadome';
 import { GOOGLE_TAG_MANAGER_INITIAL_SLICE } from '../../src/first_display/slices/google_tag_manager';
 import { LOCKR_INITIAL_SLICE } from '../../src/first_display/slices/lockr';
@@ -17,6 +18,7 @@ import { TESTLIGHT_INITIAL_SLICE } from '../../src/first_display/slices/testligh
 import type { FirstDisplayRouteRuleV1 } from '../../src/first_display/leaf/route_guard';
 import { installDidomiInitial } from '../../src/first_display/leaf/config_guard';
 import type { FirstDisplayCreativeGuardV1 } from '../../src/first_display/leaf/creative_guard';
+import type { FirstDisplayApsProtocolV1 } from '../../src/first_display/leaf/aps_protocol';
 import {
   installPermutiveInitial,
   snapshotPermutiveInitialSegments,
@@ -937,5 +939,88 @@ describe('first-display initial slice definitions', () => {
       ).toThrow();
       expect(register).not.toHaveBeenCalled();
     }
+  });
+
+  it('registers the closed APS reservation and document-channel protocol', () => {
+    const release = vi.fn();
+    const disposers: Array<() => void> = [];
+    let protocol: FirstDisplayApsProtocolV1 | undefined;
+    const bindings = Object.freeze({
+      observe: vi.fn(),
+      publisherOrigin: 'https://publisher.example',
+      register: (candidate: FirstDisplayApsProtocolV1) => {
+        protocol = candidate;
+        return release;
+      },
+    });
+    const host = Object.freeze({
+      activate: (
+        id: string,
+        own: (dispose: () => void) => void,
+        install?: (candidate: unknown, ownEffect: (dispose: () => void) => void) => void
+      ) => {
+        expect(id).toBe('aps_initial');
+        install?.(bindings, own);
+      },
+    });
+
+    APS_INITIAL_SLICE.prepare(host).activate(
+      Object.freeze({
+        own: (dispose: () => void) => disposers.push(dispose),
+        afterActivate: () => undefined,
+      })
+    );
+    expect(protocol?.rendererUrl).toBe('https://publisher.example/integrations/aps/renderer/v1');
+    expect(protocol?.deadlines).toEqual({
+      insertionMs: 1_000,
+      documentAcceptanceMs: 3_000,
+      completionMs: 10_000,
+      ownerSettlementMs: 20_000,
+    });
+    expect(protocol?.isReservationId(`r1_${'a'.repeat(22)}`)).toBe(true);
+    expect(protocol?.isLifecycleTicket(`t1_${'a'.repeat(22)}`)).toBe(true);
+    expect(protocol?.isRendererNonce(`n1_${'a'.repeat(22)}`)).toBe(true);
+    expect(protocol?.isReservationId(`r1_${'a'.repeat(21)}`)).toBe(false);
+    const nonce = `n1_${'b'.repeat(22)}`;
+    expect(
+      protocol?.parseDocumentMessage(
+        Object.freeze({ message: 'TS APS Document Accepted', version: 1, nonce }),
+        nonce
+      )
+    ).toEqual({ kind: 'document_accepted' });
+    expect(
+      protocol?.parseDocumentMessage(
+        Object.freeze({ message: 'TS APS Runner Loaded', version: 1, nonce }),
+        nonce
+      )
+    ).toEqual({ kind: 'runner_loaded' });
+    expect(
+      protocol?.parseDocumentMessage(
+        Object.freeze({ message: 'TS APS Render Completed', version: 1, nonce }),
+        nonce
+      )
+    ).toEqual({ kind: 'render_completed' });
+    expect(
+      protocol?.parseDocumentMessage(
+        Object.freeze({
+          message: 'TS APS Render Failed',
+          version: 1,
+          nonce,
+          reason: 'runner_failed',
+        }),
+        nonce
+      )
+    ).toEqual({ kind: 'render_failed', reason: 'runner_failed' });
+    for (const message of [
+      { message: 'TS APS Render Completed', version: 1, nonce: `n1_${'c'.repeat(22)}` },
+      { message: 'TS APS Render Completed', version: 1, nonce, extra: true },
+      { message: 'TS APS Render Failed', version: 1, nonce, reason: 'unknown' },
+      Object.create({ message: 'TS APS Render Completed', version: 1, nonce }),
+    ]) {
+      expect(protocol?.parseDocumentMessage(Object.freeze(message), nonce)).toBeUndefined();
+    }
+
+    disposers.reverse().forEach((dispose) => dispose());
+    expect(release).toHaveBeenCalledOnce();
   });
 });
