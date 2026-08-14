@@ -33,6 +33,8 @@ interface MockGoogleTag {
   pubads: () => unknown;
   enableServices: () => void;
   display: (divId: string) => void;
+  getConfig?: (key: string) => Record<string, unknown>;
+  setConfig?: (config: Record<string, unknown>) => void;
 }
 
 // `tsjs` is declared globally as the full `TsjsApi`; `Omit` drops it from
@@ -40,7 +42,24 @@ interface MockGoogleTag {
 type TestWindow = Omit<Window, 'tsjs'> & {
   googletag?: MockGoogleTag;
   tsjs?: Partial<TsjsApi>;
+  __tsjs_gam_attribution_enabled?: boolean;
 };
+
+function makeGoogleTag(overrides: Partial<MockGoogleTag> = {}): MockGoogleTag {
+  const pubads = {
+    getSlots: vi.fn(() => []),
+    refresh: vi.fn(),
+  };
+
+  return {
+    cmd: [],
+    defineSlot: vi.fn(),
+    pubads: vi.fn(() => pubads),
+    enableServices: vi.fn(),
+    display: vi.fn(),
+    ...overrides,
+  };
+}
 
 function runBootstrap(): void {
   // Evaluate in the jsdom global scope, exactly as an inline <script> would.
@@ -60,6 +79,7 @@ describe('gpt_bootstrap.js fallback', () => {
   beforeEach(() => {
     delete (window as TestWindow).tsjs;
     delete (window as TestWindow).googletag;
+    delete (window as TestWindow).__tsjs_gam_attribution_enabled;
     rafQueue = [];
     (
       window as { requestAnimationFrame: typeof window.requestAnimationFrame }
@@ -81,7 +101,111 @@ describe('gpt_bootstrap.js fallback', () => {
     delete (window as unknown as Record<string, unknown>).requestAnimationFrame;
     delete (window as TestWindow).tsjs;
     delete (window as TestWindow).googletag;
+    delete (window as TestWindow).__tsjs_gam_attribution_enabled;
     vi.restoreAllMocks();
+  });
+
+  it('does not create googletag before the guard when attribution is omitted or false', () => {
+    for (const flag of [undefined, false]) {
+      const bundleAdInit = vi.fn();
+      (window as TestWindow).tsjs = { adInit: bundleAdInit };
+      delete (window as TestWindow).googletag;
+      if (flag === undefined) {
+        delete (window as TestWindow).__tsjs_gam_attribution_enabled;
+      } else {
+        (window as TestWindow).__tsjs_gam_attribution_enabled = flag;
+      }
+
+      runBootstrap();
+
+      expect((window as TestWindow).googletag).toBeUndefined();
+      expect((window as TestWindow).tsjs!.adInit).toBe(bundleAdInit);
+    }
+  });
+
+  it('queues string-valued page targeting before a later publisher command', () => {
+    const queue: Array<() => void> = [];
+    const setConfig = vi.fn();
+    (window as TestWindow).googletag = makeGoogleTag({ cmd: queue, setConfig });
+    (window as TestWindow).__tsjs_gam_attribution_enabled = true;
+
+    runBootstrap();
+    const publisherCommand = vi.fn();
+    queue.push(publisherCommand);
+    [...queue].forEach((command) => command());
+
+    expect(setConfig).toHaveBeenCalledWith({ targeting: { ts: 'true' } });
+    expect(setConfig.mock.invocationCallOrder[0]).toBeLessThan(
+      publisherCommand.mock.invocationCallOrder[0]
+    );
+  });
+
+  it('queues targeting before the preinstalled adInit guard without replacing bundle APIs', () => {
+    const queue: Array<() => void> = [];
+    const setConfig = vi.fn();
+    const bundleAdInit = vi.fn();
+    (window as TestWindow).googletag = makeGoogleTag({ cmd: queue, setConfig });
+    (window as TestWindow).tsjs = { adInit: bundleAdInit };
+    (window as TestWindow).__tsjs_gam_attribution_enabled = true;
+
+    runBootstrap();
+
+    expect(queue).toHaveLength(1);
+    expect((window as TestWindow).tsjs!.adInit).toBe(bundleAdInit);
+    expect((window as TestWindow).tsjs!.scheduleInitialAdInit).toBeUndefined();
+    queue.forEach((command) => command());
+    expect(setConfig).toHaveBeenCalledWith({ targeting: { ts: 'true' } });
+  });
+
+  it('keeps bootstrap installation working when setConfig is unavailable', () => {
+    const queue: Array<() => void> = [];
+    (window as TestWindow).googletag = makeGoogleTag({ cmd: queue });
+    (window as TestWindow).__tsjs_gam_attribution_enabled = true;
+
+    runBootstrap();
+
+    expect(() => [...queue].forEach((command) => command())).not.toThrow();
+    expect(typeof (window as TestWindow).tsjs!.adInit).toBe('function');
+    expect(typeof (window as TestWindow).tsjs!.scheduleInitialAdInit).toBe('function');
+  });
+
+  it('isolates a throwing setConfig from later publisher commands', () => {
+    const queue: Array<() => void> = [];
+    const setConfig = vi.fn(() => {
+      throw new Error('publisher setConfig failed');
+    });
+    const publisherCommand = vi.fn();
+    (window as TestWindow).googletag = makeGoogleTag({ cmd: queue, setConfig });
+    (window as TestWindow).__tsjs_gam_attribution_enabled = true;
+
+    runBootstrap();
+    queue.push(publisherCommand);
+
+    expect(() => [...queue].forEach((command) => command())).not.toThrow();
+    expect(setConfig).toHaveBeenCalledWith({ targeting: { ts: 'true' } });
+    expect(publisherCommand).toHaveBeenCalledTimes(1);
+  });
+
+  it('still tracks the wrapped legacy disableInitialLoad path', () => {
+    const queue: Array<() => void> = [];
+    const disableInitialLoad = vi.fn();
+    const pubads = {
+      disableInitialLoad,
+      getSlots: vi.fn(() => []),
+      refresh: vi.fn(),
+    };
+    (window as TestWindow).googletag = makeGoogleTag({
+      cmd: queue,
+      pubads: vi.fn(() => pubads),
+    });
+    (window as TestWindow).__tsjs_gam_attribution_enabled = true;
+
+    runBootstrap();
+    [...queue].forEach((command) => command());
+    pubads.disableInitialLoad();
+
+    expect(disableInitialLoad).toHaveBeenCalledTimes(1);
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
   });
 
   it('installs fallback adInit and scheduleInitialAdInit when the bundle is absent', () => {
