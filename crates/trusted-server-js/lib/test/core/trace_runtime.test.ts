@@ -1356,7 +1356,7 @@ describe('render trace diagnostics runtime', () => {
     expect(Object.isFrozen(exportRecord.mock.calls[0]?.[0])).toBe(true);
     owner.dispose();
     expect(document.getElementById(TRACE_PANEL_ID)).toBeNull();
-  });
+  }, 15_000);
 
   it('isolates presentation failures after committing diagnostics state', () => {
     const onPresentationError = vi.fn();

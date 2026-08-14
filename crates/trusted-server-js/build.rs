@@ -44,6 +44,7 @@ struct ReleaseArtifact {
 struct CatalogManifest {
     version: u8,
     first_display: Vec<FirstDisplayCatalogModule>,
+    permitted_first_display_masks: Vec<String>,
     modules: Vec<CatalogModule>,
 }
 
@@ -165,6 +166,52 @@ fn read_and_validate_catalog(dist_dir: &Path, release: &ReleaseManifest) -> Cata
         catalog.first_display.len(),
         "tsjs: first-display catalog/release count mismatch"
     );
+    let mut previous_mask = None;
+    assert!(
+        !catalog.permitted_first_display_masks.is_empty(),
+        "tsjs: at least one first-display mask must satisfy the release ceilings"
+    );
+    let mask_limit = 1_u16 << catalog.first_display.len();
+    let mask_bit = |id: &str| {
+        catalog
+            .first_display
+            .iter()
+            .position(|module| module.id == id)
+            .map(|index| 1_u16 << index)
+            .unwrap_or_else(|| panic!("tsjs: first-display catalog is missing {id}"))
+    };
+    let gpt_mask = mask_bit("gpt_initial");
+    let aps_mask = mask_bit("aps_initial");
+    let prebid_mask = mask_bit("prebid_initial");
+    for encoded in &catalog.permitted_first_display_masks {
+        assert!(
+            encoded.len() == 4
+                && encoded
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "tsjs: permitted first-display mask must be four lowercase hex digits"
+        );
+        let mask = u16::from_str_radix(encoded, 16)
+            .expect("should parse validated permitted first-display mask");
+        assert_eq!(
+            mask & 1,
+            1,
+            "tsjs: permitted first-display mask must contain the base"
+        );
+        assert!(
+            mask < mask_limit,
+            "tsjs: permitted first-display mask contains an unknown slice bit"
+        );
+        assert!(
+            mask & (aps_mask | prebid_mask) == 0 || mask & gpt_mask != 0,
+            "tsjs: APS and Prebid participation require GPT initial ownership"
+        );
+        assert!(
+            previous_mask.is_none_or(|previous| mask > previous),
+            "tsjs: permitted first-display masks must be unique and ordered"
+        );
+        previous_mask = Some(mask);
+    }
     for (index, (module, artifact)) in catalog
         .first_display
         .iter()
@@ -357,6 +404,17 @@ fn generate_metadata(manifest: &ReleaseManifest, catalog: &CatalogManifest, out_
         "pub(crate) const GENERATED_MAX_CRITICAL_MODULES: usize = {critical};\npub(crate) const GENERATED_MAX_MANIFEST_MODULES: usize = {integrations};"
     )
     .expect("should write generated capacities");
+    writeln!(
+        code,
+        "pub(crate) const PERMITTED_FIRST_DISPLAY_MASKS: &[u16] = &[{}];",
+        catalog
+            .permitted_first_display_masks
+            .iter()
+            .map(|mask| format!("0x{mask}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+    .expect("should write permitted first-display masks");
     code.push_str(
         "pub(crate) const GPT_BOOTSTRAP_FALLBACK: &str = include_str!(concat!(env!(\"OUT_DIR\"), \"/gpt-bootstrap-fallback.js\"));\n\n",
     );

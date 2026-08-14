@@ -11,6 +11,68 @@ import {
 
 const HASH = /^[0-9a-f]{64}$/;
 const MAX_U32 = 4_294_967_295;
+const HANDOFF_FIELDS = Object.freeze([
+  'version',
+  'releaseId',
+  'generation',
+  'projectionDigest',
+  'slices',
+  'slots',
+  'attempts',
+  'tombstones',
+  'artifacts',
+  'parserState',
+  'gptDiagnostics',
+  'timing',
+  'highWater',
+  'cycles',
+  'trace',
+  'mutationRevision',
+]);
+
+/** Seal inert ordinary data before the runtime download; semantic authority stays at takeover. */
+function snapshotFirstDisplayHandoffEnvelopeV1(
+  candidate: unknown
+): FirstDisplayHandoffV1 | undefined {
+  try {
+    const serialized = JSON.stringify(candidate);
+    if (typeof serialized !== 'string' || serialized.length > 9 * 1024 * 1024) return undefined;
+    const snapshot = JSON.parse(serialized) as unknown;
+    if (typeof snapshot !== 'object' || snapshot === null || Array.isArray(snapshot)) {
+      return undefined;
+    }
+    const handoff = snapshot as unknown as FirstDisplayHandoffV1;
+    const keys = Reflect.ownKeys(snapshot);
+    if (
+      keys.length !== HANDOFF_FIELDS.length ||
+      !keys.every((key) => typeof key === 'string' && HANDOFF_FIELDS.includes(key)) ||
+      handoff.version !== 1 ||
+      !HASH.test(handoff.releaseId) ||
+      !Number.isInteger(handoff.generation) ||
+      handoff.generation < 1 ||
+      handoff.generation > MAX_U32 ||
+      !HASH.test(handoff.projectionDigest) ||
+      !Number.isInteger(handoff.mutationRevision) ||
+      handoff.mutationRevision < 0 ||
+      handoff.mutationRevision > MAX_U32 ||
+      !Array.isArray(handoff.slices) ||
+      !Array.isArray(handoff.slots) ||
+      !Array.isArray(handoff.attempts) ||
+      !Array.isArray(handoff.tombstones) ||
+      !Array.isArray(handoff.artifacts) ||
+      !Array.isArray(handoff.parserState) ||
+      !Array.isArray(handoff.cycles) ||
+      handoff.attempts.some(
+        (attempt) => !['accepted', 'no_bid', 'failed', 'cancelled'].includes(String(attempt.state))
+      )
+    ) {
+      return undefined;
+    }
+    return Object.freeze(handoff);
+  } catch {
+    return undefined;
+  }
+}
 
 export type FirstDisplayHandoffOwnerState =
   'observing' | 'sealing' | 'finalized' | 'failed' | 'disposed';
@@ -140,7 +202,7 @@ export function createFirstDisplayHandoffOwner(
         options.closeIngress();
         const captured = capture();
         if (!captured) return publishFailure();
-        const handoff = snapshotFirstDisplayHandoffV1(captured.candidate);
+        const handoff = snapshotFirstDisplayHandoffEnvelopeV1(captured.candidate);
         if (
           !handoff ||
           handoff.releaseId !== options.releaseId ||
@@ -202,13 +264,15 @@ export function performFirstDisplayTakeoverV1(options: FirstDisplayTakeoverOptio
 
   try {
     const outline = snapshotTakeoverOutlineV1(options.outline);
-    const { handoff, capsule } = options.finalized;
+    const handoff = snapshotFirstDisplayHandoffV1(options.finalized.handoff);
+    const { capsule } = options.finalized;
     const requiredObjectKinds = [
-      ...(handoff.cycles.length === 0 ? [] : (['gpt_slot'] as const)),
-      ...(handoff.artifacts.length === 0 ? [] : (['dom_artifact'] as const)),
+      ...(handoff?.cycles.length === 0 ? [] : (['gpt_slot'] as const)),
+      ...(handoff?.artifacts.length === 0 ? [] : (['dom_artifact'] as const)),
     ];
     if (
       !outline ||
+      !handoff ||
       outline.releaseId !== handoff.releaseId ||
       outline.generation !== handoff.generation ||
       outline.projectionDigest !== handoff.projectionDigest ||
@@ -238,7 +302,7 @@ export function performFirstDisplayTakeoverV1(options: FirstDisplayTakeoverOptio
     options.disposeAgent();
     options.activatePersistent(handoff, identities, (dispose) => {
       if (!ownershipOpen || typeof dispose !== 'function') {
-        throw new TypeError('persistent takeover disposer registration is closed');
+        throw new TypeError('tsjs');
       }
       persistentDisposers.push(dispose);
     });

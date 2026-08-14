@@ -323,6 +323,40 @@ describe('atomic first-display takeover', () => {
     }
   });
 
+  it('performs full semantic handoff validation at takeover before any owner effect', () => {
+    const owner = createFirstDisplayHandoffOwner({
+      releaseId: RELEASE_ID,
+      generation: 1,
+      isCurrentGeneration: () => true,
+      isTerminal: () => true,
+      isPainted: () => true,
+      closeIngress: () => undefined,
+      onFailure: () => undefined,
+    });
+    const candidate = handoff();
+    candidate.trace = { ...(candidate.trace as object), nextSequence: 1 };
+    const sealed = owner.finalize(() => ({ candidate, identities: [{}, {}] }));
+    expect(sealed).toBeDefined();
+
+    const events: string[] = [];
+    expect(
+      performFirstDisplayTakeoverV1({
+        finalized: sealed!,
+        outline: outline(),
+        isCurrentGeneration: () => true,
+        authenticateRuntimeScript: () => true,
+        currentMutationRevision: () => 0,
+        quiesceAgent: () => events.push('quiesce'),
+        detachCommittedArtifacts: () => events.push('detach'),
+        disposeAgent: () => events.push('dispose'),
+        activatePersistent: () => events.push('activate'),
+        commitPersistent: () => events.push('commit'),
+        onFailure: () => events.push('fallback'),
+      })
+    ).toBe(false);
+    expect(events).toEqual(['fallback']);
+  });
+
   it('rejects an outline that did not prepare every transferred object kind', () => {
     for (const objectKinds of [[], ['gpt_slot'], ['dom_artifact']] as const) {
       const events: string[] = [];

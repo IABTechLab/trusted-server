@@ -127,7 +127,7 @@ export function installCreativeInitial(
 ): void {
   const bindings = snapshotBindings(candidate);
   if (!bindings || typeof own !== 'function') {
-    throw new TypeError('invalid creative initial bindings');
+    throw new TypeError('tsjs');
   }
   const guard: FirstDisplayCreativeGuardV1 = Object.freeze({
     version: 1,
@@ -139,7 +139,7 @@ export function installCreativeInitial(
       shouldProxyResource(raw, bindings.location.href, bindings.location.origin),
   });
   const release = bindings.register(guard);
-  if (typeof release !== 'function') throw new TypeError('invalid creative guard disposer');
+  if (typeof release !== 'function') throw new TypeError('tsjs');
   own(release);
   bindings.observe(
     'guard_count',

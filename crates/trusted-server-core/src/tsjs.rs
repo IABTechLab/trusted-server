@@ -456,7 +456,8 @@ pub fn select_first_display_slices_v1(
             slices.push(metadata.id);
         }
     }
-    Some(FirstDisplaySelectionV1 { mask, slices })
+    trusted_server_js::first_display_mask_is_permitted(mask)
+        .then_some(FirstDisplaySelectionV1 { mask, slices })
 }
 
 impl Default for CreativeBootConfigV1 {
@@ -1616,6 +1617,21 @@ mod tests {
         })
     }
 
+    fn aps_source() -> BidRenderSourceV1 {
+        use crate::auction::types::{ApsRendererV1, ApsTagType};
+        BidRenderSourceV1::Aps(ApsRendererV1 {
+            version: 1,
+            account_id: "account-1".to_string(),
+            bid_id: "bid-1".to_string(),
+            creative_id: None,
+            tag_type: ApsTagType::Iframe,
+            creative_url: "https://creative.example/render".to_string(),
+            aax_response: "envelope".to_string(),
+            width: 300,
+            height: 250,
+        })
+    }
+
     fn cache_source() -> BidRenderSourceV1 {
         use crate::auction::types::BaselinePbsCacheSourceV1;
         BidRenderSourceV1::PbsCache(BaselinePbsCacheSourceV1 {
@@ -1683,7 +1699,59 @@ mod tests {
     }
 
     #[test]
-    fn first_display_selection_derives_exact_slices_only_from_trusted_configuration() {
+    fn first_display_selection_derives_exact_permitted_slices_from_trusted_configuration() {
+        let creative_selected = select_first_display_slices_v1(
+            &first_display_projection(Some(adm_source())),
+            FirstDisplaySelectionConfigV1 {
+                enabled_integrations: &["creative", "gpt"],
+                creative: CreativeBootConfigV1 {
+                    enabled: true,
+                    click_guard: false,
+                    render_guard: true,
+                },
+            },
+        )
+        .expect("bounded creative/GPT configuration should select the agent");
+
+        assert_eq!(
+            creative_selected.slices(),
+            &["first_display", "creative_initial", "gpt_initial"]
+        );
+        assert_eq!(creative_selected.mask(), 0x0045);
+
+        let aps_selected = select_first_display_slices_v1(
+            &first_display_projection(Some(aps_source())),
+            FirstDisplaySelectionConfigV1 {
+                enabled_integrations: &["aps", "gpt"],
+                creative: CreativeBootConfigV1::default(),
+            },
+        )
+        .expect("bounded APS/GPT configuration should select the agent");
+        assert_eq!(
+            aps_selected.slices(),
+            &["first_display", "aps_initial", "gpt_initial"]
+        );
+        assert_eq!(aps_selected.mask(), 0x0043);
+
+        let mut prebid_projection = first_display_projection(Some(adm_source()));
+        prebid_projection.bids[0].provider = "prebid".to_owned();
+        let prebid_selected = select_first_display_slices_v1(
+            &prebid_projection,
+            FirstDisplaySelectionConfigV1 {
+                enabled_integrations: &["gpt", "prebid"],
+                creative: CreativeBootConfigV1::default(),
+            },
+        )
+        .expect("bounded Prebid/GPT configuration should select the agent");
+        assert_eq!(
+            prebid_selected.slices(),
+            &["first_display", "gpt_initial", "prebid_initial"]
+        );
+        assert_eq!(prebid_selected.mask(), 0x0841);
+    }
+
+    #[test]
+    fn first_display_selection_routes_an_over_budget_configuration_to_persistent_boot() {
         let enabled = [
             "aps",
             "creative",
@@ -1700,37 +1768,21 @@ mod tests {
         ];
         let mut projection = first_display_projection(Some(adm_source()));
         projection.bids[0].provider = "prebid".to_owned();
-        let selected = select_first_display_slices_v1(
-            &projection,
-            FirstDisplaySelectionConfigV1 {
-                enabled_integrations: &enabled,
-                creative: CreativeBootConfigV1 {
-                    enabled: true,
-                    click_guard: false,
-                    render_guard: true,
+        assert!(
+            select_first_display_slices_v1(
+                &projection,
+                FirstDisplaySelectionConfigV1 {
+                    enabled_integrations: &enabled,
+                    creative: CreativeBootConfigV1 {
+                        enabled: true,
+                        click_guard: false,
+                        render_guard: true,
+                    },
                 },
-            },
-        )
-        .expect("complete closed configuration should select the agent");
-
-        assert_eq!(
-            selected.slices(),
-            &[
-                "first_display",
-                "creative_initial",
-                "datadome_initial",
-                "didomi_initial",
-                "google_tag_manager_initial",
-                "gpt_initial",
-                "lockr_initial",
-                "osano_initial",
-                "permutive_initial",
-                "sourcepoint_initial",
-                "prebid_initial",
-                "testlight_initial",
-            ]
+            )
+            .is_none(),
+            "a closed but over-budget composition must boot persistent directly"
         );
-        assert_eq!(selected.mask(), 0x1ffd);
 
         let unknown = ["gpt", "publisher_supplied"];
         assert!(

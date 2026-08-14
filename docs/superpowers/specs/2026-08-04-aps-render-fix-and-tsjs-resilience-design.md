@@ -2204,6 +2204,18 @@ the persistent runtime commits. The protected load-time claim applies to the
 server-projected agent path; subsequent programmatic work remains correct but is not
 relabeled as that measurement.
 
+The release build independently enumerates all 2,560 reachable masks: the base is
+always present, GPT may be absent for a closed no-bid batch, and APS or Prebid
+participation requires GPT. It measures and hashes every reachable composition with
+the frozen raw/gzip/Brotli algorithms, then emits the exact ordered subset satisfying
+all three first-display ceilings as `permittedFirstDisplayMasks`. Server selection
+must be both semantically eligible and present in that generated allowlist. A closed
+but size-unadmitted configuration takes direct persistent boot; it is never served an
+oversized agent and the request path never calculates a new size or relaxes a limit.
+The minimal, exact five-slice reference, and exact APS-plus-default-creative masks are
+mandatory: failure to admit any of those three fails the release build rather than
+routing the named performance cases around the gate.
+
 The agent artifact has one base entry plus only these build-catalogued slices. A
 slice absent from this table cannot enter the artifact. “Initial” means the exact
 immutable batch; it does not authorize later work from the same product:
@@ -2573,7 +2585,7 @@ artifact's exact uncompressed UTF-8 bytes. The handler derives the enabled order
 first-display set from the validated mask plus trusted configuration, or the
 takeover/deferred catalog entry, recomputes the hash, and returns the current
 artifact only on an exact match. HTML composition chooses only a precomputed
-permitted mask from the immutable projection; the later static request never needs
+release-size-admitted mask from the immutable projection; the later static request never needs
 request-local projection state or a dynamic artifact cache. `HEAD` returns
 the same status and metadata as `GET` with an empty body. An unconditional success
 is `200`, `Content-Type: application/javascript; charset=utf-8`, and
@@ -3711,7 +3723,11 @@ subscription methods. The final schema is:
 ```ts
 type RenderTracePathV1 = 'auction' | 'ssat' | 'gam-refresh'
 type RenderTraceServedFromV1 =
-  'inline' | 'gam' | 'debug-adm' | 'pbs-cache' | 'prebid'
+  | 'inline'
+  | 'gam'
+  | 'debug-adm'
+  | 'pbs-cache'
+  | 'prebid'
 
 interface RenderTraceRecord {
   readonly slotId: string
@@ -4162,9 +4178,10 @@ datadome_initial]`; it does not include core or any persistent takeover module;
   `[first_display, creative_initial, aps_initial, gpt_initial]` and drives a real
   fictional APS/PUC contract fixture through the first request action;
 - **largest permitted first display** is the largest raw, gzip, and Brotli body
-  among every mask that trusted configuration can serve (the maximizing mask may
-  differ per encoding); the capture enumerates all permitted masks, hashes, sizes,
-  and slice membership rather than checking only the two named examples;
+  among the generated size-admitted masks that trusted configuration can serve (the
+  maximizing mask may differ per encoding); the capture enumerates all reachable
+  masks with their admission result, hashes, sizes, and slice membership rather than
+  checking only the two named examples;
 - **persistent runtime** is `[core]` plus all catalogued takeover modules for the
   reference configuration, served after protected paint; and
 - **maximal total** is every first-display base/slice, production core, takeover,
@@ -4219,9 +4236,11 @@ design rather than recapturing candidate history.
 The build emits one canonical release inventory with each production bundle's id,
 role, phase, trigger, inputs, outputs, bytes, and hash. Budget membership is derived
 from that catalog rather than an obsolete exact filename list. Candidate evidence
-stores the exact raw, gzip, and Brotli values for bootstrap, every permitted
-first-display mask (with named minimal/reference/APS/largest summaries), persistent
-runtime, and maximal. It is evidence for that candidate, not a self-created baseline.
+stores the exact raw, gzip, and Brotli values for bootstrap, every reachable
+first-display mask and its generated size-admission decision (with named
+minimal/reference/APS/largest summaries), persistent runtime, and maximal. The
+generated catalog allowlist must exactly equal the measured admitted subset. It is
+evidence for that candidate, not a self-created baseline.
 After the cutover lands, subsequent work still compares against the then-current
 `origin/main` and the same independent ceilings; no candidate-side capture becomes
 permanent authority merely by being checked in.
@@ -4596,7 +4615,7 @@ Tests must cover at least:
 - direct persistent boot for rewritten creative documents and direct `/auction`
   proves neither path selects an agent or waits for a nonexistent projected-attempt
   paint; direct timing/deferred release uses the persistent owner, while every
-  permitted agent mask—including GPT reference and APS—passes the exact size,
+  generated size-admitted agent mask—including GPT reference and APS—passes the exact size,
   source-reachability, action, terminal, and paint assertions;
 - first-display-required live GPT/Prebid fetch starting after `tsjs:bids-script` and
   overlapping the first-display TSJS fetch, upstream success before/after adapter
@@ -5014,9 +5033,10 @@ The design is complete when all of the following are true:
     exactly once in the release inventory, with the bootstrap role included once and
     every TSJS module included in maximal total.
 25. The oversized role-correct and mechanical-remediation captures remain immutable
-    report-only evidence. Every permitted first-display mask, including the named
+    report-only evidence. Every generated size-admitted first-display mask, including the named
     GPT-reference and APS masks, passes the 90,000/30,000/26,000 raw/gzip/Brotli
-    ceilings; bootstrap, persistent reference, and maximal total pass their
+    ceilings; all reachable masks are measured and any other closed configuration
+    selects direct persistent boot. Bootstrap, persistent reference, and maximal total pass their
     independent §5.12 ceilings; and the candidate's semantic pre-action transfer is
     no larger than a fresh current-main build in each encoding.
     Boot-to-first-display passes the automatic fixed-network-profile

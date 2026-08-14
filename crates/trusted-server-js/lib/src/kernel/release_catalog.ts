@@ -117,6 +117,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
       'first_display/leaf/projection',
       'first_display/render_bridge',
       'first_display/registration',
+      'first_display/registration_client',
       'first_display/transaction',
       'kernel/contracts/puc_dynamic_owner',
       'kernel/identity',
@@ -132,7 +133,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     include: 'aps_participates',
     allowedImports: [
       'first_display/contracts',
-      'first_display/registration',
+      'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/leaf/aps_protocol',
     ],
@@ -146,7 +147,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     include: 'creative_guard',
     allowedImports: [
       'first_display/contracts',
-      'first_display/registration',
+      'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/leaf/creative_guard',
     ],
@@ -160,7 +161,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     include: 'integration:datadome',
     allowedImports: [
       'first_display/contracts',
-      'first_display/registration',
+      'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/leaf/route_guard',
     ],
@@ -174,7 +175,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     include: 'integration:didomi',
     allowedImports: [
       'first_display/contracts',
-      'first_display/registration',
+      'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/leaf/config_guard',
     ],
@@ -188,7 +189,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     include: 'integration:google_tag_manager',
     allowedImports: [
       'first_display/contracts',
-      'first_display/registration',
+      'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/leaf/route_guard',
     ],
@@ -202,7 +203,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     include: 'gpt_initial',
     allowedImports: [
       'first_display/contracts',
-      'first_display/registration',
+      'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/adapters/googletag',
       'first_display/leaf/gpt_protocol',
@@ -217,7 +218,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     include: 'integration:lockr',
     allowedImports: [
       'first_display/contracts',
-      'first_display/registration',
+      'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/leaf/route_guard',
     ],
@@ -231,7 +232,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     include: 'integration:osano',
     allowedImports: [
       'first_display/contracts',
-      'first_display/registration',
+      'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/leaf/consent_snapshot',
     ],
@@ -245,7 +246,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     include: 'integration:permutive',
     allowedImports: [
       'first_display/contracts',
-      'first_display/registration',
+      'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/leaf/context_snapshot',
     ],
@@ -259,7 +260,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     include: 'integration:sourcepoint',
     allowedImports: [
       'first_display/contracts',
-      'first_display/registration',
+      'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/leaf/consent_snapshot',
     ],
@@ -273,7 +274,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     include: 'prebid_participates',
     allowedImports: [
       'first_display/contracts',
-      'first_display/registration',
+      'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/leaf/prebid_protocol',
     ],
@@ -288,7 +289,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     include: 'integration:testlight',
     allowedImports: [
       'first_display/contracts',
-      'first_display/registration',
+      'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/leaf/callback_capture',
     ],

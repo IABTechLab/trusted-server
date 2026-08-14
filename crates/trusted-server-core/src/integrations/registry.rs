@@ -874,6 +874,9 @@ fn first_display_static_transport_selections(
                 continue;
             }
             for prebid_participates in prebid_values {
+                if *prebid_participates && !gpt_participates {
+                    continue;
+                }
                 let mut mask = 0_u16;
                 let mut slices = Vec::new();
                 for (index, metadata) in trusted_server_js::all_first_display_metadata()
@@ -896,7 +899,9 @@ fn first_display_static_transport_selections(
                         slices.push(metadata.id);
                     }
                 }
-                if slices.first() == Some(&"first_display") {
+                if slices.first() == Some(&"first_display")
+                    && trusted_server_js::first_display_mask_is_permitted(mask)
+                {
                     selections.push((mask, slices));
                 }
             }
@@ -2610,14 +2615,7 @@ mod tests {
         let prebid = bit("prebid_initial");
         assert_eq!(
             masks,
-            vec![
-                fixed,
-                fixed | gpt,
-                fixed | gpt | aps,
-                fixed | prebid,
-                fixed | prebid | gpt,
-                fixed | prebid | gpt | aps,
-            ],
+            vec![fixed, fixed | gpt, fixed | gpt | aps, fixed | gpt | prebid],
             "registry should enumerate every permitted participation combination"
         );
         for mask in masks {

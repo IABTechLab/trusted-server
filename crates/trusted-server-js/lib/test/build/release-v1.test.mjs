@@ -826,6 +826,122 @@ test('bundle metrics use the required five-module reference vector', () => {
   ]);
 });
 
+test('bundle metrics enumerate and hash every reachable first-display mask', () => {
+  const { metrics } = readBuildEvidence();
+  const masks = metrics.firstDisplay.masks;
+
+  assert.ok(Array.isArray(masks));
+  assert.equal(masks.length, 2_560);
+  assert.equal(new Set(masks.map(({ mask }) => mask)).size, masks.length);
+  assert.equal(new Set(masks.map(({ sha256 }) => sha256)).size, masks.length);
+  for (const measurement of masks) {
+    assert.match(measurement.mask, /^[0-9a-f]{4}$/u);
+    assert.equal(measurement.ids[0], 'first_display');
+    if (!measurement.ids.includes('gpt_initial')) {
+      assert.equal(measurement.ids.includes('aps_initial'), false);
+      assert.equal(measurement.ids.includes('prebid_initial'), false);
+    }
+    assert.deepEqual(
+      measurement.files,
+      measurement.ids.map((id) => `tsjs-${id}.js`)
+    );
+    for (const size of ['rawBytes', 'gzipBytes', 'brotliBytes']) {
+      assert.ok(Number.isSafeInteger(measurement[size]) && measurement[size] > 0);
+    }
+    assert.equal(typeof measurement.permitted, 'boolean');
+    assert.match(measurement.sha256, /^[0-9a-f]{64}$/u);
+  }
+});
+
+test('candidate architecture obeys every independent absolute transfer ceiling', () => {
+  const { metrics, release, catalog } = readBuildEvidence();
+  const currentArtifactContents = new Map(
+    release.artifacts.map(({ file }) => [
+      file,
+      fs.readFileSync(path.resolve(libDirectory, '../dist', file)),
+    ])
+  );
+  const report = bundleBudgets.buildCandidateArchitectureSizeReport({
+    metrics,
+    release,
+    catalog,
+    currentArtifactContents,
+  });
+
+  assert.doesNotThrow(() => bundleBudgets.enforceCandidateArchitectureSizeCeilings(report));
+  assert.equal(report.firstDisplay.masks.length, 2_560);
+  assert.ok(report.firstDisplay.permittedMasks.length > 0);
+  assert.ok(report.firstDisplay.permittedMasks.length < report.firstDisplay.masks.length);
+  for (const name of ['minimal', 'reference', 'aps']) {
+    assert.equal(report.firstDisplay.named[name].permitted, true);
+  }
+  assert.deepEqual(report.firstDisplay.named.reference.ids, [
+    'first_display',
+    'creative_initial',
+    'datadome_initial',
+    'gpt_initial',
+    'prebid_initial',
+  ]);
+  assert.deepEqual(report.firstDisplay.named.aps.ids, [
+    'first_display',
+    'aps_initial',
+    'creative_initial',
+    'gpt_initial',
+  ]);
+  assert.deepEqual(Object.keys(report.firstDisplay.named), [
+    'minimal',
+    'reference',
+    'aps',
+    'largestRaw',
+    'largestGzip',
+    'largestBrotli',
+  ]);
+  assert.deepEqual(Object.keys(report.ceilings), [
+    'bootstrap',
+    'firstDisplayAgent',
+    'referencePersistent',
+    'maximalTotal',
+  ]);
+});
+
+test('absolute transfer ceilings reject independent one-byte regressions', () => {
+  const ceilings = bundleBudgets.CANDIDATE_ARCHITECTURE_SIZE_CEILINGS;
+  for (const semanticSet of Object.keys(ceilings)) {
+    for (const size of ['rawBytes', 'gzipBytes', 'brotliBytes']) {
+      const report = Object.fromEntries(
+        Object.entries(ceilings).map(([name, limits]) => [name, { ...limits }])
+      );
+      report[semanticSet][size] += 1;
+      assert.throws(
+        () => bundleBudgets.enforceCandidateArchitectureSizeCeilings(report),
+        new RegExp(`${semanticSet}\\.${size} exceeds`)
+      );
+    }
+  }
+});
+
+test('generated mask allowlist must exactly match size-admitted reachable masks', () => {
+  const { metrics, release, catalog } = readBuildEvidence();
+  const currentArtifactContents = new Map(
+    release.artifacts.map(({ file }) => [
+      file,
+      fs.readFileSync(path.resolve(libDirectory, '../dist', file)),
+    ])
+  );
+  catalog.permittedFirstDisplayMasks.pop();
+
+  assert.throws(
+    () =>
+      bundleBudgets.buildCandidateArchitectureSizeReport({
+        metrics,
+        release,
+        catalog,
+        currentArtifactContents,
+      }),
+    /generated permitted first-display masks/
+  );
+});
+
 test('bundle metrics has sole ownership of semantic transfer-set derivation', () => {
   const comparatorSource = fs.readFileSync(
     path.join(libDirectory, 'scripts/check-bundle-budgets.mjs'),
@@ -1710,6 +1826,14 @@ test('bundle check authenticates frozen captures and reports both without enforc
       }
     }
   }
+
+  const commandReport = bundleBudgets.summarizeBundleBudgetCommandReport(result);
+  assert.equal(commandReport.candidateArchitecture.firstDisplay.reachableMaskCount, 2_560);
+  assert.equal(
+    commandReport.candidateArchitecture.firstDisplay.permittedMaskCount,
+    result.candidateArchitecture.firstDisplay.permittedMasks.length
+  );
+  assert.equal(Object.hasOwn(commandReport.candidateArchitecture.firstDisplay, 'masks'), false);
 });
 
 test('critical render trace source is data-only and guarded against presentation regression', () => {
@@ -1738,6 +1862,13 @@ test('bundle budgets are exposed through the package and enforced after the CI b
   assert.ok(releaseStep > buildStep, 'release verification must run after the TSJS build');
   assert.ok(budgetStep > buildStep, 'bundle budget check must run after the TSJS build');
   assert.ok(budgetStep > releaseStep, 'bundle budget check must run after release verification');
+});
+
+test('Vitest bounds worker concurrency with the supported Vitest 4 option', () => {
+  const configSource = fs.readFileSync(path.join(libDirectory, 'vitest.config.ts'), 'utf8');
+
+  assert.doesNotMatch(configSource, /\bthreads\s*:\s*false\b/u);
+  assert.match(configSource, /\bmaxWorkers\s*:\s*2\b/u);
 });
 
 test('hard-cutover absence is exposed once and enforced after both production builds', () => {

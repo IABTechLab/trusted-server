@@ -156,7 +156,7 @@ function member(value: unknown, key: PropertyKey): unknown {
 
 function call(receiver: unknown, key: PropertyKey, arguments_: readonly unknown[]): unknown {
   const callable = member(receiver, key);
-  if (typeof callable !== 'function') throw new TypeError(`missing GPT method: ${String(key)}`);
+  if (typeof callable !== 'function') throw new TypeError('tsjs');
   return Reflect.apply(callable, receiver, arguments_);
 }
 
@@ -478,12 +478,12 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
   ): void {
     if (this.disposed || this.binding !== binding) return;
     const service = externalObject(call(binding, 'pubads', []));
-    if (!service) throw new TypeError('invalid GPT pubads service');
+    if (!service) throw new TypeError('tsjs');
     this.service = service;
     this.observePublisherCalls(binding, service);
     this.installListeners(service, callbacks);
     const existing = call(service, 'getSlots', []);
-    if (!Array.isArray(existing)) throw new TypeError('invalid GPT slot inventory');
+    if (!Array.isArray(existing)) throw new TypeError('tsjs');
     const disabled = initialLoadDisabled(binding);
 
     for (const row of rows) {
@@ -593,7 +593,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
             );
             if (!this.firstAction) {
               this.firstAction = true;
-              if (!callbacks.onFirstAction()) throw new TypeError('first action rejected');
+              if (!callbacks.onFirstAction()) throw new TypeError('tsjs');
             }
           }
           if (operation === 'display') call(binding, 'display', [cycle.elementId]);
@@ -718,7 +718,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
   private journalPublisherTargeting(slot: object, key: string, installed: string): void {
     const original = call(slot, 'getTargeting', [key]);
     if (!Array.isArray(original) || !original.every((value) => typeof value === 'string')) {
-      throw new TypeError('invalid GPT targeting inventory');
+      throw new TypeError('tsjs');
     }
     this.targetingRestorers.push({
       installed,
@@ -735,7 +735,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     try {
       for (const key of ['setTargeting', 'clearTargeting'] as const) {
         const original = member(slot, key);
-        if (typeof original !== 'function') throw new TypeError(`missing GPT method: ${key}`);
+        if (typeof original !== 'function') throw new TypeError('tsjs');
         const prior = Object.getOwnPropertyDescriptor(slot, key);
         const invalidateTargeting = (targetingKey: string | undefined): void =>
           this.invalidateTargeting(slot, targetingKey);
@@ -759,7 +759,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
             writable: true,
           })
         ) {
-          throw new TypeError(`cannot observe GPT method: ${key}`);
+          throw new TypeError('tsjs');
         }
         restorers.push(() => {
           const current = Object.getOwnPropertyDescriptor(slot, key);
@@ -803,7 +803,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
             writable: true,
           })
         ) {
-          throw new TypeError(`cannot observe GPT method: ${key}`);
+          throw new TypeError('tsjs');
         }
         installed.push(() => {
           const current = Object.getOwnPropertyDescriptor(receiver, key);

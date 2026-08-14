@@ -103,6 +103,12 @@ pub fn all_first_display_ids() -> Vec<&'static str> {
         .collect()
 }
 
+/// Return whether the generated release admits this exact mask under every size ceiling.
+#[must_use]
+pub fn first_display_mask_is_permitted(mask: u16) -> bool {
+    PERMITTED_FIRST_DISPLAY_MASKS.binary_search(&mask).is_ok()
+}
+
 /// Return all catalogued integration IDs in canonical phase/injection order.
 #[must_use]
 pub fn all_integration_ids() -> Vec<&'static str> {

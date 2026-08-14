@@ -1,9 +1,6 @@
 import type { FirstDisplaySliceActivationContext } from '../transaction';
 import type { FirstDisplaySliceId } from '../../kernel/release_catalog';
-import {
-  firstDisplayComponentRegistration,
-  registerCurrentFirstDisplayComponent,
-} from '../registration';
+import { registerCurrentFirstDisplayComponent } from '../registration_client';
 
 export type OptionalFirstDisplaySliceId = Exclude<FirstDisplaySliceId, 'first_display'>;
 
@@ -29,28 +26,6 @@ export interface InitialSliceDefinition {
   readonly prepare: (host: FirstDisplaySliceHost) => PreparedInitialSlice;
 }
 
-function validHost(host: FirstDisplaySliceHost): boolean {
-  try {
-    if (
-      typeof host !== 'object' ||
-      host === null ||
-      Array.isArray(host) ||
-      Object.getPrototypeOf(host) !== Object.prototype ||
-      !Object.isFrozen(host)
-    ) {
-      return false;
-    }
-    const keys = Reflect.ownKeys(host);
-    if (keys.length !== 1 || keys[0] !== 'activate') return false;
-    const descriptor = Object.getOwnPropertyDescriptor(host, 'activate');
-    return Boolean(
-      descriptor?.enumerable && 'value' in descriptor && typeof descriptor.value === 'function'
-    );
-  } catch {
-    return false;
-  }
-}
-
 /** Define one release-owned initial slice without importing a persistent product owner. */
 export function defineInitialSlice(
   id: OptionalFirstDisplaySliceId,
@@ -59,7 +34,6 @@ export function defineInitialSlice(
   return Object.freeze({
     id,
     prepare: (host: FirstDisplaySliceHost): PreparedInitialSlice => {
-      if (!validHost(host)) throw new TypeError(`Invalid ${id} host`);
       return Object.freeze({
         activate: (context: FirstDisplaySliceActivationContext): void => {
           host.activate(id, context.own, install);
@@ -74,9 +48,7 @@ export function registerInitialSlice(
   definition: InitialSliceDefinition,
   absoluteCatalogOrder: number
 ): boolean {
-  return registerCurrentFirstDisplayComponent(
-    firstDisplayComponentRegistration(definition.id, absoluteCatalogOrder, (host) =>
-      definition.prepare(host as FirstDisplaySliceHost)
-    )
+  return registerCurrentFirstDisplayComponent(definition.id, absoluteCatalogOrder, (host) =>
+    definition.prepare(host as FirstDisplaySliceHost)
   );
 }

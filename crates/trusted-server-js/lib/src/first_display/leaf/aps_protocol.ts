@@ -154,7 +154,7 @@ export function installApsInitial(
   own: FirstDisplaySliceActivationContext['own']
 ): Readonly<{ version: 1; id: 'aps' }> {
   const value = bindings(candidate);
-  if (!value || typeof own !== 'function') throw new TypeError('invalid APS initial bindings');
+  if (!value || typeof own !== 'function') throw new TypeError('tsjs');
   const rendererUrl = new URL('/integrations/aps/renderer/v1', value.publisherOrigin).href;
   const protocol: FirstDisplayApsProtocolV1 = Object.freeze({
     version: 1,
@@ -174,7 +174,7 @@ export function installApsInitial(
     parseDocumentMessage,
   });
   const release = value.register(protocol);
-  if (typeof release !== 'function') throw new TypeError('invalid APS protocol disposer');
+  if (typeof release !== 'function') throw new TypeError('tsjs');
   own(release);
   value.observe('protocol_version', 1);
   return Object.freeze({ version: 1, id: 'aps' });

@@ -76,12 +76,12 @@ interface Attempt {
   gam: FirstDisplayGptRenderResult | undefined;
   inserted: boolean;
   insertionTimer: unknown;
-  lifecycleTicket: string | undefined;
-  nonce: string | undefined;
+  ownerTicket: string | undefined;
+  rendererNonce: string | undefined;
   ownerSource: object | undefined;
   pendingDocumentTerminal:
     'completed' | 'descriptor_invalid' | 'runner_no_load' | 'runner_failed' | undefined;
-  state:
+  phaseValue:
     | 'waiting_for_gam_and_claim'
     | 'waiting_for_owner'
     | 'waiting_for_insertion'
@@ -91,25 +91,25 @@ interface Attempt {
 
 interface LiveTicket {
   readonly attempt: Attempt;
-  readonly expiresAt: number;
-  readonly ordinal: number;
-  readonly state: 'live';
+  readonly expiresAtInternal: number;
+  readonly ordinalInternal: number;
+  readonly registryState: 'live';
   timer?: unknown;
 }
 
 interface TicketTombstone {
-  readonly expiresAt: number;
-  readonly ordinal: number;
-  readonly state: 'tombstone';
+  readonly expiresAtInternal: number;
+  readonly ordinalInternal: number;
+  readonly registryState: 'tombstone';
   timer?: unknown;
 }
 
 type TicketEntry = LiveTicket | TicketTombstone;
 
 interface ReservationEntry {
-  readonly expiresAt: number;
-  readonly ordinal: number;
-  readonly state: 'live' | 'tombstone';
+  readonly expiresAtInternal: number;
+  readonly ordinalInternal: number;
+  readonly registryState: 'live' | 'tombstone';
 }
 
 function utf8Length(value: string): number {
@@ -663,11 +663,11 @@ export function createFirstDisplayRenderBridge(
     attempt.ticket = undefined;
     if (!ticket) return;
     const entry = tickets.get(ticket);
-    if (entry?.state !== 'live' || entry.attempt !== attempt) return;
+    if (entry?.registryState !== 'live' || entry.attempt !== attempt) return;
     tickets.set(ticket, {
-      state: 'tombstone',
-      expiresAt: entry.expiresAt,
-      ordinal: entry.ordinal,
+      registryState: 'tombstone',
+      expiresAtInternal: entry.expiresAtInternal,
+      ordinalInternal: entry.ordinalInternal,
       timer: entry.timer,
     });
     notifyNativeMutation();
@@ -675,11 +675,11 @@ export function createFirstDisplayRenderBridge(
 
   const retireReservation = (attempt: Attempt): void => {
     const entry = reservations.get(attempt.reservationId);
-    if (entry?.state !== 'live') return;
+    if (entry?.registryState !== 'live') return;
     reservations.set(attempt.reservationId, {
-      expiresAt: entry.expiresAt,
-      ordinal: entry.ordinal,
-      state: 'tombstone',
+      expiresAtInternal: entry.expiresAtInternal,
+      ordinalInternal: entry.ordinalInternal,
+      registryState: 'tombstone',
     });
     notifyNativeMutation();
   };
@@ -706,8 +706,10 @@ export function createFirstDisplayRenderBridge(
     attempt.controlPort = undefined;
     attempt.documentPort = undefined;
     attempt.documentTransferred = undefined;
-    if (attempt.nonce && nonces.get(attempt.nonce) === attempt) nonces.delete(attempt.nonce);
-    attempt.nonce = undefined;
+    if (attempt.rendererNonce && nonces.get(attempt.rendererNonce) === attempt) {
+      nonces.delete(attempt.rendererNonce);
+    }
+    attempt.rendererNonce = undefined;
     retireTicket(attempt);
     retireReservation(attempt);
     attempts.delete(attempt.reservationId);
@@ -730,11 +732,11 @@ export function createFirstDisplayRenderBridge(
   ): boolean => {
     if (!attempt.active) return false;
     attempt.active = false;
-    if (attempt.controlPort && attempt.lifecycleTicket) {
+    if (attempt.controlPort && attempt.ownerTicket) {
       const settlement: Record<string, unknown> = {
         message: 'TS Owner Settled',
         version: 1,
-        lifecycleTicket: attempt.lifecycleTicket,
+        lifecycleTicket: attempt.ownerTicket,
         outcome: result,
       };
       if (result !== 'accepted') settlement.reason = reason;
@@ -774,17 +776,17 @@ export function createFirstDisplayRenderBridge(
   };
 
   const issueNonce = (attempt: Attempt): string | undefined => {
-    if (nonces.size >= MAX_NONCES || attempt.nonce) return undefined;
+    if (nonces.size >= MAX_NONCES || attempt.rendererNonce) return undefined;
     const nonce = mint('n1_', nonces);
     if (!nonce || !NONCE_ID.test(nonce)) return undefined;
     nonces.set(nonce, attempt);
-    attempt.nonce = nonce;
+    attempt.rendererNonce = nonce;
     return nonce;
   };
 
   const handleApsDocument = (attempt: Attempt, event: unknown): void => {
     const aps = apsProtocol();
-    if (!attempt.active || !attempt.nonce || !aps) return;
+    if (!attempt.active || !attempt.rendererNonce || !aps) return;
     const inspection = inspectPorts(event, messageEventPrototype);
     if (!inspection?.exact || inspection.originalCount !== 0 || inspection.ports.length !== 0) {
       fail(attempt, attempt.documentAccepted ? 'runner_failed' : 'renderer_document_no_load');
@@ -792,7 +794,7 @@ export function createFirstDisplayRenderBridge(
     }
     const parsed = aps.parseDocumentMessage(
       eventField(event, 'data', messageEventPrototype),
-      attempt.nonce
+      attempt.rendererNonce
     );
     if (!parsed) {
       fail(attempt, attempt.documentAccepted ? 'runner_failed' : 'renderer_document_no_load');
@@ -849,7 +851,7 @@ export function createFirstDisplayRenderBridge(
         ADM_LOAD_DEADLINE_MS
       );
     } else if (attempt.documentAcceptancePending) {
-      const nonce = attempt.nonce;
+      const nonce = attempt.rendererNonce;
       if (nonce) {
         handleApsDocument(attempt, {
           data: { message: 'TS APS Document Accepted', version: 1, nonce },
@@ -873,7 +875,7 @@ export function createFirstDisplayRenderBridge(
       return;
     }
     const data = eventField(event, 'data', messageEventPrototype);
-    const ticket = attempt.lifecycleTicket;
+    const ticket = attempt.ownerTicket;
     const inserted = exactRecord(data, ['message', 'version', 'lifecycleTicket']);
     if (
       inserted?.message === 'TS Owner Inserted' &&
@@ -910,7 +912,7 @@ export function createFirstDisplayRenderBridge(
 
   const startOwner = (attempt: Attempt): boolean => {
     const controlPort = attempt.controlPort;
-    const ticket = attempt.lifecycleTicket;
+    const ticket = attempt.ownerTicket;
     if (!controlPort || !ticket || !attempt.active) return false;
     const aps = apsProtocol();
     attempt.insertionTimer = arm(
@@ -978,7 +980,7 @@ export function createFirstDisplayRenderBridge(
       if (responsePort) post(responsePort, ownerRefused(routing.adId ?? ''));
       for (const port of inspection?.ports ?? []) closePort(port);
     };
-    if (entry.state !== 'live') {
+    if (entry.registryState !== 'live') {
       refuse();
       return;
     }
@@ -994,7 +996,7 @@ export function createFirstDisplayRenderBridge(
       exact.lifecycleTicket !== ticket ||
       eventSource(event, messageEventPrototype) !== attempt.ownerSource ||
       !attempt.active ||
-      attempt.state !== 'waiting_for_owner'
+      attempt.phaseValue !== 'waiting_for_owner'
     ) {
       refuse();
       if (attempt.active) fail(attempt, 'bridge_id_mismatch');
@@ -1010,7 +1012,7 @@ export function createFirstDisplayRenderBridge(
       fail(attempt, 'internal_error');
       return;
     }
-    attempt.lifecycleTicket = ticket;
+    attempt.ownerTicket = ticket;
     attempt.controlPort = channel.port1;
     attempt.controlRelease = listen(
       channel.port1,
@@ -1021,7 +1023,7 @@ export function createFirstDisplayRenderBridge(
           attempt.cycle.bid.renderSource.type === 'adm' ? 'adm_document_no_load' : 'internal_error'
         )
     );
-    attempt.state = 'waiting_for_insertion';
+    attempt.phaseValue = 'waiting_for_insertion';
     const registered = JSON.stringify({
       message: 'TS Render Owner Registered',
       adId: attempt.reservationId,
@@ -1048,7 +1050,12 @@ export function createFirstDisplayRenderBridge(
     const expiresAt = issuedAt + TICKET_TTL_MS;
     const ordinal = nextTicketOrdinal;
     nextTicketOrdinal += 1;
-    const entry: LiveTicket = { state: 'live', attempt, expiresAt, ordinal };
+    const entry: LiveTicket = {
+      registryState: 'live',
+      attempt,
+      expiresAtInternal: expiresAt,
+      ordinalInternal: ordinal,
+    };
     tickets.set(ticket, entry);
     attempt.ticket = ticket;
     entry.timer = arm(() => {
@@ -1056,9 +1063,9 @@ export function createFirstDisplayRenderBridge(
       if (current !== entry) {
         const observedAt = readNow();
         if (
-          current?.state === 'tombstone' &&
+          current?.registryState === 'tombstone' &&
           observedAt !== undefined &&
-          current.expiresAt <= observedAt
+          current.expiresAtInternal <= observedAt
         ) {
           tickets.delete(ticket);
           notifyNativeMutation();
@@ -1084,7 +1091,7 @@ export function createFirstDisplayRenderBridge(
       !attempt.active ||
       !claim ||
       attempt.gam !== 'nonempty_gam' ||
-      attempt.state !== 'waiting_for_gam_and_claim'
+      attempt.phaseValue !== 'waiting_for_gam_and_claim'
     ) {
       return false;
     }
@@ -1113,7 +1120,7 @@ export function createFirstDisplayRenderBridge(
       return false;
     }
     attempt.ownerSource = claim.source;
-    attempt.state = 'waiting_for_owner';
+    attempt.phaseValue = 'waiting_for_owner';
     retireReservation(attempt);
     const source = attempt.cycle.bid.renderSource;
     resizeCollapsedPucShell(options.document, claim.source, source.width, source.height);
@@ -1195,7 +1202,7 @@ export function createFirstDisplayRenderBridge(
         () =>
           fail(attempt, attempt.documentAccepted ? 'runner_failed' : 'renderer_document_no_load')
       );
-      if (!attempt.documentRelease) throw new Error('document listener unavailable');
+      if (!attempt.documentRelease) throw new Error('tsjs');
       frame.onload = () => {
         if (
           !attempt.active ||
@@ -1245,7 +1252,7 @@ export function createFirstDisplayRenderBridge(
   };
 
   const renderDirectFallback = (attempt: Attempt): boolean => {
-    attempt.state = 'rendering_direct';
+    attempt.phaseValue = 'rendering_direct';
     retireReservation(attempt);
     const claim = attempt.claim;
     attempt.claim = undefined;
@@ -1279,7 +1286,7 @@ export function createFirstDisplayRenderBridge(
       for (const port of inspection?.ports ?? []) closePort(port);
     };
     if (
-      reservationState.state !== 'live' ||
+      reservationState.registryState !== 'live' ||
       !inspection?.exact ||
       inspection.originalCount !== 1 ||
       inspection.ports.length !== 1 ||
@@ -1294,7 +1301,7 @@ export function createFirstDisplayRenderBridge(
     const source = eventSource(event, messageEventPrototype);
     if (
       !attempt?.active ||
-      attempt.state !== 'waiting_for_gam_and_claim' ||
+      attempt.phaseValue !== 'waiting_for_gam_and_claim' ||
       attempt.claim ||
       !source
     ) {
@@ -1308,7 +1315,7 @@ export function createFirstDisplayRenderBridge(
   try {
     options.browser.addEventListener('message', dispatch as EventListener, true);
   } catch {
-    throw new TypeError('first-display bridge listener installation failed');
+    throw new TypeError('tsjs');
   }
 
   return Object.freeze({
@@ -1356,20 +1363,20 @@ export function createFirstDisplayRenderBridge(
         gam: undefined,
         inserted: false,
         insertionTimer: undefined,
-        lifecycleTicket: undefined,
-        nonce: undefined,
+        ownerTicket: undefined,
+        rendererNonce: undefined,
         onTerminal,
         ownerSource: undefined,
         pendingDocumentTerminal: undefined,
         reservationId: cycle.bid.rendererReservationId,
-        state: 'waiting_for_gam_and_claim',
+        phaseValue: 'waiting_for_gam_and_claim',
         ticket: undefined,
       };
       attempts.set(attempt.reservationId, attempt);
       reservations.set(attempt.reservationId, {
-        expiresAt,
-        ordinal: reservationOrdinal,
-        state: 'live',
+        expiresAtInternal: expiresAt,
+        ordinalInternal: reservationOrdinal,
+        registryState: 'live',
       });
       nextReservationOrdinal += 1;
       return true;
@@ -1383,7 +1390,7 @@ export function createFirstDisplayRenderBridge(
         !attempt?.active ||
         attempt.cycle !== cycle ||
         attempt.gam ||
-        attempt.state !== 'waiting_for_gam_and_claim'
+        attempt.phaseValue !== 'waiting_for_gam_and_claim'
       ) {
         return false;
       }
@@ -1401,7 +1408,7 @@ export function createFirstDisplayRenderBridge(
     },
     sealTsAdmission: (): void => {
       if (disposed || [...attempts.values()].some((attempt) => attempt.active)) {
-        throw new TypeError('live first-display render authority');
+        throw new TypeError('tsjs');
       }
       sealed = true;
     },
@@ -1430,27 +1437,27 @@ export function createFirstDisplayRenderBridge(
       const reservationTombstones = [...reservations.entries()]
         .filter((entry): entry is [string, ReservationEntry] => {
           const value = entry[1];
-          return value.state === 'tombstone' && value.expiresAt > observedAt;
+          return value.registryState === 'tombstone' && value.expiresAtInternal > observedAt;
         })
         .map(([value, entry]) =>
           Object.freeze({
             kind: 'reservation' as const,
             value,
-            expiresAtMs: entry.expiresAt,
-            ordinal: entry.ordinal,
+            expiresAtMs: entry.expiresAtInternal,
+            ordinal: entry.ordinalInternal,
           })
         );
       const ticketTombstones = [...tickets.entries()]
         .filter((entry): entry is [string, TicketTombstone] => {
           const value = entry[1];
-          return value.state === 'tombstone' && value.expiresAt > observedAt;
+          return value.registryState === 'tombstone' && value.expiresAtInternal > observedAt;
         })
         .map(([value, entry]) =>
           Object.freeze({
             kind: 'ticket' as const,
             value,
-            expiresAtMs: entry.expiresAt,
-            ordinal: entry.ordinal,
+            expiresAtMs: entry.expiresAtInternal,
+            ordinal: entry.ordinalInternal,
           })
         );
       const artifacts = [...committedFrames.entries()].map(([slotId, entry]) =>
