@@ -255,6 +255,7 @@ pub struct ProviderPlan {
 #[derive(Debug, Clone)]
 pub struct AuctionPlan {
     enabled: bool,
+    timeout_ms: u32,
     providers: Vec<ProviderPlan>,
     bidder_routes: BTreeMap<BidderId, usize>,
     signing_enabled: bool,
@@ -355,6 +356,7 @@ impl AuctionPlan {
         }
         Ok(Self {
             enabled: true,
+            timeout_ms: config.timeout_ms,
             providers,
             bidder_routes,
             signing_enabled,
@@ -424,18 +426,33 @@ impl AuctionPlan {
             )));
         }
 
+        let naming_policy = target.naming_policy();
+        let backend_budget = naming_policy.auction_dynamic_backend_budget();
+        let mut required_backend_names = 0_usize;
         let mut predicted_names = BTreeMap::<String, &ProviderId>::new();
         for provider in &self.providers {
+            let reachable_timeout_ms = provider.timeout_ms.min(self.timeout_ms);
+            required_backend_names = required_backend_names
+                .saturating_add(naming_policy.transport_timeout_bucket_count(reachable_timeout_ms));
+            if let Some(budget) = backend_budget
+                && required_backend_names > budget
+            {
+                return Err(configuration_error(format!(
+                    "auction target `{}` requires up to {required_backend_names} dynamic provider backends, exceeding its auction budget of {budget}",
+                    target_id.adapter_id(),
+                )));
+            }
             let spec = provider.backend_spec();
-            let prediction = target.naming_policy().predict(&spec).change_context(
-                TrustedServerError::Configuration {
-                    message: format!(
-                        "provider `{}` backend prediction failed for target `{}`",
-                        provider.id,
-                        target_id.adapter_id()
-                    ),
-                },
-            )?;
+            let prediction =
+                naming_policy
+                    .predict(&spec)
+                    .change_context(TrustedServerError::Configuration {
+                        message: format!(
+                            "provider `{}` backend prediction failed for target `{}`",
+                            provider.id,
+                            target_id.adapter_id()
+                        ),
+                    })?;
             if let Some(existing) = predicted_names.insert(prediction.name.clone(), &provider.id) {
                 return Err(configuration_error(format!(
                     "providers `{existing}` and `{}` predict the same backend name `{}` for target `{}`",
@@ -690,6 +707,87 @@ mod tests {
     }
 
     #[test]
+    fn fastly_target_validation_canonicalizes_url_derived_ipv6_prediction() {
+        let mut ipv6_provider = provider("standard");
+        ipv6_provider.endpoint = "https://[2001:db8::5]:8443/openrtb".to_string();
+        ipv6_provider.timeout_ms = Some(750);
+        let plan = AuctionPlan::compile(config(BTreeMap::from([(
+            id("ipv6-provider"),
+            ipv6_provider,
+        )])))
+        .expect("should compile IPv6 provider plan");
+
+        plan.validate_for_target(crate::platform::AuctionTargetId::Fastly)
+            .expect("Fastly target validation should accept canonical IPv6 prediction");
+        let bracketed_spec = plan.providers()[0].backend_spec();
+        assert_eq!(bracketed_spec.host, "[2001:db8::5]");
+        let mut bare_spec = bracketed_spec.clone();
+        bare_spec.host = "2001:db8::5".to_string();
+        let policy = crate::platform::BackendNamingPolicy::Fastly;
+        assert_eq!(
+            policy
+                .predict(&bracketed_spec)
+                .expect("should predict URL-derived bracketed IPv6 backend"),
+            policy
+                .predict(&bare_spec)
+                .expect("should predict runtime-normalized bare IPv6 backend"),
+            "startup target validation and Fastly runtime must hash the same backend spec"
+        );
+    }
+
+    #[test]
+    fn fastly_target_validation_reserves_dynamic_backends_outside_auction() {
+        let plan_with = |count: usize| {
+            let providers = (0..count)
+                .map(|index| {
+                    let mut provider = provider("standard");
+                    provider.timeout_ms = Some(1000);
+                    (id(&format!("provider-{index}")), provider)
+                })
+                .collect();
+            AuctionPlan::compile(config(providers)).expect("should compile provider plan")
+        };
+
+        plan_with(19)
+            .validate_for_target(crate::platform::AuctionTargetId::Fastly)
+            .expect("below-budget provider plan should validate");
+        plan_with(20)
+            .validate_for_target(crate::platform::AuctionTargetId::Fastly)
+            .expect("at-budget provider plan should validate");
+        let error = plan_with(21)
+            .validate_for_target(crate::platform::AuctionTargetId::Fastly)
+            .expect_err("over-budget provider plan should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeding its auction budget of 160")
+        );
+    }
+
+    #[test]
+    fn fastly_backend_quota_uses_auction_timeout_as_reachable_bucket_ceiling() {
+        let providers = (0..21)
+            .map(|index| {
+                let mut provider = provider("standard");
+                provider.timeout_ms = Some(1000);
+                (id(&format!("provider-{index}")), provider)
+            })
+            .collect();
+        let mut bounded = config(providers);
+        bounded.timeout_ms = 100;
+        let plan = AuctionPlan::compile(bounded).expect("should compile bounded provider plan");
+
+        assert!(
+            plan.providers()
+                .iter()
+                .all(|provider| provider.timeout_ms == 1000),
+            "quota validation must not rewrite configured provider timeouts"
+        );
+        plan.validate_for_target(crate::platform::AuctionTargetId::Fastly)
+            .expect("21 providers reach only the 50ms and 100ms Fastly buckets");
+    }
+
+    #[test]
     fn disabled_target_validation_skips_fanout_and_collision_checks() {
         let providers = BTreeMap::from([
             (id("provider-one"), provider("standard")),
@@ -711,6 +809,7 @@ mod tests {
         let provider = disabled.providers[0].clone();
         let disabled_collision = AuctionPlan {
             enabled: false,
+            timeout_ms: disabled.timeout_ms,
             providers: vec![provider.clone(), provider],
             bidder_routes: BTreeMap::new(),
             signing_enabled: false,
@@ -755,6 +854,7 @@ mod tests {
         // collision rejection independently of compiler invariants.
         let collision_plan = AuctionPlan {
             enabled: true,
+            timeout_ms: compiled.timeout_ms,
             providers: vec![provider.clone(), provider],
             bidder_routes: BTreeMap::new(),
             signing_enabled: false,

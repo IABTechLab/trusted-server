@@ -146,8 +146,7 @@ exchange in that provider's summary returned by `POST /auction`:
 }
 ```
 
-This follows the Prebid Server `metadata.debug.httpcalls` representation. APS makes one direct HTTP call per provider per auction, so the map uses the
-configured provider ID (for example, `aps-main`) with one entry. Request and captured response bodies are strings, and header values are arrays so repeated headers are preserved. If a non-success response body cannot be read within the existing 2 MiB upstream limit, `responsebody` is omitted rather than reported as an empty body. APS does not add PBS-only `resolvedrequest` or `bidstatus` fields.
+This follows the Prebid Server `metadata.debug.httpcalls` representation. APS makes one direct HTTP call per provider per auction, and the map preserves the legacy `aps` key with one entry. Request and captured response bodies are strings, and header values are arrays so repeated headers are preserved. If a non-success response body cannot be read within the existing 2 MiB upstream limit, `responsebody` is omitted rather than reported as an empty body. APS does not add PBS-only `resolvedrequest` or `bidstatus` fields.
 
 The debug exchange is emitted for successful responses, `204 No Content`, malformed response bodies, and non-success HTTP statuses. Transport failures and auction timeouts happen before an HTTP response reaches the parser and continue to use the orchestrator's normal error metadata.
 
@@ -284,8 +283,8 @@ Use fictional values in source-controlled configuration and fixtures. Supply con
 - Check aggregate APS drop reasons for currency, dimensions, render source, URL, tag type, or script-gate rejection.
 - Confirm the provider timeout fits inside the auction timeout.
 - On a controlled test site, set profile `debug = true` and inspect
-  `ext.orchestrator.provider_details[].metadata.debug.httpcalls.<provider-id>` in
-  the `/auction` response.
+  `ext.orchestrator.provider_details[].metadata.debug.httpcalls.aps` in the
+  `/auction` response.
 
 ### Winner targets but does not render
 

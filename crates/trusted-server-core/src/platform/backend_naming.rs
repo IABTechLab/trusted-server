@@ -20,6 +20,8 @@ const FASTLY_TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS: u32 = 2000;
 const FASTLY_SUB_QUANTUM_LADDER_MS: [u32; 4] = [200, 150, 100, 50];
 const FASTLY_TRANSPORT_TIMEOUT_COARSE_LADDER_MS: [u32; 8] =
     [2000, 3000, 5000, 10000, 20000, 30000, 45000, 60000];
+const FASTLY_DYNAMIC_BACKEND_LIMIT: usize = 200;
+const FASTLY_NON_AUCTION_BACKEND_RESERVE: usize = 40;
 
 /// A pure backend-name and transport-timeout policy for one adapter.
 ///
@@ -98,6 +100,46 @@ impl BackendNamingPolicy {
             Self::Fastly => canonicalize_fastly_transport_timeout_ms(remaining_ms, configured_ms),
             Self::Axum | Self::Cloudflare | Self::Spin => remaining_ms.min(configured_ms),
         }
+    }
+
+    /// Return the target-specific backend-name budget available to auction providers.
+    #[must_use]
+    pub(crate) fn auction_dynamic_backend_budget(self) -> Option<usize> {
+        matches!(self, Self::Fastly).then_some(
+            FASTLY_DYNAMIC_BACKEND_LIMIT.saturating_sub(FASTLY_NON_AUCTION_BACKEND_RESERVE),
+        )
+    }
+
+    /// Count every transport-timeout bucket one provider can reach.
+    #[must_use]
+    pub(crate) fn transport_timeout_bucket_count(self, configured_ms: u32) -> usize {
+        if !matches!(self, Self::Fastly) || configured_ms == 0 {
+            return 1;
+        }
+        let mut buckets = std::collections::BTreeSet::new();
+        buckets.insert(configured_ms);
+        for remaining_ms in FASTLY_SUB_QUANTUM_LADDER_MS {
+            let timeout = self.canonicalize_transport_timeout_ms(remaining_ms, configured_ms);
+            if timeout > 0 {
+                buckets.insert(timeout);
+            }
+        }
+        for remaining_ms in (FASTLY_TRANSPORT_TIMEOUT_QUANTUM_MS
+            ..FASTLY_TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS)
+            .step_by(FASTLY_TRANSPORT_TIMEOUT_QUANTUM_MS as usize)
+        {
+            let timeout = self.canonicalize_transport_timeout_ms(remaining_ms, configured_ms);
+            if timeout > 0 {
+                buckets.insert(timeout);
+            }
+        }
+        for remaining_ms in FASTLY_TRANSPORT_TIMEOUT_COARSE_LADDER_MS {
+            let timeout = self.canonicalize_transport_timeout_ms(remaining_ms, configured_ms);
+            if timeout > 0 {
+                buckets.insert(timeout);
+            }
+        }
+        buckets.len()
     }
 }
 
@@ -252,6 +294,13 @@ fn sanitize_fastly_component(value: &str) -> String {
         .collect()
 }
 
+fn canonical_fastly_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .filter(|value| value.parse::<std::net::Ipv6Addr>().is_ok())
+        .unwrap_or(host)
+}
+
 fn fastly_canonical_spec(spec: &PlatformBackendSpec, target_port: u16) -> String {
     fn push_field(buffer: &mut String, field: &str) {
         buffer.push_str(&field.len().to_string());
@@ -261,7 +310,7 @@ fn fastly_canonical_spec(spec: &PlatformBackendSpec, target_port: u16) -> String
 
     let mut buffer = String::new();
     push_field(&mut buffer, &spec.scheme);
-    push_field(&mut buffer, &spec.host);
+    push_field(&mut buffer, canonical_fastly_host(&spec.host));
     push_field(&mut buffer, &target_port.to_string());
     push_field(&mut buffer, if spec.certificate_check { "1" } else { "0" });
     match spec.host_header_override.as_deref() {
@@ -325,7 +374,12 @@ fn predict_fastly(
     let port = spec
         .port
         .unwrap_or_else(|| default_port(&spec.scheme, true));
-    let name_base = format!("{}_{}_{}", spec.scheme, spec.host, port);
+    let name_base = format!(
+        "{}_{}_{}",
+        spec.scheme,
+        canonical_fastly_host(&spec.host),
+        port
+    );
     let host_override_suffix = spec
         .host_header_override
         .as_deref()
@@ -503,6 +557,41 @@ mod tests {
                 .expect("should predict Spin backend"),
             no_registration
         );
+    }
+
+    #[test]
+    fn fastly_prediction_canonicalizes_only_bracketed_ipv6_hosts() {
+        let mut bare = spec();
+        bare.host = "2001:db8::1".to_string();
+        bare.port = Some(8443);
+        let mut bracketed = bare.clone();
+        bracketed.host = "[2001:db8::1]".to_string();
+
+        let bare_prediction = BackendNamingPolicy::Fastly
+            .predict(&bare)
+            .expect("should predict bare IPv6 backend");
+        let bracketed_prediction = BackendNamingPolicy::Fastly
+            .predict(&bracketed)
+            .expect("should predict bracketed IPv6 backend");
+        assert_eq!(bare_prediction, bracketed_prediction);
+        assert_eq!(
+            bare_prediction
+                .name
+                .rsplit_once('_')
+                .map(|(_, digest)| digest),
+            bracketed_prediction
+                .name
+                .rsplit_once('_')
+                .map(|(_, digest)| digest),
+            "canonical forms must hash the identical Fastly specification"
+        );
+
+        assert_eq!(
+            canonical_fastly_host("origin.example.com"),
+            "origin.example.com"
+        );
+        assert_eq!(canonical_fastly_host("192.0.2.1"), "192.0.2.1");
+        assert_eq!(canonical_fastly_host("[not-ipv6]"), "[not-ipv6]");
     }
 
     #[test]

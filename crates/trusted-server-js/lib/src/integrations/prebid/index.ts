@@ -332,6 +332,7 @@ export function auctionBidsToPrebidBids(
         bidderCode: bid.seat,
         meta: {
           advertiserDomains: bid.adomain,
+          ...(renderer ? { [APS_RENDERER_FIELD]: renderer } : {}),
         },
       },
     ];
@@ -658,7 +659,7 @@ function capturePublisherAdUnitSnapshot(
 ): PublisherAdUnitSnapshot | undefined {
   if (typeof unit.code !== 'string' || unit.code.length === 0) return undefined;
 
-  const rawBidderParams: Record<string, Record<string, unknown>> = {};
+  const rawBidderParams = Object.create(null) as Record<string, Record<string, unknown>>;
   const clientSideBids: ClientSideBidSnapshot[] = [];
   let existingTsBid: TrustedServerBid | undefined;
 
@@ -747,7 +748,7 @@ function serverSideBidderParamsForRefresh(
     if (!Array.isArray(match.bids)) return {};
 
     const serverSideBidders = new Set(injectedServerSideBidderCodes());
-    const params: Record<string, Record<string, unknown>> = {};
+    const params = Object.create(null) as Record<string, Record<string, unknown>>;
 
     for (const bid of match.bids) {
       if (!bid?.bidder) continue;
@@ -999,13 +1000,30 @@ function collectAuctionEids(): AuctionEid[] | undefined {
  * repeat calls (double script inclusion, a bundle that still carries a
  * baked-in shim) a no-op instead of a double adapter registration.
  */
+function apsRendererCarrier(bid: Record<string, unknown>): unknown {
+  const meta = bid['meta'];
+  if (meta !== null && typeof meta === 'object') {
+    const renderer = (meta as Record<string, unknown>)[APS_RENDERER_FIELD];
+    if (renderer !== undefined) return renderer;
+  }
+  return bid[APS_RENDERER_FIELD];
+}
+
+function scrubApsRendererCarrier(bid: Record<string, unknown>): void {
+  delete bid[APS_RENDERER_FIELD];
+  const meta = bid['meta'];
+  if (meta !== null && typeof meta === 'object') {
+    delete (meta as Record<string, unknown>)[APS_RENDERER_FIELD];
+  }
+}
+
 function installApsBidResponseRegistry(): void {
   const prebid = pbjs as typeof pbjs & Record<string, unknown>;
   if (prebid[APS_BID_RESPONSE_LISTENER_SENTINEL] === true) return;
 
-  pbjs.onEvent('bidResponse', (rawBid) => {
-    const bid = rawBid as unknown as Record<string, unknown>;
-    const renderer = bid[APS_RENDERER_FIELD];
+  const registerRenderer = (rawBid: unknown) => {
+    const bid = rawBid as Record<string, unknown>;
+    const renderer = apsRendererCarrier(bid);
     const adId = bid['adId'];
     if (
       bid['adapterCode'] !== ADAPTER_CODE ||
@@ -1024,7 +1042,7 @@ function installApsBidResponseRegistry(): void {
     });
     // Keep the executable capability only in the bounded, one-time registry. Prebid
     // still owns the generated ad ID and ordinary GAM targeting on this bid object.
-    delete bid[APS_RENDERER_FIELD];
+    scrubApsRendererCarrier(bid);
     if (!registered) {
       // Prebid can admit zero-CPM bids when `allowZeroCpmBids` is enabled.
       // Its targeting selection rejects every negative CPM, so this bid cannot
@@ -1032,7 +1050,10 @@ function installApsBidResponseRegistry(): void {
       bid['cpm'] = -1;
       log.warn('[tsjs-prebid] rejected APS renderer capability that failed registration');
     }
-  });
+  };
+
+  pbjs.onEvent('bidAccepted', registerRenderer);
+  pbjs.onEvent('bidResponse', registerRenderer);
   prebid[APS_BID_RESPONSE_LISTENER_SENTINEL] = true;
 }
 
@@ -1185,7 +1206,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       // Preserve params only for bidder codes owned by the validated auction
       // plan. Provider IDs, returned seat aliases, APS renderer identity, and
       // ordinary browser demand cannot enter the trustedServer envelope.
-      const bidderParams: Record<string, Record<string, unknown>> = {};
+      const bidderParams = Object.create(null) as Record<string, Record<string, unknown>>;
       for (const bid of unit.bids) {
         if (!bid?.bidder || !serverSideBidders.has(bid.bidder)) {
           continue;

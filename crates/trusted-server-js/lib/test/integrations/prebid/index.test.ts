@@ -317,6 +317,7 @@ describe('prebid/auctionBidsToPrebidBids', () => {
         bidderCode: 'aps',
         ad: '',
         trustedServerRenderer: renderer,
+        meta: expect.objectContaining({ trustedServerRenderer: renderer }),
       })
     );
   });
@@ -437,23 +438,24 @@ describe('prebid/installPrebidNpm', () => {
     );
   });
 
-  it('registers accepted APS descriptors under Prebid generated ad IDs', () => {
+  it('registers normalized APS descriptors at bidAccepted under Prebid generated ad IDs', () => {
     installPrebidNpm();
 
-    const bidResponseListener = mockOnEvent.mock.calls.find(
-      ([eventName]) => eventName === 'bidResponse'
+    const bidAcceptedListener = mockOnEvent.mock.calls.find(
+      ([eventName]) => eventName === 'bidAccepted'
     )?.[1] as ((bid: Record<string, unknown>) => void) | undefined;
-    expect(bidResponseListener).toBeTypeOf('function');
+    expect(bidAcceptedListener).toBeTypeOf('function');
 
     const renderer = apsRenderer();
-    bidResponseListener!({
+    const normalizedBid: Record<string, unknown> = {
       adapterCode: 'trustedServer',
       bidderCode: 'aps',
       adId: 'prebid-generated-ad-id',
       adUnitCode: 'div-aps',
       ttl: 300,
-      trustedServerRenderer: renderer,
-    });
+      meta: { trustedServerRenderer: renderer },
+    };
+    bidAcceptedListener!(normalizedBid);
 
     const entry = testWindow.tsjs?.apsPrebidRenderers?.['prebid-generated-ad-id'];
     expect(entry).toEqual(
@@ -465,11 +467,31 @@ describe('prebid/installPrebidNpm', () => {
       })
     );
 
+    expect(normalizedBid).not.toHaveProperty('trustedServerRenderer');
+    expect(normalizedBid['meta']).not.toHaveProperty('trustedServerRenderer');
     entry?.markUsed();
     expect(mockMarkWinningBidAsUsed).toHaveBeenCalledWith({
       adId: 'prebid-generated-ad-id',
       events: true,
     });
+  });
+
+  it('keeps bidResponse as a top-level renderer compatibility fallback', () => {
+    installPrebidNpm();
+    const bidResponseListener = mockOnEvent.mock.calls.find(
+      ([eventName]) => eventName === 'bidResponse'
+    )?.[1] as ((bid: Record<string, unknown>) => void) | undefined;
+    const renderer = apsRenderer();
+
+    bidResponseListener!({
+      adapterCode: 'trustedServer',
+      bidderCode: 'aps',
+      adId: 'fallback-ad-id',
+      adUnitCode: 'div-aps',
+      trustedServerRenderer: renderer,
+    });
+
+    expect(testWindow.tsjs?.apsPrebidRenderers?.['fallback-ad-id']?.renderer).toEqual(renderer);
   });
 
   it('makes failed APS renderer registrations ineligible when zero-CPM bids are allowed', () => {
@@ -486,7 +508,7 @@ describe('prebid/installPrebidNpm', () => {
       adUnitCode: 'div-aps',
       ttl: 300,
       cpm: 1.23,
-      trustedServerRenderer: { ...apsRenderer(), aaxResponse: 'invalid' },
+      meta: { trustedServerRenderer: { ...apsRenderer(), aaxResponse: 'invalid' } },
     };
     bidResponseListener!(malformedBid);
     bidResponseListener!({
@@ -500,6 +522,7 @@ describe('prebid/installPrebidNpm', () => {
     expect(testWindow.tsjs?.apsPrebidRenderers?.['malformed-ad-id']).toBeUndefined();
     expect(testWindow.tsjs?.apsPrebidRenderers?.['foreign-ad-id']).toBeUndefined();
     expect(malformedBid).not.toHaveProperty('trustedServerRenderer');
+    expect(malformedBid['meta']).not.toHaveProperty('trustedServerRenderer');
     // Prebid's allowZeroCpmBids path still requires cpm >= 0.
     expect(malformedBid['cpm']).toBe(-1);
     expect(warnSpy).toHaveBeenCalledWith(
@@ -948,6 +971,27 @@ describe('prebid/installPrebidNpm', () => {
         'pbs-provider-id',
         'trustedServer',
       ]);
+    });
+
+    it('preserves prototype-named server-side bidders as owned JSON properties', () => {
+      testWindow.__tsjs_prebid = { serverSideBidders: ['__proto__'] };
+      const pbjs = installPrebidNpm();
+      const adUnits = [
+        {
+          bids: [{ bidder: '__proto__', params: { placement: 'server-owned' } }],
+        },
+      ];
+
+      pbjs.requestBids({ adUnits } as unknown as RequestBidsArg);
+
+      const trustedServerBid = adUnits[0].bids.find((bid) => bid.bidder === 'trustedServer');
+      const bidderParams = trustedServerBid?.params?.bidderParams as Record<string, unknown>;
+      expect(Object.prototype.hasOwnProperty.call(bidderParams, '__proto__')).toBe(true);
+      expect(bidderParams['__proto__']).toEqual({ placement: 'server-owned' });
+      expect(JSON.parse(JSON.stringify(bidderParams))).toEqual(
+        Object.fromEntries([['__proto__', { placement: 'server-owned' }]])
+      );
+      expect(adUnits[0].bids.map((bid) => bid.bidder)).toEqual(['trustedServer']);
     });
 
     it('does not let returned bidder aliases or APS renderer aliases affect folding', () => {

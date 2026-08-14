@@ -410,6 +410,31 @@ fn pbs_routed_overrides_are_ordered_and_stored_request_is_trusted_fallback() {
     assert_eq!(value["ext"]["prebid"]["returnallbidstatus"], true);
     assert_eq!(value["test"], 1);
 
+    let mut empty_overridden = canonical_parity_auction_request();
+    empty_overridden.slots[0].bidders = HashMap::from([(
+        "trustedServer".to_string(),
+        json!({"zone":"zone-a","bidderParams":{"exampleBidder":{}}}),
+    )]);
+    let routed = route_auction(empty_overridden, &inbound, &plan, None);
+    let built = match build_request(
+        &routed.inputs()[0],
+        &routed,
+        &plan.providers()[0],
+        321,
+        &finalization(None),
+    )
+    .expect("should build request after populating empty params")
+    {
+        OpenRtbBuildOutcome::Ready(request) => request,
+        OpenRtbBuildOutcome::NoImpressions => panic!("should retain overridden impression"),
+    };
+    let value = serde_json::to_value(built).expect("should serialize overridden request");
+    assert_eq!(
+        value["imp"][0]["ext"]["prebid"]["bidder"]["exampleBidder"],
+        json!({"generic":1,"ordered":2,"shared":"rule-two","zone":2}),
+        "should allow profile overrides to populate empty browser params"
+    );
+
     let mut stored = canonical_parity_auction_request();
     stored.slots[0].bidders.clear();
     let routed = route_auction(stored, &inbound, &plan, None);
@@ -430,6 +455,50 @@ fn pbs_routed_overrides_are_ordered_and_stored_request_is_trusted_fallback() {
         value["imp"][0]["ext"]["prebid"]["storedrequest"]["id"],
         "fictional-slot"
     );
+}
+
+#[test]
+fn pbs_empty_params_without_matching_override_fall_back_to_stored_request() {
+    let mut raw = config("prebid-server", json!({}));
+    raw.providers
+        .get_mut(&ProviderId::from_str("fictional-provider").expect("should parse provider"))
+        .expect("should find provider")
+        .routing = RoutingMode::Explicit;
+    raw.bidders.insert(
+        crate::auction::plan::BidderId::from_str("exampleBidder").expect("should parse bidder"),
+        BidderRouteConfig {
+            provider: ProviderId::from_str("fictional-provider").expect("should parse provider"),
+        },
+    );
+    let plan = AuctionPlan::compile(raw).expect("should compile PBS plan");
+    let mut request = canonical_parity_auction_request();
+    request.slots[0].bidders = HashMap::from([(
+        "trustedServer".to_string(),
+        json!({"bidderParams":{"exampleBidder":{}}}),
+    )]);
+    let inbound = Request::builder()
+        .uri("https://publisher.example/auction")
+        .body(EdgeBody::empty())
+        .expect("should build inbound request");
+    let routed = route_auction(request, &inbound, &plan, None);
+    let built = match build_request(
+        &routed.inputs()[0],
+        &routed,
+        &plan.providers()[0],
+        321,
+        &finalization(None),
+    )
+    .expect("should build stored request")
+    {
+        OpenRtbBuildOutcome::Ready(request) => request,
+        OpenRtbBuildOutcome::NoImpressions => panic!("should retain stored impression"),
+    };
+    let value = serde_json::to_value(built).expect("should serialize stored request");
+    assert_eq!(
+        value["imp"][0]["ext"]["prebid"]["storedrequest"]["id"],
+        "fictional-slot"
+    );
+    assert!(value["imp"][0]["ext"]["prebid"].get("bidder").is_none());
 }
 
 #[test]
@@ -733,6 +802,42 @@ fn standard_response_extraction_isolates_malformed_siblings_and_ignores_response
 }
 
 #[test]
+fn standard_response_currency_accepts_omitted_and_usd_but_rejects_other_or_malformed_values() {
+    let (_plan, routed, _request) = standard_fixture();
+    let bid = json!({"seatbid": [{"seat": "seat", "bid": [
+        {"id":"good","impid":"fictional-slot","price":1.0,"adm":"ok","w":300,"h":250}
+    ]}]});
+
+    for currency in [None, Some(json!("USD")), Some(json!("usd"))] {
+        let mut value = bid.clone();
+        if let Some(currency) = currency {
+            value["cur"] = currency;
+        }
+        let response =
+            extract_standard_response("fictional-provider", &routed.inputs()[0], &value, 0);
+        assert_eq!(
+            response.status,
+            BidStatus::Success,
+            "should accept omitted or USD currency"
+        );
+        assert_eq!(response.bids[0].currency, "USD");
+    }
+
+    let mut eur = bid.clone();
+    eur["cur"] = json!("EUR");
+    let response = extract_standard_response("fictional-provider", &routed.inputs()[0], &eur, 0);
+    assert_eq!(response.status, BidStatus::NoBid);
+    assert_eq!(response.metadata["unsupported_currency"], "EUR");
+
+    let mut malformed = bid;
+    malformed["cur"] = json!(["USD"]);
+    let response =
+        extract_standard_response("fictional-provider", &routed.inputs()[0], &malformed, 0);
+    assert_eq!(response.status, BidStatus::Error);
+    assert_eq!(response.metadata["error_type"], "parse_response");
+}
+
+#[test]
 fn standard_response_rejects_unknown_impressions_and_dimensions_but_keeps_siblings() {
     let (_plan, routed, _request) = standard_fixture();
     let response = extract_standard_response(
@@ -860,6 +965,7 @@ fn fictional_standard_executor_covers_bid_no_bid_malformed_unused_and_redirect()
         .await
         .expect("should classify malformed response");
         assert_eq!(response.status, BidStatus::Error);
+        assert_eq!(response.metadata["error_type"], "parse_response");
 
         let redirect = Arc::new(StubHttpClient::new());
         redirect.push_response_with_headers(
@@ -877,6 +983,7 @@ fn fictional_standard_executor_covers_bid_no_bid_malformed_unused_and_redirect()
         .await
         .expect("should classify redirect");
         assert_eq!(response.status, BidStatus::Error);
+        assert_eq!(response.metadata["error_type"], "http_status");
         assert_eq!(response.metadata["http_status"], 302);
         assert_eq!(
             redirect.recorded_request_uris(),
@@ -900,4 +1007,5 @@ fn malformed_top_level_standard_response_is_error() {
     let response =
         extract_standard_response("fictional-provider", &routed.inputs()[0], &json!([]), 0);
     assert_eq!(response.status, BidStatus::Error);
+    assert_eq!(response.metadata["error_type"], "parse_response");
 }

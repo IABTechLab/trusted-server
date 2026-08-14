@@ -50,9 +50,9 @@ curl -X POST http://localhost:7676/auction \
 - Optional mock-adserver mediation selecting winning bids
 - Final response with winning creatives
 
-**With Orchestrator Disabled** (`auction.enabled = false`):
-- Logs showing: `"Using legacy Prebid flow"`
-- Direct Prebid Server call (backward compatible)
+**With Auction Execution Disabled** (`auction.enabled = false`):
+- Logs showing: `"/auction: auction is disabled; returning no-bid response"`
+- Immediate no-bid response with no provider or mediator dispatch
 
 ## Configuration
 

@@ -479,6 +479,7 @@ impl GenericOpenRtbProvider {
                         error
                     );
                     AuctionResponse::error(self.provider_name(), response_time_ms)
+                        .with_metadata("error_type", json!("parse_response"))
                 }
             };
             apply_notification_policy(&mut parsed.bids, &self.plan.notifications);
@@ -519,7 +520,8 @@ impl GenericOpenRtbProvider {
                         self.provider_name(),
                         error
                     );
-                    let mut parsed = AuctionResponse::error(self.provider_name(), response_time_ms);
+                    let mut parsed = AuctionResponse::error(self.provider_name(), response_time_ms)
+                        .with_metadata("error_type", json!("parse_response"));
                     attach_provider_routing_metadata(&mut parsed, &self.plan.profile, input);
                     parsed
                 }
@@ -546,6 +548,7 @@ impl GenericOpenRtbProvider {
                 );
             }
             let mut parsed = AuctionResponse::error(self.provider_name(), response_time_ms)
+                .with_metadata("error_type", json!("http_status"))
                 .with_metadata("http_status", json!(status.as_u16()));
             attach_provider_routing_metadata(&mut parsed, &self.plan.profile, input);
             return Ok(parsed);
@@ -566,7 +569,8 @@ impl GenericOpenRtbProvider {
                     self.provider_name(),
                     error
                 );
-                let mut parsed = AuctionResponse::error(self.provider_name(), response_time_ms);
+                let mut parsed = AuctionResponse::error(self.provider_name(), response_time_ms)
+                    .with_metadata("error_type", json!("parse_response"));
                 attach_provider_routing_metadata(&mut parsed, &self.plan.profile, input);
                 return Ok(parsed);
             }

@@ -72,6 +72,7 @@ pub(super) async fn execute_standard_fixture(
     }
     if !status.is_success() {
         return Ok(AuctionResponse::error(provider.id.as_str(), 0)
+            .with_metadata("error_type", json!("http_status"))
             .with_metadata("http_status", json!(status.as_u16()))
             .with_metadata(
                 "routing",
@@ -88,12 +89,12 @@ pub(super) async fn execute_standard_fixture(
     let value: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => {
-            return Ok(
-                AuctionResponse::error(provider.id.as_str(), 0).with_metadata(
+            return Ok(AuctionResponse::error(provider.id.as_str(), 0)
+                .with_metadata("error_type", json!("parse_response"))
+                .with_metadata(
                     "routing",
                     json!({"unused_bidder_params_count": unused_bidder_params_count(&provider.profile, input)}),
-                ),
-            );
+                ));
         }
     };
     let mut parsed = extract_standard_response(provider.id.as_str(), input, &value, 0);

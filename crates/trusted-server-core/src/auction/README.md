@@ -475,99 +475,51 @@ Provider IDs own backend correlation and response identity. The configured
 profile supplies typed OpenRTB behavior. Common endpoint, timeout, routing, and
 notification policy do not belong to browser integration configuration.
 
-## Adding a New Provider
+## Adding a Provider
 
-1. Create a new file in `src/auction/providers/your_provider.rs`
+A standards-compatible OpenRTB 2.6 endpoint does not require a Rust provider
+implementation. Add an `[auction.providers.<id>]` table, select the `standard`
+profile, and route bidder codes through `[auction.bidders.<code>]`. Endpoint,
+timeout, routing, and notification behavior are compiled into the shared
+`AuctionPlan` at startup.
 
-```rust
-use async_trait::async_trait;
-use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
-use crate::auction::types::{AuctionContext, AuctionRequest, AuctionResponse};
-use crate::platform::PlatformResponse;
+Add Rust code only when an endpoint needs behavior that the existing
+`standard`, `prebid-server`, or `aps` profiles cannot express. New profile work
+belongs in `profile.rs` and `openrtb.rs`: define and validate typed profile
+configuration, register the profile with the central profile registry, and add
+request/response golden tests. Production provider registration is plan-backed;
+`AuctionOrchestrator::register_provider` exists only in the legacy test parity
+harness and is not an application extension API.
 
-pub struct YourAuctionProvider {
-    config: YourConfig,
-}
-
-#[async_trait(?Send)]
-impl AuctionProvider for YourAuctionProvider {
-    fn provider_name(&self) -> &'static str {
-        "your_provider"
-    }
-
-    async fn request_bids(
-        &self,
-        request: &AuctionRequest,
-        _context: &AuctionContext<'_>,
-    ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-        // 1. Transform AuctionRequest to your provider's format
-        // 2. Launch through services.http_client().send_async(...)
-        // 3. Wrap the handle with ProviderRequestOutcome::pending(...)
-        todo!()
-    }
-
-    async fn parse_response(
-        &self,
-        response: PlatformResponse,
-        response_time_ms: u64,
-    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        // 4. Parse PlatformResponse into AuctionResponse
-        todo!()
-    }
-
-    fn timeout_ms(&self) -> u32 {
-        self.config.timeout_ms
-    }
-
-    fn is_enabled(&self) -> bool {
-        self.config.enabled
-    }
-}
-```
-
-2. Register the provider in `src/auction/providers/mod.rs`
-
-3. Configure it in `trusted-server.toml`
+See the maintained [auction orchestration guide](../../../../docs/guide/auction-orchestration.md)
+and [integration guide](../../../../docs/guide/integration-guide.md) for complete
+configuration and validation examples.
 
 ## Testing
 
-### Mock Providers
-
-APS and adserver_mock providers are used for testing the orchestration pattern:
-
-- **APS Mock**: Returns mock bids with Amazon branding
-- **AdServer Mock**: Acts as mediator by calling mocktioneer's mediation endpoint, selects winning bids based on highest CPM
-
-Set `mock = false` in APS config when real APS integration is ready.
-
-### Example Test Flow
-
-```rust
-let orchestrator = AuctionOrchestrator::new(config);
-orchestrator.register_provider(Arc::new(PrebidAuctionProvider::try_new(prebid_config)?));
-orchestrator.register_provider(Arc::new(ApsAuctionProvider::new(aps_config)));
-
-let result = orchestrator.run_auction(&request, &context, &services).await?;
-
-// Check results
-assert_eq!(result.winning_bids.len(), 2);
-assert!(result.total_time_ms < 2000);
-```
+Compile test settings with `compile_auction_plan`, construct the orchestrator and
+integration registry from the same `Arc<AuctionPlan>`, and exercise requests
+through the normal adapter or auction endpoint. Profile tests should cover typed
+configuration validation, exact OpenRTB request output, response admission,
+provider-local failures, routing, and target capability validation. Legacy
+provider constructors and manual registration are retained only for parity tests.
 
 ## Performance Considerations
 
 - **Parallel Execution**: Providers are launched concurrently via `select()` over `PendingRequest`s; responses are processed as they become ready within the auction deadline
 - **Timeouts**: Each provider has independent timeout; global timeout enforced at flow level
-- **Error Handling**: Provider failures don't fail entire auction; partial results returned
+- **Error Handling**: Provider failures don't fail the entire auction; partial results are returned
 
 ## Related Files
 
-- `src/auction/mod.rs` - Module exports
+- `src/auction/mod.rs` - Plan compilation and module exports
+- `src/auction/plan.rs` - Typed provider plan and target validation
+- `src/auction/profile.rs` - Typed OpenRTB profile registry
+- `src/auction/routing.rs` - Central bidder-to-provider routing
+- `src/auction/openrtb.rs` - Shared request construction and response parsing
+- `src/auction/provider.rs` - Plan-backed provider execution
+- `src/auction/orchestrator.rs` - Fan-out, deadline, and mediation flow
 - `src/auction/types.rs` - Core auction types
-- `src/auction/provider.rs` - Provider trait definition
-- `src/auction/orchestrator.rs` - Orchestration logic
-- `src/auction/config.rs` - Configuration types
-- `src/auction/providers/` - Provider implementations
 
 ## Questions?
 

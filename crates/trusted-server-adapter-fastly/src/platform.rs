@@ -171,9 +171,11 @@ impl PlatformBackend for FastlyPlatformBackend {
     }
 
     fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-        self.naming_policy()
-            .predict(spec)
-            .map(|prediction| prediction.name)
+        // Use the same host normalization as registration. In particular,
+        // URL-derived IPv6 hosts arrive bracketed, but both forms must predict
+        // the backend that `ensure` actually registers.
+        backend_config_from_spec(spec)
+            .predict_name()
             .change_context(PlatformError::Backend)
     }
 
@@ -831,6 +833,36 @@ mod tests {
             predicted, ensured,
             "predicted backend name should match the registered backend name"
         );
+    }
+
+    #[test]
+    fn bracketed_ipv6_predict_name_matches_bare_and_ensured_backend_name() {
+        let backend = FastlyPlatformBackend;
+        let bracketed = PlatformBackendSpec {
+            scheme: "https".to_string(),
+            host: "[2001:db8::9]".to_string(),
+            port: Some(8443),
+            host_header_override: None,
+            certificate_check: true,
+            first_byte_timeout: Duration::from_millis(750),
+            between_bytes_timeout: Duration::from_millis(750),
+            discriminator: Some("ipv6-provider".to_string()),
+        };
+        let mut bare = bracketed.clone();
+        bare.host = "2001:db8::9".to_string();
+
+        let predicted = backend
+            .predict_name(&bracketed)
+            .expect("should predict bracketed IPv6 backend name");
+        let bare_predicted = backend
+            .predict_name(&bare)
+            .expect("should predict bare IPv6 backend name");
+        let ensured = backend
+            .ensure(&bracketed)
+            .expect("should register bracketed IPv6 backend");
+
+        assert_eq!(predicted, bare_predicted);
+        assert_eq!(predicted, ensured);
     }
 
     // --- FastlyPlatformHttpClient -------------------------------------------
