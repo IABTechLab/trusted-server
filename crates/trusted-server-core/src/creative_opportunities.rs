@@ -16,6 +16,8 @@ use crate::settings::vec_from_seq_or_map;
 
 const MAX_DYNAMIC_GAM_UNIT_PATH_BYTES: usize = 100;
 const MAX_SECTION_BYTES: usize = 100;
+const DEFAULT_TEMPLATE_CACHE_MAX_AGE_SECONDS: u32 = 60;
+const MAX_TEMPLATE_CACHE_MAX_AGE_SECONDS: u32 = 86_400;
 
 /// A single parsed segment of a [`gam_unit_path`](CreativeOpportunitySlot::gam_unit_path) template.
 #[derive(Debug, Clone)]
@@ -191,6 +193,36 @@ const fn is_default_enabled(value: &bool) -> bool {
     *value == default_enabled()
 }
 
+/// How per-user ad state reaches the page.
+///
+/// `Inline` is the shipped behaviour: the auction result is injected before
+/// `</body>` and the root document is therefore uncacheable. `Esi` stores a
+/// request-neutral shared template and fills its per-request byte seam at the edge.
+///
+/// Spike-only, for the #1009 ESI validation. Remove with the spike.
+///
+/// # Why the template must be request-neutral
+///
+/// Under `Esi` the template is shared across visitors, so
+/// nothing whose *presence* depends on the request may appear in it — not merely
+/// nothing whose *value* does. `tsjs.adSlots` is the trap: its content is derived
+/// from config and path, but whether it is emitted at all is gated on consent,
+/// bot classification, prefetch status and the auction kill switch. A template
+/// filled by the first request would freeze that request's decision for every
+/// later reader.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssemblyMode {
+    /// Inject bids inline before `</body>`. Root uncacheable. Shipped behaviour.
+    #[default]
+    Inline,
+    /// Serve a shared template; assemble its inert marker with an exact byte split.
+    ///
+    /// The operator-facing spelling remains `esi` for continuity, but no general
+    /// purpose ESI parser executes on this path.
+    Esi,
+}
+
 /// Top-level configuration for the creative opportunities system.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -261,9 +293,102 @@ pub struct CreativeOpportunitiesConfig {
     /// [`section_root`](Self::section_root) are omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section_segment: Option<usize>,
+    /// How per-user ad state reaches the page. Absent means
+    /// [`AssemblyMode::Inline`], the shipped behaviour.
+    ///
+    /// `Option` rather than a bare enum, and `skip_serializing_if`, deliberately:
+    /// these structs use `deny_unknown_fields`, so a pushed key makes an older
+    /// binary fail configuration load. Keeping it absent when unset means a
+    /// deployment that never sets it stays rollback-compatible.
+    ///
+    /// Spike-only. See [`AssemblyMode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assembly_mode: Option<AssemblyMode>,
+    /// Request headers the origin varies on, which the shared-template cache key must
+    /// cover.
+    ///
+    /// Operator-stated because a cache **lookup happens before the fetch**, so on a cold
+    /// key the origin's `Vary` is not yet known. See `VarySpec` for why the alternatives
+    /// (two-phase lookup, or storing the list and re-keying) were not taken.
+    ///
+    /// **Unset or empty means no operator-stated header is covered, so any origin
+    /// `Vary` other than structurally covered `Accept-Encoding` disqualifies the
+    /// response.** `Cookie` may never be configured: a per-cookie object violates the
+    /// reader-neutral template contract. This fail-closed default prevents a deployment
+    /// that has not stated what its origin varies on from gaining a shared cache by
+    /// omission.
+    ///
+    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_cache_vary: Option<Vec<String>>,
+    /// Maximum time a reader-neutral transformed template may remain in C2.
+    ///
+    /// This is a safety ceiling, not freshness authorization. The origin must still
+    /// provide positive shared freshness, and the stored lifetime is the smaller of
+    /// the origin's remaining edge freshness and this value. Defaults to 60 seconds
+    /// and may be configured from 1 second through 1 day.
+    ///
+    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_cache_max_age_seconds: Option<u32>,
+    /// Operator assertion that the origin's HTML does not depend on request cookies.
+    ///
+    /// Unset or `false` disqualifies **every cookie-bearing request** from the shared
+    /// template cache, in both directions. That is safe and it is also very nearly a
+    /// disable switch: Trusted Server sets its own identity cookie, so essentially every
+    /// repeat visitor carries one. Left at the default, the cache can only ever serve
+    /// first-ever page views and cookie-less clients.
+    ///
+    /// Setting `true` asserts the origin serves the same HTML with or without cookies.
+    /// It is not taken on trust alone — if the origin ever declares `Vary: Cookie`, the
+    /// response is refused regardless of this flag or the configured key. So a wrong
+    /// assertion is caught whenever the origin is honest about it, and this only widens
+    /// the window where the origin personalizes *silently*.
+    ///
+    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_is_cookie_independent: Option<bool>,
     /// Slot templates. An empty vec or `enabled = false` disables template delivery.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub slot: Vec<CreativeOpportunitySlot>,
+}
+
+impl CreativeOpportunitiesConfig {
+    /// Resolved assembly mode, defaulting to [`AssemblyMode::Inline`] when unset.
+    #[must_use]
+    pub fn assembly_mode(&self) -> AssemblyMode {
+        self.assembly_mode.unwrap_or_default()
+    }
+
+    /// Whether a cookie-bearing request may participate in the shared cache.
+    ///
+    /// Defaults to `false`, which is the conservative reading and also the one that
+    /// makes the cache almost inert on real traffic. See
+    /// [`Self::origin_is_cookie_independent`].
+    #[must_use]
+    pub fn origin_is_cookie_independent(&self) -> bool {
+        self.origin_is_cookie_independent.unwrap_or(false)
+    }
+
+    /// Headers the cache key covers, per operator config.
+    ///
+    /// Unset yields an empty operator spec, so any origin `Vary` other than the
+    /// structurally covered `Accept-Encoding` reads as a gap and the response is never
+    /// cached. Failing closed is deliberate: an unconfigured deployment should not
+    /// acquire a shared cache silently.
+    #[must_use]
+    pub fn template_cache_vary(&self) -> crate::platform::VarySpec {
+        crate::platform::VarySpec::new(self.template_cache_vary.clone().unwrap_or_default())
+    }
+
+    /// Safety ceiling for one shared transformed-template cache entry.
+    #[must_use]
+    pub fn template_cache_max_age(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(
+            self.template_cache_max_age_seconds
+                .unwrap_or(DEFAULT_TEMPLATE_CACHE_MAX_AGE_SECONDS),
+        ))
+    }
 }
 
 impl CreativeOpportunitiesConfig {
@@ -333,10 +458,32 @@ impl CreativeOpportunitiesConfig {
     /// Returns an error string when [`gam_network_id`](Self::gam_network_id) is
     /// blank but consumed by a default path or `{network_id}` template; when a
     /// slot has an invalid identifier, page pattern set, format list, or
-    /// dimensions; when a `{section}` template lacks a valid
+    /// dimensions; when `template_cache_max_age_seconds` falls outside 1–86,400;
+    /// when a `{section}` template lacks a valid
     /// [`section_root`](Self::section_root); or when configured values make a
     /// dynamic path exceed 100 UTF-8 bytes.
     pub fn validate_runtime(&self) -> Result<(), String> {
+        if self
+            .template_cache_max_age_seconds
+            .is_some_and(|seconds| !(1..=MAX_TEMPLATE_CACHE_MAX_AGE_SECONDS).contains(&seconds))
+        {
+            return Err(format!(
+                "template_cache_max_age_seconds must be between 1 and {MAX_TEMPLATE_CACHE_MAX_AGE_SECONDS}"
+            ));
+        }
+
+        if let Some(names) = &self.template_cache_vary {
+            crate::platform::VarySpec::try_new(names.clone()).map_err(|name| {
+                format!("template_cache_vary contains invalid HTTP header name `{name}`")
+            })?;
+            if names.iter().any(|name| name.eq_ignore_ascii_case("cookie")) {
+                return Err(
+                    "template_cache_vary must not include Cookie; C2 templates are reader-neutral"
+                        .to_string(),
+                );
+            }
+        }
+
         // A network ID is required only when a slot renders the default
         // `/<network_id>/<slot_id>` path or substitutes `{network_id}`. Static
         // and `{slot_id}`/`{section}`-only templates leave it inert.
@@ -1197,6 +1344,10 @@ mod tests {
             auction_timeout_ms: None,
             price_granularity: PriceGranularity::default(),
             section_root: section_root.map(str::to_string),
+            assembly_mode: None,
+            template_cache_vary: None,
+            template_cache_max_age_seconds: None,
+            origin_is_cookie_independent: None,
             section_segment: None,
             slot: vec![slot],
         }
@@ -1595,6 +1746,10 @@ mod tests {
             auction_timeout_ms: None,
             price_granularity: PriceGranularity::default(),
             section_root: None,
+            assembly_mode: None,
+            template_cache_vary: None,
+            template_cache_max_age_seconds: None,
+            origin_is_cookie_independent: None,
             section_segment: None,
             slot: Vec::new(),
         };
@@ -1869,6 +2024,164 @@ mod tests {
         assert!(
             serde_json::from_value::<ApsSlotParams>(aps_typo).is_err(),
             "unknown APS key should be rejected"
+        );
+    }
+
+    #[test]
+    fn assembly_mode_defaults_to_inline_when_absent() {
+        // Arrange: the minimal config an existing deployment would have.
+        let toml = r#"
+            gam_network_id = "99999"
+        "#;
+
+        // Act
+        let config: CreativeOpportunitiesConfig =
+            toml::from_str(toml).expect("should deserialize without assembly_mode");
+
+        // Assert
+        assert_eq!(
+            config.assembly_mode, None,
+            "an absent key should stay absent rather than materializing a value"
+        );
+        assert_eq!(
+            config.assembly_mode(),
+            AssemblyMode::Inline,
+            "should resolve to the shipped inline behaviour"
+        );
+    }
+
+    #[test]
+    fn assembly_mode_deserializes_each_variant() {
+        for (raw, expected) in [("inline", AssemblyMode::Inline), ("esi", AssemblyMode::Esi)] {
+            let toml = format!(
+                r#"
+                    gam_network_id = "99999"
+                    assembly_mode = "{raw}"
+                "#
+            );
+            let config: CreativeOpportunitiesConfig =
+                toml::from_str(&toml).unwrap_or_else(|e| panic!("should parse {raw}: {e}"));
+            assert_eq!(
+                config.assembly_mode(),
+                expected,
+                "should resolve `{raw}` to {expected:?}"
+            );
+        }
+
+        let removed_mode = r#"
+            gam_network_id = "99999"
+            assembly_mode = "client_fill"
+        "#;
+        assert!(
+            toml::from_str::<CreativeOpportunitiesConfig>(removed_mode).is_err(),
+            "client_fill is outside #1009's ESI byte-seam design and must be rejected"
+        );
+    }
+
+    #[test]
+    fn template_cache_vary_rejects_invalid_header_names() {
+        let config: CreativeOpportunitiesConfig = toml::from_str(
+            r#"
+                gam_network_id = "99999"
+                template_cache_vary = ["rsc", "not a header"]
+            "#,
+        )
+        .expect("shape should deserialize before runtime validation");
+        let err = config
+            .validate_runtime()
+            .expect_err("invalid field names must fail configuration validation");
+        assert!(err.contains("not a header"), "unexpected error: {err}");
+
+        let cookie_key: CreativeOpportunitiesConfig = toml::from_str(
+            r#"
+                gam_network_id = "99999"
+                template_cache_vary = ["Cookie"]
+            "#,
+        )
+        .expect("shape should deserialize before runtime validation");
+        let err = cookie_key
+            .validate_runtime()
+            .expect_err("per-cookie templates violate the reader-neutral C2 contract");
+        assert!(err.contains("Cookie"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn template_cache_max_age_accepts_a_positive_value_up_to_one_day() {
+        for seconds in [1_u32, 1_200, 86_400] {
+            let config: CreativeOpportunitiesConfig = toml::from_str(&format!(
+                r#"
+                    gam_network_id = "99999"
+                    template_cache_max_age_seconds = {seconds}
+                "#
+            ))
+            .unwrap_or_else(|error| panic!("{seconds}s should deserialize: {error}"));
+
+            config
+                .validate_runtime()
+                .unwrap_or_else(|error| panic!("{seconds}s should validate: {error}"));
+            let serialized = serde_json::to_value(config).expect("should serialize config");
+            assert_eq!(
+                serialized
+                    .get("template_cache_max_age_seconds")
+                    .and_then(serde_json::Value::as_u64),
+                Some(u64::from(seconds)),
+                "the configured ceiling must survive typed configuration"
+            );
+        }
+    }
+
+    #[test]
+    fn template_cache_max_age_rejects_zero_and_more_than_one_day() {
+        for seconds in [0_u32, 86_401] {
+            let config: CreativeOpportunitiesConfig = toml::from_str(&format!(
+                r#"
+                    gam_network_id = "99999"
+                    template_cache_max_age_seconds = {seconds}
+                "#
+            ))
+            .unwrap_or_else(|error| panic!("shape should deserialize before validation: {error}"));
+
+            let error = config
+                .validate_runtime()
+                .expect_err("an unsafe template-cache ceiling must fail startup validation");
+            assert!(
+                error.contains("template_cache_max_age_seconds"),
+                "unexpected validation error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn unset_template_cache_max_age_is_omitted_for_rollback_compatibility() {
+        let config: CreativeOpportunitiesConfig =
+            toml::from_str("gam_network_id = \"99999\"").expect("should deserialize");
+
+        assert_eq!(
+            config.template_cache_max_age(),
+            std::time::Duration::from_secs(60),
+            "an absent ceiling must preserve the spike's existing lifetime"
+        );
+        let serialized = toml::to_string(&config).expect("should serialize");
+
+        assert!(
+            !serialized.contains("template_cache_max_age_seconds"),
+            "an unset new key must not break rollback to an older binary: {serialized}"
+        );
+    }
+
+    #[test]
+    fn unset_assembly_mode_is_omitted_from_serialized_config() {
+        // `deny_unknown_fields` means a pushed key breaks config load on an older
+        // binary. A deployment that never sets this must not gain the key just by
+        // round-tripping through a newer one.
+        let config: CreativeOpportunitiesConfig =
+            toml::from_str("gam_network_id = \"99999\"").expect("should deserialize");
+
+        let serialized = toml::to_string(&config).expect("should serialize");
+
+        assert!(
+            !serialized.contains("assembly_mode"),
+            "unset assembly_mode must not be serialized, got:\n{serialized}"
         );
     }
 

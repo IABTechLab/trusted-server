@@ -9,7 +9,7 @@
 //! cache such as Cloudflare would otherwise serve an operator/origin
 //! `Cache-Control: public` on a cookie-bearing response as-is.
 
-use edgezero_core::http::{HeaderName, HeaderValue, Response, header};
+use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Response, header};
 
 use crate::settings::Settings;
 
@@ -30,19 +30,65 @@ fn strip_cdn_cache_headers(response: &mut Response) {
     }
 }
 
+/// Whether `Cache-Control` already forbids shared caching.
+///
+/// Extracted because both arms of the cookie-privacy net below need it.
+///
+/// `publisher::c2_bypass_reason` deliberately does **not** call this and keeps its own
+/// copy: it additionally treats `no-cache` as non-shareable, because "revalidate before
+/// reuse" is correct for an HTTP cache and too permissive for a spike-owned one. The
+/// duplicate is the stricter of the two, so consolidating them would loosen the shared-
+/// template gate rather than tidy it.
+///
+/// Directives are case-insensitive (RFC 9111 §5.2), so `No-Store` and `Private`
+/// count. `no-cache` deliberately does **not**: it requires revalidation before
+/// reuse, not a refusal to store, so a `no-cache` response is still shareable.
+/// Callers needing the stricter reading must check it themselves.
+#[must_use]
+pub fn is_private_or_no_store(headers: &HeaderMap) -> bool {
+    headers.get_all(header::CACHE_CONTROL).iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            value.split(',').any(|directive| {
+                let name = directive
+                    .split_once('=')
+                    .map_or(directive, |(name, _)| name);
+                matches!(
+                    name.trim().to_ascii_lowercase().as_str(),
+                    "private" | "no-store"
+                )
+            })
+        })
+    })
+}
+
+/// Reassert the terminal privacy invariant for a synthesized per-reader response.
+///
+/// Call this after every configurable response mutation. It deliberately overwrites
+/// `Cache-Control` and strips validators, expiry metadata, and CDN-specific cache
+/// directives so a later integration cannot turn an assembled document into C3.
+pub fn enforce_private_no_store(response: &mut Response) {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    for name in [
+        header::ETAG.as_str(),
+        header::LAST_MODIFIED.as_str(),
+        header::EXPIRES.as_str(),
+        header::AGE.as_str(),
+    ] {
+        response.headers_mut().remove(name);
+    }
+    strip_cdn_cache_headers(response);
+}
+
 /// Forces synthesized HTML to be private and non-storable.
 ///
 /// Use this exact policy whenever Trusted Server changes an origin HTML
 /// representation with request-specific content: force `private, no-store`,
 /// remove origin validators, and remove all CDN-targeted cache directives.
 pub(crate) fn enforce_synthesized_html_cache_privacy(response: &mut Response) {
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("private, no-store"),
-    );
-    response.headers_mut().remove(header::ETAG);
-    response.headers_mut().remove(header::LAST_MODIFIED);
-    strip_cdn_cache_headers(response);
+    enforce_private_no_store(response);
 }
 
 /// Forces cookie-bearing responses to stay private to shared caches.
@@ -63,14 +109,7 @@ pub fn enforce_set_cookie_cache_privacy(response: &mut Response) {
     // independent of Cache-Control and would otherwise let a shared cache store
     // and replay one visitor's Set-Cookie.
     strip_cdn_cache_headers(response);
-    // Cache-Control directives are case-insensitive (RFC 9111 §5.2), so match
-    // against a lowercased copy — `No-Store` / `Private` must count.
-    let already_uncacheable = response
-        .headers()
-        .get(header::CACHE_CONTROL)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|v| v.contains("private") || v.contains("no-store"));
+    let already_uncacheable = is_private_or_no_store(response.headers());
     if !already_uncacheable {
         response.headers_mut().insert(
             header::CACHE_CONTROL,
@@ -96,12 +135,7 @@ pub fn enforce_set_cookie_cache_privacy(response: &mut Response) {
 pub fn apply_response_headers_with_cache_privacy(settings: &Settings, response: &mut Response) {
     enforce_set_cookie_cache_privacy(response);
 
-    let response_is_uncacheable = response
-        .headers()
-        .get(header::CACHE_CONTROL)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|v| v.contains("private") || v.contains("no-store"));
+    let response_is_uncacheable = is_private_or_no_store(response.headers());
 
     for (key, value) in &settings.response_headers {
         if response_is_uncacheable
@@ -292,6 +326,40 @@ mod tests {
             assert!(
                 !response.headers().contains_key(*header_name),
                 "operator headers must not restore shared caching through {header_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_private_stamp_removes_every_cache_and_validator_header() {
+        let mut response = response_builder()
+            .header(header::CACHE_CONTROL, "public, s-maxage=600")
+            .header(header::ETAG, "\"origin\"")
+            .header(header::LAST_MODIFIED, "Wed, 12 Aug 2026 00:00:00 GMT")
+            .header(header::EXPIRES, "Wed, 12 Aug 2026 01:00:00 GMT")
+            .header(header::AGE, "30")
+            .header("surrogate-control", "max-age=600")
+            .header("cdn-cache-control", "public, max-age=600")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build response");
+
+        enforce_private_no_store(&mut response);
+
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        for name in [
+            header::ETAG.as_str(),
+            header::LAST_MODIFIED.as_str(),
+            header::EXPIRES.as_str(),
+            header::AGE.as_str(),
+            "surrogate-control",
+            "cdn-cache-control",
+        ] {
+            assert!(
+                !response.headers().contains_key(name),
+                "terminal private stamp must strip {name}"
             );
         }
     }

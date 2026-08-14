@@ -114,6 +114,83 @@ impl GptDiagnosticsRequestDecision {
     }
 }
 
+impl GptDiagnosticsRequestDecision {
+    /// An active decision, for tests in other modules that need one.
+    ///
+    /// The fields are private and built by `prepare_request` from a cookie or query
+    /// parameter; there is no other way to obtain an active decision across a module
+    /// boundary.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn active_for_tests() -> Self {
+        Self {
+            active: true,
+            clean_browser_path_and_query: None,
+            cookie_action: GptDiagnosticsCookieAction::None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod head_seam_invariant_tests {
+    use super::*;
+
+    /// Every combination of the three fields the decision carries.
+    fn all_decisions() -> Vec<GptDiagnosticsRequestDecision> {
+        let mut out = Vec::new();
+        for active in [false, true] {
+            for clean in [None, Some("/clean".to_string())] {
+                for cookie_action in [
+                    GptDiagnosticsCookieAction::None,
+                    GptDiagnosticsCookieAction::SetSession,
+                    GptDiagnosticsCookieAction::ClearSession,
+                ] {
+                    out.push(GptDiagnosticsRequestDecision {
+                        active,
+                        clean_browser_path_and_query: clean.clone(),
+                        cookie_action,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn requires_private_no_store_is_a_superset_of_injection() {
+        // Load-bearing relationship, not an incidental one. Whenever this decision
+        // injects anything into `<head>`, the response must also be stamped
+        // `private, no-store` — which is what keeps request-scoped diagnostics out
+        // of a shared cache if the explicit assembly-mode gate in
+        // `create_html_stream_processor` is ever removed or bypassed.
+        //
+        // If a future change makes a script emit without also requiring the stamp,
+        // this fails here rather than silently in a cached template.
+        for decision in all_decisions() {
+            let injects =
+                decision.bootstrap_script().is_some() || decision.module_script_tag().is_some();
+            if injects {
+                assert!(
+                    decision.requires_private_no_store(),
+                    "decision injects into <head> but does not require private/no-store: \
+                     {decision:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_default_decision_injects_nothing() {
+        let decision = GptDiagnosticsRequestDecision::default();
+        assert_eq!(decision.bootstrap_script(), None);
+        assert_eq!(decision.module_script_tag(), None);
+        assert!(
+            !decision.requires_private_no_store(),
+            "an inert decision should not force the response private"
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QueryDirective {
     Absent,
