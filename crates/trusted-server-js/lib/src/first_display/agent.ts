@@ -1,6 +1,9 @@
 import type { BootstrapController } from '../core/bootstrap_controller';
 import type { BootFailureReason } from '../kernel/fallback';
 
+import type { FirstDisplayGoogletagBatchInput } from './adapters/googletag';
+import { createFirstDisplayProjectedDriver, type FirstDisplayRenderBridgeV1 } from './driver';
+import type { FirstDisplayGptProtocolV1 } from './leaf/gpt_protocol';
 import {
   firstDisplayComponentRegistration,
   registerCurrentFirstDisplayComponent,
@@ -63,7 +66,11 @@ export interface FirstDisplayAgentOptions {
 
 /** Bootstrap-owned dependencies supplied only to the release-bound base component. */
 export interface FirstDisplayAgentRegistrationHostV1 {
-  readonly options: FirstDisplayAgentOptions;
+  readonly options: Omit<FirstDisplayAgentOptions, 'driver'> &
+    Readonly<{
+      gptInput: Omit<FirstDisplayGoogletagBatchInput, 'projection'>;
+      renderer: FirstDisplayRenderBridgeV1;
+    }>;
   readonly sliceBindings: (id: string) => unknown;
 }
 
@@ -118,6 +125,87 @@ function protocolIdentity(candidate: unknown, expected: FirstDisplayAuctionProto
     );
   } catch {
     return false;
+  }
+}
+
+function fullProtocolIdentity(
+  candidate: unknown,
+  expected: FirstDisplayAuctionProtocolId
+): boolean {
+  try {
+    if (
+      typeof candidate !== 'object' ||
+      candidate === null ||
+      Array.isArray(candidate) ||
+      Object.getPrototypeOf(candidate) !== Object.prototype ||
+      !Object.isFrozen(candidate)
+    ) {
+      return false;
+    }
+    const version = Object.getOwnPropertyDescriptor(candidate, 'version');
+    const id = Object.getOwnPropertyDescriptor(candidate, 'id');
+    return Boolean(
+      version?.enumerable &&
+      'value' in version &&
+      version.value === 1 &&
+      id?.enumerable &&
+      'value' in id &&
+      id.value === expected
+    );
+  } catch {
+    return false;
+  }
+}
+
+function captureProtocolRegistration(
+  candidate: unknown,
+  protocolId: FirstDisplayAuctionProtocolId,
+  protocols: Map<FirstDisplayAuctionProtocolId, unknown>
+): unknown {
+  try {
+    if (
+      typeof candidate !== 'object' ||
+      candidate === null ||
+      Array.isArray(candidate) ||
+      Object.getPrototypeOf(candidate) !== Object.prototype ||
+      !Object.isFrozen(candidate)
+    ) {
+      return candidate;
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(candidate);
+    const register = descriptors.register;
+    if (!register?.enumerable || !('value' in register) || typeof register.value !== 'function') {
+      return candidate;
+    }
+    const original = register.value as (protocol: unknown) => unknown;
+    const captured = Object.create(Object.prototype) as Record<PropertyKey, unknown>;
+    const wrappedRegister = (protocol: unknown): (() => void) => {
+      if (!fullProtocolIdentity(protocol, protocolId) || protocols.has(protocolId)) {
+        throw new TypeError(`invalid first-display protocol registration: ${protocolId}`);
+      }
+      const release = Reflect.apply(original, candidate, [protocol]);
+      if (typeof release !== 'function') {
+        throw new TypeError(`invalid first-display protocol disposer: ${protocolId}`);
+      }
+      protocols.set(protocolId, protocol);
+      let live = true;
+      return () => {
+        if (!live) return;
+        live = false;
+        if (protocols.get(protocolId) === protocol) protocols.delete(protocolId);
+        Reflect.apply(release, undefined, []);
+      };
+    };
+    Object.defineProperties(captured, {
+      ...descriptors,
+      register: {
+        ...register,
+        value: wrappedRegister,
+      },
+    });
+    return Object.freeze(captured);
+  } catch {
+    return candidate;
   }
 }
 
@@ -383,9 +471,10 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
     ) {
       throw new TypeError('invalid first-display base options');
     }
-    const options = descriptor.value as FirstDisplayAgentOptions;
+    const options = descriptor.value as FirstDisplayAgentRegistrationHostV1['options'];
     const sliceBindings = bindingsDescriptor.value as (id: string) => unknown;
     const auctionProtocols = new Map<FirstDisplayAuctionProtocolId, unknown>();
+    const fullProtocols = new Map<FirstDisplayAuctionProtocolId, unknown>();
     const sliceHost: FirstDisplaySliceHost = Object.freeze({
       activate: (
         id: OptionalFirstDisplaySliceId,
@@ -395,10 +484,16 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
         if (typeof install !== 'function') {
           throw new TypeError(`unimplemented first-display slice: ${id}`);
         }
-        const installed = install(sliceBindings(id), own);
         const protocolId = id.endsWith('_initial')
           ? (id.slice(0, -'_initial'.length) as FirstDisplayAuctionProtocolId)
           : undefined;
+        const candidate = sliceBindings(id);
+        const installed = install(
+          protocolId && AUCTION_PROTOCOLS.includes(protocolId)
+            ? captureProtocolRegistration(candidate, protocolId, fullProtocols)
+            : candidate,
+          own
+        );
         if (protocolId && AUCTION_PROTOCOLS.includes(protocolId)) {
           if (auctionProtocols.has(protocolId) || !protocolIdentity(installed, protocolId)) {
             throw new TypeError(`invalid first-display protocol: ${protocolId}`);
@@ -409,9 +504,25 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
     });
     return Object.freeze({
       activate: (context: FirstDisplaySliceActivationContext): void => {
-        const agent = createFirstDisplayAgent(options);
-        context.own(() => agent.dispose());
+        let agent: FirstDisplayAgent | undefined;
+        context.own(() => {
+          if (agent) agent.dispose();
+          else options.renderer.dispose();
+        });
         context.afterActivate(() => {
+          const batch = snapshotFirstDisplayBatchV1(options.batch);
+          if (!batch) throw new TypeError('invalid first-display batch');
+          const gpt = fullProtocols.get('gpt');
+          if (batch.requiredProtocols.includes('gpt') && !fullProtocolIdentity(gpt, 'gpt')) {
+            throw new TypeError('first-display GPT protocol is incomplete');
+          }
+          const driver = createFirstDisplayProjectedDriver({
+            batch,
+            ...(gpt ? { gpt: gpt as FirstDisplayGptProtocolV1 } : {}),
+            gptInput: options.gptInput,
+            renderer: options.renderer,
+          });
+          agent = createFirstDisplayAgent({ ...options, driver });
           if (!agent.coversProtocols(auctionProtocols)) {
             throw new TypeError('first-display protocol coverage is incomplete');
           }

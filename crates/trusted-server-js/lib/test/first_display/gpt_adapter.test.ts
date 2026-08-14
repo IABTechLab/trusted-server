@@ -92,7 +92,10 @@ describe('first-display GPT adapter', () => {
     const slot = {
       addService: vi.fn(() => slot),
       getSlotElementId: vi.fn(() => 'slot-1'),
-      setTargeting: vi.fn(() => slot),
+      setTargeting: vi.fn((key: string) => {
+        events.push(`target:${key}`);
+        return slot;
+      }),
     };
     const service = {
       addEventListener: vi.fn((name: string, listener: (event: unknown) => void) => {
@@ -144,7 +147,14 @@ describe('first-display GPT adapter', () => {
         onRenderEnded: (cycle, result) => renders.push([cycle.slotId, result]),
       })
     ).toBe(true);
-    expect(events).toEqual(['bound:slot-1:trusted_server', 'first-action', 'display']);
+    expect(events).toEqual([
+      'bound:slot-1:trusted_server',
+      'target:hb_adid',
+      'target:hb_pb',
+      'target:placement',
+      'first-action',
+      'display',
+    ]);
     expect(slot.setTargeting.mock.calls).toEqual([
       ['hb_adid', `r1_${'a'.repeat(22)}`],
       ['hb_pb', '1.25'],
