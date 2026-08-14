@@ -5,6 +5,7 @@ import type {
   IntegrationRegistration,
 } from '../../kernel/integration_registry';
 import type { RuntimeCapabilityV1 } from '../../kernel/runtime';
+import { validatePersistentFirstDisplaySliceAdoptionV1 } from '../../shared/takeover';
 
 import { installClickGuard } from './click';
 import { installDynamicIframeProxy } from './iframe';
@@ -12,6 +13,20 @@ import { installDynamicImageProxy } from './image';
 import { createCreativeStartup } from './startup';
 
 export const CREATIVE_INTEGRATION_ID = 'creative' as const;
+
+function validFirstDisplayAdoption(candidate: unknown): boolean {
+  return validatePersistentFirstDisplaySliceAdoptionV1(candidate, 'creative_initial', (state) => {
+    const value = state.values[0]?.[1];
+    return (
+      state.values.length === 1 &&
+      state.values[0]?.[0] === 'guard_count' &&
+      typeof value === 'number' &&
+      Number.isInteger(value) &&
+      value >= 1 &&
+      value <= 3
+    );
+  });
+}
 
 function readCreativeBoot(candidate: unknown): Readonly<CreativeBootV1> | undefined {
   try {
@@ -86,7 +101,13 @@ export function createCreativeIntegrationRegistration(releaseId: string): Integr
       const runtimeDocument = runtimeCapability?.document;
       if (!runtimeDocument) throw new TypeError('Creative runtime capability is unavailable');
       if (!creative.enabled || (!creative.clickGuard && !creative.renderGuard)) {
-        return Object.freeze({ activate: () => undefined });
+        return Object.freeze({
+          activate: ({ adoption }: IntegrationActivationContext) => {
+            if (adoption !== undefined && !validFirstDisplayAdoption(adoption)) {
+              throw new TypeError('Creative first-display parser state is invalid');
+            }
+          },
+        });
       }
       const runtime = createCreativeStartup({
         document: runtimeDocument,
@@ -96,7 +117,10 @@ export function createCreativeIntegrationRegistration(releaseId: string): Integr
       });
 
       return Object.freeze({
-        activate: ({ afterCommit, onDispose }: IntegrationActivationContext) => {
+        activate: ({ adoption, afterCommit, onDispose }: IntegrationActivationContext) => {
+          if (adoption !== undefined && !validFirstDisplayAdoption(adoption)) {
+            throw new TypeError('Creative first-display parser state is invalid');
+          }
           const runtimeRelease: { value?: () => void } = {};
           onDispose(() => runtimeRelease.value?.());
           const releaseRuntime = runtime.activate(creative);

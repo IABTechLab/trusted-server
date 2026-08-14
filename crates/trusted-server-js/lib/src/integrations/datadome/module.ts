@@ -49,6 +49,11 @@ export function createDataDomeRuntime(
 export function createDataDomeIntegrationRegistration(release: string): IntegrationRegistration {
   return createLifecycleIntegrationRegistration(DATADOME_INTEGRATION_ID, release, {
     createOwnedRuntime: () => createDataDomeRuntime(),
+    firstDisplaySliceId: 'datadome_initial',
     validateConfig: (candidate) => candidate === undefined,
+    validateFirstDisplayState: (state) =>
+      state.values.length === 1 &&
+      state.values[0]?.[0] === 'route_guard' &&
+      state.values[0][1] === 'datadome',
   });
 }

@@ -9,6 +9,7 @@ import {
 
 const RELEASE_ID = 'a'.repeat(64);
 const DIGEST = 'b'.repeat(64);
+const RESERVATION_ID = `r1_${'a'.repeat(22)}`;
 
 function handoff(revision = 0): Record<string, unknown> {
   return {
@@ -16,7 +17,7 @@ function handoff(revision = 0): Record<string, unknown> {
     releaseId: RELEASE_ID,
     generation: 1,
     projectionDigest: DIGEST,
-    slices: ['first_display'],
+    slices: ['first_display', 'gpt_initial'],
     slots: [
       {
         id: 'slot-1',
@@ -25,30 +26,84 @@ function handoff(revision = 0): Record<string, unknown> {
         gamPath: '/123/slot-1',
         formats: [[300, 250]],
         owner: 'trusted_server',
-        outcome: 'failed',
-        targeting: [],
-        committedArtifact: 'none',
-        gptToken: null,
+        outcome: 'accepted',
+        targeting: [['hb_adid', RESERVATION_ID]],
+        committedArtifact: 'gpt_adm',
+        gptToken: 'gt1_1',
       },
     ],
-    attempts: [],
+    attempts: [
+      {
+        id: 'a1_AAECAwQFBgcAAAAAAAAAAQ',
+        slotId: 'slot-1',
+        ordinal: 1,
+        state: 'accepted',
+        reason: null,
+      },
+    ],
     tombstones: [],
-    artifacts: [],
-    parserState: [],
-    gptFacts: [],
-    gptFactOverflow: 0,
-    timing: { bidsScriptMs: 1, firstDisplayMs: null, terminalMs: 2, paintMs: 3 },
+    artifacts: [
+      {
+        slotId: 'slot-1',
+        kind: 'gpt_adm',
+        owner: 'trusted_server',
+        token: RESERVATION_ID,
+      },
+    ],
+    parserState: [
+      {
+        sliceId: 'gpt_initial',
+        observations: ['protocol_version'],
+        values: [['protocol_version', 1]],
+      },
+    ],
+    gptDiagnostics: { facts: [], overflowCount: 0, dropCount: 0 },
+    timing: { bidsScriptMs: 1, firstDisplayMs: 2, terminalMs: 3, paintMs: 4 },
     highWater: {
-      navigationAttemptPrefix: 'nav1',
-      nextNavigationAttemptOrdinal: 1,
-      nextAttemptOrdinal: 1,
+      navigationAttemptPrefix: 'AAECAwQFBgc',
+      nextNavigationAttemptOrdinal: 2,
+      nextAttemptOrdinal: 2,
       nextSlotRegistrationOrdinal: 2,
       reservationClockEpochMs: 0,
-      nextReservationOrdinal: 1,
+      nextReservationOrdinal: 2,
       nextTicketOrdinal: 1,
     },
-    cycles: [],
-    trace: { nextSequence: 1, nextGlobalSlotOrdinal: 2, slots: [] },
+    cycles: [
+      {
+        slotId: 'slot-1',
+        token: 'gt1_1',
+        nextCycleOrdinal: 2,
+        unknownPriorCycle: false,
+        records: [
+          {
+            ordinal: 1,
+            responseIdentifier: 'response-one',
+            seen: ['slotRequested', 'slotRenderEnded'],
+            state: 'completed',
+          },
+        ],
+        quarantines: [],
+      },
+    ],
+    trace: {
+      nextSequence: 2,
+      nextGlobalSlotOrdinal: 2,
+      slots: [
+        {
+          slotId: 'slot-1',
+          impressions: 1,
+          bindings: [
+            {
+              atMs: 3,
+              cycleOrdinal: 1,
+              historySequence: 1,
+              state: 'completed',
+              token: 'gt1_1',
+            },
+          ],
+        },
+      ],
+    },
     mutationRevision: revision,
   };
 }
@@ -59,15 +114,18 @@ function outline(): Record<string, unknown> {
     releaseId: RELEASE_ID,
     generation: 1,
     projectionDigest: DIGEST,
-    slices: ['first_display'],
+    slices: ['first_display', 'gpt_initial'],
     slotCount: 1,
     outcomeCount: 1,
     capabilities: [],
-    objectKinds: [],
+    objectKinds: ['gpt_slot', 'dom_artifact'],
   };
 }
 
-function finalized(identity: object = {}): FinalizedFirstDisplayHandoffV1 {
+function finalized(
+  physicalSlot: object = {},
+  artifact: object = {}
+): FinalizedFirstDisplayHandoffV1 {
   const owner = createFirstDisplayHandoffOwner({
     releaseId: RELEASE_ID,
     generation: 1,
@@ -77,14 +135,18 @@ function finalized(identity: object = {}): FinalizedFirstDisplayHandoffV1 {
     closeIngress: () => undefined,
     onFailure: () => undefined,
   });
-  const value = owner.finalize(() => ({ candidate: handoff(), identities: [identity] }));
+  const value = owner.finalize(() => ({
+    candidate: handoff(),
+    identities: [physicalSlot, artifact],
+  }));
   if (!value) throw new Error('should finalize test handoff');
   return value;
 }
 
 describe('atomic first-display takeover', () => {
   it('binds the exact handoff and one-use identities to the prepared persistent barrier', () => {
-    const identity = {};
+    const physicalSlot = {};
+    const artifact = {};
     const events: string[] = [];
     let adoption: unknown;
     const prepared = Object.freeze({
@@ -99,7 +161,7 @@ describe('atomic first-display takeover', () => {
     expect(
       coordinatePreparedFirstDisplayTakeoverV1({
         prepared,
-        finalized: finalized(identity),
+        finalized: finalized(physicalSlot, artifact),
         outline: outline(),
         isCurrentGeneration: () => true,
         authenticateRuntimeScript: () => true,
@@ -113,7 +175,7 @@ describe('atomic first-display takeover', () => {
     expect(adoption).toMatchObject({
       version: 1,
       adoptInitialDisplay: true,
-      identities: [identity],
+      identities: [physicalSlot, artifact],
       handoff: { releaseId: RELEASE_ID, generation: 1 },
     });
     expect(Object.isFrozen(adoption)).toBe(true);
@@ -122,9 +184,10 @@ describe('atomic first-display takeover', () => {
 
   it('transfers one-use identities and commits in the exact non-yielding order', () => {
     const events: string[] = [];
-    const identity = {};
+    const physicalSlot = {};
+    const artifact = {};
     const result = performFirstDisplayTakeoverV1({
-      finalized: finalized(identity),
+      finalized: finalized(physicalSlot, artifact),
       outline: outline(),
       isCurrentGeneration: () => true,
       authenticateRuntimeScript: () => true,
@@ -133,7 +196,7 @@ describe('atomic first-display takeover', () => {
       detachCommittedArtifacts: () => events.push('detach-artifacts'),
       disposeAgent: () => events.push('dispose-agent'),
       activatePersistent: (_snapshot, identities, own) => {
-        expect(identities).toEqual([identity]);
+        expect(identities).toEqual([physicalSlot, artifact]);
         own(() => events.push('rollback-persistent'));
         events.push('activate-persistent');
       },
@@ -247,6 +310,28 @@ describe('atomic first-display takeover', () => {
           outline: candidate,
           isCurrentGeneration: () => failure !== 'generation',
           authenticateRuntimeScript: () => failure !== 'script',
+          currentMutationRevision: () => 0,
+          quiesceAgent: () => events.push('quiesce'),
+          detachCommittedArtifacts: () => events.push('detach'),
+          disposeAgent: () => events.push('dispose'),
+          activatePersistent: () => events.push('activate'),
+          commitPersistent: () => events.push('commit'),
+          onFailure: () => events.push('fallback'),
+        })
+      ).toBe(false);
+      expect(events).toEqual(['fallback']);
+    }
+  });
+
+  it('rejects an outline that did not prepare every transferred object kind', () => {
+    for (const objectKinds of [[], ['gpt_slot'], ['dom_artifact']] as const) {
+      const events: string[] = [];
+      expect(
+        performFirstDisplayTakeoverV1({
+          finalized: finalized(),
+          outline: { ...outline(), objectKinds },
+          isCurrentGeneration: () => true,
+          authenticateRuntimeScript: () => true,
           currentMutationRevision: () => 0,
           quiesceAgent: () => events.push('quiesce'),
           detachCommittedArtifacts: () => events.push('detach'),

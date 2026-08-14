@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { createFirstDisplayHandoffOwner } from '../../src/first_display/handoff';
 
 const RELEASE_ID = 'a'.repeat(64);
+const RESERVATION_ID = `r1_${'a'.repeat(22)}`;
 
 function handoff(
   revision: number,
@@ -19,11 +20,10 @@ function handoff(
     tombstones: [],
     artifacts: [],
     parserState: [],
-    gptFacts: [],
-    gptFactOverflow: 0,
+    gptDiagnostics: { facts: [], overflowCount: 0, dropCount: 0 },
     timing: { bidsScriptMs: 1, firstDisplayMs: null, terminalMs: 2, paintMs: 3 },
     highWater: {
-      navigationAttemptPrefix: 'nav1',
+      navigationAttemptPrefix: 'AAECAwQFBgc',
       nextNavigationAttemptOrdinal: 1,
       nextAttemptOrdinal: 1,
       nextSlotRegistrationOrdinal: 1,
@@ -36,6 +36,96 @@ function handoff(
     mutationRevision: revision,
     ...overrides,
   };
+}
+
+function acceptedHandoff(revision: number): Record<string, unknown> {
+  return handoff(revision, {
+    slices: ['first_display', 'gpt_initial'],
+    slots: [
+      {
+        id: 'slot-1',
+        aliases: [],
+        domId: 'div-1',
+        gamPath: '/123/slot-1',
+        formats: [[300, 250]],
+        owner: 'trusted_server',
+        outcome: 'accepted',
+        targeting: [['hb_adid', RESERVATION_ID]],
+        committedArtifact: 'gpt_adm',
+        gptToken: 'gt1_1',
+      },
+    ],
+    attempts: [
+      {
+        id: 'a1_AAECAwQFBgcAAAAAAAAAAQ',
+        slotId: 'slot-1',
+        ordinal: 1,
+        state: 'accepted',
+        reason: null,
+      },
+    ],
+    artifacts: [
+      {
+        slotId: 'slot-1',
+        kind: 'gpt_adm',
+        owner: 'trusted_server',
+        token: RESERVATION_ID,
+      },
+    ],
+    parserState: [
+      {
+        sliceId: 'gpt_initial',
+        observations: ['protocol_version'],
+        values: [['protocol_version', 1]],
+      },
+    ],
+    timing: { bidsScriptMs: 1, firstDisplayMs: 2, terminalMs: 3, paintMs: 4 },
+    highWater: {
+      navigationAttemptPrefix: 'AAECAwQFBgc',
+      nextNavigationAttemptOrdinal: 2,
+      nextAttemptOrdinal: 2,
+      nextSlotRegistrationOrdinal: 2,
+      reservationClockEpochMs: 0,
+      nextReservationOrdinal: 2,
+      nextTicketOrdinal: 1,
+    },
+    cycles: [
+      {
+        slotId: 'slot-1',
+        token: 'gt1_1',
+        nextCycleOrdinal: 2,
+        unknownPriorCycle: false,
+        records: [
+          {
+            ordinal: 1,
+            responseIdentifier: 'response-one',
+            seen: ['slotRequested', 'slotRenderEnded'],
+            state: 'completed',
+          },
+        ],
+        quarantines: [],
+      },
+    ],
+    trace: {
+      nextSequence: 2,
+      nextGlobalSlotOrdinal: 2,
+      slots: [
+        {
+          slotId: 'slot-1',
+          impressions: 1,
+          bindings: [
+            {
+              atMs: 3,
+              cycleOrdinal: 1,
+              historySequence: 1,
+              state: 'completed',
+              token: 'gt1_1',
+            },
+          ],
+        },
+      ],
+    },
+  });
 }
 
 function owner(options: { initialRevision?: number } = {}) {
@@ -68,7 +158,7 @@ describe('first-display final handoff owner', () => {
     expect(h.value.observeMutation()).toBe(true);
 
     const final = h.value.finalize(() => ({
-      candidate: handoff(2),
+      candidate: acceptedHandoff(2),
       identities: [physicalSlot, artifact],
     }));
     expect(final?.handoff.mutationRevision).toBe(2);
@@ -107,16 +197,26 @@ describe('first-display final handoff owner', () => {
   it('clears the capsule and fails closed on duplicate finalization or stale revision', () => {
     const duplicate = owner();
     const identity = {};
+    const artifact = {};
     const final = duplicate.value.finalize(() => ({
-      candidate: handoff(0),
-      identities: [identity],
+      candidate: acceptedHandoff(0),
+      identities: [identity, artifact],
     }));
     expect(final).toBeDefined();
     expect(
-      duplicate.value.finalize(() => ({ candidate: handoff(0), identities: [identity] }))
+      duplicate.value.finalize(() => ({
+        candidate: acceptedHandoff(0),
+        identities: [identity, artifact],
+      }))
     ).toBeUndefined();
     expect(final?.capsule.consume(RELEASE_ID, 1)).toBeUndefined();
     expect(duplicate.failures).toEqual(['bundle_partial']);
+
+    const extraIdentity = owner();
+    expect(
+      extraIdentity.value.finalize(() => ({ candidate: handoff(0), identities: [{}] }))
+    ).toBeUndefined();
+    expect(extraIdentity.failures).toEqual(['bundle_partial']);
 
     const stale = owner();
     stale.value.observeMutation();

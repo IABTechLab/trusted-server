@@ -119,6 +119,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
       'first_display/registration',
       'first_display/transaction',
       'kernel/contracts/puc_dynamic_owner',
+      'kernel/identity',
     ],
     inputs: ['boot.v1', 'projection.v1'],
     outputs: ['first_display.control.v1'],

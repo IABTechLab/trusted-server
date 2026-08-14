@@ -4,6 +4,7 @@ import type {
   IntegrationRegistration,
 } from '../../kernel/integration_registry';
 import type { IntegrationLifecycleRuntime } from '../../kernel/lifecycle_module';
+import { validatePersistentFirstDisplaySliceAdoptionV1 } from '../../shared/takeover';
 
 import {
   disposeSourcepointConsentMirror,
@@ -164,10 +165,30 @@ export function createSourcepointIntegrationRegistration(release: string): Integ
       onDispose(releaseOwnedState);
       return Object.freeze({
         activate: ({
+          adoption,
           afterCommit,
           onDispose: onActivationDispose,
         }: IntegrationActivationContext) => {
           if (criticalActive) throw new Error('Sourcepoint consent is already active');
+          if (
+            adoption !== undefined &&
+            !validatePersistentFirstDisplaySliceAdoptionV1(
+              adoption,
+              'sourcepoint_initial',
+              (state) => {
+                const value = state.values[0]?.[1];
+                return (
+                  state.values.length === 1 &&
+                  state.values[0]?.[0] === 'gpp_snapshot' &&
+                  typeof value === 'number' &&
+                  Number.isInteger(value) &&
+                  value >= 0
+                );
+              }
+            )
+          ) {
+            throw new TypeError('Sourcepoint first-display parser state is invalid');
+          }
           if (config.rewriteSdk) {
             installSourcepointGuard();
             guardInstalled = true;

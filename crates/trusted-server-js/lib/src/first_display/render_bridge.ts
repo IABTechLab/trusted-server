@@ -12,6 +12,7 @@ const ADM_SANDBOX =
 const CLAIM_DEADLINE_MS = 3_000;
 const ADM_LOAD_DEADLINE_MS = 5_000;
 const TICKET_TTL_MS = 3_000;
+const RESERVATION_TTL_MS = 15 * 60 * 1_000;
 const MAX_CAPABILITIES = 320;
 const MAX_NONCES = 256;
 const MAX_DRAWS = 8;
@@ -57,7 +58,7 @@ interface PendingClaim {
 
 interface Attempt {
   readonly cycle: FirstDisplayGptBoundCycleV1;
-  readonly onTerminal: (result: 'accepted' | 'failed' | 'cancelled') => void;
+  readonly onTerminal: (result: 'accepted' | 'failed' | 'cancelled', reason: string | null) => void;
   readonly reservationId: string;
   active: boolean;
   claim: PendingClaim | undefined;
@@ -104,6 +105,12 @@ interface TicketTombstone {
 }
 
 type TicketEntry = LiveTicket | TicketTombstone;
+
+interface ReservationEntry {
+  readonly expiresAt: number;
+  readonly ordinal: number;
+  readonly state: 'live' | 'tombstone';
+}
 
 function utf8Length(value: string): number {
   return textEncoder.encode(value).byteLength;
@@ -552,7 +559,7 @@ export function createFirstDisplayRenderBridge(
   options: FirstDisplayRenderBridgeOptionsV1
 ): FirstDisplayRenderBridgeV1 {
   const attempts = new Map<string, Attempt>();
-  const reservations = new Map<string, 'live' | 'tombstone'>();
+  const reservations = new Map<string, ReservationEntry>();
   const tickets = new Map<string, TicketEntry>();
   const nonces = new Map<string, Attempt>();
   const committedFrames = new Map<
@@ -571,6 +578,7 @@ export function createFirstDisplayRenderBridge(
   let handoffCaptured = false;
   let committedArtifactsDetached = false;
   let nextTicketOrdinal = 1;
+  let nextReservationOrdinal = 1;
   let lastNow = Number.NEGATIVE_INFINITY;
   const messageEventPrototype = (() => {
     try {
@@ -665,6 +673,17 @@ export function createFirstDisplayRenderBridge(
     notifyNativeMutation();
   };
 
+  const retireReservation = (attempt: Attempt): void => {
+    const entry = reservations.get(attempt.reservationId);
+    if (entry?.state !== 'live') return;
+    reservations.set(attempt.reservationId, {
+      expiresAt: entry.expiresAt,
+      ordinal: entry.ordinal,
+      state: 'tombstone',
+    });
+    notifyNativeMutation();
+  };
+
   const releaseAttempt = (attempt: Attempt, removeFrame: boolean): void => {
     clearOwnedTimer(attempt.claimTimer);
     clearOwnedTimer(attempt.completionTimer);
@@ -690,7 +709,7 @@ export function createFirstDisplayRenderBridge(
     if (attempt.nonce && nonces.get(attempt.nonce) === attempt) nonces.delete(attempt.nonce);
     attempt.nonce = undefined;
     retireTicket(attempt);
-    reservations.set(attempt.reservationId, 'tombstone');
+    retireReservation(attempt);
     attempts.delete(attempt.reservationId);
     if (attempt.directFrame) {
       try {
@@ -735,7 +754,7 @@ export function createFirstDisplayRenderBridge(
       );
     }
     try {
-      attempt.onTerminal(result);
+      attempt.onTerminal(result, result === 'accepted' ? null : reason);
     } catch {
       // A consumer callback cannot restore released render authority.
     }
@@ -1095,7 +1114,7 @@ export function createFirstDisplayRenderBridge(
     }
     attempt.ownerSource = claim.source;
     attempt.state = 'waiting_for_owner';
-    reservations.set(attempt.reservationId, 'tombstone');
+    retireReservation(attempt);
     const source = attempt.cycle.bid.renderSource;
     resizeCollapsedPucShell(options.document, claim.source, source.width, source.height);
     return true;
@@ -1227,7 +1246,7 @@ export function createFirstDisplayRenderBridge(
 
   const renderDirectFallback = (attempt: Attempt): boolean => {
     attempt.state = 'rendering_direct';
-    reservations.set(attempt.reservationId, 'tombstone');
+    retireReservation(attempt);
     const claim = attempt.claim;
     attempt.claim = undefined;
     if (claim) {
@@ -1260,7 +1279,7 @@ export function createFirstDisplayRenderBridge(
       for (const port of inspection?.ports ?? []) closePort(port);
     };
     if (
-      reservationState !== 'live' ||
+      reservationState.state !== 'live' ||
       !inspection?.exact ||
       inspection.originalCount !== 1 ||
       inspection.ports.length !== 1 ||
@@ -1295,7 +1314,7 @@ export function createFirstDisplayRenderBridge(
   return Object.freeze({
     bind: (
       cycle: FirstDisplayGptBoundCycleV1,
-      onTerminal: (result: 'accepted' | 'failed' | 'cancelled') => void
+      onTerminal: (result: 'accepted' | 'failed' | 'cancelled', reason: string | null) => void
     ): boolean => {
       if (
         disposed ||
@@ -1305,6 +1324,17 @@ export function createFirstDisplayRenderBridge(
         !validCycle(cycle) ||
         reservations.size >= MAX_CAPABILITIES ||
         reservations.has(cycle.bid.rendererReservationId)
+      ) {
+        return false;
+      }
+      const observedAt = readNow();
+      if (observedAt === undefined) return false;
+      const expiresAt = observedAt + RESERVATION_TTL_MS;
+      const reservationOrdinal = nextReservationOrdinal;
+      if (
+        !Number.isFinite(expiresAt) ||
+        expiresAt <= observedAt ||
+        reservationOrdinal > 4_294_967_295
       ) {
         return false;
       }
@@ -1336,7 +1366,12 @@ export function createFirstDisplayRenderBridge(
         ticket: undefined,
       };
       attempts.set(attempt.reservationId, attempt);
-      reservations.set(attempt.reservationId, 'live');
+      reservations.set(attempt.reservationId, {
+        expiresAt,
+        ordinal: reservationOrdinal,
+        state: 'live',
+      });
+      nextReservationOrdinal += 1;
       return true;
     },
     recordGam: (
@@ -1392,7 +1427,20 @@ export function createFirstDisplayRenderBridge(
       if (disposed || !ingressClosed || handoffCaptured) return undefined;
       const observedAt = readNow();
       if (observedAt === undefined) return undefined;
-      const tombstones = [...tickets.entries()]
+      const reservationTombstones = [...reservations.entries()]
+        .filter((entry): entry is [string, ReservationEntry] => {
+          const value = entry[1];
+          return value.state === 'tombstone' && value.expiresAt > observedAt;
+        })
+        .map(([value, entry]) =>
+          Object.freeze({
+            kind: 'reservation' as const,
+            value,
+            expiresAtMs: entry.expiresAt,
+            ordinal: entry.ordinal,
+          })
+        );
+      const ticketTombstones = [...tickets.entries()]
         .filter((entry): entry is [string, TicketTombstone] => {
           const value = entry[1];
           return value.state === 'tombstone' && value.expiresAt > observedAt;
@@ -1417,8 +1465,10 @@ export function createFirstDisplayRenderBridge(
       handoffCaptured = true;
       return Object.freeze({
         artifacts: Object.freeze(artifacts),
+        clockEpochMs: observedAt,
+        nextReservationOrdinal,
         nextTicketOrdinal,
-        tombstones: Object.freeze(tombstones),
+        tombstones: Object.freeze([...reservationTombstones, ...ticketTombstones]),
       });
     },
     detachCommittedArtifacts: (): boolean => {

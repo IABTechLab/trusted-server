@@ -145,6 +145,7 @@ function createGptHarness(
   });
   const adapter: GoogletagAdapter = Object.freeze({
     bindingStatus: () => 'present',
+    diagnosticsIdentity: () => undefined,
     dispose: vi.fn(),
     notifyReady: vi.fn(),
     observeDiagnostics: () => vi.fn(),
@@ -415,6 +416,15 @@ describe('slot registry', () => {
       }),
     ]);
     expect(Object.isFrozen(service.snapshotRegisteredSlots(navigation))).toBe(true);
+
+    expect(service.adoptRegistrationHighWater(navigation.generation, 9)).toBe(true);
+    expect(service.adoptRegistrationHighWater(navigation.generation, 10)).toBe(false);
+    expect(
+      service.register(navigation, [{ registeredSlotId: 'after-handoff', source: 'programmatic' }])
+    ).toMatchObject({
+      ok: true,
+      records: [expect.objectContaining({ ordinal: 9, registeredSlotId: 'after-handoff' })],
+    });
 
     expect(
       service.register(navigation, [
@@ -4386,6 +4396,7 @@ describe('Task 11 adversarial ownership review', () => {
       let rejectNext = true;
       const adapter: GoogletagAdapter = Object.freeze({
         bindingStatus: () => 'present',
+        diagnosticsIdentity: () => undefined,
         dispose: vi.fn(),
         notifyReady: vi.fn(),
         observeDiagnostics: () => vi.fn(),

@@ -205,6 +205,14 @@ export interface ReservationServiceOptions {
   readonly prepareRenderSource: (candidate: unknown) => ReservationRenderSource | undefined;
 }
 
+export interface FirstDisplayReservationTombstoneAdoptionV1 {
+  readonly clockEpochMs: number;
+  readonly tombstones: readonly Readonly<{
+    readonly expiresAtMs: number;
+    readonly reservationId: string;
+  }>[];
+}
+
 /** Tagged browser render source copied after an injected exact parser accepts it. */
 export type ReservationRenderSource = Readonly<{
   type: 'aps' | 'adm';
@@ -338,6 +346,9 @@ export interface ReservationServiceInventory {
 }
 
 export interface ReservationService {
+  readonly adoptFirstDisplayTombstones: (
+    candidate: FirstDisplayReservationTombstoneAdoptionV1
+  ) => boolean;
   readonly registerRender: (input: ReservationRegistrationInput) => ReservationRegistrationResult;
   readonly registerPrebidLease: (
     input: PrebidLeaseRegistrationInput
@@ -644,6 +655,7 @@ export function createReservationService(options: ReservationServiceOptions): Re
   const entries = new Map<string, ReservationEntry>();
   const ownerRegistrations = new WeakMap<object, OwnerRegistration>();
   const claimAdmissions = new Map<object, ClaimedAdmission>();
+  let adoptionOpen = true;
 
   const invalidateClaimAdmission = (claim: object, admission: ClaimedAdmission): void => {
     if (mapValue(claimAdmissions, claim) === admission) deleteMapValue(claimAdmissions, claim);
@@ -988,9 +1000,70 @@ export function createReservationService(options: ReservationServiceOptions): Re
     frozenResult({ recognized: true as const, claimed: false as const, state });
 
   const service: ReservationService = {
-    registerRender: (input) => register(input, false),
-    registerPrebidLease: (input) => register(input, true),
+    adoptFirstDisplayTombstones(candidate): boolean {
+      if (
+        !adoptionOpen ||
+        disposed ||
+        clockFaulted ||
+        storeFaulted ||
+        mapSize(entries) !== 0 ||
+        mapSize(claimAdmissions) !== 0 ||
+        typeof candidate !== 'object' ||
+        candidate === null ||
+        typeof candidate.clockEpochMs !== 'number' ||
+        !Number.isFinite(candidate.clockEpochMs) ||
+        candidate.clockEpochMs < 0 ||
+        !Array.isArray(candidate.tombstones) ||
+        candidate.tombstones.length > MAX_RESERVATIONS
+      ) {
+        return false;
+      }
+      const now = clock();
+      if (now === undefined) return false;
+      const prepared = new Map<string, ReservationTombstone>();
+      for (const tombstone of candidate.tombstones) {
+        if (
+          typeof tombstone !== 'object' ||
+          tombstone === null ||
+          typeof tombstone.reservationId !== 'string' ||
+          !matches(RESERVATION_ID, tombstone.reservationId) ||
+          prepared.has(tombstone.reservationId) ||
+          typeof tombstone.expiresAtMs !== 'number' ||
+          !Number.isFinite(tombstone.expiresAtMs) ||
+          tombstone.expiresAtMs < 0
+        ) {
+          return false;
+        }
+        const remainingMs = tombstone.expiresAtMs - candidate.clockEpochMs;
+        if (remainingMs <= 0) continue;
+        const expiresAt = now + remainingMs;
+        if (!Number.isFinite(expiresAt) || expiresAt <= now) return false;
+        prepared.set(
+          tombstone.reservationId,
+          frozenResult({ expiresAt, state: 'consumed' as const })
+        );
+      }
+      const published: string[] = [];
+      for (const [reservationId, tombstone] of prepared) {
+        if (!publishEntry(reservationId, undefined, tombstone)) {
+          for (const publishedId of published) deleteMapValue(entries, publishedId);
+          return false;
+        }
+        published.push(reservationId);
+      }
+      adoptionOpen = false;
+      return true;
+    },
+    registerRender: (input) => {
+      adoptionOpen = false;
+      return register(input, false);
+    },
+    registerPrebidLease: (input) => {
+      adoptionOpen = false;
+      return register(input, true);
+    },
     promotePrebidSelection(input): ReservationRegistrationResult {
+      adoptionOpen = false;
       const fields = ownDataRecord(input, [
         'reservationId',
         'auctionId',
@@ -1083,6 +1156,7 @@ export function createReservationService(options: ReservationServiceOptions): Re
       return success;
     },
     claim(input): ReservationClaimResult {
+      adoptionOpen = false;
       const minimalId = (() => {
         try {
           return input.reservationId;
@@ -1178,6 +1252,7 @@ export function createReservationService(options: ReservationServiceOptions): Re
       return result;
     },
     consumeClaim(claim, expectation): ReservationClaimAdmission | undefined {
+      adoptionOpen = false;
       const fields = ownDataRecord(expectation, [
         'attempt',
         'attemptId',
@@ -1232,6 +1307,7 @@ export function createReservationService(options: ReservationServiceOptions): Re
     },
     recognize,
     tombstone(input, state): boolean {
+      adoptionOpen = false;
       if (!validRenderTombstoneState(state)) return false;
       const fields = ownDataRecord(input, [
         'reservationId',
@@ -1256,6 +1332,7 @@ export function createReservationService(options: ReservationServiceOptions): Re
       return replaceWithTombstone(fields.reservationId, entry, state);
     },
     tombstonePrebidLease(input, state): boolean {
+      adoptionOpen = false;
       if (!validPrebidLeaseTombstoneState(state)) return false;
       const fields = ownDataRecord(input, [
         'reservationId',
@@ -1281,6 +1358,7 @@ export function createReservationService(options: ReservationServiceOptions): Re
       return replaceWithTombstone(fields.reservationId, entry, state);
     },
     tombstonePrebidGroup(input, state): number {
+      adoptionOpen = false;
       if (!validPrebidGroupTombstoneState(state)) return 0;
       const fields = ownDataRecord(input, ['auctionId', 'adUnitCode', 'navigationGeneration']);
       if (!refreshForTerminalMutation() || !fields) {

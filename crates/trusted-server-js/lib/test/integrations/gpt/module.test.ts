@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  adoptInitialGptDiagnosticsFromHandoff,
+  adoptInitialGptFactsFromHandoff,
   adoptInitialGptSlotsFromHandoff,
+  adoptInitialPucTicketsFromHandoff,
   installPbsCacheBridge,
   publishGptWinner,
   publishInitialGptProjection,
@@ -36,6 +39,144 @@ import { createTargetingService } from '../../../src/services/targeting';
 
 const RELEASE_ID = 'a'.repeat(64);
 const RESERVATION_ID = `r1_${'a'.repeat(22)}`;
+
+describe('GPT first-display diagnostics adoption', () => {
+  it('hydrates exact physical-slot cycle state before slot adoption', () => {
+    const physicalSlot = {};
+    const adoptDiagnosticsState = vi.fn(() => true);
+    const adoption = Object.freeze({
+      version: 1 as const,
+      adoptInitialDisplay: true as const,
+      handoff: Object.freeze({
+        artifacts: Object.freeze([]),
+        cycles: Object.freeze([
+          Object.freeze({
+            nextCycleOrdinal: 3,
+            records: Object.freeze([
+              Object.freeze({
+                ordinal: 1,
+                responseIdentifier: 'response-one',
+                seen: Object.freeze(['slotRequested', 'slotRenderEnded'] as const),
+                state: 'completed' as const,
+              }),
+            ]),
+            token: 'gt1_4',
+            unknownPriorCycle: false,
+          }),
+        ]),
+        trace: Object.freeze({ nextGlobalSlotOrdinal: 7 }),
+      }),
+      identities: Object.freeze([physicalSlot]),
+    });
+
+    expect(adoptInitialGptDiagnosticsFromHandoff(adoption, { adoptDiagnosticsState })).toBe(
+      adoption
+    );
+    expect(adoptDiagnosticsState).toHaveBeenCalledWith({
+      nextTraceTokenOrdinal: 7,
+      slots: [
+        {
+          nextCycleOrdinal: 3,
+          physicalSlot,
+          records: [
+            {
+              ordinal: 1,
+              responseIdentifier: 'response-one',
+              seen: ['slotRequested', 'slotRenderEnded'],
+              state: 'completed',
+            },
+          ],
+          traceToken: 'gt1_4',
+          unknownPriorCycle: false,
+        },
+      ],
+    });
+  });
+
+  it('restores diagnostics facts only when the diagnostics owner is selected', () => {
+    const adoptFirstDisplay = vi.fn(
+      (_diagnostics: unknown, _resolve?: (token: string) => unknown) => true
+    );
+    const physicalSlot = {};
+    const diagnosticsToken = Object.freeze(Object.create(null) as object);
+    const fact = Object.freeze({
+      version: 1 as const,
+      event: 'slotRenderEnded' as const,
+      token: 'gt1_1',
+      runtimeSlotNumber: 1,
+      cycleOrdinal: 1,
+      disposition: 'matched' as const,
+      issueReason: null,
+      capturedAtMs: 5,
+      elementId: 'slot-1',
+      adUnitPath: '/123/slot-1',
+      isEmpty: false,
+      renderedSize: Object.freeze([300, 250] as const),
+      isBackfill: false,
+      slotContentChanged: true,
+      visibilityPercent: null,
+    });
+    const diagnostics = Object.freeze({
+      facts: Object.freeze([fact]),
+      overflowCount: 3,
+      dropCount: 2,
+    });
+    const adapter = {
+      diagnosticsIdentity: (slot: object) =>
+        slot === physicalSlot
+          ? Object.freeze({
+              token: diagnosticsToken,
+              traceToken: 'gt1_1' as never,
+              runtimeSlotNumber: 1,
+              cycleOrdinal: 1 as never,
+            })
+          : undefined,
+    };
+    const adoption = Object.freeze({
+      version: 1 as const,
+      adoptInitialDisplay: true as const,
+      handoff: Object.freeze({
+        artifacts: Object.freeze([]),
+        cycles: Object.freeze([Object.freeze({ token: 'gt1_1' })]),
+        gptDiagnostics: diagnostics,
+      }),
+      identities: Object.freeze([physicalSlot]),
+    });
+
+    expect(adoptInitialGptFactsFromHandoff(adoption, { adoptFirstDisplay }, adapter)).toBe(
+      adoption
+    );
+    expect(adoptFirstDisplay).toHaveBeenCalledWith(diagnostics, expect.any(Function));
+    const resolve = adoptFirstDisplay.mock.calls[0]?.[1] as (token: string) => unknown;
+    expect(resolve('gt1_1')).toMatchObject({ token: diagnosticsToken, runtimeSlotNumber: 1 });
+    expect(adoptInitialGptFactsFromHandoff(adoption, undefined, adapter)).toBeUndefined();
+  });
+
+  it('transfers only lifecycle-ticket tombstones to the persistent PUC owner', () => {
+    const adoptFirstDisplayTickets = vi.fn(() => true);
+    const adoption = Object.freeze({
+      version: 1 as const,
+      adoptInitialDisplay: true as const,
+      handoff: Object.freeze({
+        highWater: Object.freeze({ reservationClockEpochMs: 40, nextTicketOrdinal: 8 }),
+        tombstones: Object.freeze([
+          Object.freeze({ expiresAtMs: 80, kind: 'ticket', value: `t1_${'a'.repeat(22)}` }),
+          Object.freeze({ expiresAtMs: 90, kind: 'reservation', value: RESERVATION_ID }),
+        ]),
+      }),
+      identities: Object.freeze([]),
+    });
+
+    expect(adoptInitialPucTicketsFromHandoff(adoption, { adoptFirstDisplayTickets })).toBe(
+      adoption
+    );
+    expect(adoptFirstDisplayTickets).toHaveBeenCalledWith({
+      clockEpochMs: 40,
+      nextTicketOrdinal: 8,
+      tombstones: [{ expiresAtMs: 80, ticket: `t1_${'a'.repeat(22)}` }],
+    });
+  });
+});
 
 function createAttemptHarness() {
   const runtime = createRuntimeSession({
@@ -467,10 +608,12 @@ describe('transactional GPT integration module', () => {
     const frame = {};
     const navigationGeneration = {};
     const adoptGptSlot = vi.fn(() => Object.freeze({ ok: true as const }));
+    const adoptRegistrationHighWater = vi.fn(() => true);
     const adoption = Object.freeze({
       version: 1 as const,
       adoptInitialDisplay: true as const,
       handoff: Object.freeze({
+        highWater: Object.freeze({ nextSlotRegistrationOrdinal: 2 }),
         slots: Object.freeze([
           Object.freeze({
             id: 'slot-1',
@@ -486,9 +629,13 @@ describe('transactional GPT integration module', () => {
       identities: Object.freeze([physicalSlot, frame]),
     });
 
-    expect(adoptInitialGptSlotsFromHandoff(adoption, navigationGeneration, { adoptGptSlot })).toBe(
-      adoption
-    );
+    expect(
+      adoptInitialGptSlotsFromHandoff(adoption, navigationGeneration, {
+        adoptGptSlot,
+        adoptRegistrationHighWater,
+      })
+    ).toBe(adoption);
+    expect(adoptRegistrationHighWater).toHaveBeenCalledExactlyOnceWith(navigationGeneration, 2);
     expect(adoptGptSlot).toHaveBeenCalledExactlyOnceWith(navigationGeneration, 'slot-1', {
       definition: {
         adUnitPath: '/123/slot-1',
@@ -501,12 +648,14 @@ describe('transactional GPT integration module', () => {
   });
 
   it.each([
-    { diagnosticsActive: false, adoptInitialDisplay: false },
-    { diagnosticsActive: true, adoptInitialDisplay: false },
-    { diagnosticsActive: false, adoptInitialDisplay: true },
+    { diagnosticsActive: false, adoptInitialDisplay: false, parserStateValid: true },
+    { diagnosticsActive: true, adoptInitialDisplay: false, parserStateValid: true },
+    { diagnosticsActive: false, adoptInitialDisplay: true, parserStateValid: true },
+    { diagnosticsActive: false, adoptInitialDisplay: true, parserStateValid: false },
+    { diagnosticsActive: false, adoptInitialDisplay: true, parserStateValid: 'absent' },
   ])(
-    'uses only catalog capabilities without replaying adopted display (diagnostics=$diagnosticsActive, adoption=$adoptInitialDisplay)',
-    async ({ diagnosticsActive, adoptInitialDisplay }) => {
+    'uses only catalog capabilities without replaying adopted display (diagnostics=$diagnosticsActive, adoption=$adoptInitialDisplay, parser=$parserStateValid)',
+    async ({ diagnosticsActive, adoptInitialDisplay, parserStateValid }) => {
       vi.useFakeTimers();
       const NativeMutationObserver = window.MutationObserver;
       const activeMutationObservers = new Set<MutationObserver>();
@@ -715,6 +864,32 @@ describe('transactional GPT integration module', () => {
                     version: 1 as const,
                     adoptInitialDisplay: true as const,
                     handoff: Object.freeze({
+                      highWater: Object.freeze({
+                        navigationAttemptPrefix: 'AAECAwQFBgc',
+                        nextAttemptOrdinal: 2,
+                        nextNavigationAttemptOrdinal: 2,
+                        nextSlotRegistrationOrdinal: 2,
+                        nextTicketOrdinal: 1,
+                        reservationClockEpochMs: 0,
+                      }),
+                      tombstones: Object.freeze([]),
+                      slices: Object.freeze(
+                        parserStateValid === 'absent'
+                          ? ['first_display']
+                          : ['first_display', 'gpt_initial']
+                      ),
+                      parserState:
+                        parserStateValid === true
+                          ? Object.freeze([
+                              Object.freeze({
+                                sliceId: 'gpt_initial',
+                                observations: Object.freeze(['protocol_version']),
+                                values: Object.freeze([
+                                  Object.freeze(['protocol_version', 1] as const),
+                                ]),
+                              }),
+                            ])
+                          : Object.freeze([]),
                       slots: Object.freeze([
                         Object.freeze({
                           id: 'critical-slot',
@@ -724,8 +899,48 @@ describe('transactional GPT integration module', () => {
                           formats: Object.freeze([Object.freeze([300, 250])]),
                         }),
                       ]),
-                      cycles: Object.freeze([Object.freeze({ slotId: 'critical-slot' })]),
+                      cycles: Object.freeze([
+                        Object.freeze({
+                          nextCycleOrdinal: 2,
+                          quarantines: Object.freeze([]),
+                          records: Object.freeze([
+                            Object.freeze({
+                              ordinal: 1,
+                              responseIdentifier: 'response-one',
+                              seen: Object.freeze(['slotRequested', 'slotRenderEnded'] as const),
+                              state: 'completed' as const,
+                            }),
+                          ]),
+                          slotId: 'critical-slot',
+                          token: 'gt1_1',
+                          unknownPriorCycle: false,
+                        }),
+                      ]),
                       artifacts: Object.freeze([]),
+                      gptDiagnostics: Object.freeze({
+                        facts: Object.freeze([]),
+                        overflowCount: 0,
+                        dropCount: 0,
+                      }),
+                      trace: Object.freeze({
+                        nextGlobalSlotOrdinal: 2,
+                        nextSequence: 2,
+                        slots: Object.freeze([
+                          Object.freeze({
+                            bindings: Object.freeze([
+                              Object.freeze({
+                                atMs: 0,
+                                cycleOrdinal: 1,
+                                historySequence: 1,
+                                state: 'completed' as const,
+                                token: 'gt1_1',
+                              }),
+                            ]),
+                            impressions: 1,
+                            slotId: 'critical-slot',
+                          }),
+                        ]),
+                      }),
                     }),
                     identities: Object.freeze([publisherSlot]),
                   })
@@ -736,6 +951,14 @@ describe('transactional GPT integration module', () => {
           : {}),
       };
       const result = await registry.install(installCallbacks);
+      if (adoptInitialDisplay && parserStateValid === false) {
+        expect(result).toMatchObject({ state: 'fallback', reason: 'bundle_partial' });
+        expect(defineSlot).not.toHaveBeenCalled();
+        expect(display).not.toHaveBeenCalled();
+        expect(refresh).not.toHaveBeenCalled();
+        vi.useRealTimers();
+        return;
+      }
       expect(result.state).toBe('kernel');
       const gpt = providerFacades.get('gpt.v1') as {
         activateLaterLifecycle: () => Readonly<{

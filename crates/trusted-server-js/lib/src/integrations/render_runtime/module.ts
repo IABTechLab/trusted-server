@@ -10,7 +10,7 @@ import {
 import { validateRequestAdsOptions } from '../../core/contracts/request_ads';
 import { log } from '../../core/log';
 import { prepareAdmIframe } from '../../core/render';
-import { createRenderTraceStore } from '../../core/trace';
+import { createRenderTraceStore, type RenderTraceRuntimeOwner } from '../../core/trace';
 import type { BootManifestV1, BrowserAuctionProjectionV1 } from '../../core/types';
 import { DisposableStack } from '../../kernel/disposable';
 import {
@@ -55,7 +55,7 @@ import {
   prepareInitialAuctionProjection,
   type ProjectionSlotRegistry,
 } from '../../services/projections';
-import { createReservationService } from '../../services/reservations';
+import { createReservationService, type ReservationService } from '../../services/reservations';
 import type { PucGamAttemptInput } from '../../services/puc_bridge';
 import {
   createCommittedArtifactStore,
@@ -97,6 +97,172 @@ function adoptionField(candidate: unknown, key: string): unknown {
 export interface AdoptedInitialRenderArtifactsV1 {
   readonly adoption: PersistentFirstDisplayAdoptionV1;
   readonly arm: () => void;
+}
+
+/** Adopt serialized replay suppression and diagnostics counters before new-epoch activity. */
+export function adoptInitialRenderStateFromHandoff(
+  candidate: unknown,
+  navigation: Pick<NavigationSession, 'adoptFirstDisplayIdentityState' | 'generation'>,
+  reservations: Pick<ReservationService, 'adoptFirstDisplayTombstones'>,
+  trace: Pick<RenderTraceRuntimeOwner, 'adoptFirstDisplay'>
+): PersistentFirstDisplayAdoptionV1 | undefined {
+  const adoption = snapshotPersistentFirstDisplayAdoptionV1(candidate);
+  if (!adoption) return undefined;
+  const highWater = adoptionField(adoption.handoff, 'highWater');
+  const tombstones = adoptionArray(adoptionField(adoption.handoff, 'tombstones'));
+  const traceState = adoptionField(adoption.handoff, 'trace');
+  const handoffSlots = adoptionArray(adoptionField(adoption.handoff, 'slots'));
+  const cycles = adoptionArray(adoptionField(adoption.handoff, 'cycles'));
+  const clockEpochMs = adoptionField(highWater, 'reservationClockEpochMs');
+  const nextNavigationAttemptOrdinal = adoptionField(highWater, 'nextNavigationAttemptOrdinal');
+  const nextAttemptOrdinal = adoptionField(highWater, 'nextAttemptOrdinal');
+  const navigationAttemptPrefix = adoptionField(highWater, 'navigationAttemptPrefix');
+  const nextSequence = adoptionField(traceState, 'nextSequence');
+  const traceSlots = adoptionArray(adoptionField(traceState, 'slots'));
+  if (
+    typeof clockEpochMs !== 'number' ||
+    typeof nextNavigationAttemptOrdinal !== 'number' ||
+    typeof nextAttemptOrdinal !== 'number' ||
+    typeof navigationAttemptPrefix !== 'string' ||
+    typeof nextSequence !== 'number' ||
+    !tombstones ||
+    !traceSlots ||
+    !handoffSlots ||
+    !cycles
+  ) {
+    return undefined;
+  }
+  if (
+    !navigation.adoptFirstDisplayIdentityState(
+      navigationAttemptPrefix,
+      Math.max(nextNavigationAttemptOrdinal, nextAttemptOrdinal)
+    )
+  ) {
+    return undefined;
+  }
+  const reservationTombstones: Array<{
+    expiresAtMs: number;
+    reservationId: string;
+  }> = [];
+  for (const tombstone of tombstones) {
+    const kind = adoptionField(tombstone, 'kind');
+    if (kind !== 'reservation') continue;
+    const reservationId = adoptionField(tombstone, 'value');
+    const expiresAtMs = adoptionField(tombstone, 'expiresAtMs');
+    if (typeof reservationId !== 'string' || typeof expiresAtMs !== 'number') return undefined;
+    reservationTombstones.push({ expiresAtMs, reservationId });
+  }
+  const slots: Array<{
+    bindings: readonly Readonly<{
+      cycleOrdinal: number;
+      historySequence: number;
+      state: 'completed' | 'retired';
+      token: string;
+    }>[];
+    impressions: number;
+    records: readonly Readonly<{
+      at: number;
+      count: number;
+      elementId: string;
+      injected: true;
+      path: 'ssat';
+      rendered: true;
+      seq: number;
+      servedFrom: 'inline';
+      slotId: string;
+    }>[];
+    slotId: string;
+  }> = [];
+  for (const slot of traceSlots) {
+    const slotId = adoptionField(slot, 'slotId');
+    const impressions = adoptionField(slot, 'impressions');
+    const rawBindings = adoptionArray(adoptionField(slot, 'bindings'));
+    const handoffSlot = handoffSlots.find((entry) => adoptionField(entry, 'id') === slotId);
+    const cycle = cycles.find((entry) => adoptionField(entry, 'slotId') === slotId);
+    const domId = adoptionField(handoffSlot, 'domId');
+    if (
+      typeof slotId !== 'string' ||
+      typeof impressions !== 'number' ||
+      !rawBindings ||
+      !handoffSlot ||
+      (rawBindings.length > 0 && (!cycle || typeof domId !== 'string'))
+    ) {
+      return undefined;
+    }
+    const bindings: Array<{
+      cycleOrdinal: number;
+      historySequence: number;
+      state: 'completed' | 'retired';
+      token: string;
+    }> = [];
+    const records: Array<{
+      at: number;
+      count: number;
+      elementId: string;
+      injected: true;
+      path: 'ssat';
+      rendered: true;
+      seq: number;
+      servedFrom: 'inline';
+      slotId: string;
+    }> = [];
+    for (let index = 0; index < rawBindings.length; index += 1) {
+      const binding = rawBindings[index];
+      const atMs = adoptionField(binding, 'atMs');
+      const cycleOrdinal = adoptionField(binding, 'cycleOrdinal');
+      const historySequence = adoptionField(binding, 'historySequence');
+      const state = adoptionField(binding, 'state');
+      const token = adoptionField(binding, 'token');
+      const cycleToken = adoptionField(cycle, 'token');
+      const cycleRecords = adoptionArray(adoptionField(cycle, 'records'));
+      if (
+        typeof atMs !== 'number' ||
+        typeof cycleOrdinal !== 'number' ||
+        typeof historySequence !== 'number' ||
+        (state !== 'completed' && state !== 'retired') ||
+        typeof token !== 'string' ||
+        cycleToken !== token ||
+        !cycleRecords?.some(
+          (record) =>
+            adoptionField(record, 'ordinal') === cycleOrdinal &&
+            adoptionField(record, 'state') === state
+        )
+      ) {
+        return undefined;
+      }
+      bindings.push({ cycleOrdinal, historySequence, state, token });
+      records.push({
+        at: atMs,
+        count: impressions - rawBindings.length + index + 1,
+        elementId: domId as string,
+        injected: true,
+        path: 'ssat',
+        rendered: true,
+        seq: historySequence,
+        servedFrom: 'inline',
+        slotId,
+      });
+    }
+    slots.push({ bindings, impressions, records, slotId });
+  }
+  if (
+    !trace.adoptFirstDisplay({
+      navigationGeneration: navigation.generation,
+      nextSequence,
+      slots,
+    })
+  ) {
+    return undefined;
+  }
+  if (
+    !reservations.adoptFirstDisplayTombstones({
+      clockEpochMs,
+      tombstones: reservationTombstones,
+    })
+  ) {
+    return undefined;
+  }
+  return adoption;
 }
 
 /** Stage transferred frames in the persistent artifact store without arming rollback disposal. */
@@ -563,6 +729,7 @@ export function createRenderRuntimeIntegrationRegistration(
         apsValidation = undefined;
       });
       const reservations = createReservationService({
+        now: () => view.performance.now(),
         prepareRenderSource: (candidate) => {
           const source = parseBidRenderSourceV1(candidate);
           return source?.type === 'pbs_cache' ? undefined : source;
@@ -902,7 +1069,16 @@ export function createRenderRuntimeIntegrationRegistration(
       return Object.freeze({
         activate: (activation: IntegrationActivationContext) => {
           if (active) throw new Error('render_runtime already activated');
-          const adopted =
+          const adoptedState =
+            activation.adoption === undefined
+              ? undefined
+              : adoptInitialRenderStateFromHandoff(
+                  activation.adoption,
+                  navigation,
+                  reservations,
+                  renderTrace
+                );
+          const adoptedArtifacts =
             activation.adoption === undefined
               ? undefined
               : adoptInitialRenderArtifactsFromHandoff(
@@ -911,7 +1087,7 @@ export function createRenderRuntimeIntegrationRegistration(
                   artifacts,
                   document
                 );
-          if (activation.adoption !== undefined && !adopted) {
+          if (activation.adoption !== undefined && (!adoptedState || !adoptedArtifacts)) {
             throw new TypeError('render_runtime first-display adoption is invalid');
           }
           const releaseAuctionContext = runtime.attachAuctionContextService(auctionContextService);
@@ -919,7 +1095,7 @@ export function createRenderRuntimeIntegrationRegistration(
             throw new TypeError('render_runtime auction context service is duplicated');
           }
           active = true;
-          if (adopted) activation.afterCommit(adopted.arm);
+          if (adoptedArtifacts) activation.afterCommit(adoptedArtifacts.arm);
           activation.onDispose(releaseAuctionContext);
           activation.onDispose(() => {
             active = false;

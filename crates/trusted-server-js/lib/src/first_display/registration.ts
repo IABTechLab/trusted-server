@@ -4,6 +4,20 @@ const HASH = /^[0-9a-f]{64}$/;
 const COMPONENT_ID = /^[a-z][a-z0-9_]{0,63}$/;
 const FIRST_DISPLAY_SRC =
   /^\/static\/tsjs=tsjs-first-display\.min\.js\?m=[0-9a-f]{4}&v=[0-9a-f]{64}$/;
+const PARSER_SLICE_ORDER = Object.freeze([
+  'aps_initial',
+  'creative_initial',
+  'datadome_initial',
+  'didomi_initial',
+  'google_tag_manager_initial',
+  'gpt_initial',
+  'lockr_initial',
+  'osano_initial',
+  'permutive_initial',
+  'sourcepoint_initial',
+  'prebid_initial',
+  'testlight_initial',
+]);
 
 export const FIRST_DISPLAY_REGISTRATION_FIELD = '_registerFirstDisplay' as const;
 
@@ -20,10 +34,86 @@ type FirstDisplayBootstrapTarget = object & {
   readonly [FIRST_DISPLAY_REGISTRATION_FIELD]?: unknown;
 };
 
+export interface FirstDisplayParserStateCollector {
+  readonly register: (sliceId: string) => boolean;
+  readonly observe: (sliceId: string, key: unknown, value: unknown) => boolean;
+  readonly snapshot: () => readonly Readonly<{
+    sliceId: string;
+    observations: readonly string[];
+    values: readonly (readonly [string, string | number | boolean | null])[];
+  }>[];
+}
+
+/** Retain only bounded ordinary-data observations needed by persistent slice owners. */
+export function createFirstDisplayParserStateCollector(): FirstDisplayParserStateCollector {
+  const states = new Map<
+    string,
+    { observations: string[]; values: Map<string, string | number | boolean | null> }
+  >();
+  const encoder = new TextEncoder();
+  const register = (sliceId: string): boolean => {
+    if (!PARSER_SLICE_ORDER.includes(sliceId)) return false;
+    if (!states.has(sliceId)) states.set(sliceId, { observations: [], values: new Map() });
+    return true;
+  };
+  const bounded = (value: string, bytes: number, allowEmpty = false): boolean => {
+    if ((!allowEmpty && value.length === 0) || encoder.encode(value).byteLength > bytes)
+      return false;
+    for (let index = 0; index < value.length; index += 1) {
+      const code = value.charCodeAt(index);
+      if (code <= 0x1f || code === 0x7f) return false;
+    }
+    return true;
+  };
+  return Object.freeze({
+    register,
+    observe: (sliceId: string, key: unknown, value: unknown): boolean => {
+      if (
+        !register(sliceId) ||
+        typeof key !== 'string' ||
+        !bounded(key, 128) ||
+        (value !== null &&
+          typeof value !== 'string' &&
+          typeof value !== 'boolean' &&
+          !(typeof value === 'number' && Number.isFinite(value))) ||
+        (typeof value === 'string' && !bounded(value, 4096, true))
+      ) {
+        return false;
+      }
+      const state = states.get(sliceId)!;
+      if (!state.values.has(key)) {
+        if (state.values.size >= 256) return false;
+        state.observations.push(key);
+      }
+      state.values.set(key, value as string | number | boolean | null);
+      return true;
+    },
+    snapshot: () =>
+      Object.freeze(
+        PARSER_SLICE_ORDER.flatMap((sliceId) => {
+          const state = states.get(sliceId);
+          if (!state) return [];
+          return [
+            Object.freeze({
+              sliceId,
+              observations: Object.freeze([...state.observations]),
+              values: Object.freeze(
+                state.observations.map((key) =>
+                  Object.freeze([key, state.values.get(key)!] as const)
+                )
+              ),
+            }),
+          ];
+        })
+      ),
+  });
+}
+
 /** Wrap one exact frozen slice observation channel with the final-revision ledger. */
 export function captureMutationObservedBindings(
   candidate: unknown,
-  observeMutation: () => boolean
+  observeMutation: () => boolean,
+  captureObservation?: (key: unknown, value: unknown) => void
 ): unknown {
   try {
     if (
@@ -49,6 +139,7 @@ export function captureMutationObservedBindings(
         ...observe,
         value: (...arguments_: unknown[]): unknown => {
           const result = Reflect.apply(original, candidate, arguments_);
+          captureObservation?.(arguments_[0], arguments_[1]);
           observeMutation();
           return result;
         },

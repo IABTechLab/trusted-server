@@ -117,6 +117,13 @@ export interface PucBridgeInventory {
 }
 
 export interface PucBridge {
+  adoptFirstDisplayTickets(
+    input: Readonly<{
+      clockEpochMs: number;
+      nextTicketOrdinal: number;
+      tombstones: readonly Readonly<{ expiresAtMs: number; ticket: string }>[];
+    }>
+  ): boolean;
   registerGamAttempt(input: PucGamAttemptInput): boolean;
   recordNonemptyGam(input: PucGamAttemptInput): boolean;
   dispose(): void;
@@ -533,6 +540,8 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
   const attempts = new Map<string, GamAttemptBinding>();
   const tickets = new Map<string, TicketEntry>();
   let pendingTicketIssues = 0;
+  let ticketAdoptionOpen = true;
+  let ticketOrdinalHighWater = 1;
   let lastNow = Number.NEGATIVE_INFINITY;
   let disposed = false;
 
@@ -1647,7 +1656,78 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
   }
 
   const bridge: PucBridge = {
+    adoptFirstDisplayTickets(input): boolean {
+      if (
+        disposed ||
+        !ticketAdoptionOpen ||
+        mapSize(tickets) !== 0 ||
+        mapSize(attempts) !== 0 ||
+        typeof input !== 'object' ||
+        input === null ||
+        typeof input.clockEpochMs !== 'number' ||
+        !Number.isFinite(input.clockEpochMs) ||
+        input.clockEpochMs < 0 ||
+        !Number.isInteger(input.nextTicketOrdinal) ||
+        input.nextTicketOrdinal < 1 ||
+        input.nextTicketOrdinal > 4_294_967_295 ||
+        !Array.isArray(input.tombstones) ||
+        input.tombstones.length > MAX_TICKETS
+      ) {
+        return false;
+      }
+      const now = readNow();
+      if (now === undefined) return false;
+      const prepared = new Map<string, TicketTombstone>();
+      for (const candidate of input.tombstones) {
+        if (
+          typeof candidate !== 'object' ||
+          candidate === null ||
+          typeof candidate.ticket !== 'string' ||
+          !LIFECYCLE_TICKET.test(candidate.ticket) ||
+          prepared.has(candidate.ticket) ||
+          typeof candidate.expiresAtMs !== 'number' ||
+          !Number.isFinite(candidate.expiresAtMs) ||
+          candidate.expiresAtMs < 0
+        ) {
+          return false;
+        }
+        const remainingMs = candidate.expiresAtMs - input.clockEpochMs;
+        if (remainingMs <= 0) continue;
+        const expiresAt = now + remainingMs;
+        if (!Number.isFinite(expiresAt) || expiresAt <= now) return false;
+        prepared.set(candidate.ticket, {
+          expiresAt,
+          expiryHandle: undefined,
+          state: 'tombstone',
+        });
+      }
+      const published: string[] = [];
+      try {
+        for (const [ticket, tombstone] of prepared) {
+          setMapValue(tickets, ticket, tombstone);
+          if (mapValue(tickets, ticket) !== tombstone) throw new Error('ticket adoption failed');
+          published.push(ticket);
+          const handle = Reflect.apply(schedulerSet, scheduler, [
+            () => expireTicket(ticket, tombstone),
+            tombstone.expiresAt - now,
+          ]);
+          if (mapValue(tickets, ticket) === tombstone) tombstone.expiryHandle = handle;
+          else clearScheduled(handle);
+        }
+      } catch {
+        for (const ticket of published) {
+          const entry = mapValue(tickets, ticket);
+          if (entry?.state === 'tombstone') clearScheduled(entry.expiryHandle);
+          deleteMapValue(tickets, ticket);
+        }
+        return false;
+      }
+      ticketOrdinalHighWater = input.nextTicketOrdinal;
+      ticketAdoptionOpen = false;
+      return ticketOrdinalHighWater === input.nextTicketOrdinal;
+    },
     registerGamAttempt(input): boolean {
+      ticketAdoptionOpen = false;
       if (disposed || !dynamicOwnerValid) return false;
       const exact = exactInput(input);
       if (!exact || mapValue(attempts, exact.reservationId) !== undefined) return false;
@@ -1744,6 +1824,7 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
       return true;
     },
     recordNonemptyGam(input): boolean {
+      ticketAdoptionOpen = false;
       if (disposed) return false;
       const exact = exactInput(input);
       if (!exact) return false;

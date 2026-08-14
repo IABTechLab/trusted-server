@@ -44,6 +44,7 @@ import {
 } from '../../src/first_display/leaf/consent_snapshot';
 import {
   captureMutationObservedBindings,
+  createFirstDisplayParserStateCollector,
   registerFirstDisplayComponent,
   type FirstDisplayComponentRegistrationV1,
 } from '../../src/first_display/registration';
@@ -80,22 +81,55 @@ function componentRegistration(): FirstDisplayComponentRegistrationV1 {
 }
 
 describe('first-display initial slice definitions', () => {
+  it('captures bounded parser observations once per key in canonical slice order', () => {
+    const collector = createFirstDisplayParserStateCollector();
+
+    expect(collector.register('lockr_initial')).toBe(true);
+    expect(collector.observe('gpt_initial', 'protocol_version', 1)).toBe(true);
+    expect(collector.observe('creative_initial', 'guard_count', 1)).toBe(true);
+    expect(collector.observe('gpt_initial', 'protocol_version', 2)).toBe(true);
+    expect(collector.observe('gpt_initial', '', 3)).toBe(false);
+
+    const snapshot = collector.snapshot();
+    expect(snapshot).toEqual([
+      {
+        sliceId: 'creative_initial',
+        observations: ['guard_count'],
+        values: [['guard_count', 1]],
+      },
+      {
+        sliceId: 'gpt_initial',
+        observations: ['protocol_version'],
+        values: [['protocol_version', 2]],
+      },
+      { sliceId: 'lockr_initial', observations: [], values: [] },
+    ]);
+    expect(Object.isFrozen(snapshot)).toBe(true);
+    expect(Object.isFrozen(snapshot[0]?.values[0])).toBe(true);
+  });
+
   it('preserves exact frozen bindings while observing each successful parser update', () => {
     const events: string[] = [];
     const candidate = Object.freeze({
       observe: (name: string, value: unknown) => events.push(`observe:${name}:${String(value)}`),
       register: () => () => undefined,
     });
-    const captured = captureMutationObservedBindings(candidate, () => {
-      events.push('mutation');
-      return true;
-    }) as typeof candidate;
+    const observations: unknown[] = [];
+    const captured = captureMutationObservedBindings(
+      candidate,
+      () => {
+        events.push('mutation');
+        return true;
+      },
+      (key, value) => observations.push([key, value])
+    ) as typeof candidate;
 
     expect(captured).not.toBe(candidate);
     expect(Object.isFrozen(captured)).toBe(true);
     expect(Reflect.ownKeys(captured)).toEqual(['observe', 'register']);
     captured.observe('segment_count', 2);
     expect(events).toEqual(['observe:segment_count:2', 'mutation']);
+    expect(observations).toEqual([['segment_count', 2]]);
   });
 
   it('returns exact protocol activation receipts while registering full protocols', () => {
@@ -117,6 +151,14 @@ describe('first-display initial slice definitions', () => {
           start: () => true,
           closeIngress: () => true,
           captureHandoff: () => Object.freeze([]),
+          captureDiagnosticsHandoff: () =>
+            Object.freeze({
+              cycles: Object.freeze([]),
+              facts: Object.freeze([]),
+              nextTraceTokenOrdinal: 1,
+              overflowCount: 0,
+              dropCount: 0,
+            }),
           detachCommittedSlots: () => true,
           dispose: () => undefined,
         })
@@ -457,6 +499,7 @@ describe('first-display initial slice definitions', () => {
       })
     );
     expect(calls).toEqual(['first', 'throwing', 'second']);
+    expect(original).toEqual([]);
     expect(target.testlight.que).not.toBe(original);
     expect(target.testlight.que.push(later)).toBe(1);
     expect(calls).toEqual(['first', 'throwing', 'second', 'later']);
@@ -465,6 +508,7 @@ describe('first-display initial slice definitions', () => {
 
     disposers.reverse().forEach((dispose) => dispose());
     expect(target.testlight).toEqual({ publisher: true, que: original });
+    expect(original).toEqual([]);
   });
 
   it('registers exact DataDome and GTM route matchers with first-party path preservation', () => {

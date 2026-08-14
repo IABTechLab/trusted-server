@@ -219,7 +219,7 @@ const CURRENT_SHARED_SOURCE_OWNER_POLICIES = Object.freeze({
   'src/kernel/diagnostics.ts': Object.freeze(['core']),
   'src/kernel/disposable.ts': Object.freeze(['core', 'gpt']),
   'src/kernel/fallback.ts': Object.freeze(['bootstrap', 'core']),
-  'src/kernel/identity.ts': Object.freeze(['core']),
+  'src/kernel/identity.ts': Object.freeze(['first_display', 'core']),
   'src/kernel/integration_registry.ts': Object.freeze(['core']),
   'src/kernel/lifecycle_module.ts': Object.freeze([
     'datadome',
@@ -261,7 +261,23 @@ const CURRENT_SHARED_SOURCE_OWNER_POLICIES = Object.freeze({
     'permutive_context',
     'sourcepoint_consent',
   ]),
-  'src/shared/takeover.ts': Object.freeze(['bootstrap', 'first_display', 'core', 'gpt']),
+  'src/shared/takeover.ts': Object.freeze([
+    'bootstrap',
+    'first_display',
+    'core',
+    'aps',
+    'creative',
+    'datadome',
+    'didomi',
+    'google_tag_manager',
+    'gpt',
+    'lockr',
+    'osano_consent',
+    'permutive_context',
+    'sourcepoint_consent',
+    'prebid',
+    'testlight',
+  ]),
 });
 const CAPABILITY_PATTERN = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*\.v[1-9][0-9]*$/u;
 const CAPABILITY_PREDICATE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/u;

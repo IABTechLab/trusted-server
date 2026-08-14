@@ -294,6 +294,55 @@ function issueReadyTicket(
 }
 
 describe('Universal Creative bridge dispatcher', () => {
+  it('adopts first-display lifecycle-ticket tombstones and expires them in the local epoch', () => {
+    let now = 100;
+    const tasks: Array<() => void> = [];
+    const harness = createHarness(() => ({ recognized: false }), {
+      now: () => now,
+      scheduler: {
+        set: (callback) => {
+          tasks.push(callback);
+          return callback;
+        },
+        clear: (handle) => {
+          const index = tasks.indexOf(handle as () => void);
+          if (index >= 0) tasks.splice(index, 1);
+        },
+      },
+    });
+
+    expect(
+      harness.bridge.adoptFirstDisplayTickets({
+        clockEpochMs: 40,
+        nextTicketOrdinal: 4,
+        tombstones: [{ expiresAtMs: 140, ticket: LIFECYCLE_TICKET }],
+      })
+    ).toBe(true);
+    expect(harness.bridge.snapshotInventoryForTest().ticketTombstones).toBe(1);
+    const responsePort = createPort();
+    const stopImmediatePropagation = vi.fn();
+    harness.dispatch({
+      data: exactOwnerRegistration(RESERVATION_ID),
+      ports: [responsePort],
+      source: Object.freeze({}),
+      stopImmediatePropagation,
+    });
+    expect(stopImmediatePropagation).toHaveBeenCalledOnce();
+    expect(responsePort.postMessage).toHaveBeenCalledOnce();
+    expect(responsePort.close).toHaveBeenCalledOnce();
+
+    now = 200;
+    tasks.shift()?.();
+    expect(harness.bridge.snapshotInventoryForTest().ticketTombstones).toBe(0);
+    expect(
+      harness.bridge.adoptFirstDisplayTickets({
+        clockEpochMs: 200,
+        nextTicketOrdinal: 5,
+        tombstones: [],
+      })
+    ).toBe(false);
+  });
+
   it('installs owner iframe lifecycle handlers before assigning either document source', () => {
     const admStart = PUC_DYNAMIC_OWNER.indexOf('const insertAdm');
     const apsStart = PUC_DYNAMIC_OWNER.indexOf('const insertAps');

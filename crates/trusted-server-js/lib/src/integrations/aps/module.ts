@@ -5,6 +5,7 @@ import type {
   IntegrationRegistration,
 } from '../../kernel/integration_registry';
 import type { RendererNonceRegistry, RenderAttempt } from '../../services/render';
+import { validatePersistentFirstDisplaySliceAdoptionV1 } from '../../shared/takeover';
 
 import { renderDirectApsAttempt, resolveApsRendererV1Url, validateApsRenderer } from './render';
 
@@ -83,6 +84,19 @@ export function createApsIntegrationRegistration(releaseId: string): Integration
       return Object.freeze({
         activate: (activation: IntegrationActivationContext) => {
           if (active) throw new Error('APS already activated');
+          if (
+            activation.adoption !== undefined &&
+            !validatePersistentFirstDisplaySliceAdoptionV1(
+              activation.adoption,
+              'aps_initial',
+              (state) =>
+                state.values.length === 1 &&
+                state.values[0]?.[0] === 'protocol_version' &&
+                state.values[0][1] === 1
+            )
+          ) {
+            throw new TypeError('APS first-display parser state is invalid');
+          }
           const validationRelease: { current?: () => void } = {};
           const rendererRelease: { current?: () => void } = {};
           activation.onDispose(() => validationRelease.current?.());

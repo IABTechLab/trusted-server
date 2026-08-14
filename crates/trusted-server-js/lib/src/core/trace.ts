@@ -56,6 +56,22 @@ export interface RenderTraceRuntimeOptions {
   readonly scheduler?: RenderTraceRuntimeScheduler;
 }
 
+export interface FirstDisplayTraceAdoptionV1 {
+  readonly navigationGeneration: object;
+  readonly nextSequence: number;
+  readonly slots: readonly Readonly<{
+    readonly bindings: readonly Readonly<{
+      readonly cycleOrdinal: number;
+      readonly historySequence: number;
+      readonly state: 'completed' | 'retired';
+      readonly token: string;
+    }>[];
+    readonly impressions: number;
+    readonly records: readonly Readonly<RenderTraceRecord>[];
+    readonly slotId: string;
+  }>[];
+}
+
 /** Closure-private data channel made available only to the deferred presentation owner. */
 export interface RenderTracePresentationSource {
   readonly current: RenderTraceDiagnostics['current'];
@@ -86,6 +102,7 @@ export interface RenderTraceRuntimeOwner {
     resolve: (elementId: string | undefined) => RenderTraceGptResolutionV1 | undefined
   ) => void;
   readonly attachPresentation: (factory: RenderTracePresentationFactory) => () => void;
+  readonly adoptFirstDisplay: (candidate: FirstDisplayTraceAdoptionV1) => boolean;
   readonly dispose: () => void;
 }
 
@@ -181,6 +198,189 @@ function createRenderTraceOwner(options: RenderTraceRuntimeOptions): RenderTrace
   let invalidatePresentationSource: (() => void) | undefined;
   let presentationAttaching = false;
   let disposed = false;
+
+  const adoptFirstDisplay = (candidate: FirstDisplayTraceAdoptionV1): boolean => {
+    try {
+      if (
+        disposed ||
+        sequence !== 0 ||
+        current.size !== 0 ||
+        history.length !== 0 ||
+        recordsBySequence.size !== 0 ||
+        counts.size !== 0 ||
+        gptImpressions.size !== 0 ||
+        typeof candidate !== 'object' ||
+        candidate === null ||
+        typeof candidate.navigationGeneration !== 'object' ||
+        candidate.navigationGeneration === null ||
+        !Number.isInteger(candidate.nextSequence) ||
+        candidate.nextSequence < 1 ||
+        candidate.nextSequence > 4_294_967_295 ||
+        !Array.isArray(candidate.slots) ||
+        candidate.slots.length > MAX_RENDER_TRACE_SLOTS
+      ) {
+        return false;
+      }
+      const adopted = new Map<
+        string,
+        Readonly<{
+          bindings: readonly Readonly<{
+            cycleOrdinal: number;
+            historySequence: number;
+            state: 'completed' | 'retired';
+            token: string;
+          }>[];
+          impressions: number;
+          records: readonly Readonly<RenderTraceRecord>[];
+        }>
+      >();
+      const recordSequences = new Set<number>();
+      const bindingKeys = new Set<string>();
+      let bindingCount = 0;
+      for (const slot of candidate.slots) {
+        if (
+          typeof slot !== 'object' ||
+          slot === null ||
+          typeof slot.slotId !== 'string' ||
+          slot.slotId.length === 0 ||
+          adopted.has(slot.slotId) ||
+          !Number.isInteger(slot.impressions) ||
+          slot.impressions < 0 ||
+          slot.impressions > 4_294_967_295 ||
+          !Array.isArray(slot.bindings) ||
+          slot.bindings.length > 10 ||
+          !Array.isArray(slot.records) ||
+          slot.records.length > 10
+        ) {
+          return false;
+        }
+        const adoptedRecords: Readonly<RenderTraceRecord>[] = [];
+        for (const record of slot.records) {
+          if (
+            typeof record !== 'object' ||
+            record === null ||
+            record.slotId !== slot.slotId ||
+            !['auction', 'ssat', 'gam-refresh'].includes(record.path) ||
+            typeof record.rendered !== 'boolean' ||
+            !Number.isInteger(record.count) ||
+            record.count < 1 ||
+            record.count > slot.impressions ||
+            !Number.isInteger(record.seq) ||
+            record.seq < 1 ||
+            record.seq >= candidate.nextSequence ||
+            recordSequences.has(record.seq) ||
+            typeof record.at !== 'number' ||
+            !Number.isFinite(record.at) ||
+            record.at < 0
+          ) {
+            return false;
+          }
+          recordSequences.add(record.seq);
+          adoptedRecords.push(copyRenderTraceRecord(record));
+        }
+        const adoptedBindings: Array<
+          Readonly<{
+            cycleOrdinal: number;
+            historySequence: number;
+            state: 'completed' | 'retired';
+            token: string;
+          }>
+        > = [];
+        for (const binding of slot.bindings) {
+          if (
+            typeof binding !== 'object' ||
+            binding === null ||
+            typeof binding.token !== 'string' ||
+            !/^gt1_[1-9a-z][0-9a-z]{0,6}$/.test(binding.token) ||
+            !Number.isInteger(binding.cycleOrdinal) ||
+            binding.cycleOrdinal < 1 ||
+            binding.cycleOrdinal > 4_294_967_295 ||
+            !Number.isInteger(binding.historySequence) ||
+            !recordSequences.has(binding.historySequence) ||
+            (binding.state !== 'completed' && binding.state !== 'retired')
+          ) {
+            return false;
+          }
+          const key = `${binding.token}:${binding.cycleOrdinal}`;
+          if (bindingKeys.has(key)) return false;
+          bindingKeys.add(key);
+          bindingCount += 1;
+          if (bindingCount > MAX_RENDER_TRACE_SLOTS) return false;
+          adoptedBindings.push(
+            Object.freeze({
+              cycleOrdinal: binding.cycleOrdinal,
+              historySequence: binding.historySequence,
+              state: binding.state,
+              token: binding.token,
+            })
+          );
+        }
+        if (
+          adoptedRecords.length > 0 &&
+          !adoptedRecords.some((record) => record.count === slot.impressions)
+        ) {
+          return false;
+        }
+        adopted.set(
+          slot.slotId,
+          Object.freeze({
+            bindings: Object.freeze(adoptedBindings),
+            impressions: slot.impressions,
+            records: Object.freeze(adoptedRecords),
+          })
+        );
+      }
+      const adoptedHistory = [...adopted.entries()]
+        .flatMap(([, value]) => value.records)
+        .sort((left, right) => left.seq - right.seq);
+      const adoptedCurrent = new Map<string, Readonly<RenderTraceRecord>>();
+      for (const [slotId, value] of adopted) {
+        const latest = value.records.reduce<Readonly<RenderTraceRecord> | undefined>(
+          (candidateRecord, record) =>
+            !candidateRecord || record.seq > candidateRecord.seq ? record : candidateRecord,
+          undefined
+        );
+        if (latest) adoptedCurrent.set(slotId, latest);
+      }
+      const retainedSequences = new Set(
+        [...adoptedHistory.slice(-MAX_RENDER_LOG_ENTRIES), ...adoptedCurrent.values()].map(
+          (record) => record.seq
+        )
+      );
+      if (
+        [...adopted.values()].some((value) =>
+          value.bindings.some((binding) => !retainedSequences.has(binding.historySequence))
+        )
+      ) {
+        return false;
+      }
+
+      sequence = candidate.nextSequence - 1;
+      for (const [slotId, value] of adopted) {
+        if (value.impressions > 0) counts.set(slotId, value.impressions);
+        const latest = adoptedCurrent.get(slotId);
+        if (latest) current.set(slotId, latest);
+        for (const binding of value.bindings) {
+          gptImpressions.set(`${binding.token}:${binding.cycleOrdinal}`, {
+            baselineSequence: undefined,
+            historySequence: binding.historySequence,
+            navigationGeneration: candidate.navigationGeneration,
+            slotId,
+            state: binding.state,
+            token: binding.token,
+          });
+        }
+      }
+      for (const record of adoptedHistory.slice(-MAX_RENDER_LOG_ENTRIES)) {
+        history.push(record);
+      }
+      for (const record of current.values()) recordsBySequence.set(record.seq, record);
+      for (const record of history) recordsBySequence.set(record.seq, record);
+      return true;
+    } catch {
+      return false;
+    }
+  };
 
   const schedule = (callback: () => void): (() => void) => {
     if (options.schedule) return options.schedule(callback);
@@ -814,6 +1014,7 @@ function createRenderTraceOwner(options: RenderTraceRuntimeOptions): RenderTrace
     pruneNavigation,
     observeGptFact,
     attachPresentation,
+    adoptFirstDisplay,
     dispose,
   });
 }

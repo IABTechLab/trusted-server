@@ -74,6 +74,11 @@ export function createGoogleTagManagerIntegrationRegistration(
 ): IntegrationRegistration {
   return createLifecycleIntegrationRegistration(GOOGLE_TAG_MANAGER_INTEGRATION_ID, release, {
     createOwnedRuntime: () => createGoogleTagManagerRuntime(),
+    firstDisplaySliceId: 'google_tag_manager_initial',
     validateConfig: (candidate) => candidate === undefined,
+    validateFirstDisplayState: (state) =>
+      state.values.length === 1 &&
+      state.values[0]?.[0] === 'route_guard' &&
+      state.values[0][1] === 'google_tag_manager',
   });
 }

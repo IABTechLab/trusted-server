@@ -94,4 +94,55 @@ describe('shared integration lifecycle module', () => {
     });
     expect(activate).not.toHaveBeenCalled();
   });
+
+  it.each([
+    { selected: true, state: true, expected: 'kernel' },
+    { selected: true, state: false, expected: 'fallback' },
+    { selected: false, state: false, expected: 'kernel' },
+  ] as const)(
+    'validates selected first-display parser state before lifecycle activation ($selected, $state)',
+    async ({ selected, state, expected }) => {
+      const activate = vi.fn(() => vi.fn());
+      const owner = registry(Object.freeze({}), Object.freeze({ activate, start: vi.fn() }));
+      owner.register(
+        createLifecycleIntegrationRegistration(TEST_INTEGRATION_ID, RELEASE_ID, {
+          firstDisplaySliceId: 'datadome_initial',
+          validateFirstDisplayState: (candidate) =>
+            candidate.values.find(([key]) => key === 'route_guard')?.[1] === 'datadome',
+        })
+      );
+      const adoption = Object.freeze({
+        version: 1 as const,
+        adoptInitialDisplay: true as const,
+        handoff: Object.freeze({
+          slices: Object.freeze(
+            selected ? ['first_display', 'datadome_initial'] : ['first_display']
+          ),
+          parserState: Object.freeze(
+            state
+              ? [
+                  Object.freeze({
+                    sliceId: 'datadome_initial',
+                    observations: Object.freeze(['route_guard']),
+                    values: Object.freeze([Object.freeze(['route_guard', 'datadome'] as const)]),
+                  }),
+                ]
+              : []
+          ),
+        }),
+        identities: Object.freeze([]),
+      });
+
+      const result = await owner.install({
+        ...callbacks([]),
+        coordinateTakeover: (prepared) => {
+          prepared.activate(adoption);
+          prepared.commit();
+        },
+      });
+
+      expect(result.state).toBe(expected);
+      expect(activate).toHaveBeenCalledTimes(expected === 'kernel' ? 1 : 0);
+    }
+  );
 });

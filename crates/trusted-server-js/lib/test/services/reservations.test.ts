@@ -145,6 +145,46 @@ function tombstone(
 }
 
 describe('renderer reservation identity and registration', () => {
+  it('atomically adopts unexpired first-display tombstones in the local clock epoch', () => {
+    let now = 100;
+    const service = serviceAt(() => now);
+
+    expect(
+      service.adoptFirstDisplayTombstones({
+        clockEpochMs: 40,
+        tombstones: [
+          { expiresAtMs: 140, reservationId: reservationId(1) },
+          { expiresAtMs: 30, reservationId: reservationId(2) },
+        ],
+      })
+    ).toBe(true);
+    expect(service.recognize(reservationId(1))).toMatchObject({
+      recognized: true,
+      state: 'consumed',
+      expiresAt: 200,
+    });
+    expect(service.recognize(reservationId(2))).toEqual({ recognized: false });
+
+    now = 200;
+    expect(service.recognize(reservationId(1))).toEqual({ recognized: false });
+    expect(service.adoptFirstDisplayTombstones({ clockEpochMs: 200, tombstones: [] })).toBe(false);
+  });
+
+  it('rejects malformed first-display tombstones without publishing a partial set', () => {
+    const service = serviceAt(() => 100);
+
+    expect(
+      service.adoptFirstDisplayTombstones({
+        clockEpochMs: 50,
+        tombstones: [
+          { expiresAtMs: 200, reservationId: reservationId(1) },
+          { expiresAtMs: 210, reservationId: reservationId(1) },
+        ],
+      })
+    ).toBe(false);
+    expect(service.recognize(reservationId(1))).toEqual({ recognized: false });
+  });
+
   it.each([
     [reservationId(), true],
     [`r1_${'A'.repeat(22)}`, true],

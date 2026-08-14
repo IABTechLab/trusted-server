@@ -19,7 +19,10 @@ export type IdentityFailureObserver = (reason: 'identity_generation_failed') => 
 
 /** Navigation-local issuer for non-repeating attempt identities. */
 export interface NavigationIdentityIssuer {
+  readonly adoptFirstDisplayState: (prefix: string, nextOrdinal: number) => boolean;
+  readonly adoptNextAttemptOrdinal: (nextOrdinal: number) => boolean;
   readonly mintAttemptId: () => IdentityGenerationResult<string>;
+  readonly snapshotPrefix: () => string;
   /** Return a frozen ordinal copy for deterministic tests. */
   readonly snapshotOrdinalForTest: () => readonly [number, number];
 }
@@ -72,6 +75,29 @@ function encodeBase64Url(bytes: Uint8Array): string {
   return encoded;
 }
 
+function decodeBase64UrlPrefix(value: string): Uint8Array<ArrayBuffer> | undefined {
+  if (!/^[A-Za-z0-9_-]{11}$/.test(value)) return undefined;
+  const bytes = new Uint8Array(new ArrayBuffer(8));
+  let byteIndex = 0;
+  let bits = 0;
+  let buffer = 0;
+  for (const character of value) {
+    const code = BASE64URL_ALPHABET.indexOf(character);
+    if (code < 0) return undefined;
+    buffer = (buffer << 6) | code;
+    bits += 6;
+    while (bits >= 8) {
+      bits -= 8;
+      if (byteIndex >= bytes.length) return undefined;
+      bytes[byteIndex] = (buffer >>> bits) & 0xff;
+      byteIndex += 1;
+      buffer &= bits === 0 ? 0 : (1 << bits) - 1;
+    }
+  }
+  if (byteIndex !== bytes.length || bits !== 2 || buffer !== 0) return undefined;
+  return bytes;
+}
+
 function validUnsignedWord(value: number): boolean {
   return Number.isInteger(value) && value >= 0 && value <= 0xffff_ffff;
 }
@@ -95,9 +121,44 @@ function createNavigationIdentityIssuer(
   }
   let highWord = initialOrdinal[0] >>> 0;
   let lowWord = initialOrdinal[1] >>> 0;
+  let adoptionOpen = highWord === 0 && lowWord === 0;
 
   const issuer: NavigationIdentityIssuer = Object.freeze({
+    adoptFirstDisplayState(prefixValue: string, nextOrdinal: number): boolean {
+      const adoptedPrefix = decodeBase64UrlPrefix(prefixValue);
+      if (
+        !adoptionOpen ||
+        highWord !== 0 ||
+        lowWord !== 0 ||
+        !adoptedPrefix ||
+        !Number.isInteger(nextOrdinal) ||
+        nextOrdinal < 1 ||
+        nextOrdinal > 0xffff_ffff
+      ) {
+        return false;
+      }
+      prefix = adoptedPrefix;
+      lowWord = (nextOrdinal - 1) >>> 0;
+      adoptionOpen = false;
+      return true;
+    },
+    adoptNextAttemptOrdinal(nextOrdinal: number): boolean {
+      if (
+        !adoptionOpen ||
+        highWord !== 0 ||
+        lowWord !== 0 ||
+        !Number.isInteger(nextOrdinal) ||
+        nextOrdinal < 1 ||
+        nextOrdinal > 0xffff_ffff
+      ) {
+        return false;
+      }
+      lowWord = (nextOrdinal - 1) >>> 0;
+      adoptionOpen = false;
+      return true;
+    },
     mintAttemptId(): IdentityGenerationResult<string> {
+      adoptionOpen = false;
       if (highWord === 0xffff_ffff && lowWord === 0xffff_ffff) {
         return reportFailure(observer);
       }
@@ -136,8 +197,17 @@ function createNavigationIdentityIssuer(
       }
     },
     snapshotOrdinalForTest: () => Object.freeze([highWord, lowWord] as const),
+    snapshotPrefix: () => encodeBase64Url(prefix),
   });
   return Object.freeze({ ok: true, value: issuer });
+}
+
+/** Create one navigation issuer from an explicitly scoped secure-random source. */
+export function createNavigationIdentityIssuerFromSource(
+  source: RandomValuesSource,
+  observer?: IdentityFailureObserver
+): IdentityGenerationResult<NavigationIdentityIssuer> {
+  return createNavigationIdentityIssuer(source, [0, 0], observer);
 }
 
 function browserRandomSource(): RandomValuesSource | undefined {
@@ -156,7 +226,8 @@ function browserRandomSource(): RandomValuesSource | undefined {
 
 /** Create a production navigation issuer from browser Web Crypto only. */
 export function createBrowserNavigationIdentityIssuer(): IdentityGenerationResult<NavigationIdentityIssuer> {
-  return createNavigationIdentityIssuer(browserRandomSource(), [0, 0]);
+  const source = browserRandomSource();
+  return source ? createNavigationIdentityIssuerFromSource(source) : IDENTITY_FAILURE;
 }
 
 /** Create a deterministic navigation issuer for tests only. */

@@ -141,6 +141,16 @@ export function createDidomiRuntime(
 export function createDidomiIntegrationRegistration(release: string): IntegrationRegistration {
   return createLifecycleIntegrationRegistration(DIDOMI_INTEGRATION_ID, release, {
     createOwnedRuntime: () => createDidomiRuntime(),
+    firstDisplaySliceId: 'didomi_initial',
     validateConfig: didomiBootConfig,
+    validateFirstDisplayState: (state) => {
+      const value = state.values[0]?.[1];
+      return (
+        state.values.length === 1 &&
+        state.values[0]?.[0] === 'sdk_path' &&
+        typeof value === 'string' &&
+        value.length > 0
+      );
+    },
   });
 }

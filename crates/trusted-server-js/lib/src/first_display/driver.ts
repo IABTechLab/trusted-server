@@ -13,7 +13,7 @@ const TERMINAL_RESULTS = new Set(['accepted', 'failed', 'cancelled']);
 export interface FirstDisplayRenderBridgeV1 {
   readonly bind: (
     cycle: FirstDisplayGptBoundCycleV1,
-    onTerminal: (result: FirstDisplayTerminalResult) => void
+    onTerminal: (result: FirstDisplayTerminalResult, reason: string | null) => void
   ) => boolean;
   readonly recordGam: (
     cycle: FirstDisplayGptBoundCycleV1,
@@ -37,9 +37,11 @@ export interface FirstDisplayRenderHandoffArtifactV1 {
 
 export interface FirstDisplayRenderHandoffV1 {
   readonly artifacts: readonly FirstDisplayRenderHandoffArtifactV1[];
+  readonly clockEpochMs: number;
+  readonly nextReservationOrdinal: number;
   readonly nextTicketOrdinal: number;
   readonly tombstones: readonly Readonly<{
-    kind: 'ticket';
+    kind: 'reservation' | 'ticket';
     value: string;
     expiresAtMs: number;
     ordinal: number;
@@ -63,7 +65,8 @@ function sameCycle(
     candidate.element === expected.element &&
     candidate.placement === expected.placement &&
     candidate.physicalSlot === expected.physicalSlot &&
-    candidate.ownership === expected.ownership
+    candidate.ownership === expected.ownership &&
+    candidate.traceToken === expected.traceToken
   );
 }
 
@@ -93,9 +96,15 @@ export function createFirstDisplayProjectedDriver(
   let ingressClosed = false;
   let handoffCaptured = false;
   let committedArtifactsDetached = false;
-  let onTerminal: ((slotId: string, result: FirstDisplayTerminalResult) => void) | undefined;
+  let onTerminal:
+    | ((slotId: string, result: FirstDisplayTerminalResult, reason: string | null) => void)
+    | undefined;
 
-  const settle = (slotId: string, result: FirstDisplayTerminalResult): boolean => {
+  const settle = (
+    slotId: string,
+    result: FirstDisplayTerminalResult,
+    reason: string | null
+  ): boolean => {
     if (
       disposed ||
       !expectedBySlot.has(slotId) ||
@@ -106,7 +115,7 @@ export function createFirstDisplayProjectedDriver(
     }
     settled.add(slotId);
     settledResults.set(slotId, result);
-    onTerminal?.(slotId, result);
+    onTerminal?.(slotId, result, reason);
     return true;
   };
 
@@ -114,7 +123,7 @@ export function createFirstDisplayProjectedDriver(
     start: (
       outcomes: readonly FirstDisplayBatchOutcomeV1[],
       onFirstAction: () => boolean,
-      terminal: (slotId: string, result: FirstDisplayTerminalResult) => void
+      terminal: (slotId: string, result: FirstDisplayTerminalResult, reason: string | null) => void
     ): void => {
       if (started || disposed) throw new TypeError('first-display driver is not startable');
       if (
@@ -142,18 +151,20 @@ export function createFirstDisplayProjectedDriver(
             options.batch.projection.bids[bidIndex]?.slot !== cycle.slotId ||
             cycle.placement !== expectedPlacement
           ) {
-            settle(cycle.slotId, 'failed');
+            settle(cycle.slotId, 'failed', 'gpt_request_failed');
             return;
           }
           bound.set(cycle.slotId, cycle);
-          if (!options.renderer.bind(cycle, (result) => settle(cycle.slotId, result))) {
-            settle(cycle.slotId, 'failed');
+          if (
+            !options.renderer.bind(cycle, (result, reason) => settle(cycle.slotId, result, reason))
+          ) {
+            settle(cycle.slotId, 'failed', 'internal_error');
           }
         },
-        onFailure: (slotId): void => {
+        onFailure: (slotId, reason): void => {
           const cycle = bound.get(slotId);
           if (cycle) options.renderer.recordFailure(cycle);
-          settle(slotId, 'failed');
+          settle(slotId, 'failed', reason);
         },
         onFirstAction: (): boolean => {
           if (actionStarted || disposed) return false;
@@ -163,10 +174,12 @@ export function createFirstDisplayProjectedDriver(
         onRenderEnded: (cycle, result): void => {
           const exact = bound.get(cycle.slotId);
           if (!exact || !sameCycle(exact, cycle)) {
-            settle(cycle.slotId, 'failed');
+            settle(cycle.slotId, 'failed', 'gpt_request_failed');
             return;
           }
-          if (!options.renderer.recordGam(exact, result)) settle(cycle.slotId, 'failed');
+          if (!options.renderer.recordGam(exact, result)) {
+            settle(cycle.slotId, 'failed', 'gpt_request_failed');
+          }
         },
       });
       if (accepted !== true) throw new TypeError('first-display GPT batch was rejected');
@@ -188,6 +201,15 @@ export function createFirstDisplayProjectedDriver(
     captureHandoff: () => {
       if (disposed || !ingressClosed || handoffCaptured) return undefined;
       const gptCycles = gptBatch?.captureHandoff() ?? Object.freeze([]);
+      const gptDiagnostics =
+        gptBatch?.captureDiagnosticsHandoff() ??
+        Object.freeze({
+          cycles: Object.freeze([]),
+          facts: Object.freeze([]),
+          nextTraceTokenOrdinal: 1,
+          overflowCount: 0,
+          dropCount: 0,
+        });
       const render = options.renderer.captureHandoff();
       if (!render) return undefined;
       const acceptedIds = new Set(
@@ -196,8 +218,16 @@ export function createFirstDisplayProjectedDriver(
           .map(([slotId]) => slotId)
       );
       const cycles = gptCycles.filter(({ slotId }) => acceptedIds.has(slotId));
+      const diagnosticCycles = gptDiagnostics.cycles.filter(({ slotId }) =>
+        acceptedIds.has(slotId)
+      );
       if (
         cycles.length !== acceptedIds.size ||
+        diagnosticCycles.length !== cycles.length ||
+        diagnosticCycles.some((cycle) => {
+          const physical = cycles.find(({ slotId }) => slotId === cycle.slotId);
+          return !physical || physical.traceToken !== cycle.token;
+        }) ||
         render.artifacts.some(({ slotId }) => !acceptedIds.has(slotId))
       ) {
         return undefined;
@@ -210,8 +240,17 @@ export function createFirstDisplayProjectedDriver(
       handoffCaptured = true;
       return Object.freeze({
         artifacts: render.artifacts,
+        clockEpochMs: render.clockEpochMs,
         cycles: Object.freeze(cycles),
+        diagnosticCycles: Object.freeze(diagnosticCycles),
+        gptDiagnostics: Object.freeze({
+          facts: Object.freeze([...gptDiagnostics.facts]),
+          overflowCount: gptDiagnostics.overflowCount,
+          dropCount: gptDiagnostics.dropCount,
+        }),
         identities: Object.freeze(identities),
+        nextTraceTokenOrdinal: gptDiagnostics.nextTraceTokenOrdinal,
+        nextReservationOrdinal: render.nextReservationOrdinal,
         nextTicketOrdinal: render.nextTicketOrdinal,
         tombstones: render.tombstones,
       });

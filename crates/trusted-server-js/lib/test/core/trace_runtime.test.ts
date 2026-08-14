@@ -67,6 +67,96 @@ function harness() {
 }
 
 describe('render trace diagnostics runtime', () => {
+  it('atomically adopts first-display sequence and impression high-water values once', () => {
+    const { owner } = harness();
+    const navigationGeneration = {};
+
+    expect(
+      owner.adoptFirstDisplay({
+        navigationGeneration,
+        nextSequence: 9,
+        slots: [
+          {
+            bindings: [
+              {
+                cycleOrdinal: 1,
+                historySequence: 8,
+                state: 'completed',
+                token: 'gt1_1',
+              },
+            ],
+            impressions: 3,
+            records: [
+              {
+                at: 4,
+                count: 3,
+                elementId: 'div-a',
+                injected: true,
+                path: 'ssat',
+                rendered: true,
+                seq: 8,
+                servedFrom: 'inline',
+                slotId: 'slot-a',
+              },
+            ],
+            slotId: 'slot-a',
+          },
+          { bindings: [], impressions: 0, records: [], slotId: 'slot-b' },
+        ],
+      })
+    ).toBe(true);
+
+    owner.observeGptFact(
+      {
+        kind: 'slotVisibilityChanged',
+        slot: { token: 'gt1_1', cycleOrdinal: 1, elementId: 'div-a' },
+        inViewPercentage: 75,
+      },
+      () => ({
+        elementId: 'div-a',
+        navigationGeneration,
+        slotId: 'slot-a',
+        traceToken: 'gt1_1',
+      })
+    );
+    expect(owner.diagnostics.current()['slot-a']).toMatchObject({
+      count: 3,
+      seq: 8,
+      visible: true,
+    });
+
+    expect(owner.record({ slotId: 'slot-a', path: 'gam-refresh', rendered: true })).toMatchObject({
+      count: 4,
+      seq: 9,
+    });
+    expect(owner.record({ slotId: 'slot-b', path: 'auction', rendered: false })).toMatchObject({
+      count: 1,
+      seq: 10,
+    });
+    expect(owner.adoptFirstDisplay({ navigationGeneration, nextSequence: 11, slots: [] })).toBe(
+      false
+    );
+  });
+
+  it('rejects malformed first-display trace adoption without partial mutation', () => {
+    const { owner } = harness();
+
+    expect(
+      owner.adoptFirstDisplay({
+        navigationGeneration: {},
+        nextSequence: 7,
+        slots: [
+          { bindings: [], impressions: 2, records: [], slotId: 'slot-a' },
+          { bindings: [], impressions: 1, records: [], slotId: 'slot-a' },
+        ],
+      })
+    ).toBe(false);
+    expect(owner.record({ slotId: 'slot-a', path: 'auction', rendered: true })).toMatchObject({
+      count: 1,
+      seq: 1,
+    });
+  });
+
   it('exposes one exact frozen read-only public surface with copied snapshots', () => {
     const { owner } = harness();
     const target = window as unknown as { tsjs?: Record<string, unknown> };

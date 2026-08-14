@@ -243,6 +243,17 @@ export function createTestlightIntegrationRegistration(release: string): Integra
         target: target as Window & TestlightTarget,
       });
     },
+    firstDisplaySliceId: 'testlight_initial',
     validateConfig: (candidate) => candidate === undefined,
+    validateFirstDisplayState: (state) => {
+      const value = state.values[0]?.[1];
+      return (
+        state.values.length === 1 &&
+        state.values[0]?.[0] === 'callback_count' &&
+        typeof value === 'number' &&
+        Number.isInteger(value) &&
+        value >= 0
+      );
+    },
   });
 }

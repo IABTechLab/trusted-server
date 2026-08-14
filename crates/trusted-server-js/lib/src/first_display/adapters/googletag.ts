@@ -4,6 +4,30 @@ import type {
   FirstDisplayProjectionV1,
 } from '../leaf/projection';
 import type { FirstDisplayGptProtocolV1 } from '../leaf/gpt_protocol';
+import type {
+  FirstDisplayGptDiagnosticEventV1,
+  FirstDisplayGptDiagnosticsV1,
+  FirstDisplayGptFactV1,
+} from '../../shared/takeover';
+
+const MAX_DIAGNOSTIC_FACTS = 512;
+const MAX_DIAGNOSTIC_FACT_BYTES = 1_000;
+const MAX_DIAGNOSTIC_SECTION_BYTES = 512 * 1024;
+const MAX_U32 = 4_294_967_295;
+const DIAGNOSTIC_ONLY_EVENTS = Object.freeze([
+  'slotResponseReceived',
+  'slotOnload',
+  'impressionViewable',
+  'slotVisibilityChanged',
+] as const);
+const DIAGNOSTIC_EVENT_ORDER: readonly FirstDisplayGptDiagnosticEventV1[] = Object.freeze([
+  'slotRequested',
+  'slotResponseReceived',
+  'slotRenderEnded',
+  'slotOnload',
+  'impressionViewable',
+  'slotVisibilityChanged',
+]);
 
 export type FirstDisplayGptRenderResult = 'gam_empty' | 'nonempty_gam';
 export type FirstDisplayGptFailureReason =
@@ -22,6 +46,26 @@ export interface FirstDisplayGptBoundCycleV1 {
   readonly physicalSlot: object;
   readonly placement: FirstDisplayProjectionSlotV1;
   readonly slotId: string;
+  readonly traceToken: string;
+}
+
+export interface FirstDisplayGptDiagnosticCycleV1 {
+  readonly nextCycleOrdinal: number;
+  readonly quarantines: readonly string[];
+  readonly records: readonly Readonly<{
+    readonly ordinal: number;
+    readonly responseIdentifier: string | null;
+    readonly seen: readonly FirstDisplayGptDiagnosticEventV1[];
+    readonly state: 'open' | 'completed' | 'retired';
+  }>[];
+  readonly slotId: string;
+  readonly token: string;
+  readonly unknownPriorCycle: boolean;
+}
+
+export interface FirstDisplayGptDiagnosticsHandoffV1 extends FirstDisplayGptDiagnosticsV1 {
+  readonly cycles: readonly Readonly<FirstDisplayGptDiagnosticCycleV1>[];
+  readonly nextTraceTokenOrdinal: number;
 }
 
 export interface FirstDisplayGoogletagBatchCallbacks {
@@ -40,6 +84,7 @@ export interface FirstDisplayGoogletagBatch {
   readonly closeIngress: () => boolean;
   /** Capture exact terminal physical identities without changing disposal ownership. */
   readonly captureHandoff: () => readonly FirstDisplayGptBoundCycleV1[] | undefined;
+  readonly captureDiagnosticsHandoff: () => FirstDisplayGptDiagnosticsHandoffV1 | undefined;
   /** Exempt exactly the accepted slot identities from provisional destruction/restoration. */
   readonly detachCommittedSlots: (slotIds: readonly string[]) => boolean;
   readonly dispose: () => void;
@@ -49,6 +94,7 @@ export interface FirstDisplayGoogletagBatchOptions {
   readonly browser: Window & { googletag?: unknown };
   readonly clearTimer: (handle: unknown) => void;
   readonly document: Document;
+  readonly diagnosticsActive?: boolean;
   readonly onNativeMutation?: () => boolean;
   readonly projection: FirstDisplayProjectionV1;
   readonly protocol: Pick<
@@ -62,15 +108,26 @@ export type FirstDisplayGoogletagBatchInput = Omit<FirstDisplayGoogletagBatchOpt
 
 type ExternalObject = Record<PropertyKey, unknown>;
 
+interface FirstDisplayDiagnosticCycleRecord {
+  readonly ordinal: number;
+  readonly seen: Set<FirstDisplayGptDiagnosticEventV1>;
+  responseIdentifier?: string;
+  state: 'open' | 'completed' | 'retired';
+}
+
 interface ActiveCycle extends FirstDisplayGptBoundCycleV1 {
+  readonly diagnosticRecords: FirstDisplayDiagnosticCycleRecord[];
   readonly elementId: string;
   readonly operations: readonly ('display' | 'refresh')[];
   readonly requestOperation: 0 | 1;
+  readonly runtimeSlotNumber: number;
   completionTimer?: unknown;
+  nextDiagnosticCycleOrdinal: number;
   requestInvoked: boolean;
   requested: boolean;
   requestTimer?: unknown;
   settled: boolean;
+  unknownPriorCycle: boolean;
 }
 
 interface TargetingRestorer {
@@ -173,6 +230,8 @@ function winnerRows(projection: FirstDisplayProjectionV1): readonly Readonly<{
 class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
   private readonly cycles = new Map<object, ActiveCycle>();
   private readonly createdSlots = new Set<object>();
+  private readonly diagnosticFacts: Readonly<FirstDisplayGptFactV1>[] = [];
+  private readonly diagnosticListeners = new Map<string, (event: unknown) => void>();
   private readonly targetingObservers = new Map<object, () => void>();
   private readonly targetingRestorers: TargetingRestorer[] = [];
   private readonly publisherCallRestorers: Array<() => void> = [];
@@ -191,6 +250,9 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
   private committedSlotsDetached = false;
   private readonly detachedSlots = new Set<object>();
   private firstAction = false;
+  private diagnosticFactOverflow = 0;
+  private diagnosticFactDrops = 0;
+  private nextTraceTokenOrdinal = 1;
   private targetingWriteDepth = 0;
 
   public constructor(private readonly options: FirstDisplayGoogletagBatchOptions) {}
@@ -275,9 +337,43 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
           physicalSlot: cycle.physicalSlot,
           placement: cycle.placement,
           slotId: cycle.slotId,
+          traceToken: cycle.traceToken,
         })
       )
     );
+  }
+
+  public captureDiagnosticsHandoff(): FirstDisplayGptDiagnosticsHandoffV1 | undefined {
+    if (this.disposed || !this.ingressClosed) return undefined;
+    return Object.freeze({
+      cycles: Object.freeze(
+        [...this.cycles.values()].map((cycle) =>
+          Object.freeze({
+            nextCycleOrdinal: cycle.nextDiagnosticCycleOrdinal,
+            quarantines: Object.freeze([]),
+            records: Object.freeze(
+              cycle.diagnosticRecords.map((record) =>
+                Object.freeze({
+                  ordinal: record.ordinal,
+                  responseIdentifier: record.responseIdentifier ?? null,
+                  seen: Object.freeze(
+                    DIAGNOSTIC_EVENT_ORDER.filter((event) => record.seen.has(event))
+                  ),
+                  state: record.state,
+                })
+              )
+            ),
+            slotId: cycle.slotId,
+            token: cycle.traceToken,
+            unknownPriorCycle: cycle.unknownPriorCycle,
+          })
+        )
+      ),
+      facts: Object.freeze([...this.diagnosticFacts]),
+      dropCount: this.diagnosticFactDrops,
+      nextTraceTokenOrdinal: this.nextTraceTokenOrdinal,
+      overflowCount: this.diagnosticFactOverflow,
+    });
   }
 
   public detachCommittedSlots(slotIds: readonly string[]): boolean {
@@ -436,8 +532,16 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
         callbacks.onFailure(row.placement.slot, 'gpt_request_failed');
         continue;
       }
+      const traceTokenOrdinal = this.nextTraceTokenOrdinal;
+      if (traceTokenOrdinal > 4_294_967_295) {
+        callbacks.onFailure(row.placement.slot, 'gpt_request_failed');
+        continue;
+      }
+      const traceToken = `gt1_${traceTokenOrdinal.toString(36)}`;
+      this.nextTraceTokenOrdinal += 1;
       const cycle: ActiveCycle = {
         bid: row.bid,
+        diagnosticRecords: [],
         element,
         elementId: element.id,
         operations: plan.operations,
@@ -445,10 +549,14 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
         physicalSlot: slot,
         placement: row.placement,
         requestOperation: plan.requestOperation,
+        runtimeSlotNumber: traceTokenOrdinal,
+        nextDiagnosticCycleOrdinal: 1,
         requestInvoked: false,
         requested: false,
         settled: false,
         slotId: row.placement.slot,
+        traceToken,
+        unknownPriorCycle: ownership === 'publisher',
       };
       this.cycles.set(slot, cycle);
       callbacks.onBound(
@@ -459,6 +567,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
           physicalSlot: cycle.physicalSlot,
           placement: cycle.placement,
           slotId: cycle.slotId,
+          traceToken: cycle.traceToken,
         })
       );
       for (const [key, value] of targetingEntries(row.bid, row.placement)) {
@@ -506,12 +615,18 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       this.notifyNativeMutation();
       const slot = physicalSlot(member(event, 'slot'));
       const cycle = slot ? this.cycles.get(slot) : undefined;
-      if (!cycle || cycle.settled || !cycle.requestInvoked) return;
+      if (!cycle) return;
+      if (cycle.settled) {
+        this.captureDiagnosticFact('slotRequested', cycle, event);
+        return;
+      }
+      if (!cycle.requestInvoked) return;
       if (cycle.requested) {
         this.failCycle(cycle, callbacks, 'cycle_unattributable');
         return;
       }
       cycle.requested = true;
+      this.captureDiagnosticFact('slotRequested', cycle, event);
       if (cycle.requestTimer !== undefined) this.clearOwnedTimer(cycle.requestTimer);
     };
     const renderListener = (event: unknown): void => {
@@ -519,7 +634,12 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       this.notifyNativeMutation();
       const slot = physicalSlot(member(event, 'slot'));
       const cycle = slot ? this.cycles.get(slot) : undefined;
-      if (!cycle || cycle.settled || !cycle.requested) return;
+      if (!cycle) return;
+      if (cycle.settled) {
+        this.captureDiagnosticFact('slotRenderEnded', cycle, event);
+        return;
+      }
+      if (!cycle.requested) return;
       const result = this.options.protocol.classifyRenderEnded(
         Object.freeze({ isEmpty: member(event, 'isEmpty') })
       );
@@ -527,6 +647,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
         this.failCycle(cycle, callbacks, 'gpt_request_failed');
         return;
       }
+      this.captureDiagnosticFact('slotRenderEnded', cycle, event);
       cycle.settled = true;
       if (cycle.requestTimer !== undefined) this.clearOwnedTimer(cycle.requestTimer);
       if (cycle.completionTimer !== undefined) this.clearOwnedTimer(cycle.completionTimer);
@@ -538,31 +659,44 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
           physicalSlot: cycle.physicalSlot,
           placement: cycle.placement,
           slotId: cycle.slotId,
+          traceToken: cycle.traceToken,
         }),
         result
       );
     };
     this.requestedListener = requestedListener;
     this.renderListener = renderListener;
+    this.diagnosticListeners.set('slotRequested', requestedListener);
+    this.diagnosticListeners.set('slotRenderEnded', renderListener);
     call(service, 'addEventListener', ['slotRequested', requestedListener]);
     call(service, 'addEventListener', ['slotRenderEnded', renderListener]);
+    if (this.options.diagnosticsActive === true) {
+      for (const eventType of DIAGNOSTIC_ONLY_EVENTS) {
+        const listener = (event: unknown): void => {
+          if (this.disposed || this.diagnosticListeners.get(eventType) !== listener) return;
+          this.notifyNativeMutation();
+          const slot = physicalSlot(member(event, 'slot'));
+          const cycle = slot ? this.cycles.get(slot) : undefined;
+          if (cycle) this.captureDiagnosticFact(eventType, cycle, event);
+        };
+        this.diagnosticListeners.set(eventType, listener);
+        call(service, 'addEventListener', [eventType, listener]);
+      }
+    }
   }
 
   private removeListener(): void {
     if (!this.service) return;
-    const requestedListener = this.requestedListener;
-    const renderListener = this.renderListener;
     this.requestedListener = undefined;
     this.renderListener = undefined;
     try {
-      if (requestedListener) {
-        call(this.service, 'removeEventListener', ['slotRequested', requestedListener]);
-      }
-      if (renderListener) {
-        call(this.service, 'removeEventListener', ['slotRenderEnded', renderListener]);
+      for (const [eventType, listener] of this.diagnosticListeners) {
+        call(this.service, 'removeEventListener', [eventType, listener]);
       }
     } catch {
       // The generation latch remains authoritative if GPT cannot detach physically.
+    } finally {
+      this.diagnosticListeners.clear();
     }
   }
 
@@ -573,6 +707,9 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
   ): void {
     if (cycle.settled) return;
     cycle.settled = true;
+    for (const record of cycle.diagnosticRecords) {
+      if (record.state === 'open') record.state = 'retired';
+    }
     if (cycle.requestTimer !== undefined) this.clearOwnedTimer(cycle.requestTimer);
     if (cycle.completionTimer !== undefined) this.clearOwnedTimer(cycle.completionTimer);
     callbacks.onFailure(cycle.slotId, reason);
@@ -701,6 +838,199 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
     }
   }
 
+  private captureDiagnosticFact(
+    eventType: FirstDisplayGptDiagnosticEventV1,
+    cycle: ActiveCycle,
+    event: unknown
+  ): void {
+    const responseIdentifier = (() => {
+      const candidate = member(event, 'responseIdentifier');
+      if (typeof candidate !== 'string' || candidate.length === 0) return undefined;
+      if (new TextEncoder().encode(candidate).byteLength > 256) return undefined;
+      for (let index = 0; index < candidate.length; index += 1) {
+        const code = candidate.charCodeAt(index);
+        if (code <= 0x1f || code === 0x7f) return undefined;
+      }
+      return candidate;
+    })();
+    let disposition: FirstDisplayGptFactV1['disposition'] = 'matched';
+    let issueReason: FirstDisplayGptFactV1['issueReason'] = null;
+    let diagnosticCycle: FirstDisplayDiagnosticCycleRecord | undefined;
+    if (eventType === 'slotRequested') {
+      if (cycle.diagnosticRecords.some((record) => record.state === 'open')) {
+        disposition = 'ambiguous';
+        issueReason = 'overlapping_request_cycles';
+      } else if (cycle.nextDiagnosticCycleOrdinal > MAX_U32) {
+        disposition = 'unmatched';
+        issueReason = 'invalid_event_order';
+      } else {
+        if (cycle.diagnosticRecords.length >= 10) {
+          const pruneIndex = cycle.diagnosticRecords.findIndex((record) => record.state !== 'open');
+          if (pruneIndex < 0) {
+            disposition = 'ambiguous';
+            issueReason = 'overlapping_request_cycles';
+          } else {
+            cycle.diagnosticRecords.splice(pruneIndex, 1);
+            cycle.unknownPriorCycle = true;
+          }
+        }
+        if (disposition === 'matched') {
+          diagnosticCycle = {
+            ordinal: cycle.nextDiagnosticCycleOrdinal,
+            ...(responseIdentifier === undefined ? {} : { responseIdentifier }),
+            seen: new Set(['slotRequested']),
+            state: 'open',
+          };
+          cycle.nextDiagnosticCycleOrdinal += 1;
+          cycle.diagnosticRecords.push(diagnosticCycle);
+        }
+      }
+    } else {
+      let candidates: FirstDisplayDiagnosticCycleRecord[];
+      if (responseIdentifier !== undefined) {
+        candidates = cycle.diagnosticRecords.filter(
+          (record) =>
+            record.responseIdentifier === responseIdentifier && !record.seen.has(eventType)
+        );
+        if (candidates.length === 0) {
+          const unboundOpen = cycle.diagnosticRecords.filter(
+            (record) =>
+              record.state === 'open' &&
+              record.responseIdentifier === undefined &&
+              !record.seen.has(eventType)
+          );
+          if (unboundOpen.length === 1) candidates = unboundOpen;
+        }
+      } else {
+        candidates = cycle.diagnosticRecords.filter(
+          (record) => record.state === 'open' && !record.seen.has(eventType)
+        );
+        if (candidates.length === 0 && !cycle.unknownPriorCycle) {
+          candidates = cycle.diagnosticRecords.filter((record) => !record.seen.has(eventType));
+        }
+      }
+      if (candidates.length === 1) {
+        diagnosticCycle = candidates[0];
+      } else if (candidates.length > 1) {
+        disposition = 'ambiguous';
+        issueReason = 'overlapping_request_cycles';
+      } else {
+        const duplicate = cycle.diagnosticRecords.find(
+          (record) =>
+            record.seen.has(eventType) &&
+            (responseIdentifier === undefined ||
+              record.responseIdentifier === responseIdentifier ||
+              record.responseIdentifier === undefined)
+        );
+        if (duplicate) {
+          diagnosticCycle = duplicate;
+          issueReason = 'invalid_event_order';
+        } else {
+          disposition = 'unmatched';
+          issueReason = cycle.unknownPriorCycle ? 'unknown_prior_cycle' : 'no_request_cycle';
+        }
+      }
+      if (diagnosticCycle && issueReason !== 'invalid_event_order') {
+        diagnosticCycle.seen.add(eventType);
+        if (diagnosticCycle.responseIdentifier === undefined && responseIdentifier !== undefined) {
+          diagnosticCycle.responseIdentifier = responseIdentifier;
+        }
+        if (eventType === 'slotRenderEnded') diagnosticCycle.state = 'completed';
+      }
+    }
+    if (this.options.diagnosticsActive !== true) return;
+    let observedAtMs: number;
+    try {
+      observedAtMs = this.options.browser.performance.now();
+      if (!Number.isFinite(observedAtMs) || observedAtMs < 0) {
+        this.incrementDiagnosticDrops();
+        return;
+      }
+    } catch {
+      this.incrementDiagnosticDrops();
+      return;
+    }
+    const size = member(event, 'size');
+    const renderedSize =
+      eventType === 'slotRenderEnded' &&
+      Array.isArray(size) &&
+      size.length === 2 &&
+      size.every(
+        (dimension) =>
+          typeof dimension === 'number' &&
+          Number.isInteger(dimension) &&
+          dimension >= 1 &&
+          dimension <= 4096
+      )
+        ? Object.freeze([size[0] as number, size[1] as number] as const)
+        : null;
+    const optionalBoolean = (key: string): boolean | null => {
+      const value = member(event, key);
+      return typeof value === 'boolean' ? value : null;
+    };
+    const visibility = member(event, 'inViewPercentage');
+    const fact: Readonly<FirstDisplayGptFactV1> = Object.freeze({
+      version: 1,
+      event: eventType,
+      token: cycle.traceToken,
+      runtimeSlotNumber: cycle.runtimeSlotNumber,
+      cycleOrdinal: disposition === 'matched' ? (diagnosticCycle?.ordinal ?? null) : null,
+      disposition,
+      issueReason,
+      capturedAtMs: observedAtMs,
+      elementId: cycle.elementId,
+      adUnitPath: cycle.placement.gamUnitPath,
+      isEmpty: eventType === 'slotRenderEnded' ? optionalBoolean('isEmpty') : null,
+      renderedSize,
+      isBackfill: eventType === 'slotRenderEnded' ? optionalBoolean('isBackfill') : null,
+      slotContentChanged:
+        eventType === 'slotRenderEnded' ? optionalBoolean('slotContentChanged') : null,
+      visibilityPercent:
+        eventType === 'slotVisibilityChanged' &&
+        typeof visibility === 'number' &&
+        Number.isFinite(visibility) &&
+        visibility >= 0 &&
+        visibility <= 100
+          ? visibility
+          : null,
+    });
+    if (this.encodedBytes(fact) > MAX_DIAGNOSTIC_FACT_BYTES) {
+      this.incrementDiagnosticDrops();
+      return;
+    }
+    const overflow = this.diagnosticFacts.length >= MAX_DIAGNOSTIC_FACTS;
+    const nextFacts = overflow
+      ? [...this.diagnosticFacts.slice(1), fact]
+      : [...this.diagnosticFacts, fact];
+    const nextOverflow = overflow
+      ? Math.min(MAX_U32, this.diagnosticFactOverflow + 1)
+      : this.diagnosticFactOverflow;
+    if (
+      this.encodedBytes({
+        facts: nextFacts,
+        overflowCount: nextOverflow,
+        dropCount: this.diagnosticFactDrops,
+      }) > MAX_DIAGNOSTIC_SECTION_BYTES
+    ) {
+      this.incrementDiagnosticDrops();
+      return;
+    }
+    this.diagnosticFacts.splice(0, this.diagnosticFacts.length, ...nextFacts);
+    this.diagnosticFactOverflow = nextOverflow;
+  }
+
+  private encodedBytes(value: unknown): number {
+    try {
+      return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+    } catch {
+      return Number.POSITIVE_INFINITY;
+    }
+  }
+
+  private incrementDiagnosticDrops(): void {
+    this.diagnosticFactDrops = Math.min(MAX_U32, this.diagnosticFactDrops + 1);
+  }
+
   private invalidateTargeting(slot: object, key: string | undefined): void {
     for (const restoration of this.targetingRestorers) {
       if (restoration.slot === slot && (key === undefined || restoration.key === key)) {
@@ -798,6 +1128,7 @@ export function createFirstDisplayGoogletagBatch(
     start: (callbacks: FirstDisplayGoogletagBatchCallbacks) => owner.start(callbacks),
     closeIngress: () => owner.closeIngress(),
     captureHandoff: () => owner.captureHandoff(),
+    captureDiagnosticsHandoff: () => owner.captureDiagnosticsHandoff(),
     detachCommittedSlots: (slotIds: readonly string[]) => owner.detachCommittedSlots(slotIds),
     dispose: () => owner.dispose(),
   });

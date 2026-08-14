@@ -101,6 +101,7 @@ export function installTestlightInitial(
       ? previousQueueDescriptor.value
       : undefined;
   const queue = ownQueueValues(originalQueue);
+  if (originalQueue) originalQueue.length = 0;
   Object.defineProperty(global, 'que', {
     configurable: true,
     enumerable: true,

@@ -1,5 +1,9 @@
 import {
+  persistentFirstDisplaySliceSelectedV1,
   snapshotPersistentFirstDisplayAdoptionV1,
+  snapshotPersistentFirstDisplaySliceStateV1,
+  type FirstDisplayGptDiagnosticEventV1,
+  type FirstDisplayGptDiagnosticsV1,
   type PersistentFirstDisplayAdoptionV1,
 } from '../../shared/takeover';
 import type {
@@ -76,23 +80,211 @@ function dataField(candidate: unknown, key: string): unknown {
   return descriptor?.enumerable && 'value' in descriptor ? descriptor.value : undefined;
 }
 
+/** Hydrate exact GPT diagnostic tokens/cycles before adopted slots become observable. */
+export function adoptInitialGptDiagnosticsFromHandoff(
+  candidate: unknown,
+  adapter: Pick<GoogletagAdapter, 'adoptDiagnosticsState'>
+): PersistentFirstDisplayAdoptionV1 | undefined {
+  const adoption = snapshotPersistentFirstDisplayAdoptionV1(candidate);
+  const adopt = adapter.adoptDiagnosticsState;
+  if (!adoption || typeof adopt !== 'function') return undefined;
+  const cycles = frozenArray(dataField(adoption.handoff, 'cycles'));
+  const artifacts = frozenArray(dataField(adoption.handoff, 'artifacts'));
+  const trace = dataField(adoption.handoff, 'trace');
+  const nextTraceTokenOrdinal = dataField(trace, 'nextGlobalSlotOrdinal');
+  if (
+    !cycles ||
+    !artifacts ||
+    typeof nextTraceTokenOrdinal !== 'number' ||
+    adoption.identities.length !== cycles.length + artifacts.length
+  ) {
+    return undefined;
+  }
+  const slots: Array<{
+    nextCycleOrdinal: number;
+    physicalSlot: object;
+    records: readonly Readonly<{
+      ordinal: number;
+      responseIdentifier: string | null;
+      seen: readonly FirstDisplayGptDiagnosticEventV1[];
+      state: 'open' | 'completed' | 'retired';
+    }>[];
+    traceToken: string;
+    unknownPriorCycle: boolean;
+  }> = [];
+  for (let index = 0; index < cycles.length; index += 1) {
+    const cycle = cycles[index];
+    const physicalSlot = adoption.identities[index];
+    const traceToken = dataField(cycle, 'token');
+    const nextCycleOrdinal = dataField(cycle, 'nextCycleOrdinal');
+    const unknownPriorCycle = dataField(cycle, 'unknownPriorCycle');
+    const records = frozenArray(dataField(cycle, 'records'));
+    if (
+      !physicalSlot ||
+      typeof traceToken !== 'string' ||
+      typeof nextCycleOrdinal !== 'number' ||
+      typeof unknownPriorCycle !== 'boolean' ||
+      !records
+    ) {
+      return undefined;
+    }
+    const copiedRecords: Array<{
+      ordinal: number;
+      responseIdentifier: string | null;
+      seen: readonly FirstDisplayGptDiagnosticEventV1[];
+      state: 'open' | 'completed' | 'retired';
+    }> = [];
+    for (const record of records) {
+      const ordinal = dataField(record, 'ordinal');
+      const responseIdentifier = dataField(record, 'responseIdentifier');
+      const seen = frozenArray(dataField(record, 'seen'));
+      const state = dataField(record, 'state');
+      if (
+        typeof ordinal !== 'number' ||
+        (responseIdentifier !== null && typeof responseIdentifier !== 'string') ||
+        !seen ||
+        seen.some(
+          (event) =>
+            event !== 'slotRequested' &&
+            event !== 'slotResponseReceived' &&
+            event !== 'slotRenderEnded' &&
+            event !== 'slotOnload' &&
+            event !== 'impressionViewable' &&
+            event !== 'slotVisibilityChanged'
+        ) ||
+        (state !== 'open' && state !== 'completed' && state !== 'retired')
+      ) {
+        return undefined;
+      }
+      copiedRecords.push({
+        ordinal,
+        responseIdentifier,
+        seen: seen as readonly FirstDisplayGptDiagnosticEventV1[],
+        state,
+      });
+    }
+    slots.push({
+      nextCycleOrdinal,
+      physicalSlot,
+      records: copiedRecords,
+      traceToken,
+      unknownPriorCycle,
+    });
+  }
+  try {
+    return Reflect.apply(adopt, adapter, [{ nextTraceTokenOrdinal, slots }]) === true
+      ? adoption
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Transfer unexpired lifecycle-ticket tombstones into the sole persistent PUC owner. */
+export function adoptInitialPucTicketsFromHandoff(
+  candidate: unknown,
+  bridge: Pick<PucBridge, 'adoptFirstDisplayTickets'>
+): PersistentFirstDisplayAdoptionV1 | undefined {
+  const adoption = snapshotPersistentFirstDisplayAdoptionV1(candidate);
+  if (!adoption) return undefined;
+  const highWater = dataField(adoption.handoff, 'highWater');
+  const clockEpochMs = dataField(highWater, 'reservationClockEpochMs');
+  const nextTicketOrdinal = dataField(highWater, 'nextTicketOrdinal');
+  const tombstones = frozenArray(dataField(adoption.handoff, 'tombstones'));
+  if (typeof clockEpochMs !== 'number' || typeof nextTicketOrdinal !== 'number' || !tombstones) {
+    return undefined;
+  }
+  const tickets: Array<{ expiresAtMs: number; ticket: string }> = [];
+  for (const tombstone of tombstones) {
+    if (dataField(tombstone, 'kind') !== 'ticket') continue;
+    const ticket = dataField(tombstone, 'value');
+    const expiresAtMs = dataField(tombstone, 'expiresAtMs');
+    if (typeof ticket !== 'string' || typeof expiresAtMs !== 'number') return undefined;
+    tickets.push({ expiresAtMs, ticket });
+  }
+  try {
+    return bridge.adoptFirstDisplayTickets({
+      clockEpochMs,
+      nextTicketOrdinal,
+      tombstones: tickets,
+    })
+      ? adoption
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Restore the ordered bounded diagnostics buffer without replaying facts as new events. */
+export function adoptInitialGptFactsFromHandoff(
+  candidate: unknown,
+  buffer: Pick<ReturnType<typeof createGptDiagnosticsFactBuffer>, 'adoptFirstDisplay'> | undefined,
+  adapter: Pick<GoogletagAdapter, 'diagnosticsIdentity'>
+): PersistentFirstDisplayAdoptionV1 | undefined {
+  const adoption = snapshotPersistentFirstDisplayAdoptionV1(candidate);
+  if (!adoption) return undefined;
+  const diagnostics = dataField(adoption.handoff, 'gptDiagnostics');
+  const facts = frozenArray(dataField(diagnostics, 'facts'));
+  const overflow = dataField(diagnostics, 'overflowCount');
+  const drops = dataField(diagnostics, 'dropCount');
+  if (!facts || typeof overflow !== 'number' || typeof drops !== 'number') return undefined;
+  if (!buffer) {
+    return facts.length === 0 && overflow === 0 && drops === 0 ? adoption : undefined;
+  }
+  const cycles = frozenArray(dataField(adoption.handoff, 'cycles'));
+  const artifacts = frozenArray(dataField(adoption.handoff, 'artifacts'));
+  if (!cycles || !artifacts || adoption.identities.length !== cycles.length + artifacts.length) {
+    return undefined;
+  }
+  const identities = new Map<string, ReturnType<GoogletagAdapter['diagnosticsIdentity']>>();
+  for (let index = 0; index < cycles.length; index += 1) {
+    const token = dataField(cycles[index], 'token');
+    const physicalSlot = adoption.identities[index];
+    if (typeof token !== 'string' || !physicalSlot) return undefined;
+    let identity: ReturnType<GoogletagAdapter['diagnosticsIdentity']>;
+    try {
+      identity = adapter.diagnosticsIdentity(physicalSlot);
+    } catch {
+      return undefined;
+    }
+    if (!identity || identity.traceToken !== token || identities.has(token)) return undefined;
+    identities.set(token, identity);
+  }
+  try {
+    return buffer.adoptFirstDisplay(
+      diagnostics as Readonly<FirstDisplayGptDiagnosticsV1>,
+      (traceToken) => identities.get(traceToken)
+    )
+      ? adoption
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Adopt the exact transferred GPT identities without defining, targeting, displaying, or refreshing. */
 export function adoptInitialGptSlotsFromHandoff(
   candidate: unknown,
   navigationGeneration: object,
-  service: Pick<SlotService, 'adoptGptSlot'>
+  service: Pick<SlotService, 'adoptGptSlot' | 'adoptRegistrationHighWater'>
 ): PersistentFirstDisplayAdoptionV1 | undefined {
   const adoption = snapshotPersistentFirstDisplayAdoptionV1(candidate);
   if (!adoption) return undefined;
   const slots = frozenArray(dataField(adoption.handoff, 'slots'));
   const cycles = frozenArray(dataField(adoption.handoff, 'cycles'));
   const artifacts = frozenArray(dataField(adoption.handoff, 'artifacts'));
+  const highWater = dataField(adoption.handoff, 'highWater');
+  const nextSlotRegistrationOrdinal = dataField(highWater, 'nextSlotRegistrationOrdinal');
   if (
     !slots ||
     !cycles ||
     !artifacts ||
+    typeof nextSlotRegistrationOrdinal !== 'number' ||
     adoption.identities.length !== cycles.length + artifacts.length
   ) {
+    return undefined;
+  }
+  if (!service.adoptRegistrationHighWater(navigationGeneration, nextSlotRegistrationOrdinal)) {
     return undefined;
   }
   const slotById = new Map<string, unknown>();
@@ -1655,6 +1847,22 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
       const { afterCommit, onDispose } = activation;
       const adoptionCandidate = activation.adoption;
       if (active) throw new Error('GPT already activated');
+      if (adoptionCandidate !== undefined) {
+        const selected = persistentFirstDisplaySliceSelectedV1(adoptionCandidate, 'gpt_initial');
+        const initialState = selected
+          ? snapshotPersistentFirstDisplaySliceStateV1(adoptionCandidate, 'gpt_initial')
+          : undefined;
+        if (
+          selected === undefined ||
+          (selected &&
+            (!initialState ||
+              initialState.values.length !== 1 ||
+              initialState.values[0]?.[0] !== 'protocol_version' ||
+              initialState.values[0][1] !== 1))
+        ) {
+          throw new TypeError('GPT first-display parser state is invalid');
+        }
+      }
       const diagnosticsEventRelease: { current?: () => void } = {};
       const diagnosticsRelease: { current?: () => void } = {};
       const pbsCacheBridgeRelease: { current?: () => void } = {};
@@ -1681,7 +1889,10 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
       });
 
       slotServiceRelease.current = slotCapability.attachPhysicalService(slots);
-      slots.start();
+      const diagnosticsAdoption =
+        adoptionCandidate === undefined
+          ? undefined
+          : adoptInitialGptDiagnosticsFromHandoff(adoptionCandidate, googletag);
       const adoption =
         adoptionCandidate === undefined
           ? undefined
@@ -1690,19 +1901,35 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
               auction.navigation.generation,
               slots
             );
-      if (adoptionCandidate !== undefined && !adoption) {
+      if (adoptionCandidate !== undefined && (!diagnosticsAdoption || !adoption)) {
         throw new TypeError('GPT first-display adoption is invalid');
       }
+      const factAdoption =
+        adoptionCandidate === undefined
+          ? undefined
+          : adoptInitialGptFactsFromHandoff(adoptionCandidate, diagnosticsFacts, googletag);
+      if (adoptionCandidate !== undefined && !factAdoption) {
+        throw new TypeError('GPT first-display diagnostics facts are invalid');
+      }
+      slots.start();
       criticalReconciliationRelease = slots.activateReconciliation();
       const bridge = createPucBridge({
         messaging: messages.messaging,
         mintLifecycleTicket: render.mintLifecycleTicket,
+        now: () => document.defaultView!.performance.now(),
         publisherOrigin: render.publisherOrigin,
         rendererNonces: render.rendererNonces,
         rendererUrl,
         reservations: render.reservations,
         resizeCollapsedShell: resizeCollapsedPucShell,
       });
+      const ticketAdoption =
+        adoptionCandidate === undefined
+          ? undefined
+          : adoptInitialPucTicketsFromHandoff(adoptionCandidate, bridge);
+      if (adoptionCandidate !== undefined && !ticketAdoption) {
+        throw new TypeError('GPT first-display ticket adoption is invalid');
+      }
       pucBridge = bridge;
       bridgeRelease.current = () => {
         bridge.dispose();

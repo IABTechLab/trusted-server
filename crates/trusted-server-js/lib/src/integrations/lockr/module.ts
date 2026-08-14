@@ -137,6 +137,19 @@ export function createLockrRuntime(
 export function createLockrIntegrationRegistration(release: string): IntegrationRegistration {
   return createLifecycleIntegrationRegistration(LOCKR_INTEGRATION_ID, release, {
     createOwnedRuntime: () => createLockrRuntime(),
+    firstDisplaySliceId: 'lockr_initial',
     validateConfig: (candidate) => candidate === undefined,
+    validateFirstDisplayState: (state) => {
+      const readiness = state.values[1];
+      return (
+        state.values[0]?.[0] === 'route_guard' &&
+        state.values[0][1] === 'lockr' &&
+        (state.values.length === 1 ||
+          (state.values.length === 2 &&
+            (readiness?.[0] === 'sdk_host'
+              ? typeof readiness[1] === 'string' && readiness[1].length > 0
+              : readiness?.[0] === 'readiness_timeout' && readiness[1] === 50)))
+      );
+    },
   });
 }
