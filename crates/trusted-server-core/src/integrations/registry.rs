@@ -743,15 +743,20 @@ impl Default for IntegrationRegistryInner {
 struct TsjsStaticTransportV1 {
     artifacts_by_hash: HashMap<String, crate::tsjs::TsjsStaticArtifactV1>,
     critical_hash_by_selection: HashMap<TsjsCatalogSelectionV1, String>,
+    first_display_hash_by_mask: HashMap<u16, String>,
+    first_display_mask_by_hash: HashMap<String, u16>,
 }
 
 impl TsjsStaticTransportV1 {
-    fn new(inner: &IntegrationRegistryInner) -> Self {
+    fn new(
+        inner: &IntegrationRegistryInner,
+        creative_boot: crate::tsjs::CreativeBootConfigV1,
+    ) -> Self {
         let mut transport = Self::default();
-        let creative = crate::tsjs::creative_tsjs_static_artifact_v1().clone();
+        let creative_artifact = crate::tsjs::creative_tsjs_static_artifact_v1().clone();
         transport
             .artifacts_by_hash
-            .insert(creative.hash().to_owned(), creative);
+            .insert(creative_artifact.hash().to_owned(), creative_artifact);
 
         for render_trace_overlay in [false, true] {
             for selection in tsjs_static_transport_selections(inner, render_trace_overlay) {
@@ -778,6 +783,26 @@ impl TsjsStaticTransportV1 {
                     .critical_hash_by_selection
                     .insert(normalized_selection, hash);
             }
+        }
+
+        for (mask, slices) in first_display_static_transport_selections(inner, creative_boot) {
+            let artifact = crate::tsjs::TsjsStaticArtifactV1::new_first_display(mask, &slices)
+                .expect("catalog-derived first-display selection should compose");
+            let hash = artifact.hash().to_owned();
+            transport
+                .artifacts_by_hash
+                .entry(hash.clone())
+                .or_insert(artifact);
+            transport
+                .first_display_hash_by_mask
+                .insert(mask, hash.clone());
+            assert!(
+                transport
+                    .first_display_mask_by_hash
+                    .insert(hash, mask)
+                    .is_none(),
+                "distinct first-display masks should have distinct exact bytes"
+            );
         }
 
         transport
@@ -825,6 +850,62 @@ fn tsjs_static_transport_selections(
                 gpt_diagnostics_active: *gpt_diagnostics_active,
                 render_trace_overlay,
             });
+        }
+    }
+    selections
+}
+
+fn first_display_static_transport_selections(
+    inner: &IntegrationRegistryInner,
+    creative: crate::tsjs::CreativeBootConfigV1,
+) -> Vec<(u16, Vec<&'static str>)> {
+    if !inner.enabled_integration_ids.contains(&"gpt") {
+        return Vec::new();
+    }
+    let aps_values: &[bool] = if inner.enabled_integration_ids.contains(&"aps") {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    let prebid_values: &[bool] = if inner.enabled_integration_ids.contains(&"prebid") {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    let creative_guard = creative.enabled && (creative.click_guard || creative.render_guard);
+    let mut selections = Vec::new();
+    for gpt_participates in [false, true] {
+        for aps_participates in aps_values {
+            if *aps_participates && !gpt_participates {
+                continue;
+            }
+            for prebid_participates in prebid_values {
+                let mut mask = 0_u16;
+                let mut slices = Vec::new();
+                for (index, metadata) in trusted_server_js::all_first_display_metadata()
+                    .into_iter()
+                    .enumerate()
+                {
+                    let selected = match metadata.include {
+                        Some("eligible_batch") => true,
+                        Some("gpt_initial") => gpt_participates,
+                        Some("aps_participates") => *aps_participates,
+                        Some("creative_guard") => creative_guard,
+                        Some("prebid_participates") => *prebid_participates,
+                        Some(predicate) => predicate
+                            .strip_prefix("integration:")
+                            .is_some_and(|id| inner.enabled_integration_ids.contains(&id)),
+                        None => false,
+                    };
+                    if selected {
+                        mask |= 1_u16 << index;
+                        slices.push(metadata.id);
+                    }
+                }
+                if slices.first() == Some(&"first_display") {
+                    selections.push((mask, slices));
+                }
+            }
         }
     }
     selections
@@ -933,10 +1014,11 @@ pub struct IntegrationRegistry {
 impl Default for IntegrationRegistry {
     fn default() -> Self {
         let mut inner = IntegrationRegistryInner::default();
-        inner.tsjs_static_transport = TsjsStaticTransportV1::new(&inner);
+        let creative_boot = crate::tsjs::CreativeBootConfigV1::default();
+        inner.tsjs_static_transport = TsjsStaticTransportV1::new(&inner, creative_boot);
         Self {
             inner: Arc::new(inner),
-            creative_boot: crate::tsjs::CreativeBootConfigV1::default(),
+            creative_boot,
         }
     }
 }
@@ -1050,7 +1132,7 @@ impl IntegrationRegistry {
             }
         }
 
-        inner.tsjs_static_transport = TsjsStaticTransportV1::new(&inner);
+        inner.tsjs_static_transport = TsjsStaticTransportV1::new(&inner, creative_boot);
         Ok(Self {
             inner: Arc::new(inner),
             creative_boot,
@@ -1479,14 +1561,54 @@ impl IntegrationRegistry {
         self.inner.tsjs_static_transport.artifacts_by_hash.get(hash)
     }
 
+    /// Resolve one configuration-permitted first-display artifact by exact mask and hash.
+    #[must_use]
+    pub(crate) fn tsjs_first_display_artifact(
+        &self,
+        mask: u16,
+        hash: &str,
+    ) -> Option<&crate::tsjs::TsjsStaticArtifactV1> {
+        let indexed_hash = self
+            .inner
+            .tsjs_static_transport
+            .first_display_hash_by_mask
+            .get(&mask)?;
+        if indexed_hash != hash
+            || self
+                .inner
+                .tsjs_static_transport
+                .first_display_mask_by_hash
+                .get(hash)
+                != Some(&mask)
+        {
+            return None;
+        }
+        self.tsjs_static_artifact(hash)
+    }
+
+    /// Return the finite precomputed first-display masks admitted by this registry.
+    #[must_use]
+    pub fn tsjs_first_display_masks(&self) -> Vec<u16> {
+        let mut masks = self
+            .inner
+            .tsjs_static_transport
+            .first_display_hash_by_mask
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        masks.sort_unstable();
+        masks
+    }
+
     #[cfg(test)]
     #[must_use]
     pub fn empty_for_tests() -> Self {
         let mut inner = IntegrationRegistryInner::default();
-        inner.tsjs_static_transport = TsjsStaticTransportV1::new(&inner);
+        let creative_boot = crate::tsjs::CreativeBootConfigV1::default();
+        inner.tsjs_static_transport = TsjsStaticTransportV1::new(&inner, creative_boot);
         Self {
             inner: Arc::new(inner),
-            creative_boot: crate::tsjs::CreativeBootConfigV1::default(),
+            creative_boot,
         }
     }
 
@@ -1516,10 +1638,11 @@ impl IntegrationRegistry {
             disabled_js_ids: Vec::new(),
             tsjs_static_transport: TsjsStaticTransportV1::default(),
         };
-        inner.tsjs_static_transport = TsjsStaticTransportV1::new(&inner);
+        let creative_boot = crate::tsjs::CreativeBootConfigV1::default();
+        inner.tsjs_static_transport = TsjsStaticTransportV1::new(&inner, creative_boot);
         Self {
             inner: Arc::new(inner),
-            creative_boot: crate::tsjs::CreativeBootConfigV1::default(),
+            creative_boot,
         }
     }
 
@@ -1550,10 +1673,11 @@ impl IntegrationRegistry {
             disabled_js_ids: Vec::new(),
             tsjs_static_transport: TsjsStaticTransportV1::default(),
         };
-        inner.tsjs_static_transport = TsjsStaticTransportV1::new(&inner);
+        let creative_boot = crate::tsjs::CreativeBootConfigV1::default();
+        inner.tsjs_static_transport = TsjsStaticTransportV1::new(&inner, creative_boot);
         Self {
             inner: Arc::new(inner),
-            creative_boot: crate::tsjs::CreativeBootConfigV1::default(),
+            creative_boot,
         }
     }
 
@@ -1580,10 +1704,11 @@ impl IntegrationRegistry {
             disabled_js_ids: Vec::new(),
             tsjs_static_transport: TsjsStaticTransportV1::default(),
         };
-        inner.tsjs_static_transport = TsjsStaticTransportV1::new(&inner);
+        let creative_boot = crate::tsjs::CreativeBootConfigV1::default();
+        inner.tsjs_static_transport = TsjsStaticTransportV1::new(&inner, creative_boot);
         Self {
             inner: Arc::new(inner),
-            creative_boot: crate::tsjs::CreativeBootConfigV1::default(),
+            creative_boot,
         }
     }
 
@@ -1650,10 +1775,11 @@ impl IntegrationRegistry {
             disabled_js_ids: Vec::new(),
             tsjs_static_transport: TsjsStaticTransportV1::default(),
         };
-        inner.tsjs_static_transport = TsjsStaticTransportV1::new(&inner);
+        let creative_boot = crate::tsjs::CreativeBootConfigV1::default();
+        inner.tsjs_static_transport = TsjsStaticTransportV1::new(&inner, creative_boot);
         Self {
             inner: Arc::new(inner),
-            creative_boot: crate::tsjs::CreativeBootConfigV1::default(),
+            creative_boot,
         }
     }
 }
@@ -2572,6 +2698,75 @@ mod tests {
                     "selection and transport lookups should share precomputed bytes"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn tsjs_static_transport_precomputes_every_configuration_permitted_first_display_mask() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config("gpt", &serde_json::json!({}))
+            .expect("should enable GPT");
+        settings
+            .integrations
+            .insert_config(
+                "aps",
+                &serde_json::json!({ "enabled": true, "account_id": "test-account" }),
+            )
+            .expect("should enable APS");
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let masks = registry.tsjs_first_display_masks();
+
+        let catalog = trusted_server_js::all_first_display_ids();
+        let bit = |id: &str| {
+            1_u16
+                << catalog
+                    .iter()
+                    .position(|candidate| *candidate == id)
+                    .expect("catalog should contain slice")
+        };
+        let fixed = bit("first_display") | bit("creative_initial");
+        let gpt = bit("gpt_initial");
+        let aps = bit("aps_initial");
+        let prebid = bit("prebid_initial");
+        assert_eq!(
+            masks,
+            vec![
+                fixed,
+                fixed | gpt,
+                fixed | gpt | aps,
+                fixed | prebid,
+                fixed | prebid | gpt,
+                fixed | prebid | gpt | aps,
+            ],
+            "registry should enumerate every permitted participation combination"
+        );
+        for mask in masks {
+            let selected = trusted_server_js::all_first_display_ids()
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, id)| (mask & (1 << index) != 0).then_some(id))
+                .collect::<Vec<_>>();
+            let body = trusted_server_js::concatenate_first_display_slices(&selected[1..])
+                .expect("mask should select a closed composition");
+            let hash = trusted_server_js::concatenated_first_display_hash(&selected[1..])
+                .expect("mask should have a stable hash");
+            let artifact = registry
+                .tsjs_first_display_artifact(mask, &hash)
+                .expect("should resolve the precomputed mask/hash pair");
+
+            assert_eq!(artifact.body().as_ref(), body.as_bytes());
+            assert_eq!(
+                artifact.src(),
+                format!("/static/tsjs=tsjs-first-display.min.js?m={mask:04x}&v={hash}")
+            );
+            assert!(
+                registry
+                    .tsjs_first_display_artifact(mask ^ (1 << 1), &hash)
+                    .is_none(),
+                "hash-to-mask lookup must reject a mismatched selection"
+            );
         }
     }
 

@@ -385,12 +385,28 @@ pub fn handle_tsjs_dynamic(
         return Ok(tsjs_not_found_response());
     }
     let filename = &path[PREFIX.len()..];
-    let Some(requested_hash) = req.uri().query().and_then(|query| query.strip_prefix("v=")) else {
+
+    if filename == "tsjs-first-display.min.js" {
+        let Some((mask, requested_hash)) = req
+            .uri()
+            .query()
+            .and_then(parse_first_display_artifact_query)
+        else {
+            return Ok(tsjs_not_found_response());
+        };
+        let Some(artifact) = integration_registry.tsjs_first_display_artifact(mask, requested_hash)
+        else {
+            return Ok(tsjs_not_found_response());
+        };
+        let mut resp = serve_precomputed_tsjs_artifact(artifact, req);
+        strip_tsjs_head_body(&mut resp, req.method());
+        apply_tsjs_success_headers(&mut resp);
+        return Ok(resp);
+    }
+
+    let Some(requested_hash) = req.uri().query().and_then(parse_tsjs_hash_query) else {
         return Ok(tsjs_not_found_response());
     };
-    if !valid_lowercase_sha256(requested_hash) {
-        return Ok(tsjs_not_found_response());
-    }
 
     if filename == "tsjs-unified.min.js" {
         let Some(artifact) = integration_registry.tsjs_static_artifact(requested_hash) else {
@@ -438,6 +454,25 @@ fn valid_lowercase_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn parse_tsjs_hash_query(query: &str) -> Option<&str> {
+    let hash = query.strip_prefix("v=")?;
+    valid_lowercase_sha256(hash).then_some(hash)
+}
+
+fn parse_first_display_artifact_query(query: &str) -> Option<(u16, &str)> {
+    let (mask, hash) = query.strip_prefix("m=")?.split_once("&v=")?;
+    if mask.len() != 4
+        || !mask
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || !valid_lowercase_sha256(hash)
+    {
+        return None;
+    }
+    let mask = u16::from_str_radix(mask, 16).ok()?;
+    (mask & 1 == 1).then_some((mask, hash))
 }
 
 fn apply_tsjs_success_headers(response: &mut Response<EdgeBody>) {
@@ -8895,6 +8930,86 @@ mod tests {
             response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
             Some(&HeaderValue::from_static("nosniff"))
         );
+    }
+
+    #[test]
+    fn tsjs_dynamic_serves_only_the_exact_precomputed_first_display_mask_and_hash() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config("gpt", &serde_json::json!({}))
+            .expect("should enable GPT");
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let mask = *registry
+            .tsjs_first_display_masks()
+            .first()
+            .expect("GPT should permit one first-display mask");
+        let selected = trusted_server_js::all_first_display_ids()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, id)| (mask & (1 << index) != 0).then_some(id))
+            .collect::<Vec<_>>();
+        let hash = trusted_server_js::concatenated_first_display_hash(&selected[1..])
+            .expect("selected slices should hash");
+        let src = format!("/static/tsjs=tsjs-first-display.min.js?m={mask:04x}&v={hash}");
+
+        let request = build_request(Method::GET, &format!("https://publisher.example{src}"));
+        let response = handle_tsjs_dynamic(&request, &registry).expect("should serve artifact");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static(
+                "application/javascript; charset=utf-8"
+            ))
+        );
+        assert_eq!(
+            response
+                .into_body()
+                .into_bytes()
+                .unwrap_or_default()
+                .as_ref(),
+            trusted_server_js::concatenate_first_display_slices(&selected[1..])
+                .expect("should compose selected slices")
+                .as_bytes()
+        );
+
+        let head = build_request(Method::HEAD, &format!("https://publisher.example{src}"));
+        let response = handle_tsjs_dynamic(&head, &registry).expect("should serve HEAD metadata");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .into_body()
+                .into_bytes()
+                .unwrap_or_default()
+                .is_empty()
+        );
+
+        for suffix in [
+            format!("tsjs-first-display.min.js?v={hash}&m={mask:04x}"),
+            format!("tsjs-first-display.min.js?m={mask:04x}&v={hash}&x=1"),
+            format!(
+                "tsjs-first-display.min.js?m={:04x}&v={hash}",
+                mask ^ (1 << 1)
+            ),
+            format!(
+                "tsjs-first-display.min.js?m={mask:04x}&v={}",
+                "0".repeat(64)
+            ),
+            format!("tsjs-first_display.min.js?m={mask:04x}&v={hash}"),
+        ] {
+            let request = build_request(
+                Method::GET,
+                &format!("https://publisher.example/static/tsjs={suffix}"),
+            );
+            let response = handle_tsjs_dynamic(&request, &registry).expect("should reject locally");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "case {suffix}");
+            assert_eq!(
+                response.headers().get(header::CACHE_CONTROL),
+                Some(&HeaderValue::from_static("no-store")),
+                "case {suffix}"
+            );
+        }
     }
 
     #[test]

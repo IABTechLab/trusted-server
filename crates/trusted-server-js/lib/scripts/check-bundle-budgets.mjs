@@ -297,10 +297,8 @@ export function canonicalJsonSha256(value) {
   return createHash('sha256').update(canonicalJson(value)).digest('hex');
 }
 
-/** Load the complete authored current release catalog without importing production TS at runtime. */
-export function loadAuthoredReleaseCatalog(
-  source = fs.readFileSync(releaseCatalogSourcePath, 'utf8')
-) {
+/** Evaluate the authored catalog source without importing production TS at runtime. */
+function loadAuthoredCatalogModule(source) {
   const transpiled = ts.transpileModule(source, {
     compilerOptions: {
       module: ts.ModuleKind.CommonJS,
@@ -316,8 +314,15 @@ export function loadAuthoredReleaseCatalog(
       filename: releaseCatalogSourcePath,
     }
   );
-  const catalog = module.exports.RELEASE_CATALOG;
-  const validateCatalog = module.exports.validateReleaseCatalog;
+  return module.exports;
+}
+
+export function loadAuthoredReleaseCatalog(
+  source = fs.readFileSync(releaseCatalogSourcePath, 'utf8')
+) {
+  const authored = loadAuthoredCatalogModule(source);
+  const catalog = authored.RELEASE_CATALOG;
+  const validateCatalog = authored.validateReleaseCatalog;
   if (!Array.isArray(catalog) || typeof validateCatalog !== 'function') {
     fail('authored release catalog did not export its catalog and validator');
   }
@@ -327,6 +332,17 @@ export function loadAuthoredReleaseCatalog(
     fail(
       `authored release catalog failed self-validation: ${error instanceof Error ? error.message : error}`
     );
+  }
+  return JSON.parse(JSON.stringify(catalog));
+}
+
+/** Load the complete authored first-display catalog from the same source authority. */
+export function loadAuthoredFirstDisplayCatalog(
+  source = fs.readFileSync(releaseCatalogSourcePath, 'utf8')
+) {
+  const catalog = loadAuthoredCatalogModule(source).FIRST_DISPLAY_CATALOG;
+  if (!Array.isArray(catalog)) {
+    fail('authored release catalog did not export its first-display catalog');
   }
   return JSON.parse(JSON.stringify(catalog));
 }
@@ -525,6 +541,9 @@ function validateMetricSets(sets, label) {
 /** Validate semantic set membership against exact release artifact ownership. */
 export function validateSemanticBundleSets(metrics, release, catalog) {
   if (catalog?.version !== 1) fail('catalog.version must equal 1');
+  if (!Array.isArray(catalog.firstDisplay) || catalog.firstDisplay.length !== 13) {
+    fail('catalog.firstDisplay must contain the closed thirteen-row inventory');
+  }
   if (release?.version !== 1 || !Array.isArray(release.artifacts)) {
     fail('release inventory is invalid');
   }
@@ -550,7 +569,9 @@ export function validateSemanticBundleSets(metrics, release, catalog) {
       typeof artifact !== 'object' ||
       typeof artifact.id !== 'string' ||
       typeof artifact.file !== 'string' ||
-      !['bootstrap', 'core', 'integration'].includes(artifact.role) ||
+      !['bootstrap', 'first_display_base', 'first_display_slice', 'core', 'integration'].includes(
+        artifact.role
+      ) ||
       ids.has(artifact.id) ||
       files.has(artifact.file)
     ) {
@@ -561,6 +582,11 @@ export function validateSemanticBundleSets(metrics, release, catalog) {
   }
   const expectedArtifacts = [
     { id: 'bootstrap', role: 'bootstrap', file: 'gpt-bootstrap-fallback.js' },
+    ...catalog.firstDisplay.map(({ id }, index) => ({
+      id,
+      role: index === 0 ? 'first_display_base' : 'first_display_slice',
+      file: `tsjs-${id}.js`,
+    })),
     { id: 'core', role: 'core', file: 'tsjs-core.js' },
     ...catalog.modules.map(({ id }) => ({
       id,
@@ -588,8 +614,8 @@ export function validateSemanticBundleSets(metrics, release, catalog) {
   for (const setName of SET_NAMES) {
     const setIds = metrics.sets[setName].files.map((file) => {
       const artifact = files.get(file);
-      if (!artifact || artifact.role === 'bootstrap') {
-        fail(`buildMetrics.sets.${setName} contains an unknown or bootstrap artifact`);
+      if (!artifact || !['core', 'integration'].includes(artifact.role)) {
+        fail(`buildMetrics.sets.${setName} contains an unknown or non-persistent artifact`);
       }
       return artifact.id;
     });
@@ -734,7 +760,8 @@ function findCriticalDeferredViolations(currentGraph, release) {
 }
 
 function validateCurrentSourceOwnership(currentGraph, release) {
-  const artifactIds = new Set(release.artifacts.map(({ id }) => id));
+  const artifactsById = new Map(release.artifacts.map((artifact) => [artifact.id, artifact]));
+  const artifactIds = new Set(artifactsById.keys());
   const violations = findCriticalDeferredViolations(currentGraph, release);
   for (const source of Object.keys(CURRENT_PROVIDER_SOURCE_OWNERS)) {
     if (!Object.hasOwn(currentGraph.sourceOwners, source)) {
@@ -742,6 +769,21 @@ function validateCurrentSourceOwnership(currentGraph, release) {
     }
   }
   for (const [source, owners] of Object.entries(currentGraph.sourceOwners)) {
+    const firstDisplaySource = source.startsWith('src/first_display/');
+    const firstDisplayOwners = owners.filter((owner) =>
+      ['first_display_base', 'first_display_slice'].includes(artifactsById.get(owner)?.role)
+    );
+    if (firstDisplaySource) {
+      for (const owner of owners) {
+        if (!firstDisplayOwners.includes(owner)) {
+          violations.push(`${owner} reaches first-display source ${source}`);
+        }
+      }
+      continue;
+    }
+    for (const owner of firstDisplayOwners) {
+      violations.push(`${owner} reaches persistent source ${source}`);
+    }
     const policy = currentExactSourceOwner(source);
     if (policy) {
       if (!artifactIds.has(policy.owner)) {
@@ -842,7 +884,7 @@ function validateCurrentMeasurements(metrics, release, catalog, contents) {
     }
   }
   for (const [index, module] of metrics.modules.entries()) {
-    const artifact = release.artifacts[index + 1];
+    const artifact = release.artifacts.filter(({ role }) => role !== 'bootstrap')[index];
     if (module.rawBytes !== artifact.bytes || module.sha256 !== artifact.hash) {
       fail(`build metrics do not match current artifact bytes: ${artifact.id}`);
     }
@@ -891,10 +933,12 @@ function validateReleaseInventoryShape(release, label) {
     const phaseAndTriggerAreValid =
       artifact.role === 'bootstrap' || artifact.role === 'core'
         ? artifact.phase === null && artifact.trigger === null
-        : artifact.role === 'integration' &&
-          (artifact.phase === 'critical'
-            ? artifact.trigger === null
-            : artifact.phase === 'deferred' && artifact.trigger === 'first_display_or_idle');
+        : artifact.role === 'first_display_base' || artifact.role === 'first_display_slice'
+          ? artifact.phase === 'first_display' && artifact.trigger === null
+          : artifact.role === 'integration' &&
+            (artifact.phase === 'critical'
+              ? artifact.trigger === null
+              : artifact.phase === 'deferred' && artifact.trigger === 'first_display_or_idle');
     if (
       !/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(artifact.id) ||
       ids.has(artifact.id) ||
@@ -915,12 +959,20 @@ function validateReleaseInventoryShape(release, label) {
   }
 }
 
-function validateCurrentReleaseSemantics(current, generatedCatalog, authoredCatalog) {
+function validateCurrentReleaseSemantics(
+  current,
+  generatedCatalog,
+  authoredCatalog,
+  authoredFirstDisplayCatalog
+) {
   if (
     generatedCatalog?.version !== 1 ||
     !Array.isArray(generatedCatalog.modules) ||
+    !Array.isArray(generatedCatalog.firstDisplay) ||
     !Array.isArray(authoredCatalog) ||
-    generatedCatalog.modules.length !== authoredCatalog.length
+    !Array.isArray(authoredFirstDisplayCatalog) ||
+    generatedCatalog.modules.length !== authoredCatalog.length ||
+    canonicalJson(generatedCatalog.firstDisplay) !== canonicalJson(authoredFirstDisplayCatalog)
   ) {
     fail('current generated/authored catalog inventory is invalid');
   }
@@ -934,6 +986,15 @@ function validateCurrentReleaseSemantics(current, generatedCatalog, authoredCata
       outputs: [],
       file: 'gpt-bootstrap-fallback.js',
     },
+    ...authoredFirstDisplayCatalog.map((entry, index) => ({
+      id: entry.id,
+      role: index === 0 ? 'first_display_base' : 'first_display_slice',
+      phase: 'first_display',
+      trigger: null,
+      inputs: entry.inputs,
+      outputs: entry.outputs,
+      file: `tsjs-${entry.id}.js`,
+    })),
     {
       id: 'core',
       role: 'core',
@@ -969,7 +1030,8 @@ function validateCurrentReleaseSemantics(current, generatedCatalog, authoredCata
     fail('current release does not match the live catalog artifact count');
   }
 
-  const providers = new Map([['runtime.v1', 1]]);
+  const coreIndex = current.artifacts.findIndex(({ role }) => role === 'core');
+  const providers = new Map([['runtime.v1', coreIndex]]);
   for (const [index, artifact] of current.artifacts.entries()) {
     if (artifact.role !== 'integration') continue;
     for (const capability of artifact.outputs) {
@@ -990,11 +1052,14 @@ function validateCurrentReleaseSemantics(current, generatedCatalog, authoredCata
         fail(`current release artifact ${index} ${field} differs from the live catalog`);
       }
     }
-    if (index === 0 && (artifact.inputs.length !== 0 || artifact.outputs.length !== 0)) {
+    if (
+      artifact.role === 'bootstrap' &&
+      (artifact.inputs.length !== 0 || artifact.outputs.length !== 0)
+    ) {
       fail('current bootstrap invariant requires no inputs or outputs');
     }
     if (
-      index === 1 &&
+      artifact.role === 'core' &&
       (artifact.inputs.length !== 0 || canonicalJson(artifact.outputs) !== '["runtime.v1"]')
     ) {
       fail('current core invariant requires only the runtime.v1 output');
@@ -1142,6 +1207,7 @@ export function validateRoleCorrectTransfer({
   currentArtifactContents,
   verifyGitProvenance = false,
   authoredCatalog = loadAuthoredReleaseCatalog(),
+  authoredFirstDisplayCatalog = loadAuthoredFirstDisplayCatalog(),
 }) {
   const intermediate = baseline?.roleCorrectTransfer;
   if (!intermediate || typeof intermediate !== 'object') fail('role-correct capture is missing');
@@ -1189,7 +1255,7 @@ export function validateRoleCorrectTransfer({
     'reviewRemediationTransfer'
   );
   validateReductionCheckpoint(capture, intermediate);
-  validateCurrentReleaseSemantics(release, catalog, authoredCatalog);
+  validateCurrentReleaseSemantics(release, catalog, authoredCatalog, authoredFirstDisplayCatalog);
   validateSemanticBundleSets(metrics, release, catalog);
   const graphViolations = findProductionGraphViolations(metrics, release);
   if (graphViolations.length > 0)
