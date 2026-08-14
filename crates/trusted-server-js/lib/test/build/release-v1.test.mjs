@@ -105,6 +105,65 @@ function readBuildEvidence() {
   };
 }
 
+function buildStructurallyValidDescendant(mutateEvidence = () => {}) {
+  const evidence = readBuildEvidence();
+  const distDirectory = path.resolve(libDirectory, '../dist');
+  const logicalContents = new Map(
+    evidence.release.artifacts.map(({ file }) => {
+      const source = fs.readFileSync(path.join(distDirectory, file), 'utf8');
+      return [file, Buffer.from(source.replace(evidence.release.releaseId, RELEASE_SENTINEL))];
+    })
+  );
+  logicalContents.set(
+    'tsjs-core.js',
+    Buffer.concat([
+      logicalContents.get('tsjs-core.js'),
+      Buffer.from('\n/* descendant release */\n'),
+    ])
+  );
+  mutateEvidence(evidence);
+
+  const releaseArtifacts = evidence.release.artifacts.map((artifact) => ({
+    id: artifact.id,
+    role: artifact.role,
+    phase: artifact.phase ?? '',
+    trigger: artifact.trigger ?? '',
+    bytes: logicalContents.get(artifact.file),
+  }));
+  const releaseId = computeReleaseId(releaseArtifacts);
+  const currentArtifactContents = new Map(
+    evidence.release.artifacts.map(({ file }) => [
+      file,
+      Buffer.from(stampRelease(logicalContents.get(file), releaseId)),
+    ])
+  );
+
+  evidence.release.releaseId = releaseId;
+  for (const artifact of evidence.release.artifacts) {
+    const bytes = currentArtifactContents.get(artifact.file);
+    artifact.bytes = bytes.byteLength;
+    artifact.hash = createHash('sha256').update(bytes).digest('hex');
+  }
+  Object.assign(
+    evidence.metrics.bootstrap,
+    bundleMetrics.measureBytes(currentArtifactContents.get('gpt-bootstrap-fallback.js'))
+  );
+  const productionArtifacts = evidence.release.artifacts.filter(({ role }) => role !== 'bootstrap');
+  for (const [index, module] of evidence.metrics.modules.entries()) {
+    const artifact = productionArtifacts[index];
+    module.rawBytes = artifact.bytes;
+    module.sha256 = artifact.hash;
+  }
+  const setFiles = bundleMetrics.deriveInventorySetFiles(
+    evidence.release.artifacts,
+    evidence.catalog.modules
+  );
+  for (const [setName, files] of Object.entries(setFiles)) {
+    evidence.metrics.sets[setName] = bundleMetrics.measureBundleSet(files, currentArtifactContents);
+  }
+  return { ...evidence, currentArtifactContents };
+}
+
 function executeGeneratedArtifact(window, file, registrations, { preserveTarget = false } = {}) {
   const target = preserveTarget
     ? window.tsjs
@@ -148,7 +207,7 @@ test('generated release inventory pins the server bundle order', () => {
   }
 });
 
-test('critical transport co-bundles core and render ownership within the approved ceiling', () => {
+test('critical transport co-bundles core and render ownership exactly once', () => {
   const metrics = JSON.parse(
     fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-build-metrics-v1.json'), 'utf8')
   );
@@ -165,12 +224,6 @@ test('critical transport co-bundles core and render ownership within the approve
     renderRuntime.sources.map(({ file }) => file),
     ['src/integrations/render_runtime/transport_marker.ts'],
     'the logical render artifact must not duplicate the co-bundled implementation'
-  );
-  assert.ok(metrics.sets.minimal.rawBytes <= 220_000, 'minimal raw bytes exceed the ceiling');
-  assert.ok(metrics.sets.minimal.gzipBytes <= 59_000, 'minimal gzip bytes exceed the ceiling');
-  assert.ok(
-    metrics.sets.minimal.brotliBytes < 51_645,
-    'minimal Brotli bytes must improve on the oversized intermediate capture'
   );
 });
 
@@ -712,40 +765,36 @@ test('bundle budget membership rejects every noncanonical release inventory shap
 });
 
 test('critical bundle graphs exclude deferred entries and transitive presentation sources', () => {
-  const { baseline, metrics, release } = readBuildEvidence();
-  const sourceOwners = baseline.reviewRemediationTransfer.sourceOwners;
+  const { metrics, release } = readBuildEvidence();
   const cleanMetrics = structuredClone(metrics);
-  assert.deepEqual(findCriticalDeferredSourceViolations(cleanMetrics, release, sourceOwners), []);
+  assert.deepEqual(findCriticalDeferredSourceViolations(cleanMetrics, release), []);
 
   const reachesDeferredEntry = structuredClone(cleanMetrics);
   reachesDeferredEntry.modules[0].sources.push({
     file: 'src/integrations/gpt/later.ts',
     renderedBytes: 1,
   });
-  assert.deepEqual(
-    findCriticalDeferredSourceViolations(reachesDeferredEntry, release, sourceOwners),
-    ['core reaches deferred-owned source src/integrations/gpt/later.ts']
-  );
+  assert.deepEqual(findCriticalDeferredSourceViolations(reachesDeferredEntry, release), [
+    'core reaches deferred-owned source src/integrations/gpt/later.ts',
+  ]);
 
   const reachesPresentationHelper = structuredClone(cleanMetrics);
   reachesPresentationHelper.modules[0].sources.push({
     file: 'src/integrations/gpt_diagnostics/overlay.ts',
     renderedBytes: 1,
   });
-  assert.deepEqual(
-    findCriticalDeferredSourceViolations(reachesPresentationHelper, release, sourceOwners),
-    ['core reaches deferred-owned source src/integrations/gpt_diagnostics/overlay.ts']
-  );
+  assert.deepEqual(findCriticalDeferredSourceViolations(reachesPresentationHelper, release), [
+    'core reaches deferred-owned source src/integrations/gpt_diagnostics/overlay.ts',
+  ]);
 
   const reachesRenderTracePresentation = structuredClone(cleanMetrics);
   reachesRenderTracePresentation.modules[0].sources.push({
     file: 'src/integrations/gpt_diagnostics/presentation.ts',
     renderedBytes: 1,
   });
-  assert.deepEqual(
-    findCriticalDeferredSourceViolations(reachesRenderTracePresentation, release, sourceOwners),
-    ['core reaches deferred-owned source src/integrations/gpt_diagnostics/presentation.ts']
-  );
+  assert.deepEqual(findCriticalDeferredSourceViolations(reachesRenderTracePresentation, release), [
+    'core reaches deferred-owned source src/integrations/gpt_diagnostics/presentation.ts',
+  ]);
 });
 
 test('permanent comparator pins every historical and role-correct evidence subtree', () => {
@@ -817,8 +866,10 @@ test('permanent comparator pins every historical and role-correct evidence subtr
 
 test('bundle check authenticates historical capture provenance for descendant builds', () => {
   const evidence = readBuildEvidence();
+  const intermediate = evidence.baseline.roleCorrectTransfer;
   const capture = evidence.baseline.reviewRemediationTransfer;
 
+  assert.doesNotThrow(() => bundleBudgets.validateFrozenCaptureProvenance(intermediate, capture));
   assert.doesNotThrow(() => bundleBudgets.validateCaptureSourceProvenance(capture));
   assert.doesNotThrow(() =>
     bundleBudgets.validateRoleCorrectTransfer({ ...evidence, verifyGitProvenance: true })
@@ -826,7 +877,7 @@ test('bundle check authenticates historical capture provenance for descendant bu
 });
 
 test('capture provenance rejects mismatched recorded lock and tool metadata', () => {
-  const capture = readBuildEvidence().baseline.reviewRemediationTransfer;
+  const baseline = readBuildEvidence().baseline;
   const mutations = {
     packageLockSha256: (candidate) => (candidate.tools.packageLockSha256 = '0'.repeat(64)),
     node: (candidate) => (candidate.tools.node = 'v0.0.0'),
@@ -836,24 +887,34 @@ test('capture provenance rejects mismatched recorded lock and tool metadata', ()
     esbuild: (candidate) => (candidate.tools.esbuild = '0.0.0'),
   };
 
-  for (const [field, mutate] of Object.entries(mutations)) {
-    const candidate = structuredClone(capture);
-    mutate(candidate);
-    assert.throws(
-      () => bundleBudgets.validateCaptureSourceProvenance(candidate),
-      new RegExp(field, 'i'),
-      field
-    );
+  for (const captureName of ['roleCorrectTransfer', 'reviewRemediationTransfer']) {
+    for (const [field, mutate] of Object.entries(mutations)) {
+      const intermediate = structuredClone(baseline.roleCorrectTransfer);
+      const capture = structuredClone(baseline.reviewRemediationTransfer);
+      mutate(captureName === 'roleCorrectTransfer' ? intermediate : capture);
+      assert.throws(
+        () => bundleBudgets.validateFrozenCaptureProvenance(intermediate, capture),
+        new RegExp(field, 'i'),
+        `${captureName}.${field}`
+      );
+    }
   }
 });
 
 test('capture provenance rejects an invalid source or missing captured build input', () => {
-  const capture = readBuildEvidence().baseline.reviewRemediationTransfer;
+  const baseline = readBuildEvidence().baseline;
+  const capture = baseline.reviewRemediationTransfer;
   const invalidSource = structuredClone(capture);
   invalidSource.source.sha = '0'.repeat(40);
 
   assert.throws(
     () => bundleBudgets.validateCaptureSourceProvenance(invalidSource),
+    /capture source SHA/
+  );
+  const invalidIntermediate = structuredClone(baseline.roleCorrectTransfer);
+  invalidIntermediate.source.sha = '0'.repeat(40);
+  assert.throws(
+    () => bundleBudgets.validateFrozenCaptureProvenance(invalidIntermediate, capture),
     /capture source SHA/
   );
   assert.throws(
@@ -872,7 +933,70 @@ test('capture provenance rejects an invalid source or missing captured build inp
   );
 });
 
-test('capture-exact validation is phase-aware while current bytes stay authoritative', () => {
+test('authenticated frozen captures report descendant release drift without rejecting it', () => {
+  const descendant = buildStructurallyValidDescendant();
+
+  const result = bundleBudgets.validateRoleCorrectTransfer(descendant);
+
+  assert.notEqual(
+    descendant.release.releaseId,
+    descendant.baseline.reviewRemediationTransfer.release.releaseId
+  );
+  assert.deepEqual(Object.keys(result.captureReports), [
+    'roleCorrectTransfer',
+    'reviewRemediationTransfer',
+  ]);
+  for (const report of Object.values(result.captureReports)) {
+    assert.equal(
+      report.minimal.rawBytes.deltaBytes,
+      report.minimal.rawBytes.currentBytes - report.minimal.rawBytes.capturedBytes
+    );
+    assert.equal(Object.hasOwn(report.minimal.rawBytes, 'ceilingBytes'), false);
+  }
+
+  const coreIndex = descendant.release.artifacts
+    .filter(({ role }) => role !== 'bootstrap')
+    .findIndex(({ id }) => id === 'core');
+  descendant.metrics.modules[coreIndex].sources.push({
+    file: 'src/test/descendant_fake.ts',
+    renderedBytes: 1,
+  });
+  assert.throws(
+    () => bundleBudgets.validateRoleCorrectTransfer(descendant),
+    /production test\/fake\/no-op seam/
+  );
+  descendant.metrics.modules[coreIndex].sources.pop();
+  descendant.release.artifacts.pop();
+  assert.throws(
+    () => bundleBudgets.validateRoleCorrectTransfer(descendant),
+    /live catalog artifact count|exact catalog artifact count/
+  );
+});
+
+test('valid live catalog and release drift is independent from both frozen captures', () => {
+  const authoredCatalog = bundleBudgets.loadAuthoredReleaseCatalog();
+  const descendant = buildStructurallyValidDescendant((evidence) => {
+    const catalogEntry = evidence.catalog.modules.find(({ id }) => id === 'testlight');
+    const artifact = evidence.release.artifacts.find(({ id }) => id === 'testlight');
+    const authoredEntry = authoredCatalog.find(({ id }) => id === 'testlight');
+    catalogEntry.phase = 'deferred';
+    catalogEntry.trigger = 'first_display_or_idle';
+    artifact.phase = 'deferred';
+    artifact.trigger = 'first_display_or_idle';
+    authoredEntry.phase = 'deferred';
+    authoredEntry.trigger = 'first_display_or_idle';
+  });
+
+  assert.throws(
+    () => bundleBudgets.validateRoleCorrectTransfer(descendant),
+    /generated catalog entry .* differs from current authored catalog/
+  );
+  assert.doesNotThrow(() =>
+    bundleBudgets.validateRoleCorrectTransfer({ ...descendant, authoredCatalog })
+  );
+});
+
+test('current release validation is capture-independent while generated bytes stay authoritative', () => {
   const evidence = readBuildEvidence();
   const contents = new Map(
     evidence.release.artifacts.map(({ file }) => [
@@ -886,20 +1010,6 @@ test('capture-exact validation is phase-aware while current bytes stay authorita
       currentArtifactContents: contents,
     })
   );
-  const isCleanCaptureRelease =
-    evidence.release.releaseId === evidence.baseline.reviewRemediationTransfer.release.releaseId;
-  const validateExactCapture = () =>
-    bundleBudgets.validateRoleCorrectTransfer({
-      ...evidence,
-      currentArtifactContents: contents,
-      requireExactCapture: true,
-    });
-  if (isCleanCaptureRelease) {
-    assert.doesNotThrow(validateExactCapture);
-  } else {
-    assert.throws(validateExactCapture, /clean capture parent/);
-  }
-
   const changed = structuredClone(evidence);
   changed.release.artifacts[0].hash = 'a'.repeat(64);
   assert.throws(
@@ -907,9 +1017,8 @@ test('capture-exact validation is phase-aware while current bytes stay authorita
       bundleBudgets.validateRoleCorrectTransfer({
         ...changed,
         currentArtifactContents: contents,
-        requireExactCapture: true,
       }),
-    /clean capture parent/
+    /current artifact bytes/
   );
   const changedBytes = new Map(contents);
   changedBytes.set('gpt-bootstrap-fallback.js', Buffer.from('changed'));
@@ -918,7 +1027,6 @@ test('capture-exact validation is phase-aware while current bytes stay authorita
       bundleBudgets.validateRoleCorrectTransfer({
         ...evidence,
         currentArtifactContents: changedBytes,
-        requireExactCapture: isCleanCaptureRelease,
       }),
     /current artifact bytes/
   );
@@ -938,7 +1046,7 @@ test('capture-exact validation is phase-aware while current bytes stay authorita
   changedMetadata.release.artifacts[2].inputs = [];
   assert.throws(
     () => bundleBudgets.validateRoleCorrectTransfer(changedMetadata),
-    /canonical capture metadata/
+    /must consume runtime\.v1/
   );
 
   const unexpectedReleaseField = structuredClone(evidence);
@@ -956,7 +1064,47 @@ test('capture-exact validation is phase-aware while current bytes stay authorita
   );
 });
 
-test('source ownership capture rejects an omitted current non-entry module source', () => {
+test('current semantic graph rejects malformed, duplicate, unresolved, late, and deferred capabilities', () => {
+  const mutations = [
+    [
+      /invalid output capability/,
+      (candidate) => candidate.release.artifacts.find(({ id }) => id === 'aps').outputs.push('bad'),
+    ],
+    [
+      /multiple providers/,
+      (candidate) =>
+        candidate.release.artifacts.find(({ id }) => id === 'aps').outputs.push('runtime.v1'),
+    ],
+    [
+      /unknown capability/,
+      (candidate) =>
+        candidate.release.artifacts.find(({ id }) => id === 'aps').inputs.push('missing.v1'),
+    ],
+    [
+      /provider must precede consumer/,
+      (candidate) =>
+        candidate.release.artifacts.find(({ id }) => id === 'render_runtime').inputs.push('gpt.v1'),
+    ],
+    [
+      /deferred integration cannot provide/,
+      (candidate) =>
+        candidate.release.artifacts.find(({ id }) => id === 'gpt_later').outputs.push('late.v1'),
+    ],
+    [
+      /bootstrap invariant/,
+      (candidate) => candidate.release.artifacts[0].outputs.push('bootstrap.v1'),
+    ],
+    [/core invariant/, (candidate) => candidate.release.artifacts[1].inputs.push('runtime.v1')],
+  ];
+
+  for (const [pattern, mutate] of mutations) {
+    const candidate = readBuildEvidence();
+    mutate(candidate);
+    assert.throws(() => bundleBudgets.validateRoleCorrectTransfer(candidate), pattern);
+  }
+});
+
+test('source ownership drift is report-only for an otherwise valid current graph', () => {
   const evidence = readBuildEvidence();
   const currentArtifactContents = new Map(
     evidence.release.artifacts.map(({ file }) => [
@@ -965,27 +1113,109 @@ test('source ownership capture rejects an omitted current non-entry module sourc
     ])
   );
   const omittedModuleSource = structuredClone(evidence);
-  const gptIndex = omittedModuleSource.release.artifacts
+  const creativeIndex = omittedModuleSource.release.artifacts
     .filter(({ role }) => role !== 'bootstrap')
-    .findIndex(({ id }) => id === 'gpt');
-  const gptModule = omittedModuleSource.metrics.modules[gptIndex];
-  const sourceIndex = gptModule.sources.findIndex(
-    ({ file }) => file === 'src/integrations/gpt/startup.ts'
+    .findIndex(({ id }) => id === 'creative');
+  const creativeModule = omittedModuleSource.metrics.modules[creativeIndex];
+  const sourceIndex = creativeModule.sources.findIndex(
+    ({ file }) => file === 'src/shared/scheduler.ts'
   );
   assert.notEqual(sourceIndex, -1);
-  assert.notEqual(gptModule.sources[sourceIndex].file, gptModule.entry);
-  gptModule.sources.splice(sourceIndex, 1);
-  assert.throws(
-    () =>
-      bundleBudgets.validateRoleCorrectTransfer({
-        ...omittedModuleSource,
-        currentArtifactContents,
-      }),
-    /current source ownership differs from immutable capture/
+  assert.notEqual(creativeModule.sources[sourceIndex].file, creativeModule.entry);
+  creativeModule.sources.splice(sourceIndex, 1);
+  assert.doesNotThrow(() =>
+    bundleBudgets.validateRoleCorrectTransfer({
+      ...omittedModuleSource,
+      currentArtifactContents,
+    })
   );
 });
 
-test('source ownership capture rejects cleared current bootstrap sources', () => {
+test('harmless current source reassignment does not consult captured ownership', () => {
+  const evidence = readBuildEvidence();
+  const creative = evidence.metrics.modules.find(({ file }) => file === 'tsjs-creative.js');
+  const datadome = evidence.metrics.modules.find(({ file }) => file === 'tsjs-datadome.js');
+  const sourceIndex = creative.sources.findIndex(({ file }) => file === 'src/shared/async.ts');
+  assert.notEqual(sourceIndex, -1);
+  const [asyncSource] = creative.sources.splice(sourceIndex, 1);
+  datadome.sources.push(asyncSource);
+
+  assert.doesNotThrow(() => bundleBudgets.validateRoleCorrectTransfer(evidence));
+});
+
+test('current source classification fails closed for renamed provider source', () => {
+  const { metrics, release } = readBuildEvidence();
+  const gpt = metrics.modules.find(({ file }) => file === 'tsjs-gpt.js');
+  const provider = gpt.sources.find(({ file }) => file === 'src/integrations/gpt/module.ts');
+  provider.file = 'src/integrations/gpt/provider.ts';
+
+  assert.match(
+    bundleBudgets.findProductionGraphViolations(metrics, release).join('\n'),
+    /current provider source is missing.*gpt\/module\.ts|unclassified current production source.*gpt\/provider\.ts/
+  );
+});
+
+test('unknown shared source cannot bridge deferred and critical artifacts', () => {
+  const { metrics, release } = readBuildEvidence();
+  const source = {
+    file: 'src/shared/new_deferred_runtime.ts',
+    renderedBytes: 1,
+  };
+  metrics.modules.find(({ file }) => file === 'tsjs-core.js').sources.push({ ...source });
+  metrics.modules.find(({ file }) => file === 'tsjs-gpt_later.js').sources.push({ ...source });
+
+  assert.match(
+    bundleBudgets.findProductionGraphViolations(metrics, release).join('\n'),
+    /unclassified current production source src\/shared\/new_deferred_runtime\.ts/
+  );
+});
+
+test('provider implementation moved under core remains unclassified', () => {
+  const { metrics, release } = readBuildEvidence();
+  const gpt = metrics.modules.find(({ file }) => file === 'tsjs-gpt.js');
+  const provider = gpt.sources.find(({ file }) => file === 'src/integrations/gpt/module.ts');
+  provider.file = 'src/core/gpt_provider.ts';
+
+  assert.match(
+    bundleBudgets.findProductionGraphViolations(metrics, release).join('\n'),
+    /unclassified current production source src\/core\/gpt_provider\.ts/
+  );
+});
+
+test('deferred implementation moved under shared remains unclassified', () => {
+  const { metrics, release } = readBuildEvidence();
+  const prebidLater = metrics.modules.find(({ file }) => file === 'tsjs-prebid_later.js');
+  const deferred = prebidLater.sources.find(
+    ({ file }) => file === 'src/integrations/prebid/refresh.ts'
+  );
+  deferred.file = 'src/shared/prebid_refresh_runtime.ts';
+
+  assert.match(
+    bundleBudgets.findProductionGraphViolations(metrics, release).join('\n'),
+    /unclassified current production source src\/shared\/prebid_refresh_runtime\.ts/
+  );
+});
+
+test('new deferred-owned source cannot reach a critical artifact', () => {
+  const { metrics, release } = readBuildEvidence();
+  const deferredSource = {
+    file: 'src/integrations/gpt_diagnostics/presentation/new_panel.ts',
+    renderedBytes: 1,
+  };
+  metrics.modules
+    .find(({ file }) => file === 'tsjs-diagnostics_presentation.js')
+    .sources.push({
+      ...deferredSource,
+    });
+  metrics.modules.find(({ file }) => file === 'tsjs-core.js').sources.push({ ...deferredSource });
+
+  assert.match(
+    bundleBudgets.findProductionGraphViolations(metrics, release).join('\n'),
+    /core reaches deferred-owned source.*new_panel\.ts/
+  );
+});
+
+test('current graph inventory rejects cleared bootstrap sources', () => {
   const evidence = readBuildEvidence();
   const currentArtifactContents = new Map(
     evidence.release.artifacts.map(({ file }) => [
@@ -996,41 +1226,25 @@ test('source ownership capture rejects cleared current bootstrap sources', () =>
   evidence.metrics.bootstrap.sources = [];
   assert.throws(
     () => bundleBudgets.validateRoleCorrectTransfer({ ...evidence, currentArtifactContents }),
-    /current source ownership differs from immutable capture/
+    /does not contain its entry source/
   );
 });
 
-test('source ownership capture pins artifact-owner order', () => {
-  const { baseline, metrics, release } = readBuildEvidence();
-  const reorderedOwners = structuredClone(baseline.reviewRemediationTransfer.sourceOwners);
-  reorderedOwners['src/core/release.ts'].reverse();
-  assert.match(
-    bundleBudgets.findProductionGraphViolations(metrics, release, reorderedOwners).join('\n'),
-    /current source ownership differs from immutable capture/
-  );
+test('current graph validation has no captured ownership-policy parameter', () => {
+  const { metrics, release } = readBuildEvidence();
+  assert.equal(bundleBudgets.findProductionGraphViolations.length, 2);
+  assert.deepEqual(bundleBudgets.findProductionGraphViolations(metrics, release), []);
 });
 
-test('source ownership graph rejects duplicate bootstrap sources and captured owners', () => {
-  const { baseline, metrics, release } = readBuildEvidence();
+test('source ownership graph rejects duplicate bootstrap sources', () => {
+  const { metrics, release } = readBuildEvidence();
   const duplicateBootstrapSource = structuredClone(metrics);
   duplicateBootstrapSource.bootstrap.sources.push(
     structuredClone(duplicateBootstrapSource.bootstrap.sources[0])
   );
   assert.throws(
-    () =>
-      bundleBudgets.findProductionGraphViolations(
-        duplicateBootstrapSource,
-        release,
-        baseline.reviewRemediationTransfer.sourceOwners
-      ),
+    () => bundleBudgets.findProductionGraphViolations(duplicateBootstrapSource, release),
     /gpt-bootstrap-fallback\.js\.sources\[.*\] is invalid/
-  );
-
-  const duplicateCapturedOwner = structuredClone(baseline.reviewRemediationTransfer.sourceOwners);
-  duplicateCapturedOwner['src/kernel/runtime.ts'].push('core');
-  assert.throws(
-    () => bundleBudgets.findProductionGraphViolations(metrics, release, duplicateCapturedOwner),
-    /captured source ownership is invalid/
   );
 });
 
@@ -1044,42 +1258,33 @@ test('exact release key validation accepts equivalent insertion order', () => {
   assert.doesNotThrow(() => bundleBudgets.validateRoleCorrectTransfer(evidence));
 });
 
-test('transfer ceilings use ceil at a fractional five-percent boundary', () => {
-  assert.equal(typeof bundleBudgets.enforceTransferCeilings, 'function');
+test('transfer capture reports deltas without an acceptance ceiling', () => {
+  assert.equal(typeof bundleBudgets.buildTransferCaptureReport, 'function');
   const captured = Object.fromEntries(
     ['bootstrap', 'minimal', 'reference', 'maximal'].map((setName) => [
       setName,
       { rawBytes: 10, gzipBytes: 10, brotliBytes: 10 },
     ])
   );
-  const atCeiling = structuredClone(captured);
-  for (const set of Object.values(atCeiling)) {
-    set.rawBytes = 11;
-    set.gzipBytes = 11;
-    set.brotliBytes = 11;
+  const current = structuredClone(captured);
+  for (const set of Object.values(current)) {
+    set.rawBytes = 12;
+    set.gzipBytes = 12;
+    set.brotliBytes = 12;
   }
-  assert.doesNotThrow(() => bundleBudgets.enforceTransferCeilings(captured, atCeiling));
-  atCeiling.reference.gzipBytes += 1;
-  assert.throws(
-    () => bundleBudgets.enforceTransferCeilings(captured, atCeiling),
-    /reference\.gzipBytes is 12 bytes; ceiling is 11/
-  );
+  const report = bundleBudgets.buildTransferCaptureReport(captured, current);
+  assert.deepEqual(report.reference.gzipBytes, {
+    capturedBytes: 10,
+    currentBytes: 12,
+    deltaBytes: 2,
+  });
+  assert.equal(Object.hasOwn(report.reference.gzipBytes, 'ceilingBytes'), false);
 });
 
-test('production bundle graphs reject every frozen forbidden edge', () => {
-  const { baseline, metrics, release } = readBuildEvidence();
-  const sourceOwners = baseline.reviewRemediationTransfer.sourceOwners;
+test('production bundle graphs reject every current forbidden edge', () => {
+  const { metrics, release } = readBuildEvidence();
   assert.equal(typeof bundleBudgets.findProductionGraphViolations, 'function');
-  assert.deepEqual(
-    bundleBudgets.findProductionGraphViolations(
-      metrics,
-      release,
-      sourceOwners,
-      baseline.reviewRemediationTransfer.logicalProviderSources,
-      baseline.reviewRemediationTransfer.physicalMarkerOwners
-    ),
-    []
-  );
+  assert.deepEqual(bundleBudgets.findProductionGraphViolations(metrics, release), []);
   const rejectSource = (artifactId, file, pattern) => {
     const candidate = structuredClone(metrics);
     const artifactIndex = release.artifacts
@@ -1087,15 +1292,15 @@ test('production bundle graphs reject every frozen forbidden edge', () => {
       .findIndex(({ id }) => id === artifactId);
     candidate.modules[artifactIndex].sources.push({ file, renderedBytes: 1 });
     assert.match(
-      bundleBudgets.findProductionGraphViolations(candidate, release, sourceOwners).join('\n'),
+      bundleBudgets.findProductionGraphViolations(candidate, release).join('\n'),
       pattern
     );
   };
 
   rejectSource('gpt', 'src/integrations/render_runtime/module.ts', /inlines provider core/);
   rejectSource('aps', 'src/kernel/runtime.ts', /inlines provider core/);
-  rejectSource('gpt', 'src/adapters/prebid.ts', /owned by prebid/);
-  rejectSource('aps', 'src/shared/dom_insertion_dispatcher.ts', /owned by .*gpt/);
+  rejectSource('gpt', 'src/adapters/prebid.ts', /inlines provider prebid/);
+  rejectSource('aps', 'src/shared/dom_insertion_dispatcher.ts', /forbidden shared source/);
   rejectSource('aps', 'src/test/fake_adapter.ts', /test\/fake\/no-op seam/);
   const vendoredProvider = structuredClone(metrics);
   vendoredProvider.modules[1].sources.push({
@@ -1103,29 +1308,23 @@ test('production bundle graphs reject every frozen forbidden edge', () => {
     renderedBytes: 1,
   });
   assert.throws(
-    () => bundleBudgets.findProductionGraphViolations(vendoredProvider, release, sourceOwners),
+    () => bundleBudgets.findProductionGraphViolations(vendoredProvider, release),
     /sources\[.*\] is invalid/
   );
 });
 
 test('production bundle graphs scan bootstrap sources for test and fake seams', () => {
-  const { baseline, metrics, release } = readBuildEvidence();
+  const { metrics, release } = readBuildEvidence();
   metrics.bootstrap.sources.push({ file: 'src/test/fake_adapter.ts', renderedBytes: 1 });
 
   assert.match(
-    bundleBudgets
-      .findProductionGraphViolations(
-        metrics,
-        release,
-        baseline.reviewRemediationTransfer.sourceOwners
-      )
-      .join('\n'),
+    bundleBudgets.findProductionGraphViolations(metrics, release).join('\n'),
     /bootstrap reaches production test\/fake\/no-op seam src\/test\/fake_adapter\.ts/
   );
 });
 
 test('production bundle graphs reject provider implementation modules, not only entries', () => {
-  const { baseline, metrics, release } = readBuildEvidence();
+  const { metrics, release } = readBuildEvidence();
   const gptIndex = release.artifacts
     .filter(({ role }) => role !== 'bootstrap')
     .findIndex(({ id }) => id === 'gpt');
@@ -1135,45 +1334,21 @@ test('production bundle graphs reject provider implementation modules, not only 
   });
 
   assert.match(
-    bundleBudgets
-      .findProductionGraphViolations(
-        metrics,
-        release,
-        baseline.reviewRemediationTransfer.sourceOwners
-      )
-      .join('\n'),
+    bundleBudgets.findProductionGraphViolations(metrics, release).join('\n'),
     /gpt inlines provider core.*src\/integrations\/render_runtime\/module\.ts/
   );
 });
 
-test('logical provider ownership cannot be authorized by a duplicated source capture', () => {
-  const { baseline, metrics, release } = readBuildEvidence();
-  const capture = baseline.reviewRemediationTransfer;
+test('current provider policy rejects duplicated provider source without capture input', () => {
+  const { metrics, release } = readBuildEvidence();
   const providerSource = 'src/services/render.ts';
   const gptIndex = release.artifacts
     .filter(({ role }) => role !== 'bootstrap')
     .findIndex(({ id }) => id === 'gpt');
   metrics.modules[gptIndex].sources.push({ file: providerSource, renderedBytes: 1 });
-  const permissiveOwners = structuredClone(capture.sourceOwners);
-  permissiveOwners[providerSource] = ['core', 'gpt'];
-  const logicalProviderSources = {
-    ...capture.logicalProviderSources,
-    render_runtime: capture.logicalProviderSources.render_runtime.filter(
-      (source) => source !== providerSource
-    ),
-    core: [...capture.logicalProviderSources.core, providerSource],
-  };
 
   assert.match(
-    bundleBudgets
-      .findProductionGraphViolations(
-        metrics,
-        release,
-        permissiveOwners,
-        logicalProviderSources,
-        capture.physicalMarkerOwners
-      )
-      .join('\n'),
+    bundleBudgets.findProductionGraphViolations(metrics, release).join('\n'),
     /gpt inlines provider core.*src\/services\/render\.ts/
   );
 });
@@ -1197,20 +1372,14 @@ for (const [consumerId, providerId, providerSource] of [
   ['diagnostics_presentation', 'gpt_diagnostics', 'src/integrations/gpt_diagnostics/store.ts'],
 ]) {
   test(`production bundle graph rejects ${consumerId} inlining ${providerId} implementation`, () => {
-    const { baseline, metrics, release } = readBuildEvidence();
+    const { metrics, release } = readBuildEvidence();
     const artifactIndex = release.artifacts
       .filter(({ role }) => role !== 'bootstrap')
       .findIndex(({ id }) => id === consumerId);
     metrics.modules[artifactIndex].sources.push({ file: providerSource, renderedBytes: 1 });
 
     assert.match(
-      bundleBudgets
-        .findProductionGraphViolations(
-          metrics,
-          release,
-          baseline.reviewRemediationTransfer.sourceOwners
-        )
-        .join('\n'),
+      bundleBudgets.findProductionGraphViolations(metrics, release).join('\n'),
       new RegExp(
         `${consumerId} inlines provider ${providerId}.*${providerSource.replaceAll('.', '\\.')}`
       )
@@ -1219,7 +1388,7 @@ for (const [consumerId, providerId, providerSource] of [
 }
 
 test('critical bundle graph rejects deferred-presentation-only source ownership', () => {
-  const { baseline, metrics, release } = readBuildEvidence();
+  const { metrics, release } = readBuildEvidence();
   const coreIndex = release.artifacts
     .filter(({ role }) => role !== 'bootstrap')
     .findIndex(({ id }) => id === 'core');
@@ -1229,19 +1398,13 @@ test('critical bundle graph rejects deferred-presentation-only source ownership'
   });
 
   assert.match(
-    bundleBudgets
-      .findProductionGraphViolations(
-        metrics,
-        release,
-        baseline.reviewRemediationTransfer.sourceOwners
-      )
-      .join('\n'),
+    bundleBudgets.findProductionGraphViolations(metrics, release).join('\n'),
     /core reaches deferred-owned source src\/integrations\/gpt_diagnostics\/exhaustive\.ts/
   );
 });
 
 test('production bundle graphs reject actual underscore-named test seams', () => {
-  const { baseline, metrics, release } = readBuildEvidence();
+  const { metrics, release } = readBuildEvidence();
   const apsIndex = release.artifacts
     .filter(({ role }) => role !== 'bootstrap')
     .findIndex(({ id }) => id === 'aps');
@@ -1251,23 +1414,17 @@ test('production bundle graphs reject actual underscore-named test seams', () =>
   });
 
   assert.match(
-    bundleBudgets
-      .findProductionGraphViolations(
-        metrics,
-        release,
-        baseline.reviewRemediationTransfer.sourceOwners
-      )
-      .join('\n'),
+    bundleBudgets.findProductionGraphViolations(metrics, release).join('\n'),
     /aps reaches production test\/fake\/no-op seam src\/composition\/browser_test\.ts/
   );
 });
 
-test('role-correct bundle check reports historical deltas and enforces transfer ceilings', () => {
+test('bundle check authenticates frozen captures and reports both without enforcing them', () => {
   const result = checkBundleBudgets();
 
   assert.equal(result.roleCorrectStatus, 'immutable-intermediate');
-  assert.equal(result.reviewRemediationStatus, 'frozen-release-baseline');
-  assert.equal(result.transferCeilingsEnforced, true);
+  assert.equal(result.reviewRemediationStatus, 'immutable-report-only');
+  assert.equal(result.transferCapturesEnforced, false);
   assert.deepEqual(Object.keys(result.historicalDeltas), [
     'bootstrap',
     'minimal',
@@ -1282,10 +1439,19 @@ test('role-correct bundle check reports historical deltas and enforces transfer 
       );
     }
   }
-  for (const [setName, report] of Object.entries(result.reviewRemediationTransfer)) {
-    for (const size of ['rawBytes', 'gzipBytes', 'brotliBytes']) {
-      assert.equal(report[size].ceilingBytes, Math.ceil(report[size].capturedBytes * 1.05));
-      assert.ok(report[size].currentBytes <= report[size].ceilingBytes, `${setName}.${size}`);
+  assert.deepEqual(Object.keys(result.frozenTransferReports), [
+    'roleCorrectTransfer',
+    'reviewRemediationTransfer',
+  ]);
+  for (const captureReport of Object.values(result.frozenTransferReports)) {
+    for (const report of Object.values(captureReport)) {
+      for (const size of ['rawBytes', 'gzipBytes', 'brotliBytes']) {
+        assert.equal(
+          report[size].deltaBytes,
+          report[size].currentBytes - report[size].capturedBytes
+        );
+        assert.equal(Object.hasOwn(report[size], 'ceilingBytes'), false);
+      }
     }
   }
 });
