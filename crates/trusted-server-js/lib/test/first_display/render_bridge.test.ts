@@ -628,4 +628,34 @@ describe('bounded first-display render bridge', () => {
     expect(() => terminal.bridge.sealTsAdmission()).not.toThrow();
     expect(terminal.bridge.bind(terminal.cycle, () => undefined)).toBe(false);
   });
+
+  it('captures and detaches an accepted direct frame without retaining provisional authority', () => {
+    const h = harness('adm');
+    expect(h.bridge.recordGam(h.cycle, 'gam_empty')).toBe(true);
+    const frame = h.element.querySelector('iframe');
+    frame?.dispatchEvent(new h.dom.window.Event('load'));
+    h.bridge.sealTsAdmission();
+
+    expect(h.bridge.closeIngress()).toBe(true);
+    expect(h.bridge.captureHandoff()).toEqual({
+      artifacts: [
+        {
+          identity: frame,
+          kind: 'gpt_adm',
+          owner: 'trusted_server',
+          slotId: 'slot-1',
+          token: RESERVATION_ID,
+        },
+      ],
+      nextTicketOrdinal: 1,
+      tombstones: [],
+    });
+    expect(h.bridge.detachCommittedArtifacts()).toBe(true);
+    expect(h.bridge.detachCommittedArtifacts()).toBe(false);
+    h.bridge.dispose();
+
+    expect(frame?.isConnected).toBe(true);
+    expect(h.target.removeEventListener).toHaveBeenCalledTimes(1);
+    expect(h.timers).toHaveLength(0);
+  });
 });

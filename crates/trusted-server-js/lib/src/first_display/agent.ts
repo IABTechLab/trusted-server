@@ -1,7 +1,11 @@
 import type { BootstrapController } from '../core/bootstrap_controller';
 import type { BootFailureReason } from '../kernel/fallback';
+import type { FirstDisplaySliceId } from '../kernel/release_catalog';
 
-import type { FirstDisplayGoogletagBatchInput } from './adapters/googletag';
+import type {
+  FirstDisplayGoogletagBatchInput,
+  FirstDisplayGptBoundCycleV1,
+} from './adapters/googletag';
 import { createFirstDisplayProjectedDriver, type FirstDisplayRenderBridgeV1 } from './driver';
 import type { FirstDisplayApsProtocolV1 } from './leaf/aps_protocol';
 import type { FirstDisplayGptProtocolV1 } from './leaf/gpt_protocol';
@@ -25,6 +29,11 @@ import {
   createFirstDisplayRenderBridge,
   type FirstDisplayRenderBridgeOptionsV1,
 } from './render_bridge';
+import {
+  createFirstDisplayHandoffOwner,
+  type FinalizedFirstDisplayHandoffV1,
+  type FirstDisplayHandoffOwner,
+} from './handoff';
 
 const MAX_U32 = 4_294_967_295;
 const AUCTION_PROTOCOLS = ['aps', 'gpt', 'prebid'] as const;
@@ -48,7 +57,29 @@ export interface FirstDisplayDriver {
     onTerminal: (slotId: string, result: FirstDisplayTerminalResult) => void
   ) => void;
   readonly sealTsAdmission: () => void;
+  readonly closeIngress: () => boolean;
+  readonly captureHandoff: () => FirstDisplayDriverHandoffV1 | undefined;
+  readonly detachCommittedArtifacts: () => boolean;
   readonly dispose: () => void;
+}
+
+export interface FirstDisplayDriverHandoffV1 {
+  readonly artifacts: readonly Readonly<{
+    identity: object;
+    kind: 'gpt_adm' | 'aps';
+    owner: 'trusted_server' | 'publisher';
+    slotId: string;
+    token: string;
+  }>[];
+  readonly cycles: readonly FirstDisplayGptBoundCycleV1[];
+  readonly identities: readonly object[];
+  readonly nextTicketOrdinal: number;
+  readonly tombstones: readonly Readonly<{
+    kind: 'ticket';
+    value: string;
+    expiresAtMs: number;
+    ordinal: number;
+  }>[];
 }
 
 export interface FirstDisplayPaintScheduler {
@@ -67,6 +98,12 @@ export interface FirstDisplayAgentOptions {
   readonly onFailure: (reason: BootFailureReason) => void;
   readonly onPrebidAdmissionFailure?: (reason: 'prebid_admission_failed') => void;
   readonly initialMutationRevision?: number;
+  readonly now?: () => number;
+  readonly handoff?: Readonly<{
+    releaseId: string;
+    generation: number;
+    slices: readonly FirstDisplaySliceId[];
+  }>;
 }
 
 /** Bootstrap-owned dependencies supplied only to the release-bound base component. */
@@ -138,6 +175,8 @@ export interface FirstDisplayAgent {
   readonly admitTsBid: (complete: () => void) => boolean;
   readonly observeNativeMutation: () => boolean;
   readonly snapshot: () => FirstDisplayAgentSnapshotV1;
+  readonly finalizeHandoff: () => FinalizedFirstDisplayHandoffV1 | undefined;
+  readonly detachCommittedArtifacts: () => boolean;
   readonly dispose: () => void;
 }
 
@@ -256,6 +295,7 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
     FirstDisplayTerminalResult | 'no_bid' | 'failed' | 'cancelled'
   >();
   private readonly pending = new Set<string>();
+  private readonly handoffOwner: FirstDisplayHandoffOwner | undefined;
   private stateValue: FirstDisplayAgentState = 'ready';
   private mutationRevision: number;
   private initialDisplayCommitted = false;
@@ -263,10 +303,35 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
   private disposedDriver = false;
   private failed = false;
   private actionStarted = false;
+  private handoffFinalized = false;
+  private committedArtifactsDetached = false;
+  private lastTimingMs: number;
+  private firstDisplayMs: number | null = null;
+  private terminalMs: number | undefined;
+  private paintMs: number | undefined;
 
   public constructor(private readonly options: FirstDisplayAgentOptions) {
     this.batch = snapshotFirstDisplayBatchV1(options.batch);
     this.mutationRevision = options.initialMutationRevision ?? 0;
+    this.lastTimingMs = options.bootstrap.startedAtMs;
+    this.handoffOwner = options.handoff
+      ? createFirstDisplayHandoffOwner({
+          releaseId: options.handoff.releaseId,
+          generation: options.handoff.generation,
+          initialMutationRevision: this.mutationRevision,
+          isCurrentGeneration: () => !this.failed && this.stateValue !== 'disposed',
+          isTerminal: () => this.stateValue === 'painted',
+          isPainted: () => this.stateValue === 'painted',
+          closeIngress: () => {
+            if (!this.options.driver.closeIngress()) {
+              throw new TypeError('first-display ingress did not close');
+            }
+          },
+          onFailure: (reason) => {
+            this.fail(reason);
+          },
+        })
+      : undefined;
   }
 
   public get state(): FirstDisplayAgentState {
@@ -334,6 +399,11 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
 
   public observeNativeMutation(): boolean {
     if (this.stateValue !== 'painted' || this.failed) return false;
+    if (this.handoffOwner) {
+      const observed = this.handoffOwner.observeMutation();
+      this.mutationRevision = this.handoffOwner.mutationRevision;
+      return observed;
+    }
     if (this.mutationRevision >= MAX_U32) return this.fail('bundle_partial');
     this.mutationRevision += 1;
     return true;
@@ -354,9 +424,43 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
     });
   }
 
+  public finalizeHandoff(): FinalizedFirstDisplayHandoffV1 | undefined {
+    if (
+      this.stateValue !== 'painted' ||
+      this.failed ||
+      !this.handoffOwner ||
+      this.handoffFinalized
+    ) {
+      return undefined;
+    }
+    const finalized = this.handoffOwner.finalize(() => {
+      const captured = this.options.driver.captureHandoff();
+      if (!captured) return undefined;
+      const candidate = this.captureHandoffData(captured);
+      return candidate ? Object.freeze({ candidate, identities: captured.identities }) : undefined;
+    });
+    if (!finalized) return undefined;
+    this.handoffFinalized = true;
+    return finalized;
+  }
+
+  public detachCommittedArtifacts(): boolean {
+    if (
+      !this.handoffFinalized ||
+      this.committedArtifactsDetached ||
+      this.stateValue !== 'painted'
+    ) {
+      return false;
+    }
+    if (!this.options.driver.detachCommittedArtifacts()) return false;
+    this.committedArtifactsDetached = true;
+    return true;
+  }
+
   public dispose(): void {
     if (this.stateValue === 'disposed') return;
     this.stateValue = 'disposed';
+    this.handoffOwner?.dispose();
     this.disposeDriver();
     this.pending.clear();
   }
@@ -383,6 +487,11 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
   private recordTerminal(): void {
     if (this.stateValue !== 'active' || this.pending.size !== 0) return;
     this.stateValue = 'terminal';
+    this.terminalMs = this.readTiming();
+    if (this.terminalMs === undefined) {
+      this.fail('bundle_partial');
+      return;
+    }
     this.options.bootstrap.settle();
     this.mark('tsjs:first-display-terminal');
     this.scheduleProtectedPaint(2);
@@ -399,6 +508,9 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
       return false;
     }
     this.actionStarted = true;
+    const firstDisplayMs = this.readTiming();
+    if (firstDisplayMs === undefined) return this.fail('bundle_partial');
+    this.firstDisplayMs = firstDisplayMs;
     this.mark('tsjs:first-display');
     return true;
   }
@@ -418,6 +530,11 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
       }
       this.sealed = true;
       this.stateValue = 'painted';
+      this.paintMs = this.readTiming();
+      if (this.paintMs === undefined) {
+        this.fail('bundle_partial');
+        return;
+      }
       this.mark('tsjs:first-display-paint');
       try {
         this.options.onProtectedPaint();
@@ -439,6 +556,152 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
     } catch {
       // Timing observability cannot alter display ownership.
     }
+  }
+
+  private readTiming(): number | undefined {
+    try {
+      const value = this.options.now?.() ?? this.options.bootstrap.startedAtMs;
+      if (!Number.isFinite(value) || value < 0 || value < this.lastTimingMs) return undefined;
+      this.lastTimingMs = value;
+      return value;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private captureHandoffData(captured: FirstDisplayDriverHandoffV1): unknown | undefined {
+    const handoff = this.options.handoff;
+    const batch = this.batch;
+    if (!handoff || !batch || this.terminalMs === undefined || this.paintMs === undefined) {
+      return undefined;
+    }
+    const cycleBySlot = new Map(captured.cycles.map((cycle) => [cycle.slotId, cycle]));
+    const artifactBySlot = new Map(
+      captured.artifacts.map((artifact) => [artifact.slotId, artifact])
+    );
+    if (
+      cycleBySlot.size !== captured.cycles.length ||
+      artifactBySlot.size !== captured.artifacts.length
+    ) {
+      return undefined;
+    }
+    const bidBySlot = new Map(batch.projection.bids.map((bid) => [bid.slot, bid]));
+    const slots = batch.projection.slots.map((placement, index) => {
+      const outcome = this.results.get(placement.slot);
+      const projected = batch.outcomes[index];
+      if (!outcome || !projected || projected.slotId !== placement.slot) {
+        throw new TypeError('incomplete first-display outcome');
+      }
+      const cycle = cycleBySlot.get(placement.slot);
+      const bid = bidBySlot.get(placement.slot);
+      const targeting: Record<string, string> = { ...placement.targeting };
+      if (bid) {
+        Object.assign(targeting, bid.targeting);
+        targeting.hb_adid = bid.rendererReservationId;
+      }
+      const committedArtifact =
+        outcome === 'accepted' && (projected.kind === 'gpt_adm' || projected.kind === 'aps')
+          ? projected.kind
+          : 'none';
+      return {
+        id: placement.slot,
+        aliases: [],
+        domId: cycle?.element.id ?? placement.divId,
+        gamPath: placement.gamUnitPath,
+        formats: placement.formats.map((format) => [...format]),
+        owner: cycle?.ownership ?? 'trusted_server',
+        outcome,
+        targeting: Object.keys(targeting)
+          .sort()
+          .map((key) => [key, targeting[key]]),
+        committedArtifact,
+        gptToken: null,
+      };
+    });
+    const acceptedIds = new Set(
+      slots.filter((slot) => slot.outcome === 'accepted').map((slot) => slot.id)
+    );
+    if (
+      captured.cycles.some(({ slotId }) => !acceptedIds.has(slotId)) ||
+      captured.artifacts.some((artifact) => {
+        const projected = batch.outcomes.find(({ slotId }) => slotId === artifact.slotId);
+        const bid = bidBySlot.get(artifact.slotId);
+        return (
+          !acceptedIds.has(artifact.slotId) ||
+          !projected ||
+          projected.kind !== artifact.kind ||
+          bid?.rendererReservationId !== artifact.token
+        );
+      })
+    ) {
+      return undefined;
+    }
+    const attempts = slots.map((slot, index) => ({
+      id: `fd1_${index + 1}`,
+      slotId: slot.id,
+      ordinal: index + 1,
+      state: slot.outcome,
+      reason: null,
+    }));
+    const artifacts = slots
+      .filter((slot) => slot.committedArtifact !== 'none')
+      .map((slot) => {
+        const bid = bidBySlot.get(slot.id);
+        if (!bid) throw new TypeError('accepted artifact bid is unavailable');
+        return {
+          slotId: slot.id,
+          kind: slot.committedArtifact,
+          owner: slot.owner,
+          token: bid.rendererReservationId,
+        };
+      });
+    const cycles = captured.cycles.map((cycle, index) => ({
+      token: `gt1_${index + 1}`,
+      nextCycleOrdinal: 2,
+      unknownPriorCycle: cycle.ownership === 'publisher',
+      records: [{ ordinal: 1, state: 'completed' }],
+      quarantines: [],
+    }));
+    return {
+      version: 1,
+      releaseId: handoff.releaseId,
+      generation: handoff.generation,
+      projectionDigest: batch.projectionDigest,
+      slices: [...handoff.slices],
+      slots,
+      attempts,
+      tombstones: captured.tombstones.map((entry) => ({ ...entry })),
+      artifacts,
+      parserState: [],
+      gptFacts: [],
+      gptFactOverflow: 0,
+      timing: {
+        bidsScriptMs: this.options.bootstrap.startedAtMs,
+        firstDisplayMs: this.firstDisplayMs,
+        terminalMs: this.terminalMs,
+        paintMs: this.paintMs,
+      },
+      highWater: {
+        navigationAttemptPrefix: `fd_${handoff.generation}`,
+        nextNavigationAttemptOrdinal: 2,
+        nextAttemptOrdinal: attempts.length + 1,
+        nextSlotRegistrationOrdinal: slots.length + 1,
+        reservationClockEpochMs: 0,
+        nextReservationOrdinal: batch.projection.bids.length + 1,
+        nextTicketOrdinal: captured.nextTicketOrdinal,
+      },
+      cycles,
+      trace: {
+        nextSequence: 1,
+        nextGlobalSlotOrdinal: slots.length + 1,
+        slots: slots.map((slot) => ({
+          slotId: slot.id,
+          impressions: slot.outcome === 'accepted' ? 1 : 0,
+          bindings: [],
+        })),
+      },
+      mutationRevision: this.mutationRevision,
+    };
   }
 
   private fail(reason: BootFailureReason): false {
@@ -481,6 +744,8 @@ export function createFirstDisplayAgent(options: FirstDisplayAgentOptions): Firs
     admitTsBid: (complete: () => void) => owner.admitTsBid(complete),
     observeNativeMutation: () => owner.observeNativeMutation(),
     snapshot: () => owner.snapshot(),
+    finalizeHandoff: () => owner.finalizeHandoff(),
+    detachCommittedArtifacts: () => owner.detachCommittedArtifacts(),
     dispose: () => owner.dispose(),
   });
 }

@@ -64,12 +64,16 @@ function harness() {
       gptCallbacks = callbacks;
       return true;
     }),
+    captureHandoff: vi.fn(() => [cycleOwner.value].filter(Boolean)),
+    closeIngress: vi.fn(() => true),
+    detachCommittedSlots: vi.fn(() => true),
     dispose: vi.fn(),
   };
   const protocol = {
     createBatch: vi.fn(() => gptBatch),
   } as unknown as FirstDisplayGptProtocolV1;
   const events: string[] = [];
+  const cycleOwner: { value?: FirstDisplayGptBoundCycleV1 } = {};
   const renderer = {
     bind: vi.fn((_cycle: FirstDisplayGptBoundCycleV1, terminal: typeof renderTerminal) => {
       events.push('render:bind');
@@ -81,6 +85,9 @@ function harness() {
       return true;
     }),
     recordFailure: vi.fn(() => true),
+    captureHandoff: vi.fn(() => ({ artifacts: [], nextTicketOrdinal: 1, tombstones: [] })),
+    closeIngress: vi.fn(() => true),
+    detachCommittedArtifacts: vi.fn(() => true),
     sealTsAdmission: vi.fn(() => events.push('render:seal')),
     dispose: vi.fn(() => events.push('render:dispose')),
   };
@@ -112,6 +119,7 @@ function harness() {
     placement: value.projection.slots[0]!,
     slotId: 'slot-1',
   });
+  cycleOwner.value = cycle;
   return {
     cycle,
     driver,
@@ -170,12 +178,39 @@ describe('projected first-display driver', () => {
     expect(h.renderer.dispose).toHaveBeenCalledOnce();
   });
 
+  it('captures accepted objects before detaching them from both provisional owners', () => {
+    const h = harness();
+    h.getGptCallbacks().onBound(h.cycle);
+    h.getGptCallbacks().onFirstAction();
+    h.getGptCallbacks().onRenderEnded(h.cycle, 'nonempty_gam');
+    h.getRenderTerminal()('accepted');
+    h.driver.sealTsAdmission();
+
+    expect(h.driver.closeIngress()).toBe(true);
+    expect(h.driver.captureHandoff()).toEqual({
+      artifacts: [],
+      cycles: [h.cycle],
+      identities: [h.cycle.physicalSlot],
+      nextTicketOrdinal: 1,
+      tombstones: [],
+    });
+    expect(h.driver.detachCommittedArtifacts()).toBe(true);
+    expect(h.gptBatch.detachCommittedSlots).toHaveBeenCalledWith(['slot-1']);
+    expect(h.renderer.detachCommittedArtifacts).toHaveBeenCalledOnce();
+  });
+
   it('rejects an action list that does not exactly match the immutable batch', () => {
     const value = batch();
     const driver = createFirstDisplayProjectedDriver({
       batch: value,
       gpt: {
-        createBatch: () => ({ start: () => true, dispose: () => undefined }),
+        createBatch: () => ({
+          start: () => true,
+          captureHandoff: () => [],
+          closeIngress: () => true,
+          detachCommittedSlots: () => true,
+          dispose: () => undefined,
+        }),
       } as unknown as FirstDisplayGptProtocolV1,
       gptInput: {
         browser: window,
@@ -187,6 +222,9 @@ describe('projected first-display driver', () => {
         bind: () => true,
         recordGam: () => true,
         recordFailure: () => true,
+        captureHandoff: () => ({ artifacts: [], nextTicketOrdinal: 1, tombstones: [] }),
+        closeIngress: () => true,
+        detachCommittedArtifacts: () => true,
         sealTsAdmission: () => undefined,
         dispose: () => undefined,
       },

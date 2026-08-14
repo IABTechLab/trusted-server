@@ -113,6 +113,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     allowedImports: [
       'first_display/contracts',
       'first_display/driver',
+      'first_display/handoff',
       'first_display/leaf/projection',
       'first_display/render_bridge',
       'first_display/registration',

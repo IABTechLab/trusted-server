@@ -90,12 +90,14 @@ interface Attempt {
 interface LiveTicket {
   readonly attempt: Attempt;
   readonly expiresAt: number;
+  readonly ordinal: number;
   readonly state: 'live';
   timer?: unknown;
 }
 
 interface TicketTombstone {
   readonly expiresAt: number;
+  readonly ordinal: number;
   readonly state: 'tombstone';
   timer?: unknown;
 }
@@ -552,10 +554,22 @@ export function createFirstDisplayRenderBridge(
   const reservations = new Map<string, 'live' | 'tombstone'>();
   const tickets = new Map<string, TicketEntry>();
   const nonces = new Map<string, Attempt>();
-  const committedFrames = new Set<HTMLIFrameElement>();
+  const committedFrames = new Map<
+    string,
+    Readonly<{
+      frame: HTMLIFrameElement;
+      kind: 'gpt_adm' | 'aps';
+      owner: 'trusted_server';
+      token: string;
+    }>
+  >();
   const timers = new Set<unknown>();
   let disposed = false;
   let sealed = false;
+  let ingressClosed = false;
+  let handoffCaptured = false;
+  let committedArtifactsDetached = false;
+  let nextTicketOrdinal = 1;
   let lastNow = Number.NEGATIVE_INFINITY;
   const messageEventPrototype = (() => {
     try {
@@ -633,7 +647,12 @@ export function createFirstDisplayRenderBridge(
     if (!ticket) return;
     const entry = tickets.get(ticket);
     if (entry?.state !== 'live' || entry.attempt !== attempt) return;
-    tickets.set(ticket, { state: 'tombstone', expiresAt: entry.expiresAt, timer: entry.timer });
+    tickets.set(ticket, {
+      state: 'tombstone',
+      expiresAt: entry.expiresAt,
+      ordinal: entry.ordinal,
+      timer: entry.timer,
+    });
   };
 
   const releaseAttempt = (attempt: Attempt, removeFrame: boolean): void => {
@@ -694,7 +713,17 @@ export function createFirstDisplayRenderBridge(
     }
     const committedFrame = result === 'accepted' ? attempt.directFrame : undefined;
     releaseAttempt(attempt, result !== 'accepted');
-    if (committedFrame?.isConnected) committedFrames.add(committedFrame);
+    if (committedFrame?.isConnected) {
+      committedFrames.set(
+        attempt.cycle.slotId,
+        Object.freeze({
+          frame: committedFrame,
+          kind: attempt.cycle.bid.renderSource.type === 'adm' ? 'gpt_adm' : 'aps',
+          owner: 'trusted_server',
+          token: attempt.reservationId,
+        })
+      );
+    }
     try {
       attempt.onTerminal(result);
     } catch {
@@ -987,7 +1016,9 @@ export function createFirstDisplayRenderBridge(
     const issuedAt = readNow();
     if (issuedAt === undefined) return undefined;
     const expiresAt = issuedAt + TICKET_TTL_MS;
-    const entry: LiveTicket = { state: 'live', attempt, expiresAt };
+    const ordinal = nextTicketOrdinal;
+    nextTicketOrdinal += 1;
+    const entry: LiveTicket = { state: 'live', attempt, expiresAt, ordinal };
     tickets.set(ticket, entry);
     attempt.ticket = ticket;
     entry.timer = arm(() => {
@@ -1196,7 +1227,7 @@ export function createFirstDisplayRenderBridge(
   };
 
   const dispatch = (event: unknown): void => {
-    if (disposed) return;
+    if (disposed || ingressClosed) return;
     const data = eventField(event, 'data', messageEventPrototype);
     const routing = routingMessage(data);
     if (routing.message === 'TS Render Owner Register') {
@@ -1253,6 +1284,7 @@ export function createFirstDisplayRenderBridge(
     ): boolean => {
       if (
         disposed ||
+        ingressClosed ||
         sealed ||
         typeof onTerminal !== 'function' ||
         !validCycle(cycle) ||
@@ -1323,23 +1355,86 @@ export function createFirstDisplayRenderBridge(
       }
       sealed = true;
     },
-    dispose: (): void => {
-      if (disposed) return;
-      disposed = true;
+    closeIngress: (): boolean => {
+      if (
+        disposed ||
+        ingressClosed ||
+        !sealed ||
+        [...attempts.values()].some((attempt) => attempt.active)
+      ) {
+        return false;
+      }
+      ingressClosed = true;
       try {
         options.browser.removeEventListener('message', dispatch as EventListener, true);
       } catch {
-        // Generation latching makes a failed physical removal inert.
+        // The closed generation cannot regain authority through a failed physical removal.
+      }
+      for (const handle of [...timers]) clearOwnedTimer(handle);
+      return true;
+    },
+    captureHandoff: () => {
+      if (disposed || !ingressClosed || handoffCaptured) return undefined;
+      const observedAt = readNow();
+      if (observedAt === undefined) return undefined;
+      const tombstones = [...tickets.entries()]
+        .filter((entry): entry is [string, TicketTombstone] => {
+          const value = entry[1];
+          return value.state === 'tombstone' && value.expiresAt > observedAt;
+        })
+        .map(([value, entry]) =>
+          Object.freeze({
+            kind: 'ticket' as const,
+            value,
+            expiresAtMs: entry.expiresAt,
+            ordinal: entry.ordinal,
+          })
+        );
+      const artifacts = [...committedFrames.entries()].map(([slotId, entry]) =>
+        Object.freeze({
+          identity: entry.frame,
+          kind: entry.kind,
+          owner: entry.owner,
+          slotId,
+          token: entry.token,
+        })
+      );
+      handoffCaptured = true;
+      return Object.freeze({
+        artifacts: Object.freeze(artifacts),
+        nextTicketOrdinal,
+        tombstones: Object.freeze(tombstones),
+      });
+    },
+    detachCommittedArtifacts: (): boolean => {
+      if (disposed || !ingressClosed || !handoffCaptured || committedArtifactsDetached) {
+        return false;
+      }
+      committedArtifactsDetached = true;
+      return true;
+    },
+    dispose: (): void => {
+      if (disposed) return;
+      disposed = true;
+      if (!ingressClosed) {
+        ingressClosed = true;
+        try {
+          options.browser.removeEventListener('message', dispatch as EventListener, true);
+        } catch {
+          // Generation latching makes a failed physical removal inert.
+        }
       }
       for (const attempt of [...attempts.values()]) {
         if (attempt.active) settle(attempt, 'cancelled', 'navigation_disposed');
       }
       for (const handle of [...timers]) clearOwnedTimer(handle);
-      for (const frame of committedFrames) {
-        try {
-          frame.remove();
-        } catch {
-          // The committed owner is terminal and cannot be restored by a hostile DOM node.
+      if (!committedArtifactsDetached) {
+        for (const { frame } of committedFrames.values()) {
+          try {
+            frame.remove();
+          } catch {
+            // The committed owner is terminal and cannot be restored by a hostile DOM node.
+          }
         }
       }
       committedFrames.clear();

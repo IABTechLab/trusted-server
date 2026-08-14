@@ -76,7 +76,7 @@ function finalized(identity: object = {}): FinalizedFirstDisplayHandoffV1 {
     closeIngress: () => undefined,
     onFailure: () => undefined,
   });
-  const value = owner.finalize(handoff(), [identity]);
+  const value = owner.finalize(() => ({ candidate: handoff(), identities: [identity] }));
   if (!value) throw new Error('should finalize test handoff');
   return value;
 }
