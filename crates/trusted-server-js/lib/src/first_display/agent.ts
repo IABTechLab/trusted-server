@@ -18,9 +18,8 @@ import type { FirstDisplayGptProtocolV1 } from './leaf/gpt_protocol';
 import {
   captureMutationObservedBindings,
   createFirstDisplayParserStateCollector,
-  firstDisplayComponentRegistration,
-  registerCurrentFirstDisplayComponent,
 } from './registration';
+import { registerCurrentFirstDisplayComponent } from './registration_client';
 import type { FirstDisplaySliceActivationContext } from './transaction';
 import type {
   FirstDisplaySliceHost,
@@ -141,13 +140,13 @@ function createBrowserMessageChannel(
 ): ReturnType<FirstDisplayRenderBridgeOptionsV1['createChannel']> {
   const constructor = Reflect.get(browser, 'MessageChannel');
   if (typeof constructor !== 'function') {
-    throw new TypeError('MessageChannel is unavailable');
+    throw new TypeError('tsjs');
   }
   const channel = Reflect.construct(constructor, []) as Record<PropertyKey, unknown>;
   const port1 = Reflect.get(channel, 'port1');
   const port2 = Reflect.get(channel, 'port2');
   if (typeof port1 !== 'object' || port1 === null || typeof port2 !== 'object' || port2 === null) {
-    throw new TypeError('MessageChannel is incompatible');
+    throw new TypeError('tsjs');
   }
   return { port1, port2 } as ReturnType<FirstDisplayRenderBridgeOptionsV1['createChannel']>;
 }
@@ -158,7 +157,7 @@ function fillBrowserRandom(browser: Window, bytes: Uint8Array): void {
     typeof crypto === 'object' && crypto !== null
       ? Reflect.get(crypto, 'getRandomValues')
       : undefined;
-  if (typeof getRandomValues !== 'function') throw new TypeError('Web Crypto is unavailable');
+  if (typeof getRandomValues !== 'function') throw new TypeError('tsjs');
   Reflect.apply(getRandomValues, crypto, [bytes]);
 }
 
@@ -168,7 +167,7 @@ function readBrowserNow(browser: Window): number {
     typeof performance === 'object' && performance !== null
       ? Reflect.get(performance, 'now')
       : undefined;
-  if (typeof now !== 'function') throw new TypeError('Performance clock is unavailable');
+  if (typeof now !== 'function') throw new TypeError('tsjs');
   return Reflect.apply(now, performance, []) as number;
 }
 
@@ -281,11 +280,11 @@ function captureProtocolRegistration(
     const captured = Object.create(Object.prototype) as Record<PropertyKey, unknown>;
     const wrappedRegister = (protocol: unknown): (() => void) => {
       if (!fullProtocolIdentity(protocol, protocolId) || protocols.has(protocolId)) {
-        throw new TypeError(`invalid first-display protocol registration: ${protocolId}`);
+        throw new TypeError('tsjs');
       }
       const release = Reflect.apply(original, candidate, [protocol]);
       if (typeof release !== 'function') {
-        throw new TypeError(`invalid first-display protocol disposer: ${protocolId}`);
+        throw new TypeError('tsjs');
       }
       protocols.set(protocolId, protocol);
       let live = true;
@@ -310,8 +309,8 @@ function captureProtocolRegistration(
 }
 
 class FirstDisplayAgentOwner implements FirstDisplayAgent {
-  private readonly batch: FirstDisplayBatchV1 | undefined;
-  private readonly results = new Map<
+  private readonly agentBatch: FirstDisplayBatchV1 | undefined;
+  private readonly slotResults = new Map<
     string,
     FirstDisplayTerminalResult | 'no_bid' | 'failed' | 'cancelled'
   >();
@@ -320,8 +319,8 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
   private readonly handoffOwner: FirstDisplayHandoffOwner | undefined;
   private stateValue: FirstDisplayAgentState = 'ready';
   private mutationObserver: MutationObserver | undefined;
-  private mutationRevision: number;
-  private initialDisplayCommitted = false;
+  private observedMutationRevision: number;
+  private displayWasCommitted = false;
   private sealed = false;
   private disposedDriver = false;
   private failed = false;
@@ -329,9 +328,9 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
   private handoffFinalized = false;
   private committedArtifactsDetached = false;
   private lastTimingMs: number;
-  private firstDisplayMs: number | null = null;
-  private terminalMs: number | undefined;
-  private paintMs: number | undefined;
+  private firstActionAtMs: number | null = null;
+  private terminalAtMs: number | undefined;
+  private paintAtMs: number | undefined;
   private nextTraceSequence = 1;
   private readonly acceptedTrace = new Map<
     string,
@@ -339,20 +338,20 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
   >();
 
   public constructor(private readonly options: FirstDisplayAgentOptions) {
-    this.batch = snapshotFirstDisplayBatchV1(options.batch);
-    this.mutationRevision = options.initialMutationRevision ?? 0;
+    this.agentBatch = snapshotFirstDisplayBatchV1(options.batch);
+    this.observedMutationRevision = options.initialMutationRevision ?? 0;
     this.lastTimingMs = options.bootstrap.startedAtMs;
     this.handoffOwner = options.handoff
       ? createFirstDisplayHandoffOwner({
           releaseId: options.handoff.releaseId,
           generation: options.handoff.generation,
-          initialMutationRevision: this.mutationRevision,
+          initialMutationRevision: this.observedMutationRevision,
           isCurrentGeneration: () => !this.failed && this.stateValue !== 'disposed',
           isTerminal: () => this.stateValue === 'painted',
           isPainted: () => this.stateValue === 'painted',
           closeIngress: () => {
             if (!this.options.driver.closeIngress()) {
-              throw new TypeError('first-display ingress did not close');
+              throw new TypeError('tsjs');
             }
             this.closeNativeMutationIngress();
           },
@@ -370,29 +369,29 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
 
   public coversProtocols(protocols: ReadonlyMap<FirstDisplayAuctionProtocolId, unknown>): boolean {
     return Boolean(
-      this.batch &&
-      protocols.size === this.batch.requiredProtocols.length &&
-      this.batch.requiredProtocols.every((id) => protocolIdentity(protocols.get(id), id))
+      this.agentBatch &&
+      protocols.size === this.agentBatch.requiredProtocols.length &&
+      this.agentBatch.requiredProtocols.every((id) => protocolIdentity(protocols.get(id), id))
     );
   }
 
   public start(): boolean {
     if (this.stateValue !== 'ready') return false;
-    if (!this.batch) return this.fail('abi_mismatch');
+    if (!this.agentBatch) return this.fail('abi_mismatch');
     if (!this.options.bootstrap.registerAgent()) {
       this.stateValue = 'failed';
       return false;
     }
 
     const actions: FirstDisplayBatchOutcomeV1[] = [];
-    for (let index = 0; index < this.batch.outcomes.length; index += 1) {
-      const outcome = this.batch.outcomes[index]!;
+    for (let index = 0; index < this.agentBatch.outcomes.length; index += 1) {
+      const outcome = this.agentBatch.outcomes[index]!;
       if (ACTION_KINDS.has(outcome.kind)) {
         this.pending.add(outcome.slotId);
         actions.push(outcome);
       } else {
-        this.results.set(outcome.slotId, outcome.kind as 'no_bid' | 'failed' | 'cancelled');
-        const decision = this.batch.projection.auction.results[index];
+        this.slotResults.set(outcome.slotId, outcome.kind as 'no_bid' | 'failed' | 'cancelled');
+        const decision = this.agentBatch.projection.auction.results[index];
         this.reasons.set(outcome.slotId, decision?.outcome === 'failed' ? decision.reason : null);
       }
     }
@@ -434,25 +433,25 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
     if (this.stateValue !== 'painted' || this.failed) return false;
     if (this.handoffOwner) {
       const observed = this.handoffOwner.observeMutation();
-      this.mutationRevision = this.handoffOwner.mutationRevision;
+      this.observedMutationRevision = this.handoffOwner.mutationRevision;
       return observed;
     }
-    if (this.mutationRevision >= MAX_U32) return this.fail('bundle_partial');
-    this.mutationRevision += 1;
+    if (this.observedMutationRevision >= MAX_U32) return this.fail('bundle_partial');
+    this.observedMutationRevision += 1;
     return true;
   }
 
   public snapshot(): FirstDisplayAgentSnapshotV1 {
-    const outcomes = this.batch?.outcomes.map(({ slotId }) =>
+    const outcomes = this.agentBatch?.outcomes.map(({ slotId }) =>
       Object.freeze({
         slotId,
-        result: this.results.get(slotId) ?? 'failed',
+        result: this.slotResults.get(slotId) ?? 'failed',
       })
     );
     return Object.freeze({
       state: this.stateValue,
-      mutationRevision: this.mutationRevision,
-      initialDisplayCommitted: this.initialDisplayCommitted,
+      mutationRevision: this.observedMutationRevision,
+      initialDisplayCommitted: this.displayWasCommitted,
       outcomes: Object.freeze(outcomes ?? []),
     });
   }
@@ -515,7 +514,7 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
       return;
     }
     if (!this.pending.has(slotId)) {
-      if (!this.results.has(slotId)) this.fail('bundle_partial');
+      if (!this.slotResults.has(slotId)) this.fail('bundle_partial');
       return;
     }
     if (result === 'accepted') {
@@ -531,17 +530,17 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
       this.nextTraceSequence += 1;
     }
     this.pending.delete(slotId);
-    this.results.set(slotId, result);
+    this.slotResults.set(slotId, result);
     this.reasons.set(slotId, reason);
-    if (result === 'accepted') this.initialDisplayCommitted = true;
+    if (result === 'accepted') this.displayWasCommitted = true;
     if (this.pending.size === 0) this.recordTerminal();
   }
 
   private recordTerminal(): void {
     if (this.stateValue !== 'active' || this.pending.size !== 0) return;
     this.stateValue = 'terminal';
-    this.terminalMs = this.readTiming();
-    if (this.terminalMs === undefined) {
+    this.terminalAtMs = this.readTiming();
+    if (this.terminalAtMs === undefined) {
       this.fail('bundle_partial');
       return;
     }
@@ -563,7 +562,7 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
     this.actionStarted = true;
     const firstDisplayMs = this.readTiming();
     if (firstDisplayMs === undefined) return this.fail('bundle_partial');
-    this.firstDisplayMs = firstDisplayMs;
+    this.firstActionAtMs = firstDisplayMs;
     this.mark('tsjs:first-display');
     return true;
   }
@@ -583,8 +582,8 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
       }
       this.sealed = true;
       this.stateValue = 'painted';
-      this.paintMs = this.readTiming();
-      if (this.paintMs === undefined) {
+      this.paintAtMs = this.readTiming();
+      if (this.paintAtMs === undefined) {
         this.fail('bundle_partial');
         return;
       }
@@ -624,8 +623,8 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
 
   private captureHandoffData(captured: FirstDisplayDriverHandoffV1): unknown | undefined {
     const handoff = this.options.handoff;
-    const batch = this.batch;
-    if (!handoff || !batch || this.terminalMs === undefined || this.paintMs === undefined) {
+    const batch = this.agentBatch;
+    if (!handoff || !batch || this.terminalAtMs === undefined || this.paintAtMs === undefined) {
       return undefined;
     }
     const cycleBySlot = new Map(captured.cycles.map((cycle) => [cycle.slotId, cycle]));
@@ -648,10 +647,10 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
     }
     const bidBySlot = new Map(batch.projection.bids.map((bid) => [bid.slot, bid]));
     const slots = batch.projection.slots.map((placement, index) => {
-      const outcome = this.results.get(placement.slot);
+      const outcome = this.slotResults.get(placement.slot);
       const projected = batch.outcomes[index];
       if (!outcome || !projected || projected.slotId !== placement.slot) {
-        throw new TypeError('incomplete first-display outcome');
+        throw new TypeError('tsjs');
       }
       const cycle = cycleBySlot.get(placement.slot);
       const bid = bidBySlot.get(placement.slot);
@@ -718,7 +717,7 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
         const bid = bidBySlot.get(slot.id);
         const capturedArtifact = artifactBySlot.get(slot.id);
         if (!bid || !capturedArtifact) {
-          throw new TypeError('accepted artifact handoff is unavailable');
+          throw new TypeError('tsjs');
         }
         return {
           slotId: slot.id,
@@ -730,7 +729,7 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
     const cycles = captured.cycles.map((cycle) => {
       const diagnostic = diagnosticCycleBySlot.get(cycle.slotId);
       if (!diagnostic || diagnostic.token !== cycle.traceToken) {
-        throw new TypeError('accepted GPT diagnostic cycle is unavailable');
+        throw new TypeError('tsjs');
       }
       return {
         slotId: diagnostic.slotId,
@@ -783,9 +782,9 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
       }),
       timing: {
         bidsScriptMs: this.options.bootstrap.startedAtMs,
-        firstDisplayMs: this.firstDisplayMs,
-        terminalMs: this.terminalMs,
-        paintMs: this.paintMs,
+        firstDisplayMs: this.firstActionAtMs,
+        terminalMs: this.terminalAtMs,
+        paintMs: this.paintAtMs,
       },
       highWater: {
         navigationAttemptPrefix: issuer.snapshotPrefix(),
@@ -802,7 +801,7 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
         nextGlobalSlotOrdinal: captured.nextTraceTokenOrdinal,
         slots: traceSlots,
       },
-      mutationRevision: this.mutationRevision,
+      mutationRevision: this.observedMutationRevision,
     };
   }
 
@@ -838,8 +837,7 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
     try {
       const document = this.options.mutationDocument;
       const Observer = document.defaultView?.MutationObserver;
-      if (!Observer || !document.documentElement)
-        throw new TypeError('MutationObserver unavailable');
+      if (!Observer || !document.documentElement) throw new TypeError('tsjs');
       const observer = new Observer((records) => this.observeDomMutations(records));
       observer.observe(document.documentElement, {
         attributes: true,
@@ -879,7 +877,7 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
       observer.disconnect();
       this.observeDomMutations(records);
     } catch {
-      throw new TypeError('first-display DOM mutation ingress did not close');
+      throw new TypeError('tsjs');
     }
   }
 
@@ -924,7 +922,7 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
       !Object.isFrozen(host) ||
       Reflect.ownKeys(host).length !== 2
     ) {
-      throw new TypeError('invalid first-display base host');
+      throw new TypeError('tsjs');
     }
     const descriptor = Object.getOwnPropertyDescriptor(host, 'options');
     const bindingsDescriptor = Object.getOwnPropertyDescriptor(host, 'sliceBindings');
@@ -938,7 +936,7 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
       !('value' in bindingsDescriptor) ||
       typeof bindingsDescriptor.value !== 'function'
     ) {
-      throw new TypeError('invalid first-display base options');
+      throw new TypeError('tsjs');
     }
     const options = descriptor.value as FirstDisplayAgentRegistrationHostV1['options'];
     const sliceBindings = bindingsDescriptor.value as (id: string) => unknown;
@@ -953,10 +951,10 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
         install?: InitialSliceInstaller
       ): void => {
         if (typeof install !== 'function') {
-          throw new TypeError(`unimplemented first-display slice: ${id}`);
+          throw new TypeError('tsjs');
         }
         if (!parserState.register(id)) {
-          throw new TypeError(`invalid first-display parser slice: ${id}`);
+          throw new TypeError('tsjs');
         }
         const protocolId = id.endsWith('_initial')
           ? (id.slice(0, -'_initial'.length) as FirstDisplayAuctionProtocolId)
@@ -966,7 +964,7 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
           () => agent?.observeNativeMutation() === true,
           (key, value) => {
             if (!parserState.observe(id, key, value)) {
-              throw new TypeError(`invalid first-display parser observation: ${id}`);
+              throw new TypeError('tsjs');
             }
           }
         );
@@ -978,7 +976,7 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
         );
         if (protocolId && AUCTION_PROTOCOLS.includes(protocolId)) {
           if (auctionProtocols.has(protocolId) || !protocolIdentity(installed, protocolId)) {
-            throw new TypeError(`invalid first-display protocol: ${protocolId}`);
+            throw new TypeError('tsjs');
           }
           auctionProtocols.set(protocolId, installed);
         }
@@ -1012,14 +1010,14 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
         rendererOwner.value = renderer;
         context.afterActivate(() => {
           const batch = snapshotFirstDisplayBatchV1(options.batch);
-          if (!batch) throw new TypeError('invalid first-display batch');
+          if (!batch) throw new TypeError('tsjs');
           const gpt = fullProtocols.get('gpt');
           const aps = fullProtocols.get('aps');
           if (batch.requiredProtocols.includes('gpt') && !fullProtocolIdentity(gpt, 'gpt')) {
-            throw new TypeError('first-display GPT protocol is incomplete');
+            throw new TypeError('tsjs');
           }
           if (batch.requiredProtocols.includes('aps') && !fullProtocolIdentity(aps, 'aps')) {
-            throw new TypeError('first-display APS protocol is incomplete');
+            throw new TypeError('tsjs');
           }
           const driver = createFirstDisplayProjectedDriver({
             batch,
@@ -1035,7 +1033,7 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
             return target;
           });
           if (!identityIssuer.ok) {
-            throw new TypeError('first-display navigation identity is unavailable');
+            throw new TypeError('tsjs');
           }
           agent = createFirstDisplayAgent({
             ...options,
@@ -1045,19 +1043,17 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
             parserState: parserState.snapshot,
           });
           if (!agent.coversProtocols(auctionProtocols)) {
-            throw new TypeError('first-display protocol coverage is incomplete');
+            throw new TypeError('tsjs');
           }
-          if (!agent.start()) throw new TypeError('first-display agent did not start');
+          if (!agent.start()) throw new TypeError('tsjs');
           options.onAgentReady?.(agent);
         });
       },
       sliceHost,
     });
   } catch {
-    throw new TypeError('invalid first-display base host');
+    throw new TypeError('tsjs');
   }
 }
 
-registerCurrentFirstDisplayComponent(
-  firstDisplayComponentRegistration('first_display', 1, prepareRegisteredAgent)
-);
+registerCurrentFirstDisplayComponent('first_display', 1, prepareRegisteredAgent);

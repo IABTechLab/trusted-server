@@ -293,6 +293,6 @@ describe('projected first-display driver', () => {
         () => true,
         () => undefined
       )
-    ).toThrow('first-display action list');
+    ).toThrow('tsjs');
   });
 });

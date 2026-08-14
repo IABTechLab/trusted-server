@@ -2014,7 +2014,7 @@ collapse those checkpoints or carry unverified behavior between them.
       `/static/tsjs=tsjs-first-display.min.js?m=<four-lowercase-hex>&v=<firstDisplayHash>`,
       `/static/tsjs=tsjs-unified.min.js?v=<runtimeHash>`, and exact enabled deferred
       paths. First-display accepts exact `m` then `v`, bit 0 set, unused bits zero, a
-      configuration-permitted mask, exact selected slices, and exact body hash; other
+      release-size-admitted configuration mask, exact selected slices, and exact body hash; other
       routes accept one `v` only. Cover lowercase 64-hex SHA-256 over exact
       uncompressed response bytes, `GET`/`HEAD` parity, JavaScript MIME plus
       `nosniff`, conditional `304`, and local `404 no-store` for wrong method,
@@ -4036,7 +4036,9 @@ runtime.
       GPT-mediated ADM, or GPT-mediated APS/PUC (including attributable empty-GAM
       fallback). PBS Cache, direct/programmatic `/auction`, an unknown source, an
       unrepresentable obligation, or no projected batch must select direct persistent
-      boot. Publisher data cannot override the decision.
+      boot. A semantically closed mask absent from the release-generated size-admission
+      allowlist must also select direct persistent boot. Publisher data cannot override
+      the decision.
 
   ```bash
   npm --prefix crates/trusted-server-js/lib test -- --run \
@@ -4073,8 +4075,11 @@ runtime.
       `TsjsApi`, broker, or extension point.
 
 - [ ] **Step E4: Build the dormant agent artifact and architecture gate.** Generate
-      exactly one server-composed artifact for each permitted slice mask; precompute
-      selection-to-URL and hash-to-selection at registry construction. The build
+      and hash all 2,560 reachable masks, emit an exact ordered allowlist containing
+      only masks within every raw/gzip/Brotli ceiling, and require the minimal,
+      five-slice reference, and APS-plus-default-creative masks to be admitted.
+      Precompute one server-composed artifact, selection-to-URL, and hash-to-selection
+      only for that admitted subset at registry construction. The build
       rejects imports from persistent core, capability broker, generic slot/auction/
       trace registries, later GPT/Prebid code, deferred entries, test/fake/no-op code,
       and `*ForTest` exports. Persistent artifacts reject imports from
@@ -4416,7 +4421,8 @@ never define a ceiling.
 
 - [ ] **Step H5: Test-drive independent candidate architecture and size ceilings.**
       Build the canonical release inventory and calculate exact raw/gzip/Brotli for
-      the inline bootstrap, every permitted first-display mask, the reference
+      the inline bootstrap, every reachable first-display mask and its exact generated
+      size-admission decision, the reference
       persistent runtime after paint, and maximal total with each production role
       once. Enforce these reviewed constants directly:
 
@@ -4427,8 +4433,11 @@ never define a ceiling.
   | reference persistent runtime after paint  | ≤524,288   | ≤163,840 | ≤131,072 |
   | maximal total, every production role once | ≤1,048,576 | ≤327,680 | ≤262,144 |
 
-  Enumerate and hash every permitted mask; the maximizing mask may differ by
-  encoding. Keep the named minimal, reference, APS, and largest summaries. Reject an
+  Enumerate and hash all 2,560 reachable masks; require the generated catalog allowlist
+  to equal the measured admitted subset exactly. The maximizing admitted mask may
+  differ by encoding. Keep the named minimal, exact five-slice reference, exact
+  APS-plus-default-creative, and largest summaries, and fail unless all three named
+  masks are admitted. Reject an
   unclassified/multiply counted artifact, missing production role, test artifact,
   omitted split module, first-display reachability to persistent/deferred code,
   takeover reachability to deferred code, provider implementation outside its one
@@ -5343,7 +5352,7 @@ main.
   ```
 
 - [ ] **Step 2: Enforce the final absolute and fresh-main transfer gates.** Require
-      bootstrap ≤48,000/16,000/14,000, every permitted agent mask
+      bootstrap ≤48,000/16,000/14,000, every generated size-admitted agent mask
       ≤90,000/30,000/26,000, persistent reference
       ≤524,288/163,840/131,072, and maximal total
       ≤1,048,576/327,680/262,144 raw/gzip/Brotli. In the same blocking job, freshly
@@ -5482,8 +5491,8 @@ not create another design, plan, cache specification, or evidence document.
 - Modify: `docs/guide/integrations/aps.md`
 
 - [ ] **Step A1: Test-drive finite TSJS transport resolution.** Construct and hash
-      every permitted first-display mask and persistent takeover selection once during
-      registry construction. Store exact hash-to-selection and
+      every generated size-admitted first-display mask and persistent takeover
+      selection once during registry construction. Store exact hash-to-selection and
       selection-to-canonical-URL mappings, resolve misses
       without concatenating or hashing module bodies, and reuse the precomputed URL
       for boot metadata and the selected script tag. A hit may assemble the response

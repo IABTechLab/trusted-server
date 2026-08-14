@@ -4006,9 +4006,11 @@ describe('browser composition', () => {
     expect(renderTrace?.history()).toHaveLength(1);
     expect(Object.isFrozen(renderTrace?.history()[0])).toBe(true);
     const programmaticSlot = document.getElementById('programmatic-slot');
-    expect(programmaticSlot?.getAttribute('data-ts-rendered')).toBe('true');
-    expect(programmaticSlot?.getAttribute('data-ts-injected')).toBe('true');
-    expect(document.getElementById(TRACE_PANEL_ID)?.textContent).toContain('programmatic-slot');
+    await vi.waitFor(() => {
+      expect(programmaticSlot?.getAttribute('data-ts-rendered')).toBe('true');
+      expect(programmaticSlot?.getAttribute('data-ts-injected')).toBe('true');
+      expect(document.getElementById(TRACE_PANEL_ID)?.textContent).toContain('programmatic-slot');
+    });
     expect(target).not.toHaveProperty('renders');
     expect(target).not.toHaveProperty('renderLog');
     expect(target).not.toHaveProperty('renderSeq');

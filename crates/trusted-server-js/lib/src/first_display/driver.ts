@@ -87,7 +87,7 @@ export function createFirstDisplayProjectedDriver(
           projection: options.batch.projection,
         });
   if (expected.length > 0 && !gptBatch) {
-    throw new TypeError('first-display GPT protocol is unavailable');
+    throw new TypeError('tsjs');
   }
   let started = false;
   let disposed = false;
@@ -125,7 +125,7 @@ export function createFirstDisplayProjectedDriver(
       onFirstAction: () => boolean,
       terminal: (slotId: string, result: FirstDisplayTerminalResult, reason: string | null) => void
     ): void => {
-      if (started || disposed) throw new TypeError('first-display driver is not startable');
+      if (started || disposed) throw new TypeError('tsjs');
       if (
         outcomes.length !== expected.length ||
         outcomes.some((outcome, index) => {
@@ -133,7 +133,7 @@ export function createFirstDisplayProjectedDriver(
           return !row || row.slotId !== outcome.slotId || row.kind !== outcome.kind;
         })
       ) {
-        throw new TypeError('invalid first-display action list');
+        throw new TypeError('tsjs');
       }
       started = true;
       onTerminal = terminal;
@@ -182,11 +182,11 @@ export function createFirstDisplayProjectedDriver(
           }
         },
       });
-      if (accepted !== true) throw new TypeError('first-display GPT batch was rejected');
+      if (accepted !== true) throw new TypeError('tsjs');
     },
     sealTsAdmission: (): void => {
       if (sealed || disposed || settled.size !== expected.length) {
-        throw new TypeError('first-display driver cannot seal');
+        throw new TypeError('tsjs');
       }
       sealed = true;
       options.renderer.sealTsAdmission();

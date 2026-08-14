@@ -669,7 +669,7 @@ describe('bounded first-display render bridge', () => {
 
   it('seals only after every attempt is terminal and refuses later authority', () => {
     const active = harness('adm');
-    expect(() => active.bridge.sealTsAdmission()).toThrow('live first-display render authority');
+    expect(() => active.bridge.sealTsAdmission()).toThrow('tsjs');
 
     const terminal = harness('adm');
     expect(terminal.bridge.recordGam(terminal.cycle, 'gam_empty')).toBe(true);

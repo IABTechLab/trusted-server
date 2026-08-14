@@ -11,6 +11,7 @@ import {
   deriveInventorySetFiles,
   measureBundleSet,
   measureBytes,
+  measureReachableFirstDisplayMasks,
   BUNDLE_SEPARATOR,
 } from './scripts/bundle-metrics.mjs';
 import { computeReleaseId, RELEASE_SENTINEL, stampRelease } from './scripts/release-v1.mjs';
@@ -22,6 +23,12 @@ const metricsFile = 'tsjs-build-metrics-v1.json';
 const releaseFile = 'tsjs-release-v1.json';
 const catalogFile = 'tsjs-catalog-v1.json';
 const bootstrapFile = 'gpt-bootstrap-fallback.js';
+
+// These properties are closure-private implementation details of the base agent.
+// Mangle only that artifact: protocol, registration, handoff, and public agent keys
+// intentionally keep their authored names across independently built components.
+const firstDisplayBasePrivateProperties =
+  /^(?:options|stateValue|agentBatch|slotResults|handoffOwner|mutationObserver|observedMutationRevision|displayWasCommitted|sealed|failed|pending|reasons|actionStarted|disposedDriver|handoffFinalized|committedArtifactsDetached|lastTimingMs|firstActionAtMs|terminalAtMs|paintAtMs|nextTraceSequence|acceptedTrace|recordTerminal|recordFirstAction|scheduleProtectedPaint|readTiming|captureHandoffData|disposeDriver|installNativeMutationIngress|observeDomMutations|isOwnedRuntimeInsertion|closeNativeMutationIngress|disposeNativeMutationIngress|claimTimer|completionTimer|controlRelease|directFrame|documentAccepted|documentAcceptancePending|documentRelease|documentTimer|documentTransferred|insertionTimer|pendingDocumentTerminal|ownerSource|ownerTicket|rendererNonce|phaseValue|registryState|expiresAtInternal|ordinalInternal|controlPort|claim|gam|inserted|ticket|active|cycle|onTerminal|reservationId|timer|attempt|recordFailure)$/;
 
 fs.rmSync(distributionDirectory, { recursive: true, force: true });
 fs.mkdirSync(distributionDirectory, { recursive: true });
@@ -179,6 +186,9 @@ async function buildArtifact(artifact) {
   const result = await build({
     configFile: false,
     root: libDirectory,
+    ...(artifact.id === 'first_display'
+      ? { esbuild: { mangleProps: firstDisplayBasePrivateProperties } }
+      : {}),
     define: {
       __TSJS_EMBEDDED_RELEASE_ID_V1__: JSON.stringify(RELEASE_SENTINEL),
       __TSJS_EMBEDDED_INTEGRATION_IDS_V1__: JSON.stringify(catalogIds),
@@ -333,6 +343,24 @@ fs.writeFileSync(
   path.join(distributionDirectory, releaseFile),
   `${JSON.stringify({ version: 1, releaseId, artifacts: artifactInventory })}\n`
 );
+const bootstrapArtifact = artifacts[0];
+const bootstrapBytes = fs.readFileSync(path.join(distributionDirectory, bootstrapFile));
+const artifactContents = new Map(
+  artifactInventory.map(({ file }) => [
+    file,
+    fs.readFileSync(path.join(distributionDirectory, file)),
+  ])
+);
+const inventorySetFiles = deriveInventorySetFiles(artifactInventory, releaseCatalog);
+const firstDisplayMaskCatalog = firstDisplayCatalog.map(({ id }, maskBit) => ({
+  id,
+  maskBit,
+  file: `tsjs-${id}.js`,
+}));
+const firstDisplayMasks = await measureReachableFirstDisplayMasks(
+  firstDisplayMaskCatalog,
+  artifactContents
+);
 fs.writeFileSync(
   path.join(distributionDirectory, catalogFile),
   `${JSON.stringify({
@@ -348,6 +376,9 @@ fs.writeFileSync(
         obligation,
       })
     ),
+    permittedFirstDisplayMasks: firstDisplayMasks
+      .filter(({ permitted }) => permitted)
+      .map(({ mask }) => mask),
     modules: releaseCatalog.map(({ id, phase, trigger, include }) => ({
       id,
       phase,
@@ -356,16 +387,6 @@ fs.writeFileSync(
     })),
   })}\n`
 );
-
-const bootstrapArtifact = artifacts[0];
-const bootstrapBytes = fs.readFileSync(path.join(distributionDirectory, bootstrapFile));
-const artifactContents = new Map(
-  artifactInventory.map(({ file }) => [
-    file,
-    fs.readFileSync(path.join(distributionDirectory, file)),
-  ])
-);
-const inventorySetFiles = deriveInventorySetFiles(artifactInventory, releaseCatalog);
 const metrics = {
   schemaVersion: 1,
   compression: {
@@ -392,11 +413,7 @@ const metrics = {
     sources: bootstrapArtifact.moduleContributions,
   },
   firstDisplay: {
-    catalog: firstDisplayCatalog.map(({ id }, maskBit) => ({
-      id,
-      maskBit,
-      file: `tsjs-${id}.js`,
-    })),
+    catalog: firstDisplayMaskCatalog,
     components: Object.fromEntries(
       artifacts
         .filter(({ phase }) => phase === 'first_display')
@@ -410,6 +427,7 @@ const metrics = {
           },
         ])
     ),
+    masks: firstDisplayMasks,
   },
   sets: Object.fromEntries(
     Object.entries(inventorySetFiles).map(([setName, setFiles]) => [

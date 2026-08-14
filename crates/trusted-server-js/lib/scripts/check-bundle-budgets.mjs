@@ -10,10 +10,14 @@ import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 
 import {
+  BUNDLE_SEPARATOR,
   BUNDLE_SET_NAMES,
   BUNDLE_SIZE_NAMES,
+  FIRST_DISPLAY_AGENT_SIZE_CEILING,
   deriveInventorySetFiles,
   deriveSemanticBundleSetIds,
+  enumerateReachableFirstDisplayMasks,
+  firstDisplayMaskIsPermitted,
   measureBundleSet,
   measureBytes,
 } from './bundle-metrics.mjs';
@@ -47,6 +51,22 @@ const BOOTSTRAP_BASELINE = Object.freeze({
   rawBytes: 19_101,
   gzipBytes: 5_468,
   brotliBytes: 4_632,
+});
+export const CANDIDATE_ARCHITECTURE_SIZE_CEILINGS = Object.freeze({
+  bootstrap: Object.freeze({ rawBytes: 48_000, gzipBytes: 16_000, brotliBytes: 14_000 }),
+  firstDisplayAgent: Object.freeze({
+    ...FIRST_DISPLAY_AGENT_SIZE_CEILING,
+  }),
+  referencePersistent: Object.freeze({
+    rawBytes: 524_288,
+    gzipBytes: 163_840,
+    brotliBytes: 131_072,
+  }),
+  maximalTotal: Object.freeze({
+    rawBytes: 1_048_576,
+    gzipBytes: 327_680,
+    brotliBytes: 262_144,
+  }),
 });
 const PRODUCTION_SEAM_PATTERN =
   /(?:^|\/)(?:tests?|fixtures?|fakes?|no-?op)(?:\/|$)|(?:^|[/_.-])(?:test|fake|no-?op)(?=[/_.-]|$)|ForTest/u;
@@ -886,6 +906,152 @@ function validateArtifactContents(release, contents) {
   }
 }
 
+function firstDisplayCompositionBytes(files, contents) {
+  const parts = files.flatMap((file, index) => {
+    const bytes = contents.get(file);
+    if (!(bytes instanceof Uint8Array)) fail(`current artifact bytes are missing: ${file}`);
+    return index === files.length - 1 ? [bytes] : [bytes, BUNDLE_SEPARATOR];
+  });
+  return Buffer.concat(parts);
+}
+
+function validateFirstDisplayMaskMeasurements(metrics, contents) {
+  const catalog = metrics?.firstDisplay?.catalog;
+  const masks = metrics?.firstDisplay?.masks;
+  const expected = enumerateReachableFirstDisplayMasks(catalog);
+  if (!Array.isArray(masks) || masks.length !== expected.length) {
+    fail(`build metrics must contain all ${expected.length} reachable first-display masks`);
+  }
+  const hashes = new Set();
+  for (const [index, canonical] of expected.entries()) {
+    const measured = masks[index];
+    if (
+      !hasExactKeys(measured, [
+        'mask',
+        'ids',
+        'files',
+        'rawBytes',
+        'gzipBytes',
+        'brotliBytes',
+        'sha256',
+        'permitted',
+      ]) ||
+      measured.mask !== canonical.mask ||
+      canonicalJson(measured.ids) !== canonicalJson(canonical.ids) ||
+      canonicalJson(measured.files) !== canonicalJson(canonical.files)
+    ) {
+      fail(`build metrics first-display mask ${index} is not canonical`);
+    }
+    for (const sizeName of SIZE_NAMES) {
+      assertPositiveInteger(measured[sizeName], `firstDisplay.masks.${index}.${sizeName}`);
+    }
+    const bytes = firstDisplayCompositionBytes(canonical.files, contents);
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    if (
+      measured.rawBytes !== bytes.byteLength ||
+      measured.sha256 !== sha256 ||
+      measured.permitted !== firstDisplayMaskIsPermitted(measured) ||
+      hashes.has(sha256)
+    ) {
+      fail(`build metrics first-display mask ${canonical.mask} bytes or digest are invalid`);
+    }
+    hashes.add(sha256);
+  }
+  return masks;
+}
+
+function largestMask(masks, sizeName) {
+  return masks.reduce((largest, candidate) =>
+    candidate[sizeName] > largest[sizeName] ? candidate : largest
+  );
+}
+
+function namedFirstDisplayMask(masks, ids, name) {
+  const key = JSON.stringify(ids);
+  const matches = masks.filter((mask) => JSON.stringify(mask.ids) === key);
+  if (matches.length !== 1) fail(`first-display ${name} mask is unavailable or ambiguous`);
+  return matches[0];
+}
+
+/** Build the four independent absolute-size measurements from one canonical release. */
+export function buildCandidateArchitectureSizeReport({
+  metrics,
+  release,
+  catalog,
+  currentArtifactContents,
+}) {
+  validateSemanticBundleSets(metrics, release, catalog);
+  if (!(currentArtifactContents instanceof Map)) fail('current artifact contents must be a Map');
+  const masks = validateFirstDisplayMaskMeasurements(metrics, currentArtifactContents);
+  const permittedMasks = masks.filter(({ permitted }) => permitted === true);
+  if (permittedMasks.length === 0) fail('release has no permitted first-display masks');
+  const generatedPermittedMasks = catalog?.permittedFirstDisplayMasks;
+  if (
+    !Array.isArray(generatedPermittedMasks) ||
+    canonicalJson(generatedPermittedMasks) !== canonicalJson(permittedMasks.map(({ mask }) => mask))
+  ) {
+    fail('generated permitted first-display masks do not match measured size admission');
+  }
+  const largestRaw = largestMask(permittedMasks, 'rawBytes');
+  const largestGzip = largestMask(permittedMasks, 'gzipBytes');
+  const largestBrotli = largestMask(permittedMasks, 'brotliBytes');
+  const maximalFiles = release.artifacts.map(({ file }) => file);
+  const maximalTotal = measureBundleSet(maximalFiles, currentArtifactContents);
+  const named = {
+    minimal: namedFirstDisplayMask(masks, ['first_display'], 'minimal'),
+    reference: namedFirstDisplayMask(
+      masks,
+      ['first_display', 'creative_initial', 'datadome_initial', 'gpt_initial', 'prebid_initial'],
+      'reference'
+    ),
+    aps: namedFirstDisplayMask(
+      masks,
+      ['first_display', 'aps_initial', 'creative_initial', 'gpt_initial'],
+      'APS'
+    ),
+    largestRaw,
+    largestGzip,
+    largestBrotli,
+  };
+  for (const name of ['minimal', 'reference', 'aps']) {
+    if (!named[name].permitted) fail(`required first-display ${name} mask exceeds its ceiling`);
+  }
+  return {
+    ceilings: CANDIDATE_ARCHITECTURE_SIZE_CEILINGS,
+    bootstrap: Object.fromEntries(
+      SIZE_NAMES.map((sizeName) => [sizeName, metrics.bootstrap[sizeName]])
+    ),
+    firstDisplayAgent: {
+      rawBytes: largestRaw.rawBytes,
+      gzipBytes: largestGzip.gzipBytes,
+      brotliBytes: largestBrotli.brotliBytes,
+    },
+    referencePersistent: Object.fromEntries(
+      SIZE_NAMES.map((sizeName) => [sizeName, metrics.sets.reference[sizeName]])
+    ),
+    maximalTotal: Object.fromEntries(
+      SIZE_NAMES.map((sizeName) => [sizeName, maximalTotal[sizeName]])
+    ),
+    firstDisplay: { masks, permittedMasks, named },
+  };
+}
+
+/** Reject any semantic set that exceeds one reviewed independent ceiling. */
+export function enforceCandidateArchitectureSizeCeilings(report) {
+  for (const [semanticSet, limits] of Object.entries(CANDIDATE_ARCHITECTURE_SIZE_CEILINGS)) {
+    const measured = report?.[semanticSet];
+    for (const sizeName of SIZE_NAMES) {
+      if (!Number.isSafeInteger(measured?.[sizeName]) || measured[sizeName] < 1) {
+        fail(`${semanticSet}.${sizeName} is not a positive integer measurement`);
+      }
+      if (measured[sizeName] > limits[sizeName]) {
+        fail(`${semanticSet}.${sizeName} exceeds ${limits[sizeName]} bytes: ${measured[sizeName]}`);
+      }
+    }
+  }
+  return report;
+}
+
 function validateCurrentMeasurements(metrics, release, catalog, contents) {
   const expectedSets = deriveInventorySetFiles(release.artifacts, catalog.modules);
   for (const setName of SET_NAMES) {
@@ -1355,6 +1521,13 @@ export function checkBundleBudgets({ baselinePath = defaultBaselinePath } = {}) 
     currentArtifactContents,
     verifyGitProvenance: true,
   });
+  const candidateArchitecture = buildCandidateArchitectureSizeReport({
+    metrics,
+    release,
+    catalog,
+    currentArtifactContents,
+  });
+  enforceCandidateArchitectureSizeCeilings(candidateArchitecture);
 
   return {
     baselinePath,
@@ -1363,15 +1536,43 @@ export function checkBundleBudgets({ baselinePath = defaultBaselinePath } = {}) 
     transferCapturesEnforced: false,
     historicalDeltas,
     frozenTransferReports: roleCorrect.captureReports,
+    candidateArchitecture,
     productionGraphReport: buildProductionGraphReport(metrics, release),
     sets: metrics.sets,
+  };
+}
+
+/** Keep the blocking CLI report reviewable while full mask evidence stays in build metrics. */
+export function summarizeBundleBudgetCommandReport(result) {
+  const architecture = result?.candidateArchitecture;
+  const firstDisplay = architecture?.firstDisplay;
+  if (
+    !architecture ||
+    !firstDisplay ||
+    !Array.isArray(firstDisplay.masks) ||
+    !Array.isArray(firstDisplay.permittedMasks)
+  ) {
+    fail('candidate architecture report is missing first-display mask evidence');
+  }
+  return {
+    ...result,
+    candidateArchitecture: {
+      ...architecture,
+      firstDisplay: {
+        reachableMaskCount: firstDisplay.masks.length,
+        permittedMaskCount: firstDisplay.permittedMasks.length,
+        named: firstDisplay.named,
+      },
+    },
   };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const result = checkBundleBudgets(parseArgs(process.argv.slice(2)));
-    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    process.stdout.write(
+      `${JSON.stringify(summarizeBundleBudgetCommandReport(result), null, 2)}\n`
+    );
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : error}\n`);
     process.exitCode = 1;

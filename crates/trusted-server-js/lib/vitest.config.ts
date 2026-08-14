@@ -47,11 +47,10 @@ export default defineConfig({
       'test/eslint/no-adtech-globals.test.mjs',
       'test/build/*.test.mjs',
     ],
-    // Run tests in the main thread to avoid spawning
-    // child processes/workers, which are blocked in this sandbox.
-    threads: false,
-    // Explicitly use thread pool (no forks) when workers are enabled.
-    // Kept for clarity if threads are re-enabled later.
+    // Bound JSDOM concurrency so the package-wide suite does not starve its
+    // five-second lifecycle assertions while retaining per-file isolation.
+    maxWorkers: 2,
+    // Use worker threads rather than child processes.
     pool: 'threads',
     setupFiles: [],
     // The GPT diagnostics export contract is expressed as `expectTypeOf`

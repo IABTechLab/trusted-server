@@ -227,7 +227,7 @@ export function installPrebidInitial(
   own: FirstDisplaySliceActivationContext['own']
 ): Readonly<{ version: 1; id: 'prebid' }> {
   const value = bindings(candidate);
-  if (!value || typeof own !== 'function') throw new TypeError('invalid Prebid initial bindings');
+  if (!value || typeof own !== 'function') throw new TypeError('tsjs');
   const protocol: FirstDisplayPrebidProtocolV1 = Object.freeze({
     version: 1,
     id: 'prebid',
@@ -240,7 +240,7 @@ export function installPrebidInitial(
     snapshotTrustedBid,
   });
   const release = value.register(protocol);
-  if (typeof release !== 'function') throw new TypeError('invalid Prebid protocol disposer');
+  if (typeof release !== 'function') throw new TypeError('tsjs');
   own(release);
   value.observe('protocol_version', 1);
   return Object.freeze({ version: 1, id: 'prebid' });

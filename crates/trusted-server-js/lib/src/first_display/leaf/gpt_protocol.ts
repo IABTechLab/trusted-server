@@ -139,7 +139,7 @@ export function installGptInitial(
 ): Readonly<{ version: 1; id: 'gpt' }> {
   const value = bindings(candidate);
   if (!value || typeof own !== 'function' || typeof createBatch !== 'function') {
-    throw new TypeError('invalid GPT initial bindings');
+    throw new TypeError('tsjs');
   }
   const protocol: FirstDisplayGptProtocolV1 = Object.freeze({
     version: 1,
@@ -156,7 +156,7 @@ export function installGptInitial(
     classifyRenderEnded,
   });
   const release = value.register(protocol);
-  if (typeof release !== 'function') throw new TypeError('invalid GPT protocol disposer');
+  if (typeof release !== 'function') throw new TypeError('tsjs');
   own(release);
   value.observe('protocol_version', 1);
   return Object.freeze({ version: 1, id: 'gpt' });

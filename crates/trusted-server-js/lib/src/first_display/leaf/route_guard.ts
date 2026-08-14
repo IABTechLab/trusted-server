@@ -110,7 +110,7 @@ function ownRule(
   rule: FirstDisplayRouteRuleV1
 ): void {
   const release = bindings.register(Object.freeze(rule));
-  if (typeof release !== 'function') throw new TypeError('route guard disposer is invalid');
+  if (typeof release !== 'function') throw new TypeError('tsjs');
   own(release);
   bindings.observe('route_guard', rule.id);
 }
@@ -121,7 +121,7 @@ export function installDataDomeInitial(
   own: FirstDisplaySliceActivationContext['own']
 ): void {
   const bindings = routeBindings(candidate);
-  if (!bindings) throw new TypeError('invalid DataDome initial bindings');
+  if (!bindings) throw new TypeError('tsjs');
   ownRule(bindings, own, {
     id: 'datadome',
     matches: (kind, url) => SCRIPT_KINDS.has(kind) && DATADOME_URL.test(url),
@@ -145,7 +145,7 @@ export function installGoogleTagManagerInitial(
   own: FirstDisplaySliceActivationContext['own']
 ): void {
   const bindings = routeBindings(candidate);
-  if (!bindings) throw new TypeError('invalid GTM initial bindings');
+  if (!bindings) throw new TypeError('tsjs');
   ownRule(bindings, own, {
     id: 'google_tag_manager',
     matches: (kind, url) => GTM_KINDS.has(kind) && isGtmUrl(url),
@@ -205,7 +205,7 @@ export function installLockrInitial(
   own: FirstDisplaySliceActivationContext['own']
 ): void {
   const bindings = snapshotLockrBindings(candidate);
-  if (!bindings) throw new TypeError('invalid Lockr initial bindings');
+  if (!bindings) throw new TypeError('tsjs');
   ownRule(bindings, own, {
     id: 'lockr',
     matches: (kind, url) => SCRIPT_KINDS.has(kind) && isLockrUrl(url),
