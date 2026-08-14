@@ -17,6 +17,7 @@ export type FirstDisplayGptFailureReason =
 
 export interface FirstDisplayGptBoundCycleV1 {
   readonly bid: FirstDisplayProjectionBidV1;
+  readonly element: HTMLElement;
   readonly ownership: 'publisher' | 'trusted_server';
   readonly physicalSlot: object;
   readonly placement: FirstDisplayProjectionSlotV1;
@@ -364,6 +365,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       }
       const cycle: ActiveCycle = {
         bid: row.bid,
+        element,
         elementId: element.id,
         operations: plan.operations,
         ownership,
@@ -379,6 +381,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       callbacks.onBound(
         Object.freeze({
           bid: cycle.bid,
+          element: cycle.element,
           ownership: cycle.ownership,
           physicalSlot: cycle.physicalSlot,
           placement: cycle.placement,
@@ -455,6 +458,7 @@ class FirstDisplayGoogletagBatchOwner implements FirstDisplayGoogletagBatch {
       callbacks.onRenderEnded(
         Object.freeze({
           bid: cycle.bid,
+          element: cycle.element,
           ownership: cycle.ownership,
           physicalSlot: cycle.physicalSlot,
           placement: cycle.placement,

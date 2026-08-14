@@ -3,6 +3,7 @@ import type { BootFailureReason } from '../kernel/fallback';
 
 import type { FirstDisplayGoogletagBatchInput } from './adapters/googletag';
 import { createFirstDisplayProjectedDriver, type FirstDisplayRenderBridgeV1 } from './driver';
+import type { FirstDisplayApsProtocolV1 } from './leaf/aps_protocol';
 import type { FirstDisplayGptProtocolV1 } from './leaf/gpt_protocol';
 import {
   firstDisplayComponentRegistration,
@@ -20,6 +21,10 @@ import {
   type FirstDisplayBatchOutcomeV1,
   type FirstDisplayBatchV1,
 } from './leaf/projection';
+import {
+  createFirstDisplayRenderBridge,
+  type FirstDisplayRenderBridgeOptionsV1,
+} from './render_bridge';
 
 const MAX_U32 = 4_294_967_295;
 const AUCTION_PROTOCOLS = ['aps', 'gpt', 'prebid'] as const;
@@ -69,9 +74,44 @@ export interface FirstDisplayAgentRegistrationHostV1 {
   readonly options: Omit<FirstDisplayAgentOptions, 'driver'> &
     Readonly<{
       gptInput: Omit<FirstDisplayGoogletagBatchInput, 'projection'>;
-      renderer: FirstDisplayRenderBridgeV1;
     }>;
   readonly sliceBindings: (id: string) => unknown;
+}
+
+function createBrowserMessageChannel(
+  browser: Window
+): ReturnType<FirstDisplayRenderBridgeOptionsV1['createChannel']> {
+  const constructor = Reflect.get(browser, 'MessageChannel');
+  if (typeof constructor !== 'function') {
+    throw new TypeError('MessageChannel is unavailable');
+  }
+  const channel = Reflect.construct(constructor, []) as Record<PropertyKey, unknown>;
+  const port1 = Reflect.get(channel, 'port1');
+  const port2 = Reflect.get(channel, 'port2');
+  if (typeof port1 !== 'object' || port1 === null || typeof port2 !== 'object' || port2 === null) {
+    throw new TypeError('MessageChannel is incompatible');
+  }
+  return { port1, port2 } as ReturnType<FirstDisplayRenderBridgeOptionsV1['createChannel']>;
+}
+
+function fillBrowserRandom(browser: Window, bytes: Uint8Array): void {
+  const crypto = Reflect.get(browser, 'crypto');
+  const getRandomValues =
+    typeof crypto === 'object' && crypto !== null
+      ? Reflect.get(crypto, 'getRandomValues')
+      : undefined;
+  if (typeof getRandomValues !== 'function') throw new TypeError('Web Crypto is unavailable');
+  Reflect.apply(getRandomValues, crypto, [bytes]);
+}
+
+function readBrowserNow(browser: Window): number {
+  const performance = Reflect.get(browser, 'performance');
+  const now =
+    typeof performance === 'object' && performance !== null
+      ? Reflect.get(performance, 'now')
+      : undefined;
+  if (typeof now !== 'function') throw new TypeError('Performance clock is unavailable');
+  return Reflect.apply(now, performance, []) as number;
 }
 
 interface PreparedFirstDisplayBaseV1 {
@@ -505,22 +545,45 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
     return Object.freeze({
       activate: (context: FirstDisplaySliceActivationContext): void => {
         let agent: FirstDisplayAgent | undefined;
+        const rendererOwner: { value: FirstDisplayRenderBridgeV1 | undefined } = {
+          value: undefined,
+        };
         context.own(() => {
           if (agent) agent.dispose();
-          else options.renderer.dispose();
+          else rendererOwner.value?.dispose();
         });
+        const renderer = createFirstDisplayRenderBridge({
+          browser: options.gptInput.browser,
+          clearTimer: options.gptInput.clearTimer,
+          createChannel: () => createBrowserMessageChannel(options.gptInput.browser),
+          document: options.gptInput.document,
+          fillRandom: (bytes) => fillBrowserRandom(options.gptInput.browser, bytes),
+          getAps: () => {
+            const protocol = fullProtocols.get('aps');
+            return fullProtocolIdentity(protocol, 'aps')
+              ? (protocol as FirstDisplayApsProtocolV1)
+              : undefined;
+          },
+          now: () => readBrowserNow(options.gptInput.browser),
+          setTimer: options.gptInput.setTimer,
+        });
+        rendererOwner.value = renderer;
         context.afterActivate(() => {
           const batch = snapshotFirstDisplayBatchV1(options.batch);
           if (!batch) throw new TypeError('invalid first-display batch');
           const gpt = fullProtocols.get('gpt');
+          const aps = fullProtocols.get('aps');
           if (batch.requiredProtocols.includes('gpt') && !fullProtocolIdentity(gpt, 'gpt')) {
             throw new TypeError('first-display GPT protocol is incomplete');
+          }
+          if (batch.requiredProtocols.includes('aps') && !fullProtocolIdentity(aps, 'aps')) {
+            throw new TypeError('first-display APS protocol is incomplete');
           }
           const driver = createFirstDisplayProjectedDriver({
             batch,
             ...(gpt ? { gpt: gpt as FirstDisplayGptProtocolV1 } : {}),
             gptInput: options.gptInput,
-            renderer: options.renderer,
+            renderer,
           });
           agent = createFirstDisplayAgent({ ...options, driver });
           if (!agent.coversProtocols(auctionProtocols)) {

@@ -1020,6 +1020,7 @@ describe('first-display initial slice definitions', () => {
       })
     );
     expect(protocol?.rendererUrl).toBe('https://publisher.example/integrations/aps/renderer/v1');
+    expect(protocol?.publisherOrigin).toBe('https://publisher.example');
     expect(protocol?.deadlines).toEqual({
       insertionMs: 1_000,
       documentAcceptanceMs: 3_000,

@@ -12,6 +12,7 @@ export type FirstDisplayApsDocumentMessageV1 =
 export interface FirstDisplayApsProtocolV1 {
   readonly version: 1;
   readonly id: 'aps';
+  readonly publisherOrigin: string;
   readonly rendererUrl: string;
   readonly sandbox: string;
   readonly deadlines: Readonly<{
@@ -158,6 +159,7 @@ export function installApsInitial(
   const protocol: FirstDisplayApsProtocolV1 = Object.freeze({
     version: 1,
     id: 'aps',
+    publisherOrigin: value.publisherOrigin,
     rendererUrl,
     sandbox: SANDBOX,
     deadlines: Object.freeze({
