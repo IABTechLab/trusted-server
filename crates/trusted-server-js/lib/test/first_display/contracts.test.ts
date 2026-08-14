@@ -10,6 +10,7 @@ import {
 } from '../../src/first_display/contracts';
 
 const HASH = 'a'.repeat(64);
+const RESERVATION_ID = `r1_${'a'.repeat(22)}`;
 
 function outline(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -42,14 +43,14 @@ function handoff(overrides: Record<string, unknown> = {}): Record<string, unknow
         formats: [[300, 250]],
         owner: 'trusted_server',
         outcome: 'accepted',
-        targeting: [['hb_adid', 'bid-1']],
+        targeting: [['hb_adid', RESERVATION_ID]],
         committedArtifact: 'gpt_adm',
         gptToken: 'gt1_1',
       },
     ],
     attempts: [
       {
-        id: 'attempt-1',
+        id: 'a1_AAECAwQFBgcAAAAAAAAAAQ',
         slotId: 'slot-1',
         ordinal: 1,
         state: 'accepted',
@@ -59,19 +60,44 @@ function handoff(overrides: Record<string, unknown> = {}): Record<string, unknow
     tombstones: [
       {
         kind: 'reservation',
-        value: 'opaque-1',
+        value: RESERVATION_ID,
         expiresAtMs: 1_000,
         ordinal: 1,
       },
     ],
     artifacts: [
-      { slotId: 'slot-1', kind: 'gpt_adm', owner: 'trusted_server', token: 'artifact-1' },
+      { slotId: 'slot-1', kind: 'gpt_adm', owner: 'trusted_server', token: RESERVATION_ID },
     ],
     parserState: [
-      { sliceId: 'gpt_initial', observations: ['slot-defined'], values: [['ready', true]] },
+      {
+        sliceId: 'gpt_initial',
+        observations: ['protocol_version'],
+        values: [['protocol_version', 1]],
+      },
     ],
-    gptFacts: [{ kind: 'slotRenderEnded', observedAtMs: 12, slot: { token: 'gt1_1' } }],
-    gptFactOverflow: 0,
+    gptDiagnostics: {
+      facts: [
+        {
+          version: 1,
+          event: 'slotRenderEnded',
+          token: 'gt1_1',
+          runtimeSlotNumber: 1,
+          cycleOrdinal: 1,
+          disposition: 'matched',
+          issueReason: null,
+          capturedAtMs: 12,
+          elementId: 'div-1',
+          adUnitPath: '/123/home',
+          isEmpty: false,
+          renderedSize: [300, 250],
+          isBackfill: false,
+          slotContentChanged: true,
+          visibilityPercent: null,
+        },
+      ],
+      overflowCount: 0,
+      dropCount: 0,
+    },
     timing: {
       bidsScriptMs: 1,
       firstDisplayMs: 2,
@@ -79,7 +105,7 @@ function handoff(overrides: Record<string, unknown> = {}): Record<string, unknow
       paintMs: 4,
     },
     highWater: {
-      navigationAttemptPrefix: 'nav1',
+      navigationAttemptPrefix: 'AAECAwQFBgc',
       nextNavigationAttemptOrdinal: 2,
       nextAttemptOrdinal: 2,
       nextSlotRegistrationOrdinal: 2,
@@ -93,14 +119,35 @@ function handoff(overrides: Record<string, unknown> = {}): Record<string, unknow
         token: 'gt1_1',
         nextCycleOrdinal: 2,
         unknownPriorCycle: false,
-        records: [{ ordinal: 1, state: 'completed' }],
+        records: [
+          {
+            ordinal: 1,
+            responseIdentifier: 'response-one',
+            seen: ['slotRequested', 'slotRenderEnded'],
+            state: 'completed',
+          },
+        ],
         quarantines: [],
       },
     ],
     trace: {
       nextSequence: 2,
       nextGlobalSlotOrdinal: 2,
-      slots: [{ slotId: 'slot-1', impressions: 1, bindings: ['gt1_1'] }],
+      slots: [
+        {
+          slotId: 'slot-1',
+          impressions: 1,
+          bindings: [
+            {
+              atMs: 3,
+              cycleOrdinal: 1,
+              historySequence: 1,
+              state: 'completed',
+              token: 'gt1_1',
+            },
+          ],
+        },
+      ],
     },
     mutationRevision: 7,
     ...overrides,
@@ -158,6 +205,124 @@ describe('first-display immutable contracts', () => {
         })
       )
     ).toBeUndefined();
+    expect(
+      snapshotFirstDisplayHandoffV1(handoff({ slices: ['first_display'], parserState: [] }))
+    ).toBeUndefined();
+    expect(
+      snapshotFirstDisplayHandoffV1(
+        handoff({
+          parserState: [
+            {
+              sliceId: 'gpt_initial',
+              observations: ['protocol_version', 'extra'],
+              values: [
+                ['protocol_version', 1],
+                ['extra', true],
+              ],
+            },
+          ],
+        })
+      )
+    ).toBeUndefined();
+    expect(
+      snapshotFirstDisplayHandoffV1(
+        handoff({
+          artifacts: [
+            {
+              ...((handoff().artifacts as object[])[0] as object),
+              token: `r1_${'b'.repeat(22)}`,
+            },
+          ],
+        })
+      )
+    ).toBeUndefined();
+    expect(
+      snapshotFirstDisplayHandoffV1(
+        handoff({ trace: { nextSequence: 2, nextGlobalSlotOrdinal: 2, slots: [] } })
+      )
+    ).toBeUndefined();
+    expect(
+      snapshotFirstDisplayHandoffV1(
+        handoff({
+          tombstones: [{ ...(handoff().tombstones as object[])[0], value: 'opaque-reservation' }],
+        })
+      )
+    ).toBeUndefined();
+    expect(
+      snapshotFirstDisplayHandoffV1(
+        handoff({
+          tombstones: [{ ...(handoff().tombstones as object[])[0], expiresAtMs: 0 }],
+        })
+      )
+    ).toBeUndefined();
+    expect(
+      snapshotFirstDisplayHandoffV1(
+        handoff({
+          timing: { bidsScriptMs: 2, firstDisplayMs: 1, terminalMs: 3, paintMs: 4 },
+        })
+      )
+    ).toBeUndefined();
+    expect(
+      snapshotFirstDisplayHandoffV1(
+        handoff({
+          attempts: [
+            {
+              ...((handoff().attempts as object[])[0] as object),
+              id: 'attempt-1',
+            },
+          ],
+        })
+      )
+    ).toBeUndefined();
+    expect(
+      snapshotFirstDisplayHandoffV1(
+        handoff({
+          attempts: [
+            {
+              ...((handoff().attempts as object[])[0] as object),
+              state: 'no_bid',
+            },
+          ],
+        })
+      )
+    ).toBeUndefined();
+    expect(
+      snapshotFirstDisplayHandoffV1(
+        handoff({
+          attempts: [
+            {
+              ...((handoff().attempts as object[])[0] as object),
+              state: 'failed',
+              reason: null,
+            },
+          ],
+        })
+      )
+    ).toBeUndefined();
+    expect(snapshotFirstDisplayHandoffV1(handoff({ parserState: [] }))).toBeUndefined();
+    const parserRow = (handoff().parserState as object[])[0]!;
+    expect(
+      snapshotFirstDisplayHandoffV1(handoff({ parserState: [parserRow, parserRow] }))
+    ).toBeUndefined();
+    expect(
+      snapshotFirstDisplayHandoffV1(
+        handoff({
+          parserState: [
+            { sliceId: 'gpt_initial', observations: ['ready'], values: [['other', true]] },
+          ],
+        })
+      )
+    ).toBeUndefined();
+    expect(
+      snapshotFirstDisplayHandoffV1(
+        handoff({
+          highWater: {
+            ...(handoff().highWater as object),
+            navigationAttemptPrefix: 'nav1',
+          },
+        })
+      )
+    ).toBeUndefined();
   });
 
   it('enforces 255/256/257 slot and outcome boundaries and strict high-water counters', () => {
@@ -169,13 +334,16 @@ describe('first-display immutable contracts', () => {
         ...(slot as Record<string, unknown>),
         id: `slot-${index}`,
         domId: `div-${index}`,
-        gptToken: `gt1_${(index + 1).toString(36)}`,
+        outcome: 'no_bid',
+        committedArtifact: 'none',
+        gptToken: null,
       }));
       const attempts = Array.from({ length: count }, (_, index) => ({
         ...(attempt as Record<string, unknown>),
-        id: `attempt-${index}`,
+        id: `a1_AAECAwQFBgc${index.toString(36).padStart(11, 'A')}`,
         slotId: `slot-${index}`,
         ordinal: index + 1,
+        state: 'no_bid',
       }));
       expect(
         snapshotFirstDisplayHandoffV1(
@@ -183,13 +351,21 @@ describe('first-display immutable contracts', () => {
             slots,
             attempts,
             artifacts: [],
-            parserState: [],
-            gptFacts: [],
+            gptDiagnostics: { facts: [], overflowCount: 0, dropCount: 0 },
             tombstones: [],
             cycles: [],
-            trace: { nextSequence: 1, nextGlobalSlotOrdinal: count + 1, slots: [] },
+            trace: {
+              nextSequence: 1,
+              nextGlobalSlotOrdinal: count + 1,
+              slots: slots.map((entry) => ({
+                slotId: entry.id,
+                impressions: 0,
+                bindings: [],
+              })),
+            },
             highWater: {
               ...(base.highWater as object),
+              nextNavigationAttemptOrdinal: count + 1,
               nextAttemptOrdinal: count + 1,
               nextSlotRegistrationOrdinal: count + 1,
             },
@@ -209,6 +385,11 @@ describe('first-display immutable contracts', () => {
         handoff({ highWater: { ...(base.highWater as object), nextAttemptOrdinal: 1 } })
       )
     ).toBeUndefined();
+    expect(
+      snapshotFirstDisplayHandoffV1(
+        handoff({ trace: { ...(base.trace as object), nextSequence: 1 } })
+      )
+    ).toBeUndefined();
   });
 
   it('publishes the exact independent size ceilings', () => {
@@ -217,14 +398,32 @@ describe('first-display immutable contracts', () => {
     expect(MAX_FIRST_DISPLAY_HANDOFF_BYTES).toBe(8.5 * 1024 * 1024);
   });
 
-  it('enforces the exact 512 KiB diagnostics subsection boundary', () => {
-    const exactFacts = [...Array.from({ length: 127 }, () => 'x'.repeat(4096)), 'x'.repeat(3711)];
-    expect(new TextEncoder().encode(JSON.stringify(exactFacts))).toHaveLength(MAX_GPT_FACT_BYTES);
-    expect(snapshotFirstDisplayHandoffV1(handoff({ gptFacts: exactFacts }))).toBeDefined();
-    exactFacts[127] += 'x';
-    expect(snapshotFirstDisplayHandoffV1(handoff({ gptFacts: exactFacts }))).toBeUndefined();
-    exactFacts[127] = exactFacts[127]!.slice(0, -2);
-    expect(snapshotFirstDisplayHandoffV1(handoff({ gptFacts: exactFacts }))).toBeDefined();
+  it('enforces the exact normalized diagnostics shape and per-fact byte ceiling', () => {
+    const subsection = handoff().gptDiagnostics as {
+      facts: Array<Record<string, unknown>>;
+      overflowCount: number;
+      dropCount: number;
+    };
+    expect(snapshotFirstDisplayHandoffV1(handoff())).toBeDefined();
+    expect(
+      snapshotFirstDisplayHandoffV1(
+        handoff({ gptFacts: subsection.facts, gptFactOverflow: 0, gptDiagnostics: undefined })
+      )
+    ).toBeUndefined();
+    subsection.facts[0]!.elementId = 'x'.repeat(1_001);
+    expect(snapshotFirstDisplayHandoffV1(handoff({ gptDiagnostics: subsection }))).toBeUndefined();
+  });
+
+  it('advances the global GPT token high-water above retained diagnostics facts', () => {
+    const subsection = handoff().gptDiagnostics as {
+      facts: Array<Record<string, unknown>>;
+      overflowCount: number;
+      dropCount: number;
+    };
+    subsection.facts[0]!.token = 'gt1_3';
+    subsection.facts[0]!.runtimeSlotNumber = 3;
+
+    expect(snapshotFirstDisplayHandoffV1(handoff({ gptDiagnostics: subsection }))).toBeUndefined();
   });
 
   it('enforces the exact 8 MiB non-diagnostics canonical boundary', () => {
@@ -232,8 +431,7 @@ describe('first-display immutable contracts', () => {
       attempts: [],
       tombstones: [],
       artifacts: [],
-      parserState: [],
-      gptFacts: [],
+      gptDiagnostics: { facts: [], overflowCount: 0, dropCount: 0 },
       cycles: [],
       trace: { nextSequence: 1, nextGlobalSlotOrdinal: 257, slots: [] },
       highWater: {
@@ -248,9 +446,32 @@ describe('first-display immutable contracts', () => {
       id: `slot-${slotIndex}`,
       aliases: [],
       domId: `div-${slotIndex}`,
+      outcome: 'no_bid',
+      committedArtifact: 'none',
       gptToken: null,
       targeting: Array.from({ length: 32 }, (_, targetingIndex) => [`k${targetingIndex}`, '']),
     }));
+    base.attempts = Array.from({ length: 256 }, (_, slotIndex) => ({
+      id: `a1_AAECAwQFBgc${slotIndex.toString(36).padStart(11, 'A')}`,
+      slotId: `slot-${slotIndex}`,
+      ordinal: slotIndex + 1,
+      state: 'no_bid',
+      reason: null,
+    }));
+    base.highWater = {
+      ...(base.highWater as object),
+      nextNavigationAttemptOrdinal: 257,
+      nextAttemptOrdinal: 257,
+    };
+    base.trace = {
+      nextSequence: 1,
+      nextGlobalSlotOrdinal: 257,
+      slots: (base.slots as Array<Record<string, unknown>>).map((entry) => ({
+        slotId: entry.id,
+        impressions: 0,
+        bindings: [],
+      })),
+    };
     const encoder = new TextEncoder();
     let remaining =
       MAX_FIRST_DISPLAY_NON_DIAGNOSTICS_BYTES - encoder.encode(JSON.stringify(base)).byteLength;
@@ -291,5 +512,8 @@ describe('first-display immutable contracts', () => {
     const cleared = createFirstDisplayOwnershipCapsuleV1(HASH, 7, [physicalSlot]);
     cleared?.clear();
     expect(cleared?.consume(HASH, 7)).toBeUndefined();
+    expect(
+      createFirstDisplayOwnershipCapsuleV1(HASH, 7, [physicalSlot, physicalSlot])
+    ).toBeUndefined();
   });
 });

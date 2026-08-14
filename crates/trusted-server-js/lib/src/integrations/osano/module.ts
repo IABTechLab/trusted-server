@@ -4,6 +4,7 @@ import type {
   IntegrationRegistration,
 } from '../../kernel/integration_registry';
 import type { IntegrationLifecycleRuntime } from '../../kernel/lifecycle_module';
+import { validatePersistentFirstDisplaySliceAdoptionV1 } from '../../shared/takeover';
 
 import {
   disposeOsanoConsentMirror,
@@ -98,10 +99,27 @@ export function createOsanoIntegrationRegistration(release: string): Integration
       });
       return Object.freeze({
         activate: ({
+          adoption,
           afterCommit,
           onDispose: onActivationDispose,
         }: IntegrationActivationContext) => {
           if (criticalActive) throw new Error('Osano critical slice is already active');
+          if (
+            adoption !== undefined &&
+            !validatePersistentFirstDisplaySliceAdoptionV1(
+              adoption,
+              'osano_initial',
+              (state) =>
+                state.values.length === 0 ||
+                (state.values.length === 1 &&
+                  state.values[0]?.[0] === 'consent_snapshot' &&
+                  typeof state.values[0][1] === 'number' &&
+                  Number.isInteger(state.values[0][1]) &&
+                  state.values[0][1] >= 0)
+            )
+          ) {
+            throw new TypeError('Osano first-display parser state is invalid');
+          }
           criticalActive = true;
           onActivationDispose(() => {
             criticalActive = false;

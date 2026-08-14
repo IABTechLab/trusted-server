@@ -11,6 +11,7 @@ import type {
 } from '../../../src/kernel/runtime';
 import {
   adoptInitialRenderArtifactsFromHandoff,
+  adoptInitialRenderStateFromHandoff,
   createRenderRuntimeIntegrationRegistration,
 } from '../../../src/integrations/render_runtime/module';
 import { log } from '../../../src/core/log';
@@ -24,6 +25,106 @@ afterEach(() => {
 });
 
 describe('render_runtime provider', () => {
+  it('adopts first-display replay tombstones and trace high-water state', () => {
+    const adoptFirstDisplayIdentityState = vi.fn(() => true);
+    const adoptTombstones = vi.fn(() => true);
+    const adoptTrace = vi.fn(() => true);
+    const navigationGeneration = {};
+    const adoption = Object.freeze({
+      version: 1 as const,
+      adoptInitialDisplay: true as const,
+      handoff: Object.freeze({
+        highWater: Object.freeze({
+          nextAttemptOrdinal: 7,
+          nextNavigationAttemptOrdinal: 6,
+          navigationAttemptPrefix: 'CAcGBQQDAgE',
+          reservationClockEpochMs: 50,
+        }),
+        tombstones: Object.freeze([
+          Object.freeze({
+            expiresAtMs: 250,
+            kind: 'reservation',
+            ordinal: 4,
+            value: `r1_${'a'.repeat(22)}`,
+          }),
+          Object.freeze({ expiresAtMs: 90, kind: 'ticket', ordinal: 2, value: 'ticket' }),
+        ]),
+        slots: Object.freeze([Object.freeze({ id: 'slot-1', domId: 'div-1' })]),
+        cycles: Object.freeze([
+          Object.freeze({
+            records: Object.freeze([Object.freeze({ ordinal: 1, state: 'completed' as const })]),
+            slotId: 'slot-1',
+            token: 'gt1_1',
+          }),
+        ]),
+        trace: Object.freeze({
+          nextSequence: 9,
+          slots: Object.freeze([
+            Object.freeze({
+              bindings: Object.freeze([
+                Object.freeze({
+                  atMs: 4,
+                  cycleOrdinal: 1,
+                  historySequence: 8,
+                  state: 'completed' as const,
+                  token: 'gt1_1',
+                }),
+              ]),
+              impressions: 3,
+              slotId: 'slot-1',
+            }),
+          ]),
+        }),
+      }),
+      identities: Object.freeze([]),
+    });
+
+    expect(
+      adoptInitialRenderStateFromHandoff(
+        adoption,
+        { adoptFirstDisplayIdentityState, generation: navigationGeneration },
+        { adoptFirstDisplayTombstones: adoptTombstones },
+        { adoptFirstDisplay: adoptTrace }
+      )
+    ).toBe(adoption);
+    expect(adoptFirstDisplayIdentityState).toHaveBeenCalledExactlyOnceWith('CAcGBQQDAgE', 7);
+    expect(adoptTrace).toHaveBeenCalledWith({
+      navigationGeneration,
+      nextSequence: 9,
+      slots: [
+        {
+          bindings: [
+            {
+              cycleOrdinal: 1,
+              historySequence: 8,
+              state: 'completed',
+              token: 'gt1_1',
+            },
+          ],
+          impressions: 3,
+          records: [
+            {
+              at: 4,
+              count: 3,
+              elementId: 'div-1',
+              injected: true,
+              path: 'ssat',
+              rendered: true,
+              seq: 8,
+              servedFrom: 'inline',
+              slotId: 'slot-1',
+            },
+          ],
+          slotId: 'slot-1',
+        },
+      ],
+    });
+    expect(adoptTombstones).toHaveBeenCalledWith({
+      clockEpochMs: 50,
+      tombstones: [{ expiresAtMs: 250, reservationId: `r1_${'a'.repeat(22)}` }],
+    });
+  });
+
   it('adopts transferred DOM artifacts without removing them on rollback, then arms commit ownership', () => {
     const frame = document.createElement('iframe');
     document.body.append(frame);

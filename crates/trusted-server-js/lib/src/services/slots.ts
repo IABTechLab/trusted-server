@@ -149,6 +149,10 @@ export interface SlotService {
     registeredSlotId: string,
     binding: GptSlotBinding
   ) => GptSlotAdoptionResult;
+  readonly adoptRegistrationHighWater: (
+    navigationGeneration: object,
+    nextOrdinal: number
+  ) => boolean;
   readonly dispose: () => void;
   readonly handleGptEvent: (
     type: GptEventType,
@@ -224,6 +228,7 @@ export interface SlotReconciliationBoundary {
 
 interface NavigationState {
   disposed: boolean;
+  highWaterAdopted: boolean;
   nextOrdinal: number;
   observerRelease: (() => void) | undefined;
   readonly owner: NavigationSession;
@@ -2059,6 +2064,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     if (existing) return existing.disposed ? undefined : existing;
     const state: NavigationState = {
       disposed: false,
+      highWaterAdopted: false,
       nextOrdinal: 0,
       observerRelease: undefined,
       owner,
@@ -2392,6 +2398,27 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       }
       return Object.freeze({ ok: false, reason: 'stale_owner' });
     }
+  };
+
+  const adoptRegistrationHighWater = (
+    navigationGeneration: object,
+    nextOrdinal: number
+  ): boolean => {
+    const state = mapValue(navigationStates, navigationGeneration);
+    if (
+      !state ||
+      state.disposed ||
+      state.highWaterAdopted ||
+      !state.owner.isCurrent() ||
+      !Number.isInteger(nextOrdinal) ||
+      nextOrdinal < state.nextOrdinal ||
+      nextOrdinal > 4_294_967_295
+    ) {
+      return false;
+    }
+    state.nextOrdinal = nextOrdinal;
+    state.highWaterAdopted = true;
+    return true;
   };
 
   const request = (input: SlotRequestInput): SlotRequestHandle => {
@@ -3224,6 +3251,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       );
       return operation;
     },
+    adoptRegistrationHighWater,
     adoptGptSlot,
     dispose: (): void => {
       if (disposed) return;

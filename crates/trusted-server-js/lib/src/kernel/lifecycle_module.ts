@@ -1,3 +1,8 @@
+import {
+  type PersistentFirstDisplaySliceStateV1,
+  validatePersistentFirstDisplaySliceAdoptionV1,
+} from '../shared/takeover';
+
 import type {
   IntegrationActivationContext,
   IntegrationPrepareContext,
@@ -16,7 +21,11 @@ export interface IntegrationLifecycleRuntime {
 
 export interface LifecycleIntegrationRegistrationOptions {
   readonly createOwnedRuntime?: (context: IntegrationPrepareContext) => IntegrationLifecycleRuntime;
+  readonly firstDisplaySliceId?: string;
   readonly validateConfig?: (candidate: unknown) => boolean;
+  readonly validateFirstDisplayState?: (
+    candidate: Readonly<PersistentFirstDisplaySliceStateV1>
+  ) => boolean;
 }
 
 function validFrozenConfig(candidate: unknown): boolean {
@@ -123,7 +132,18 @@ export function createLifecycleIntegrationRegistration(
       if (!runtime) throw new TypeError(`${id} integration runtime is unavailable`);
 
       return Object.freeze({
-        activate: ({ afterCommit, onDispose }: IntegrationActivationContext) => {
+        activate: ({ adoption, afterCommit, onDispose }: IntegrationActivationContext) => {
+          if (adoption !== undefined && options.firstDisplaySliceId !== undefined) {
+            if (
+              !validatePersistentFirstDisplaySliceAdoptionV1(
+                adoption,
+                options.firstDisplaySliceId,
+                options.validateFirstDisplayState
+              )
+            ) {
+              throw new TypeError(`${id} first-display parser state is invalid`);
+            }
+          }
           const runtimeRelease: { value?: () => void } = {};
           onDispose(() => runtimeRelease.value?.());
           const releaseRuntime = runtime.activate(config);

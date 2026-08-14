@@ -86,6 +86,7 @@ function fixture(kind: 'adm' | 'aps' = 'adm') {
     physicalSlot: {},
     placement,
     slotId: 'slot-1',
+    traceToken: 'gt1_1',
   });
   return { cycle, dom, element };
 }
@@ -177,7 +178,13 @@ function harness(kind: 'adm' | 'aps' = 'adm', onNativeMutation?: () => boolean) 
     },
   });
   const terminals: string[] = [];
-  expect(bridge.bind(value.cycle, (result) => terminals.push(result))).toBe(true);
+  const terminalFacts: Array<readonly [string, string | null]> = [];
+  expect(
+    bridge.bind(value.cycle, (result, reason) => {
+      terminals.push(result);
+      terminalFacts.push([result, reason]);
+    })
+  ).toBe(true);
   const dispatch = (event: Record<string, unknown>): void => {
     if (!listener) throw new Error('expected capture listener');
     listener(event);
@@ -197,7 +204,18 @@ function harness(kind: 'adm' | 'aps' = 'adm', onNativeMutation?: () => boolean) 
     now += delayMs;
     entry[1].callback();
   };
-  return { ...value, bridge, channels, dispatch, fire, fireLast, target, terminals, timers };
+  return {
+    ...value,
+    bridge,
+    channels,
+    dispatch,
+    fire,
+    fireLast,
+    target,
+    terminalFacts,
+    terminals,
+    timers,
+  };
 }
 
 function requestEvent(
@@ -570,6 +588,7 @@ describe('bounded first-display render bridge', () => {
     expect(timeout.bridge.recordGam(timeout.cycle, 'nonempty_gam')).toBe(true);
     timeout.fire(3_000);
     expect(timeout.terminals).toEqual(['failed']);
+    expect(timeout.terminalFacts).toEqual([['failed', 'bridge_claim_timeout']]);
 
     const pending = harness('adm');
     expect(pending.bridge.recordGam(pending.cycle, 'gam_empty')).toBe(true);
@@ -578,6 +597,7 @@ describe('bounded first-display render bridge', () => {
     pending.bridge.dispose();
     pending.bridge.dispose();
     expect(pending.terminals).toEqual(['cancelled']);
+    expect(pending.terminalFacts).toEqual([['cancelled', 'navigation_disposed']]);
     expect(pending.element.contains(frame)).toBe(false);
     expect(pending.target.removeEventListener).toHaveBeenCalledTimes(1);
     expect(pending.target.removeEventListener).toHaveBeenCalledWith(
@@ -595,11 +615,13 @@ describe('bounded first-display render bridge', () => {
     expect(ticket.bridge.recordGam(ticket.cycle, 'nonempty_gam')).toBe(true);
     ticket.fire(3_000);
     expect(ticket.terminals).toEqual(['failed']);
+    expect(ticket.terminalFacts).toEqual([['failed', 'owner_registration_timeout']]);
 
     const insertion = harness('adm');
     registerOwner(insertion);
     insertion.fire(1_000);
     expect(insertion.terminals).toEqual(['failed']);
+    expect(insertion.terminalFacts).toEqual([['failed', 'owner_insertion_timeout']]);
 
     const adm = harness('adm');
     const admOwner = registerOwner(adm);
@@ -610,6 +632,7 @@ describe('bounded first-display render bridge', () => {
     });
     adm.fire(5_000);
     expect(adm.terminals).toEqual(['failed']);
+    expect(adm.terminalFacts).toEqual([['failed', 'adm_document_no_load']]);
 
     const document = harness('aps');
     const documentOwner = registerOwner(document);
@@ -620,6 +643,7 @@ describe('bounded first-display render bridge', () => {
     });
     document.fireLast(3_000);
     expect(document.terminals).toEqual(['failed']);
+    expect(document.terminalFacts).toEqual([['failed', 'renderer_document_no_load']]);
 
     const completion = harness('aps');
     const completionOwner = registerOwner(completion);
@@ -640,6 +664,7 @@ describe('bounded first-display render bridge', () => {
     });
     completion.fire(10_000);
     expect(completion.terminals).toEqual(['failed']);
+    expect(completion.terminalFacts).toEqual([['failed', 'runner_failed']]);
   });
 
   it('seals only after every attempt is terminal and refuses later authority', () => {
@@ -671,8 +696,17 @@ describe('bounded first-display render bridge', () => {
           token: RESERVATION_ID,
         },
       ],
+      clockEpochMs: 0,
+      nextReservationOrdinal: 2,
       nextTicketOrdinal: 1,
-      tombstones: [],
+      tombstones: [
+        {
+          expiresAtMs: 900_000,
+          kind: 'reservation',
+          ordinal: 1,
+          value: RESERVATION_ID,
+        },
+      ],
     });
     expect(h.bridge.detachCommittedArtifacts()).toBe(true);
     expect(h.bridge.detachCommittedArtifacts()).toBe(false);

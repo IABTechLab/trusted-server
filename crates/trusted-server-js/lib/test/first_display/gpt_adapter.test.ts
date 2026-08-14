@@ -134,10 +134,29 @@ describe('first-display GPT adapter', () => {
     slot.setTargeting('publisher', 'value');
     service.refresh([slot]);
     binding.display('publisher-slot');
-    listeners.get('slotRequested')?.({ slot });
-    expect(mutations).toHaveBeenCalledTimes(4);
+    listeners.get('slotRequested')?.({ slot, responseIdentifier: 'response-two' });
+    listeners.get('slotRenderEnded')?.({
+      slot,
+      responseIdentifier: 'response-two',
+      isEmpty: false,
+    });
+    expect(mutations).toHaveBeenCalledTimes(5);
 
     expect(adapter.closeIngress()).toBe(true);
+    expect(adapter.captureDiagnosticsHandoff()?.cycles).toEqual([
+      expect.objectContaining({
+        nextCycleOrdinal: 3,
+        records: [
+          expect.objectContaining({ ordinal: 1, state: 'completed' }),
+          expect.objectContaining({
+            ordinal: 2,
+            responseIdentifier: 'response-two',
+            seen: ['slotRequested', 'slotRenderEnded'],
+            state: 'completed',
+          }),
+        ],
+      }),
+    ]);
     mutations.mockClear();
     slot.setTargeting('publisher', 'later');
     service.refresh([slot]);
@@ -585,5 +604,140 @@ describe('first-display GPT adapter', () => {
 
     expect(service.removeEventListener).toHaveBeenCalledTimes(2);
     expect(destroySlots).not.toHaveBeenCalled();
+  });
+
+  it('captures six exact normalized diagnostics facts with stable slot identity', () => {
+    const dom = new JSDOM('<!doctype html><div id="slot-1"></div>', {
+      url: 'https://publisher.example/',
+    });
+    vi.spyOn(dom.window.performance, 'now').mockReturnValue(12.5);
+    const listeners = new Map<string, (event: unknown) => void>();
+    const slot = {
+      addService: () => slot,
+      getAdUnitPath: () => '/123/example',
+      getSlotElementId: () => 'slot-1',
+      setTargeting: () => slot,
+    };
+    const service = {
+      addEventListener: (name: string, listener: (event: unknown) => void) =>
+        listeners.set(name, listener),
+      getSlots: () => [],
+      removeEventListener: () => undefined,
+    };
+    Object.defineProperty(dom.window, 'googletag', {
+      configurable: true,
+      value: {
+        cmd: { push: (command: () => void) => command() },
+        defineSlot: () => slot,
+        display: () => undefined,
+        getConfig: () => ({ disableInitialLoad: false }),
+        pubads: () => service,
+      },
+    });
+    const value = snapshotFirstDisplayBatchV1(fixture())!;
+    const adapter = createFirstDisplayGoogletagBatch({
+      browser: dom.window as unknown as Window,
+      clearTimer: () => undefined,
+      diagnosticsActive: true,
+      document: dom.window.document,
+      projection: value.projection,
+      protocol: protocol(),
+      setTimer: (callback) => callback,
+    });
+    adapter.start({
+      onBound: () => undefined,
+      onFailure: () => undefined,
+      onFirstAction: () => true,
+      onRenderEnded: () => undefined,
+    });
+
+    listeners.get('slotRequested')?.({ slot, responseIdentifier: 'response-one' });
+    listeners.get('slotResponseReceived')?.({ slot, responseIdentifier: 'response-one' });
+    listeners.get('slotRenderEnded')?.({
+      slot,
+      responseIdentifier: 'response-one',
+      isEmpty: false,
+      size: [300, 250],
+      isBackfill: false,
+      slotContentChanged: true,
+    });
+    listeners.get('slotOnload')?.({ slot });
+    listeners.get('impressionViewable')?.({ slot });
+    listeners.get('slotVisibilityChanged')?.({ slot, inViewPercentage: 42 });
+    expect(adapter.closeIngress()).toBe(true);
+
+    const diagnostics = adapter.captureDiagnosticsHandoff();
+    expect([...listeners.keys()]).toEqual([
+      'slotRequested',
+      'slotRenderEnded',
+      'slotResponseReceived',
+      'slotOnload',
+      'impressionViewable',
+      'slotVisibilityChanged',
+    ]);
+    expect(diagnostics).toMatchObject({
+      nextTraceTokenOrdinal: 2,
+      overflowCount: 0,
+      dropCount: 0,
+    });
+    expect(diagnostics?.facts).toHaveLength(6);
+    expect(
+      (
+        diagnostics as unknown as {
+          readonly cycles: readonly unknown[];
+        }
+      )?.cycles
+    ).toEqual([
+      {
+        nextCycleOrdinal: 2,
+        quarantines: [],
+        records: [
+          {
+            ordinal: 1,
+            responseIdentifier: 'response-one',
+            seen: [
+              'slotRequested',
+              'slotResponseReceived',
+              'slotRenderEnded',
+              'slotOnload',
+              'impressionViewable',
+              'slotVisibilityChanged',
+            ],
+            state: 'completed',
+          },
+        ],
+        slotId: 'slot-1',
+        token: 'gt1_1',
+        unknownPriorCycle: false,
+      },
+    ]);
+    expect(diagnostics?.facts[0]).toEqual({
+      version: 1,
+      event: 'slotRequested',
+      token: 'gt1_1',
+      runtimeSlotNumber: 1,
+      cycleOrdinal: 1,
+      disposition: 'matched',
+      issueReason: null,
+      capturedAtMs: 12.5,
+      elementId: 'slot-1',
+      adUnitPath: '/123/example',
+      isEmpty: null,
+      renderedSize: null,
+      isBackfill: null,
+      slotContentChanged: null,
+      visibilityPercent: null,
+    });
+    expect(diagnostics?.facts[2]).toMatchObject({
+      event: 'slotRenderEnded',
+      isEmpty: false,
+      renderedSize: [300, 250],
+      isBackfill: false,
+      slotContentChanged: true,
+    });
+    expect(diagnostics?.facts[5]).toMatchObject({
+      event: 'slotVisibilityChanged',
+      visibilityPercent: 42,
+    });
   });
 });

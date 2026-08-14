@@ -1227,6 +1227,7 @@ describe('browser googletag adapter readiness', () => {
         slot: {
           token: expect.any(Object),
           traceToken: 'gt1_1',
+          runtimeSlotNumber: 1,
           elementId: 'fictional-slot',
           adUnitPath: '/example/fictional-slot',
         },
@@ -1258,6 +1259,7 @@ describe('browser googletag adapter readiness', () => {
     expect(Reflect.ownKeys(safeSlot).sort()).toEqual([
       'adUnitPath',
       'elementId',
+      'runtimeSlotNumber',
       'token',
       'traceToken',
     ]);
@@ -1570,6 +1572,7 @@ describe('browser googletag adapter readiness', () => {
     expect(Reflect.ownKeys(facts[0]?.slot ?? {}).sort()).toEqual([
       'adUnitPath',
       'elementId',
+      'runtimeSlotNumber',
       'token',
       'traceToken',
     ]);
@@ -1586,6 +1589,116 @@ describe('browser googletag adapter readiness', () => {
     expect(adapter.traceToken(first)).toMatch(/^gt1_[1-9a-z][0-9a-z]{0,6}$/);
     adapter.dispose();
     expect(adapter.traceToken(first)).toBeUndefined();
+  });
+
+  it('adopts transferred per-slot diagnostics cycles and the global token high-water value once', () => {
+    const adapter = createBrowserGoogletagAdapter({});
+    const adopted = {};
+
+    expect(
+      adapter.adoptDiagnosticsState?.({
+        nextTraceTokenOrdinal: 9,
+        slots: [
+          {
+            nextCycleOrdinal: 4,
+            physicalSlot: adopted,
+            records: [
+              {
+                ordinal: 1,
+                responseIdentifier: null,
+                seen: ['slotRequested', 'slotRenderEnded'],
+                state: 'completed',
+              },
+              {
+                ordinal: 3,
+                responseIdentifier: null,
+                seen: ['slotRequested'],
+                state: 'retired',
+              },
+            ],
+            traceToken: 'gt1_5',
+            unknownPriorCycle: true,
+          },
+        ],
+      })
+    ).toBe(true);
+    expect(adapter.traceToken(adopted)).toBe('gt1_5');
+    const adoptedIdentity = adapter.diagnosticsIdentity(adopted);
+    expect(adoptedIdentity).toMatchObject({
+      traceToken: 'gt1_5',
+      runtimeSlotNumber: 5,
+      cycleOrdinal: 3,
+    });
+    expect(typeof adoptedIdentity?.token).toBe('object');
+    expect(adapter.diagnosticsIdentity(adopted)?.token).toBe(adoptedIdentity?.token);
+    expect(adapter.traceToken({})).toBe('gt1_9');
+    expect(adapter.adoptDiagnosticsState?.({ nextTraceTokenOrdinal: 10, slots: [] })).toBe(false);
+  });
+
+  it('preserves transferred cycle correlation for late diagnostics after takeover', async () => {
+    const ready = createReadyGoogletag();
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+    const adopted = {};
+    const facts: GoogletagDiagnosticsFact[] = [];
+
+    expect(
+      adapter.adoptDiagnosticsState?.({
+        nextTraceTokenOrdinal: 2,
+        slots: [
+          {
+            nextCycleOrdinal: 2,
+            physicalSlot: adopted,
+            records: [
+              {
+                ordinal: 1,
+                responseIdentifier: 'response-one',
+                seen: ['slotRequested', 'slotRenderEnded'],
+                state: 'completed',
+              },
+            ],
+            traceToken: 'gt1_1',
+            unknownPriorCycle: true,
+          },
+        ],
+      } as never)
+    ).toBe(true);
+    adapter.observeDiagnostics((fact) => facts.push(fact));
+    await adapter.run((gpt) => gpt.subscribe('slotOnload', () => undefined, true)).result;
+
+    for (const listener of ready.listeners.get('slotOnload') ?? []) {
+      listener({ slot: adopted, responseIdentifier: 'response-one' });
+    }
+
+    expect(facts).toHaveLength(1);
+    expect(facts[0]?.slot).toMatchObject({ traceToken: 'gt1_1', cycleOrdinal: 1 });
+  });
+
+  it('rejects malformed diagnostics adoption without consuming the token high-water value', () => {
+    const adapter = createBrowserGoogletagAdapter({});
+    const physicalSlot = {};
+
+    expect(
+      adapter.adoptDiagnosticsState?.({
+        nextTraceTokenOrdinal: 2,
+        slots: [
+          {
+            nextCycleOrdinal: 1,
+            physicalSlot,
+            records: [
+              {
+                ordinal: 1,
+                responseIdentifier: null,
+                seen: ['slotRequested', 'slotRenderEnded'],
+                state: 'completed',
+              },
+            ],
+            traceToken: 'gt1_1',
+            unknownPriorCycle: false,
+          },
+        ],
+      })
+    ).toBe(false);
+    expect(adapter.traceToken(physicalSlot)).toBe('gt1_1');
   });
 
   it('does not retain default canonical tokens in a collision ledger', () => {

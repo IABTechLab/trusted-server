@@ -55,6 +55,33 @@ describe('navigation identity issuer', () => {
     expect(created.value.snapshotOrdinalForTest()).toEqual([0, 2]);
   });
 
+  it('adopts the next first-display ordinal once before minting', () => {
+    const { source } = deterministicSource([0, 1, 2, 3, 4, 5, 6, 7]);
+    const created = createTestNavigationIdentityIssuer({ getRandomValues: source });
+    if (!created.ok) throw new Error('Expected an identity issuer');
+
+    expect(created.value.adoptNextAttemptOrdinal(9)).toBe(true);
+    expect(created.value.mintAttemptId()).toEqual({
+      ok: true,
+      value: 'a1_AAECAwQFBgcAAAAAAAAACQ',
+    });
+    expect(created.value.adoptNextAttemptOrdinal(10)).toBe(false);
+    expect(created.value.snapshotOrdinalForTest()).toEqual([0, 9]);
+  });
+
+  it('adopts the exact first-display prefix and next ordinal as one state transition', () => {
+    const { source } = deterministicSource([0, 1, 2, 3, 4, 5, 6, 7]);
+    const created = createTestNavigationIdentityIssuer({ getRandomValues: source });
+    if (!created.ok) throw new Error('Expected an identity issuer');
+
+    expect(created.value.adoptFirstDisplayState('CAcGBQQDAgE', 9)).toBe(true);
+    expect(created.value.mintAttemptId()).toEqual({
+      ok: true,
+      value: 'a1_CAcGBQQDAgEAAAAAAAAACQ',
+    });
+    expect(created.value.adoptFirstDisplayState('AAECAwQFBgc', 10)).toBe(false);
+  });
+
   it('owns an immutable copy of the source-filled navigation prefix', () => {
     let sourceBuffer: Uint8Array<ArrayBuffer> | undefined;
     const created = createTestNavigationIdentityIssuer({

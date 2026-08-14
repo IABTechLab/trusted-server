@@ -1,8 +1,12 @@
 import type {
+  GptSlotTokenV1,
+  GptTraceCycleOrdinalV1,
   GoogletagAdapter,
   GoogletagDiagnosticsFact,
   GoogletagDiagnosticsObserver,
+  GoogletagDiagnosticsSlotSnapshot,
 } from '../../adapters/googletag';
+import type { FirstDisplayGptDiagnosticsV1, FirstDisplayGptFactV1 } from '../../shared/takeover';
 
 const MAX_BUFFERED_FACTS = 512;
 const DIAGNOSTICS_ONLY_EVENTS = Object.freeze([
@@ -11,12 +15,24 @@ const DIAGNOSTICS_ONLY_EVENTS = Object.freeze([
   'impressionViewable',
   'slotVisibilityChanged',
 ] as const);
+const ALL_DIAGNOSTIC_EVENTS = new Set<string>([
+  'slotRequested',
+  'slotResponseReceived',
+  'slotRenderEnded',
+  'slotOnload',
+  'impressionViewable',
+  'slotVisibilityChanged',
+]);
 export interface GptDiagnosticsFactBufferOptions {
   readonly onConsumerError?: (error: unknown) => void;
   readonly onOverflow?: (droppedFacts: number) => void;
 }
 
 export interface GptDiagnosticsFactBuffer {
+  readonly adoptFirstDisplay: (
+    diagnostics: Readonly<FirstDisplayGptDiagnosticsV1>,
+    resolveSlot?: (traceToken: string) => Readonly<GoogletagDiagnosticsSlotSnapshot> | undefined
+  ) => boolean;
   readonly publish: (fact: Readonly<GoogletagDiagnosticsFact>) => boolean;
   readonly activate: (consumer: GoogletagDiagnosticsObserver) => (() => void) | undefined;
   readonly dispose: () => void;
@@ -80,6 +96,177 @@ function validFact(fact: unknown): fact is Readonly<GoogletagDiagnosticsFact> {
   );
 }
 
+const FIRST_DISPLAY_FACT_KEYS = Object.freeze([
+  'version',
+  'event',
+  'token',
+  'runtimeSlotNumber',
+  'cycleOrdinal',
+  'disposition',
+  'issueReason',
+  'capturedAtMs',
+  'elementId',
+  'adUnitPath',
+  'isEmpty',
+  'renderedSize',
+  'isBackfill',
+  'slotContentChanged',
+  'visibilityPercent',
+]);
+
+function exactFrozenRecord(
+  candidate: unknown,
+  keys: readonly string[]
+): Readonly<Record<string, unknown>> | undefined {
+  if (
+    typeof candidate !== 'object' ||
+    candidate === null ||
+    Array.isArray(candidate) ||
+    !Object.isFrozen(candidate)
+  ) {
+    return undefined;
+  }
+  const actual = Reflect.ownKeys(candidate);
+  if (
+    actual.length !== keys.length ||
+    actual.some((key) => typeof key !== 'string' || !keys.includes(key))
+  ) {
+    return undefined;
+  }
+  const result: Record<string, unknown> = {};
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(candidate, key);
+    if (!descriptor?.enumerable || !('value' in descriptor)) return undefined;
+    result[key] = descriptor.value;
+  }
+  return result;
+}
+
+function validTransferredFact(candidate: unknown): candidate is Readonly<FirstDisplayGptFactV1> {
+  const fields = exactFrozenRecord(candidate, FIRST_DISPLAY_FACT_KEYS);
+  if (!fields) return false;
+  const tokenOrdinal =
+    typeof fields.token === 'string' && /^gt1_[1-9a-z][0-9a-z]{0,6}$/.test(fields.token)
+      ? Number.parseInt(fields.token.slice(4), 36)
+      : undefined;
+  const event = fields.event;
+  const disposition = fields.disposition;
+  const issueReason = fields.issueReason;
+  const renderedSize = fields.renderedSize;
+  return (
+    fields.version === 1 &&
+    ALL_DIAGNOSTIC_EVENTS.has(event as string) &&
+    tokenOrdinal !== undefined &&
+    tokenOrdinal >= 1 &&
+    tokenOrdinal <= 4_294_967_295 &&
+    fields.runtimeSlotNumber === tokenOrdinal &&
+    (fields.cycleOrdinal === null ||
+      (Number.isInteger(fields.cycleOrdinal) &&
+        (fields.cycleOrdinal as number) >= 1 &&
+        (fields.cycleOrdinal as number) <= 4_294_967_295)) &&
+    (disposition === 'matched' || disposition === 'unmatched' || disposition === 'ambiguous') &&
+    (issueReason === null ||
+      issueReason === 'no_request_cycle' ||
+      issueReason === 'overlapping_request_cycles' ||
+      issueReason === 'unknown_prior_cycle' ||
+      issueReason === 'invalid_event_order') &&
+    typeof fields.capturedAtMs === 'number' &&
+    Number.isFinite(fields.capturedAtMs) &&
+    fields.capturedAtMs >= 0 &&
+    (fields.elementId === null ||
+      (typeof fields.elementId === 'string' && fields.elementId.length > 0)) &&
+    (fields.adUnitPath === null ||
+      (typeof fields.adUnitPath === 'string' && fields.adUnitPath.length > 0)) &&
+    (fields.isEmpty === null || typeof fields.isEmpty === 'boolean') &&
+    (renderedSize === null ||
+      (Array.isArray(renderedSize) &&
+        Object.isFrozen(renderedSize) &&
+        renderedSize.length === 2 &&
+        renderedSize.every(
+          (dimension) => Number.isInteger(dimension) && dimension >= 1 && dimension <= 4096
+        ))) &&
+    (fields.isBackfill === null || typeof fields.isBackfill === 'boolean') &&
+    (fields.slotContentChanged === null || typeof fields.slotContentChanged === 'boolean') &&
+    (fields.visibilityPercent === null ||
+      (typeof fields.visibilityPercent === 'number' &&
+        Number.isFinite(fields.visibilityPercent) &&
+        fields.visibilityPercent >= 0 &&
+        fields.visibilityPercent <= 100))
+  );
+}
+
+function rawFirstDisplayFacts(
+  diagnostics: Readonly<FirstDisplayGptDiagnosticsV1>,
+  resolveSlot?: (traceToken: string) => Readonly<GoogletagDiagnosticsSlotSnapshot> | undefined
+): readonly Readonly<GoogletagDiagnosticsFact>[] | undefined {
+  const fields = exactFrozenRecord(diagnostics, ['facts', 'overflowCount', 'dropCount']);
+  if (
+    !fields ||
+    !Array.isArray(fields.facts) ||
+    !Object.isFrozen(fields.facts) ||
+    fields.facts.length > MAX_BUFFERED_FACTS ||
+    !Number.isInteger(fields.overflowCount) ||
+    (fields.overflowCount as number) < 0 ||
+    (fields.overflowCount as number) > 4_294_967_295 ||
+    !Number.isInteger(fields.dropCount) ||
+    (fields.dropCount as number) < 0 ||
+    (fields.dropCount as number) > 4_294_967_295
+  ) {
+    return undefined;
+  }
+  const slotByTraceToken = new Map<string, Readonly<GoogletagDiagnosticsSlotSnapshot>>();
+  const facts: Array<Readonly<GoogletagDiagnosticsFact>> = [];
+  for (const candidate of fields.facts) {
+    if (!validTransferredFact(candidate)) return undefined;
+    let slot = slotByTraceToken.get(candidate.token);
+    if (!slot) {
+      let resolved: Readonly<GoogletagDiagnosticsSlotSnapshot> | undefined;
+      try {
+        resolved = resolveSlot?.(candidate.token);
+      } catch {
+        return undefined;
+      }
+      if (
+        resolved &&
+        (typeof resolved.token !== 'object' ||
+          resolved.token === null ||
+          resolved.traceToken !== candidate.token ||
+          resolved.runtimeSlotNumber !== candidate.runtimeSlotNumber)
+      ) {
+        return undefined;
+      }
+      slot = Object.freeze({
+        token: resolved?.token ?? Object.freeze(Object.create(null) as object),
+        traceToken: candidate.token as GptSlotTokenV1,
+        runtimeSlotNumber: candidate.runtimeSlotNumber,
+        ...(candidate.cycleOrdinal === null
+          ? {}
+          : { cycleOrdinal: candidate.cycleOrdinal as GptTraceCycleOrdinalV1 }),
+        ...(candidate.elementId === null ? {} : { elementId: candidate.elementId }),
+        ...(candidate.adUnitPath === null ? {} : { adUnitPath: candidate.adUnitPath }),
+      });
+      slotByTraceToken.set(candidate.token, slot);
+    }
+    facts.push(
+      Object.freeze({
+        kind: candidate.event,
+        observedAtMs: candidate.capturedAtMs,
+        slot,
+        ...(candidate.isEmpty === null ? {} : { isEmpty: candidate.isEmpty }),
+        ...(candidate.renderedSize === null ? {} : { size: candidate.renderedSize }),
+        ...(candidate.isBackfill === null ? {} : { isBackfill: candidate.isBackfill }),
+        ...(candidate.slotContentChanged === null
+          ? {}
+          : { slotContentChanged: candidate.slotContentChanged }),
+        ...(candidate.visibilityPercent === null
+          ? {}
+          : { inViewPercentage: candidate.visibilityPercent }),
+      })
+    );
+  }
+  return Object.freeze(facts);
+}
+
 /** Own the GPT-side bounded handoff between early callbacks and diagnostics consumers. */
 export function createGptDiagnosticsFactBuffer(
   options: GptDiagnosticsFactBufferOptions = {}
@@ -90,6 +277,7 @@ export function createGptDiagnosticsFactBuffer(
   let replaying = false;
   let disposed = false;
   let droppedFacts = 0;
+  let adoptionOpen = true;
 
   const reportConsumerError = (error: unknown): void => {
     try {
@@ -124,13 +312,28 @@ export function createGptDiagnosticsFactBuffer(
   };
 
   return Object.freeze({
+    adoptFirstDisplay: (
+      diagnostics: Readonly<FirstDisplayGptDiagnosticsV1>,
+      resolveSlot?: (traceToken: string) => Readonly<GoogletagDiagnosticsSlotSnapshot> | undefined
+    ): boolean => {
+      const facts = rawFirstDisplayFacts(diagnostics, resolveSlot);
+      if (disposed || !adoptionOpen || pending.length !== 0 || consumer !== undefined || !facts) {
+        return false;
+      }
+      pending.push(...facts);
+      droppedFacts = diagnostics.overflowCount;
+      adoptionOpen = false;
+      return true;
+    },
     publish: (fact: Readonly<GoogletagDiagnosticsFact>): boolean => {
+      adoptionOpen = false;
       if (disposed || !validFact(fact)) return false;
       if (replaying || !consumer) enqueue(fact);
       else deliver(fact);
       return true;
     },
     activate: (nextConsumer: GoogletagDiagnosticsObserver): (() => void) | undefined => {
+      adoptionOpen = false;
       if (disposed || consumer || typeof nextConsumer !== 'function') return undefined;
       consumer = nextConsumer;
       consumerGeneration += 1;

@@ -1,16 +1,23 @@
 import type { BootstrapController } from '../core/bootstrap_controller';
 import type { BootFailureReason } from '../kernel/fallback';
+import {
+  createNavigationIdentityIssuerFromSource,
+  type NavigationIdentityIssuer,
+} from '../kernel/identity';
 import type { FirstDisplaySliceId } from '../kernel/release_catalog';
+import type { FirstDisplayGptDiagnosticsV1 } from '../shared/takeover';
 
 import type {
   FirstDisplayGoogletagBatchInput,
   FirstDisplayGptBoundCycleV1,
+  FirstDisplayGptDiagnosticCycleV1,
 } from './adapters/googletag';
 import { createFirstDisplayProjectedDriver, type FirstDisplayRenderBridgeV1 } from './driver';
 import type { FirstDisplayApsProtocolV1 } from './leaf/aps_protocol';
 import type { FirstDisplayGptProtocolV1 } from './leaf/gpt_protocol';
 import {
   captureMutationObservedBindings,
+  createFirstDisplayParserStateCollector,
   firstDisplayComponentRegistration,
   registerCurrentFirstDisplayComponent,
 } from './registration';
@@ -55,7 +62,7 @@ export interface FirstDisplayDriver {
   readonly start: (
     outcomes: readonly FirstDisplayBatchOutcomeV1[],
     onFirstAction: () => boolean,
-    onTerminal: (slotId: string, result: FirstDisplayTerminalResult) => void
+    onTerminal: (slotId: string, result: FirstDisplayTerminalResult, reason: string | null) => void
   ) => void;
   readonly sealTsAdmission: () => void;
   readonly closeIngress: () => boolean;
@@ -73,10 +80,15 @@ export interface FirstDisplayDriverHandoffV1 {
     token: string;
   }>[];
   readonly cycles: readonly FirstDisplayGptBoundCycleV1[];
+  readonly diagnosticCycles: readonly Readonly<FirstDisplayGptDiagnosticCycleV1>[];
+  readonly clockEpochMs: number;
+  readonly gptDiagnostics: Readonly<FirstDisplayGptDiagnosticsV1>;
   readonly identities: readonly object[];
+  readonly nextReservationOrdinal: number;
+  readonly nextTraceTokenOrdinal: number;
   readonly nextTicketOrdinal: number;
   readonly tombstones: readonly Readonly<{
-    kind: 'ticket';
+    kind: 'reservation' | 'ticket';
     value: string;
     expiresAtMs: number;
     ordinal: number;
@@ -101,6 +113,12 @@ export interface FirstDisplayAgentOptions {
   readonly mutationDocument?: Document;
   readonly initialMutationRevision?: number;
   readonly now?: () => number;
+  readonly identityIssuer?: NavigationIdentityIssuer;
+  readonly parserState?: () => readonly Readonly<{
+    sliceId: string;
+    observations: readonly string[];
+    values: readonly (readonly [string, string | number | boolean | null])[];
+  }>[];
   readonly handoff?: Readonly<{
     releaseId: string;
     generation: number;
@@ -298,6 +316,7 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
     FirstDisplayTerminalResult | 'no_bid' | 'failed' | 'cancelled'
   >();
   private readonly pending = new Set<string>();
+  private readonly reasons = new Map<string, string | null>();
   private readonly handoffOwner: FirstDisplayHandoffOwner | undefined;
   private stateValue: FirstDisplayAgentState = 'ready';
   private mutationObserver: MutationObserver | undefined;
@@ -313,6 +332,11 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
   private firstDisplayMs: number | null = null;
   private terminalMs: number | undefined;
   private paintMs: number | undefined;
+  private nextTraceSequence = 1;
+  private readonly acceptedTrace = new Map<
+    string,
+    Readonly<{ atMs: number; historySequence: number }>
+  >();
 
   public constructor(private readonly options: FirstDisplayAgentOptions) {
     this.batch = snapshotFirstDisplayBatchV1(options.batch);
@@ -361,12 +385,15 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
     }
 
     const actions: FirstDisplayBatchOutcomeV1[] = [];
-    for (const outcome of this.batch.outcomes) {
+    for (let index = 0; index < this.batch.outcomes.length; index += 1) {
+      const outcome = this.batch.outcomes[index]!;
       if (ACTION_KINDS.has(outcome.kind)) {
         this.pending.add(outcome.slotId);
         actions.push(outcome);
       } else {
         this.results.set(outcome.slotId, outcome.kind as 'no_bid' | 'failed' | 'cancelled');
+        const decision = this.batch.projection.auction.results[index];
+        this.reasons.set(outcome.slotId, decision?.outcome === 'failed' ? decision.reason : null);
       }
     }
     this.stateValue = 'active';
@@ -378,8 +405,8 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
       this.options.driver.start(
         Object.freeze(actions),
         () => this.recordFirstAction(),
-        (slotId, result) => {
-          this.settle(slotId, result);
+        (slotId, result, reason) => {
+          this.settle(slotId, result, reason);
         }
       );
       return true;
@@ -471,21 +498,41 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
     this.pending.clear();
   }
 
-  private settle(slotId: string, result: FirstDisplayTerminalResult): void {
+  private settle(slotId: string, result: FirstDisplayTerminalResult, reason: string | null): void {
     if (!this.actionStarted) {
       this.fail('bundle_partial');
       return;
     }
     if (this.stateValue !== 'active') return;
-    if (typeof result !== 'string' || !TERMINAL_RESULTS.has(result)) {
+    if (
+      typeof result !== 'string' ||
+      !TERMINAL_RESULTS.has(result) ||
+      (result === 'accepted'
+        ? reason !== null
+        : typeof reason !== 'string' || reason.length === 0 || reason.length > 256)
+    ) {
       this.fail('bundle_partial');
       return;
     }
-    if (!this.pending.delete(slotId)) {
+    if (!this.pending.has(slotId)) {
       if (!this.results.has(slotId)) this.fail('bundle_partial');
       return;
     }
+    if (result === 'accepted') {
+      const atMs = this.readTiming();
+      if (atMs === undefined || this.nextTraceSequence > 4_294_967_295) {
+        this.fail('bundle_partial');
+        return;
+      }
+      this.acceptedTrace.set(
+        slotId,
+        Object.freeze({ atMs, historySequence: this.nextTraceSequence })
+      );
+      this.nextTraceSequence += 1;
+    }
+    this.pending.delete(slotId);
     this.results.set(slotId, result);
+    this.reasons.set(slotId, reason);
     if (result === 'accepted') this.initialDisplayCommitted = true;
     if (this.pending.size === 0) this.recordTerminal();
   }
@@ -582,11 +629,19 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
       return undefined;
     }
     const cycleBySlot = new Map(captured.cycles.map((cycle) => [cycle.slotId, cycle]));
+    const diagnosticCycleBySlot = new Map(
+      captured.diagnosticCycles.map((cycle) => [cycle.slotId, cycle])
+    );
+    const cycleTokenBySlot = new Map(
+      captured.cycles.map((cycle) => [cycle.slotId, cycle.traceToken])
+    );
     const artifactBySlot = new Map(
       captured.artifacts.map((artifact) => [artifact.slotId, artifact])
     );
     if (
       cycleBySlot.size !== captured.cycles.length ||
+      diagnosticCycleBySlot.size !== captured.diagnosticCycles.length ||
+      captured.diagnosticCycles.length !== captured.cycles.length ||
       artifactBySlot.size !== captured.artifacts.length
     ) {
       return undefined;
@@ -621,7 +676,7 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
           .sort()
           .map((key) => [key, targeting[key]]),
         committedArtifact,
-        gptToken: null,
+        gptToken: cycleTokenBySlot.get(placement.slot) ?? null,
       };
     });
     const acceptedIds = new Set(
@@ -642,33 +697,74 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
     ) {
       return undefined;
     }
-    const attempts = slots.map((slot, index) => ({
-      id: `fd1_${index + 1}`,
-      slotId: slot.id,
-      ordinal: index + 1,
-      state: slot.outcome,
-      reason: null,
-    }));
+    const issuer = this.options.identityIssuer;
+    if (!issuer) return undefined;
+    const attempts = [];
+    for (let index = 0; index < slots.length; index += 1) {
+      const slot = slots[index]!;
+      const identity = issuer.mintAttemptId();
+      if (!identity.ok) return undefined;
+      attempts.push({
+        id: identity.value,
+        slotId: slot.id,
+        ordinal: index + 1,
+        state: slot.outcome,
+        reason: this.reasons.get(slot.id) ?? null,
+      });
+    }
     const artifacts = slots
       .filter((slot) => slot.committedArtifact !== 'none')
       .map((slot) => {
         const bid = bidBySlot.get(slot.id);
-        if (!bid) throw new TypeError('accepted artifact bid is unavailable');
+        const capturedArtifact = artifactBySlot.get(slot.id);
+        if (!bid || !capturedArtifact) {
+          throw new TypeError('accepted artifact handoff is unavailable');
+        }
         return {
           slotId: slot.id,
           kind: slot.committedArtifact,
-          owner: slot.owner,
+          owner: capturedArtifact.owner,
           token: bid.rendererReservationId,
         };
       });
-    const cycles = captured.cycles.map((cycle, index) => ({
-      slotId: cycle.slotId,
-      token: `gt1_${index + 1}`,
-      nextCycleOrdinal: 2,
-      unknownPriorCycle: cycle.ownership === 'publisher',
-      records: [{ ordinal: 1, state: 'completed' }],
-      quarantines: [],
-    }));
+    const cycles = captured.cycles.map((cycle) => {
+      const diagnostic = diagnosticCycleBySlot.get(cycle.slotId);
+      if (!diagnostic || diagnostic.token !== cycle.traceToken) {
+        throw new TypeError('accepted GPT diagnostic cycle is unavailable');
+      }
+      return {
+        slotId: diagnostic.slotId,
+        token: diagnostic.token,
+        nextCycleOrdinal: diagnostic.nextCycleOrdinal,
+        unknownPriorCycle: diagnostic.unknownPriorCycle,
+        records: diagnostic.records.map((record) => ({
+          ordinal: record.ordinal,
+          responseIdentifier: record.responseIdentifier,
+          seen: [...record.seen],
+          state: record.state,
+        })),
+        quarantines: [...diagnostic.quarantines],
+      };
+    });
+    const traceSlots = slots.map((slot) => {
+      const accepted = this.acceptedTrace.get(slot.id);
+      return {
+        slotId: slot.id,
+        impressions: accepted ? 1 : 0,
+        bindings:
+          !accepted || slot.gptToken === null
+            ? []
+            : [
+                {
+                  atMs: accepted.atMs,
+                  cycleOrdinal: 1,
+                  historySequence: accepted.historySequence,
+                  state: 'completed',
+                  token: slot.gptToken,
+                },
+              ],
+      };
+    });
     return {
       version: 1,
       releaseId: handoff.releaseId,
@@ -679,9 +775,12 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
       attempts,
       tombstones: captured.tombstones.map((entry) => ({ ...entry })),
       artifacts,
-      parserState: [],
-      gptFacts: [],
-      gptFactOverflow: 0,
+      parserState: this.options.parserState?.() ?? [],
+      gptDiagnostics: Object.freeze({
+        facts: Object.freeze([...captured.gptDiagnostics.facts]),
+        overflowCount: captured.gptDiagnostics.overflowCount,
+        dropCount: captured.gptDiagnostics.dropCount,
+      }),
       timing: {
         bidsScriptMs: this.options.bootstrap.startedAtMs,
         firstDisplayMs: this.firstDisplayMs,
@@ -689,23 +788,19 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
         paintMs: this.paintMs,
       },
       highWater: {
-        navigationAttemptPrefix: `fd_${handoff.generation}`,
-        nextNavigationAttemptOrdinal: 2,
+        navigationAttemptPrefix: issuer.snapshotPrefix(),
+        nextNavigationAttemptOrdinal: attempts.length + 1,
         nextAttemptOrdinal: attempts.length + 1,
         nextSlotRegistrationOrdinal: slots.length + 1,
-        reservationClockEpochMs: 0,
-        nextReservationOrdinal: batch.projection.bids.length + 1,
+        reservationClockEpochMs: captured.clockEpochMs,
+        nextReservationOrdinal: captured.nextReservationOrdinal,
         nextTicketOrdinal: captured.nextTicketOrdinal,
       },
       cycles,
       trace: {
-        nextSequence: 1,
-        nextGlobalSlotOrdinal: slots.length + 1,
-        slots: slots.map((slot) => ({
-          slotId: slot.id,
-          impressions: slot.outcome === 'accepted' ? 1 : 0,
-          bindings: [],
-        })),
+        nextSequence: this.nextTraceSequence,
+        nextGlobalSlotOrdinal: captured.nextTraceTokenOrdinal,
+        slots: traceSlots,
       },
       mutationRevision: this.mutationRevision,
     };
@@ -849,6 +944,7 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
     const sliceBindings = bindingsDescriptor.value as (id: string) => unknown;
     const auctionProtocols = new Map<FirstDisplayAuctionProtocolId, unknown>();
     const fullProtocols = new Map<FirstDisplayAuctionProtocolId, unknown>();
+    const parserState = createFirstDisplayParserStateCollector();
     let agent: FirstDisplayAgent | undefined;
     const sliceHost: FirstDisplaySliceHost = Object.freeze({
       activate: (
@@ -859,12 +955,20 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
         if (typeof install !== 'function') {
           throw new TypeError(`unimplemented first-display slice: ${id}`);
         }
+        if (!parserState.register(id)) {
+          throw new TypeError(`invalid first-display parser slice: ${id}`);
+        }
         const protocolId = id.endsWith('_initial')
           ? (id.slice(0, -'_initial'.length) as FirstDisplayAuctionProtocolId)
           : undefined;
         const candidate = captureMutationObservedBindings(
           sliceBindings(id),
-          () => agent?.observeNativeMutation() === true
+          () => agent?.observeNativeMutation() === true,
+          (key, value) => {
+            if (!parserState.observe(id, key, value)) {
+              throw new TypeError(`invalid first-display parser observation: ${id}`);
+            }
+          }
         );
         const installed = install(
           protocolId && AUCTION_PROTOCOLS.includes(protocolId)
@@ -926,10 +1030,19 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
             },
             renderer,
           });
+          const identityIssuer = createNavigationIdentityIssuerFromSource((target) => {
+            fillBrowserRandom(options.gptInput.browser, target);
+            return target;
+          });
+          if (!identityIssuer.ok) {
+            throw new TypeError('first-display navigation identity is unavailable');
+          }
           agent = createFirstDisplayAgent({
             ...options,
             driver,
+            identityIssuer: identityIssuer.value,
             mutationDocument: options.gptInput.document,
+            parserState: parserState.snapshot,
           });
           if (!agent.coversProtocols(auctionProtocols)) {
             throw new TypeError('first-display protocol coverage is incomplete');

@@ -39,6 +39,17 @@ function last<T>(values: readonly T[]): T | undefined {
 }
 
 describe('GptDiagnosticsStore', () => {
+  it('adopts an explicit first-display runtime slot number and advances its high-water value', () => {
+    const store = new GptDiagnosticsStore();
+    const adoptedToken = {};
+
+    store.recordSlotRequested({ token: adoptedToken, runtimeSlotNumber: 5, elementId: 'adopted' });
+    store.recordSlotRequested({ token: {}, elementId: 'fresh' });
+
+    expect(store.snapshot().slots.map(({ runtimeSlotNumber }) => runtimeSlotNumber)).toEqual([
+      5, 6,
+    ]);
+  });
   it('uses the explicit creative-attempt and attribution retention bounds', () => {
     expect(CREATIVE_ATTEMPT_WINDOW_MS).toBe(30_000);
     expect(MAX_CREATIVE_ATTEMPTS).toBe(128);

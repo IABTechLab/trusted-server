@@ -120,6 +120,123 @@ describe('GPT diagnostics fact transport', () => {
     expect(buffer.publish(fact(515))).toBe(false);
   });
 
+  it('validates and rehydrates the bounded first-display fact buffer once', () => {
+    const overflows = vi.fn();
+    const buffer = createGptDiagnosticsFactBuffer({ onOverflow: overflows });
+    const transferredToken = Object.freeze(Object.create(null) as object);
+    const base = {
+      version: 1 as const,
+      token: 'gt1_5',
+      runtimeSlotNumber: 5,
+      cycleOrdinal: 1,
+      disposition: 'matched' as const,
+      issueReason: null,
+      capturedAtMs: 1,
+      elementId: 'slot-1',
+      adUnitPath: '/example/slot-1',
+      isEmpty: null,
+      renderedSize: null,
+      isBackfill: null,
+      slotContentChanged: null,
+      visibilityPercent: null,
+    };
+    const adopted = Object.freeze({
+      facts: Object.freeze([
+        Object.freeze({ ...base, event: 'slotRequested' as const }),
+        Object.freeze({
+          ...base,
+          event: 'slotRenderEnded' as const,
+          capturedAtMs: 2,
+          isEmpty: false,
+          renderedSize: Object.freeze([300, 250] as const),
+          isBackfill: false,
+          slotContentChanged: true,
+        }),
+      ]),
+      overflowCount: 7,
+      dropCount: 3,
+    });
+    const received: Readonly<GoogletagDiagnosticsFact>[] = [];
+
+    expect(
+      buffer.adoptFirstDisplay(adopted, (traceToken) =>
+        traceToken === 'gt1_5'
+          ? Object.freeze({
+              token: transferredToken,
+              traceToken: 'gt1_5' as never,
+              runtimeSlotNumber: 5,
+              cycleOrdinal: 1 as never,
+              elementId: 'slot-1',
+              adUnitPath: '/example/slot-1',
+            })
+          : undefined
+      )
+    ).toBe(true);
+    const release = buffer.activate((value) => received.push(value));
+    expect(received).toHaveLength(2);
+    expect(received.map((value) => projectGptTraceFact(value))).toEqual([
+      {
+        kind: 'slotRequested',
+        observedAtMs: 1,
+        slot: { token: 'gt1_5', cycleOrdinal: 1, elementId: 'slot-1' },
+      },
+      {
+        kind: 'slotRenderEnded',
+        observedAtMs: 2,
+        slot: { token: 'gt1_5', cycleOrdinal: 1, elementId: 'slot-1' },
+        isEmpty: false,
+      },
+    ]);
+    expect(typeof received[0]?.slot.token).toBe('object');
+    expect(received[0]?.slot.token).toBe(received[1]?.slot.token);
+    expect(received[0]?.slot.token).toBe(transferredToken);
+    expect(received[0]?.slot.runtimeSlotNumber).toBe(5);
+    expect(Object.isFrozen(received[0])).toBe(true);
+    expect(Object.isFrozen(received[0]?.slot)).toBe(true);
+    release?.();
+    for (let index = 0; index < 513; index += 1) buffer.publish(fact(index + 3));
+    expect(overflows).toHaveBeenLastCalledWith(8);
+    expect(
+      buffer.adoptFirstDisplay(
+        Object.freeze({ facts: Object.freeze([]), overflowCount: 0, dropCount: 0 })
+      )
+    ).toBe(false);
+  });
+
+  it('rejects malformed first-display facts without consuming adoption', () => {
+    const buffer = createGptDiagnosticsFactBuffer();
+    const malformed = Object.freeze({
+      facts: Object.freeze([
+        Object.freeze({
+          version: 1,
+          event: 'slotRequested',
+          token: 'gt1_01',
+          runtimeSlotNumber: 1,
+          cycleOrdinal: 1,
+          disposition: 'matched',
+          issueReason: null,
+          capturedAtMs: 1,
+          elementId: null,
+          adUnitPath: null,
+          isEmpty: null,
+          renderedSize: null,
+          isBackfill: null,
+          slotContentChanged: null,
+          visibilityPercent: null,
+        }),
+      ]),
+      overflowCount: 0,
+      dropCount: 0,
+    });
+
+    expect(buffer.adoptFirstDisplay(malformed)).toBe(false);
+    expect(
+      buffer.adoptFirstDisplay(
+        Object.freeze({ facts: Object.freeze([]), overflowCount: 0, dropCount: 0 })
+      )
+    ).toBe(true);
+  });
+
   it('isolates consumer throws and admits only one live module consumer', () => {
     const errors: unknown[] = [];
     const buffer = createGptDiagnosticsFactBuffer({

@@ -6,6 +6,7 @@ import type {
 import type { IntegrationLifecycleRuntime } from '../../kernel/lifecycle_module';
 import type { RuntimeCapabilityV1 } from '../../kernel/runtime';
 import { log } from '../../core/log';
+import { validatePersistentFirstDisplaySliceAdoptionV1 } from '../../shared/takeover';
 
 import { installPermutiveGuard, resetGuardState } from './script_guard';
 import { getPermutiveSegments } from './segments';
@@ -269,8 +270,27 @@ export function createPermutiveIntegrationRegistration(release: string): Integra
         resetGuardState();
       });
       return Object.freeze({
-        activate: ({ onDispose: onActivationDispose }: IntegrationActivationContext) => {
+        activate: ({ adoption, onDispose: onActivationDispose }: IntegrationActivationContext) => {
           if (criticalActive) throw new Error('Permutive context is already active');
+          if (
+            adoption !== undefined &&
+            !validatePersistentFirstDisplaySliceAdoptionV1(
+              adoption,
+              'permutive_initial',
+              (state) => {
+                const row = state.values[0];
+                return (
+                  state.values.length === 0 ||
+                  (state.values.length === 1 &&
+                    (row?.[0] === 'sdk_config'
+                      ? typeof row[1] === 'string' && row[1].length > 0
+                      : row?.[0] === 'readiness_timeout' && row[1] === 50))
+                );
+              }
+            )
+          ) {
+            throw new TypeError('Permutive first-display parser state is invalid');
+          }
           try {
             installPermutiveGuard();
             releaseContext = runtime.registerAuctionContext(PERMUTIVE_INTEGRATION_ID, () => {

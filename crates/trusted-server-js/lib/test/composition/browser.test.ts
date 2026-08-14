@@ -328,6 +328,7 @@ function synchronousGptAdapter(initialSlots: readonly object[] = []) {
   });
   const adapter: GoogletagAdapter = Object.freeze({
     bindingStatus: () => 'present',
+    diagnosticsIdentity: () => undefined,
     dispose: vi.fn(),
     notifyReady: vi.fn(),
     observeDiagnostics: (observer: GoogletagDiagnosticsObserver) => {
@@ -1435,6 +1436,7 @@ describe('browser composition', () => {
     } as unknown as GoogletagFacade;
     const googletag: GoogletagAdapter = Object.freeze({
       bindingStatus: () => 'present',
+      diagnosticsIdentity: () => undefined,
       dispose: vi.fn(),
       notifyReady: vi.fn(),
       observeDiagnostics: () => vi.fn(),

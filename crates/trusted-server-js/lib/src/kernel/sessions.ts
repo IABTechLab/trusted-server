@@ -103,6 +103,8 @@ export interface NavigationSession {
   readonly capture: <Arguments extends readonly unknown[]>(
     callback: (...arguments_: Arguments) => unknown
   ) => (...arguments_: Arguments) => boolean;
+  readonly adoptNextAttemptOrdinal: (nextOrdinal: number) => boolean;
+  readonly adoptFirstDisplayIdentityState: (prefix: string, nextOrdinal: number) => boolean;
   readonly claimAlias: (alias: string) => boolean;
   readonly claimIntent: (slot: string) => boolean;
   readonly claimTargeting: (slot: string) => boolean;
@@ -461,6 +463,16 @@ class NavigationSessionOwner implements NavigationSession {
 
   public get signal(): AbortSignal {
     return this.scope.signal;
+  }
+
+  public adoptNextAttemptOrdinal(nextOrdinal: number): boolean {
+    if (!this.isCurrent() || !this.issuer) return false;
+    return this.issuer.adoptNextAttemptOrdinal(nextOrdinal);
+  }
+
+  public adoptFirstDisplayIdentityState(prefix: string, nextOrdinal: number): boolean {
+    if (!this.isCurrent() || !this.issuer) return false;
+    return this.issuer.adoptFirstDisplayState(prefix, nextOrdinal);
   }
 
   public get currentAuctionProjection(): Readonly<object> | undefined {

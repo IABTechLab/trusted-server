@@ -19,6 +19,10 @@ import type {
   IntegrationPrepareContext,
   IntegrationRegistration,
 } from '../../kernel/integration_registry';
+import {
+  persistentFirstDisplaySliceSelectedV1,
+  snapshotPersistentFirstDisplaySliceStateV1,
+} from '../../shared/takeover';
 import type {
   AuctionBatchScope,
   NavigationSession,
@@ -343,8 +347,24 @@ export function createPrebidIntegrationRegistration(releaseId: string): Integrat
       });
 
       return Object.freeze({
-        activate: ({ afterCommit, onDispose }: IntegrationActivationContext) => {
+        activate: ({ adoption, afterCommit, onDispose }: IntegrationActivationContext) => {
           if (active) throw new Error('Prebid integration is already active');
+          if (adoption !== undefined) {
+            const selected = persistentFirstDisplaySliceSelectedV1(adoption, 'prebid_initial');
+            const initialState = selected
+              ? snapshotPersistentFirstDisplaySliceStateV1(adoption, 'prebid_initial')
+              : undefined;
+            if (
+              selected === undefined ||
+              (selected &&
+                (!initialState ||
+                  initialState.values.length !== 1 ||
+                  initialState.values[0]?.[0] !== 'protocol_version' ||
+                  initialState.values[0][1] !== 1))
+            ) {
+              throw new TypeError('Prebid first-display adoption is invalid');
+            }
+          }
           active = true;
           onDispose(dispose);
           afterCommit(() => {

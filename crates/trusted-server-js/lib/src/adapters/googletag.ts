@@ -220,6 +220,8 @@ export interface GoogletagOperation<T> {
 /** Narrow GPT boundary consumed by kernel sessions and services. */
 export interface GoogletagAdapter {
   bindingStatus(): GoogletagBindingStatus;
+  adoptDiagnosticsState?(input: GoogletagDiagnosticsAdoptionV1): boolean;
+  diagnosticsIdentity(slot: object): Readonly<GoogletagDiagnosticsSlotSnapshot> | undefined;
   traceToken(slot: object): GptSlotTokenV1 | undefined;
   observeDiagnostics(observer: GoogletagDiagnosticsObserver): (() => void) | undefined;
   observePublisherCalls(observer: GoogletagPublisherCallObserver): () => void;
@@ -229,6 +231,22 @@ export interface GoogletagAdapter {
   ): GoogletagOperation<T>;
   notifyReady(): void;
   dispose(): void;
+}
+
+export interface GoogletagDiagnosticsAdoptionV1 {
+  readonly nextTraceTokenOrdinal: number;
+  readonly slots: readonly Readonly<{
+    readonly nextCycleOrdinal: number;
+    readonly physicalSlot: object;
+    readonly records: readonly Readonly<{
+      readonly ordinal: number;
+      readonly responseIdentifier: string | null;
+      readonly seen: readonly GoogletagDiagnosticsEventName[];
+      readonly state: 'open' | 'completed' | 'retired';
+    }>[];
+    readonly traceToken: string;
+    readonly unknownPriorCycle: boolean;
+  }>[];
 }
 
 export type GoogletagDiagnosticsEventName =
@@ -299,6 +317,7 @@ function acceptedTraceCycleHandle(value: unknown): value is Readonly<GoogletagTr
 export interface GoogletagDiagnosticsSlotSnapshot {
   readonly token: object;
   readonly traceToken?: GptSlotTokenV1;
+  readonly runtimeSlotNumber?: number;
   readonly cycleOrdinal?: GptTraceCycleOrdinalV1;
   readonly elementId?: string;
   readonly adUnitPath?: string;
@@ -1108,6 +1127,7 @@ export function createBrowserGoogletagAdapter(
   const initialLoadOwner = Object.freeze({});
   let diagnosticsObserver: GoogletagDiagnosticsObserver | undefined;
   let nextTraceTokenOrdinal = diagnosticsOptions.initialTraceTokenOrdinal ?? 1;
+  let diagnosticsAdoptionOpen = true;
   let pendingReservations = 0;
   let disposed = false;
   let firstDisplayObserved = false;
@@ -1189,6 +1209,7 @@ export function createBrowserGoogletagAdapter(
 
   const diagnosticsSlotState = (physicalSlot: object): DiagnosticsSlotState | undefined => {
     if (disposed) return undefined;
+    diagnosticsAdoptionOpen = false;
     try {
       let state = weakMapValue(diagnosticsSlots, physicalSlot);
       if (!state) {
@@ -1199,6 +1220,135 @@ export function createBrowserGoogletagAdapter(
       return state;
     } catch {
       return undefined;
+    }
+  };
+
+  const adoptDiagnosticsState = (input: GoogletagDiagnosticsAdoptionV1): boolean => {
+    if (
+      disposed ||
+      !diagnosticsAdoptionOpen ||
+      typeof input !== 'object' ||
+      input === null ||
+      !Number.isInteger(input.nextTraceTokenOrdinal) ||
+      input.nextTraceTokenOrdinal < 1 ||
+      input.nextTraceTokenOrdinal > 4_294_967_295 ||
+      !Array.isArray(input.slots) ||
+      input.slots.length > 256
+    ) {
+      return false;
+    }
+    const physicalSlots = new Set<object>();
+    const traceTokens = new Set<string>();
+    const prepared: Array<Readonly<{ physicalSlot: object; state: DiagnosticsSlotState }>> = [];
+    let maximumTokenOrdinal = 0;
+    for (const adopted of input.slots) {
+      const tokenOrdinal =
+        typeof adopted?.traceToken === 'string' &&
+        /^gt1_[1-9a-z][0-9a-z]{0,6}$/.test(adopted.traceToken)
+          ? Number.parseInt(adopted.traceToken.slice(4), 36)
+          : Number.NaN;
+      if (
+        typeof adopted !== 'object' ||
+        adopted === null ||
+        (typeof adopted.physicalSlot !== 'object' && typeof adopted.physicalSlot !== 'function') ||
+        adopted.physicalSlot === null ||
+        physicalSlots.has(adopted.physicalSlot) ||
+        !Number.isInteger(tokenOrdinal) ||
+        tokenOrdinal < 1 ||
+        tokenOrdinal > 4_294_967_295 ||
+        traceTokens.has(adopted.traceToken) ||
+        !Number.isInteger(adopted.nextCycleOrdinal) ||
+        adopted.nextCycleOrdinal < 1 ||
+        adopted.nextCycleOrdinal > 4_294_967_295 ||
+        typeof adopted.unknownPriorCycle !== 'boolean' ||
+        !Array.isArray(adopted.records) ||
+        adopted.records.length > 10
+      ) {
+        return false;
+      }
+      const ordinals = new Set<number>();
+      const cycles: TraceCycle[] = [];
+      let maximumCycleOrdinal = 0;
+      for (const record of adopted.records) {
+        const seen = Array.isArray(record?.seen) ? (record.seen as readonly unknown[]) : undefined;
+        const responseIdentifier = record?.responseIdentifier;
+        if (
+          typeof record !== 'object' ||
+          record === null ||
+          !Number.isInteger(record.ordinal) ||
+          record.ordinal < 1 ||
+          record.ordinal > 4_294_967_295 ||
+          ordinals.has(record.ordinal) ||
+          (record.state !== 'open' && record.state !== 'completed' && record.state !== 'retired') ||
+          !seen ||
+          seen.length === 0 ||
+          seen.length > 6 ||
+          new Set(seen).size !== seen.length ||
+          seen.some(
+            (event: unknown) =>
+              event !== 'slotRequested' &&
+              event !== 'slotResponseReceived' &&
+              event !== 'slotRenderEnded' &&
+              event !== 'slotOnload' &&
+              event !== 'impressionViewable' &&
+              event !== 'slotVisibilityChanged'
+          ) ||
+          !seen.includes('slotRequested') ||
+          (record.state === 'open' && seen.includes('slotRenderEnded')) ||
+          (record.state === 'completed' && !seen.includes('slotRenderEnded')) ||
+          (responseIdentifier !== null &&
+            (typeof responseIdentifier !== 'string' ||
+              responseIdentifier.length === 0 ||
+              new TextEncoder().encode(responseIdentifier).byteLength > 256 ||
+              [...responseIdentifier].some((character) => {
+                const code = character.charCodeAt(0);
+                return code <= 0x1f || code === 0x7f;
+              })))
+        ) {
+          return false;
+        }
+        const retired = record.state === 'retired';
+        const handle = createGoogletagTraceCycleHandle(() => retired);
+        cycles.push({
+          handle,
+          ordinal: record.ordinal as GptTraceCycleOrdinalV1,
+          ...(responseIdentifier === null ? {} : { responseIdentifier }),
+          seen: new Set(seen as readonly GoogletagDiagnosticsEventName[]),
+          state: record.state,
+        });
+        ordinals.add(record.ordinal);
+        maximumCycleOrdinal = Math.max(maximumCycleOrdinal, record.ordinal);
+      }
+      if (adopted.nextCycleOrdinal <= maximumCycleOrdinal) return false;
+      physicalSlots.add(adopted.physicalSlot);
+      traceTokens.add(adopted.traceToken);
+      maximumTokenOrdinal = Math.max(maximumTokenOrdinal, tokenOrdinal);
+      prepared.push({
+        physicalSlot: adopted.physicalSlot,
+        state: {
+          cycles,
+          nextCycleOrdinal: adopted.nextCycleOrdinal,
+          token: Object.freeze(Object.create(null) as object),
+          traceToken: adopted.traceToken as GptSlotTokenV1,
+          unknownPriorCycle: adopted.unknownPriorCycle,
+        },
+      });
+    }
+    if (input.nextTraceTokenOrdinal <= maximumTokenOrdinal) return false;
+    try {
+      for (const adopted of prepared) {
+        setWeakMapValue(diagnosticsSlots, adopted.physicalSlot, adopted.state);
+        for (const cycle of adopted.state.cycles) {
+          setWeakMapValue(traceCycleHandleOwners, cycle.handle, adopted.state);
+        }
+        if (mintedTraceTokens) addSetValue(mintedTraceTokens, adopted.state.traceToken!);
+      }
+      nextTraceTokenOrdinal = input.nextTraceTokenOrdinal;
+      diagnosticsAdoptionOpen = false;
+      return true;
+    } catch {
+      reportDiagnosticsFailure('trace_cycle_invalid');
+      return false;
     }
   };
 
@@ -1328,6 +1478,9 @@ export function createBrowserGoogletagAdapter(
       const safeSlot = Object.freeze({
         token: state.token,
         ...(state.traceToken === undefined ? {} : { traceToken: state.traceToken }),
+        ...(state.traceToken === undefined
+          ? {}
+          : { runtimeSlotNumber: Number.parseInt(state.traceToken.slice(4), 36) }),
         ...(cycleOrdinal === undefined ? {} : { cycleOrdinal }),
         ...(state.elementId === undefined ? {} : { elementId: state.elementId }),
         ...(state.adUnitPath === undefined ? {} : { adUnitPath: state.adUnitPath }),
@@ -2879,6 +3032,23 @@ export function createBrowserGoogletagAdapter(
 
   return Object.freeze({
     bindingStatus: (): GoogletagBindingStatus => currentBinding().status,
+    adoptDiagnosticsState,
+    diagnosticsIdentity: (slot: object): Readonly<GoogletagDiagnosticsSlotSnapshot> | undefined => {
+      const state = diagnosticsSlotState(slot);
+      if (!state?.traceToken) return undefined;
+      const currentCycle = state.cycles.reduce<TraceCycle | undefined>(
+        (latest, cycle) => (!latest || cycle.ordinal > latest.ordinal ? cycle : latest),
+        undefined
+      );
+      return Object.freeze({
+        token: state.token,
+        traceToken: state.traceToken,
+        runtimeSlotNumber: Number.parseInt(state.traceToken.slice(4), 36),
+        ...(currentCycle === undefined ? {} : { cycleOrdinal: currentCycle.ordinal }),
+        ...(state.elementId === undefined ? {} : { elementId: state.elementId }),
+        ...(state.adUnitPath === undefined ? {} : { adUnitPath: state.adUnitPath }),
+      });
+    },
     traceToken: (slot: object): GptSlotTokenV1 | undefined =>
       diagnosticsSlotState(slot)?.traceToken,
     observeDiagnostics,

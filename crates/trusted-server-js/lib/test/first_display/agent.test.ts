@@ -9,6 +9,7 @@ import {
   type FirstDisplayTerminalResult,
 } from '../../src/first_display/agent';
 import { snapshotFirstDisplayBatchV1 } from '../../src/first_display/leaf/projection';
+import { createTestNavigationIdentityIssuer } from '../../src/kernel/identity';
 
 function batch(
   kinds: readonly ('no_bid' | 'failed' | 'gpt_adm' | 'aps')[]
@@ -131,13 +132,24 @@ function harness(options: { now?: number; hidden?: boolean } = {}) {
 function driver(events: string[]): FirstDisplayDriver & {
   settleForTest: (slotId: string, result: 'accepted' | 'failed' | 'cancelled') => void;
 } {
-  let settle: ((slotId: string, result: 'accepted' | 'failed' | 'cancelled') => void) | undefined;
+  let settle:
+    | ((slotId: string, result: 'accepted' | 'failed' | 'cancelled', reason: string | null) => void)
+    | undefined;
   return Object.freeze({
     captureHandoff: () =>
       Object.freeze({
         artifacts: Object.freeze([]),
+        clockEpochMs: 0,
         cycles: Object.freeze([]),
+        diagnosticCycles: Object.freeze([]),
+        gptDiagnostics: Object.freeze({
+          facts: Object.freeze([]),
+          overflowCount: 0,
+          dropCount: 0,
+        }),
         identities: Object.freeze([]),
+        nextReservationOrdinal: 1,
+        nextTraceTokenOrdinal: 1,
         nextTicketOrdinal: 1,
         tombstones: Object.freeze([]),
       }),
@@ -146,13 +158,18 @@ function driver(events: string[]): FirstDisplayDriver & {
     start: (
       _outcomes: readonly FirstDisplayBatchOutcomeV1[],
       onFirstAction: () => boolean,
-      onTerminal: (slotId: string, result: FirstDisplayTerminalResult) => void
+      onTerminal: (
+        slotId: string,
+        result: FirstDisplayTerminalResult,
+        reason: string | null
+      ) => void
     ) => {
       events.push('driver:start');
       onFirstAction();
       settle = onTerminal;
     },
-    settleForTest: (slotId: string, result: FirstDisplayTerminalResult) => settle?.(slotId, result),
+    settleForTest: (slotId: string, result: FirstDisplayTerminalResult) =>
+      settle?.(slotId, result, result === 'accepted' ? null : 'internal_error'),
     sealTsAdmission: () => events.push('driver:seal'),
     dispose: () => events.push('driver:dispose'),
   });
@@ -422,6 +439,10 @@ describe('bounded first-display agent', () => {
     const h = harness();
     const host = document.createElement('div');
     document.body.append(host);
+    const issuer = createTestNavigationIdentityIssuer({
+      getRandomValues: (target) => target,
+    });
+    if (!issuer.ok) throw new Error('Expected first-display identity issuer');
     const agent = createFirstDisplayAgent({
       batch: batch(['no_bid']),
       bootstrap: h.bootstrap,
@@ -434,6 +455,7 @@ describe('bounded first-display agent', () => {
         generation: 1,
         slices: ['first_display'],
       },
+      identityIssuer: issuer.value,
       onProtectedPaint: () => undefined,
       onFailure: (reason) => h.failures.push(reason),
     });
@@ -511,17 +533,29 @@ describe('bounded first-display agent', () => {
     const events: string[] = [];
     const physicalSlot = {};
     const artifact = {};
-    const projectedBatch = snapshotFirstDisplayBatchV1(batch(['gpt_adm']))!;
+    const projectedBatch = snapshotFirstDisplayBatchV1(batch(['gpt_adm', 'gpt_adm']))!;
+    const issuer = createTestNavigationIdentityIssuer({
+      getRandomValues: (target) => {
+        target.set([0, 1, 2, 3, 4, 5, 6, 7]);
+        return target;
+      },
+    });
+    if (!issuer.ok) throw new Error('Expected first-display identity issuer');
     const element = document.createElement('div');
     element.id = 'slot-0';
     const ownedDriver: FirstDisplayDriver = Object.freeze({
       start: (
         _outcomes: readonly FirstDisplayBatchOutcomeV1[],
         onFirstAction: () => boolean,
-        onTerminal: (slotId: string, result: FirstDisplayTerminalResult) => void
+        onTerminal: (
+          slotId: string,
+          result: FirstDisplayTerminalResult,
+          reason: string | null
+        ) => void
       ) => {
         onFirstAction();
-        onTerminal('slot-0', 'accepted');
+        onTerminal('slot-0', 'accepted', null);
+        onTerminal('slot-1', 'failed', 'renderer_document_no_load');
       },
       sealTsAdmission: () => events.push('seal'),
       closeIngress: () => {
@@ -548,9 +582,35 @@ describe('bounded first-display agent', () => {
               physicalSlot,
               placement: projectedBatch.projection.slots[0]!,
               slotId: 'slot-0',
+              traceToken: 'gt1_1',
             }),
           ]),
+          diagnosticCycles: Object.freeze([
+            Object.freeze({
+              nextCycleOrdinal: 2,
+              quarantines: Object.freeze([]),
+              records: Object.freeze([
+                Object.freeze({
+                  ordinal: 1,
+                  responseIdentifier: 'response-one',
+                  seen: Object.freeze(['slotRequested', 'slotRenderEnded'] as const),
+                  state: 'completed' as const,
+                }),
+              ]),
+              slotId: 'slot-0',
+              token: 'gt1_1',
+              unknownPriorCycle: false,
+            }),
+          ]),
+          gptDiagnostics: Object.freeze({
+            facts: Object.freeze([]),
+            overflowCount: 0,
+            dropCount: 0,
+          }),
           identities: Object.freeze([physicalSlot, artifact]),
+          clockEpochMs: 0,
+          nextReservationOrdinal: 1,
+          nextTraceTokenOrdinal: 2,
           nextTicketOrdinal: 1,
           tombstones: Object.freeze([]),
         });
@@ -562,13 +622,22 @@ describe('bounded first-display agent', () => {
       dispose: () => events.push('dispose'),
     });
     const agent = createFirstDisplayAgent({
-      batch: batch(['gpt_adm']),
+      batch: batch(['gpt_adm', 'gpt_adm']),
       bootstrap: h.bootstrap,
       driver: ownedDriver,
       performance: h.performance,
       paint: h.paint,
       onProtectedPaint: () => undefined,
       onFailure: (reason) => h.failures.push(reason),
+      identityIssuer: issuer.value,
+      parserState: () =>
+        Object.freeze([
+          Object.freeze({
+            sliceId: 'gpt_initial',
+            observations: Object.freeze(['protocol_version']),
+            values: Object.freeze([Object.freeze(['protocol_version', 1] as const)]),
+          }),
+        ]),
       handoff: Object.freeze({
         releaseId: 'a'.repeat(64),
         generation: 1,
@@ -588,6 +657,46 @@ describe('bounded first-display agent', () => {
       projectionDigest: 'b'.repeat(64),
       slices: ['first_display', 'gpt_initial'],
       mutationRevision: 0,
+      parserState: [
+        {
+          sliceId: 'gpt_initial',
+          observations: ['protocol_version'],
+          values: [['protocol_version', 1]],
+        },
+      ],
+      attempts: [
+        expect.objectContaining({ id: 'a1_AAECAwQFBgcAAAAAAAAAAQ', ordinal: 1 }),
+        expect.objectContaining({
+          id: 'a1_AAECAwQFBgcAAAAAAAAAAg',
+          ordinal: 2,
+          reason: 'renderer_document_no_load',
+          state: 'failed',
+        }),
+      ],
+      highWater: expect.objectContaining({
+        navigationAttemptPrefix: 'AAECAwQFBgc',
+        nextNavigationAttemptOrdinal: 3,
+      }),
+      trace: {
+        nextGlobalSlotOrdinal: 2,
+        nextSequence: 2,
+        slots: [
+          {
+            bindings: [
+              {
+                atMs: 0,
+                cycleOrdinal: 1,
+                historySequence: 1,
+                state: 'completed',
+                token: 'gt1_1',
+              },
+            ],
+            impressions: 1,
+            slotId: 'slot-0',
+          },
+          { bindings: [], impressions: 0, slotId: 'slot-1' },
+        ],
+      },
     });
     expect(finalized?.capsule.consume('a'.repeat(64), 1)).toEqual([physicalSlot, artifact]);
     expect(agent.detachCommittedArtifacts()).toBe(true);

@@ -58,12 +58,36 @@ function batch() {
 function harness() {
   const value = batch();
   let gptCallbacks: FirstDisplayGoogletagBatchCallbacks | undefined;
-  let renderTerminal: ((result: 'accepted' | 'failed' | 'cancelled') => void) | undefined;
+  let renderTerminal:
+    ((result: 'accepted' | 'failed' | 'cancelled', reason: string | null) => void) | undefined;
   const gptBatch = {
     start: vi.fn((callbacks: FirstDisplayGoogletagBatchCallbacks) => {
       gptCallbacks = callbacks;
       return true;
     }),
+    captureDiagnosticsHandoff: vi.fn(() => ({
+      cycles: [cycleOwner.value]
+        .filter((cycle): cycle is FirstDisplayGptBoundCycleV1 => cycle !== undefined)
+        .map((cycle) => ({
+          nextCycleOrdinal: 2,
+          quarantines: [],
+          records: [
+            {
+              ordinal: 1,
+              responseIdentifier: 'response-one',
+              seen: ['slotRequested', 'slotRenderEnded'] as const,
+              state: 'completed' as const,
+            },
+          ],
+          slotId: cycle.slotId,
+          token: cycle.traceToken,
+          unknownPriorCycle: false,
+        })),
+      facts: [],
+      nextTraceTokenOrdinal: 2,
+      overflowCount: 0,
+      dropCount: 0,
+    })),
     captureHandoff: vi.fn(() => [cycleOwner.value].filter(Boolean)),
     closeIngress: vi.fn(() => true),
     detachCommittedSlots: vi.fn(() => true),
@@ -85,7 +109,13 @@ function harness() {
       return true;
     }),
     recordFailure: vi.fn(() => true),
-    captureHandoff: vi.fn(() => ({ artifacts: [], nextTicketOrdinal: 1, tombstones: [] })),
+    captureHandoff: vi.fn(() => ({
+      artifacts: [],
+      clockEpochMs: 0,
+      nextReservationOrdinal: 1,
+      nextTicketOrdinal: 1,
+      tombstones: [],
+    })),
     closeIngress: vi.fn(() => true),
     detachCommittedArtifacts: vi.fn(() => true),
     sealTsAdmission: vi.fn(() => events.push('render:seal')),
@@ -109,7 +139,7 @@ function harness() {
       events.push('action');
       return true;
     },
-    (slotId, result) => terminals.push([slotId, result])
+    (slotId, result, reason) => terminals.push([slotId, result, reason])
   );
   const cycle = Object.freeze({
     bid: value.projection.bids[0]!,
@@ -118,6 +148,7 @@ function harness() {
     physicalSlot: {},
     placement: value.projection.slots[0]!,
     slotId: 'slot-1',
+    traceToken: 'gt1_1',
   });
   cycleOwner.value = cycle;
   return {
@@ -140,10 +171,10 @@ describe('projected first-display driver', () => {
     h.getGptCallbacks().onRenderEnded(h.cycle, 'nonempty_gam');
     expect(h.terminals).toEqual([]);
 
-    h.getRenderTerminal()('accepted');
-    h.getRenderTerminal()('failed');
+    h.getRenderTerminal()('accepted', null);
+    h.getRenderTerminal()('failed', 'internal_error');
     expect(h.events).toEqual(['render:bind', 'action', 'render:gam:nonempty_gam']);
-    expect(h.terminals).toEqual([['slot-1', 'accepted']]);
+    expect(h.terminals).toEqual([['slot-1', 'accepted', null]]);
   });
 
   it('fails an empty or mismatched physical GPT cycle without guessing', () => {
@@ -159,7 +190,7 @@ describe('projected first-display driver', () => {
     mismatched
       .getGptCallbacks()
       .onRenderEnded(Object.freeze({ ...mismatched.cycle, physicalSlot: {} }), 'nonempty_gam');
-    expect(mismatched.terminals).toEqual([['slot-1', 'failed']]);
+    expect(mismatched.terminals).toEqual([['slot-1', 'failed', 'gpt_request_failed']]);
     expect(mismatched.renderer.recordGam).not.toHaveBeenCalled();
   });
 
@@ -168,7 +199,7 @@ describe('projected first-display driver', () => {
     h.getGptCallbacks().onBound(h.cycle);
     h.getGptCallbacks().onFirstAction();
     h.getGptCallbacks().onFailure('slot-1', 'gpt_request_timeout');
-    expect(h.terminals).toEqual([['slot-1', 'failed']]);
+    expect(h.terminals).toEqual([['slot-1', 'failed', 'gpt_request_timeout']]);
 
     h.driver.sealTsAdmission();
     h.driver.dispose();
@@ -183,14 +214,35 @@ describe('projected first-display driver', () => {
     h.getGptCallbacks().onBound(h.cycle);
     h.getGptCallbacks().onFirstAction();
     h.getGptCallbacks().onRenderEnded(h.cycle, 'nonempty_gam');
-    h.getRenderTerminal()('accepted');
+    h.getRenderTerminal()('accepted', null);
     h.driver.sealTsAdmission();
 
     expect(h.driver.closeIngress()).toBe(true);
     expect(h.driver.captureHandoff()).toEqual({
       artifacts: [],
+      clockEpochMs: 0,
       cycles: [h.cycle],
+      diagnosticCycles: [
+        {
+          nextCycleOrdinal: 2,
+          quarantines: [],
+          records: [
+            {
+              ordinal: 1,
+              responseIdentifier: 'response-one',
+              seen: ['slotRequested', 'slotRenderEnded'],
+              state: 'completed',
+            },
+          ],
+          slotId: 'slot-1',
+          token: 'gt1_1',
+          unknownPriorCycle: false,
+        },
+      ],
+      gptDiagnostics: { facts: [], overflowCount: 0, dropCount: 0 },
       identities: [h.cycle.physicalSlot],
+      nextReservationOrdinal: 1,
+      nextTraceTokenOrdinal: 2,
       nextTicketOrdinal: 1,
       tombstones: [],
     });
@@ -222,7 +274,13 @@ describe('projected first-display driver', () => {
         bind: () => true,
         recordGam: () => true,
         recordFailure: () => true,
-        captureHandoff: () => ({ artifacts: [], nextTicketOrdinal: 1, tombstones: [] }),
+        captureHandoff: () => ({
+          artifacts: [],
+          clockEpochMs: 0,
+          nextReservationOrdinal: 1,
+          nextTicketOrdinal: 1,
+          tombstones: [],
+        }),
         closeIngress: () => true,
         detachCommittedArtifacts: () => true,
         sealTsAdmission: () => undefined,

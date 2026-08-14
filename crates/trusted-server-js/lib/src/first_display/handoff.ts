@@ -145,7 +145,9 @@ export function createFirstDisplayHandoffOwner(
           !handoff ||
           handoff.releaseId !== options.releaseId ||
           handoff.generation !== options.generation ||
-          handoff.mutationRevision !== revision
+          handoff.mutationRevision !== revision ||
+          captured.identities.length !== handoff.cycles.length + handoff.artifacts.length ||
+          new Set(captured.identities).size !== captured.identities.length
         ) {
           return publishFailure();
         }
@@ -201,6 +203,10 @@ export function performFirstDisplayTakeoverV1(options: FirstDisplayTakeoverOptio
   try {
     const outline = snapshotTakeoverOutlineV1(options.outline);
     const { handoff, capsule } = options.finalized;
+    const requiredObjectKinds = [
+      ...(handoff.cycles.length === 0 ? [] : (['gpt_slot'] as const)),
+      ...(handoff.artifacts.length === 0 ? [] : (['dom_artifact'] as const)),
+    ];
     if (
       !outline ||
       outline.releaseId !== handoff.releaseId ||
@@ -210,6 +216,7 @@ export function performFirstDisplayTakeoverV1(options: FirstDisplayTakeoverOptio
       outline.outcomeCount !== handoff.slots.length ||
       outline.slices.length !== handoff.slices.length ||
       outline.slices.some((id, index) => id !== handoff.slices[index]) ||
+      requiredObjectKinds.some((kind) => !outline.objectKinds.includes(kind)) ||
       !options.isCurrentGeneration() ||
       !options.authenticateRuntimeScript() ||
       options.currentMutationRevision() !== handoff.mutationRevision

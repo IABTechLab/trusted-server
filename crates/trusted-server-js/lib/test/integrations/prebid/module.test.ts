@@ -356,6 +356,68 @@ describe('production Prebid critical registration', () => {
     }
   });
 
+  it('adopts the sealed initial Prebid slice without replaying an initial bid publication', async () => {
+    const harness = initialProductionPrebidHarness([
+      Object.freeze({
+        moduleName: 'sharedIdSystem',
+        configNames: Object.freeze(['sharedId']),
+        eidSources: Object.freeze(['sharedid.org']),
+      }),
+    ]);
+    try {
+      const prepared = await createPrebidIntegrationRegistration(RELEASE_ID).prepare(
+        harness.prepareContext
+      );
+      const adoption = Object.freeze({
+        version: 1 as const,
+        adoptInitialDisplay: true as const,
+        handoff: Object.freeze({
+          slices: Object.freeze(['first_display', 'prebid_initial']),
+          parserState: Object.freeze([
+            Object.freeze({
+              sliceId: 'prebid_initial',
+              observations: Object.freeze(['protocol_version']),
+              values: Object.freeze([Object.freeze(['protocol_version', 1] as const)]),
+            }),
+          ]),
+        }),
+        identities: Object.freeze([]),
+      });
+
+      prepared.activate(Object.freeze({ ...harness.activationContext, adoption }));
+      for (const callback of harness.afterCommit) callback();
+
+      expect(harness.binding.bidder()).toEqual(expect.any(Object));
+      expect(harness.registerPucGamAttempt).not.toHaveBeenCalled();
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it('rejects a takeover that omits the selected initial Prebid state', async () => {
+    const harness = initialProductionPrebidHarness([]);
+    try {
+      const prepared = await createPrebidIntegrationRegistration(RELEASE_ID).prepare(
+        harness.prepareContext
+      );
+      const adoption = Object.freeze({
+        version: 1 as const,
+        adoptInitialDisplay: true as const,
+        handoff: Object.freeze({
+          slices: Object.freeze(['first_display', 'prebid_initial']),
+          parserState: Object.freeze([]),
+        }),
+        identities: Object.freeze([]),
+      });
+
+      expect(() =>
+        prepared.activate(Object.freeze({ ...harness.activationContext, adoption }))
+      ).toThrow('Prebid first-display adoption is invalid');
+    } finally {
+      harness.dispose();
+    }
+  });
+
   it('publishes the initial TS winner and promotes its exact selection through render.v1', async () => {
     const harness = initialProductionPrebidHarness([
       Object.freeze({

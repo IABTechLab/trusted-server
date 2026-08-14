@@ -41,6 +41,7 @@ const CALLBACK_KINDS: GptDiagnosticsCallbackKind[] = [
 
 export interface GptDiagnosticsSlotLike {
   readonly token?: object | undefined;
+  readonly runtimeSlotNumber?: number | undefined;
   readonly elementId?: string | undefined;
   readonly adUnitPath?: string | undefined;
   getSlotElementId?: (() => string) | undefined;
@@ -1028,8 +1029,27 @@ export class GptDiagnosticsStore {
       }
     }
 
-    const runtimeSlotNumber = this.nextRuntimeSlotNumber;
-    this.nextRuntimeSlotNumber += 1;
+    const adoptedRuntimeSlotNumber = slot.runtimeSlotNumber;
+    if (
+      adoptedRuntimeSlotNumber !== undefined &&
+      (!Number.isInteger(adoptedRuntimeSlotNumber) ||
+        adoptedRuntimeSlotNumber < this.nextRuntimeSlotNumber ||
+        adoptedRuntimeSlotNumber > 4_294_967_295 ||
+        this.slots.has(adoptedRuntimeSlotNumber))
+    ) {
+      this.incrementDisposition(kind, 'unmatched');
+      this.addIssue(
+        kind,
+        { runtimeSlotNumber: adoptedRuntimeSlotNumber },
+        timestampMs,
+        'unmatched',
+        'invalid_slot_identity'
+      );
+      this.notify();
+      return undefined;
+    }
+    const runtimeSlotNumber = adoptedRuntimeSlotNumber ?? this.nextRuntimeSlotNumber;
+    this.nextRuntimeSlotNumber = runtimeSlotNumber + 1;
     const record: MutableSlotRecord = {
       runtimeSlotNumber,
       requests: [],
