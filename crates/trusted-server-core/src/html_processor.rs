@@ -841,15 +841,15 @@ mod tests {
 
     #[test]
     fn integration_head_injector_marks_only_attribution_enabled_gpt_bundle() {
-        fn process(gam_attribution_enabled: Option<bool>) -> String {
-            let integrations = if let Some(gam_attribution_enabled) = gam_attribution_enabled {
+        fn process(gpt_config: Option<(bool, bool)>) -> String {
+            let integrations = if let Some((enabled, gam_attribution_enabled)) = gpt_config {
                 let mut settings = create_test_settings();
                 settings
                     .integrations
                     .insert_config(
                         "gpt",
                         &json!({
-                            "enabled": true,
+                            "enabled": enabled,
                             "gam_attribution_enabled": gam_attribution_enabled
                         }),
                     )
@@ -868,11 +868,12 @@ mod tests {
             String::from_utf8(output).expect("should produce valid UTF-8")
         }
 
-        let attributed = process(Some(true));
-        let unattributed = process(Some(false));
+        let attributed = process(Some((true, true)));
+        let unattributed = process(Some((true, false)));
+        let disabled_gpt = process(Some((false, true)));
         let without_gpt = process(None);
 
-        for html in [&attributed, &unattributed, &without_gpt] {
+        for html in [&attributed, &unattributed, &disabled_gpt, &without_gpt] {
             assert_eq!(
                 html.matches("id=\"trustedserver-js\"").count(),
                 1,
@@ -886,6 +887,10 @@ mod tests {
         assert!(
             !unattributed.contains("data-ts-gam-attribution"),
             "should leave an attribution-disabled GPT publisher bundle unmarked"
+        );
+        assert!(
+            !disabled_gpt.contains("data-ts-gam-attribution"),
+            "should let the GPT master switch suppress attribution metadata"
         );
         assert!(
             !without_gpt.contains("data-ts-gam-attribution"),
