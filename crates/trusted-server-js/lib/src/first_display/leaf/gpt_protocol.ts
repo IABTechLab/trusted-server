@@ -1,4 +1,8 @@
 import type { FirstDisplaySliceActivationContext } from '../transaction';
+import type {
+  FirstDisplayGoogletagBatch,
+  FirstDisplayGoogletagBatchInput,
+} from '../adapters/googletag';
 
 export interface FirstDisplayGptRequestPlanV1 {
   readonly operations: readonly ('display' | 'refresh')[];
@@ -13,6 +17,7 @@ export interface FirstDisplayGptProtocolV1 {
     requestStartMs: 3_000;
     completionMs: 10_000;
   }>;
+  readonly createBatch: (input: FirstDisplayGoogletagBatchInput) => FirstDisplayGoogletagBatch;
   readonly requestPlan: (candidate: unknown) => FirstDisplayGptRequestPlanV1 | undefined;
   readonly validTargetingValue: (candidate: unknown) => candidate is string;
   readonly classifyRenderEnded: (candidate: unknown) => 'gam_empty' | 'nonempty_gam' | undefined;
@@ -22,6 +27,11 @@ interface GptInitialBindings {
   readonly observe: (name: 'protocol_version', value: number) => void;
   readonly register: (protocol: FirstDisplayGptProtocolV1) => () => void;
 }
+
+export type FirstDisplayGptBatchFactoryV1 = (
+  input: FirstDisplayGoogletagBatchInput,
+  protocol: FirstDisplayGptProtocolV1
+) => FirstDisplayGoogletagBatch;
 
 const textEncoder = new TextEncoder();
 
@@ -124,10 +134,13 @@ function classifyRenderEnded(candidate: unknown): 'gam_empty' | 'nonempty_gam' |
 /** Register the sole provisional GPT request planning and cycle-attribution policy. */
 export function installGptInitial(
   candidate: unknown,
-  own: FirstDisplaySliceActivationContext['own']
+  own: FirstDisplaySliceActivationContext['own'],
+  createBatch: FirstDisplayGptBatchFactoryV1
 ): Readonly<{ version: 1; id: 'gpt' }> {
   const value = bindings(candidate);
-  if (!value || typeof own !== 'function') throw new TypeError('invalid GPT initial bindings');
+  if (!value || typeof own !== 'function' || typeof createBatch !== 'function') {
+    throw new TypeError('invalid GPT initial bindings');
+  }
   const protocol: FirstDisplayGptProtocolV1 = Object.freeze({
     version: 1,
     id: 'gpt',
@@ -136,6 +149,8 @@ export function installGptInitial(
       requestStartMs: 3_000,
       completionMs: 10_000,
     }),
+    createBatch: (input: FirstDisplayGoogletagBatchInput): FirstDisplayGoogletagBatch =>
+      createBatch(input, protocol),
     requestPlan,
     validTargetingValue,
     classifyRenderEnded,

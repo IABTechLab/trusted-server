@@ -104,14 +104,16 @@ export default {
     ],
     messages: {
       externalGlobalOwnedByAdapter:
-        'Access to "{{name}}" is owned by src/adapters; inject an adapter interface instead.',
+        'Access to "{{name}}" is owned by an exact adapter directory; inject an adapter interface instead.',
     },
   },
 
   create(context) {
     const sourceCode = context.sourceCode;
     const relativeFilename = normalizeFilename(context.filename, context.options[0]?.rootDirectory);
-    const isAdapter = relativeFilename.startsWith('src/adapters/');
+    const isAdapter =
+      relativeFilename.startsWith('src/adapters/') ||
+      relativeFilename.startsWith('src/first_display/adapters/');
 
     if (isAdapter) return {};
 
