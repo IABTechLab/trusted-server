@@ -222,6 +222,71 @@ test('generated release inventory pins the server bundle order', () => {
   }
 });
 
+test('generated first-display components self-register through one authenticated artifact sink', () => {
+  const release = JSON.parse(
+    fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-release-v1.json'), 'utf8')
+  );
+  const firstDisplay = release.artifacts.filter(({ phase }) => phase === 'first_display');
+  const dom = new JSDOM(
+    `<!doctype html><script id="trustedserver-js" src="/static/tsjs=tsjs-first-display.min.js?m=1fff&v=${'b'.repeat(64)}"></script>`,
+    {
+      runScripts: 'outside-only',
+      url: 'https://publisher.example/article',
+    }
+  );
+  const script = dom.window.document.querySelector('script');
+  const registrations = [];
+  const target = {};
+  Object.defineProperty(target, '_registerFirstDisplay', {
+    configurable: true,
+    enumerable: false,
+    value(registration, source) {
+      assert.equal(this, target);
+      assert.equal(source, script);
+      registrations.push(registration);
+      return true;
+    },
+    writable: false,
+  });
+  Object.defineProperty(dom.window, 'tsjs', {
+    configurable: true,
+    value: target,
+  });
+  Object.defineProperty(dom.window.document, 'currentScript', {
+    configurable: true,
+    value: script,
+  });
+
+  try {
+    dom.window.eval(
+      firstDisplay
+        .map(({ file }) =>
+          fs.readFileSync(path.resolve(libDirectory, '../dist', file), 'utf8')
+        )
+        .join(';\n')
+    );
+    assert.deepEqual(
+      registrations.map(({ id, order }) => ({ id, order })),
+      firstDisplay.map(({ id }, index) => ({ id, order: index + 1 }))
+    );
+    for (const registration of registrations) {
+      assert.deepEqual(Reflect.ownKeys(registration), [
+        'abi',
+        'id',
+        'releaseId',
+        'order',
+        'prepare',
+      ]);
+      assert.equal(registration.abi, 1);
+      assert.equal(registration.releaseId, release.releaseId);
+      assert.equal(typeof registration.prepare, 'function');
+      assert.equal(Object.isFrozen(registration), true);
+    }
+  } finally {
+    dom.window.close();
+  }
+});
+
 test('critical transport co-bundles core and render ownership exactly once', () => {
   const metrics = JSON.parse(
     fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-build-metrics-v1.json'), 'utf8')

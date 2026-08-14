@@ -1,6 +1,38 @@
 import { describe, expect, it, vi } from 'vitest';
+import { JSDOM } from 'jsdom';
 
-import { createBootstrapController } from '../../src/core/bootstrap_controller';
+import {
+  createBootstrapController,
+  createFirstDisplayArtifactController,
+} from '../../src/core/bootstrap_controller';
+import type { FirstDisplayComponentRegistrationV1 } from '../../src/first_display/registration';
+import type { FirstDisplaySliceActivationContext } from '../../src/first_display/transaction';
+
+const RELEASE_ID = 'a'.repeat(64);
+
+function artifactDocument(): {
+  document: Document;
+  script: HTMLScriptElement;
+} {
+  const dom = new JSDOM(
+    `<!doctype html><script id="trustedserver-js" src="/static/tsjs=tsjs-first-display.min.js?m=0041&v=${'b'.repeat(64)}"></script>`,
+    { url: 'https://publisher.example/' }
+  );
+  const script = dom.window.document.querySelector('script') as HTMLScriptElement;
+  Object.defineProperty(dom.window.document, 'currentScript', {
+    configurable: true,
+    value: script,
+  });
+  return { document: dom.window.document, script };
+}
+
+function component(
+  id: string,
+  order: number,
+  activate: FirstDisplayComponentRegistrationV1['prepare']
+): FirstDisplayComponentRegistrationV1 {
+  return Object.freeze({ abi: 1, id, releaseId: RELEASE_ID, order, prepare: activate });
+}
 
 describe('first-display bootstrap controller', () => {
   it('owns the bids mark, one deadline, and exact registration/action transitions', () => {
@@ -48,5 +80,96 @@ describe('first-display bootstrap controller', () => {
     expect(failures).toEqual(['bundle_partial']);
     now = 0;
     expect(controller.registerAgent()).toBe(false);
+  });
+
+  it('owns the ephemeral artifact sink and starts only after every selected component activates', () => {
+    const { document, script } = artifactDocument();
+    const target = {};
+    const events: string[] = [];
+    const bootstrap = createBootstrapController({
+      performance: { mark: () => undefined },
+      now: () => 0,
+      setTimer: (callback) => callback,
+      clearTimer: () => undefined,
+      onFailure: (reason) => events.push(`failure:${reason}`),
+    });
+    const artifact = createFirstDisplayArtifactController({
+      bootstrap,
+      target,
+      document,
+      script,
+      releaseId: RELEASE_ID,
+      generation: 1,
+      expectedSliceIds: ['first_display', 'gpt_initial'],
+      isCurrentGeneration: () => true,
+      hostFor: (id) => Object.freeze({ id }),
+    });
+    const sink = Object.getOwnPropertyDescriptor(target, '_registerFirstDisplay');
+    expect(sink).toMatchObject({ configurable: true, enumerable: false, writable: false });
+
+    expect(
+      Reflect.apply(sink?.value, target, [
+        component('first_display', 1, () =>
+          Object.freeze({
+            activate: ({ afterActivate }: FirstDisplaySliceActivationContext) => {
+              events.push('activate:base');
+              afterActivate(() => events.push('start:action'));
+            },
+          })
+        ),
+        script,
+      ])
+    ).toBe(true);
+    expect(events).toEqual([]);
+    expect(
+      Reflect.apply(sink?.value, target, [
+        component('gpt_initial', 7, () =>
+          Object.freeze({ activate: () => events.push('activate:gpt') })
+        ),
+        script,
+      ])
+    ).toBe(true);
+    expect(events).toEqual(['activate:base', 'activate:gpt', 'start:action']);
+    expect(artifact?.state).toBe('active');
+    expect(Object.prototype.hasOwnProperty.call(target, '_registerFirstDisplay')).toBe(false);
+  });
+
+  it('fails closed and removes the sink on a wrong-release component', () => {
+    const { document, script } = artifactDocument();
+    const target = {};
+    const failures: string[] = [];
+    const bootstrap = createBootstrapController({
+      performance: { mark: () => undefined },
+      now: () => 0,
+      setTimer: (callback) => callback,
+      clearTimer: () => undefined,
+      onFailure: (reason) => failures.push(reason),
+    });
+    const artifact = createFirstDisplayArtifactController({
+      bootstrap,
+      target,
+      document,
+      script,
+      releaseId: RELEASE_ID,
+      generation: 1,
+      expectedSliceIds: ['first_display'],
+      isCurrentGeneration: () => true,
+      hostFor: () => Object.freeze({}),
+    });
+    const sink = Object.getOwnPropertyDescriptor(target, '_registerFirstDisplay')?.value;
+    expect(
+      Reflect.apply(sink, target, [
+        Object.freeze({
+          ...component('first_display', 1, () =>
+            Object.freeze({ activate: () => undefined })
+          ),
+          releaseId: 'b'.repeat(64),
+        }),
+        script,
+      ])
+    ).toBe(false);
+    expect(artifact?.state).toBe('failed');
+    expect(failures).toEqual(['abi_mismatch']);
+    expect(Object.prototype.hasOwnProperty.call(target, '_registerFirstDisplay')).toBe(false);
   });
 });

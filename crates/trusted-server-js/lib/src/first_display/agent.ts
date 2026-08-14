@@ -1,6 +1,15 @@
 import type { BootstrapController } from '../core/bootstrap_controller';
 import type { BootFailureReason } from '../kernel/fallback';
 
+import {
+  firstDisplayComponentRegistration,
+  registerCurrentFirstDisplayComponent,
+} from './registration';
+import type {
+  FirstDisplaySliceActivationContext,
+  PreparedFirstDisplaySliceV1,
+} from './transaction';
+
 const HASH = /^[0-9a-f]{64}$/;
 const MAX_OUTCOMES = 256;
 const MAX_U32 = 4_294_967_295;
@@ -48,6 +57,11 @@ export interface FirstDisplayAgentOptions {
   readonly onFailure: (reason: BootFailureReason) => void;
   readonly onPrebidAdmissionFailure?: (reason: 'prebid_admission_failed') => void;
   readonly initialMutationRevision?: number;
+}
+
+/** Bootstrap-owned dependencies supplied only to the release-bound base component. */
+export interface FirstDisplayAgentRegistrationHostV1 {
+  readonly options: FirstDisplayAgentOptions;
 }
 
 export interface FirstDisplayAgentSnapshotV1 {
@@ -341,3 +355,44 @@ export function createFirstDisplayAgent(options: FirstDisplayAgentOptions): Firs
     dispose: () => owner.dispose(),
   });
 }
+
+function prepareRegisteredAgent(host: unknown): PreparedFirstDisplaySliceV1 {
+  try {
+    if (
+      typeof host !== 'object' ||
+      host === null ||
+      Array.isArray(host) ||
+      Object.getPrototypeOf(host) !== Object.prototype ||
+      !Object.isFrozen(host) ||
+      Reflect.ownKeys(host).length !== 1
+    ) {
+      throw new TypeError('invalid first-display base host');
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(host, 'options');
+    if (
+      !descriptor?.enumerable ||
+      !('value' in descriptor) ||
+      typeof descriptor.value !== 'object' ||
+      descriptor.value === null ||
+      !Object.isFrozen(descriptor.value)
+    ) {
+      throw new TypeError('invalid first-display base options');
+    }
+    const options = descriptor.value as FirstDisplayAgentOptions;
+    return Object.freeze({
+      activate: (context: FirstDisplaySliceActivationContext): void => {
+        const agent = createFirstDisplayAgent(options);
+        context.own(() => agent.dispose());
+        context.afterActivate(() => {
+          if (!agent.start()) throw new TypeError('first-display agent did not start');
+        });
+      },
+    });
+  } catch {
+    throw new TypeError('invalid first-display base host');
+  }
+}
+
+registerCurrentFirstDisplayComponent(
+  firstDisplayComponentRegistration('first_display', 1, prepareRegisteredAgent)
+);

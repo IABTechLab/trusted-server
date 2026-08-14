@@ -58,7 +58,7 @@ describe('release-private first-display transaction', () => {
     ).toBe(true);
     expect(
       transaction.register(
-        registration('gpt_initial', 2, (own) => {
+        registration('gpt_initial', 7, (own) => {
           own(() => events.push('dispose-gpt'));
           events.push('activate-gpt');
         })
@@ -68,6 +68,40 @@ describe('release-private first-display transaction', () => {
     expect(events).toEqual(['activate-base', 'activate-gpt']);
     transaction.dispose();
     expect(events).toEqual(['activate-base', 'activate-gpt', 'dispose-gpt', 'dispose-base']);
+  });
+
+  it('starts the responsible action only after every selected slice has activated', () => {
+    const { document, script } = documentWithScript();
+    const events: string[] = [];
+    const transaction = createFirstDisplayTransaction({
+      document,
+      script,
+      releaseId: RELEASE_ID,
+      generation: 7,
+      expectedSliceIds: ['first_display', 'gpt_initial'],
+      isCurrentGeneration: () => true,
+    });
+    transaction.register({
+      ...registration('first_display', 1),
+      prepare: () => ({
+        activate: ({
+          afterActivate,
+        }: {
+          afterActivate: (callback: () => void) => void;
+        }) => {
+          events.push('activate-base');
+          afterActivate(() => events.push('start-action'));
+        },
+      }),
+    });
+    transaction.register(
+      registration('gpt_initial', 7, () => {
+        events.push('activate-gpt');
+      })
+    );
+
+    expect(transaction.activate()).toBe(true);
+    expect(events).toEqual(['activate-base', 'activate-gpt', 'start-action']);
   });
 
   it('rejects unknown, duplicate, omitted, misordered, late, wrong-release, and accessor registrations', () => {
@@ -90,7 +124,7 @@ describe('release-private first-display transaction', () => {
     const omitted = make();
     expect(omitted.register(registration('first_display', 1))).toBe(true);
     expect(omitted.activate()).toBe(false);
-    expect(make().register(registration('gpt_initial', 2))).toBe(false);
+    expect(make().register(registration('gpt_initial', 7))).toBe(false);
     expect(
       make().register({ ...registration('first_display', 1), releaseId: 'b'.repeat(64) })
     ).toBe(false);
@@ -99,9 +133,9 @@ describe('release-private first-display transaction', () => {
     expect(make().register(accessor)).toBe(false);
     const late = make();
     expect(late.register(registration('first_display', 1))).toBe(true);
-    expect(late.register(registration('gpt_initial', 2))).toBe(true);
+    expect(late.register(registration('gpt_initial', 7))).toBe(true);
     expect(late.activate()).toBe(true);
-    expect(late.register(registration('gpt_initial', 2))).toBe(false);
+    expect(late.register(registration('gpt_initial', 7))).toBe(false);
   });
 
   it('authenticates the exact parser-inserted current script and current generation', () => {
@@ -147,7 +181,7 @@ describe('release-private first-display transaction', () => {
       })
     );
     transaction.register(
-      registration('gpt_initial', 2, (own) => {
+      registration('gpt_initial', 7, (own) => {
         own(() => events.push('dispose-c'));
         throw new Error('boom');
       })
