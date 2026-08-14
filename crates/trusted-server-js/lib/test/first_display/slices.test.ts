@@ -9,6 +9,7 @@ import { DIDOMI_INITIAL_SLICE } from '../../src/first_display/slices/didomi';
 import { CREATIVE_INITIAL_SLICE } from '../../src/first_display/slices/creative';
 import { APS_INITIAL_SLICE } from '../../src/first_display/slices/aps';
 import { GPT_INITIAL_SLICE } from '../../src/first_display/slices/gpt';
+import { PREBID_INITIAL_SLICE } from '../../src/first_display/slices/prebid';
 import { DATADOME_INITIAL_SLICE } from '../../src/first_display/slices/datadome';
 import { GOOGLE_TAG_MANAGER_INITIAL_SLICE } from '../../src/first_display/slices/google_tag_manager';
 import { LOCKR_INITIAL_SLICE } from '../../src/first_display/slices/lockr';
@@ -21,6 +22,7 @@ import { installDidomiInitial } from '../../src/first_display/leaf/config_guard'
 import type { FirstDisplayCreativeGuardV1 } from '../../src/first_display/leaf/creative_guard';
 import type { FirstDisplayApsProtocolV1 } from '../../src/first_display/leaf/aps_protocol';
 import type { FirstDisplayGptProtocolV1 } from '../../src/first_display/leaf/gpt_protocol';
+import type { FirstDisplayPrebidProtocolV1 } from '../../src/first_display/leaf/prebid_protocol';
 import {
   installPermutiveInitial,
   snapshotPermutiveInitialSegments,
@@ -1080,6 +1082,83 @@ describe('first-display initial slice definitions', () => {
     expect(protocol?.classifyRenderEnded(Object.freeze({ isEmpty: true }))).toBe('gam_empty');
     expect(protocol?.classifyRenderEnded(Object.freeze({ isEmpty: false }))).toBe('nonempty_gam');
     expect(protocol?.classifyRenderEnded(Object.freeze({ isEmpty: 'false' }))).toBeUndefined();
+
+    disposers.reverse().forEach((dispose) => dispose());
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('registers the Prebid admission policy for the protected batch only', () => {
+    const release = vi.fn();
+    const disposers: Array<() => void> = [];
+    let protocol: FirstDisplayPrebidProtocolV1 | undefined;
+    const bindings = Object.freeze({
+      observe: vi.fn(),
+      register: (candidate: FirstDisplayPrebidProtocolV1) => {
+        protocol = candidate;
+        return release;
+      },
+    });
+    const host = Object.freeze({
+      activate: (
+        id: string,
+        own: (dispose: () => void) => void,
+        install?: (candidate: unknown, ownEffect: (dispose: () => void) => void) => void
+      ) => {
+        expect(id).toBe('prebid_initial');
+        install?.(bindings, own);
+      },
+    });
+
+    PREBID_INITIAL_SLICE.prepare(host).activate(
+      Object.freeze({
+        own: (dispose: () => void) => disposers.push(dispose),
+        afterActivate: () => undefined,
+      })
+    );
+    expect(protocol).toMatchObject({
+      bidderCode: 'trustedServer',
+      maxPendingOperations: 64,
+      externalReadyMs: 10_000,
+      admissionLeaseMs: 10_000,
+      renderReservationMs: 15 * 60 * 1_000,
+    });
+    expect(protocol?.normalizeEidSource('  ID5-SYNC.COM ')).toBe('id5-sync.com');
+    expect(protocol?.normalizeEidSource('   ')).toBeUndefined();
+    const prepared = protocol?.snapshotTrustedBid(
+      Object.freeze({
+        auctionId: 'auction-1',
+        adUnitCode: 'slot-1',
+        bid: Object.freeze({
+          requestId: 'request-1',
+          adId: `r1_${'a'.repeat(22)}`,
+          cpm: 1.25,
+          width: 300,
+          height: 250,
+          ad: '',
+          ttl: 300,
+          creativeId: 'creative-1',
+          netRevenue: true,
+          currency: 'USD',
+          bidderCode: 'trustedServer',
+          meta: Object.freeze({
+            advertiserDomains: Object.freeze(['advertiser.example']),
+            tsAuctionId: 'auction-1',
+            tsBidId: 'bid-1',
+          }),
+        }),
+      })
+    );
+    expect(prepared).toBeDefined();
+    expect(Object.isFrozen(prepared)).toBe(true);
+    expect(prepared?.bid.adId).toBe(`r1_${'a'.repeat(22)}`);
+    expect(
+      protocol?.snapshotTrustedBid(
+        Object.freeze({
+          ...prepared,
+          bid: Object.freeze({ ...prepared?.bid, bidderCode: 'publisherBidder' }),
+        })
+      )
+    ).toBeUndefined();
 
     disposers.reverse().forEach((dispose) => dispose());
     expect(release).toHaveBeenCalledOnce();
