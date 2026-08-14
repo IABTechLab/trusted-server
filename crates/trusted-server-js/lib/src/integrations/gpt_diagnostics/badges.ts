@@ -106,6 +106,10 @@ function deliveryLabel(cycle: GptDiagnosticsRequestCycle): string | undefined {
   }
 }
 
+function formatSizes(sizes: ReadonlyArray<readonly [number, number]>): string {
+  return sizes.map((size) => `${size[0]}×${size[1]}`).join(', ');
+}
+
 function badgeText(cycle: GptDiagnosticsRequestCycle): string {
   const firstLine: string[] = [];
   if (cycle.isEmpty === true) firstLine.push('Empty');
@@ -115,7 +119,13 @@ function badgeText(cycle: GptDiagnosticsRequestCycle): string {
   const delivery = deliveryLabel(cycle);
   if (delivery) firstLine.push(delivery);
   if (cycle.requestPath === 'competing') firstLine.push('Competing paths');
-  if (cycle.size) firstLine.push(`${cycle.size[0]}×${cycle.size[1]}`);
+  if (cycle.requestedSlotSizes) {
+    firstLine.push(`Requested ${formatSizes(cycle.requestedSlotSizes)}`);
+  }
+  if (cycle.size) firstLine.push(`GPT fill ${cycle.size[0]}×${cycle.size[1]}`);
+  if (cycle.observedSlotSize) {
+    firstLine.push(`Outer box ${cycle.observedSlotSize[0]}×${cycle.observedSlotSize[1]}`);
+  }
 
   const timingLine: string[] = [];
   const response = formatMilliseconds(cycle.durations.requestToResponseMs);

@@ -1065,20 +1065,13 @@ export function installTsAdInit(): void {
         // implementation must never interrupt slot mapping or delivery.
         try {
           const opportunity = trustedServerOpportunity(bid);
-          if (bid.hb_auction_id !== undefined) {
-            ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
-              gptSlot,
-              slot.id,
-              opportunity,
-              bid.hb_auction_id
-            );
-          } else {
-            ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
-              gptSlot,
-              slot.id,
-              opportunity
-            );
-          }
+          ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
+            gptSlot,
+            slot.id,
+            opportunity,
+            bid.hb_auction_id,
+            slot.formats
+          );
         } catch {
           // Diagnostics must not alter ad delivery.
         }
