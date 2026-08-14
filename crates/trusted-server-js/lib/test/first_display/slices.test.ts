@@ -8,6 +8,7 @@ import {
 import { DIDOMI_INITIAL_SLICE } from '../../src/first_display/slices/didomi';
 import { CREATIVE_INITIAL_SLICE } from '../../src/first_display/slices/creative';
 import { APS_INITIAL_SLICE } from '../../src/first_display/slices/aps';
+import { GPT_INITIAL_SLICE } from '../../src/first_display/slices/gpt';
 import { DATADOME_INITIAL_SLICE } from '../../src/first_display/slices/datadome';
 import { GOOGLE_TAG_MANAGER_INITIAL_SLICE } from '../../src/first_display/slices/google_tag_manager';
 import { LOCKR_INITIAL_SLICE } from '../../src/first_display/slices/lockr';
@@ -19,6 +20,7 @@ import type { FirstDisplayRouteRuleV1 } from '../../src/first_display/leaf/route
 import { installDidomiInitial } from '../../src/first_display/leaf/config_guard';
 import type { FirstDisplayCreativeGuardV1 } from '../../src/first_display/leaf/creative_guard';
 import type { FirstDisplayApsProtocolV1 } from '../../src/first_display/leaf/aps_protocol';
+import type { FirstDisplayGptProtocolV1 } from '../../src/first_display/leaf/gpt_protocol';
 import {
   installPermutiveInitial,
   snapshotPermutiveInitialSegments,
@@ -1019,6 +1021,65 @@ describe('first-display initial slice definitions', () => {
     ]) {
       expect(protocol?.parseDocumentMessage(Object.freeze(message), nonce)).toBeUndefined();
     }
+
+    disposers.reverse().forEach((dispose) => dispose());
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('registers the GPT request-cycle and targeting policy before any initial action', () => {
+    const release = vi.fn();
+    const disposers: Array<() => void> = [];
+    let protocol: FirstDisplayGptProtocolV1 | undefined;
+    const bindings = Object.freeze({
+      observe: vi.fn(),
+      register: (candidate: FirstDisplayGptProtocolV1) => {
+        protocol = candidate;
+        return release;
+      },
+    });
+    const host = Object.freeze({
+      activate: (
+        id: string,
+        own: (dispose: () => void) => void,
+        install?: (candidate: unknown, ownEffect: (dispose: () => void) => void) => void
+      ) => {
+        expect(id).toBe('gpt_initial');
+        install?.(bindings, own);
+      },
+    });
+
+    GPT_INITIAL_SLICE.prepare(host).activate(
+      Object.freeze({
+        own: (dispose: () => void) => disposers.push(dispose),
+        afterActivate: () => undefined,
+      })
+    );
+    expect(protocol?.deadlines).toEqual({
+      externalReadyMs: 10_000,
+      requestStartMs: 3_000,
+      completionMs: 10_000,
+    });
+    expect(
+      protocol?.requestPlan(
+        Object.freeze({ initialLoadDisabled: false, ownership: 'trusted_server' })
+      )
+    ).toEqual({ operations: ['display'], requestOperation: 0 });
+    expect(
+      protocol?.requestPlan(
+        Object.freeze({ initialLoadDisabled: true, ownership: 'trusted_server' })
+      )
+    ).toEqual({ operations: ['display', 'refresh'], requestOperation: 1 });
+    expect(
+      protocol?.requestPlan(Object.freeze({ initialLoadDisabled: false, ownership: 'publisher' }))
+    ).toEqual({ operations: ['refresh'], requestOperation: 0 });
+    expect(protocol?.validTargetingValue('x'.repeat(40))).toBe(true);
+    expect(protocol?.validTargetingValue('😀'.repeat(40))).toBe(true);
+    expect(protocol?.validTargetingValue('x'.repeat(41))).toBe(false);
+    expect(protocol?.validTargetingValue('😀'.repeat(41))).toBe(false);
+    expect(protocol?.validTargetingValue('bad\nvalue')).toBe(false);
+    expect(protocol?.classifyRenderEnded(Object.freeze({ isEmpty: true }))).toBe('gam_empty');
+    expect(protocol?.classifyRenderEnded(Object.freeze({ isEmpty: false }))).toBe('nonempty_gam');
+    expect(protocol?.classifyRenderEnded(Object.freeze({ isEmpty: 'false' }))).toBeUndefined();
 
     disposers.reverse().forEach((dispose) => dispose());
     expect(release).toHaveBeenCalledOnce();
