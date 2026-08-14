@@ -215,6 +215,7 @@ const CURRENT_SHARED_SOURCE_OWNER_POLICIES = Object.freeze({
   'src/core/templates/iframe.html?raw': Object.freeze(['core']),
   'src/core/trace.ts': Object.freeze(['core', 'gpt_diagnostics']),
   'src/kernel/contracts/message_protocol.ts': Object.freeze(['core', 'gpt']),
+  'src/kernel/contracts/puc_dynamic_owner.ts': Object.freeze(['gpt', 'gpt_initial']),
   'src/kernel/diagnostics.ts': Object.freeze(['core']),
   'src/kernel/disposable.ts': Object.freeze(['core', 'gpt']),
   'src/kernel/fallback.ts': Object.freeze(['bootstrap', 'core']),
@@ -781,8 +782,11 @@ function validateCurrentSourceOwnership(currentGraph, release) {
       }
       continue;
     }
+    const sharedOwners = CURRENT_SHARED_SOURCE_OWNER_POLICIES[source];
     for (const owner of firstDisplayOwners) {
-      violations.push(`${owner} reaches persistent source ${source}`);
+      if (!sharedOwners?.includes(owner)) {
+        violations.push(`${owner} reaches persistent source ${source}`);
+      }
     }
     const policy = currentExactSourceOwner(source);
     if (policy) {
