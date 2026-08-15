@@ -144,11 +144,19 @@ export function snapshotPermutiveInitialSegments(raw: string | null): readonly s
 }
 
 function isPermutiveSdkUrl(url: string): boolean {
-  const lower = url.toLowerCase();
-  return (
-    (lower.includes('.edge.permutive.app') || lower.includes('cdn.permutive.com')) &&
-    lower.endsWith('-web.js')
-  );
+  try {
+    const parsed = new URL(url);
+    const hostname = parsed.hostname.toLowerCase();
+    return (
+      parsed.protocol === 'https:' &&
+      (hostname === 'cdn.permutive.com' || hostname.endsWith('.edge.permutive.app')) &&
+      parsed.pathname.toLowerCase().endsWith('-web.js') &&
+      parsed.search === '' &&
+      parsed.hash === ''
+    );
+  } catch {
+    return false;
+  }
 }
 
 function bestEffort(action: () => void): void {

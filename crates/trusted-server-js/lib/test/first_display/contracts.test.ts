@@ -181,6 +181,12 @@ describe('first-display immutable contracts', () => {
     expect(
       snapshotTakeoverOutlineV1(outline({ capabilities: ['gpt_slot', 'gpt_slot'] }))
     ).toBeUndefined();
+    expect(
+      snapshotTakeoverOutlineV1(outline({ capabilities: ['a.0_0_0_0_0_0_0_0_0_0_0_0_0_0_0_0_!'] }))
+    ).toBeUndefined();
+    expect(
+      snapshotTakeoverOutlineV1(outline({ capabilities: ['trace.presentation_v1'] }))?.capabilities
+    ).toEqual(['trace.presentation_v1']);
   });
 
   it('accepts the complete exact handoff and rejects payload or live-authority fields', () => {

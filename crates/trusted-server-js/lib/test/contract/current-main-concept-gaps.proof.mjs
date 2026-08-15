@@ -140,8 +140,8 @@ test('RCJ-APS-03 waits for an APS callback instead of script load', async () => 
   const rust = await readFile(sourcePath, 'utf8');
   const documentMatch = /const APS_RENDERER_DOCUMENT: &str = r#"([\s\S]*?)"#;/.exec(rust);
   assert.ok(documentMatch, 'current main should expose the renderer document under test');
-  const scriptMatch = /<script>([\s\S]*?)<\/script>/.exec(documentMatch[1]);
-  assert.ok(scriptMatch, 'renderer document should contain executable code');
+  const scriptSource = JSDOM.fragment(documentMatch[1]).querySelector('script')?.textContent;
+  assert.ok(scriptSource, 'renderer document should contain executable code');
 
   const nonce = 'a'.repeat(22);
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
@@ -150,7 +150,7 @@ test('RCJ-APS-03 waits for an APS callback instead of script load', async () => 
   });
   const posts = [];
   dom.window.postMessage = (message) => posts.push(message);
-  dom.window.eval(scriptMatch[1]);
+  dom.window.eval(scriptSource);
   dom.window.dispatchEvent(
     new dom.window.MessageEvent('message', {
       data: { nonce, renderer: apsDescriptor(dom.window) },
