@@ -179,13 +179,13 @@ export interface BrowserComposition {
 
 export const BROWSER_TEST_DIAGNOSTICS_PROVIDER_ID = 'browser_test_diagnostics_provider';
 export const BROWSER_TEST_TRACE_PROVIDER_ID = 'browser_test_trace_provider';
-const TRUSTED_BROWSER_TEST_CRITICAL_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
+const TRUSTED_BROWSER_TEST_RUNTIME_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
 
-function installBrowserTestCriticalScript(runtimeDocument: Document): void {
+function installBrowserTestRuntimeScript(runtimeDocument: Document): void {
   if (runtimeDocument.currentScript) return;
   const script = runtimeDocument.createElement('script');
   script.id = 'trustedserver-js';
-  script.src = new URL(TRUSTED_BROWSER_TEST_CRITICAL_SRC, runtimeDocument.location.origin).href;
+  script.src = new URL(TRUSTED_BROWSER_TEST_RUNTIME_SRC, runtimeDocument.location.origin).href;
   runtimeDocument.head.insertBefore(script, null);
   Object.defineProperty(runtimeDocument, 'currentScript', {
     configurable: true,
@@ -237,11 +237,11 @@ export interface BrowserRuntimeComposition extends BrowserComposition {
   readonly rendererNonceRegistryForTest: () => RendererNonceRegistry | undefined;
   /** Return the single runtime-owned PUC bridge only in coordinated-cutover tests. */
   readonly pucBridgeForTest: () => PucBridge | undefined;
-  /** Join one prospective GPT attempt through the runtime-owned services in tests. */
+  /** Join one candidate GPT attempt through the runtime-owned services in tests. */
   readonly startGptSlotOperationForTest: (
     input: Omit<GptSlotOperationInput, 'createSlotOperation' | 'pucBridge' | 'slots'>
   ) => SlotOperationCreationResult;
-  /** Publish one prospective server winner through the ordered GPT transaction in tests. */
+  /** Publish one candidate server winner through the ordered GPT transaction in tests. */
   readonly publishGptWinnerForTest: (
     input: Omit<
       GptWinnerPublicationInput,
@@ -703,7 +703,7 @@ export function createTestBrowserRuntimeComposition(
 ): BrowserRuntimeComposition {
   const runtimeDocument =
     runtimeOptions.document ?? (typeof document === 'undefined' ? undefined : document);
-  if (runtimeDocument) installBrowserTestCriticalScript(runtimeDocument);
+  if (runtimeDocument) installBrowserTestRuntimeScript(runtimeDocument);
   const composition = createBrowserComposition(compositionOptions);
   const providedBindings = runtimeOptions.getBindings;
   let browserServices: Readonly<BrowserServices> | undefined;
@@ -1753,7 +1753,7 @@ export function createTestBrowserRuntimeComposition(
       Object.freeze({
         abi: 1,
         id: BROWSER_TEST_DIAGNOSTICS_PROVIDER_ID,
-        phase: 'critical',
+        phase: 'takeover',
         releaseId: runtimeOptions.releaseId,
         prepare: () => {
           const facts = gptDiagnosticsFacts;
@@ -1786,7 +1786,7 @@ export function createTestBrowserRuntimeComposition(
       Object.freeze({
         abi: 1,
         id: BROWSER_TEST_TRACE_PROVIDER_ID,
-        phase: 'critical',
+        phase: 'takeover',
         releaseId: runtimeOptions.releaseId,
         prepare: () => {
           const trace = renderTrace;

@@ -45,7 +45,7 @@ export function createApsIntegrationRegistration(releaseId: string): Integration
   return Object.freeze({
     abi: 1 as const,
     id: 'aps',
-    phase: 'critical' as const,
+    phase: 'takeover' as const,
     releaseId,
     prepare: (context: IntegrationPrepareContext) => {
       const render = capability<RenderCapability>(context.interfaces, 'render.v1');

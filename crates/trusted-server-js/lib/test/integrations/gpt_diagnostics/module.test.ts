@@ -35,7 +35,7 @@ function prepare(
   ) as PreparedIntegration;
 }
 
-describe('critical GPT diagnostics data provider', () => {
+describe('takeover GPT diagnostics data provider', () => {
   it('accepts a valid foreign-realm Document at the registration boundary', () => {
     const frame = document.createElement('iframe');
     document.body.append(frame);

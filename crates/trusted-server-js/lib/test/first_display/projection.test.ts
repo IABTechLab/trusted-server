@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
 import { parseBrowserAuctionProjectionV1 } from '../../src/core/contracts/auction_projection';
-import { snapshotFirstDisplayBatchV1 } from '../../src/first_display/leaf/projection';
+import {
+  acceptServerFirstDisplayBatchV1,
+  snapshotFirstDisplayBatchV1,
+} from '../../src/first_display/leaf/projection';
 
 function freezeTree<Value>(value: Value): Value {
   if (typeof value !== 'object' || value === null || Object.isFrozen(value)) return value;
@@ -77,6 +80,19 @@ function winnerFixture(options: { provider?: string; source?: 'adm' | 'aps' | 'p
 }
 
 describe('first-display projection snapshot', () => {
+  it('accepts only the already-frozen server envelope used by the production agent', () => {
+    const candidate = freezeTree(winnerFixture({ provider: 'prebid' }));
+
+    expect(acceptServerFirstDisplayBatchV1(candidate)).toMatchObject({
+      requiredProtocols: ['gpt', 'prebid'],
+      outcomes: [{ slotId: 'slot-1', kind: 'gpt_adm' }],
+    });
+    expect(acceptServerFirstDisplayBatchV1(winnerFixture())).toBeUndefined();
+    expect(
+      acceptServerFirstDisplayBatchV1(freezeTree(winnerFixture({ source: 'pbs_cache' })))
+    ).toBeUndefined();
+  });
+
   it('derives canonical protocol coverage and remains equal to the persistent ADM parser', () => {
     const candidate = freezeTree(winnerFixture({ provider: 'prebid' }));
     const snapshot = snapshotFirstDisplayBatchV1(candidate);

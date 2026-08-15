@@ -207,7 +207,7 @@ export function createPrebidIntegrationRegistration(releaseId: string): Integrat
   return Object.freeze({
     abi: 1,
     id: PREBID_INTEGRATION_ID,
-    phase: 'critical',
+    phase: 'takeover',
     releaseId,
     prepare: ({ config, interfaces, onDispose }: IntegrationPrepareContext) => {
       if (!validFrozenConfig(config)) throw new TypeError('Prebid integration config is invalid');

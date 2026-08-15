@@ -1,8 +1,12 @@
 import type { BootManifestV1 } from '../core/types';
+import {
+  snapshotOutlinedFirstDisplayHandoffV1,
+  type FirstDisplayHandoffV1,
+} from '../shared/first_display_contracts';
 import { snapshotPersistentFirstDisplayAdoptionV1 } from '../shared/takeover';
 
 import { DisposableStack, type DisposeCallback } from './disposable';
-import { trustedCriticalOrigin, type BootFailureReason } from './fallback';
+import { trustedArtifactOrigin, type BootFailureReason } from './fallback';
 
 const INTEGRATION_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const RELEASE_ID = /^[0-9a-f]{64}$/;
@@ -52,7 +56,7 @@ export interface PreparedIntegration {
 export interface IntegrationRegistration {
   readonly abi: 1;
   readonly id: string;
-  readonly phase: 'critical' | 'deferred';
+  readonly phase: 'takeover' | 'deferred';
   readonly releaseId: string;
   readonly prepare: (
     context: IntegrationPrepareContext
@@ -66,6 +70,11 @@ export interface IntegrationRuntimeFailure {
 
 /** One-use, non-yielding barrier exposed only after every inert preparation succeeds. */
 export interface PreparedKernelTakeover {
+  /** Validate and freeze the complete handoff before either owner mutates state. */
+  readonly validateHandoff: (
+    handoff: unknown,
+    outline: unknown
+  ) => FirstDisplayHandoffV1 | undefined;
   readonly activate: (adoption?: unknown) => void;
   readonly commit: () => void;
   readonly rollback: () => void;
@@ -106,9 +115,9 @@ export interface IntegrationRegistryOptions {
   readonly catalog?: readonly IntegrationCatalogEntry[];
   /** Kernel-owned root capability; never published or returned by the registry facade. */
   readonly runtimeCapability?: Readonly<Record<string, unknown>>;
-  /** Captured parser-inserted critical script; required by production runtime. */
-  readonly criticalScript?: HTMLScriptElement;
-  readonly criticalScriptId?: 'trustedserver-js' | 'trustedserver-js-runtime';
+  /** Captured parser-inserted takeover script; required by production runtime. */
+  readonly takeoverScript?: HTMLScriptElement;
+  readonly takeoverScriptId?: 'trustedserver-js' | 'trustedserver-js-runtime';
   readonly document?: Document;
   readonly startedAtMs: number;
   readonly now?: () => number;
@@ -126,7 +135,7 @@ export interface IntegrationRegistryOptions {
 
 export interface IntegrationCatalogEntry {
   readonly id: string;
-  readonly phase: 'critical' | 'deferred';
+  readonly phase: 'takeover' | 'deferred';
   readonly trigger: 'first_display_or_idle' | null;
   readonly consumes: readonly string[];
   readonly provides: readonly string[];
@@ -202,7 +211,7 @@ export function snapshotIntegrationRegistration(
       abi !== 1 ||
       typeof id !== 'string' ||
       !INTEGRATION_ID.test(id) ||
-      (phase !== 'critical' && phase !== 'deferred') ||
+      (phase !== 'takeover' && phase !== 'deferred') ||
       typeof releaseId !== 'string' ||
       !RELEASE_ID.test(releaseId) ||
       typeof prepare !== 'function'
@@ -295,7 +304,7 @@ function validateCatalog(
   const seen = new Set<string>();
   const catalog: IntegrationCatalogEntry[] = [];
   let sawDeferred = false;
-  let criticalCount = 0;
+  let takeoverCount = 0;
   const providerIndex = new Map<string, number>();
   for (const entry of entries) {
     const fields = readExactDataFields(entry, ['id', 'phase', 'trigger', 'consumes', 'provides']);
@@ -307,8 +316,8 @@ function validateCatalog(
     if (!consumes || !provides) return undefined;
     if (seen.has(fields.id)) return undefined;
     seen.add(fields.id);
-    if (fields.phase === 'critical') {
-      if (fields.trigger !== null || sawDeferred || ++criticalCount > 14) return undefined;
+    if (fields.phase === 'takeover') {
+      if (fields.trigger !== null || sawDeferred || ++takeoverCount > 14) return undefined;
     } else if (fields.phase === 'deferred') {
       sawDeferred = true;
       if (fields.trigger !== 'first_display_or_idle' || provides.length !== 0) return undefined;
@@ -353,7 +362,8 @@ function validateManifest(
     const manifestFields = readExactDataFields(candidate, [
       'version',
       'releaseId',
-      'criticalSrc',
+      'firstDisplay',
+      'runtimeSrc',
       'integrations',
     ]);
     if (!manifestFields) return undefined;
@@ -363,9 +373,35 @@ function validateManifest(
     const manifestIntegrations = snapshotExactArray(manifestFields.integrations, MAX_INTEGRATIONS);
     if (!manifestIntegrations) return undefined;
 
+    let firstDisplay: BootManifestV1['firstDisplay'];
+    if (manifestFields.firstDisplay === null) {
+      firstDisplay = null;
+    } else {
+      const fields = readExactDataFields(manifestFields.firstDisplay, ['src', 'slices']);
+      const slices = snapshotExactArray(fields?.slices, 13);
+      if (
+        !fields ||
+        typeof fields.src !== 'string' ||
+        !/^\/static\/tsjs=tsjs-first-display\.min\.js\?m=[0-9a-f]{4}&v=[0-9a-f]{64}$/.test(
+          fields.src
+        ) ||
+        !slices ||
+        slices.length === 0 ||
+        slices[0] !== 'first_display' ||
+        slices.some((id) => typeof id !== 'string') ||
+        new Set(slices).size !== slices.length
+      ) {
+        return undefined;
+      }
+      firstDisplay = Object.freeze({
+        src: fields.src,
+        slices: Object.freeze([...slices] as string[]),
+      });
+    }
+
     if (
-      typeof manifestFields.criticalSrc !== 'string' ||
-      !/^\/static\/tsjs=tsjs-unified\.min\.js\?v=[0-9a-f]{64}$/.test(manifestFields.criticalSrc)
+      typeof manifestFields.runtimeSrc !== 'string' ||
+      !/^\/static\/tsjs=tsjs-unified\.min\.js\?v=[0-9a-f]{64}$/.test(manifestFields.runtimeSrc)
     ) {
       return undefined;
     }
@@ -373,7 +409,7 @@ function validateManifest(
     const seen = new Set<string>();
     const integrations: BootManifestV1['integrations'][number][] = [];
     let sawDeferred = false;
-    let criticalCount = 0;
+    let takeoverCount = 0;
     let previousCatalogIndex = -1;
     for (const entry of manifestIntegrations) {
       const phaseDescriptor = isRecord(entry) && Object.getOwnPropertyDescriptor(entry, 'phase');
@@ -381,9 +417,9 @@ function validateManifest(
       const phase = phaseDescriptor.value;
       const entryFields = readExactDataFields(
         entry,
-        phase === 'critical' ? ['id', 'phase'] : ['id', 'phase', 'trigger', 'src']
+        phase === 'takeover' ? ['id', 'phase'] : ['id', 'phase', 'trigger', 'src']
       );
-      if (!entryFields || (phase !== 'critical' && phase !== 'deferred')) return undefined;
+      if (!entryFields || (phase !== 'takeover' && phase !== 'deferred')) return undefined;
       if (typeof entryFields.id !== 'string' || !INTEGRATION_ID.test(entryFields.id)) {
         return undefined;
       }
@@ -393,11 +429,11 @@ function validateManifest(
         return undefined;
       }
       previousCatalogIndex = catalogIndex;
-      if (seen.has(entryFields.id) || (sawDeferred && phase === 'critical')) return undefined;
+      if (seen.has(entryFields.id) || (sawDeferred && phase === 'takeover')) return undefined;
       seen.add(entryFields.id);
-      if (phase === 'critical') {
-        criticalCount += 1;
-        if (criticalCount > 14 || catalogEntry.trigger !== null) return undefined;
+      if (phase === 'takeover') {
+        takeoverCount += 1;
+        if (takeoverCount > 14 || catalogEntry.trigger !== null) return undefined;
         integrations.push(Object.freeze({ id: entryFields.id, phase }));
         continue;
       }
@@ -439,7 +475,8 @@ function validateManifest(
     return Object.freeze({
       version: 1,
       releaseId: embeddedReleaseId,
-      criticalSrc: manifestFields.criticalSrc,
+      firstDisplay,
+      runtimeSrc: manifestFields.runtimeSrc,
       integrations: Object.freeze(integrations),
     });
   } catch {
@@ -511,8 +548,8 @@ function observeThenableRejection(
 class IntegrationRegistryOwner {
   private readonly manifestValue: BootManifestV1 | undefined;
   private readonly catalog: readonly IntegrationCatalogEntry[];
-  private readonly criticalScript: HTMLScriptElement | undefined;
-  private readonly criticalScriptId: 'trustedserver-js' | 'trustedserver-js-runtime';
+  private readonly takeoverScript: HTMLScriptElement | undefined;
+  private readonly takeoverScriptId: 'trustedserver-js' | 'trustedserver-js-runtime';
   private readonly document: Document | undefined;
   private readonly registrations = new Map<string, IntegrationRegistration>();
   private readonly capabilities = new Map<string, Readonly<Record<string, unknown>>>();
@@ -535,14 +572,14 @@ class IntegrationRegistryOwner {
   private installPromise: Promise<IntegrationInstallResult> | undefined;
   private registrationWaiter: (() => void) | undefined;
   private registryState: IntegrationRegistryState = 'collecting';
-  private nextCriticalRegistrationIndex = 0;
+  private nextTakeoverRegistrationIndex = 0;
   private ownedCallbackDepth = 0;
   private unwindPending = false;
 
   public constructor(options: IntegrationRegistryOptions) {
     this.releaseId = options.releaseId;
-    this.criticalScript = options.criticalScript;
-    this.criticalScriptId = options.criticalScriptId ?? 'trustedserver-js';
+    this.takeoverScript = options.takeoverScript;
+    this.takeoverScriptId = options.takeoverScriptId ?? 'trustedserver-js';
     this.document = options.document;
     this.startedAtMs = options.startedAtMs;
     this.now = options.now ?? (() => performance.now());
@@ -565,7 +602,7 @@ class IntegrationRegistryOwner {
         options.knownIntegrationIds.map((id) =>
           Object.freeze({
             id,
-            phase: 'critical' as const,
+            phase: 'takeover' as const,
             trigger: null,
             consumes: Object.freeze([]),
             provides: Object.freeze([]),
@@ -639,19 +676,19 @@ class IntegrationRegistryOwner {
         return false;
       }
       const { id, phase, releaseId, prepare } = registration;
-      const criticalIntegrations = this.manifestValue?.integrations.filter(
-        (entry) => entry.phase === 'critical'
+      const takeoverIntegrations = this.manifestValue?.integrations.filter(
+        (entry) => entry.phase === 'takeover'
       );
-      const nextCritical = criticalIntegrations?.[this.nextCriticalRegistrationIndex];
+      const nextTakeover = takeoverIntegrations?.[this.nextTakeoverRegistrationIndex];
       if (
         releaseId !== this.releaseId ||
         !this.manifestValue?.integrations.some(
           (entry) => entry.id === id && entry.phase === phase
         ) ||
-        phase !== 'critical' ||
-        nextCritical?.id !== id ||
+        phase !== 'takeover' ||
+        nextTakeover?.id !== id ||
         this.registrations.has(id) ||
-        !this.ownsCriticalScript()
+        !this.ownsTakeoverScript()
       ) {
         this.fail('abi_mismatch');
         return false;
@@ -673,7 +710,7 @@ class IntegrationRegistryOwner {
           prepare: prepare as IntegrationRegistration['prepare'],
         })
       );
-      this.nextCriticalRegistrationIndex += 1;
+      this.nextTakeoverRegistrationIndex += 1;
       if (this.hasEveryRequiredRegistration()) this.wakeRegistrationWaiter();
       return true;
     } catch {
@@ -682,28 +719,28 @@ class IntegrationRegistryOwner {
     }
   }
 
-  private ownsCriticalScript(): boolean {
-    if (!this.criticalScript && !this.document) return true;
-    const script = this.criticalScript;
+  private ownsTakeoverScript(): boolean {
+    if (!this.takeoverScript && !this.document) return true;
+    const script = this.takeoverScript;
     const document = this.document;
     const Script = document?.defaultView?.HTMLScriptElement;
     const manifest = this.manifestValue;
     if (!script || !document || !Script || !manifest) return false;
     try {
-      const origin = trustedCriticalOrigin(document);
+      const origin = trustedArtifactOrigin(document);
       if (!origin) return false;
-      const expected = new URL(manifest.criticalSrc, origin);
-      const matches = document.querySelectorAll(`script#${this.criticalScriptId}`);
+      const expected = new URL(manifest.runtimeSrc, origin);
+      const matches = document.querySelectorAll(`script#${this.takeoverScriptId}`);
       return (
         script instanceof Script &&
-        script.id === this.criticalScriptId &&
+        script.id === this.takeoverScriptId &&
         script.isConnected &&
         matches.length === 1 &&
         matches[0] === script &&
         document.currentScript === script &&
         expected.origin === origin &&
         expected.hash === '' &&
-        `${expected.pathname}${expected.search}` === manifest.criticalSrc &&
+        `${expected.pathname}${expected.search}` === manifest.runtimeSrc &&
         script.src === expected.href
       );
     } catch {
@@ -848,7 +885,7 @@ class IntegrationRegistryOwner {
   private hasEveryRequiredRegistration(): boolean {
     return Boolean(
       this.manifestValue?.integrations
-        .filter((entry) => entry.phase === 'critical')
+        .filter((entry) => entry.phase === 'takeover')
         .every((entry) => this.registrations.has(entry.id))
     );
   }
@@ -1107,7 +1144,7 @@ class IntegrationRegistryOwner {
       if (!this.canContinue('preparing')) return this.fallbackResult();
     }
     for (const entry of this.manifestValue.integrations) {
-      if (entry.phase !== 'critical') continue;
+      if (entry.phase !== 'takeover') continue;
       if (!this.canContinue('preparing')) return this.fallbackResult();
 
       const scope = new DisposableStack(this.onDisposalError);
@@ -1173,8 +1210,28 @@ class IntegrationRegistryOwner {
 
     let activated = false;
     let committed: IntegrationKernelResult | undefined;
+    let validatedHandoff: FirstDisplayHandoffV1 | undefined;
     const prepared: PreparedKernelTakeover = Object.freeze({
+      validateHandoff: (candidate: unknown, outlineCandidate: unknown) => {
+        if (activated || committed || validatedHandoff) return undefined;
+        const handoff = snapshotOutlinedFirstDisplayHandoffV1(candidate, outlineCandidate);
+        if (!handoff) return undefined;
+        validatedHandoff = handoff;
+        return handoff;
+      },
       activate: (adoption?: unknown): void => {
+        if (callbacks.coordinateTakeover) {
+          const accepted = snapshotPersistentFirstDisplayAdoptionV1(adoption);
+          const handoff = validatedHandoff;
+          if (
+            !accepted ||
+            !handoff ||
+            !Object.is(accepted.handoff, handoff) ||
+            accepted.identities.length !== handoff.cycles.length + handoff.artifacts.length
+          ) {
+            throw new Error('Prepared kernel adoption is unavailable');
+          }
+        }
         if (activated || committed || !this.activatePrepared(callbacks, adoption)) {
           throw new Error('Prepared kernel activation is unavailable');
         }

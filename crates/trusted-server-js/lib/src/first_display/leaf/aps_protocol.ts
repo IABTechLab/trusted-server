@@ -1,4 +1,4 @@
-import type { FirstDisplaySliceActivationContext } from '../transaction';
+import type { FirstDisplaySliceActivationContext } from '../../shared/first_display_transaction';
 import {
   createFirstDisplayRenderBridge,
   type FirstDisplayRenderBridgeOptionsV1,
@@ -163,8 +163,7 @@ export function installApsInitial(
   const value = bindings(candidate);
   if (!value || typeof own !== 'function') throw new TypeError('tsjs');
   const rendererUrl = new URL('/integrations/aps/renderer/v1', value.publisherOrigin).href;
-  let protocol: FirstDisplayApsProtocolV1;
-  protocol = Object.freeze({
+  const protocol: FirstDisplayApsProtocolV1 = Object.freeze({
     version: 1,
     id: 'aps',
     publisherOrigin: value.publisherOrigin,

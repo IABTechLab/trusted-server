@@ -742,7 +742,7 @@ impl Default for IntegrationRegistryInner {
 #[derive(Default)]
 struct TsjsStaticTransportV1 {
     artifacts_by_hash: HashMap<String, crate::tsjs::TsjsStaticArtifactV1>,
-    critical_hash_by_selection: HashMap<TsjsCatalogSelectionV1, String>,
+    takeover_hash_by_selection: HashMap<TsjsCatalogSelectionV1, String>,
     first_display_hash_by_mask: HashMap<u16, String>,
     first_display_mask_by_hash: HashMap<String, u16>,
 }
@@ -761,18 +761,18 @@ impl TsjsStaticTransportV1 {
         for render_trace_overlay in [false, true] {
             for selection in tsjs_static_transport_selections(inner, render_trace_overlay) {
                 let normalized_selection = normalize_tsjs_transport_selection(inner, selection);
-                let critical_ids = tsjs_selected_catalog_metadata(inner, normalized_selection)
+                let takeover_ids = tsjs_selected_catalog_metadata(inner, normalized_selection)
                     .into_iter()
                     .filter(|metadata| {
-                        metadata.phase == Some(trusted_server_js::TsjsModulePhase::Critical)
+                        metadata.phase == Some(trusted_server_js::TsjsModulePhase::Takeover)
                     })
                     .map(|metadata| metadata.id)
                     .collect::<Vec<_>>();
-                let artifact = if critical_ids.as_slice() == crate::tsjs::creative_tsjs_module_ids()
+                let artifact = if takeover_ids.as_slice() == crate::tsjs::creative_tsjs_module_ids()
                 {
                     crate::tsjs::creative_tsjs_static_artifact_v1().clone()
                 } else {
-                    crate::tsjs::TsjsStaticArtifactV1::new(&critical_ids)
+                    crate::tsjs::TsjsStaticArtifactV1::new(&takeover_ids)
                 };
                 let hash = artifact.hash().to_owned();
                 transport
@@ -780,7 +780,7 @@ impl TsjsStaticTransportV1 {
                     .entry(hash.clone())
                     .or_insert(artifact);
                 transport
-                    .critical_hash_by_selection
+                    .takeover_hash_by_selection
                     .insert(normalized_selection, hash);
             }
         }
@@ -1511,10 +1511,10 @@ impl IntegrationRegistry {
 
     /// Return the enabled parser-blocking catalog slice in canonical order.
     #[must_use]
-    pub fn tsjs_critical_module_ids(&self, selection: TsjsCatalogSelectionV1) -> Vec<&'static str> {
+    pub fn tsjs_takeover_module_ids(&self, selection: TsjsCatalogSelectionV1) -> Vec<&'static str> {
         tsjs_selected_catalog_metadata(&self.inner, selection)
             .into_iter()
-            .filter(|metadata| metadata.phase == Some(trusted_server_js::TsjsModulePhase::Critical))
+            .filter(|metadata| metadata.phase == Some(trusted_server_js::TsjsModulePhase::Takeover))
             .map(|metadata| metadata.id)
             .collect()
     }
@@ -1542,9 +1542,10 @@ impl IntegrationRegistry {
         tsjs_static_transport_selections(&self.inner, render_trace_overlay)
     }
 
-    /// Return the precomputed critical artifact for one document selection.
+    /// Return the precomputed takeover artifact for one document selection.
+    #[cfg(test)]
     #[must_use]
-    pub(crate) fn tsjs_critical_artifact(
+    pub(crate) fn tsjs_takeover_artifact(
         &self,
         selection: TsjsCatalogSelectionV1,
     ) -> Option<&crate::tsjs::TsjsStaticArtifactV1> {
@@ -1552,7 +1553,7 @@ impl IntegrationRegistry {
         let hash = self
             .inner
             .tsjs_static_transport
-            .critical_hash_by_selection
+            .takeover_hash_by_selection
             .get(&normalized_selection)?;
         self.tsjs_static_artifact(hash)
     }
@@ -2665,7 +2666,7 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_static_transport_precomputes_every_admitted_critical_artifact() {
+    fn tsjs_static_transport_precomputes_every_admitted_takeover_artifact() {
         let mut settings = crate::test_support::tests::create_test_settings();
         settings
             .integrations
@@ -2675,11 +2676,11 @@ mod tests {
 
         for render_trace_overlay in [false, true] {
             for selection in registry.tsjs_static_transport_selections(render_trace_overlay) {
-                let module_ids = registry.tsjs_critical_module_ids(selection);
+                let module_ids = registry.tsjs_takeover_module_ids(selection);
                 let expected_body = trusted_server_js::concatenate_modules(&module_ids);
                 let expected_hash = trusted_server_js::concatenated_hash(&module_ids);
                 let artifact = registry
-                    .tsjs_critical_artifact(selection)
+                    .tsjs_takeover_artifact(selection)
                     .expect("should precompute every admitted selection");
 
                 assert_eq!(artifact.hash(), expected_hash, "should preserve exact hash");
@@ -2691,7 +2692,7 @@ mod tests {
                 assert_eq!(
                     artifact.src(),
                     format!("/static/tsjs=tsjs-unified.min.js?v={expected_hash}"),
-                    "should precompute the exact critical URL"
+                    "should precompute the exact takeover URL"
                 );
                 assert_eq!(
                     registry
@@ -2737,7 +2738,13 @@ mod tests {
         let prebid = bit("prebid_initial");
         assert_eq!(
             masks,
-            vec![fixed, fixed | gpt, fixed | gpt | aps, fixed | gpt | prebid],
+            vec![
+                fixed,
+                fixed | gpt,
+                fixed | gpt | aps,
+                fixed | gpt | prebid,
+                fixed | gpt | aps | prebid,
+            ],
             "registry should enumerate every permitted participation combination"
         );
         for mask in masks {
@@ -2833,23 +2840,26 @@ mod tests {
             .insert_config("osano", &serde_json::json!({ "enabled": true }))
             .expect("should insert osano config");
 
-        let registry = IntegrationRegistry::with_plan(
-            &settings,
-            Arc::new(
-                crate::auction::compile_auction_plan(&settings)
-                    .expect("should compile auction plan"),
-            ),
-        )
-        .expect("should create registry");
-        let immediate = registry.js_module_ids_immediate();
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let selection = TsjsCatalogSelectionV1::default();
+        let takeover = registry.tsjs_takeover_module_ids(selection);
+        let deferred = registry.tsjs_deferred_module_ids(selection);
 
         assert!(
-            immediate.contains(&"sourcepoint"),
-            "should include Sourcepoint when explicitly enabled"
+            takeover.contains(&"sourcepoint_consent"),
+            "should include the Sourcepoint consent owner when explicitly enabled"
         );
         assert!(
-            immediate.contains(&"osano"),
-            "should include Osano when explicitly enabled"
+            takeover.contains(&"osano_consent"),
+            "should include the Osano consent owner when explicitly enabled"
+        );
+        assert!(
+            deferred.contains(&"sourcepoint_lifecycle"),
+            "should defer the Sourcepoint lifecycle owner"
+        );
+        assert!(
+            deferred.contains(&"osano_lifecycle"),
+            "should defer the Osano lifecycle owner"
         );
 
         let metadata = registry.registered_integrations();

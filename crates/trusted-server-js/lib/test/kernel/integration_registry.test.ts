@@ -38,7 +38,7 @@ function createIntegrationRegistry(options: TestRegistryOptions) {
       knownIntegrationIds.map((id) =>
         Object.freeze({
           id,
-          phase: 'critical' as const,
+          phase: 'takeover' as const,
           trigger: null,
           consumes: Object.freeze([]),
           provides: Object.freeze([]),
@@ -52,8 +52,9 @@ function manifest(ids: readonly string[]): BootManifestV1 {
   return {
     version: 1,
     releaseId: RELEASE_ID,
-    criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
-    integrations: ids.map((id) => ({ id, phase: 'critical' as const })),
+    firstDisplay: null,
+    runtimeSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
+    integrations: ids.map((id) => ({ id, phase: 'takeover' as const })),
   };
 }
 
@@ -64,7 +65,7 @@ function registration(
   return {
     abi: 1,
     id,
-    phase: 'critical',
+    phase: 'takeover',
     releaseId: RELEASE_ID,
     prepare: () => ({ activate: () => undefined }),
     ...hooks,
@@ -91,13 +92,7 @@ afterEach(() => {
 describe('integration manifest and registration admission', () => {
   it('offers one synchronous activation/commit barrier after every preparation completes', async () => {
     const order: string[] = [];
-    const adoption = Object.freeze({
-      version: 1 as const,
-      adoptInitialDisplay: true as const,
-      handoff: Object.freeze({}),
-      identities: Object.freeze([{}]),
-    });
-    expect(snapshotPersistentFirstDisplayAdoptionV1(adoption)).toBe(adoption);
+    let adoption: unknown;
     const registry = createIntegrationRegistry({
       manifest: manifest(['gpt']),
       releaseId: RELEASE_ID,
@@ -127,6 +122,83 @@ describe('integration manifest and registration admission', () => {
       coordinateTakeover: (prepared) => {
         expect(Object.isFrozen(prepared)).toBe(true);
         expect(order).toEqual(['core:prepare', 'module:prepare']);
+        const handoff = prepared.validateHandoff(
+          {
+            version: 1,
+            releaseId: RELEASE_ID,
+            generation: 1,
+            projectionDigest: 'b'.repeat(64),
+            slices: ['first_display'],
+            slots: [
+              {
+                id: 'slot-1',
+                aliases: [],
+                domId: 'div-1',
+                gamPath: '/123/slot-1',
+                formats: [[300, 250]],
+                owner: 'trusted_server',
+                outcome: 'failed',
+                targeting: [],
+                committedArtifact: 'none',
+                gptToken: null,
+              },
+            ],
+            attempts: [
+              {
+                id: 'a1_AAECAwQFBgcAAAAAAAAAAQ',
+                slotId: 'slot-1',
+                ordinal: 1,
+                state: 'failed',
+                reason: 'internal_error',
+              },
+            ],
+            tombstones: [],
+            artifacts: [],
+            parserState: [],
+            gptDiagnostics: { facts: [], overflowCount: 0, dropCount: 0 },
+            timing: {
+              bidsScriptMs: 0,
+              firstDisplayMs: null,
+              terminalMs: 0,
+              paintMs: 0,
+            },
+            highWater: {
+              navigationAttemptPrefix: 'AAECAwQFBgc',
+              nextNavigationAttemptOrdinal: 2,
+              nextAttemptOrdinal: 2,
+              nextSlotRegistrationOrdinal: 2,
+              reservationClockEpochMs: 0,
+              nextReservationOrdinal: 1,
+              nextTicketOrdinal: 1,
+            },
+            cycles: [],
+            trace: {
+              nextSequence: 1,
+              nextGlobalSlotOrdinal: 2,
+              slots: [{ slotId: 'slot-1', impressions: 0, bindings: [] }],
+            },
+            mutationRevision: 0,
+          },
+          {
+            version: 1,
+            releaseId: RELEASE_ID,
+            generation: 1,
+            projectionDigest: 'b'.repeat(64),
+            slices: ['first_display'],
+            slotCount: 1,
+            outcomeCount: 1,
+            capabilities: [],
+            objectKinds: [],
+          }
+        );
+        expect(handoff).toBeDefined();
+        adoption = Object.freeze({
+          version: 1 as const,
+          adoptInitialDisplay: true as const,
+          handoff: handoff!,
+          identities: Object.freeze([]),
+        });
+        expect(snapshotPersistentFirstDisplayAdoptionV1(adoption)).toBe(adoption);
         prepared.activate(adoption);
         expect(() => prepared.activate()).toThrow();
         expect(order).toEqual([
@@ -193,7 +265,7 @@ describe('integration manifest and registration admission', () => {
 
   it.each([
     ['old three-field ABI', { id: 'gpt', release: RELEASE_ID, prepare: vi.fn() }],
-    ['missing abi', { id: 'gpt', phase: 'critical', releaseId: RELEASE_ID, prepare: vi.fn() }],
+    ['missing abi', { id: 'gpt', phase: 'takeover', releaseId: RELEASE_ID, prepare: vi.fn() }],
     ['unknown field', { ...registration('gpt'), unexpected: true }],
     ['wrong phase', { ...registration('gpt'), phase: 'deferred' }],
     ['custom prototype', Object.assign(Object.create({ inherited: true }), registration('gpt'))],
@@ -215,26 +287,26 @@ describe('integration manifest and registration admission', () => {
     if (vi.isMockFunction(prepare)) expect(prepare).not.toHaveBeenCalled();
   });
 
-  it('authenticates every critical registration to the captured connected core script', () => {
-    const criticalScript = document.createElement('script');
-    criticalScript.id = 'trustedserver-js';
-    criticalScript.src = `${window.location.origin}/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
-    document.head.append(criticalScript);
+  it('authenticates every takeover registration to the captured connected core script', () => {
+    const runtimeScript = document.createElement('script');
+    runtimeScript.id = 'trustedserver-js';
+    runtimeScript.src = `${window.location.origin}/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
+    document.head.append(runtimeScript);
     Object.defineProperty(document, 'currentScript', {
       configurable: true,
-      value: criticalScript,
+      value: runtimeScript,
     });
     const registry = createIntegrationRegistryOwner({
       catalog: Object.freeze([
         Object.freeze({
           id: 'gpt',
-          phase: 'critical' as const,
+          phase: 'takeover' as const,
           trigger: null,
           consumes: Object.freeze([]),
           provides: Object.freeze([]),
         }),
       ]),
-      criticalScript,
+      takeoverScript: runtimeScript,
       document,
       knownIntegrationIds: Object.freeze(['gpt']),
       manifest: manifest(['gpt']),
@@ -247,27 +319,27 @@ describe('integration manifest and registration admission', () => {
   });
 
   it.each(['different current script', 'disconnected script', 'wrong exact source'])(
-    'rejects a critical registration from a %s',
+    'rejects a takeover registration from a %s',
     (failure) => {
-      const criticalScript = document.createElement('script');
-      criticalScript.id = 'trustedserver-js';
-      criticalScript.src = `${window.location.origin}/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
-      document.head.append(criticalScript);
+      const runtimeScript = document.createElement('script');
+      runtimeScript.id = 'trustedserver-js';
+      runtimeScript.src = `${window.location.origin}/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
+      document.head.append(runtimeScript);
       Object.defineProperty(document, 'currentScript', {
         configurable: true,
-        value: criticalScript,
+        value: runtimeScript,
       });
       const registry = createIntegrationRegistryOwner({
         catalog: Object.freeze([
           Object.freeze({
             id: 'gpt',
-            phase: 'critical' as const,
+            phase: 'takeover' as const,
             trigger: null,
             consumes: Object.freeze([]),
             provides: Object.freeze([]),
           }),
         ]),
-        criticalScript,
+        takeoverScript: runtimeScript,
         document,
         knownIntegrationIds: Object.freeze(['gpt']),
         manifest: manifest(['gpt']),
@@ -281,9 +353,9 @@ describe('integration manifest and registration admission', () => {
           value: document.createElement('script'),
         });
       } else if (failure === 'disconnected script') {
-        criticalScript.remove();
+        runtimeScript.remove();
       } else {
-        criticalScript.src = `${window.location.origin}/static/tsjs=tsjs-unified.min.js?v=${'d'.repeat(64)}`;
+        runtimeScript.src = `${window.location.origin}/static/tsjs=tsjs-unified.min.js?v=${'d'.repeat(64)}`;
       }
 
       expect(registry.register(registration('gpt'))).toBe(false);
@@ -316,7 +388,7 @@ describe('integration manifest and registration admission', () => {
   it('rejects an integration array with executable iteration without invoking it', async () => {
     const iterator = vi.fn(function* () {
       for (let index = 0; index < 21; index += 1) {
-        yield { id: `module_${index}`, phase: 'critical' };
+        yield { id: `module_${index}`, phase: 'takeover' };
       }
     });
     const integrations: unknown[] = [];
@@ -470,7 +542,7 @@ describe('integration manifest and registration admission', () => {
     expect(secondPrepare).not.toHaveBeenCalled();
   });
 
-  it('rejects a critical registration that skips the next manifest entry', async () => {
+  it('rejects a takeover registration that skips the next manifest entry', async () => {
     const prepare = vi.fn(() => ({ activate: () => undefined }));
     const registry = createIntegrationRegistry({
       manifest: manifest(['gpt', 'prebid']),
@@ -498,7 +570,7 @@ describe('integration manifest and registration admission', () => {
     const candidate = {
       abi: 1 as const,
       id: 'gpt',
-      phase: 'critical' as const,
+      phase: 'takeover' as const,
       releaseId: RELEASE_ID,
       prepare: acceptedPrepare,
     };
@@ -581,7 +653,7 @@ describe('integration manifest and registration admission', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it('accepts exactly 14 critical modules in manifest order', async () => {
+  it('accepts exactly 14 takeover modules in manifest order', async () => {
     const ids = Array.from({ length: 14 }, (_, index) => `module_${index}`);
     const order: string[] = [];
     const registry = createIntegrationRegistry({
@@ -611,21 +683,21 @@ describe('integration manifest and registration admission', () => {
 });
 
 describe('integration preparation and activation transaction', () => {
-  it('stages only declared provider capabilities for later critical consumers', async () => {
+  it('stages only declared provider capabilities for later takeover consumers', async () => {
     const gpt = Object.freeze({ kind: 'gpt' });
     let consumerInterfaces: Readonly<Record<string, unknown>> | undefined;
     const registry = createIntegrationRegistryOwner({
       catalog: Object.freeze([
         Object.freeze({
           id: 'gpt',
-          phase: 'critical' as const,
+          phase: 'takeover' as const,
           trigger: null,
           consumes: Object.freeze(['runtime.v1']),
           provides: Object.freeze(['gpt.v1']),
         }),
         Object.freeze({
           id: 'prebid',
-          phase: 'critical' as const,
+          phase: 'takeover' as const,
           trigger: null,
           consumes: Object.freeze(['gpt.v1']),
           provides: Object.freeze([]),
@@ -661,13 +733,13 @@ describe('integration preparation and activation transaction', () => {
     expect(Reflect.ownKeys(consumerInterfaces ?? {})).toEqual(['gpt.v1']);
   });
 
-  it('prepares a deferred consumer from committed critical capabilities only', async () => {
+  it('prepares a deferred consumer from committed takeover capabilities only', async () => {
     const gpt = Object.freeze({ kind: 'gpt' });
     const registry = createIntegrationRegistryOwner({
       catalog: Object.freeze([
         Object.freeze({
           id: 'gpt',
-          phase: 'critical' as const,
+          phase: 'takeover' as const,
           trigger: null,
           consumes: Object.freeze([]),
           provides: Object.freeze(['gpt.v1']),
@@ -684,7 +756,7 @@ describe('integration preparation and activation transaction', () => {
       manifest: {
         ...manifest(['gpt']),
         integrations: Object.freeze([
-          Object.freeze({ id: 'gpt', phase: 'critical' as const }),
+          Object.freeze({ id: 'gpt', phase: 'takeover' as const }),
           Object.freeze({
             id: 'gpt_later',
             phase: 'deferred' as const,
@@ -740,14 +812,14 @@ describe('integration preparation and activation transaction', () => {
       catalog: Object.freeze([
         Object.freeze({
           id: 'gpt',
-          phase: 'critical' as const,
+          phase: 'takeover' as const,
           trigger: null,
           consumes: Object.freeze([]),
           provides: Object.freeze(['gpt.v1']),
         }),
         Object.freeze({
           id: 'prebid',
-          phase: 'critical' as const,
+          phase: 'takeover' as const,
           trigger: null,
           consumes: Object.freeze(['gpt.v1']),
           provides: Object.freeze([]),

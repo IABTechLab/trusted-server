@@ -23,10 +23,7 @@ export interface FirstDisplayAdmRenderBridgeOptionsV1 {
 interface AdmAttempt {
   readonly cycle: FirstDisplayGptBoundCycleV1;
   readonly expiresAtMs: number;
-  readonly onTerminal: (
-    result: 'accepted' | 'failed' | 'cancelled',
-    reason: string | null
-  ) => void;
+  readonly onTerminal: (result: 'accepted' | 'failed' | 'cancelled', reason: string | null) => void;
   readonly ordinal: number;
   active: boolean;
   frame: HTMLIFrameElement | undefined;
@@ -69,10 +66,7 @@ export function createFirstDisplayAdmRenderBridge(
   options: FirstDisplayAdmRenderBridgeOptionsV1
 ): FirstDisplayRenderBridgeV1 {
   const attempts = new Map<string, AdmAttempt>();
-  const committedFrames = new Map<
-    string,
-    Readonly<{ frame: HTMLIFrameElement; token: string }>
-  >();
+  const committedFrames = new Map<string, Readonly<{ frame: HTMLIFrameElement; token: string }>>();
   const timers = new Set<unknown>();
   let nextReservationOrdinal = 1;
   let lastNow = Number.NEGATIVE_INFINITY;
@@ -109,14 +103,14 @@ export function createFirstDisplayAdmRenderBridge(
   };
   const arm = (callback: () => void, delayMs: number): unknown => {
     try {
-      let handle: unknown;
-      handle = options.setTimer(() => {
-        if (!timers.delete(handle)) return;
+      const timer = { handle: undefined as unknown };
+      timer.handle = options.setTimer(() => {
+        if (!timers.delete(timer.handle)) return;
         callback();
       }, delayMs);
-      if (handle === undefined) return undefined;
-      timers.add(handle);
-      return handle;
+      if (timer.handle === undefined) return undefined;
+      timers.add(timer.handle);
+      return timer.handle;
     } catch {
       return undefined;
     }
@@ -154,14 +148,10 @@ export function createFirstDisplayAdmRenderBridge(
     notifyNativeMutation();
     return true;
   };
-  const fail = (attempt: AdmAttempt, reason: string): boolean =>
-    settle(attempt, 'failed', reason);
+  const fail = (attempt: AdmAttempt, reason: string): boolean => settle(attempt, 'failed', reason);
 
   return Object.freeze({
-    bind: (
-      cycle: FirstDisplayGptBoundCycleV1,
-      onTerminal: AdmAttempt['onTerminal']
-    ): boolean => {
+    bind: (cycle: FirstDisplayGptBoundCycleV1, onTerminal: AdmAttempt['onTerminal']): boolean => {
       const reservationId = cycle.bid.rendererReservationId;
       const observedAt = readNow();
       const ordinal = nextReservationOrdinal;
@@ -217,10 +207,7 @@ export function createFirstDisplayAdmRenderBridge(
         frame.onerror = () => fail(attempt, 'adm_document_no_load');
         frame.srcdoc = intended;
         attempt.frame = frame;
-        attempt.timer = arm(
-          () => fail(attempt, 'adm_document_no_load'),
-          ADM_LOAD_DEADLINE_MS
-        );
+        attempt.timer = arm(() => fail(attempt, 'adm_document_no_load'), ADM_LOAD_DEADLINE_MS);
         if (attempt.timer === undefined) return fail(attempt, 'internal_error');
         cycle.element.appendChild(frame);
         return true;
@@ -230,7 +217,9 @@ export function createFirstDisplayAdmRenderBridge(
     },
     recordFailure: (cycle: FirstDisplayGptBoundCycleV1): boolean => {
       const attempt = attempts.get(cycle.bid.rendererReservationId);
-      return Boolean(attempt?.active && attempt.cycle === cycle && fail(attempt, 'gpt_request_failed'));
+      return Boolean(
+        attempt?.active && attempt.cycle === cycle && fail(attempt, 'gpt_request_failed')
+      );
     },
     sealTsAdmission: (): void => {
       if (disposed || sealed || [...attempts.values()].some(({ active }) => active)) {

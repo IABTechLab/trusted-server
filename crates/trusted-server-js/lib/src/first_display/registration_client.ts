@@ -1,6 +1,6 @@
 declare const __TSJS_EMBEDDED_RELEASE_ID_V1__: string;
 
-import type { FirstDisplayComponentRegistrationV1 } from './registration';
+import type { FirstDisplayComponentRegistrationV1 } from '../shared/first_display_registration';
 
 /** Submit one immutable component record and the synchronous current-script identity. */
 export function registerCurrentFirstDisplayComponent(

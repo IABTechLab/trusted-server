@@ -344,7 +344,7 @@ export function validateEvidence(evidence, expected) {
     fail("performance ratio limit drifted");
   exactKeys(
     timing.main,
-    ["sha", "artifactModel", "criticalTransferBytes", "samples", "p90"],
+    ["sha", "artifactModel", "selectedTransferBytes", "samples", "p90"],
     "main performance timing",
   );
   exactString(timing.main.sha, expected.mainSha, "performance main SHA");
@@ -355,13 +355,13 @@ export function validateEvidence(evidence, expected) {
     fail("performance main artifact model is invalid");
   }
   finiteNumber(
-    timing.main.criticalTransferBytes,
-    "main critical transfer bytes",
+    timing.main.selectedTransferBytes,
+    "main selected transfer bytes",
     { integer: true, minimum: 1 },
   );
   exactKeys(
     timing.candidate,
-    ["artifactModel", "criticalTransferBytes", "samples", "p90"],
+    ["artifactModel", "selectedTransferBytes", "samples", "p90"],
     "candidate performance timing",
   );
   exactString(
@@ -370,8 +370,8 @@ export function validateEvidence(evidence, expected) {
     "performance candidate artifact model",
   );
   finiteNumber(
-    timing.candidate.criticalTransferBytes,
-    "candidate critical transfer bytes",
+    timing.candidate.selectedTransferBytes,
+    "candidate selected transfer bytes",
     { integer: true, minimum: 1 },
   );
   const validateVariant = (variant, path) => {
@@ -425,14 +425,14 @@ export function validateEvidence(evidence, expected) {
     timing.candidate.artifactModel,
     "transfer.candidateReferenceTransfer",
   );
-  if (timing.main.criticalTransferBytes !== mainTransfer.externalRawBytes) {
-    fail("main critical transfer bytes disagree with semantic transfer");
+  if (timing.main.selectedTransferBytes !== mainTransfer.externalRawBytes) {
+    fail("main selected transfer bytes disagree with semantic transfer");
   }
   if (
-    timing.candidate.criticalTransferBytes !==
+    timing.candidate.selectedTransferBytes !==
     candidateTransfer.externalRawBytes
   ) {
-    fail("candidate critical transfer bytes disagree with semantic transfer");
+    fail("candidate selected transfer bytes disagree with semantic transfer");
   }
   for (const metric of ["rawBytes", "gzipBytes", "brotliBytes"]) {
     if (
@@ -492,10 +492,10 @@ export function validateEvidence(evidence, expected) {
     }
   }
 
-  exactKeys(evidence.requests, ["critical", "deferred"], "requests");
-  exactKeys(evidence.requests.critical, ["count"], "requests.critical");
-  if (evidence.requests.critical.count !== 1)
-    fail("critical request count must be exactly one");
+  exactKeys(evidence.requests, ["selected", "deferred"], "requests");
+  exactKeys(evidence.requests.selected, ["count"], "requests.selected");
+  if (evidence.requests.selected.count !== 1)
+    fail("selected request count must be exactly one");
   exactKeys(
     evidence.requests.deferred,
     [
@@ -631,13 +631,13 @@ function validFixture() {
           main: {
             sha: mainSha,
             artifactModel: "legacy-main-v1",
-            criticalTransferBytes: 80_000,
+            selectedTransferBytes: 80_000,
             samples: mainSamples,
             p90: 200,
           },
           candidate: {
             artifactModel: "release-v1",
-            criticalTransferBytes: 79_000,
+            selectedTransferBytes: 79_000,
             samples: candidateSamples,
             p90: 210,
           },
@@ -724,7 +724,7 @@ function validFixture() {
         },
       },
       requests: {
-        critical: { count: 1 },
+        selected: { count: 1 },
         deferred: {
           count: 2,
           requestBeforePaintCount: 0,
@@ -792,7 +792,7 @@ function runSelfTest() {
     [
       "candidate transfer bytes",
       (value) =>
-        (value.performance.requestToFirstActionMs.candidate.criticalTransferBytes = 0),
+        (value.performance.requestToFirstActionMs.candidate.selectedTransferBytes = 0),
     ],
     [
       "main sample count",
@@ -801,7 +801,7 @@ function runSelfTest() {
     [
       "main transfer bytes",
       (value) =>
-        (value.performance.requestToFirstActionMs.main.criticalTransferBytes = 0),
+        (value.performance.requestToFirstActionMs.main.selectedTransferBytes = 0),
     ],
     [
       "stale transfer main SHA",
@@ -859,7 +859,7 @@ function runSelfTest() {
           value.transfer.mainReferenceTransfer.rawBytes - transfer.rawBytes + 1;
         transfer.sources[1].rawBytes += increase;
         transfer.rawBytes += increase;
-        value.performance.requestToFirstActionMs.candidate.criticalTransferBytes +=
+        value.performance.requestToFirstActionMs.candidate.selectedTransferBytes +=
           increase;
       },
     ],
@@ -940,7 +940,7 @@ function runSelfTest() {
       },
     ],
     ["heap main SHA", (value) => (value.heap.main.sha = "b".repeat(40))],
-    ["critical count", (value) => (value.requests.critical.count = 2)],
+    ["selected count", (value) => (value.requests.selected.count = 2)],
     ["deferred count", (value) => (value.requests.deferred.count = 1)],
     ["excess deferred count", (value) => (value.requests.deferred.count = 3)],
     [
@@ -1023,7 +1023,7 @@ function runSelfTest() {
   );
   const generatorSource = readFileSync(
     new URL(
-      "crates/trusted-server-integration-tests/src/bin/generate-tsjs-prospective-fixture.rs",
+      "crates/trusted-server-integration-tests/src/bin/generate-tsjs-fixture.rs",
       repositoryRoot,
     ),
     "utf8",
@@ -1046,8 +1046,8 @@ function runSelfTest() {
   );
   assert.match(
     performanceTest,
-    /generate-tsjs-prospective-fixture/u,
-    "the browser gate must consume the generated prospective server controller",
+    /generate-tsjs-fixture/u,
+    "the browser gate must consume the generated production server controller",
   );
   assert.match(
     performanceTest,
@@ -1056,8 +1056,8 @@ function runSelfTest() {
   );
   assert.match(
     generatorSource,
-    /prospective_tsjs_first_display_fragment_v1/u,
-    "the prospective server fixture must emit the admitted first-display transport",
+    /tsjs_bootstrap_fragment_v1/u,
+    "the production server fixture must emit the admitted first-display transport",
   );
   assert.match(
     performanceTest,
@@ -1107,7 +1107,7 @@ function runSelfTest() {
   );
   assert.match(
     performanceTest,
-    /CRITICAL_IDS = \["render_runtime", "creative", "gpt"\]/u,
+    /SELECTED_IDS = \["render_runtime", "creative", "gpt"\]/u,
     "the release-v1 comparison must use the same core, render, creative, and GPT shape",
   );
   assert.match(
@@ -1139,7 +1139,7 @@ function runSelfTest() {
     "inline:legacy-boot",
     "inline:legacy-ad-init",
     "inline:boot-controller",
-    "external:${criticalSrc}",
+    "external:${selectedSrc}",
   ]) {
     assert.ok(
       performanceTest.includes(endpoint),
@@ -1166,7 +1166,7 @@ function runSelfTest() {
     "crates/trusted-server-core/src/html_processor.rs",
     "crates/trusted-server-core/src/publisher.rs",
     "crates/trusted-server-core/src/tsjs.rs",
-    "crates/trusted-server-integration-tests/src/bin/generate-tsjs-prospective-fixture.rs",
+    "crates/trusted-server-integration-tests/src/bin/generate-tsjs-fixture.rs",
   ]) {
     assert.ok(
       performanceWorkflow.includes(`- \"${path}\"`),
@@ -1328,7 +1328,7 @@ function runSelfTest() {
   assert.match(
     generalTestWorkflow,
     /test-typescript:[\s\S]*?uses: actions\/checkout@v4\n        with:\n          fetch-depth: 0/u,
-    "the rc/july adoption contract must receive the pinned baseline commit",
+    "the current-main concept audit must receive the pinned baseline commit",
   );
   console.log(
     `TSJS performance evidence self-test passed (${mutations.length} mutations)`,

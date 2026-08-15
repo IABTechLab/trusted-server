@@ -1,4 +1,3 @@
-import type { BootstrapController } from '../core/bootstrap_controller';
 import type { BootFailureReason } from '../kernel/fallback';
 import {
   createNavigationIdentityIssuerFromSource,
@@ -6,6 +5,16 @@ import {
 } from '../kernel/identity';
 import type { FirstDisplaySliceId } from '../kernel/release_catalog';
 import type { FirstDisplayGptDiagnosticsV1 } from '../shared/takeover';
+import {
+  captureMutationObservedBindings,
+  createFirstDisplayParserStateCollector,
+} from '../shared/first_display_registration';
+import type { FirstDisplaySliceActivationContext } from '../shared/first_display_transaction';
+import {
+  createFirstDisplayHandoffOwner,
+  type FinalizedFirstDisplayHandoffV1,
+  type FirstDisplayHandoffOwner,
+} from '../shared/first_display_handoff';
 
 import type {
   FirstDisplayGoogletagBatchInput,
@@ -16,29 +25,19 @@ import { createFirstDisplayAdmRenderBridge } from './adm_render_bridge';
 import { createFirstDisplayProjectedDriver, type FirstDisplayRenderBridgeV1 } from './driver';
 import type { FirstDisplayApsProtocolV1 } from './leaf/aps_protocol';
 import type { FirstDisplayGptProtocolV1 } from './leaf/gpt_protocol';
-import {
-  captureMutationObservedBindings,
-  createFirstDisplayParserStateCollector,
-} from './registration';
 import { registerCurrentFirstDisplayComponent } from './registration_client';
-import type { FirstDisplaySliceActivationContext } from './transaction';
 import type {
   FirstDisplaySliceHost,
   InitialSliceInstaller,
   OptionalFirstDisplaySliceId,
 } from './slices/definition';
 import {
-  snapshotFirstDisplayBatchV1,
+  acceptServerFirstDisplayBatchV1,
   type FirstDisplayAuctionProtocolId,
   type FirstDisplayBatchOutcomeV1,
   type FirstDisplayBatchV1,
 } from './leaf/projection';
 import type { FirstDisplayRenderBridgeOptionsV1 } from './render_bridge';
-import {
-  createFirstDisplayHandoffOwner,
-  type FinalizedFirstDisplayHandoffV1,
-  type FirstDisplayHandoffOwner,
-} from './handoff';
 
 const MAX_U32 = 4_294_967_295;
 const AUCTION_PROTOCOLS = ['aps', 'gpt', 'prebid'] as const;
@@ -54,6 +53,15 @@ export type {
 export type FirstDisplayTerminalResult = 'accepted' | 'failed' | 'cancelled';
 export type FirstDisplayAgentState =
   'ready' | 'active' | 'terminal' | 'painted' | 'failed' | 'disposed';
+
+export interface FirstDisplayBootstrapController {
+  readonly state: 'installing' | 'agent_registered' | 'action_started' | 'settled' | 'failed';
+  readonly startedAtMs: number;
+  readonly registerAgent: () => boolean;
+  readonly startAction: () => boolean;
+  readonly settle: () => boolean;
+  readonly fail: (reason: BootFailureReason) => boolean;
+}
 
 export interface FirstDisplayDriver {
   readonly start: (
@@ -100,9 +108,12 @@ export interface FirstDisplayPaintScheduler {
 
 export interface FirstDisplayAgentOptions {
   readonly batch: unknown;
-  readonly bootstrap: BootstrapController;
+  readonly bootstrap: FirstDisplayBootstrapController;
   readonly driver: FirstDisplayDriver;
-  readonly performance: Readonly<{ mark: (name: string) => void }>;
+  readonly performance: Readonly<{
+    mark: (name: string) => void;
+    measure?: (name: string, startMark: string, endMark: string) => void;
+  }>;
   readonly paint: FirstDisplayPaintScheduler;
   readonly onProtectedPaint: () => void;
   readonly onFailure: (reason: BootFailureReason) => void;
@@ -336,7 +347,7 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
   >();
 
   public constructor(private readonly options: FirstDisplayAgentOptions) {
-    this.agentBatch = snapshotFirstDisplayBatchV1(options.batch);
+    this.agentBatch = acceptServerFirstDisplayBatchV1(options.batch);
     this.observedMutationRevision = options.initialMutationRevision ?? 0;
     this.lastTimingMs = options.bootstrap.startedAtMs;
     this.handoffOwner = options.handoff
@@ -562,6 +573,15 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
     if (firstDisplayMs === undefined) return this.fail('bundle_partial');
     this.firstActionAtMs = firstDisplayMs;
     this.mark('tsjs:first-display');
+    try {
+      this.options.performance.measure?.(
+        'tsjs:boot-to-first-display',
+        'tsjs:bids-script',
+        'tsjs:first-display'
+      );
+    } catch {
+      // Timing observability cannot alter display ownership.
+    }
     return true;
   }
 
@@ -990,7 +1010,7 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
           else rendererOwner.value?.dispose();
         });
         context.afterActivate(() => {
-          const batch = snapshotFirstDisplayBatchV1(options.batch);
+          const batch = acceptServerFirstDisplayBatchV1(options.batch);
           if (!batch) throw new TypeError('tsjs');
           const gpt = fullProtocols.get('gpt');
           const aps = fullProtocols.get('aps');

@@ -68,7 +68,7 @@ describe('GPT deferred navigation and reconciliation owner', () => {
     window.history.replaceState({}, '', '/');
   });
 
-  it('leaves critical history, listeners, timers, and reconciliation unchanged before activation', () => {
+  it('leaves takeover history, listeners, timers, and reconciliation unchanged before activation', () => {
     vi.useFakeTimers();
     const beforePush = window.history.pushState;
     const beforeReplace = window.history.replaceState;

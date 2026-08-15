@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -14,7 +15,7 @@ import {
 } from '../../scripts/release-v1.mjs';
 import {
   checkBundleBudgets,
-  findCriticalDeferredSourceViolations,
+  findTakeoverDeferredSourceViolations,
   validateSemanticBundleSets,
 } from '../../scripts/check-bundle-budgets.mjs';
 import * as bundleBudgets from '../../scripts/check-bundle-budgets.mjs';
@@ -23,7 +24,7 @@ import * as bundleMetrics from '../../scripts/bundle-metrics.mjs';
 const testDirectory = path.dirname(fileURLToPath(import.meta.url));
 const libDirectory = path.resolve(testDirectory, '../..');
 const repositoryRoot = path.resolve(libDirectory, '../../..');
-const bundle = (id, logical, role = 'integration', phase = 'critical', trigger = '') => ({
+const bundle = (id, logical, role = 'integration', phase = 'takeover', trigger = '') => ({
   id,
   role,
   phase,
@@ -69,7 +70,7 @@ const EXPECTED_RELEASE_BUNDLE_ORDER = [
   'sourcepoint_lifecycle',
 ];
 
-const CRITICAL_CONSENT_ARTIFACTS = Object.freeze([
+const TAKEOVER_CONSENT_ARTIFACTS = Object.freeze([
   Object.freeze({
     id: 'osano_consent',
     config: undefined,
@@ -159,7 +160,7 @@ function buildStructurallyValidDescendant(mutateEvidence = () => {}) {
   }
   Object.assign(
     evidence.metrics.bootstrap,
-    bundleMetrics.measureBytes(currentArtifactContents.get('gpt-bootstrap-fallback.js'))
+    bundleMetrics.measureBytes(currentArtifactContents.get('tsjs-bootstrap.js'))
   );
   const productionArtifacts = evidence.release.artifacts.filter(({ role }) => role !== 'bootstrap');
   for (const [index, module] of evidence.metrics.modules.entries()) {
@@ -220,6 +221,19 @@ test('generated release inventory pins the server bundle order', () => {
       'hash',
     ]);
   }
+});
+
+test('release id printer validates the complete generated inventory', () => {
+  const manifest = JSON.parse(
+    fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-release-v1.json'), 'utf8')
+  );
+  const printed = execFileSync(
+    process.execPath,
+    [path.join(libDirectory, 'scripts/print-release-id.mjs')],
+    { encoding: 'utf8' }
+  ).trim();
+
+  assert.equal(printed, manifest.releaseId);
 });
 
 test('generated first-display components self-register through one authenticated artifact sink', () => {
@@ -453,7 +467,7 @@ test('generated first-display components self-register through one authenticated
   }
 });
 
-test('critical transport co-bundles core and render ownership exactly once', () => {
+test('takeover transport co-bundles core and render ownership exactly once', () => {
   const metrics = JSON.parse(
     fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-build-metrics-v1.json'), 'utf8')
   );
@@ -489,7 +503,7 @@ test('generated integration artifacts execute their release-bound catalog entryp
       0,
       'the catalog marker must not publish a duplicate render owner'
     );
-    registrations.push({ id: 'render_runtime', phase: 'critical' });
+    registrations.push({ id: 'render_runtime', phase: 'takeover' });
     for (const artifact of release.artifacts.filter(
       ({ role, id }) => role === 'integration' && id !== 'render_runtime'
     )) {
@@ -508,7 +522,7 @@ test('generated integration artifacts execute their release-bound catalog entryp
   }
 });
 
-test('generated critical transport owns branded render operations without GPT duplication', () => {
+test('generated takeover transport owns branded render operations without GPT duplication', () => {
   const metrics = JSON.parse(
     fs.readFileSync(path.resolve(libDirectory, '../dist/tsjs-build-metrics-v1.json'), 'utf8')
   );
@@ -521,7 +535,7 @@ test('generated critical transport owns branded render operations without GPT du
     metrics.modules
       .find(({ file }) => file === 'tsjs-core.js')
       ?.sources.some(({ file }) => file === 'src/services/render.ts'),
-    'the co-bundled critical transport must own the branded render implementation'
+    'the co-bundled takeover transport must own the branded render implementation'
   );
   assert.equal(
     gpt.sources.some(({ file }) => file === 'src/services/render.ts'),
@@ -633,11 +647,11 @@ test('co-bundled render_runtime and independent GPT start one branded display fl
       pubads: () => pubads,
       setConfig: () => undefined,
     };
-    const criticalBody = fs.readFileSync(
+    const takeoverBody = fs.readFileSync(
       path.resolve(libDirectory, '../dist/tsjs-core.js'),
       'utf8'
     );
-    const criticalHash = createHash('sha256').update(criticalBody).digest('hex');
+    const runtimeHash = createHash('sha256').update(takeoverBody).digest('hex');
     const boot = dom.window.eval(`(() => {
       const freeze = Object.freeze;
       const placement = freeze({
@@ -695,18 +709,19 @@ test('co-bundled render_runtime and independent GPT start one branded display fl
         manifest: freeze({
           version: 1,
           releaseId: '${release.releaseId}',
-          criticalSrc: '/static/tsjs=tsjs-unified.min.js?v=${criticalHash}',
+          firstDisplay: null,
+          runtimeSrc: '/static/tsjs=tsjs-unified.min.js?v=${runtimeHash}',
           integrations: freeze([
-            freeze({ id: 'render_runtime', phase: 'critical' }),
-            freeze({ id: 'gpt', phase: 'critical' })
+            freeze({ id: 'render_runtime', phase: 'takeover' }),
+            freeze({ id: 'gpt', phase: 'takeover' })
           ])
         })
       });
     })()`);
-    const criticalScript = dom.window.document.createElement('script');
-    criticalScript.id = 'trustedserver-js';
-    criticalScript.src = `/static/tsjs=tsjs-unified.min.js?v=${criticalHash}`;
-    dom.window.document.head.append(criticalScript);
+    const runtimeScript = dom.window.document.createElement('script');
+    runtimeScript.id = 'trustedserver-js';
+    runtimeScript.src = `/static/tsjs=tsjs-unified.min.js?v=${runtimeHash}`;
+    dom.window.document.head.append(runtimeScript);
     Object.defineProperty(dom.window, 'tsjs', { configurable: true, value: {} });
     Object.defineProperties(dom.window.tsjs, {
       boot: { configurable: true, enumerable: true, value: boot, writable: true },
@@ -714,15 +729,15 @@ test('co-bundled render_runtime and independent GPT start one branded display fl
     });
     Object.defineProperty(dom.window.document, 'currentScript', {
       configurable: true,
-      value: criticalScript,
+      value: runtimeScript,
     });
-    dom.window.eval(criticalBody);
+    dom.window.eval(takeoverBody);
     executeGeneratedArtifact(dom.window, 'tsjs-gpt.js', registrations, { preserveTarget: true });
     await new Promise((resolve) => queueMicrotask(resolve));
     assert.equal(
       dom.window.tsjs?._internal?.state,
       'kernel',
-      `critical transport should commit: ${JSON.stringify(dom.window.tsjs?._internal)}`
+      `takeover transport should commit: ${JSON.stringify(dom.window.tsjs?._internal)}`
     );
     for (let index = 0; index < 10 && displayCalls.length === 0; index += 1) {
       await new Promise((resolve) => setTimeout(resolve, 0));
@@ -737,7 +752,7 @@ test('co-bundled render_runtime and independent GPT start one branded display fl
   }
 });
 
-for (const fixture of CRITICAL_CONSENT_ARTIFACTS) {
+for (const fixture of TAKEOVER_CONSENT_ARTIFACTS) {
   test(`generated ${fixture.id} artifact activates through runtime.v1 and publishes ${fixture.capability}`, () => {
     const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
       runScripts: 'outside-only',
@@ -777,7 +792,7 @@ for (const fixture of CRITICAL_CONSENT_ARTIFACTS) {
       );
       assert.ok(
         activationDisposers.length > 0 || afterCommit.length > 0,
-        'real critical activation must acquire or schedule owned behavior'
+        'real takeover activation must acquire or schedule owned behavior'
       );
     } finally {
       activationDisposers.reverse().forEach((release) => release());
@@ -807,7 +822,7 @@ test('bundle metrics use the required five-module reference vector', () => {
   );
 
   assert.deepEqual(actualIds, bundleMetrics.deriveSemanticBundleSetIds(catalog.modules));
-  assert.equal(metrics.bootstrap.file, 'gpt-bootstrap-fallback.js');
+  assert.equal(metrics.bootstrap.file, 'tsjs-bootstrap.js');
   assert.equal(
     metrics.compression.concatenationSeparator,
     bundleMetrics.BUNDLE_SEPARATOR.toString('utf8')
@@ -987,7 +1002,7 @@ test('role-correct budgets use deterministic pure aggregation and compression me
     assert.deepEqual(bundleMetrics.measureBundleSet(files, contents), metrics.sets[name]);
   }
   assert.deepEqual(
-    bundleMetrics.measureBytes(contents.get('gpt-bootstrap-fallback.js')),
+    bundleMetrics.measureBytes(contents.get('tsjs-bootstrap.js')),
     Object.fromEntries(
       ['rawBytes', 'gzipBytes', 'brotliBytes', 'sha256'].map((key) => [key, metrics.bootstrap[key]])
     )
@@ -1006,7 +1021,7 @@ test('release build has one bundle aggregation and compression measurement owner
   assert.match(buildSource, /measureBytes\(bootstrapBytes\)/);
   assert.doesNotMatch(buildSource, /node:zlib|const separator\s*=|function compress\s*\(/);
   assert.doesNotMatch(buildSource, /function measureBundleSet\s*\(/);
-  assert.doesNotMatch(buildSource, /MINIMAL_CRITICAL_IDS|REFERENCE_CRITICAL_IDS/);
+  assert.doesNotMatch(buildSource, /MINIMAL_TAKEOVER_IDS|REFERENCE_TAKEOVER_IDS/);
 });
 
 test('reduced remediation capture appends provenance without changing earlier evidence', () => {
@@ -1091,8 +1106,8 @@ test('bundle budget membership rejects every noncanonical release inventory shap
 
   assert.doesNotThrow(() => validateSemanticBundleSets(metrics, release, catalog));
   rejectReleaseMutation((artifacts) => {
-    artifacts[0].file = 'tsjs-bootstrap.js';
-  }, /bootstrap\/bootstrap\/gpt-bootstrap-fallback\.js/);
+    artifacts[0].file = 'gpt-bootstrap-fallback.js';
+  }, /bootstrap\/bootstrap\/tsjs-bootstrap\.js/);
   rejectReleaseMutation((artifacts) => {
     artifacts.find(({ id }) => id === 'core').id = 'runtime_core';
   }, /core\/core\/tsjs-core\.js/);
@@ -1126,10 +1141,10 @@ test('bundle budget membership rejects every noncanonical release inventory shap
   );
 });
 
-test('critical bundle graphs exclude deferred entries and transitive presentation sources', () => {
+test('takeover bundle graphs exclude deferred entries and transitive presentation sources', () => {
   const { metrics, release } = readBuildEvidence();
   const cleanMetrics = structuredClone(metrics);
-  assert.deepEqual(findCriticalDeferredSourceViolations(cleanMetrics, release), []);
+  assert.deepEqual(findTakeoverDeferredSourceViolations(cleanMetrics, release), []);
 
   const reachesDeferredEntry = structuredClone(cleanMetrics);
   reachesDeferredEntry.modules
@@ -1138,7 +1153,7 @@ test('critical bundle graphs exclude deferred entries and transitive presentatio
       file: 'src/integrations/gpt/later.ts',
       renderedBytes: 1,
     });
-  assert.deepEqual(findCriticalDeferredSourceViolations(reachesDeferredEntry, release), [
+  assert.deepEqual(findTakeoverDeferredSourceViolations(reachesDeferredEntry, release), [
     'core reaches deferred-owned source src/integrations/gpt/later.ts',
   ]);
 
@@ -1149,7 +1164,7 @@ test('critical bundle graphs exclude deferred entries and transitive presentatio
       file: 'src/integrations/gpt_diagnostics/overlay.ts',
       renderedBytes: 1,
     });
-  assert.deepEqual(findCriticalDeferredSourceViolations(reachesPresentationHelper, release), [
+  assert.deepEqual(findTakeoverDeferredSourceViolations(reachesPresentationHelper, release), [
     'core reaches deferred-owned source src/integrations/gpt_diagnostics/overlay.ts',
   ]);
 
@@ -1160,7 +1175,7 @@ test('critical bundle graphs exclude deferred entries and transitive presentatio
       file: 'src/integrations/gpt_diagnostics/presentation.ts',
       renderedBytes: 1,
     });
-  assert.deepEqual(findCriticalDeferredSourceViolations(reachesRenderTracePresentation, release), [
+  assert.deepEqual(findTakeoverDeferredSourceViolations(reachesRenderTracePresentation, release), [
     'core reaches deferred-owned source src/integrations/gpt_diagnostics/presentation.ts',
   ]);
 });
@@ -1389,7 +1404,7 @@ test('current release validation is capture-independent while generated bytes st
     /current artifact bytes/
   );
   const changedBytes = new Map(contents);
-  changedBytes.set('gpt-bootstrap-fallback.js', Buffer.from('changed'));
+  changedBytes.set('tsjs-bootstrap.js', Buffer.from('changed'));
   assert.throws(
     () =>
       bundleBudgets.validateRoleCorrectTransfer({
@@ -1527,7 +1542,7 @@ test('current source classification fails closed for renamed provider source', (
   );
 });
 
-test('unknown shared source cannot bridge deferred and critical artifacts', () => {
+test('unknown shared source cannot bridge deferred and takeover artifacts', () => {
   const { metrics, release } = readBuildEvidence();
   const source = {
     file: 'src/shared/new_deferred_runtime.ts',
@@ -1568,7 +1583,7 @@ test('deferred implementation moved under shared remains unclassified', () => {
   );
 });
 
-test('new deferred-owned source cannot reach a critical artifact', () => {
+test('new deferred-owned source cannot reach a takeover artifact', () => {
   const { metrics, release } = readBuildEvidence();
   const deferredSource = {
     file: 'src/integrations/gpt_diagnostics/presentation/new_panel.ts',
@@ -1616,7 +1631,7 @@ test('source ownership graph rejects duplicate bootstrap sources', () => {
   );
   assert.throws(
     () => bundleBudgets.findProductionGraphViolations(duplicateBootstrapSource, release),
-    /gpt-bootstrap-fallback\.js\.sources\[.*\] is invalid/
+    /tsjs-bootstrap\.js\.sources\[.*\] is invalid/
   );
 });
 
@@ -1759,7 +1774,7 @@ for (const [consumerId, providerId, providerSource] of [
   });
 }
 
-test('critical bundle graph rejects deferred-presentation-only source ownership', () => {
+test('takeover bundle graph rejects deferred-presentation-only source ownership', () => {
   const { metrics, release } = readBuildEvidence();
   const coreIndex = release.artifacts
     .filter(({ role }) => role !== 'bootstrap')
@@ -1836,7 +1851,7 @@ test('bundle check authenticates frozen captures and reports both without enforc
   assert.equal(Object.hasOwn(commandReport.candidateArchitecture.firstDisplay, 'masks'), false);
 });
 
-test('critical render trace source is data-only and guarded against presentation regression', () => {
+test('takeover render trace source is data-only and guarded against presentation regression', () => {
   const traceSource = fs.readFileSync(path.join(libDirectory, 'src/core/trace.ts'), 'utf8');
   const architectureSource = fs.readFileSync(
     path.join(libDirectory, 'scripts/check-hard-cutover-absence.mjs'),
@@ -1847,7 +1862,7 @@ test('critical render trace source is data-only and guarded against presentation
     traceSource,
     /\b(?:Document|HTMLElement|MutationObserver)\b|createElement|getElementById|querySelector|clipboard|data-ts-/
   );
-  assert.match(architectureSource, /critical render trace presentation leakage/);
+  assert.match(architectureSource, /core render trace presentation leakage/);
 });
 
 test('bundle budgets are exposed through the package and enforced after the CI build', () => {
@@ -1997,7 +2012,7 @@ test('release id changes independently with id, role, phase, trigger, bytes, and
   assert.notEqual(
     computeReleaseId(base),
     computeReleaseId([
-      bundle('core', 'a', 'integration', 'critical', 'first_display_or_idle'),
+      bundle('core', 'a', 'integration', 'takeover', 'first_display_or_idle'),
       base[1],
     ])
   );

@@ -3,7 +3,7 @@ import { installGptStub } from "../../helpers/gpt-stub.js";
 import { readState, runtimeUrl } from "../../helpers/state.js";
 
 const HOST_ID = "trusted-server-gpt-diagnostics";
-const CRITICAL_TSJS_MODULE =
+const TAKEOVER_TSJS_MODULE =
     /tsjs=tsjs-unified(?:\.min)?\.js(?:[?#]|$)/i;
 const STANDALONE_GPT_DIAGNOSTICS_MODULE =
     /tsjs=tsjs-gpt_diagnostics(?:\.min)?\.js(?:[?#]|$)/i;
@@ -120,11 +120,11 @@ test.describe("GPT runtime diagnostics", () => {
         browserName,
         page,
     }) => {
-        const criticalRequests: string[] = [];
+        const takeoverRequests: string[] = [];
         const standaloneDiagnosticsRequests: string[] = [];
         page.on("request", (request) => {
-            if (CRITICAL_TSJS_MODULE.test(request.url()))
-                criticalRequests.push(request.url());
+            if (TAKEOVER_TSJS_MODULE.test(request.url()))
+                takeoverRequests.push(request.url());
             if (STANDALONE_GPT_DIAGNOSTICS_MODULE.test(request.url()))
                 standaloneDiagnosticsRequests.push(request.url());
         });
@@ -139,7 +139,7 @@ test.describe("GPT runtime diagnostics", () => {
         expect(activationResponse?.headers()["cache-control"]).toContain(
             "no-store",
         );
-        expect(criticalRequests).toHaveLength(1);
+        expect(takeoverRequests).toHaveLength(1);
         expect(standaloneDiagnosticsRequests).toEqual([]);
         const activationCookie = (await page.context().cookies()).find(
             (cookie) => cookie.name === "__Host-ts-console",

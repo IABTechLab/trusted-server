@@ -203,9 +203,10 @@ describe('render_runtime provider', () => {
           manifest: Object.freeze({
             version: 1,
             releaseId: RELEASE_ID,
-            criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'b'.repeat(64)}`,
+            firstDisplay: null,
+            runtimeSrc: `/static/tsjs=tsjs-unified.min.js?v=${'b'.repeat(64)}`,
             integrations: Object.freeze([
-              Object.freeze({ id: 'render_runtime', phase: 'critical' as const }),
+              Object.freeze({ id: 'render_runtime', phase: 'takeover' as const }),
             ]),
           }),
         }),
@@ -263,10 +264,11 @@ describe('render_runtime provider', () => {
           manifest: Object.freeze({
             version: 1,
             releaseId: RELEASE_ID,
-            criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'b'.repeat(64)}`,
+            firstDisplay: null,
+            runtimeSrc: `/static/tsjs=tsjs-unified.min.js?v=${'b'.repeat(64)}`,
             integrations: Object.freeze([
-              Object.freeze({ id: 'render_runtime', phase: 'critical' as const }),
-              Object.freeze({ id: 'permutive_context', phase: 'critical' as const }),
+              Object.freeze({ id: 'render_runtime', phase: 'takeover' as const }),
+              Object.freeze({ id: 'permutive_context', phase: 'takeover' as const }),
             ]),
           }),
         }),
@@ -425,9 +427,10 @@ describe('render_runtime provider', () => {
           manifest: Object.freeze({
             version: 1,
             releaseId: RELEASE_ID,
-            criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'b'.repeat(64)}`,
+            firstDisplay: null,
+            runtimeSrc: `/static/tsjs=tsjs-unified.min.js?v=${'b'.repeat(64)}`,
             integrations: Object.freeze([
-              Object.freeze({ id: 'render_runtime', phase: 'critical' as const }),
+              Object.freeze({ id: 'render_runtime', phase: 'takeover' as const }),
             ]),
           }),
         }),
@@ -612,9 +615,10 @@ describe('render_runtime provider', () => {
           manifest: Object.freeze({
             version: 1,
             releaseId: RELEASE_ID,
-            criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'b'.repeat(64)}`,
+            firstDisplay: null,
+            runtimeSrc: `/static/tsjs=tsjs-unified.min.js?v=${'b'.repeat(64)}`,
             integrations: Object.freeze([
-              Object.freeze({ id: 'render_runtime', phase: 'critical' as const }),
+              Object.freeze({ id: 'render_runtime', phase: 'takeover' as const }),
             ]),
           }),
         }),

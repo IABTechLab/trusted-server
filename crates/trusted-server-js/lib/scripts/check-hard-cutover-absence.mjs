@@ -143,11 +143,11 @@ forbid(
   'empty catch in migrated TSJS source',
   /catch\s*(?:\([^)]*\))?\s*\{\s*\}/g
 );
-const criticalTraceFile = path.join(packageRoot, 'src/core/trace.ts');
+const coreTraceFile = path.join(packageRoot, 'src/core/trace.ts');
 forbidSource(
-  criticalTraceFile,
-  fs.readFileSync(criticalTraceFile, 'utf8'),
-  'critical render trace presentation leakage',
+  coreTraceFile,
+  fs.readFileSync(coreTraceFile, 'utf8'),
+  'core render trace presentation leakage',
   /\b(?:Document|HTMLElement|MutationObserver)\b|createElement|getElementById|querySelector|clipboard|data-ts-/g
 );
 forbid(
@@ -238,9 +238,20 @@ for (const manifest of [
 }
 
 const forbiddenFiles = [
+  'crates/trusted-server-integration-tests/src/bin/generate-tsjs-prospective-fixture.rs',
+  'crates/trusted-server-js/lib/src/composition/browser.ts',
+  'crates/trusted-server-js/lib/src/composition/critical_transport.ts',
+  'crates/trusted-server-js/lib/src/composition/index.ts',
+  'crates/trusted-server-js/lib/src/core/bootstrap_controller.ts',
   'crates/trusted-server-js/lib/src/core/context.ts',
   'crates/trusted-server-js/lib/src/core/request.ts',
+  'crates/trusted-server-js/lib/src/first_display/contracts.ts',
+  'crates/trusted-server-js/lib/src/first_display/handoff.ts',
+  'crates/trusted-server-js/lib/src/first_display/registration.ts',
+  'crates/trusted-server-js/lib/src/first_display/transaction.ts',
+  'crates/trusted-server-js/lib/src/integrations/gpt/bootstrap_fallback.ts',
   'crates/trusted-server-js/lib/test/core/context.test.ts',
+  'crates/trusted-server-js/lib/test/core/bootstrap_controller.test.ts',
   'crates/trusted-server-js/lib/test/core/trace.test.ts',
 ];
 for (const file of forbiddenFiles) {

@@ -7,7 +7,7 @@ import {
 import { createIntegrationRegistry } from '../../../src/kernel/integration_registry';
 
 const RELEASE_ID = 'a'.repeat(64);
-const CRITICAL_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
+const RUNTIME_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
 
 describe('transactional Didomi integration module', () => {
   it('sets an absolute SDK path without clobbering publisher config and compare-restores it', () => {
@@ -59,8 +59,9 @@ describe('transactional Didomi integration module', () => {
       manifest: {
         version: 1,
         releaseId: RELEASE_ID,
-        criticalSrc: CRITICAL_SRC,
-        integrations: [{ id: 'didomi', phase: 'critical' }],
+        firstDisplay: null,
+        runtimeSrc: RUNTIME_SRC,
+        integrations: [{ id: 'didomi', phase: 'takeover' }],
       },
       releaseId: RELEASE_ID,
       knownIntegrationIds: Object.freeze(['didomi']),

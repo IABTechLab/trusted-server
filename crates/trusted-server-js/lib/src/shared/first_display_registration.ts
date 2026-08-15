@@ -1,3 +1,4 @@
+/** Private registration protocol shared by the bootstrap and provisional artifact. */
 declare const __TSJS_EMBEDDED_RELEASE_ID_V1__: string;
 
 const HASH = /^[0-9a-f]{64}$/;

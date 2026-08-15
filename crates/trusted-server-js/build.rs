@@ -324,7 +324,7 @@ fn read_and_validate_release(dist_dir: &Path) -> ReleaseManifest {
             "integration" => {
                 assert!(index >= 15);
                 if integration_index < 14 {
-                    assert_eq!(artifact.phase.as_deref(), Some("critical"));
+                    assert_eq!(artifact.phase.as_deref(), Some("takeover"));
                     assert!(artifact.trigger.is_none());
                 } else {
                     assert_eq!(artifact.phase.as_deref(), Some("deferred"));
@@ -388,10 +388,10 @@ fn generate_metadata(manifest: &ReleaseManifest, catalog: &CatalogManifest, out_
         .iter()
         .filter(|artifact| artifact.role == "integration")
         .count();
-    let critical = manifest
+    let takeover = manifest
         .artifacts
         .iter()
-        .filter(|artifact| artifact.phase.as_deref() == Some("critical"))
+        .filter(|artifact| artifact.phase.as_deref() == Some("takeover"))
         .count();
     writeln!(
         code,
@@ -401,7 +401,7 @@ fn generate_metadata(manifest: &ReleaseManifest, catalog: &CatalogManifest, out_
     .expect("should write release id");
     writeln!(
         code,
-        "pub(crate) const GENERATED_MAX_CRITICAL_MODULES: usize = {critical};\npub(crate) const GENERATED_MAX_MANIFEST_MODULES: usize = {integrations};"
+        "pub(crate) const GENERATED_MAX_TAKEOVER_MODULES: usize = {takeover};\npub(crate) const GENERATED_MAX_MANIFEST_MODULES: usize = {integrations};"
     )
     .expect("should write generated capacities");
     writeln!(
@@ -416,7 +416,7 @@ fn generate_metadata(manifest: &ReleaseManifest, catalog: &CatalogManifest, out_
     )
     .expect("should write permitted first-display masks");
     code.push_str(
-        "pub(crate) const GPT_BOOTSTRAP_FALLBACK: &str = include_str!(concat!(env!(\"OUT_DIR\"), \"/gpt-bootstrap-fallback.js\"));\n\n",
+        "pub(crate) const TSJS_BOOTSTRAP: &str = include_str!(concat!(env!(\"OUT_DIR\"), \"/tsjs-bootstrap.js\"));\n\n",
     );
     writeln!(
         code,

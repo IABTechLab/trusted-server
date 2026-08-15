@@ -92,7 +92,7 @@ export function createCreativeIntegrationRegistration(releaseId: string): Integr
   return Object.freeze({
     abi: 1,
     id: CREATIVE_INTEGRATION_ID,
-    phase: 'critical',
+    phase: 'takeover',
     releaseId,
     prepare: ({ config, interfaces }: IntegrationPrepareContext) => {
       const creative = readCreativeBoot(config);

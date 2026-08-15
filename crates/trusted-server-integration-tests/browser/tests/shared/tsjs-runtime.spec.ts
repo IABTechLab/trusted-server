@@ -1,14 +1,14 @@
 import { expect, test, type Page } from "@playwright/test";
 import {
-  criticalTsjsFixture,
-  loadCriticalTsjsFixture,
-  type CriticalTsjsFixture,
+  loadRuntimeTsjsFixture,
+  runtimeTsjsFixture,
+  type RuntimeTsjsFixture,
 } from "../../helpers/tsjs-fixture.js";
 
-const KERNEL_FIXTURE = criticalTsjsFixture(["render_runtime"]);
-const FALLBACK_FIXTURE = criticalTsjsFixture([]);
+const KERNEL_FIXTURE = runtimeTsjsFixture(["render_runtime"]);
+const FALLBACK_FIXTURE = runtimeTsjsFixture([]);
 
-function boot(fixture: CriticalTsjsFixture) {
+function boot(fixture: RuntimeTsjsFixture) {
   return {
     abi: 1,
     releaseId: fixture.releaseId,
@@ -60,6 +60,56 @@ async function openRuntimePage(page: Page) {
 }
 
 test.describe("TSJS hard-cutover runtime", () => {
+  test("generated bootstrap transfers one direct-runtime watchdog to the persistent owner", async ({
+    page,
+  }) => {
+    const runtimeRequests: string[] = [];
+    const runtimeUrl = new URL(
+      KERNEL_FIXTURE.runtimeSrc,
+      "https://runtime.test",
+    ).toString();
+    await page.route(runtimeUrl, (route) => {
+      runtimeRequests.push(route.request().url());
+      return route.fulfill({
+        status: 200,
+        contentType: "application/javascript; charset=utf-8",
+        headers: { "x-content-type-options": "nosniff" },
+        body: KERNEL_FIXTURE.runtimeBody,
+      });
+    });
+    await page.route("https://runtime.test/direct", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "text/html; charset=utf-8",
+        body: `<!doctype html><head><script>const __TSJS_SERVER_BOOT_INPUT_V1__={target:(window.tsjs=window.tsjs||{}),boot:${JSON.stringify(boot(KERNEL_FIXTURE))},outline:null};${KERNEL_FIXTURE.bootstrapBody}</script><script src="${KERNEL_FIXTURE.runtimeSrc}" id="trustedserver-js"></script></head><body></body>`,
+      }),
+    );
+
+    await page.goto("https://runtime.test/direct");
+    await waitForRuntime(page, "kernel");
+
+    const observation = await page.evaluate(() => ({
+      claimPresent: Object.prototype.hasOwnProperty.call(
+        (window as unknown as { tsjs: object }).tsjs,
+        "_claimDirectRuntime",
+      ),
+      runtimeScripts: document.querySelectorAll("script#trustedserver-js")
+        .length,
+      bidsMarks: performance.getEntriesByName("tsjs:bids-script", "mark")
+        .length,
+      state: (window as unknown as { tsjs: { _internal: { state: string } } })
+        .tsjs._internal.state,
+    }));
+
+    expect(runtimeRequests).toEqual([runtimeUrl]);
+    expect(observation).toEqual({
+      claimPresent: false,
+      runtimeScripts: 1,
+      bidsMarks: 1,
+      state: "kernel",
+    });
+  });
+
   test("publishes only the kernel API and drains a hostile preload queue once", async ({
     page,
   }) => {
@@ -95,7 +145,7 @@ test.describe("TSJS hard-cutover runtime", () => {
       };
     }, boot(KERNEL_FIXTURE));
 
-    await loadCriticalTsjsFixture(page, KERNEL_FIXTURE);
+    await loadRuntimeTsjsFixture(page, KERNEL_FIXTURE);
     await waitForRuntime(page, "kernel");
 
     const state = await page.evaluate(() => {
@@ -147,34 +197,40 @@ test.describe("TSJS hard-cutover runtime", () => {
     page,
   }) => {
     await openRuntimePage(page);
-    await page.evaluate(({ initialBoot, releaseId }) => {
-      const browserWindow = window as unknown as {
-        tsjs: Record<string, unknown>;
-        fallbackEffects: { messageListeners: number; timeouts: number };
-      };
-      browserWindow.fallbackEffects = { messageListeners: 0, timeouts: 0 };
-      const nativeAddEventListener = window.addEventListener.bind(window);
-      window.addEventListener = ((
-        type: string,
-        listener: EventListenerOrEventListenerObject,
-      ) => {
-        if (type === "message")
-          browserWindow.fallbackEffects.messageListeners += 1;
-        nativeAddEventListener(type, listener);
-      }) as typeof window.addEventListener;
-      const nativeSetTimeout = window.setTimeout.bind(window);
-      window.setTimeout = ((handler: TimerHandler, timeout?: number) => {
-        browserWindow.fallbackEffects.timeouts += 1;
-        return nativeSetTimeout(handler, timeout);
-      }) as typeof window.setTimeout;
-      browserWindow.tsjs = {
-        boot: { ...initialBoot, manifest: { version: 2, releaseId } },
-        que: [],
-        _integrationConfig: {},
-      };
-    }, { initialBoot: boot(FALLBACK_FIXTURE), releaseId: FALLBACK_FIXTURE.releaseId });
+    await page.evaluate(
+      ({ initialBoot, releaseId }) => {
+        const browserWindow = window as unknown as {
+          tsjs: Record<string, unknown>;
+          fallbackEffects: { messageListeners: number; timeouts: number };
+        };
+        browserWindow.fallbackEffects = { messageListeners: 0, timeouts: 0 };
+        const nativeAddEventListener = window.addEventListener.bind(window);
+        window.addEventListener = ((
+          type: string,
+          listener: EventListenerOrEventListenerObject,
+        ) => {
+          if (type === "message")
+            browserWindow.fallbackEffects.messageListeners += 1;
+          nativeAddEventListener(type, listener);
+        }) as typeof window.addEventListener;
+        const nativeSetTimeout = window.setTimeout.bind(window);
+        window.setTimeout = ((handler: TimerHandler, timeout?: number) => {
+          browserWindow.fallbackEffects.timeouts += 1;
+          return nativeSetTimeout(handler, timeout);
+        }) as typeof window.setTimeout;
+        browserWindow.tsjs = {
+          boot: { ...initialBoot, manifest: { version: 2, releaseId } },
+          que: [],
+          _integrationConfig: {},
+        };
+      },
+      {
+        initialBoot: boot(FALLBACK_FIXTURE),
+        releaseId: FALLBACK_FIXTURE.releaseId,
+      },
+    );
 
-    await loadCriticalTsjsFixture(page, FALLBACK_FIXTURE);
+    await loadRuntimeTsjsFixture(page, FALLBACK_FIXTURE);
     await waitForRuntime(page, "fallback");
     const before = await page.evaluate(() => ({
       effects: {
@@ -189,7 +245,9 @@ test.describe("TSJS hard-cutover runtime", () => {
       ).sort(),
     }));
 
-    await page.addScriptTag({ content: "window.tsjs._registerIntegration({});" });
+    await page.addScriptTag({
+      content: "window.tsjs._registerIntegration({});",
+    });
     await page.evaluate(() => {
       window.dispatchEvent(
         new MessageEvent("message", { data: { message: "Prebid Request" } }),

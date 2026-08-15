@@ -46,9 +46,10 @@ function deferredManifest(ids: readonly string[]): BootManifestV1 {
   return Object.freeze({
     version: 1,
     releaseId: RELEASE_ID,
-    criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${HASH}`,
+    firstDisplay: null,
+    runtimeSrc: `/static/tsjs=tsjs-unified.min.js?v=${HASH}`,
     integrations: Object.freeze([
-      Object.freeze({ id: 'render_runtime', phase: 'critical' as const }),
+      Object.freeze({ id: 'render_runtime', phase: 'takeover' as const }),
       ...ids.map((id) =>
         Object.freeze({
           id,
@@ -81,6 +82,26 @@ afterEach(() => {
 });
 
 describe('protected first-display paint gate', () => {
+  it('adopts an agent-owned protected paint and proceeds directly to idle', async () => {
+    const platform = scheduler({ idle: true });
+    const markPaint = vi.fn();
+    const gate = createProtectedFirstDisplayGate({
+      document,
+      markPaint,
+      paintAlreadyRecorded: true,
+      scheduler: platform.value,
+    });
+
+    gate.commit();
+
+    expect(platform.frames).toEqual([]);
+    expect(platform.idle).toHaveLength(1);
+    expect(markPaint).not.toHaveBeenCalled();
+    expect(gate.protectAttemptBatch([Promise.resolve()])).toBe(false);
+    platform.idle.shift()?.();
+    await expect(gate.ready).resolves.toBe(true);
+  });
+
   it('releases a no-attempt page only at 10 seconds, after two frames and idle', async () => {
     vi.useFakeTimers();
     const platform = scheduler({ idle: true });
@@ -222,10 +243,10 @@ describe('protected first-display paint gate', () => {
 describe('authenticated deferred module loading', () => {
   it('starts every module in manifest order without awaiting a sibling', async () => {
     const prepare = vi.fn();
-    const critical = document.createElement('script');
-    critical.nonce = 'response-nonce';
+    const takeover = document.createElement('script');
+    takeover.nonce = 'response-nonce';
     const loader = createDeferredPhaseLoader({
-      criticalScript: critical,
+      runtimeScript: takeover,
       document,
       prepare,
       gate: Promise.resolve(),
@@ -255,9 +276,9 @@ describe('authenticated deferred module loading', () => {
         })
       )
     );
-    const critical = document.createElement('script');
+    const takeover = document.createElement('script');
     const loader = createDeferredPhaseLoader({
-      criticalScript: critical,
+      runtimeScript: takeover,
       document,
       prepare,
       gate: Promise.resolve(),
@@ -283,7 +304,7 @@ describe('authenticated deferred module loading', () => {
       return Object.freeze({ activate: () => undefined });
     });
     const loader = createDeferredPhaseLoader({
-      criticalScript: document.createElement('script'),
+      runtimeScript: document.createElement('script'),
       document,
       prepare,
       gate: Promise.resolve(),
@@ -307,7 +328,7 @@ describe('authenticated deferred module loading', () => {
   });
 
   it('classifies exact URL mutation before insertion as policy_blocked', async () => {
-    const critical = document.createElement('script');
+    const takeover = document.createElement('script');
     const originalCreate = document.createElement.bind(document);
     vi.spyOn(document, 'createElement').mockImplementation(((name: string) => {
       const element = originalCreate(name);
@@ -321,7 +342,7 @@ describe('authenticated deferred module loading', () => {
       return element;
     }) as typeof document.createElement);
     const loader = createDeferredPhaseLoader({
-      criticalScript: critical,
+      runtimeScript: takeover,
       document,
       prepare: vi.fn(),
       gate: Promise.resolve(),
@@ -339,7 +360,7 @@ describe('authenticated deferred module loading', () => {
     ['load', 'load_without_registration'],
   ] as const)('classifies a script %s without accepted registration', async (event, reason) => {
     const loader = createDeferredPhaseLoader({
-      criticalScript: document.createElement('script'),
+      runtimeScript: document.createElement('script'),
       document,
       prepare: vi.fn(),
       gate: Promise.resolve(),
@@ -355,7 +376,7 @@ describe('authenticated deferred module loading', () => {
 
   it('rejects registration after the expected node is removed or replaced', async () => {
     const loader = createDeferredPhaseLoader({
-      criticalScript: document.createElement('script'),
+      runtimeScript: document.createElement('script'),
       document,
       prepare: vi.fn(),
       gate: Promise.resolve(),
@@ -396,7 +417,7 @@ describe('authenticated deferred module loading', () => {
     ],
   ] as const)('classifies an %s failure at its exact stage', async (_name, prepared, reason) => {
     const loader = createDeferredPhaseLoader({
-      criticalScript: document.createElement('script'),
+      runtimeScript: document.createElement('script'),
       document,
       prepare: () => prepared(),
       gate: Promise.resolve(),
@@ -416,7 +437,7 @@ describe('authenticated deferred module loading', () => {
   it('keeps the shared module alive after one caller deadline expires', async () => {
     vi.useFakeTimers();
     const loader = createDeferredPhaseLoader({
-      criticalScript: document.createElement('script'),
+      runtimeScript: document.createElement('script'),
       document,
       prepare: () => Object.freeze({ activate: () => undefined }),
       gate: Promise.resolve(),
@@ -439,7 +460,7 @@ describe('authenticated deferred module loading', () => {
   it('retires a hung shared module at its independent ten-second deadline', async () => {
     vi.useFakeTimers();
     const loader = createDeferredPhaseLoader({
-      criticalScript: document.createElement('script'),
+      runtimeScript: document.createElement('script'),
       document,
       prepare: vi.fn(),
       gate: Promise.resolve(),
@@ -457,7 +478,7 @@ describe('authenticated deferred module loading', () => {
   it('does not start after the owning gate is disposed', async () => {
     const gate = createProtectedFirstDisplayGate({ document, scheduler: scheduler().value });
     const loader = createDeferredPhaseLoader({
-      criticalScript: document.createElement('script'),
+      runtimeScript: document.createElement('script'),
       document,
       prepare: vi.fn(),
       gate: gate.ready,
@@ -477,7 +498,7 @@ describe('authenticated deferred module loading', () => {
     base.href = 'https://attacker.example/subtree/';
     document.head.append(base);
     createDeferredPhaseLoader({
-      criticalScript: document.createElement('script'),
+      runtimeScript: document.createElement('script'),
       document,
       prepare: vi.fn(),
       gate: Promise.resolve(),
@@ -500,7 +521,7 @@ describe('authenticated deferred module loading', () => {
       value: Object.freeze({ createPolicy }),
     });
     createDeferredPhaseLoader({
-      criticalScript: document.createElement('script'),
+      runtimeScript: document.createElement('script'),
       document,
       prepare: vi.fn(),
       gate: Promise.resolve(),
@@ -518,9 +539,9 @@ describe('authenticated deferred module loading', () => {
     expect(() => rules?.createScriptURL('https://attacker.example/x.js')).toThrow();
   });
 
-  it('copies no nonce when the critical script has no nonempty nonce', async () => {
+  it('copies no nonce when the takeover script has no nonempty nonce', async () => {
     createDeferredPhaseLoader({
-      criticalScript: document.createElement('script'),
+      runtimeScript: document.createElement('script'),
       document,
       prepare: vi.fn(),
       gate: Promise.resolve(),

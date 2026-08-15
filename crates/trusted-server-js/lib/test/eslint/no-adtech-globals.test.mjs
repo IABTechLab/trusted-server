@@ -278,13 +278,13 @@ test('restricted paths enforce dependency direction and exact target-file exempt
     (await restrictedMessages("import '../core/types';", 'src/services/new-service.ts')).length > 0
   );
   assert.ok(
-    (await restrictedMessages("import '../composition/browser';", 'src/kernel/new-runtime.ts'))
+    (await restrictedMessages("import '../composition/runtime_transport';", 'src/kernel/new-runtime.ts'))
       .length > 0
   );
   assert.ok(
     (
       await restrictedMessages(
-        "import '../../composition/browser';",
+        "import '../../composition/runtime_transport';",
         'src/integrations/gpt/new-module.ts'
       )
     ).length > 0
@@ -312,10 +312,10 @@ test('restricted paths enforce dependency direction and exact target-file exempt
   );
 });
 
-test('generated fallback source graph excludes APS integration implementation', async () => {
-  const graph = await collectRelativeModuleGraph('src/integrations/gpt/bootstrap_fallback.ts');
+test('generated bootstrap source graph excludes APS integration implementation', async () => {
+  const graph = await collectRelativeModuleGraph('src/core/bootstrap.ts');
 
-  assert.ok(graph.includes('src/kernel/fallback.ts'));
+  assert.ok(graph.includes('src/core/release_id.ts'));
   assert.deepEqual(
     graph.filter((filename) => filename.startsWith('src/integrations/aps/')),
     []

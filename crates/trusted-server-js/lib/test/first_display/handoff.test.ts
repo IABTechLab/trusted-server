@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { createFirstDisplayHandoffOwner } from '../../src/first_display/handoff';
+import { createFirstDisplayHandoffOwner } from '../../src/shared/first_display_handoff';
 
 const RELEASE_ID = 'a'.repeat(64);
 const RESERVATION_ID = `r1_${'a'.repeat(22)}`;

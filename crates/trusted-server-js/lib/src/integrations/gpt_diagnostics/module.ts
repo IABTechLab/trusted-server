@@ -67,14 +67,14 @@ function gptEventsCapability(
     : undefined;
 }
 
-/** Build the critical, data-only GPT diagnostics fact provider. */
+/** Build the takeover, data-only GPT diagnostics fact provider. */
 export function createGptDiagnosticsIntegrationRegistration(
   releaseId: string
 ): IntegrationRegistration {
   return Object.freeze({
     abi: 1,
     id: GPT_DIAGNOSTICS_INTEGRATION_ID,
-    phase: 'critical',
+    phase: 'takeover',
     releaseId,
     prepare: (context: IntegrationPrepareContext) => {
       if (!activeConfiguration(context.config)) {

@@ -7,7 +7,7 @@ import {
   createFirstDisplayOwnershipCapsuleV1,
   snapshotFirstDisplayHandoffV1,
   snapshotTakeoverOutlineV1,
-} from '../../src/first_display/contracts';
+} from '../../src/shared/first_display_contracts';
 
 const HASH = 'a'.repeat(64);
 const RESERVATION_ID = `r1_${'a'.repeat(22)}`;

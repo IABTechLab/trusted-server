@@ -57,7 +57,7 @@ function isCatalogModule(module) {
     module !== null &&
     typeof module === 'object' &&
     typeof module.id === 'string' &&
-    ['critical', 'deferred'].includes(module.phase) &&
+    ['takeover', 'deferred'].includes(module.phase) &&
     (module.trigger === null || module.trigger === 'first_display_or_idle') &&
     typeof module.include === 'string'
   );
@@ -72,9 +72,9 @@ export function deriveSemanticBundleSetIds(modules) {
   if (new Set(catalogIds).size !== catalogIds.length || catalogIds.includes('core')) {
     fail('catalog modules contain a duplicate or reserved id');
   }
-  const critical = modules.filter(({ phase }) => phase === 'critical');
+  const takeover = modules.filter(({ phase }) => phase === 'takeover');
   const reference = REFERENCE_INCLUDE_ORDER.map((include) =>
-    critical.filter((module) => module.include === include)
+    takeover.filter((module) => module.include === include)
   );
   if (reference.some((matches) => matches.length !== 1)) {
     fail('catalog must define every reference predicate exactly once');
@@ -82,7 +82,7 @@ export function deriveSemanticBundleSetIds(modules) {
   return {
     minimal: [
       'core',
-      ...critical.filter(({ include }) => include === 'always').map(({ id }) => id),
+      ...takeover.filter(({ include }) => include === 'always').map(({ id }) => id),
     ],
     reference: ['core', ...reference.map(([module]) => module.id)],
     maximal: ['core', ...catalogIds],

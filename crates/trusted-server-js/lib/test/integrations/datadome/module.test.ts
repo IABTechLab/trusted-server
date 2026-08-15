@@ -20,7 +20,7 @@ import {
 } from '../../../src/kernel/integration_registry';
 
 const RELEASE_ID = 'a'.repeat(64);
-const CRITICAL_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
+const RUNTIME_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
 
 function callbacks(order: string[]): IntegrationInstallCallbacks {
   return {
@@ -44,8 +44,9 @@ describe('transactional DataDome integration module', () => {
       manifest: {
         version: 1,
         releaseId: RELEASE_ID,
-        criticalSrc: CRITICAL_SRC,
-        integrations: [{ id: 'datadome', phase: 'critical' }],
+        firstDisplay: null,
+        runtimeSrc: RUNTIME_SRC,
+        integrations: [{ id: 'datadome', phase: 'takeover' }],
       },
       releaseId: RELEASE_ID,
       knownIntegrationIds: Object.freeze(['datadome']),
@@ -77,8 +78,9 @@ describe('transactional DataDome integration module', () => {
       manifest: {
         version: 1,
         releaseId: RELEASE_ID,
-        criticalSrc: CRITICAL_SRC,
-        integrations: [{ id: 'datadome', phase: 'critical' }],
+        firstDisplay: null,
+        runtimeSrc: RUNTIME_SRC,
+        integrations: [{ id: 'datadome', phase: 'takeover' }],
       },
       releaseId: RELEASE_ID,
       knownIntegrationIds: Object.freeze(['datadome']),

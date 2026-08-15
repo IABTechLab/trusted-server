@@ -9,7 +9,7 @@ const DIST = resolve(TSJS_CRATE, "dist");
 interface ReleaseArtifact {
   id: string;
   role: "bootstrap" | "core" | "integration";
-  phase: "critical" | "deferred" | null;
+  phase: "takeover" | "deferred" | null;
   file: string;
 }
 
@@ -19,26 +19,29 @@ interface Release {
   artifacts: ReleaseArtifact[];
 }
 
-export interface CriticalTsjsFixture {
+export interface RuntimeTsjsFixture {
   releaseId: string;
-  criticalBody: string;
-  criticalSrc: string;
+  bootstrapBody: string;
+  runtimeBody: string;
+  runtimeSrc: string;
   manifest: {
     version: 1;
     releaseId: string;
-    criticalSrc: string;
-    integrations: Array<{ id: string; phase: "critical" }>;
+    firstDisplay: null;
+    runtimeSrc: string;
+    integrations: Array<{ id: string; phase: "takeover" }>;
   };
 }
 
 function exactArtifact(release: Release, id: string): ReleaseArtifact {
   const matches = release.artifacts.filter((artifact) => artifact.id === id);
-  if (matches.length !== 1) throw new Error(`expected one TSJS artifact for ${id}`);
+  if (matches.length !== 1)
+    throw new Error(`expected one TSJS artifact for ${id}`);
   return matches[0]!;
 }
 
-/** Build the same content-addressed critical response and manifest as production. */
-export function criticalTsjsFixture(ids: readonly string[]): CriticalTsjsFixture {
+/** Build the same content-addressed persistent-runtime response and manifest as production. */
+export function runtimeTsjsFixture(ids: readonly string[]): RuntimeTsjsFixture {
   const release = JSON.parse(
     readFileSync(resolve(DIST, "tsjs-release-v1.json"), "utf8"),
   ) as Release;
@@ -49,50 +52,56 @@ export function criticalTsjsFixture(ids: readonly string[]): CriticalTsjsFixture
     ids.map((id) => exactArtifact(release, id)),
   );
   for (const artifact of artifacts.slice(1)) {
-    if (artifact.phase !== "critical") {
-      throw new Error(`TSJS fixture module ${artifact.id} is not critical`);
+    if (artifact.phase !== "takeover") {
+      throw new Error(`TSJS fixture module ${artifact.id} is not takeover`);
     }
   }
-  const criticalBody = artifacts
+  const runtimeBody = artifacts
     .map((artifact) => readFileSync(resolve(DIST, artifact.file), "utf8"))
     .join(";\n");
-  const hash = createHash("sha256").update(criticalBody, "utf8").digest("hex");
-  const criticalSrc = `/static/tsjs=tsjs-unified.min.js?v=${hash}`;
+  const hash = createHash("sha256").update(runtimeBody, "utf8").digest("hex");
+  const runtimeSrc = `/static/tsjs=tsjs-unified.min.js?v=${hash}`;
+  const bootstrapBody = readFileSync(
+    resolve(DIST, exactArtifact(release, "bootstrap").file),
+    "utf8",
+  );
   return {
     releaseId: release.releaseId,
-    criticalBody,
-    criticalSrc,
+    bootstrapBody,
+    runtimeBody,
+    runtimeSrc,
     manifest: {
       version: 1,
       releaseId: release.releaseId,
-      criticalSrc,
-      integrations: ids.map((id) => ({ id, phase: "critical" as const })),
+      firstDisplay: null,
+      runtimeSrc,
+      integrations: ids.map((id) => ({ id, phase: "takeover" as const })),
     },
   };
 }
 
 /** Serve a fixture from the exact content-addressed production route. */
-export async function routeCriticalTsjsFixture(
+export async function routeRuntimeTsjsFixture(
   page: Page,
-  fixture: CriticalTsjsFixture,
+  fixture: RuntimeTsjsFixture,
 ): Promise<void> {
-  const absoluteUrl = new URL(fixture.criticalSrc, page.url()).toString();
+  const absoluteUrl = new URL(fixture.runtimeSrc, page.url()).toString();
   await page.route(absoluteUrl, (route) =>
     route.fulfill({
       status: 200,
       contentType: "application/javascript; charset=utf-8",
       headers: { "x-content-type-options": "nosniff" },
-      body: fixture.criticalBody,
+      body: fixture.runtimeBody,
     }),
   );
 }
 
 /** Execute a fixture through the authenticated parser-equivalent script boundary. */
-export async function loadCriticalTsjsFixture(
+export async function loadRuntimeTsjsFixture(
   page: Page,
-  fixture: CriticalTsjsFixture,
+  fixture: RuntimeTsjsFixture,
 ): Promise<void> {
-  await routeCriticalTsjsFixture(page, fixture);
+  await routeRuntimeTsjsFixture(page, fixture);
   await page.evaluate(
     (src) =>
       new Promise<void>((resolveLoad, rejectLoad) => {
@@ -102,11 +111,14 @@ export async function loadCriticalTsjsFixture(
         script.addEventListener("load", () => resolveLoad(), { once: true });
         script.addEventListener(
           "error",
-          () => rejectLoad(new Error("critical TSJS fixture did not load")),
+          () =>
+            rejectLoad(
+              new Error("persistent TSJS runtime fixture did not load"),
+            ),
           { once: true },
         );
         document.head.appendChild(script);
       }),
-    fixture.criticalSrc,
+    fixture.runtimeSrc,
   );
 }

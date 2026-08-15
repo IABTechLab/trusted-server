@@ -1,13 +1,14 @@
 import { parseBrowserAuctionProjectionV1 } from '../core/contracts/auction_projection';
 import { validateRequestAdsOptions } from '../core/contracts/request_ads';
-import { log } from '../core/log';
 import { prepareProgrammaticAdUnits } from '../core/registry';
+import { EMBEDDED_MAX_MANIFEST_MODULES } from '../core/release_capacity';
 import type { BootManifestV1 } from '../core/types';
+
+import { publicLog, TsjsUnavailableError, type BootFailureReason } from './fallback_surface';
 
 export { AdUnitRegistrationError, type AdUnitRegistrationErrorCode } from '../core/registry';
 export { RequestAdsInputError, type RequestAdsInputErrorCode } from '../core/contracts/request_ads';
-
-import { MAX_MANIFEST_MODULES } from './release_catalog';
+export { publicLog, TsjsUnavailableError, type BootFailureReason } from './fallback_surface';
 
 const SAFE_PROJECTION = {
   version: 1,
@@ -15,9 +16,9 @@ const SAFE_PROJECTION = {
   slots: [],
   bids: [],
 } as const;
-const CRITICAL_SRC_PATTERN = /^\/static\/tsjs=tsjs-unified\.min\.js\?v=[0-9a-f]{64}$/;
-
-export type BootFailureReason = 'abi_mismatch' | 'bundle_partial';
+const RUNTIME_SRC_PATTERN = /^\/static\/tsjs=tsjs-unified\.min\.js\?v=[0-9a-f]{64}$/;
+const FIRST_DISPLAY_SRC_PATTERN =
+  /^\/static\/tsjs=tsjs-first-display\.min\.js\?m=[0-9a-f]{4}&v=[0-9a-f]{64}$/;
 
 function exactHttpOrigin(candidate: unknown): string | undefined {
   if (typeof candidate !== 'string') return undefined;
@@ -35,7 +36,7 @@ function exactHttpOrigin(candidate: unknown): string | undefined {
 }
 
 /** Resolve the document's authentication origin, including stamped opaque creatives. */
-export function trustedCriticalOrigin(runtimeDocument: Document): string | undefined {
+export function trustedArtifactOrigin(runtimeDocument: Document): string | undefined {
   try {
     const view = runtimeDocument.defaultView;
     const documentOrigin = exactHttpOrigin(view?.location.origin);
@@ -48,19 +49,6 @@ export function trustedCriticalOrigin(runtimeDocument: Document): string | undef
     return exactHttpOrigin(stamp.value);
   } catch {
     return undefined;
-  }
-}
-
-export class TsjsUnavailableError extends Error {
-  public readonly code = 'runtime_unavailable' as const;
-  public readonly releaseId: string;
-  public readonly reason: BootFailureReason;
-
-  public constructor(releaseId: string, reason: BootFailureReason) {
-    super('TSJS runtime is unavailable');
-    this.name = 'TsjsUnavailableError';
-    this.releaseId = releaseId;
-    this.reason = reason;
   }
 }
 
@@ -119,17 +107,32 @@ function snapshotOwnArray(value: unknown, maximum: number): readonly unknown[] |
 
 function manifestMatches(candidate: unknown, expected: BootManifestV1): boolean {
   const record = ownDataRecord(candidate);
-  if (!record || !exactKeys(record, ['version', 'releaseId', 'criticalSrc', 'integrations'])) {
+  if (
+    !record ||
+    !exactKeys(record, ['version', 'releaseId', 'firstDisplay', 'runtimeSrc', 'integrations'])
+  ) {
     return false;
   }
   if (
     record.version !== 1 ||
     record.releaseId !== expected.releaseId ||
-    record.criticalSrc !== expected.criticalSrc
+    record.runtimeSrc !== expected.runtimeSrc
   ) {
     return false;
   }
-  const integrations = snapshotOwnArray(record.integrations, MAX_MANIFEST_MODULES);
+  const firstDisplay = snapshotFirstDisplay(record.firstDisplay);
+  if (
+    (expected.firstDisplay === null && firstDisplay !== null) ||
+    (expected.firstDisplay !== null &&
+      (firstDisplay === null ||
+        firstDisplay === undefined ||
+        firstDisplay.src !== expected.firstDisplay.src ||
+        firstDisplay.slices.length !== expected.firstDisplay.slices.length ||
+        firstDisplay.slices.some((id, index) => id !== expected.firstDisplay?.slices[index])))
+  ) {
+    return false;
+  }
+  const integrations = snapshotOwnArray(record.integrations, EMBEDDED_MAX_MANIFEST_MODULES);
   if (!integrations || integrations.length !== expected.integrations.length) return false;
   return integrations.every((entry, index) => {
     const fields = ownDataRecord(entry);
@@ -137,12 +140,31 @@ function manifestMatches(candidate: unknown, expected: BootManifestV1): boolean 
     if (!accepted || !fields || fields.id !== accepted.id || fields.phase !== accepted.phase) {
       return false;
     }
-    return accepted.phase === 'critical'
+    return accepted.phase === 'takeover'
       ? exactKeys(fields, ['id', 'phase'])
       : exactKeys(fields, ['id', 'phase', 'trigger', 'src']) &&
           fields.trigger === accepted.trigger &&
           fields.src === accepted.src;
   });
+}
+
+function snapshotFirstDisplay(candidate: unknown): BootManifestV1['firstDisplay'] | undefined {
+  if (candidate === null) return null;
+  const fields = ownDataRecord(candidate);
+  if (!fields || !exactKeys(fields, ['src', 'slices'])) return undefined;
+  const slices = snapshotOwnArray(fields.slices, 13);
+  if (
+    typeof fields.src !== 'string' ||
+    !FIRST_DISPLAY_SRC_PATTERN.test(fields.src) ||
+    !slices ||
+    slices.length === 0 ||
+    slices[0] !== 'first_display' ||
+    slices.some((id) => typeof id !== 'string') ||
+    new Set(slices).size !== slices.length
+  ) {
+    return undefined;
+  }
+  return Object.freeze({ src: fields.src, slices: Object.freeze([...slices] as string[]) });
 }
 
 function deepFreeze<T>(value: T): Readonly<T> {
@@ -166,7 +188,7 @@ function captureTrustedArtifactSrc(
 ): string | undefined {
   try {
     const Script = runtimeDocument.defaultView?.HTMLScriptElement;
-    const origin = trustedCriticalOrigin(runtimeDocument);
+    const origin = trustedArtifactOrigin(runtimeDocument);
     if (
       !Script ||
       !origin ||
@@ -180,23 +202,23 @@ function captureTrustedArtifactSrc(
     const matches = runtimeDocument.querySelectorAll(`script#${expectedId}`);
     if (matches.length !== 1 || matches[0] !== script) return undefined;
     const absolute = new URL(script.src);
-    const criticalSrc = `${absolute.pathname}${absolute.search}`;
+    const runtimeSrc = `${absolute.pathname}${absolute.search}`;
     if (
       absolute.origin !== origin ||
       absolute.hash !== '' ||
-      !CRITICAL_SRC_PATTERN.test(criticalSrc) ||
-      new URL(criticalSrc, origin).href !== absolute.href
+      !RUNTIME_SRC_PATTERN.test(runtimeSrc) ||
+      new URL(runtimeSrc, origin).href !== absolute.href
     ) {
       return undefined;
     }
-    return criticalSrc;
+    return runtimeSrc;
   } catch {
     return undefined;
   }
 }
 
 /** Capture the canonical source owned by one parser-inserted persistent artifact tag. */
-export function captureTrustedCriticalSrc(
+export function captureTrustedSelectedRuntimeSrc(
   runtimeDocument: Document,
   script: HTMLScriptElement
 ): string | undefined {
@@ -292,9 +314,9 @@ export function buildKernelBoot(
 export function buildFallbackBoot(
   releaseId: string,
   candidate: unknown,
-  trustedCriticalSrc: string
+  trustedRuntimeSrc: string
 ): Readonly<object> | undefined {
-  if (!CRITICAL_SRC_PATTERN.test(trustedCriticalSrc)) {
+  if (!RUNTIME_SRC_PATTERN.test(trustedRuntimeSrc)) {
     return undefined;
   }
   const projection =
@@ -303,7 +325,10 @@ export function buildFallbackBoot(
   const manifest: BootManifestV1 = {
     version: 1,
     releaseId,
-    criticalSrc: trustedCriticalSrc,
+    firstDisplay:
+      snapshotFirstDisplay(readBootField(readBootField(candidate, 'manifest'), 'firstDisplay')) ??
+      null,
+    runtimeSrc: trustedRuntimeSrc,
     integrations: [],
   };
   return deepFreeze({
@@ -316,48 +341,18 @@ export function buildFallbackBoot(
   });
 }
 
-const LOG_LEVELS = Object.freeze({
-  silent: true,
-  error: true,
-  warn: true,
-  info: true,
-  debug: true,
-});
-
-function observeLog(callback: () => void): void {
-  try {
-    callback();
-  } catch {
-    // The public logger is observation only.
-  }
-}
-
-export const publicLog = Object.freeze({
-  setLevel: (level: Parameters<typeof log.setLevel>[0]) => {
-    if (!Object.prototype.hasOwnProperty.call(LOG_LEVELS, level)) {
-      throw new TypeError('Invalid TSJS log level');
-    }
-    log.setLevel(level);
-  },
-  getLevel: () => log.getLevel(),
-  error: (...values: readonly unknown[]) => observeLog(() => log.error(...values)),
-  warn: (...values: readonly unknown[]) => observeLog(() => log.warn(...values)),
-  info: (...values: readonly unknown[]) => observeLog(() => log.info(...values)),
-  debug: (...values: readonly unknown[]) => observeLog(() => log.debug(...values)),
-});
-
 export interface FallbackFieldsOptions {
   readonly releaseId: string;
   readonly reason: BootFailureReason;
   readonly boot: unknown;
-  readonly trustedCriticalSrc: string;
+  readonly trustedRuntimeSrc: string;
 }
 
 /** Construct the complete, non-rendering public shell without runtime services. */
 export function createFallbackFields(
   options: FallbackFieldsOptions
 ): Readonly<Record<string, unknown>> | undefined {
-  const boot = buildFallbackBoot(options.releaseId, options.boot, options.trustedCriticalSrc);
+  const boot = buildFallbackBoot(options.releaseId, options.boot, options.trustedRuntimeSrc);
   if (!boot) return undefined;
   const projection = boot as {
     readonly auctionProjection: {

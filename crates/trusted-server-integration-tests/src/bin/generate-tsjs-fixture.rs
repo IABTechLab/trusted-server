@@ -5,7 +5,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 use trusted_server_core::tsjs::{
-    CreativeBootConfigV1, TsjsBootScriptConfigV1, prospective_tsjs_first_display_fragment_v1,
+    CreativeBootConfigV1, TsjsBootScriptConfigV1, tsjs_bootstrap_fragment_v1,
 };
 
 type DynError = Box<dyn Error + Send + Sync + 'static>;
@@ -29,12 +29,12 @@ fn main() -> Result<(), DynError> {
 fn run(args: &Args) -> Result<String, DynError> {
     let projection = fs::read_to_string(&args.projection).map_err(|error| {
         error_box(format!(
-            "failed to read prospective projection '{}': {error}",
+            "failed to read production projection '{}': {error}",
             args.projection.display()
         ))
     })?;
     let ids = args.ids.iter().map(String::as_str).collect::<Vec<_>>();
-    let controller = prospective_tsjs_first_display_fragment_v1(
+    let controller = tsjs_bootstrap_fragment_v1(
         TsjsBootScriptConfigV1 {
             module_ids: &ids,
             auction_projection_json: &projection,
@@ -50,7 +50,7 @@ fn run(args: &Args) -> Result<String, DynError> {
     )
     .map_err(|error| {
         error_box(format!(
-            "failed to build prospective TSJS fixture: {error:?}"
+            "failed to build production TSJS fixture: {error:?}"
         ))
     })?;
     Ok(format!(
@@ -104,7 +104,7 @@ fn next_string_arg(
 }
 
 fn usage() -> String {
-    "usage: generate-tsjs-prospective-fixture --projection <path> --ids <comma-separated-integration-ids>"
+    "usage: generate-tsjs-fixture --projection <path> --ids <comma-separated-integration-ids>"
         .to_string()
 }
 
@@ -170,7 +170,7 @@ mod tests {
             ],
             projection: projection.path().to_path_buf(),
         };
-        let html = run(&args).expect("should serialize an E7 prospective fixture");
+        let html = run(&args).expect("should serialize an production TSJS fixture");
 
         assert!(html.contains(r#"id="perf-slot""#));
         assert!(html.contains(

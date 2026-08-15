@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { IntegrationRegistration } from '../../src/kernel/integration_registry';
 import {
-  MAX_CRITICAL_MODULES,
+  MAX_TAKEOVER_MODULES,
   MAX_MANIFEST_MODULES,
   RELEASE_CATALOG,
   selectReleaseCatalog,
@@ -18,7 +18,7 @@ const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 const EXPECTED_CATALOG = Object.freeze([
   [
     'render_runtime',
-    'critical',
+    'takeover',
     'always',
     ['runtime.v1'],
     [
@@ -33,53 +33,53 @@ const EXPECTED_CATALOG = Object.freeze([
   ],
   [
     'aps',
-    'critical',
+    'takeover',
     'integration:aps',
     ['runtime.v1', 'slots.v1', 'render.v1', 'messages.v1', 'trace.v1'],
     ['aps.v1'],
   ],
-  ['creative', 'critical', 'creative_guard', ['runtime.v1'], []],
-  ['datadome', 'critical', 'integration:datadome', ['runtime.v1'], []],
-  ['didomi', 'critical', 'integration:didomi', ['runtime.v1'], []],
-  ['google_tag_manager', 'critical', 'integration:google_tag_manager', ['runtime.v1'], []],
+  ['creative', 'takeover', 'creative_guard', ['runtime.v1'], []],
+  ['datadome', 'takeover', 'integration:datadome', ['runtime.v1'], []],
+  ['didomi', 'takeover', 'integration:didomi', ['runtime.v1'], []],
+  ['google_tag_manager', 'takeover', 'integration:google_tag_manager', ['runtime.v1'], []],
   [
     'gpt',
-    'critical',
+    'takeover',
     'integration:gpt',
     ['runtime.v1', 'slots.v1', 'auction.v1', 'render.v1', 'messages.v1', 'trace.v1'],
     ['gpt.v1', 'gpt.events.v1', 'pbs_cache.baseline.v1'],
   ],
   [
     'gpt_diagnostics',
-    'critical',
+    'takeover',
     'gpt_diagnostics_active',
     ['runtime.v1', 'gpt.events.v1'],
     ['gpt_diag.v1'],
   ],
-  ['lockr', 'critical', 'integration:lockr', ['runtime.v1'], []],
-  ['osano_consent', 'critical', 'integration:osano', ['runtime.v1'], ['osano_consent.v1']],
+  ['lockr', 'takeover', 'integration:lockr', ['runtime.v1'], []],
+  ['osano_consent', 'takeover', 'integration:osano', ['runtime.v1'], ['osano_consent.v1']],
   [
     'permutive_context',
-    'critical',
+    'takeover',
     'integration:permutive',
     ['runtime.v1'],
     ['permutive_context.v1'],
   ],
   [
     'sourcepoint_consent',
-    'critical',
+    'takeover',
     'integration:sourcepoint',
     ['runtime.v1'],
     ['sourcepoint_consent.v1'],
   ],
   [
     'prebid',
-    'critical',
+    'takeover',
     'integration:prebid',
     ['runtime.v1', 'slots.v1', 'render.v1', 'messages.v1', 'aps.v1?aps'],
     ['prebid.v1'],
   ],
-  ['testlight', 'critical', 'integration:testlight', ['runtime.v1'], []],
+  ['testlight', 'takeover', 'integration:testlight', ['runtime.v1'], []],
   [
     'diagnostics_presentation',
     'deferred',
@@ -172,11 +172,11 @@ function transitiveSources(entry: string): ReadonlySet<string> {
   return visited;
 }
 
-describe('canonical critical and deferred product slices', () => {
+describe('canonical takeover and deferred product slices', () => {
   it('maps every spec catalog row exactly once with exact phase, predicate, and capabilities', () => {
     expect(RELEASE_CATALOG).toHaveLength(MAX_MANIFEST_MODULES);
     expect(MAX_MANIFEST_MODULES).toBe(20);
-    expect(MAX_CRITICAL_MODULES).toBe(14);
+    expect(MAX_TAKEOVER_MODULES).toBe(14);
     expect(new Set(RELEASE_CATALOG.map(({ id }) => id))).toHaveLength(20);
     expect(
       RELEASE_CATALOG.map(({ id, phase, include, consumes, provides }) => [
@@ -269,11 +269,13 @@ describe('canonical critical and deferred product slices', () => {
   );
 
   it('keeps production core and deferred entry graphs free of test seams and owner duplication', () => {
-    const coreSources = transitiveSources('src/composition/index.ts');
+    const coreSources = transitiveSources('src/composition/runtime_transport.ts');
     expect(
       [...coreSources].some((source) => /(?:browser_test|\/test\/|ForTest)/.test(source))
     ).toBe(false);
-    expect([...coreSources].some((source) => source.startsWith('src/integrations/'))).toBe(false);
+    expect(
+      [...coreSources].filter((source) => source.startsWith('src/integrations/')).sort()
+    ).toEqual(['src/integrations/render_runtime/module.ts']);
 
     for (const [, request] of DEFERRED_FACTORIES) {
       const entry = `${request.replace('../../', 'src/').replace(/^src\/src\//, 'src/')}.ts`;

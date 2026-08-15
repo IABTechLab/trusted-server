@@ -1019,7 +1019,7 @@ function createRenderTraceOwner(options: RenderTraceRuntimeOptions): RenderTrace
   });
 }
 
-/** Data-only critical trace owner; contains no DOM presentation behavior. */
+/** Data-only takeover trace owner; contains no DOM presentation behavior. */
 export function createRenderTraceStore(
   options: RenderTraceRuntimeOptions = {}
 ): RenderTraceRuntimeOwner {

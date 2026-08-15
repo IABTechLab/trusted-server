@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TsjsApi } from '../../src/core/types';
 
 const RELEASE = 'a'.repeat(64);
-const CRITICAL_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
+const RUNTIME_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
 
 function boot() {
   return {
@@ -12,8 +12,9 @@ function boot() {
     manifest: {
       version: 1,
       releaseId: RELEASE,
-      criticalSrc: CRITICAL_SRC,
-      integrations: [{ id: 'render_runtime', phase: 'critical' }],
+      firstDisplay: null,
+      runtimeSrc: RUNTIME_SRC,
+      integrations: [{ id: 'render_runtime', phase: 'takeover' }],
     },
     auctionProjection: {
       version: 1,
@@ -27,14 +28,14 @@ function boot() {
 }
 
 async function loadMinimalProductionRuntime(): Promise<void> {
-  await import('../../src/composition/index');
+  await import('../../src/composition/runtime_transport');
   await import('../../src/integrations/render_runtime/index');
 }
 
-function installCriticalScript(): void {
+function installRuntimeScript(): void {
   const script = document.createElement('script');
   script.id = 'trustedserver-js';
-  script.src = new URL(CRITICAL_SRC, window.location.origin).href;
+  script.src = new URL(RUNTIME_SRC, window.location.origin).href;
   document.head.append(script);
   Object.defineProperty(document, 'currentScript', { configurable: true, value: script });
 }
@@ -44,7 +45,7 @@ describe('hard-cutover requestAds API', () => {
     await vi.resetModules();
     document.head.replaceChildren();
     delete (window as unknown as { tsjs?: unknown }).tsjs;
-    installCriticalScript();
+    installRuntimeScript();
   });
 
   it('replaces a callback-era request function with the exact Promise result surface', async () => {

@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { createBootstrapController } from '../../src/core/bootstrap_controller';
 import {
   createFirstDisplayAgent,
   type FirstDisplayAuctionProtocolId,
   type FirstDisplayBatchOutcomeV1,
+  type FirstDisplayBootstrapController,
   type FirstDisplayDriver,
   type FirstDisplayTerminalResult,
 } from '../../src/first_display/agent';
@@ -93,28 +93,56 @@ function batch(
 function harness(options: { now?: number; hidden?: boolean } = {}) {
   let now = options.now ?? 0;
   const marks: string[] = [];
+  const measures: Array<readonly [string, string, string]> = [];
   const timers: Array<() => void> = [];
   const frames: Array<() => void> = [];
   const failures: string[] = [];
-  const performance = { mark: (name: string) => marks.push(name) };
-  const bootstrap = createBootstrapController({
-    performance,
-    now: () => now,
-    setTimer: (callback) => {
-      timers.push(callback);
-      return callback;
+  const performance = {
+    mark: (name: string) => marks.push(name),
+    measure: (name: string, start: string, end: string) => measures.push([name, start, end]),
+  };
+  let bootstrapState: FirstDisplayBootstrapController['state'] = 'installing';
+  const startedAtMs = now;
+  const deadline = () => !Number.isFinite(now - startedAtMs) || now - startedAtMs >= 10_000;
+  const fail = (reason: 'abi_mismatch' | 'bundle_partial'): boolean => {
+    if (bootstrapState === 'settled' || bootstrapState === 'failed') return false;
+    bootstrapState = 'failed';
+    failures.push(reason);
+    return true;
+  };
+  performance.mark('tsjs:bids-script');
+  const bootstrap: FirstDisplayBootstrapController = Object.freeze({
+    get state() {
+      return bootstrapState;
     },
-    clearTimer: (handle) => {
-      const index = timers.indexOf(handle as () => void);
-      if (index >= 0) timers.splice(index, 1);
+    startedAtMs,
+    registerAgent: () => {
+      if (bootstrapState !== 'installing') return false;
+      if (deadline()) return fail('bundle_partial') && false;
+      bootstrapState = 'agent_registered';
+      return true;
     },
-    onFailure: (reason) => failures.push(reason),
+    startAction: () => {
+      if (bootstrapState !== 'agent_registered') return false;
+      if (deadline()) return fail('bundle_partial') && false;
+      bootstrapState = 'action_started';
+      return true;
+    },
+    settle: () => {
+      if (bootstrapState !== 'agent_registered' && bootstrapState !== 'action_started') {
+        return false;
+      }
+      bootstrapState = 'settled';
+      return true;
+    },
+    fail,
   });
   return {
     bootstrap,
     failures,
     frames,
     marks,
+    measures,
     timers,
     performance,
     now: () => now,
@@ -277,6 +305,9 @@ describe('bounded first-display agent', () => {
 
     expect(agent.start()).toBe(true);
     expect(h.marks).toEqual(['tsjs:bids-script', 'tsjs:first-display']);
+    expect(h.measures).toEqual([
+      ['tsjs:boot-to-first-display', 'tsjs:bids-script', 'tsjs:first-display'],
+    ]);
     expect(events).toEqual(['driver:start']);
     ownedDriver.settleForTest('slot-1', 'accepted');
     expect(h.marks).toEqual(['tsjs:bids-script', 'tsjs:first-display']);

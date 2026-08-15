@@ -1089,6 +1089,34 @@ export function snapshotFirstDisplayHandoffV1(
   }
 }
 
+/** Validate one complete handoff against the server-authored takeover outline. */
+export function snapshotOutlinedFirstDisplayHandoffV1(
+  candidate: unknown,
+  outlineCandidate: unknown
+): FirstDisplayHandoffV1 | undefined {
+  const handoff = snapshotFirstDisplayHandoffV1(candidate);
+  const outline = snapshotTakeoverOutlineV1(outlineCandidate);
+  const requiredObjectKinds = [
+    ...(handoff?.cycles.length === 0 ? [] : (['gpt_slot'] as const)),
+    ...(handoff?.artifacts.length === 0 ? [] : (['dom_artifact'] as const)),
+  ];
+  if (
+    !handoff ||
+    !outline ||
+    outline.releaseId !== handoff.releaseId ||
+    outline.generation !== handoff.generation ||
+    outline.projectionDigest !== handoff.projectionDigest ||
+    outline.slotCount !== handoff.slots.length ||
+    outline.outcomeCount !== handoff.slots.length ||
+    outline.slices.length !== handoff.slices.length ||
+    outline.slices.some((id, index) => id !== handoff.slices[index]) ||
+    requiredObjectKinds.some((kind) => !outline.objectKinds.includes(kind))
+  ) {
+    return undefined;
+  }
+  return handoff;
+}
+
 /** Mint a closure-private, release/generation-bound one-use object-identity capsule. */
 export function createFirstDisplayOwnershipCapsuleV1<T extends object>(
   releaseId: string,
