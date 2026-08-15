@@ -8736,9 +8736,14 @@ mod tests {
 
         #[test]
         fn ad_slots_script_contains_slot_data() {
-            let slots = vec![make_slot()];
+            let mut slot = make_slot();
+            slot.targeting
+                .insert("ts".to_string(), "operator-value".to_string());
+            let slots = vec![slot];
             let config = make_config();
             let script = build_ad_slots_script(&slots, &config, "/");
+            let slot_json = crate::publisher::build_slot_json(&slots[0], &config, "example")
+                .expect("should build slot JSON");
             assert!(
                 script.contains("window.tsjs=window.tsjs||{}"),
                 "should initialise tsjs namespace"
@@ -8752,6 +8757,10 @@ mod tests {
             assert!(
                 !script.contains("__ts_request_id"),
                 "must NOT contain request_id"
+            );
+            assert_eq!(
+                slot_json["targeting"]["ts"], "operator-value",
+                "should forward operator-provided ts targeting verbatim"
             );
         }
 
