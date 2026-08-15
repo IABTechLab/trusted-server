@@ -174,8 +174,18 @@ describe('gpt_bootstrap.js fallback', () => {
     const setConfig = vi.fn(() => {
       throw new Error('publisher setConfig failed');
     });
+    const disableInitialLoad = vi.fn();
+    const pubads = {
+      disableInitialLoad,
+      getSlots: vi.fn(() => []),
+      refresh: vi.fn(),
+    };
     const publisherCommand = vi.fn();
-    (window as TestWindow).googletag = makeGoogleTag({ cmd: queue, setConfig });
+    (window as TestWindow).googletag = makeGoogleTag({
+      cmd: queue,
+      setConfig,
+      pubads: vi.fn(() => pubads),
+    });
     (window as TestWindow).__tsjs_gam_attribution_enabled = true;
 
     runBootstrap();
@@ -184,6 +194,10 @@ describe('gpt_bootstrap.js fallback', () => {
     expect(() => [...queue].forEach((command) => command())).not.toThrow();
     expect(setConfig).toHaveBeenCalledWith({ targeting: { ts: 'true' } });
     expect(publisherCommand).toHaveBeenCalledTimes(1);
+    expect(typeof (window as TestWindow).tsjs!.adInit).toBe('function');
+    pubads.disableInitialLoad();
+    expect(disableInitialLoad).toHaveBeenCalledTimes(1);
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
   });
 
   it('still tracks the wrapped legacy disableInitialLoad path', () => {
