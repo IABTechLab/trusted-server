@@ -11,6 +11,35 @@ pub struct AuctionConfig {
     #[serde(default)]
     pub enabled: bool,
 
+    /// Strip executable markup from winning-bid creative HTML before delivery.
+    ///
+    /// Sanitization removes `script`/`object`/`embed`/`form`/etc. **with their inner
+    /// content**, which blanks script-based creatives — the majority of programmatic
+    /// display. It is the primary defence when the creative renders in a context that
+    /// shares the publisher's origin.
+    ///
+    /// Disable only when creatives render in a foreign-origin frame (for example the
+    /// Prebid Universal Creative inside the ad server's iframe), where the markup
+    /// cannot reach the publisher origin. Defaults to disabled.
+    #[serde(
+        default = "default_sanitize_creatives",
+        skip_serializing_if = "is_default_sanitize_creatives"
+    )]
+    pub sanitize_creatives: bool,
+
+    /// Rewrite winning-bid creative HTML to first-party endpoints (applied
+    /// after sanitization when [`Self::sanitize_creatives`] is enabled).
+    ///
+    /// The default must stay omitted from serialized config blobs: older
+    /// [`AuctionConfig`] schemas reject unknown fields during binary rollback.
+    /// An explicit `false` remains serialized and requires restoring a
+    /// compatible blob before rolling back.
+    #[serde(
+        default = "default_rewrite_creatives",
+        skip_serializing_if = "is_default_rewrite_creatives"
+    )]
+    pub rewrite_creatives: bool,
+
     /// Provider names that participate in bidding
     /// Simply list the provider names (e.g., ["prebid", "aps"])
     #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
@@ -41,6 +70,8 @@ impl Default for AuctionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            sanitize_creatives: default_sanitize_creatives(),
+            rewrite_creatives: default_rewrite_creatives(),
             providers: Vec::new(),
             mediator: None,
             timeout_ms: default_timeout(),
@@ -52,6 +83,23 @@ impl Default for AuctionConfig {
 
 fn default_timeout() -> u32 {
     2000
+}
+
+fn default_sanitize_creatives() -> bool {
+    false
+}
+
+fn default_rewrite_creatives() -> bool {
+    true
+}
+
+// This predicate preserves rollback compatibility by omitting the default field.
+fn is_default_rewrite_creatives(value: &bool) -> bool {
+    *value == default_rewrite_creatives()
+}
+
+fn is_default_sanitize_creatives(value: &bool) -> bool {
+    *value == default_sanitize_creatives()
 }
 
 fn default_creative_store() -> String {
@@ -77,5 +125,78 @@ impl AuctionConfig {
     #[must_use]
     pub fn has_mediator(&self) -> bool {
         self.mediator.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn creative_processing_defaults() {
+        let config: AuctionConfig =
+            serde_json::from_value(serde_json::json!({})).expect("should deserialize defaults");
+
+        assert!(
+            config.rewrite_creatives,
+            "creative rewriting stays enabled by default: existing deployments keep first-party proxying"
+        );
+        assert!(
+            !config.sanitize_creatives,
+            "creative sanitization is opt-in: it strips executable markup with its content"
+        );
+    }
+
+    #[test]
+    fn default_rewrite_creatives_is_not_serialized() {
+        let serialized =
+            serde_json::to_value(AuctionConfig::default()).expect("should serialize defaults");
+
+        assert!(
+            serialized.get("rewrite_creatives").is_none(),
+            "should omit the default rewrite setting"
+        );
+    }
+
+    #[test]
+    fn disabled_rewrite_creatives_is_serialized() {
+        let config = AuctionConfig {
+            rewrite_creatives: false,
+            ..AuctionConfig::default()
+        };
+        let serialized = serde_json::to_value(config).expect("should serialize disabled rewriting");
+
+        assert_eq!(
+            serialized.get("rewrite_creatives"),
+            Some(&serde_json::Value::Bool(false)),
+            "should preserve an explicit rewrite opt-out"
+        );
+    }
+
+    #[test]
+    fn default_sanitize_creatives_is_not_serialized() {
+        let serialized =
+            serde_json::to_value(AuctionConfig::default()).expect("should serialize defaults");
+
+        assert!(
+            serialized.get("sanitize_creatives").is_none(),
+            "should omit the default sanitize setting"
+        );
+    }
+
+    #[test]
+    fn enabled_sanitize_creatives_is_serialized() {
+        let config = AuctionConfig {
+            sanitize_creatives: true,
+            ..AuctionConfig::default()
+        };
+        let serialized =
+            serde_json::to_value(config).expect("should serialize enabled sanitization");
+
+        assert_eq!(
+            serialized.get("sanitize_creatives"),
+            Some(&serde_json::Value::Bool(true)),
+            "should preserve an explicit sanitize opt-in"
+        );
     }
 }

@@ -24,7 +24,10 @@ use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
 use super::AuctionOrchestrator;
-use super::formats::{convert_to_openrtb_response, convert_tsjs_to_auction_request};
+use super::formats::{
+    convert_to_openrtb_response, convert_to_openrtb_response_with_report,
+    convert_tsjs_to_auction_request,
+};
 use super::telemetry::{
     AuctionObservationContext, AuctionSource, AuctionTerminalOutcome, build_auction_events,
     emit_auction_events_best_effort_lazy,
@@ -65,6 +68,10 @@ const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
 /// When `bids` is supplied, each entry's `bidder`/`params` pair is forwarded
 /// directly as `imp.ext.prebid.bidder.<bidder>`.
 ///
+/// APS `OpenRTB` demand is never forwarded through Prebid Server. An ad unit
+/// whose only bidder is `aps` intentionally does not use PBS stored-request
+/// fallback; configure a non-APS PBS bidder for stored-request demand instead.
+///
 /// ## Context passthrough (`config`)
 ///
 /// The optional `config` object is filtered through
@@ -76,9 +83,10 @@ const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
 /// ## Response
 ///
 /// Returns an `OpenRTB 2.x` response. Creative HTML is inlined in each bid's
-/// `adm` field after sanitisation and first-party URL rewriting. Response
-/// headers include `X-TS-EC` (the caller's Edge Cookie ID) and
-/// `X-TS-EC-Fresh` (a freshly generated ID for cookie renewal).
+/// `adm` field after mandatory server-side sanitization. First-party resource
+/// and click URL rewriting plus creative TSJS injection are enabled by default;
+/// setting [`auction.rewrite_creatives`][`crate::auction_config_types::AuctionConfig::rewrite_creatives`]
+/// to `false` skips only that rewrite pass.
 ///
 /// ## Scroll, refresh, and SPA navigation
 ///
@@ -86,7 +94,7 @@ const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
 /// callers** (e.g. slim-Prebid, native apps, server-to-server integrations).
 /// It is **not** the intended path for scroll or GPT refresh events.
 ///
-/// **SPA navigation** is handled by `GET /__ts/page-bids`: the client-side SPA
+/// **SPA navigation** is handled by `GET /_ts/page-bids`: the client-side SPA
 /// hook (`installSpaAuctionHook`) intercepts `pushState`/`replaceState`/`popstate`
 /// events and calls that endpoint to fetch fresh slots and bids for each new
 /// route, then invokes `window.tsjs.adInit()` with the updated data.
@@ -171,7 +179,7 @@ pub async fn handle_auction(
     let consent_context = ec_context.consent().clone();
 
     // Server-side auction consent gate. The publisher-navigation and
-    // `/__ts/page-bids` paths fail closed for GDPR/unknown jurisdictions that
+    // `/_ts/page-bids` paths fail closed for GDPR/unknown jurisdictions that
     // lack effective TCF Purpose 1. `/auction` is the programmatic entry point
     // for the same server-side auction, so it must gate identically: returning
     // a no-bid response here prevents outbound PBS/APS calls and the forwarding
@@ -234,7 +242,7 @@ pub async fn handle_auction(
     // denied but a non-personalized auction may still run — could forward
     // persistent client EIDs from the body/cookie, since `gate_eids_by_consent`
     // only strips on TCF/GDPR signals. This matches the publisher and
-    // `/__ts/page-bids` paths, which also resolve client EIDs only when
+    // `/_ts/page-bids` paths, which also resolve client EIDs only when
     // `ec_id.is_some()`.
     let client_eids = if ec_id.is_some() {
         resolve_client_auction_eids(
@@ -317,26 +325,52 @@ pub async fn handle_auction(
         }
     };
 
+    let conversion = match convert_to_openrtb_response_with_report(
+        &result,
+        settings,
+        &auction_request,
+        ec_context.ec_allowed(),
+    ) {
+        Ok(conversion) => conversion,
+        Err(error) => {
+            let elapsed_ms = observation.elapsed_ms();
+            emit_auction_events_best_effort_lazy(services, || {
+                build_auction_events(
+                    observation,
+                    AuctionTerminalOutcome::ExecutionFailed {
+                        request: Some(&auction_request),
+                        provider_responses: &result.provider_responses,
+                        reason: "response_conversion_failed",
+                        elapsed_ms,
+                    },
+                )
+            })
+            .await;
+            return Err(error);
+        }
+    };
+
     emit_auction_events_best_effort_lazy(services, || {
         build_auction_events(
             observation,
             AuctionTerminalOutcome::Completed {
                 request: &auction_request,
                 result: &result,
+                delivered_winner_slots: Some(&conversion.delivery.delivered_winner_slots),
             },
         )
     })
     .await;
 
     log::info!(
-        "Auction completed: {} providers, {} winning bids, {}ms total",
+        "Auction completed: {} providers, {} delivered winning bids, {} dropped winners, {}ms total",
         result.provider_responses.len(),
-        result.winning_bids.len(),
+        conversion.delivery.delivered_winner_slots.len(),
+        conversion.delivery.dropped_winner_count,
         result.total_time_ms
     );
 
-    // Convert to OpenRTB response format with inline creative HTML
-    convert_to_openrtb_response(&result, settings, &auction_request, ec_context.ec_allowed())
+    Ok(conversion.response)
 }
 
 /// Resolves partner EIDs from the KV identity graph for bidstream decoration.
@@ -546,7 +580,7 @@ pub(crate) fn merge_auction_eids(
 mod tests {
     use super::*;
     use crate::auction::config::AuctionConfig;
-    use crate::auction::provider::AuctionProvider;
+    use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
     use crate::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
     use crate::auction::types::{AuctionRequest, AuctionResponse};
     use crate::consent::jurisdiction::Jurisdiction;
@@ -555,7 +589,7 @@ mod tests {
     use crate::platform::test_support::{
         NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, noop_services,
     };
-    use crate::platform::{ClientInfo, PlatformPendingRequest, PlatformResponse};
+    use crate::platform::{ClientInfo, PlatformResponse};
     use crate::test_support::tests::create_test_settings;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
@@ -620,7 +654,7 @@ mod tests {
             &self,
             _request: &AuctionRequest,
             _context: &AuctionContext<'_>,
-        ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
             panic!("provider must not be contacted when the consent gate denies the auction");
         }
 
@@ -646,7 +680,7 @@ mod tests {
         // GDPR/unknown jurisdiction lacking effective TCF Purpose 1 must not run
         // a server-side auction. The /auction endpoint must short-circuit to a
         // no-bid response before dispatching to any provider — matching the
-        // publisher-navigation and /__ts/page-bids paths.
+        // publisher-navigation and /_ts/page-bids paths.
         let settings = create_test_settings();
         let config = AuctionConfig {
             enabled: true,
@@ -742,7 +776,7 @@ mod tests {
             &self,
             request: &AuctionRequest,
             _context: &AuctionContext<'_>,
-        ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
             *self.had_eids.lock().expect("should lock captured eids") =
                 Some(request.user.eids.is_some());
             Err(Report::new(TrustedServerError::Auction {

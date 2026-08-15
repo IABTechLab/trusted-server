@@ -1,12 +1,12 @@
 # First-Party Proxy
 
-Learn how Trusted Server proxies third-party assets through first-party domains to improve privacy, security, and ad performance.
+Learn how Trusted Server proxies third-party assets through first-party domains to give the deployer control over routing, security, and ad performance.
 
 ## Overview
 
 The First-Party Proxy system rewrites third-party URLs in ad creatives to route through your domain, providing:
 
-- **Privacy Protection** - No direct third-party cookies or tracking
+- **First-Party Routing** - Rewritten asset requests route through your domain
 - **EC ID Forwarding** - Controlled identity propagation
 - **Creative Rewrites** - Automatic HTML/CSS URL transformation
 - **Click Tracking** - First-party click redirects
@@ -189,54 +189,70 @@ fetch('/first-party/sign?url=' + encodeURIComponent(imageUrl))
 
 ### `/first-party/proxy-rebuild` - URL Modification
 
-Modifies existing signed URLs by adding or removing parameters.
+Re-signs an existing signed click URL after creative script adds or removes
+query parameters. The original `tstoken` is validated before any change is
+applied, and `tsurl`, `tstoken`, and `tsexp` may never be added or deleted.
 
-**Request**:
+Two request forms are supported, differing only in transport and response.
 
-```
-POST /first-party/proxy-rebuild?tsclick=encoded_click_url&add=key:value&del=key
-```
-
-**Query Parameters**:
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `tsclick` | Yes | Base64-encoded original click/proxy URL |
-| `add` | No | Parameter to add (format: `key:value`) |
-| `del` | No | Parameter key to remove |
-
-**Behavior**:
-
-1. **Decodes** the `tsclick` base64 URL
-2. **Parses** existing parameters
-3. **Adds** specified parameters (`add`)
-4. **Removes** specified parameters (`del`)
-5. **Re-signs** the modified URL
-6. **Returns** new signed URL
-
-**Example**:
-
-Original click URL:
+**POST (JSON) — used by the click guard on a same-origin page**:
 
 ```
-/first-party/click?tsurl=https://example.com&product=A&tstoken=sig1
+POST /first-party/proxy-rebuild
+Content-Type: application/json
+
+{
+  "tsclick": "/first-party/click?tsurl=https%3A%2F%2Fexample.com&product=A&tstoken=sig1",
+  "add": { "variant": "red" },
+  "del": ["product"]
+}
 ```
 
-Modify URL (add `variant=red`, remove `product`):
+| Field     | Required | Description                                              |
+| --------- | -------- | -------------------------------------------------------- |
+| `tsclick` | Yes      | The signed click URL, root-relative or absolute          |
+| `add`     | No       | Object of parameters to add; keys must not already exist |
+| `del`     | No       | Array of parameter names to remove                       |
 
-```
-POST /first-party/proxy-rebuild?
-  tsclick=L2ZpcnN0LXBhcnR5L2NsaWNrP3RzdXJsPWh0dHBzOi8vZXhhbXBsZS5jb20mcHJvZHVjdD1BJnRzdG9rZW49c2lnMQ==&
-  add=variant:red&
-  del=product
-```
-
-Response:
+Responds `200` with the rebuilt URL and diagnostics:
 
 ```json
 {
-  "href": "/first-party/click?tsurl=https://example.com&variant=red&tstoken=sig2"
+  "href": "/first-party/click?tsurl=https%3A%2F%2Fexample.com&variant=red&tstoken=sig2",
+  "base": "https://example.com",
+  "added": { "variant": "red" },
+  "removed": ["product"]
 }
 ```
+
+**GET (query) — navigation recovery from an opaque-origin creative frame**:
+
+```
+GET /first-party/proxy-rebuild?tsclick=<url-encoded click>&add=<JSON object>&del=<JSON array>
+```
+
+| Parameter | Required | Description                                       |
+| --------- | -------- | ------------------------------------------------- |
+| `tsclick` | Yes      | URL-encoded signed click URL (not base64)         |
+| `add`     | No       | URL-encoded JSON object, e.g. `{"variant":"red"}` |
+| `del`     | No       | URL-encoded JSON array, e.g. `["product"]`        |
+
+Responds `302` with the rebuilt click in `Location` (plus
+`Cache-Control: no-store, private`), so the browser continues to
+`/first-party/click`, which then redirects to the advertiser.
+
+**Form-encoded POST (navigation, no URL length limit)**: a `POST` carrying
+`Content-Type: application/x-www-form-urlencoded` with the same fields is also
+treated as a navigation and answered with the `302`. The click guard uses it
+when the GET URL would exceed the platform's request-URL limit (Fastly Compute
+rejects request URLs over 8192 bytes before the handler runs), which a long
+signed click can do once nested inside another query string.
+
+Creative iframes are sandboxed without `allow-same-origin`, giving them an
+opaque origin whose `fetch` to this endpoint is cross-origin (`Origin: null`)
+and blocked by CORS. The navigation forms exist for that case: navigations are not
+subject to CORS, so the click guard navigates instead of fetching. Both forms
+apply identical validation.
 
 ::: warning Use Cases
 This endpoint is designed for advanced scenarios like A/B testing where you need to modify URLs without re-signing from scratch. Most implementations won't need this.
@@ -387,7 +403,7 @@ EC IDs are re-applied on **every redirect hop**:
   → 200 response
 ```
 
-This ensures downstream trackers receive consistent IDs even through redirect chains.
+This ensures downstream endpoints receive consistent IDs even through redirect chains.
 
 ### Click ID Forwarding
 
@@ -404,10 +420,10 @@ User clicks → redirect includes ID:
 Location: https://advertiser.com?ts-ec=user123
 ```
 
-::: tip Privacy Control
+::: tip Forwarding Conditions
 EC IDs are only forwarded when:
 
-1. User has given GDPR consent (if required)
+1. Consent rules permitted the EC ID to be issued (issuance is gated per jurisdiction)
 2. ID exists in request (header/cookie)
 3. Integration hasn't disabled forwarding (`forward_ec_id: false`)
    :::
@@ -665,7 +681,7 @@ Trusted Server:
 
 **Automatic Protection**:
 
-- HTML/CSS rewriting removes malicious URLs
+- HTML/CSS rewriting routes URLs through signed first-party endpoints
 - Data URIs are skipped (`data:`, `javascript:`, `blob:`)
 - Protocol validation (only `http://` and `https://`)
 

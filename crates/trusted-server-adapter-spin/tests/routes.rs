@@ -330,6 +330,56 @@ async fn auction_is_routed() {
     assert_ne!(resp.status().as_u16(), 404, "/auction must be routed");
 }
 
+/// `GET` on the SPA re-auction endpoint must reach the page-bids handler on
+/// both the canonical path and its deprecated `/__ts/` alias.
+///
+/// The alias is what pre-rename tsjs bundles still request, and on a SPA that
+/// path is what delivers ads for in-session navigations — so a dropped or
+/// misspelled registration silently costs revenue rather than erroring loudly.
+/// Spin registers `GET` and `OPTIONS` separately, so the preflight-denial parity
+/// test does not imply the `GET` side is wired.
+///
+/// Paths are literals rather than `PAGE_BIDS_PATH` / `PAGE_BIDS_LEGACY_PATH`:
+/// this pins the actual URL the client fetches, which asserting a const against
+/// itself would not.
+///
+/// These test settings configure no creative opportunities, so the handler's own
+/// deterministic answer is a 404 `Creative opportunities not configured`. That
+/// body is the anchor: an unregistered path would instead fall through to the
+/// publisher fallback and attempt an outbound fetch to the (nonexistent) test
+/// origin, which cannot produce this message. A bare `!= 404` check would be
+/// wrong here — the handler legitimately returns 404 under this config.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn page_bids_get_is_routed_on_canonical_path_and_alias() {
+    let mut responses = Vec::new();
+
+    for path in ["/_ts/page-bids", "/__ts/page-bids"] {
+        let req = request_builder()
+            .method("GET")
+            .uri(path)
+            .header("sec-fetch-site", "same-origin")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request");
+        let resp = route(test_router(), req).await;
+        let status = resp.status().as_u16();
+        let body = String::from_utf8_lossy(&resp.into_body().into_bytes().unwrap_or_default())
+            .into_owned();
+
+        assert!(
+            body.contains("Creative opportunities not configured"),
+            "GET {path} must reach the page-bids handler, \
+             got status {status} body {body:?}"
+        );
+
+        responses.push((status, body));
+    }
+
+    assert_eq!(
+        responses[0], responses[1],
+        "the deprecated alias must answer identically to the canonical path"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Publisher fallback method parity — non-GET/POST methods must reach the
 // publisher origin fallback (not a router-level 405), matching Fastly/Axum.
@@ -464,6 +514,27 @@ async fn first_party_proxy_rebuild_is_routed() {
         resp.status().as_u16(),
         404,
         "/first-party/proxy-rebuild must be routed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_party_proxy_rebuild_get_is_routed() {
+    // The opaque-origin creative click guard recovers via GET navigation, so the
+    // route must be registered for GET and must not fall through to the
+    // publisher origin. This asserts routing only; the 302 and its rebuilt
+    // Location are covered by `proxy_rebuild_get_with_origin_form_uri_redirects`
+    // in the core crate, which can sign a real `tsclick`.
+    let router = test_router();
+    let req = request_builder()
+        .method("GET")
+        .uri("/first-party/proxy-rebuild?tsclick=%2Ffirst-party%2Fclick%3Ftsurl%3Dhttps%253A%252F%252Fexample.com")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build request");
+    let resp = route(router, req).await;
+    assert_ne!(
+        resp.status().as_u16(),
+        404,
+        "GET /first-party/proxy-rebuild must be routed"
     );
 }
 
