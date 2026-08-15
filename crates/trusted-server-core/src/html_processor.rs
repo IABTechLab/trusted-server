@@ -365,10 +365,6 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         render_trace_overlay,
                     };
                     let manifest_ids = integrations.tsjs_catalog_module_ids(selection);
-                    let critical_src = integrations
-                        .tsjs_critical_artifact(selection)
-                        .expect("should precompute selected critical artifact")
-                        .src();
                     let diagnostics_active = manifest_ids.contains(&"gpt_diagnostics");
                     let state = ad_bids_state
                         .lock()
@@ -388,8 +384,13 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         snippet.push_str(debug_comment);
                         snippet.push('\n');
                     }
+                    // Integration config is one transient pre-core transport; each
+                    // module receives only its frozen typed value during preparation.
+                    for insert in integrations.head_inserts(&ctx) {
+                        snippet.push_str(&insert);
+                    }
                     let publisher_origin = patterns.replacement_url();
-                    let boot = tsjs::tsjs_boot_script_with_critical_src_v1(
+                    let boot = tsjs::tsjs_bootstrap_fragment_v1(
                         tsjs::TsjsBootScriptConfigV1 {
                             module_ids: &manifest_ids,
                             auction_projection_json: projection_json,
@@ -397,12 +398,11 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             render_trace_overlay,
                             gpt_diagnostics_active: diagnostics_active,
                         },
-                        critical_src,
                         &publisher_origin,
                     )
                     .or_else(|error| {
                         log::error!("invalid TSJS document boot projection: {error:?}");
-                        tsjs::tsjs_boot_script_with_critical_src_v1(
+                        tsjs::tsjs_bootstrap_fragment_v1(
                             tsjs::TsjsBootScriptConfigV1 {
                                 module_ids: &manifest_ids,
                                 auction_projection_json: EMPTY_AUCTION_PROJECTION_JSON,
@@ -410,20 +410,11 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                                 render_trace_overlay,
                                 gpt_diagnostics_active: diagnostics_active,
                             },
-                            critical_src,
                             &publisher_origin,
                         )
                     })
                     .unwrap_or_default();
                     snippet.push_str(&boot);
-                    // Integration config is one transient pre-core transport; each
-                    // module receives only its frozen typed value during preparation.
-                    for insert in integrations.head_inserts(&ctx) {
-                        snippet.push_str(&insert);
-                    }
-                    // Exactly one parser-time TSJS tag: core plus selected critical modules.
-                    // Deferred modules are authenticated and loaded by the committed runtime.
-                    snippet.push_str(&tsjs::tsjs_script_tag_from_src(critical_src));
                     el.prepend(&snippet, ContentType::Html);
                     injected_tsjs.set(true);
                 }
@@ -887,7 +878,7 @@ mod tests {
             .expect("should process HTML");
         let processed = String::from_utf8(output).expect("should produce valid UTF-8");
         let bundle_marker = "id=\"trustedserver-js\"";
-        let diagnostics_manifest_marker = r#""id":"gpt_diagnostics","phase":"critical""#;
+        let diagnostics_manifest_marker = r#""id":"gpt_diagnostics","phase":"takeover""#;
         let diagnostics_script_marker = "tsjs-gpt_diagnostics.min.js";
         let cleanup_asset_marker = "tsjs-gpt_diagnostics-bootstrap.min.js";
         let cleanup_program_marker = "history.replaceState";
@@ -919,7 +910,7 @@ mod tests {
             .expect("should include the request-scoped inline cleanup");
         let bundle_index = processed
             .find(bundle_marker)
-            .expect("should include the critical TSJS bundle");
+            .expect("should include the selected TSJS artifact");
         assert!(
             cleanup_index < bundle_index,
             "request-scoped URL cleanup must run before publisher/core work"
@@ -1715,8 +1706,8 @@ mod tests {
             .expect("should process HTML");
         let html = std::str::from_utf8(&output).expect("should produce UTF-8");
         let boot = html
-            .find("t.boot=")
-            .expect("should emit exact boot transport");
+            .find("const __TSJS_SERVER_BOOT_INPUT_V1__=")
+            .expect("should emit exact server boot input transport");
         let core = html
             .find("id=\"trustedserver-js\"")
             .expect("should emit core bundle");
@@ -1726,8 +1717,11 @@ mod tests {
         assert!(html.contains(
             r#""creative":{"version":1,"enabled":true,"clickGuard":true,"renderGuard":false}"#
         ));
-        assert_eq!(html.matches("tsjs:bids-script").count(), 1);
-        assert_eq!(html.matches("t.boot=").count(), 1);
+        assert!(html.contains(r#"performance.mark("tsjs:bids-script")"#));
+        assert_eq!(
+            html.matches("const __TSJS_SERVER_BOOT_INPUT_V1__=").count(),
+            1
+        );
         assert!(!html.contains(".adSlots"));
         assert!(!html.contains(".bids="));
     }
@@ -1759,7 +1753,9 @@ mod tests {
             html.contains(r#""auctionId":"auction-body""#),
             "should inject the exact projection into immutable boot"
         );
-        let boot_pos = html.find("t.boot=").expect("boot should be in output");
+        let boot_pos = html
+            .find("const __TSJS_SERVER_BOOT_INPUT_V1__=")
+            .expect("server boot input should be in output");
         let core_pos = html
             .find("id=\"trustedserver-js\"")
             .expect("core should be in output");
@@ -1795,7 +1791,7 @@ mod tests {
             .expect("should process");
         let html = std::str::from_utf8(&output).expect("should be utf8");
         assert_eq!(
-            html.matches("t.boot=").count(),
+            html.matches("const __TSJS_SERVER_BOOT_INPUT_V1__=").count(),
             1,
             "should inject immutable boot exactly once even with multiple body elements"
         );
@@ -1911,9 +1907,10 @@ mod tests {
             .process_chunk(b"<html><head></head><body>content</body></html>", true)
             .expect("should process");
         let html = std::str::from_utf8(&output).expect("should be utf8");
-        assert!(
-            html.contains("t.boot="),
-            "every document should receive one complete boot value"
+        assert_eq!(
+            html.matches("const __TSJS_SERVER_BOOT_INPUT_V1__=").count(),
+            1,
+            "every document should receive one complete server boot input"
         );
         assert!(!html.contains(".bids="));
     }

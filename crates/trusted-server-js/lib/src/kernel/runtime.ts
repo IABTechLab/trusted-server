@@ -5,7 +5,7 @@ import type { GptDiagnosticsApi } from '../core/types';
 import {
   buildFallbackBoot,
   buildKernelBoot,
-  captureTrustedCriticalSrc,
+  captureTrustedSelectedRuntimeSrc,
   captureTrustedRuntimeSrc,
   createFallbackFields,
   publicLog,
@@ -244,8 +244,8 @@ class RuntimeOwner implements Runtime {
   private installPromise: Promise<IntegrationInstallResult> | undefined;
   private kernelBoot: Readonly<object> | undefined;
   private fallbackBoot: Readonly<object> | undefined;
-  private criticalScript: HTMLScriptElement | undefined;
-  private trustedCriticalSrc: string | undefined;
+  private selectedScript: HTMLScriptElement | undefined;
+  private trustedRuntimeSrc: string | undefined;
   private phaseGate: ProtectedFirstDisplayGate | undefined;
   private phaseLoader: DeferredPhaseLoader | undefined;
   private auctionContextService: RuntimeAuctionContextService | undefined;
@@ -271,16 +271,16 @@ class RuntimeOwner implements Runtime {
       const runtimeDocument = this.runtimeDocument();
       const Script = runtimeDocument?.defaultView?.HTMLScriptElement;
       const currentScript = runtimeDocument?.currentScript;
-      this.criticalScript = Script && currentScript instanceof Script ? currentScript : undefined;
+      this.selectedScript = Script && currentScript instanceof Script ? currentScript : undefined;
       const takeoverMode = this.options.coordinateTakeover !== undefined;
-      const capturedCriticalSrc =
-        runtimeDocument && this.criticalScript
+      const capturedRuntimeSrc =
+        runtimeDocument && this.selectedScript
           ? takeoverMode
-            ? captureTrustedRuntimeSrc(runtimeDocument, this.criticalScript)
-            : captureTrustedCriticalSrc(runtimeDocument, this.criticalScript)
+            ? captureTrustedRuntimeSrc(runtimeDocument, this.selectedScript)
+            : captureTrustedSelectedRuntimeSrc(runtimeDocument, this.selectedScript)
           : undefined;
-      if (!capturedCriticalSrc) return false;
-      this.trustedCriticalSrc = capturedCriticalSrc;
+      if (!capturedRuntimeSrc) return false;
+      this.trustedRuntimeSrc = capturedRuntimeSrc;
       const startedAtMs = (this.options.now ?? (() => performance.now()))();
       queueDescriptor = Object.getOwnPropertyDescriptor(this.options.target, 'que');
       bootDescriptor = Object.getOwnPropertyDescriptor(this.options.target, 'boot');
@@ -318,7 +318,7 @@ class RuntimeOwner implements Runtime {
             this.options.knownIntegrationIds.map((id) =>
               Object.freeze({
                 id,
-                phase: 'critical' as const,
+                phase: 'takeover' as const,
                 trigger: null,
                 consumes: Object.freeze([]),
                 provides: Object.freeze([]),
@@ -398,10 +398,10 @@ class RuntimeOwner implements Runtime {
           }
           return undefined;
         },
-        ...(this.criticalScript && runtimeDocument
+        ...(this.selectedScript && runtimeDocument
           ? {
-              criticalScript: this.criticalScript,
-              criticalScriptId: takeoverMode
+              takeoverScript: this.selectedScript,
+              takeoverScriptId: takeoverMode
                 ? ('trustedserver-js-runtime' as const)
                 : ('trustedserver-js' as const),
               document: runtimeDocument,
@@ -415,9 +415,9 @@ class RuntimeOwner implements Runtime {
       this.fallbackBoot = buildFallbackBoot(
         EMBEDDED_RELEASE_ID,
         bootCandidate,
-        this.trustedCriticalSrc
+        this.trustedRuntimeSrc
       );
-      if (!this.fallbackBoot) throw new Error('Trusted critical artifact source is unavailable');
+      if (!this.fallbackBoot) throw new Error('Trusted runtime artifact source is unavailable');
       if (this.registry.manifest) {
         this.kernelBoot = buildKernelBoot(
           EMBEDDED_RELEASE_ID,
@@ -452,8 +452,8 @@ class RuntimeOwner implements Runtime {
       this.ingress = undefined;
       this.kernelBoot = undefined;
       this.fallbackBoot = undefined;
-      this.criticalScript = undefined;
-      this.trustedCriticalSrc = undefined;
+      this.selectedScript = undefined;
+      this.trustedRuntimeSrc = undefined;
       return false;
     }
   }
@@ -625,12 +625,12 @@ class RuntimeOwner implements Runtime {
   }
 
   private commitFallback(reason: BootFailureReason): void {
-    if (!this.ownsRegistrationHandshake() || !this.ingress || !this.trustedCriticalSrc) return;
+    if (!this.ownsRegistrationHandshake() || !this.ingress || !this.trustedRuntimeSrc) return;
     const fields = createFallbackFields({
       releaseId: EMBEDDED_RELEASE_ID,
       reason,
       boot: this.fallbackBoot,
-      trustedCriticalSrc: this.trustedCriticalSrc,
+      trustedRuntimeSrc: this.trustedRuntimeSrc,
     });
     if (!fields) return;
     const published = publishQueue(this.options.target, this.ingress, fields);
@@ -687,6 +687,7 @@ class RuntimeOwner implements Runtime {
     if (!runtimeDocument || !manifest) return;
     const gate = createProtectedFirstDisplayGate({
       document: runtimeDocument,
+      ...(this.options.coordinateTakeover ? { paintAlreadyRecorded: true } : {}),
       ...(this.options.phaseScheduler ? { scheduler: this.options.phaseScheduler } : {}),
       markPaint: () => {
         try {
@@ -697,10 +698,10 @@ class RuntimeOwner implements Runtime {
       },
     });
     this.phaseGate = gate;
-    const criticalScript = this.criticalScript;
-    if (criticalScript) {
+    const runtimeScript = this.selectedScript;
+    if (runtimeScript) {
       this.phaseLoader = createDeferredPhaseLoader({
-        criticalScript,
+        runtimeScript,
         document: runtimeDocument,
         gate: gate.ready,
         manifest,

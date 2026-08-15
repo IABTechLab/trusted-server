@@ -96,6 +96,90 @@ export interface FirstDisplayBatchV1 {
   readonly projection: FirstDisplayProjectionV1;
 }
 
+/**
+ * Admit the immutable same-script server projection without cloning it again.
+ *
+ * Rust owns the exhaustive projection grammar and the bootstrap recursively freezes
+ * that generated data before this authenticated release artifact can receive it.
+ */
+export function acceptServerFirstDisplayBatchV1(
+  candidate: unknown
+): FirstDisplayBatchV1 | undefined {
+  try {
+    const envelope = candidate as Readonly<{
+      version: unknown;
+      projectionDigest: unknown;
+      projection: FirstDisplayProjectionV1;
+    }>;
+    const projection = envelope.projection;
+    const results = projection.auction.results;
+    const { slots, bids } = projection;
+    if (
+      !Object.isFrozen(candidate) ||
+      envelope.version !== 1 ||
+      typeof envelope.projectionDigest !== 'string' ||
+      !HASH.test(envelope.projectionDigest) ||
+      !Object.isFrozen(projection) ||
+      projection.version !== 1 ||
+      projection.auction.version !== 1 ||
+      !Object.isFrozen(results) ||
+      results.length === 0 ||
+      results.length > MAX_SLOTS ||
+      !Object.isFrozen(slots) ||
+      slots.length !== results.length ||
+      !Object.isFrozen(bids) ||
+      bids.length > results.length
+    ) {
+      return undefined;
+    }
+    const outcomes: FirstDisplayBatchOutcomeV1[] = [];
+    let winner = 0;
+    let aps = false;
+    let prebid = false;
+    for (let index = 0; index < results.length; index += 1) {
+      const decision = results[index]!;
+      const slot = slots[index]!;
+      if (decision.slot !== slot.slot) return undefined;
+      if (decision.outcome !== 'winner') {
+        if (decision.outcome !== 'no_bid' && decision.outcome !== 'failed') return undefined;
+        outcomes.push(Object.freeze({ slotId: decision.slot, kind: decision.outcome }));
+        continue;
+      }
+      const bid = bids[winner++];
+      if (
+        !bid ||
+        bid.candidateId !== decision.candidateId ||
+        bid.slot !== decision.slot ||
+        (bid.renderSource.type !== 'adm' && bid.renderSource.type !== 'aps')
+      ) {
+        return undefined;
+      }
+      aps ||= bid.renderSource.type === 'aps';
+      prebid ||= bid.provider === 'prebid';
+      outcomes.push(
+        Object.freeze({
+          slotId: decision.slot,
+          kind: bid.renderSource.type === 'aps' ? 'aps' : 'gpt_adm',
+        })
+      );
+    }
+    if (winner !== bids.length) return undefined;
+    return Object.freeze({
+      version: 1,
+      projectionDigest: envelope.projectionDigest,
+      requiredProtocols: Object.freeze([
+        ...(aps ? (['aps'] as const) : []),
+        ...(winner ? (['gpt'] as const) : []),
+        ...(prebid ? (['prebid'] as const) : []),
+      ]),
+      outcomes: Object.freeze(outcomes),
+      projection,
+    });
+  } catch {
+    return undefined;
+  }
+}
+
 const textEncoder = new TextEncoder();
 
 function exactRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | undefined {

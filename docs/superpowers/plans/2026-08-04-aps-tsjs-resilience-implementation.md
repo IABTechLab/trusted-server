@@ -109,12 +109,14 @@ owners and dependency directions.
 ```text
 crates/trusted-server-js/lib/src/
   first_display/
-    contracts.ts        exact outline/handoff/capsule data contracts and validators
-    transaction.ts      inert slice preparation, synchronous activation, rollback
     agent.ts            immutable-batch owner, seal, paint, mutation revision, disposal
-    handoff.ts          bounded final snapshot and one-use ownership capsule
     composition.ts      sole parser-blocking agent entry; no persistent/runtime imports
     slices/*.ts         exact APS/GPT/Prebid/creative/parser-time initial obligations
+  shared/
+    first_display_contracts.ts     exact outline/handoff/capsule data validators
+    first_display_transaction.ts   inert slice preparation, activation, rollback
+    first_display_handoff.ts       bounded snapshot and one-use ownership capsule
+    first_display_registration.ts  release-private component registration ABI
   kernel/
     identity.ts         navigation-prefix + u64 attempts; 128-bit CSPRNG tickets/nonces
     disposable.ts       owned disposer stack and terminal latch primitives
@@ -144,11 +146,12 @@ crates/trusted-server-js/lib/src/
     gpt_diagnostics/{data_api,presentation}.ts  data-only API + deferred UI owners
     */lifecycle.ts      catalogued later-only Osano/Permutive/Sourcepoint slices
   core/
+    bootstrap.ts        sole generated queue/watchdog/direct/agent boot source
     index.ts            post-paint persistent entry and final public API installation
-    bootstrap_controller.ts  generated minimal queue/watchdog/fallback controller
     trace.ts            trace reducer/store, public API, private presentation attach
     types.ts            public and wire types
   composition/
+    runtime_transport.ts  production persistent-runtime entry
     browser_test.ts     test-only concrete composition and injection seams
 ```
 
@@ -1736,7 +1739,7 @@ collapse those checkpoints or carry unverified behavior between them.
   git commit -m "Add transactional TSJS module ownership"
   ```
 
-### Task 8A: Implement the minimal bootstrap controller and terminal fallback, dormant
+### Task 8A: Implement the minimal bootstrap controller and terminal fallback before the switch
 
 **Files:**
 
@@ -1751,8 +1754,8 @@ collapse those checkpoints or carry unverified behavior between them.
 - Modify: `crates/trusted-server-js/lib/src/core/global.d.ts`
 - Create: `crates/trusted-server-js/lib/test/core/queue.test.ts`
 - Create: `crates/trusted-server-js/lib/test/core/log.test.ts`
-- Create: `crates/trusted-server-js/lib/src/core/bootstrap_controller.ts`
-- Create: `crates/trusted-server-js/lib/test/core/bootstrap_controller.test.ts`
+- Create: `crates/trusted-server-js/lib/src/core/bootstrap.ts`
+- Create: `crates/trusted-server-js/lib/test/build/generated-fallback.test.mjs`
 - Delete after migrating its tests: `crates/trusted-server-js/lib/src/integrations/gpt/bootstrap_fallback.ts`
 - Modify: `crates/trusted-server-core/src/integrations/gpt.rs`
 - Modify: `crates/trusted-server-core/src/tsjs.rs`
@@ -1818,7 +1821,7 @@ collapse those checkpoints or carry unverified behavior between them.
       terminal fallback. Post-paint agent takeover owns the separate §5.2.1 deadline.
       Combine timers with monotonic checks at every synchronous barrier. Abort
       completes reverse-order unwind before fallback. Deferred bundles after fallback
-      are rejected and cannot replace that generation. Exercise the dormant state
+      are rejected and cannot replace that generation. Exercise the pre-switch state
       machine through test composition; Tasks 18E–18G supply the agent and handoff
       behavior before production wiring.
 
@@ -1906,13 +1909,14 @@ collapse those checkpoints or carry unverified behavior between them.
 - [ ] **Step 6: Run:**
 
   ```bash
-  npm --prefix crates/trusted-server-js/lib test -- --run test/kernel/runtime.test.ts test/core/bootstrap_controller.test.ts
+  npm --prefix crates/trusted-server-js/lib test -- --run test/kernel/runtime.test.ts
+  npm --prefix crates/trusted-server-js/lib run test:release
   cargo test-fastly release_id
   cargo test-fastly
   npm --prefix crates/trusted-server-js/lib run build
   ```
 
-- [ ] **Step 7: Stage and commit the dormant controller, fallback, and release identity**
+- [ ] **Step 7: Stage and commit the pre-switch controller, fallback, and release identity**
       together. Include the migrated fallback deletion so no behavior-bearing orphan
       remains outside the commit:
 
@@ -1930,8 +1934,8 @@ collapse those checkpoints or carry unverified behavior between them.
     crates/trusted-server-js/lib/src/core/global.d.ts \
     crates/trusted-server-js/lib/test/core/queue.test.ts \
     crates/trusted-server-js/lib/test/core/log.test.ts \
-    crates/trusted-server-js/lib/src/core/bootstrap_controller.ts \
-    crates/trusted-server-js/lib/test/core/bootstrap_controller.test.ts \
+    crates/trusted-server-js/lib/src/core/bootstrap.ts \
+    crates/trusted-server-js/lib/test/build/generated-fallback.test.mjs \
     crates/trusted-server-js/lib/src/integrations/gpt/bootstrap_fallback.ts \
     crates/trusted-server-core/src/integrations/gpt.rs \
     crates/trusted-server-core/src/tsjs.rs \
@@ -2022,7 +2026,7 @@ collapse those checkpoints or carry unverified behavior between them.
       reordered/extra query, or mismatched selection. Assert no redirect and no
       publisher-origin fallthrough on all four adapters.
 
-- [ ] **Step 5: Implement hash-validating agent/unified/deferred handler machinery and dormant
+- [ ] **Step 5: Implement hash-validating agent/unified/deferred handler machinery and pre-switch
       manifest emission.** Exercise the agent route through the test-only registry;
       production has no permitted agent selection until Task 18E registers real
       artifacts. `firstDisplay.src` names agent base plus selected slices;
@@ -2067,7 +2071,7 @@ collapse those checkpoints or carry unverified behavior between them.
       keys, custom prototypes, wrong literals/types, unknown/cross-phase ids,
       duplicate/late calls, the wrong core-created element, and a different
       `document.currentScript`. Phase is exactly `takeover | deferred`; there is no
-      `critical` compatibility value. Stage declared frozen provider interfaces after
+      retired phase alias. Stage declared frozen provider interfaces after
       provider preparation, make them effect-inert until activation, and expose no
       broker/readiness object through public or `_internal` surfaces.
 
@@ -3123,7 +3127,7 @@ with an earlier one.
       adapter, slot service, render service, and test-only browser composition; do not
       wire a shipped entry point yet.
 
-- [ ] **Step 8: Implement and test the prospective real performance marks before the switch.**
+- [ ] **Step 8: Implement and test the real performance marks before the switch.**
       Make the generated bootstrap controller execute
       `performance.mark('tsjs:bids-script')` immediately before the selected parser-blocking head
       sequence but leave its production call site unchanged. In the shared render/
@@ -3138,9 +3142,9 @@ with an earlier one.
       missing/throwing Performance API cases, and assert
       `performance.measure('tsjs:boot-to-first-display', 'tsjs:bids-script', 'tsjs:first-display')`
       uses those exact marks. `window.__tsjsPerf` is historical test scaffolding and is
-      rejected by the prospective post-switch test.
+      rejected by the post-switch test.
 
-- [ ] **Step 9: Run the entire GPT suite and prospective boot-mark tests, not only new files:**
+- [ ] **Step 9: Run the entire GPT suite and boot-mark tests, not only new files:**
 
   ```bash
   npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/gpt
@@ -3821,7 +3825,7 @@ labelled `module.ts` paths are created here before Task 18D modifies them.
       host; Osano USP/GPP/TCF marker ownership and lifecycle; Permutive bounded
       readiness/API host and at-most-100 normalized segments; Sourcepoint optional SDK
       plus GPP storage/marker lifecycle; and Testlight preexisting/later callbacks,
-      invalid entries, and throw isolation. Run unchanged pre-cutover fixtures beside
+      invalid entries, and throw isolation. Run unchanged current-main fixtures beside
       module-composed fixtures. Permutive and any other auction-context contributor
       register only through the injected runtime service during activation and remove
       that contribution through the pre-registered disposer; no import-time global
@@ -3853,7 +3857,7 @@ labelled `module.ts` paths are created here before Task 18D modifies them.
       `afterCommit`. Shared helpers must preserve each integration's exact matcher,
       startup order, failure isolation, and disposal semantics.
 
-- [ ] **Step C4: Generate and test the prospective manifest member list/order from the exact**
+- [ ] **Step C4: Generate and test the manifest member list/order from the exact**
       enabled bundle list. Embed the same release id in core and every integration
       IIFE. Add failures for integration before core, unknown/missing/duplicate member,
       malformed/unsorted/oversized manifest, wrong release, preparation or activation
@@ -4010,14 +4014,14 @@ labelled `module.ts` paths are created here before Task 18D modifies them.
 
 #### Task 18E: Define the lean first-display catalog and closed contracts
 
-This task creates only pure contracts, validators, catalog selection, and a dormant
+This task creates only pure contracts, validators, catalog selection, and a pre-switch
 agent artifact. It does not switch production HTML or construct the persistent
 runtime.
 
 **Task 18E files:**
 
-- Create: `crates/trusted-server-js/lib/src/first_display/contracts.ts`
-- Create: `crates/trusted-server-js/lib/src/first_display/transaction.ts`
+- Create: `crates/trusted-server-js/lib/src/shared/first_display_contracts.ts`
+- Create: `crates/trusted-server-js/lib/src/shared/first_display_transaction.ts`
 - Create: `crates/trusted-server-js/lib/test/first_display/contracts.test.ts`
 - Create: `crates/trusted-server-js/lib/test/first_display/transaction.test.ts`
 - Modify: `crates/trusted-server-js/lib/src/kernel/release_catalog.ts`
@@ -4074,7 +4078,7 @@ runtime.
       effects. The sink is closure-private and exposes no public service locator,
       `TsjsApi`, broker, or extension point.
 
-- [ ] **Step E4: Build the dormant agent artifact and architecture gate.** Generate
+- [ ] **Step E4: Build the pre-switch agent artifact and architecture gate.** Generate
       and hash all 2,560 reachable masks, emit an exact ordered allowlist containing
       only masks within every raw/gzip/Brotli ceiling, and require the minimal,
       five-slice reference, and APS-plus-default-creative masks to be admitted.
@@ -4086,7 +4090,7 @@ runtime.
       `first_display/**`. A hit assembles response bytes at most once; a miss performs
       no concatenation or hashing. Do not emit the agent from production HTML yet.
 
-- [ ] **Step E5: Run, commit, and keep the artifact dormant.**
+- [ ] **Step E5: Run, commit, and keep the artifact unreachable before the switch.**
 
   ```bash
   npm --prefix crates/trusted-server-js/lib test -- --run \
@@ -4100,8 +4104,8 @@ runtime.
   cargo test-fastly first_display_selection
   git diff --check
   git add \
-    crates/trusted-server-js/lib/src/first_display/contracts.ts \
-    crates/trusted-server-js/lib/src/first_display/transaction.ts \
+    crates/trusted-server-js/lib/src/shared/first_display_contracts.ts \
+    crates/trusted-server-js/lib/src/shared/first_display_transaction.ts \
     crates/trusted-server-js/lib/test/first_display/contracts.test.ts \
     crates/trusted-server-js/lib/test/first_display/transaction.test.ts \
     crates/trusted-server-js/lib/src/kernel/release_catalog.ts \
@@ -4134,8 +4138,8 @@ runtime.
 - Create: `crates/trusted-server-js/lib/src/first_display/slices/testlight.ts`
 - Create: `crates/trusted-server-js/lib/test/first_display/agent.test.ts`
 - Create: `crates/trusted-server-js/lib/test/first_display/slices.test.ts`
-- Modify: `crates/trusted-server-js/lib/src/core/bootstrap_controller.ts`
-- Modify: `crates/trusted-server-js/lib/test/core/bootstrap_controller.test.ts`
+- Modify: `crates/trusted-server-js/lib/src/core/bootstrap.ts`
+- Modify: `crates/trusted-server-js/lib/test/build/generated-fallback.test.mjs`
 - Modify: `crates/trusted-server-js/lib/build-all.mjs`
 - Modify: `crates/trusted-server-js/lib/test/build/release-v1.test.mjs`
 
@@ -4190,13 +4194,13 @@ runtime.
       integration obligations activate in the direct persistent transaction when no
       agent is selected.
 
-- [ ] **Step F6: Run and commit the dormant agent behavior.**
+- [ ] **Step F6: Run and commit the pre-switch agent behavior.**
 
   ```bash
   npm --prefix crates/trusted-server-js/lib test -- --run \
     test/first_display/agent.test.ts \
     test/first_display/slices.test.ts \
-    test/core/bootstrap_controller.test.ts
+    test/build/generated-fallback.test.mjs
   npm --prefix crates/trusted-server-js/lib run build
   npm --prefix crates/trusted-server-js/lib run test:architecture
   npm --prefix crates/trusted-server-js/lib run typecheck
@@ -4204,8 +4208,8 @@ runtime.
   git add crates/trusted-server-js/lib/src/first_display
   git add crates/trusted-server-js/lib/test/first_display
   git add \
-    crates/trusted-server-js/lib/src/core/bootstrap_controller.ts \
-    crates/trusted-server-js/lib/test/core/bootstrap_controller.test.ts \
+    crates/trusted-server-js/lib/src/core/bootstrap.ts \
+    crates/trusted-server-js/lib/test/build/generated-fallback.test.mjs \
     crates/trusted-server-js/lib/build-all.mjs \
     crates/trusted-server-js/lib/test/build/release-v1.test.mjs
   git diff --cached --check
@@ -4216,11 +4220,11 @@ runtime.
 
 **Task 18G files:**
 
-- Create: `crates/trusted-server-js/lib/src/first_display/handoff.ts`
+- Create: `crates/trusted-server-js/lib/src/shared/first_display_handoff.ts`
 - Create: `crates/trusted-server-js/lib/test/first_display/handoff.test.ts`
 - Create: `crates/trusted-server-js/lib/test/first_display/takeover.test.ts`
 - Modify: `crates/trusted-server-js/lib/src/first_display/agent.ts`
-- Modify: `crates/trusted-server-js/lib/src/core/bootstrap_controller.ts`
+- Modify: `crates/trusted-server-js/lib/src/core/bootstrap.ts`
 - Modify: `crates/trusted-server-js/lib/src/core/index.ts`
 - Modify: `crates/trusted-server-js/lib/src/kernel/runtime.ts`
 - Modify: `crates/trusted-server-js/lib/src/kernel/sessions.ts`
@@ -4287,7 +4291,7 @@ runtime.
       later than persistent commit and start independently after the common gate. A
       takeover/deferred failure creates no second runtime or head-of-line blocking.
 
-- [ ] **Step G6: Run and commit the prospective takeover without switching production
+- [ ] **Step G6: Run and commit the takeover without switching production
       HTML.**
 
   ```bash
@@ -4302,11 +4306,11 @@ runtime.
   npm --prefix crates/trusted-server-js/lib run typecheck
   git diff --check
   git add \
-    crates/trusted-server-js/lib/src/first_display/handoff.ts \
+    crates/trusted-server-js/lib/src/shared/first_display_handoff.ts \
     crates/trusted-server-js/lib/test/first_display/handoff.test.ts \
     crates/trusted-server-js/lib/test/first_display/takeover.test.ts \
     crates/trusted-server-js/lib/src/first_display/agent.ts \
-    crates/trusted-server-js/lib/src/core/bootstrap_controller.ts \
+    crates/trusted-server-js/lib/src/core/bootstrap.ts \
     crates/trusted-server-js/lib/src/core/index.ts \
     crates/trusted-server-js/lib/src/kernel/runtime.ts \
     crates/trusted-server-js/lib/src/kernel/sessions.ts \
@@ -4559,7 +4563,7 @@ never define a ceiling.
 
 - [ ] **Step 1: Complete the pre-switch checklist with no production-wiring changes staged.**
       The atomic switch is allowed to flip wiring only after every behavior suite
-      below is already green against the test-only composition and prospective
+      below is already green against the test-only composition and production-shape
       routes/artifacts:
   - render attempt, direct APS, direct ADM, current-main PBS Cache black-box parity, PUC claim/channel, artifact
     store, reservations, slots, targeting, projections, auction batching, context,
@@ -4586,7 +4590,7 @@ never define a ceiling.
   do not rewrite a historical capture or defer a failing transfer/agent/persistent/maximal
   gate until after the atomic switch.
 
-  Verify the prospective performance-mark tests from Tasks 16/18F/18G are already green: the
+  Verify the performance-mark tests from Tasks 16/18F/18G are already green: the
   unit-tested server fragment names `tsjs:bids-script`, the adapter names exactly one
   authoritative `tsjs:first-display`, the protected attempt records
   `tsjs:first-display-terminal`, the shared paint gate records
@@ -4798,6 +4802,7 @@ later group's spec files or workflow changes.
 - Modify: `crates/trusted-server-integration-tests/browser/tests/shared/aps-renderer.spec.ts`
 - Create: `crates/trusted-server-integration-tests/browser/tests/shared/aps-puc-lifecycle.spec.ts`
 - Create: `crates/trusted-server-integration-tests/browser/tests/shared/tsjs-runtime.spec.ts`
+- Modify: `crates/trusted-server-integration-tests/browser/tests/shared/tsjs-performance.spec.ts`
 - Modify: `crates/trusted-server-integration-tests/browser/tests/shared/creative-sandbox.spec.ts`
 - Modify: `crates/trusted-server-integration-tests/browser/tests/nextjs/gpt-diagnostics.spec.ts`
 - Modify: `crates/trusted-server-integration-tests/browser/tests/nextjs/navigation.spec.ts`
@@ -4925,13 +4930,15 @@ later group's spec files or workflow changes.
   TS_BROWSER_FRAMEWORKS=nextjs TS_BROWSER_PROJECTS=chromium,firefox,webkit \
     ./scripts/integration-tests-browser.sh \
       tests/shared/tsjs-runtime.spec.ts \
+      tests/shared/tsjs-performance.spec.ts \
       --project=chromium --project=firefox --project=webkit
   # GREEN, after 20A implementation: expected PASS.
   TS_BROWSER_FRAMEWORKS=nextjs TS_BROWSER_PROJECTS=chromium,firefox,webkit \
     ./scripts/integration-tests-browser.sh \
       tests/shared/tsjs-runtime.spec.ts \
+      tests/shared/tsjs-performance.spec.ts \
       --project=chromium --project=firefox --project=webkit
-  git add crates/trusted-server-integration-tests/browser/playwright.config.ts crates/trusted-server-integration-tests/browser/tests/shared/tsjs-runtime.spec.ts crates/trusted-server-integration-tests/browser/helpers/infra.ts crates/trusted-server-integration-tests/browser/helpers/state.ts scripts/integration-tests-browser.sh
+  git add crates/trusted-server-integration-tests/browser/playwright.config.ts crates/trusted-server-integration-tests/browser/tests/shared/tsjs-runtime.spec.ts crates/trusted-server-integration-tests/browser/tests/shared/tsjs-performance.spec.ts crates/trusted-server-integration-tests/browser/helpers/infra.ts crates/trusted-server-integration-tests/browser/helpers/state.ts scripts/integration-tests-browser.sh
   git commit -m "Cover TSJS bootstrap and deferred loading in browsers"
   ```
 
@@ -5009,6 +5016,7 @@ later group's spec files or workflow changes.
       tests/shared/aps-renderer.spec.ts \
       tests/shared/aps-puc-lifecycle.spec.ts \
       tests/shared/tsjs-runtime.spec.ts \
+      tests/shared/tsjs-performance.spec.ts \
       tests/shared/creative-sandbox.spec.ts \
       tests/nextjs/gpt-diagnostics.spec.ts \
       tests/nextjs/navigation.spec.ts \
@@ -5445,9 +5453,9 @@ not create another design, plan, cache specification, or evidence document.
 - Modify: `crates/trusted-server-js/lib/test/build/release-v1.test.mjs`
 - Modify as proven by the RED attribution:
   `crates/trusted-server-js/lib/src/first_display/agent.ts`,
-  `crates/trusted-server-js/lib/src/first_display/contracts.ts`,
-  `crates/trusted-server-js/lib/src/first_display/transaction.ts`,
-  `crates/trusted-server-js/lib/src/first_display/handoff.ts`, or
+  `crates/trusted-server-js/lib/src/shared/first_display_contracts.ts`,
+  `crates/trusted-server-js/lib/src/shared/first_display_transaction.ts`,
+  `crates/trusted-server-js/lib/src/shared/first_display_handoff.ts`, or
   `crates/trusted-server-js/lib/src/first_display/composition.ts`
 - Modify as proven by the RED attribution:
   `crates/trusted-server-js/lib/src/first_display/slices/aps.ts`,
@@ -5478,7 +5486,7 @@ not create another design, plan, cache specification, or evidence document.
 - Modify: `crates/trusted-server-adapter-cloudflare/src/platform.rs`
 - Modify: `crates/trusted-server-integration-tests/tests/aps_runner_proxy.rs`
 - Modify: `crates/trusted-server-integration-tests/browser/tests/shared/tsjs-performance.spec.ts`
-- Modify: `crates/trusted-server-integration-tests/src/bin/generate-tsjs-prospective-fixture.rs`
+- Modify: `crates/trusted-server-integration-tests/src/bin/generate-tsjs-fixture.rs`
 - Modify: `scripts/validate-tsjs-performance-evidence.mjs`
 - Modify: `.github/workflows/tsjs-performance-gate.yml`
 - Read only: `crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json`
@@ -5624,7 +5632,7 @@ not create another design, plan, cache specification, or evidence document.
       interception, an environment-selected profile, a fixed historical SHA, or an
       unshaped loopback comparison cannot satisfy this step. Wire the standalone
       workflow to the exact generator path
-      `crates/trusted-server-integration-tests/src/bin/generate-tsjs-prospective-fixture.rs`,
+      `crates/trusted-server-integration-tests/src/bin/generate-tsjs-fixture.rs`,
       `crates/trusted-server-core/src/auction/**`, `publisher.rs`, `tsjs.rs`,
       `html_processor.rs`, the TSJS build/runtime tree, browser performance fixture,
       evidence validator, and workflow itself while preserving dispatch and

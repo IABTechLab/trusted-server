@@ -1,13 +1,10 @@
-import type { BootFailureReason } from '../kernel/fallback';
+import type { BootFailureReason } from '../kernel/fallback_surface';
 import type { PreparedKernelTakeover } from '../kernel/integration_registry';
 
-import {
-  createFirstDisplayOwnershipCapsuleV1,
-  snapshotFirstDisplayHandoffV1,
-  snapshotTakeoverOutlineV1,
-  type FirstDisplayHandoffV1,
-  type FirstDisplayOwnershipCapsuleV1,
-} from './contracts';
+import type {
+  FirstDisplayHandoffV1,
+  FirstDisplayOwnershipCapsuleV1,
+} from './first_display_contracts';
 
 const HASH = /^[0-9a-f]{64}$/;
 const MAX_U32 = 4_294_967_295;
@@ -113,6 +110,11 @@ export interface FirstDisplayTakeoverOptions {
   readonly quiesceAgent: () => void;
   readonly detachCommittedArtifacts: () => void;
   readonly disposeAgent: () => void;
+  /** Persistent-core validator; executes before either owner mutates state. */
+  readonly validateHandoff: (
+    handoff: unknown,
+    outline: unknown
+  ) => FirstDisplayHandoffV1 | undefined;
   readonly activatePersistent: (
     handoff: FirstDisplayHandoffV1,
     identities: readonly object[],
@@ -124,9 +126,48 @@ export interface FirstDisplayTakeoverOptions {
 
 export interface PreparedFirstDisplayTakeoverOptions extends Omit<
   FirstDisplayTakeoverOptions,
-  'activatePersistent' | 'commitPersistent'
+  'activatePersistent' | 'commitPersistent' | 'validateHandoff'
 > {
   readonly prepared: PreparedKernelTakeover;
+}
+
+function createFirstDisplayOwnershipCapsuleV1<T extends object>(
+  releaseId: string,
+  generation: number,
+  identities: readonly T[]
+): FirstDisplayOwnershipCapsuleV1<T> | undefined {
+  if (
+    !HASH.test(releaseId) ||
+    !Number.isInteger(generation) ||
+    generation < 1 ||
+    generation > MAX_U32 ||
+    identities.length > 512
+  ) {
+    return undefined;
+  }
+  const accepted = [...identities];
+  if (
+    accepted.some((identity) => typeof identity !== 'object' || identity === null) ||
+    new Set(accepted).size !== accepted.length
+  ) {
+    return undefined;
+  }
+  let live: T[] | undefined = accepted;
+  return Object.freeze({
+    releaseId,
+    generation,
+    consume: (candidateReleaseId: string, candidateGeneration: number) => {
+      if (!live || candidateReleaseId !== releaseId || candidateGeneration !== generation) {
+        return undefined;
+      }
+      const result = Object.freeze(live);
+      live = undefined;
+      return result;
+    },
+    clear: () => {
+      live = undefined;
+    },
+  });
 }
 
 /**
@@ -263,24 +304,10 @@ export function performFirstDisplayTakeoverV1(options: FirstDisplayTakeoverOptio
   };
 
   try {
-    const outline = snapshotTakeoverOutlineV1(options.outline);
-    const handoff = snapshotFirstDisplayHandoffV1(options.finalized.handoff);
+    const handoff = options.validateHandoff(options.finalized.handoff, options.outline);
     const { capsule } = options.finalized;
-    const requiredObjectKinds = [
-      ...(handoff?.cycles.length === 0 ? [] : (['gpt_slot'] as const)),
-      ...(handoff?.artifacts.length === 0 ? [] : (['dom_artifact'] as const)),
-    ];
     if (
-      !outline ||
       !handoff ||
-      outline.releaseId !== handoff.releaseId ||
-      outline.generation !== handoff.generation ||
-      outline.projectionDigest !== handoff.projectionDigest ||
-      outline.slotCount !== handoff.slots.length ||
-      outline.outcomeCount !== handoff.slots.length ||
-      outline.slices.length !== handoff.slices.length ||
-      outline.slices.some((id, index) => id !== handoff.slices[index]) ||
-      requiredObjectKinds.some((kind) => !outline.objectKinds.includes(kind)) ||
       !options.isCurrentGeneration() ||
       !options.authenticateRuntimeScript() ||
       options.currentMutationRevision() !== handoff.mutationRevision
@@ -329,6 +356,7 @@ export function coordinatePreparedFirstDisplayTakeoverV1(
   return performFirstDisplayTakeoverV1({
     finalized: options.finalized,
     outline: options.outline,
+    validateHandoff: options.prepared.validateHandoff,
     isCurrentGeneration: options.isCurrentGeneration,
     authenticateRuntimeScript: options.authenticateRuntimeScript,
     currentMutationRevision: options.currentMutationRevision,

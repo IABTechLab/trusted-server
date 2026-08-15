@@ -40,6 +40,8 @@ export interface ProtectedFirstDisplayGateOptions {
   readonly document: Document;
   readonly scheduler?: PhaseScheduler;
   readonly markPaint?: () => void;
+  /** The provisional agent already completed the terminal/two-frame paint gate. */
+  readonly paintAlreadyRecorded?: boolean;
 }
 
 function browserScheduler(document: Document): PhaseScheduler {
@@ -164,6 +166,11 @@ export function createProtectedFirstDisplayGate(
     commit: () => {
       if (committed || disposed) return;
       committed = true;
+      if (options.paintAlreadyRecorded) {
+        releasedFromAttemptGuard = true;
+        scheduleIdle();
+        return;
+      }
       attemptTimer = scheduler.setTimeout(() => {
         attemptTimer = undefined;
         enterPaintGate();
@@ -214,7 +221,7 @@ export interface DeferredPhaseLoader {
 }
 
 export interface DeferredPhaseLoaderOptions {
-  readonly criticalScript: HTMLScriptElement;
+  readonly runtimeScript: HTMLScriptElement;
   readonly document: Document;
   readonly prepare: (
     registration: IntegrationRegistration,
@@ -486,7 +493,7 @@ export function createDeferredPhaseLoader(
     );
     const script = options.document.createElement('script');
     script.async = true;
-    const nonce = options.criticalScript.nonce;
+    const nonce = options.runtimeScript.nonce;
     if (nonce !== '') script.nonce = nonce;
     transaction.script = script;
     try {

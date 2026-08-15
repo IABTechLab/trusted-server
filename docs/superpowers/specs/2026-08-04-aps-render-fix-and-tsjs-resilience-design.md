@@ -2421,14 +2421,11 @@ Tests require literal removal where the platform operation succeeds and zero
 surviving authority in every case; “no second listener/wrapper survives” means no
 live TSJS authority, not control over publisher replacements.
 
-All “critical” persistent-module language below means the atomic **takeover**
-transaction on an agent page and the ordinary bootstrap transaction on a page where
-the agent is omitted. It does not authorize those module bytes to enter the
-first-display artifact. Where the older topology below describes core as creating
-the first protected attempt or waiting ten seconds before the first phase release,
-the agent path instead follows the terminal/paint/takeover sequence above; the
-ten-second no-attempt guard remains only for a direct-to-runtime page with no
-server-projected agent batch.
+The atomic **takeover** transaction runs on an agent page; the ordinary bootstrap
+transaction runs on a page where the agent is omitted. Takeover module bytes never
+enter the first-display artifact. The agent path follows the terminal, paint, and
+takeover sequence above; the ten-second no-attempt guard remains only for a
+direct-to-runtime page with no server-projected agent batch.
 
 Each shipped integration remains a separately built IIFE with imports inlined, so
 module singletons cannot be the shared-runtime mechanism. `tsjs-core` installs the
@@ -2521,9 +2518,9 @@ The hash names the exact uncompressed base agent plus selected slice bytes in ca
 order. A mask not permitted by current trusted configuration is not served even when
 its hash is otherwise valid.
 `runtimeSrc` is the exact same-origin
-`/static/tsjs=tsjs-unified.min.js?v=<criticalHash>` URL emitted immediately after
+`/static/tsjs=tsjs-unified.min.js?v=<runtimeHash>` URL emitted immediately after
 the bootstrap controller only when `firstDisplay` is `null`, and otherwise loaded by
-the controller after the agent's protected paint. `criticalHash` is 64 lowercase
+the controller after the agent's protected paint. `runtimeHash` is 64 lowercase
 hexadecimal characters equal to SHA-256 over the exact uncompressed UTF-8 response
 bytes. Those bytes are core followed by the manifest's takeover IIFEs in manifest
 order with the build's exact `;\n` separator; their embedded registrations and `releaseId` bind the
@@ -2576,10 +2573,10 @@ downloaded monolith does not satisfy this contract.
 The static transport is exact and shared by Fastly, Axum, Cloudflare, and Spin.
 Only `GET` and `HEAD` for
 `/static/tsjs=tsjs-first-display.min.js?m=<sliceMask>&v=<firstDisplayHash>`,
-`/static/tsjs=tsjs-unified.min.js?v=<criticalHash>` and
+`/static/tsjs=tsjs-unified.min.js?v=<runtimeHash>` and
 `/static/tsjs=tsjs-<deferred-id>.min.js?v=<moduleHash>` are admitted. The
 first-display query has exactly canonical `m` then `v`; the other routes have
-exactly one `v` and no other field. `firstDisplayHash` and `criticalHash` use
+exactly one `v` and no other field. `firstDisplayHash` and `runtimeHash` use
 the exact composition rules above; `moduleHash` is SHA-256 over that deferred
 artifact's exact uncompressed UTF-8 bytes. The handler derives the enabled ordered
 first-display set from the validated mask plus trusted configuration, or the
@@ -2609,7 +2606,7 @@ parser-blocking fetch early enough to overlap the first-display TSJS request whe
 required for the first projected display. When Prebid integration is enabled, its
 external artifact tag is always emitted through that early overlap path because the
 current-main client readiness, bidder/user-ID/EID configuration, publisher queue, and
-initial auction contract are critical. It remains
+initial auction contract are required before the first action. It remains
 an external script, never a TSJS source input or TSJS generated artifact. Its adapter installs
 and owns all request-capable actions only after the agent transaction commits, so
 an early library load cannot race a TS-owned display before correctness listeners.
@@ -2632,7 +2629,7 @@ unbounded implementation into the agent:
   programmatic/direct auctions, ongoing lifecycle state, publisher APIs, refresh,
   later navigation, reconciliation, diagnostics data, current-main behavior, and
   retained audited concept gaps. On an agent page it prepares after paint and adopts initial state;
-  on a no-agent page it is the ordinary critical boot transaction; and
+  on a no-agent page it is the ordinary runtime boot transaction; and
 - **deferred** remains restricted to independently loadable behavior that has no
   ownership or parser-time obligation at persistent-runtime commit, such as
   presentation UI and a genuinely optional later lifecycle slice. A deferred
@@ -4059,7 +4056,7 @@ work neither enables sanitization nor broadens creative privileges.
 
 Every other enabled TSJS integration becomes a thin transactional integration module without an
 internal feature rewrite. Its complete current unit suite runs unchanged against a
-pre-cutover fixture and a module-composed fixture. At minimum the parity corpus
+current-main fixture and a module-composed fixture. At minimum the parity corpus
 proves:
 
 | Integration        | Required preserved behavior                                                                                                                                            |
@@ -4099,7 +4096,7 @@ by line count:
 
 | Current area                         | Target responsibility                                                                                                                                                                                  |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| production `composition/browser`     | deleted as a catch-all root; a new first-display composition owns only §5.2.1 slices, while persistent core constructs kernel/session/broker, API, diagnostics facade, and direct-auction coordination |
+| production `composition/browser`     | deleted as a catch-all root; first-display composition owns only §5.2.1 slices, while persistent core constructs kernel/session/broker, API, diagnostics facade, and direct-auction coordination |
 | `first_display/**`                   | fixed agent coordinator plus exact initial APS/GPT/Prebid/creative/parser-time slices, handoff serializer/capsule, protected paint, and no public runtime API                                          |
 | test composition seams               | separate unshipped entry containing fake/no-op adapters, schedulers, corpus hooks, and `*ForTest` accessors                                                                                            |
 | `gpt/index.ts`                       | persistent GPT owner that can adopt exact initial slot/cycle identities; the separate `gpt_initial` slice owns only the immutable projected request and transfer facts                                 |
@@ -4161,7 +4158,7 @@ The existing `roleCorrectTransfer` subtree records the first role-correct captur
 from the exact clean, pushed parent after Task 18D. Review established that this was
 an oversized intermediate implementation, so its provenance and bytes stay
 immutable but its self-derived 5% ceilings are not release acceptance. After
-mechanical critical-runtime remediation, the implementation appended a distinct
+mechanical runtime-graph remediation, the implementation appended a distinct
 `reviewRemediationTransfer` subtree to the same JSON without changing either earlier
 subtree. That second immutable checkpoint records graph de-duplication and its
 historical timing failure; neither fact authorizes or blocks the final release.
@@ -4772,7 +4769,7 @@ analytics row:
   overflow.
 - Empty GAM fallback: parent settles empty/failure before exactly one child render.
 - Direct ADM: exact owned iframe reaches one accepted result. Existing PBS Cache
-  fixtures retain their pre-cutover observable result without entering the new
+  fixtures retain their current-main observable result without entering the new
   APS/ADM owner protocol.
 - Failure fixtures: wrong id, invalid descriptor, missing claim, missing owner,
   missing document acknowledgement, and runner failure each reach the specified

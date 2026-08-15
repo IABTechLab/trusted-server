@@ -17,7 +17,7 @@ pub enum TsjsArtifactRole {
     FirstDisplaySlice,
     /// Sole TSJS kernel artifact.
     Core,
-    /// Catalogued critical or deferred integration module.
+    /// Catalogued takeover or deferred integration module.
     Integration,
 }
 
@@ -26,8 +26,8 @@ pub enum TsjsArtifactRole {
 pub enum TsjsModulePhase {
     /// Parser-blocking provisional phase, disposed or adopted after protected paint.
     FirstDisplay,
-    /// Parser-blocking server-composed first-display module.
-    Critical,
+    /// Persistent module prepared for the atomic runtime takeover.
+    Takeover,
     /// Authenticated module loaded only after the protected phase gate.
     Deferred,
 }
@@ -55,8 +55,8 @@ pub struct TsjsArtifactMetadata {
     pub hash: &'static str,
 }
 
-/// Maximum catalogued critical modules.
-pub const MAX_CRITICAL_MODULES: usize = GENERATED_MAX_CRITICAL_MODULES;
+/// Maximum catalogued takeover modules.
+pub const MAX_TAKEOVER_MODULES: usize = GENERATED_MAX_TAKEOVER_MODULES;
 /// Maximum integrations in one boot manifest.
 pub const MAX_MANIFEST_MODULES: usize = GENERATED_MAX_MANIFEST_MODULES;
 /// Return the sentinel-normalized release identifier shared by every bundle.
@@ -66,11 +66,11 @@ pub const fn release_id() -> &'static str {
     TSJS_RELEASE_ID
 }
 
-/// Return the generated, executable GPT bootstrap fallback proposal.
+/// Return the generated, executable TSJS bootstrap controller.
 #[must_use]
 #[inline]
-pub const fn gpt_bootstrap_fallback_bundle() -> &'static str {
-    GPT_BOOTSTRAP_FALLBACK
+pub const fn bootstrap_bundle() -> &'static str {
+    TSJS_BOOTSTRAP
 }
 
 /// Return the JS bundle content for a given module ID (e.g., "core", "prebid").
@@ -279,7 +279,7 @@ fn public_metadata(artifact: &TsjsGeneratedArtifactMeta) -> TsjsArtifactMetadata
         },
         phase: artifact.phase.map(|phase| match phase {
             "first_display" => TsjsModulePhase::FirstDisplay,
-            "critical" => TsjsModulePhase::Critical,
+            "takeover" => TsjsModulePhase::Takeover,
             "deferred" => TsjsModulePhase::Deferred,
             _ => unreachable!("generated artifact phase should be validated"),
         }),
@@ -302,16 +302,16 @@ mod tests {
         let generated = include_str!(concat!(env!("OUT_DIR"), "/tsjs_modules.rs"));
 
         assert_eq!(metadata.len(), 20, "should embed all catalog modules");
-        assert_eq!(MAX_CRITICAL_MODULES, 14);
+        assert_eq!(MAX_TAKEOVER_MODULES, 14);
         assert_eq!(MAX_MANIFEST_MODULES, 20);
         assert!(
             !generated.contains("INTERNAL_DIAGNOSTICS_SUBSCRIPTIONS"),
             "the synchronous diagnostics ingress must not generate subscription capacity"
         );
         assert_eq!(metadata[0].id, "render_runtime");
-        assert_eq!(metadata[0].phase, Some(TsjsModulePhase::Critical));
+        assert_eq!(metadata[0].phase, Some(TsjsModulePhase::Takeover));
         assert_eq!(metadata[13].id, "testlight");
-        assert_eq!(metadata[13].phase, Some(TsjsModulePhase::Critical));
+        assert_eq!(metadata[13].phase, Some(TsjsModulePhase::Takeover));
         assert_eq!(metadata[14].id, "diagnostics_presentation");
         assert_eq!(metadata[14].phase, Some(TsjsModulePhase::Deferred));
         assert_eq!(metadata[19].id, "sourcepoint_lifecycle");

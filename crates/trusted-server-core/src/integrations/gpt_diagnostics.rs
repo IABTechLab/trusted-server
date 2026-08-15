@@ -1,7 +1,7 @@
 //! Query-activated, browser-session GPT runtime diagnostics integration.
 //!
 //! Exact `ts_console` directives establish or clear a host-only session cookie.
-//! Active documents select `gpt_diagnostics` as a critical member of the unified
+//! Active documents select `gpt_diagnostics` as a takeover member of the unified
 //! TSJS manifest, whose runtime owns diagnostics fact capture and delivery. No
 //! standalone diagnostics browser module or script tag is emitted.
 
@@ -33,7 +33,7 @@ const CLEAR_CONSOLE_COOKIE: &str =
 #[derive(Debug, Clone, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct GptDiagnosticsConfig {
-    /// Whether requests may activate the unified critical GPT diagnostics runtime.
+    /// Whether requests may activate the unified GPT diagnostics runtime.
     #[serde(default)]
     pub enabled: bool,
 }
@@ -404,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn ts_console_register_defers_browser_delivery_to_the_unified_critical_catalog() {
+    fn ts_console_register_defers_browser_delivery_to_the_unified_takeover_catalog() {
         let registry = IntegrationRegistry::new(&settings(true)).expect("should build registry");
 
         assert!(registry.integration_enabled(GPT_DIAGNOSTICS_INTEGRATION_ID));

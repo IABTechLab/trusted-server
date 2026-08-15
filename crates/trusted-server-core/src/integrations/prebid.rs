@@ -3287,15 +3287,15 @@ excluded_gam_ad_unit_path_suffixes = ["{suffix}"]
             "Prebid preload should be removed when auto-config is enabled"
         );
         // The external Prebid artifact remains distinct and precedes the one
-        // parser-time TSJS critical tag. Prebid's TS-owned adapter is included
-        // in that unified critical artifact, never a standalone shim tag.
+        // parser-time TSJS selected-runtime tag. Prebid's TS-owned adapter is included
+        // in that unified runtime artifact, never a standalone shim tag.
         let bundle_index = processed
             .find(PREBID_BUNDLE_ROUTE)
             .expect("should inject external prebid bundle route");
         let shim_index = processed
             .find("id=\"trustedserver-js\"")
-            .expect("should inject one critical TSJS tag");
-        assert!(processed.contains(r#""id":"prebid","phase":"critical""#));
+            .expect("should inject one TSJS runtime tag");
+        assert!(processed.contains(r#""id":"prebid","phase":"takeover""#));
         assert!(!processed.contains("tsjs-prebid.min.js"));
         assert!(
             bundle_index < shim_index,

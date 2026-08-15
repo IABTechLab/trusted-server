@@ -29,8 +29,9 @@ function manifest(ids: readonly string[]) {
   return {
     version: 1,
     releaseId: RELEASE_ID,
-    criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
-    integrations: ids.map((id) => ({ id, phase: 'critical' as const })),
+    firstDisplay: null,
+    runtimeSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
+    integrations: ids.map((id) => ({ id, phase: 'takeover' as const })),
   };
 }
 
@@ -39,7 +40,7 @@ function catalog(ids: readonly string[]) {
     ids.map((id) =>
       Object.freeze({
         id,
-        phase: 'critical' as const,
+        phase: 'takeover' as const,
         trigger: null,
         consumes: Object.freeze(id === 'creative' ? ['runtime.v1'] : []),
         provides: Object.freeze([]),
@@ -60,7 +61,7 @@ function registration(
   id: string,
   prepare: IntegrationRegistration['prepare']
 ): IntegrationRegistration {
-  return Object.freeze({ abi: 1, id, phase: 'critical', releaseId: RELEASE_ID, prepare });
+  return Object.freeze({ abi: 1, id, phase: 'takeover', releaseId: RELEASE_ID, prepare });
 }
 
 function runtimeCapability() {

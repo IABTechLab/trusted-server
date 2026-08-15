@@ -3,11 +3,11 @@ import { describe, expect, it } from 'vitest';
 import {
   buildFallbackBoot,
   buildKernelBoot,
-  trustedCriticalOrigin,
+  trustedArtifactOrigin,
 } from '../../src/kernel/fallback';
 
 const RELEASE_ID = 'a'.repeat(64);
-const TRUSTED_CRITICAL_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'d'.repeat(64)}`;
+const TRUSTED_RUNTIME_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'d'.repeat(64)}`;
 
 function opaqueDocument(stamp: PropertyDescriptor | undefined): Document {
   const view = { location: { origin: 'null' } } as Record<string, unknown>;
@@ -15,10 +15,10 @@ function opaqueDocument(stamp: PropertyDescriptor | undefined): Document {
   return { defaultView: view } as unknown as Document;
 }
 
-describe('critical artifact origin', () => {
+describe('takeover artifact origin', () => {
   it('accepts only the immutable own-data creative stamp for an opaque document', () => {
     expect(
-      trustedCriticalOrigin(
+      trustedArtifactOrigin(
         opaqueDocument({
           configurable: false,
           enumerable: false,
@@ -42,7 +42,7 @@ describe('critical artifact origin', () => {
       writable: false,
     },
   ])('rejects an absent, mutable, accessor-backed, or non-origin creative stamp', (stamp) => {
-    expect(trustedCriticalOrigin(opaqueDocument(stamp))).toBeUndefined();
+    expect(trustedArtifactOrigin(opaqueDocument(stamp))).toBeUndefined();
   });
 });
 
@@ -50,7 +50,8 @@ function manifest(ids: readonly string[]) {
   return {
     version: 1 as const,
     releaseId: RELEASE_ID,
-    criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
+    firstDisplay: null,
+    runtimeSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
     integrations: ids.map((id) =>
       id === 'diagnostics_presentation'
         ? {
@@ -59,7 +60,7 @@ function manifest(ids: readonly string[]) {
             trigger: 'first_display_or_idle' as const,
             src: `/static/tsjs=integrations/${id}.min.js?v=${'d'.repeat(64)}`,
           }
-        : { id, phase: 'critical' as const }
+        : { id, phase: 'takeover' as const }
     ),
   };
 }
@@ -138,7 +139,7 @@ describe('kernel boot creative ABI', () => {
 });
 
 describe('terminal fallback boot manifest', () => {
-  it('uses the independently trusted critical source when the manifest field is missing', () => {
+  it('uses the independently trusted takeover source when the manifest field is missing', () => {
     const fallback = buildFallbackBoot(
       RELEASE_ID,
       {
@@ -149,18 +150,19 @@ describe('terminal fallback boot manifest', () => {
           integrations: [],
         },
       },
-      TRUSTED_CRITICAL_SRC
+      TRUSTED_RUNTIME_SRC
     ) as { readonly manifest: unknown };
 
     expect(fallback.manifest).toEqual({
       version: 1,
       releaseId: RELEASE_ID,
-      criticalSrc: TRUSTED_CRITICAL_SRC,
+      firstDisplay: null,
+      runtimeSrc: TRUSTED_RUNTIME_SRC,
       integrations: [],
     });
   });
 
-  it('uses the independently trusted critical source when the manifest field is malformed', () => {
+  it('uses the independently trusted takeover source when the manifest field is malformed', () => {
     const fallback = buildFallbackBoot(
       RELEASE_ID,
       {
@@ -168,22 +170,24 @@ describe('terminal fallback boot manifest', () => {
         manifest: {
           version: 1,
           releaseId: RELEASE_ID,
-          criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'e'.repeat(64)}&publisher=1`,
+          firstDisplay: null,
+          runtimeSrc: `/static/tsjs=tsjs-unified.min.js?v=${'e'.repeat(64)}&publisher=1`,
           integrations: [],
         },
       },
-      TRUSTED_CRITICAL_SRC
+      TRUSTED_RUNTIME_SRC
     ) as { readonly manifest: unknown };
 
     expect(fallback.manifest).toEqual({
       version: 1,
       releaseId: RELEASE_ID,
-      criticalSrc: TRUSTED_CRITICAL_SRC,
+      firstDisplay: null,
+      runtimeSrc: TRUSTED_RUNTIME_SRC,
       integrations: [],
     });
   });
 
-  it('refuses to construct a fallback boot without an independently trusted critical source', () => {
+  it('refuses to construct a fallback boot without an independently trusted takeover source', () => {
     expect(
       buildFallbackBoot(
         RELEASE_ID,
@@ -193,24 +197,26 @@ describe('terminal fallback boot manifest', () => {
     ).toBeUndefined();
   });
 
-  it('publishes the exact phase-aware fallback manifest with the accepted critical source', () => {
+  it('publishes the exact phase-aware fallback manifest with the accepted takeover source', () => {
     const acceptedManifest = manifest(['render_runtime', 'diagnostics_presentation']);
     const fallback = buildFallbackBoot(
       RELEASE_ID,
       boot({ version: 1, enabled: false, clickGuard: false, renderGuard: false }),
-      acceptedManifest.criticalSrc
+      acceptedManifest.runtimeSrc
     ) as { readonly manifest: unknown };
 
     expect(fallback.manifest).toEqual({
       version: 1,
       releaseId: RELEASE_ID,
-      criticalSrc: acceptedManifest.criticalSrc,
+      firstDisplay: null,
+      runtimeSrc: acceptedManifest.runtimeSrc,
       integrations: [],
     });
     expect(Reflect.ownKeys(fallback.manifest as object).sort()).toEqual([
-      'criticalSrc',
+      'firstDisplay',
       'integrations',
       'releaseId',
+      'runtimeSrc',
       'version',
     ]);
     expect(Object.isFrozen(fallback.manifest)).toBe(true);
@@ -305,7 +311,7 @@ describe('kernel boot diagnostics presentation membership', () => {
     const expectedManifest = manifest(['render_runtime']);
     const candidateManifest = {
       ...expectedManifest,
-      criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'e'.repeat(64)}`,
+      runtimeSrc: `/static/tsjs=tsjs-unified.min.js?v=${'e'.repeat(64)}`,
     };
 
     expect(

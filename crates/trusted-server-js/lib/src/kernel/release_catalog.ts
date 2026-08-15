@@ -1,4 +1,4 @@
-export type ReleasePhase = 'critical' | 'deferred';
+export type ReleasePhase = 'takeover' | 'deferred';
 export type ReleaseTrigger = 'first_display_or_idle';
 export type ReleaseIncludePredicate =
   | 'always'
@@ -111,14 +111,14 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     id: 'first_display',
     include: 'eligible_batch',
     allowedImports: [
-      'first_display/contracts',
+      'shared/first_display_contracts',
+      'shared/first_display_handoff',
+      'shared/first_display_registration',
+      'shared/first_display_transaction',
       'first_display/adm_render_bridge',
       'first_display/driver',
-      'first_display/handoff',
       'first_display/leaf/projection',
-      'first_display/registration',
       'first_display/registration_client',
-      'first_display/transaction',
       'kernel/identity',
     ],
     inputs: ['boot.v1', 'projection.v1'],
@@ -131,7 +131,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     id: 'aps_initial',
     include: 'aps_participates',
     allowedImports: [
-      'first_display/contracts',
+      'shared/first_display_contracts',
       'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/leaf/aps_protocol',
@@ -147,7 +147,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     id: 'creative_initial',
     include: 'creative_guard',
     allowedImports: [
-      'first_display/contracts',
+      'shared/first_display_contracts',
       'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/leaf/creative_guard',
@@ -161,7 +161,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     id: 'datadome_initial',
     include: 'integration:datadome',
     allowedImports: [
-      'first_display/contracts',
+      'shared/first_display_contracts',
       'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/leaf/route_guard',
@@ -175,7 +175,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     id: 'didomi_initial',
     include: 'integration:didomi',
     allowedImports: [
-      'first_display/contracts',
+      'shared/first_display_contracts',
       'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/leaf/config_guard',
@@ -189,7 +189,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     id: 'google_tag_manager_initial',
     include: 'integration:google_tag_manager',
     allowedImports: [
-      'first_display/contracts',
+      'shared/first_display_contracts',
       'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/leaf/route_guard',
@@ -203,7 +203,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     id: 'gpt_initial',
     include: 'gpt_initial',
     allowedImports: [
-      'first_display/contracts',
+      'shared/first_display_contracts',
       'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/adapters/googletag',
@@ -218,7 +218,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     id: 'lockr_initial',
     include: 'integration:lockr',
     allowedImports: [
-      'first_display/contracts',
+      'shared/first_display_contracts',
       'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/leaf/route_guard',
@@ -232,7 +232,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     id: 'osano_initial',
     include: 'integration:osano',
     allowedImports: [
-      'first_display/contracts',
+      'shared/first_display_contracts',
       'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/leaf/consent_snapshot',
@@ -246,7 +246,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     id: 'permutive_initial',
     include: 'integration:permutive',
     allowedImports: [
-      'first_display/contracts',
+      'shared/first_display_contracts',
       'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/leaf/context_snapshot',
@@ -260,7 +260,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     id: 'sourcepoint_initial',
     include: 'integration:sourcepoint',
     allowedImports: [
-      'first_display/contracts',
+      'shared/first_display_contracts',
       'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/leaf/consent_snapshot',
@@ -274,7 +274,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     id: 'prebid_initial',
     include: 'prebid_participates',
     allowedImports: [
-      'first_display/contracts',
+      'shared/first_display_contracts',
       'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/leaf/prebid_protocol',
@@ -289,7 +289,7 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     id: 'testlight_initial',
     include: 'integration:testlight',
     allowedImports: [
-      'first_display/contracts',
+      'shared/first_display_contracts',
       'first_display/registration_client',
       'first_display/slices/definition',
       'first_display/leaf/callback_capture',
@@ -364,7 +364,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     order: 1,
     id: 'render_runtime',
     product: 'runtime',
-    phase: 'critical',
+    phase: 'takeover',
     trigger: null,
     include: 'always',
     provides: [
@@ -383,7 +383,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     order: 2,
     id: 'aps',
     product: 'APS',
-    phase: 'critical',
+    phase: 'takeover',
     trigger: null,
     include: 'integration:aps',
     provides: ['aps.v1'],
@@ -394,7 +394,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     order: 3,
     id: 'creative',
     product: 'creative',
-    phase: 'critical',
+    phase: 'takeover',
     trigger: null,
     include: 'creative_guard',
     provides: [],
@@ -405,7 +405,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     order: 4,
     id: 'datadome',
     product: 'DataDome',
-    phase: 'critical',
+    phase: 'takeover',
     trigger: null,
     include: 'integration:datadome',
     provides: [],
@@ -416,7 +416,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     order: 5,
     id: 'didomi',
     product: 'Didomi',
-    phase: 'critical',
+    phase: 'takeover',
     trigger: null,
     include: 'integration:didomi',
     provides: [],
@@ -427,7 +427,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     order: 6,
     id: 'google_tag_manager',
     product: 'GTM/GA',
-    phase: 'critical',
+    phase: 'takeover',
     trigger: null,
     include: 'integration:google_tag_manager',
     provides: [],
@@ -438,7 +438,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     order: 7,
     id: 'gpt',
     product: 'GPT',
-    phase: 'critical',
+    phase: 'takeover',
     trigger: null,
     include: 'integration:gpt',
     provides: ['gpt.v1', 'gpt.events.v1', 'pbs_cache.baseline.v1'],
@@ -450,7 +450,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     order: 8,
     id: 'gpt_diagnostics',
     product: 'diagnostics',
-    phase: 'critical',
+    phase: 'takeover',
     trigger: null,
     include: 'gpt_diagnostics_active',
     provides: ['gpt_diag.v1'],
@@ -462,7 +462,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     order: 9,
     id: 'lockr',
     product: 'Lockr',
-    phase: 'critical',
+    phase: 'takeover',
     trigger: null,
     include: 'integration:lockr',
     provides: [],
@@ -473,7 +473,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     order: 10,
     id: 'osano_consent',
     product: 'Osano',
-    phase: 'critical',
+    phase: 'takeover',
     trigger: null,
     include: 'integration:osano',
     provides: ['osano_consent.v1'],
@@ -484,7 +484,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     order: 11,
     id: 'permutive_context',
     product: 'Permutive',
-    phase: 'critical',
+    phase: 'takeover',
     trigger: null,
     include: 'integration:permutive',
     provides: ['permutive_context.v1'],
@@ -495,7 +495,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     order: 12,
     id: 'sourcepoint_consent',
     product: 'Sourcepoint',
-    phase: 'critical',
+    phase: 'takeover',
     trigger: null,
     include: 'integration:sourcepoint',
     provides: ['sourcepoint_consent.v1'],
@@ -506,7 +506,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     order: 13,
     id: 'prebid',
     product: 'Prebid',
-    phase: 'critical',
+    phase: 'takeover',
     trigger: null,
     include: 'integration:prebid',
     provides: ['prebid.v1'],
@@ -518,7 +518,7 @@ export const RELEASE_CATALOG: readonly ReleaseCatalogEntry[] = Object.freeze([
     order: 14,
     id: 'testlight',
     product: 'Testlight',
-    phase: 'critical',
+    phase: 'takeover',
     trigger: null,
     include: 'integration:testlight',
     provides: [],
@@ -601,7 +601,7 @@ export function validateReleaseCatalog(entries: readonly ReleaseCatalogEntry[]):
   const ids = new Set<string>();
   const providers = new Map<string, number>([['runtime.v1', 0]]);
   let sawDeferred = false;
-  let criticalCount = 0;
+  let takeoverCount = 0;
 
   for (const [index, entry] of entries.entries()) {
     if (entry.order !== index + 1) throw new TypeError('Release catalog order is invalid');
@@ -619,11 +619,11 @@ export function validateReleaseCatalog(entries: readonly ReleaseCatalogEntry[]):
       throw new TypeError('Release catalog id is invalid or duplicated');
     }
     ids.add(entry.id);
-    if (entry.phase === 'critical') {
-      criticalCount += 1;
-      if (criticalCount > 14) throw new TypeError('Release catalog exceeds critical capacity');
+    if (entry.phase === 'takeover') {
+      takeoverCount += 1;
+      if (takeoverCount > 14) throw new TypeError('Release catalog exceeds takeover capacity');
       if (sawDeferred || entry.trigger !== null)
-        throw new TypeError('Critical phase order is invalid');
+        throw new TypeError('Takeover phase order is invalid');
     } else {
       sawDeferred = true;
       if (entry.trigger !== 'first_display_or_idle') {
@@ -694,12 +694,12 @@ export function selectReleaseCatalog(
 
 validateReleaseCatalog(RELEASE_CATALOG);
 
-export const MAX_CRITICAL_MODULES = RELEASE_CATALOG.filter(
-  ({ phase }) => phase === 'critical'
+export const MAX_TAKEOVER_MODULES = RELEASE_CATALOG.filter(
+  ({ phase }) => phase === 'takeover'
 ).length;
 export const MAX_MANIFEST_MODULES = RELEASE_CATALOG.length;
-export const MINIMAL_CRITICAL_IDS = Object.freeze(['core', 'render_runtime'] as const);
-export const REFERENCE_CRITICAL_IDS = Object.freeze([
+export const MINIMAL_TAKEOVER_IDS = Object.freeze(['core', 'render_runtime'] as const);
+export const REFERENCE_TAKEOVER_IDS = Object.freeze([
   'core',
   'render_runtime',
   'creative',

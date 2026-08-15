@@ -36,7 +36,7 @@ import type {
   PreparedIntegration,
 } from '../../src/kernel/integration_registry';
 import {
-  MAX_CRITICAL_MODULES,
+  MAX_TAKEOVER_MODULES,
   MAX_MANIFEST_MODULES,
   RELEASE_CATALOG,
 } from '../../src/kernel/release_catalog';
@@ -64,7 +64,7 @@ const EXPECTED_MAXIMAL_INTEGRATION_IDS = Object.freeze([
   'prebid_later',
   'sourcepoint_lifecycle',
 ]);
-const CRITICAL_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
+const RUNTIME_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
 const DEFERRED_INTEGRATION_IDS = Object.freeze([
   'diagnostics_presentation',
   'gpt_later',
@@ -107,10 +107,11 @@ function maximalManifest(): Readonly<BootManifestV1> {
   return Object.freeze({
     version: 1,
     releaseId: TEST_RELEASE_ID,
-    criticalSrc: CRITICAL_SRC,
+    firstDisplay: null,
+    runtimeSrc: RUNTIME_SRC,
     integrations: Object.freeze(
       RELEASE_CATALOG.map(({ id, phase, trigger }) => {
-        if (phase === 'critical') return Object.freeze({ id, phase });
+        if (phase === 'takeover') return Object.freeze({ id, phase });
         if (trigger !== 'first_display_or_idle') {
           throw new TypeError(`Deferred fixture ${id} is missing its canonical trigger`);
         }
@@ -214,7 +215,7 @@ function createMaximalHarness(options: MaximalHarnessOptions = {}) {
   const registrationsById = new Map(
     registrations.map((registration) => [registration.id, registration])
   );
-  const criticalRegistrations = registrations.filter(({ phase }) => phase === 'critical');
+  const takeoverRegistrations = registrations.filter(({ phase }) => phase === 'takeover');
   const deferredRegistrations = registrations.filter(({ phase }) => phase === 'deferred');
   const frames: FrameRequestCallback[] = [];
   const idle: Array<() => void> = [];
@@ -417,20 +418,20 @@ function createMaximalHarness(options: MaximalHarnessOptions = {}) {
 
   expect(composition.runtime.start()).toBe(true);
   expect(composition.runtime.start()).toBe(false);
-  for (const registration of criticalRegistrations) {
+  for (const registration of takeoverRegistrations) {
     expect(
       composition.runtime.registerIntegration(registration),
       `register ${registration.id}`
     ).toBe(true);
     events.push(`register:${registration.id}`);
   }
-  const criticalScript = document.querySelector<HTMLScriptElement>('#trustedserver-js');
-  if (!criticalScript) throw new Error('Maximal fixture critical script is unavailable');
+  const runtimeScript = document.querySelector<HTMLScriptElement>('#trustedserver-js');
+  if (!runtimeScript) throw new Error('Maximal fixture takeover script is unavailable');
   const nativeHeadAppend = document.head.append.bind(document.head);
   const appendDeferred = vi.spyOn(document.head, 'append').mockImplementation((...nodes) => {
     nativeHeadAppend(...nodes);
     for (const node of nodes) {
-      if (!(node instanceof HTMLScriptElement) || node === criticalScript) continue;
+      if (!(node instanceof HTMLScriptElement) || node === runtimeScript) continue;
       const matchedId = /\/static\/tsjs=tsjs-([a-z0-9_-]+)\.min\.js$/.exec(
         new URL(node.src).pathname
       )?.[1];
@@ -453,7 +454,7 @@ function createMaximalHarness(options: MaximalHarnessOptions = {}) {
       node.onload?.(new Event('load'));
       Object.defineProperty(document, 'currentScript', {
         configurable: true,
-        value: criticalScript,
+        value: runtimeScript,
       });
     }
   });
@@ -524,7 +525,7 @@ function createMaximalHarness(options: MaximalHarnessOptions = {}) {
 
   return Object.freeze({
     assertReleased,
-    criticalIntegrationIds: criticalRegistrations.map(({ id }) => id),
+    takeoverIntegrationIds: takeoverRegistrations.map(({ id }) => id),
     composition,
     deferredDeadlines: () =>
       Object.freeze(
@@ -569,20 +570,21 @@ describe('generated maximal browser runtime transaction', () => {
     expect(manifest).toMatchObject({
       version: 1,
       releaseId: TEST_RELEASE_ID,
-      criticalSrc: CRITICAL_SRC,
+      firstDisplay: null,
+      runtimeSrc: RUNTIME_SRC,
     });
     expect(manifest.integrations.map(({ id }) => id)).toEqual(integrationIds);
     expect(
       manifest.integrations
-        .slice(0, MAX_CRITICAL_MODULES)
-        .every(({ phase }) => phase === 'critical')
+        .slice(0, MAX_TAKEOVER_MODULES)
+        .every(({ phase }) => phase === 'takeover')
     ).toBe(true);
     expect(
-      manifest.integrations.slice(MAX_CRITICAL_MODULES).every(({ phase }) => phase === 'deferred')
+      manifest.integrations.slice(MAX_TAKEOVER_MODULES).every(({ phase }) => phase === 'deferred')
     ).toBe(true);
     for (const entry of manifest.integrations) {
       expect(Object.isFrozen(entry)).toBe(true);
-      if (entry.phase === 'critical') {
+      if (entry.phase === 'takeover') {
         expect(Reflect.ownKeys(entry).sort()).toEqual(['id', 'phase']);
       } else {
         expect(Reflect.ownKeys(entry).sort()).toEqual(['id', 'phase', 'src', 'trigger']);
@@ -606,7 +608,7 @@ describe('generated maximal browser runtime transaction', () => {
       const registration: IntegrationRegistration = Object.freeze({
         abi: 1,
         id: 'fixture',
-        phase: 'critical',
+        phase: 'takeover',
         releaseId: TEST_RELEASE_ID,
         prepare: async () =>
           provider
@@ -806,13 +808,13 @@ describe('generated maximal browser runtime transaction', () => {
     );
     try {
       const installed = await harness.composition.runtime.install();
-      const failureIndex = harness.criticalIntegrationIds.indexOf(failureId);
+      const failureIndex = harness.takeoverIntegrationIds.indexOf(failureId);
       const preparedIds =
         phase === 'activate'
-          ? harness.criticalIntegrationIds
-          : harness.criticalIntegrationIds.slice(0, failureIndex + 1);
+          ? harness.takeoverIntegrationIds
+          : harness.takeoverIntegrationIds.slice(0, failureIndex + 1);
       const activatedIds =
-        phase === 'activate' ? harness.criticalIntegrationIds.slice(0, failureIndex + 1) : [];
+        phase === 'activate' ? harness.takeoverIntegrationIds.slice(0, failureIndex + 1) : [];
 
       expect(installed).toEqual({ state: 'fallback', reason: 'bundle_partial' });
       expect(harness.composition.runtime.state).toBe('fallback');
@@ -821,7 +823,7 @@ describe('generated maximal browser runtime transaction', () => {
         reason: 'bundle_partial',
       });
       expect(harness.events.filter((event) => event.startsWith('register:'))).toEqual(
-        harness.criticalIntegrationIds.map((id) => `register:${id}`)
+        harness.takeoverIntegrationIds.map((id) => `register:${id}`)
       );
       expect(harness.events.filter((event) => event.startsWith('prepare:'))).toEqual(
         preparedIds.map((id) => `prepare:${id}`)

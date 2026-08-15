@@ -1,14 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
-import { FIRST_DISPLAY_CONTRACT_IDS } from '../../src/first_display/contracts';
+import { FIRST_DISPLAY_CONTRACT_IDS } from '../../src/shared/first_display_contracts';
 import * as releaseCatalog from '../../src/kernel/release_catalog';
 import {
   FIRST_DISPLAY_CATALOG,
   MAX_FIRST_DISPLAY_SLICES,
-  MAX_CRITICAL_MODULES,
+  MAX_TAKEOVER_MODULES,
   MAX_MANIFEST_MODULES,
-  MINIMAL_CRITICAL_IDS,
-  REFERENCE_CRITICAL_IDS,
+  MINIMAL_TAKEOVER_IDS,
+  REFERENCE_TAKEOVER_IDS,
   RELEASE_CATALOG,
   selectFirstDisplayCatalog,
   selectReleaseCatalog,
@@ -17,20 +17,20 @@ import {
 } from '../../src/kernel/release_catalog';
 
 const EXPECTED = [
-  ['render_runtime', 'runtime', 'critical', null, 'always'],
-  ['aps', 'APS', 'critical', null, 'integration:aps'],
-  ['creative', 'creative', 'critical', null, 'creative_guard'],
-  ['datadome', 'DataDome', 'critical', null, 'integration:datadome'],
-  ['didomi', 'Didomi', 'critical', null, 'integration:didomi'],
-  ['google_tag_manager', 'GTM/GA', 'critical', null, 'integration:google_tag_manager'],
-  ['gpt', 'GPT', 'critical', null, 'integration:gpt'],
-  ['gpt_diagnostics', 'diagnostics', 'critical', null, 'gpt_diagnostics_active'],
-  ['lockr', 'Lockr', 'critical', null, 'integration:lockr'],
-  ['osano_consent', 'Osano', 'critical', null, 'integration:osano'],
-  ['permutive_context', 'Permutive', 'critical', null, 'integration:permutive'],
-  ['sourcepoint_consent', 'Sourcepoint', 'critical', null, 'integration:sourcepoint'],
-  ['prebid', 'Prebid', 'critical', null, 'integration:prebid'],
-  ['testlight', 'Testlight', 'critical', null, 'integration:testlight'],
+  ['render_runtime', 'runtime', 'takeover', null, 'always'],
+  ['aps', 'APS', 'takeover', null, 'integration:aps'],
+  ['creative', 'creative', 'takeover', null, 'creative_guard'],
+  ['datadome', 'DataDome', 'takeover', null, 'integration:datadome'],
+  ['didomi', 'Didomi', 'takeover', null, 'integration:didomi'],
+  ['google_tag_manager', 'GTM/GA', 'takeover', null, 'integration:google_tag_manager'],
+  ['gpt', 'GPT', 'takeover', null, 'integration:gpt'],
+  ['gpt_diagnostics', 'diagnostics', 'takeover', null, 'gpt_diagnostics_active'],
+  ['lockr', 'Lockr', 'takeover', null, 'integration:lockr'],
+  ['osano_consent', 'Osano', 'takeover', null, 'integration:osano'],
+  ['permutive_context', 'Permutive', 'takeover', null, 'integration:permutive'],
+  ['sourcepoint_consent', 'Sourcepoint', 'takeover', null, 'integration:sourcepoint'],
+  ['prebid', 'Prebid', 'takeover', null, 'integration:prebid'],
+  ['testlight', 'Testlight', 'takeover', null, 'integration:testlight'],
   [
     'diagnostics_presentation',
     'diagnostics',
@@ -168,11 +168,11 @@ describe('canonical release catalog', () => {
   });
 
   it('derives capacity and budget vectors without an internal diagnostics subscriber cap', () => {
-    expect(MAX_CRITICAL_MODULES).toBe(14);
+    expect(MAX_TAKEOVER_MODULES).toBe(14);
     expect(MAX_MANIFEST_MODULES).toBe(20);
     expect('MAX_INTERNAL_DIAGNOSTICS_SUBSCRIPTIONS' in releaseCatalog).toBe(false);
-    expect(MINIMAL_CRITICAL_IDS).toEqual(['core', 'render_runtime']);
-    expect(REFERENCE_CRITICAL_IDS).toEqual([
+    expect(MINIMAL_TAKEOVER_IDS).toEqual(['core', 'render_runtime']);
+    expect(REFERENCE_TAKEOVER_IDS).toEqual([
       'core',
       'render_runtime',
       'creative',
@@ -185,16 +185,16 @@ describe('canonical release catalog', () => {
     expect(() => validateReleaseCatalog(RELEASE_CATALOG.slice(0, 15))).not.toThrow();
     expect(() => validateReleaseCatalog(RELEASE_CATALOG.slice(0, 19))).not.toThrow();
     expect(() => validateReleaseCatalog(RELEASE_CATALOG.slice(0, 20))).not.toThrow();
-    const fifteenCritical = [
+    const fifteenTakeover = [
       ...RELEASE_CATALOG.slice(0, 14),
       {
         ...RELEASE_CATALOG[14]!,
-        phase: 'critical' as const,
+        phase: 'takeover' as const,
         trigger: null,
       },
     ];
-    expect(() => validateReleaseCatalog(fifteenCritical)).toThrow(
-      /critical capacity|phase override/i
+    expect(() => validateReleaseCatalog(fifteenTakeover)).toThrow(
+      /takeover capacity|phase override/i
     );
     expect(() => validateReleaseCatalog([...RELEASE_CATALOG, RELEASE_CATALOG[0]!])).toThrow();
   });

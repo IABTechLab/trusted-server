@@ -439,13 +439,13 @@ describe('render trace diagnostics runtime', () => {
 
   it('creates no DOM stamps, UI, or scheduled work before deferred presentation attaches', () => {
     const slot = document.createElement('div');
-    slot.id = 'critical-only-slot';
+    slot.id = 'takeover-only-slot';
     document.body.append(slot);
     const { owner, tasks } = harness();
 
     owner.record({
-      slotId: 'critical-only-slot',
-      elementId: 'critical-only-slot',
+      slotId: 'takeover-only-slot',
+      elementId: 'takeover-only-slot',
       path: 'ssat',
       rendered: true,
       injected: true,

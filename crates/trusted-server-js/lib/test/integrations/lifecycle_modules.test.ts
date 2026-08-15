@@ -15,7 +15,7 @@ import {
 import { RELEASE_CATALOG } from '../../src/kernel/release_catalog';
 
 const RELEASE_ID = 'a'.repeat(64);
-const CRITICAL_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
+const RUNTIME_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
 const registrations: ReadonlyArray<
   readonly [string, (release: string) => IntegrationRegistration]
 > = Object.freeze([
@@ -82,8 +82,9 @@ describe('remaining integration lifecycle modules', () => {
       manifest: {
         version: 1,
         releaseId: RELEASE_ID,
-        criticalSrc: CRITICAL_SRC,
-        integrations: ids.map((id) => ({ id, phase: 'critical' as const })),
+        firstDisplay: null,
+        runtimeSrc: RUNTIME_SRC,
+        integrations: ids.map((id) => ({ id, phase: 'takeover' as const })),
       },
       releaseId: RELEASE_ID,
       knownIntegrationIds: ids,
@@ -121,8 +122,9 @@ describe('remaining integration lifecycle modules', () => {
         manifest: {
           version: 1,
           releaseId: RELEASE_ID,
-          criticalSrc: CRITICAL_SRC,
-          integrations: [{ id, phase: 'critical' }],
+          firstDisplay: null,
+          runtimeSrc: RUNTIME_SRC,
+          integrations: [{ id, phase: 'takeover' }],
         },
         releaseId: RELEASE_ID,
         knownIntegrationIds: Object.freeze([id]),

@@ -301,10 +301,10 @@ export interface GptDiagnosticsRecorder {
   ): void;
 }
 
-/** Release-internal critical module emitted inside the unified artifact. */
-export interface BootManifestCriticalIntegrationV1 {
+/** Release-internal takeover module emitted inside the persistent artifact. */
+export interface BootManifestTakeoverIntegrationV1 {
   readonly id: string;
-  readonly phase: 'critical';
+  readonly phase: 'takeover';
 }
 
 /** Release-internal later module authenticated and loaded by core. */
@@ -316,13 +316,19 @@ export interface BootManifestDeferredIntegrationV1 {
 }
 
 export type BootManifestIntegrationV1 =
-  BootManifestCriticalIntegrationV1 | BootManifestDeferredIntegrationV1;
+  BootManifestTakeoverIntegrationV1 | BootManifestDeferredIntegrationV1;
+
+export interface BootManifestFirstDisplayV1 {
+  readonly src: string;
+  readonly slices: readonly string[];
+}
 
 /** Exact phase-aware bundle set and injection order required by one TSJS release. */
 export interface BootManifestV1 {
   readonly version: 1;
   readonly releaseId: string;
-  readonly criticalSrc: string;
+  readonly firstDisplay: Readonly<BootManifestFirstDisplayV1> | null;
+  readonly runtimeSrc: string;
   readonly integrations: readonly BootManifestIntegrationV1[];
 }
 

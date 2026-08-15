@@ -1,4 +1,4 @@
-import type { FirstDisplaySliceActivationContext } from '../transaction';
+import type { FirstDisplaySliceActivationContext } from '../../shared/first_display_transaction';
 
 export type FirstDisplayConsentRouteKindV1 = 'script' | 'preload' | 'prefetch';
 

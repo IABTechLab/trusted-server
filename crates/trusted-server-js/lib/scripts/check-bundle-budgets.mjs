@@ -105,10 +105,10 @@ const CURRENT_PROVIDER_SOURCE_OWNERS = Object.freeze({
   'src/integrations/sourcepoint/consent.ts': 'sourcepoint_consent',
 });
 const CURRENT_EXACT_SOURCE_OWNERS = Object.freeze({
+  'src/core/bootstrap.ts': 'bootstrap',
   'src/adapters/googletag.ts': 'gpt',
   'src/adapters/messaging.ts': 'core',
-  'src/composition/browser.ts': 'core',
-  'src/composition/critical_transport.ts': 'core',
+  'src/composition/runtime_transport.ts': 'core',
   'src/services/auction_batch.ts': 'core',
   'src/services/context.ts': 'core',
   'src/services/projections.ts': 'core',
@@ -135,7 +135,6 @@ const CURRENT_EXACT_SOURCE_OWNERS = Object.freeze({
   'src/integrations/google_tag_manager/index.ts': 'google_tag_manager',
   'src/integrations/google_tag_manager/module.ts': 'google_tag_manager',
   'src/integrations/google_tag_manager/script_guard.ts': 'google_tag_manager',
-  'src/integrations/gpt/bootstrap_fallback.ts': 'bootstrap',
   'src/integrations/gpt/diagnostics_facts.ts': 'gpt',
   'src/integrations/gpt/index.ts': 'gpt',
   'src/integrations/gpt/later.ts': 'gpt_later',
@@ -206,6 +205,29 @@ const CURRENT_SHARED_SOURCE_OWNER_POLICIES = Object.freeze({
   ]),
   'src/core/puc_shell.ts': Object.freeze(['gpt']),
   'src/core/queue.ts': Object.freeze(['bootstrap', 'core']),
+  'src/core/release_id.ts': Object.freeze([
+    'bootstrap',
+    'core',
+    'aps',
+    'creative',
+    'datadome',
+    'didomi',
+    'google_tag_manager',
+    'gpt',
+    'gpt_diagnostics',
+    'lockr',
+    'osano_consent',
+    'permutive_context',
+    'sourcepoint_consent',
+    'prebid',
+    'testlight',
+    'diagnostics_presentation',
+    'gpt_later',
+    'osano_lifecycle',
+    'permutive_lifecycle',
+    'prebid_later',
+    'sourcepoint_lifecycle',
+  ]),
   'src/core/registry.ts': Object.freeze(['bootstrap', 'core']),
   'src/core/release.ts': Object.freeze([
     'bootstrap',
@@ -239,6 +261,7 @@ const CURRENT_SHARED_SOURCE_OWNER_POLICIES = Object.freeze({
   'src/kernel/diagnostics.ts': Object.freeze(['core']),
   'src/kernel/disposable.ts': Object.freeze(['core', 'gpt']),
   'src/kernel/fallback.ts': Object.freeze(['bootstrap', 'core']),
+  'src/kernel/fallback_surface.ts': Object.freeze(['bootstrap', 'core']),
   'src/kernel/identity.ts': Object.freeze(['first_display', 'core']),
   'src/kernel/integration_registry.ts': Object.freeze(['core']),
   'src/kernel/lifecycle_module.ts': Object.freeze([
@@ -260,6 +283,10 @@ const CURRENT_SHARED_SOURCE_OWNER_POLICIES = Object.freeze({
   ]),
   'src/kernel/sessions.ts': Object.freeze(['core']),
   'src/shared/async.ts': Object.freeze(['creative', 'datadome']),
+  'src/shared/first_display_contracts.ts': Object.freeze(['core']),
+  'src/shared/first_display_handoff.ts': Object.freeze(['bootstrap', 'first_display']),
+  'src/shared/first_display_registration.ts': Object.freeze(['bootstrap', 'first_display']),
+  'src/shared/first_display_transaction.ts': Object.freeze(['bootstrap']),
   'src/shared/beacon_guard.ts': Object.freeze(['google_tag_manager']),
   'src/shared/dom_insertion_dispatcher.ts': Object.freeze([
     'datadome',
@@ -397,7 +424,10 @@ function loadHistoricalReleaseCatalog(capture, label) {
   } catch {
     fail(`${label} authored release catalog is missing at its captured source SHA`);
   }
-  return loadAuthoredReleaseCatalog(source);
+  return loadAuthoredReleaseCatalog(source).map((entry) => ({
+    ...entry,
+    phase: entry.phase === 'critical' ? 'takeover' : entry.phase,
+  }));
 }
 
 /** Authenticate the immutable inputs and tool versions recorded by a historical capture. */
@@ -589,7 +619,7 @@ export function validateSemanticBundleSets(metrics, release, catalog) {
   validateMetricSets(metrics.sets, 'buildMetrics.sets');
   if (
     !metrics.bootstrap ||
-    metrics.bootstrap.file !== 'gpt-bootstrap-fallback.js' ||
+    metrics.bootstrap.file !== 'tsjs-bootstrap.js' ||
     typeof metrics.bootstrap.sha256 !== 'string' ||
     !/^[0-9a-f]{64}$/.test(metrics.bootstrap.sha256)
   ) {
@@ -619,7 +649,7 @@ export function validateSemanticBundleSets(metrics, release, catalog) {
     files.set(artifact.file, artifact);
   }
   const expectedArtifacts = [
-    { id: 'bootstrap', role: 'bootstrap', file: 'gpt-bootstrap-fallback.js' },
+    { id: 'bootstrap', role: 'bootstrap', file: 'tsjs-bootstrap.js' },
     ...catalog.firstDisplay.map(({ id }, index) => ({
       id,
       role: index === 0 ? 'first_display_base' : 'first_display_slice',
@@ -780,7 +810,7 @@ export function buildProductionGraphReport(metrics, release) {
   return { largestContributions, repeatedAttributions };
 }
 
-function findCriticalDeferredViolations(currentGraph, release) {
+function findTakeoverDeferredViolations(currentGraph, release) {
   const artifactsById = new Map(release.artifacts.map((artifact) => [artifact.id, artifact]));
   const violations = [];
   for (const [source, owners] of Object.entries(currentGraph.sourceOwners)) {
@@ -788,7 +818,7 @@ function findCriticalDeferredViolations(currentGraph, release) {
     if (policy && artifactsById.get(policy.owner)?.phase === 'deferred') {
       for (const owner of owners) {
         const artifact = artifactsById.get(owner);
-        if (artifact?.role === 'core' || artifact?.phase === 'critical') {
+        if (artifact?.role === 'core' || artifact?.phase === 'takeover') {
           violations.push(`${owner} reaches deferred-owned source ${source}`);
         }
       }
@@ -800,7 +830,7 @@ function findCriticalDeferredViolations(currentGraph, release) {
 function validateCurrentSourceOwnership(currentGraph, release) {
   const artifactsById = new Map(release.artifacts.map((artifact) => [artifact.id, artifact]));
   const artifactIds = new Set(artifactsById.keys());
-  const violations = findCriticalDeferredViolations(currentGraph, release);
+  const violations = findTakeoverDeferredViolations(currentGraph, release);
   for (const source of Object.keys(CURRENT_PROVIDER_SOURCE_OWNERS)) {
     if (!Object.hasOwn(currentGraph.sourceOwners, source)) {
       violations.push(`current provider source is missing: ${source}`);
@@ -859,9 +889,9 @@ function validateCurrentSourceOwnership(currentGraph, release) {
   return violations;
 }
 
-/** Return critical artifacts that transitively bundle explicit deferred-phase source. */
-export function findCriticalDeferredSourceViolations(metrics, release) {
-  return findCriticalDeferredViolations(readCurrentSourceGraph(metrics, release), release);
+/** Return takeover artifacts that transitively bundle explicit deferred-phase source. */
+export function findTakeoverDeferredSourceViolations(metrics, release) {
+  return findTakeoverDeferredViolations(readCurrentSourceGraph(metrics, release), release);
 }
 
 /** Return all current production graph ownership and seam violations. */
@@ -1060,9 +1090,9 @@ function validateCurrentMeasurements(metrics, release, catalog, contents) {
       fail(`build metrics do not match current artifact bytes: ${setName}`);
     }
   }
-  const bootstrapBytes = contents.get('gpt-bootstrap-fallback.js');
+  const bootstrapBytes = contents.get('tsjs-bootstrap.js');
   if (!(bootstrapBytes instanceof Uint8Array)) {
-    fail('current artifact bytes are missing: gpt-bootstrap-fallback.js');
+    fail('current artifact bytes are missing: tsjs-bootstrap.js');
   }
   const measuredBootstrap = measureBytes(bootstrapBytes);
   for (const key of [...SIZE_NAMES, 'sha256']) {
@@ -1085,7 +1115,7 @@ function hasExactKeys(value, keys) {
   return actual.length === expected.size && actual.every((key) => expected.has(key));
 }
 
-function validateReleaseInventoryShape(release, label) {
+function validateReleaseInventoryShape(release, label, allowHistoricalPhase = false) {
   if (!hasExactKeys(release, ['version', 'releaseId', 'artifacts'])) {
     fail(`${label} release inventory must have exact keys version,releaseId,artifacts`);
   }
@@ -1123,7 +1153,8 @@ function validateReleaseInventoryShape(release, label) {
         : artifact.role === 'first_display_base' || artifact.role === 'first_display_slice'
           ? artifact.phase === 'first_display' && artifact.trigger === null
           : artifact.role === 'integration' &&
-            (artifact.phase === 'critical'
+            (artifact.phase === 'takeover' ||
+            (allowHistoricalPhase && artifact.phase === 'critical')
               ? artifact.trigger === null
               : artifact.phase === 'deferred' && artifact.trigger === 'first_display_or_idle');
     if (
@@ -1133,7 +1164,10 @@ function validateReleaseInventoryShape(release, label) {
       !stringArray(artifact.inputs) ||
       !stringArray(artifact.outputs) ||
       typeof artifact.file !== 'string' ||
-      !/^(?:gpt-bootstrap-fallback|tsjs-[a-z0-9_]+)\.js$/u.test(artifact.file) ||
+      !(
+        /^tsjs-[a-z0-9_]+\.js$/u.test(artifact.file) ||
+        (allowHistoricalPhase && artifact.file === 'gpt-bootstrap-fallback.js')
+      ) ||
       files.has(artifact.file) ||
       !Number.isSafeInteger(artifact.bytes) ||
       artifact.bytes <= 0 ||
@@ -1171,7 +1205,7 @@ function validateCurrentReleaseSemantics(
       trigger: null,
       inputs: [],
       outputs: [],
-      file: 'gpt-bootstrap-fallback.js',
+      file: 'tsjs-bootstrap.js',
     },
     ...authoredFirstDisplayCatalog.map((entry, index) => ({
       id: entry.id,
@@ -1261,7 +1295,7 @@ function validateCurrentReleaseSemantics(
         fail(`current deferred integration cannot provide capabilities: ${artifact.id}`);
       }
     } else if (sawDeferred) {
-      fail('current critical integration cannot follow a deferred integration');
+      fail('current takeover integration cannot follow a deferred integration');
     }
     for (const edge of artifact.inputs) {
       const parts = edge.split('?');
@@ -1293,8 +1327,12 @@ function validateCapturedMembership(capture, historicalCatalog, label = 'capture
   );
   const idsByFile = new Map(capture.release.artifacts.map(({ id, file }) => [file, id]));
   const expectedFiles = deriveInventorySetFiles(capture.release.artifacts, historicalCatalog);
+  const bootstrapFile = artifactsById.get('bootstrap')?.file;
+  if (typeof bootstrapFile !== 'string') {
+    fail(`${label} bootstrap release artifact is missing`);
+  }
   const expected = {
-    bootstrap: { artifactIds: ['bootstrap'], files: ['gpt-bootstrap-fallback.js'] },
+    bootstrap: { artifactIds: ['bootstrap'], files: [bootstrapFile] },
     ...Object.fromEntries(
       SET_NAMES.map((setName) => [
         setName,
@@ -1331,7 +1369,7 @@ function validateCapturedMembership(capture, historicalCatalog, label = 'capture
     }
     if (
       setName === 'bootstrap' &&
-      (set.artifactIds[0] !== 'bootstrap' || set.files[0] !== 'gpt-bootstrap-fallback.js')
+      (set.artifactIds[0] !== 'bootstrap' || set.files[0] !== bootstrapFile)
     ) {
       fail(`${label} bootstrap semantic membership is invalid`);
     }
@@ -1428,8 +1466,8 @@ export function validateRoleCorrectTransfer({
     validateFrozenCaptureProvenance(intermediate, capture);
   }
 
-  validateReleaseInventoryShape(intermediate.release, 'role-correct intermediate');
-  validateReleaseInventoryShape(capture.release, 'captured');
+  validateReleaseInventoryShape(intermediate.release, 'role-correct intermediate', true);
+  validateReleaseInventoryShape(capture.release, 'captured', true);
   validateReleaseInventoryShape(release, 'current');
   validateCapturedMembership(
     intermediate,

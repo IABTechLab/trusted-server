@@ -467,16 +467,21 @@ function snapshotKnownSlots(knownSlots: ReadonlySet<string>): ReadonlySet<string
   }
 }
 
+interface ValidatedProgrammaticAdUnits {
+  readonly measurementMemo: WeakMap<object, JsonMeasurement>;
+  readonly pending: readonly PendingProgrammaticAdUnit[];
+}
+
 /**
  * Validate and detach one complete public registration call before slot mutation.
  *
  * The returned graph is recursively frozen and safe to serialize later without
  * reading publisher accessors again.
  */
-export function prepareProgrammaticAdUnits(
+function validateProgrammaticAdUnitsInput(
   value: unknown,
   knownSlots: ReadonlySet<string>
-): readonly ProgrammaticAdUnit[] {
+): ValidatedProgrammaticAdUnits {
   let units: readonly unknown[] | undefined;
   try {
     units = Array.isArray(value) ? ownDataArray(value, MAX_PROGRAMMATIC_UNITS) : [value];
@@ -600,6 +605,20 @@ export function prepareProgrammaticAdUnits(
   if (occupied.size + pending.length > MAX_ACTIVE_SLOT_RECORDS) {
     throw new AdUnitRegistrationError('registry_capacity');
   }
+  return Object.freeze({ measurementMemo, pending: Object.freeze(pending) });
+}
+
+/** Validate one complete registration without retaining publisher-owned input. */
+export function validateProgrammaticAdUnits(value: unknown, knownSlots: ReadonlySet<string>): void {
+  validateProgrammaticAdUnitsInput(value, knownSlots);
+}
+
+/** Validate and detach one complete public registration call before slot mutation. */
+export function prepareProgrammaticAdUnits(
+  value: unknown,
+  knownSlots: ReadonlySet<string>
+): readonly ProgrammaticAdUnit[] {
+  const { measurementMemo, pending } = validateProgrammaticAdUnitsInput(value, knownSlots);
 
   const completedCopies = new WeakMap<object, Record<string, unknown> | unknown[]>();
   const prepared: ProgrammaticAdUnit[] = [];

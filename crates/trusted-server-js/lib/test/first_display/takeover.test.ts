@@ -5,7 +5,8 @@ import {
   createFirstDisplayHandoffOwner,
   performFirstDisplayTakeoverV1,
   type FinalizedFirstDisplayHandoffV1,
-} from '../../src/first_display/handoff';
+} from '../../src/shared/first_display_handoff';
+import { snapshotOutlinedFirstDisplayHandoffV1 } from '../../src/shared/first_display_contracts';
 
 const RELEASE_ID = 'a'.repeat(64);
 const DIGEST = 'b'.repeat(64);
@@ -150,6 +151,7 @@ describe('atomic first-display takeover', () => {
     const events: string[] = [];
     let adoption: unknown;
     const prepared = Object.freeze({
+      validateHandoff: snapshotOutlinedFirstDisplayHandoffV1,
       activate: (candidate?: unknown) => {
         adoption = candidate;
         events.push('activate');
@@ -187,6 +189,7 @@ describe('atomic first-display takeover', () => {
     const physicalSlot = {};
     const artifact = {};
     const result = performFirstDisplayTakeoverV1({
+      validateHandoff: snapshotOutlinedFirstDisplayHandoffV1,
       finalized: finalized(physicalSlot, artifact),
       outline: outline(),
       isCurrentGeneration: () => true,
@@ -217,6 +220,7 @@ describe('atomic first-display takeover', () => {
   it('rolls back partial persistent effects without resurrecting the agent', () => {
     const events: string[] = [];
     const result = performFirstDisplayTakeoverV1({
+      validateHandoff: snapshotOutlinedFirstDisplayHandoffV1,
       finalized: finalized(),
       outline: outline(),
       isCurrentGeneration: () => true,
@@ -250,6 +254,7 @@ describe('atomic first-display takeover', () => {
       let revision = 0;
       const events: string[] = [];
       const result = performFirstDisplayTakeoverV1({
+        validateHandoff: snapshotOutlinedFirstDisplayHandoffV1,
         finalized: finalized(),
         outline: outline(),
         isCurrentGeneration: () => true,
@@ -279,6 +284,7 @@ describe('atomic first-display takeover', () => {
     const events: string[] = [];
     expect(
       performFirstDisplayTakeoverV1({
+        validateHandoff: snapshotOutlinedFirstDisplayHandoffV1,
         finalized: finalized(),
         outline: outline(),
         isCurrentGeneration: () => true,
@@ -306,6 +312,7 @@ describe('atomic first-display takeover', () => {
       if (failure === 'outline') candidate.projectionDigest = 'c'.repeat(64);
       expect(
         performFirstDisplayTakeoverV1({
+          validateHandoff: snapshotOutlinedFirstDisplayHandoffV1,
           finalized: finalized(),
           outline: candidate,
           isCurrentGeneration: () => failure !== 'generation',
@@ -341,6 +348,7 @@ describe('atomic first-display takeover', () => {
     const events: string[] = [];
     expect(
       performFirstDisplayTakeoverV1({
+        validateHandoff: snapshotOutlinedFirstDisplayHandoffV1,
         finalized: sealed!,
         outline: outline(),
         isCurrentGeneration: () => true,
@@ -362,6 +370,7 @@ describe('atomic first-display takeover', () => {
       const events: string[] = [];
       expect(
         performFirstDisplayTakeoverV1({
+          validateHandoff: snapshotOutlinedFirstDisplayHandoffV1,
           finalized: finalized(),
           outline: { ...outline(), objectKinds },
           isCurrentGeneration: () => true,

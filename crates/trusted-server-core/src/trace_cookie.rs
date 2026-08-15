@@ -94,8 +94,8 @@ fn query_disables(query: Option<&str>) -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`TrustedServerError::InvalidHeaderValue`] if the configured cookie
-/// domain cannot be rendered as an HTTP header value.
+/// Returns [`TrustedServerError::InvalidHeaderValue`] if the fixed host-only cookie
+/// value cannot be rendered as an HTTP header value.
 pub fn handle_trace_mode(
     settings: &Settings,
     query: Option<&str>,

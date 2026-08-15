@@ -216,7 +216,7 @@ export function createPermutiveIntegrationRegistration(release: string): Integra
   return Object.freeze({
     abi: 1,
     id: PERMUTIVE_INTEGRATION_ID,
-    phase: 'critical',
+    phase: 'takeover',
     releaseId: release,
     prepare: ({ config, interfaces, onDispose }: IntegrationPrepareContext) => {
       const runtimeCapability = interfaces['runtime.v1'];
@@ -235,12 +235,12 @@ export function createPermutiveIntegrationRegistration(release: string): Integra
         registerContext: () => () => undefined,
         resetGuard: () => undefined,
       });
-      let criticalActive = false;
+      let takeoverActive = false;
       let releaseContext: (() => void) | undefined;
       let lifecycleRelease: (() => void) | undefined;
       const capability: PermutiveContextCapabilityV1 = Object.freeze({
         activateLifecycle: () => {
-          if (!criticalActive || lifecycleRelease) {
+          if (!takeoverActive || lifecycleRelease) {
             throw new TypeError('Permutive lifecycle is unavailable');
           }
           lifecycleRelease = lifecycle.activate(undefined);
@@ -251,16 +251,16 @@ export function createPermutiveIntegrationRegistration(release: string): Integra
           };
         },
         segments: () =>
-          criticalActive ? snapshotSegments(getPermutiveSegments()) : Object.freeze([]),
+          takeoverActive ? snapshotSegments(getPermutiveSegments()) : Object.freeze([]),
         startLifecycle: () => {
-          if (!criticalActive || !lifecycleRelease) {
+          if (!takeoverActive || !lifecycleRelease) {
             throw new TypeError('Permutive lifecycle is not active');
           }
           lifecycle.start(undefined);
         },
       });
       onDispose(() => {
-        criticalActive = false;
+        takeoverActive = false;
         const releaseLifecycle = lifecycleRelease;
         lifecycleRelease = undefined;
         releaseLifecycle?.();
@@ -271,7 +271,7 @@ export function createPermutiveIntegrationRegistration(release: string): Integra
       });
       return Object.freeze({
         activate: ({ adoption, onDispose: onActivationDispose }: IntegrationActivationContext) => {
-          if (criticalActive) throw new Error('Permutive context is already active');
+          if (takeoverActive) throw new Error('Permutive context is already active');
           if (
             adoption !== undefined &&
             !validatePersistentFirstDisplaySliceAdoptionV1(
@@ -305,9 +305,9 @@ export function createPermutiveIntegrationRegistration(release: string): Integra
             resetGuardState();
             throw error;
           }
-          criticalActive = true;
+          takeoverActive = true;
           onActivationDispose(() => {
-            criticalActive = false;
+            takeoverActive = false;
             const release = releaseContext;
             releaseContext = undefined;
             release?.();

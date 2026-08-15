@@ -603,7 +603,7 @@ export function createRenderRuntimeIntegrationRegistration(
   return Object.freeze({
     abi: 1 as const,
     id: 'render_runtime',
-    phase: 'critical' as const,
+    phase: 'takeover' as const,
     releaseId,
     prepare: (context: IntegrationPrepareContext) => {
       const runtime = exactRuntimeCapability(context.interfaces);

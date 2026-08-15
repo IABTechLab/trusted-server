@@ -7,7 +7,7 @@ import {
 import { createLifecycleIntegrationRegistration } from '../../src/kernel/lifecycle_module';
 
 const RELEASE_ID = 'a'.repeat(64);
-const CRITICAL_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
+const RUNTIME_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
 const TEST_INTEGRATION_ID = 'datadome';
 
 function callbacks(order: string[]): IntegrationInstallCallbacks {
@@ -23,8 +23,9 @@ function registry(config: unknown, runtime: unknown) {
     manifest: {
       version: 1,
       releaseId: RELEASE_ID,
-      criticalSrc: CRITICAL_SRC,
-      integrations: [{ id: TEST_INTEGRATION_ID, phase: 'critical' }],
+      firstDisplay: null,
+      runtimeSrc: RUNTIME_SRC,
+      integrations: [{ id: TEST_INTEGRATION_ID, phase: 'takeover' }],
     },
     releaseId: RELEASE_ID,
     knownIntegrationIds: Object.freeze([TEST_INTEGRATION_ID]),
@@ -114,10 +115,39 @@ describe('shared integration lifecycle module', () => {
       const adoption = Object.freeze({
         version: 1 as const,
         adoptInitialDisplay: true as const,
-        handoff: Object.freeze({
+        handoff: {
+          version: 1,
+          releaseId: RELEASE_ID,
+          generation: 1,
+          projectionDigest: 'b'.repeat(64),
           slices: Object.freeze(
             selected ? ['first_display', 'datadome_initial'] : ['first_display']
           ),
+          slots: [
+            {
+              id: 'slot-1',
+              aliases: [],
+              domId: 'slot-1',
+              gamPath: '/123/slot-1',
+              formats: [[300, 250]],
+              owner: 'trusted_server',
+              outcome: 'failed',
+              targeting: [],
+              committedArtifact: 'none',
+              gptToken: null,
+            },
+          ],
+          attempts: [
+            {
+              id: 'a1_AAECAwQFBgcAAAAAAAAAAQ',
+              slotId: 'slot-1',
+              ordinal: 1,
+              state: 'failed',
+              reason: 'internal_error',
+            },
+          ],
+          tombstones: [],
+          artifacts: [],
           parserState: Object.freeze(
             state
               ? [
@@ -129,14 +159,45 @@ describe('shared integration lifecycle module', () => {
                 ]
               : []
           ),
-        }),
+          gptDiagnostics: { facts: [], overflowCount: 0, dropCount: 0 },
+          timing: { bidsScriptMs: 1, firstDisplayMs: null, terminalMs: 2, paintMs: 3 },
+          highWater: {
+            navigationAttemptPrefix: 'AAECAwQFBgc',
+            nextNavigationAttemptOrdinal: 2,
+            nextAttemptOrdinal: 2,
+            nextSlotRegistrationOrdinal: 2,
+            reservationClockEpochMs: 0,
+            nextReservationOrdinal: 1,
+            nextTicketOrdinal: 1,
+          },
+          cycles: [],
+          trace: {
+            nextSequence: 1,
+            nextGlobalSlotOrdinal: 1,
+            slots: [{ slotId: 'slot-1', impressions: 0, bindings: [] }],
+          },
+          mutationRevision: 0,
+        },
         identities: Object.freeze([]),
       });
 
       const result = await owner.install({
         ...callbacks([]),
         coordinateTakeover: (prepared) => {
-          prepared.activate(adoption);
+          const slices = selected ? ['first_display', 'datadome_initial'] : ['first_display'];
+          const handoff = prepared.validateHandoff(adoption.handoff, {
+            version: 1,
+            releaseId: RELEASE_ID,
+            generation: 1,
+            projectionDigest: 'b'.repeat(64),
+            slices,
+            slotCount: 1,
+            outcomeCount: 1,
+            capabilities: [],
+            objectKinds: [],
+          });
+          if (!handoff) throw new Error('should validate lifecycle handoff');
+          prepared.activate(Object.freeze({ ...adoption, handoff }));
           prepared.commit();
         },
       });

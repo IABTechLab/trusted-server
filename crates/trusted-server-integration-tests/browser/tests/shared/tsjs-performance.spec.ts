@@ -48,7 +48,7 @@ const NETWORK_PROFILE = Object.freeze({
 });
 // Current main always ships creative with core, and production's default
 // creative guard is enabled. Keep both comparison sides on that same shape.
-const CRITICAL_IDS = ["render_runtime", "creative", "gpt"] as const;
+const SELECTED_IDS = ["render_runtime", "creative", "gpt"] as const;
 const DEFERRED_IDS = ["diagnostics_presentation", "gpt_later"] as const;
 const LEGACY_AD_INIT_INLINE = "window.tsjs.adInit();";
 const HEAP_CHECKPOINTS = [
@@ -70,7 +70,7 @@ interface ReleaseArtifact {
     | "first_display_slice"
     | "core"
     | "integration";
-  phase: "first_display" | "critical" | "deferred" | null;
+  phase: "first_display" | "takeover" | "deferred" | null;
   trigger: "first_display_or_idle" | null;
   file: string;
   hash: string;
@@ -86,9 +86,9 @@ interface FixtureResources {
   artifactModel: "release-v1" | "legacy-main-v1";
   release: Release | null;
   controllerDocument: string | null;
-  criticalBody: string;
-  criticalTransferBytes: number;
-  criticalSrc: string;
+  selectedBody: string;
+  selectedTransferBytes: number;
+  selectedSrc: string;
   runtimeBody: string | null;
   runtimeSrc: string | null;
   deferred: Map<string, { body: string; src: string }>;
@@ -114,7 +114,7 @@ interface ReferenceTransfer {
 interface FixtureRun {
   context: BrowserContext;
   page: Page;
-  criticalRequests: string[];
+  selectedRequests: string[];
   runtimeRequests: string[];
   deferredRequests: string[];
   pageErrors: string[];
@@ -125,6 +125,10 @@ interface FixtureRun {
 interface FixtureServer {
   origin: string;
   close(): Promise<void>;
+}
+
+interface FixtureServerOptions {
+  rejectRuntime?: boolean;
 }
 
 interface BrowserObservation {
@@ -138,7 +142,7 @@ interface BrowserObservation {
   releaseId: string | undefined;
   displayCount: number;
   diagnosticsPresentationCount: number;
-  criticalScriptCount: number;
+  selectedScriptCount: number;
   deferred: Array<{
     id: string;
     startTime: number;
@@ -237,10 +241,10 @@ function loadReleaseFixtureResources(repositoryRoot: string): FixtureResources {
   const release = JSON.parse(readFileSync(releaseFile, "utf8")) as Release;
   expect(release.version).toBe(1);
   const runtimeArtifacts = [exactArtifact(release, "core")].concat(
-    CRITICAL_IDS.map((id) => exactArtifact(release, id)),
+    SELECTED_IDS.map((id) => exactArtifact(release, id)),
   );
   for (const artifact of runtimeArtifacts.slice(1)) {
-    expect(artifact.phase).toBe("critical");
+    expect(artifact.phase).toBe("takeover");
   }
   expect(
     runtimeArtifacts.map(({ id }) => id),
@@ -261,11 +265,11 @@ function loadReleaseFixtureResources(repositoryRoot: string): FixtureResources {
   );
   for (const artifact of firstDisplayArtifacts)
     expect(artifact.phase).toBe("first_display");
-  const criticalBody = firstDisplayArtifacts
+  const selectedBody = firstDisplayArtifacts
     .map((artifact) => readFileSync(resolve(dist, artifact.file), "utf8"))
     .join(";\n");
-  const criticalHash = createHash("sha256").update(criticalBody).digest("hex");
-  const criticalSrc = `/static/tsjs=tsjs-first-display.min.js?m=0045&v=${criticalHash}`;
+  const selectedHash = createHash("sha256").update(selectedBody).digest("hex");
+  const selectedSrc = `/static/tsjs=tsjs-first-display.min.js?m=0045&v=${selectedHash}`;
   const deferred = new Map<string, { body: string; src: string }>();
   for (const id of DEFERRED_IDS) {
     const artifact = exactArtifact(release, id);
@@ -293,14 +297,14 @@ function loadReleaseFixtureResources(repositoryRoot: string): FixtureResources {
         "--package",
         "trusted-server-integration-tests",
         "--bin",
-        "generate-tsjs-prospective-fixture",
+        "generate-tsjs-fixture",
         "--target",
         host,
         "--",
         "--projection",
         projectionPath,
         "--ids",
-        [...CRITICAL_IDS, ...DEFERRED_IDS].join(","),
+        [...SELECTED_IDS, ...DEFERRED_IDS].join(","),
       ],
       {
         cwd: repositoryRoot,
@@ -311,10 +315,12 @@ function loadReleaseFixtureResources(repositoryRoot: string): FixtureResources {
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
-  const criticalTag = `<script src="${criticalSrc}" id="trustedserver-js"></script>`;
-  expect(controllerDocument.match(/tsjs:bids-script/gu)).toHaveLength(1);
+  const selectedTag = `<script src="${selectedSrc}" id="trustedserver-js"></script>`;
+  // The single generated bootstrap carries mutually exclusive direct-runtime and
+  // first-display branches; each branch owns one mark callsite.
+  expect(controllerDocument.match(/tsjs:bids-script/gu)).toHaveLength(2);
   expect(controllerDocument.match(/id="trustedserver-js"/gu)).toHaveLength(1);
-  expect(controllerDocument).toContain(criticalTag);
+  expect(controllerDocument).toContain(selectedTag);
   expect(controllerDocument).toContain(`"releaseId":"${release.releaseId}"`);
   expect(controllerDocument).toContain(`"runtimeSrc":"${runtimeSrc}"`);
   expect(controllerDocument).not.toContain(
@@ -329,18 +335,18 @@ function loadReleaseFixtureResources(repositoryRoot: string): FixtureResources {
       body: exactControllerInline(controllerDocument),
     },
     {
-      semanticEndpoint: `external:${criticalSrc}`,
+      semanticEndpoint: `external:${selectedSrc}`,
       delivery: "external",
-      body: criticalBody,
+      body: selectedBody,
     },
   ]);
   return {
     artifactModel: "release-v1",
     release,
     controllerDocument,
-    criticalBody,
-    criticalTransferBytes: Buffer.byteLength(criticalBody, "utf8"),
-    criticalSrc,
+    selectedBody,
+    selectedTransferBytes: Buffer.byteLength(selectedBody, "utf8"),
+    selectedSrc,
     runtimeBody,
     runtimeSrc,
     deferred,
@@ -352,11 +358,11 @@ function loadLegacyMainFixtureResources(
   repositoryRoot: string,
 ): FixtureResources {
   const dist = resolve(repositoryRoot, "crates/trusted-server-js/dist");
-  const criticalBody = ["tsjs-core.js", "tsjs-creative.js", "tsjs-gpt.js"]
+  const selectedBody = ["tsjs-core.js", "tsjs-creative.js", "tsjs-gpt.js"]
     .map((file) => readFileSync(resolve(dist, file), "utf8"))
     .join(";\n");
-  const criticalHash = createHash("sha256").update(criticalBody).digest("hex");
-  const criticalSrc = `/static/tsjs=tsjs-unified.min.js?v=${criticalHash}`;
+  const selectedHash = createHash("sha256").update(selectedBody).digest("hex");
+  const selectedSrc = `/static/tsjs=tsjs-unified.min.js?v=${selectedHash}`;
   const referenceTransfer = measureReferenceTransfer([
     {
       semanticEndpoint: "inline:legacy-boot",
@@ -369,18 +375,18 @@ function loadLegacyMainFixtureResources(
       body: LEGACY_AD_INIT_INLINE,
     },
     {
-      semanticEndpoint: `external:${criticalSrc}`,
+      semanticEndpoint: `external:${selectedSrc}`,
       delivery: "external",
-      body: criticalBody,
+      body: selectedBody,
     },
   ]);
   return {
     artifactModel: "legacy-main-v1",
     release: null,
     controllerDocument: null,
-    criticalBody,
-    criticalTransferBytes: Buffer.byteLength(criticalBody, "utf8"),
-    criticalSrc,
+    selectedBody,
+    selectedTransferBytes: Buffer.byteLength(selectedBody, "utf8"),
+    selectedSrc,
     runtimeBody: null,
     runtimeSrc: null,
     deferred: new Map(),
@@ -442,21 +448,21 @@ function fixtureDocument(
   resources: FixtureResources,
   manualDisplay: boolean,
 ): string {
-  const criticalTag = `<script src="${resources.criticalSrc}" id="trustedserver-js"></script>`;
+  const selectedTag = `<script src="${resources.selectedSrc}" id="trustedserver-js"></script>`;
   const comparisonSetup = `<script>window.__fixtureGpt.setManual(true);performance.mark("${COMPARISON_START_MARK}");</script>`;
   if (resources.artifactModel === "legacy-main-v1") {
     const release = manualDisplay ? "" : "window.__fixtureGpt.release();";
-    return `<!doctype html><html><head><meta charset="utf-8"><script>${legacyBootInline()}</script>${comparisonSetup}${criticalTag}</head><body><div id="perf-slot"></div><script>${LEGACY_AD_INIT_INLINE}${release}</script></body></html>`;
+    return `<!doctype html><html><head><meta charset="utf-8"><script>${legacyBootInline()}</script>${comparisonSetup}${selectedTag}</head><body><div id="perf-slot"></div><script>${LEGACY_AD_INIT_INLINE}${release}</script></body></html>`;
   }
   if (!resources.controllerDocument)
     throw new Error("generated controller document is unavailable");
-  const controlledCriticalTag = `${comparisonSetup}${criticalTag}`;
+  const controlledSelectedTag = `${comparisonSetup}${selectedTag}`;
   const withControlledGpt = resources.controllerDocument.replace(
-    criticalTag,
-    controlledCriticalTag,
+    selectedTag,
+    controlledSelectedTag,
   );
   if (withControlledGpt === resources.controllerDocument)
-    throw new Error("generated controller critical tag is unavailable");
+    throw new Error("generated controller selected tag is unavailable");
   if (manualDisplay) return withControlledGpt;
   const released = withControlledGpt.replace(
     "</body>",
@@ -677,6 +683,105 @@ async function installFixtureGpt(context: BrowserContext): Promise<void> {
   });
 }
 
+async function installAttemptResourceProbe(
+  context: BrowserContext,
+): Promise<void> {
+  await context.addInitScript(() => {
+    const activeMessageListeners =
+      new Set<EventListenerOrEventListenerObject>();
+    const activeTimeouts = new Set<number>();
+    const activePorts = new Set<MessagePort>();
+    let createdMessageListeners = 0;
+    let createdTimeouts = 0;
+    let createdPorts = 0;
+
+    const nativeAddEventListener = window.addEventListener.bind(window);
+    const nativeRemoveEventListener = window.removeEventListener.bind(window);
+    window.addEventListener = ((
+      type: string,
+      listener: EventListenerOrEventListenerObject,
+      options?: boolean | AddEventListenerOptions,
+    ) => {
+      if (type === "message" && !activeMessageListeners.has(listener)) {
+        activeMessageListeners.add(listener);
+        createdMessageListeners += 1;
+      }
+      nativeAddEventListener(type, listener, options);
+    }) as typeof window.addEventListener;
+    window.removeEventListener = ((
+      type: string,
+      listener: EventListenerOrEventListenerObject,
+      options?: boolean | EventListenerOptions,
+    ) => {
+      if (type === "message") activeMessageListeners.delete(listener);
+      nativeRemoveEventListener(type, listener, options);
+    }) as typeof window.removeEventListener;
+
+    const nativeSetTimeout = window.setTimeout.bind(window);
+    const nativeClearTimeout = window.clearTimeout.bind(window);
+    window.setTimeout = ((
+      handler: TimerHandler,
+      timeout?: number,
+      ...arguments_: unknown[]
+    ) => {
+      let handle = 0;
+      const run = () => {
+        activeTimeouts.delete(handle);
+        if (typeof handler === "function") {
+          Reflect.apply(handler, window, arguments_);
+        } else {
+          window.eval(handler);
+        }
+      };
+      handle = nativeSetTimeout(run, timeout);
+      activeTimeouts.add(handle);
+      createdTimeouts += 1;
+      return handle;
+    }) as typeof window.setTimeout;
+    window.clearTimeout = ((handle?: number) => {
+      if (typeof handle === "number") activeTimeouts.delete(handle);
+      nativeClearTimeout(handle);
+    }) as typeof window.clearTimeout;
+
+    const NativeMessageChannel = window.MessageChannel;
+    const TrackedMessageChannel = function (): MessageChannel {
+      const channel = new NativeMessageChannel();
+      for (const port of [channel.port1, channel.port2]) {
+        activePorts.add(port);
+        createdPorts += 1;
+        const nativeClose = port.close.bind(port);
+        let closed = false;
+        Object.defineProperty(port, "close", {
+          configurable: true,
+          value: () => {
+            if (!closed) {
+              closed = true;
+              activePorts.delete(port);
+            }
+            nativeClose();
+          },
+        });
+      }
+      return channel;
+    } as unknown as typeof MessageChannel;
+    Object.setPrototypeOf(TrackedMessageChannel, NativeMessageChannel);
+    TrackedMessageChannel.prototype = NativeMessageChannel.prototype;
+    window.MessageChannel = TrackedMessageChannel;
+
+    Object.defineProperty(window, "__tsjsAttemptResources", {
+      configurable: false,
+      value: () => ({
+        activeMessageListeners: activeMessageListeners.size,
+        activePorts: activePorts.size,
+        activeTimeouts: activeTimeouts.size,
+        createdMessageListeners,
+        createdPorts,
+        createdTimeouts,
+      }),
+    });
+  });
+}
+
 function noBidAuction(requestBody: unknown) {
   const request = requestBody as {
     id?: unknown;
@@ -725,6 +830,7 @@ async function serveFixtureRequest(
   request: IncomingMessage,
   response: ServerResponse,
   resources: FixtureResources,
+  options: FixtureServerOptions,
 ): Promise<void> {
   const url = new URL(request.url ?? "/", "http://127.0.0.1");
   if (url.pathname === "/fixture") {
@@ -736,12 +842,12 @@ async function serveFixtureRequest(
     );
     return;
   }
-  if (`${url.pathname}${url.search}` === resources.criticalSrc) {
+  if (`${url.pathname}${url.search}` === resources.selectedSrc) {
     sendResponse(
       response,
       200,
       "application/javascript; charset=utf-8",
-      resources.criticalBody,
+      resources.selectedBody,
       true,
     );
     return;
@@ -751,6 +857,15 @@ async function serveFixtureRequest(
     resources.runtimeSrc !== null &&
     `${url.pathname}${url.search}` === resources.runtimeSrc
   ) {
+    if (options.rejectRuntime) {
+      sendResponse(
+        response,
+        503,
+        "text/plain; charset=utf-8",
+        "persistent runtime rejected by test fixture",
+      );
+      return;
+    }
     sendResponse(
       response,
       200,
@@ -813,21 +928,25 @@ async function serveFixtureRequest(
 
 async function startFixtureServer(
   resources: FixtureResources,
+  options: FixtureServerOptions = {},
 ): Promise<FixtureServer> {
   const server = createServer((request, response) => {
-    void serveFixtureRequest(request, response, resources).catch((error) => {
-      const failure = error instanceof Error ? error : new Error(String(error));
-      if (response.headersSent) {
-        response.destroy(failure);
-        return;
-      }
-      sendResponse(
-        response,
-        500,
-        "text/plain; charset=utf-8",
-        "fixture server failure",
-      );
-    });
+    void serveFixtureRequest(request, response, resources, options).catch(
+      (error) => {
+        const failure =
+          error instanceof Error ? error : new Error(String(error));
+        if (response.headersSent) {
+          response.destroy(failure);
+          return;
+        }
+        sendResponse(
+          response,
+          500,
+          "text/plain; charset=utf-8",
+          "fixture server failure",
+        );
+      },
+    );
   });
   await new Promise<void>((resolveListen, rejectListen) => {
     const onError = (error: Error) => {
@@ -867,9 +986,12 @@ async function startFixtureServer(
 async function openFixture(
   browser: Browser,
   fixtureServer: FixtureServer,
+  resources: FixtureResources,
   manualDisplay = false,
+  probeAttemptResources = false,
 ): Promise<FixtureRun> {
   const context = await browser.newContext();
+  if (probeAttemptResources) await installAttemptResourceProbe(context);
   await installFixtureGpt(context);
   const page = await context.newPage();
   const networkSession = await context.newCDPSession(page);
@@ -881,14 +1003,14 @@ async function openFixture(
     uploadThroughput: 93_750,
     packetLoss: 0,
   });
-  const criticalRequests: string[] = [];
+  const selectedRequests: string[] = [];
   const runtimeRequests: string[] = [];
   const deferredRequests: string[] = [];
   const pageErrors: string[] = [];
   const consoleMessages: string[] = [];
   page.on("request", (request) => {
     const url = request.url();
-    if (url.endsWith(resources.criticalSrc)) criticalRequests.push(url);
+    if (url.endsWith(resources.selectedSrc)) selectedRequests.push(url);
     if (resources.runtimeSrc && url.endsWith(resources.runtimeSrc))
       runtimeRequests.push(url);
     if (
@@ -906,7 +1028,7 @@ async function openFixture(
   return {
     context,
     page,
-    criticalRequests,
+    selectedRequests,
     runtimeRequests,
     deferredRequests,
     pageErrors,
@@ -944,10 +1066,10 @@ async function observeComparisonFixture(
       actionMark: FIRST_OBSERVABLE_ACTION_MARK,
     },
   );
-  expect(run.criticalRequests).toHaveLength(1);
-  const criticalRequest = new URL(run.criticalRequests[0]!);
-  expect(`${criticalRequest.pathname}${criticalRequest.search}`).toBe(
-    resources.criticalSrc,
+  expect(run.selectedRequests).toHaveLength(1);
+  const selectedRequest = new URL(run.selectedRequests[0]!);
+  expect(`${selectedRequest.pathname}${selectedRequest.search}`).toBe(
+    resources.selectedSrc,
   );
   expect(run.pageErrors).toEqual([]);
   expect(observation.displayCount).toBe(1);
@@ -982,7 +1104,28 @@ async function waitForMark(run: FixtureRun, name: string): Promise<void> {
       renderHistory: window.tsjs?.diagnostics?.renderTrace?.history(),
     }));
     throw new Error(
-      `${name} was not recorded: ${JSON.stringify({ ...diagnostics, consoleMessages: run.consoleMessages, criticalRequests: run.criticalRequests, deferredRequests: run.deferredRequests, pageErrors: run.pageErrors })}; ${String(error)}`,
+      `${name} was not recorded: ${JSON.stringify({ ...diagnostics, consoleMessages: run.consoleMessages, selectedRequests: run.selectedRequests, runtimeRequests: run.runtimeRequests, deferredRequests: run.deferredRequests, pageErrors: run.pageErrors })}; ${String(error)}`,
+    );
+  }
+}
+
+async function waitForKernel(run: FixtureRun): Promise<void> {
+  try {
+    await expect
+      .poll(() => run.page.evaluate(() => window.tsjs?._internal?.state))
+      .toBe("kernel");
+  } catch (error) {
+    const diagnostics = await run.page.evaluate(() => ({
+      runtimeState: window.tsjs?._internal?.state,
+      runtimeReason: (window.tsjs?._internal as { reason?: string } | undefined)
+        ?.reason,
+      names: window.tsjs ? Object.getOwnPropertyNames(window.tsjs) : [],
+      marks: performance
+        .getEntriesByType("mark")
+        .map((entry) => ({ name: entry.name, startTime: entry.startTime })),
+    }));
+    throw new Error(
+      `persistent runtime did not commit: ${JSON.stringify({ ...diagnostics, consoleMessages: run.consoleMessages, selectedRequests: run.selectedRequests, runtimeRequests: run.runtimeRequests, deferredRequests: run.deferredRequests, pageErrors: run.pageErrors })}; ${String(error)}`,
     );
   }
 }
@@ -994,15 +1137,32 @@ async function observeFixture(
   const comparison = await observeComparisonFixture(run, resources);
   await waitForMark(run, "tsjs:first-display");
   await waitForMark(run, "tsjs:first-display-paint");
+  await waitForKernel(run);
   for (const id of DEFERRED_IDS) {
-    await expect
-      .poll(() =>
-        run.page.evaluate(
-          (moduleId) => window.__fixtureGpt.executionTime(moduleId),
-          id,
-        ),
-      )
-      .not.toBeUndefined();
+    try {
+      await expect
+        .poll(() =>
+          run.page.evaluate(
+            (moduleId) => window.__fixtureGpt.executionTime(moduleId),
+            id,
+          ),
+        )
+        .not.toBeUndefined();
+    } catch (error) {
+      const lifecycle = await run.page.evaluate(
+        (deferredIds) =>
+          deferredIds.map((moduleId) => ({
+            id: moduleId,
+            loadTime: window.__fixtureGpt.loadTime(moduleId),
+            preparationTime: window.__fixtureGpt.preparationTime(moduleId),
+            executionTime: window.__fixtureGpt.executionTime(moduleId),
+          })),
+        DEFERRED_IDS,
+      );
+      throw new Error(
+        `deferred ${id} did not execute: ${JSON.stringify({ lifecycle, deferredRequests: run.deferredRequests, consoleMessages: run.consoleMessages, pageErrors: run.pageErrors })}; ${String(error)}`,
+      );
+    }
   }
   const observation = await run.page.evaluate((deferredIds) => {
     const entries = (name: string) => performance.getEntriesByName(name);
@@ -1056,7 +1216,7 @@ async function observeFixture(
       diagnosticsPresentationCount: document.querySelectorAll(
         "#ts-render-trace-panel",
       ).length,
-      criticalScriptCount: document.querySelectorAll("script#trustedserver-js")
+      selectedScriptCount: document.querySelectorAll("script#trustedserver-js")
         .length,
       deferred,
       paintTime,
@@ -1073,8 +1233,8 @@ async function observeFixture(
   expect(observation.runtimeState).toBe("kernel");
   expect(observation.displayCount).toBe(1);
   expect(observation.diagnosticsPresentationCount).toBe(1);
-  expect(observation.criticalScriptCount).toBe(1);
-  expect(run.criticalRequests).toHaveLength(1);
+  expect(observation.selectedScriptCount).toBe(1);
+  expect(run.selectedRequests).toHaveLength(1);
   expect(run.deferredRequests).toHaveLength(DEFERRED_IDS.length);
   expect(run.pageErrors).toEqual([]);
   expect(Number.isFinite(observation.timingMs)).toBe(true);
@@ -1134,7 +1294,7 @@ async function collectHeapCheckpoints(
   fixtureServer: FixtureServer,
   resources: FixtureResources,
 ): Promise<Record<HeapCheckpoint, number>> {
-  const heapRun = await openFixture(browser, fixtureServer, true);
+  const heapRun = await openFixture(browser, fixtureServer, resources, true);
   const retainedHeapBytes = {} as Record<HeapCheckpoint, number>;
   try {
     await expect
@@ -1213,8 +1373,16 @@ declare global {
       release(): void;
       setManual(manual: boolean): void;
     };
+    __tsjsAttemptResources(): {
+      activeMessageListeners: number;
+      activePorts: number;
+      activeTimeouts: number;
+      createdMessageListeners: number;
+      createdPorts: number;
+      createdTimeouts: number;
+    };
     tsjs?: {
-      _internal?: { state?: string };
+      _internal?: { initialDisplayCommitted?: boolean; state?: string };
       diagnostics?: {
         renderTrace?: { current(): unknown; history(): unknown };
       };
@@ -1299,6 +1467,88 @@ test("gates semantic reference transfer against the exact current main build", (
   }
 });
 
+test("boots the generated first-display artifact through persistent takeover", async ({
+  browser,
+}) => {
+  const resources = loadReleaseFixtureResources(REPO_ROOT);
+  const server = await startFixtureServer(resources);
+  try {
+    const run = await openFixture(browser, server, resources);
+    try {
+      try {
+        await observeFixture(run, resources);
+      } catch (error) {
+        const diagnostics = await run.page.evaluate(() => ({
+          runtimeState: window.tsjs?._internal?.state,
+          runtimeReason: (
+            window.tsjs?._internal as { reason?: string } | undefined
+          )?.reason,
+          names: window.tsjs ? Object.getOwnPropertyNames(window.tsjs) : [],
+          marks: performance
+            .getEntriesByType("mark")
+            .map((entry) => ({ name: entry.name, startTime: entry.startTime })),
+          displayCount: window.__fixtureGpt.displayCount(),
+          gptCalls: window.__fixtureGpt.calls(),
+        }));
+        throw new Error(
+          `first-display smoke failed: ${JSON.stringify({ ...diagnostics, consoleMessages: run.consoleMessages, selectedRequests: run.selectedRequests, runtimeRequests: run.runtimeRequests, deferredRequests: run.deferredRequests, pageErrors: run.pageErrors })}; ${String(error)}`,
+        );
+      }
+    } finally {
+      await run.close();
+    }
+  } finally {
+    await server.close();
+  }
+});
+
+test("generated first-display fallback releases its runtime and provisional resources", async ({
+  browser,
+}) => {
+  const resources = loadReleaseFixtureResources(REPO_ROOT);
+  const server = await startFixtureServer(resources, { rejectRuntime: true });
+  try {
+    const run = await openFixture(browser, server, resources, false, true);
+    try {
+      await expect
+        .poll(() => run.page.evaluate(() => window.tsjs?._internal?.state))
+        .toBe("fallback");
+      const observation = await run.page.evaluate(() => ({
+        initialDisplayCommitted:
+          window.tsjs?._internal?.initialDisplayCommitted,
+        privateFields: [
+          "_firstDisplayTakeover",
+          "_registerFirstDisplay",
+        ].filter((name) =>
+          Object.prototype.hasOwnProperty.call(window.tsjs ?? {}, name),
+        ),
+        resources: window.__tsjsAttemptResources(),
+        runtimeScripts: document.querySelectorAll(
+          "script#trustedserver-js-runtime",
+        ).length,
+        selectedScripts: document.querySelectorAll("script#trustedserver-js")
+          .length,
+      }));
+
+      expect(run.runtimeRequests).toHaveLength(1);
+      expect(observation.initialDisplayCommitted).toBe(true);
+      expect(observation.privateFields).toEqual([]);
+      expect(observation.runtimeScripts).toBe(0);
+      expect(observation.selectedScripts).toBe(1);
+      expect(observation.resources).toMatchObject({
+        activeMessageListeners: 0,
+        activePorts: 0,
+        activeTimeouts: 0,
+      });
+      expect(observation.resources.createdTimeouts).toBeGreaterThan(0);
+    } finally {
+      await run.close();
+    }
+  } finally {
+    await server.close();
+  }
+});
+
 test.describe("TSJS first-display performance gate", () => {
   test.describe.configure({ retries: 0, mode: "serial" });
   const activeFixtureServers: FixtureServer[] = [];
@@ -1350,7 +1600,7 @@ test.describe("TSJS first-display performance gate", () => {
       comparison: ComparisonObservation;
       candidate?: BrowserObservation;
     }> => {
-      const run = await openFixture(browser, fixtureServer);
+      const run = await openFixture(browser, fixtureServer, resources);
       try {
         if (resources.artifactModel === "release-v1") {
           const candidate = await observeFixture(run, resources);
@@ -1528,13 +1778,13 @@ test.describe("TSJS first-display performance gate", () => {
           main: {
             sha: mainSha,
             artifactModel: mainResources.artifactModel,
-            criticalTransferBytes: mainResources.criticalTransferBytes,
+            selectedTransferBytes: mainResources.selectedTransferBytes,
             samples: mainSamples,
             p90: mainP90,
           },
           candidate: {
             artifactModel: candidateResources.artifactModel,
-            criticalTransferBytes: candidateResources.criticalTransferBytes,
+            selectedTransferBytes: candidateResources.selectedTransferBytes,
             samples: candidateSamples,
             p90: candidateP90,
           },
@@ -1567,7 +1817,7 @@ test.describe("TSJS first-display performance gate", () => {
         candidate: { checkpoints: candidateHeapBytes },
       },
       requests: {
-        critical: { count: 1 },
+        selected: { count: 1 },
         deferred: {
           count: representative!.deferred.length,
           requestBeforePaintCount: deferredBeforePaint,

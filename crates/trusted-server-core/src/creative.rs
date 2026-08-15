@@ -574,7 +574,7 @@ fn process_auction_creative_with_rewriter(
 /// - 1x1 `<img>` pixels → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
 /// - Non-pixel absolute images → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
 /// - `<iframe src>` (absolute or protocol-relative) → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
-/// - Injects one exact creative boot controller and content-addressed critical
+/// - Injects one exact creative boot controller and content-addressed runtime
 ///   artifact at the top of `<body>` to safeguard click URLs inside creatives.
 ///
 /// The proxy/click URLs are emitted **root-relative** (`/first-party/…`), which
@@ -1121,15 +1121,15 @@ mod tests {
             "expected unified tsjs injection: {out}"
         );
         assert!(
-            out.contains("t.boot="),
+            out.contains("__TSJS_SERVER_BOOT_INPUT_V1__"),
             "expected creative boot transport: {out}"
         );
         assert!(
-            out.contains(r#"{"id":"render_runtime","phase":"critical"}"#),
+            out.contains(r#"{"id":"render_runtime","phase":"takeover"}"#),
             "expected render runtime membership: {out}"
         );
         assert!(
-            out.contains(r#"{"id":"creative","phase":"critical"}"#),
+            out.contains(r#"{"id":"creative","phase":"takeover"}"#),
             "expected creative membership: {out}"
         );
         assert!(

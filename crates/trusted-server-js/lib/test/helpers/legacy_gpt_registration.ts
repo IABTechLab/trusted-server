@@ -57,7 +57,7 @@ export function createLegacyGptRegistrationForTest(releaseId: string): Integrati
   return Object.freeze({
     abi: 1,
     id: 'gpt',
-    phase: 'critical',
+    phase: 'takeover',
     releaseId,
     prepare: ({ config, interfaces }: IntegrationPrepareContext) => {
       if (!recursivelyFrozen(config)) throw new TypeError('GPT integration config is invalid');

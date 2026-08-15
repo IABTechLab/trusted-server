@@ -111,7 +111,7 @@ export function createSourcepointIntegrationRegistration(release: string): Integ
   return Object.freeze({
     abi: 1,
     id: SOURCEPOINT_INTEGRATION_ID,
-    phase: 'critical',
+    phase: 'takeover',
     releaseId: release,
     prepare: ({ config, interfaces, onDispose }: IntegrationPrepareContext) => {
       const runtimeCapability = interfaces['runtime.v1'];
@@ -129,12 +129,12 @@ export function createSourcepointIntegrationRegistration(release: string): Integ
         resetConsentMirror: disposeSourcepointConsentMirror,
         resetGuard: () => undefined,
       });
-      let criticalActive = false;
+      let takeoverActive = false;
       let guardInstalled = false;
       let lifecycleRelease: (() => void) | undefined;
       const capability: SourcepointConsentCapabilityV1 = Object.freeze({
         activateLifecycle: () => {
-          if (!criticalActive || lifecycleRelease) {
+          if (!takeoverActive || lifecycleRelease) {
             throw new TypeError('Sourcepoint lifecycle is unavailable');
           }
           lifecycleRelease = lifecycle.activate(config);
@@ -145,14 +145,14 @@ export function createSourcepointIntegrationRegistration(release: string): Integ
           };
         },
         startLifecycle: () => {
-          if (!criticalActive || !lifecycleRelease) {
+          if (!takeoverActive || !lifecycleRelease) {
             throw new TypeError('Sourcepoint lifecycle is not active');
           }
           lifecycle.start(config);
         },
       });
       const releaseOwnedState = (): void => {
-        criticalActive = false;
+        takeoverActive = false;
         const releaseLifecycle = lifecycleRelease;
         lifecycleRelease = undefined;
         releaseLifecycle?.();
@@ -169,7 +169,7 @@ export function createSourcepointIntegrationRegistration(release: string): Integ
           afterCommit,
           onDispose: onActivationDispose,
         }: IntegrationActivationContext) => {
-          if (criticalActive) throw new Error('Sourcepoint consent is already active');
+          if (takeoverActive) throw new Error('Sourcepoint consent is already active');
           if (
             adoption !== undefined &&
             !validatePersistentFirstDisplaySliceAdoptionV1(
@@ -193,7 +193,7 @@ export function createSourcepointIntegrationRegistration(release: string): Integ
             installSourcepointGuard();
             guardInstalled = true;
           }
-          criticalActive = true;
+          takeoverActive = true;
           onActivationDispose(releaseOwnedState);
           afterCommit(() => {
             mirrorSourcepointConsent();

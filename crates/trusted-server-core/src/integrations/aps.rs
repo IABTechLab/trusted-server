@@ -2778,17 +2778,16 @@ mod tests {
             1
         );
 
-        for value in [json!({
+        let value = json!({
             "cur": "EUR",
             "seatbid": [{"bid": [bid("eur", 1.0, "iframe")]}]
-        })] {
-            let response = provider.parse_aps_response(&value, 12, &request());
-            assert_eq!(response.status, BidStatus::Error);
-            assert_eq!(
-                drop_count(&response, AuctionDropReason::InvalidProviderResponse),
-                1
-            );
-        }
+        });
+        let response = provider.parse_aps_response(&value, 12, &request());
+        assert_eq!(response.status, BidStatus::Error);
+        assert_eq!(
+            drop_count(&response, AuctionDropReason::InvalidProviderResponse),
+            1
+        );
 
         let body = br#"{"seatbid":[{"bid":[{"id":"overflow","impid":"fictional-slot","price":1e400,"w":300,"h":250,"ext":{"creativeurl":"https://creative.example/render","tagtype":"iframe"}}]}]}"#;
         let response = futures::executor::block_on(

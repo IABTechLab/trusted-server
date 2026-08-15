@@ -19,7 +19,7 @@ on:
       - "crates/trusted-server-core/src/tsjs.rs"
       - "crates/trusted-server-integration-tests/Cargo.toml"
       - "crates/trusted-server-integration-tests/browser/**"
-      - "crates/trusted-server-integration-tests/src/bin/generate-tsjs-prospective-fixture.rs"
+      - "crates/trusted-server-integration-tests/src/bin/generate-tsjs-fixture.rs"
       - "crates/trusted-server-js/**"
       - "scripts/validate-tsjs-performance-evidence.mjs"
   workflow_dispatch:

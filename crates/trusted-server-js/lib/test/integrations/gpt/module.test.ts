@@ -261,8 +261,9 @@ function manifest(ids: readonly string[]) {
   return {
     version: 1,
     releaseId: RELEASE_ID,
-    criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
-    integrations: ids.map((id) => ({ id, phase: 'critical' as const })),
+    firstDisplay: null,
+    runtimeSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
+    integrations: ids.map((id) => ({ id, phase: 'takeover' as const })),
   };
 }
 
@@ -270,7 +271,7 @@ function registration(
   id: string,
   prepare: IntegrationRegistration['prepare']
 ): IntegrationRegistration {
-  return Object.freeze({ abi: 1, id, phase: 'critical', releaseId: RELEASE_ID, prepare });
+  return Object.freeze({ abi: 1, id, phase: 'takeover', releaseId: RELEASE_ID, prepare });
 }
 
 function callbacks(order: string[]): IntegrationInstallCallbacks {
@@ -599,7 +600,7 @@ describe('transactional GPT integration module', () => {
     vi.unstubAllGlobals();
     resetGuardState();
     delete (window as Window & { googletag?: unknown }).googletag;
-    document.getElementById('critical-slot')?.remove();
+    document.getElementById('takeover-slot')?.remove();
     document.getElementById('spa-winner')?.remove();
   });
 
@@ -748,10 +749,11 @@ describe('transactional GPT integration module', () => {
       const bootManifest = Object.freeze({
         version: 1 as const,
         releaseId: RELEASE_ID,
-        criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
+        firstDisplay: null,
+        runtimeSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
         integrations: Object.freeze([
-          Object.freeze({ id: 'render_runtime', phase: 'critical' as const }),
-          Object.freeze({ id: 'gpt', phase: 'critical' as const }),
+          Object.freeze({ id: 'render_runtime', phase: 'takeover' as const }),
+          Object.freeze({ id: 'gpt', phase: 'takeover' as const }),
         ]),
       });
       const runtime = Object.freeze({
@@ -765,16 +767,16 @@ describe('transactional GPT integration module', () => {
                 auctionId: 'initial',
                 results: Object.freeze([
                   Object.freeze({
-                    slot: 'critical-slot',
+                    slot: 'takeover-slot',
                     outcome: 'no_bid' as const,
                   }),
                 ]),
               }),
               slots: Object.freeze([
                 Object.freeze({
-                  slot: 'critical-slot',
-                  gamUnitPath: '/123/critical-slot',
-                  divId: 'critical-slot',
+                  slot: 'takeover-slot',
+                  gamUnitPath: '/123/takeover-slot',
+                  divId: 'takeover-slot',
                   formats: Object.freeze([Object.freeze([300, 250] as const)]),
                   targeting: Object.freeze({}),
                 }),
@@ -801,7 +803,7 @@ describe('transactional GPT integration module', () => {
         catalog: Object.freeze([
           Object.freeze({
             id: 'render_runtime',
-            phase: 'critical' as const,
+            phase: 'takeover' as const,
             trigger: null,
             consumes: Object.freeze(['runtime.v1']),
             provides: Object.freeze([
@@ -816,7 +818,7 @@ describe('transactional GPT integration module', () => {
           }),
           Object.freeze({
             id: 'gpt',
-            phase: 'critical' as const,
+            phase: 'takeover' as const,
             trigger: null,
             consumes: Object.freeze([
               'runtime.v1',
@@ -844,9 +846,11 @@ describe('transactional GPT integration module', () => {
         startedAtMs: 0,
         now: () => 0,
       });
-      const criticalElement = document.createElement('div');
-      criticalElement.id = 'critical-slot';
-      document.body.appendChild(criticalElement);
+      const takeoverElement = document.createElement('div');
+      takeoverElement.id = 'takeover-slot';
+      document.body.appendChild(takeoverElement);
+      const adoptedFrame = document.createElement('iframe');
+      takeoverElement.appendChild(adoptedFrame);
       expect(registry.register(createRenderRuntimeIntegrationRegistration(RELEASE_ID))).toBe(true);
       expect(registry.register(createProductionGptRegistration(RELEASE_ID))).toBe(true);
 
@@ -859,90 +863,141 @@ describe('transactional GPT integration module', () => {
                   NonNullable<IntegrationInstallCallbacks['coordinateTakeover']>
                 >[0]
               ) => {
+                const slices = Object.freeze(
+                  parserStateValid === 'absent'
+                    ? (['first_display'] as const)
+                    : (['first_display', 'gpt_initial'] as const)
+                );
+                const handoff = prepared.validateHandoff(
+                  Object.freeze({
+                    version: 1 as const,
+                    releaseId: RELEASE_ID,
+                    generation: 1,
+                    projectionDigest: 'b'.repeat(64),
+                    slices,
+                    slots: Object.freeze([
+                      Object.freeze({
+                        id: 'takeover-slot',
+                        aliases: Object.freeze([]),
+                        owner: 'publisher',
+                        domId: 'takeover-slot',
+                        gamPath: '/123/takeover-slot',
+                        formats: Object.freeze([Object.freeze([300, 250])]),
+                        outcome: 'accepted' as const,
+                        targeting: Object.freeze([
+                          Object.freeze(['hb_adid', RESERVATION_ID] as const),
+                        ]),
+                        committedArtifact: 'gpt_adm' as const,
+                        gptToken: 'gt1_1',
+                      }),
+                    ]),
+                    attempts: Object.freeze([
+                      Object.freeze({
+                        id: 'a1_AAECAwQFBgcAAAAAAAAAAQ',
+                        slotId: 'takeover-slot',
+                        ordinal: 1,
+                        state: 'accepted' as const,
+                        reason: null,
+                      }),
+                    ]),
+                    tombstones: Object.freeze([]),
+                    artifacts: Object.freeze([
+                      Object.freeze({
+                        slotId: 'takeover-slot',
+                        kind: 'gpt_adm' as const,
+                        owner: 'publisher' as const,
+                        token: RESERVATION_ID,
+                      }),
+                    ]),
+                    parserState:
+                      parserStateValid === true
+                        ? Object.freeze([
+                            Object.freeze({
+                              sliceId: 'gpt_initial',
+                              observations: Object.freeze(['protocol_version']),
+                              values: Object.freeze([
+                                Object.freeze(['protocol_version', 1] as const),
+                              ]),
+                            }),
+                          ])
+                        : Object.freeze([]),
+                    gptDiagnostics: Object.freeze({
+                      facts: Object.freeze([]),
+                      overflowCount: 0,
+                      dropCount: 0,
+                    }),
+                    timing: Object.freeze({
+                      bidsScriptMs: 1,
+                      firstDisplayMs: 2,
+                      terminalMs: 3,
+                      paintMs: 4,
+                    }),
+                    highWater: Object.freeze({
+                      navigationAttemptPrefix: 'AAECAwQFBgc',
+                      nextAttemptOrdinal: 2,
+                      nextNavigationAttemptOrdinal: 2,
+                      nextSlotRegistrationOrdinal: 2,
+                      nextReservationOrdinal: 2,
+                      nextTicketOrdinal: 1,
+                      reservationClockEpochMs: 0,
+                    }),
+                    cycles: Object.freeze([
+                      Object.freeze({
+                        nextCycleOrdinal: 2,
+                        quarantines: Object.freeze([]),
+                        records: Object.freeze([
+                          Object.freeze({
+                            ordinal: 1,
+                            responseIdentifier: 'response-one',
+                            seen: Object.freeze(['slotRequested', 'slotRenderEnded'] as const),
+                            state: 'completed' as const,
+                          }),
+                        ]),
+                        slotId: 'takeover-slot',
+                        token: 'gt1_1',
+                        unknownPriorCycle: false,
+                      }),
+                    ]),
+                    trace: Object.freeze({
+                      nextGlobalSlotOrdinal: 2,
+                      nextSequence: 2,
+                      slots: Object.freeze([
+                        Object.freeze({
+                          bindings: Object.freeze([
+                            Object.freeze({
+                              atMs: 2,
+                              cycleOrdinal: 1,
+                              historySequence: 1,
+                              state: 'completed' as const,
+                              token: 'gt1_1',
+                            }),
+                          ]),
+                          impressions: 1,
+                          slotId: 'takeover-slot',
+                        }),
+                      ]),
+                    }),
+                    mutationRevision: 0,
+                  }),
+                  Object.freeze({
+                    version: 1 as const,
+                    releaseId: RELEASE_ID,
+                    generation: 1,
+                    projectionDigest: 'b'.repeat(64),
+                    slices,
+                    slotCount: 1,
+                    outcomeCount: 1,
+                    capabilities: Object.freeze([]),
+                    objectKinds: Object.freeze(['gpt_slot', 'dom_artifact']),
+                  })
+                );
+                if (!handoff) throw new Error('should validate test handoff');
                 prepared.activate(
                   Object.freeze({
                     version: 1 as const,
                     adoptInitialDisplay: true as const,
-                    handoff: Object.freeze({
-                      highWater: Object.freeze({
-                        navigationAttemptPrefix: 'AAECAwQFBgc',
-                        nextAttemptOrdinal: 2,
-                        nextNavigationAttemptOrdinal: 2,
-                        nextSlotRegistrationOrdinal: 2,
-                        nextTicketOrdinal: 1,
-                        reservationClockEpochMs: 0,
-                      }),
-                      tombstones: Object.freeze([]),
-                      slices: Object.freeze(
-                        parserStateValid === 'absent'
-                          ? ['first_display']
-                          : ['first_display', 'gpt_initial']
-                      ),
-                      parserState:
-                        parserStateValid === true
-                          ? Object.freeze([
-                              Object.freeze({
-                                sliceId: 'gpt_initial',
-                                observations: Object.freeze(['protocol_version']),
-                                values: Object.freeze([
-                                  Object.freeze(['protocol_version', 1] as const),
-                                ]),
-                              }),
-                            ])
-                          : Object.freeze([]),
-                      slots: Object.freeze([
-                        Object.freeze({
-                          id: 'critical-slot',
-                          owner: 'publisher',
-                          domId: 'critical-slot',
-                          gamPath: '/123/critical-slot',
-                          formats: Object.freeze([Object.freeze([300, 250])]),
-                        }),
-                      ]),
-                      cycles: Object.freeze([
-                        Object.freeze({
-                          nextCycleOrdinal: 2,
-                          quarantines: Object.freeze([]),
-                          records: Object.freeze([
-                            Object.freeze({
-                              ordinal: 1,
-                              responseIdentifier: 'response-one',
-                              seen: Object.freeze(['slotRequested', 'slotRenderEnded'] as const),
-                              state: 'completed' as const,
-                            }),
-                          ]),
-                          slotId: 'critical-slot',
-                          token: 'gt1_1',
-                          unknownPriorCycle: false,
-                        }),
-                      ]),
-                      artifacts: Object.freeze([]),
-                      gptDiagnostics: Object.freeze({
-                        facts: Object.freeze([]),
-                        overflowCount: 0,
-                        dropCount: 0,
-                      }),
-                      trace: Object.freeze({
-                        nextGlobalSlotOrdinal: 2,
-                        nextSequence: 2,
-                        slots: Object.freeze([
-                          Object.freeze({
-                            bindings: Object.freeze([
-                              Object.freeze({
-                                atMs: 0,
-                                cycleOrdinal: 1,
-                                historySequence: 1,
-                                state: 'completed' as const,
-                                token: 'gt1_1',
-                              }),
-                            ]),
-                            impressions: 1,
-                            slotId: 'critical-slot',
-                          }),
-                        ]),
-                      }),
-                    }),
-                    identities: Object.freeze([publisherSlot]),
+                    handoff,
+                    identities: Object.freeze([publisherSlot, adoptedFrame]),
                   })
                 );
                 prepared.commit();
@@ -951,7 +1006,7 @@ describe('transactional GPT integration module', () => {
           : {}),
       };
       const result = await registry.install(installCallbacks);
-      if (adoptInitialDisplay && parserStateValid === false) {
+      if (adoptInitialDisplay && parserStateValid !== true) {
         expect(result).toMatchObject({ state: 'fallback', reason: 'bundle_partial' });
         expect(defineSlot).not.toHaveBeenCalled();
         expect(display).not.toHaveBeenCalled();
@@ -984,12 +1039,12 @@ describe('transactional GPT integration module', () => {
         return;
       }
       await vi.waitFor(() => expect(definedSlots).toHaveLength(1));
-      const criticalNavigation = gpt.navigation();
+      const takeoverNavigation = gpt.navigation();
       gpt.slots.request({
-        intentId: 'critical-request',
-        navigationGeneration: criticalNavigation.generation,
+        intentId: 'takeover-request',
+        navigationGeneration: takeoverNavigation.generation,
         operation: 'display',
-        registeredSlotId: 'critical-slot',
+        registeredSlotId: 'takeover-slot',
         requestClass: 'initial',
       });
       await vi.waitFor(() => expect(display).toHaveBeenCalledOnce());
@@ -997,9 +1052,9 @@ describe('transactional GPT integration module', () => {
       expect(activeMutationObservers.size).toBe(2);
       const firstPhysicalSlot = definedSlots[0];
       expect(firstPhysicalSlot).toBeDefined();
-      criticalElement.remove();
+      takeoverElement.remove();
       const replacementElement = document.createElement('div');
-      replacementElement.id = 'critical-slot';
+      replacementElement.id = 'takeover-slot';
       document.body.appendChild(replacementElement);
       await Promise.resolve();
       await vi.advanceTimersByTimeAsync(250);

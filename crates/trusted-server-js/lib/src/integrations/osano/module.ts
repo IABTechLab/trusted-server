@@ -62,18 +62,18 @@ export function createOsanoIntegrationRegistration(release: string): Integration
   return Object.freeze({
     abi: 1,
     id: OSANO_INTEGRATION_ID,
-    phase: 'critical',
+    phase: 'takeover',
     releaseId: release,
     prepare: ({ config, interfaces, onDispose }: IntegrationPrepareContext) => {
       if (config !== undefined || !runtimeCapability(interfaces)) {
-        throw new TypeError('Osano critical capability graph is invalid');
+        throw new TypeError('Osano takeover capability graph is invalid');
       }
       const lifecycle = createOsanoRuntime();
-      let criticalActive = false;
+      let takeoverActive = false;
       let lifecycleRelease: (() => void) | undefined;
       const capability: OsanoConsentCapabilityV1 = Object.freeze({
         activateLifecycle: () => {
-          if (!criticalActive || lifecycleRelease) {
+          if (!takeoverActive || lifecycleRelease) {
             throw new TypeError('Osano lifecycle is unavailable');
           }
           lifecycleRelease = lifecycle.activate(undefined);
@@ -84,14 +84,14 @@ export function createOsanoIntegrationRegistration(release: string): Integration
           };
         },
         startLifecycle: () => {
-          if (!criticalActive || !lifecycleRelease) {
+          if (!takeoverActive || !lifecycleRelease) {
             throw new TypeError('Osano lifecycle is not active');
           }
           lifecycle.start(undefined);
         },
       });
       onDispose(() => {
-        criticalActive = false;
+        takeoverActive = false;
         const releaseLifecycle = lifecycleRelease;
         lifecycleRelease = undefined;
         releaseLifecycle?.();
@@ -103,7 +103,7 @@ export function createOsanoIntegrationRegistration(release: string): Integration
           afterCommit,
           onDispose: onActivationDispose,
         }: IntegrationActivationContext) => {
-          if (criticalActive) throw new Error('Osano critical slice is already active');
+          if (takeoverActive) throw new Error('Osano takeover slice is already active');
           if (
             adoption !== undefined &&
             !validatePersistentFirstDisplaySliceAdoptionV1(
@@ -120,9 +120,9 @@ export function createOsanoIntegrationRegistration(release: string): Integration
           ) {
             throw new TypeError('Osano first-display parser state is invalid');
           }
-          criticalActive = true;
+          takeoverActive = true;
           onActivationDispose(() => {
-            criticalActive = false;
+            takeoverActive = false;
             disposeOsanoConsentMirror();
           });
           afterCommit(() => {

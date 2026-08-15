@@ -93,7 +93,8 @@ function runtimeManifest(releaseId: string, ids: readonly string[]) {
   return {
     version: 1 as const,
     releaseId,
-    criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
+    firstDisplay: null,
+    runtimeSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
     integrations: ids.map((id) =>
       DEFERRED_INTEGRATION_IDS.has(id)
         ? {
@@ -102,7 +103,7 @@ function runtimeManifest(releaseId: string, ids: readonly string[]) {
             trigger: 'first_display_or_idle' as const,
             src: `/static/tsjs=tsjs-${id}.min.js?v=${'d'.repeat(64)}`,
           }
-        : { id, phase: 'critical' as const }
+        : { id, phase: 'takeover' as const }
     ),
   };
 }
@@ -122,7 +123,7 @@ function runtimeCatalog(ids: readonly string[]) {
       }
       return Object.freeze({
         id,
-        phase: DEFERRED_INTEGRATION_IDS.has(id) ? ('deferred' as const) : ('critical' as const),
+        phase: DEFERRED_INTEGRATION_IDS.has(id) ? ('deferred' as const) : ('takeover' as const),
         trigger: DEFERRED_INTEGRATION_IDS.has(id) ? ('first_display_or_idle' as const) : null,
         consumes: Object.freeze(
           id === BROWSER_TEST_DIAGNOSTICS_PROVIDER_ID
@@ -170,7 +171,7 @@ function createLegacyPrebidIntegrationRegistration(releaseId: string): Integrati
   return Object.freeze({
     abi: 1,
     id: 'prebid',
-    phase: 'critical',
+    phase: 'takeover',
     releaseId,
     prepare: ({ config, interfaces }: IntegrationPrepareContext) => {
       const runtime = exactLegacyRuntime(interfaces, 'prebid');
@@ -189,7 +190,7 @@ function createLegacyCreativeIntegrationRegistration(releaseId: string): Integra
   return Object.freeze({
     abi: 1,
     id: 'creative',
-    phase: 'critical',
+    phase: 'takeover',
     releaseId,
     prepare: ({ config, interfaces }: IntegrationPrepareContext) => {
       const creative = config as Readonly<{
@@ -556,7 +557,7 @@ describe('browser composition', () => {
     expect(composition.adapters.prebid.bindingStatus()).toBe('incompatible');
   });
 
-  it('routes the prospective first-display measure through the concrete test composition', async () => {
+  it('routes the first-display measure through the concrete test composition', async () => {
     const display = vi.fn();
     const pubadsService = {};
     const performance = { mark: vi.fn(), measure: vi.fn() };
@@ -1070,15 +1071,15 @@ describe('browser composition', () => {
       'sourcepoint_lifecycle',
     ]);
     const rows = runtimeManifest(releaseId, [
-      'critical_lifecycle',
+      'takeover_lifecycle',
       ...deferredIds,
-      'later_critical',
+      'later_takeover',
     ]).integrations;
 
     expect(rows.map(({ id, phase }) => [id, phase])).toEqual([
-      ['critical_lifecycle', 'critical'],
+      ['takeover_lifecycle', 'takeover'],
       ...deferredIds.map((id) => [id, 'deferred']),
-      ['later_critical', 'critical'],
+      ['later_takeover', 'takeover'],
     ]);
   });
 
@@ -1361,7 +1362,7 @@ describe('browser composition', () => {
         Object.freeze({
           abi: 1,
           id: 'test',
-          phase: 'critical',
+          phase: 'takeover',
           releaseId: 'a'.repeat(64),
           prepare: ({
             interfaces,
@@ -1640,7 +1641,7 @@ describe('browser composition', () => {
           Object.freeze({
             abi: 1,
             id: 'diagnostics_probe',
-            phase: 'critical',
+            phase: 'takeover',
             releaseId,
             prepare: ({ interfaces }: IntegrationPrepareContext) => {
               expect(interfaces).not.toHaveProperty('diagnostics');
@@ -2133,7 +2134,7 @@ describe('browser composition', () => {
     vi.useFakeTimers();
     const releaseId = 'a'.repeat(64);
     const target = {};
-    const criticalMembers = Object.freeze([
+    const takeoverMembers = Object.freeze([
       ['render_runtime', createRenderRuntimeIntegrationRegistration] as const,
       ['datadome', createDataDomeIntegrationRegistration] as const,
       ['didomi', createDidomiIntegrationRegistration] as const,
@@ -2149,7 +2150,7 @@ describe('browser composition', () => {
       ['permutive_lifecycle', createPermutiveLifecycleIntegrationRegistration] as const,
       ['sourcepoint_lifecycle', createSourcepointLifecycleIntegrationRegistration] as const,
     ]);
-    const members = Object.freeze([...criticalMembers, ...deferredMembers]);
+    const members = Object.freeze([...takeoverMembers, ...deferredMembers]);
     const ids = Object.freeze(members.map(([id]) => id));
     const configFor = (id: string): unknown => {
       if (id === 'didomi') return Object.freeze({ proxyPath: '/integrations/didomi/consent/' });
@@ -2158,24 +2159,24 @@ describe('browser composition', () => {
     };
     const manifest = runtimeManifest(releaseId, ids);
     expect(manifest.integrations.map(({ id, phase }) => [id, phase])).toEqual([
-      ['render_runtime', 'critical'],
-      ['datadome', 'critical'],
-      ['didomi', 'critical'],
-      ['google_tag_manager', 'critical'],
-      ['lockr', 'critical'],
-      ['osano_consent', 'critical'],
-      ['permutive_context', 'critical'],
-      ['sourcepoint_consent', 'critical'],
-      ['testlight', 'critical'],
+      ['render_runtime', 'takeover'],
+      ['datadome', 'takeover'],
+      ['didomi', 'takeover'],
+      ['google_tag_manager', 'takeover'],
+      ['lockr', 'takeover'],
+      ['osano_consent', 'takeover'],
+      ['permutive_context', 'takeover'],
+      ['sourcepoint_consent', 'takeover'],
+      ['testlight', 'takeover'],
       ['osano_lifecycle', 'deferred'],
       ['permutive_lifecycle', 'deferred'],
       ['sourcepoint_lifecycle', 'deferred'],
     ]);
-    const criticalScript = document.createElement('script');
-    criticalScript.id = 'trustedserver-js';
-    criticalScript.src = new URL(manifest.criticalSrc, window.location.origin).href;
-    document.head.append(criticalScript);
-    let executingScript: HTMLScriptElement | null = criticalScript;
+    const runtimeScript = document.createElement('script');
+    runtimeScript.id = 'trustedserver-js';
+    runtimeScript.src = new URL(manifest.runtimeSrc, window.location.origin).href;
+    document.head.append(runtimeScript);
+    let executingScript: HTMLScriptElement | null = runtimeScript;
     const currentScript = vi
       .spyOn(document, 'currentScript', 'get')
       .mockImplementation(() => executingScript);
@@ -2217,19 +2218,19 @@ describe('browser composition', () => {
     const headAppend = vi.spyOn(document.head, 'append').mockImplementation((...nodes) => {
       originalHeadAppend(...nodes);
       for (const node of nodes) {
-        if (!(node instanceof HTMLScriptElement) || node === criticalScript) continue;
+        if (!(node instanceof HTMLScriptElement) || node === runtimeScript) continue;
         const member = deferredMembers.find(([id]) => node.src.includes(`tsjs-${id}.min.js`));
         if (!member) continue;
         executingScript = node;
         loadedDeferredIds.push(member[0]);
         expect(composition.runtime.registerIntegration(member[1](releaseId))).toBe(true);
         node.onload?.(new Event('load'));
-        executingScript = criticalScript;
+        executingScript = runtimeScript;
       }
     });
 
     expect(composition.runtime.start()).toBe(true);
-    for (const [, createRegistration] of criticalMembers) {
+    for (const [, createRegistration] of takeoverMembers) {
       expect(composition.runtime.registerIntegration(createRegistration(releaseId))).toBe(true);
     }
     await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
@@ -2251,7 +2252,7 @@ describe('browser composition', () => {
     expect(Object.getOwnPropertyDescriptor(window, 'testlight')).toEqual(testlightBefore);
     headAppend.mockRestore();
     currentScript.mockRestore();
-    criticalScript.remove();
+    runtimeScript.remove();
   });
 
   it('injects the exact creative boot into reversible activation and post-commit startup', async () => {
@@ -2720,7 +2721,7 @@ describe('browser composition', () => {
             Object.freeze({
               abi: 1,
               id: 'lifecycle_probe',
-              phase: 'critical',
+              phase: 'takeover',
               releaseId,
               prepare: ({ interfaces }: { interfaces: Readonly<Record<string, unknown>> }) => {
                 expect(interfaces).not.toHaveProperty('diagnostics');
@@ -3592,7 +3593,7 @@ describe('browser composition', () => {
         Object.freeze({
           abi: 1,
           id: 'missing',
-          phase: 'critical',
+          phase: 'takeover',
           releaseId: 'a'.repeat(64),
           prepare: latePreparation,
         })
@@ -3673,7 +3674,7 @@ describe('browser composition', () => {
           Object.freeze({
             abi: 1,
             id: 'context_test',
-            phase: 'critical',
+            phase: 'takeover',
             releaseId,
             prepare: () => Object.freeze({ activate: vi.fn() }),
           })
@@ -3732,11 +3733,11 @@ describe('browser composition', () => {
       'diagnostics_presentation',
     ]);
     const manifest = runtimeManifest(releaseId, integrationIds);
-    const criticalScript = document.createElement('script');
-    criticalScript.id = 'trustedserver-js';
-    criticalScript.src = new URL(manifest.criticalSrc, window.location.origin).href;
-    document.head.append(criticalScript);
-    let executingScript: HTMLScriptElement | null = criticalScript;
+    const runtimeScript = document.createElement('script');
+    runtimeScript.id = 'trustedserver-js';
+    runtimeScript.src = new URL(manifest.runtimeSrc, window.location.origin).href;
+    document.head.append(runtimeScript);
+    let executingScript: HTMLScriptElement | null = runtimeScript;
     const currentScript = vi
       .spyOn(document, 'currentScript', 'get')
       .mockImplementation(() => executingScript);
@@ -3869,7 +3870,7 @@ describe('browser composition', () => {
     const headAppend = vi.spyOn(document.head, 'append').mockImplementation((...nodes) => {
       originalHeadAppend(...nodes);
       for (const node of nodes) {
-        if (!(node instanceof HTMLScriptElement) || node === criticalScript) continue;
+        if (!(node instanceof HTMLScriptElement) || node === runtimeScript) continue;
         expect(node.src).toBe(
           new URL(
             manifest.integrations.find(({ id }) => id === 'diagnostics_presentation')!.src!,
@@ -3884,7 +3885,7 @@ describe('browser composition', () => {
         ).toBe(true);
         loadedPresentation();
         node.onload?.(new Event('load'));
-        executingScript = criticalScript;
+        executingScript = runtimeScript;
       }
     });
 
@@ -3899,7 +3900,7 @@ describe('browser composition', () => {
         Object.freeze({
           abi: 1,
           id: 'context_test',
-          phase: 'critical',
+          phase: 'takeover',
           releaseId,
           prepare: () => Object.freeze({ activate: vi.fn() }),
         })
@@ -4104,7 +4105,7 @@ describe('browser composition', () => {
     document.body.innerHTML = '';
     headAppend.mockRestore();
     currentScript.mockRestore();
-    criticalScript.remove();
+    runtimeScript.remove();
     preGateSlot.remove();
     vi.unstubAllGlobals();
   });

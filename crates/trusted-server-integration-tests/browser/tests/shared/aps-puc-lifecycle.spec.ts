@@ -1,11 +1,11 @@
 import { expect, test, type Page } from "@playwright/test";
 import { installGptStub } from "../../helpers/gpt-stub.js";
 import {
-  criticalTsjsFixture,
-  loadCriticalTsjsFixture,
+  loadRuntimeTsjsFixture,
+  runtimeTsjsFixture,
 } from "../../helpers/tsjs-fixture.js";
 
-const GPT_FIXTURE = criticalTsjsFixture(["render_runtime", "gpt"]);
+const GPT_FIXTURE = runtimeTsjsFixture(["render_runtime", "gpt"]);
 
 const SLOT = "puc-lifecycle-slot";
 const RESERVATION_ID = "r1_AAAAAAAAAAAAAAAAAAAAAA";
@@ -104,7 +104,7 @@ async function openLifecyclePage(
       completeOnDisplay: nonemptyCompletionOnDisplay,
     },
   );
-  await loadCriticalTsjsFixture(page, GPT_FIXTURE);
+  await loadRuntimeTsjsFixture(page, GPT_FIXTURE);
   await expect
     .poll(() =>
       page.evaluate(

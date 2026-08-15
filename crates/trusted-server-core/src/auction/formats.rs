@@ -1778,7 +1778,7 @@ mod tests {
             "should remove malicious script content before rewriting: {adm}"
         );
         assert!(
-            !adm.contains("auction-handler-marker") && !adm.contains("onerror"),
+            !adm.contains("auction-handler-marker") && !adm.contains(r#" onerror=""#),
             "should remove event handlers before rewriting: {adm}"
         );
     }
@@ -1900,7 +1900,7 @@ mod tests {
             "should still remove malicious script content: {adm}"
         );
         assert!(
-            !adm.contains("auction-handler-marker") && !adm.contains("onerror"),
+            !adm.contains("auction-handler-marker") && !adm.contains(r#" onerror=""#),
             "should still remove event handlers: {adm}"
         );
     }

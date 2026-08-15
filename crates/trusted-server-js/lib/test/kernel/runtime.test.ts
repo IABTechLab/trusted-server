@@ -11,13 +11,13 @@ import { createDiagnosticsPresentationIntegrationRegistration } from '../../src/
 import { createLifecycleIntegrationRegistration } from '../../src/kernel/lifecycle_module';
 
 const RELEASE = 'a'.repeat(64);
-const TRUSTED_CRITICAL_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
+const TRUSTED_RUNTIME_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
 
-function installTestCriticalScript(runtimeDocument: Document, takeover = false): void {
+function installTestRuntimeScript(runtimeDocument: Document, takeover = false): void {
   if (runtimeDocument.currentScript) return;
   const script = runtimeDocument.createElement('script');
   script.id = takeover ? 'trustedserver-js-runtime' : 'trustedserver-js';
-  script.src = new URL(TRUSTED_CRITICAL_SRC, runtimeDocument.location.origin).href;
+  script.src = new URL(TRUSTED_RUNTIME_SRC, runtimeDocument.location.origin).href;
   runtimeDocument.head.insertBefore(script, null);
   Object.defineProperty(runtimeDocument, 'currentScript', {
     configurable: true,
@@ -26,7 +26,7 @@ function installTestCriticalScript(runtimeDocument: Document, takeover = false):
 }
 
 function createRuntime(options: RuntimeOptions) {
-  installTestCriticalScript(options.document ?? document, options.coordinateTakeover !== undefined);
+  installTestRuntimeScript(options.document ?? document, options.coordinateTakeover !== undefined);
   return createRuntimeOwner(options);
 }
 
@@ -52,6 +52,74 @@ function boot(results: readonly object[] = []) {
   };
 }
 
+function takeoverHandoff() {
+  const projectionDigest = 'b'.repeat(64);
+  return {
+    handoff: {
+      version: 1,
+      releaseId: RELEASE,
+      generation: 1,
+      projectionDigest,
+      slices: ['first_display'],
+      slots: [
+        {
+          id: 'slot-1',
+          aliases: [],
+          domId: 'div-1',
+          gamPath: '/123/slot-1',
+          formats: [[300, 250]],
+          owner: 'trusted_server',
+          outcome: 'failed',
+          targeting: [],
+          committedArtifact: 'none',
+          gptToken: null,
+        },
+      ],
+      attempts: [
+        {
+          id: 'a1_AAECAwQFBgcAAAAAAAAAAQ',
+          slotId: 'slot-1',
+          ordinal: 1,
+          state: 'failed',
+          reason: 'internal_error',
+        },
+      ],
+      tombstones: [],
+      artifacts: [],
+      parserState: [],
+      gptDiagnostics: { facts: [], overflowCount: 0, dropCount: 0 },
+      timing: { bidsScriptMs: 0, firstDisplayMs: null, terminalMs: 0, paintMs: 0 },
+      highWater: {
+        navigationAttemptPrefix: 'AAECAwQFBgc',
+        nextNavigationAttemptOrdinal: 2,
+        nextAttemptOrdinal: 2,
+        nextSlotRegistrationOrdinal: 2,
+        reservationClockEpochMs: 0,
+        nextReservationOrdinal: 1,
+        nextTicketOrdinal: 1,
+      },
+      cycles: [],
+      trace: {
+        nextSequence: 1,
+        nextGlobalSlotOrdinal: 2,
+        slots: [{ slotId: 'slot-1', impressions: 0, bindings: [] }],
+      },
+      mutationRevision: 0,
+    },
+    outline: {
+      version: 1,
+      releaseId: RELEASE,
+      generation: 1,
+      projectionDigest,
+      slices: ['first_display'],
+      slotCount: 1,
+      outcomeCount: 1,
+      capabilities: [],
+      objectKinds: [],
+    },
+  } as const;
+}
+
 function manifest(ids: readonly string[]) {
   const deferredIds = new Set([
     'diagnostics_presentation',
@@ -64,7 +132,8 @@ function manifest(ids: readonly string[]) {
   return {
     version: 1,
     releaseId: RELEASE,
-    criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
+    firstDisplay: null,
+    runtimeSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
     integrations: ids.map((id) =>
       deferredIds.has(id)
         ? {
@@ -73,7 +142,7 @@ function manifest(ids: readonly string[]) {
             trigger: 'first_display_or_idle' as const,
             src: `/static/tsjs=tsjs-${id}.min.js?v=${'d'.repeat(64)}`,
           }
-        : { id, phase: 'critical' as const }
+        : { id, phase: 'takeover' as const }
     ),
   };
 }
@@ -137,7 +206,7 @@ describe('Runtime bootstrap owner', () => {
       },
     },
     {
-      boundary: 'no critical tag',
+      boundary: 'no takeover tag',
       arrange: () => document,
     },
     {
@@ -149,7 +218,7 @@ describe('Runtime bootstrap owner', () => {
         if (!foreignDocument) throw new Error('should expose an iframe document');
         const script = foreignDocument.createElement('script');
         script.id = 'trustedserver-js';
-        script.src = new URL(TRUSTED_CRITICAL_SRC, window.location.origin).href;
+        script.src = new URL(TRUSTED_RUNTIME_SRC, window.location.origin).href;
         foreignDocument.head.append(script);
         Object.defineProperty(document, 'currentScript', { configurable: true, value: script });
         return document;
@@ -160,7 +229,7 @@ describe('Runtime bootstrap owner', () => {
       arrange: () => {
         const script = document.createElement('script');
         script.id = 'publisher-script';
-        script.src = new URL(TRUSTED_CRITICAL_SRC, window.location.origin).href;
+        script.src = new URL(TRUSTED_RUNTIME_SRC, window.location.origin).href;
         document.head.append(script);
         Object.defineProperty(document, 'currentScript', { configurable: true, value: script });
         return document;
@@ -171,7 +240,7 @@ describe('Runtime bootstrap owner', () => {
       arrange: () => {
         const script = document.createElement('script');
         script.id = 'trustedserver-js';
-        script.src = new URL(TRUSTED_CRITICAL_SRC, window.location.origin).href;
+        script.src = new URL(TRUSTED_RUNTIME_SRC, window.location.origin).href;
         Object.defineProperty(document, 'currentScript', { configurable: true, value: script });
         return document;
       },
@@ -181,7 +250,7 @@ describe('Runtime bootstrap owner', () => {
       arrange: () => {
         const script = document.createElement('script');
         script.id = 'trustedserver-js';
-        script.src = new URL(TRUSTED_CRITICAL_SRC, window.location.origin).href;
+        script.src = new URL(TRUSTED_RUNTIME_SRC, window.location.origin).href;
         const duplicate = script.cloneNode() as HTMLScriptElement;
         document.head.append(script, duplicate);
         Object.defineProperty(document, 'currentScript', { configurable: true, value: script });
@@ -193,7 +262,7 @@ describe('Runtime bootstrap owner', () => {
       arrange: () => {
         const script = document.createElement('script');
         script.id = 'trustedserver-js';
-        script.src = `https://attacker.example${TRUSTED_CRITICAL_SRC}`;
+        script.src = `https://attacker.example${TRUSTED_RUNTIME_SRC}`;
         document.head.append(script);
         Object.defineProperty(document, 'currentScript', { configurable: true, value: script });
         return document;
@@ -204,7 +273,7 @@ describe('Runtime bootstrap owner', () => {
       arrange: () => {
         const script = document.createElement('script');
         script.id = 'trustedserver-js';
-        script.src = `${new URL(TRUSTED_CRITICAL_SRC, window.location.origin).href}#publisher`;
+        script.src = `${new URL(TRUSTED_RUNTIME_SRC, window.location.origin).href}#publisher`;
         document.head.append(script);
         Object.defineProperty(document, 'currentScript', { configurable: true, value: script });
         return document;
@@ -238,7 +307,7 @@ describe('Runtime bootstrap owner', () => {
         return document;
       },
     },
-  ])('rejects caller-supplied critical source at the $boundary boundary', ({ arrange }) => {
+  ])('rejects caller-supplied takeover source at the $boundary boundary', ({ arrange }) => {
     const runtimeDocument = arrange();
     const queued = vi.fn();
     const target = { boot: boot(), que: [queued] };
@@ -257,7 +326,7 @@ describe('Runtime bootstrap owner', () => {
         requestAds: vi.fn(),
       },
     };
-    options['trustedCriticalSrc'] = TRUSTED_CRITICAL_SRC;
+    options['trustedRuntimeSrc'] = TRUSTED_RUNTIME_SRC;
     const runtime = createRuntimeOwner(options);
 
     expect(runtime.start()).toBe(false);
@@ -294,7 +363,7 @@ describe('Runtime bootstrap owner', () => {
       runtime.registerIntegration({
         abi: 1,
         id: 'gpt',
-        phase: 'critical',
+        phase: 'takeover',
         releaseId: RELEASE,
         prepare: () => ({
           activate: ({ afterCommit }: { afterCommit(callback: () => void): void }) => {
@@ -337,7 +406,7 @@ describe('Runtime bootstrap owner', () => {
       catalog: Object.freeze([
         Object.freeze({
           id: 'render_runtime',
-          phase: 'critical' as const,
+          phase: 'takeover' as const,
           trigger: null,
           consumes: Object.freeze(['runtime.v1']),
           provides: Object.freeze(['direct.v1']),
@@ -351,7 +420,7 @@ describe('Runtime bootstrap owner', () => {
       runtime.registerIntegration({
         abi: 1,
         id: 'render_runtime',
-        phase: 'critical',
+        phase: 'takeover',
         releaseId: RELEASE,
         prepare: ({ interfaces }: { interfaces: Readonly<Record<string, unknown>> }) => {
           expect(Reflect.ownKeys(interfaces)).toEqual(['runtime.v1']);
@@ -393,7 +462,7 @@ describe('Runtime bootstrap owner', () => {
     expect(() => api.addAdUnits('late')).toThrow('inactive');
   });
 
-  it('publishes the staged critical GPT diagnostics API without waiting for presentation', async () => {
+  it('publishes the staged takeover GPT diagnostics API without waiting for presentation', async () => {
     const target: Record<string, unknown> = {};
     const renderTrace = Object.freeze({ current: vi.fn(), history: vi.fn(), subscribe: vi.fn() });
     const gpt = Object.freeze({
@@ -415,14 +484,14 @@ describe('Runtime bootstrap owner', () => {
       catalog: Object.freeze([
         Object.freeze({
           id: 'render_runtime',
-          phase: 'critical' as const,
+          phase: 'takeover' as const,
           trigger: null,
           consumes: Object.freeze(['runtime.v1']),
           provides: Object.freeze(['direct.v1']),
         }),
         Object.freeze({
           id: 'gpt_diagnostics',
-          phase: 'critical' as const,
+          phase: 'takeover' as const,
           trigger: null,
           consumes: Object.freeze(['runtime.v1']),
           provides: Object.freeze(['gpt_diag.v1']),
@@ -446,7 +515,7 @@ describe('Runtime bootstrap owner', () => {
       runtime.registerIntegration({
         abi: 1,
         id: 'render_runtime',
-        phase: 'critical',
+        phase: 'takeover',
         releaseId: RELEASE,
         prepare: () =>
           Object.freeze({
@@ -465,7 +534,7 @@ describe('Runtime bootstrap owner', () => {
       runtime.registerIntegration({
         abi: 1,
         id: 'gpt_diagnostics',
-        phase: 'critical',
+        phase: 'takeover',
         releaseId: RELEASE,
         prepare: () =>
           Object.freeze({
@@ -500,14 +569,14 @@ describe('Runtime bootstrap owner', () => {
       catalog: Object.freeze([
         Object.freeze({
           id: 'creative',
-          phase: 'critical' as const,
+          phase: 'takeover' as const,
           trigger: null,
           consumes: Object.freeze(['runtime.v1']),
           provides: Object.freeze([]),
         }),
         Object.freeze({
           id: 'gpt_diagnostics',
-          phase: 'critical' as const,
+          phase: 'takeover' as const,
           trigger: null,
           consumes: Object.freeze(['runtime.v1']),
           provides: Object.freeze(['gpt_diag.v1']),
@@ -538,7 +607,7 @@ describe('Runtime bootstrap owner', () => {
         runtime.registerIntegration({
           abi: 1,
           id,
-          phase: 'critical',
+          phase: 'takeover',
           releaseId: RELEASE,
           prepare: ({ config }: { config: unknown }) => {
             prepared.set(id, config);
@@ -580,15 +649,15 @@ describe('Runtime bootstrap owner', () => {
     vi.useFakeTimers();
     const frames: FrameRequestCallback[] = [];
     const idle: Array<() => void> = [];
-    const criticalHash = 'c'.repeat(64);
+    const runtimeHash = 'c'.repeat(64);
     const deferredHash = 'd'.repeat(64);
-    const criticalScript = document.createElement('script');
-    criticalScript.id = 'trustedserver-js';
-    criticalScript.src = `${window.location.origin}/static/tsjs=tsjs-unified.min.js?v=${criticalHash}`;
-    document.head.insertBefore(criticalScript, null);
+    const runtimeScript = document.createElement('script');
+    runtimeScript.id = 'trustedserver-js';
+    runtimeScript.src = `${window.location.origin}/static/tsjs=tsjs-unified.min.js?v=${runtimeHash}`;
+    document.head.insertBefore(runtimeScript, null);
     Object.defineProperty(document, 'currentScript', {
       configurable: true,
-      value: criticalScript,
+      value: runtimeScript,
     });
     const target: Record<string, unknown> = {};
     const deferredPrepare = vi.fn(() => Object.freeze({ activate: () => undefined }));
@@ -599,9 +668,10 @@ describe('Runtime bootstrap owner', () => {
       manifest: {
         version: 1,
         releaseId: RELEASE,
-        criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${criticalHash}`,
+        firstDisplay: null,
+        runtimeSrc: `/static/tsjs=tsjs-unified.min.js?v=${runtimeHash}`,
         integrations: [
-          { id: 'render_runtime', phase: 'critical' },
+          { id: 'render_runtime', phase: 'takeover' },
           {
             id: 'gpt_later',
             phase: 'deferred',
@@ -614,7 +684,7 @@ describe('Runtime bootstrap owner', () => {
       catalog: Object.freeze([
         Object.freeze({
           id: 'render_runtime',
-          phase: 'critical' as const,
+          phase: 'takeover' as const,
           trigger: null,
           consumes: Object.freeze([]),
           provides: Object.freeze([]),
@@ -655,7 +725,7 @@ describe('Runtime bootstrap owner', () => {
       runtime.registerIntegration({
         abi: 1,
         id: 'render_runtime',
-        phase: 'critical',
+        phase: 'takeover',
         releaseId: RELEASE,
         prepare: () => Object.freeze({ activate: () => undefined }),
       })
@@ -677,7 +747,7 @@ describe('Runtime bootstrap owner', () => {
     await Promise.resolve();
     await Promise.resolve();
     const deferredScript = [...document.head.querySelectorAll('script')].find(
-      (script) => script !== criticalScript
+      (script) => script !== runtimeScript
     );
     expect(deferredScript?.src).toContain('tsjs-gpt_later.min.js');
     Object.defineProperty(document, 'currentScript', {
@@ -703,13 +773,13 @@ describe('Runtime bootstrap owner', () => {
 
   it('loads overlay-only presentation, GPT later, and Prebid later as separate authenticated artifacts', async () => {
     vi.useFakeTimers();
-    const criticalHash = 'c'.repeat(64);
+    const runtimeHash = 'c'.repeat(64);
     const deferredHash = 'd'.repeat(64);
-    const criticalScript = document.createElement('script');
-    criticalScript.id = 'trustedserver-js';
-    criticalScript.src = `${window.location.origin}/static/tsjs=tsjs-unified.min.js?v=${criticalHash}`;
-    document.head.insertBefore(criticalScript, null);
-    let executingScript: HTMLScriptElement | null = criticalScript;
+    const runtimeScript = document.createElement('script');
+    runtimeScript.id = 'trustedserver-js';
+    runtimeScript.src = `${window.location.origin}/static/tsjs=tsjs-unified.min.js?v=${runtimeHash}`;
+    document.head.insertBefore(runtimeScript, null);
+    let executingScript: HTMLScriptElement | null = runtimeScript;
     vi.spyOn(document, 'currentScript', 'get').mockImplementation(() => executingScript);
     const frames: FrameRequestCallback[] = [];
     const idle: Array<() => void> = [];
@@ -748,8 +818,9 @@ describe('Runtime bootstrap owner', () => {
       manifest: {
         version: 1,
         releaseId: RELEASE,
-        criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${criticalHash}`,
-        integrations: [{ id: 'trace_provider', phase: 'critical' }, ...manifestEntries],
+        firstDisplay: null,
+        runtimeSrc: `/static/tsjs=tsjs-unified.min.js?v=${runtimeHash}`,
+        integrations: [{ id: 'trace_provider', phase: 'takeover' }, ...manifestEntries],
       },
       knownIntegrationIds: Object.freeze([
         'trace_provider',
@@ -759,14 +830,14 @@ describe('Runtime bootstrap owner', () => {
       catalog: Object.freeze([
         Object.freeze({
           id: 'trace_provider',
-          phase: 'critical' as const,
+          phase: 'takeover' as const,
           trigger: null,
           consumes: Object.freeze([]),
           provides: Object.freeze(['trace.v1', 'trace.presentation.v1']),
         }),
         Object.freeze({
           id: 'optional_gpt_diag_provider',
-          phase: 'critical' as const,
+          phase: 'takeover' as const,
           trigger: null,
           consumes: Object.freeze([]),
           provides: Object.freeze(['gpt_diag.v1']),
@@ -833,7 +904,7 @@ describe('Runtime bootstrap owner', () => {
       runtime.registerIntegration({
         abi: 1,
         id: 'trace_provider',
-        phase: 'critical',
+        phase: 'takeover',
         releaseId: RELEASE,
         prepare: () =>
           Object.freeze({
@@ -858,7 +929,7 @@ describe('Runtime bootstrap owner', () => {
     vi.spyOn(document.head, 'append').mockImplementation((...nodes) => {
       originalHeadAppend(...nodes);
       for (const node of nodes) {
-        if (!(node instanceof HTMLScriptElement) || node === criticalScript) continue;
+        if (!(node instanceof HTMLScriptElement) || node === runtimeScript) continue;
         const entry = manifestEntries.find(({ src }) => node.src.endsWith(src));
         if (!entry) throw new Error('Unexpected deferred artifact source');
         executingScript = node;
@@ -869,7 +940,7 @@ describe('Runtime bootstrap owner', () => {
             : createLifecycleIntegrationRegistration(entry.id, RELEASE);
         expect(runtime.registerIntegration(registration)).toBe(true);
         node.onload?.(new Event('load'));
-        executingScript = criticalScript;
+        executingScript = runtimeScript;
       }
     });
 
@@ -962,7 +1033,7 @@ describe('Runtime bootstrap owner', () => {
       runtime.registerIntegration({
         abi: 1,
         id: 'gpt',
-        phase: 'critical',
+        phase: 'takeover',
         releaseId: RELEASE,
         prepare: ({ onDispose }: { onDispose(callback: () => void): void }) => {
           order.push('module:prepare');
@@ -1006,7 +1077,17 @@ describe('Runtime bootstrap owner', () => {
       activateOwner: () => order.push('activate'),
       coordinateTakeover: (prepared) => {
         order.push('takeover:begin');
-        prepared.activate();
+        const candidate = takeoverHandoff();
+        const handoff = prepared.validateHandoff(candidate.handoff, candidate.outline);
+        expect(handoff).toBeDefined();
+        prepared.activate(
+          Object.freeze({
+            version: 1 as const,
+            adoptInitialDisplay: true as const,
+            handoff: handoff!,
+            identities: Object.freeze([]),
+          })
+        );
         order.push('takeover:activated');
         prepared.commit();
         order.push('takeover:committed');
@@ -1019,7 +1100,8 @@ describe('Runtime bootstrap owner', () => {
     });
 
     expect(runtime.start()).toBe(true);
-    await expect(runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+    const result = await runtime.install();
+    expect(result, JSON.stringify(order)).toMatchObject({ state: 'kernel' });
     expect(order).toEqual([
       'prepare',
       'takeover:begin',
@@ -1058,7 +1140,7 @@ describe('Runtime bootstrap owner', () => {
       runtime.registerIntegration({
         abi: 1,
         id: 'gpt',
-        phase: 'critical',
+        phase: 'takeover',
         releaseId: RELEASE,
         prepare: () => ({ activate: activateModule }),
       })
@@ -1121,7 +1203,7 @@ describe('Runtime bootstrap owner', () => {
       runtime.registerIntegration({
         abi: 1,
         id: 'gpt',
-        phase: 'critical',
+        phase: 'takeover',
         releaseId: RELEASE,
         prepare: () => ({
           activate: ({ afterCommit }: { afterCommit(callback: () => void): void }) => {
@@ -1204,15 +1286,15 @@ describe('Runtime bootstrap owner', () => {
     ).toBe(false);
   });
 
-  it('publishes the captured exact critical source when the manifest field is missing', async () => {
-    const criticalSrc = `/static/tsjs=tsjs-unified.min.js?v=${'d'.repeat(64)}`;
-    const criticalScript = document.createElement('script');
-    criticalScript.id = 'trustedserver-js';
-    criticalScript.src = new URL(criticalSrc, window.location.origin).href;
-    document.head.insertBefore(criticalScript, null);
+  it('publishes the captured exact takeover source when the manifest field is missing', async () => {
+    const runtimeSrc = `/static/tsjs=tsjs-unified.min.js?v=${'d'.repeat(64)}`;
+    const runtimeScript = document.createElement('script');
+    runtimeScript.id = 'trustedserver-js';
+    runtimeScript.src = new URL(runtimeSrc, window.location.origin).href;
+    document.head.insertBefore(runtimeScript, null);
     Object.defineProperty(document, 'currentScript', {
       configurable: true,
-      value: criticalScript,
+      value: runtimeScript,
     });
     const candidateManifest = {
       version: 1,
@@ -1247,25 +1329,27 @@ describe('Runtime bootstrap owner', () => {
     expect((target as { boot: { manifest: unknown } }).boot.manifest).toEqual({
       version: 1,
       releaseId: RELEASE,
-      criticalSrc,
+      firstDisplay: null,
+      runtimeSrc,
       integrations: [],
     });
   });
 
-  it('publishes the captured exact critical source when the manifest field is malformed', async () => {
-    const criticalSrc = `/static/tsjs=tsjs-unified.min.js?v=${'d'.repeat(64)}`;
-    const criticalScript = document.createElement('script');
-    criticalScript.id = 'trustedserver-js';
-    criticalScript.src = new URL(criticalSrc, window.location.origin).href;
-    document.head.insertBefore(criticalScript, null);
+  it('publishes the captured exact takeover source when the manifest field is malformed', async () => {
+    const runtimeSrc = `/static/tsjs=tsjs-unified.min.js?v=${'d'.repeat(64)}`;
+    const runtimeScript = document.createElement('script');
+    runtimeScript.id = 'trustedserver-js';
+    runtimeScript.src = new URL(runtimeSrc, window.location.origin).href;
+    document.head.insertBefore(runtimeScript, null);
     Object.defineProperty(document, 'currentScript', {
       configurable: true,
-      value: criticalScript,
+      value: runtimeScript,
     });
     const candidateManifest = {
       version: 1,
       releaseId: RELEASE,
-      criticalSrc: `${criticalSrc}&publisher=1`,
+      firstDisplay: null,
+      runtimeSrc: `${runtimeSrc}&publisher=1`,
       integrations: [],
     };
     const target = {
@@ -1296,12 +1380,13 @@ describe('Runtime bootstrap owner', () => {
     expect((target as { boot: { manifest: unknown } }).boot.manifest).toEqual({
       version: 1,
       releaseId: RELEASE,
-      criticalSrc,
+      firstDisplay: null,
+      runtimeSrc,
       integrations: [],
     });
   });
 
-  it('leaves the namespace unclaimed when no trusted critical source exists', () => {
+  it('leaves the namespace unclaimed when no trusted takeover source exists', () => {
     const target = {
       boot: boot(),
       que: [vi.fn()],
@@ -1423,7 +1508,7 @@ describe('Runtime bootstrap owner', () => {
       first.registerIntegration({
         abi: 1,
         id: 'gpt',
-        phase: 'critical',
+        phase: 'takeover',
         releaseId: RELEASE,
         prepare: ({ onDispose }: { onDispose(callback: () => void): void }) => {
           onDispose(staleDisposal);
@@ -1440,7 +1525,7 @@ describe('Runtime bootstrap owner', () => {
       second.registerIntegration({
         abi: 1,
         id: 'gpt',
-        phase: 'critical',
+        phase: 'takeover',
         releaseId: RELEASE,
         prepare: () => ({ activate: vi.fn() }),
       })
@@ -1486,7 +1571,7 @@ describe('Runtime bootstrap owner', () => {
       {
         abi: 1,
         id: 'gpt',
-        phase: 'critical',
+        phase: 'takeover',
         releaseId: RELEASE,
         prepare: () => ({ activate: staleModuleActivation }),
       },
@@ -1504,7 +1589,7 @@ describe('Runtime bootstrap owner', () => {
       second.registerIntegration({
         abi: 1,
         id: 'gpt',
-        phase: 'critical',
+        phase: 'takeover',
         releaseId: RELEASE,
         prepare: () => ({ activate: vi.fn() }),
       })
@@ -1538,7 +1623,7 @@ describe('Runtime bootstrap owner', () => {
     const firstModule = await import('../../src/kernel/runtime');
     vi.resetModules();
     const secondModule = await import('../../src/kernel/runtime');
-    installTestCriticalScript(document);
+    installTestRuntimeScript(document);
     const first = firstModule.createRuntime(options);
     const second = secondModule.createRuntime(options);
 
@@ -1581,12 +1666,12 @@ describe('Runtime bootstrap owner', () => {
       {
         abi: 1,
         id: 'gpt',
-        phase: 'critical',
+        phase: 'takeover',
         releaseId: 'b'.repeat(64),
         prepare: vi.fn(),
       },
     ],
-    ['unknown id', { abi: 1, id: 'aps', phase: 'critical', releaseId: RELEASE, prepare: vi.fn() }],
+    ['unknown id', { abi: 1, id: 'aps', phase: 'takeover', releaseId: RELEASE, prepare: vi.fn() }],
   ])(
     'classifies %s registration as abi_mismatch without invoking module code',
     async (_name, registration) => {
@@ -1618,7 +1703,7 @@ describe('Runtime bootstrap owner', () => {
     const registration = {
       abi: 1,
       id: 'gpt',
-      phase: 'critical',
+      phase: 'takeover',
       releaseId: RELEASE,
       prepare,
     };
@@ -1676,7 +1761,7 @@ describe('Runtime bootstrap owner', () => {
       runtime.registerIntegration({
         abi: 1,
         id: 'gpt',
-        phase: 'critical',
+        phase: 'takeover',
         releaseId: RELEASE,
         prepare,
       });
@@ -1706,7 +1791,7 @@ describe('Runtime bootstrap owner', () => {
     runtime.registerIntegration({
       abi: 1,
       id: 'gpt',
-      phase: 'critical',
+      phase: 'takeover',
       releaseId: RELEASE,
       prepare: () =>
         new Promise<{ activate(): void }>((resolve) => {
@@ -1737,7 +1822,7 @@ describe('Runtime bootstrap owner', () => {
     runtime.registerIntegration({
       abi: 1,
       id: 'gpt',
-      phase: 'critical',
+      phase: 'takeover',
       releaseId: RELEASE,
       prepare: () => ({
         activate: ({ afterCommit }: { afterCommit(callback: () => void): void }) =>

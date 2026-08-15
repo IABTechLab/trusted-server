@@ -47,7 +47,7 @@ import {
   createFirstDisplayParserStateCollector,
   registerFirstDisplayComponent,
   type FirstDisplayComponentRegistrationV1,
-} from '../../src/first_display/registration';
+} from '../../src/shared/first_display_registration';
 import { createDidomiRuntime } from '../../src/integrations/didomi/module';
 import { shouldProxyExternalUrl } from '../../src/integrations/creative/proxy_sign';
 import { getPermutiveSegments } from '../../src/integrations/permutive/segments';

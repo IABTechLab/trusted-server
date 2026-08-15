@@ -1,10 +1,26 @@
-import { FIRST_DISPLAY_CATALOG, type FirstDisplaySliceId } from '../kernel/release_catalog';
+import type { FirstDisplaySliceId } from '../kernel/release_catalog';
+
+/** Closure-private activation transaction shared by bootstrap and provisional base. */
 
 const HASH = /^[0-9a-f]{64}$/;
 const FIRST_DISPLAY_SRC =
   /^\/static\/tsjs=tsjs-first-display\.min\.js\?m=[0-9a-f]{4}&v=[0-9a-f]{64}$/;
 const FIRST_DISPLAY_ORDER = new Map(
-  FIRST_DISPLAY_CATALOG.map(({ id, order }) => [id, order] as const)
+  [
+    'first_display',
+    'aps_initial',
+    'creative_initial',
+    'datadome_initial',
+    'didomi_initial',
+    'google_tag_manager_initial',
+    'gpt_initial',
+    'lockr_initial',
+    'osano_initial',
+    'permutive_initial',
+    'sourcepoint_initial',
+    'prebid_initial',
+    'testlight_initial',
+  ].map((id, index) => [id, index + 1] as const)
 );
 
 export type FirstDisplayTransactionState =

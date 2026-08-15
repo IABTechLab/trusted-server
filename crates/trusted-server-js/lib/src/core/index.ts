@@ -30,6 +30,32 @@ type BootstrapTarget = object & {
   _integrationConfig?: unknown;
 };
 
+type DirectRuntimeCompletion = (outcome: 'kernel' | 'runtime_fallback' | 'failed_start') => void;
+
+function directRuntimeClaim(
+  target: BootstrapTarget
+): ((source: unknown, cancel: unknown) => DirectRuntimeCompletion | undefined) | null | undefined {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(target, '_claimDirectRuntime');
+    if (!descriptor) return undefined;
+    if (
+      !descriptor.configurable ||
+      descriptor.enumerable ||
+      descriptor.writable ||
+      !('value' in descriptor) ||
+      typeof descriptor.value !== 'function'
+    ) {
+      return null;
+    }
+    return descriptor.value as (
+      source: unknown,
+      cancel: unknown
+    ) => DirectRuntimeCompletion | undefined;
+  } catch {
+    return null;
+  }
+}
+
 export type BrowserRuntimeCompositionFactory = (
   runtimeOptions: RuntimeOptions,
   compositionOptions: Readonly<Record<string, never>>
@@ -187,6 +213,8 @@ export function startProductionRuntime(createComposition: BrowserRuntimeComposit
   if (!target) return;
   const takeover = consumeFirstDisplayTakeoverTransport(target);
   if (takeover.status === 'invalid') return;
+  const claimDirect = takeover.status === 'absent' ? directRuntimeClaim(target) : undefined;
+  if (claimDirect === null) return;
   const configs = consumeIntegrationConfig(target);
   // A malformed, accessor-backed, or undeletable transport must not survive
   // beneath either terminal namespace. Leave the namespace unclaimed.
@@ -212,13 +240,20 @@ export function startProductionRuntime(createComposition: BrowserRuntimeComposit
     },
     {}
   );
-  if (!composition.runtime.start()) return;
+  const completeDirect = claimDirect?.(document.currentScript, () => composition.runtime.dispose());
+  if (claimDirect && !completeDirect) return;
+  if (!composition.runtime.start()) {
+    completeDirect?.('failed_start');
+    return;
+  }
 
   let requested = false;
   const install = (): void => {
     if (requested) return;
     requested = true;
-    void composition.runtime.install();
+    void composition.runtime.install().then((result) => {
+      completeDirect?.(result.state === 'kernel' ? 'kernel' : 'runtime_fallback');
+    });
   };
   queueMicrotask(install);
 }

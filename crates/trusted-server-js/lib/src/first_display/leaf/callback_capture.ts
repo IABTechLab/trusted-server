@@ -1,4 +1,4 @@
-import type { FirstDisplaySliceActivationContext } from '../transaction';
+import type { FirstDisplaySliceActivationContext } from '../../shared/first_display_transaction';
 
 interface TestlightGlobal {
   que?: unknown[];

@@ -1,1 +1,1 @@
-// The mandatory render owner is co-bundled with core by the critical transport.
+// The mandatory render owner is co-bundled with the persistent runtime transport.

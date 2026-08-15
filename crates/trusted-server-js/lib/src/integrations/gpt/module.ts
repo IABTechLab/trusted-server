@@ -1696,7 +1696,7 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
     : undefined;
   if (diagnosticsFacts) scope.onDispose(diagnosticsFacts.dispose);
   let pucBridge: PucBridge | undefined;
-  let criticalReconciliationRelease: (() => void) | undefined;
+  let takeoverReconciliationRelease: (() => void) | undefined;
   let laterLifecycleActive = false;
   let laterLifecycleRelease: (() => void) | undefined;
   const gptCapability: GptCapabilityV1 = Object.freeze({
@@ -1706,11 +1706,11 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
       }
       const currentBridge = pucBridge;
       if (!currentBridge) throw new TypeError('GPT later bridge is unavailable');
-      const releaseReconciliation = criticalReconciliationRelease;
+      const releaseReconciliation = takeoverReconciliationRelease;
       if (!releaseReconciliation) {
-        throw new TypeError('GPT critical reconciliation owner is unavailable');
+        throw new TypeError('GPT takeover reconciliation owner is unavailable');
       }
-      criticalReconciliationRelease = undefined;
+      takeoverReconciliationRelease = undefined;
       const controllers = new Set<AbortController>();
       let ownerActive = true;
       laterLifecycleActive = true;
@@ -1883,9 +1883,9 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
         const release = laterLifecycleRelease;
         laterLifecycleRelease = undefined;
         release?.();
-        const releaseCriticalReconciliation = criticalReconciliationRelease;
-        criticalReconciliationRelease = undefined;
-        releaseCriticalReconciliation?.();
+        const releaseTakeoverReconciliation = takeoverReconciliationRelease;
+        takeoverReconciliationRelease = undefined;
+        releaseTakeoverReconciliation?.();
       });
 
       slotServiceRelease.current = slotCapability.attachPhysicalService(slots);
@@ -1912,7 +1912,7 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
         throw new TypeError('GPT first-display diagnostics facts are invalid');
       }
       slots.start();
-      criticalReconciliationRelease = slots.activateReconciliation();
+      takeoverReconciliationRelease = slots.activateReconciliation();
       const bridge = createPucBridge({
         messaging: messages.messaging,
         mintLifecycleTicket: render.mintLifecycleTicket,
@@ -1993,7 +1993,7 @@ export function createGptIntegrationRegistration(releaseId: string): Integration
   return Object.freeze({
     abi: 1,
     id: GPT_INTEGRATION_ID,
-    phase: 'critical',
+    phase: 'takeover',
     releaseId,
     prepare: (context: IntegrationPrepareContext) => prepareProductionGpt(context),
   });

@@ -22,7 +22,12 @@ const distributionDirectory = path.resolve(libDirectory, '..', 'dist');
 const metricsFile = 'tsjs-build-metrics-v1.json';
 const releaseFile = 'tsjs-release-v1.json';
 const catalogFile = 'tsjs-catalog-v1.json';
-const bootstrapFile = 'gpt-bootstrap-fallback.js';
+const bootstrapFile = 'tsjs-bootstrap.js';
+
+// Closure-private implementation names used only inside the inline artifact.
+// Registration, takeover, handoff, and public API protocol keys are excluded.
+const bootstrapPrivateProperties =
+  /^(?:stateValue|registrations|disposers|authenticated|reject|unwind)$/;
 
 // These properties are closure-private implementation details of the base agent.
 // Mangle only that artifact: protocol, registration, handoff, and public agent keys
@@ -33,7 +38,7 @@ const firstDisplayBasePrivateProperties =
 // These names are private to the GPT initial IIFE and never cross its protocol
 // receipt or handoff boundary. Keep the cross-artifact protocol keys authored.
 const firstDisplayGptPrivateProperties =
-  /^(?:createdSlots|diagnosticFacts|diagnosticListeners|targetingObservers|targetingRestorers|publisherCallRestorers|commandQueue|commandQueueIndex|createdBinding|renderListener|requestedListener|committedSlotsDetached|detachedSlots|diagnosticFactOverflow|diagnosticFactDrops|targetingWriteDepth|ensureBinding|restoreCreatedBinding|installListeners|removeListener|failCycle|journalPublisherTargeting|observePublisherTargeting|observePublisherCalls|restorePublisherCalls|notifyNativeMutation|captureDiagnosticFact|clearOwnedTimer|writeTargeting|invalidateTargeting)$/;
+  /^(?:binding|command|createdSlots|diagnosticFacts|diagnosticListeners|targetingObservers|targetingRestorers|publisherCallRestorers|timers|service|started|disposed|ingressClosed|firstAction|commandQueue|commandQueueIndex|createdBinding|renderListener|requestedListener|committedSlotsDetached|detachedSlots|diagnosticFactOverflow|diagnosticFactDrops|targetingWriteDepth|ensureBinding|restoreCreatedBinding|installListeners|removeListener|removePendingCommand|failCycle|failRows|journalPublisherTargeting|observePublisherTargeting|observePublisherCalls|restorePublisherCalls|restorePublisherTargeting|notifyNativeMutation|captureDiagnosticFact|clearOwnedTimer|incrementDiagnosticDrops|writeTargeting|invalidateTargeting)$/;
 
 fs.rmSync(distributionDirectory, { recursive: true, force: true });
 fs.mkdirSync(distributionDirectory, { recursive: true });
@@ -136,7 +141,7 @@ const artifacts = [
     inputs: [],
     outputs: [],
     file: bootstrapFile,
-    entry: 'integrations/gpt/bootstrap_fallback.ts',
+    entry: 'core/bootstrap.ts',
   },
   ...firstDisplayCatalog.map((entry, index) => ({
     id: entry.id,
@@ -157,7 +162,7 @@ const artifacts = [
     inputs: [],
     outputs: ['runtime.v1'],
     file: 'tsjs-core.js',
-    entry: 'composition/critical_transport.ts',
+    entry: 'composition/runtime_transport.ts',
   },
   ...releaseCatalog.map((entry) => ({
     id: entry.id,
@@ -191,15 +196,18 @@ async function buildArtifact(artifact) {
   const result = await build({
     configFile: false,
     root: libDirectory,
-    ...(['first_display', 'aps_initial'].includes(artifact.id)
-      ? { esbuild: { mangleProps: firstDisplayBasePrivateProperties } }
-      : artifact.id === 'gpt_initial'
-        ? { esbuild: { mangleProps: firstDisplayGptPrivateProperties } }
-        : {}),
+    ...(artifact.role === 'bootstrap'
+      ? { esbuild: { mangleProps: bootstrapPrivateProperties } }
+      : ['first_display', 'aps_initial'].includes(artifact.id)
+        ? { esbuild: { mangleProps: firstDisplayBasePrivateProperties } }
+        : artifact.id === 'gpt_initial'
+          ? { esbuild: { mangleProps: firstDisplayGptPrivateProperties } }
+          : {}),
     define: {
       __TSJS_EMBEDDED_RELEASE_ID_V1__: JSON.stringify(RELEASE_SENTINEL),
       __TSJS_EMBEDDED_INTEGRATION_IDS_V1__: JSON.stringify(catalogIds),
       __TSJS_EMBEDDED_RUNTIME_CATALOG_V1__: JSON.stringify(runtimeCatalog),
+      __TSJS_EMBEDDED_MAX_MANIFEST_MODULES_V1__: JSON.stringify(releaseCatalog.length),
     },
     build: {
       emptyOutDir: false,
@@ -254,7 +262,7 @@ const deferredEntries = new Set(
     .map(({ entry }) => path.normalize(`src/${entry}`))
 );
 for (const artifact of artifacts) {
-  if (artifact.role !== 'core' && artifact.phase !== 'critical') continue;
+  if (artifact.role !== 'core' && artifact.phase !== 'takeover') continue;
   const reachedDeferred = artifact.moduleIds.find((moduleId) =>
     deferredEntries.has(path.normalize(moduleId))
   );
@@ -297,7 +305,7 @@ for (const artifact of artifacts.filter(({ phase }) => phase === 'first_display'
   }
 }
 for (const artifact of artifacts.filter(
-  ({ role, phase }) => role === 'core' || phase === 'critical' || phase === 'deferred'
+  ({ role, phase }) => role === 'core' || phase === 'takeover' || phase === 'deferred'
 )) {
   const forbidden = artifact.moduleIds.find((moduleId) =>
     path.normalize(moduleId).startsWith(path.normalize('src/first_display/'))

@@ -2743,7 +2743,9 @@ pub(crate) mod coordinated_cutover_v1 {
             {
                 Some(source.clone())
             }
-            (None, Some(raw_creative), _) => {
+            (None, Some(raw_creative), None)
+                if bid.cache_host.is_none() && bid.cache_path.is_none() =>
+            {
                 let priced = crate::creative::expand_auction_price_macro(
                     raw_creative,
                     bid.price
@@ -3863,28 +3865,42 @@ mod tests {
         }
 
         #[test]
-        fn projection_preserves_current_main_adm_over_cache_precedence() {
-            let mut bid = tagged_adm_bid("slot-1", "AAAAAAAAAAAA", 1.5);
-            bid.renderer = None;
-            bid.creative = Some("<div>creative</div>".to_string());
-            bid.cache_id = Some("f47447a0-b759-4f2f-9887-af458b79b570".to_string());
-            bid.cache_host = Some("cache.example".to_string());
-            bid.cache_path = Some("/pbc/v1/cache".to_string());
-            let result = result_with_winners(vec![bid]);
-            let canonical = coordinated_cutover_v1::build_browser_auction_projection_v1(
-                &result,
-                PriceGranularity::Dense,
-                &Settings::default(),
-                "https://publisher.example",
-                None,
-                &ScriptedIdentityGenerator::new([vec![8; 16]]),
-            )
-            .expect("accepted ADM should take precedence over cache coordinates");
+        fn projection_rejects_adm_with_any_coexisting_cache_coordinate() {
+            for extra in ["id", "host", "path"] {
+                let mut bid = tagged_adm_bid("slot-1", "AAAAAAAAAAAA", 1.5);
+                bid.renderer = None;
+                bid.creative = Some("<div>creative</div>".to_string());
+                if extra == "id" {
+                    bid.cache_id = Some("f47447a0-b759-4f2f-9887-af458b79b570".to_string());
+                }
+                if extra == "host" {
+                    bid.cache_host = Some("cache.example".to_string());
+                }
+                if extra == "path" {
+                    bid.cache_path = Some("/pbc/v1/cache".to_string());
+                }
+                let generator = ScriptedIdentityGenerator::new([]);
+                let canonical = coordinated_cutover_v1::build_browser_auction_projection_v1(
+                    &result_with_winners(vec![bid]),
+                    PriceGranularity::Dense,
+                    &Settings::default(),
+                    "https://publisher.example",
+                    None,
+                    &generator,
+                )
+                .expect("ambiguous ADM source should remain attributable");
 
-            assert!(matches!(
-                canonical.projection.bids[0].render_source,
-                BidRenderSourceV1::Adm(_)
-            ));
+                assert!(canonical.projection.bids.is_empty(), "extra {extra}");
+                assert_eq!(generator.count.load(Ordering::SeqCst), 0, "extra {extra}");
+                assert_eq!(
+                    canonical.projection.auction.results[0],
+                    SlotAuctionDecisionV1::Failed {
+                        slot: "slot-1".to_string(),
+                        reason: AuctionSlotFailureReason::WinnerNotRenderable,
+                    },
+                    "extra {extra}"
+                );
+            }
         }
 
         #[test]
@@ -6582,8 +6598,8 @@ mod tests {
             .pop()
             .expect("should expose one transport selection");
         let src = registry
-            .tsjs_critical_artifact(selection)
-            .expect("should precompute selected critical artifact")
+            .tsjs_takeover_artifact(selection)
+            .expect("should precompute selected takeover artifact")
             .src();
         let req = build_request(Method::GET, &format!("https://publisher.example{src}"));
 
@@ -6612,8 +6628,8 @@ mod tests {
             .pop()
             .expect("should expose one transport selection");
         let src = registry
-            .tsjs_critical_artifact(selection)
-            .expect("should precompute selected critical artifact")
+            .tsjs_takeover_artifact(selection)
+            .expect("should precompute selected takeover artifact")
             .src();
         let get = build_request(Method::GET, &format!("https://publisher.example{src}"));
         let head = build_request(Method::HEAD, &format!("https://publisher.example{src}"));
@@ -6660,7 +6676,7 @@ mod tests {
             .tsjs_static_transport_selections(false)
             .pop()
             .expect("should expose one transport selection");
-        let ids = registry.tsjs_critical_module_ids(selection);
+        let ids = registry.tsjs_takeover_module_ids(selection);
         let src = crate::tsjs::tsjs_script_src(&ids);
         let first = build_request(Method::GET, &format!("https://publisher.example{src}"));
         let first_response =
@@ -6776,7 +6792,7 @@ mod tests {
             .tsjs_static_transport_selections(false)
             .pop()
             .expect("should expose one transport selection");
-        let ids = registry.tsjs_critical_module_ids(selection);
+        let ids = registry.tsjs_takeover_module_ids(selection);
         let hash = trusted_server_js::concatenated_hash(&ids);
         let cases = [
             (Method::OPTIONS, format!("tsjs-unified.min.js?v={hash}")),
@@ -6803,7 +6819,7 @@ mod tests {
                 format!(
                     "tsjs-creative.min.js?v={}",
                     trusted_server_js::single_module_hash("creative")
-                        .expect("should hash critical creative")
+                        .expect("should hash the creative runtime")
                 ),
             ),
         ];
@@ -6828,7 +6844,7 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_dynamic_rejects_critical_diagnostics_as_a_standalone_alias() {
+    fn tsjs_dynamic_rejects_takeover_diagnostics_as_a_standalone_alias() {
         let mut settings = create_test_settings();
         settings
             .integrations

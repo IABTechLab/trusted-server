@@ -1,12 +1,12 @@
 import { test, expect } from "@playwright/test";
 import { runtimeUrl } from "../../helpers/state.js";
 import {
-  criticalTsjsFixture,
-  routeCriticalTsjsFixture,
-  type CriticalTsjsFixture,
+  routeRuntimeTsjsFixture,
+  runtimeTsjsFixture,
+  type RuntimeTsjsFixture,
 } from "../../helpers/tsjs-fixture.js";
 
-const CREATIVE_FIXTURE = criticalTsjsFixture(["render_runtime", "creative"]);
+const CREATIVE_FIXTURE = runtimeTsjsFixture(["render_runtime", "creative"]);
 
 // Creative iframes are sandboxed WITHOUT `allow-same-origin`, so the creative
 // runtime executes in an opaque origin whose `location.href` is `about:srcdoc`.
@@ -29,7 +29,7 @@ const CREATIVE_SANDBOX_TOKENS = [
 function creativeDocument(
   origin: string,
   bundleUrl: string,
-  fixture: CriticalTsjsFixture,
+  fixture: RuntimeTsjsFixture,
   signedClick: string,
 ): string {
   const boot = JSON.stringify({
@@ -98,8 +98,8 @@ test.describe("Sandboxed creative iframe", () => {
 
     await page.goto(runtimeUrl("/"), { waitUntil: "domcontentloaded" });
 
-    await routeCriticalTsjsFixture(page, CREATIVE_FIXTURE);
-    const bundleUrl = new URL(CREATIVE_FIXTURE.criticalSrc, origin).toString();
+    await routeRuntimeTsjsFixture(page, CREATIVE_FIXTURE);
+    const bundleUrl = new URL(CREATIVE_FIXTURE.runtimeSrc, origin).toString();
 
     const rebuildResponse = page.waitForResponse(
       (response) => response.url().includes("/first-party/proxy-rebuild"),

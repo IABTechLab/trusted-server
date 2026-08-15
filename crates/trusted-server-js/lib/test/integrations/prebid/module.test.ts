@@ -39,8 +39,9 @@ function manifest(ids: readonly string[]) {
   return {
     version: 1,
     releaseId: RELEASE_ID,
-    criticalSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
-    integrations: ids.map((id) => ({ id, phase: 'critical' as const })),
+    firstDisplay: null,
+    runtimeSrc: `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`,
+    integrations: ids.map((id) => ({ id, phase: 'takeover' as const })),
   };
 }
 
@@ -48,7 +49,7 @@ function registration(
   id: string,
   prepare: IntegrationRegistration['prepare']
 ): IntegrationRegistration {
-  return Object.freeze({ abi: 1, id, phase: 'critical', releaseId: RELEASE_ID, prepare });
+  return Object.freeze({ abi: 1, id, phase: 'takeover', releaseId: RELEASE_ID, prepare });
 }
 
 function callbacks(order: string[]): IntegrationInstallCallbacks {
@@ -337,7 +338,7 @@ function initialProductionPrebidHarness(userIdModules: readonly object[]) {
   });
 }
 
-describe('production Prebid critical registration', () => {
+describe('production Prebid takeover registration', () => {
   afterEach(() => {
     delete (window as unknown as { pbjs?: unknown }).pbjs;
   });
@@ -695,7 +696,7 @@ describe('transactional test-composition Prebid boundary', () => {
   });
 });
 
-describe('RCJ-PREBID-04 prospective refresh policy', () => {
+describe('RCJ-PREBID-04 refresh policy', () => {
   function refreshHarness(
     excludedGamAdUnitPathSuffixes: readonly string[] | (() => readonly string[])
   ) {

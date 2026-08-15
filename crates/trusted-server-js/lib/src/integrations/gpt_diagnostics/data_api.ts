@@ -101,7 +101,7 @@ function disposePresentationCandidate(candidate: unknown): void {
   }
 }
 
-/** Owns the stable, data-only GPT diagnostics API published in the critical barrier. */
+/** Owns the stable, data-only GPT diagnostics API published in the takeover barrier. */
 export class GptDiagnosticsDataApiController {
   readonly api: GptDiagnosticsApi;
 

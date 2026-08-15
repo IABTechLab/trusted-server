@@ -28,7 +28,7 @@ function controller(store = new GptDiagnosticsStore()) {
   });
 }
 
-describe('critical GPT diagnostics data API', () => {
+describe('takeover GPT diagnostics data API', () => {
   it('deeply isolates delivery evidence and exports attribution issues', () => {
     const store = new GptDiagnosticsStore({ schedule: (callback) => callback() });
     const slot = Object.freeze({

@@ -1,7 +1,7 @@
 import { JSDOM } from 'jsdom';
 import { describe, expect, it, vi } from 'vitest';
 
-import { createFirstDisplayTransaction } from '../../src/first_display/transaction';
+import { createFirstDisplayTransaction } from '../../src/shared/first_display_transaction';
 
 const RELEASE_ID = 'a'.repeat(64);
 
