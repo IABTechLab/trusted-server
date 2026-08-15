@@ -182,11 +182,39 @@ function legacyBootInline(): string {
 }
 
 function exactControllerInline(document: string): string {
-  const inline = [
-    ...document.matchAll(/<script([^>]*)>([\s\S]*?)<\/script>/giu),
-  ]
-    .filter((match) => !/\bsrc\s*=/iu.test(match[1] ?? ""))
-    .map((match) => match[2] ?? "");
+  const normalized = document.toLowerCase();
+  const opening = "<script>";
+  const closing = "</script";
+  const inline: string[] = [];
+  let cursor = 0;
+  for (;;) {
+    const start = normalized.indexOf(opening, cursor);
+    if (start < 0) break;
+    const bodyStart = start + opening.length;
+    let closeStart = normalized.indexOf(closing, bodyStart);
+    let closeEnd = -1;
+    while (closeStart >= 0) {
+      closeEnd = closeStart + closing.length;
+      while (
+        closeEnd < normalized.length &&
+        (normalized[closeEnd] === " " ||
+          normalized[closeEnd] === "\t" ||
+          normalized[closeEnd] === "\n" ||
+          normalized[closeEnd] === "\r" ||
+          normalized[closeEnd] === "\f")
+      ) {
+        closeEnd += 1;
+      }
+      if (normalized[closeEnd] === ">") break;
+      closeStart = normalized.indexOf(closing, closeEnd);
+    }
+    if (closeStart < 0 || closeEnd < 0)
+      throw new Error(
+        "production controller contains an unclosed inline script",
+      );
+    inline.push(document.slice(bodyStart, closeStart));
+    cursor = closeEnd + 1;
+  }
   if (
     inline.length !== 1 ||
     !inline[0]?.includes('performance.mark("tsjs:bids-script")')

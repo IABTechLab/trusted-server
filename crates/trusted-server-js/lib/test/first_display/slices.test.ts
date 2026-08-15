@@ -696,6 +696,12 @@ describe('first-display initial slice definitions', () => {
     });
     expect((contributor?.()?.permutive_segments as readonly string[]).length).toBe(100);
     expect(route?.matches('script', 'https://cdn.permutive.com/example-web.js')).toBe(true);
+    expect(
+      route?.matches('script', 'https://cdn.permutive.com.attacker.example/example-web.js')
+    ).toBe(false);
+    expect(
+      route?.matches('script', 'https://cdn.permutive.com@attacker.example/example-web.js')
+    ).toBe(false);
     expect(route?.matches('script', 'https://cdn.permutive.com/example.js')).toBe(false);
     expect(route?.rewrite('https://cdn.permutive.com/example-web.js')).toBe(
       'https://publisher.example/integrations/permutive/sdk'

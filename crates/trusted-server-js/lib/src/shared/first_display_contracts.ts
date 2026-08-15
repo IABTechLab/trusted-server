@@ -31,7 +31,6 @@ const MAX_FORMATS = 32;
 const MAX_ALIASES = 32;
 const MAX_FACTS = 512;
 const HASH = /^[0-9a-f]{64}$/;
-const CAPABILITY = /^[a-z][a-z0-9_]*(?:[._][a-z0-9_]+)*$/;
 const FIRST_DISPLAY_ORDER = new Map(
   FIRST_DISPLAY_CONTRACT_IDS.map((id, index) => [id, index + 1] as const)
 );
@@ -92,6 +91,26 @@ function isU32(value: unknown, allowZero = true): value is number {
 
 function finiteNonnegative(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+function isCapability(value: string): boolean {
+  if (value.length === 0 || value.length > MAX_PROPERTY_BYTES) return false;
+  const first = value.charCodeAt(0);
+  if (first < 0x61 || first > 0x7a) return false;
+  let previousWasDot = false;
+  for (let index = 1; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code === 0x2e) {
+      if (previousWasDot || index === value.length - 1) return false;
+      previousWasDot = true;
+      continue;
+    }
+    const lowercase = code >= 0x61 && code <= 0x7a;
+    const digit = code >= 0x30 && code <= 0x39;
+    if (!lowercase && !digit && code !== 0x5f) return false;
+    previousWasDot = false;
+  }
+  return true;
 }
 
 function boundedString(
@@ -208,7 +227,7 @@ export function snapshotTakeoverOutlineV1(candidate: unknown): TakeoverOutlineV1
     ]);
     if (!fields) return undefined;
     const slices = snapshotSlices(fields.slices);
-    const capabilities = uniqueStrings(fields.capabilities, 32, (value) => CAPABILITY.test(value));
+    const capabilities = uniqueStrings(fields.capabilities, 32, isCapability);
     const objectKinds = uniqueStrings(
       fields.objectKinds,
       2,
