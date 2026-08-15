@@ -986,19 +986,20 @@ deployment:
     diagnostic before interpreting descriptive delivery results.
 
 Rollback is ordered so newly routed treatment traffic cannot become unmarked
-control. First record the last clean reporting boundary and stop new treatment
-assignment/routing. Verify through router or access logs that routing stopped;
-then set `gam_attribution_enabled = false` and deploy the kill switch. Fresh
-Trusted Server documents must keep normal GPT behavior while omitting the
-marker. Already-open documents—including long-lived SPA sessions and any marked
-document restored from a cache—retain page-level targeting and may continue
-issuing marked lazy or refreshed requests. Exclude the entire post-boundary
-drain interval from both cohorts. The drain ends only after router/access logs
-and GAM show no remaining `ts=true` traffic for one complete, runbook-defined
-reporting interval and a fresh synthetic navigation confirms that new documents
-are unmarked. If marked traffic persists, the interval remains excluded rather
-than being inferred as control. Historical GAM rows remain valid, and the GAM
-key may stay defined and reportable for historical analysis.
+control. First stop new treatment assignment/routing and verify through router
+or access logs that routing stopped, then record the last clean reporting
+boundary. Keep `gam_attribution_enabled = true` while already-open
+documents—including long-lived SPA sessions and any marked document restored
+from a cache—drain; they retain page-level targeting and may continue issuing
+marked lazy or refreshed requests. Exclude the entire post-boundary drain
+interval from both cohorts. The drain ends only after router/access logs and GAM
+show no remaining `ts=true` traffic for one complete, runbook-defined reporting
+interval. Then set `gam_attribution_enabled = false`, deploy the kill switch,
+and use a fresh synthetic Trusted Server navigation to confirm normal GPT
+behavior while the marker is absent. If marked traffic persists, keep
+attribution enabled and the interval excluded rather than inferring it as
+control. Historical GAM rows remain valid, and the GAM key may stay defined and
+reportable for historical analysis.
 
 If an active privacy, targeting-collision, or ad-delivery incident requires an
 immediate kill, deploy `gam_attribution_enabled = false` without waiting for
@@ -1133,8 +1134,8 @@ baseline limitation and requires coverage checks.
 13. CSP-compatible inline execution is proven before launch. A fallback-only
     page remains attributed to treatment but raises an incident and cannot be
     treated as a healthy experiment page.
-14. Normal rollback stops and verifies new treatment routing before deploying
-    the attribution kill switch, and reporting excludes already-open or cached
-    marked documents until observed traffic drains according to the documented
-    boundary rule. An emergency kill invalidates the affected and drain windows
-    instead of treating newly unmarked traffic as control.
+14. Normal rollback stops and verifies new treatment routing, records the clean
+    boundary, and keeps attribution enabled until already-open or cached marked
+    documents drain according to the documented rule. Only then is the kill
+    switch deployed. An emergency kill invalidates the affected and drain
+    windows instead of treating newly unmarked traffic as control.

@@ -905,8 +905,9 @@ This task must not add buffering or adapter logic.
   - saved report pairs are exported after the same reporting-latency and
     invalid-traffic window, and monitoring/synthetic samples do not prove
     per-response marker completeness;
-  - normal rollback stops and verifies routing before flipping the setting,
-    then excludes the open-document drain interval;
+  - normal rollback stops and verifies routing, records the boundary, keeps
+    attribution enabled through the excluded open-document drain, and flips the
+    setting only after marked traffic reaches zero;
   - an emergency kill flips immediately and invalidates the affected/drain
     interval.
 
@@ -1018,7 +1019,7 @@ This task must not add buffering or adapter logic.
   git log --oneline --decorate -8
   ```
 
-  Expected: a clean worktree, seven focused implementation commits, and no
+  Expected: a clean worktree, focused implementation commits, and no
   production changes to creative-opportunity filtering, Prebid interception,
   streaming buffering, or adapter behavior.
 
@@ -1052,10 +1053,11 @@ remain separate from Tasks 1-8 because they require publisher/router/GAM access.
       `0 <= Report B <= Report A` for every selected metric.
 - [ ] Start the sticky treatment cohort only after every gate passes; use GAM
       share versus router allocation only as a diagnostic.
-- [ ] For normal rollback, close the clean report boundary, stop and verify new
-      treatment routing, disable attribution, and exclude the marked-document
-      drain interval. For an emergency kill, disable immediately and invalidate
-      the affected plus drain intervals.
+- [ ] For normal rollback, stop and verify new treatment routing, close the
+      clean report boundary, keep attribution enabled while marked documents
+      drain through the excluded interval, and disable only after marked traffic
+      reaches zero for the agreed interval. For an emergency kill, disable
+      immediately and invalidate the affected plus drain intervals.
 
 ## Definition of done
 

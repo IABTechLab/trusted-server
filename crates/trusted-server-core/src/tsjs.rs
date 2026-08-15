@@ -11,9 +11,23 @@ pub fn tsjs_script_src(module_ids: &[&str]) -> String {
 /// `<script>` tag for injecting the tsjs bundle.
 #[must_use]
 pub fn tsjs_script_tag(module_ids: &[&str]) -> String {
+    tsjs_script_tag_with_attributes(module_ids, &[])
+}
+
+/// Publisher `<script>` tag for the tsjs bundle with trusted static attributes.
+#[must_use]
+pub fn tsjs_script_tag_with_attributes(
+    module_ids: &[&str],
+    attributes: &[(&'static str, &'static str)],
+) -> String {
+    let attributes = attributes
+        .iter()
+        .map(|(name, value)| format!(" {name}=\"{value}\""))
+        .collect::<String>();
+
     format!(
-        "<script src=\"{}\" id=\"trustedserver-js\"></script>",
-        tsjs_script_src(module_ids)
+        "<script src=\"{}\" id=\"trustedserver-js\"{attributes}></script>",
+        tsjs_script_src(module_ids),
     )
 }
 
@@ -171,18 +185,38 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_unified_helpers_use_all_module_ids() {
-        let ids = all_module_ids();
+    fn publisher_tsjs_script_tag_renders_static_attributes() {
+        let module_ids = ["gpt"];
+        let src = tsjs_script_src(&module_ids);
 
         assert_eq!(
-            tsjs_unified_script_src(),
+            tsjs_script_tag_with_attributes(&module_ids, &[("data-ts-gam-attribution", "true")]),
+            format!(
+                "<script src=\"{src}\" id=\"trustedserver-js\" data-ts-gam-attribution=\"true\"></script>"
+            ),
+            "should render trusted static attributes on the publisher bundle tag"
+        );
+        assert_eq!(
+            tsjs_script_tag(&module_ids),
+            format!("<script src=\"{src}\" id=\"trustedserver-js\"></script>"),
+            "should keep the generic tag byte-for-byte unmarked"
+        );
+    }
+
+    #[test]
+    fn tsjs_unified_helpers_use_all_module_ids() {
+        let ids = all_module_ids();
+        let src = tsjs_unified_script_src();
+
+        assert_eq!(
+            src,
             tsjs_script_src(&ids),
             "should hash all module IDs for the unified script source"
         );
         assert_eq!(
             tsjs_unified_script_tag(),
-            tsjs_script_tag(&ids),
-            "should wrap the all-module unified script source"
+            format!("<script src=\"{src}\" id=\"trustedserver-js\"></script>"),
+            "should keep the all-module generic tag byte-for-byte unmarked"
         );
     }
 
