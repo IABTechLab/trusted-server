@@ -2,8 +2,8 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 use edgezero_cli::args::{
-    ActiveVersionArgs, AuthArgs, BuildArgs, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs,
-    DeployArgs, HealthcheckArgs, ProvisionArgs, RollbackArgs, ServeArgs,
+    ActiveVersionArgs, AuthArgs, BuildArgs, ConfigDiffArgs, ConfigGcArgs, ConfigPushArgs,
+    ConfigValidateArgs, DeployArgs, HealthcheckArgs, ProvisionArgs, RollbackArgs, ServeArgs,
 };
 use trusted_server_core::config::TrustedServerAppConfig;
 
@@ -55,6 +55,8 @@ enum ConfigCommand {
     Init(ConfigInitArgs),
     /// Diff `trusted-server.toml` against the live `EdgeZero` config.
     Diff(ConfigDiffArgs),
+    /// Reclaim orphaned chunk entries leaked from prior oversized pushes.
+    Gc(ConfigGcArgs),
     /// Push `trusted-server.toml` as a blob envelope through `EdgeZero`.
     Push(ConfigPushArgs),
     /// Validate `edgezero.toml` and the typed Trusted Server config.
@@ -102,6 +104,7 @@ fn dispatch(args: Args) -> Result<(), String> {
                 Err(err) => Err(err),
             }
         }
+        Command::Config(ConfigCommand::Gc(args)) => edgezero_cli::run_config_gc(&args),
         Command::Config(ConfigCommand::Push(args)) => {
             edgezero_cli::run_config_push_typed::<TrustedServerAppConfig>(&args)
         }
@@ -300,6 +303,39 @@ mod tests {
     }
 
     #[test]
+    fn deploy_rejects_renamed_stage_flag_before_separator() {
+        // `--stage` was renamed to `--staging`, and adapter passthrough is
+        // `last = true` (only captured after `--`). A stray `--stage` before the
+        // separator must fail closed at parse time rather than being swallowed as
+        // passthrough, which would leave `staging` false and route a
+        // staging-intended deploy to production.
+        Args::try_parse_from(["ts", "deploy", "--adapter", "fastly", "--stage"])
+            .expect_err("should reject the renamed-away --stage flag, not route it to production");
+    }
+
+    #[test]
+    fn deploy_captures_adapter_passthrough_after_separator() {
+        let args = parse(&[
+            "ts",
+            "deploy",
+            "--adapter",
+            "fastly",
+            "--",
+            "--comment",
+            "ci",
+        ]);
+        let Command::Deploy(deploy) = args.command else {
+            panic!("expected deploy command");
+        };
+        assert!(!deploy.staging, "should default to a production deploy");
+        assert_eq!(
+            deploy.adapter_args,
+            vec!["--comment", "ci"],
+            "should capture args after -- as adapter passthrough"
+        );
+    }
+
+    #[test]
     fn parses_audit_with_default_outputs() {
         let args = parse(&["ts", "audit", "https://publisher.example"]);
         let Command::Audit(audit) = args.command else {
@@ -436,6 +472,54 @@ mod tests {
         assert!(!diff.local);
         assert!(!diff.exit_code);
         assert!(!diff.no_env);
+    }
+
+    #[test]
+    fn config_gc_previews_by_default() {
+        let args = parse(&["ts", "config", "gc", "--adapter", "fastly"]);
+        let Command::Config(ConfigCommand::Gc(gc)) = args.command else {
+            panic!("expected config gc command");
+        };
+        assert_eq!(gc.adapter, "fastly");
+        assert_eq!(
+            gc.older_than, None,
+            "should not require an older-than window to preview"
+        );
+        assert!(!gc.dry_run);
+        assert!(!gc.no_env);
+    }
+
+    #[test]
+    fn config_gc_parses_destructive_sweep() {
+        let args = parse(&[
+            "ts",
+            "config",
+            "gc",
+            "--adapter",
+            "fastly",
+            "--yes",
+            "--older-than",
+            "7d",
+        ]);
+        let Command::Config(ConfigCommand::Gc(gc)) = args.command else {
+            panic!("expected config gc command");
+        };
+        assert!(gc.yes);
+        assert_eq!(gc.older_than, Some("7d".to_owned()));
+    }
+
+    #[test]
+    fn config_gc_rejects_dry_run_with_yes() {
+        Args::try_parse_from([
+            "ts",
+            "config",
+            "gc",
+            "--adapter",
+            "fastly",
+            "--dry-run",
+            "--yes",
+        ])
+        .expect_err("should reject conflicting --dry-run and --yes");
     }
 
     #[test]
