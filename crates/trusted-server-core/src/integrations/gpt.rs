@@ -491,11 +491,11 @@ impl IntegrationHeadInjector for GptIntegration {
     /// route changes (see `auction/endpoints.rs`).
     /// The `POST /auction` endpoint is not involved in scroll or refresh flows.
     fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        let gam_attribution_flag = self
-            .config
-            .gam_attribution_enabled
-            .then_some("window.__tsjs_gam_attribution_enabled=true;")
-            .unwrap_or_default();
+        let gam_attribution_flag = if self.config.gam_attribution_enabled {
+            "window.__tsjs_gam_attribution_enabled=true;"
+        } else {
+            ""
+        };
 
         let mut scripts = vec![
             format!(
