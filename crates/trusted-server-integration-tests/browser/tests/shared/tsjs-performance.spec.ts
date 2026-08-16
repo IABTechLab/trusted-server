@@ -131,6 +131,12 @@ interface FixtureServerOptions {
   rejectRuntime?: boolean;
 }
 
+interface OpenFixtureOptions {
+  manualDisplay?: boolean;
+  probeAttemptResources?: boolean;
+  waitUntil?: "commit" | "load";
+}
+
 interface BrowserObservation {
   timingMs: number;
   markTimingMs: number;
@@ -1015,9 +1021,13 @@ async function openFixture(
   browser: Browser,
   fixtureServer: FixtureServer,
   resources: FixtureResources,
-  manualDisplay = false,
-  probeAttemptResources = false,
+  options: OpenFixtureOptions = {},
 ): Promise<FixtureRun> {
+  const {
+    manualDisplay = false,
+    probeAttemptResources = false,
+    waitUntil = "load",
+  } = options;
   const context = await browser.newContext();
   if (probeAttemptResources) await installAttemptResourceProbe(context);
   await installFixtureGpt(context);
@@ -1052,7 +1062,7 @@ async function openFixture(
     consoleMessages.push(`${message.type()}: ${message.text()}`),
   );
   const fixtureUrl = `${fixtureServer.origin}/fixture${manualDisplay ? "?manual=1" : ""}`;
-  await page.goto(fixtureUrl, { waitUntil: "load" });
+  await page.goto(fixtureUrl, { waitUntil });
   return {
     context,
     page,
@@ -1322,7 +1332,9 @@ async function collectHeapCheckpoints(
   fixtureServer: FixtureServer,
   resources: FixtureResources,
 ): Promise<Record<HeapCheckpoint, number>> {
-  const heapRun = await openFixture(browser, fixtureServer, resources, true);
+  const heapRun = await openFixture(browser, fixtureServer, resources, {
+    manualDisplay: true,
+  });
   const retainedHeapBytes = {} as Record<HeapCheckpoint, number>;
   try {
     await expect
@@ -1536,7 +1548,9 @@ test("generated first-display fallback releases its runtime and provisional reso
   const resources = loadReleaseFixtureResources(REPO_ROOT);
   const server = await startFixtureServer(resources, { rejectRuntime: true });
   try {
-    const run = await openFixture(browser, server, resources, false, true);
+    const run = await openFixture(browser, server, resources, {
+      probeAttemptResources: true,
+    });
     try {
       await expect
         .poll(() => run.page.evaluate(() => window.tsjs?._internal?.state))
@@ -1591,11 +1605,12 @@ test.describe("TSJS first-display performance gate", () => {
     browser,
     browserName,
   }) => {
-    // The paired comparison performs 110 cold navigations through the common
-    // first-action endpoint, then one full candidate lifecycle observation and
-    // four paired heap checkpoints. The 30-minute cap guards hosted-runner
-    // variance and evidence finalization; it is not permission to await the
-    // post-action lifecycle during every timing sample.
+    // The paired comparison opens 110 cold navigations at response commit and
+    // closes each at the common first-action endpoint, then performs one
+    // load-complete candidate lifecycle observation and four paired heap
+    // checkpoints. The 30-minute cap guards hosted-runner variance and evidence
+    // finalization; it is not permission to await the post-action lifecycle
+    // during every timing sample.
     test.setTimeout(1_800_000);
     const mode = process.env.TSJS_PERF_MODE;
     test.skip(
@@ -1627,7 +1642,9 @@ test.describe("TSJS first-display performance gate", () => {
       fixtureServer: FixtureServer,
       resources: FixtureResources,
     ): Promise<ComparisonObservation> => {
-      const run = await openFixture(browser, fixtureServer, resources);
+      const run = await openFixture(browser, fixtureServer, resources, {
+        waitUntil: "commit",
+      });
       try {
         const comparison = await observeComparisonFixture(run, resources);
         return comparison;
@@ -1695,6 +1712,7 @@ test.describe("TSJS first-display performance gate", () => {
       browser,
       candidateServer,
       candidateResources,
+      { waitUntil: "load" },
     );
     const representative = await observeFixture(
       representativeRun,
