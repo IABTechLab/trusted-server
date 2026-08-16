@@ -59,24 +59,10 @@ install_browser() {
 }
 
 run_sample() {
-  test -n "${RUNNER_TEMP:-}"
-  config_file="$RUNNER_TEMP/tsjs-performance-playwright.config.mjs"
-  printf '%s\n' \
-    'export default {' \
-    '  testDir: process.cwd(),' \
-    '  timeout: 30000,' \
-    '  retries: 0,' \
-    '  workers: 1,' \
-    '  use: { headless: true },' \
-    "  projects: [{ name: 'chromium', use: { browserName: 'chromium' } }]," \
-    "  reporter: [['list']]," \
-    "  outputDir: './test-results'" \
-    '};' > "$config_file"
-
   cd "$repository_root/crates/trusted-server-integration-tests/browser"
   npx playwright test \
     tests/shared/tsjs-performance.spec.ts \
-    --config="$config_file" \
+    --config="$repository_root/crates/trusted-server-integration-tests/browser/playwright.performance.config.ts" \
     --project=chromium \
     --workers=1
 }

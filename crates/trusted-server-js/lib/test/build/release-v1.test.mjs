@@ -2007,6 +2007,35 @@ test('APS and TSJS workflows keep feature programs in repository script files', 
       `workflow script target must exist: ${match[1]}`
     );
   }
+
+  const performanceScript = fs.readFileSync(
+    path.join(repositoryRoot, 'scripts/ci/tsjs-performance.sh'),
+    'utf8'
+  );
+  const performanceConfig =
+    'crates/trusted-server-integration-tests/browser/playwright.performance.config.ts';
+  assert.doesNotMatch(
+    performanceScript,
+    /printf[\s\S]*export default/u,
+    'the performance action must not synthesize an executable config'
+  );
+  assert.ok(
+    performanceScript.includes(`--config="$repository_root/${performanceConfig}"`),
+    'the performance action must invoke its checked-in Playwright config'
+  );
+  assert.ok(
+    fs.existsSync(path.join(repositoryRoot, performanceConfig)),
+    'the performance Playwright config must be a real repository file'
+  );
+  const performanceConfigSource = fs.readFileSync(
+    path.join(repositoryRoot, performanceConfig),
+    'utf8'
+  );
+  assert.match(
+    performanceConfigSource,
+    /timeout: 30_000[\s\S]*retries: 0[\s\S]*workers: 1[\s\S]*browserName: "chromium"/u,
+    'the checked-in performance config must preserve the immutable single-Chromium instrument'
+  );
 });
 
 test('cutover workflows bind exact release evidence and prior artifact provenance', () => {

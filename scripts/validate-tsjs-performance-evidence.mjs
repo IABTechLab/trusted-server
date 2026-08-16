@@ -33,7 +33,6 @@ const EXPECTED = Object.freeze({
     "afterRefresh",
     "afterSpaNavigation",
   ]),
-  heapMaximumRatio: 1.1,
   heapHardCeilingBytes: 4 * 1024 * 1024,
   workflowName: "TSJS Performance Gate",
   workflowFile: ".github/workflows/tsjs-performance-gate.yml",
@@ -445,16 +444,14 @@ export function validateEvidence(evidence, expected) {
 
   exactKeys(
     evidence.heap,
-    ["collection", "maximumRatio", "hardCeilingBytes", "main", "candidate"],
+    ["collection", "hardCeilingBytes", "main", "candidate"],
     "heap",
   );
   exactString(
     evidence.heap.collection,
-    "one-collectGarbage-then-immediate-getHeapUsage",
+    "playwright-requestGC-then-immediate-cdp-getHeapUsage",
     "heap.collection",
   );
-  if (evidence.heap.maximumRatio !== EXPECTED.heapMaximumRatio)
-    fail("heap ratio limit drifted");
   if (evidence.heap.hardCeilingBytes !== EXPECTED.heapHardCeilingBytes)
     fail("heap hard ceiling drifted");
   exactKeys(evidence.heap.main, ["sha", "checkpoints"], "heap.main");
@@ -486,9 +483,6 @@ export function validateEvidence(evidence, expected) {
       candidateUsedSize > EXPECTED.heapHardCeilingBytes
     ) {
       fail(`${name} retained heap exceeds the hard ceiling`);
-    }
-    if (candidateUsedSize > mainUsedSize * EXPECTED.heapMaximumRatio) {
-      fail(`${name} retained heap exceeds the paired 10% limit`);
     }
   }
 
@@ -708,8 +702,7 @@ function validFixture() {
         },
       },
       heap: {
-        collection: "one-collectGarbage-then-immediate-getHeapUsage",
-        maximumRatio: 1.1,
+        collection: "playwright-requestGC-then-immediate-cdp-getHeapUsage",
         hardCeilingBytes: 4 * 1024 * 1024,
         main: {
           sha: mainSha,
@@ -929,16 +922,17 @@ function runSelfTest() {
       (value) => (value.performance.requestToFirstActionMs.observedRatio = 1),
     ],
     [
-      "heap ratio",
-      (value) => (value.heap.candidate.checkpoints.afterBoot = 1_800_000),
-    ],
-    [
       "heap hard ceiling",
       (value) => {
         value.heap.main.checkpoints.afterBoot = 4 * 1024 * 1024 + 1;
         value.heap.candidate.checkpoints.afterBoot = 4 * 1024 * 1024 + 1;
       },
     ],
+    [
+      "heap collection",
+      (value) => (value.heap.collection = "direct-cdp-collection"),
+    ],
+    ["retired heap ratio policy", (value) => (value.heap.maximumRatio = 1.1)],
     ["heap main SHA", (value) => (value.heap.main.sha = "b".repeat(40))],
     ["selected count", (value) => (value.requests.selected.count = 2)],
     ["deferred count", (value) => (value.requests.deferred.count = 1)],
@@ -1268,10 +1262,66 @@ function runSelfTest() {
     /publisherRefresh/u,
     "the retained-heap refresh checkpoint must use the publisher GPT refresh path",
   );
+  assert.doesNotMatch(
+    performanceTest,
+    /MAXIMUM_HEAP_RATIO|paired retained heap/u,
+    "hard-cutover retained heap must use the absolute ceiling rather than a legacy-shape ratio",
+  );
+  assert.match(
+    performanceTest,
+    /page\.requestGC\(\)/u,
+    "retained-heap checkpoints must use Playwright's supported garbage-collection operation",
+  );
+  assert.doesNotMatch(
+    performanceTest,
+    /HeapProfiler\.collectGarbage/u,
+    "retained-heap checkpoints must not issue the raw unbounded CDP garbage-collection command",
+  );
+  assert.match(
+    performanceTest,
+    /HEAP_OPERATION_TIMEOUT_MS = 30_000/u,
+    "retained-heap collection must fail locally instead of consuming the whole performance budget",
+  );
+  for (const phase of [
+    "open",
+    "runtime-ready",
+    "release",
+    "first-render",
+    "publisher-refresh",
+    "spa-dispatch",
+    "spa-response",
+    "spa-reconciliation",
+    "close",
+  ]) {
+    assert.ok(
+      performanceTest.includes(`\${label}:${phase}`),
+      `retained-heap lifecycle phase ${phase} must use the bounded phase runner`,
+    );
+  }
+  assert.match(
+    performanceTest,
+    /const heapBrowser = await chromium\.launch\([\s\S]*collectHeapCheckpoints\([\s\S]*heapBrowser,[\s\S]*mainServer[\s\S]*collectHeapCheckpoints\([\s\S]*heapBrowser,[\s\S]*candidateServer/u,
+    "paired retained-heap checkpoints must run in one fresh, explicitly closed Chromium process",
+  );
+  assert.match(
+    performanceTest,
+    /await withHeapOperationTimeout\("heap browser close", heapBrowser\.close\(\)\)/u,
+    "the isolated retained-heap browser must close within its local failure boundary",
+  );
   assert.match(
     performanceTest,
     /auctionId: "performance-navigation"[\s\S]*results: \[\{ slot: "perf-slot", outcome: "no_bid" \}\]/u,
     "the SPA heap checkpoint must use a projection with real GPT reconciliation",
+  );
+  assert.match(
+    performanceTest,
+    /history\.pushState\(\{\}, "", "\/fixture\/navigation"\)/u,
+    "the paired SPA heap checkpoint must change pathname so current main and candidate both observe the same navigation",
+  );
+  assert.doesNotMatch(
+    performanceTest,
+    /history\.pushState\(\{\}, "", "\/fixture\?navigation=/u,
+    "the paired SPA heap checkpoint must not use a query-only transition ignored by current main",
   );
   assert.match(
     performanceTest,

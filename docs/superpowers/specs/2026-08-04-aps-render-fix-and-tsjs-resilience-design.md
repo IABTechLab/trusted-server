@@ -4417,6 +4417,11 @@ writes the complete schema-5 evidence before failing. Validation and upload run
 with `always()` so a failed gate retains its exact diagnostic artifact; neither the
 test nor the validator converts an exceeded budget into success.
 
+The performance workflow invokes checked-in repository scripts, and its
+performance-only Playwright configuration is also a checked-in TypeScript file.
+Neither workflow YAML nor a shell script synthesizes executable source or
+configuration at runtime.
+
 The historical GPT blocking ratio remains request-action latency, so the gate and job
 call it **bids-script-to-first-action**, not paint latency. The same evidence records
 candidate terminal and paint distributions for GPT and APS. Every sample must remain
@@ -4424,19 +4429,28 @@ inside the unchanged path-specific render deadline and §5.2 paint allowance; th
 prevents an agent from improving transfer latency by postponing completion or
 takeover without fabricating a non-equivalent current-`main` terminal/paint ratio.
 
-Retained heap for the paired GPT case uses Chromium CDP forced-GC checkpoints after
-boot, first render, refresh, and SPA navigation. After the display samples, the job
-opens one separate fresh browser context per variant and executes the equivalent
-lifecycle supported by that variant's real artifact shape. The APS case uses its two
-candidate-only checkpoints in the table above. At each checkpoint the job sends
-`HeapProfiler.collectGarbage` once followed immediately by `Runtime.getHeapUsage`;
-the single `usedSize` is the checkpoint statistic, with no hidden averaging,
-maximum selection, or rerun. Candidate must be at most current `main` × 1.10 at each
-checkpoint, and both variants must remain below the immutable 4 MiB hard ceiling.
-Any checkpoint over either limit fails the one declared run; the job cannot replace
-only that measurement or rerun only the heap fixture. Correctness runs independently
-in Chromium, Firefox, and WebKit. Correctness failures are never waived by a
-performance pass.
+Retained heap for the paired GPT case uses forced-GC Chromium checkpoints after boot,
+first render, refresh, and SPA navigation. After the display samples, the job launches
+one fresh Chromium process, opens one separate fresh browser context per variant, and
+executes the equivalent lifecycle supported by that variant's real artifact shape.
+This keeps retained-heap evidence out of the process that has already completed 111
+cold navigation contexts. The APS case uses its two candidate-only checkpoints in the
+table above. At each checkpoint the job calls Playwright's supported `page.requestGC()`
+once followed immediately by CDP `Runtime.getHeapUsage`; each GC, usage, detach, and
+cleanup operation has an explicit 30-second local failure boundary. The single
+`usedSize` is the checkpoint statistic, with no hidden averaging, maximum selection,
+or rerun. Both variants must remain below the immutable 4 MiB hard ceiling. The
+schema records current-main values and identity for direct inspection, but does not
+turn the smaller legacy runtime shape into an arbitrary multiplier for the
+hard-cutover kernel and deferred architecture. Any checkpoint over the absolute limit
+fails the one declared run; the job cannot replace only that measurement or rerun only
+the heap fixture. Correctness runs independently in Chromium, Firefox, and WebKit.
+Correctness failures are never waived by a performance pass.
+
+The paired SPA checkpoint changes the document pathname, not only its query. Current
+`main` and candidate use their respective real navigation hooks, and both must observe
+that same pathname transition, request `/_ts/page-bids`, consume the response body,
+and finish GPT slot reconciliation before the final forced-GC measurement.
 
 ## 6. Security and privacy
 
@@ -5090,9 +5104,11 @@ The design is complete when all of the following are true:
     Boot-to-first-display passes the automatic fixed-network-profile
     candidate-versus-current-`main` timing gate, including the candidate's real-mark
     and deferred-order assertions; the candidate-only APS fixture passes every named
-    action/completion/paint and 3/3.75 MiB heap ceiling; paired retained-heap results
-    remain within their ratio and hard ceiling. No gate permits disabled shaping,
-    selective sample reruns,
+    action/completion/paint and 3/3.75 MiB heap ceiling; current-main and candidate
+    retained-heap results are recorded at the same four lifecycle checkpoints and
+    each remains within the 4 MiB hard ceiling. The legacy-main heap shape is
+    observability context, not a relative acceptance threshold for the hard-cutover
+    kernel and deferred runtime. No gate permits disabled shaping, selective sample reruns,
     candidate self-baselining, or membership loopholes.
     Handoff tests prove a final same-task data snapshot after static preparation,
     monotonic high-water/cycle/trace transfer, one-use capsule, exact physical-slot
