@@ -1940,6 +1940,75 @@ test('protected real-GAM evidence is dispatchable for an unmerged branch without
   );
 });
 
+function workflowJob(source, name) {
+  const marker = `  ${name}:\n`;
+  const start = source.indexOf(marker);
+  assert.notEqual(start, -1, `workflow must contain ${name}`);
+  const remainder = source.slice(start + marker.length);
+  const nextJob = remainder.search(/^ {2}[a-zA-Z0-9_-]+:\n/mu);
+  return nextJob === -1 ? remainder : remainder.slice(0, nextJob);
+}
+
+test('APS and TSJS workflows keep feature programs in repository script files', () => {
+  const workflows = {
+    performance: fs.readFileSync(
+      path.join(repositoryRoot, '.github/workflows/tsjs-performance-gate.yml'),
+      'utf8'
+    ),
+    realGam: fs.readFileSync(
+      path.join(repositoryRoot, '.github/workflows/aps-real-gam.yml'),
+      'utf8'
+    ),
+    quality: workflowJob(
+      fs.readFileSync(path.join(repositoryRoot, '.github/workflows/test.yml'), 'utf8'),
+      'cutover-quality-evidence'
+    ),
+    conformance: workflowJob(
+      fs.readFileSync(path.join(repositoryRoot, '.github/workflows/integration-tests.yml'), 'utf8'),
+      'browser-tests-aps-tsjs-conformance'
+    ),
+    cutover: workflowJob(
+      fs.readFileSync(path.join(repositoryRoot, '.github/workflows/integration-tests.yml'), 'utf8'),
+      'cutover-suite'
+    ),
+  };
+  const combined = Object.values(workflows).join('\n');
+
+  for (const [name, workflow] of Object.entries(workflows)) {
+    assert.doesNotMatch(workflow, /^\s*run:\s*[>|]/mu, `${name} must not embed a run program`);
+    assert.doesNotMatch(workflow, /\bnode\s+-e\b/u, `${name} must not embed JavaScript`);
+    assert.doesNotMatch(
+      workflow,
+      /(?:^|\n)\s*(?:for|while)\s+\S+/u,
+      `${name} must not embed loops`
+    );
+    assert.doesNotMatch(
+      workflow,
+      /<<-?['"]?[A-Z][A-Z0-9_]*['"]?/u,
+      `${name} must not embed heredocs`
+    );
+  }
+
+  for (const script of [
+    'scripts/ci/read-toolchains.sh',
+    'scripts/ci/aps-real-gam.sh',
+    'scripts/ci/aps-tsjs-cutover.sh',
+    'scripts/ci/aps-tsjs-evidence.mjs',
+    'scripts/ci/aps-tsjs-quality.sh',
+    'scripts/ci/tsjs-performance.sh',
+  ]) {
+    assert.ok(combined.includes(script), `a workflow must invoke ${script}`);
+    assert.ok(fs.existsSync(path.join(repositoryRoot, script)), `${script} must be a real file`);
+  }
+
+  for (const match of combined.matchAll(/(?:bash|node)\s+(scripts\/ci\/[^\s"']+)/gu)) {
+    assert.ok(
+      fs.existsSync(path.join(repositoryRoot, match[1])),
+      `workflow script target must exist: ${match[1]}`
+    );
+  }
+});
+
 test('cutover workflows bind exact release evidence and prior artifact provenance', () => {
   const qualityWorkflow = fs.readFileSync(
     path.join(repositoryRoot, '.github/workflows/test.yml'),
@@ -1952,6 +2021,23 @@ test('cutover workflows bind exact release evidence and prior artifact provenanc
   const realGamWorkflow = fs.readFileSync(
     path.join(repositoryRoot, '.github/workflows/aps-real-gam.yml'),
     'utf8'
+  );
+  const qualityScript = fs.readFileSync(
+    path.join(repositoryRoot, 'scripts/ci/aps-tsjs-quality.sh'),
+    'utf8'
+  );
+  const cutoverScript = fs.readFileSync(
+    path.join(repositoryRoot, 'scripts/ci/aps-tsjs-cutover.sh'),
+    'utf8'
+  );
+  const evidenceScript = fs.readFileSync(
+    path.join(repositoryRoot, 'scripts/ci/aps-tsjs-evidence.mjs'),
+    'utf8'
+  );
+  const evidenceSelfTest = execFileSync(
+    process.execPath,
+    [path.join(repositoryRoot, 'scripts/ci/aps-tsjs-evidence.mjs'), 'self-test'],
+    { encoding: 'utf8' }
   );
   const realGamNetwork = fs.readFileSync(
     path.join(
@@ -1975,28 +2061,30 @@ test('cutover workflows bind exact release evidence and prior artifact provenanc
   ]) {
     assert.match(workflow, /evidence_id:[\s\S]*?required: true/, `${name} evidence id`);
     assert.match(workflow, /release_id:[\s\S]*?required: true/, `${name} release id`);
-    assert.match(workflow, /evidence-manifest\.json/, `${name} evidence manifest`);
-    assert.match(workflow, /commitSha/, `${name} commit SHA binding`);
-    assert.match(workflow, /runId/, `${name} run id binding`);
-    assert.match(workflow, /conclusion/, `${name} conclusion binding`);
+    assert.match(workflow, /scripts\/ci\/aps-tsjs-evidence\.mjs/, `${name} evidence script`);
   }
   for (const [name, workflow] of [
     ['integration', integrationWorkflow],
     ['real-GAM', realGamWorkflow],
   ]) {
     assert.match(workflow, /previous_artifact_id:[\s\S]*?required: true/, `${name} prior input`);
-    assert.match(workflow, /previousArtifactId/, `${name} prior artifact binding`);
   }
+  assert.match(evidenceScript, /evidence-manifest\.json/);
+  assert.match(evidenceScript, /commitSha/);
+  assert.match(evidenceScript, /runId/);
+  assert.match(evidenceScript, /conclusion/);
+  assert.match(evidenceScript, /previousArtifactId/);
+  assert.match(evidenceSelfTest, /APS\/TSJS evidence self-test passed/);
   assert.match(qualityWorkflow, /aps-tsjs-quality-\$\{\{ github\.run_id \}\}/);
-  assert.match(qualityWorkflow, /set -euo pipefail[\s\S]*?quality\.log/);
-  assert.match(qualityWorkflow, /tsjs-build-metrics-v1\.json/);
+  assert.match(qualityScript, /set -euo pipefail[\s\S]*?quality\.log/);
+  assert.match(qualityScript, /tsjs-build-metrics-v1\.json/);
   assert.match(integrationWorkflow, /aps-tsjs-cutover-\$\{\{ github\.sha \}\}/);
-  assert.match(integrationWorkflow, /for runtime in axum fastly cloudflare spin/);
-  assert.match(integrationWorkflow, /aps-proxy-\$runtime\.log/);
-  assert.match(integrationWorkflow, /--project=chromium --project=firefox --project=webkit/);
+  assert.match(cutoverScript, /for runtime in axum fastly cloudflare spin/);
+  assert.match(cutoverScript, /aps-proxy-\$runtime\.log/);
+  assert.match(cutoverScript, /--project=chromium --project=firefox --project=webkit/);
   assert.match(integrationWorkflow, /Scrub all integration evidence before upload/);
   assert.match(realGamWorkflow, /aps-real-gam-\$\{\{ github\.run_id \}\}/);
-  assert.match(realGamWorkflow, /capabilities\?/);
+  assert.match(evidenceScript, /capabilities\?/);
   assert.match(realGamNetwork, /pucRelease\.value !== expectedPucRelease/);
   assert.match(hardCutoverPolicy, /PUC package is vendored into the local harness/);
 });

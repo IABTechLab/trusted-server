@@ -367,7 +367,7 @@ git mv crates/trusted-server-js/lib/test/contract/rc-july-adoption.test.mjs crat
 
 test('the implementation plan contains no executable retired-source command', () => {
   const planSource = readFileSync(planPath, 'utf8');
-  assert.equal(countExecutableShellFences(planSource), 109);
+  assert.equal(countExecutableShellFences(planSource), 111);
   assert.deepEqual(auditRetiredPlanCommands(planSource), []);
 
   const mutatedPlanSource = planSource.replace(

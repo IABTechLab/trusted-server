@@ -21,6 +21,8 @@ on:
       - "crates/trusted-server-integration-tests/browser/**"
       - "crates/trusted-server-integration-tests/src/bin/generate-tsjs-fixture.rs"
       - "crates/trusted-server-js/**"
+      - "scripts/ci/read-toolchains.sh"
+      - "scripts/ci/tsjs-performance.sh"
       - "scripts/validate-tsjs-performance-evidence.mjs"
   workflow_dispatch:
     inputs:
@@ -70,20 +72,12 @@ jobs:
 
       - name: Validate immutable measurement inputs
         shell: bash
-        run: |
-          test "$TSJS_PERF_MODE" = preswitch || test "$TSJS_PERF_MODE" = postswitch || test "$TSJS_PERF_MODE" = pull-request
-          [[ "$TSJS_EVIDENCE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$ ]]
+        run: bash scripts/ci/tsjs-performance.sh validate-inputs
 
       - name: Read repository toolchain pins
         id: toolchains
         shell: bash
-        run: |
-          node_version="$(awk '$1 == "nodejs" { print $2 }' .tool-versions)"
-          rust_version="$(awk '$1 == "rust" { print $2 }' .tool-versions)"
-          test -n "$node_version"
-          test -n "$rust_version"
-          echo "node=$node_version" >> "$GITHUB_OUTPUT"
-          echo "rust=$rust_version" >> "$GITHUB_OUTPUT"
+        run: bash scripts/ci/read-toolchains.sh
 
       - name: Set up pinned Node.js
         uses: actions/setup-node@v4
@@ -102,73 +96,27 @@ jobs:
 
       - name: Verify installed toolchain pins
         shell: bash
-        run: |
-          test "$(node --version)" = "v24.12.0"
-          test "$(npm --version)" = "11.6.2"
-          test "$(rustc --version | awk '{ print $2 }')" = "1.95.0"
+        run: bash scripts/ci/tsjs-performance.sh verify-toolchains
 
       - name: Build the real TSJS artifacts once
-        working-directory: crates/trusted-server-js/lib
-        run: |
-          npm ci
-          npm run build
-          npm run check:bundle
-          node ../../../scripts/validate-tsjs-performance-evidence.mjs --self-test
+        run: bash scripts/ci/tsjs-performance.sh build-candidate
 
       - name: Build the exact current main artifacts
         shell: bash
-        run: |
-          git fetch origin main
-          main_sha="$(git rev-parse origin/main)"
-          main_root="$RUNNER_TEMP/tsjs-performance-main"
-          [[ "$main_sha" =~ ^[0-9a-f]{40}$ ]]
-          test "$(git cat-file -t "$main_sha")" = commit
-          git worktree add --detach "$main_root" "$main_sha"
-          npm --prefix "$main_root/crates/trusted-server-js/lib" ci
-          npm --prefix "$main_root/crates/trusted-server-js/lib" run build
-          echo "TSJS_PERF_MAIN_SHA=$main_sha" >> "$GITHUB_ENV"
-          echo "TSJS_PERF_MAIN_ROOT=$main_root" >> "$GITHUB_ENV"
+        run: bash scripts/ci/tsjs-performance.sh build-main
 
       - name: Install the lockfile-pinned Chromium setup
-        working-directory: crates/trusted-server-integration-tests/browser
-        run: |
-          npm ci
-          node -e 'const version = require("@playwright/test/package.json").version; if (version !== "1.58.2") throw new Error("unexpected Playwright " + version)'
-          npx playwright install --with-deps chromium
+        run: bash scripts/ci/tsjs-performance.sh install-browser
 
       - name: Run the complete TSJS performance sample exactly once
-        working-directory: crates/trusted-server-integration-tests/browser
         env:
           CI: "true"
           GITHUB_SHA: ${{ env.TSJS_PERF_HEAD_SHA }}
-        run: |
-          config_file="$RUNNER_TEMP/tsjs-performance-playwright.config.mjs"
-          printf "%s\n" \
-            "export default {" \
-            "  testDir: process.cwd()," \
-            "  timeout: 30000," \
-            "  retries: 0," \
-            "  workers: 1," \
-            "  use: { headless: true }," \
-            "  projects: [{ name: 'chromium', use: { browserName: 'chromium' } }]," \
-            "  reporter: [['list']]," \
-            "  outputDir: './test-results'" \
-            "};" > "$config_file"
-          npx playwright test \
-            tests/shared/tsjs-performance.spec.ts \
-            --config="$config_file" \
-            --project=chromium \
-            --workers=1
+        run: bash scripts/ci/tsjs-performance.sh run-sample
 
       - name: Validate the generated evidence before upload
         if: always()
-        run: >-
-          node scripts/validate-tsjs-performance-evidence.mjs
-          --file "$TSJS_PERF_OUTPUT"
-          --evidence-id "$TSJS_EVIDENCE_ID"
-          --head-sha "$TSJS_PERF_HEAD_SHA"
-          --main-sha "$TSJS_PERF_MAIN_SHA"
-          --mode "$TSJS_PERF_MODE"
+        run: bash scripts/ci/tsjs-performance.sh validate-evidence
 
       - name: Upload immutable TSJS performance evidence
         if: always()

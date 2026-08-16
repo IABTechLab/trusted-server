@@ -153,6 +153,92 @@ fn generated_aps_runner_proxy_configs(
     ))
 }
 
+#[cfg(feature = "aps-runner-proxy")]
+#[derive(Default)]
+struct CloudflareApsRouteReadiness {
+    consecutive_exact_contracts: u8,
+}
+
+#[cfg(feature = "aps-runner-proxy")]
+impl CloudflareApsRouteReadiness {
+    fn observe(
+        &mut self,
+        status: u16,
+        allow: Option<&str>,
+        cache_control: Option<&str>,
+        body_is_empty: bool,
+    ) -> bool {
+        let is_exact_contract = status == 405
+            && allow == Some("GET")
+            && cache_control == Some("no-store")
+            && body_is_empty;
+        self.consecutive_exact_contracts = if is_exact_contract {
+            self.consecutive_exact_contracts.saturating_add(1)
+        } else {
+            0
+        };
+        self.consecutive_exact_contracts >= 2
+    }
+}
+
+#[cfg(feature = "aps-runner-proxy")]
+fn wait_for_aps_route_ready(base_url: &str, options: super::ReadyCheckOptions) -> TestResult<()> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(options.interval)
+        .build()
+        .change_context(TestError::RuntimeSpawn)
+        .attach("failed to build Cloudflare APS readiness client")?;
+    let renderer_url = format!(
+        "{}{}",
+        base_url,
+        trusted_server_core::integrations::aps::APS_RENDERER_V1_ROUTE
+    );
+    let probe_method =
+        reqwest::Method::from_bytes(b"PROPFIND").expect("should parse PROPFIND readiness method");
+    let mut readiness = CloudflareApsRouteReadiness::default();
+
+    for _ in 0..options.max_attempts {
+        if let Ok(response) = client.request(probe_method.clone(), &renderer_url).send() {
+            let status = response.status().as_u16();
+            let allow = response
+                .headers()
+                .get(reqwest::header::ALLOW)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let cache_control = response
+                .headers()
+                .get(reqwest::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let semantic_headers_are_exact = response
+                .headers()
+                .keys()
+                .map(reqwest::header::HeaderName::as_str)
+                .filter(|name| {
+                    !matches!(
+                        *name,
+                        "connection" | "content-length" | "date" | "server" | "transfer-encoding"
+                    )
+                })
+                .all(|name| matches!(name, "allow" | "cache-control"));
+            let body_is_empty = response.bytes().is_ok_and(|body| body.is_empty());
+
+            if readiness.observe(
+                status,
+                allow.as_deref(),
+                cache_control.as_deref(),
+                semantic_headers_are_exact && body_is_empty,
+            ) {
+                return Ok(());
+            }
+        }
+
+        std::thread::sleep(options.interval);
+    }
+
+    Err(Report::new(options.timeout_error).attach(options.timeout_message))
+}
+
 impl RuntimeEnvironment for CloudflareWorkers {
     fn id(&self) -> &'static str {
         "cloudflare"
@@ -319,9 +405,8 @@ impl RuntimeEnvironment for CloudflareWorkers {
             _state_directory: Some(state_directory),
         };
         let base_url = format!("http://127.0.0.1:{port}");
-        super::wait_for_http_ready(
+        wait_for_aps_route_ready(
             &base_url,
-            trusted_server_core::integrations::aps::APS_RENDERER_V1_ROUTE,
             super::ReadyCheckOptions {
                 // Wrangler performs noticeably more startup work for the
                 // two-Worker service-binding fixture than the other local
@@ -457,5 +542,49 @@ mod tests {
             validate_loopback_fixture_url("http://127.0.0.1:1234/prebid-creative.js").is_ok(),
             "should accept an explicit loopback fixture target"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "aps-runner-proxy")]
+    fn aps_route_readiness_requires_two_consecutive_exact_contracts() {
+        let mut readiness = CloudflareApsRouteReadiness::default();
+
+        assert!(
+            !readiness.observe(405, Some("GET"), Some("no-store"), true),
+            "should not accept only one exact observation"
+        );
+        assert!(
+            !readiness.observe(503, None, None, false),
+            "should reset after a transient startup response"
+        );
+        assert!(
+            !readiness.observe(405, Some("GET"), Some("no-store"), true),
+            "should restart the consecutive count"
+        );
+        assert!(
+            readiness.observe(405, Some("GET"), Some("no-store"), true),
+            "should accept two consecutive exact observations"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "aps-runner-proxy")]
+    fn aps_route_readiness_rejects_partial_405_contracts() {
+        for (status, allow, cache_control, body_is_empty) in [
+            (200, Some("GET"), Some("no-store"), true),
+            (405, Some("POST"), Some("no-store"), true),
+            (405, Some("GET"), Some("public"), true),
+            (405, Some("GET"), Some("no-store"), false),
+        ] {
+            let mut readiness = CloudflareApsRouteReadiness::default();
+            assert!(
+                !readiness.observe(status, allow, cache_control, body_is_empty),
+                "should reject an incomplete local method contract"
+            );
+            assert!(
+                !readiness.observe(405, Some("GET"), Some("no-store"), true),
+                "should require two exact observations after rejection"
+            );
+        }
     }
 }
