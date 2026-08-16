@@ -5796,10 +5796,12 @@ document.
       and release-v1 variants stop at the common first observable action, preserving
       five warmups, 50 alternating samples per variant, the fixed network profile,
       p90 rules, and transfer budgets. After sampling, perform exactly one separate
-      full release-v1 observation for candidate marks, paint, takeover, and deferred
-      ordering, then retain the separate paired heap contexts and unchanged evidence
-      schema. Observe the source contract fail before the implementation and pass
-      after it.
+      full release-v1 observation for release identity, candidate marks, paint,
+      takeover, and deferred ordering, then retain the separate paired heap contexts
+      and unchanged evidence schema. Assert release identity only in that full
+      observation because it belongs to persistent takeover, not the earlier
+      first-action measurement boundary. Observe the source contract fail before the
+      implementation and pass after it.
 
 ### Task 24: Run final repository verification and assemble the cutover evidence
 

@@ -1221,15 +1221,27 @@ function runSelfTest() {
     /timeout-minutes: 40/u,
     "the performance job must leave setup and finalization headroom around the 30-minute browser-test budget",
   );
+  const timingVariantSource = performanceTest.match(
+    /const observeTimingVariant[\s\S]*?^    \};/mu,
+  )?.[0];
+  assert.ok(
+    timingVariantSource,
+    "the browser gate must define one bounded paired timing observer",
+  );
   assert.match(
-    performanceTest,
-    /const observeTimingVariant[\s\S]*observeComparisonFixture\(run, resources\)[\s\S]*return comparison/u,
+    timingVariantSource,
+    /observeComparisonFixture\(run, resources\)[\s\S]*return comparison/u,
     "paired warmup and measured navigations must stop at the common first-action timing endpoint",
+  );
+  assert.doesNotMatch(
+    timingVariantSource,
+    /releaseId/u,
+    "the timing observer must not wait for or assert release identity that belongs to persistent takeover",
   );
   assert.match(
     performanceTest,
-    /const representativeRun = await openFixture\([\s\S]*candidateServer,[\s\S]*candidateResources,[\s\S]*const representative = await observeFixture\([\s\S]*representativeRun,[\s\S]*candidateResources/u,
-    "the same run must retain one separate full candidate lifecycle observation for paint, takeover, and deferred-order evidence",
+    /const representativeRun = await openFixture\([\s\S]*candidateServer,[\s\S]*candidateResources,[\s\S]*const representative = await observeFixture\([\s\S]*representativeRun,[\s\S]*candidateResources[\s\S]*expect\(representative\.releaseId\)\.toBe\(\s*candidateResources\.release\?\.releaseId,?\s*\)/u,
+    "the same run must retain one separate full candidate lifecycle observation for release identity, paint, takeover, and deferred-order evidence",
   );
   assert.match(
     performanceTest,

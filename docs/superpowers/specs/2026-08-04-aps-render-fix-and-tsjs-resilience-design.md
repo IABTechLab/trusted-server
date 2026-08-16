@@ -4316,12 +4316,15 @@ safety budget. Each of the 110 paired warmup/measured navigations stops immediat
 after the common first observable action used by the timing metric; neither variant
 waits for post-action lifecycle work inside the timing sample. After sampling, the
 same test performs exactly one separate full candidate lifecycle observation for
-the candidate marks, paint, takeover, and deferred-order evidence, followed by the
-separate paired heap contexts. The budgets absorb hosted-runner variance, checkout,
-the candidate/current-`main` builds, browser setup, validation, finalization, and
-immutable upload. They do not reduce the five warmups, 50 measured samples per
-variant, fixed network profile, assertions, or evidence requirements, and they are
-not permission to repeat post-measurement lifecycle work in every sample.
+release identity, candidate marks, paint, takeover, and deferred-order evidence,
+followed by the separate paired heap contexts. Release identity is intentionally
+asserted there because it belongs to persistent takeover and need not exist at the
+earlier first-action measurement boundary. The budgets absorb hosted-runner
+variance, checkout, the candidate/current-`main` builds, browser setup, validation,
+finalization, and immutable upload. They do not reduce the five warmups, 50 measured
+samples per variant, fixed network profile, assertions, or evidence requirements,
+and they are not permission to repeat post-measurement lifecycle work in every
+sample.
 
 The job declares a paired GPT-reference case and a candidate-only APS first-display
 case. Both variants of the GPT pair use the same projection, enabled behavior,
