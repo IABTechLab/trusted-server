@@ -5793,15 +5793,16 @@ document.
 - [x] **Step B6: Stop paired performance samples at the measured endpoint.** Add a
       validator contract that fails while the release-v1 branch awaits a full
       lifecycle during every warmup and measured navigation. Make both current-main
-      and release-v1 variants stop at the common first observable action, preserving
-      five warmups, 50 alternating samples per variant, the fixed network profile,
-      p90 rules, and transfer budgets. After sampling, perform exactly one separate
-      full release-v1 observation for release identity, candidate marks, paint,
-      takeover, and deferred ordering, then retain the separate paired heap contexts
-      and unchanged evidence schema. Assert release identity only in that full
-      observation because it belongs to persistent takeover, not the earlier
-      first-action measurement boundary. Observe the source contract fail before the
-      implementation and pass after it.
+      and release-v1 timing navigations return at response commit and stop at the
+      common first observable action, without waiting for the browser `load` event;
+      preserve five warmups, 50 alternating samples per variant, the fixed network
+      profile, p90 rules, and transfer budgets. After sampling, perform exactly one
+      separate load-complete release-v1 observation for release identity, candidate
+      marks, paint, takeover, and deferred ordering, then retain the separate paired
+      heap contexts and unchanged evidence schema. Assert release identity only in
+      that full observation because it belongs to persistent takeover, not the
+      earlier first-action measurement boundary. Observe the source contract fail
+      before the implementation and pass after it.
 
 ### Task 24: Run final repository verification and assemble the cutover evidence
 

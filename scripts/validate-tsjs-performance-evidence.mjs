@@ -1233,6 +1233,11 @@ function runSelfTest() {
     /observeComparisonFixture\(run, resources\)[\s\S]*return comparison/u,
     "paired warmup and measured navigations must stop at the common first-action timing endpoint",
   );
+  assert.match(
+    timingVariantSource,
+    /openFixture\([\s\S]*\{\s*waitUntil: "commit",?\s*\}\s*\)/u,
+    "paired timing navigation must not wait for the page load event and its deferred lifecycle",
+  );
   assert.doesNotMatch(
     timingVariantSource,
     /releaseId/u,
@@ -1240,7 +1245,7 @@ function runSelfTest() {
   );
   assert.match(
     performanceTest,
-    /const representativeRun = await openFixture\([\s\S]*candidateServer,[\s\S]*candidateResources,[\s\S]*const representative = await observeFixture\([\s\S]*representativeRun,[\s\S]*candidateResources[\s\S]*expect\(representative\.releaseId\)\.toBe\(\s*candidateResources\.release\?\.releaseId,?\s*\)/u,
+    /const representativeRun = await openFixture\([\s\S]*candidateServer,[\s\S]*candidateResources,[\s\S]*\{\s*waitUntil: "load"\s*\}[\s\S]*const representative = await observeFixture\([\s\S]*representativeRun,[\s\S]*candidateResources[\s\S]*expect\(representative\.releaseId\)\.toBe\(\s*candidateResources\.release\?\.releaseId,?\s*\)/u,
     "the same run must retain one separate full candidate lifecycle observation for release identity, paint, takeover, and deferred-order evidence",
   );
   assert.match(
