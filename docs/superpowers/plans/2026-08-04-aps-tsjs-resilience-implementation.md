@@ -5708,6 +5708,79 @@ not create another design, plan, cache specification, or evidence document.
       ratio is a release blocker to remediate, not permission to relabel main,
       restore the frozen-reference gate, or loosen the threshold.
 
+### Task 23B: Extract CI programs and stabilize Cloudflare APS readiness
+
+This remediation keeps the feature workflows reviewable and closes the observed
+Wrangler startup race without weakening the adapter contract. It amends the existing
+specification and plan only; it creates no additional design, plan, cache, or evidence
+document.
+
+**Files:**
+
+- Modify: `.github/workflows/aps-real-gam.yml`
+- Modify: `.github/workflows/integration-tests.yml`
+- Modify: `.github/workflows/test.yml`
+- Modify: `.github/workflows/tsjs-performance-gate.yml`
+- Create: `scripts/ci/read-toolchains.sh`
+- Create: `scripts/ci/aps-real-gam.sh`
+- Create: `scripts/ci/aps-tsjs-cutover.sh`
+- Create: `scripts/ci/aps-tsjs-evidence.mjs`
+- Create: `scripts/ci/aps-tsjs-quality.sh`
+- Create: `scripts/ci/tsjs-performance.sh`
+- Modify: `crates/trusted-server-js/lib/test/build/release-v1.test.mjs`
+- Modify: `scripts/validate-tsjs-performance-evidence.mjs`
+- Modify: `crates/trusted-server-integration-tests/tests/environments/cloudflare.rs`
+
+- [x] **Step B1: Test-drive the workflow source-shape contract.** Add a focused
+      release test that scopes itself to the APS/TSJS jobs introduced by this plan,
+      rejects multiline or folded `run` programs, `node -e`, shell loops, heredocs,
+      and generated configuration bodies, and verifies every referenced
+      `scripts/ci/` target exists. Move existing workflow-content assertions so they
+      inspect the owning script while continuing to prove exact-main resolution,
+      immutable inputs, browser selection, adapter coverage, release binding,
+      manifest fields, and evidence scrubbing. Observe RED against the existing
+      inline workflow programs before creating scripts.
+
+  ```bash
+  npm --prefix crates/trusted-server-js/lib test -- --run \
+    test/build/release-v1.test.mjs
+  node scripts/validate-tsjs-performance-evidence.mjs --self-test
+  ```
+
+- [x] **Step B2: Extract feature-owned CI logic into focused repository scripts.**
+      `read-toolchains.sh` owns checked repository-pin extraction;
+      `tsjs-performance.sh` owns performance input/toolchain validation, candidate
+      and exact-current-main builds, pinned browser installation, sample execution,
+      and evidence validation; the quality and cutover scripts own their respective
+      command sequences and runtime/browser matrices; `aps-real-gam.sh` owns
+      protected-input validation and its browser invocation; and
+      `aps-tsjs-evidence.mjs` owns schema-1 manifest writing plus pre-upload evidence
+      scrubbing. Rewire workflow steps to invoke these files with simple one-command
+      `run` values. Keep ordinary one-line package, Cargo, and existing-script calls
+      direct. Do not introduce a monolithic dispatcher, change a command, skip an
+      adapter/browser, expose a secret as an argument, or alter an artifact path.
+
+- [x] **Step B3: Test-drive Cloudflare route-stability readiness.** Add a unit-tested
+      readiness observation state machine. Only an exact renderer-route `405` with
+      `Allow: GET` and `Cache-Control: no-store` advances the count, every other
+      response resets it, and readiness requires two consecutive accepted
+      observations. Replace the Cloudflare harness's generic one-`GET` readiness
+      check with repeated real `PROPFIND` requests using that state machine. Keep the
+      actual adapter corpus's independent first `PROPFIND` expectation unchanged.
+
+  ```bash
+  cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml \
+    --features aps-runner-proxy environments::cloudflare -- --nocapture
+  ./scripts/integration-tests-aps-runner-proxy.sh --runtime cloudflare
+  ```
+
+- [x] **Step B4: Verify the extraction and unchanged behavior.** Run YAML parsing,
+      repository formatting, the focused release/performance self-tests, all APS
+      proxy route/unit tests, and the exact Cloudflare runtime corpus. Then run the
+      four-runtime APS proxy corpus and the full TSJS release/quality gates before
+      replacing Task-24 evidence. A script extraction is not green if a gate,
+      browser, runtime, security check, manifest field, or uploaded path disappears.
+
 ### Task 24: Run final repository verification and assemble the cutover evidence
 
 **Files:**
@@ -5715,6 +5788,13 @@ not create another design, plan, cache specification, or evidence document.
 - Modify: `.github/workflows/test.yml`
 - Modify: `.github/workflows/integration-tests.yml`
 - Modify: `.github/workflows/aps-real-gam.yml`
+- Modify: `.github/workflows/tsjs-performance-gate.yml`
+- Modify: `scripts/ci/aps-real-gam.sh`
+- Modify: `scripts/ci/aps-tsjs-cutover.sh`
+- Modify: `scripts/ci/aps-tsjs-evidence.mjs`
+- Modify: `scripts/ci/aps-tsjs-quality.sh`
+- Modify: `scripts/ci/read-toolchains.sh`
+- Modify: `scripts/ci/tsjs-performance.sh`
 - Do not create another plan/design/runbook; workflow artifacts are the evidence
 
 - [ ] **Step 1: Run formatting:**

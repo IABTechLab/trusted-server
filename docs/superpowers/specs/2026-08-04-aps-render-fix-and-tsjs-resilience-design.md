@@ -1604,6 +1604,16 @@ Cloudflare and Spin wasm, rather than injecting already-normalized core response
 adapter that cannot preserve the raw evidence, common cap, or total deadline cannot
 enable APS and blocks the release.
 
+Runtime-harness readiness is distinct from endpoint acceptance. In particular, the
+Cloudflare/Wrangler harness must not declare the service ready merely because one
+worker answers an unrelated `GET` while a service-binding worker can still return a
+transient startup `503`. Before the adversarial corpus begins, that harness requires
+two consecutive requests to the actual renderer route using the deliberately
+unsupported `PROPFIND` method to return the complete local `405` contract, including
+`Allow: GET` and `Cache-Control: no-store`; any other result resets the consecutive
+count. This readiness probe does not replace or relax the corpus's own independent
+`PROPFIND` assertion, and production request handling remains unchanged.
+
 No APS runner bytes, digest, vendor-version record, redistribution license, update
 script, generated artifact, or offline fallback is stored in Trusted Server source or
 release artifacts. The runner route is live, unversioned, unvendored, unpinned, and
@@ -4469,6 +4479,25 @@ performance pass.
 | Adapter parity        | exact renderer sandbox/CSP/header bytes plus runner-proxy routing, five-second deadline, closed response parsing, bounded relay, header filtering, and failures match on all adapters                                                                                                                                                                                                             |
 | Regression            | non-APS Cache/ADM and notifications, pure external Prebid/native bids/EIDs/user IDs/refresh exclusions, publisher GPT/handoff/SRA/SPA, creative processing/click recovery, render trace/GPT diagnostics, and every remaining integration remain correct                                                                                                                                           |
 | Quality               | full-package TypeScript/lint including tests/scripts/build code, ESLint and release-catalog dependency boundaries, production-metafile/test-hook exclusions, format, clippy, Rust adapter suites, Vitest, artifact integration, Playwright, immutable historical bundle reporting, role-correct transfer budgets, performance/heap budgets, and complete maximal inventory                        |
+
+Feature-owned GitHub Actions YAML is declarative orchestration, not a program
+container. Multiline shell programs, generated configuration bodies, validation
+branches, loops, release-manifest writers, and evidence scrubbers introduced by this
+design live in reviewable repository files under `scripts/ci/`. Workflow `run` steps
+may invoke those scripts or use a simple one-command tool invocation such as
+`npm ci`, `cargo test-axum`, or an existing `./scripts/...` entrypoint; they must not
+embed `node -e`, heredocs, shell loops, generated-file bodies, or folded/multiline
+program logic. Shared toolchain extraction and evidence handling are reused rather
+than copied between workflows, while workflow-specific orchestration remains in
+focused scripts instead of one opaque dispatcher.
+
+Repository contract tests read both the workflow and the referenced script files.
+They reject feature-owned embedded workflow programs and missing script targets,
+then assert the security, release-binding, exact-main, performance, browser-matrix,
+adapter-corpus, manifest, and evidence-scrubbing behavior in the scripts that own it.
+This source-shape rule changes only how CI logic is maintained; it does not weaken a
+gate, broaden secret exposure, alter protected-environment admission, or introduce a
+second evidence format.
 
 ### 7.2 Mandatory race matrix
 

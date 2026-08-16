@@ -1021,6 +1021,14 @@ function runSelfTest() {
     new URL(".github/workflows/tsjs-performance-gate.yml", repositoryRoot),
     "utf8",
   );
+  const performanceWorkflowScript = readFileSync(
+    new URL("scripts/ci/tsjs-performance.sh", repositoryRoot),
+    "utf8",
+  );
+  const toolchainScript = readFileSync(
+    new URL("scripts/ci/read-toolchains.sh", repositoryRoot),
+    "utf8",
+  );
   const generatorSource = readFileSync(
     new URL(
       "crates/trusted-server-integration-tests/src/bin/generate-tsjs-fixture.rs",
@@ -1152,9 +1160,9 @@ function runSelfTest() {
     "the browser gate must softly collect all evidence while enforcing every transfer encoding",
   );
   assert.match(
-    performanceWorkflow,
+    performanceWorkflowScript,
     /git fetch origin main[\s\S]*main_sha="\$\(git rev-parse origin\/main\)"[\s\S]*TSJS_PERF_MAIN_SHA/u,
-    "the performance workflow must resolve and export the exact current main SHA",
+    "the performance workflow script must resolve and export the exact current main SHA",
   );
   assert.match(
     performanceWorkflow,
@@ -1174,9 +1182,9 @@ function runSelfTest() {
     );
   }
   assert.match(
-    performanceWorkflow,
-    /validate-tsjs-performance-evidence\.mjs --self-test/u,
-    "the performance workflow must execute transfer/schema negative fixtures before measurement",
+    performanceWorkflowScript,
+    /validate-tsjs-performance-evidence\.mjs"? --self-test/u,
+    "the performance workflow script must execute transfer/schema negative fixtures before measurement",
   );
   assert.match(
     performanceWorkflow,
@@ -1189,7 +1197,7 @@ function runSelfTest() {
     "the performance workflow must not attest a pull-request merge SHA as the source commit",
   );
   assert.doesNotMatch(
-    performanceWorkflow,
+    `${performanceWorkflow}\n${performanceWorkflowScript}`,
     /62421ee44c62f24534ea8782a46dfa5bfbcea950/u,
     "the performance workflow must never build a frozen reference instead of current main",
   );
@@ -1239,29 +1247,29 @@ function runSelfTest() {
     "the SPA heap checkpoint must await the response body and reconciled GPT slot",
   );
   assert.doesNotMatch(
-    performanceWorkflow,
+    `${performanceWorkflow}\n${performanceWorkflowScript}`,
     /setup-integration-test-env|VICEROY|WASM_ARTIFACT|build-test-images/u,
     "the hermetic performance fixture must not build unused runtime infrastructure",
   );
   assert.match(
-    performanceWorkflow,
-    /node_version="\$\(awk '\$1 == "nodejs" \{ print \$2 \}' \.tool-versions\)"/u,
-    "the performance workflow must extract the pinned Node.js version with valid awk quoting",
+    toolchainScript,
+    /node_version="\$\(awk '\$1 == "nodejs" \{ print \$2 \}' "\$tool_versions"\)"/u,
+    "the toolchain script must extract the pinned Node.js version with valid awk quoting",
   );
   assert.match(
-    performanceWorkflow,
-    /rust_version="\$\(awk '\$1 == "rust" \{ print \$2 \}' \.tool-versions\)"/u,
-    "the performance workflow must extract the pinned Rust version with valid awk quoting",
+    toolchainScript,
+    /rust_version="\$\(awk '\$1 == "rust" \{ print \$2 \}' "\$tool_versions"\)"/u,
+    "the toolchain script must extract the pinned Rust version with valid awk quoting",
   );
   assert.match(
-    performanceWorkflow,
+    toolchainScript,
     /test -n "\$node_version"[\s\S]*test -n "\$rust_version"/u,
-    "the performance workflow must reject empty toolchain pins",
+    "the toolchain script must reject empty toolchain pins",
   );
   assert.match(
-    performanceWorkflow,
-    /test "\$\(node --version\)" = "v24\.12\.0"[\s\S]*test "\$\(npm --version\)" = "11\.6\.2"[\s\S]*test "\$\(rustc --version \| awk '\{ print \$2 \}'\)" = "1\.95\.0"/u,
-    "the performance workflow must verify the installed Node.js, npm, and Rust versions",
+    performanceWorkflowScript,
+    /test "\$\(node --version\)" = "v\$node_version"[\s\S]*test "\$\(npm --version\)" = "11\.6\.2"[\s\S]*test "\$\(rustc --version \| awk '\{ print \$2 \}'\)" = "\$rust_version"/u,
+    "the performance workflow script must verify the installed Node.js, npm, and Rust versions",
   );
   assert.match(
     integrationWorkflow,
