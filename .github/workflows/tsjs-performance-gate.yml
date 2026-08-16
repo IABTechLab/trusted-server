@@ -59,7 +59,7 @@ jobs:
   measure:
     name: measure ${{ inputs.mode || 'pull-request' }} (${{ inputs.evidence_id || format('tsjs-pr-{0}', github.run_id) }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 40
     env:
       TSJS_EVIDENCE_ID: ${{ inputs.evidence_id || format('tsjs-pr-{0}', github.run_id) }}
       TSJS_PERF_MODE: ${{ inputs.mode || 'pull-request' }}

@@ -1213,8 +1213,13 @@ function runSelfTest() {
   );
   assert.match(
     performanceTest,
-    /test\.setTimeout\(1_500_000\)/u,
-    "the browser gate must leave enough time to collect and write failure evidence after the 20-minute sample",
+    /test\.setTimeout\(1_800_000\)/u,
+    "the browser gate must leave enough time to collect heap checkpoints and write evidence after the 25-minute sample",
+  );
+  assert.match(
+    performanceWorkflow,
+    /timeout-minutes: 40/u,
+    "the performance job must leave setup and finalization headroom around the 30-minute browser-test budget",
   );
   assert.match(
     performanceTest,
