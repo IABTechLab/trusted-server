@@ -1630,9 +1630,6 @@ test.describe("TSJS first-display performance gate", () => {
       const run = await openFixture(browser, fixtureServer, resources);
       try {
         const comparison = await observeComparisonFixture(run, resources);
-        if (resources.artifactModel === "release-v1") {
-          expect(comparison.releaseId).toBe(resources.release?.releaseId);
-        }
         return comparison;
       } finally {
         await run.close();
@@ -1703,6 +1700,9 @@ test.describe("TSJS first-display performance gate", () => {
       representativeRun,
       candidateResources,
     ).finally(() => representativeRun.close());
+    expect(representative.releaseId).toBe(
+      candidateResources.release?.releaseId,
+    );
 
     const mainHeapBytes = await collectHeapCheckpoints(
       browser,
