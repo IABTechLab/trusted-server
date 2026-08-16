@@ -310,6 +310,69 @@ describe('scheduleInitialAdInit', () => {
     expect(adInit).toHaveBeenCalledTimes(1);
   });
 
+  it('applies the SSR slot definitions on the initial document', async () => {
+    // Under a shared-template mode the head script emits no `tsjs.adSlots`, so the
+    // `</body>` seam is the only source of slot definitions. They must arrive, or
+    // `adInit()` iterates an empty list and the page defines no TS slots at all.
+    await importGptModule();
+    const ts = (window as TestWindow).tsjs!;
+    ts.adInit = vi.fn();
+    const ssrSlot = {
+      id: 'ssr_slot',
+      gam_unit_path: '/123/ssr',
+      div_id: 'div-ssr',
+      formats: [[728, 90]] as Array<[number, number]>,
+    };
+
+    ts.scheduleInitialAdInit!({ ssr_slot: { hb_pb: '1.00' } }, [ssrSlot]);
+
+    expect(ts.adSlots).toEqual([ssrSlot]);
+    expect(ts.bids).toEqual({ ssr_slot: { hb_pb: '1.00' } });
+  });
+
+  it('drops the SSR slot definitions when a navigation has already committed', async () => {
+    // The guard covered the bids and the adInit call, but the shared-template seam
+    // assigned `tsjs.adSlots` on the line *before* calling the scheduler — outside the
+    // guard entirely. A navigation that committed while the SSR document was still
+    // streaming therefore kept its own bids and silently lost its slots to the stale
+    // SSR payload, and the next `adInit()` for that route defined the wrong slots.
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({ slots: [], bids: {} }),
+    });
+    await importGptModule();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    history.pushState({}, '', '/b');
+    await flushAsync();
+    expect(ts.navGeneration).toBe(1);
+    const liveSlot = {
+      id: 'live_slot',
+      gam_unit_path: '/123/live',
+      div_id: 'div-live',
+      formats: [[300, 250]] as Array<[number, number]>,
+    };
+    ts.adSlots = [liveSlot];
+
+    ts.scheduleInitialAdInit!({ ssr_slot: { hb_pb: '1.00' } }, [
+      {
+        id: 'ssr_slot',
+        gam_unit_path: '/123/ssr',
+        div_id: 'div-ssr',
+        formats: [[728, 90]],
+      },
+    ]);
+
+    expect(ts.adSlots).toEqual([liveSlot]);
+
+    window.dispatchEvent(new Event('load'));
+    flushFrame();
+    flushFrame();
+    expect(adInit).not.toHaveBeenCalled();
+  });
+
   it('cancels queued GPT work when a navigation commits before the command queue drains', async () => {
     // adInit() only queues its slot work on googletag.cmd, which drains when
     // GPT itself loads — possibly long after the generation check that

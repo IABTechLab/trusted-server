@@ -665,7 +665,15 @@ function installInitialLoadDetector(ts: TsjsApi): void {
  * SSR bootstrap as current. For the same reason the initial bids payload is
  * passed in and applied here, generation-guarded — assigning it
  * unconditionally at body end would clobber the live bids a faster SPA
- * navigation already applied. When a navigation has committed since — or
+ * navigation already applied.
+ *
+ * `initialSlots` is passed in for exactly the same reason and was missing it.
+ * Only the shared-template `</body>` seam sends slots — under `inline` they
+ * come from the head script, which runs before any navigation can commit — and
+ * that seam assigned `tsjs.adSlots` on the line *before* calling this. The
+ * guard protected the bids and `adInit()` while the assignment it was meant to
+ * protect had already happened, so a committed SPA navigation kept its bids and
+ * lost its slots. When a navigation has committed since — or
  * commits while the deferred callback is pending — the SSR payload is
  * dropped and `adInit()` is not run: running anyway would re-run the newer
  * route's live slots/bids, destroying and redefining that route's TS slots
@@ -685,8 +693,12 @@ function installInitialLoadDetector(ts: TsjsApi): void {
  * holds whenever the request is actually issued.
  */
 function installScheduleInitialAdInit(ts: TsjsApi): void {
-  ts.scheduleInitialAdInit = function (initialBids?: Record<string, AuctionBidData>) {
+  ts.scheduleInitialAdInit = function (
+    initialBids?: Record<string, AuctionBidData>,
+    initialSlots?: AuctionSlot[]
+  ) {
     if ((ts.navGeneration ?? 0) !== 0) return;
+    if (initialSlots) ts.adSlots = initialSlots;
     if (initialBids) ts.bids = initialBids;
     const runUnlessNavigated = (): void => {
       if ((ts.navGeneration ?? 0) !== 0) return;
@@ -1053,20 +1065,13 @@ export function installTsAdInit(): void {
         // implementation must never interrupt slot mapping or delivery.
         try {
           const opportunity = trustedServerOpportunity(bid);
-          if (bid.hb_auction_id !== undefined) {
-            ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
-              gptSlot,
-              slot.id,
-              opportunity,
-              bid.hb_auction_id
-            );
-          } else {
-            ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
-              gptSlot,
-              slot.id,
-              opportunity
-            );
-          }
+          ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
+            gptSlot,
+            slot.id,
+            opportunity,
+            bid.hb_auction_id,
+            slot.formats
+          );
         } catch {
           // Diagnostics must not alter ad delivery.
         }

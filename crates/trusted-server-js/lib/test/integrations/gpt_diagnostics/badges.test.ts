@@ -252,7 +252,12 @@ describe('GptDiagnosticsBadgeManager', () => {
         renderAtMs: 318,
         viewableAtMs: 1318,
         isEmpty: false,
+        requestedSlotSizes: [
+          [728, 90],
+          [970, 250],
+        ],
         size: [728, 90],
+        observedSlotSize: [980, 270],
         incompleteSequence: false,
         durations: {
           requestToResponseMs: 276,
@@ -260,7 +265,9 @@ describe('GptDiagnosticsBadgeManager', () => {
           renderToViewableMs: 1000,
         },
       })
-    ).toBe('Filled · 728×90\nResponse 276 ms · Render 42 ms\nViewable after 1 s');
+    ).toBe(
+      'Filled · Requested 728×90, 970×250 · GPT fill 728×90 · Outer box 980×270\nResponse 276 ms · Render 42 ms\nViewable after 1 s'
+    );
     expect(
       gptDiagnosticsBadgeTextForTest({
         requestNumber: 1,

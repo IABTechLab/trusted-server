@@ -89,7 +89,7 @@ Each request cycle can show:
 - GPT slot-onload, impression-viewable, and visibility observations.
 - Non-negative request-to-response, response-to-render, render-to-load, and
   render-to-viewable durations.
-- Rendered size, backfill, and slot-content-change facts exposed by GPT.
+- GPT-reported rendered size, a separately labelled observed outer slot box when safely bound, backfill, and slot-content-change facts.
 - Current DOM binding status and viewport intersection.
 
 Elapsed time alone never changes a pending GPT request to Incomplete. Incomplete
@@ -276,6 +276,30 @@ because selector support is unavailable or throws, the export reports
 `dom_uniqueness_unverifiable`. Framework replacement of an element with a new unique
 element using the same exact ID is rebound automatically.
 
+When Trusted Server associates a GPT slot with its next request, diagnostics retains
+`requestedSlotSizes`: the configured `AuctionSlot.formats` list Trusted Server supplied
+to GPT for that request. It is a bounded validated copy of the complete configured
+list, not an inferred responsive size or a claim about the final selected size. It is
+omitted for publisher and otherwise unknown request paths where Trusted Server did not
+supply formats.
+
+For an explicitly filled render, diagnostics can also retain `observedSlotSize`: the
+current outer CSS box of the uniquely bound, connected slot element. This is measured
+after `slotRenderEnded`. When `ResizeObserver` is available, it remains current
+while that same request cycle is latest for the GPT slot; otherwise it is the most
+recently sampled box. It is displayed separately from `size`, which remains the exact
+GPT-reported `slotRenderEnded.size` fill-size fact. The panel and badge label the three
+separate facts as requested slot sizes, GPT-reported fill size, and observed outer slot
+box. The observed box may differ from GPT's reported size (for example, a flexible APS
+creative can report `1×1` while its allocated outer slot box is larger). It is a
+publisher-page layout measurement, not a claim about universal internal creative-pixel
+dimensions. Empty, unbound, missing, or ambiguous slots do not report an observed box;
+delayed measurements from an older cycle are rejected after a refresh.
+
+Cross-origin and SafeFrame boundaries prevent diagnostics from inspecting iframe
+content. It does not inspect iframe content or alter the APS sandbox, so it cannot
+use this field to prove the inner creative's pixels.
+
 Badges and the panel live in a closed Shadow DOM. Diagnostics do not add attributes,
 classes, or inline styles to publisher slot elements.
 
@@ -326,6 +350,8 @@ The allowlisted export contains:
 - `version: 1` and an ISO `capturedAt` timestamp.
 - Current page origin and pathname, excluding query parameters and fragments.
 - Retained slots, binding facts, visibility, and request cycles.
+- `requestedSlotSizes` when Trusted Server supplied configured formats for that exact
+  request, plus GPT-reported fill `size` and an optional observed outer `observedSlotSize`.
 - Request path, request intent ID, opportunity, creative-progress timestamps, and
   safe failure enums.
 - The per-auction diagnostics token (`trustedServerAuctionId`) and the
@@ -362,6 +388,7 @@ inaccessible to JavaScript.
 - Retained request cycles per slot: 10.
 - Retained callback issues: 128.
 - Retained auction-slot-to-GPT-slot associations: 64.
+- Requested slot sizes per correlated request: 16 valid positive sizes.
 - Retained creative attempts, including status tombstones: 128.
 - Retained attribution issues: 128.
 

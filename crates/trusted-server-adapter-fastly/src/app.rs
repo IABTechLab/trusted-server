@@ -257,6 +257,11 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
         .kv_store(Arc::clone(&state.default_kv_store))
+        // Spike-only (#1009). Constructed unconditionally, but only read when the
+        // assembly mode is a shared-template one — which defaults to Inline, so this
+        // is inert until an operator opts in.
+        .template_cache(Arc::new(crate::template_cache::FastlyTemplateCache::new()))
+        .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .geo(Arc::new(FastlyPlatformGeo))
@@ -1239,12 +1244,15 @@ mod tests {
 
     use super::{
         AppState, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH,
-        TrustedServerApp, build_state_from_settings, startup_error_router,
+        TrustedServerApp, build_per_request_services, build_state_from_settings,
+        startup_error_router,
     };
     use bytes::Bytes;
     use edgezero_core::body::Body;
+    use edgezero_core::context::RequestContext;
     use edgezero_core::http::{Method, Response, StatusCode, header, request_builder};
     use edgezero_core::key_value_store::NoopKvStore;
+    use edgezero_core::params::PathParams;
     use edgezero_core::router::RouterService;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Mutex;
@@ -1377,6 +1385,36 @@ mod tests {
     fn test_router() -> RouterService {
         let state = build_state_from_settings(test_settings()).expect("should build test state");
         TrustedServerApp::routes_for_state(&state)
+    }
+
+    #[test]
+    fn per_request_services_register_the_fastly_template_assembler() {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
+        let context = RequestContext::new(
+            empty_request(Method::GET, "/article"),
+            PathParams::default(),
+        );
+
+        let services = build_per_request_services(&state, &context);
+        let template = format!(
+            "<html><body>article{}</body></html>",
+            trusted_server_core::publisher::AD_ASSEMBLY_SEAM
+        );
+        let fragment = b"<script>reader state</script>";
+        let assembled = services
+            .template_assembler()
+            .assemble(template.as_bytes(), fragment)
+            .expect("Fastly services should provide ESI assembly");
+
+        assert_eq!(
+            assembled,
+            template
+                .replace(
+                    trusted_server_core::publisher::AD_ASSEMBLY_SEAM,
+                    std::str::from_utf8(fragment).expect("fragment should be UTF-8")
+                )
+                .into_bytes()
+        );
     }
 
     /// Builds a router whose `AppState` uses a registry containing the given
