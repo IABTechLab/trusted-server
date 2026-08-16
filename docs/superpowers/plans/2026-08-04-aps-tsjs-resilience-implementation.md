@@ -5653,7 +5653,7 @@ not create another design, plan, cache specification, or evidence document.
   TASK23A_EVIDENCE_ID="aps-tsjs-postswitch-$TASK23A_HEAD_SHA"
   TASK23A_OUTPUT="crates/trusted-server-integration-tests/browser/test-results/tsjs-performance-current.json"
   export TSJS_EVIDENCE_ID="$TASK23A_EVIDENCE_ID"
-  export GITHUB_SHA="$TASK23A_HEAD_SHA"
+  export TSJS_PERF_HEAD_SHA="$TASK23A_HEAD_SHA"
   export TSJS_PERF_MAIN_SHA="$TASK23A_MAIN_SHA"
   export TSJS_PERF_MAIN_ROOT="$TASK23A_MAIN_ROOT"
   export TSJS_PERF_OUTPUT="$TASK23A_OUTPUT"
@@ -5833,6 +5833,15 @@ document.
       absolute hard ceiling, and no selective reruns. One unchanged local run must
       pass and write validator-accepted schema-5 evidence; the hosted workflow pass
       remains required Task-24 evidence.
+
+- [x] **Step B8: Bind performance evidence to the immutable PR head.** The hosted
+      browser run passes but validation rejects its synthetic merge `headSha` because
+      GitHub's reserved `GITHUB_SHA` cannot be replaced reliably by step `env`. Add a
+      source contract that requires the evidence writer to read the already-declared
+      `TSJS_PERF_HEAD_SHA`, rejects any writer read or workflow override of
+      `GITHUB_SHA`, and removes the ineffective override. Keep the validator, transfer
+      provenance, artifact name, and pull-request head expression on the same dedicated
+      binding.
 
 ### Task 24: Run final repository verification and assemble the cutover evidence
 
