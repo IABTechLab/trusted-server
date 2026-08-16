@@ -767,7 +767,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -1398,7 +1398,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#908e229a424e837717450c36c656d73891466d08"
+source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#5f3d648c3c6c38fc6e6b22b5c65c66177363aad8"
 dependencies = [
  "toml",
 ]
@@ -1406,7 +1406,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-axum"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#908e229a424e837717450c36c656d73891466d08"
+source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#5f3d648c3c6c38fc6e6b22b5c65c66177363aad8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1434,7 +1434,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-cloudflare"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#908e229a424e837717450c36c656d73891466d08"
+source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#5f3d648c3c6c38fc6e6b22b5c65c66177363aad8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1457,7 +1457,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#908e229a424e837717450c36c656d73891466d08"
+source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#5f3d648c3c6c38fc6e6b22b5c65c66177363aad8"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1486,7 +1486,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-spin"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#908e229a424e837717450c36c656d73891466d08"
+source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#5f3d648c3c6c38fc6e6b22b5c65c66177363aad8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1513,7 +1513,7 @@ dependencies = [
 [[package]]
 name = "edgezero-cli"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#908e229a424e837717450c36c656d73891466d08"
+source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#5f3d648c3c6c38fc6e6b22b5c65c66177363aad8"
 dependencies = [
  "chrono",
  "clap",
@@ -1538,7 +1538,7 @@ dependencies = [
 [[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#908e229a424e837717450c36c656d73891466d08"
+source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#5f3d648c3c6c38fc6e6b22b5c65c66177363aad8"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -1569,7 +1569,7 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#908e229a424e837717450c36c656d73891466d08"
+source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#5f3d648c3c6c38fc6e6b22b5c65c66177363aad8"
 dependencies = [
  "log",
  "proc-macro2",
@@ -5920,7 +5920,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
