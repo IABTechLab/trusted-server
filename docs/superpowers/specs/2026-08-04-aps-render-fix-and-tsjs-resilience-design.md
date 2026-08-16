@@ -4311,7 +4311,7 @@ validator, or the workflow itself. Its existing `workflow_dispatch` and
 `workflow_call` entrypoints remain available for named pre-switch and post-switch
 evidence.
 
-The browser test has a 30-minute safety budget and its Actions job has a 40-minute
+The browser test has a 40-minute safety budget and its Actions job has a 50-minute
 safety budget. Each of the 110 paired warmup/measured navigations returns from
 navigation at response commit and closes immediately after the common first
 observable action used by the timing metric; neither variant waits for the browser
@@ -4325,7 +4325,13 @@ absorb hosted-runner variance, checkout, the candidate/current-`main` builds,
 browser setup, validation, finalization, and immutable upload. They do not reduce
 the five warmups, 50 measured samples per variant, fixed network profile, assertions,
 or evidence requirements, and they are not permission to repeat post-measurement
-lifecycle work in every sample.
+lifecycle work in every sample. The final budget is evidence-based: after removing
+the redundant lifecycle waits and returning timing navigations at response commit,
+the declared hosted runner completed the shaped sample, full candidate observation,
+and first paired heap context at the former 30-minute boundary, before the second
+required heap context and evidence write. The ten-minute inner reserve covers that
+remaining required context plus evidence serialization; the outer reserve covers
+build/setup, validation, and immutable upload.
 
 The job declares a paired GPT-reference case and a candidate-only APS first-display
 case. Both variants of the GPT pair use the same projection, enabled behavior,
