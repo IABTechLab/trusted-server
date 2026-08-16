@@ -1592,9 +1592,10 @@ test.describe("TSJS first-display performance gate", () => {
     browserName,
   }) => {
     // The shaped comparison performs 110 cold navigations before four paired
-    // heap checkpoints. Keep enough time to write the complete evidence even
-    // when a candidate fails the soft p90 assertion by a wide margin.
-    test.setTimeout(1_500_000);
+    // heap checkpoints. Hosted runners need roughly 25 minutes for the shaped
+    // sample, so reserve five more minutes for heap collection and evidence
+    // finalization even when a candidate fails a soft assertion.
+    test.setTimeout(1_800_000);
     const mode = process.env.TSJS_PERF_MODE;
     test.skip(
       mode !== "preswitch" && mode !== "postswitch" && mode !== "pull-request",

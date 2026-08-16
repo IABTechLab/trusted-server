@@ -5781,6 +5781,15 @@ document.
       replacing Task-24 evidence. A script extraction is not green if a gate,
       browser, runtime, security check, manifest field, or uploaded path disappears.
 
+- [x] **Step B5: Test-drive sufficient performance finalization headroom.** Preserve
+      the five warmups, 50 samples per variant, fixed CDP profile, heap checkpoints,
+      soft assertions, schema validation, and immutable upload. Add a validator
+      contract that requires a 30-minute Playwright test budget and 40-minute Actions
+      job budget, observe it fail against the former 25/35-minute limits, then align
+      the test and job. The additional five-minute inner reserve is only for the
+      paired heap checkpoints and evidence write after the approximately 25-minute
+      shaped sample; the outer reserve covers setup and finalization.
+
 ### Task 24: Run final repository verification and assemble the cutover evidence
 
 **Files:**

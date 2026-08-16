@@ -4311,6 +4311,14 @@ validator, or the workflow itself. Its existing `workflow_dispatch` and
 `workflow_call` entrypoints remain available for named pre-switch and post-switch
 evidence.
 
+The browser test has a 30-minute budget and its Actions job has a 40-minute budget.
+The shaped 110-navigation comparison consumes approximately 25 minutes on the
+declared hosted-runner class; the test reserve belongs to the required paired heap
+checkpoints and evidence finalization, while the outer reserve belongs to checkout,
+the candidate/current-`main` builds, browser setup, validation, and immutable upload.
+Neither budget changes the five warmups, 50 measured samples per variant, network
+profile, assertions, or evidence requirements.
+
 The job declares a paired GPT-reference case and a candidate-only APS first-display
 case. Both variants of the GPT pair use the same projection, enabled behavior,
 upstream fictional stubs, page markup, creative policy, warm/cold cache state, and
