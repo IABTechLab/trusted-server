@@ -1185,6 +1185,21 @@ function runSelfTest() {
     /TSJS_PERF_HEAD_SHA: \$\{\{ github\.event_name == 'pull_request' && github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}/u,
     "the performance workflow must bind PR evidence to the head commit rather than the synthetic merge commit",
   );
+  assert.match(
+    performanceTest,
+    /const headSha = process\.env\.TSJS_PERF_HEAD_SHA/u,
+    "the browser evidence writer must consume the dedicated immutable head SHA binding",
+  );
+  assert.doesNotMatch(
+    performanceTest,
+    /process\.env\.GITHUB_SHA/u,
+    "the browser evidence writer must not read GitHub's reserved synthetic merge SHA",
+  );
+  assert.doesNotMatch(
+    performanceWorkflow,
+    /^\s+GITHUB_SHA:/mu,
+    "the performance workflow must not pretend to override GitHub's reserved SHA variable",
+  );
   assert.doesNotMatch(
     performanceWorkflow,
     /GITHUB_SHA: \$\{\{ github\.sha \}\}|--head-sha "\$\{\{ github\.sha \}\}"/u,

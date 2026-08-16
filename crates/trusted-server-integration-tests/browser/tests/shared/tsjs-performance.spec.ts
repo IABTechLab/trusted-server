@@ -1848,7 +1848,7 @@ test.describe("TSJS first-display performance gate", () => {
     }
 
     const evidenceId = process.env.TSJS_EVIDENCE_ID;
-    const headSha = process.env.GITHUB_SHA;
+    const headSha = process.env.TSJS_PERF_HEAD_SHA;
     const outputArgument = process.env.TSJS_PERF_OUTPUT;
     expect(evidenceId, "TSJS_EVIDENCE_ID is required").toMatch(
       /^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/u,

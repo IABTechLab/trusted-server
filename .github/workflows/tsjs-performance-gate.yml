@@ -111,7 +111,6 @@ jobs:
       - name: Run the complete TSJS performance sample exactly once
         env:
           CI: "true"
-          GITHUB_SHA: ${{ env.TSJS_PERF_HEAD_SHA }}
         run: bash scripts/ci/tsjs-performance.sh run-sample
 
       - name: Validate the generated evidence before upload

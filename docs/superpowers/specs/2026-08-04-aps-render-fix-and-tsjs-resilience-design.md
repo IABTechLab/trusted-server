@@ -4417,6 +4417,11 @@ writes the complete schema-5 evidence before failing. Validation and upload run
 with `always()` so a failed gate retains its exact diagnostic artifact; neither the
 test nor the validator converts an exceeded budget into success.
 
+On a pull request, both the evidence writer and validator consume the dedicated
+`TSJS_PERF_HEAD_SHA` value resolved from `pull_request.head.sha`. They do not read or
+attempt to override GitHub's reserved `GITHUB_SHA`, which names the synthetic merge
+commit for a pull-request workflow.
+
 The performance workflow invokes checked-in repository scripts, and its
 performance-only Playwright configuration is also a checked-in TypeScript file.
 Neither workflow YAML nor a shell script synthesizes executable source or
