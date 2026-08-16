@@ -5786,9 +5786,20 @@ document.
       soft assertions, schema validation, and immutable upload. Add a validator
       contract that requires a 30-minute Playwright test budget and 40-minute Actions
       job budget, observe it fail against the former 25/35-minute limits, then align
-      the test and job. The additional five-minute inner reserve is only for the
-      paired heap checkpoints and evidence write after the approximately 25-minute
-      shaped sample; the outer reserve covers setup and finalization.
+      the test and job. These are safety caps for hosted-runner variance, setup,
+      paired heap checkpoints, evidence finalization, validation, and upload; they do
+      not relax any sample count, profile, assertion, or evidence requirement.
+
+- [x] **Step B6: Stop paired performance samples at the measured endpoint.** Add a
+      validator contract that fails while the release-v1 branch awaits a full
+      lifecycle during every warmup and measured navigation. Make both current-main
+      and release-v1 variants stop at the common first observable action, preserving
+      five warmups, 50 alternating samples per variant, the fixed network profile,
+      p90 rules, and transfer budgets. After sampling, perform exactly one separate
+      full release-v1 observation for candidate marks, paint, takeover, and deferred
+      ordering, then retain the separate paired heap contexts and unchanged evidence
+      schema. Observe the source contract fail before the implementation and pass
+      after it.
 
 ### Task 24: Run final repository verification and assemble the cutover evidence
 
