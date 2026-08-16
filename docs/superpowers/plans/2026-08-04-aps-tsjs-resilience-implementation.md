@@ -5372,9 +5372,10 @@ main.
 - [ ] **Step 3: Run the production-wired paired timing and heap gate.** On Chromium
       145.0.7632.6 and `github-hosted:ubuntu-24.04`, alternate five warmups and 50
       samples per variant under the fixed CDP profile. Require candidate GPT p90 ≤
-      current-main p90 ×1.10. In separate contexts require candidate heap ≤ main
-      ×1.10 at boot, first render, refresh, and SPA navigation, with both sides ≤4
-      MiB. Never rerun or drop only a slow sample.
+      current-main p90 ×1.10. In separate contexts record both sides at boot, first
+      render, refresh, and SPA navigation and require each side ≤4 MiB. Do not use
+      legacy main's smaller pre-kernel runtime shape as a relative hard-cutover heap
+      threshold. Never rerun or drop only a slow sample.
 
 - [ ] **Step 4: Run the candidate-only APS quantitative gate.** Drive the invariant
       fictional APS/PUC fixture through its real first action, accepted completion,
@@ -5703,10 +5704,11 @@ not create another design, plan, cache specification, or evidence document.
       Task-24 matrix only after they pass. From a clean pushed SHA, run `check:bundle`
       and the automatic network-shaped
       candidate-versus-current-`main` workflow, including candidate real-mark,
-      deferred-order, and paired retained-heap assertions. Download and validate each
-      named schema-5 artifact before treating Task 24 as release evidence. A failed
-      ratio is a release blocker to remediate, not permission to relabel main,
-      restore the frozen-reference gate, or loosen the threshold.
+      deferred-order, and absolute retained-heap assertions. Download and validate
+      each named schema-5 artifact before treating Task 24 as release evidence. A
+      failed timing ratio or absolute heap ceiling is a release blocker to remediate,
+      not permission to relabel main, restore the frozen-reference gate, or loosen a
+      threshold.
 
 ### Task 23B: Extract CI programs and stabilize Cloudflare APS readiness
 
@@ -5727,6 +5729,7 @@ document.
 - Create: `scripts/ci/aps-tsjs-evidence.mjs`
 - Create: `scripts/ci/aps-tsjs-quality.sh`
 - Create: `scripts/ci/tsjs-performance.sh`
+- Create: `crates/trusted-server-integration-tests/browser/playwright.performance.config.ts`
 - Modify: `crates/trusted-server-js/lib/test/build/release-v1.test.mjs`
 - Modify: `scripts/validate-tsjs-performance-evidence.mjs`
 - Modify: `crates/trusted-server-integration-tests/tests/environments/cloudflare.rs`
@@ -5739,7 +5742,9 @@ document.
       inspect the owning script while continuing to prove exact-main resolution,
       immutable inputs, browser selection, adapter coverage, release binding,
       manifest fields, and evidence scrubbing. Observe RED against the existing
-      inline workflow programs before creating scripts.
+      inline workflow programs before creating scripts. Treat an executable config
+      synthesized by a checked-in shell script as inline code too: the performance
+      Playwright config must itself be a checked-in source file.
 
   ```bash
   npm --prefix crates/trusted-server-js/lib test -- --run \
@@ -5756,9 +5761,11 @@ document.
       protected-input validation and its browser invocation; and
       `aps-tsjs-evidence.mjs` owns schema-1 manifest writing plus pre-upload evidence
       scrubbing. Rewire workflow steps to invoke these files with simple one-command
-      `run` values. Keep ordinary one-line package, Cargo, and existing-script calls
-      direct. Do not introduce a monolithic dispatcher, change a command, skip an
-      adapter/browser, expose a secret as an argument, or alter an artifact path.
+      `run` values. Check in the performance-only Playwright config and have the
+      performance script reference it directly; do not synthesize source or config
+      bodies at runtime. Keep ordinary one-line package, Cargo, and existing-script
+      calls direct. Do not introduce a monolithic dispatcher, change a command, skip
+      an adapter/browser, expose a secret as an argument, or alter an artifact path.
 
 - [x] **Step B3: Test-drive Cloudflare route-stability readiness.** Add a unit-tested
       readiness observation state machine. Only an exact renderer-route `405` with
@@ -5808,6 +5815,24 @@ document.
       that full observation because it belongs to persistent takeover, not the
       earlier first-action measurement boundary. Observe the source contract fail
       before the implementation and pass after it.
+
+- [x] **Step B7: Correct, isolate, and bound retained-heap collection.** Hosted-runner
+      traces prove all 110 paired timing navigations finish before the run enters its
+      first retained-heap context and then consumes the remaining 40-minute test
+      budget without evidence. A bounded local replay proves each main GC/usage
+      checkpoint through refresh completes; the actual stall is the SPA response
+      wait. The fixture used a query-only `pushState`, which candidate observes but
+      current main's real pathname-based hook intentionally ignores. Test-drive a
+      pathname-changing navigation that both real artifact shapes observe. Reject
+      direct `HeapProfiler.collectGarbage`, require Playwright's supported
+      `page.requestGC()` operation, and bound and label every heap lifecycle phase at
+      30 seconds. Launch one fresh Chromium process after timing and the representative
+      lifecycle, collect current-main and candidate contexts sequentially in that
+      process, and close it explicitly. Keep the same four checkpoints, one collection
+      per checkpoint, immediate `Runtime.getHeapUsage`, recorded current-main context,
+      absolute hard ceiling, and no selective reruns. One unchanged local run must
+      pass and write validator-accepted schema-5 evidence; the hosted workflow pass
+      remains required Task-24 evidence.
 
 ### Task 24: Run final repository verification and assemble the cutover evidence
 
@@ -6148,7 +6173,7 @@ The plan is complete only when:
     candidate size ceilings, the fresh-main semantic transfer comparison, the
     automatic network-shaped candidate-versus-current-main browser-time gate,
     candidate APS quantitative gate, real-mark/deferred-order/takeover-absence
-    assertions, and paired retained-heap gates pass in attested clean-checkout
+    assertions, and absolute retained-heap gates pass in attested clean-checkout
     quality, integration, and real-GAM runs for the exact release SHA and release id.
     Candidate reference pre-action transfer is no larger than fresh main in raw,
     gzip, or Brotli; no candidate-derived historical capture defines acceptance.
