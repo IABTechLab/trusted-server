@@ -1591,10 +1591,11 @@ test.describe("TSJS first-display performance gate", () => {
     browser,
     browserName,
   }) => {
-    // The shaped comparison performs 110 cold navigations before four paired
-    // heap checkpoints. Hosted runners need roughly 25 minutes for the shaped
-    // sample, so reserve five more minutes for heap collection and evidence
-    // finalization even when a candidate fails a soft assertion.
+    // The paired comparison performs 110 cold navigations through the common
+    // first-action endpoint, then one full candidate lifecycle observation and
+    // four paired heap checkpoints. The 30-minute cap guards hosted-runner
+    // variance and evidence finalization; it is not permission to await the
+    // post-action lifecycle during every timing sample.
     test.setTimeout(1_800_000);
     const mode = process.env.TSJS_PERF_MODE;
     test.skip(
@@ -1622,30 +1623,17 @@ test.describe("TSJS first-display performance gate", () => {
     const candidateServer = await startFixtureServer(candidateResources);
     activeFixtureServers.push(mainServer, candidateServer);
 
-    const observeVariant = async (
+    const observeTimingVariant = async (
       fixtureServer: FixtureServer,
       resources: FixtureResources,
-    ): Promise<{
-      comparison: ComparisonObservation;
-      candidate?: BrowserObservation;
-    }> => {
+    ): Promise<ComparisonObservation> => {
       const run = await openFixture(browser, fixtureServer, resources);
       try {
+        const comparison = await observeComparisonFixture(run, resources);
         if (resources.artifactModel === "release-v1") {
-          const candidate = await observeFixture(run, resources);
-          expect(candidate.releaseId).toBe(resources.release?.releaseId);
-          return {
-            comparison: {
-              timingMs: candidate.timingMs,
-              displayCount: candidate.displayCount,
-              releaseId: candidate.releaseId,
-            },
-            candidate,
-          };
+          expect(comparison.releaseId).toBe(resources.release?.releaseId);
         }
-        return {
-          comparison: await observeComparisonFixture(run, resources),
-        };
+        return comparison;
       } finally {
         await run.close();
       }
@@ -1663,13 +1651,12 @@ test.describe("TSJS first-display performance gate", () => {
               [mainServer, mainResources],
             ] as const);
       for (const [server, resources] of variants) {
-        await observeVariant(server, resources);
+        await observeTimingVariant(server, resources);
       }
     }
 
     const mainSamples: number[] = [];
     const candidateSamples: number[] = [];
-    let representative: BrowserObservation | undefined;
     for (let index = 0; index < SAMPLES; index += 1) {
       const variants =
         index % 2 === 0
@@ -1682,12 +1669,11 @@ test.describe("TSJS first-display performance gate", () => {
               ["main", mainServer, mainResources],
             ] as const);
       for (const [variant, server, resources] of variants) {
-        const observation = await observeVariant(server, resources);
+        const observation = await observeTimingVariant(server, resources);
         if (variant === "main") {
-          mainSamples.push(observation.comparison.timingMs);
+          mainSamples.push(observation.timingMs);
         } else {
-          candidateSamples.push(observation.comparison.timingMs);
-          representative = observation.candidate;
+          candidateSamples.push(observation.timingMs);
         }
       }
     }
@@ -1707,6 +1693,16 @@ test.describe("TSJS first-display performance gate", () => {
         )
         .toBeLessThanOrEqual(mainResources.referenceTransfer[metric]);
     }
+
+    const representativeRun = await openFixture(
+      browser,
+      candidateServer,
+      candidateResources,
+    );
+    const representative = await observeFixture(
+      representativeRun,
+      candidateResources,
+    ).finally(() => representativeRun.close());
 
     const mainHeapBytes = await collectHeapCheckpoints(
       browser,
@@ -1741,19 +1737,19 @@ test.describe("TSJS first-display performance gate", () => {
     const outputPath = isAbsolute(outputArgument!)
       ? outputArgument!
       : resolve(REPO_ROOT, outputArgument!);
-    const deferredBeforePaint = representative!.deferred.filter(
-      ({ startTime }) => startTime < representative!.paintTime,
+    const deferredBeforePaint = representative.deferred.filter(
+      ({ startTime }) => startTime < representative.paintTime,
     ).length;
-    const deferredPreparationBeforePaint = representative!.deferred.filter(
-      ({ preparationTime }) => preparationTime < representative!.paintTime,
+    const deferredPreparationBeforePaint = representative.deferred.filter(
+      ({ preparationTime }) => preparationTime < representative.paintTime,
     ).length;
-    const deferredExecutionBeforePaint = representative!.deferred.filter(
-      ({ executionTime }) => executionTime < representative!.paintTime,
+    const deferredExecutionBeforePaint = representative.deferred.filter(
+      ({ executionTime }) => executionTime < representative.paintTime,
     ).length;
-    const deferredStarts = representative!.deferred.map(
+    const deferredStarts = representative.deferred.map(
       ({ startTime }) => startTime,
     );
-    const deferredByResponseEnd = [...representative!.deferred].sort(
+    const deferredByResponseEnd = [...representative.deferred].sort(
       (left, right) => left.responseEnd - right.responseEnd,
     );
     const npmVersion = execFileSync("npm", ["--version"], {
@@ -1797,10 +1793,9 @@ test.describe("TSJS first-display performance gate", () => {
         source: "fixture-first-observable-action",
         comparisonStart: true,
         firstObservableAction: true,
-        candidateBidsScript: representative!.bidsScriptCount === 1,
-        candidateFirstDisplay: representative!.firstDisplayCount === 1,
-        candidateFirstDisplayPaint:
-          representative!.firstDisplayPaintCount === 1,
+        candidateBidsScript: representative.bidsScriptCount === 1,
+        candidateFirstDisplay: representative.firstDisplayCount === 1,
+        candidateFirstDisplayPaint: representative.firstDisplayPaintCount === 1,
       },
       performance: {
         requestToFirstActionMs: {
@@ -1848,9 +1843,9 @@ test.describe("TSJS first-display performance gate", () => {
       requests: {
         selected: { count: 1 },
         deferred: {
-          count: representative!.deferred.length,
+          count: representative.deferred.length,
           requestBeforePaintCount: deferredBeforePaint,
-          preloadBeforePaintCount: representative!.preloadBeforePaintCount,
+          preloadBeforePaintCount: representative.preloadBeforePaintCount,
           preparationBeforePaintCount: deferredPreparationBeforePaint,
           executionBeforePaintCount: deferredExecutionBeforePaint,
           independentlyTriggered:

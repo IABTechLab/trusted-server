@@ -1214,12 +1214,22 @@ function runSelfTest() {
   assert.match(
     performanceTest,
     /test\.setTimeout\(1_800_000\)/u,
-    "the browser gate must leave enough time to collect heap checkpoints and write evidence after the 25-minute sample",
+    "the browser gate must leave enough time to collect heap checkpoints and write evidence after the complete shaped sample",
   );
   assert.match(
     performanceWorkflow,
     /timeout-minutes: 40/u,
     "the performance job must leave setup and finalization headroom around the 30-minute browser-test budget",
+  );
+  assert.match(
+    performanceTest,
+    /const observeTimingVariant[\s\S]*observeComparisonFixture\(run, resources\)[\s\S]*return comparison/u,
+    "paired warmup and measured navigations must stop at the common first-action timing endpoint",
+  );
+  assert.match(
+    performanceTest,
+    /const representativeRun = await openFixture\([\s\S]*candidateServer,[\s\S]*candidateResources,[\s\S]*const representative = await observeFixture\([\s\S]*representativeRun,[\s\S]*candidateResources/u,
+    "the same run must retain one separate full candidate lifecycle observation for paint, takeover, and deferred-order evidence",
   );
   assert.match(
     performanceTest,
