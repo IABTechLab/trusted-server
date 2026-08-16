@@ -1608,10 +1608,10 @@ test.describe("TSJS first-display performance gate", () => {
     // The paired comparison opens 110 cold navigations at response commit and
     // closes each at the common first-action endpoint, then performs one
     // load-complete candidate lifecycle observation and four paired heap
-    // checkpoints. The 30-minute cap guards hosted-runner variance and evidence
+    // checkpoints. The 40-minute cap guards hosted-runner variance and evidence
     // finalization; it is not permission to await the post-action lifecycle
     // during every timing sample.
-    test.setTimeout(1_800_000);
+    test.setTimeout(2_400_000);
     const mode = process.env.TSJS_PERF_MODE;
     test.skip(
       mode !== "preswitch" && mode !== "postswitch" && mode !== "pull-request",

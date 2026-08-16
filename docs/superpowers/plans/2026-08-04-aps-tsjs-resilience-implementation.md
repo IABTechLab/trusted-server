@@ -5784,11 +5784,16 @@ document.
 - [x] **Step B5: Test-drive sufficient performance finalization headroom.** Preserve
       the five warmups, 50 samples per variant, fixed CDP profile, heap checkpoints,
       soft assertions, schema validation, and immutable upload. Add a validator
-      contract that requires a 30-minute Playwright test budget and 40-minute Actions
-      job budget, observe it fail against the former 25/35-minute limits, then align
-      the test and job. These are safety caps for hosted-runner variance, setup,
-      paired heap checkpoints, evidence finalization, validation, and upload; they do
-      not relax any sample count, profile, assertion, or evidence requirement.
+      contract, observe the former 25/35-minute limits fail before heap evidence, and
+      align the test/job initially to 30/40 minutes. After the endpoint-only and
+      response-commit optimizations in Step B6, retain the exact source and evidence
+      requirements and observe the declared hosted runner reach the end of the first
+      paired heap context at the 30-minute boundary, before the second heap context
+      and evidence write. Strengthen the final contract to a 40-minute Playwright
+      budget and 50-minute Actions budget. These are safety caps for hosted-runner
+      variance, setup, paired heap contexts, evidence finalization, validation, and
+      upload; they do not relax any sample count, profile, assertion, or evidence
+      requirement.
 
 - [x] **Step B6: Stop paired performance samples at the measured endpoint.** Add a
       validator contract that fails while the release-v1 branch awaits a full
