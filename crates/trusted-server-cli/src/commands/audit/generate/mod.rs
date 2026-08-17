@@ -4,6 +4,7 @@ pub(crate) mod collector;
 mod crawl_plan;
 mod evidence;
 mod gpt_slots;
+mod page_patterns;
 mod slot_toml;
 mod unit_template;
 mod validate;
@@ -546,7 +547,14 @@ pub(crate) fn run_update_slots(
         replace,
     );
     let rendered_slots = render_slots(&merged);
-    let updated = splice_creative_slots(&existing, network_id.as_deref(), &rendered_slots)?;
+    let updated = splice_creative_slots(
+        &existing,
+        &slot_toml::CreativeSectionKeys {
+            network_id: network_id.as_deref(),
+            ..slot_toml::CreativeSectionKeys::default()
+        },
+        &rendered_slots,
+    )?;
 
     // Everything above is derived from a live, page-controlled ad stack, so the
     // candidate has to clear the runtime's own load path before it can replace

@@ -337,11 +337,50 @@ fn toml_inline_value(value: &serde_json::Value) -> String {
 ///
 /// If the config has no `[creative_opportunities]` section, a fresh one is
 /// appended so `generate` works against a config that omits it.
+/// The config-level values a splice writes alongside the slot array.
+#[derive(Debug, Clone, Default)]
+pub(super) struct CreativeSectionKeys<'a> {
+    /// GAM network id, when one was resolved.
+    pub(super) network_id: Option<&'a str>,
+    /// `section_root`, written only when a slot uses a `{section}` template.
+    pub(super) section_root: Option<&'a str>,
+    /// `section_segment`, written only alongside `section_root`.
+    pub(super) section_segment: Option<usize>,
+}
+
+impl CreativeSectionKeys<'_> {
+    /// The `key = value` lines this policy contributes, in config order.
+    fn lines(&self) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        if let Some(network_id) = self.network_id {
+            out.push((
+                "gam_network_id",
+                format!("gam_network_id = {}", toml_string(network_id)),
+            ));
+        }
+        // Both keys are omitted unless a template needs them. They are
+        // `deny_unknown_fields` additions, so writing them into a config that
+        // does not need them would make it unloadable by an older binary for no
+        // benefit.
+        if let Some(section_root) = self.section_root {
+            out.push((
+                "section_root",
+                format!("section_root = {}", toml_string(section_root)),
+            ));
+            if let Some(segment) = self.section_segment {
+                out.push(("section_segment", format!("section_segment = {segment}")));
+            }
+        }
+        out
+    }
+}
+
 pub(super) fn splice_creative_slots(
     existing: &str,
-    network_id: Option<&str>,
+    keys: &CreativeSectionKeys<'_>,
     rendered_slots: &str,
 ) -> CliResult<String> {
+    let network_id = keys.network_id;
     let rendered = rendered_slots.trim_matches('\n');
     let existing = remove_inline_slot_value(existing)?;
 
@@ -378,28 +417,27 @@ pub(super) fn splice_creative_slots(
                  `gam_network_id` to the config and re-run",
             );
         };
+        let _ = network_id;
         let mut result = existing;
         if !result.is_empty() && !result.ends_with('\n') {
             result.push('\n');
         }
         result.push_str("\n[creative_opportunities]\n");
-        result.push_str(&format!("gam_network_id = {}\n", toml_string(network_id)));
+        for (_, line) in keys.lines() {
+            result.push_str(&line);
+            result.push('\n');
+        }
         result.push_str(rendered);
         result.push('\n');
         return Ok(result);
     }
 
-    // Section exists — update `gam_network_id` (best-effort) and replace slots.
+    // Section exists — set the scalar keys, then replace the slot array.
+    // `upsert` rather than `replace`: `section_root`/`section_segment` are new
+    // keys that a config predating templating simply does not have.
     let mut document = existing.clone();
-    if let Some(network_id) = network_id
-        && let Ok(updated) = replace_key_in_section(
-            &document,
-            "creative_opportunities",
-            "gam_network_id",
-            &format!("gam_network_id = {}", toml_string(network_id)),
-        )
-    {
-        document = updated;
+    for (key, line) in keys.lines() {
+        document = upsert_key_in_section(&document, "creative_opportunities", key, &line)?;
     }
 
     let lines: Vec<&str> = document.lines().collect();
@@ -594,6 +632,51 @@ pub(super) fn replace_key_in_section(
     Ok(output)
 }
 
+/// Sets `key` in `section`, replacing an existing assignment or inserting one.
+///
+/// [`replace_key_in_section`] can only rewrite a key that is already present, so
+/// it cannot add `section_root` or `section_segment` to a config that predates
+/// them — which is every config a first templated run touches. This inserts
+/// immediately after the section header instead, keeping the new key inside the
+/// section's scalar block rather than stranding it after a subtable, where TOML
+/// would read it as belonging to that subtable.
+///
+/// # Errors
+///
+/// Returns an error when `section` is not present in the document.
+pub(super) fn upsert_key_in_section(
+    document: &str,
+    section: &str,
+    key: &str,
+    replacement_line: &str,
+) -> CliResult<String> {
+    if let Ok(replaced) = replace_key_in_section(document, section, key, replacement_line) {
+        return Ok(replaced);
+    }
+
+    let section_header = format!("[{section}]");
+    let Some(header_index) = document
+        .lines()
+        .position(|line| is_table_header(line, &section_header))
+    else {
+        return cli_error(format!(
+            "failed to update config because section `{section_header}` was not found"
+        ));
+    };
+
+    let mut lines: Vec<String> = document.lines().map(str::to_string).collect();
+    lines.insert(header_index + 1, replacement_line.to_string());
+
+    let mut output = lines.join("\n");
+    if document.ends_with('\n') {
+        output.push('\n');
+    }
+    if uses_crlf(document) {
+        output = output.replace("\r\n", "\n").replace('\n', "\r\n");
+    }
+    Ok(output)
+}
+
 fn is_key_line(trimmed_line: &str, key: &str) -> bool {
     trimmed_line
         .strip_prefix(key)
@@ -643,6 +726,14 @@ mod tests {
         render_slots(&merged)
     }
 
+    /// Section keys carrying only a network id, the common test case.
+    fn network_keys(network_id: &str) -> CreativeSectionKeys<'_> {
+        CreativeSectionKeys {
+            network_id: Some(network_id),
+            ..CreativeSectionKeys::default()
+        }
+    }
+
     fn existing_config(toml_str: &str) -> CreativeOpportunitiesConfig {
         toml::from_str::<CreativeOpportunitiesConfig>(toml_str).expect("valid creative config")
     }
@@ -656,7 +747,7 @@ mod tests {
              formats = [{ width = 300, height = 250 }]\n\n\
              [auction]\nenabled = true\n";
 
-        let out = splice_creative_slots(existing, Some("222"), &header_rendered())
+        let out = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
             .expect("should splice");
 
         assert!(
@@ -686,7 +777,7 @@ mod tests {
         // produce a document that no longer parses.
         let existing = "[\"creative_opportunities\"]\ngam_network_id = \"111\"\n";
 
-        let error = splice_creative_slots(existing, Some("222"), &header_rendered())
+        let error = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
             .expect_err("should refuse an unrecognised section form");
 
         assert!(
@@ -699,12 +790,132 @@ mod tests {
     fn splice_rejects_top_level_inline_creative_opportunities_table() {
         let existing = "creative_opportunities = { gam_network_id = \"111\" }\n";
 
-        let error = splice_creative_slots(existing, Some("222"), &header_rendered())
+        let error = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
             .expect_err("should refuse a top-level inline table");
 
         assert!(
             format!("{error:?}").contains("cannot edit safely"),
             "error should tell the operator to rewrite the section, got {error:?}"
+        );
+    }
+
+    /// Section keys for a templated run: network id plus the section policy.
+    fn template_keys<'a>(
+        network_id: &'a str,
+        root: &'a str,
+        segment: usize,
+    ) -> CreativeSectionKeys<'a> {
+        CreativeSectionKeys {
+            network_id: Some(network_id),
+            section_root: Some(root),
+            section_segment: Some(segment),
+        }
+    }
+
+    #[test]
+    fn splice_inserts_section_policy_keys_a_config_does_not_have_yet() {
+        // The whole point of `upsert`: every config predating templating lacks
+        // these keys, so a replace-only writer could never add them.
+        let existing = "[creative_opportunities]\ngam_network_id = \"111\"\n\n\
+             [auction]\nenabled = true\n";
+
+        let out = splice_creative_slots(
+            existing,
+            &template_keys("222", "homepage", 0),
+            &header_rendered(),
+        )
+        .expect("should splice");
+
+        let value = toml::from_str::<toml::Value>(&out).expect("spliced config is valid TOML");
+        let creative = &value["creative_opportunities"];
+        assert_eq!(creative["gam_network_id"].as_str(), Some("222"));
+        assert_eq!(creative["section_root"].as_str(), Some("homepage"));
+        assert_eq!(creative["section_segment"].as_integer(), Some(0));
+        assert_eq!(
+            value["auction"]["enabled"].as_bool(),
+            Some(true),
+            "inserting must not disturb later sections"
+        );
+    }
+
+    #[test]
+    fn splice_replaces_section_policy_keys_that_are_already_present() {
+        let existing = "[creative_opportunities]\ngam_network_id = \"111\"\n\
+             section_root = \"old\"\nsection_segment = 2\n";
+
+        let out = splice_creative_slots(
+            existing,
+            &template_keys("111", "homepage", 1),
+            &header_rendered(),
+        )
+        .expect("should splice");
+
+        let value = toml::from_str::<toml::Value>(&out).expect("valid TOML");
+        let creative = &value["creative_opportunities"];
+        assert_eq!(creative["section_root"].as_str(), Some("homepage"));
+        assert_eq!(creative["section_segment"].as_integer(), Some(1));
+        assert_eq!(
+            out.matches("section_root").count(),
+            1,
+            "the key must be replaced, not duplicated"
+        );
+    }
+
+    #[test]
+    fn splice_omits_section_policy_when_no_slot_needs_it() {
+        // `section_root`/`section_segment` are `deny_unknown_fields` additions:
+        // writing them into a config that does not need them would make it
+        // unloadable by an older binary for no benefit.
+        let existing = "[creative_opportunities]\ngam_network_id = \"111\"\n";
+
+        let out = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
+            .expect("should splice");
+
+        assert!(
+            !out.contains("section_root") && !out.contains("section_segment"),
+            "an untemplated run must not add rollback-fatal keys, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn splice_writes_section_policy_into_a_freshly_created_section() {
+        let existing = "[publisher]\ndomain = \"x\"\n";
+
+        let out = splice_creative_slots(
+            existing,
+            &template_keys("222", "homepage", 0),
+            &header_rendered(),
+        )
+        .expect("should append a fresh section");
+
+        let value = toml::from_str::<toml::Value>(&out).expect("valid TOML");
+        let creative = &value["creative_opportunities"];
+        assert_eq!(creative["gam_network_id"].as_str(), Some("222"));
+        assert_eq!(creative["section_root"].as_str(), Some("homepage"));
+        assert_eq!(creative["section_segment"].as_integer(), Some(0));
+    }
+
+    #[test]
+    fn upsert_keeps_an_inserted_key_inside_the_section_scalar_block() {
+        // Appending at the end of the section would land the key after a
+        // subtable, where TOML reads it as part of that subtable instead.
+        let document = "[creative_opportunities]\ngam_network_id = \"111\"\n\n\
+             [[creative_opportunities.slot]]\nid = \"a\"\n\
+             page_patterns = [\"/\"]\nformats = [{ width = 1, height = 1 }]\n";
+
+        let out = upsert_key_in_section(
+            document,
+            "creative_opportunities",
+            "section_root",
+            "section_root = \"homepage\"",
+        )
+        .expect("should insert");
+
+        let value = toml::from_str::<toml::Value>(&out).expect("valid TOML");
+        assert_eq!(
+            value["creative_opportunities"]["section_root"].as_str(),
+            Some("homepage"),
+            "the key must belong to the section, not the slot subtable"
         );
     }
 
@@ -716,8 +927,12 @@ mod tests {
         // route to the startup error router once pushed.
         let existing = "[publisher]\ndomain = \"x\"\n";
 
-        let error = splice_creative_slots(existing, None, &header_rendered())
-            .expect_err("should refuse to create a section with no network id");
+        let error = splice_creative_slots(
+            existing,
+            &CreativeSectionKeys::default(),
+            &header_rendered(),
+        )
+        .expect_err("should refuse to create a section with no network id");
 
         assert!(
             format!("{error:?}").contains("without a GAM network id"),
@@ -729,7 +944,7 @@ mod tests {
     fn splice_appends_section_when_config_has_none() {
         let existing = "[publisher]\ndomain = \"x\"\n";
 
-        let out = splice_creative_slots(existing, Some("222"), &header_rendered())
+        let out = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
             .expect("should append a fresh section");
 
         let value = toml::from_str::<toml::Value>(&out).expect("appended config is valid TOML");
@@ -771,7 +986,7 @@ mod tests {
             false,
         );
 
-        let out = splice_creative_slots(existing, Some("111"), &render_slots(&merged))
+        let out = splice_creative_slots(existing, &network_keys("111"), &render_slots(&merged))
             .expect("should splice");
 
         let value = toml::from_str::<toml::Value>(&out).expect("spliced config is valid TOML");
@@ -803,7 +1018,7 @@ mod tests {
         let existing = "[creative_opportunities]\r\ngam_network_id = \"111\"\r\n\r\n\
              [auction]\r\nenabled = true\r\n";
 
-        let out = splice_creative_slots(existing, Some("222"), &header_rendered())
+        let out = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
             .expect("should splice");
 
         assert!(
@@ -846,7 +1061,7 @@ mod tests {
         // Config with no [creative_opportunities] at all — generate should append it.
         let existing = "[publisher]\ndomain = \"x\"\n\n[auction]\nenabled = true\n";
 
-        let out = splice_creative_slots(existing, Some("222"), &header_rendered())
+        let out = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
             .expect("should splice");
 
         let value = toml::from_str::<toml::Value>(&out).expect("valid TOML");
@@ -872,14 +1087,14 @@ mod tests {
         // header comment; it must keep exactly one copy, not append another.
         let first = splice_creative_slots(
             "[publisher]\ndomain = \"x\"\n\n[auction]\nenabled = true\n",
-            Some("222"),
+            &network_keys("222"),
             &header_rendered(),
         )
         .expect("first splice");
-        let second =
-            splice_creative_slots(&first, Some("222"), &header_rendered()).expect("second splice");
-        let third =
-            splice_creative_slots(&second, Some("222"), &header_rendered()).expect("third splice");
+        let second = splice_creative_slots(&first, &network_keys("222"), &header_rendered())
+            .expect("second splice");
+        let third = splice_creative_slots(&second, &network_keys("222"), &header_rendered())
+            .expect("third splice");
 
         assert_eq!(
             third
@@ -899,7 +1114,7 @@ mod tests {
         let existing = "[creative_opportunities] # ad templates\ngam_network_id = \"111\"\n\n\
              [auction] # flags\nenabled = true\n";
 
-        let out = splice_creative_slots(existing, Some("222"), &header_rendered())
+        let out = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
             .expect("should splice");
 
         assert_eq!(
@@ -931,7 +1146,7 @@ mod tests {
         let existing =
             "[creative_opportunities]\ngam_network_id = \"111\"\n\n[auction]\nenabled = true\n";
 
-        let out = splice_creative_slots(existing, Some("222"), &header_rendered())
+        let out = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
             .expect("should splice");
 
         let value = toml::from_str::<toml::Value>(&out).expect("valid TOML");
@@ -958,7 +1173,7 @@ mod tests {
              slot = [{ id = \"old\", div_id = \"old\", gam_unit_path = \"/111/old\", page_patterns = [\"/\"], formats = [{ width = 300, height = 250 }] }]\n\n\
              [auction]\nenabled = true\n";
 
-        let out = splice_creative_slots(existing, Some("222"), &header_rendered())
+        let out = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
             .expect("should replace inline slot array");
 
         let value = toml::from_str::<toml::Value>(&out).expect("spliced config should be valid");
@@ -980,7 +1195,7 @@ mod tests {
              gam_network_id = \"111\"\n\
              slot = { \"0\" = { id = \"old\", div_id = \"old\", gam_unit_path = \"/111/old\", page_patterns = [\"/\"], formats = [{ width = 300, height = 250 }] } }\n";
 
-        let out = splice_creative_slots(existing, Some("222"), &header_rendered())
+        let out = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
             .expect("should replace inline slot map");
 
         let value = toml::from_str::<toml::Value>(&out).expect("spliced config should be valid");
