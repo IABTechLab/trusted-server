@@ -549,7 +549,7 @@ pub(crate) fn run_update_slots(
     let root_url = root.final_url().unwrap_or_else(|_| target_url.clone());
     let mut table = evidence::EvidenceTable::default();
     let mut notes = Vec::new();
-    fold_collected(&mut table, &root_url, &root)?;
+    fold_collected(&mut table, &root_url, &root, &mut notes)?;
 
     // One page per section is enough: ad slots repeat per section, so the crawl
     // is sized by the publisher's taxonomy rather than its catalogue.
@@ -563,7 +563,7 @@ pub(crate) fn run_update_slots(
         if index > 0 {
             let repeat = first_collector.collect_page(&root_url, request.cookies);
             match repeat {
-                Ok(page) => fold_collected(&mut table, &root_url, &page)?,
+                Ok(page) => fold_collected(&mut table, &root_url, &page, &mut notes)?,
                 Err(error) => notes.push(format!("skipped `{root_url}` on {label}: {error}")),
             }
         }
@@ -581,8 +581,17 @@ pub(crate) fn run_update_slots(
         ));
     }
 
+    // Emit what the crawl learned before any refusal below can return early.
+    // The guards exist precisely for runs that went wrong, so that is when the
+    // per-page reasons matter most.
+    emit_notes(out, &mut notes)?;
+
     if table.is_empty() {
-        return cli_error("no ad-template slots were discovered on any crawled page");
+        return cli_error(format!(
+            "no ad-template slots were discovered on any of the {} crawled page(s); \
+             see the notes above for what each page reported",
+            table.pages().len()
+        ));
     }
     guard_challenge_rate(&table)?;
 
@@ -624,10 +633,7 @@ pub(crate) fn run_update_slots(
     // preview looked fine" would not be evidence that the config loads.
     notes.extend(validate::check_candidate(&updated, &existing)?);
 
-    for note in &notes {
-        writeln!(out, "note: {note}")
-            .map_err(|error| report_error(format!("failed to write command output: {error}")))?;
-    }
+    emit_notes(out, &mut notes)?;
     if policy.is_some() {
         writeln!(
             out,
@@ -661,13 +667,65 @@ pub(crate) fn run_update_slots(
     .map_err(|error| report_error(format!("failed to write command output: {error}")))
 }
 
+/// A page carrying fewer scripts than this is not a real publisher page.
+///
+/// A production page runs dozens: the ad stack, analytics, consent, and the
+/// site's own bundles. A bot-protection interstitial runs its own challenge
+/// script and little else.
+const INTERSTITIAL_SCRIPT_CEILING: usize = 3;
+
+/// Whether a page that loaded successfully is nonetheless not the real page.
+///
+/// Bot protection commonly answers with **200** and a challenge document rather
+/// than a 4xx, so status-code checks pass and the page simply appears to have no
+/// ad stack. Left unexplained, that is indistinguishable from a publisher who
+/// genuinely runs no ads on that page — and the operator's next move is entirely
+/// different in each case.
+fn looks_like_an_interstitial(artifact: &AuditArtifact) -> Option<String> {
+    if artifact.js_asset_count > INTERSTITIAL_SCRIPT_CEILING
+        || !artifact.detected_integrations.is_empty()
+    {
+        return None;
+    }
+    Some(format!(
+        "the page returned successfully but carried only {} script(s) and no recognised \
+         integrations, which is the shape of a bot-protection challenge rather than the \
+         real page. Supply a current --cookie for the origin",
+        artifact.js_asset_count
+    ))
+}
+
+/// Writes and clears the pending notes, so each is reported exactly once.
+fn emit_notes(out: &mut dyn Write, notes: &mut Vec<String>) -> CliResult<()> {
+    for note in notes.drain(..) {
+        writeln!(out, "note: {note}")
+            .map_err(|error| report_error(format!("failed to write command output: {error}")))?;
+    }
+    Ok(())
+}
+
 /// Discovers a collected page's slots and folds them into `table`.
+///
+/// Per-page collector warnings are appended to `notes`. They carry the reason a
+/// page came back without slots — a non-2xx main document, a navigation that
+/// never settled — which is the difference between "this publisher has no ad
+/// stack here" and "bot protection served a challenge". Dropping them leaves
+/// the operator with a refusal and no way to act on it.
 fn fold_collected(
     table: &mut evidence::EvidenceTable,
     url: &Url,
     collected: &collector::CollectedPage,
+    notes: &mut Vec<String>,
 ) -> CliResult<()> {
+    // `analyze_collected_page` already carries the collector's warnings forward,
+    // so this is the complete set, not a second copy.
     let artifact = analyze_collected_page(collected)?;
+    for warning in &artifact.warnings {
+        notes.push(format!("`{}`: {warning}", url.path()));
+    }
+    if let Some(reason) = looks_like_an_interstitial(&artifact) {
+        notes.push(format!("`{}`: {reason}", url.path()));
+    }
     let page_has_prebid = artifact
         .detected_integrations
         .iter()
@@ -709,7 +767,7 @@ fn crawl_sections(
         match collected {
             Ok(page) => {
                 let final_url = page.final_url().unwrap_or_else(|_| url.clone());
-                if let Err(error) = fold_collected(table, &final_url, &page) {
+                if let Err(error) = fold_collected(table, &final_url, &page, notes) {
                     fold_error = Some(error);
                     return Ok(collector::ControlFlow::Stop);
                 }
