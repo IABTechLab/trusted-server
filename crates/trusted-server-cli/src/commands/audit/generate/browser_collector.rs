@@ -114,6 +114,10 @@ impl DeviceProfile {
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct BrowserAuditCollector {
     profile: Option<DeviceProfile>,
+    /// Pause between page loads during a crawl.
+    page_delay: Duration,
+    /// Run a visible browser instead of a headless one.
+    headful: bool,
 }
 
 impl BrowserAuditCollector {
@@ -122,6 +126,48 @@ impl BrowserAuditCollector {
     pub(crate) fn with_profile(profile: DeviceProfile) -> Self {
         Self {
             profile: Some(profile),
+            ..Self::default()
+        }
+    }
+
+    /// Sets the pause between page loads.
+    ///
+    /// A crawl issues a dozen navigations in a row. Firing them back to back is
+    /// both discourteous to the origin and self-defeating: request pacing is one
+    /// of the signals bot protection scores, so an unpaced crawl invites the
+    /// challenge that empties the rest of the run.
+    #[must_use]
+    pub(crate) fn with_page_delay(mut self, delay: Duration) -> Self {
+        self.page_delay = delay;
+        self
+    }
+
+    /// Runs a visible browser rather than a headless one.
+    ///
+    /// Headless Chrome is trivially detectable and is scored heavily by bot
+    /// protection, so an origin that serves a real page to a normal browser may
+    /// answer the same request headless with a challenge.
+    #[must_use]
+    pub(crate) fn headful(mut self, headful: bool) -> Self {
+        self.headful = headful;
+        self
+    }
+}
+
+/// The browser-session knobs one crawl runs under.
+#[derive(Debug, Clone, Copy)]
+struct SessionSettings {
+    profile: Option<DeviceProfile>,
+    page_delay: Duration,
+    headful: bool,
+}
+
+impl BrowserAuditCollector {
+    fn session(self) -> SessionSettings {
+        SessionSettings {
+            profile: self.profile,
+            page_delay: self.page_delay,
+            headful: self.headful,
         }
     }
 }
@@ -141,13 +187,13 @@ impl AuditCollector for BrowserAuditCollector {
                 ))
             })?;
 
-        let profile = self.profile;
+        let settings = self.session();
         runtime.block_on(async {
             let mut collected = None;
             with_browser(
                 std::slice::from_ref(target_url),
                 cookies,
-                profile,
+                settings,
                 &mut |_, result| {
                     collected = Some(result);
                     Ok(ControlFlow::Stop)
@@ -176,7 +222,7 @@ impl AuditCollector for BrowserAuditCollector {
                 ))
             })?;
 
-        runtime.block_on(with_browser(targets, cookies, self.profile, on_page))
+        runtime.block_on(with_browser(targets, cookies, self.session(), on_page))
     }
 }
 
@@ -191,9 +237,14 @@ impl AuditCollector for BrowserAuditCollector {
 async fn with_browser(
     targets: &[Url],
     cookies: &[(String, String)],
-    profile: Option<DeviceProfile>,
+    settings: SessionSettings,
     sink: PageSink<'_>,
 ) -> CliResult<()> {
+    let SessionSettings {
+        profile,
+        page_delay,
+        headful,
+    } = settings;
     let chrome_executable = find_browser_executable()?;
     let user_data_dir = TempDir::new().map_err(|error| {
         report_error(format!(
@@ -207,8 +258,15 @@ async fn with_browser(
     let mut builder = BrowserConfig::builder()
         .chrome_executable(chrome_executable)
         .user_data_dir(user_data_dir.path())
-        .new_headless_mode()
         .respect_https_errors();
+    // `BrowserConfig` defaults to the *old* headless mode, which is both more
+    // detectable and less faithful than either alternative — so both branches
+    // must be explicit. Omitting the call is not the same as running headful.
+    builder = if headful {
+        builder.with_head()
+    } else {
+        builder.new_headless_mode()
+    };
     if let Some(profile) = profile {
         let viewport = profile.viewport();
         builder = builder
@@ -243,6 +301,11 @@ async fn with_browser(
     // Sitemap discovery is a whole-site fact, so only the first target pays for it.
     let mut result = Ok(());
     for (index, target) in targets.iter().enumerate() {
+        // Pace the crawl. Back-to-back navigations are both discourteous to the
+        // origin and a signal bot protection scores against the session.
+        if index > 0 && !page_delay.is_zero() {
+            sleep(page_delay).await;
+        }
         let collected = collect_page_from_browser(&mut browser, target, cookies, index == 0).await;
         match sink(target, collected) {
             Ok(ControlFlow::Continue) => {}

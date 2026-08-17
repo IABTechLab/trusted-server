@@ -156,6 +156,22 @@ pub(crate) struct AuditAdTemplatesGenerateArgs {
     /// for any slot where the profiles disagree.
     #[arg(long, value_delimiter = ',', default_value = "desktop")]
     pub profiles: Vec<String>,
+    /// Pause in milliseconds between page loads during the crawl.
+    ///
+    /// A crawl issues a dozen navigations in a row. Firing them back to back is
+    /// discourteous to the origin, and request pacing is one of the signals bot
+    /// protection scores, so an unpaced crawl can trigger the challenge that
+    /// empties the rest of the run.
+    #[arg(long, default_value_t = 750)]
+    pub page_delay_ms: u64,
+    /// Run a visible browser instead of a headless one.
+    ///
+    /// Headless Chrome is trivially detectable and scored heavily by bot
+    /// protection, so an origin that serves the real page to a normal browser
+    /// may answer the same request headless with a challenge. Requires a desktop
+    /// session; it opens a real window.
+    #[arg(long)]
+    pub headful: bool,
 }
 
 impl AuditAdTemplatesGenerateArgs {
@@ -240,6 +256,8 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<(), String> {
                 .iter()
                 .map(|profile| {
                     generate::browser_collector::BrowserAuditCollector::with_profile(*profile)
+                        .with_page_delay(std::time::Duration::from_millis(gen_args.page_delay_ms))
+                        .headful(gen_args.headful)
                 })
                 .collect();
             let selected: Vec<(&str, &dyn generate::collector::AuditCollector)> = profiles
