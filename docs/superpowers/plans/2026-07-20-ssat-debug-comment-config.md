@@ -89,7 +89,7 @@ cargo test -p trusted-server-core --lib auction_debug_comment_options -- --nocap
 cargo test -p trusted-server-core --lib bad_verbosity_string_fails_config_load -- --nocapture
 ```
 
-Expected: the first command fails because the current default still contains provider-controlled keys and `AuctionDebugCommentVerbosity::Upstream` does not exist. The invalid-verbosity regression continues to pass.
+Expected: both commands fail to compile because Rust builds the complete lib test binary before applying the name filter, and the newly added test references the nonexistent `AuctionDebugCommentVerbosity::Upstream`. This is the intended RED state; the existing invalid-verbosity assertion is re-confirmed after the enum compiles in Step 4.
 
 - [ ] **Step 3: Implement the minimal settings change**
 
@@ -217,7 +217,9 @@ Expected: new privacy tests fail because current redacted rendering clones value
 Import both key constants. Add private helpers close to `redact_response_for_dump`:
 
 ```rust
-fn validated_error_type(metadata: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
+fn validated_error_type(
+    metadata: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<&str> {
     let value = metadata.get("error_type")?.as_str()?;
     matches!(
         value,
@@ -227,7 +229,7 @@ fn validated_error_type(metadata: &serde_json::Map<String, serde_json::Value>) -
 }
 
 fn validated_http_status(
-    metadata: &serde_json::Map<String, serde_json::Value>,
+    metadata: &std::collections::HashMap<String, serde_json::Value>,
 ) -> Option<u64> {
     metadata
         .get("http_status")?
@@ -254,7 +256,7 @@ Implement `redacted_metadata_for_dump` so it reconstructs values only when each 
 
 ```rust
 fn redacted_metadata_for_dump(
-    metadata: &serde_json::Map<String, serde_json::Value>,
+    metadata: &std::collections::HashMap<String, serde_json::Value>,
     options: &AuctionDebugCommentOptions,
 ) -> serde_json::Map<String, serde_json::Value> {
     let selected = |key: &str| {
@@ -297,7 +299,11 @@ let metadata = match options.verbosity {
         }
         metadata
     }
-    AuctionDebugCommentVerbosity::Full => response.metadata.clone(),
+    AuctionDebugCommentVerbosity::Full => response
+        .metadata
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect(),
 };
 ```
 
