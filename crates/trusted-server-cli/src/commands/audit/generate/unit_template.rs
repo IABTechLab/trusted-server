@@ -25,11 +25,6 @@
 //! [`derive_section`] against every observation. A template that does not
 //! reproduce what the live page actually requested is downgraded, not written.
 
-#![allow(
-    dead_code,
-    reason = "inference is exercised by tests until run_update_slots orchestrates the crawl"
-)]
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use trusted_server_core::creative_opportunities::{CreativeOpportunitySlot, derive_section};

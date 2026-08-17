@@ -14,10 +14,6 @@
 //! - **Sitemap entries** give a real *article* per section (`/news/story-abc`),
 //!   which is where in-content slots live, and reveal sections hidden behind a
 //!   navigation overflow menu.
-#![allow(
-    dead_code,
-    reason = "planner is exercised by tests until run_update_slots orchestrates the crawl"
-)]
 
 use std::collections::BTreeMap;
 
@@ -58,11 +54,11 @@ const NON_PAGE_EXTENSIONS: &[&str] = &[
 
 /// Bounds on how much of a site a single run will load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct CrawlBudget {
+pub(crate) struct CrawlBudget {
     /// Maximum number of sections to sample.
-    pub(super) max_sections: usize,
+    pub(crate) max_sections: usize,
     /// Maximum number of pages to load in total, including the root.
-    pub(super) max_pages: usize,
+    pub(crate) max_pages: usize,
 }
 
 impl Default for CrawlBudget {

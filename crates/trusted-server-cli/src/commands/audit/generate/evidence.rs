@@ -19,11 +19,6 @@
 //! div ids carry per-render framework hashes and would otherwise look like a new
 //! slot on every page.
 
-#![allow(
-    dead_code,
-    reason = "table is exercised by tests until run_update_slots orchestrates the crawl"
-)]
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::gpt_slots::DiscoveredSlots;

@@ -22,13 +22,14 @@ use url::Url;
 
 use crate::commands::audit::generate::collector::AuditCollector;
 use crate::commands::audit::generate::slot_toml::{
-    merge_slots, render_slots, replace_key_in_section, resolve_network_id, splice_creative_slots,
-    toml_string,
+    render_slots, replace_key_in_section, resolve_network_id, splice_creative_slots, toml_string,
 };
 use crate::commands::config::init::EXAMPLE_CONFIG;
 use crate::error::{CliResult, cli_error, report_error};
 
 use analyzer::{analyze_collected_page, extract_gtm_container_id};
+
+pub(crate) use crawl_plan::CrawlBudget;
 
 /// Writes `contents` to `path` atomically: a same-directory temp file is
 /// written and fsynced, then renamed over the target, then the directory entry
@@ -488,28 +489,157 @@ fn render_discovered_slots(target_url: &Url, slots: &gpt_slots::DiscoveredSlots)
 /// Returns an error when the config cannot be read, the page cannot be
 /// collected, no slots are discovered, or the config has no
 /// `[creative_opportunities]` section to update.
-#[allow(clippy::too_many_arguments, reason = "cohesive one-shot command entry")]
+/// Everything one `ts audit ad-templates generate` invocation needs.
+pub(crate) struct UpdateSlotsRequest<'a> {
+    /// Page URL to start from; also bounds the crawl to its origin.
+    pub(crate) url: &'a str,
+    /// Operator config to rewrite in place.
+    pub(crate) config_path: &'a Path,
+    /// The config's current `[creative_opportunities]`, when it has one.
+    pub(crate) existing_creative: Option<&'a CreativeOpportunitiesConfig>,
+    /// Explicit `--page-pattern` values. When non-empty these apply to every
+    /// slot and pattern inference is skipped entirely.
+    pub(crate) page_patterns: &'a [String],
+    /// Replace existing slots rather than merging into them.
+    pub(crate) replace: bool,
+    /// Cookies to carry into the crawl.
+    pub(crate) cookies: &'a [(String, String)],
+    /// Print the candidate instead of writing it.
+    pub(crate) dry_run: bool,
+    /// Crawl bounds.
+    pub(crate) budget: crawl_plan::CrawlBudget,
+}
+
+/// Share of crawled pages that may yield no slots before the run is refused.
+///
+/// A bot-protection challenge serves an interstitial that loads fine and
+/// contains no ad stack, so it looks like a page with no slots. Writing a config
+/// from a crawl that was mostly challenges would silently narrow the operator's
+/// slot set; refusing is the safer failure.
+const MAX_EMPTY_PAGE_SHARE: f64 = 0.25;
+
+/// Runs `ts audit ad-templates generate`: crawl the site's sections, reconcile
+/// what each slot looked like across them, infer a `{section}` ad-unit template
+/// where the evidence proves one, and rewrite the config's slot array in place.
+///
+/// # Errors
+///
+/// Returns an error when the config cannot be read, the root page cannot be
+/// collected, no slots are discovered, too many pages came back empty, the
+/// pages disagree about the GAM network id, or the resulting config would not
+/// load.
 pub(crate) fn run_update_slots(
-    url: &str,
-    config_path: &Path,
-    existing_creative: Option<&CreativeOpportunitiesConfig>,
-    page_patterns: &[String],
-    replace: bool,
-    cookies: &[(String, String)],
-    dry_run: bool,
+    request: &UpdateSlotsRequest<'_>,
     collector: &dyn AuditCollector,
     out: &mut dyn Write,
 ) -> CliResult<()> {
-    let target_url = parse_audit_url(url)?;
-    let existing = fs::read_to_string(config_path).map_err(|error| {
+    let target_url = parse_audit_url(request.url)?;
+    let existing = fs::read_to_string(request.config_path).map_err(|error| {
         report_error(format!(
             "failed to read config {}: {error}",
-            config_path.display()
+            request.config_path.display()
         ))
     })?;
 
-    let collected = collector.collect_page(&target_url, cookies)?;
-    let artifact = analyze_collected_page(&collected)?;
+    let root = collector.collect_page(&target_url, request.cookies)?;
+    let root_url = root.final_url().unwrap_or_else(|_| target_url.clone());
+    let mut table = evidence::EvidenceTable::default();
+    let mut notes = Vec::new();
+    fold_collected(&mut table, &root_url, &root)?;
+
+    // One page per section is enough: ad slots repeat per section, so the crawl
+    // is sized by the publisher's taxonomy rather than its catalogue.
+    let plan = crawl_plan::plan_crawl(&root_url, &root.links, &root.sitemap_locs, request.budget);
+    notes.extend(plan.notes.iter().cloned());
+    crawl_sections(collector, &plan, request.cookies, &mut table, &mut notes)?;
+
+    if table.is_empty() {
+        return cli_error("no ad-template slots were discovered on any crawled page");
+    }
+    guard_challenge_rate(&table)?;
+
+    let discovered_network_id = table.network_id()?;
+    let network_id = resolve_network_id(
+        request.existing_creative,
+        discovered_network_id.as_deref(),
+        request.replace,
+    );
+
+    // Templating needs a network id to bind `{network_id}` against; without one
+    // every path stays literal.
+    let inference = network_id
+        .as_deref()
+        .map(|id| unit_template::infer_unit_templates(&table, id));
+    if let Some(outcome) = &inference {
+        notes.extend(outcome.diagnostics.iter().cloned());
+    }
+    let policy = inference
+        .as_ref()
+        .and_then(|outcome| outcome.policy.clone());
+
+    let slots = build_render_slots(&table, inference.as_ref(), policy.as_ref(), request)?;
+    let merged = slot_toml::merge_render_slots(request.existing_creative, slots, request.replace);
+    let rendered_slots = render_slots(&merged);
+    let updated = splice_creative_slots(
+        &existing,
+        &slot_toml::CreativeSectionKeys {
+            network_id: network_id.as_deref(),
+            section_root: policy.as_ref().map(|policy| policy.section_root.as_str()),
+            section_segment: policy.as_ref().map(|policy| policy.section_segment),
+        },
+        &rendered_slots,
+    )?;
+
+    // Everything above is derived from a live, page-controlled ad stack, so the
+    // candidate has to clear the runtime's own load path before it can replace
+    // the operator's file. This runs on the dry-run path too — otherwise "the
+    // preview looked fine" would not be evidence that the config loads.
+    notes.extend(validate::check_candidate(&updated, &existing)?);
+
+    for note in &notes {
+        writeln!(out, "note: {note}")
+            .map_err(|error| report_error(format!("failed to write command output: {error}")))?;
+    }
+    if policy.is_some() {
+        writeln!(
+            out,
+            "note: this config now uses a {{section}} ad-unit template. Deploy a \
+             template-aware binary BEFORE pushing it, and do not roll that binary \
+             back while this config is live — an older binary rejects the whole \
+             config and serves an error on every route."
+        )
+        .map_err(|error| report_error(format!("failed to write command output: {error}")))?;
+    }
+
+    if request.dry_run {
+        writeln!(out, "{updated}")
+            .map_err(|error| report_error(format!("failed to write preview: {error}")))?;
+        return Ok(());
+    }
+    write_file_atomically(request.config_path, &updated).map_err(|error| {
+        report_error(format!(
+            "failed to write config {}: {error}",
+            request.config_path.display()
+        ))
+    })?;
+    writeln!(
+        out,
+        "Wrote {} slot(s) to {} ({} slot(s) seen across {} page(s))",
+        merged.len(),
+        request.config_path.display(),
+        table.slot_count(),
+        table.pages().len(),
+    )
+    .map_err(|error| report_error(format!("failed to write command output: {error}")))
+}
+
+/// Discovers a collected page's slots and folds them into `table`.
+fn fold_collected(
+    table: &mut evidence::EvidenceTable,
+    url: &Url,
+    collected: &collector::CollectedPage,
+) -> CliResult<()> {
+    let artifact = analyze_collected_page(collected)?;
     let page_has_prebid = artifact
         .detected_integrations
         .iter()
@@ -519,71 +649,109 @@ pub(crate) fn run_update_slots(
         &collected.network_requests,
         page_has_prebid,
     );
-    if discovered.slots.is_empty() {
-        return cli_error("no ad-template slots were discovered on the page");
-    }
+    table.fold_page(url.path(), &discovered);
+    Ok(())
+}
 
-    // Patterns for slots seen on this run: the `--page-pattern` values, or the
-    // audited path when none are given (preserving single-page behavior). The
-    // default uses the recorded post-redirect URL so it matches the page that
-    // was actually audited, falling back to the requested URL when the
-    // recorded final URL is invalid.
-    let run_patterns: Vec<String> = if page_patterns.is_empty() {
-        let audited_url = collected.final_url().unwrap_or_else(|_| target_url.clone());
-        vec![default_page_pattern(&audited_url)]
-    } else {
-        page_patterns.to_vec()
-    };
-    // Reject a pattern the runtime cannot compile before it reaches the file:
-    // a persisted invalid glob either fails the next config load or is silently
-    // dropped at pattern-compile time, leaving the slot matching fewer pages
-    // than the config claims.
-    validate_page_patterns(&run_patterns)?;
-
-    let merged = merge_slots(existing_creative, &discovered, &run_patterns, replace);
-    let network_id = resolve_network_id(
-        existing_creative,
-        discovered.gam_network_id.as_deref(),
-        replace,
-    );
-    let rendered_slots = render_slots(&merged);
-    let updated = splice_creative_slots(
-        &existing,
-        &slot_toml::CreativeSectionKeys {
-            network_id: network_id.as_deref(),
-            ..slot_toml::CreativeSectionKeys::default()
-        },
-        &rendered_slots,
-    )?;
-
-    // Everything above is derived from a live, page-controlled ad stack, so the
-    // candidate has to clear the runtime's own load path before it can replace
-    // the operator's file. This runs on the dry-run path too — otherwise "the
-    // preview looked fine" would not be evidence that the config loads.
-    for warning in validate::check_candidate(&updated, &existing)? {
-        writeln!(out, "warning: {warning}")
-            .map_err(|error| report_error(format!("failed to write command output: {error}")))?;
-    }
-
-    if dry_run {
-        writeln!(out, "{updated}")
-            .map_err(|error| report_error(format!("failed to write preview: {error}")))?;
+/// Walks the planned section pages, folding each into `table`.
+///
+/// A page that fails to collect is recorded as a note rather than aborting: on a
+/// multi-section crawl one blocked or slow page should not discard the sections
+/// that did work. The empty-page guard afterwards catches the case where enough
+/// of them failed that the result is untrustworthy.
+fn crawl_sections(
+    collector: &dyn AuditCollector,
+    plan: &crawl_plan::CrawlPlan,
+    cookies: &[(String, String)],
+    table: &mut evidence::EvidenceTable,
+    notes: &mut Vec<String>,
+) -> CliResult<()> {
+    let targets = plan.targets();
+    if targets.is_empty() {
+        notes.push(
+            "no additional site sections were discovered, so only the requested page was \
+             audited; pass explicit --page-pattern values or more URLs to widen coverage"
+                .to_string(),
+        );
         return Ok(());
     }
-    write_file_atomically(config_path, &updated).map_err(|error| {
-        report_error(format!(
-            "failed to write config {}: {error}",
-            config_path.display()
-        ))
+
+    let mut fold_error = None;
+    collector.collect_pages(&targets, cookies, &mut |url, collected| {
+        match collected {
+            Ok(page) => {
+                let final_url = page.final_url().unwrap_or_else(|_| url.clone());
+                if let Err(error) = fold_collected(table, &final_url, &page) {
+                    fold_error = Some(error);
+                    return Ok(collector::ControlFlow::Stop);
+                }
+            }
+            Err(error) => notes.push(format!("skipped `{url}`: {error}")),
+        }
+        Ok(collector::ControlFlow::Continue)
     })?;
-    writeln!(
-        out,
-        "Wrote {} slot(s) to {} ({} discovered this run)",
-        merged.len(),
-        config_path.display(),
-        discovered.slots.len(),
-    )
-    .map_err(|error| report_error(format!("failed to write command output: {error}")))
+    match fold_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Refuses a crawl where too many pages produced no slots.
+fn guard_challenge_rate(table: &evidence::EvidenceTable) -> CliResult<()> {
+    let total = table.pages().len();
+    let empty = table.empty_pages().len();
+    if total == 0 || (empty as f64) <= (total as f64) * MAX_EMPTY_PAGE_SHARE {
+        return Ok(());
+    }
+    let blocked: Vec<&str> = table.empty_pages().iter().map(String::as_str).collect();
+    cli_error(format!(
+        "{empty} of {total} crawled page(s) produced no ad slots ({}), which usually means \
+         bot protection served a challenge instead of the real page. Refusing to write a \
+         config from partial evidence; re-run with a valid --cookie for the origin",
+        blocked.join(", ")
+    ))
+}
+
+/// Turns the evidence table into slots ready to render.
+fn build_render_slots(
+    table: &evidence::EvidenceTable,
+    inference: Option<&unit_template::InferenceOutcome>,
+    policy: Option<&unit_template::SectionPolicy>,
+    request: &UpdateSlotsRequest<'_>,
+) -> CliResult<Vec<slot_toml::RenderSlot>> {
+    // Explicit `--page-pattern` values are an operator override: they apply to
+    // every slot and disable inference from observed paths entirely.
+    let explicit = !request.page_patterns.is_empty();
+    if explicit {
+        validate_page_patterns(request.page_patterns)?;
+    }
+    let section_segment = policy.map_or(0, |policy| policy.section_segment);
+
+    let mut slots = Vec::with_capacity(table.slot_count());
+    for slot in table.slots() {
+        let patterns = if explicit {
+            request.page_patterns.to_vec()
+        } else {
+            let derived = page_patterns::patterns_for_paths(slot.paths(), section_segment);
+            validate_page_patterns(&derived)?;
+            derived
+        };
+        let unit_path = match inference.and_then(|outcome| outcome.decision(&slot.div_id)) {
+            Some(unit_template::SlotDecision::Template(template)) => Some(template.clone()),
+            Some(unit_template::SlotDecision::Literal(path)) => Some(path.clone()),
+            // Refused: write the slot without a path rather than a wrong one.
+            Some(unit_template::SlotDecision::Refuse { .. }) | None => None,
+        };
+        slots.push(slot_toml::RenderSlot::from_evidence(
+            &slot.id,
+            &slot.div_id,
+            unit_path,
+            slot.formats.iter().copied(),
+            patterns,
+            slot.has_prebid,
+        ));
+    }
+    Ok(slots)
 }
 /// Rejects any page pattern the runtime's glob compiler would not accept.
 ///
@@ -607,16 +775,6 @@ fn validate_page_patterns(patterns: &[String]) -> CliResult<()> {
         "refusing to write invalid page pattern(s): {}",
         invalid.join("; ")
     ))
-}
-
-/// The default page pattern for a scraped URL: its path, or `/` for the root.
-fn default_page_pattern(target_url: &Url) -> String {
-    let path = target_url.path();
-    if path.is_empty() {
-        "/".to_string()
-    } else {
-        path.to_string()
-    }
 }
 
 #[cfg(test)]
@@ -655,6 +813,58 @@ mod tests {
             self.calls.set(self.calls.get() + 1);
             Ok(self.collected.clone())
         }
+    }
+
+    /// A collector serving a distinct page per URL, recording the crawl order.
+    struct SiteCollector {
+        pages: std::collections::HashMap<String, CollectedPage>,
+        visited: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl SiteCollector {
+        fn new(pages: Vec<(&str, CollectedPage)>) -> Self {
+            Self {
+                pages: pages
+                    .into_iter()
+                    .map(|(url, page)| (url.to_string(), page))
+                    .collect(),
+                visited: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl AuditCollector for SiteCollector {
+        fn collect_page(
+            &self,
+            target_url: &Url,
+            _cookies: &[(String, String)],
+        ) -> CliResult<CollectedPage> {
+            self.visited.borrow_mut().push(target_url.to_string());
+            self.pages
+                .get(target_url.as_str())
+                .cloned()
+                .ok_or_else(|| report_error(format!("no fake page for {target_url}")))
+        }
+    }
+
+    /// Builds a page carrying one GPT slot plus same-origin nav links.
+    fn site_page(url: &str, unit_path: &str, nav_paths: &[&str]) -> CollectedPage {
+        let mut page = collected_page();
+        page.requested_url = url.to_string();
+        page.final_url = url.to_string();
+        page.gpt_slots = vec![collector::CollectedGptSlot {
+            gam_unit_path: unit_path.to_string(),
+            div_id: "ad-header-0".to_string(),
+            sizes: vec![(728, 90)],
+        }];
+        page.links = nav_paths
+            .iter()
+            .map(|path| collector::CollectedLink {
+                url: format!("https://publisher.example{path}"),
+                in_nav: true,
+            })
+            .collect();
+        page
     }
 
     fn collected_page() -> CollectedPage {
@@ -1042,13 +1252,16 @@ mod tests {
         let mut out = Vec::new();
 
         run_update_slots(
-            "https://publisher.example/",
-            &config_path,
-            None,
-            &[],
-            false,
-            &[],
-            false,
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                budget: CrawlBudget::default(),
+            },
             &collector,
             &mut out,
         )
@@ -1056,10 +1269,19 @@ mod tests {
 
         let written = fs::read_to_string(&config_path).expect("should read config");
         let value = toml::from_str::<toml::Value>(&written).expect("valid TOML");
+        let patterns: Vec<&str> = value["creative_opportunities"]["slot"][0]["page_patterns"]
+            .as_array()
+            .expect("page_patterns array")
+            .iter()
+            .map(|entry| entry.as_str().expect("pattern string"))
+            .collect();
+        // Patterns come from the post-redirect path: had the requested `/` been
+        // used, this would be `["/"]`. They now cover the whole section rather
+        // than only the one article that happened to be scraped.
         assert_eq!(
-            value["creative_opportunities"]["slot"][0]["page_patterns"][0].as_str(),
-            Some("/news/story"),
-            "default pattern should use the post-redirect path, not the requested one"
+            patterns,
+            ["/news", "/news/*"],
+            "should derive section patterns from the post-redirect path"
         );
     }
 
@@ -1073,13 +1295,16 @@ mod tests {
         let mut out = Vec::new();
 
         let error = run_update_slots(
-            "https://publisher.example/",
-            &config_path,
-            None,
-            &["[".to_string()],
-            false,
-            &[],
-            false,
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &["[".to_string()],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                budget: CrawlBudget::default(),
+            },
             &collector,
             &mut out,
         )
@@ -1111,13 +1336,16 @@ mod tests {
         let mut out = Vec::new();
 
         run_update_slots(
-            "https://publisher.example/",
-            &config_path,
-            None,
-            &["/20**".to_string()],
-            false,
-            &[],
-            false,
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &["/20**".to_string()],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                budget: CrawlBudget::default(),
+            },
             &collector,
             &mut out,
         )
@@ -1144,13 +1372,16 @@ mod tests {
         let mut out = Vec::new();
 
         run_update_slots(
-            "https://publisher.example/",
-            &config_path,
-            None,
-            &[],
-            false,
-            &[],
-            false,
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                budget: CrawlBudget::default(),
+            },
             &collector,
             &mut out,
         )
@@ -1194,6 +1425,210 @@ mod tests {
     }
 
     #[test]
+    fn a_crawl_writes_a_section_template_and_per_section_patterns() {
+        // The end-to-end payoff: crawl sections, reconcile the slot across them,
+        // infer `{section}`, and write a config the runtime loads.
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        fs::write(&config_path, loadable_config()).expect("should write config");
+
+        let nav = ["/news", "/deals"];
+        let collector = SiteCollector::new(vec![
+            (
+                "https://publisher.example/",
+                site_page(
+                    "https://publisher.example/",
+                    "/123456789/site/homepage",
+                    &nav,
+                ),
+            ),
+            (
+                "https://publisher.example/news",
+                site_page(
+                    "https://publisher.example/news",
+                    "/123456789/site/news",
+                    &nav,
+                ),
+            ),
+            (
+                "https://publisher.example/deals",
+                site_page(
+                    "https://publisher.example/deals",
+                    "/123456789/site/deals",
+                    &nav,
+                ),
+            ),
+        ]);
+        let mut out = Vec::new();
+
+        run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                budget: CrawlBudget::default(),
+            },
+            &collector,
+            &mut out,
+        )
+        .expect("should crawl and update slots");
+
+        let written = fs::read_to_string(&config_path).expect("should read config");
+        let value = toml::from_str::<toml::Value>(&written).expect("valid TOML");
+        let creative = &value["creative_opportunities"];
+
+        assert_eq!(
+            creative["section_root"].as_str(),
+            Some("homepage"),
+            "the unvisited-section fallback should come from the root page"
+        );
+        assert_eq!(creative["section_segment"].as_integer(), Some(0));
+        let slot = &creative["slot"][0];
+        assert_eq!(
+            slot["gam_unit_path"].as_str(),
+            Some("/{network_id}/site/{section}"),
+            "the varying segment should become a template"
+        );
+        let patterns: Vec<&str> = slot["page_patterns"]
+            .as_array()
+            .expect("patterns array")
+            .iter()
+            .map(|entry| entry.as_str().expect("pattern"))
+            .collect();
+        assert_eq!(
+            patterns,
+            ["/", "/deals", "/deals/*", "/news", "/news/*"],
+            "each witnessed section should contribute both halves of its pair"
+        );
+
+        // The whole point of the gate: what was written must actually load.
+        trusted_server_core::settings::Settings::from_toml(&written)
+            .expect("generated config must load through the runtime path");
+
+        let report = String::from_utf8(out).expect("utf8 output");
+        assert!(
+            report.contains("Deploy a template-aware binary BEFORE pushing"),
+            "a templated config must warn about the rollback contract, got:\n{report}"
+        );
+    }
+
+    #[test]
+    fn a_crawl_refuses_when_most_pages_are_challenged() {
+        // Bot protection serves an interstitial that loads fine and has no ad
+        // stack, so it looks like a page with no slots. Writing from that would
+        // silently narrow the operator's slot set.
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        let original = loadable_config();
+        fs::write(&config_path, &original).expect("should write config");
+
+        let nav = ["/news", "/deals"];
+        let mut blocked_news = site_page("https://publisher.example/news", "/123456789/x", &nav);
+        blocked_news.gpt_slots.clear();
+        let mut blocked_deals = site_page("https://publisher.example/deals", "/123456789/x", &nav);
+        blocked_deals.gpt_slots.clear();
+        let collector = SiteCollector::new(vec![
+            (
+                "https://publisher.example/",
+                site_page(
+                    "https://publisher.example/",
+                    "/123456789/site/homepage",
+                    &nav,
+                ),
+            ),
+            ("https://publisher.example/news", blocked_news),
+            ("https://publisher.example/deals", blocked_deals),
+        ]);
+        let mut out = Vec::new();
+
+        let error = run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                budget: CrawlBudget::default(),
+            },
+            &collector,
+            &mut out,
+        )
+        .expect_err("a mostly-challenged crawl should refuse");
+
+        assert!(
+            format!("{error:?}").contains("bot protection"),
+            "the error should name the likely cause, got {error:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("read config"),
+            original,
+            "a refused run must leave the config untouched"
+        );
+    }
+
+    #[test]
+    fn max_pages_one_restores_single_page_behavior() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        fs::write(&config_path, loadable_config()).expect("should write config");
+
+        let nav = ["/news", "/deals"];
+        let collector = SiteCollector::new(vec![(
+            "https://publisher.example/",
+            site_page(
+                "https://publisher.example/",
+                "/123456789/site/homepage",
+                &nav,
+            ),
+        )]);
+        let mut out = Vec::new();
+
+        run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                budget: CrawlBudget {
+                    max_sections: 8,
+                    max_pages: 1,
+                },
+            },
+            &collector,
+            &mut out,
+        )
+        .expect("should update from the single page");
+
+        assert_eq!(
+            collector.visited.borrow().len(),
+            1,
+            "max_pages = 1 must not crawl beyond the requested page"
+        );
+        let written = fs::read_to_string(&config_path).expect("read config");
+        let value = toml::from_str::<toml::Value>(&written).expect("valid TOML");
+        assert!(
+            value["creative_opportunities"]
+                .get("section_root")
+                .is_none(),
+            "one page cannot witness a section, so no rollback-fatal key may be written"
+        );
+        assert_eq!(
+            value["creative_opportunities"]["slot"][0]["gam_unit_path"].as_str(),
+            Some("/123456789/site/homepage"),
+            "a single page keeps the literal path"
+        );
+    }
+
+    #[test]
     fn generated_config_loads_through_the_runtime_settings_path() {
         // The end-to-end contract: whatever `generate` writes must survive the
         // same load path the adapter runs at startup. An unloadable config is a
@@ -1208,13 +1643,16 @@ mod tests {
         let mut out = Vec::new();
 
         run_update_slots(
-            "https://publisher.example/",
-            &config_path,
-            None,
-            &[],
-            false,
-            &[],
-            false,
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                budget: CrawlBudget::default(),
+            },
             &collector,
             &mut out,
         )
@@ -1301,13 +1739,16 @@ mod tests {
                 let mut out = Vec::new();
 
                 run_update_slots(
-                    "https://publisher.example/",
-                    &loaded.app_config_path,
-                    loaded.settings.creative_opportunities.as_ref(),
-                    &[],
-                    false,
-                    &[],
-                    true,
+                    &UpdateSlotsRequest {
+                        url: "https://publisher.example/",
+                        config_path: &loaded.app_config_path,
+                        existing_creative: loaded.settings.creative_opportunities.as_ref(),
+                        page_patterns: &[],
+                        replace: false,
+                        cookies: &[],
+                        dry_run: true,
+                        budget: CrawlBudget::default(),
+                    },
                     &collector,
                     &mut out,
                 )
@@ -1327,18 +1768,6 @@ mod tests {
                     "dry run must not persist environment-only config"
                 );
             },
-        );
-    }
-
-    #[test]
-    fn default_page_pattern_uses_path_or_root() {
-        assert_eq!(
-            default_page_pattern(&Url::parse("https://x/news/story").expect("url")),
-            "/news/story"
-        );
-        assert_eq!(
-            default_page_pattern(&Url::parse("https://x/").expect("url")),
-            "/"
         );
     }
 }

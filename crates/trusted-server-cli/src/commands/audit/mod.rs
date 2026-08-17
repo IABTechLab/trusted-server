@@ -137,6 +137,26 @@ pub(crate) struct AuditAdTemplatesGenerateArgs {
     /// cookie) so the origin serves the real page instead of a challenge.
     #[arg(long = "cookie", value_name = "NAME=VALUE", value_parser = parse_cookie)]
     pub cookies: Vec<(String, String)>,
+    /// Maximum site sections to sample. Each contributes a landing page and an
+    /// article, so this bounds how much of the publisher's taxonomy is covered.
+    #[arg(long, default_value_t = 8)]
+    pub max_sections: usize,
+    /// Maximum pages to load in total, including the requested page.
+    ///
+    /// Set to 1 to restore single-page behavior: no crawl, no section
+    /// discovery, and the audited path as the only page pattern.
+    #[arg(long, default_value_t = 17)]
+    pub max_pages: usize,
+}
+
+impl AuditAdTemplatesGenerateArgs {
+    /// The crawl bounds these arguments describe.
+    pub(crate) fn budget(&self) -> generate::CrawlBudget {
+        generate::CrawlBudget {
+            max_sections: self.max_sections,
+            max_pages: self.max_pages,
+        }
+    }
 }
 
 /// Arguments for `ts audit ad-templates verify <url>...`.
@@ -190,13 +210,16 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<(), String> {
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
             generate::run_update_slots(
-                gen_args.url.as_str(),
-                &loaded.app_config_path,
-                loaded.settings.creative_opportunities.as_ref(),
-                &gen_args.page_patterns,
-                gen_args.replace,
-                &gen_args.cookies,
-                gen_args.dry_run,
+                &generate::UpdateSlotsRequest {
+                    url: gen_args.url.as_str(),
+                    config_path: &loaded.app_config_path,
+                    existing_creative: loaded.settings.creative_opportunities.as_ref(),
+                    page_patterns: &gen_args.page_patterns,
+                    replace: gen_args.replace,
+                    cookies: &gen_args.cookies,
+                    dry_run: gen_args.dry_run,
+                    budget: gen_args.budget(),
+                },
                 &collector,
                 &mut out,
             )

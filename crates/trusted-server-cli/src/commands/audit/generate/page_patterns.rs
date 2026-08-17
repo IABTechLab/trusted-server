@@ -10,11 +10,6 @@
 //! **not** the bare `/news` landing page. Emitting only the star form silently
 //! drops the landing page from the slot.
 
-#![allow(
-    dead_code,
-    reason = "expansion is exercised by tests until run_update_slots orchestrates the crawl"
-)]
-
 use std::collections::BTreeSet;
 
 /// The root pattern, matching only the site root.

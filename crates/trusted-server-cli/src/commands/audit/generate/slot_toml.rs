@@ -10,6 +10,7 @@ use trusted_server_core::creative_opportunities::{
     CreativeOpportunitiesConfig, CreativeOpportunitySlot,
 };
 
+#[cfg(test)]
 use crate::commands::audit::generate::gpt_slots;
 use crate::error::{CliResult, cli_error, report_error};
 
@@ -41,6 +42,11 @@ impl RenderSlot {
             .to_string()
     }
 
+    /// Builds a slot from one page's discovery.
+    ///
+    /// Superseded in production by [`RenderSlot::from_evidence`], which reads
+    /// cross-page evidence; retained as test scaffolding for the merge cases.
+    #[cfg(test)]
     fn from_discovered(slot: &gpt_slots::DiscoveredSlot, patterns: &[String]) -> Self {
         Self {
             id: slot.id.clone(),
@@ -56,6 +62,35 @@ impl RenderSlot {
             targeting: BTreeMap::new(),
             aps_slot_id: None,
             prebid_bidders: slot.has_prebid.then(BTreeMap::new),
+        }
+    }
+
+    /// Builds a slot from cross-page evidence and the inferred unit path.
+    ///
+    /// `gam_unit_path` is `None` when inference refused to represent the slot;
+    /// the slot is still written so its div and formats are not lost, and the
+    /// runtime falls back to the default `/<network_id>/<id>` path.
+    pub(super) fn from_evidence(
+        id: &str,
+        div_id: &str,
+        gam_unit_path: Option<String>,
+        formats: impl IntoIterator<Item = (u32, u32)>,
+        page_patterns: Vec<String>,
+        has_prebid: bool,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            div_id: Some(div_id.to_string()),
+            gam_unit_path,
+            page_patterns,
+            formats: formats
+                .into_iter()
+                .map(|(width, height)| (width, height, None))
+                .collect(),
+            floor_price: None,
+            targeting: BTreeMap::new(),
+            aps_slot_id: None,
+            prebid_bidders: has_prebid.then(BTreeMap::new),
         }
     }
 
@@ -109,6 +144,7 @@ fn media_type_label(media_type: &MediaType) -> Option<&'static str> {
 /// - Otherwise existing slots are preserved (covering other pages / hand-tuned
 ///   fields); a slot re-seen this run has `run_patterns` unioned into its
 ///   `page_patterns`; slots seen only this run are appended.
+#[cfg(test)]
 pub(super) fn merge_slots(
     existing: Option<&CreativeOpportunitiesConfig>,
     discovered: &gpt_slots::DiscoveredSlots,
@@ -120,7 +156,21 @@ pub(super) fn merge_slots(
         .iter()
         .map(|slot| RenderSlot::from_discovered(slot, run_patterns))
         .collect();
+    merge_render_slots(existing, discovered_slots, replace)
+}
 
+/// Merges already-built slots into the existing set.
+///
+/// Same reconciliation as [`merge_slots`], but the caller supplies the slots —
+/// the crawl path builds them from cross-page evidence rather than from one
+/// page's discoveries. A slot re-seen this run keeps its configured fields and
+/// gains this run's patterns; a genuinely new slot is appended with a
+/// non-colliding id.
+pub(super) fn merge_render_slots(
+    existing: Option<&CreativeOpportunitiesConfig>,
+    discovered_slots: Vec<RenderSlot>,
+    replace: bool,
+) -> Vec<RenderSlot> {
     let existing_slots = existing.map(|config| config.slot.as_slice()).unwrap_or(&[]);
     if replace || existing_slots.is_empty() {
         return discovered_slots;

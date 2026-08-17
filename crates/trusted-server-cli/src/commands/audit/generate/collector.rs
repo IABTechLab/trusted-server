@@ -14,10 +14,6 @@ pub(crate) type PageSink<'a> =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ControlFlow {
     /// Collect the next target.
-    #[allow(
-        dead_code,
-        reason = "constructed by run_update_slots once it orchestrates the crawl"
-    )]
     Continue,
     /// Stop the crawl without an error (budget reached, challenge rate exceeded).
     Stop,
@@ -50,10 +46,6 @@ pub(crate) trait AuditCollector {
     ///
     /// Returns an error when `on_page` does, or when the session itself cannot
     /// be established. Individual page failures are delivered to `on_page`.
-    #[allow(
-        dead_code,
-        reason = "called by run_update_slots once it orchestrates the crawl"
-    )]
     fn collect_pages(
         &self,
         targets: &[Url],
