@@ -36,6 +36,7 @@ use crate::settings::{IntegrationConfig, Settings};
 
 const APS_INTEGRATION_ID: &str = "aps";
 const APS_RENDERER_ROUTE: &str = "/integrations/aps/renderer";
+const APS_RENDERER_BOOTSTRAP_QUERY: &str = "mode=data-bootstrap";
 const DEFAULT_CURRENCY: &str = "USD";
 const APS_SDK_SOURCE: &str = "prebid";
 const APS_SDK_VERSION: &str = "2.2.0";
@@ -47,72 +48,12 @@ const MAX_LANGUAGE_BYTES: usize = 8;
 const MAX_PAGE_URL_BYTES: usize = 8192;
 const MAX_RENDER_ENVELOPE_BYTES: usize = 256 * 1024;
 const APS_RENDERER_CSP: &str = "default-src 'none'; sandbox allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation; script-src 'unsafe-inline' https:; connect-src https:; frame-src https:; img-src https: data:; media-src https: blob:; style-src 'unsafe-inline' https:; font-src https: data:;";
+const APS_RENDERER_BOOTSTRAP_CSP: &str = "default-src 'none'; sandbox allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts allow-top-navigation-by-user-activation; script-src 'unsafe-inline' https:; connect-src https:; frame-src https: data:; img-src https: data:; media-src https: blob:; style-src 'unsafe-inline' https:; font-src https: data:;";
 
-const APS_RENDERER_DOCUMENT: &str = r#"<!doctype html>
-<meta charset="utf-8">
-<script>
-(function(){
-'use strict';
-var match=/^#tsaps=([A-Za-z0-9_-]{22,128})$/.exec(location.hash);
-var expected=match&&match[1];
-try{history.replaceState(null,'',location.pathname+location.search);}catch(_error){}
-if(!expected)return;
-function keys(value,expectedKeys){
- if(!value||typeof value!=='object'||Array.isArray(value))return false;
- var actual=Object.keys(value).sort();
- return actual.length===expectedKeys.length&&actual.every(function(key,index){return key===expectedKeys[index];});
-}
-function validRenderer(renderer){
- if(!keys(renderer,['aaxResponse','accountId','bidId','creativeId','creativeUrl','height','tagType','type','version','width'])&&
-    !keys(renderer,['aaxResponse','accountId','bidId','creativeUrl','height','tagType','type','version','width']))return false;
- if(renderer.type!=='aps'||renderer.version!==1||typeof renderer.accountId!=='string'||!renderer.accountId||new TextEncoder().encode(renderer.accountId).length>1024)return false;
- if(typeof renderer.bidId!=='string'||!renderer.bidId||!Number.isInteger(renderer.width)||renderer.width<=0||!Number.isInteger(renderer.height)||renderer.height<=0)return false;
- if(Object.prototype.hasOwnProperty.call(renderer,'creativeId')&&(typeof renderer.creativeId!=='string'||!renderer.creativeId||new TextEncoder().encode(renderer.creativeId).length>1024))return false;
- if(renderer.tagType!=='iframe'&&renderer.tagType!=='script')return false;
- if(typeof renderer.creativeUrl!=='string'||new TextEncoder().encode(renderer.creativeUrl).length>4096)return false;
- if(typeof renderer.aaxResponse!=='string'||!renderer.aaxResponse||renderer.aaxResponse.length>349528)return false;
- try{
-  var url=new URL(renderer.creativeUrl);
-  if(url.protocol!=='https:'||url.username||url.password)return false;
-  var binary=atob(renderer.aaxResponse);
-  if(binary.length>262144||btoa(binary)!==renderer.aaxResponse)return false;
-  var bytes=Uint8Array.from(binary,function(character){return character.charCodeAt(0);});
-  var decoded=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));
-  if(!keys(decoded,['seatbid'])||!Array.isArray(decoded.seatbid)||decoded.seatbid.length!==1)return false;
-  var seat=decoded.seatbid[0];
-  if(!keys(seat,['bid'])||!Array.isArray(seat.bid)||seat.bid.length!==1)return false;
-  var bid=seat.bid[0];
-  if(!keys(bid,['ext','h','id','price','w'])||!keys(bid.ext,['creativeurl','tagtype']))return false;
-  return bid.id===renderer.bidId&&bid.w===renderer.width&&bid.h===renderer.height&&
-   bid.ext.creativeurl===renderer.creativeUrl&&bid.ext.tagtype===renderer.tagType&&
-   typeof bid.price==='number'&&Number.isFinite(bid.price)&&bid.price>=0;
- }catch(_error){return false;}
-}
-function receive(event){
- if(event.source!==parent)return;
- var message=event.data;
- if(!keys(message,['nonce','renderer'])||message.nonce!==expected||!validRenderer(message.renderer))return;
- removeEventListener('message',receive);
- var acceptedNonce=expected;
- expected='';
- var renderer=message.renderer;
- window._aps=window._aps instanceof Map?window._aps:new Map();
- var account=window._aps.get(renderer.accountId);
- if(!account){
-  account={queue:[],store:new Map([['listeners',new Map()]])};
-  window._aps.set(renderer.accountId,account);
- }
- account.queue.push(new CustomEvent('prebid/creative/render',{detail:{aaxResponse:renderer.aaxResponse,seatBidId:renderer.bidId}}));
- var script=document.createElement('script');
- script.src='https://client.aps.amazon-adsystem.com/prebid-creative.js';
- script.onload=function(){parent.postMessage({message:'trusted-server/aps/renderer-ready',nonce:acceptedNonce},'*');};
- script.onerror=function(){parent.postMessage({message:'trusted-server/aps/renderer-failed',nonce:acceptedNonce},'*');};
- document.head.appendChild(script);
-}
-addEventListener('message',receive);
-})();
-</script>
-"#;
+const APS_RENDERER_DOCUMENT: &str =
+    include_str!("../../../trusted-server-js/lib/src/integrations/aps/renderer.html");
+const APS_RENDERER_BOOTSTRAP_DOCUMENT: &str =
+    include_str!("../../../trusted-server-js/lib/src/integrations/aps/renderer-bootstrap.html");
 
 /// Configuration for the APS `OpenRTB` integration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
@@ -1211,13 +1152,28 @@ impl IntegrationProxy for ApsRendererIntegration {
                     message: "Failed to build APS not-found response".to_string(),
                 });
         }
+        let (renderer_document, renderer_csp) = match request.uri().query() {
+            None => (APS_RENDERER_DOCUMENT, APS_RENDERER_CSP),
+            Some(APS_RENDERER_BOOTSTRAP_QUERY) => {
+                (APS_RENDERER_BOOTSTRAP_DOCUMENT, APS_RENDERER_BOOTSTRAP_CSP)
+            }
+            Some(_) => {
+                return http::Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(EdgeBody::from("Not Found"))
+                    .change_context(TrustedServerError::Integration {
+                        integration: APS_INTEGRATION_ID.to_string(),
+                        message: "Failed to build APS not-found response".to_string(),
+                    });
+            }
+        };
         http::Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .header("x-content-type-options", "nosniff")
             .header("referrer-policy", "no-referrer")
-            .header(header::CONTENT_SECURITY_POLICY, APS_RENDERER_CSP)
-            .body(EdgeBody::from(APS_RENDERER_DOCUMENT))
+            .header(header::CONTENT_SECURITY_POLICY, renderer_csp)
+            .body(EdgeBody::from(renderer_document))
             .change_context(TrustedServerError::Integration {
                 integration: APS_INTEGRATION_ID.to_string(),
                 message: "Failed to build APS renderer response".to_string(),
@@ -2318,7 +2274,7 @@ mod tests {
     }
 
     #[test]
-    fn registers_and_serves_only_static_renderer_route() {
+    fn registers_and_serves_static_renderer_and_data_bootstrap_modes() {
         let integration = ApsRendererIntegration;
         let routes = integration.routes();
         assert_eq!(routes.len(), 1, "should register one route");
@@ -2347,6 +2303,25 @@ mod tests {
             APS_RENDERER_CSP
         );
 
+        let bootstrap = http::Request::builder()
+            .method(Method::GET)
+            .uri(format!(
+                "{APS_RENDERER_ROUTE}?{APS_RENDERER_BOOTSTRAP_QUERY}"
+            ))
+            .body(EdgeBody::empty())
+            .expect("should build renderer bootstrap request");
+        let response =
+            futures::executor::block_on(integration.handle(&settings, &services, bootstrap))
+                .expect("should serve renderer bootstrap");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_SECURITY_POLICY],
+            APS_RENDERER_BOOTSTRAP_CSP
+        );
+        assert!(APS_RENDERER_BOOTSTRAP_CSP.contains("allow-same-origin"));
+        assert!(APS_RENDERER_BOOTSTRAP_CSP.contains("frame-src https: data:"));
+        assert!(APS_RENDERER_BOOTSTRAP_DOCUMENT.contains("trusted-server/aps/bootstrap-navigate"));
+
         let post = http::Request::builder()
             .method(Method::POST)
             .uri(APS_RENDERER_ROUTE)
@@ -2374,6 +2349,7 @@ mod tests {
 
         assert_eq!(registration.integration_id, APS_INTEGRATION_ID);
         assert_eq!(registration.proxies.len(), 1);
+        assert!(registration.request_filters.is_empty());
         assert!(registration.js_disabled);
     }
 
@@ -2425,12 +2401,15 @@ mod tests {
     #[test]
     fn renderer_document_is_static_and_nonce_bound() {
         assert!(APS_RENDERER_DOCUMENT.contains("^#tsaps="));
-        assert!(APS_RENDERER_DOCUMENT.contains("event.source!==parent"));
-        assert!(APS_RENDERER_DOCUMENT.contains("message.nonce!==expected"));
+        assert!(APS_RENDERER_DOCUMENT.contains("event.source !== parent"));
+        assert!(APS_RENDERER_DOCUMENT.contains("message.nonce !== expected"));
+        assert!(APS_RENDERER_DOCUMENT.contains("['nonce', 'publisherOrigin', 'renderer']"));
+        assert!(APS_RENDERER_DOCUMENT.contains("['nonce', 'renderer']"));
+        assert!(APS_RENDERER_DOCUMENT.contains("url.origin === publisherOrigin"));
         assert!(APS_RENDERER_DOCUMENT.contains("prebid/creative/render"));
         assert!(APS_RENDERER_DOCUMENT.contains("window._aps instanceof Map"));
-        assert!(APS_RENDERER_DOCUMENT.contains("store:new Map([['listeners',new Map()]])"));
-        assert!(APS_RENDERER_DOCUMENT.contains("account.queue.push(new CustomEvent"));
+        assert!(APS_RENDERER_DOCUMENT.contains("store: new Map([['listeners', new Map()]])"));
+        assert!(APS_RENDERER_DOCUMENT.contains("account.queue.push("));
         assert!(
             APS_RENDERER_DOCUMENT.contains("trusted-server/aps/renderer-ready")
                 && APS_RENDERER_DOCUMENT.contains("trusted-server/aps/renderer-failed")
@@ -2442,7 +2421,7 @@ mod tests {
         );
         assert!(!APS_RENDERER_DOCUMENT.contains("<script src="));
         let queue_index = APS_RENDERER_DOCUMENT
-            .find("account.queue.push(new CustomEvent")
+            .find("account.queue.push(")
             .expect("should queue render event");
         let runner_index = APS_RENDERER_DOCUMENT
             .find("document.head.appendChild(script)")

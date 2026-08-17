@@ -150,30 +150,27 @@ Trusted Server does not insert APS creative markup into the publisher document. 
 
 Seats, `impid`, markup, notifications, user-sync data, sibling bids, losing seats, and unknown fields are not exposed. The browser decodes this envelope and cross-checks the ID, dimensions, URL, and tag type before any DOM mutation or message suppression.
 
-Both rendering paths use `GET /integrations/aps/renderer`, a static Trusted Server document with its own restrictive CSP. The document initializes the account-keyed APS queue and then loads only the fixed runner at `https://client.aps.amazon-adsystem.com/prebid-creative.js`.
+Both rendering paths use a publisher-origin bootstrap followed by two nested `data:` documents. TSJS first loads `GET /integrations/aps/renderer?mode=data-bootstrap` with a sandbox that omits `allow-same-origin`. The bootstrap is therefore opaque and cannot read or modify the publisher document. After a nonce-bound readiness message, TSJS adds `allow-same-origin` and asks the bootstrap to navigate itself to a per-impression `data:` container. The container then creates the static inner `data:` renderer under the same permanent sandbox.
 
-The outer iframe uses these sandbox permissions:
+Both data documents are naturally opaque even with `allow-same-origin`, so the publisher cannot access them. Keeping that token on both frames also avoids WebKit propagating an opaque origin to the HTTPS creative: the creative and its same-origin descendants retain their real origin in Chromium, Firefox, and WebKit.
 
-```text
-allow-forms
-allow-pointer-lock
-allow-popups
-allow-popups-to-escape-sandbox
-allow-scripts
-allow-top-navigation-by-user-activation
-```
+The outer container's CSP allows child frames from `data:` and only the fully validated creative URL's exact origin. That policy is inherited by the inner data renderer and intersects with the renderer's own CSP. It permits the expected creative frame but blocks the inner renderer from navigating itself to the publisher origin before a request is made. This exact-origin boundary intentionally blocks an immediate creative-frame redirect or same-frame navigation to a different origin; validate real APS inventory for intermediate or redirect origins before rollout. User-activated top navigation and popups remain governed by the sandbox tokens.
 
-It deliberately omits `allow-same-origin`, so APS and bidder execution remains below an opaque-origin boundary. The renderer response repeats these restrictions with a CSP `sandbox` directive, preventing another embedding path from restoring publisher-origin execution by omitting the iframe attribute. Trusted Server generates a fresh 128-bit nonce, binds it in the iframe URL fragment before navigation, and requires the same one-time nonce in the parent message and renderer acknowledgement. Existing slot content is retained until the static renderer has accepted the descriptor and loaded the fixed runner.
+A network-loaded HTTPS creative does not inherit its ancestor's CSP and can create further frames. To prevent it from using a publisher-origin descendant plus an executable publisher gadget to regain access to the top page, enabling APS appends a separate `Content-Security-Policy: frame-ancestors 'self'` policy to every Trusted Server response. Browsers require every ancestor to match, so publisher documents cannot load below the opaque container or third-party creative. This secure default also prevents the APS-enabled publisher from being embedded cross-origin; publishers that require trusted external embedders need a separately reviewed ancestor-allowlist feature before enabling APS.
+
+Trusted Server generates independent 128-bit nonces for the container and renderer. Once the inner renderer is ready, the container transfers a dedicated `MessagePort` between trusted top-page TSJS and the inner renderer. The complete descriptor travels only over that port; the inner renderer revalidates it, rejects the publisher origin, and requires the creative origin to equal the origin bound in the container CSP. The container URL contains only that exact origin, static renderer source, and nonces—never the response envelope, bid ID, price, or creative URL path.
+
+The inner document initializes the account-keyed APS queue and loads only the fixed runner at `https://client.aps.amazon-adsystem.com/prebid-creative.js`. A `renderer-ready` acknowledgement still means that Amazon's runner loaded, not that the final creative painted. Existing slot content remains until that acknowledgement. The query-free `GET /integrations/aps/renderer` response remains available with its original stricter CSP and legacy message shape for cached clients and rollback.
 
 ### Direct `/auction`
 
-The TSJS auction client validates the typed renderer descriptor, creates the opaque renderer iframe, and sends the minimized envelope after the frame loads. Ordinary non-APS `adm` continues through the existing sanitizer and generic creative iframe.
+The TSJS auction client validates the typed renderer descriptor and mounts the nested data renderer in the winning slot. Ordinary non-APS `adm` continues through the existing sanitizer and generic creative iframe.
 
 ### GAM and Universal Creative
 
-For initial navigation and page-bids, Trusted Server publishes the same descriptor in `window.tsjs.bids`. The source-checked Prebid Universal Creative bridge accepts requests only from the iframe that owns the matching `hb_adid`, validates the complete envelope, and returns a static dynamic-renderer program that creates the same opaque renderer iframe.
+For initial navigation and page-bids, Trusted Server publishes the same descriptor in `window.tsjs.bids`. The source-checked Prebid Universal Creative bridge accepts requests only from the iframe that owns the matching `hb_adid`, validates the complete envelope, and returns a static dynamic-renderer program with a one-shot mount capability. That program asks trusted top-page TSJS to mount the nested data renderer as a sibling of the Universal Creative iframe, outside inherited GAM and Universal Creative sandbox restrictions.
 
-For client-side `trustedServer` adapter auctions, Prebid generates its own `hb_adid`. Trusted Server binds that generated ID to the validated APS descriptor in a bounded, expiring browser registry before GAM refresh. The bridge verifies that the requesting Universal Creative iframe belongs to the same ad unit, consumes the capability once, and passes the APS bid ID separately to the Amazon runner.
+For client-side `trustedServer` adapter auctions, Prebid generates its own `hb_adid`. Trusted Server binds that generated ID to the validated APS descriptor in a bounded, expiring browser registry before GAM refresh. The bridge verifies that the requesting Universal Creative iframe belongs to the same ad unit, consumes both the renderer and mount capabilities once, and passes the APS bid ID separately to the Amazon runner.
 
 These paths do not fetch PBS Cache, fire generic APS win/billing beacons, or call `apstag.setDisplayBids()` for the Trusted Server winner. Publisher-owned native APS objects are otherwise left untouched.
 
@@ -182,10 +179,10 @@ These paths do not fetch PBS Cache, fire generic APS win/billing beacons, or cal
 The publisher policy must permit the same-origin renderer route, for example:
 
 ```text
-frame-src 'self'
+frame-src 'self' data:
 ```
 
-Do not add `allow-same-origin` to the outer renderer sandbox. The renderer endpoint supplies its own CSP for the fixed runner and HTTPS creative resources. The same-origin renderer route inherits the publisher page scheme; use HTTPS in production. APS endpoints and third-party creative URLs always require HTTPS.
+The `data:` source is required for the bootstrap's self-navigation to the opaque container. APS also adds `frame-ancestors 'self'` as an independent response policy; do not override or remove that policy. Do not weaken or bypass the initial bootstrap sandbox. TSJS adds `allow-same-origin` only when navigating away from the publisher-origin bootstrap; both final data documents remain naturally opaque. The bootstrap response supplies the resource CSP for the fixed runner and HTTPS creative resources, while the container narrows `frame-src` to the validated creative origin. The same-origin bootstrap route inherits the publisher page scheme; use HTTPS in production. APS endpoints and third-party creative URLs always require HTTPS.
 
 Before enabling script creatives, verify under the publisher's actual CSP that both iframe and script-tag creatives:
 
@@ -235,8 +232,8 @@ Use fictional values in source-controlled configuration and fixtures. Supply con
 
 ### Winner targets but does not render
 
-- Confirm `GET /integrations/aps/renderer` returns HTML with its CSP and `Referrer-Policy: no-referrer`.
-- Confirm publisher CSP permits `frame-src 'self'`.
+- Confirm `GET /integrations/aps/renderer?mode=data-bootstrap` returns HTML with its bootstrap CSP and `Referrer-Policy: no-referrer`.
+- Confirm publisher CSP permits `frame-src 'self' data:`.
 - Confirm the GAM creative uses the supported Prebid Universal Creative bridge and the winning `hb_adid`.
 - For client-side `trustedServer` adapter auctions, confirm Prebid's `bidResponse` contains a generated `adId` and that the corresponding capability appears briefly in `window.tsjs.apsPrebidRenderers` before rendering.
 - Ensure no native APS path is trying to handle the same cohort.

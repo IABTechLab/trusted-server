@@ -1,0 +1,228 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta
+  http-equiv="Content-Security-Policy"
+  content="default-src 'none'; script-src 'unsafe-inline' https:; connect-src https:; frame-src https:; img-src https: data:; media-src https: blob:; style-src 'unsafe-inline' https:; font-src https: data:"
+/>
+<meta name="referrer" content="no-referrer" />
+<script>
+  (function () {
+    'use strict';
+    var match = /^#tsaps=([A-Za-z0-9_-]{22,128})$/.exec(location.hash);
+    var expected = match && match[1];
+    try {
+      history.replaceState(null, '', location.pathname + location.search);
+    } catch (_error) {}
+    if (!expected) return;
+    function keys(value, expectedKeys) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+      var actual = Object.keys(value).sort();
+      return (
+        actual.length === expectedKeys.length &&
+        actual.every(function (key, index) {
+          return key === expectedKeys[index];
+        })
+      );
+    }
+    function validPublisherOrigin(value) {
+      if (typeof value !== 'string') return false;
+      try {
+        var url = new URL(value);
+        return (
+          (url.protocol === 'https:' || url.protocol === 'http:') &&
+          !url.username &&
+          !url.password &&
+          url.origin === value &&
+          url.pathname === '/' &&
+          !url.search &&
+          !url.hash
+        );
+      } catch (_error) {
+        return false;
+      }
+    }
+    function validRenderer(renderer, publisherOrigin, creativeOrigin) {
+      var hasPublisherOrigin = publisherOrigin !== undefined;
+      var hasCreativeOrigin = creativeOrigin !== undefined;
+      if (
+        (!keys(renderer, [
+          'aaxResponse',
+          'accountId',
+          'bidId',
+          'creativeId',
+          'creativeUrl',
+          'height',
+          'tagType',
+          'type',
+          'version',
+          'width',
+        ]) &&
+          !keys(renderer, [
+            'aaxResponse',
+            'accountId',
+            'bidId',
+            'creativeUrl',
+            'height',
+            'tagType',
+            'type',
+            'version',
+            'width',
+          ])) ||
+        (hasPublisherOrigin && !validPublisherOrigin(publisherOrigin))
+      )
+        return false;
+      if (
+        renderer.type !== 'aps' ||
+        renderer.version !== 1 ||
+        typeof renderer.accountId !== 'string' ||
+        !renderer.accountId ||
+        new TextEncoder().encode(renderer.accountId).length > 1024
+      )
+        return false;
+      if (
+        typeof renderer.bidId !== 'string' ||
+        !renderer.bidId ||
+        !Number.isSafeInteger(renderer.width) ||
+        renderer.width <= 0 ||
+        !Number.isSafeInteger(renderer.height) ||
+        renderer.height <= 0
+      )
+        return false;
+      if (
+        Object.prototype.hasOwnProperty.call(renderer, 'creativeId') &&
+        (typeof renderer.creativeId !== 'string' ||
+          !renderer.creativeId ||
+          new TextEncoder().encode(renderer.creativeId).length > 1024)
+      )
+        return false;
+      if (renderer.tagType !== 'iframe' && renderer.tagType !== 'script') return false;
+      if (
+        typeof renderer.creativeUrl !== 'string' ||
+        new TextEncoder().encode(renderer.creativeUrl).length > 4096
+      )
+        return false;
+      if (
+        typeof renderer.aaxResponse !== 'string' ||
+        !renderer.aaxResponse ||
+        renderer.aaxResponse.length > 349528
+      )
+        return false;
+      try {
+        var url = new URL(renderer.creativeUrl);
+        if (
+          url.protocol !== 'https:' ||
+          url.username ||
+          url.password ||
+          (hasPublisherOrigin && url.origin === publisherOrigin) ||
+          (hasCreativeOrigin && url.origin !== creativeOrigin)
+        )
+          return false;
+        var binary = atob(renderer.aaxResponse);
+        if (binary.length > 262144 || btoa(binary) !== renderer.aaxResponse) return false;
+        var bytes = Uint8Array.from(binary, function (character) {
+          return character.charCodeAt(0);
+        });
+        var decoded = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+        if (
+          !keys(decoded, ['seatbid']) ||
+          !Array.isArray(decoded.seatbid) ||
+          decoded.seatbid.length !== 1
+        )
+          return false;
+        var seat = decoded.seatbid[0];
+        if (!keys(seat, ['bid']) || !Array.isArray(seat.bid) || seat.bid.length !== 1) return false;
+        var bid = seat.bid[0];
+        if (
+          !keys(bid, ['ext', 'h', 'id', 'price', 'w']) ||
+          !keys(bid.ext, ['creativeurl', 'tagtype'])
+        )
+          return false;
+        return (
+          bid.id === renderer.bidId &&
+          bid.w === renderer.width &&
+          bid.h === renderer.height &&
+          bid.ext.creativeurl === renderer.creativeUrl &&
+          bid.ext.tagtype === renderer.tagType &&
+          typeof bid.price === 'number' &&
+          Number.isFinite(bid.price) &&
+          bid.price >= 0
+        );
+      } catch (_error) {
+        return false;
+      }
+    }
+    function render(message, creativeOrigin, send) {
+      var modern = keys(message, ['nonce', 'publisherOrigin', 'renderer']);
+      var legacy = keys(message, ['nonce', 'renderer']);
+      if (
+        (!modern && !legacy) ||
+        message.nonce !== expected ||
+        !validRenderer(
+          message.renderer,
+          modern ? message.publisherOrigin : undefined,
+          creativeOrigin
+        )
+      )
+        return false;
+      var acceptedNonce = expected;
+      expected = '';
+      var renderer = message.renderer;
+      window._aps = window._aps instanceof Map ? window._aps : new Map();
+      var account = window._aps.get(renderer.accountId);
+      if (!account) {
+        account = { queue: [], store: new Map([['listeners', new Map()]]) };
+        window._aps.set(renderer.accountId, account);
+      }
+      account.queue.push(
+        new CustomEvent('prebid/creative/render', {
+          detail: { aaxResponse: renderer.aaxResponse, seatBidId: renderer.bidId },
+        })
+      );
+      var script = document.createElement('script');
+      script.src = 'https://client.aps.amazon-adsystem.com/prebid-creative.js';
+      script.onload = function () {
+        send({ message: 'trusted-server/aps/renderer-ready', nonce: acceptedNonce });
+      };
+      script.onerror = function () {
+        send({ message: 'trusted-server/aps/renderer-failed', nonce: acceptedNonce });
+      };
+      document.head.appendChild(script);
+      return true;
+    }
+    function receive(event) {
+      if (event.source !== parent) return;
+      var message = event.data;
+      if (
+        keys(message, ['creativeOrigin', 'message', 'nonce']) &&
+        message.message === 'trusted-server/aps/channel-init' &&
+        message.nonce === expected &&
+        validPublisherOrigin(message.creativeOrigin) &&
+        new URL(message.creativeOrigin).protocol === 'https:' &&
+        event.ports.length === 1
+      ) {
+        removeEventListener('message', receive);
+        var port = event.ports[0];
+        port.onmessage = function (portEvent) {
+          if (!keys(portEvent.data, ['nonce', 'publisherOrigin', 'renderer'])) return;
+          if (
+            render(portEvent.data, message.creativeOrigin, function (response) {
+              port.postMessage(response);
+            })
+          )
+            port.onmessage = null;
+        };
+        port.start();
+        port.postMessage({ message: 'trusted-server/aps/channel-ready', nonce: expected });
+        return;
+      }
+      if (
+        render(message, undefined, function (response) {
+          parent.postMessage(response, '*');
+        })
+      )
+        removeEventListener('message', receive);
+    }
+    addEventListener('message', receive);
+    parent.postMessage({ message: 'trusted-server/aps/document-ready', nonce: expected }, '*');
+  })();
+</script>

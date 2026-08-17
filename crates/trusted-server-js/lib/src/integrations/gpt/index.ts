@@ -10,9 +10,9 @@ import type {
 import {
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
-  apsRendererUrl,
   consumeApsPrebidRenderer,
   getApsPrebidRenderer,
+  registerApsUniversalCreativeMount,
   validateApsRenderer,
 } from '../aps/render';
 
@@ -225,13 +225,14 @@ function slotIdForMessageSource(source: MessageEventSource | null): string | und
     ?.id;
 }
 
-function messageSourceBelongsToAdUnit(
+function slotRootForMessageSource(
   source: MessageEventSource | null,
-  adUnitCode: string
-): boolean {
-  return source
-    ? sourceIsInSlotRoots(source, candidateSlotRootsForConfiguredDivId(adUnitCode))
-    : false;
+  divId: string
+): HTMLElement | undefined {
+  if (!source) return undefined;
+  return candidateSlotRootsForConfiguredDivId(divId).find((root) =>
+    sourceIsInSlotRoots(source, [root])
+  );
 }
 
 function clearTargetingKeys(slot: GoogleTagSlot, keys: Iterable<string>): void {
@@ -1700,13 +1701,15 @@ export function installTsRenderBridge(): void {
       // Prebid handles ad IDs globally and would otherwise answer a request from
       // an unrelated iframe when this slot-bound capability rejects it.
       e.stopImmediatePropagation();
-      if (!messageSourceBelongsToAdUnit(e.source, prebidRendererEntry.adUnitCode)) return;
+      const mountContainer = slotRootForMessageSource(e.source, prebidRendererEntry.adUnitCode);
+      if (!mountContainer) return;
       const renderer = validateApsRenderer(prebidRendererEntry.renderer);
-      const rendererUrl = apsRendererUrl();
-      if (!renderer || !rendererUrl) return;
+      if (!renderer) return;
       if (!hasConsumedPrebidApsIdCapacity(consumedPrebidApsIds, adId)) return;
       if (!consumeApsPrebidRenderer(adId, prebidRendererEntry)) return;
       recordConsumedPrebidApsId(consumedPrebidApsIds, adId, prebidRendererEntry.expiresAt);
+      const apsMountId = registerApsUniversalCreativeMount(mountContainer, renderer);
+      if (!apsMountId) return;
 
       port.postMessage(
         JSON.stringify({
@@ -1714,7 +1717,8 @@ export function installTsRenderBridge(): void {
           adId,
           renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
           rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
-          rendererUrl,
+          apsMountId,
+          publisherOrigin: window.location.origin,
           apsRenderer: renderer,
           width: renderer.width,
           height: renderer.height,
@@ -1753,8 +1757,11 @@ export function installTsRenderBridge(): void {
       e.stopImmediatePropagation();
       if (consumedServerApsBySlot.get(slotId) === adId) return;
       const renderer = validateApsRenderer(matchedBid.renderer);
-      const rendererUrl = apsRendererUrl();
-      if (!renderer || !rendererUrl) return;
+      const configuredSlot = window.tsjs?.adSlots?.find((slot) => slot.id === slotId);
+      const mountContainer = slotRootForMessageSource(e.source, configuredSlot?.div_id ?? slotId);
+      if (!renderer || !mountContainer) return;
+      const apsMountId = registerApsUniversalCreativeMount(mountContainer, renderer);
+      if (!apsMountId) return;
       consumedServerApsBySlot.set(slotId, adId);
       port.postMessage(
         JSON.stringify({
@@ -1762,7 +1769,8 @@ export function installTsRenderBridge(): void {
           adId,
           renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
           rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
-          rendererUrl,
+          apsMountId,
+          publisherOrigin: window.location.origin,
           apsRenderer: renderer,
           width: renderer.width,
           height: renderer.height,
