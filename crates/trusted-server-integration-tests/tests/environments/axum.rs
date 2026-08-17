@@ -6,7 +6,7 @@ use error_stack::ResultExt as _;
 use std::io::{BufRead as _, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use trusted_server_core::config_payload::CONFIG_BLOB_KEY;
+use trusted_server_core::config_payload::{CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_ID};
 
 /// Default port the Axum dev server binds to when no `PORT` env var is supplied.
 const AXUM_DEFAULT_PORT: u16 = 8787;
@@ -34,10 +34,13 @@ impl RuntimeEnvironment for AxumDevServer {
         let port = super::find_available_port().unwrap_or(AXUM_DEFAULT_PORT);
 
         let app_config = integration_app_config_envelope(origin_port())?;
-        let config_segment = CONFIG_BLOB_KEY
+        let store_segment = DEFAULT_CONFIG_STORE_ID
             .to_ascii_uppercase()
             .replace(['-', '.', ' '], "_");
-        let config_variable = format!("TRUSTED_SERVER_CONFIG_{config_segment}_{config_segment}");
+        let key_segment = CONFIG_BLOB_KEY
+            .to_ascii_uppercase()
+            .replace(['-', '.', ' '], "_");
+        let config_variable = format!("TRUSTED_SERVER_CONFIG_{store_segment}_{key_segment}");
 
         let mut child = Command::new(&binary)
             .env("PORT", port.to_string())
