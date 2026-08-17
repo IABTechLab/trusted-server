@@ -371,9 +371,12 @@ if settings.debug.auction_html_comment {
    `integrations.prebid.debug = true` to capture them. Operators must treat
    `upstream` as potentially sensitive because untyped provider values can
    contain or echo identifiers and request data.
-3. **Raw structured identity data requires `Full`.** The PBS `debug.httpcalls`
-   and `resolvedrequest` subtrees remain excluded in `upstream` mode and require
-   `verbosity = "full"` plus `integrations.prebid.debug = true`.
+3. **The complete PBS debug subtree requires `Full`.** The PBS
+   `debug.httpcalls` and `resolvedrequest` subtrees remain excluded in
+   `upstream` mode and require `verbosity = "full"` plus
+   `integrations.prebid.debug = true`. This does not make `Upstream`
+   identity-safe: its six untyped diagnostic values may themselves contain
+   nested identity or request data, as stated above.
 4. **Comment-terminator neutralization and the total byte cap are
    unconditional** — they are HTML-injection and page-bloat safety nets, not
    privacy controls, and must never be gated behind `verbosity` or any other
@@ -435,6 +438,7 @@ Arrange-Act-Assert, matching existing `auction_debug_comment_*` tests — no
   strings and nested identity-shaped JSON under every safe key; assert only
   valid values survive and `message` is regenerated rather than copied.
 - `upstream_mode_includes_provider_diagnostics_but_not_debug_subtree`
+- `verbosity_upstream_still_truncates_creative`
 - `metadata_keys_empty_yields_empty_safe_metadata_in_redacted`
 - `metadata_keys_attack_vector_debug_key_never_surfaces_in_redacted_mode` —
   configuring `metadata_keys = ["debug"]` under `Redacted` still produces no
