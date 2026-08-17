@@ -33,6 +33,21 @@ use crate::commands::audit::generate::collector::{CollectedGptSlot, CollectedReq
 static HEX_HASH_SEGMENT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"-[0-9a-f]{16,}(?:-|$)").expect("should compile hex hash regex"));
 
+/// Matches a React `useId` token, which changes on every render.
+///
+/// React emits these in both cases — `_R_3f_` from a server render and `_r_0_`
+/// from a client one — so matching only the uppercase form leaves the lowercase
+/// variant in the stem. That is not merely untidy: the suffix differs per
+/// render, so one logical slot fragments into a new key on every page, which
+/// both breaks runtime div matching and starves template inference of the
+/// repeated observations it needs.
+///
+/// The uppercase form is distinctive enough to match bare. The lowercase one is
+/// anchored (`_r_`, a short alphanumeric run, `_`) so an ordinary id that merely
+/// contains `_r_` keeps its full stem.
+static REACT_USE_ID: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"_R_|_r_[0-9a-z]{1,8}_").expect("should compile react id regex"));
+
 /// Hosts that serve GPT `gampad/ads` requests.
 const GAMPAD_HOSTS: &[&str] = &["securepubads.g.doubleclick.net", "pubads.g.doubleclick.net"];
 
@@ -185,12 +200,13 @@ fn is_usable_unit_path(path: &str) -> bool {
 /// a valid **prefix** of the live div id, which is how verify matches slots.
 ///
 /// `div-gpt-ad-leaderboard-1` (stable) is unchanged; `ad-header-0-_R_9sl…-container`
-/// → `ad-header-0`; `ad-in_content-de66…f272-in_content-0` → `ad-in_content`.
+/// and `ad-header-0-_r_8_` → `ad-header-0`; `ad-in_content-de66…f272-in_content-0`
+/// → `ad-in_content`.
 fn normalize_div_stem(div_id: &str) -> String {
     let stem = div_id.strip_suffix("-container").unwrap_or(div_id);
     let mut cut = stem.len();
-    if let Some(pos) = stem.find("_R_") {
-        cut = cut.min(pos);
+    if let Some(matched) = REACT_USE_ID.find(stem) {
+        cut = cut.min(matched.start());
     }
     if let Some(matched) = HEX_HASH_SEGMENT.find(stem) {
         cut = cut.min(matched.start());
@@ -494,6 +510,36 @@ mod tests {
             div_id: div.to_string(),
             sizes: sizes.to_vec(),
         }
+    }
+
+    #[test]
+    fn lowercase_react_use_id_suffixes_collapse_to_one_slot() {
+        // React emits `_r_0_` client-side and `_R_3f_` server-side, and the
+        // token changes per render. Leaving it in the stem fragments one slot
+        // into a new key on every page, which starves template inference.
+        for volatile in [
+            "ad-header-0-_r_0_",
+            "ad-header-0-_r_8_",
+            "ad-header-0-_r_a_",
+            "ad-header-0-_R_3f_",
+        ] {
+            let registry = vec![registry_slot("/123/site/news", volatile, &[(728, 90)])];
+            let discovered = discover_gpt_slots(&registry, &[], false);
+            assert_eq!(
+                discovered.slots[0].div_id, "ad-header-0",
+                "`{volatile}` should normalize to a stable stem"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_id_containing_r_is_left_alone() {
+        // The React shape is anchored, so a legitimate id keeps its full stem.
+        let registry = vec![registry_slot("/123/site/news", "ad_r_rail", &[(300, 250)])];
+
+        let discovered = discover_gpt_slots(&registry, &[], false);
+
+        assert_eq!(discovered.slots[0].div_id, "ad_r_rail");
     }
 
     #[test]

@@ -111,7 +111,7 @@ impl DeviceProfile {
 }
 
 /// Collects pages through a local Chrome, emulating one device profile.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct BrowserAuditCollector {
     profile: Option<DeviceProfile>,
     /// Pause between page loads during a crawl.
@@ -120,6 +120,10 @@ pub(crate) struct BrowserAuditCollector {
     headful: bool,
     /// Answer the consent APIs as a consenting reader.
     assume_consent: bool,
+    /// Route the browser through this proxy, as `host:port`.
+    proxy: Option<String>,
+    /// Accept TLS certificates that do not validate.
+    accept_invalid_certs: bool,
 }
 
 impl BrowserAuditCollector {
@@ -163,24 +167,50 @@ impl BrowserAuditCollector {
         self.assume_consent = assume_consent;
         self
     }
+
+    /// Routes the browser through `proxy` (`host:port`).
+    ///
+    /// Lets the audit run against a production hostname served by a local
+    /// MITM proxy, so the page's origin, cookie scope, and any origin checks in
+    /// the ad stack match production rather than `localhost`.
+    #[must_use]
+    pub(crate) fn with_proxy(mut self, proxy: Option<String>) -> Self {
+        self.proxy = proxy;
+        self
+    }
+
+    /// Accepts TLS certificates that do not validate.
+    ///
+    /// Needed when a MITM proxy presents a certificate from a CA the browser
+    /// profile does not trust. Dangerous against a real origin: see the flag
+    /// documentation.
+    #[must_use]
+    pub(crate) fn accept_invalid_certs(mut self, accept: bool) -> Self {
+        self.accept_invalid_certs = accept;
+        self
+    }
 }
 
 /// The browser-session knobs one crawl runs under.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SessionSettings {
     profile: Option<DeviceProfile>,
     page_delay: Duration,
     headful: bool,
     assume_consent: bool,
+    proxy: Option<String>,
+    accept_invalid_certs: bool,
 }
 
 impl BrowserAuditCollector {
-    fn session(self) -> SessionSettings {
+    fn session(&self) -> SessionSettings {
         SessionSettings {
             profile: self.profile,
             page_delay: self.page_delay,
             headful: self.headful,
             assume_consent: self.assume_consent,
+            proxy: self.proxy.clone(),
+            accept_invalid_certs: self.accept_invalid_certs,
         }
     }
 }
@@ -344,6 +374,8 @@ async fn with_browser(
         page_delay,
         headful,
         assume_consent,
+        proxy,
+        accept_invalid_certs,
     } = settings;
     let chrome_executable = find_browser_executable()?;
     let user_data_dir = TempDir::new().map_err(|error| {
@@ -357,8 +389,26 @@ async fn with_browser(
     // the config with slots of its choosing. Validate certificates.
     let mut builder = BrowserConfig::builder()
         .chrome_executable(chrome_executable)
-        .user_data_dir(user_data_dir.path())
-        .respect_https_errors();
+        .user_data_dir(user_data_dir.path());
+    if !accept_invalid_certs {
+        builder = builder.respect_https_errors();
+    }
+    if let Some(proxy) = &proxy {
+        // Chrome ignores a scheme-less `--proxy-server` value, silently sending
+        // traffic direct instead, so normalise it. `<-loopback>` keeps Chrome
+        // from bypassing the proxy for loopback hosts, which is exactly the case
+        // a local MITM proxy serves.
+        let endpoint = if proxy.contains("://") {
+            proxy.clone()
+        } else {
+            format!("http://{proxy}")
+        };
+        // Keys carry no `--`: chromiumoxide adds it, so a pre-formatted
+        // `--flag=value` string becomes `----flag=value` and is ignored.
+        builder = builder
+            .arg(("proxy-server", endpoint.as_str()))
+            .arg(("proxy-bypass-list", "<-loopback>"));
+    }
     // `BrowserConfig` defaults to the *old* headless mode, which is both more
     // detectable and less faithful than either alternative — so both branches
     // must be explicit. Omitting the call is not the same as running headful.
@@ -375,7 +425,10 @@ async fn with_browser(
         if let Some(user_agent) = profile.user_agent() {
             // Ad stacks branch on the user agent as well as the viewport, so
             // emulating size alone can still return desktop ad units.
-            builder = builder.arg(format!("--user-agent={user_agent}"));
+            // Key without the `--`: chromiumoxide prefixes it, so passing a
+            // pre-formatted `--flag=value` string yields `----flag=value`,
+            // which Chrome silently ignores.
+            builder = builder.arg(("user-agent", user_agent));
         }
     }
     let config = builder.build().map_err(|error| {

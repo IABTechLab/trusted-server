@@ -181,6 +181,23 @@ pub(crate) struct AuditAdTemplatesGenerateArgs {
     /// all. Pass this to observe the un-consented page instead.
     #[arg(long)]
     pub no_assume_consent: bool,
+    /// Route the audit browser through a proxy, as `host:port`.
+    ///
+    /// Pairs with `ts dev proxy`, which serves a production hostname from a
+    /// local Trusted Server. Auditing through it means the page's origin,
+    /// cookie scope, and any origin checks in the ad stack match production
+    /// rather than `localhost`.
+    #[arg(long, value_name = "HOST:PORT")]
+    pub browser_proxy: Option<String>,
+    /// Accept TLS certificates that do not validate.
+    ///
+    /// DANGEROUS against a real origin: the audit sends any `--cookie` session
+    /// upstream and treats the response as evidence, so an invalid certificate
+    /// could mean an impersonator is harvesting the session and fabricating the
+    /// result. Intended for a local MITM proxy whose CA the browser profile does
+    /// not trust; prefer installing that CA (`ts dev proxy ca`) over this flag.
+    #[arg(long)]
+    pub danger_accept_invalid_certs: bool,
 }
 
 impl AuditAdTemplatesGenerateArgs {
@@ -268,6 +285,8 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<(), String> {
                         .with_page_delay(std::time::Duration::from_millis(gen_args.page_delay_ms))
                         .headful(gen_args.headful)
                         .assume_consent(!gen_args.no_assume_consent)
+                        .with_proxy(gen_args.browser_proxy.clone())
+                        .accept_invalid_certs(gen_args.danger_accept_invalid_certs)
                 })
                 .collect();
             let selected: Vec<(&str, &dyn generate::collector::AuditCollector)> = profiles
