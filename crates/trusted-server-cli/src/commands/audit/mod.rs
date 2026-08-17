@@ -172,6 +172,15 @@ pub(crate) struct AuditAdTemplatesGenerateArgs {
     /// session; it opens a real window.
     #[arg(long)]
     pub headful: bool,
+    /// Do not answer the IAB consent APIs on behalf of the audit browser.
+    ///
+    /// Publishers gate slot definition behind their consent platform, and a
+    /// fresh audit profile has no consent cookie, so by default the crawl
+    /// answers the standard TCF v2 and US Privacy interfaces as a consenting,
+    /// out-of-scope reader. Without that, such a site reports no ad slots at
+    /// all. Pass this to observe the un-consented page instead.
+    #[arg(long)]
+    pub no_assume_consent: bool,
 }
 
 impl AuditAdTemplatesGenerateArgs {
@@ -258,6 +267,7 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<(), String> {
                     generate::browser_collector::BrowserAuditCollector::with_profile(*profile)
                         .with_page_delay(std::time::Duration::from_millis(gen_args.page_delay_ms))
                         .headful(gen_args.headful)
+                        .assume_consent(!gen_args.no_assume_consent)
                 })
                 .collect();
             let selected: Vec<(&str, &dyn generate::collector::AuditCollector)> = profiles

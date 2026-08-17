@@ -118,6 +118,8 @@ pub(crate) struct BrowserAuditCollector {
     page_delay: Duration,
     /// Run a visible browser instead of a headless one.
     headful: bool,
+    /// Answer the consent APIs as a consenting reader.
+    assume_consent: bool,
 }
 
 impl BrowserAuditCollector {
@@ -152,6 +154,15 @@ impl BrowserAuditCollector {
         self.headful = headful;
         self
     }
+
+    /// Answers the IAB consent APIs so a gated ad stack initialises.
+    ///
+    /// See [`CONSENT_STUB_SCRIPT`] for what is answered and why.
+    #[must_use]
+    pub(crate) fn assume_consent(mut self, assume_consent: bool) -> Self {
+        self.assume_consent = assume_consent;
+        self
+    }
 }
 
 /// The browser-session knobs one crawl runs under.
@@ -160,6 +171,7 @@ struct SessionSettings {
     profile: Option<DeviceProfile>,
     page_delay: Duration,
     headful: bool,
+    assume_consent: bool,
 }
 
 impl BrowserAuditCollector {
@@ -168,9 +180,96 @@ impl BrowserAuditCollector {
             profile: self.profile,
             page_delay: self.page_delay,
             headful: self.headful,
+            assume_consent: self.assume_consent,
         }
     }
 }
+
+/// Answers the consent APIs as a consenting, non-GDPR reader.
+///
+/// Publishers gate slot definition behind their consent platform, so a browser
+/// with no consent cookie never reaches `googletag.defineSlot` and the audit
+/// sees a page with no ad stack. That is indistinguishable from a page that
+/// genuinely has none, and it is the state every fresh audit profile starts in.
+///
+/// Rather than special-casing each vendor, this answers the two IAB interfaces
+/// every compliant platform exposes — TCF v2 (`__tcfapi`) and US Privacy
+/// (`__uspapi`) — installed before any page script runs so the real platform
+/// finds them already defined. `gdprApplies: false` is used deliberately: it
+/// needs no fabricated consent string, and it is the same signal the ad stack
+/// receives for genuinely out-of-scope traffic.
+///
+/// This makes the audit behave like a consenting reader; it does not alter what
+/// the publisher's own readers experience.
+const CONSENT_STUB_SCRIPT: &str = r#"(() => {
+    const tcData = {
+        tcString: '',
+        tcfPolicyVersion: 2,
+        cmpId: 0,
+        cmpVersion: 1,
+        gdprApplies: false,
+        eventStatus: 'tcloaded',
+        cmpStatus: 'loaded',
+        listenerId: 1,
+        isServiceSpecific: true,
+        useNonStandardTexts: false,
+        purposeOneTreatment: false,
+        publisherCC: 'US',
+        purpose: { consents: {}, legitimateInterests: {} },
+        vendor: { consents: {}, legitimateInterests: {} },
+        specialFeatureOptins: {},
+    };
+    for (let index = 1; index <= 10; index += 1) {
+        tcData.purpose.consents[index] = true;
+        tcData.purpose.legitimateInterests[index] = true;
+    }
+
+    const tcfapi = (command, version, callback, parameter) => {
+        if (typeof callback !== 'function') return;
+        switch (command) {
+            case 'ping':
+                callback({
+                    gdprApplies: false,
+                    cmpLoaded: true,
+                    cmpStatus: 'loaded',
+                    displayStatus: 'hidden',
+                    apiVersion: '2.0',
+                    cmpId: 0,
+                }, true);
+                break;
+            case 'addEventListener':
+            case 'getTCData':
+                callback(tcData, true);
+                break;
+            case 'removeEventListener':
+                callback(true, true);
+                break;
+            default:
+                callback(tcData, true);
+        }
+    };
+
+    const uspapi = (command, version, callback) => {
+        if (typeof callback !== 'function') return;
+        callback({ version: 1, uspString: '1---' }, true);
+    };
+
+    // Non-writable so the real platform cannot replace these and re-gate the
+    // page; a failed assignment is the intended outcome.
+    const pin = (name, value) => {
+        try {
+            Object.defineProperty(window, name, {
+                value,
+                writable: false,
+                configurable: false,
+            });
+        } catch (error) {
+            /* already pinned */
+        }
+    };
+    pin('__tcfapi', tcfapi);
+    pin('__uspapi', uspapi);
+})();"#;
 
 impl AuditCollector for BrowserAuditCollector {
     fn collect_page(
@@ -244,6 +343,7 @@ async fn with_browser(
         profile,
         page_delay,
         headful,
+        assume_consent,
     } = settings;
     let chrome_executable = find_browser_executable()?;
     let user_data_dir = TempDir::new().map_err(|error| {
@@ -306,7 +406,9 @@ async fn with_browser(
         if index > 0 && !page_delay.is_zero() {
             sleep(page_delay).await;
         }
-        let collected = collect_page_from_browser(&mut browser, target, cookies, index == 0).await;
+        let collected =
+            collect_page_from_browser(&mut browser, target, cookies, index == 0, assume_consent)
+                .await;
         match sink(target, collected) {
             Ok(ControlFlow::Continue) => {}
             Ok(ControlFlow::Stop) => break,
@@ -346,10 +448,21 @@ async fn collect_page_from_browser(
     target_url: &Url,
     cookies: &[(String, String)],
     discover_sitemap: bool,
+    assume_consent: bool,
 ) -> CliResult<CollectedPage> {
     let page = browser.new_page("about:blank").await.map_err(|error| {
         report_error(format!("failed to create browser page for audit: {error}"))
     })?;
+
+    // Must run before any page script, so the consent platform finds the APIs
+    // already answered rather than installing its own gate.
+    if assume_consent {
+        page.evaluate_on_new_document(CONSENT_STUB_SCRIPT)
+            .await
+            .map_err(|error| {
+                report_error(format!("failed to install the consent stub: {error}"))
+            })?;
+    }
 
     // Set operator-supplied cookies before navigating so the origin sees an
     // authenticated session on the first request. Scoping each to the target URL
@@ -470,6 +583,19 @@ async fn collect_page_from_browser(
     // page keeps its link graph in the framework payload, so parsing the raw
     // HTML finds only a fraction of the site's sections. Best-effort — an empty
     // list just means crawl planning falls back to other sources.
+    // When the registry is empty, report what GPT actually looked like. An
+    // empty registry has several very different causes — the library never
+    // loaded, it loaded but the command queue never drained, or slots really
+    // are absent — and the operator's next move differs for each.
+    if gpt_slots.is_empty()
+        && let Ok(result) = page.evaluate(GPT_DIAGNOSTIC_SCRIPT).await
+        && let Ok(state) = result.into_value::<serde_json::Value>()
+    {
+        warnings.push(format!(
+            "no GPT slots in the registry; googletag state: {state}"
+        ));
+    }
+
     let links: Vec<CollectedLink> = match page.evaluate(LINKS_SCRIPT).await {
         Ok(result) => result.into_value().unwrap_or_default(),
         Err(_) => Vec::new(),
@@ -624,6 +750,26 @@ const SITEMAP_SCRIPT: &str = r#"async () => {
         }
     }
     return pages.slice(0, 5000);
+}"#;
+
+/// Reports the observable state of GPT, for pages whose registry came back empty.
+const GPT_DIAGNOSTIC_SCRIPT: &str = r#"() => {
+    const tag = window.googletag;
+    const count = (() => {
+        try { return tag.pubads().getSlots().length } catch (error) { return -1 }
+    })();
+    return {
+        googletag: typeof tag,
+        api_ready: !!(tag && tag.apiReady),
+        cmd_pending: tag && tag.cmd && typeof tag.cmd.length === 'number' ? tag.cmd.length : -1,
+        has_pubads: !!(tag && typeof tag.pubads === 'function'),
+        slots: count,
+        tcfapi: typeof window.__tcfapi,
+        scripts: document.scripts.length,
+        ts_ad_slots: (() => {
+            try { return (window.tsjs && window.tsjs.adSlots || []).length } catch (error) { return -1 }
+        })(),
+    };
 }"#;
 
 /// Reads the live GPT slot registry into `{gam_unit_path, div_id, sizes}` rows.
