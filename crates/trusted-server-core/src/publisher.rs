@@ -5000,14 +5000,40 @@ mod tests {
             );
         }
 
+        fn non_regulated_consent() -> crate::consent::ConsentContext {
+            crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            }
+        }
+
         async fn run_with_slots(
             settings: &Settings,
             services: &RuntimeServices,
             slots: &[CreativeOpportunitySlot],
             req: Request<EdgeBody>,
         ) -> PublisherResponse {
+            run_with_slots_and_consent(settings, services, slots, req, non_regulated_consent())
+                .await
+        }
+
+        async fn run_with_slots_and_consent(
+            settings: &Settings,
+            services: &RuntimeServices,
+            slots: &[CreativeOpportunitySlot],
+            req: Request<EdgeBody>,
+            consent: crate::consent::ConsentContext,
+        ) -> PublisherResponse {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            run_with_orchestrator(settings, services, &orchestrator, slots, req).await
+            run_with_orchestrator_and_consent(
+                settings,
+                services,
+                &orchestrator,
+                slots,
+                req,
+                consent,
+            )
+            .await
         }
 
         async fn run_with_orchestrator(
@@ -5017,10 +5043,25 @@ mod tests {
             slots: &[CreativeOpportunitySlot],
             req: Request<EdgeBody>,
         ) -> PublisherResponse {
-            let consent = crate::consent::ConsentContext {
-                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
-                ..Default::default()
-            };
+            run_with_orchestrator_and_consent(
+                settings,
+                services,
+                orchestrator,
+                slots,
+                req,
+                non_regulated_consent(),
+            )
+            .await
+        }
+
+        async fn run_with_orchestrator_and_consent(
+            settings: &Settings,
+            services: &RuntimeServices,
+            orchestrator: &AuctionOrchestrator,
+            slots: &[CreativeOpportunitySlot],
+            req: Request<EdgeBody>,
+            consent: crate::consent::ConsentContext,
+        ) -> PublisherResponse {
             let mut ec_context = EcContext::new_for_test(None, consent);
 
             handle_publisher_request(
@@ -5303,14 +5344,7 @@ mod tests {
         async fn navigation_without_matched_slots_replaces_origin_cache_policy() {
             let settings = settings_with_enabled_auction_and_creative_opportunities();
 
-            for cache_control in [
-                "no-cache",
-                "max-age=0",
-                "must-revalidate",
-                "s-maxage=0",
-                "private, max-age=0",
-                "No-Store",
-            ] {
+            for cache_control in ["no-cache", "max-age=0", "must-revalidate", "s-maxage=0"] {
                 // Arrange
                 let stub = Arc::new(StubHttpClient::new());
                 queue_html_response_with_cache_control(&stub, cache_control);
@@ -5332,6 +5366,116 @@ mod tests {
                         .and_then(|value| value.to_str().ok()),
                     Some("max-age=60"),
                     "inactive server-side ad templates should replace origin {cache_control} policy"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn navigation_without_matched_slots_preserves_private_origin_cache_policy() {
+            let settings = settings_with_enabled_auction_and_creative_opportunities();
+
+            for cache_control in ["private, max-age=0", "No-Store"] {
+                // Arrange
+                let stub = Arc::new(StubHttpClient::new());
+                queue_html_response_with_cache_control(&stub, cache_control);
+                let services = build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                );
+
+                // Act
+                let response =
+                    run_with_slots(&settings, &services, &[], conditional_navigation_request())
+                        .await;
+                let response_head = response_head(response);
+
+                // Assert
+                assert_eq!(
+                    response_head
+                        .headers
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(cache_control),
+                    "inactive server-side ad templates should preserve private origin {cache_control} policy"
+                );
+                for (header_name, expected) in [
+                    (header::ETAG, ORIGIN_ETAG),
+                    (header::LAST_MODIFIED, ORIGIN_LAST_MODIFIED),
+                    (
+                        header::HeaderName::from_static("surrogate-control"),
+                        "max-age=300",
+                    ),
+                    (
+                        header::HeaderName::from_static("fastly-surrogate-control"),
+                        "max-age=300",
+                    ),
+                    (
+                        header::HeaderName::from_static("cdn-cache-control"),
+                        "max-age=300",
+                    ),
+                    (
+                        header::HeaderName::from_static("cloudflare-cdn-cache-control"),
+                        "max-age=300",
+                    ),
+                ] {
+                    assert_eq!(
+                        response_head
+                            .headers
+                            .get(&header_name)
+                            .and_then(|value| value.to_str().ok()),
+                        Some(expected),
+                        "inactive server-side ad templates should preserve {header_name}"
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn request_scoped_ad_stack_suppression_preserves_origin_cache_policy() {
+            let settings = settings_with_enabled_auction_and_creative_opportunities();
+            let slots = [article_slot()];
+            let mut bot_request = conditional_navigation_request();
+            bot_request.headers_mut().insert(
+                "user-agent",
+                HeaderValue::from_static("Mozilla/5.0 (compatible; Googlebot/2.1)"),
+            );
+            let mut prefetch_request = conditional_navigation_request();
+            prefetch_request
+                .headers_mut()
+                .insert("sec-purpose", HeaderValue::from_static("prefetch"));
+
+            for (skip_reason, request, consent) in [
+                ("bot", bot_request, non_regulated_consent()),
+                ("prefetch", prefetch_request, non_regulated_consent()),
+                (
+                    "consent denied",
+                    conditional_navigation_request(),
+                    crate::consent::ConsentContext {
+                        jurisdiction: crate::consent::jurisdiction::Jurisdiction::Gdpr,
+                        ..Default::default()
+                    },
+                ),
+            ] {
+                // Arrange
+                let stub = Arc::new(StubHttpClient::new());
+                queue_html_response_with_cache_control(&stub, "no-cache");
+                let services = build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                );
+
+                // Act
+                let response =
+                    run_with_slots_and_consent(&settings, &services, &slots, request, consent)
+                        .await;
+                let response_head = response_head(response);
+
+                // Assert
+                assert_eq!(
+                    response_head
+                        .headers
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("no-cache"),
+                    "{skip_reason} should retain the origin cache policy"
                 );
             }
         }

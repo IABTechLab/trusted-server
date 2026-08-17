@@ -1350,12 +1350,24 @@ unit it maps to (`gam_unit_path`).
 `enabled` is the dedicated server-side ad-template switch. It defaults to `true`
 for compatibility with existing configurations. Set it to `false` to stop
 publisher HTML and SPA page-bids template delivery while retaining the slot
-configuration and direct `POST /auction` endpoint. For a successful GET
-publisher document with an inactive template stack, Trusted Server intentionally
-sets the browser-facing policy to `Cache-Control: max-age=60`, replacing the
-origin `Cache-Control` value as specified by
-[#1007](https://github.com/IABTechLab/trusted-server/issues/1007). Error
-responses and non-document requests retain the origin policy.
+configuration and direct `POST /auction` endpoint.
+
+#### Publisher document cache policy
+
+For a successful GET publisher document, Trusted Server applies the
+browser-facing `Cache-Control: max-age=60` policy from
+[#1007](https://github.com/IABTechLab/trusted-server/issues/1007) when the
+server-side ad stack is structurally inactive. This includes an absent
+`[creative_opportunities]` section, `enabled = false`, no slot matching the
+path, or a disabled auction. The policy replaces the origin browser cache
+policy except when the origin sends `private` or `no-store`, which are
+preserved. Bot, prefetch, and consent-denied requests also retain the origin
+policy because they can produce a request-specific representation for the same
+URL. Error responses and non-document requests retain the origin policy.
+
+Any response that carries `Set-Cookie` is finalized as
+`Cache-Control: private, max-age=0`; this privacy rule takes precedence over
+the short inactive-stack policy.
 
 ```toml
 [creative_opportunities]
@@ -1378,8 +1390,11 @@ page_patterns = ["/", "/news", "/news/*", "/reviews", "/reviews/*"]
 formats = [{ width = 728, height = 90 }]
 ```
 
-The same switch can be overridden through the legacy environment-variable
-loader:
+The same switch can be overridden through the typed CLI environment overlay.
+Because EdgeZero only replaces TOML leaves that already exist, first add
+`enabled = true` to the `[creative_opportunities]` block in the base config
+before using this override. See [Environment Variable Overrides (Typed
+CLI)](#environment-variable-overrides-typed-cli) for the general overlay rules.
 
 ```bash
 TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED=false

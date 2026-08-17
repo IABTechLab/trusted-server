@@ -429,12 +429,12 @@ mod tests {
     }
 
     #[test]
-    fn enforce_set_cookie_cache_privacy_downgrades_late_cookie() {
+    fn enforce_set_cookie_cache_privacy_downgrades_inactive_cache_policy() {
         // Mirrors the EdgeZero post-ec_finalize guard: a Set-Cookie added after
-        // finalize headers ran (origin-public response) must be downgraded.
+        // finalize headers ran must override the inactive template cache policy.
         let mut response = response_with_headers(&[
             ("set-cookie", "ts-ec=abc; Path=/"),
-            ("cache-control", "public, max-age=600"),
+            ("cache-control", "max-age=60"),
             ("surrogate-control", "max-age=600"),
         ]);
 
@@ -446,11 +446,11 @@ mod tests {
                 .get("cache-control")
                 .and_then(|v| v.to_str().ok()),
             Some("private, max-age=0"),
-            "should downgrade a late public cookie response to private"
+            "should downgrade an inactive cache policy on a cookie response"
         );
         assert!(
             response.headers().get("surrogate-control").is_none(),
-            "should strip surrogate-control from the late cookie response"
+            "should strip surrogate-control from the inactive cookie response"
         );
     }
 

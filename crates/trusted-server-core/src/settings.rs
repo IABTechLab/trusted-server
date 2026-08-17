@@ -5042,7 +5042,7 @@ formats = [{ width = 300, height = 250 }]
     }
 
     #[test]
-    fn settings_creative_opportunity_enabled_flag_supports_environment_override() {
+    fn legacy_settings_loader_applies_creative_opportunity_enabled_environment_override() {
         let toml = format!(
             "{}\n[creative_opportunities]\nenabled = true\ngam_network_id = \"21765378893\"\n",
             crate_test_settings_str()
@@ -5062,7 +5062,7 @@ formats = [{ width = 300, height = 250 }]
                     .creative_opportunities
                     .expect("should have creative opportunities")
                     .enabled,
-                "environment override should disable template delivery"
+                "legacy settings loader should disable template delivery"
             );
         });
     }
