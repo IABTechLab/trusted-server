@@ -1,4 +1,4 @@
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -98,17 +98,19 @@ pub struct IntegrationScriptContext<'a> {
     pub document_state: &'a IntegrationDocumentState,
 }
 
+type IntegrationDocumentStateMap = BTreeMap<(&'static str, TypeId), Arc<dyn Any + Send + Sync>>;
+
 /// Per-document state shared between HTML/script rewriters and post-processors.
 ///
 /// This exists to support multi-phase HTML processing without requiring a second HTML parse.
 #[derive(Clone, Default)]
 pub struct IntegrationDocumentState {
-    inner: Arc<Mutex<BTreeMap<&'static str, Arc<dyn Any + Send + Sync>>>>,
+    inner: Arc<Mutex<IntegrationDocumentStateMap>>,
 }
 
 impl std::fmt::Debug for IntegrationDocumentState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let keys: Vec<&'static str> = {
+        let keys: Vec<(&'static str, TypeId)> = {
             let guard = self
                 .inner
                 .lock()
@@ -136,7 +138,7 @@ impl IntegrationDocumentState {
             .inner
             .lock()
             .expect("should lock integration document state");
-        let value = guard.get(integration_id)?;
+        let value = guard.get(&(integration_id, TypeId::of::<T>()))?;
         let cloned: Arc<dyn Any + Send + Sync> = Arc::clone(value);
         cloned.downcast::<T>().ok()
     }
@@ -159,17 +161,15 @@ impl IntegrationDocumentState {
             .lock()
             .expect("should lock integration document state");
 
-        if let Some(existing) = guard.get(integration_id)
+        let key = (integration_id, TypeId::of::<T>());
+        if let Some(existing) = guard.get(&key)
             && let Ok(downcast) = Arc::clone(existing).downcast::<T>()
         {
             return downcast;
         }
 
         let value: Arc<T> = Arc::new(init());
-        guard.insert(
-            integration_id,
-            Arc::clone(&value) as Arc<dyn Any + Send + Sync>,
-        );
+        guard.insert(key, Arc::clone(&value) as Arc<dyn Any + Send + Sync>);
         value
     }
 
@@ -327,7 +327,7 @@ pub trait IntegrationProxy: Send + Sync {
 pub struct RequestFilterInput<'a> {
     pub settings: &'a Settings,
     pub services: &'a RuntimeServices,
-    pub request: &'a Request<EdgeBody>,
+    pub request: &'a mut Request<EdgeBody>,
     pub geo_info: Option<&'a GeoInfo>,
     /// Whether the request matches a registered integration proxy route.
     pub is_integration_route: bool,
@@ -1345,6 +1345,8 @@ mod tests {
     }
 
     struct EnrichingRequestFilter;
+    #[derive(Clone, Copy)]
+    struct RequestAnnotation;
 
     #[async_trait(?Send)]
     impl IntegrationRequestFilter for EnrichingRequestFilter {
@@ -1354,8 +1356,9 @@ mod tests {
 
         async fn filter_request(
             &self,
-            _input: RequestFilterInput<'_>,
+            input: RequestFilterInput<'_>,
         ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
+            input.request.extensions_mut().insert(RequestAnnotation);
             Ok(RequestFilterDecision::Continue(RequestFilterEffects {
                 request_headers: vec![HeaderMutation::set("x-datadome-isbot", "1")],
                 response_headers: vec![HeaderMutation::set("x-dd-b", "allowed")],
@@ -1400,6 +1403,37 @@ mod tests {
                 .expect("should build echo response");
             Ok(response)
         }
+    }
+
+    #[test]
+    fn document_state_keeps_multiple_types_for_one_integration() {
+        let state = IntegrationDocumentState::default();
+        let number = state.get_or_insert_with("test", || 7_u32);
+        let label = state.get_or_insert_with("test", || "first".to_string());
+        let repeated_number = state.get_or_insert_with("test", || 99_u32);
+
+        assert!(
+            Arc::ptr_eq(&number, &repeated_number),
+            "repeated insertion should preserve the original typed state"
+        );
+        assert_eq!(
+            *state.get::<u32>("test").expect("should retrieve number"),
+            7,
+            "should retain numeric state"
+        );
+        assert_eq!(
+            state
+                .get::<String>("test")
+                .expect("should retrieve label")
+                .as_str(),
+            "first",
+            "should retain string state under the same integration ID"
+        );
+        assert_eq!(
+            label.as_str(),
+            "first",
+            "should return inserted string state"
+        );
     }
 
     #[test]
@@ -1486,6 +1520,10 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("1"),
             "should apply DataDome-style request enrichment before routing"
+        );
+        assert!(
+            req.extensions().get::<RequestAnnotation>().is_some(),
+            "should preserve private request annotations for downstream routing"
         );
         match outcome {
             RequestFilterRegistryOutcome::Continue(effects) => {
