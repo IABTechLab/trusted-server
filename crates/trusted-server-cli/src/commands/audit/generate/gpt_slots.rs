@@ -130,6 +130,9 @@ fn slot_from_registry(entry: &CollectedGptSlot, page_has_prebid: bool) -> Option
     if is_multi_slot_div(&entry.div_id) {
         return None;
     }
+    if !is_usable_unit_path(&entry.gam_unit_path) {
+        return None;
+    }
     let formats: Vec<(u32, u32)> = entry
         .sizes
         .iter()
@@ -140,6 +143,14 @@ fn slot_from_registry(entry: &CollectedGptSlot, page_has_prebid: bool) -> Option
         return None;
     }
     let div_stem = normalize_div_stem(&entry.div_id);
+    // Normalization truncates at the first ephemeral marker, so a div id that is
+    // *entirely* ephemeral (`_R_9sl…`, or exactly `-container`) reduces to the
+    // empty string. An empty `div_id` override fails config load outright, and
+    // an empty prefix would bind the slot to the first id-bearing element on the
+    // page, so such a slot is unusable rather than merely imprecise.
+    if div_stem.is_empty() {
+        return None;
+    }
     Some(DiscoveredSlot {
         id: slot_id_from_div(&div_stem),
         div_id: div_stem,
@@ -153,6 +164,17 @@ fn slot_from_registry(entry: &CollectedGptSlot, page_has_prebid: bool) -> Option
 /// slots (joined with `~`) rather than one element.
 fn is_multi_slot_div(div_id: &str) -> bool {
     div_id.contains('~')
+}
+
+/// Whether a scraped GAM ad-unit path can be represented in config.
+///
+/// `gam_unit_path` is a template: `{` and `}` delimit placeholders and
+/// [`parse_unit_template`](trusted_server_core::creative_opportunities) offers no
+/// escape syntax. A live path containing a brace would either fail config load
+/// or, worse, be silently reinterpreted as a placeholder-bearing template. A
+/// blank path is rejected for the same reason config load rejects it.
+fn is_usable_unit_path(path: &str) -> bool {
+    !path.trim().is_empty() && !path.contains(['{', '}'])
 }
 
 /// Strips ephemeral GPT div-id noise so the stored id is stable across renders.
@@ -220,6 +242,9 @@ fn parse_gampad_request(raw_url: &str) -> Option<(String, DiscoveredSlot)> {
         .filter(|segment| segment.bytes().all(|byte| byte.is_ascii_digit()))?
         .to_string();
     let gam_unit_path = format!("/{}", iu_parts.replace(',', "/"));
+    if !is_usable_unit_path(&gam_unit_path) {
+        return None;
+    }
     // A usable unit path needs the network id plus at least one path segment.
     parts.next()?;
 
@@ -232,6 +257,11 @@ fn parse_gampad_request(raw_url: &str) -> Option<(String, DiscoveredSlot)> {
         return None;
     }
     let div_id = normalize_div_stem(&raw_div);
+    // See `slot_from_registry`: a fully ephemeral div id normalizes to nothing,
+    // which is neither a valid config value nor a usable runtime prefix.
+    if div_id.is_empty() {
+        return None;
+    }
 
     let formats = parse_sizes(sizes_raw.as_deref().or(fallback_sizes_raw.as_deref())?);
     if formats.is_empty() {
@@ -464,6 +494,65 @@ mod tests {
             div_id: div.to_string(),
             sizes: sizes.to_vec(),
         }
+    }
+
+    #[test]
+    fn registry_slot_with_brace_in_unit_path_is_skipped() {
+        // `gam_unit_path` is a template and there is no escape syntax, so a
+        // literal brace either fails config load or is silently reinterpreted as
+        // a placeholder. Neither is acceptable to persist.
+        let registry = vec![
+            registry_slot("/123/home/{section}", "div-gpt-ad-a", &[(300, 250)]),
+            registry_slot("/123/home/ok", "div-gpt-ad-b", &[(300, 250)]),
+        ];
+
+        let discovered = discover_gpt_slots(&registry, &[], false);
+
+        assert_eq!(
+            discovered.slots.len(),
+            1,
+            "the brace-bearing slot should be dropped, the clean one kept"
+        );
+        assert_eq!(discovered.slots[0].gam_unit_path, "/123/home/ok");
+    }
+
+    #[test]
+    fn registry_slot_whose_div_id_is_entirely_ephemeral_is_skipped() {
+        // `_R_…` is a React SSR marker; normalizing truncates at it, leaving an
+        // empty stem. An empty div_id fails config load, and as a runtime prefix
+        // it would match the first id-bearing element on the page.
+        let registry = vec![registry_slot(
+            "/123/home/header",
+            "_R_9slkta7pd6",
+            &[(728, 90)],
+        )];
+
+        let discovered = discover_gpt_slots(&registry, &[], false);
+
+        assert!(
+            discovered.slots.is_empty(),
+            "a slot with no stable div stem should be dropped, got {:?}",
+            discovered.slots
+        );
+    }
+
+    #[test]
+    fn volatile_guid_div_id_still_normalizes_to_a_usable_prefix() {
+        // The live autoblog shape: a GUID between two copies of the slot name.
+        // This must survive - only a stem that normalizes to *nothing* is dropped.
+        let registry = vec![registry_slot(
+            "/88059007/autoblog/homepage",
+            "ad-in_content-0949b6c5726343bf8bbec2ac47b494b4-in_content-0",
+            &[(300, 250)],
+        )];
+
+        let discovered = discover_gpt_slots(&registry, &[], false);
+
+        assert_eq!(discovered.slots.len(), 1);
+        assert_eq!(
+            discovered.slots[0].div_id, "ad-in_content",
+            "the GUID and trailing index should be truncated to a stable prefix"
+        );
     }
 
     #[test]

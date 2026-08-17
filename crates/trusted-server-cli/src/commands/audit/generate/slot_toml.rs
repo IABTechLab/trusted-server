@@ -365,14 +365,25 @@ pub(super) fn splice_creative_slots(
 
     // No section yet — append a fresh one with the network id and slots.
     if !has_canonical_header {
+        // `gam_network_id` is a required field, so creating the section without
+        // one writes a config that cannot load at all. This is reachable: the
+        // network id is only recovered when the scraped unit path starts with an
+        // all-digit segment, which an MCM/child-network path like
+        // `/1234,5678/home/header` does not.
+        let Some(network_id) = network_id else {
+            return cli_error(
+                "refusing to create a `[creative_opportunities]` section without a \
+                 GAM network id: none could be determined from the audited page, and \
+                 the key is required. Add `[creative_opportunities]` with a \
+                 `gam_network_id` to the config and re-run",
+            );
+        };
         let mut result = existing;
         if !result.is_empty() && !result.ends_with('\n') {
             result.push('\n');
         }
         result.push_str("\n[creative_opportunities]\n");
-        if let Some(network_id) = network_id {
-            result.push_str(&format!("gam_network_id = {}\n", toml_string(network_id)));
-        }
+        result.push_str(&format!("gam_network_id = {}\n", toml_string(network_id)));
         result.push_str(rendered);
         result.push('\n');
         return Ok(result);
@@ -694,6 +705,23 @@ mod tests {
         assert!(
             format!("{error:?}").contains("cannot edit safely"),
             "error should tell the operator to rewrite the section, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn splice_refuses_fresh_section_without_a_network_id() {
+        // Reachable whenever the scraped unit path has no all-digit leading
+        // segment (MCM/child-network paths). Writing the section anyway produces
+        // a config missing a required field, which fails load and takes every
+        // route to the startup error router once pushed.
+        let existing = "[publisher]\ndomain = \"x\"\n";
+
+        let error = splice_creative_slots(existing, None, &header_rendered())
+            .expect_err("should refuse to create a section with no network id");
+
+        assert!(
+            format!("{error:?}").contains("without a GAM network id"),
+            "error should name the missing network id, got {error:?}"
         );
     }
 

@@ -3,6 +3,7 @@ pub(crate) mod browser_collector;
 pub(crate) mod collector;
 mod gpt_slots;
 mod slot_toml;
+mod validate;
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -543,6 +544,15 @@ pub(crate) fn run_update_slots(
     );
     let rendered_slots = render_slots(&merged);
     let updated = splice_creative_slots(&existing, network_id.as_deref(), &rendered_slots)?;
+
+    // Everything above is derived from a live, page-controlled ad stack, so the
+    // candidate has to clear the runtime's own load path before it can replace
+    // the operator's file. This runs on the dry-run path too — otherwise "the
+    // preview looked fine" would not be evidence that the config loads.
+    for warning in validate::check_candidate(&updated, &existing)? {
+        writeln!(out, "warning: {warning}")
+            .map_err(|error| report_error(format!("failed to write command output: {error}")))?;
+    }
 
     if dry_run {
         writeln!(out, "{updated}")
@@ -1148,6 +1158,68 @@ mod tests {
         );
         let written = fs::read_to_string(&config_path).expect("should read config");
         toml::from_str::<toml::Value>(&written).expect("rewritten config is valid TOML");
+    }
+
+    /// A full, loadable config with real secrets substituted, so the write-side
+    /// validation gate is live rather than downgraded by a broken baseline.
+    fn loadable_config() -> String {
+        EXAMPLE_CONFIG
+            .replace(
+                "replace-with-admin-password-32-bytes",
+                "test-admin-password-32-bytes-minimum",
+            )
+            .replace(
+                "trusted-server-placeholder-secret",
+                "test-ec-passphrase-32-bytes-minimum",
+            )
+            .replace(
+                "change-me-proxy-secret",
+                "test-proxy-secret-32-bytes-minimum",
+            )
+    }
+
+    #[test]
+    fn generated_config_loads_through_the_runtime_settings_path() {
+        // The end-to-end contract: whatever `generate` writes must survive the
+        // same load path the adapter runs at startup. An unloadable config is a
+        // full-site outage once pushed, not a degraded ad stack.
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        let baseline = loadable_config();
+        trusted_server_core::settings::Settings::from_toml(&baseline)
+            .expect("test baseline must itself be loadable or the gate is not exercised");
+        fs::write(&config_path, &baseline).expect("should write config");
+        let collector = FakeCollector::new(collected_page_with_header_slot());
+        let mut out = Vec::new();
+
+        run_update_slots(
+            "https://publisher.example/",
+            &config_path,
+            None,
+            &[],
+            false,
+            &[],
+            false,
+            &collector,
+            &mut out,
+        )
+        .expect("should update slots");
+
+        let written = fs::read_to_string(&config_path).expect("should read config");
+        let settings = trusted_server_core::settings::Settings::from_toml(&written)
+            .expect("generated config must load through the runtime path");
+        let creative = settings
+            .creative_opportunities
+            .expect("generated config should carry creative opportunities");
+        assert_eq!(
+            creative.slot.len(),
+            1,
+            "the discovered slot should be present after a real load"
+        );
+        assert_eq!(
+            creative.slot[0].div_id.as_deref(),
+            Some("div-gpt-ad-header")
+        );
     }
 
     #[test]
