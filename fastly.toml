@@ -61,6 +61,12 @@ build = """
             key = "tinybird_access_append_token"
             data = "test-tinybird-access-append-token"
 
+        # App-config secret references resolve from this canonical logical store.
+        # Populate production values through the EdgeZero secret-store workflow.
+        [[local_server.secret_stores.trusted_server_secrets]]
+            key = "placeholder"
+            data = "placeholder"
+
     [local_server.config_stores]
         [local_server.config_stores.trusted_server_config]
             format = "inline-toml"

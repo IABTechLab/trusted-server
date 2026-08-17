@@ -38,7 +38,7 @@
 # Regex matched against the request path. This one guards the admin surface.
 path = "^/_ts/admin"
 username = "admin"
-password = "replace-with-admin-password-32-bytes"
+password = "handler_password"
 
 # You can add more handlers to basic-auth-protect other path prefixes. The
 # sample password below is a known placeholder that deploy validation rejects,
@@ -59,8 +59,8 @@ domain = "example.com"
 cookie_domain = ".example.com"
 # Upstream origin to proxy publisher content from. No trailing slash.
 origin_url = "https://origin.example.com"
-# HMAC secret for signing first-party proxy URLs. Replace before deploying.
-proxy_secret = "change-me-proxy-secret"
+# Secret Store key for the HMAC secret used to sign first-party proxy URLs.
+proxy_secret = "publisher_proxy_secret"
 # Optional: override the outbound Host header sent to origin_url.
 # origin_host_header_override = "www.example.com"
 # Optional: max bytes buffered when a response is post-processed in full (HTML
@@ -73,22 +73,23 @@ proxy_secret = "change-me-proxy-secret"
 # REQUIRED — Edge Cookie (EC) identity
 # -----------------------------------------------------------------------------
 [ec]
-# Secret used to derive EC identifiers. Must be >= 32 chars and non-placeholder
-# in production (deploy validation rejects known placeholders).
-passphrase = "trusted-server-placeholder-secret"
+# Secret Store key for the secret used to derive EC identifiers.
+passphrase = "ec_passphrase"
 # KV store that persists EC identity state. This is the physical store name
 # bound per adapter (e.g. `ec_identity_store` in fastly.toml); edgezero.toml's
 # logical KV id is `trusted_server_kv`.
 ec_store = "ec_identity_store"
 # Max concurrent partner pull-sync requests.
 pull_sync_concurrency = 3
+# Keep this empty when no partners are configured. Replace this line with
+# `[[ec.partners]]` entries when adding partners.
+partners = []
 # Optional cluster-heuristic tuning (defaults shown):
 # cluster_trust_threshold = 10    # entries with cluster_size <= this are individual users
 # cluster_recheck_secs = 3600     # re-evaluate cluster_size after this many seconds
 
-# Optional identity partners (SSP/DSP/identity vendors). Each needs a real,
-# non-placeholder api_token (>= 32 bytes) at deploy. Configure real partners via
-# private config, not this template.
+# Example partner configuration. Provision referenced keys in
+# trusted_server_secrets before validating/pushing.
 # [[ec.partners]]
 # name = "Example Partner"
 # source_domain = "partner.example.com"
@@ -97,7 +98,9 @@ pull_sync_concurrency = 3
 # openrtb_atype = 3
 # include this partner's UIDs in auction user.eids
 # bidstream_enabled = true
-# api_token = "replace-with-partner-api-token-32-bytes-minimum"
+# api_token = "partner_api_token"
+# Optional when pull sync is enabled:
+# ts_pull_token = "partner_ts_pull_token"
 # batch_rate_limit = 60      # max batch-sync requests/min (default 60)
 # pull_sync_enabled = false  # default false
 

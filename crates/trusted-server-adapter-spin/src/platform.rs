@@ -39,6 +39,7 @@ type HeaderPairs = Vec<(String, Vec<u8>)>;
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 type BufferedResponseParts = (HeaderPairs, Vec<u8>);
 
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 const SPIN_VARIABLE_HEX: &[u8; 16] = b"0123456789abcdef";
 
 // ---------------------------------------------------------------------------
@@ -116,25 +117,22 @@ impl PlatformBackend for NoopBackend {
 
 /// Bridges edgezero's [`ConfigStoreHandle`] to [`PlatformConfigStore`].
 ///
-/// Reads delegate through the handle after mapping Trusted Server keys to Spin
-/// variable names. Writes are unsupported on current Spin runtime config and
-/// return typed errors.
-struct ConfigStoreHandleAdapter(ConfigStoreHandle);
+/// Spin config stores are KV-backed, so reads preserve the requested key
+/// verbatim. Writes are unsupported on current Spin runtime config and return
+/// typed errors.
+pub(crate) struct ConfigStoreHandleAdapter(pub(crate) ConfigStoreHandle);
 
 impl PlatformConfigStore for ConfigStoreHandleAdapter {
     fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
-        let variable_name = spin_variable_name(key, PlatformError::ConfigStore)?;
-        futures::executor::block_on(self.0.get(&variable_name))
-            .map_err(|e| {
-                Report::new(PlatformError::ConfigStore)
-                    .attach(format!(
-                        "config store lookup failed for key `{key}` as Spin variable `{variable_name}`: {e}"
-                    ))
+        futures::executor::block_on(self.0.get(key))
+            .map_err(|error| {
+                Report::new(PlatformError::ConfigStore).attach(format!(
+                    "config store lookup failed for key `{key}`: {error}"
+                ))
             })?
             .ok_or_else(|| {
-                Report::new(PlatformError::ConfigStore).attach(format!(
-                    "key `{key}` not found as Spin variable `{variable_name}`"
-                ))
+                Report::new(PlatformError::ConfigStore)
+                    .attach(format!("key `{key}` not found in Spin config store"))
             })
     }
 
@@ -149,6 +147,7 @@ impl PlatformConfigStore for ConfigStoreHandleAdapter {
     }
 }
 
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 fn spin_variable_name(
     key: &str,
     error_context: PlatformError,
@@ -187,6 +186,7 @@ fn spin_variable_name(
     Ok(out)
 }
 
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 fn push_spin_variable_escape(out: &mut String, byte: u8) {
     out.push('_');
     out.push('x');
@@ -676,7 +676,7 @@ fn into_spin_method(method: &edgezero_core::http::Method) -> spin_sdk::http::Met
 ///   with a real secret-provider source (e.g. Vault, Azure Key Vault) to avoid
 ///   storing signing keys in plaintext on disk.
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-struct SpinSecretStoreAdapter;
+pub(crate) struct SpinSecretStoreAdapter;
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 impl PlatformSecretStore for SpinSecretStoreAdapter {
@@ -794,12 +794,22 @@ mod tests {
     use super::*;
 
     use edgezero_core::body::Body;
+    use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::request_builder;
     use edgezero_core::params::PathParams;
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use std::io::Write as _;
+
+    struct InMemoryConfigStore(std::collections::BTreeMap<String, String>);
+
+    #[async_trait::async_trait(?Send)]
+    impl ConfigStore for InMemoryConfigStore {
+        async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+            Ok(self.0.get(key).cloned())
+        }
+    }
 
     fn make_ctx_without_spin_context() -> RequestContext {
         let req = request_builder()
@@ -891,6 +901,29 @@ mod tests {
                 .expect("should not fail")
                 .is_none(),
             "should return None for any client IP"
+        );
+    }
+
+    #[test]
+    fn config_store_handle_adapter_reads_verbatim_kv_key() {
+        let handle = ConfigStoreHandle::new(Arc::new(InMemoryConfigStore(
+            std::collections::BTreeMap::from([(
+                "trusted_server_config".to_owned(),
+                "blob-envelope".to_owned(),
+            )]),
+        )));
+        let adapter = ConfigStoreHandleAdapter(handle);
+
+        let value = adapter
+            .get(
+                &StoreName::from("trusted_server_config"),
+                "trusted_server_config",
+            )
+            .expect("should read the verbatim config-store key");
+
+        assert_eq!(
+            value, "blob-envelope",
+            "should not translate a KV-backed config key into a Spin variable name"
         );
     }
 

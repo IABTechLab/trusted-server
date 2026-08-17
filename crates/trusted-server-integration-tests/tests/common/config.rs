@@ -1,7 +1,6 @@
 use edgezero_core::blob_envelope::BlobEnvelope;
 use error_stack::Report;
-use trusted_server_core::config::validate_settings_for_deploy;
-use trusted_server_core::settings::Settings;
+use trusted_server_core::config::TrustedServerAppConfig;
 
 use crate::common::runtime::{TestError, TestResult};
 
@@ -10,18 +9,19 @@ const APP_CONFIG: &str = include_str!("../../fixtures/configs/trusted-server.int
 
 pub fn integration_app_config_envelope(origin_port: u16) -> TestResult<String> {
     let origin_url = format!("http://127.0.0.1:{origin_port}");
-    let mut settings = Settings::from_toml(APP_CONFIG).map_err(|report| {
+    let app_config: TrustedServerAppConfig = toml::from_str(APP_CONFIG).map_err(|error| {
         Report::new(TestError::ConfigGeneration).attach(format!(
-            "invalid Trusted Server integration config: {report:?}"
+            "invalid Trusted Server integration config: {error}"
         ))
     })?;
+    let mut settings = app_config.into_settings();
     settings.publisher.origin_url = origin_url;
-    validate_settings_for_deploy(&settings).map_err(|report| {
+    let app_config = TrustedServerAppConfig::new(settings).map_err(|report| {
         Report::new(TestError::ConfigGeneration)
             .attach(format!("invalid generated integration config: {report:?}"))
     })?;
 
-    let data = serde_json::to_value(&settings).map_err(|error| {
+    let data = serde_json::to_value(&app_config).map_err(|error| {
         Report::new(TestError::ConfigGeneration)
             .attach(format!("failed to serialize integration settings: {error}"))
     })?;

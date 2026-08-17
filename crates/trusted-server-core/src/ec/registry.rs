@@ -61,6 +61,68 @@ pub struct PartnerRegistry {
 }
 
 impl PartnerRegistry {
+    /// Validates partner structure without inspecting secret values.
+    ///
+    /// This is the push-time half of partner validation. API-token length,
+    /// placeholder, and collision checks remain in [`Self::from_config`],
+    /// after secret references have been resolved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when non-secret partner
+    /// structure is invalid.
+    pub fn validate_config_for_deploy(
+        partners: &[EcPartner],
+    ) -> Result<(), Report<TrustedServerError>> {
+        let mut source_domains = HashMap::with_capacity(partners.len());
+
+        for partner in partners {
+            let normalized_source = normalize_partner_source_domain(&partner.source_domain)
+                .map_err(|msg| {
+                    Report::new(TrustedServerError::Configuration {
+                        message: format!("ec.partners: {msg}"),
+                    })
+                })?;
+
+            if source_domains
+                .insert(normalized_source.clone(), ())
+                .is_some()
+            {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!("ec.partners: duplicate source_domain '{normalized_source}'"),
+                }));
+            }
+
+            validate_rate_limits_values(partner.batch_rate_limit, partner.pull_sync_rate_limit)
+                .map_err(|error| {
+                    Report::new(TrustedServerError::Configuration {
+                        message: format!(
+                            "ec.partners: invalid rate limits for '{normalized_source}': {error}"
+                        ),
+                    })
+                })?;
+
+            if partner.pull_sync_enabled {
+                validate_pull_sync_fields(
+                    partner.pull_sync_url.as_deref(),
+                    &partner.pull_sync_allowed_domains,
+                    partner
+                        .ts_pull_token
+                        .as_ref()
+                        .map(|token| token.expose().as_str()),
+                    false,
+                )
+                .change_context(TrustedServerError::Configuration {
+                    message: format!(
+                        "ec.partners: pull sync config invalid for '{normalized_source}'"
+                    ),
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Builds a registry from the config-defined partner list.
     ///
     /// # Errors
@@ -231,34 +293,56 @@ fn build_partner_config(
 }
 
 fn validate_rate_limits(config: &PartnerConfig) -> Result<(), Report<TrustedServerError>> {
-    if config.batch_rate_limit == 0 {
-        return Err(Report::new(TrustedServerError::Configuration {
-            message: "batch_rate_limit must be greater than 0".to_owned(),
-        }));
+    validate_rate_limits_values(config.batch_rate_limit, config.pull_sync_rate_limit).map_err(
+        |message| {
+            Report::new(TrustedServerError::Configuration {
+                message: message.to_owned(),
+            })
+        },
+    )
+}
+
+fn validate_rate_limits_values(
+    batch_rate_limit: u32,
+    pull_sync_rate_limit: u32,
+) -> Result<(), &'static str> {
+    if batch_rate_limit == 0 {
+        return Err("batch_rate_limit must be greater than 0");
     }
 
-    if config.pull_sync_rate_limit == 0 {
-        return Err(Report::new(TrustedServerError::Configuration {
-            message: "pull_sync_rate_limit must be greater than 0".to_owned(),
-        }));
+    if pull_sync_rate_limit == 0 {
+        return Err("pull_sync_rate_limit must be greater than 0");
     }
 
     Ok(())
 }
 
 fn validate_pull_sync(config: &PartnerConfig) -> Result<(), Report<TrustedServerError>> {
-    let url_str = config.pull_sync_url.as_deref().unwrap_or("");
+    validate_pull_sync_fields(
+        config.pull_sync_url.as_deref(),
+        &config.pull_sync_allowed_domains,
+        config
+            .ts_pull_token
+            .as_ref()
+            .map(|token| token.expose().as_str()),
+        true,
+    )
+}
+
+fn validate_pull_sync_fields(
+    url: Option<&str>,
+    allowed_domains: &[String],
+    token_value: Option<&str>,
+    require_nonempty_token: bool,
+) -> Result<(), Report<TrustedServerError>> {
+    let url_str = url.unwrap_or("");
     if url_str.is_empty() {
         return Err(Report::new(TrustedServerError::Configuration {
             message: "pull_sync_url is required when pull_sync_enabled is true".to_owned(),
         }));
     }
 
-    if config
-        .ts_pull_token
-        .as_ref()
-        .is_none_or(|token| token.expose().trim().is_empty())
-    {
+    if token_value.is_none() {
         return Err(Report::new(TrustedServerError::Configuration {
             message: "ts_pull_token is required when pull_sync_enabled is true".to_owned(),
         }));
@@ -289,7 +373,7 @@ fn validate_pull_sync(config: &PartnerConfig) -> Result<(), Report<TrustedServer
         .trim_end_matches('.')
         .to_ascii_lowercase();
 
-    let domain_match = config.pull_sync_allowed_domains.iter().any(|d| {
+    let domain_match = allowed_domains.iter().any(|d| {
         let normalized = d.trim_end_matches('.').to_ascii_lowercase();
         host == normalized
     });
@@ -297,6 +381,12 @@ fn validate_pull_sync(config: &PartnerConfig) -> Result<(), Report<TrustedServer
     if !domain_match {
         return Err(Report::new(TrustedServerError::Configuration {
             message: format!("pull_sync_url hostname '{host}' not in pull_sync_allowed_domains"),
+        }));
+    }
+
+    if require_nonempty_token && token_value.is_some_and(|value| value.trim().is_empty()) {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: "ts_pull_token must not be empty when pull sync is enabled".to_owned(),
         }));
     }
 

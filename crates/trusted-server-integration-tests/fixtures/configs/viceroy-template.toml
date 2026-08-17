@@ -66,6 +66,22 @@
             key = "api_key"
             data = "test-api-key"
 
+        [[local_server.secret_stores.trusted_server_secrets]]
+            key = "integration_admin_password"
+            data = "integration-admin-password-32-bytes-ok"
+        [[local_server.secret_stores.trusted_server_secrets]]
+            key = "integration_proxy_secret"
+            data = "integration-test-proxy-secret-32-bytes-ok"
+        [[local_server.secret_stores.trusted_server_secrets]]
+            key = "integration_ec_passphrase"
+            data = "integration-test-ec-secret-padded-32"
+        [[local_server.secret_stores.trusted_server_secrets]]
+            key = "integration_partner_token_alpha"
+            data = "integration-test-token-alpha-32-bytes-ok"
+        [[local_server.secret_stores.trusted_server_secrets]]
+            key = "integration_partner_token_bravo"
+            data = "integration-test-token-bravo-32-bytes-ok"
+
     [local_server.config_stores]
         # Generated integration configs inject the trusted_server_config blob
         # into the store required by the Fastly entry point.
