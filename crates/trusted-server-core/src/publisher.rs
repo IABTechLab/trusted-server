@@ -1902,7 +1902,7 @@ fn redact_response_for_dump(
     options: &AuctionDebugCommentOptions,
 ) -> serde_json::Value {
     let metadata: serde_json::Map<String, serde_json::Value> = match options.verbosity {
-        AuctionDebugCommentVerbosity::Redacted => response
+        AuctionDebugCommentVerbosity::Redacted | AuctionDebugCommentVerbosity::Upstream => response
             .metadata
             .iter()
             .filter(|(key, _)| {
@@ -1946,7 +1946,7 @@ fn redact_bid_for_dump(
     options: &AuctionDebugCommentOptions,
 ) -> serde_json::Value {
     let mut value = serde_json::to_value(bid).unwrap_or(serde_json::Value::Null);
-    if options.verbosity == AuctionDebugCommentVerbosity::Redacted
+    if options.verbosity != AuctionDebugCommentVerbosity::Full
         && let Some(creative) = &bid.creative
     {
         value["creative"] =

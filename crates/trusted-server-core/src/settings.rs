@@ -1878,13 +1878,10 @@ pub struct DebugConfig {
     #[serde(default)]
     pub ja4_endpoint_enabled: bool,
 
-    /// Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` dumping a
-    /// redacted per-provider auction result: pipeline stats (SSP count, mediator
-    /// status, winning bid count) plus every provider response — each bid's
-    /// creative previewed (not the full `adm` markup) and provider metadata
-    /// filtered to a fail-closed allowlist that drops identity-bearing keys.
-    /// Never enable in production — visible in page source and injects (bounded)
-    /// raw HTML from SSPs.
+    /// Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` dumping
+    /// per-provider auction diagnostics. The default validates response-level
+    /// metadata, but bid fields and bounded creative previews remain visible;
+    /// this is not a fully anonymized dump. Never enable in production.
     #[serde(default)]
     pub auction_html_comment: bool,
 
@@ -1917,16 +1914,21 @@ pub struct DebugConfig {
 /// of what an operator lists in [`AuctionDebugCommentOptions::metadata_keys`].
 /// `metadata_keys` is a subset selector against this const, never a way to
 /// add new keys.
-pub(crate) const AUCTION_DEBUG_METADATA_ALLOWLIST: &[&str] = &[
-    "error_type",
-    "http_status",
-    "message",
-    "upstream_message",
-    "upstream_message_truncated",
-    "responsetimemillis",
+pub(crate) const AUCTION_DEBUG_METADATA_ALLOWLIST: &[&str] =
+    &["error_type", "http_status", "message"];
+
+/// Provider-controlled diagnostic keys exposed only by `Upstream` or `Full`.
+///
+/// Values remain untyped upstream JSON and may contain request or identity
+/// data. Keeping this list separate prevents [`AuctionDebugCommentOptions::metadata_keys`]
+/// from widening the default response-metadata boundary.
+pub(crate) const AUCTION_DEBUG_UPSTREAM_METADATA_KEYS: &[&str] = &[
     "errors",
     "warnings",
+    "responsetimemillis",
     "bidstatus",
+    "upstream_message",
+    "upstream_message_truncated",
 ];
 
 fn default_true() -> bool {
@@ -1964,20 +1966,22 @@ pub struct AuctionDebugCommentOptions {
 
     /// Subset of [`AUCTION_DEBUG_METADATA_ALLOWLIST`] to surface in
     /// [`AuctionDebugCommentVerbosity::Redacted`] mode. Keys outside the
-    /// fixed allowlist are always dropped, config or not. Ignored when
-    /// `verbosity` is `Full`.
+    /// fixed allowlist are always dropped, config or not. This selector cannot
+    /// unlock provider diagnostics. Ignored when `verbosity` is `Full`.
     #[serde(default = "default_auction_debug_metadata_keys")]
     pub metadata_keys: Vec<String>,
 
-    /// `Redacted` (default): `metadata_keys` subset only, creative preview
-    /// truncated to `MAX_BID_CREATIVE_DUMP_BYTES`.
+    /// `Redacted` (default): validated `metadata_keys` subset only, with
+    /// creative previews truncated to `MAX_BID_CREATIVE_DUMP_BYTES`.
+    /// `Upstream`: redacted fields plus six untyped provider diagnostics;
+    /// creative previews remain truncated.
     /// `Full`: raw `response.metadata` verbatim, including the `debug`
     /// subtree (httpcalls/resolvedrequest) when present, and no creative
     /// truncation. The total dump byte cap and comment-terminator
     /// neutralization still apply unconditionally.
     ///
-    /// NEVER enable `Full` in production — identity-bearing request/response
-    /// data becomes visible to any visitor via view-source.
+    /// NEVER enable `Upstream` or `Full` in production — identity-bearing
+    /// request/response data may become visible via view-source.
     #[serde(default)]
     pub verbosity: AuctionDebugCommentVerbosity,
 }
@@ -2012,6 +2016,7 @@ impl AuctionDebugCommentOptions {
 pub enum AuctionDebugCommentVerbosity {
     #[default]
     Redacted,
+    Upstream,
     Full,
 }
 
@@ -2716,11 +2721,12 @@ mod tests {
         assert!(opts.include_bids, "should default to true");
         assert_eq!(
             opts.metadata_keys,
-            AUCTION_DEBUG_METADATA_ALLOWLIST
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect::<Vec<_>>(),
-            "should default metadata_keys to the full allowlist"
+            vec![
+                "error_type".to_string(),
+                "http_status".to_string(),
+                "message".to_string(),
+            ],
+            "should default to only schema-validated response metadata"
         );
         assert_eq!(
             opts.verbosity,
@@ -2733,17 +2739,24 @@ mod tests {
     fn auction_debug_comment_options_normalize_trims_and_drops_empty_keys() {
         let mut opts = AuctionDebugCommentOptions {
             metadata_keys: vec![
-                " status ".to_string(),
+                " http_status ".to_string(),
                 "".to_string(),
-                "warnings".to_string(),
+                "debug".to_string(),
             ],
             ..AuctionDebugCommentOptions::default()
         };
         opts.normalize();
         assert_eq!(
             opts.metadata_keys,
-            vec!["status".to_string(), "warnings".to_string()]
+            vec!["http_status".to_string(), "debug".to_string()]
         );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_deserializes_upstream_verbosity() {
+        let options: AuctionDebugCommentOptions = toml::from_str(r#"verbosity = "upstream""#)
+            .expect("should deserialize upstream verbosity");
+        assert_eq!(options.verbosity, AuctionDebugCommentVerbosity::Upstream);
     }
 
     #[test]
