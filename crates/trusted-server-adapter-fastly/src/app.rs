@@ -100,6 +100,7 @@ use error_stack::Report;
 use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{handle_admin_ec_lookup, handle_admin_eids_lookup};
@@ -756,7 +757,7 @@ async fn dispatch_fallback(
     };
 
     let result = if uses_dynamic_tsjs_fallback(&method, &path) {
-        handle_tsjs_dynamic(&req, &state.registry)
+        handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SurrogateControl)
     } else if state.registry.has_route(&method, &path) {
         // Integration-proxy responses are not bounded by
         // publisher.max_buffered_body_bytes. Publisher fallback below uses the
@@ -829,6 +830,7 @@ async fn dispatch_fallback(
                             &mut ec.ec_context,
                             auction,
                             req,
+                            EdgeCacheHeader::SurrogateControl,
                         )
                         .await
                         {

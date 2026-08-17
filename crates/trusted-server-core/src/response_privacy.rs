@@ -11,6 +11,10 @@
 
 use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Response, header};
 
+use crate::cache_policy::{
+    cache_control_headers_are_private_or_no_store, is_edge_cache_header_name,
+    remove_edge_cache_headers,
+};
 use crate::settings::Settings;
 
 /// CDN-targeted cache headers stripped from every cookie-bearing response.
@@ -73,19 +77,7 @@ fn strip_cdn_cache_headers(response: &mut Response) {
 /// Callers needing the stricter reading must check it themselves.
 #[must_use]
 pub fn is_private_or_no_store(headers: &HeaderMap) -> bool {
-    headers.get_all(header::CACHE_CONTROL).iter().any(|value| {
-        value.to_str().is_ok_and(|value| {
-            value.split(',').any(|directive| {
-                let name = directive
-                    .split_once('=')
-                    .map_or(directive, |(name, _)| name);
-                matches!(
-                    name.trim().to_ascii_lowercase().as_str(),
-                    "private" | "no-store"
-                )
-            })
-        })
-    })
+    cache_control_headers_are_private_or_no_store(headers)
 }
 
 /// Reassert the terminal privacy invariant for a synthesized per-reader response.
@@ -116,6 +108,17 @@ pub fn enforce_private_no_store(response: &mut Response) {
 /// remove origin validators, and remove all CDN-targeted cache directives.
 pub(crate) fn enforce_synthesized_html_cache_privacy(response: &mut Response) {
     enforce_private_no_store(response);
+}
+
+/// Removes runtime edge-cache headers from a response finalized as uncacheable.
+///
+/// Call this after any late response-header mutations so a final `private` or
+/// `no-store` directive cannot coexist with an independently authoritative edge
+/// cache header.
+pub fn enforce_uncacheable_cache_privacy(response: &mut Response) {
+    if is_private_or_no_store(response.headers()) {
+        remove_edge_cache_headers(response.headers_mut());
+    }
 }
 
 /// Forces cookie-bearing responses to stay private to shared caches.
@@ -163,13 +166,12 @@ pub fn apply_response_headers_with_cache_privacy(settings: &Settings, response: 
     enforce_set_cookie_cache_privacy(response);
 
     let response_is_uncacheable = is_private_or_no_store(response.headers());
+    enforce_uncacheable_cache_privacy(response);
 
     for (key, value) in &settings.response_headers {
         if response_is_uncacheable
             && (key.eq_ignore_ascii_case(header::CACHE_CONTROL.as_str())
-                || CDN_CACHE_HEADERS
-                    .iter()
-                    .any(|name| key.eq_ignore_ascii_case(name)))
+                || is_edge_cache_header_name(key))
         {
             continue;
         }
@@ -189,6 +191,8 @@ pub fn apply_response_headers_with_cache_privacy(settings: &Settings, response: 
         };
         response.headers_mut().insert(header_name, header_value);
     }
+
+    enforce_uncacheable_cache_privacy(response);
 
     // Operator headers can themselves introduce Set-Cookie (alongside public
     // or surrogate cache headers) onto a previously cookieless response, which

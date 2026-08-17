@@ -11,6 +11,7 @@ use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
+use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
@@ -204,7 +205,7 @@ fn edgezero_main(mut req: FastlyRequest) {
     }
 
     if let Some(policy) = asset_cache_policy {
-        policy.apply_after_route_finalization(&mut response);
+        policy.apply_after_route_finalization(&mut response, EdgeCacheHeader::SurrogateControl);
     }
 
     if let Some(ec_state) = ec_state {
@@ -331,6 +332,7 @@ fn send_edgezero_response(
     request_filter_effects: Option<&RequestFilterEffects>,
 ) {
     apply_terminal_response_effects(&mut response, request_filter_effects);
+    crate::middleware::enforce_uncacheable_cache_privacy(&mut response);
 
     let (parts, body) = response.into_parts();
 

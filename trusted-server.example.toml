@@ -119,6 +119,31 @@ enabled = false
 # Required for integrations.prebid.external_bundle_url and first-party proxy redirects.
 # allowed_domains = ["ads.example.com", "assets.example.com", "*.cdn.example.com"]
 
+# Static/rehosted asset cache policies are operator-controlled. Disabled rules
+# do not match, and matcher/policy validation is deferred until they are enabled;
+# IDs must still be nonempty and unique. Keep rules disabled unless the matched
+# publisher paths are known content-addressed.
+# [[cache.asset_rules]]
+# id = "nextjs-static"
+# enabled = false
+# preset = "nextjs-static"
+# visibility = "public"
+# browser_ttl_seconds = 31536000
+# edge_ttl_seconds = 31536000
+# immutable = true
+#
+# [[cache.asset_rules]]
+# id = "publisher-fingerprinted-assets"
+# enabled = false
+# path_globs = ["/assets/**/*.js", "/assets/**/*.css", "/assets/**/*.png", "/assets/**/*.webp"]
+# Immutable custom rules require an explicit fingerprint_style selected for the
+# publisher's bundler, for example "hex", "esbuild-base32", or "vite-base64-url".
+# fingerprint_style = "vite-base64-url"
+# visibility = "public"
+# browser_ttl_seconds = 31536000
+# edge_ttl_seconds = 31536000
+# immutable = true
+
 [auction]
 enabled = false
 # Defaults to true. Keep this leaf present when using the EdgeZero v0.0.4

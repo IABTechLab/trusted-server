@@ -48,6 +48,9 @@ use crate::auction::telemetry::{
 use crate::auction::types::{
     AuctionContext, AuctionRequest, Bid, DeviceInfo, PublisherInfo, SiteInfo, UserInfo,
 };
+use crate::cache_policy::{
+    CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
+};
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
@@ -498,11 +501,13 @@ fn encode_complete_body(
 
 /// Unified tsjs static serving: `/static/tsjs=<filename>`
 ///
-/// Serves two types of bundles:
+/// Serves three types of bundles:
 /// - **Unified bundle** (`tsjs-unified.min.js`): core + immediate (non-deferred)
 ///   integration modules.
 /// - **Deferred module** (`tsjs-{id}.min.js`): a single self-contained IIFE for
-///   modules loaded with `defer` (e.g., prebid).
+///   modules loaded with `defer` (e.g., Prebid).
+/// - **Standalone diagnostics module** (`tsjs-gpt_diagnostics.min.js`): delivered
+///   only when the diagnostics integration is enabled and a document activates it.
 ///
 /// # Errors
 ///
@@ -510,6 +515,7 @@ fn encode_complete_body(
 pub fn handle_tsjs_dynamic(
     req: &Request<EdgeBody>,
     integration_registry: &IntegrationRegistry,
+    edge_header: EdgeCacheHeader,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     const PREFIX: &str = "/static/tsjs=";
     const UNIFIED_FILENAMES: &[&str] = &["tsjs-unified.js", "tsjs-unified.min.js"];
@@ -524,10 +530,8 @@ pub fn handle_tsjs_dynamic(
         // Serve core + immediate modules (excludes deferred like prebid)
         let module_ids = integration_registry.js_module_ids_immediate();
         let body = trusted_server_js::concatenate_modules(&module_ids);
-        let mut resp = serve_static_with_etag(&body, req, "application/javascript; charset=utf-8");
-        resp.headers_mut()
-            .insert(HEADER_X_COMPRESS_HINT, HeaderValue::from_static("on"));
-        return Ok(resp);
+        let hash = trusted_server_js::concatenated_hash(&module_ids);
+        return Ok(serve_tsjs_static(req, &body, &hash, edge_header));
     }
 
     if let Some(module_id) = parse_single_module_filename(filename) {
@@ -535,22 +539,50 @@ pub fn handle_tsjs_dynamic(
         // are served as content-addressed standalone assets. Delivery remains
         // cookie-independent so the static response can stay publicly cached.
         let deferred_ids = integration_registry.js_module_ids_deferred();
-        let diagnostics_standalone = module_id
+        let is_enabled_diagnostics_module = module_id
             == crate::integrations::gpt_diagnostics::GPT_DIAGNOSTICS_INTEGRATION_ID
-            && integration_registry.integration_enabled(module_id);
-        if !deferred_ids.contains(&module_id) && !diagnostics_standalone {
+            && integration_registry.is_enabled(module_id);
+        if !deferred_ids.contains(&module_id) && !is_enabled_diagnostics_module {
             return Ok(not_found_response());
         }
-        if let Some(content) = trusted_server_js::module_bundle(module_id) {
-            let mut resp =
-                serve_static_with_etag(content, req, "application/javascript; charset=utf-8");
-            resp.headers_mut()
-                .insert(HEADER_X_COMPRESS_HINT, HeaderValue::from_static("on"));
-            return Ok(resp);
+        if let (Some(content), Some(hash)) = (
+            trusted_server_js::module_bundle(module_id),
+            trusted_server_js::single_module_hash(module_id),
+        ) {
+            return Ok(serve_tsjs_static(req, content, hash, edge_header));
         }
     }
 
     Ok(not_found_response())
+}
+
+fn serve_tsjs_static(
+    req: &Request<EdgeBody>,
+    body: &str,
+    expected_hash: &str,
+    edge_header: EdgeCacheHeader,
+) -> Response<EdgeBody> {
+    let mut response = serve_static_with_etag(
+        body,
+        req,
+        "application/javascript; charset=utf-8",
+        edge_header,
+    );
+    if request_version_hash(req).is_some_and(|hash| hash == expected_hash) {
+        CachePolicy::public_immutable(Duration::from_secs(31_536_000))
+            .apply_to_headers(response.headers_mut(), edge_header);
+    }
+    response
+        .headers_mut()
+        .insert(HEADER_X_COMPRESS_HINT, HeaderValue::from_static("on"));
+    response
+}
+
+fn request_version_hash(req: &Request<EdgeBody>) -> Option<&str> {
+    req.uri().query()?.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == "v").then_some(value)
+    })
 }
 
 /// Extract a module ID from a deferred-module filename like `tsjs-sourcepoint.min.js`.
@@ -1461,6 +1493,34 @@ pub(crate) fn classify_response_route(
     }
 
     ResponseRoute::Stream
+}
+
+fn response_cache_control_is_private_or_no_store(response: &Response<EdgeBody>) -> bool {
+    cache_control_headers_are_private_or_no_store(response.headers())
+}
+
+fn apply_publisher_asset_cache_policy(
+    settings: &Settings,
+    path: &str,
+    method: &Method,
+    edge_header: EdgeCacheHeader,
+    response: &mut Response<EdgeBody>,
+) -> Result<(), Report<TrustedServerError>> {
+    let is_cacheable_method = *method == Method::GET || *method == Method::HEAD;
+    if !is_cacheable_method || response_cache_control_is_private_or_no_store(response) {
+        return Ok(());
+    }
+
+    let status = response.status();
+    if !(status.is_success() || status == StatusCode::NOT_MODIFIED) {
+        return Ok(());
+    }
+
+    if let Some(policy) = settings.asset_cache_policy_for_path(path)? {
+        policy.apply_to_headers(response.headers_mut(), edge_header);
+    }
+
+    Ok(())
 }
 
 /// Owned version of [`ProcessResponseParams`] for returning from
@@ -3784,6 +3844,7 @@ pub async fn handle_publisher_request(
     ec_context: &mut EcContext,
     auction: AuctionDispatch<'_>,
     mut req: Request<EdgeBody>,
+    edge_header: EdgeCacheHeader,
 ) -> Result<PublisherResponse, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
 
@@ -4534,6 +4595,14 @@ pub async fn handle_publisher_request(
         set_response_compression(&mut response, reader_compression);
     }
 
+    apply_publisher_asset_cache_policy(
+        settings,
+        &request_path,
+        &request_method,
+        edge_header,
+        &mut response,
+    )?;
+
     match route {
         ResponseRoute::PassThrough => {
             log::debug!(
@@ -4613,6 +4682,7 @@ pub async fn handle_publisher_request(
                 suppress_datadome_client_side_tag,
                 &content_type,
             );
+
             let body = std::mem::replace(response.body_mut(), EdgeBody::empty());
             response.headers_mut().remove(header::CONTENT_LENGTH);
 
@@ -6928,6 +6998,7 @@ mod tests {
                 registry: None,
             },
             req,
+            EdgeCacheHeader::SMaxageFallback,
         )
         .await
         .expect("should proxy publisher request")
@@ -8095,6 +8166,7 @@ mod tests {
                     registry: None,
                 },
                 request,
+                EdgeCacheHeader::SMaxageFallback,
             )
             .await
             .expect("should proxy publisher request");
@@ -9285,6 +9357,7 @@ mod tests {
                     registry: None,
                 },
                 navigation_request(),
+                EdgeCacheHeader::SMaxageFallback,
             )
             .await
             .expect("the request itself should succeed; the cap trips during streaming");
@@ -9452,6 +9525,7 @@ mod tests {
                     registry: None,
                 },
                 navigation_request(),
+                EdgeCacheHeader::SMaxageFallback,
             )
             .await
             .expect("should proxy publisher request");
@@ -10346,6 +10420,7 @@ mod tests {
                     registry: None,
                 },
                 authenticated,
+                EdgeCacheHeader::SMaxageFallback,
             )
             .await
             .expect("should proxy publisher request");
@@ -11630,6 +11705,7 @@ mod tests {
                     registry: None,
                 },
                 req,
+                EdgeCacheHeader::SMaxageFallback,
             )
             .await
             .expect("should proxy publisher request")
@@ -12393,6 +12469,7 @@ mod tests {
                 registry: None,
             },
             req,
+            EdgeCacheHeader::SMaxageFallback,
         )
         .await
         .expect("should proxy publisher request");
@@ -13450,7 +13527,8 @@ mod tests {
             "https://publisher.example/static/tsjs=unknown.js",
         );
 
-        let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
+        let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should handle tsjs request");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
@@ -13464,7 +13542,8 @@ mod tests {
             "https://publisher.example/static/tsjs=tsjs-unified.min.js",
         );
 
-        let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
+        let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should handle tsjs request");
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -13486,7 +13565,8 @@ mod tests {
             HeaderValue::from_static("__Host-ts-console=1"),
         );
 
-        let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
+        let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should handle tsjs request");
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(!response.headers().contains_key(header::SET_COOKIE));
@@ -13548,7 +13628,8 @@ mod tests {
             "https://publisher.example/static/tsjs=tsjs-prebid.min.js",
         );
 
-        let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
+        let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should handle tsjs request");
         assert_eq!(
             response.status(),
             StatusCode::OK,
@@ -13577,7 +13658,8 @@ mod tests {
             "https://publisher.example/static/tsjs=tsjs-prebid.min.js",
         );
 
-        let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
+        let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should handle tsjs request");
         assert_eq!(
             response.status(),
             StatusCode::NOT_FOUND,
@@ -13595,7 +13677,8 @@ mod tests {
             "https://publisher.example/static/tsjs=tsjs-evil.min.js",
         );
 
-        let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
+        let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should handle tsjs request");
         assert_eq!(
             response.status(),
             StatusCode::NOT_FOUND,
@@ -18468,6 +18551,7 @@ mod tests {
                     registry: None,
                 },
                 req,
+                EdgeCacheHeader::SMaxageFallback,
             )
             .await
             .expect("should proxy publisher request");
@@ -18551,6 +18635,7 @@ mod tests {
                     registry: None,
                 },
                 req,
+                EdgeCacheHeader::SMaxageFallback,
             )
             .await
             .expect("should proxy publisher request");
