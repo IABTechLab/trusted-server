@@ -1046,29 +1046,30 @@ Disabled rules never match, and their matcher and policy validation is deferred
 until they are enabled. Rule IDs are always normalized and must remain nonempty
 and unique, including for disabled placeholders.
 
-| Field                            | Type          | Required | Description                                                     |
-| -------------------------------- | ------------- | -------- | --------------------------------------------------------------- |
-| `id`                             | String        | Yes      | Unique operator-facing rule identifier                          |
-| `enabled`                        | Boolean       | No       | Whether the rule participates in matching (default `false`)     |
-| `preset`                         | String        | Matcher  | Built-in preset such as `nextjs-static`                         |
-| `path_prefix`                    | String        | Matcher  | Request path prefix                                             |
-| `path_glob`                      | String        | Matcher  | Single glob matched against the request path                    |
-| `path_globs`                     | Array[String] | Matcher  | Multiple globs matched against the request path                 |
-| `path_regex`                     | String        | Matcher  | Regex matched against the request path                          |
-| `extensions`                     | Array[String] | Matcher  | Case-insensitive file extensions                                |
-| `fingerprint_style`              | String        | No       | Required bundler fingerprint convention before matching         |
-| `visibility`                     | String        | No       | `public` or `private` (default `public`)                        |
-| `browser_ttl_seconds`            | Integer       | Policy   | Browser `max-age`; must be positive when `immutable = true`     |
-| `edge_ttl_seconds`               | Integer       | Policy   | TTL emitted through the runtime-specific shared-cache directive |
-| `stale_while_revalidate_seconds` | Integer       | No       | Optional `stale-while-revalidate`                               |
-| `stale_if_error_seconds`         | Integer       | No       | Optional `stale-if-error`                                       |
-| `immutable`                      | Boolean       | No       | Add `immutable` for a validated content-addressed rule          |
+| Field                            | Type          | Required | Description                                                                        |
+| -------------------------------- | ------------- | -------- | ---------------------------------------------------------------------------------- |
+| `id`                             | String        | Yes      | Unique operator-facing rule identifier                                             |
+| `enabled`                        | Boolean       | No       | Whether the rule participates in matching (default `false`)                        |
+| `preset`                         | String        | Matcher  | Built-in preset such as `nextjs-static`                                            |
+| `path_prefix`                    | String        | Matcher  | Request path prefix                                                                |
+| `path_glob`                      | String        | Matcher  | Single glob matched against the request path                                       |
+| `path_globs`                     | Array[String] | Matcher  | Multiple globs matched against the request path                                    |
+| `path_regex`                     | String        | Matcher  | Regex matched against the request path                                             |
+| `extensions`                     | Array[String] | Matcher  | Case-insensitive file extensions                                                   |
+| `fingerprint_style`              | String        | No       | Required bundler fingerprint convention before matching                            |
+| `visibility`                     | String        | No       | `public` or `private` (default `public`)                                           |
+| `browser_ttl_seconds`            | Integer       | Policy   | Browser `max-age`; required for private rules and positive with `immutable = true` |
+| `edge_ttl_seconds`               | Integer       | Policy   | Public rules only: TTL emitted through the runtime-specific shared-cache directive |
+| `stale_while_revalidate_seconds` | Integer       | No       | Optional `stale-while-revalidate`                                                  |
+| `stale_if_error_seconds`         | Integer       | No       | Optional `stale-if-error`                                                          |
+| `immutable`                      | Boolean       | No       | Add `immutable` for a validated content-addressed rule                             |
 
-An enabled rule must configure exactly one matcher and at least one of
-`browser_ttl_seconds` or `edge_ttl_seconds`. `path_glob` and `path_globs` are
-mutually exclusive. `immutable = true` additionally requires a positive browser
-TTL and either the content-addressed `nextjs-static` preset or an explicit
-`fingerprint_style`.
+An enabled rule must configure exactly one matcher. Public rules must configure
+at least one of `browser_ttl_seconds` or `edge_ttl_seconds`; private rules must
+configure `browser_ttl_seconds` and must not configure `edge_ttl_seconds`.
+`path_glob` and `path_globs` are mutually exclusive. `immutable = true`
+additionally requires a positive browser TTL and either the content-addressed
+`nextjs-static` preset or an explicit `fingerprint_style`.
 
 The filename fingerprint check is intentionally conservative and style-specific.
 It examines the suffix immediately before the final extension and requires a
@@ -1144,11 +1145,15 @@ built-in cache policy and do not require an asset rule. Shared-cache keys for
 `/static/tsjs=` must preserve `v`; otherwise a matching immutable response can
 collide with the missing or mismatched version's short-TTL response.
 
-`edge_ttl_seconds` only emits the selected runtime's shared-cache directive. The
-runtime or service must also enable and consume that directive. The checked-in
-Cloudflare manifests enable Workers Cache. Fastly synthetic and final egress
-responses still require explicit runtime cache integration, tracked in
-[#908](https://github.com/IABTechLab/trusted-server/issues/908).
+`edge_ttl_seconds` only emits the selected runtime's shared-cache directive for
+public rules. The runtime or service must also enable and consume that
+directive. The checked-in Cloudflare manifests intentionally do not enable
+Workers Cache: the Worker serves the full publisher gateway, not an isolated
+static-only entrypoint. Emitting `Cloudflare-CDN-Cache-Control` alone must not
+be treated as permission to cache every response. Any future Workers Cache
+opt-in must isolate or explicitly allowlist cacheable traffic. Fastly synthetic
+and final egress responses still require explicit runtime cache integration,
+tracked in [#908](https://github.com/IABTechLab/trusted-server/issues/908).
 
 ## Integration Configurations
 

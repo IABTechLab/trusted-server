@@ -291,6 +291,35 @@ mod tests {
     }
 
     #[test]
+    fn cookie_privacy_ignores_quoted_extension_directives() {
+        let settings = settings_with_response_headers(&[]);
+        let mut response = response_builder()
+            .header(header::SET_COOKIE, "id=abc")
+            .header(
+                header::CACHE_CONTROL,
+                "public, max-age=600, ext=\"a,no-store,b\"",
+            )
+            .header("surrogate-control", "max-age=600")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build response");
+
+        apply_response_headers_with_cache_privacy(&settings, &mut response);
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("private, max-age=0"),
+            "quoted extension text must not prevent the cookie privacy downgrade"
+        );
+        assert!(
+            !response.headers().contains_key("surrogate-control"),
+            "cookie privacy downgrade should strip edge-cache headers"
+        );
+    }
+
+    #[test]
     fn preserves_private_no_store_against_operator_cache_headers_without_cookie() {
         let settings = settings_with_response_headers(&[
             ("cache-control", "public, max-age=600"),

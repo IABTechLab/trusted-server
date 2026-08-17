@@ -11,9 +11,6 @@ compatibility_date = "2024-09-23"
 # (auction-eligible publisher navigations), so this is a hard requirement.
 compatibility_flags = ["nodejs_compat", "cache_option_enabled"]
 
-[cache]
-enabled = true
-
 [build]
 command = "bash build.sh"
 

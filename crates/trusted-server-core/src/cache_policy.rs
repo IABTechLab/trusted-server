@@ -289,14 +289,38 @@ pub fn is_edge_cache_header_name(name: &str) -> bool {
 /// as `not-private` or `no-storey` do not match `private` / `no-store`.
 #[must_use]
 pub fn cache_control_value_has_directive(value: &str, directive: &str) -> bool {
-    value.split(',').any(|part| {
+    let part_has_directive = |part: &str| {
         let part = part.trim();
         let directive_name = part
             .find(['=', ';'])
             .map_or(part, |end| &part[..end])
             .trim();
         directive_name.eq_ignore_ascii_case(directive)
-    })
+    };
+
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut part_start = 0;
+    for (index, character) in value.char_indices() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                quoted = false;
+            }
+        } else if character == '"' {
+            quoted = true;
+        } else if character == ',' {
+            if part_has_directive(&value[part_start..index]) {
+                return true;
+            }
+            part_start = index + character.len_utf8();
+        }
+    }
+
+    part_has_directive(&value[part_start..])
 }
 
 /// Return true when any `Cache-Control` header value contains `directive`.
@@ -543,6 +567,10 @@ mod tests {
         assert!(
             !cache_control_value_has_directive("public, no-storey, not-private", "private"),
             "should not match pseudo-private directives by substring"
+        );
+        assert!(
+            !cache_control_value_has_directive("public, ext=\"a,no-store,b\"", "no-store"),
+            "should ignore directive-shaped text inside quoted extension values"
         );
     }
 

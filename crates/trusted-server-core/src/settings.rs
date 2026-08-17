@@ -2056,7 +2056,24 @@ impl CacheAssetRule {
     }
 
     fn validate_policy_shape(&self) -> Result<(), Report<TrustedServerError>> {
-        if self.browser_ttl_seconds.is_none() && self.edge_ttl_seconds.is_none() {
+        if self.visibility == CachePolicyVisibility::Private {
+            if self.edge_ttl_seconds.is_some() {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "cache.asset_rules `{}` sets edge_ttl_seconds with private visibility; private rules must use browser_ttl_seconds",
+                        self.id
+                    ),
+                }));
+            }
+            if self.browser_ttl_seconds.is_none() {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "cache.asset_rules `{}` with private visibility must configure browser_ttl_seconds",
+                        self.id
+                    ),
+                }));
+            }
+        } else if self.browser_ttl_seconds.is_none() && self.edge_ttl_seconds.is_none() {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
                     "cache.asset_rules `{}` must configure browser_ttl_seconds or edge_ttl_seconds",
@@ -3480,6 +3497,59 @@ mod tests {
         assert!(
             format!("{browser_ttl_err:?}").contains("positive browser_ttl_seconds"),
             "should explain immutable browser TTL requirement: {browser_ttl_err:?}"
+        );
+
+        let private_edge_only = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "private-edge-only"
+            enabled = true
+            path_prefix = "/assets/"
+            visibility = "private"
+            edge_ttl_seconds = 300
+        "#,
+            crate_test_settings_str()
+        );
+        let private_edge_only_err = Settings::from_toml(&private_edge_only)
+            .expect_err("should reject private rule with only an edge TTL");
+        assert!(
+            format!("{private_edge_only_err:?}").contains("edge_ttl_seconds"),
+            "should explain that private rules cannot use an edge TTL: {private_edge_only_err:?}"
+        );
+
+        let private_dual_ttl = private_edge_only.replace(
+            "id = \"private-edge-only\"",
+            "id = \"private-dual-ttl\"\n            browser_ttl_seconds = 300",
+        );
+        let private_dual_ttl_err = Settings::from_toml(&private_dual_ttl)
+            .expect_err("should reject private rule with browser and edge TTLs");
+        assert!(
+            format!("{private_dual_ttl_err:?}").contains("edge_ttl_seconds"),
+            "should reject edge TTL even when a private rule has a browser TTL: {private_dual_ttl_err:?}"
+        );
+
+        let private_browser_ttl = private_edge_only.replace(
+            "id = \"private-edge-only\"\n            enabled = true\n            path_prefix = \"/assets/\"\n            visibility = \"private\"\n            edge_ttl_seconds = 300",
+            "id = \"private-browser-ttl\"\n            enabled = true\n            path_prefix = \"/assets/\"\n            visibility = \"private\"\n            browser_ttl_seconds = 300",
+        );
+        let private_settings = Settings::from_toml(&private_browser_ttl)
+            .expect("should accept a private rule with a browser TTL");
+        let private_policy = private_settings
+            .asset_cache_policy_for_path("/assets/app.js")
+            .expect("should evaluate private cache rule")
+            .expect("should match private cache rule");
+        assert_eq!(
+            private_policy
+                .cache_control_value(crate::cache_policy::EdgeCacheHeader::SurrogateControl),
+            "private, max-age=300",
+            "private rules should render their browser TTL"
+        );
+        assert_eq!(
+            private_policy
+                .edge_header_value(crate::cache_policy::EdgeCacheHeader::SurrogateControl),
+            None,
+            "private rules should not render an edge cache TTL"
         );
     }
 
