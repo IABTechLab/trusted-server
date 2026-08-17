@@ -13,7 +13,8 @@ use url::Url;
 use which::which;
 
 use crate::commands::audit::generate::collector::{
-    AuditCollector, CollectedGptSlot, CollectedPage, CollectedRequest, CollectedScriptTag,
+    AuditCollector, CollectedGptSlot, CollectedLink, CollectedPage, CollectedRequest,
+    CollectedScriptTag, ControlFlow, PageSink,
 };
 use crate::error::{CliResult, report_error};
 
@@ -49,14 +50,56 @@ impl AuditCollector for BrowserAuditCollector {
                 ))
             })?;
 
-        runtime.block_on(collect_page_via_browser_async(target_url, cookies))
+        runtime.block_on(async {
+            let mut collected = None;
+            with_browser(
+                std::slice::from_ref(target_url),
+                cookies,
+                &mut |_, result| {
+                    collected = Some(result);
+                    Ok(ControlFlow::Stop)
+                },
+            )
+            .await?;
+            collected.unwrap_or_else(|| Err(report_error("browser session produced no page")))
+        })
+    }
+
+    fn collect_pages(
+        &self,
+        targets: &[Url],
+        cookies: &[(String, String)],
+        on_page: PageSink<'_>,
+    ) -> CliResult<()> {
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                report_error(format!(
+                    "failed to build Tokio runtime for browser audit: {error}"
+                ))
+            })?;
+
+        runtime.block_on(with_browser(targets, cookies, on_page))
     }
 }
 
-async fn collect_page_via_browser_async(
-    target_url: &Url,
+/// Launches one browser, walks `targets` on it, and hands each result to `sink`.
+///
+/// One launch for the whole crawl rather than one per page: a cold Chrome start
+/// plus a fresh profile dominates the cost of a multi-page run. The shared
+/// profile is also load-bearing — a bot-protection clearance cookie earned on
+/// the first page carries to the rest of the crawl, which is what makes a
+/// multi-section walk of a protected site viable at all. The tradeoff is that
+/// paywall meters and personalization also accumulate across the run.
+async fn with_browser(
+    targets: &[Url],
     cookies: &[(String, String)],
-) -> CliResult<CollectedPage> {
+    sink: PageSink<'_>,
+) -> CliResult<()> {
     let chrome_executable = find_browser_executable()?;
     let user_data_dir = TempDir::new().map_err(|error| {
         report_error(format!(
@@ -93,13 +136,25 @@ async fn collect_page_via_browser_async(
         }
     });
 
-    let result = collect_page_from_browser(&mut browser, target_url, cookies).await;
+    // Sitemap discovery is a whole-site fact, so only the first target pays for it.
+    let mut result = Ok(());
+    for (index, target) in targets.iter().enumerate() {
+        let collected = collect_page_from_browser(&mut browser, target, cookies, index == 0).await;
+        match sink(target, collected) {
+            Ok(ControlFlow::Continue) => {}
+            Ok(ControlFlow::Stop) => break,
+            Err(error) => {
+                result = Err(error);
+                break;
+            }
+        }
+    }
 
     let close_result = timeout(BROWSER_CLOSE_TIMEOUT, browser.close())
         .await
         .map_err(|_| report_error("timed out closing browser after audit"))
-        .and_then(|result| {
-            result.map_err(|error| {
+        .and_then(|closed| {
+            closed.map_err(|error| {
                 report_error(format!("failed to close browser after audit: {error}"))
             })
         });
@@ -109,15 +164,21 @@ async fn collect_page_via_browser_async(
     let _ = handler_task.await;
 
     match (result, close_result) {
-        (Ok(collected), Ok(_)) => Ok(collected),
-        (Ok(_), Err(error)) | (Err(error), _) => Err(error),
+        (Ok(()), Ok(_)) => Ok(()),
+        (Ok(()), Err(error)) | (Err(error), _) => Err(error),
     }
 }
 
+/// Collects one page on an already-launched browser.
+///
+/// `discover_sitemap` runs the `robots.txt`/sitemap fetch from inside this
+/// page's context. It is meaningful only once per crawl (the site's sitemap does
+/// not change per page), so callers pass `true` for the root page only.
 async fn collect_page_from_browser(
     browser: &mut Browser,
     target_url: &Url,
     cookies: &[(String, String)],
+    discover_sitemap: bool,
 ) -> CliResult<CollectedPage> {
     let page = browser.new_page("about:blank").await.map_err(|error| {
         report_error(format!("failed to create browser page for audit: {error}"))
@@ -238,6 +299,34 @@ async fn collect_page_from_browser(
         Err(_) => Vec::new(),
     };
 
+    // Links come from the hydrated DOM, not the served markup: an app-router
+    // page keeps its link graph in the framework payload, so parsing the raw
+    // HTML finds only a fraction of the site's sections. Best-effort — an empty
+    // list just means crawl planning falls back to other sources.
+    let links: Vec<CollectedLink> = match page.evaluate(LINKS_SCRIPT).await {
+        Ok(result) => result.into_value().unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+
+    // Sitemap discovery is a whole-site fact, so it runs once per crawl. A miss
+    // is normal (no sitemap, robots 404, fetch blocked) and leaves planning to
+    // the link graph alone.
+    let mut sitemap_locs: Vec<String> = if discover_sitemap {
+        match page.evaluate(SITEMAP_SCRIPT).await {
+            Ok(result) => result.into_value().unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    sitemap_locs.truncate(MAX_SITEMAP_LOCS);
+    if discover_sitemap && sitemap_locs.is_empty() {
+        warnings.push(
+            "no sitemap was reachable; site sections were inferred from page links only"
+                .to_string(),
+        );
+    }
+
     Ok(CollectedPage {
         requested_url: target_url.to_string(),
         final_url,
@@ -258,9 +347,117 @@ async fn collect_page_from_browser(
             })
             .collect(),
         gpt_slots,
+        links,
+        sitemap_locs,
         warnings,
     })
 }
+
+/// Maximum sitemap `<loc>` entries kept. Section discovery needs one page per
+/// section, so a 50,000-URL catalog sitemap is truncated hard.
+const MAX_SITEMAP_LOCS: usize = 5000;
+
+/// Reads same-origin `a[href]` targets from the hydrated DOM.
+///
+/// `anchor.href` is absolutized by the DOM already, and `in_nav` records whether
+/// the anchor sits inside site navigation — navigation is the publisher's own
+/// declaration of its taxonomy, so those links rank higher when picking sections.
+///
+/// Reading the DOM rather than the served markup is deliberate: an app-router
+/// page keeps its link graph in the framework payload, so parsing raw HTML finds
+/// only a fraction of a site's sections.
+const LINKS_SCRIPT: &str = r#"() => {
+    try {
+        const navAnchors = new Set(
+            Array.from(document.querySelectorAll(
+                'nav a[href], header a[href], [role="navigation"] a[href]'
+            ))
+        );
+        const out = [];
+        const seen = new Set();
+        for (const anchor of document.querySelectorAll('a[href]')) {
+            if (out.length >= 2000) break;
+            const href = anchor.href;
+            if (!href || seen.has(href)) continue;
+            if (!href.startsWith(location.origin)) continue;
+            seen.add(href);
+            out.push({ url: href, in_nav: navAnchors.has(anchor) });
+        }
+        return out;
+    } catch (error) {
+        return [];
+    }
+}"#;
+
+/// Discovers sitemap page URLs from inside the page, starting at `robots.txt`.
+///
+/// Runs in the browser rather than through a Rust HTTP client on purpose: the
+/// in-page `fetch` carries the session's cookies and Chrome's TLS fingerprint,
+/// so a bot-protection layer that would answer a bare client with a challenge
+/// serves the real document instead. It also gets transparent gzip and an XML
+/// parser for free, which is why sitemap support needs no new Rust dependency.
+///
+/// Same-origin is enforced here *and* again in Rust: a `Sitemap:` directive can
+/// name any host, and this crawl carries operator-supplied cookies.
+const SITEMAP_SCRIPT: &str = r#"async () => {
+    const sameOrigin = (raw) => {
+        try {
+            return new URL(raw, location.origin).origin === location.origin;
+        } catch (error) {
+            return false;
+        }
+    };
+    const fetchText = async (url) => {
+        try {
+            const response = await fetch(url, { credentials: 'same-origin' });
+            if (!response.ok) return null;
+            return await response.text();
+        } catch (error) {
+            return null;
+        }
+    };
+    const parseLocs = (text) => {
+        try {
+            const doc = new DOMParser().parseFromString(text, 'application/xml');
+            if (doc.querySelector('parsererror')) return { pages: [], indexes: [] };
+            const indexes = Array.from(doc.querySelectorAll('sitemapindex > sitemap > loc'))
+                .map((node) => (node.textContent || '').trim()).filter(sameOrigin);
+            const pages = Array.from(doc.querySelectorAll('urlset > url > loc'))
+                .map((node) => (node.textContent || '').trim()).filter(sameOrigin);
+            return { pages, indexes };
+        } catch (error) {
+            return { pages: [], indexes: [] };
+        }
+    };
+
+    const roots = [];
+    const robots = await fetchText('/robots.txt');
+    if (robots) {
+        for (const line of robots.split(/\r?\n/)) {
+            const match = /^\s*sitemap\s*:\s*(\S+)/i.exec(line);
+            if (match && sameOrigin(match[1])) roots.push(match[1]);
+        }
+    }
+    if (roots.length === 0) roots.push('/sitemap.xml', '/sitemap_index.xml');
+
+    const pages = [];
+    let childrenFollowed = 0;
+    for (const root of roots) {
+        if (pages.length >= 5000) break;
+        const text = await fetchText(root);
+        if (!text) continue;
+        const parsed = parseLocs(text);
+        pages.push(...parsed.pages);
+        for (const child of parsed.indexes) {
+            if (childrenFollowed >= 10 || pages.length >= 5000) break;
+            childrenFollowed += 1;
+            const childText = await fetchText(child);
+            if (!childText) continue;
+            pages.push(...parseLocs(childText).pages);
+        }
+    }
+    return pages.slice(0, 5000);
+}"#;
 
 /// Reads the live GPT slot registry into `{gam_unit_path, div_id, sizes}` rows.
 ///

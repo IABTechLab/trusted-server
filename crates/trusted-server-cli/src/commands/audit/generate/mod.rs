@@ -1,6 +1,7 @@
 mod analyzer;
 pub(crate) mod browser_collector;
 pub(crate) mod collector;
+mod crawl_plan;
 mod gpt_slots;
 mod slot_toml;
 mod validate;
@@ -667,6 +668,8 @@ mod tests {
                 resource_type: Some("script".to_string()),
             }],
             gpt_slots: Vec::new(),
+            links: Vec::new(),
+            sitemap_locs: Vec::new(),
             warnings: Vec::new(),
         }
     }
@@ -953,6 +956,8 @@ mod tests {
                 resource_type: Some("fetch".to_string()),
             }],
             gpt_slots: Vec::new(),
+            links: Vec::new(),
+            sitemap_locs: Vec::new(),
             warnings: Vec::new(),
         };
 

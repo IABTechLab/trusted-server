@@ -286,6 +286,8 @@ mod tests {
                 resource_type: Some("Script".to_string()),
             }],
             gpt_slots: Vec::new(),
+            links: Vec::new(),
+            sitemap_locs: Vec::new(),
             warnings: vec!["partial settle".to_string()],
         };
 
@@ -323,6 +325,8 @@ mod tests {
             script_tags: Vec::new(),
             network_requests: Vec::new(),
             gpt_slots: Vec::new(),
+            links: Vec::new(),
+            sitemap_locs: Vec::new(),
             warnings: Vec::new(),
         };
 
@@ -341,6 +345,8 @@ mod tests {
             script_tags: Vec::new(),
             network_requests: Vec::new(),
             gpt_slots: Vec::new(),
+            links: Vec::new(),
+            sitemap_locs: Vec::new(),
             warnings: Vec::new(),
         };
 
@@ -366,6 +372,8 @@ mod tests {
                 resource_type: Some("script".to_string()),
             }],
             gpt_slots: Vec::new(),
+            links: Vec::new(),
+            sitemap_locs: Vec::new(),
             warnings: Vec::new(),
         };
 
@@ -401,6 +409,8 @@ mod tests {
             ],
             network_requests: Vec::new(),
             gpt_slots: Vec::new(),
+            links: Vec::new(),
+            sitemap_locs: Vec::new(),
             warnings: Vec::new(),
         };
 
@@ -432,6 +442,8 @@ mod tests {
             script_tags: Vec::new(),
             network_requests: Vec::new(),
             gpt_slots: Vec::new(),
+            links: Vec::new(),
+            sitemap_locs: Vec::new(),
             warnings: Vec::new(),
         };
 
