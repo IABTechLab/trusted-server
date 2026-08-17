@@ -10,6 +10,30 @@ use std::process::{Child, Command, Stdio};
 /// Default port the Axum dev server binds to when no `PORT` env var is supplied.
 const AXUM_DEFAULT_PORT: u16 = 8787;
 
+/// Secret-store entries referenced by the integration app-config fixture.
+const INTEGRATION_SECRET_ENV: &[(&str, &str)] = &[
+    (
+        "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_INTEGRATION_ADMIN_PASSWORD",
+        "integration-admin-password-32-bytes-ok",
+    ),
+    (
+        "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_INTEGRATION_PROXY_SECRET",
+        "integration-test-proxy-secret-32-bytes-ok",
+    ),
+    (
+        "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_INTEGRATION_EC_PASSPHRASE",
+        "integration-test-ec-secret-padded-32",
+    ),
+    (
+        "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_INTEGRATION_PARTNER_TOKEN_ALPHA",
+        "integration-test-token-alpha-32-bytes-ok",
+    ),
+    (
+        "TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_INTEGRATION_PARTNER_TOKEN_BRAVO",
+        "integration-test-token-bravo-32-bytes-ok",
+    ),
+];
+
 /// Axum native dev-server runtime environment.
 ///
 /// Spawns the pre-built `trusted-server-axum` binary directly (no WASM, no
@@ -40,6 +64,7 @@ impl RuntimeEnvironment for AxumDevServer {
                 "TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG",
                 app_config,
             )
+            .envs(INTEGRATION_SECRET_ENV.iter().copied())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()

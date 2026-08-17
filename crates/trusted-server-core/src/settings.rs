@@ -2781,21 +2781,27 @@ impl Settings {
         Self::finalize_deserialized(settings, "Build-time configuration")
     }
 
+    pub(crate) fn normalize_deserialized(&mut self) {
+        self.cache.normalize();
+        self.proxy.normalize();
+        self.image_optimizer.normalize();
+        self.debug.auction_html_comment_options.normalize();
+        self.consent.validate();
+    }
+
     pub(crate) fn finalize_deserialized(
         mut settings: Self,
         validation_label: &str,
     ) -> Result<Self, Report<TrustedServerError>> {
-        settings.cache.normalize();
-        settings.proxy.normalize();
-        settings.image_optimizer.normalize();
-        settings.debug.auction_html_comment_options.normalize();
-        settings.consent.validate();
-
+        settings.normalize_deserialized();
         settings.prepare_runtime()?;
 
         settings.validate().map_err(|err| {
             Report::new(TrustedServerError::Configuration {
-                message: format!("{validation_label} validation failed: {err}"),
+                message: format!(
+                    "{validation_label} validation failed: {}",
+                    validation_error_summary(&err)
+                ),
             })
         })?;
 
@@ -3097,7 +3103,7 @@ impl Settings {
     ///
     /// Returns [`TrustedServerError::Configuration`] listing any uncovered
     /// admin endpoints.
-    fn validate_admin_coverage(&self) -> Result<(), Report<TrustedServerError>> {
+    pub(crate) fn validate_admin_coverage(&self) -> Result<(), Report<TrustedServerError>> {
         let uncovered = self.uncovered_admin_endpoints()?;
         if uncovered.is_empty() {
             return Ok(());
@@ -3119,7 +3125,9 @@ impl Settings {
     /// regexes, so a narrow handler can shadow the admin namespace for paths no
     /// probe enumerates. Handlers are Trusted Server's own basic-auth gates, so
     /// a placeholder password is never valid on any of them.
-    fn validate_admin_handler_passwords(&self) -> Result<(), Report<TrustedServerError>> {
+    pub(crate) fn validate_admin_handler_passwords(
+        &self,
+    ) -> Result<(), Report<TrustedServerError>> {
         for handler in &self.handlers {
             if is_admin_placeholder_password(handler.password.expose()) {
                 return Err(Report::new(TrustedServerError::Configuration {
@@ -3212,6 +3220,47 @@ fn validate_host_header_override(value: &str) -> Result<(), ValidationError> {
     }
 
     Ok(())
+}
+
+fn validation_error_summary(errors: &validator::ValidationErrors) -> String {
+    fn walk(errors: &validator::ValidationErrors, prefix: &str, messages: &mut Vec<String>) {
+        let mut fields = errors
+            .errors()
+            .keys()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>();
+        fields.sort_unstable();
+
+        for field in fields {
+            let path = if prefix.is_empty() {
+                field.to_owned()
+            } else {
+                format!("{prefix}.{field}")
+            };
+            let Some(kind) = errors.errors().get(field) else {
+                continue;
+            };
+            match kind {
+                validator::ValidationErrorsKind::Field(validations) => {
+                    for validation in validations {
+                        messages.push(format!("{path}: {}", validation.code));
+                    }
+                }
+                validator::ValidationErrorsKind::Struct(inner) => {
+                    walk(inner, &path, messages);
+                }
+                validator::ValidationErrorsKind::List(items) => {
+                    for (index, inner) in items {
+                        walk(inner, &format!("{path}[{index}]"), messages);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut messages = Vec::new();
+    walk(errors, "", &mut messages);
+    messages.join(", ")
 }
 
 fn validate_redacted_not_empty(value: &Redacted<String>) -> Result<(), ValidationError> {
