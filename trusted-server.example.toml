@@ -224,9 +224,11 @@ format = "compact"
 
 [creative_opportunities]
 # Set to false to disable server-side ad templates while retaining slot definitions
-# and direct POST /auction callers. This intentionally sets successful GET publisher
-# documents to Cache-Control: max-age=60. Before rolling back to a binary that
-# predates this setting, restore true, re-push and finalize the config first.
+# and direct POST /auction callers. Structurally inactive templates use
+# Cache-Control: max-age=60; this setting is one cause. Origin private/no-store
+# policies and bot, prefetch, or consent-denied requests retain their origin policy.
+# Before rolling back to a binary that predates this setting, restore true, re-push
+# and finalize the config first.
 enabled = true
 gam_network_id = "123456789"
 # FCP is not affected by this value — body content above </body> has already
