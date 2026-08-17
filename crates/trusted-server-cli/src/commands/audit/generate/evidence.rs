@@ -61,6 +61,62 @@ impl SlotEvidence {
     }
 }
 
+/// Slots grouped by the shape that would make them one placement: an identical
+/// ad-unit path and an identical format set.
+type SlotsByShape<'a> = BTreeMap<(String, Vec<(u32, u32)>), Vec<&'a SlotEvidence>>;
+
+/// Several observed slots that are really one placement under volatile div ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FragmentGroup {
+    /// The volatile div ids observed, in evidence order.
+    pub(super) div_ids: Vec<String>,
+    /// The ad-unit path every fragment shared.
+    pub(super) unit_path: String,
+    /// The stable prefix the ids share, when they share a useful one.
+    ///
+    /// Offered to the operator as a starting point only. It is deliberately not
+    /// written as a `div_id`: the shared prefix reaches only as far as the
+    /// *observed* tokens happen to agree, so it would keep matching this crawl's
+    /// ids and stop matching the next render's.
+    pub(super) suggested_prefix: Option<String>,
+}
+
+/// Whether no two slots were ever seen on the same page.
+fn pages_are_disjoint(slots: &[&SlotEvidence]) -> bool {
+    for (index, slot) in slots.iter().enumerate() {
+        let pages = slot.paths();
+        if slots[index + 1..]
+            .iter()
+            .any(|other| other.paths().intersection(&pages).next().is_some())
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// The longest prefix the div ids share, trimmed back to a separator.
+///
+/// Trimming matters: the raw common prefix usually ends mid-token (the leading
+/// digits of a timestamp two fragments happen to share), which is worse than
+/// useless as a suggestion. Cutting at the last `-` or `_` yields the part a
+/// human would recognise as the placement's name.
+fn shared_div_prefix(slots: &[&SlotEvidence]) -> Option<String> {
+    let mut prefix: &str = slots.first()?.div_id.as_str();
+    for slot in &slots[1..] {
+        let shared = slot
+            .div_id
+            .char_indices()
+            .zip(prefix.chars())
+            .take_while(|((_, left), right)| left == right)
+            .count();
+        prefix = &prefix[..shared];
+    }
+    let trimmed = prefix.trim_end_matches(|ch: char| ch != '-' && ch != '_');
+    let candidate = trimmed.trim_end_matches(['-', '_']);
+    (!candidate.is_empty()).then(|| candidate.to_string())
+}
+
 /// Slot evidence accumulated across every collected page.
 #[derive(Debug, Clone, Default)]
 pub(super) struct EvidenceTable {
@@ -142,6 +198,46 @@ impl EvidenceTable {
     /// Whether any slot was observed at all.
     pub(super) fn is_empty(&self) -> bool {
         self.slots.is_empty()
+    }
+
+    /// Groups of slots that are one slot wearing a different div id per page.
+    ///
+    /// Some ad stacks build div ids from a per-render token — a timestamp, a
+    /// framework id — so the same placement arrives under a new key on every
+    /// page. Written verbatim those ids never match at runtime, and the
+    /// fragmentation also starves template inference, which needs to see one
+    /// slot more than once.
+    ///
+    /// Detection is by evidence rather than by guessing at token shapes, because
+    /// each stack invents its own. Candidates share an identical ad-unit path and
+    /// identical formats; what separates a fragmented slot from two legitimate
+    /// siblings on the same unit is **co-occurrence**. Real siblings appear
+    /// together on a page; fragments of one slot never do, because each page
+    /// produces exactly one of them.
+    pub(super) fn fragmented_slots(&self) -> Vec<FragmentGroup> {
+        let mut by_shape: SlotsByShape<'_> = BTreeMap::new();
+        for slot in self.slots() {
+            // Only slots pinned to exactly one unit path can be compared this
+            // way; a slot whose unit varies is inference's problem, not this one.
+            let units = slot.unit_paths();
+            if units.len() != 1 {
+                continue;
+            }
+            let unit = (*units.iter().next().expect("one unit path")).to_string();
+            let formats: Vec<(u32, u32)> = slot.formats.iter().copied().collect();
+            by_shape.entry((unit, formats)).or_default().push(slot);
+        }
+
+        by_shape
+            .into_iter()
+            .filter(|(_, slots)| slots.len() > 1)
+            .filter(|(_, slots)| pages_are_disjoint(slots))
+            .map(|((unit_path, _), slots)| FragmentGroup {
+                div_ids: slots.iter().map(|slot| slot.div_id.clone()).collect(),
+                unit_path,
+                suggested_prefix: shared_div_prefix(&slots),
+            })
+            .collect()
     }
 
     /// The single GAM network id observed across the crawl.
@@ -288,6 +384,110 @@ mod tests {
             ids,
             ["zeta-slot", "alpha-slot"],
             "generated config should follow crawl order"
+        );
+    }
+
+    #[test]
+    fn one_placement_under_per_render_div_ids_is_detected() {
+        // The live shape: a timestamped token means each page yields a new key
+        // for the same placement. Same unit, same formats, never co-occurring.
+        let mut table = EvidenceTable::default();
+        for (path, div) in [
+            (
+                "/features/a",
+                "rh-gam-kso_26329268ce6Bj0uc8sL0_ei_overlay_1",
+            ),
+            ("/news/b", "rh-gam-kso_26329269aoYmv4RQyN3n_ei_overlay_1"),
+            ("/deals/c", "rh-gam-kso_26329270mYPDB3tz8cpB_ei_overlay_1"),
+        ] {
+            table.fold_page(
+                path,
+                &page(&[("/99/site_Overlay", div, &[(300, 250)])], false),
+            );
+        }
+
+        let groups = table.fragmented_slots();
+
+        assert_eq!(groups.len(), 1, "the three fragments should form one group");
+        assert_eq!(groups[0].div_ids.len(), 3);
+        assert_eq!(groups[0].unit_path, "/99/site_Overlay");
+        assert_eq!(
+            groups[0].suggested_prefix.as_deref(),
+            Some("rh-gam-kso"),
+            "the suggestion should be trimmed back off the volatile token"
+        );
+    }
+
+    #[test]
+    fn genuine_siblings_on_one_unit_are_not_treated_as_fragments() {
+        // Two real in-content positions can share a unit path and formats. What
+        // distinguishes them from fragments is that they appear *together* on a
+        // page, so refusing to write them would lose real inventory.
+        let mut table = EvidenceTable::default();
+        table.fold_page(
+            "/news/story",
+            &page(
+                &[
+                    ("/99/site/news", "ad-in_content-1", &[(300, 250)]),
+                    ("/99/site/news", "ad-in_content-2", &[(300, 250)]),
+                ],
+                false,
+            ),
+        );
+
+        assert!(
+            table.fragmented_slots().is_empty(),
+            "co-occurring slots are siblings, not fragments"
+        );
+    }
+
+    #[test]
+    fn slots_differing_in_formats_are_not_fragments() {
+        let mut table = EvidenceTable::default();
+        table.fold_page(
+            "/a",
+            &page(&[("/99/site/x", "slot-aaaa", &[(300, 250)])], false),
+        );
+        table.fold_page(
+            "/b",
+            &page(&[("/99/site/x", "slot-bbbb", &[(728, 90)])], false),
+        );
+
+        assert!(
+            table.fragmented_slots().is_empty(),
+            "a differing format set means these are different placements"
+        );
+    }
+
+    #[test]
+    fn a_slot_seen_alone_is_never_a_fragment() {
+        let mut table = EvidenceTable::default();
+        table.fold_page(
+            "/a",
+            &page(&[("/99/site/x", "only-slot", &[(300, 250)])], false),
+        );
+
+        assert!(table.fragmented_slots().is_empty());
+    }
+
+    #[test]
+    fn fragments_with_no_shared_prefix_report_none() {
+        let mut table = EvidenceTable::default();
+        table.fold_page(
+            "/a",
+            &page(&[("/99/site/x", "alpha-1111", &[(300, 250)])], false),
+        );
+        table.fold_page(
+            "/b",
+            &page(&[("/99/site/x", "beta-2222", &[(300, 250)])], false),
+        );
+
+        let groups = table.fragmented_slots();
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].suggested_prefix, None,
+            "unrelated ids should not produce a misleading suggestion"
         );
     }
 

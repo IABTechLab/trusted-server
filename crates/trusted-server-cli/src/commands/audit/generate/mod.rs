@@ -614,7 +614,32 @@ pub(crate) fn run_update_slots(
         .as_ref()
         .and_then(|outcome| outcome.policy.clone());
 
-    let slots = build_render_slots(&table, inference.as_ref(), policy.as_ref(), request)?;
+    // Slots that are one placement wearing a per-render div id cannot be
+    // written: the ids never match at runtime. Report them so the operator can
+    // add the placement once with a prefix they know is stable.
+    let fragmented = table.fragmented_slots();
+    for group in &fragmented {
+        let suggestion = group.suggested_prefix.as_deref().map_or_else(
+            || "no stable prefix was shared".to_string(),
+            |prefix| format!("they share the prefix `{prefix}`"),
+        );
+        notes.push(format!(
+            "skipped {} slot(s) that look like one placement under a per-render div id on \
+             `{}` ({}); {suggestion}. Add it once by hand with a div_id prefix that is \
+             stable across renders",
+            group.div_ids.len(),
+            group.unit_path,
+            group.div_ids.join(", "),
+        ));
+    }
+
+    let slots = build_render_slots(
+        &table,
+        inference.as_ref(),
+        policy.as_ref(),
+        request,
+        &fragmented,
+    )?;
     let merged = slot_toml::merge_render_slots(request.existing_creative, slots, request.replace);
     let rendered_slots = render_slots(&merged);
     let updated = splice_creative_slots(
@@ -804,7 +829,12 @@ fn build_render_slots(
     inference: Option<&unit_template::InferenceOutcome>,
     policy: Option<&unit_template::SectionPolicy>,
     request: &UpdateSlotsRequest<'_>,
+    fragmented: &[evidence::FragmentGroup],
 ) -> CliResult<Vec<slot_toml::RenderSlot>> {
+    let skip: std::collections::BTreeSet<&str> = fragmented
+        .iter()
+        .flat_map(|group| group.div_ids.iter().map(String::as_str))
+        .collect();
     // Explicit `--page-pattern` values are an operator override: they apply to
     // every slot and disable inference from observed paths entirely.
     let explicit = !request.page_patterns.is_empty();
@@ -815,6 +845,9 @@ fn build_render_slots(
 
     let mut slots = Vec::with_capacity(table.slot_count());
     for slot in table.slots() {
+        if skip.contains(slot.div_id.as_str()) {
+            continue;
+        }
         let patterns = if explicit {
             request.page_patterns.to_vec()
         } else {
