@@ -29,6 +29,8 @@ use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
+#[cfg(target_arch = "wasm32")]
+use trusted_server_core::settings_data::default_secret_store_name;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::build_runtime_services;
@@ -38,11 +40,23 @@ use crate::platform::build_runtime_services;
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "wasm32")]
-static CLOUDFLARE_CONFIG_JSON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+thread_local! {
+    static CLOUDFLARE_CONFIG_JSON: std::cell::OnceCell<String> = const { std::cell::OnceCell::new() };
+    static CLOUDFLARE_ENV: std::cell::OnceCell<worker::Env> = const { std::cell::OnceCell::new() };
+}
 
 #[cfg(target_arch = "wasm32")]
 pub fn set_cloudflare_config_json(value: String) {
-    let _ = CLOUDFLARE_CONFIG_JSON.set(value);
+    CLOUDFLARE_CONFIG_JSON.with(|slot| {
+        let _ = slot.set(value);
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn set_cloudflare_env(env: worker::Env) {
+    CLOUDFLARE_ENV.with(|slot| {
+        let _ = slot.set(env);
+    });
 }
 
 /// Application state built once at startup and shared across all requests.
@@ -70,18 +84,22 @@ fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
-    Settings::from_toml(include_str!("../../../trusted-server.example.toml"))
+    Err(Report::new(TrustedServerError::Configuration {
+        message: "Cloudflare startup settings require a Worker config binding".to_string(),
+    })
+    .attach("use TrustedServerApp::routes_with_settings for host tests"))
 }
 
 #[cfg(target_arch = "wasm32")]
 fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServerError>> {
-    let raw_config = CLOUDFLARE_CONFIG_JSON.get().ok_or_else(|| {
+    let raw_config = CLOUDFLARE_CONFIG_JSON.with(|slot| slot.get().cloned());
+    let raw_config = raw_config.ok_or_else(|| {
         Report::new(TrustedServerError::Configuration {
             message: "Cloudflare TRUSTED_SERVER_CONFIG is required".to_string(),
         })
         .attach("set TRUSTED_SERVER_CONFIG to JSON containing the app_config blob envelope")
     })?;
-    let value: serde_json::Value = serde_json::from_str(raw_config).map_err(|error| {
+    let value: serde_json::Value = serde_json::from_str(&raw_config).map_err(|error| {
         Report::new(TrustedServerError::Configuration {
             message: "invalid Cloudflare TRUSTED_SERVER_CONFIG JSON".to_string(),
         })
@@ -95,7 +113,15 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
                 message: "Cloudflare TRUSTED_SERVER_CONFIG missing app_config".to_string(),
             })
         })?;
-    settings_from_config_blob(envelope)
+    let env = CLOUDFLARE_ENV
+        .with(|slot| slot.get().cloned())
+        .ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
+                message: "Cloudflare Worker environment is unavailable during startup".to_string(),
+            })
+        })?;
+    let secret_store = crate::platform::CloudflareSecretStoreAdapter { env };
+    settings_from_config_blob(envelope, &secret_store, &default_secret_store_name())
 }
 
 /// Build the application state from explicit settings.

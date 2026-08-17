@@ -9,6 +9,7 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 
+use edgezero_core::app_config::{SecretField, SecretKind, SecretPathSegment};
 use error_stack::Report;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use validator::{Validate, ValidationError, ValidationErrors};
@@ -25,6 +26,7 @@ use crate::integrations::{
 use crate::settings::{IntegrationConfig, Settings};
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
+const MIN_PROXY_SECRET_LENGTH: usize = 32;
 #[cfg(test)]
 const DEPLOY_VALIDATED_INTEGRATION_IDS: &[&str] = &[
     "prebid",
@@ -54,15 +56,20 @@ pub struct TrustedServerAppConfig {
 }
 
 impl TrustedServerAppConfig {
-    /// Creates a validated app-config wrapper from [`Settings`].
+    /// Creates a push-valid app-config wrapper from [`Settings`].
     ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError::Configuration`] when deploy validation
+    /// Returns [`TrustedServerError::Configuration`] when push-safe validation
     /// fails.
     pub fn new(settings: Settings) -> Result<Self, Report<TrustedServerError>> {
-        validate_settings_for_deploy(&settings)?;
-        Ok(Self { settings })
+        let app_config = Self { settings };
+        edgezero_core::app_config::validate_excluding_secrets(&app_config).map_err(|errors| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("Configuration validation failed: {errors}"),
+            })
+        })?;
+        Ok(app_config)
     }
 
     /// Consumes the wrapper and returns the inner [`Settings`].
@@ -92,41 +99,107 @@ impl<'de> Deserialize<'de> for TrustedServerAppConfig {
     where
         D: Deserializer<'de>,
     {
-        let settings = Settings::deserialize(deserializer)?;
-        let settings = Settings::finalize_deserialized(settings, "Configuration")
-            .map_err(serde::de::Error::custom)?;
+        let mut settings = Settings::deserialize(deserializer)?;
+        settings.normalize_deserialized();
         Ok(Self { settings })
     }
 }
 
 impl Validate for TrustedServerAppConfig {
     fn validate(&self) -> Result<(), ValidationErrors> {
-        validate_settings_for_deploy(&self.settings)
-            .map_err(|report| report_to_validation_errors(&report))
+        let mut errors = self.settings.validate().err().unwrap_or_default();
+        if let Err(report) = validate_settings_for_deploy(&self.settings) {
+            errors.add(
+                DEPLOY_VALIDATION_FIELD,
+                report_to_validation_error(&report, "trusted_server_deploy_validation"),
+            );
+        }
+        if errors.errors().is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 }
 
 impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
-    // Phase 1 intentionally preserves the existing inline-settings model:
-    // `ts config push` publishes the validated Trusted Server config as one
-    // app-config blob. Migrating app-level secrets to `EdgeZero` secret-store
-    // references needs nested/array extraction support and operator migration
-    // work tracked separately.
-    const SECRET_FIELDS: &'static [edgezero_core::app_config::SecretField] = &[];
+    fn secret_fields() -> Vec<SecretField> {
+        let field = |path: Vec<SecretPathSegment>, optional| SecretField {
+            kind: SecretKind::KeyInDefault,
+            optional,
+            path,
+        };
+        let object = |name: &'static str| SecretPathSegment::Field(Cow::Borrowed(name));
+
+        vec![
+            field(vec![object("publisher"), object("proxy_secret")], false),
+            field(vec![object("ec"), object("passphrase")], false),
+            field(
+                vec![
+                    object("ec"),
+                    object("partners"),
+                    SecretPathSegment::ArrayEach,
+                    object("api_token"),
+                ],
+                false,
+            ),
+            field(
+                vec![
+                    object("ec"),
+                    object("partners"),
+                    SecretPathSegment::ArrayEach,
+                    object("ts_pull_token"),
+                ],
+                true,
+            ),
+            field(
+                vec![
+                    object("handlers"),
+                    SecretPathSegment::ArrayEach,
+                    object("password"),
+                ],
+                false,
+            ),
+        ]
+    }
 }
 
-/// Runs Trusted Server deploy-time validation for pushed app config.
+/// Runs Trusted Server push-time validation for app config.
 ///
-/// This supplements [`Settings`] structural validation with checks that should
-/// fail before an operator publishes a config blob: placeholder secrets,
-/// enabled integration startup checks, auction provider references, and EC
-/// partner registry construction.
+/// Secret fields contain secret-store key names at this stage, so this function
+/// deliberately excludes checks that require resolved values. The `EdgeZero` CLI
+/// additionally calls [`edgezero_core::app_config::validate_excluding_secrets`]
+/// to remove validators attached to those leaves.
 ///
 /// # Errors
 ///
-/// Returns [`TrustedServerError`] when the config should not be deployed.
+/// Returns [`TrustedServerError`] when non-secret configuration or a secret key
+/// reference is invalid.
 pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    validate_secret_key_references(settings)?;
+
+    let mut structural_settings = settings.clone();
+    structural_settings.prepare_runtime()?;
+    structural_settings.validate_admin_coverage()?;
+
+    let enabled_auction_providers = validate_enabled_integrations(settings)?;
+    validate_auction_provider_names(settings, &enabled_auction_providers)?;
+    PartnerRegistry::validate_config_for_deploy(&settings.ec.partners)?;
+    Ok(())
+}
+
+/// Runs Trusted Server runtime validation after secret references are resolved.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError`] when resolved secrets or runtime-only
+/// configuration checks are invalid.
+pub fn validate_settings_for_runtime(
+    settings: &Settings,
+) -> Result<(), Report<TrustedServerError>> {
     settings.reject_placeholder_secrets()?;
+    validate_proxy_secret_strength(settings)?;
+    settings.validate_admin_handler_passwords()?;
     let enabled_auction_providers = validate_enabled_integrations(settings)?;
     validate_auction_provider_names(settings, &enabled_auction_providers)?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
@@ -180,6 +253,59 @@ where
         .map(|config| config.is_some())
 }
 
+fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    validate_secret_key_reference(
+        "publisher.proxy_secret",
+        settings.publisher.proxy_secret.expose(),
+    )?;
+    validate_secret_key_reference("ec.passphrase", settings.ec.passphrase.expose())?;
+
+    for (index, partner) in settings.ec.partners.iter().enumerate() {
+        validate_secret_key_reference(
+            &format!("ec.partners[{index}].api_token"),
+            partner.api_token.expose(),
+        )?;
+        if let Some(token) = &partner.ts_pull_token {
+            validate_secret_key_reference(
+                &format!("ec.partners[{index}].ts_pull_token"),
+                token.expose(),
+            )?;
+        }
+    }
+
+    for (index, handler) in settings.handlers.iter().enumerate() {
+        validate_secret_key_reference(
+            &format!("handlers[{index}].password"),
+            handler.password.expose(),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_secret_key_reference(
+    path: &str,
+    key_name: &str,
+) -> Result<(), Report<TrustedServerError>> {
+    if key_name.is_empty() {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!("secret key reference at `{path}` must not be empty"),
+        }));
+    }
+    Ok(())
+}
+
+fn validate_proxy_secret_strength(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    if settings.publisher.proxy_secret.expose().len() < MIN_PROXY_SECRET_LENGTH {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "publisher.proxy_secret must be at least {MIN_PROXY_SECRET_LENGTH} bytes after secret resolution"
+            ),
+        }));
+    }
+    Ok(())
+}
+
 fn validate_auction_provider_names(
     settings: &Settings,
     enabled_auction_providers: &HashSet<&'static str>,
@@ -206,19 +332,21 @@ fn validate_auction_provider_names(
     Ok(())
 }
 
-fn report_to_validation_errors(report: &Report<TrustedServerError>) -> ValidationErrors {
-    let mut error = ValidationError::new("trusted_server_deploy_validation");
+fn report_to_validation_error(
+    report: &Report<TrustedServerError>,
+    code: &'static str,
+) -> ValidationError {
+    let mut error = ValidationError::new(code);
     error.message = Some(Cow::Owned(report.to_string()));
-
-    let mut errors = ValidationErrors::new();
-    errors.add(DEPLOY_VALIDATION_FIELD, error);
-    errors
+    error
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::redacted::Redacted;
     use crate::test_support::tests::crate_test_settings_str;
+    use edgezero_core::app_config::AppConfigMeta;
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -233,7 +361,9 @@ mod tests {
         slot: Vec<serde_json::Value>,
     }
 
-    fn serialized_creative_opportunities(gam_unit_path: Option<&str>) -> serde_json::Value {
+    fn app_config_with_creative_opportunities(
+        gam_unit_path: Option<&str>,
+    ) -> TrustedServerAppConfig {
         let mut toml = crate_test_settings_str();
         toml.push_str(
             r#"
@@ -251,9 +381,15 @@ formats = [{ width = 300, height = 250 }]
             toml.push_str(&format!("gam_unit_path = {gam_unit_path:?}\n"));
         }
 
-        let app_config: TrustedServerAppConfig =
+        let mut app_config: TrustedServerAppConfig =
             toml::from_str(&toml).expect("should deserialize app config wrapper");
-        serde_json::to_value(app_config)
+        app_config.settings.proxy.allowed_domains =
+            vec!["*.example".to_owned(), "*.example.com".to_owned()];
+        app_config
+    }
+
+    fn serialized_creative_opportunities(gam_unit_path: Option<&str>) -> serde_json::Value {
+        serde_json::to_value(app_config_with_creative_opportunities(gam_unit_path))
             .expect("should serialize app config wrapper")
             .get("creative_opportunities")
             .cloned()
@@ -297,18 +433,65 @@ formats = [{ width = 300, height = 250 }]
     }
 
     #[test]
-    fn dynamic_gam_unit_templates_are_rejected_by_legacy_schema() {
-        for gam_unit_path in ["/{network_id}/example", "/example/{slot_id}"] {
-            let creative_opportunities = serialized_creative_opportunities(Some(gam_unit_path));
-            let err =
-                serde_json::from_value::<LegacyCreativeOpportunitiesConfig>(creative_opportunities)
-                    .expect_err("should reject dynamic GAM unit template");
+    fn push_validation_accepts_secret_key_names() {
+        let mut settings = valid_settings();
+        settings.publisher.proxy_secret = Redacted::new("publisher_proxy".to_owned());
+        settings.ec.passphrase = Redacted::new("ec_key".to_owned());
+        settings.handlers[0].password = Redacted::new("handler_password".to_owned());
+        settings.handlers[1].password = Redacted::new("admin_password".to_owned());
+        let app_config = TrustedServerAppConfig::new(settings)
+            .expect("should validate key names without values");
 
-            assert!(
-                err.to_string().contains("section_segment"),
-                "legacy error should name section_segment: {err}"
-            );
-        }
+        let serialized =
+            serde_json::to_string(&app_config).expect("should serialize key-name-only app config");
+        assert!(serialized.contains("publisher_proxy"));
+        assert!(!serialized.contains("unit-test-proxy-secret"));
+    }
+
+    #[test]
+    fn secret_metadata_lists_all_secret_paths_and_optionality() {
+        let fields = TrustedServerAppConfig::secret_fields();
+        let paths = fields
+            .iter()
+            .map(|field| (field.dotted_path(), field.optional))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paths,
+            vec![
+                ("publisher.proxy_secret".to_owned(), false),
+                ("ec.passphrase".to_owned(), false),
+                ("ec.partners[*].api_token".to_owned(), false),
+                ("ec.partners[*].ts_pull_token".to_owned(), true),
+                ("handlers[*].password".to_owned(), false),
+            ],
+            "should expose the native EdgeZero secret metadata contract"
+        );
+        assert!(
+            fields.iter().all(|field| matches!(
+                field.kind,
+                edgezero_core::app_config::SecretKind::KeyInDefault
+            )),
+            "all Trusted Server app secrets should use the default secret store"
+        );
+    }
+
+    #[test]
+    fn app_config_deserialization_does_not_finalize_runtime_templates() {
+        let creative_opportunities =
+            serialized_creative_opportunities(Some("/{network_id}/example"));
+        let slot = creative_opportunities["slot"][0]
+            .as_object()
+            .expect("should serialize creative opportunity slot");
+
+        assert!(
+            slot.contains_key("gam_unit_path"),
+            "push deserialization should preserve the operator config field"
+        );
+        assert!(
+            !slot.contains_key("section_segment"),
+            "push deserialization should not add runtime-only compiled fields"
+        );
     }
 
     #[test]
@@ -328,7 +511,53 @@ formats = [{ width = 300, height = 250 }]
     }
 
     #[test]
-    fn deploy_validation_rejects_placeholders() {
+    fn app_config_new_rejects_empty_secret_key_reference() {
+        let mut settings = valid_settings();
+        settings.publisher.proxy_secret = Redacted::new(String::new());
+
+        let err = TrustedServerAppConfig::new(settings)
+            .expect_err("should reject an empty secret key reference");
+
+        assert!(
+            err.to_string().contains("publisher.proxy_secret"),
+            "error should identify the empty secret reference: {err:?}"
+        );
+    }
+
+    #[test]
+    fn app_config_new_rejects_invalid_non_secret_settings() {
+        let mut settings = valid_settings();
+        settings.publisher.domain = "invalid/domain".to_owned();
+
+        let err = TrustedServerAppConfig::new(settings)
+            .expect_err("should reject invalid publisher domain before creating an app config");
+
+        assert!(
+            err.to_string().contains("invalid_publisher_domain"),
+            "error should identify the structural validation failure: {err:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_validation_rejects_short_proxy_secret() {
+        let mut settings = valid_settings();
+        settings.publisher.proxy_secret = Redacted::new("short".to_owned());
+
+        let err = validate_settings_for_runtime(&settings)
+            .expect_err("should reject a short resolved proxy secret");
+
+        assert!(
+            err.to_string().contains("at least 32 bytes"),
+            "error should identify the required proxy-secret strength: {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("short"),
+            "error should not expose the resolved secret"
+        );
+    }
+
+    #[test]
+    fn runtime_validation_rejects_placeholders() {
         let settings = Settings::from_toml(
             r#"
 [publisher]
@@ -346,10 +575,10 @@ username = "admin"
 password = "production-admin-password-32-bytes"
 "#,
         )
-        .expect("should parse placeholder settings before deploy validation");
+        .expect("should parse placeholder settings before runtime validation");
 
-        let err =
-            validate_settings_for_deploy(&settings).expect_err("should reject placeholder secrets");
+        let err = validate_settings_for_runtime(&settings)
+            .expect_err("should reject placeholder secrets at runtime");
 
         assert!(
             err.to_string().contains("Insecure default"),
