@@ -5,6 +5,7 @@ mod crawl_plan;
 mod evidence;
 mod gpt_slots;
 mod slot_toml;
+mod unit_template;
 mod validate;
 
 use std::collections::BTreeSet;

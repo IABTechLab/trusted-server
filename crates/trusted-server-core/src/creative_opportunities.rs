@@ -171,8 +171,12 @@ fn sanitize_section(segment: &str) -> String {
 /// The path is used **raw** (not percent-decoded) so this stays consistent with
 /// how [`page_patterns`](CreativeOpportunitySlot::page_patterns) glob-match the
 /// same path — e.g. `/new%20s` yields `new_20s`, never the decoded `new_s`.
+///
+/// Public so operator tooling that *infers* a `{section}` template from observed
+/// ad-unit paths can check its inference against the exact derivation the
+/// runtime will perform, rather than reimplementing the sanitization rules.
 #[must_use]
-fn derive_section(path: &str, section_root: &str, section_segment: usize) -> String {
+pub fn derive_section(path: &str, section_root: &str, section_segment: usize) -> String {
     match path
         .split('/')
         .filter(|segment| !segment.is_empty())
