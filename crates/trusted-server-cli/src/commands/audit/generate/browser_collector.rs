@@ -4,6 +4,7 @@ use std::time::Duration;
 use chromiumoxide::ArcHttpRequest;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::network::CookieParam;
+use chromiumoxide::handler::viewport::Viewport;
 use futures::StreamExt as _;
 use serde::Deserialize;
 use tempfile::TempDir;
@@ -32,8 +33,98 @@ const RESOURCE_TIMING_BUFFER_WARNING_THRESHOLD: usize = 250;
 const RESOURCE_TIMING_BUFFER_WARNING: &str =
     "browser resource timing buffer reached its default size; some network assets may be missing";
 
-#[derive(Default)]
-pub(crate) struct BrowserAuditCollector;
+/// A device the crawl can emulate.
+///
+/// Publishers routinely serve different GAM ad units per device
+/// (`/network/desktop/news` vs `/network/mobile/news`). A single-profile crawl
+/// cannot see that, so it would infer a template that is right for the profile
+/// it used and silently wrong for every other impression. Crawling twice makes
+/// the disagreement visible: the two profiles produce two ad-unit paths for the
+/// same page, which template inference already treats as unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeviceProfile {
+    /// A desktop viewport with Chrome's own user agent.
+    Desktop,
+    /// A phone viewport with touch and a mobile user agent.
+    Mobile,
+}
+
+impl DeviceProfile {
+    /// The operator-facing name, matching the `--profiles` value.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Desktop => "desktop",
+            Self::Mobile => "mobile",
+        }
+    }
+
+    /// Parses a `--profiles` value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the accepted values when `raw` is not one.
+    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "desktop" => Ok(Self::Desktop),
+            "mobile" => Ok(Self::Mobile),
+            other => Err(format!(
+                "unknown device profile `{other}` (expected desktop or mobile)"
+            )),
+        }
+    }
+
+    /// The viewport to emulate.
+    fn viewport(self) -> Viewport {
+        match self {
+            Self::Desktop => Viewport {
+                width: 1280,
+                height: 800,
+                device_scale_factor: Some(1.0),
+                emulating_mobile: false,
+                is_landscape: true,
+                has_touch: false,
+            },
+            Self::Mobile => Viewport {
+                width: 390,
+                height: 844,
+                device_scale_factor: Some(3.0),
+                emulating_mobile: true,
+                is_landscape: false,
+                has_touch: true,
+            },
+        }
+    }
+
+    /// The user agent override, or `None` to keep Chrome's own.
+    ///
+    /// Ad stacks branch on the user agent as well as the viewport, so emulating
+    /// the viewport alone can still yield desktop ad units on a phone-sized page.
+    fn user_agent(self) -> Option<&'static str> {
+        match self {
+            Self::Desktop => None,
+            Self::Mobile => Some(
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) \
+                 AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            ),
+        }
+    }
+}
+
+/// Collects pages through a local Chrome, emulating one device profile.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct BrowserAuditCollector {
+    profile: Option<DeviceProfile>,
+}
+
+impl BrowserAuditCollector {
+    /// A collector emulating `profile`.
+    #[must_use]
+    pub(crate) fn with_profile(profile: DeviceProfile) -> Self {
+        Self {
+            profile: Some(profile),
+        }
+    }
+}
 
 impl AuditCollector for BrowserAuditCollector {
     fn collect_page(
@@ -50,11 +141,13 @@ impl AuditCollector for BrowserAuditCollector {
                 ))
             })?;
 
+        let profile = self.profile;
         runtime.block_on(async {
             let mut collected = None;
             with_browser(
                 std::slice::from_ref(target_url),
                 cookies,
+                profile,
                 &mut |_, result| {
                     collected = Some(result);
                     Ok(ControlFlow::Stop)
@@ -83,7 +176,7 @@ impl AuditCollector for BrowserAuditCollector {
                 ))
             })?;
 
-        runtime.block_on(with_browser(targets, cookies, on_page))
+        runtime.block_on(with_browser(targets, cookies, self.profile, on_page))
     }
 }
 
@@ -98,6 +191,7 @@ impl AuditCollector for BrowserAuditCollector {
 async fn with_browser(
     targets: &[Url],
     cookies: &[(String, String)],
+    profile: Option<DeviceProfile>,
     sink: PageSink<'_>,
 ) -> CliResult<()> {
     let chrome_executable = find_browser_executable()?;
@@ -110,17 +204,27 @@ async fn with_browser(
     // cookies and writes what it scrapes into the operator's config, so a
     // certificate-invalid impersonator could both harvest the session and seed
     // the config with slots of its choosing. Validate certificates.
-    let config = BrowserConfig::builder()
+    let mut builder = BrowserConfig::builder()
         .chrome_executable(chrome_executable)
         .user_data_dir(user_data_dir.path())
         .new_headless_mode()
-        .respect_https_errors()
-        .build()
-        .map_err(|error| {
-            report_error(format!(
-                "failed to build Chromium configuration for audit: {error}"
-            ))
-        })?;
+        .respect_https_errors();
+    if let Some(profile) = profile {
+        let viewport = profile.viewport();
+        builder = builder
+            .window_size(viewport.width, viewport.height)
+            .viewport(viewport);
+        if let Some(user_agent) = profile.user_agent() {
+            // Ad stacks branch on the user agent as well as the viewport, so
+            // emulating size alone can still return desktop ad units.
+            builder = builder.arg(format!("--user-agent={user_agent}"));
+        }
+    }
+    let config = builder.build().map_err(|error| {
+        report_error(format!(
+            "failed to build Chromium configuration for audit: {error}"
+        ))
+    })?;
 
     let (mut browser, mut handler) = Browser::launch(config).await.map_err(|error| {
         report_error(format!(

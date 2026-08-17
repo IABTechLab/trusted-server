@@ -147,6 +147,15 @@ pub(crate) struct AuditAdTemplatesGenerateArgs {
     /// discovery, and the audited path as the only page pattern.
     #[arg(long, default_value_t = 17)]
     pub max_pages: usize,
+    /// Device profiles to audit, comma-separated: `desktop`, `mobile`.
+    ///
+    /// Defaults to `desktop`. Publishers often serve different GAM ad units per
+    /// device, which a single-profile crawl cannot see — it would infer a
+    /// template correct for the profile it used and silently wrong elsewhere.
+    /// Passing both crawls each page twice and refuses to write an ad-unit path
+    /// for any slot where the profiles disagree.
+    #[arg(long, value_delimiter = ',', default_value = "desktop")]
+    pub profiles: Vec<String>,
 }
 
 impl AuditAdTemplatesGenerateArgs {
@@ -156,6 +165,26 @@ impl AuditAdTemplatesGenerateArgs {
             max_sections: self.max_sections,
             max_pages: self.max_pages,
         }
+    }
+
+    /// The device profiles to audit, deduplicated in the order given.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a name is not a known profile, or when none were
+    /// given.
+    pub(crate) fn profiles(&self) -> Result<Vec<generate::DeviceProfile>, String> {
+        let mut profiles: Vec<generate::DeviceProfile> = Vec::new();
+        for raw in &self.profiles {
+            let profile = generate::DeviceProfile::parse(raw)?;
+            if !profiles.contains(&profile) {
+                profiles.push(profile);
+            }
+        }
+        if profiles.is_empty() {
+            return Err("--profiles needs at least one of: desktop, mobile".to_string());
+        }
+        Ok(profiles)
     }
 }
 
@@ -206,7 +235,23 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<(), String> {
         Some(AuditSubcommand::Page(page_args)) => page::run_page(page_args),
         Some(AuditSubcommand::AdTemplates(AuditAdTemplatesCommand::Generate(gen_args))) => {
             let loaded = crate::app_config::load_file_settings(&gen_args.config)?;
-            let collector = generate::browser_collector::BrowserAuditCollector;
+            let profiles = gen_args.profiles()?;
+            let collectors: Vec<generate::browser_collector::BrowserAuditCollector> = profiles
+                .iter()
+                .map(|profile| {
+                    generate::browser_collector::BrowserAuditCollector::with_profile(*profile)
+                })
+                .collect();
+            let selected: Vec<(&str, &dyn generate::collector::AuditCollector)> = profiles
+                .iter()
+                .zip(collectors.iter())
+                .map(|(profile, collector)| {
+                    (
+                        profile.label(),
+                        collector as &dyn generate::collector::AuditCollector,
+                    )
+                })
+                .collect();
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
             generate::run_update_slots(
@@ -220,7 +265,7 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<(), String> {
                     dry_run: gen_args.dry_run,
                     budget: gen_args.budget(),
                 },
-                &collector,
+                &selected,
                 &mut out,
             )
         }
@@ -230,7 +275,7 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<(), String> {
         Some(AuditSubcommand::Generate(generate_args)) => {
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
-            let collector = generate::browser_collector::BrowserAuditCollector;
+            let collector = generate::browser_collector::BrowserAuditCollector::default();
             generate::run_generate(generate_args, &collector, &mut out)
         }
         None => match &args.legacy_url {
@@ -239,7 +284,7 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<(), String> {
                     .expect("should build generation args when legacy URL is present");
                 let stdout = std::io::stdout();
                 let mut out = stdout.lock();
-                let collector = generate::browser_collector::BrowserAuditCollector;
+                let collector = generate::browser_collector::BrowserAuditCollector::default();
                 generate::run_generate(&generate_args, &collector, &mut out)
             }
             None => Err("provide a URL or a subcommand (`page`, `ad-templates`)".to_string()),

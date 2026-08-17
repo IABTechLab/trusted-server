@@ -29,6 +29,7 @@ use crate::error::{CliResult, cli_error, report_error};
 
 use analyzer::{analyze_collected_page, extract_gtm_container_id};
 
+pub(crate) use browser_collector::DeviceProfile;
 pub(crate) use crawl_plan::CrawlBudget;
 
 /// Writes `contents` to `path` atomically: a same-directory temp file is
@@ -530,9 +531,12 @@ const MAX_EMPTY_PAGE_SHARE: f64 = 0.25;
 /// load.
 pub(crate) fn run_update_slots(
     request: &UpdateSlotsRequest<'_>,
-    collector: &dyn AuditCollector,
+    collectors: &[(&str, &dyn AuditCollector)],
     out: &mut dyn Write,
 ) -> CliResult<()> {
+    let Some((_, first_collector)) = collectors.first() else {
+        return cli_error("no device profile was selected to audit with");
+    };
     let target_url = parse_audit_url(request.url)?;
     let existing = fs::read_to_string(request.config_path).map_err(|error| {
         report_error(format!(
@@ -541,7 +545,7 @@ pub(crate) fn run_update_slots(
         ))
     })?;
 
-    let root = collector.collect_page(&target_url, request.cookies)?;
+    let root = first_collector.collect_page(&target_url, request.cookies)?;
     let root_url = root.final_url().unwrap_or_else(|_| target_url.clone());
     let mut table = evidence::EvidenceTable::default();
     let mut notes = Vec::new();
@@ -551,7 +555,31 @@ pub(crate) fn run_update_slots(
     // is sized by the publisher's taxonomy rather than its catalogue.
     let plan = crawl_plan::plan_crawl(&root_url, &root.links, &root.sitemap_locs, request.budget);
     notes.extend(plan.notes.iter().cloned());
-    crawl_sections(collector, &plan, request.cookies, &mut table, &mut notes)?;
+
+    // Every profile walks the same pages into the same table. When two profiles
+    // disagree about a slot's ad-unit path, that shows up as two observations of
+    // one page, which inference already refuses to represent.
+    for (index, (label, collector)) in collectors.iter().enumerate() {
+        if index > 0 {
+            let repeat = first_collector.collect_page(&root_url, request.cookies);
+            match repeat {
+                Ok(page) => fold_collected(&mut table, &root_url, &page)?,
+                Err(error) => notes.push(format!("skipped `{root_url}` on {label}: {error}")),
+            }
+        }
+        crawl_sections(*collector, &plan, request.cookies, &mut table, &mut notes)?;
+    }
+    if collectors.len() > 1 {
+        notes.push(format!(
+            "audited {} device profile(s): {}",
+            collectors.len(),
+            collectors
+                .iter()
+                .map(|(label, _)| *label)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
 
     if table.is_empty() {
         return cli_error("no ad-template slots were discovered on any crawled page");
@@ -1262,7 +1290,7 @@ mod tests {
                 dry_run: false,
                 budget: CrawlBudget::default(),
             },
-            &collector,
+            &[("desktop", &collector)],
             &mut out,
         )
         .expect("should update slots");
@@ -1305,7 +1333,7 @@ mod tests {
                 dry_run: false,
                 budget: CrawlBudget::default(),
             },
-            &collector,
+            &[("desktop", &collector)],
             &mut out,
         )
         .expect_err("should reject an invalid glob");
@@ -1346,7 +1374,7 @@ mod tests {
                 dry_run: false,
                 budget: CrawlBudget::default(),
             },
-            &collector,
+            &[("desktop", &collector)],
             &mut out,
         )
         .expect("should accept a runtime-normalisable pattern");
@@ -1382,7 +1410,7 @@ mod tests {
                 dry_run: false,
                 budget: CrawlBudget::default(),
             },
-            &collector,
+            &[("desktop", &collector)],
             &mut out,
         )
         .expect("should update slots");
@@ -1472,7 +1500,7 @@ mod tests {
                 dry_run: false,
                 budget: CrawlBudget::default(),
             },
-            &collector,
+            &[("desktop", &collector)],
             &mut out,
         )
         .expect("should crawl and update slots");
@@ -1517,6 +1545,86 @@ mod tests {
     }
 
     #[test]
+    fn disagreeing_device_profiles_refuse_to_write_a_unit_path() {
+        // Two profiles serving different ad units for the same page is exactly
+        // the failure a single-profile crawl cannot see. Writing either path
+        // would be correct for one device and silently wrong for the other.
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        fs::write(&config_path, loadable_config()).expect("should write config");
+
+        let nav = ["/news"];
+        let desktop = SiteCollector::new(vec![
+            (
+                "https://publisher.example/",
+                site_page(
+                    "https://publisher.example/",
+                    "/123456789/desktop/homepage",
+                    &nav,
+                ),
+            ),
+            (
+                "https://publisher.example/news",
+                site_page(
+                    "https://publisher.example/news",
+                    "/123456789/desktop/news",
+                    &nav,
+                ),
+            ),
+        ]);
+        let mobile = SiteCollector::new(vec![
+            (
+                "https://publisher.example/",
+                site_page(
+                    "https://publisher.example/",
+                    "/123456789/mobile/homepage",
+                    &nav,
+                ),
+            ),
+            (
+                "https://publisher.example/news",
+                site_page(
+                    "https://publisher.example/news",
+                    "/123456789/mobile/news",
+                    &nav,
+                ),
+            ),
+        ]);
+        let mut out = Vec::new();
+
+        run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &desktop), ("mobile", &mobile)],
+            &mut out,
+        )
+        .expect("the run should complete and report the conflict");
+
+        let written = fs::read_to_string(&config_path).expect("read config");
+        let value = toml::from_str::<toml::Value>(&written).expect("valid TOML");
+        let creative = &value["creative_opportunities"];
+        assert!(
+            creative.get("section_root").is_none(),
+            "a device split must not produce a section template"
+        );
+        assert!(
+            creative["slot"][0].get("gam_unit_path").is_none(),
+            "no ad-unit path is better than one that is wrong on mobile, got:\n{written}"
+        );
+        // What was written must still load.
+        trusted_server_core::settings::Settings::from_toml(&written)
+            .expect("a slot without an explicit unit path must still load");
+    }
+
+    #[test]
     fn a_crawl_refuses_when_most_pages_are_challenged() {
         // Bot protection serves an interstitial that loads fine and has no ad
         // stack, so it looks like a page with no slots. Writing from that would
@@ -1556,7 +1664,7 @@ mod tests {
                 dry_run: false,
                 budget: CrawlBudget::default(),
             },
-            &collector,
+            &[("desktop", &collector)],
             &mut out,
         )
         .expect_err("a mostly-challenged crawl should refuse");
@@ -1603,7 +1711,7 @@ mod tests {
                     max_pages: 1,
                 },
             },
-            &collector,
+            &[("desktop", &collector)],
             &mut out,
         )
         .expect("should update from the single page");
@@ -1653,7 +1761,7 @@ mod tests {
                 dry_run: false,
                 budget: CrawlBudget::default(),
             },
-            &collector,
+            &[("desktop", &collector)],
             &mut out,
         )
         .expect("should update slots");
@@ -1749,7 +1857,7 @@ mod tests {
                         dry_run: true,
                         budget: CrawlBudget::default(),
                     },
-                    &collector,
+                    &[("desktop", &collector)],
                     &mut out,
                 )
                 .expect("should render dry-run update");
