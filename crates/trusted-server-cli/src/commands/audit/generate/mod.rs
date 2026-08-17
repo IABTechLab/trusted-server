@@ -2,6 +2,7 @@ mod analyzer;
 pub(crate) mod browser_collector;
 pub(crate) mod collector;
 mod crawl_plan;
+mod evidence;
 mod gpt_slots;
 mod slot_toml;
 mod validate;
