@@ -1471,9 +1471,16 @@ canary keys are no longer read.
 The Fastly service must provide the logical config store selected by
 `[stores.config].default` in `edgezero.toml`. By default, the logical store ID
 is also the platform store name and the app-config blob key. Deployments can
-override those independently with
-`EDGEZERO__STORES__CONFIG__<ID>__NAME` and
-`EDGEZERO__STORES__CONFIG__<ID>__KEY`.
+override the platform store name with
+`EDGEZERO__STORES__CONFIG__<ID>__NAME`; both the runtime and `ts config push`
+honor that override. The runtime also reads
+`EDGEZERO__STORES__CONFIG__<ID>__KEY`, but `ts config push` requires a matching
+`--key` argument to publish the blob at that key:
+
+```bash
+EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY=staging \
+  ts config push --adapter fastly --key staging
+```
 
 The resolved store and key must contain a valid Trusted Server app-config blob
 envelope. An absent or empty entry makes application startup fail closed. Use

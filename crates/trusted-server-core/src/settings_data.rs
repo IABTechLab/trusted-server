@@ -3,7 +3,7 @@ use error_stack::{Report, ResultExt};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
-use crate::config_payload::{settings_from_config_blob, CONFIG_BLOB_KEY};
+use crate::config_payload::{DEFAULT_CONFIG_STORE_ID, settings_from_config_blob};
 use crate::error::TrustedServerError;
 use crate::platform::{PlatformConfigStore, StoreName};
 use crate::settings::Settings;
@@ -34,7 +34,7 @@ pub fn default_config_store_name() -> StoreName {
 }
 
 fn default_config_store_name_from_env(env_config: &EnvConfig) -> StoreName {
-    StoreName::from(env_config.store_name("config", CONFIG_BLOB_KEY))
+    StoreName::from(env_config.store_name("config", DEFAULT_CONFIG_STORE_ID))
 }
 
 /// Returns the default config-store key containing the app-config blob.
@@ -44,7 +44,7 @@ pub fn default_config_key() -> String {
 }
 
 fn default_config_key_from_env(env_config: &EnvConfig) -> String {
-    env_config.store_key("config", CONFIG_BLOB_KEY)
+    env_config.store_key("config", DEFAULT_CONFIG_STORE_ID)
 }
 
 /// Loads [`Settings`] from a platform config store and key.
@@ -183,7 +183,7 @@ fn configuration_error<T>(message: String) -> Result<T, Report<TrustedServerErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_payload::CONFIG_BLOB_KEY;
+    use crate::config_payload::{CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_ID};
     use crate::platform::PlatformError;
     use crate::settings::Settings;
     use crate::test_support::tests::crate_test_settings_str;
@@ -241,8 +241,12 @@ mod tests {
             .default_id();
 
         assert_eq!(
-            CONFIG_BLOB_KEY, manifest_default,
+            DEFAULT_CONFIG_STORE_ID, manifest_default,
             "compiled default should match edgezero.toml"
+        );
+        assert_eq!(
+            CONFIG_BLOB_KEY, DEFAULT_CONFIG_STORE_ID,
+            "default blob key should match the default config store id"
         );
         assert_eq!(
             manifest_default, "trusted_server_config",
@@ -254,7 +258,7 @@ mod tests {
     fn config_defaults_honor_edgezero_store_name_and_key_overrides() {
         let name_variable = format!(
             "EDGEZERO__STORES__CONFIG__{}__NAME",
-            CONFIG_BLOB_KEY.to_ascii_uppercase()
+            DEFAULT_CONFIG_STORE_ID.to_ascii_uppercase()
         );
         let name_config = EnvConfig::from_vars([(name_variable, "example-config-store")]);
         let store_name = default_config_store_name_from_env(&name_config);
@@ -267,7 +271,7 @@ mod tests {
 
         let key_variable = format!(
             "EDGEZERO__STORES__CONFIG__{}__KEY",
-            CONFIG_BLOB_KEY.to_ascii_uppercase()
+            DEFAULT_CONFIG_STORE_ID.to_ascii_uppercase()
         );
         let key_config = EnvConfig::from_vars([(key_variable, "example-config-key")]);
 

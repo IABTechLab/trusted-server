@@ -75,6 +75,43 @@ fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
     Settings::from_toml(include_str!("../../../trusted-server.example.toml"))
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
+// Older Cloudflare bindings used this JSON property before config stores adopted
+// the manifest-derived default. Remove this fallback only when support for those
+// bindings is deliberately retired.
+const LEGACY_CONFIG_BLOB_KEY: &str = "app_config";
+
+#[cfg(any(test, target_arch = "wasm32"))]
+#[derive(Debug, Eq, PartialEq)]
+enum CloudflareConfigEnvelopeError {
+    Missing {
+        primary_key: &'static str,
+        legacy_key: &'static str,
+    },
+    NonString {
+        key: &'static str,
+    },
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+impl CloudflareConfigEnvelopeError {
+    fn configuration_message(&self) -> String {
+        match self {
+            Self::Missing {
+                primary_key,
+                legacy_key,
+            } => {
+                format!(
+                    "Cloudflare TRUSTED_SERVER_CONFIG missing string values at `{primary_key}` and legacy `{legacy_key}`"
+                )
+            }
+            Self::NonString { key } => {
+                format!("Cloudflare TRUSTED_SERVER_CONFIG value at `{key}` must be a string")
+            }
+        }
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServerError>> {
     let raw_config = CLOUDFLARE_CONFIG_JSON.get().ok_or_else(|| {
@@ -91,26 +128,43 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
         })
         .attach(format!("failed to parse TRUSTED_SERVER_CONFIG: {error}"))
     })?;
-    let envelope = cloudflare_config_envelope(&value).ok_or_else(|| {
+    let envelope = cloudflare_config_envelope(&value).map_err(|error| {
         Report::new(TrustedServerError::Configuration {
-            message: format!(
-                "Cloudflare TRUSTED_SERVER_CONFIG missing string value at `{CONFIG_BLOB_KEY}`"
-            ),
+            message: error.configuration_message(),
         })
     })?;
     settings_from_config_blob(envelope)
 }
 
 #[cfg(any(test, target_arch = "wasm32"))]
-fn cloudflare_config_envelope(value: &serde_json::Value) -> Option<&str> {
-    const LEGACY_CONFIG_BLOB_KEY: &str = "app_config";
-
+fn cloudflare_config_envelope(
+    value: &serde_json::Value,
+) -> Result<&str, CloudflareConfigEnvelopeError> {
     match value.get(CONFIG_BLOB_KEY) {
-        Some(envelope) => envelope.as_str(),
-        None if CONFIG_BLOB_KEY != LEGACY_CONFIG_BLOB_KEY => value
-            .get(LEGACY_CONFIG_BLOB_KEY)
-            .and_then(serde_json::Value::as_str),
-        None => None,
+        Some(envelope) => envelope
+            .as_str()
+            .ok_or(CloudflareConfigEnvelopeError::NonString {
+                key: CONFIG_BLOB_KEY,
+            }),
+        None if CONFIG_BLOB_KEY != LEGACY_CONFIG_BLOB_KEY => {
+            match value.get(LEGACY_CONFIG_BLOB_KEY) {
+                Some(envelope) => {
+                    envelope
+                        .as_str()
+                        .ok_or(CloudflareConfigEnvelopeError::NonString {
+                            key: LEGACY_CONFIG_BLOB_KEY,
+                        })
+                }
+                None => Err(CloudflareConfigEnvelopeError::Missing {
+                    primary_key: CONFIG_BLOB_KEY,
+                    legacy_key: LEGACY_CONFIG_BLOB_KEY,
+                }),
+            }
+        }
+        None => Err(CloudflareConfigEnvelopeError::Missing {
+            primary_key: CONFIG_BLOB_KEY,
+            legacy_key: LEGACY_CONFIG_BLOB_KEY,
+        }),
     }
 }
 
@@ -620,37 +674,73 @@ mod tests {
     #[test]
     fn cloudflare_config_prefers_manifest_default_key() {
         let value = config_value(&[
-            ("app_config", "legacy-envelope"),
+            (LEGACY_CONFIG_BLOB_KEY, "legacy-envelope"),
             (CONFIG_BLOB_KEY, "manifest-envelope"),
         ]);
 
         assert_eq!(
             cloudflare_config_envelope(&value),
-            Some("manifest-envelope"),
+            Ok("manifest-envelope"),
             "manifest-derived key should take precedence"
         );
     }
 
     #[test]
     fn cloudflare_config_accepts_legacy_app_config_key() {
-        let value = config_value(&[("app_config", "legacy-envelope")]);
+        let value = config_value(&[(LEGACY_CONFIG_BLOB_KEY, "legacy-envelope")]);
 
         assert_eq!(
             cloudflare_config_envelope(&value),
-            Some("legacy-envelope"),
+            Ok("legacy-envelope"),
             "legacy app_config key should remain compatible"
         );
     }
 
     #[test]
+    fn cloudflare_config_reports_missing_keys() {
+        let value = serde_json::json!({});
+
+        assert_eq!(
+            cloudflare_config_envelope(&value),
+            Err(CloudflareConfigEnvelopeError::Missing {
+                primary_key: CONFIG_BLOB_KEY,
+                legacy_key: LEGACY_CONFIG_BLOB_KEY,
+            }),
+            "missing config should name both accepted keys"
+        );
+    }
+
+    #[test]
     fn cloudflare_config_does_not_mask_malformed_manifest_value() {
-        let mut value = config_value(&[("app_config", "legacy-envelope")]);
+        let mut value = config_value(&[(LEGACY_CONFIG_BLOB_KEY, "legacy-envelope")]);
         value[CONFIG_BLOB_KEY] = serde_json::Value::Bool(true);
 
         assert_eq!(
             cloudflare_config_envelope(&value),
-            None,
+            Err(CloudflareConfigEnvelopeError::NonString {
+                key: CONFIG_BLOB_KEY,
+            }),
             "malformed manifest-derived value should not fall back"
+        );
+    }
+
+    #[test]
+    fn cloudflare_config_reports_malformed_legacy_value() {
+        let value = serde_json::json!({ LEGACY_CONFIG_BLOB_KEY: false });
+        let error = cloudflare_config_envelope(&value)
+            .expect_err("should reject a malformed legacy config value");
+
+        assert_eq!(
+            error,
+            CloudflareConfigEnvelopeError::NonString {
+                key: LEGACY_CONFIG_BLOB_KEY,
+            },
+            "malformed legacy value should name the legacy key"
+        );
+        assert_eq!(
+            error.configuration_message(),
+            "Cloudflare TRUSTED_SERVER_CONFIG value at `app_config` must be a string",
+            "configuration error should name the malformed legacy key"
         );
     }
 }
