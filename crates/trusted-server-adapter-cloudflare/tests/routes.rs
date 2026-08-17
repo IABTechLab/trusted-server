@@ -219,10 +219,21 @@ fn all_explicit_routes_are_registered() {
         ("GET", "/_ts/admin/ec/{id}"),
         ("GET", "/_ts/admin/eids"),
         ("POST", "/auction"),
+        // SPA re-auction endpoint, plus its deprecated `/__ts/` alias. Both
+        // paths are spelled out as literals rather than referencing
+        // `PAGE_BIDS_PATH` / `PAGE_BIDS_LEGACY_PATH` so this test pins the
+        // actual URL the tsjs client fetches — asserting a const against itself
+        // would still pass if the const's value changed out from under the
+        // client.
+        ("GET", "/_ts/page-bids"),
+        ("OPTIONS", "/_ts/page-bids"),
+        ("GET", "/__ts/page-bids"),
+        ("OPTIONS", "/__ts/page-bids"),
         ("GET", "/first-party/proxy"),
         ("GET", "/first-party/click"),
         ("GET", "/first-party/sign"),
         ("POST", "/first-party/sign"),
+        ("GET", "/first-party/proxy-rebuild"),
         ("POST", "/first-party/proxy-rebuild"),
     ];
 

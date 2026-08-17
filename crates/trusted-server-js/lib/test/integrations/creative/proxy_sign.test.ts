@@ -47,8 +47,30 @@ describe('creative/proxy_sign.ts', () => {
   });
 
   it('returns null when fetch is unavailable', async () => {
-    global.fetch = undefined as any;
+    global.fetch = undefined as unknown as typeof fetch;
     const result = await signProxyUrl('https://cdn.example/asset.js');
     expect(result).toBeNull();
+  });
+
+  it('skips the doomed POST in an opaque origin and returns null', async () => {
+    // A sandboxed srcdoc creative without `allow-same-origin` has origin
+    // "null": the JSON POST would preflight and fail, so signing bails out
+    // without issuing the request.
+    const originDescriptor = Object.getOwnPropertyDescriptor(window, 'origin');
+    Object.defineProperty(window, 'origin', { value: 'null', configurable: true });
+    const fetchMock = vi.fn();
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    try {
+      const result = await signProxyUrl('https://cdn.example/asset.js');
+      expect(result).toBeNull();
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      if (originDescriptor) {
+        Object.defineProperty(window, 'origin', originDescriptor);
+      } else {
+        delete (window as { origin?: string }).origin;
+      }
+    }
   });
 });
