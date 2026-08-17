@@ -86,9 +86,10 @@ Run:
 
 ```bash
 cargo test -p trusted-server-core --lib auction_debug_comment_options -- --nocapture
+cargo test -p trusted-server-core --lib bad_verbosity_string_fails_config_load -- --nocapture
 ```
 
-Expected: failure because the current default still contains provider-controlled keys and `AuctionDebugCommentVerbosity::Upstream` does not exist.
+Expected: the first command fails because the current default still contains provider-controlled keys and `AuctionDebugCommentVerbosity::Upstream` does not exist. The invalid-verbosity regression continues to pass.
 
 - [ ] **Step 3: Implement the minimal settings change**
 
@@ -130,7 +131,7 @@ Update the public docs on `metadata_keys` and `verbosity` to state:
 
 - [ ] **Step 4: Run focused tests and confirm GREEN**
 
-Run the command from Step 2.
+Run both commands from Step 2.
 
 Expected: all matching settings tests pass, including invalid-verbosity rejection.
 
@@ -321,7 +322,9 @@ Add:
 - `verbosity_upstream_still_truncates_creative`
 - `metadata_keys_empty_yields_empty_safe_metadata_in_redacted`
 
-The upstream fixture must include all six diagnostics plus a `debug` subtree. Assert all six diagnostics appear, `debug` does not, the configured safe subset still works, and the creative carries the existing truncation marker. Retain existing tests proving `Full` includes `debug`, skips per-creative truncation, still respects the 256 KiB total cap, and still neutralizes both comment terminators.
+The upstream fixture must include all six diagnostics plus a `debug` subtree. Assert all six diagnostics appear, `debug` does not, the configured safe subset still works, and the creative carries the existing truncation marker. Retain existing tests proving `Full` includes `debug`, skips per-creative truncation, and still respects the 256 KiB total cap.
+
+Extend `auction_debug_comment_neutralises_every_comment_terminator_vector` so its existing five attack vectors run once with `Redacted` and once with `Full`. Do not replace this table with the narrower two-vector full-mode test: every vector must prove that verbosity cannot bypass the unconditional HTML-comment safety boundary.
 
 Run:
 
@@ -440,7 +443,7 @@ Expected: no warnings or errors.
 
 - [ ] **Step 5: Run documentation and JavaScript gates required by repository CI**
 
-Use the repository-pinned Node version (`.nvmrc`) for JavaScript commands:
+Use the repository-pinned Node version (`.tool-versions`, currently Node 24.12.0) for JavaScript commands:
 
 ```bash
 cd crates/trusted-server-js/lib && npm run format
