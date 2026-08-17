@@ -104,6 +104,9 @@ rewrite_sdk = true
 
 [integrations.gpt]
 enabled = false
+# Keep this leaf present when using the corresponding EdgeZero v0.0.4
+# environment override. Attribution remains off until explicitly enabled.
+gam_attribution_enabled = false
 script_url = "https://ads.example.com/gpt.js"
 cache_ttl_seconds = 3600
 rewrite_script = true
