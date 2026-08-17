@@ -19,8 +19,8 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
-    handle_tsjs_dynamic, page_bids_preflight_denied,
+    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, buffer_publisher_response_async,
+    handle_page_bids, handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
@@ -129,7 +129,13 @@ where
     Fut: Future<Output = Result<Response, Report<TrustedServerError>>>,
 {
     let services = build_runtime_services(&ctx);
-    let req = ctx.into_request();
+    let mut req = ctx.into_request();
+    if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+        &state.settings,
+        &mut req,
+    ) {
+        return Ok(http_error(&error));
+    }
     Ok(handler(state, services, req)
         .await
         .unwrap_or_else(|e| http_error(&e)))
@@ -140,7 +146,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
-/// `/__ts/page-bids`, and the publisher fallback).
+/// `/_ts/page-bids`, and the publisher fallback).
 ///
 /// Mirrors the Fastly entry point: `EcContext::default()` leaves jurisdiction
 /// Unknown, which fails the auction consent gate closed even for consented
@@ -170,8 +176,9 @@ fn build_ec_context(state: &AppState, services: &RuntimeServices, req: &Request)
 async fn dispatch_fallback(
     state: &AppState,
     services: &RuntimeServices,
-    req: Request,
+    mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
+    trusted_server_core::integrations::gpt_diagnostics::prepare_request(&state.settings, &mut req)?;
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
@@ -279,7 +286,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 12] {
+fn named_routes() -> [NamedRoute; 13] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -328,7 +335,15 @@ fn named_routes() -> [NamedRoute; 12] {
         // GET runs the SPA re-auction; OPTIONS is denied in-handler as a CORS
         // preflight guard for this side-effecting endpoint.
         NamedRoute {
-            path: "/__ts/page-bids",
+            path: PAGE_BIDS_PATH,
+            primary_methods: &[Method::GET, Method::OPTIONS],
+            handler: NamedRouteHandler::PageBids,
+        },
+        // Deprecated double-underscore alias, kept so tsjs bundles served before
+        // the `/_ts/page-bids` rename keep getting ads on SPA navigations until
+        // they age out of browser caches. See `PAGE_BIDS_LEGACY_PATH`.
+        NamedRoute {
+            path: PAGE_BIDS_LEGACY_PATH,
             primary_methods: &[Method::GET, Method::OPTIONS],
             handler: NamedRouteHandler::PageBids,
         },
@@ -349,7 +364,11 @@ fn named_routes() -> [NamedRoute; 12] {
         },
         NamedRoute {
             path: "/first-party/proxy-rebuild",
-            primary_methods: &[Method::POST],
+            // GET serves the click guard's navigation fallback: the creative
+            // iframe is an opaque origin (sandbox without `allow-same-origin`),
+            // so its JSON POST is blocked by CORS and the guard navigates here
+            // for a 302 instead.
+            primary_methods: &[Method::GET, Method::POST],
             handler: NamedRouteHandler::FirstPartyProxyRebuild,
         },
     ]
