@@ -229,11 +229,83 @@ hand-tuned fields and gains this run's patterns, and a hand-written
 instead, which also discards any template you wrote by hand.
 
 Behind bot protection, pass a valid clearance cookie. The crawl reuses one
-browser session, so clearance earned on the first page carries to the rest:
+browser session, so clearance earned on the first page carries to the rest, and
+`--page-delay-ms` spaces the requests — an unpaced crawl is both discourteous to
+the origin and likelier to be challenged partway through:
 
 ```bash
-ts audit ad-templates generate https://publisher.example/ --cookie 'datadome=<value>'
+ts audit ad-templates generate https://publisher.example/ \
+  --cookie '<NAME>=<VALUE>' --page-delay-ms 1500
 ```
+
+Some origins refuse a headless browser outright regardless of the cookie.
+`--headful` runs a visible one, which is also the quickest way to _see_ whether
+a challenge is being shown:
+
+```bash
+ts audit ad-templates generate https://publisher.example/ --headful
+```
+
+### Sites behind a consent platform
+
+Publishers gate slot definition behind their consent platform, and the audit
+runs in a throwaway browser profile with no consent cookie. Left alone, such a
+site defines no slots at all and looks identical to a site with no ad stack.
+
+The crawl therefore answers the two IAB interfaces every compliant platform
+exposes — TCF v2 and US Privacy — as a consenting, out-of-scope reader, before
+any page script runs. This changes only what the audit browser sees; it does not
+affect the publisher's own readers. Pass `--no-assume-consent` to observe the
+un-consented page instead.
+
+When a page still yields no slots, the run reports GPT's observable state —
+whether the library reached `apiReady`, how many queued commands never drained,
+how many scripts ran. An empty slot registry has several very different causes,
+and that line distinguishes them.
+
+### Auditing a production hostname served locally
+
+`ts dev proxy` serves a production hostname from a local Trusted Server.
+Auditing through it keeps the page's origin, cookie scope, and any origin checks
+in the ad stack matching production rather than `localhost`:
+
+```bash
+ts dev proxy --map www.publisher.example=127.0.0.1:7676 --upstream-plaintext --rewrite-host
+
+ts audit ad-templates generate https://www.publisher.example/ \
+  --browser-proxy 127.0.0.1:18080 --danger-accept-invalid-certs
+```
+
+`--danger-accept-invalid-certs` covers the proxy's MITM certificate when the
+throwaway browser profile does not trust its CA; installing that CA
+(`ts dev proxy ca`) is preferable. Against a real origin the flag is dangerous —
+the audit sends any `--cookie` session upstream and treats the response as
+evidence, so an invalid certificate could mean an impersonator is both
+harvesting the session and fabricating the result.
+
+Note that a local Trusted Server injects its own configured slots into the page,
+so a run through the proxy can rediscover config it already has. Slot ids that
+are absent from the current config are the publisher's own.
+
+### Slots that change div id on every render
+
+Some ad stacks build div ids from a per-render token, so one placement arrives
+under a new id on every page. Those ids match nothing at runtime, so the run
+declines to write them and reports the group instead:
+
+```text
+note: skipped 3 slot(s) that look like one placement under a per-render div id
+      on `/12345678/example.com_Overlay` (kso_2632930aBc_overlay_1, …);
+      they share the prefix `kso`. Add it once by hand with a div_id prefix
+      that is stable across renders
+```
+
+The detection is by evidence, not by recognising token shapes: candidates share
+an ad-unit path and formats, and what separates a fragmented placement from two
+legitimate siblings on one unit is co-occurrence — real siblings appear together
+on a page, fragments never do. The suggested prefix is a starting point only, not
+written as a `div_id`, because it reaches only as far as the observed tokens
+happen to agree.
 
 ### Checking for a device split
 
