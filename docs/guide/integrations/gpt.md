@@ -144,6 +144,7 @@ Takes over `googletag.cmd` so every queued callback is wrapped before GPT execut
 - Check the proxy responses have `200` status (look for `X-GPT-Proxy: true` header)
 - Verify the `script_url` config points to the correct GPT endpoint
 - Review server logs for upstream fetch failures
+- Open [GPT Runtime Diagnostics](./gpt-diagnostics.md) with `?ts_console=1` to see the observed request, render, load, and delivery evidence per slot
 
 ## Implementation
 
@@ -152,6 +153,7 @@ Takes over `googletag.cmd` so every queued callback is wrapped before GPT execut
 
 ## Next Steps
 
+- Use [GPT Runtime Diagnostics](/guide/integrations/gpt-diagnostics) to inspect GPT lifecycle and Trusted Server delivery evidence in the browser
 - Review [Integrations Overview](/guide/integrations-overview) for comparison with other integrations
 - Check [Configuration Reference](/guide/configuration) for advanced options
 - Learn about [First-Party Proxy](/guide/first-party-proxy) architecture
