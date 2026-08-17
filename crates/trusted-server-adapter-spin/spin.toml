@@ -25,6 +25,13 @@ version = "0.1.0"
 [variables]
 v_current_x2dkid = { default = "" }
 v_active_x2dkids = { default = "" }
+# Trusted Server app-config secret references. Replace the empty defaults with
+# values supplied by the deployment's secret provider; never commit values here.
+v_trusted_x5fserver_x5fsecrets_v_publisher_x5fproxy_x5fsecret = { default = "" }
+v_trusted_x5fserver_x5fsecrets_v_ec_x5fpassphrase = { default = "" }
+v_trusted_x5fserver_x5fsecrets_v_partner_x5fapi_x5ftoken = { default = "" }
+v_trusted_x5fserver_x5fsecrets_v_partner_x5fts_x5fpull_x5ftoken = { default = "" }
+v_trusted_x5fserver_x5fsecrets_v_handler_x5fpassword = { default = "" }
 
 [[trigger.http]]
 route = "/..."
@@ -38,11 +45,16 @@ source = "../../target/wasm32-wasip1/release/trusted_server_adapter_spin.wasm"
 # origins are still served over plaintext http. Follow-up: scope this to the
 # configured origins once they can be enumerated from settings.
 allowed_outbound_hosts = ["https://*:*", "http://*:*"]
-key_value_stores = ["default"]
+key_value_stores = ["default", "trusted_server_config"]
 
 [component.trusted-server.variables]
 v_current_x2dkid = "{{ v_current_x2dkid }}"
 v_active_x2dkids = "{{ v_active_x2dkids }}"
+v_trusted_x5fserver_x5fsecrets_v_publisher_x5fproxy_x5fsecret = "{{ v_trusted_x5fserver_x5fsecrets_v_publisher_x5fproxy_x5fsecret }}"
+v_trusted_x5fserver_x5fsecrets_v_ec_x5fpassphrase = "{{ v_trusted_x5fserver_x5fsecrets_v_ec_x5fpassphrase }}"
+v_trusted_x5fserver_x5fsecrets_v_partner_x5fapi_x5ftoken = "{{ v_trusted_x5fserver_x5fsecrets_v_partner_x5fapi_x5ftoken }}"
+v_trusted_x5fserver_x5fsecrets_v_partner_x5fts_x5fpull_x5ftoken = "{{ v_trusted_x5fserver_x5fsecrets_v_partner_x5fts_x5fpull_x5ftoken }}"
+v_trusted_x5fserver_x5fsecrets_v_handler_x5fpassword = "{{ v_trusted_x5fserver_x5fsecrets_v_handler_x5fpassword }}"
 
 [component.trusted-server.build]
 command = "cargo build --target wasm32-wasip1 --release -p trusted-server-adapter-spin --features spin"

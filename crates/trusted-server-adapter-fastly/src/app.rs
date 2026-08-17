@@ -174,7 +174,13 @@ pub(crate) fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>>
 pub(crate) fn load_settings_from_config_store() -> Result<Settings, Report<TrustedServerError>> {
     let store_name = default_config_store_name();
     let config_key = default_config_key();
-    get_settings_from_config_store(&FastlyPlatformConfigStore, &store_name, &config_key)
+    get_settings_from_config_store(
+        &FastlyPlatformConfigStore,
+        &FastlyPlatformSecretStore,
+        &store_name,
+        &config_key,
+        &trusted_server_core::settings_data::default_secret_store_name(),
+    )
 }
 
 pub(crate) fn build_state_from_settings(

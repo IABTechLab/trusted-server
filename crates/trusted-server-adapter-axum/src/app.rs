@@ -38,7 +38,7 @@ use trusted_server_core::settings_data::{
 use trusted_server_core::platform::RuntimeServices;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
-use crate::platform::{AxumPlatformConfigStore, build_runtime_services};
+use crate::platform::{AxumPlatformConfigStore, AxumPlatformSecretStore, build_runtime_services};
 
 // ---------------------------------------------------------------------------
 // AppState
@@ -60,8 +60,13 @@ pub struct AppState {
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let store_name = default_config_store_name();
     let config_key = default_config_key();
-    let settings =
-        get_settings_from_config_store(&AxumPlatformConfigStore, &store_name, &config_key)?;
+    let settings = get_settings_from_config_store(
+        &AxumPlatformConfigStore,
+        &AxumPlatformSecretStore,
+        &store_name,
+        &config_key,
+        &trusted_server_core::settings_data::default_secret_store_name(),
+    )?;
     build_state_with_settings(settings)
 }
 
