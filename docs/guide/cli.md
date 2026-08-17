@@ -98,7 +98,7 @@ Chrome or Chromium must be installed locally. The command checks common PATH
 names and standard macOS/Linux install locations.
 
 ```bash
-ts audit https://publisher.example
+ts audit generate https://publisher.example
 ```
 
 By default, the command writes:
@@ -118,13 +118,13 @@ ts config validate
 If a config already exists, avoid overwriting it:
 
 ```bash
-ts audit https://publisher.example --no-config
+ts audit generate https://publisher.example --no-config
 ```
 
 Use custom output paths when reviewing artifacts first:
 
 ```bash
-ts audit https://publisher.example \
+ts audit generate https://publisher.example \
   --js-assets audit/js-assets.toml \
   --config audit/trusted-server.toml
 ```
@@ -132,7 +132,232 @@ ts audit https://publisher.example \
 Use `--force` only when replacing existing output files is intentional:
 
 ```bash
-ts audit https://publisher.example --force
+ts audit generate https://publisher.example --force
+```
+
+The legacy `ts audit <url>` form remains a compatibility alias for artifact
+generation. New automation should use `ts audit generate <url>`.
+
+## Generate ad-template slots from a live site
+
+`ts audit ad-templates generate <url>` discovers the publisher's ad slots and
+rewrites the `[creative_opportunities]` slot array in `trusted-server.toml` in
+place, preserving every other section and comment.
+
+```bash
+ts audit ad-templates generate https://publisher.example/
+```
+
+It samples the site rather than a single page. Ad slots repeat per site
+section, so the crawl is sized by the publisher's taxonomy — a dozen sections —
+not its catalogue:
+
+1. Load the requested page and read its links and, from `robots.txt`, its
+   sitemap.
+2. Group both into candidate sections, keeping one landing page and one article
+   per section.
+3. Load those pages, recording each slot's div, sizes, and GAM ad-unit path.
+4. Reconcile every slot across the pages it appeared on.
+5. Infer a `{section}` ad-unit template if the evidence proves one.
+6. Verify the result loads, then write it.
+
+### What it writes
+
+Given a site whose ad units track the section, the run produces:
+
+```toml
+[creative_opportunities]
+gam_network_id = "99999"
+section_root = "homepage"
+section_segment = 0
+
+[[creative_opportunities.slot]]
+id = "ad-header-0"
+div_id = "ad-header-0"
+gam_unit_path = "/{network_id}/example/{section}"
+page_patterns = ["/", "/deals", "/deals/*", "/news", "/news/*"]
+formats = [{ width = 728, height = 90 }]
+```
+
+Each section contributes **two** patterns. `*` crosses `/` in this glob
+dialect, so `/news/*` matches `/news/a/b` but not the bare `/news` landing
+page; emitting only the star form would drop the landing page from the slot.
+
+Sizes are unioned across pages, so a format that renders only on articles
+survives alongside the homepage's.
+
+### When it keeps literal paths, and when it refuses
+
+A wrong ad-unit template makes the publisher bid against inventory that does not
+exist, so the command prefers a narrow literal path over a plausible guess.
+
+| Situation                                                                                     | Result                                                                                                                                  |
+| --------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| Only one page was crawled                                                                     | Literal path. One observation cannot distinguish a literal from a template.                                                             |
+| The ad unit never varied by section                                                           | Literal path.                                                                                                                           |
+| A section's slug is not derivable from its URL (`/car-research` requesting `.../carresearch`) | Literal path; the round-trip check catches it.                                                                                          |
+| No root page was seen, so `section_root` is unknown                                           | Literal path rather than a guessed fallback.                                                                                            |
+| Two path segments could both be the section                                                   | No template; the ambiguity is reported.                                                                                                 |
+| The ad unit varies by device, geo, or anything the URL cannot supply                          | **No `gam_unit_path` at all** for that slot.                                                                                            |
+| Crawled pages report different GAM network ids                                                | The run fails; the pages are not one property.                                                                                          |
+| More than a quarter of crawled pages return no slots                                          | The run fails. That is the signature of bot protection serving challenge pages, and writing from it would silently narrow the slot set. |
+
+Every run checks that the config it produced still loads before replacing the
+file, and `--dry-run` runs the same check — a clean preview is evidence the
+config loads, not just that it parses.
+
+### Bounding and steering the crawl
+
+```bash
+# Cover more of a large site.
+ts audit ad-templates generate https://publisher.example/ --max-sections 20 --max-pages 41
+
+# Audit exactly one page, as earlier releases did.
+ts audit ad-templates generate https://publisher.example/ --max-pages 1
+
+# Set the patterns yourself; this disables pattern inference entirely.
+ts audit ad-templates generate https://publisher.example/ \
+  --page-pattern '/' --page-pattern '/news' --page-pattern '/news/*'
+
+# Preview without writing.
+ts audit ad-templates generate https://publisher.example/ --dry-run
+```
+
+Re-running merges into the existing slots: a slot seen again keeps its
+hand-tuned fields and gains this run's patterns, and a hand-written
+`gam_unit_path` template is preserved. `--replace` discards existing slots
+instead, which also discards any template you wrote by hand.
+
+Behind bot protection, pass a valid clearance cookie. The crawl reuses one
+browser session, so clearance earned on the first page carries to the rest, and
+`--page-delay-ms` spaces the requests — an unpaced crawl is both discourteous to
+the origin and likelier to be challenged partway through:
+
+```bash
+ts audit ad-templates generate https://publisher.example/ \
+  --cookie '<NAME>=<VALUE>' --page-delay-ms 1500
+```
+
+Some origins refuse a headless browser outright regardless of the cookie.
+`--headful` runs a visible one, which is also the quickest way to _see_ whether
+a challenge is being shown:
+
+```bash
+ts audit ad-templates generate https://publisher.example/ --headful
+```
+
+### Sites behind a consent platform
+
+Publishers gate slot definition behind their consent platform, and the audit
+runs in a throwaway browser profile with no consent cookie. Left alone, such a
+site defines no slots at all and looks identical to a site with no ad stack.
+
+The crawl therefore answers the two IAB interfaces every compliant platform
+exposes — TCF v2 and US Privacy — as a consenting, out-of-scope reader, before
+any page script runs. This changes only what the audit browser sees; it does not
+affect the publisher's own readers. Pass `--no-assume-consent` to observe the
+un-consented page instead.
+
+When a page still yields no slots, the run reports GPT's observable state —
+whether the library reached `apiReady`, how many queued commands never drained,
+how many scripts ran. An empty slot registry has several very different causes,
+and that line distinguishes them.
+
+### Auditing a production hostname served locally
+
+`ts dev proxy` serves a production hostname from a local Trusted Server.
+Auditing through it keeps the page's origin, cookie scope, and any origin checks
+in the ad stack matching production rather than `localhost`:
+
+```bash
+ts dev proxy --map www.publisher.example=127.0.0.1:7676 --upstream-plaintext --rewrite-host
+
+ts audit ad-templates generate https://www.publisher.example/ \
+  --browser-proxy 127.0.0.1:18080 --danger-accept-invalid-certs
+```
+
+`--danger-accept-invalid-certs` covers the proxy's MITM certificate when the
+throwaway browser profile does not trust its CA; installing that CA
+(`ts dev proxy ca`) is preferable. Against a real origin the flag is dangerous —
+the audit sends any `--cookie` session upstream and treats the response as
+evidence, so an invalid certificate could mean an impersonator is both
+harvesting the session and fabricating the result.
+
+Note that a local Trusted Server injects its own configured slots into the page,
+so a run through the proxy can rediscover config it already has. Slot ids that
+are absent from the current config are the publisher's own.
+
+### Slots that change div id on every render
+
+Some ad stacks build div ids from a per-render token, so one placement arrives
+under a new id on every page. Those ids match nothing at runtime, so the run
+declines to write them and reports the group instead:
+
+```text
+note: skipped 3 slot(s) that look like one placement under a per-render div id
+      on `/12345678/example.com_Overlay` (kso_2632930aBc_overlay_1, …);
+      they share the prefix `kso`. Add it once by hand with a div_id prefix
+      that is stable across renders
+```
+
+The detection is by evidence, not by recognising token shapes: candidates share
+an ad-unit path and formats, and what separates a fragmented placement from two
+legitimate siblings on one unit is co-occurrence — real siblings appear together
+on a page, fragments never do. The suggested prefix is a starting point only, not
+written as a `div_id`, because it reaches only as far as the observed tokens
+happen to agree.
+
+### Checking for a device split
+
+Publishers often serve a different ad unit per device
+(`/network/desktop/news` against `/network/mobile/news`). A desktop-only crawl
+cannot see that — it infers a template correct for desktop and silently wrong
+for every mobile impression.
+
+```bash
+ts audit ad-templates generate https://publisher.example/ --profiles desktop,mobile
+```
+
+Each page is loaded once per profile. Where the profiles disagree, the slot is
+written with its div and formats but **no** `gam_unit_path`, so the runtime
+falls back to the default unit rather than bidding on one that does not exist.
+
+### Deploy ordering for templated config
+
+> **A config containing `section_root` or `section_segment` is not
+> rollback-safe.** These keys are rejected outright by a Trusted Server binary
+> that predates ad-unit templating, and the rejection fails the _entire_
+> configuration load — not just the ad-template section — so every route serves
+> an error. This is a full-site outage, not a degraded ad stack.
+
+When a run reports that it wrote a `{section}` template:
+
+1. Deploy the template-aware binary **first**.
+2. Then `ts config push`.
+3. Do **not** roll that binary back while the config is live.
+
+A run that did not template writes neither key, and leaves the config exactly as
+rollback-safe as it was.
+
+### Audit safety defaults
+
+Every `ts audit` browser session validates TLS certificates. This matters
+because `--cookie` sends a real session to the origin and the page's own
+response becomes the audit's evidence, so a certificate-invalid host could both
+harvest the session and fabricate what the audit reports. Override only for a
+host you control with a known self-signed certificate:
+
+```bash
+ts audit page https://staging.publisher.example --danger-accept-invalid-certs
+```
+
+`ts audit ad-templates verify` matches configured slots against the
+**post-redirect** path, so it refuses a redirect that leaves the requested
+origin rather than accepting another site's evidence as verification. Allow it
+for a known redirect between your own properties (for example apex to `www`):
+
+```bash
+ts audit ad-templates verify https://publisher.example/ --allow-cross-origin-redirect
 ```
 
 `ts audit` is not an EdgeZero adapter command. It has no `--adapter` option and

@@ -17,6 +17,7 @@ workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 chromiumoxide = { workspace = true }
 clap = { workspace = true }
+edgezero-core = { workspace = true }
 edgezero-cli = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
@@ -62,4 +63,5 @@ tokio = { workspace = true, features = ["test-util"] }
 x509-parser = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+temp-env = { workspace = true }
 tempfile = { workspace = true }

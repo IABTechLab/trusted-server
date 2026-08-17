@@ -173,8 +173,12 @@ fn sanitize_section(segment: &str) -> String {
 /// The path is used **raw** (not percent-decoded) so this stays consistent with
 /// how [`page_patterns`](CreativeOpportunitySlot::page_patterns) glob-match the
 /// same path — e.g. `/new%20s` yields `new_20s`, never the decoded `new_s`.
+///
+/// Public so operator tooling that *infers* a `{section}` template from observed
+/// ad-unit paths can check its inference against the exact derivation the
+/// runtime will perform, rather than reimplementing the sanitization rules.
 #[must_use]
-fn derive_section(path: &str, section_root: &str, section_segment: usize) -> String {
+pub fn derive_section(path: &str, section_root: &str, section_segment: usize) -> String {
     match path
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -695,15 +699,7 @@ impl CreativeOpportunitySlot {
         // skip `compile_patterns`). Re-compiles on every call.
         self.page_patterns
             .iter()
-            .any(|pattern| match Pattern::new(pattern) {
-                Ok(p) => p.matches(path),
-                Err(_) => {
-                    let normalised = pattern.replace("**", "*");
-                    Pattern::new(&normalised)
-                        .map(|p| p.matches(path))
-                        .unwrap_or(false)
-                }
-            })
+            .any(|pattern| compile_page_pattern(pattern).is_ok_and(|p| p.matches(path)))
     }
 
     /// Compile [`page_patterns`](Self::page_patterns) into the
@@ -720,22 +716,20 @@ impl CreativeOpportunitySlot {
         self.compiled_patterns = self
             .page_patterns
             .iter()
-            .filter_map(|pattern| {
-                match Pattern::new(pattern).or_else(|_| Pattern::new(&pattern.replace("**", "*"))) {
-                    Ok(compiled) => Some(compiled),
-                    Err(_) => {
-                        // Build-time validation only requires *one* valid pattern
-                        // per slot, so a mixed valid/invalid set passes the build
-                        // with the bad pattern silently dropped here. Warn so the
-                        // operator can see the slot matches fewer pages than
-                        // configured.
-                        log::warn!(
-                            "slot `{}`: dropping page pattern '{}' — it does not compile as a glob",
-                            self.id,
-                            pattern
-                        );
-                        None
-                    }
+            .filter_map(|pattern| match compile_page_pattern(pattern) {
+                Ok(compiled) => Some(compiled),
+                Err(_) => {
+                    // Build-time validation only requires *one* valid pattern
+                    // per slot, so a mixed valid/invalid set passes the build
+                    // with the bad pattern silently dropped here. Warn so the
+                    // operator can see the slot matches fewer pages than
+                    // configured.
+                    log::warn!(
+                        "slot `{}`: dropping page pattern '{}' — it does not compile as a glob",
+                        self.id,
+                        pattern
+                    );
+                    None
                 }
             })
             .collect();
@@ -998,6 +992,37 @@ pub struct PrebidSlotParams {
     pub bidders: HashMap<String, serde_json::Value>,
 }
 
+/// Compiles a [`page_patterns`](CreativeOpportunitySlot::page_patterns) entry
+/// using the runtime's normalisation.
+///
+/// This is the single definition of what the runtime accepts as a page glob:
+/// a direct [`Pattern::new`], falling back to the `**`→`*` rewrite that
+/// [`CreativeOpportunitySlot::compile_patterns`] and
+/// [`matches_path`](CreativeOpportunitySlot::matches_path) apply. Tooling that
+/// writes patterns into operator config validates them through this function so
+/// it cannot persist a pattern the runtime would silently drop.
+///
+/// # Errors
+///
+/// Returns an error string when the pattern compiles neither directly nor after
+/// normalisation.
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::creative_opportunities::compile_page_pattern;
+///
+/// assert!(compile_page_pattern("/news/*").is_ok());
+/// // `**` in a position the glob crate rejects is normalised to `*`.
+/// assert!(compile_page_pattern("/20**").is_ok());
+/// assert!(compile_page_pattern("[").is_err());
+/// ```
+pub fn compile_page_pattern(pattern: &str) -> Result<Pattern, String> {
+    Pattern::new(pattern)
+        .or_else(|_| Pattern::new(&pattern.replace("**", "*")))
+        .map_err(|error| format!("page pattern '{pattern}' is not a valid glob: {error}"))
+}
+
 /// Validates that a slot ID contains only safe characters.
 ///
 /// Allowed characters: ASCII alphanumerics, underscores (`_`), and hyphens (`-`).
@@ -1030,9 +1055,212 @@ pub fn match_slots<'a>(
     slots.iter().filter(|s| s.matches_path(path)).collect()
 }
 
+/// Three-state outcome of the server-side ad-stack gate.
+///
+/// [`Yes`](RuntimeAdStackExpected::Yes) and [`No`](RuntimeAdStackExpected::No)
+/// are decided purely from known inputs; [`Unknown`](RuntimeAdStackExpected::Unknown)
+/// is reserved for callers (such as the operator CLI) that cannot prove the live
+/// consent state and pass `None` for `consent_allows_auction`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RuntimeAdStackExpected {
+    /// All known gates pass and consent is known to allow the auction.
+    Yes,
+    /// At least one known gate blocks the server-side ad stack.
+    No,
+    /// All known gates pass but consent is unproven.
+    Unknown,
+}
+
+/// Identifies a single gate evaluated by [`evaluate_ad_stack_gate`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum AdStackGateName {
+    /// Request method is `GET`.
+    MethodGet,
+    /// Request is a top-level navigation.
+    Navigation,
+    /// Request is not a prefetch.
+    NotPrefetch,
+    /// Request is not from a known bot.
+    NotBot,
+    /// At least one configured slot matches the request path.
+    MatchedSlots,
+    /// Consent is known to allow the auction.
+    ConsentAllowsAuction,
+    /// The global `[auction].enabled` kill switch is on.
+    AuctionEnabled,
+}
+
+/// Inputs to [`evaluate_ad_stack_gate`].
+///
+/// `consent_allows_auction` is tri-state: `Some(true)` allows, `Some(false)`
+/// blocks, and `None` means the caller cannot prove the consent state.
+#[derive(Debug, Clone, Copy)]
+pub struct AdStackGateInput {
+    /// Request method is `GET`.
+    pub method_get: bool,
+    /// Request is a top-level navigation.
+    pub navigation: bool,
+    /// Request advertises itself as a prefetch.
+    pub prefetch: bool,
+    /// Request is from a known bot.
+    pub bot: bool,
+    /// At least one configured slot matches the request path.
+    pub matched_slots: bool,
+    /// Whether consent allows the auction; `None` when unprovable.
+    pub consent_allows_auction: Option<bool>,
+    /// The global `[auction].enabled` kill switch.
+    pub auction_enabled: bool,
+}
+
+/// Result of [`evaluate_ad_stack_gate`]: the three-state expectation plus the
+/// list of gates that blocked the stack (empty unless `expected` is
+/// [`No`](RuntimeAdStackExpected::No)).
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AdStackGateResult {
+    /// The three-state ad-stack expectation.
+    pub expected: RuntimeAdStackExpected,
+    blocking_gates: Vec<AdStackGateName>,
+}
+
+impl AdStackGateResult {
+    /// Returns the gates that blocked the server-side ad stack.
+    #[must_use]
+    pub fn blocking_gates(&self) -> &[AdStackGateName] {
+        &self.blocking_gates
+    }
+}
+
+/// Evaluates whether the server-side ad stack should run for a request.
+///
+/// Any known gate that fails sets [`No`](RuntimeAdStackExpected::No) and is
+/// recorded in [`AdStackGateResult::blocking_gates`]. When no known gate blocks,
+/// the result is [`Yes`](RuntimeAdStackExpected::Yes) if consent is known to
+/// allow the auction, or [`Unknown`](RuntimeAdStackExpected::Unknown) when
+/// `consent_allows_auction` is `None`.
+///
+/// Gate polarity mirrors the runtime publisher path: `method_get`, `navigation`,
+/// `matched_slots`, and `auction_enabled` block when `false`; `prefetch` and
+/// `bot` block when `true`.
+#[must_use]
+pub fn evaluate_ad_stack_gate(input: AdStackGateInput) -> AdStackGateResult {
+    let mut blocking_gates = Vec::new();
+    if !input.method_get {
+        blocking_gates.push(AdStackGateName::MethodGet);
+    }
+    if !input.navigation {
+        blocking_gates.push(AdStackGateName::Navigation);
+    }
+    if input.prefetch {
+        blocking_gates.push(AdStackGateName::NotPrefetch);
+    }
+    if input.bot {
+        blocking_gates.push(AdStackGateName::NotBot);
+    }
+    if !input.matched_slots {
+        blocking_gates.push(AdStackGateName::MatchedSlots);
+    }
+    if input.consent_allows_auction == Some(false) {
+        blocking_gates.push(AdStackGateName::ConsentAllowsAuction);
+    }
+    if !input.auction_enabled {
+        blocking_gates.push(AdStackGateName::AuctionEnabled);
+    }
+
+    let expected = if !blocking_gates.is_empty() {
+        RuntimeAdStackExpected::No
+    } else if input.consent_allows_auction.is_none() {
+        RuntimeAdStackExpected::Unknown
+    } else {
+        RuntimeAdStackExpected::Yes
+    };
+
+    AdStackGateResult {
+        expected,
+        blocking_gates,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ad_stack_gate_passes_for_eligible_navigation() {
+        let result = evaluate_ad_stack_gate(AdStackGateInput {
+            method_get: true,
+            navigation: true,
+            prefetch: false,
+            bot: false,
+            matched_slots: true,
+            consent_allows_auction: Some(true),
+            auction_enabled: true,
+        });
+
+        assert_eq!(result.expected, RuntimeAdStackExpected::Yes);
+        assert!(result.blocking_gates().is_empty());
+    }
+
+    #[test]
+    fn ad_stack_gate_blocks_known_kill_switch() {
+        let result = evaluate_ad_stack_gate(AdStackGateInput {
+            method_get: true,
+            navigation: true,
+            prefetch: false,
+            bot: false,
+            matched_slots: true,
+            consent_allows_auction: Some(true),
+            auction_enabled: false,
+        });
+
+        assert_eq!(result.expected, RuntimeAdStackExpected::No);
+        assert!(
+            result
+                .blocking_gates()
+                .contains(&AdStackGateName::AuctionEnabled)
+        );
+    }
+
+    #[test]
+    fn ad_stack_gate_is_unknown_when_consent_is_unknown() {
+        let result = evaluate_ad_stack_gate(AdStackGateInput {
+            method_get: true,
+            navigation: true,
+            prefetch: false,
+            bot: false,
+            matched_slots: true,
+            consent_allows_auction: None,
+            auction_enabled: true,
+        });
+
+        assert_eq!(result.expected, RuntimeAdStackExpected::Unknown);
+    }
+
+    // Locks the spec §5.2 mirror invariant: with Some(consent) supplied for every
+    // input combination, `expected == Yes` must equal the legacy all-AND boolean.
+    #[test]
+    fn ad_stack_gate_with_known_consent_matches_legacy_boolean() {
+        for bits in 0u8..128 {
+            let input = AdStackGateInput {
+                method_get: bits & 1 != 0,
+                navigation: bits & 2 != 0,
+                prefetch: bits & 4 != 0,
+                bot: bits & 8 != 0,
+                matched_slots: bits & 16 != 0,
+                consent_allows_auction: Some(bits & 32 != 0),
+                auction_enabled: bits & 64 != 0,
+            };
+            // Legacy semantics: all positive gates true, both negative gates false.
+            let legacy = input.method_get
+                && input.navigation
+                && !input.prefetch
+                && !input.bot
+                && input.matched_slots
+                && input.consent_allows_auction == Some(true)
+                && input.auction_enabled;
+            let got = evaluate_ad_stack_gate(input).expected == RuntimeAdStackExpected::Yes;
+            assert_eq!(got, legacy, "gate mismatch for bits={bits}");
+        }
+    }
 
     fn make_slot(id: &str, patterns: Vec<&str>) -> CreativeOpportunitySlot {
         CreativeOpportunitySlot {
