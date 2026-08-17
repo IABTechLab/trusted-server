@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-20
 
-**Status:** Approved; security model revised 2026-08-17
+**Status:** Proposed security revision; awaiting approval
 
 **Issue:** [IABTechLab/trusted-server#935](https://github.com/IABTechLab/trusted-server/issues/935) — "For SSAT, make debug comment configurable"
 
@@ -21,16 +21,18 @@ This design adds a config table, `[debug.auction_html_comment_options]`,
 alongside the existing bool, with:
 
 1. Section toggles (provider responses / mediator response / bids array).
-2. A configurable subset of an expanded, still-hardcoded metadata allowlist.
+2. A configurable subset of a revised, still-hardcoded safe metadata
+   allowlist.
 3. A three-level `verbosity` switch: `redacted` (safe default), `upstream`
-   (bounded provider error text), and `full` (raw metadata and creatives).
+   (provider diagnostic text), and `full` (raw metadata and creatives).
 
 ## Goals
 
 1. Let an operator omit sections of the dump to keep it small/focused.
 2. Let an operator select which of the already-safe metadata keys to surface.
 3. Surface `http_status` in the safe default mode, and make the already-captured
-   `upstream_message` available through an explicit intermediate `upstream`
+   provider-controlled diagnostic text available through an explicit
+   intermediate `upstream`
    mode so "was it a 400, and for what reason" is answerable without enabling
    the complete provider dump. Upstream text is provider-controlled and may
    echo sensitive request values, so it is not part of `redacted` mode.
@@ -105,6 +107,10 @@ server-side by the prebid integration:
   other request values. It is therefore available only in `upstream` and
   `full` modes, never in the safe `redacted` default.
 
+The current allowlist's `errors` and `warnings` values also come verbatim from
+PBS. They carry the same echo risk as `upstream_message`, so this design moves
+them out of `redacted` and makes them available only in `upstream` and `full`.
+
 Also captured server-side, but deliberately excluded from the allowlist and
 staying that way in redacted mode: the raw `debug` subtree
 (`httpcalls`/`resolvedrequest`) that PBS returns when `integrations.prebid.debug`
@@ -124,8 +130,9 @@ pub struct DebugConfig {
     // inject_adm_for_testing)...
 
     /// Behavior of the ts-debug comment. Only consulted when
-    /// `auction_html_comment` is true. Defaults reproduce today's fixed
-    /// output plus the two allowlist additions below.
+    /// `auction_html_comment` is true. Defaults preserve today's enabled
+    /// sections and redacted creative previews while using the revised safe
+    /// metadata allowlist documented below.
     #[serde(default)]
     pub auction_html_comment_options: AuctionDebugCommentOptions,
 }
@@ -155,8 +162,8 @@ pub struct AuctionDebugCommentOptions {
 
     /// `Redacted` (default): `metadata_keys` subset only, creative preview
     /// truncated to `MAX_BID_CREATIVE_DUMP_BYTES`.
-    /// `Upstream`: the redacted fields plus bounded provider-controlled
-    /// `upstream_message` and `upstream_message_truncated`; creatives remain
+    /// `Upstream`: the redacted fields plus provider-controlled `errors`,
+    /// `warnings`, and bounded `upstream_message` fields; creatives remain
     /// truncated and all other metadata remains filtered.
     /// `Full`: raw `response.metadata` verbatim, including the `debug`
     /// subtree (httpcalls/resolvedrequest — device IP, geo, eids, TC consent
@@ -229,8 +236,6 @@ const AUCTION_DEBUG_METADATA_ALLOWLIST: &[&str] = &[
     "http_status",
     "message",
     "responsetimemillis",
-    "errors",
-    "warnings",
     "bidstatus",
 ];
 ```
@@ -277,16 +282,18 @@ if options.include_mediator_response
   `options.metadata_keys ∩ AUCTION_DEBUG_METADATA_ALLOWLIST`. The intersection
   is computed here, at the render call — this is the actual security
   boundary, not the config struct itself.
-- `Upstream`: the same filtered metadata as `Redacted`, plus
-  `upstream_message` and `upstream_message_truncated` when present. These keys
-  are selected by the enum branch, never by `metadata_keys`, so configuration
-  cannot widen the boundary accidentally. This mode is explicitly sensitive
-  because upstream text may echo request data.
+- `Upstream`: the same filtered metadata as `Redacted`, plus `errors`,
+  `warnings`, `upstream_message`, and `upstream_message_truncated` when
+  present. These keys are selected by the enum branch, never by
+  `metadata_keys`, so configuration cannot widen the boundary accidentally.
+  This mode is explicitly sensitive because PBS supplies these values and its
+  diagnostic text may echo request data.
 - `Full`: `metadata` = `response.metadata.clone()`, unfiltered.
 - `bids` = `[]` when `!options.include_bids`; otherwise each bid goes through
   `redact_bid_for_dump(bid, options)`.
 
-The implementation keeps the two upstream keys in a separate hardcoded const,
+The implementation keeps the four provider-controlled diagnostic keys in a
+separate hardcoded const,
 `AUCTION_DEBUG_UPSTREAM_METADATA_KEYS`. It first builds the safe configured
 intersection, then adds those keys only for `Upstream`; `Full` remains a direct
 copy of all metadata. Pattern-based text redaction is deliberately avoided:
@@ -295,8 +302,10 @@ so presenting such filtering as safe would weaken the fail-closed contract.
 
 `redact_bid_for_dump(bid, options)`:
 
-- `Redacted` and `Upstream`: `creative` truncated to
-  `MAX_BID_CREATIVE_DUMP_BYTES` (512), as today.
+- `Redacted` and `Upstream`: retain at most
+  `MAX_BID_CREATIVE_DUMP_BYTES` (512) bytes of the creative, as today. The
+  appended truncation marker is outside that retained-prefix limit, so the
+  rendered field may be slightly larger than 512 bytes.
 - `Full`: `creative` passed through untruncated.
 
 Unconditional regardless of `options` (safety nets, not redaction controls):
@@ -331,11 +340,12 @@ if settings.debug.auction_html_comment {
    intent is clearly to widen access; fail-closed means the config cannot
    widen the boundary, only narrow what's already inside it.
 2. **Provider-controlled text requires an explicit sensitivity mode.**
-   `upstream_message` is never in the redacted allowlist. It appears only when
-   verbosity is `upstream` or `full`, and only when
-   `integrations.prebid.debug = true` captured it. Operators must treat
-   `upstream` as potentially sensitive because a provider can echo identifiers
-   or request values in an error message.
+   `errors`, `warnings`, `upstream_message`, and
+   `upstream_message_truncated` are never in the redacted allowlist. They
+   appear only when verbosity is `upstream` or `full`; the upstream-message
+   fields additionally require `integrations.prebid.debug = true` to capture
+   them. Operators must treat `upstream` as potentially sensitive because a
+   provider can echo identifiers or request values in diagnostic text.
 3. **Raw structured identity data requires `Full`.** The PBS `debug.httpcalls`
    and `resolvedrequest` subtrees remain excluded in `upstream` mode and require
    `verbosity = "full"` plus `integrations.prebid.debug = true`.
@@ -349,11 +359,15 @@ if settings.debug.auction_html_comment {
 
 ## Edge Cases and Behavior Changes
 
-- **`metadata_keys = []`**: valid; yields `metadata: {}` per response. An
-  operator can explicitly request zero metadata while still seeing bids/status.
+- **`metadata_keys = []`**: valid; yields no configured safe metadata in
+  `Redacted`. In `Upstream`, provider-controlled diagnostic fields may still
+  be added by that explicit sensitivity mode. `Full` ignores the selector and
+  copies all metadata. An operator can therefore request zero metadata only
+  while remaining in `Redacted`.
 - **`verbosity=Upstream` is intentionally narrower than `Full`**: it adds only
-  the bounded upstream error message fields. It does not expose arbitrary
-  metadata, raw PBS requests/responses, or untruncated creatives.
+  the provider-controlled `errors`/`warnings` diagnostics and bounded upstream
+  error message fields. It does not expose arbitrary metadata, raw PBS
+  requests/responses, or untruncated creatives.
 - **`verbosity=Full` value is provider-dependent**: only `prebid.rs` populates
   `metadata["debug"]` today. For `aps` and other direct integrations, `Full`
   only removes creative truncation and the metadata filter — there's no
@@ -381,10 +395,11 @@ Arrange-Act-Assert, matching existing `auction_debug_comment_*` tests — no
   key is gone and structured `http_status` is added. The fixture must contain
   the relevant metadata so the assertion proves the behavior.
 - `configured_metadata_subset_only_includes_selected_safe_keys`
-- `redacted_mode_never_surfaces_provider_controlled_upstream_message` — use an
-  identity-shaped marker to prove the default privacy boundary.
-- `upstream_mode_includes_bounded_upstream_message_but_not_debug_subtree`
-- `metadata_keys_empty_yields_empty_metadata_object`
+- `redacted_mode_never_surfaces_provider_controlled_diagnostic_text` — put
+  identity-shaped markers in `errors`, `warnings`, and `upstream_message` to
+  prove the default privacy boundary.
+- `upstream_mode_includes_provider_diagnostics_but_not_debug_subtree`
+- `metadata_keys_empty_yields_empty_safe_metadata_in_redacted`
 - `metadata_keys_attack_vector_debug_key_never_surfaces_in_redacted_mode` —
   configuring `metadata_keys = ["debug"]` under `Redacted` still produces no
   `debug` key. This is the load-bearing security test for this whole design.
@@ -415,7 +430,7 @@ include_mediator_response = true
 include_bids = true
 metadata_keys = [
     "error_type", "http_status", "message",
-    "responsetimemillis", "errors", "warnings", "bidstatus",
+    "responsetimemillis", "bidstatus",
 ]
 # "redacted" (default), "upstream", or "full".
 # "upstream" exposes provider-controlled error text, which may echo request
