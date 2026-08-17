@@ -114,6 +114,51 @@ async fn authenticated_admin_routes_return_501() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_admin_ec_routes_return_501() {
+    // The EC identity graph is Fastly KV backed, so Spin answers the admin
+    // EC lookup routes locally with 501 instead of letting them fall through
+    // to the publisher fallback.
+    let sample_ec_id = format!("{}.abc123", "a".repeat(64));
+    for path in [
+        "/_ts/admin/ec".to_owned(),
+        format!("/_ts/admin/ec/{sample_ec_id}"),
+    ] {
+        let req = request_builder()
+            .method("GET")
+            .uri(&path)
+            .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request");
+        let resp = route(test_router(), req).await;
+
+        assert_eq!(
+            resp.status().as_u16(),
+            501,
+            "{path} should report that Spin EC lookup is unsupported"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_admin_eids_route_returns_200() {
+    // The EIDs echo is pure request inspection (no KV), so this adapter
+    // serves the real handler.
+    let req = request_builder()
+        .method("GET")
+        .uri("/_ts/admin/eids")
+        .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build request");
+    let resp = route(test_router(), req).await;
+
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "/_ts/admin/eids should serve the real EIDs echo handler"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_route_returns_ok() {
     // Parity with the Fastly/Axum adapters: GET /health is a cheap liveness probe
     // answering 200 "ok", not routed through publisher handling.
