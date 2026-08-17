@@ -20,7 +20,7 @@ use crate::ad_templates::expected::{ExpectedSlot, expected_slots_for_path, norma
 use crate::ad_templates::output::{
     ConfiguredJson, EvidencePhaseJson, ExtraEvidenceJson, FormatJson, GateState, Gates,
     GptEvidenceJson, PageJson, RuntimeAdStackExpectedJson, SlotEvidenceJson, SlotJson, SlotStatus,
-    VerificationReport, Warning,
+    VerificationReport, Warning, escape_terminal_text,
 };
 use crate::commands::audit::AuditAdTemplatesVerifyArgs;
 use crate::commands::audit::collector::{
@@ -41,8 +41,11 @@ pub(crate) fn run_verify(args: &AuditAdTemplatesVerifyArgs) -> Result<(), String
         loaded.settings.creative_opportunities.as_ref(),
         loaded.settings.auction.enabled,
         &args.urls,
-        args.strict,
-        args.scroll,
+        VerifyOptions {
+            strict: args.strict,
+            scroll: args.scroll,
+            allow_cross_origin_redirect: args.allow_cross_origin_redirect,
+        },
         &args.cookies,
     );
 
@@ -61,6 +64,17 @@ pub(crate) fn run_verify(args: &AuditAdTemplatesVerifyArgs) -> Result<(), String
     }
 }
 
+/// Run-level verification switches.
+#[derive(Debug, Clone, Copy)]
+struct VerifyOptions {
+    /// Exit non-zero when a matched slot is missing or only partially confirmed.
+    strict: bool,
+    /// Perform a deterministic scroll pass after the initial settle.
+    scroll: bool,
+    /// Accept evidence from a page that redirected to a different origin.
+    allow_cross_origin_redirect: bool,
+}
+
 /// Builds the verification report for `urls` using `collector`.
 ///
 /// `creative` is the effective `[creative_opportunities]` config (if any) and
@@ -70,8 +84,7 @@ fn build_report(
     creative: Option<&CreativeOpportunitiesConfig>,
     auction_enabled: bool,
     urls: &[url::Url],
-    strict: bool,
-    scroll: bool,
+    options: VerifyOptions,
     cookies: &[(String, String)],
 ) -> VerificationReport {
     let init_script = build_init_script(creative);
@@ -84,7 +97,7 @@ fn build_report(
         let request = BrowserCollectRequest {
             url: url.clone(),
             init_scripts: init_script.clone().into_iter().collect(),
-            scroll,
+            scroll: options.scroll,
             collect_ad_evidence: true,
             cookies: cookies.to_vec(),
         };
@@ -94,9 +107,20 @@ fn build_report(
                 any_error = true;
                 pages.push(error_page(url, &message));
             }
+            // Slots are matched on the *final* path, so a redirect to a
+            // different origin would let an unrelated site's evidence satisfy
+            // `--strict` — and the path-equality redirect warning would not even
+            // fire when the paths happen to agree. Reject unless opted in.
+            Ok(collected)
+                if !options.allow_cross_origin_redirect
+                    && origin_changed(url, &collected.final_url) =>
+            {
+                any_error = true;
+                pages.push(cross_origin_page(url, &collected.final_url));
+            }
             Ok(collected) => {
                 let (page, strict_failed) = build_page(url, &collected, creative, auction_enabled);
-                if strict && strict_failed {
+                if options.strict && strict_failed {
                     any_strict_fail = true;
                 }
                 pages.push(page);
@@ -104,13 +128,18 @@ fn build_report(
         }
     }
 
-    let ok = !(any_error || (strict && any_strict_fail));
+    let ok = !(any_error || (options.strict && any_strict_fail));
     VerificationReport {
         ok,
-        strict,
+        strict: options.strict,
         pages,
         warnings: Vec::new(),
     }
+}
+
+/// Whether navigation left the requested URL's origin (scheme, host, or port).
+fn origin_changed(requested: &url::Url, final_url: &url::Url) -> bool {
+    requested.origin() != final_url.origin()
 }
 
 /// Builds the read-only collector init script from the configured slots.
@@ -227,6 +256,37 @@ fn error_page(requested: &url::Url, message: &str) -> PageJson {
     }
 }
 
+/// Builds a page-level cross-origin-redirect refusal.
+///
+/// The final URL is reported so the operator can re-run against it explicitly
+/// (or pass `--allow-cross-origin-redirect`) once they have confirmed it is
+/// their own property.
+fn cross_origin_page(requested: &url::Url, final_url: &url::Url) -> PageJson {
+    let requested_path = normalize_path_or_url(requested.as_str()).unwrap_or_else(|_| "/".into());
+    PageJson {
+        url: requested.to_string(),
+        final_url: Some(final_url.to_string()),
+        requested_path,
+        path: None,
+        error: Some(Warning {
+            code: "cross_origin_redirect".to_string(),
+            message: format!(
+                "navigation left the requested origin ({} -> {}); \
+                 evidence from another origin is not accepted as verification. \
+                 Re-run against the final URL, or pass --allow-cross-origin-redirect",
+                requested.origin().ascii_serialization(),
+                final_url.origin().ascii_serialization(),
+            ),
+        }),
+        runtime_ad_stack_expected: None,
+        gates: None,
+        matched_slot_count: None,
+        slots: Vec::new(),
+        extra_evidence: Vec::new(),
+        warnings: Vec::new(),
+    }
+}
+
 fn empty_evidence() -> BrowserAdEvidence {
     BrowserAdEvidence {
         dom_ids: Vec::new(),
@@ -325,10 +385,29 @@ fn write_json(out: &mut dyn Write, report: &VerificationReport) -> Result<(), St
 }
 
 fn write_human(out: &mut dyn Write, report: &VerificationReport) -> Result<(), String> {
+    // Warning codes and messages can originate in the audited page (the
+    // collector forwards `String(error)` from page scripts), so escape control
+    // characters before writing them to the operator's terminal.
+    let write_warning = |out: &mut dyn Write, indent: &str, warning: &Warning| {
+        writeln!(
+            out,
+            "{indent}warning [{}]: {}",
+            escape_terminal_text(&warning.code),
+            escape_terminal_text(&warning.message)
+        )
+        .map_err(write_err)
+    };
+
     for page in &report.pages {
         writeln!(out, "url: {}", page.url).map_err(write_err)?;
         if let Some(error) = &page.error {
-            writeln!(out, "  error [{}]: {}", error.code, error.message).map_err(write_err)?;
+            writeln!(
+                out,
+                "  error [{}]: {}",
+                escape_terminal_text(&error.code),
+                escape_terminal_text(&error.message)
+            )
+            .map_err(write_err)?;
             continue;
         }
         if let Some(path) = &page.path {
@@ -338,13 +417,11 @@ fn write_human(out: &mut dyn Write, report: &VerificationReport) -> Result<(), S
             writeln!(out, "  slot {}: {}", slot.id, status_label(slot.status))
                 .map_err(write_err)?;
             for warning in &slot.warnings {
-                writeln!(out, "    warning [{}]: {}", warning.code, warning.message)
-                    .map_err(write_err)?;
+                write_warning(out, "    ", warning)?;
             }
         }
         for warning in &page.warnings {
-            writeln!(out, "  warning [{}]: {}", warning.code, warning.message)
-                .map_err(write_err)?;
+            write_warning(out, "  ", warning)?;
         }
     }
     writeln!(out, "ok: {}", report.ok).map_err(write_err)
@@ -450,6 +527,24 @@ mod tests {
         strict: bool,
         urls: &[&str],
     ) -> VerificationReport {
+        report_for_with_options(
+            collector,
+            auction_enabled,
+            urls,
+            VerifyOptions {
+                strict,
+                scroll: false,
+                allow_cross_origin_redirect: false,
+            },
+        )
+    }
+
+    fn report_for_with_options(
+        collector: &dyn AuditCollector,
+        auction_enabled: bool,
+        urls: &[&str],
+        options: VerifyOptions,
+    ) -> VerificationReport {
         let config = news_config();
         let parsed: Vec<url::Url> = urls
             .iter()
@@ -460,8 +555,7 @@ mod tests {
             Some(&config),
             auction_enabled,
             &parsed,
-            strict,
-            false,
+            options,
             &[],
         )
     }
@@ -484,6 +578,75 @@ mod tests {
         assert!(
             warnings.iter().any(|w| w["code"] == "redirected"),
             "redirect should emit a `redirected` warning"
+        );
+    }
+
+    #[test]
+    fn cross_origin_redirect_is_rejected_even_when_paths_match() {
+        // Same path on a different origin: the redirect warning would not fire,
+        // so without the origin check this unrelated page's evidence would
+        // satisfy --strict.
+        let collector = FakeCollector::page(
+            "https://www.example.com/news/story",
+            "https://impostor.example.net/news/story",
+            confirmed_news_evidence(),
+        );
+        let report = report_for(
+            &collector,
+            true,
+            true,
+            &["https://www.example.com/news/story"],
+        );
+
+        assert!(!report.ok, "a cross-origin redirect must not report ok");
+        let json = serde_json::to_value(&report).expect("should serialize");
+        assert_eq!(json["pages"][0]["error"]["code"], "cross_origin_redirect");
+        assert!(
+            json["pages"][0]["slots"]
+                .as_array()
+                .expect("slots array")
+                .is_empty(),
+            "off-origin evidence must not be reported as slot verification"
+        );
+    }
+
+    #[test]
+    fn cross_origin_redirect_is_accepted_with_explicit_opt_in() {
+        let collector = FakeCollector::page(
+            "https://example.com/news/story",
+            "https://www.example.com/news/story",
+            confirmed_news_evidence(),
+        );
+        let report = report_for_with_options(
+            &collector,
+            true,
+            &["https://example.com/news/story"],
+            VerifyOptions {
+                strict: true,
+                scroll: false,
+                allow_cross_origin_redirect: true,
+            },
+        );
+
+        assert!(
+            report.ok,
+            "an opted-in apex -> www redirect should verify normally"
+        );
+        assert_eq!(report.pages[0].matched_slot_count, Some(1));
+    }
+
+    #[test]
+    fn same_origin_path_redirect_still_verifies() {
+        let collector = FakeCollector::page(
+            "https://www.example.com/",
+            "https://www.example.com/news/story",
+            confirmed_news_evidence(),
+        );
+        let report = report_for(&collector, true, true, &["https://www.example.com/"]);
+
+        assert!(
+            report.ok,
+            "a same-origin redirect should still be verified, not refused"
         );
     }
 

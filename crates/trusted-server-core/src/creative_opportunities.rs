@@ -531,15 +531,7 @@ impl CreativeOpportunitySlot {
         // skip `compile_patterns`). Re-compiles on every call.
         self.page_patterns
             .iter()
-            .any(|pattern| match Pattern::new(pattern) {
-                Ok(p) => p.matches(path),
-                Err(_) => {
-                    let normalised = pattern.replace("**", "*");
-                    Pattern::new(&normalised)
-                        .map(|p| p.matches(path))
-                        .unwrap_or(false)
-                }
-            })
+            .any(|pattern| compile_page_pattern(pattern).is_ok_and(|p| p.matches(path)))
     }
 
     /// Compile [`page_patterns`](Self::page_patterns) into the
@@ -556,22 +548,20 @@ impl CreativeOpportunitySlot {
         self.compiled_patterns = self
             .page_patterns
             .iter()
-            .filter_map(|pattern| {
-                match Pattern::new(pattern).or_else(|_| Pattern::new(&pattern.replace("**", "*"))) {
-                    Ok(compiled) => Some(compiled),
-                    Err(_) => {
-                        // Build-time validation only requires *one* valid pattern
-                        // per slot, so a mixed valid/invalid set passes the build
-                        // with the bad pattern silently dropped here. Warn so the
-                        // operator can see the slot matches fewer pages than
-                        // configured.
-                        log::warn!(
-                            "slot `{}`: dropping page pattern '{}' — it does not compile as a glob",
-                            self.id,
-                            pattern
-                        );
-                        None
-                    }
+            .filter_map(|pattern| match compile_page_pattern(pattern) {
+                Ok(compiled) => Some(compiled),
+                Err(_) => {
+                    // Build-time validation only requires *one* valid pattern
+                    // per slot, so a mixed valid/invalid set passes the build
+                    // with the bad pattern silently dropped here. Warn so the
+                    // operator can see the slot matches fewer pages than
+                    // configured.
+                    log::warn!(
+                        "slot `{}`: dropping page pattern '{}' — it does not compile as a glob",
+                        self.id,
+                        pattern
+                    );
+                    None
                 }
             })
             .collect();
@@ -832,6 +822,37 @@ pub struct PrebidSlotParams {
     /// explicit per-bidder params only when you do not need zone-aware overrides.
     #[serde(default)]
     pub bidders: HashMap<String, serde_json::Value>,
+}
+
+/// Compiles a [`page_patterns`](CreativeOpportunitySlot::page_patterns) entry
+/// using the runtime's normalisation.
+///
+/// This is the single definition of what the runtime accepts as a page glob:
+/// a direct [`Pattern::new`], falling back to the `**`→`*` rewrite that
+/// [`CreativeOpportunitySlot::compile_patterns`] and
+/// [`matches_path`](CreativeOpportunitySlot::matches_path) apply. Tooling that
+/// writes patterns into operator config validates them through this function so
+/// it cannot persist a pattern the runtime would silently drop.
+///
+/// # Errors
+///
+/// Returns an error string when the pattern compiles neither directly nor after
+/// normalisation.
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::creative_opportunities::compile_page_pattern;
+///
+/// assert!(compile_page_pattern("/news/*").is_ok());
+/// // `**` in a position the glob crate rejects is normalised to `*`.
+/// assert!(compile_page_pattern("/20**").is_ok());
+/// assert!(compile_page_pattern("[").is_err());
+/// ```
+pub fn compile_page_pattern(pattern: &str) -> Result<Pattern, String> {
+    Pattern::new(pattern)
+        .or_else(|_| Pattern::new(&pattern.replace("**", "*")))
+        .map_err(|error| format!("page pattern '{pattern}' is not a valid glob: {error}"))
 }
 
 /// Validates that a slot ID contains only safe characters.

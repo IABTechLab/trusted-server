@@ -345,11 +345,26 @@ pub(super) fn splice_creative_slots(
     let rendered = rendered_slots.trim_matches('\n');
     let existing = remove_inline_slot_value(existing)?;
 
-    // No section yet — append a fresh one with the network id and slots.
-    if !existing
+    // Presence is decided structurally (toml_edit), but the splice below is a
+    // line edit that only recognises a canonical `[creative_opportunities]`
+    // header. Reconciling the two here keeps a valid-but-unrecognised form —
+    // a quoted `["creative_opportunities"]` header, a top-level
+    // `creative_opportunities = { ... }` inline table, or a section implied
+    // only by its subtables — from being treated as absent and getting a
+    // duplicate table appended, which would produce invalid TOML.
+    let has_canonical_header = existing
         .lines()
-        .any(|line| is_table_header(line, "[creative_opportunities]"))
-    {
+        .any(|line| is_table_header(line, "[creative_opportunities]"));
+    if section_is_present(&existing)? && !has_canonical_header {
+        return cli_error(
+            "target config declares `creative_opportunities` in a form this updater cannot \
+             edit safely; rewrite it as a `[creative_opportunities]` table (with \
+             `[[creative_opportunities.slot]]` entries) and re-run",
+        );
+    }
+
+    // No section yet — append a fresh one with the network id and slots.
+    if !has_canonical_header {
         let mut result = existing;
         if !result.is_empty() && !result.ends_with('\n') {
             result.push('\n');
@@ -443,6 +458,22 @@ pub(super) fn splice_creative_slots(
         result = result.replace('\n', "\r\n");
     }
     Ok(result)
+}
+
+/// Whether `document` declares `creative_opportunities` at all, in any valid
+/// TOML representation (canonical table, quoted header, inline table, or a
+/// section implied only by its subtables).
+///
+/// # Errors
+///
+/// Returns an error when the document does not parse as TOML.
+fn section_is_present(document: &str) -> CliResult<bool> {
+    let parsed = document.parse::<DocumentMut>().map_err(|error| {
+        report_error(format!(
+            "failed to parse target config before updating slots: {error}"
+        ))
+    })?;
+    Ok(parsed.get("creative_opportunities").is_some())
 }
 
 /// Removes a scalar `creative_opportunities.slot` value so it can be replaced
@@ -635,6 +666,108 @@ mod tests {
             "trailing auction section preserved"
         );
         toml::from_str::<toml::Value>(&out).expect("spliced config is valid TOML");
+    }
+
+    #[test]
+    fn splice_rejects_quoted_section_header_instead_of_duplicating_it() {
+        // A quoted header is valid TOML but the line-based splice does not
+        // recognise it; appending a second `[creative_opportunities]` would
+        // produce a document that no longer parses.
+        let existing = "[\"creative_opportunities\"]\ngam_network_id = \"111\"\n";
+
+        let error = splice_creative_slots(existing, Some("222"), &header_rendered())
+            .expect_err("should refuse an unrecognised section form");
+
+        assert!(
+            format!("{error:?}").contains("cannot edit safely"),
+            "error should tell the operator to rewrite the section, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn splice_rejects_top_level_inline_creative_opportunities_table() {
+        let existing = "creative_opportunities = { gam_network_id = \"111\" }\n";
+
+        let error = splice_creative_slots(existing, Some("222"), &header_rendered())
+            .expect_err("should refuse a top-level inline table");
+
+        assert!(
+            format!("{error:?}").contains("cannot edit safely"),
+            "error should tell the operator to rewrite the section, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn splice_appends_section_when_config_has_none() {
+        let existing = "[publisher]\ndomain = \"x\"\n";
+
+        let out = splice_creative_slots(existing, Some("222"), &header_rendered())
+            .expect("should append a fresh section");
+
+        let value = toml::from_str::<toml::Value>(&out).expect("appended config is valid TOML");
+        assert_eq!(
+            value["creative_opportunities"]["gam_network_id"].as_str(),
+            Some("222")
+        );
+    }
+
+    #[test]
+    fn splice_preserves_section_scalars_and_provider_subtables() {
+        // Mirrors the templated operator shape: section policy scalars in the
+        // head block and a per-slot prebid provider subtable.
+        let existing = "[creative_opportunities]\n\
+             gam_network_id = \"111\"\n\
+             auction_timeout_ms = 2000\n\
+             section_root = \"homepage\"\n\n\
+             [[creative_opportunities.slot]]\n\
+             id = \"ad-header-0\"\n\
+             div_id = \"ad-header-0\"\n\
+             gam_unit_path = \"/{network_id}/example/{section}\"\n\
+             page_patterns = [\"/\"]\n\
+             formats = [{ width = 728, height = 90 }]\n\
+             [creative_opportunities.slot.providers.prebid]\n\
+             bidders = {}\n\n\
+             [auction]\nenabled = true\n";
+        let existing_config = existing_config(
+            &existing
+                .replace("[creative_opportunities]\n", "")
+                .replace("[[creative_opportunities.slot]]", "[[slot]]")
+                .replace("[creative_opportunities.slot.", "[slot.")
+                .replace("\n[auction]\nenabled = true\n", ""),
+        );
+        let discovered = discovered_header_slot();
+        let merged = merge_slots(
+            Some(&existing_config),
+            &discovered,
+            &["/news/*".to_string()],
+            false,
+        );
+
+        let out = splice_creative_slots(existing, Some("111"), &render_slots(&merged))
+            .expect("should splice");
+
+        let value = toml::from_str::<toml::Value>(&out).expect("spliced config is valid TOML");
+        let creative = &value["creative_opportunities"];
+        assert_eq!(
+            creative["section_root"].as_str(),
+            Some("homepage"),
+            "section policy scalars must survive the splice"
+        );
+        assert_eq!(creative["auction_timeout_ms"].as_integer(), Some(2000));
+        assert_eq!(
+            creative["slot"][0]["gam_unit_path"].as_str(),
+            Some("/{network_id}/example/{section}"),
+            "an existing templated unit path must not be rewritten to a literal"
+        );
+        assert!(
+            creative["slot"][0]["providers"]["prebid"]["bidders"].is_table(),
+            "the prebid provider subtable must be re-emitted"
+        );
+        assert_eq!(
+            value["auction"]["enabled"].as_bool(),
+            Some(true),
+            "trailing sections must be preserved"
+        );
     }
 
     #[test]

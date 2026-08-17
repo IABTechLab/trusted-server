@@ -251,13 +251,27 @@ pub fn compare_page_evidence(
     for slot in expected {
         let resolved = resolve_dom(&evidence.dom_ids, &slot.div_id);
         let resolved_id = resolved.map(|dom| dom.dom_id.clone());
-        let gpt_idx = evidence.gpt_slots.iter().position(|gpt| {
-            gpt.gam_unit_path == slot.gam_unit_path
-                && gpt_div_matches(&gpt.div_id, slot, resolved_id.as_deref())
+        // An unrenderable (`None`) configured path can never match live GPT
+        // evidence; matching on anything else would confirm the wrong unit.
+        let gpt_idx = slot.gam_unit_path.as_deref().and_then(|unit_path| {
+            evidence.gpt_slots.iter().position(|gpt| {
+                gpt.gam_unit_path == unit_path
+                    && gpt_div_matches(&gpt.div_id, slot, resolved_id.as_deref())
+            })
         });
 
         let banner = banner_sizes(slot);
         let mut warnings = Vec::new();
+        if slot.gam_unit_path.is_none() {
+            warnings.push(warning(
+                "gam_unit_path_unrenderable",
+                format!(
+                    "slot `{}` gam_unit_path template renders past GAM's unit-path byte limit \
+                     for this page's section; the runtime rejects this config",
+                    slot.id
+                ),
+            ));
+        }
 
         let (status, dom_for_evidence, gpt_for_evidence, phase) = if let Some(idx) = gpt_idx {
             consumed_gpt[idx] = true;
@@ -434,7 +448,7 @@ mod tests {
         ExpectedSlot {
             id: id.to_string(),
             div_id: div_id.to_string(),
-            gam_unit_path: gam_unit_path.to_string(),
+            gam_unit_path: Some(gam_unit_path.to_string()),
             formats: sizes
                 .iter()
                 .map(|&(width, height)| ExpectedFormat {
@@ -453,7 +467,7 @@ mod tests {
         ExpectedSlot {
             id: id.to_string(),
             div_id: div_id.to_string(),
-            gam_unit_path: gam_unit_path.to_string(),
+            gam_unit_path: Some(gam_unit_path.to_string()),
             formats: vec![ExpectedFormat {
                 width: 0,
                 height: 0,
@@ -484,6 +498,36 @@ mod tests {
         assert!(
             result.slots[0].warnings.is_empty(),
             "confirmed slot should carry no warnings"
+        );
+    }
+
+    #[test]
+    fn unrenderable_gam_unit_path_never_confirms() {
+        let mut expected = expected_slot("atf", "ad-atf-", "/123/news/atf", &[(300, 250)], &[]);
+        expected.gam_unit_path = None;
+        let evidence = evidence(
+            vec![dom("ad-atf-0")],
+            vec![gpt_slot("/123/news/atf", "ad-atf-0", &[(300, 250)])],
+            Vec::new(),
+        );
+
+        let result = compare_page_evidence(
+            &[expected],
+            &evidence,
+            RuntimeGateSummary::unknown_allowed(),
+        );
+
+        assert_eq!(
+            result.slots[0].status,
+            SlotStatus::Partial,
+            "an unrenderable configured path must not confirm against GPT evidence"
+        );
+        assert!(
+            result.slots[0]
+                .warnings
+                .iter()
+                .any(|w| w.code == "gam_unit_path_unrenderable"),
+            "should explain why the slot cannot be confirmed"
         );
     }
 

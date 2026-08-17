@@ -138,6 +138,27 @@ ts audit generate https://publisher.example --force
 The legacy `ts audit <url>` form remains a compatibility alias for artifact
 generation. New automation should use `ts audit generate <url>`.
 
+### Audit safety defaults
+
+Every `ts audit` browser session validates TLS certificates. This matters
+because `--cookie` sends a real session to the origin and the page's own
+response becomes the audit's evidence, so a certificate-invalid host could both
+harvest the session and fabricate what the audit reports. Override only for a
+host you control with a known self-signed certificate:
+
+```bash
+ts audit page https://staging.publisher.example --danger-accept-invalid-certs
+```
+
+`ts audit ad-templates verify` matches configured slots against the
+**post-redirect** path, so it refuses a redirect that leaves the requested
+origin rather than accepting another site's evidence as verification. Allow it
+for a known redirect between your own properties (for example apex to `www`):
+
+```bash
+ts audit ad-templates verify https://publisher.example/ --allow-cross-origin-redirect
+```
+
 `ts audit` is not an EdgeZero adapter command. It has no `--adapter` option and
 it does not provision resources, push config, build, deploy, or contact platform
 APIs.

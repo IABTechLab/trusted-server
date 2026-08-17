@@ -25,6 +25,16 @@ function __ts_push(list, entry) {
   if (list.length < __ts_max_entries) list.push(entry)
 }
 
+// GPT sizes reach Rust as u32 pairs, so anything non-integral (fluid slots,
+// NaN, negative or fractional dimensions) must be dropped here — a single bad
+// pair would fail deserialization of the whole evidence payload and discard
+// every other slot's otherwise valid evidence.
+function __ts_size_pair(width, height) {
+  if (!Number.isInteger(width) || !Number.isInteger(height)) return null
+  if (width < 0 || height < 0) return null
+  return [width, height]
+}
+
 function __ts_normalize_sizes(sizes) {
   const out = []
   if (!Array.isArray(sizes)) return out
@@ -32,8 +42,9 @@ function __ts_normalize_sizes(sizes) {
   const pairs = typeof sizes[0] === "number" ? [sizes] : sizes
   for (const size of pairs) {
     if (out.length >= __ts_max_entries) break
-    if (Array.isArray(size) && typeof size[0] === "number" && typeof size[1] === "number") {
-      out.push([size[0], size[1]])
+    const pair = Array.isArray(size) ? __ts_size_pair(size[0], size[1]) : null
+    if (pair) {
+      out.push(pair)
     } else {
       __ts_push(__ts_ev.warnings, {
         code: "fluid_size_ignored",
@@ -148,10 +159,21 @@ window.__tsCollectAdTemplateEvidence = function () {
           const sizes = []
           for (const size of rawSizes) {
             if (sizes.length >= __ts_max_entries) break
-            if (size && typeof size.getWidth === "function") {
-              sizes.push([size.getWidth(), size.getHeight()])
-            } else if (Array.isArray(size) && typeof size[0] === "number") {
-              sizes.push([size[0], size[1]])
+            let pair = null
+            if (size && typeof size.getWidth === "function" && typeof size.getHeight === "function") {
+              // A fluid GPT size answers getWidth()/getHeight() with a
+              // non-numeric value rather than throwing.
+              pair = __ts_size_pair(size.getWidth(), size.getHeight())
+            } else if (Array.isArray(size)) {
+              pair = __ts_size_pair(size[0], size[1])
+            }
+            if (pair) {
+              sizes.push(pair)
+            } else {
+              __ts_push(__ts_ev.warnings, {
+                code: "fluid_size_ignored",
+                message: "non-numeric GPT size ignored",
+              })
             }
           }
           const exists = __ts_ev.gpt_slots.some(

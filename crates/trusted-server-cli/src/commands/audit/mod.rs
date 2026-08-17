@@ -156,6 +156,13 @@ pub(crate) struct AuditAdTemplatesVerifyArgs {
     /// Perform a deterministic scroll pass after the initial settle.
     #[arg(long)]
     pub scroll: bool,
+    /// Accept evidence from a page that redirected to a different origin.
+    ///
+    /// Off by default: slots are matched on the post-redirect path, so an
+    /// off-origin page could otherwise satisfy `--strict`. Enable only for a
+    /// known redirect between your own properties (e.g. apex to `www`).
+    #[arg(long)]
+    pub allow_cross_origin_redirect: bool,
     /// Cookie to send with each page request, as `name=value`. Repeatable.
     /// Use to carry an existing session (e.g. a valid bot-protection clearance
     /// cookie) so the origin serves the real page instead of a challenge.

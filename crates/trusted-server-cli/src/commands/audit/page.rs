@@ -4,6 +4,7 @@ use std::io::{self, Write};
 
 use clap::Args;
 
+use crate::ad_templates::output::escape_terminal_text;
 use crate::commands::audit::browser::BrowserCollector;
 use crate::commands::audit::collector::{
     AuditCollector, BrowserCollectRequest, BrowserOpts, CollectedPage,
@@ -57,11 +58,19 @@ fn write_summary(out: &mut dyn Write, url: &url::Url, page: &CollectedPage) -> R
     let to_err = |error: io::Error| format!("failed to write command output: {error}");
     writeln!(out, "url: {url}").map_err(to_err)?;
     writeln!(out, "final url: {}", page.final_url).map_err(to_err)?;
-    writeln!(out, "title: {}", page.title).map_err(to_err)?;
+    // The title and collector warning messages are page-controlled, so escape
+    // control characters before they reach the operator's terminal.
+    writeln!(out, "title: {}", escape_terminal_text(&page.title)).map_err(to_err)?;
     writeln!(out, "scripts: {}", page.script_count).map_err(to_err)?;
     writeln!(out, "resources: {}", page.resource_count).map_err(to_err)?;
     for warning in &page.warnings {
-        writeln!(out, "warning [{}]: {}", warning.code, warning.message).map_err(to_err)?;
+        writeln!(
+            out,
+            "warning [{}]: {}",
+            escape_terminal_text(&warning.code),
+            escape_terminal_text(&warning.message)
+        )
+        .map_err(to_err)?;
     }
     Ok(())
 }

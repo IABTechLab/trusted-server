@@ -28,6 +28,15 @@ pub struct BrowserOpts {
     /// Hard cap in milliseconds on waiting for the page to settle.
     #[arg(long, default_value_t = 10_000)]
     pub settle_max_ms: u64,
+    /// Navigate to origins whose TLS certificate does not validate.
+    ///
+    /// DANGEROUS: the audit sends any `--cookie` session to the origin and
+    /// treats what it reads back as verification evidence, so an invalid
+    /// certificate could mean an impersonator is harvesting the session and
+    /// fabricating the evidence. Use only against a host you control with a
+    /// known self-signed certificate.
+    #[arg(long)]
+    pub danger_accept_invalid_certs: bool,
 }
 
 /// A request to collect a single page.

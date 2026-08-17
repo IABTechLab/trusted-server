@@ -10,7 +10,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
-use trusted_server_core::creative_opportunities::CreativeOpportunitiesConfig;
+use trusted_server_core::creative_opportunities::{
+    CreativeOpportunitiesConfig, compile_page_pattern,
+};
 use url::Url;
 
 use crate::commands::audit::generate::collector::AuditCollector;
@@ -22,6 +24,45 @@ use crate::commands::config::init::EXAMPLE_CONFIG;
 use crate::error::{CliResult, cli_error, report_error};
 
 use analyzer::{analyze_collected_page, extract_gtm_container_id};
+
+/// Writes `contents` to `path` atomically: a same-directory temp file is
+/// written and fsynced, then renamed over the target, then the directory entry
+/// is fsynced.
+///
+/// A plain `fs::write` truncates the destination before writing, so a full disk
+/// or an interrupted run would leave an operator's `trusted-server.toml` empty
+/// or half-written. `rename` within a directory is atomic, so a reader sees
+/// either the old file or the complete new one.
+///
+/// The target's existing permissions are carried onto the replacement, since
+/// the temp file is created 0600 and the config may intentionally be broader.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error when the temp file cannot be created,
+/// written, synced, or renamed over `path`.
+fn write_file_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    let mut temp = tempfile::Builder::new()
+        .prefix(".ts-audit-")
+        .tempfile_in(directory)?;
+    temp.write_all(contents.as_bytes())?;
+    temp.as_file().sync_all()?;
+    if let Ok(metadata) = fs::metadata(path) {
+        temp.as_file().set_permissions(metadata.permissions())?;
+    }
+    temp.persist(path).map_err(|error| error.error)?;
+
+    // Best-effort durability for the rename itself. Opening a directory handle
+    // is not portable (Windows rejects it), and the content is already safely
+    // on disk either way, so a failure here is not worth failing the command.
+    let _ = fs::File::open(directory).and_then(|handle| handle.sync_all());
+    Ok(())
+}
 
 /// Arguments for `ts audit generate <url>` — bootstraps draft Trusted Server
 /// config and JavaScript asset audit files from a live page (issue #800).
@@ -229,7 +270,7 @@ fn write_audit_outputs(outputs: &AuditOutputs, plan: &AuditOutputPlan) -> CliRes
 
     let mut written_paths = Vec::new();
     if let Some(path) = &plan.js_assets_path {
-        fs::write(path, &outputs.js_assets_toml).map_err(|error| {
+        write_file_atomically(path, &outputs.js_assets_toml).map_err(|error| {
             report_error(format!(
                 "failed to write JS asset audit {}: {error}",
                 path.display()
@@ -238,7 +279,7 @@ fn write_audit_outputs(outputs: &AuditOutputs, plan: &AuditOutputPlan) -> CliRes
         written_paths.push(path.display().to_string());
     }
     if let Some(path) = &plan.config_path {
-        fs::write(path, &outputs.draft_config_toml).map_err(|error| {
+        write_file_atomically(path, &outputs.draft_config_toml).map_err(|error| {
             report_error(format!(
                 "failed to write draft config {}: {error}",
                 path.display()
@@ -488,6 +529,11 @@ pub(crate) fn run_update_slots(
     } else {
         page_patterns.to_vec()
     };
+    // Reject a pattern the runtime cannot compile before it reaches the file:
+    // a persisted invalid glob either fails the next config load or is silently
+    // dropped at pattern-compile time, leaving the slot matching fewer pages
+    // than the config claims.
+    validate_page_patterns(&run_patterns)?;
 
     let merged = merge_slots(existing_creative, &discovered, &run_patterns, replace);
     let network_id = resolve_network_id(
@@ -503,7 +549,7 @@ pub(crate) fn run_update_slots(
             .map_err(|error| report_error(format!("failed to write preview: {error}")))?;
         return Ok(());
     }
-    fs::write(config_path, &updated).map_err(|error| {
+    write_file_atomically(config_path, &updated).map_err(|error| {
         report_error(format!(
             "failed to write config {}: {error}",
             config_path.display()
@@ -518,6 +564,30 @@ pub(crate) fn run_update_slots(
     )
     .map_err(|error| report_error(format!("failed to write command output: {error}")))
 }
+/// Rejects any page pattern the runtime's glob compiler would not accept.
+///
+/// Uses [`compile_page_pattern`] so the accepted set is exactly what
+/// `CreativeOpportunitySlot::compile_patterns` accepts at startup, including the
+/// `**`→`*` normalisation. All patterns are reported at once so an operator
+/// passing several `--page-pattern` values fixes them in one pass.
+///
+/// # Errors
+///
+/// Returns a user-facing error listing every pattern that does not compile.
+fn validate_page_patterns(patterns: &[String]) -> CliResult<()> {
+    let invalid: Vec<String> = patterns
+        .iter()
+        .filter_map(|pattern| compile_page_pattern(pattern).err())
+        .collect();
+    if invalid.is_empty() {
+        return Ok(());
+    }
+    cli_error(format!(
+        "refusing to write invalid page pattern(s): {}",
+        invalid.join("; ")
+    ))
+}
+
 /// The default page pattern for a scraped URL: its path, or `/` for the root.
 fn default_page_pattern(target_url: &Url) -> String {
     let path = target_url.path();
@@ -589,6 +659,19 @@ mod tests {
             gpt_slots: Vec::new(),
             warnings: Vec::new(),
         }
+    }
+
+    /// A collected page carrying one discoverable GPT slot, for `run_update_slots`.
+    fn collected_page_with_header_slot() -> CollectedPage {
+        let mut collected = collected_page();
+        collected.requested_url = "https://publisher.example/".to_string();
+        collected.final_url = "https://publisher.example/".to_string();
+        collected.gpt_slots = vec![collector::CollectedGptSlot {
+            gam_unit_path: "/222/homepage/header".to_string(),
+            div_id: "div-gpt-ad-header".to_string(),
+            sizes: vec![(728, 90)],
+        }];
+        collected
     }
 
     fn audit_args(url: &str) -> GenerateArgs {
@@ -953,6 +1036,118 @@ mod tests {
             Some("/news/story"),
             "default pattern should use the post-redirect path, not the requested one"
         );
+    }
+
+    #[test]
+    fn update_slots_rejects_invalid_page_pattern_without_touching_config() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        let original = "[creative_opportunities]\ngam_network_id = \"111\"\n";
+        fs::write(&config_path, original).expect("should write config");
+        let collector = FakeCollector::new(collected_page_with_header_slot());
+        let mut out = Vec::new();
+
+        let error = run_update_slots(
+            "https://publisher.example/",
+            &config_path,
+            None,
+            &["[".to_string()],
+            false,
+            &[],
+            false,
+            &collector,
+            &mut out,
+        )
+        .expect_err("should reject an invalid glob");
+
+        assert!(
+            format!("{error:?}").contains("page pattern '['"),
+            "error should name the offending pattern, got {error:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("should read config"),
+            original,
+            "a rejected pattern must leave the operator config untouched"
+        );
+    }
+
+    #[test]
+    fn update_slots_accepts_double_star_pattern_like_the_runtime() {
+        // `/20**` does not compile directly but the runtime normalises it to
+        // `/20*`; validation must accept exactly what the runtime accepts.
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        fs::write(
+            &config_path,
+            "[creative_opportunities]\ngam_network_id = \"111\"\n",
+        )
+        .expect("should write config");
+        let collector = FakeCollector::new(collected_page_with_header_slot());
+        let mut out = Vec::new();
+
+        run_update_slots(
+            "https://publisher.example/",
+            &config_path,
+            None,
+            &["/20**".to_string()],
+            false,
+            &[],
+            false,
+            &collector,
+            &mut out,
+        )
+        .expect("should accept a runtime-normalisable pattern");
+
+        let written = fs::read_to_string(&config_path).expect("should read config");
+        let value = toml::from_str::<toml::Value>(&written).expect("valid TOML");
+        assert_eq!(
+            value["creative_opportunities"]["slot"][0]["page_patterns"][0].as_str(),
+            Some("/20**")
+        );
+    }
+
+    #[test]
+    fn update_slots_write_replaces_the_config_without_leaving_temp_files() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        fs::write(
+            &config_path,
+            "[creative_opportunities]\ngam_network_id = \"111\"\n",
+        )
+        .expect("should write config");
+        let collector = FakeCollector::new(collected_page_with_header_slot());
+        let mut out = Vec::new();
+
+        run_update_slots(
+            "https://publisher.example/",
+            &config_path,
+            None,
+            &[],
+            false,
+            &[],
+            false,
+            &collector,
+            &mut out,
+        )
+        .expect("should update slots");
+
+        let entries: Vec<String> = fs::read_dir(temp.path())
+            .expect("should read temp dir")
+            .map(|entry| {
+                entry
+                    .expect("should read entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            ["trusted-server.toml"],
+            "the atomic write should leave no stray temp file behind"
+        );
+        let written = fs::read_to_string(&config_path).expect("should read config");
+        toml::from_str::<toml::Value>(&written).expect("rewritten config is valid TOML");
     }
 
     #[test]

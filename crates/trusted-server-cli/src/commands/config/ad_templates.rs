@@ -195,7 +195,14 @@ fn run_match(args: &AdTemplatesMatchArgs, out: &mut dyn Write) -> Result<(), Str
     };
     let matched = match_slots(&config.slot, &path);
 
-    write_match_result(out, &path, &matched, &config.gam_network_id, args.details)
+    write_match_result(
+        out,
+        &path,
+        &matched,
+        &config.gam_network_id,
+        &config.section_for_path(&path),
+        args.details,
+    )
 }
 
 fn run_check(args: &AdTemplatesCheckArgs, out: &mut dyn Write) -> Result<(), String> {
@@ -258,7 +265,14 @@ fn run_explain(args: &AdTemplatesExplainArgs, out: &mut dyn Write) -> Result<(),
     };
 
     let matched = match_slots(&config.slot, &path);
-    write_match_result(out, &path, &matched, &config.gam_network_id, true)?;
+    write_match_result(
+        out,
+        &path,
+        &matched,
+        &config.gam_network_id,
+        &config.section_for_path(&path),
+        true,
+    )?;
 
     let method_pass = args.method.eq_ignore_ascii_case("GET");
     let navigation_pass = !args.non_navigation;
@@ -314,6 +328,7 @@ fn write_match_result(
     path: &str,
     matched: &[&CreativeOpportunitySlot],
     gam_network_id: &str,
+    section: &str,
     details: bool,
 ) -> Result<(), String> {
     if matched.is_empty() {
@@ -330,7 +345,8 @@ fn write_match_result(
 
     if details {
         for slot in matched {
-            writeln!(out, "- {}", format_slot(slot, gam_network_id)).map_err(output_error)?;
+            writeln!(out, "- {}", format_slot(slot, gam_network_id, section))
+                .map_err(output_error)?;
         }
     }
 
@@ -341,7 +357,11 @@ fn write_gate(out: &mut dyn Write, label: &str, pass: bool) -> Result<(), String
     writeln!(out, "gate {label}: {}", if pass { "pass" } else { "block" }).map_err(output_error)
 }
 
-fn format_slot(slot: &CreativeOpportunitySlot, gam_network_id: &str) -> String {
+/// Formats one matched slot for `--details` output.
+///
+/// `section` is the value the runtime derives from the evaluated path, so a
+/// `{section}` template renders the same unit path the live request would use.
+fn format_slot(slot: &CreativeOpportunitySlot, gam_network_id: &str, section: &str) -> String {
     let formats = slot
         .formats
         .iter()
@@ -349,11 +369,16 @@ fn format_slot(slot: &CreativeOpportunitySlot, gam_network_id: &str) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     let providers = format_providers(slot);
+    // `None` means a dynamic template renders past GAM's unit-path byte limit —
+    // a config the runtime rejects, so surface it rather than printing a path.
+    let gam_unit_path = slot
+        .render_gam_unit_path(gam_network_id, section)
+        .unwrap_or_else(|| "<unrenderable: exceeds GAM unit-path byte limit>".to_string());
     format!(
         "{} div={} gam={} patterns=[{}] formats=[{}] providers=[{}]",
         slot.id,
         slot.resolved_div_id(),
-        slot.resolved_gam_unit_path(gam_network_id),
+        gam_unit_path,
         slot.page_patterns.join(", "),
         formats,
         providers,

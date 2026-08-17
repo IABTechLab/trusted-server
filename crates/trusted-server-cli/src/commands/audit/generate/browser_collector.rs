@@ -63,10 +63,15 @@ async fn collect_page_via_browser_async(
             "failed to create temporary browser profile for audit: {error}"
         ))
     })?;
+    // chromiumoxide ignores TLS errors by default. `generate` sends operator
+    // cookies and writes what it scrapes into the operator's config, so a
+    // certificate-invalid impersonator could both harvest the session and seed
+    // the config with slots of its choosing. Validate certificates.
     let config = BrowserConfig::builder()
         .chrome_executable(chrome_executable)
         .user_data_dir(user_data_dir.path())
         .new_headless_mode()
+        .respect_https_errors()
         .build()
         .map_err(|error| {
             report_error(format!(

@@ -61,6 +61,8 @@ pub struct BrowserCollector {
     settle_quiet: Duration,
     /// Hard cap on settling.
     settle_max: Duration,
+    /// Navigate to origins with invalid TLS certificates (dangerous opt-in).
+    accept_invalid_certs: bool,
 }
 
 impl Default for BrowserCollector {
@@ -77,6 +79,7 @@ impl BrowserCollector {
             chrome: None,
             settle_quiet: Duration::from_millis(DEFAULT_SETTLE_QUIET_MS),
             settle_max: Duration::from_millis(DEFAULT_SETTLE_MAX_MS),
+            accept_invalid_certs: false,
         }
     }
 
@@ -87,6 +90,7 @@ impl BrowserCollector {
             chrome: opts.chrome.clone(),
             settle_quiet: Duration::from_millis(opts.settle_quiet_ms),
             settle_max: Duration::from_millis(opts.settle_max_ms),
+            accept_invalid_certs: opts.danger_accept_invalid_certs,
         }
     }
 }
@@ -206,8 +210,17 @@ impl AuditCollector for BrowserCollector {
         // so audit output stays clean, then restore the prior threshold.
         let previous_level = log::max_level();
         log::set_max_level(log::LevelFilter::Error);
-        let result = runtime
-            .block_on(async move { collect(&chrome, profile.path(), request, settle).await });
+        let accept_invalid_certs = self.accept_invalid_certs;
+        let result = runtime.block_on(async move {
+            collect(
+                &chrome,
+                profile.path(),
+                request,
+                settle,
+                accept_invalid_certs,
+            )
+            .await
+        });
         log::set_max_level(previous_level);
         result
     }
@@ -219,10 +232,20 @@ async fn collect(
     profile_dir: &std::path::Path,
     request: BrowserCollectRequest,
     settle_config: SettleConfig,
+    accept_invalid_certs: bool,
 ) -> Result<CollectedPage, String> {
-    let config = BrowserConfig::builder()
+    // chromiumoxide defaults to ignoring TLS errors. The audit sends
+    // operator-supplied session cookies and treats what it reads back as
+    // verification evidence, so a certificate-invalid impersonator could both
+    // harvest the session and fabricate the evidence. Validate certificates
+    // unless the operator explicitly opts out.
+    let mut builder = BrowserConfig::builder()
         .chrome_executable(chrome)
-        .user_data_dir(profile_dir)
+        .user_data_dir(profile_dir);
+    if !accept_invalid_certs {
+        builder = builder.respect_https_errors();
+    }
+    let config = builder
         .build()
         .map_err(|error| format!("failed to build browser config: {error}"))?;
 

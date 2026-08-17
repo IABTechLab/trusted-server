@@ -14,9 +14,43 @@
     reason = "wire model assembled by the audit verifier in a later task"
 )]
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 use trusted_server_core::creative_opportunities::RuntimeAdStackExpected;
+
+/// Escapes control characters in page-controlled text bound for a terminal.
+///
+/// Page titles and collector warning messages are attacker-controlled: an
+/// audited page can put ANSI/OSC escape sequences in `document.title` and drive
+/// the operator's terminal (cursor movement, clipboard writes, forged output)
+/// when the value is printed verbatim. Every C0 control (including ESC), DEL,
+/// and the C1 range are rendered as `\u{XXXX}` so the text stays inert. JSON
+/// output is unaffected — `serde_json` escapes these already.
+///
+/// Returns a borrowed `Cow` when the input needs no escaping.
+#[must_use]
+pub fn escape_terminal_text(value: &str) -> Cow<'_, str> {
+    if !value.chars().any(is_terminal_control) {
+        return Cow::Borrowed(value);
+    }
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if is_terminal_control(ch) {
+            escaped.push_str(&format!("\\u{{{:04X}}}", ch as u32));
+        } else {
+            escaped.push(ch);
+        }
+    }
+    Cow::Owned(escaped)
+}
+
+/// Whether `ch` can act as a terminal control code (C0, DEL, or C1).
+fn is_terminal_control(ch: char) -> bool {
+    let code = ch as u32;
+    code < 0x20 || (0x7f..=0x9f).contains(&code)
+}
 
 /// Confirmation status for a single configured slot.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
@@ -175,8 +209,9 @@ pub struct SlotJson {
 pub struct ConfiguredJson {
     /// Resolved div element ID.
     pub div_id: String,
-    /// Resolved GAM unit path.
-    pub gam_unit_path: String,
+    /// Resolved GAM unit path, or `null` when a dynamic template renders past
+    /// GAM's unit-path byte limit for this page's section.
+    pub gam_unit_path: Option<String>,
     /// Configured formats.
     pub formats: Vec<FormatJson>,
     /// Configured provider names.
@@ -260,7 +295,7 @@ impl VerificationReport {
                     phase: EvidencePhaseJson::InitialLoad,
                     configured: ConfiguredJson {
                         div_id: "ad-atf-".to_string(),
-                        gam_unit_path: "/123/news/atf".to_string(),
+                        gam_unit_path: Some("/123/news/atf".to_string()),
                         formats: vec![FormatJson {
                             width: 300,
                             height: 250,
@@ -323,6 +358,42 @@ impl VerificationReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_terminal_text_passes_through_ordinary_titles() {
+        assert!(
+            matches!(
+                escape_terminal_text("Example News — Story"),
+                Cow::Borrowed(_)
+            ),
+            "text with no control characters should not allocate"
+        );
+        assert_eq!(
+            escape_terminal_text("Example News — Story"),
+            "Example News — Story"
+        );
+    }
+
+    #[test]
+    fn escape_terminal_text_neutralizes_control_sequences() {
+        // ESC-based CSI/OSC sequences and a raw newline are the terminal-driving
+        // primitives a hostile page would put in `document.title`.
+        assert_eq!(
+            escape_terminal_text("a\u{1b}]0;pwned\u{7}b"),
+            "a\\u{001B}]0;pwned\\u{0007}b",
+            "ESC and BEL should be rendered inert"
+        );
+        assert_eq!(
+            escape_terminal_text("line\nforged: ok"),
+            "line\\u{000A}forged: ok",
+            "a newline should not let a title forge an output line"
+        );
+        assert_eq!(
+            escape_terminal_text("del\u{7f}c1\u{9b}"),
+            "del\\u{007F}c1\\u{009B}",
+            "DEL and the C1 range should be escaped too"
+        );
+    }
 
     #[test]
     fn verification_json_contains_gate_state_and_extra_evidence() {

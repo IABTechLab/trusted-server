@@ -24,8 +24,14 @@ pub struct ExpectedSlot {
     pub id: String,
     /// Resolved HTML `div` element ID (override or the slot id).
     pub div_id: String,
-    /// Resolved GAM unit path (override or `/<gam_network_id>/<id>`).
-    pub gam_unit_path: String,
+    /// Resolved GAM unit path: the rendered `gam_unit_path` template (or
+    /// `/<gam_network_id>/<id>` when the slot has none).
+    ///
+    /// `None` when a dynamic template renders beyond GAM's unit-path byte limit
+    /// for this path's section. Runtime validation rejects such a config, so
+    /// this only occurs for a config that would fail to load; the slot is then
+    /// reported unconfirmable rather than matched against a wrong path.
+    pub gam_unit_path: Option<String>,
     /// Configured ad formats.
     pub formats: Vec<ExpectedFormat>,
     /// Configured provider names, in `aps`, `prebid` order.
@@ -53,16 +59,22 @@ pub struct ExpectedFormat {
 /// Uses [`match_slots`] so glob semantics stay identical to the runtime, and
 /// preserves configured slot order. `path` is assumed already normalized via
 /// [`normalize_path_or_url`].
+///
+/// `gam_unit_path` templates are rendered against the section the runtime would
+/// derive from `path` (per the config's `section_root`/`section_segment`
+/// policy), so `{section}`-bearing configs project the same unit path the live
+/// page requests.
 // Shared projection used by the audit verifier; the static commands match slots
 // directly against the runtime matcher.
 #[must_use]
 pub fn expected_slots_for_path(path: &str, config: &CreativeOpportunitiesConfig) -> ExpectedSlots {
+    let section = config.section_for_path(path);
     let slots = match_slots(&config.slot, path)
         .into_iter()
         .map(|slot| ExpectedSlot {
             id: slot.id.clone(),
             div_id: slot.resolved_div_id().to_string(),
-            gam_unit_path: slot.resolved_gam_unit_path(&config.gam_network_id),
+            gam_unit_path: slot.render_gam_unit_path(&config.gam_network_id, &section),
             formats: slot
                 .formats
                 .iter()
@@ -182,7 +194,10 @@ mod tests {
             ["atf"]
         );
         assert_eq!(expected.slots[0].div_id, "ad-atf-");
-        assert_eq!(expected.slots[0].gam_unit_path, "/123/news/atf");
+        assert_eq!(
+            expected.slots[0].gam_unit_path.as_deref(),
+            Some("/123/news/atf")
+        );
         assert_eq!(expected.slots[0].providers, ["prebid"]);
         assert_eq!(
             expected.slots[0].formats,
@@ -208,8 +223,69 @@ mod tests {
 
         let expected = expected_slots_for_path("/", &config);
         assert_eq!(expected.slots[0].div_id, "footer");
-        assert_eq!(expected.slots[0].gam_unit_path, "/42/footer");
+        assert_eq!(
+            expected.slots[0].gam_unit_path.as_deref(),
+            Some("/42/footer")
+        );
         assert!(expected.slots[0].providers.is_empty());
+    }
+
+    #[test]
+    fn expected_slots_render_section_templates_per_path() {
+        let toml = "gam_network_id = \"99999\"\n\
+             section_root = \"homepage\"\n\
+             \n\
+             [[slot]]\n\
+             id = \"ad-header-0\"\n\
+             gam_unit_path = \"/{network_id}/example/{section}\"\n\
+             page_patterns = [\"/\", \"/news\", \"/news/*\"]\n\
+             formats = [{ width = 728, height = 90 }]\n";
+        let mut config =
+            toml::from_str::<CreativeOpportunitiesConfig>(toml).expect("should deserialize");
+        config.compile_slots();
+
+        // A path with a section segment renders that segment.
+        assert_eq!(
+            expected_slots_for_path("/news/story", &config).slots[0]
+                .gam_unit_path
+                .as_deref(),
+            Some("/99999/example/news"),
+            "a section template should render the path's section"
+        );
+        // The site root falls back to the configured section_root.
+        assert_eq!(
+            expected_slots_for_path("/", &config).slots[0]
+                .gam_unit_path
+                .as_deref(),
+            Some("/99999/example/homepage"),
+            "the root path should render section_root"
+        );
+    }
+
+    #[test]
+    fn expected_slots_report_unrenderable_dynamic_template_as_none() {
+        // A `{section}` template that renders past GAM's 100-byte unit-path
+        // limit. `validate_runtime` rejects this config, so the verifier reports
+        // the slot as unconfirmable rather than matching a truncated path.
+        let toml = "gam_network_id = \"99999\"\n\
+             section_root = \"homepage\"\n\
+             \n\
+             [[slot]]\n\
+             id = \"ad-header-0\"\n\
+             gam_unit_path = \"/{section}/{section}\"\n\
+             page_patterns = [\"/*\"]\n\
+             formats = [{ width = 728, height = 90 }]\n";
+        let mut config =
+            toml::from_str::<CreativeOpportunitiesConfig>(toml).expect("should deserialize");
+        config.compile_slots();
+
+        let long_path = format!("/{}", "a".repeat(60));
+        let expected = expected_slots_for_path(&long_path, &config);
+
+        assert_eq!(
+            expected.slots[0].gam_unit_path, None,
+            "an over-limit dynamic render should project as None"
+        );
     }
 
     #[test]
