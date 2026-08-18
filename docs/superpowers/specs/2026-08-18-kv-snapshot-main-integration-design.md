@@ -60,9 +60,18 @@ streamed-response support. Otherwise it loads the snapshot, dispatches the
 auction, and uses the existing streamed `send` path.
 
 Fastly's auction fan-out continues using the existing multi-request `select`
-behavior. Stream-preserving pending metadata is limited to the single-request
-`wait` path so it cannot become ambiguously associated after `select` reorders
-pending requests.
+behavior. A stream-preserving pending request carries the response-stream flag
+and original request method through the opaque pending handle. Fastly overrides
+`wait` to complete that handle directly with `fastly::PendingRequest::wait()`
+and passes both values to the existing response converter, which preserves
+HEAD and bodiless-status framing while returning `EdgeBody::Stream` only when
+a response body is allowed.
+
+A stream-preserving pending request must never enter multi-request `select`:
+Fastly rejects that combination defensively. Regular auction pendings retain
+the current buffered `select` path and its backend-correlation behavior. This
+single-wait boundary prevents stream metadata from becoming ambiguously
+associated when Fastly reorders remaining pending handles.
 
 ### Recovery and privacy
 
@@ -78,8 +87,14 @@ state.
 
 ## Error Handling
 
-- Origin-start failure returns the existing proxy error and performs no EC KV
-  preload or auction dispatch.
+- A concurrent pending-origin start failure returns the existing proxy error
+  and performs no EC KV preload or auction dispatch.
+- A pending-origin wait failure occurs after auction dispatch. It emits exactly
+  one existing `origin_proxy_error` abandonment event and returns the existing
+  proxy error.
+- On the eager fallback, origin send failure likewise happens after snapshot
+  preload and auction dispatch and retains current `origin_proxy_error`
+  abandonment behavior.
 - KV read failure becomes a non-authoritative failed snapshot; auctions proceed
   without server-side EIDs and recovery does not rotate.
 - Pending streamed-response setup failure follows the existing proxy error path.
@@ -92,16 +107,28 @@ Tests will be written before production changes and must prove:
 
 - a streaming-capable concurrent client starts origin before the EC KV read;
 - the pending origin response remains an `EdgeBody::Stream`;
+- Fastly's direct single-request `wait` does not call `select`, while ordinary
+  auction fan-out remains on the buffered `select` path;
+- stream-marked pendings are rejected by multi-request `select`;
+- HEAD plus `1xx`, `204`, `205`, and `304` responses remain bodiless with their
+  existing content-length/framing semantics on the pending-stream path;
 - cache bypass, request rewriting, conditional/range removal, and DataDome
   behavior survive the reordered path;
-- eager adapters preload before auction dispatch and still stream via `send`;
+- a pending-origin start failure performs no KV read, auction dispatch, or
+  abandonment emission;
+- a pending-origin wait failure after dispatch emits exactly one
+  `origin_proxy_error` abandonment and returns the existing proxy error;
+- fallback clients preload before auction dispatch, use `send`, request a
+  streamed response exactly when `supports_streaming_responses` is true, and
+  otherwise retain their existing buffered behavior;
 - the snapshot is reused by auction, finalize, cookie ingestion, withdrawal,
   and pull sync;
 - missing, failed, tombstoned, newly created, and transiently missing snapshots
   retain the existing fail-closed behavior;
-- current SSAT telemetry and publisher-domain attribution remain intact.
+- current SSAT telemetry and publisher-domain attribution remain intact,
+  including the configured publisher domain in both the `AuctionRequest` and
+  emitted observation rows on the reordered path.
 
 After focused red/green tests, run repository formatting, all adapter test
 aliases, all target-matched Clippy aliases, and a temporary merge check against
 `1009-esi-cacheable-root-spec`. No #1013 code will be committed to PR #885.
-
