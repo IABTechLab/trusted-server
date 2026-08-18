@@ -249,6 +249,28 @@ pub(crate) fn host_cookie(name: &str, value: &str, url: &url::Url) -> Result<Coo
     Ok(cookie)
 }
 
+fn format_cookie_install_error(name: &str, _error: impl std::fmt::Display) -> String {
+    // Do not forward the CDP error: a browser implementation may include the
+    // rejected cookie value in its diagnostic.
+    format!("failed to set cookie `{name}`")
+}
+
+/// Installs host-only, root-scoped cookies before a page has an origin.
+pub(crate) async fn set_browser_cookies(
+    browser: &Browser,
+    cookies: &[(String, String)],
+    url: &url::Url,
+) -> Result<(), String> {
+    for (name, value) in cookies {
+        let cookie = host_cookie(name, value, url)?;
+        browser
+            .set_cookies(vec![cookie])
+            .await
+            .map_err(|error| format_cookie_install_error(name, error))?;
+    }
+    Ok(())
+}
+
 /// Auto-detects a Chrome/Chromium executable.
 ///
 /// Searches `PATH` by common names first, then well-known per-OS install
@@ -443,6 +465,8 @@ async fn collect_with_browser(
     settle_config: SettleConfig,
     assume_consent: bool,
 ) -> Result<CollectedPage, String> {
+    set_browser_cookies(browser, &request.cookies, &request.url).await?;
+
     // Open a blank page first so init scripts are installed before the real
     // document loads (evaluate-on-new-document applies to subsequent navigations).
     let page = browser
@@ -496,16 +520,6 @@ async fn collect_open_page(
         page.evaluate_on_new_document(script.clone())
             .await
             .map_err(|error| format!("failed to install init script: {error}"))?;
-    }
-
-    // Set operator-supplied cookies on the context before navigating so the
-    // origin sees an authenticated session on the first request. Scoping each to
-    // the request URL lets Chrome infer domain/path.
-    for (name, value) in &request.cookies {
-        let cookie = host_cookie(name, value, &request.url)?;
-        page.set_cookie(cookie)
-            .await
-            .map_err(|error| format!("failed to set cookie `{name}`: {error}"))?;
     }
 
     tokio::time::timeout(NAVIGATION_TIMEOUT, page.goto(request.url.as_str()))
@@ -879,7 +893,9 @@ fn decode_ad_evidence_envelope(
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
 
     use super::*;
     use crate::commands::audit::collector::{
@@ -928,6 +944,90 @@ mod tests {
         assert!(
             cookie.url.is_none(),
             "domain/path and URL must not be combined"
+        );
+    }
+
+    #[test]
+    fn cookie_install_error_identifies_name_without_a_value() {
+        let error = format_cookie_install_error(
+            "datadome",
+            "invalid cookie value operator-secret-cookie-value",
+        );
+
+        assert_eq!(error, "failed to set cookie `datadome`");
+        assert!(!error.contains("operator-secret-cookie-value"));
+    }
+
+    #[test]
+    #[ignore = "requires local Chrome/Chromium; run through scripts/test-cli.sh"]
+    fn supplied_cookie_reaches_first_navigation() {
+        if !browser_fixture_available() {
+            return;
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("should bind fixture server");
+        let address = listener.local_addr().expect("should read fixture address");
+        let (request_tx, request_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("should accept browser request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("should set fixture read timeout");
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut chunk = [0_u8; 1024];
+                let chunk_len = stream.read(&mut chunk).expect("should read HTTP request");
+                assert!(chunk_len > 0, "request should contain complete headers");
+                request.extend_from_slice(&chunk[..chunk_len]);
+                assert!(
+                    request.len() <= 16 * 1024,
+                    "request headers should be bounded"
+                );
+            }
+            request_tx
+                .send(String::from_utf8_lossy(&request).into_owned())
+                .expect("should send captured request");
+
+            let body = b"<!doctype html><title>cookie fixture</title>";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("should write fixture headers");
+            stream.write_all(body).expect("should write fixture body");
+        });
+
+        let collector = BrowserCollector {
+            settle_quiet: Duration::from_millis(100),
+            settle_max: Duration::from_secs(1),
+            ..BrowserCollector::new()
+        };
+        collector
+            .collect_page(BrowserCollectRequest {
+                url: url::Url::parse(&format!("http://{address}/"))
+                    .expect("should parse fixture URL"),
+                init_scripts: Vec::new(),
+                scroll: false,
+                collect_ad_evidence: false,
+                cookies: vec![("clearance".to_string(), "token".to_string())],
+            })
+            .expect("cookie should be installed before first navigation");
+
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("fixture should receive the first navigation");
+        assert!(
+            request.lines().any(|line| {
+                line.split_once(':').is_some_and(|(name, value)| {
+                    name.eq_ignore_ascii_case("cookie")
+                        && value
+                            .trim()
+                            .split(';')
+                            .any(|cookie| cookie.trim() == "clearance=token")
+                })
+            }),
+            "first navigation should carry the supplied cookie; request was {request:?}"
         );
     }
 

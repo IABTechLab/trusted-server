@@ -13,7 +13,7 @@ use url::Url;
 
 use crate::commands::audit::browser::{
     BrowserLaunchOptions, CONSENT_STUB_SCRIPT as SHARED_CONSENT_STUB_SCRIPT, build_browser_config,
-    host_cookie, resolve_chrome,
+    resolve_chrome, set_browser_cookies,
 };
 use crate::commands::audit::collector::BrowserOpts;
 use crate::commands::audit::generate::collector::{
@@ -458,6 +458,10 @@ async fn collect_page_from_browser(
     settle_quiet: Duration,
     settle_max: Duration,
 ) -> CliResult<CollectedPage> {
+    set_browser_cookies(browser, cookies, target_url)
+        .await
+        .map_err(report_error)?;
+
     let page = browser.new_page("about:blank").await.map_err(|error| {
         report_error(format!("failed to create browser page for audit: {error}"))
     })?;
@@ -465,7 +469,6 @@ async fn collect_page_from_browser(
     let result = collect_open_page(
         &page,
         target_url,
-        cookies,
         discover_sitemap,
         assume_consent,
         settle_quiet,
@@ -490,7 +493,6 @@ async fn collect_page_from_browser(
 async fn collect_open_page(
     page: &chromiumoxide::Page,
     target_url: &Url,
-    cookies: &[(String, String)],
     discover_sitemap: bool,
     assume_consent: bool,
     settle_quiet: Duration,
@@ -512,16 +514,6 @@ async fn collect_open_page(
                 "failed to increase the resource timing buffer: {error}"
             ))
         })?;
-
-    // Set operator-supplied cookies before navigating so the origin sees an
-    // authenticated session on the first request. Scoping each to the target URL
-    // lets Chrome infer domain/path.
-    for (name, value) in cookies {
-        let cookie = host_cookie(name, value, target_url).map_err(report_error)?;
-        page.set_cookie(cookie)
-            .await
-            .map_err(|error| report_error(format!("failed to set cookie `{name}`: {error}")))?;
-    }
 
     let mut warnings = Vec::new();
 
