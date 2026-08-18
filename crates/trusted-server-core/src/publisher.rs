@@ -2853,10 +2853,8 @@ pub async fn handle_publisher_request(
                 message: "publisher origin request was already consumed".to_owned(),
             })
         })?;
-        let mut platform_request = PlatformHttpRequest::new(origin_req, backend_name.clone());
-        if services.http_client().supports_streaming_responses() {
-            platform_request = platform_request.with_stream_response();
-        }
+        let mut platform_request =
+            PlatformHttpRequest::new(origin_req, backend_name.clone()).with_stream_response();
         if should_run_ad_stack {
             platform_request = platform_request.with_cache_bypass();
         }
@@ -4311,7 +4309,9 @@ mod tests {
 
     use super::*;
     use crate::auction::orchestrator::OrchestrationResult;
+    use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
     use crate::auction::types::AuctionResponse;
+    use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
 
     #[test]
     fn request_head_snapshot_preserves_downstream_shape_without_body() {
@@ -4353,7 +4353,7 @@ mod tests {
         build_services_with_secret_http_client_and_client_ip, noop_services,
         noop_services_with_telemetry_sink,
     };
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use edgezero_core::body::Body as EdgeBody;
     use http::{Method, Request as HttpRequest, StatusCode, header};
     use std::sync::Arc;
@@ -4368,6 +4368,90 @@ mod tests {
         http: Arc<StubHttpClient>,
         http_calls_at_lookup: Arc<AtomicUsize>,
         lookups: Arc<AtomicUsize>,
+    }
+
+    const SCHEDULING_PROVIDER: &str = "scheduling-capture";
+
+    #[derive(Debug)]
+    struct CapturedSchedulingAuction {
+        request: AuctionRequest,
+        client_uri: String,
+        client_host: Option<String>,
+        client_fastly_ssl: Option<String>,
+        client_user_agent: Option<String>,
+        http_calls_at_dispatch: usize,
+        lookups_at_dispatch: usize,
+    }
+
+    struct SchedulingCaptureProvider {
+        captured: Arc<Mutex<Option<CapturedSchedulingAuction>>>,
+        http: Arc<StubHttpClient>,
+        lookups: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for SchedulingCaptureProvider {
+        fn provider_name(&self) -> &'static str {
+            SCHEDULING_PROVIDER
+        }
+
+        async fn request_bids(
+            &self,
+            request: &AuctionRequest,
+            context: &AuctionContext<'_>,
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+            let header_value = |name: &str| {
+                context
+                    .request
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+            };
+            *self.captured.lock().expect("should lock captured auction") =
+                Some(CapturedSchedulingAuction {
+                    request: request.clone(),
+                    client_uri: context.request.uri().to_string(),
+                    client_host: header_value(header::HOST.as_str()),
+                    client_fastly_ssl: header_value("fastly-ssl"),
+                    client_user_agent: header_value(header::USER_AGENT.as_str()),
+                    http_calls_at_dispatch: self.http.recorded_backend_names().len(),
+                    lookups_at_dispatch: self.lookups.load(Ordering::SeqCst),
+                });
+            Err(Report::new(TrustedServerError::Auction {
+                message: "scheduling capture only".to_owned(),
+            }))
+        }
+
+        async fn parse_response(
+            &self,
+            _response: crate::platform::PlatformResponse,
+            _response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            panic!("parse_response must not run when scheduling capture fails")
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            100
+        }
+
+        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
+            Some("scheduling-capture-backend".to_owned())
+        }
+    }
+
+    struct SchedulingProbeOutcome {
+        lookups: usize,
+        http_calls_at_lookup: usize,
+        stream_flags: Vec<bool>,
+        cache_bypass_flags: Vec<bool>,
+        body_is_stream: bool,
+        request_rewritten: bool,
+        response_is_private: bool,
+        auction_preserved_client_snapshot: bool,
+        origin_kv_auction_order: bool,
+        datadome_tag_suppressed: bool,
+        ok: bool,
     }
 
     impl EcKvStore for OrderRecordingKv {
@@ -4416,6 +4500,7 @@ mod tests {
             .header("fastly-ssl", "1")
             .header(header::IF_NONE_MATCH, "\"cached-page\"")
             .header(header::RANGE, "bytes=0-18")
+            .header(header::USER_AGENT, "scheduling-browser")
             .body(EdgeBody::empty())
             .expect("should build navigation request");
         request
@@ -4424,16 +4509,55 @@ mod tests {
         request
     }
 
-    /// Drives one EC-capable navigation and returns
-    /// `(lookups, http_calls_at_first_lookup, stream_flags, body_is_stream,
-    /// request_rewritten, response_is_private, result_is_ok)`.
+    fn scheduling_settings() -> Settings {
+        let toml = format!(
+            "{}\n[auction]\nenabled = true\nproviders = [\"{SCHEDULING_PROVIDER}\"]\n\n\
+             [creative_opportunities]\ngam_network_id = \"12345\"\n",
+            crate_test_settings_str()
+        );
+        let mut settings = Settings::from_toml(&toml).expect("should parse scheduling settings");
+        settings.proxy.allowed_domains = vec!["*.example".to_owned(), "*.example.com".to_owned()];
+        settings
+            .integrations
+            .insert_config(
+                "datadome",
+                &serde_json::json!({
+                    "enabled": true,
+                    "client_side_key": "scheduling-test-key",
+                }),
+            )
+            .expect("should configure DataDome integration");
+        settings
+    }
+
+    fn scheduling_slot() -> CreativeOpportunitySlot {
+        CreativeOpportunitySlot {
+            id: "scheduling-slot".to_owned(),
+            gam_unit_path: None,
+            div_id: None,
+            page_patterns: vec!["/article".to_owned()],
+            formats: vec![CreativeOpportunityFormat {
+                width: 300,
+                height: 250,
+                media_type: MediaType::Banner,
+            }],
+            floor_price: None,
+            targeting: Default::default(),
+            providers: Default::default(),
+            compiled_patterns: Vec::new(),
+            compiled_unit: None,
+        }
+    }
+
+    /// Drives one EC-capable navigation and captures the complete pending-origin
+    /// ordering plus the origin and auction views of the request.
     async fn run_scheduling_probe(
         concurrent_fanout: bool,
         streaming_responses: bool,
         pending_streaming_responses: bool,
         queue_origin: bool,
-    ) -> (usize, usize, Vec<bool>, bool, bool, bool, bool) {
-        let settings = create_test_settings();
+    ) -> SchedulingProbeOutcome {
+        let settings = scheduling_settings();
         let http = Arc::new(StubHttpClient::new());
         http.set_concurrent_fanout(concurrent_fanout);
         http.set_streaming_responses_supported(streaming_responses);
@@ -4467,6 +4591,14 @@ mod tests {
             "test precondition: an active, consent-allowed EC must exist"
         );
         let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let captured_auction = Arc::new(Mutex::new(None));
+        let mut orchestrator = orchestrator;
+        orchestrator.register_provider(Arc::new(SchedulingCaptureProvider {
+            captured: Arc::clone(&captured_auction),
+            http: Arc::clone(&http),
+            lookups: Arc::clone(&lookups),
+        }));
+        let slots = [scheduling_slot()];
 
         let result = handle_publisher_request(
             &settings,
@@ -4475,13 +4607,14 @@ mod tests {
             &mut ec_context,
             AuctionDispatch {
                 orchestrator: &orchestrator,
-                slots: &[],
+                slots: &slots,
                 registry: None,
             },
             navigation_request(),
         )
         .await;
 
+        let ok = result.is_ok();
         let body_is_stream = result.as_ref().ok().is_some_and(|response| match response {
             PublisherResponse::PassThrough { body, .. } => body.is_stream(),
             PublisherResponse::Buffered(response) => response.body().is_stream(),
@@ -4514,88 +4647,162 @@ mod tests {
                     && header_value(header::RANGE.as_str()).is_none()
             });
 
-        (
-            lookups.load(Ordering::SeqCst),
-            http_calls_at_lookup.load(Ordering::SeqCst),
-            http.recorded_stream_response_flags(),
+        let captured_auction = captured_auction
+            .lock()
+            .expect("should lock captured auction")
+            .take();
+        let auction_preserved_client_snapshot = captured_auction.as_ref().is_some_and(|captured| {
+            captured.client_uri == "https://publisher.example/article"
+                && captured.client_host.as_deref() == Some("publisher.example")
+                && captured.client_fastly_ssl.as_deref() == Some("1")
+                && captured.client_user_agent.as_deref() == Some("scheduling-browser")
+                && captured
+                    .request
+                    .device
+                    .as_ref()
+                    .and_then(|device| device.user_agent.as_deref())
+                    == Some("scheduling-browser")
+        });
+        let origin_kv_auction_order = captured_auction.as_ref().is_some_and(|captured| {
+            captured.http_calls_at_dispatch == 1 && captured.lookups_at_dispatch == 1
+        });
+        let datadome_tag_suppressed = if let Ok(response) = result {
+            let registry = IntegrationRegistry::new(&settings)
+                .expect("should create integration registry with DataDome");
+            buffer_publisher_response_async(
+                response,
+                &Method::GET,
+                &settings,
+                &registry,
+                &orchestrator,
+                &services,
+            )
+            .await
+            .ok()
+            .and_then(|response| response.into_body().into_bytes())
+            .and_then(|body| String::from_utf8(body.to_vec()).ok())
+            .is_some_and(|html| {
+                !html.contains("window.ddjskey") && !html.contains("/integrations/datadome/tags.js")
+            })
+        } else {
+            false
+        };
+
+        SchedulingProbeOutcome {
+            lookups: lookups.load(Ordering::SeqCst),
+            http_calls_at_lookup: http_calls_at_lookup.load(Ordering::SeqCst),
+            stream_flags: http.recorded_stream_response_flags(),
+            cache_bypass_flags: http.recorded_cache_bypass_flags(),
             body_is_stream,
             request_rewritten,
             response_is_private,
-            result.is_ok(),
-        )
+            auction_preserved_client_snapshot,
+            origin_kv_auction_order,
+            datadome_tag_suppressed,
+            ok,
+        }
     }
 
     #[tokio::test]
     async fn concurrent_client_starts_origin_before_ec_lookup() {
-        let (
-            lookups,
-            http_calls_at_lookup,
-            stream_flags,
-            body_is_stream,
-            request_rewritten,
-            response_is_private,
-            ok,
-        ) = run_scheduling_probe(true, true, true, true).await;
+        let outcome = run_scheduling_probe(true, true, true, true).await;
 
-        assert!(ok, "should proxy the origin response");
-        assert_eq!(lookups, 1, "should perform exactly one EC lookup");
+        assert!(outcome.ok, "should proxy the origin response");
+        assert_eq!(outcome.lookups, 1, "should perform exactly one EC lookup");
         assert_eq!(
-            http_calls_at_lookup, 1,
+            outcome.http_calls_at_lookup, 1,
             "a concurrent client must start the origin before its EC KV lookup"
         );
-        assert_eq!(stream_flags, vec![true]);
+        assert_eq!(outcome.stream_flags, vec![true]);
+        assert_eq!(
+            outcome.cache_bypass_flags,
+            vec![true],
+            "pending publisher origin request should bypass platform caching"
+        );
         assert!(
-            body_is_stream,
+            outcome.body_is_stream,
             "pending origin wait should preserve the publisher body stream"
         );
         assert!(
-            request_rewritten,
+            outcome.request_rewritten,
             "pending origin path should preserve rewriting and header filtering"
         );
         assert!(
-            response_is_private,
+            outcome.response_is_private,
             "DataDome-suppressed pending HTML should remain private"
+        );
+        assert!(
+            outcome.origin_kv_auction_order,
+            "pending origin should start before KV lookup and auction dispatch"
+        );
+        assert!(
+            outcome.auction_preserved_client_snapshot,
+            "auction dispatch should retain the original client URI and headers"
+        );
+        assert!(
+            outcome.datadome_tag_suppressed,
+            "configured DataDome client injection should remain suppressed"
         );
     }
 
     #[tokio::test]
     async fn eager_client_reads_ec_before_starting_origin() {
-        let (lookups, http_calls_at_lookup, stream_flags, _, _, _, ok) =
-            run_scheduling_probe(false, false, false, true).await;
+        let outcome = run_scheduling_probe(false, false, false, true).await;
 
-        assert!(ok, "should proxy the origin response");
-        assert_eq!(lookups, 1, "should perform exactly one EC lookup");
+        assert!(outcome.ok, "should proxy the origin response");
+        assert_eq!(outcome.lookups, 1, "should perform exactly one EC lookup");
         assert_eq!(
-            http_calls_at_lookup, 0,
+            outcome.http_calls_at_lookup, 0,
             "an eager client must not start the origin before its EC KV lookup"
         );
-        assert_eq!(stream_flags, vec![false]);
+        assert_eq!(outcome.stream_flags, vec![false]);
     }
 
     #[tokio::test]
     async fn concurrent_send_streaming_without_pending_streaming_uses_eager_fallback() {
-        let (lookups, http_calls_at_lookup, stream_flags, body_is_stream, _, _, ok) =
-            run_scheduling_probe(true, true, false, true).await;
+        let outcome = run_scheduling_probe(true, true, false, true).await;
 
-        assert!(ok, "should proxy through the eager send fallback");
-        assert_eq!(lookups, 1, "should perform exactly one EC lookup");
+        assert!(outcome.ok, "should proxy through the eager send fallback");
+        assert_eq!(outcome.lookups, 1, "should perform exactly one EC lookup");
         assert_eq!(
-            http_calls_at_lookup, 0,
+            outcome.http_calls_at_lookup, 0,
             "client without pending streaming must preload EC before eager send"
         );
-        assert_eq!(stream_flags, vec![true]);
-        assert!(body_is_stream, "eager fallback should retain streamed body");
+        assert_eq!(outcome.stream_flags, vec![true]);
+        assert!(
+            outcome.body_is_stream,
+            "eager fallback should retain streamed body"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_streaming_does_not_require_eager_send_streaming() {
+        let outcome = run_scheduling_probe(true, false, true, true).await;
+
+        assert!(outcome.ok, "should proxy through the pending origin path");
+        assert_eq!(outcome.lookups, 1, "should perform exactly one EC lookup");
+        assert_eq!(
+            outcome.http_calls_at_lookup, 1,
+            "pending-stream support should start origin before the EC lookup"
+        );
+        assert_eq!(outcome.stream_flags, vec![true]);
+        assert!(
+            outcome.body_is_stream,
+            "pending-stream support should retain the streamed body independently of eager send"
+        );
     }
 
     #[tokio::test]
     async fn concurrent_origin_start_failure_skips_ec_and_auction_work() {
         // No origin response is queued, so the concurrent `send_async` fails.
-        let (lookups, _http_calls, _stream_flags, _, _, _, ok) =
-            run_scheduling_probe(true, true, true, false).await;
+        let outcome = run_scheduling_probe(true, true, true, false).await;
 
-        assert!(!ok, "origin-start failure should surface as an error");
+        assert!(
+            !outcome.ok,
+            "origin-start failure should surface as an error"
+        );
         assert_eq!(
-            lookups, 0,
+            outcome.lookups, 0,
             "origin-start failure must occur before any EC KV work"
         );
     }
