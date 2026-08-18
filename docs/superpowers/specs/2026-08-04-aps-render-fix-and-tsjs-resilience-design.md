@@ -2795,8 +2795,11 @@ and diagnostics remain the dedicated typed `creative` and `diagnostics` boot fie
 because they are also stable public inspection surfaces. `render_runtime` and
 `diagnostics_presentation` have no independent config entry.
 
-The server serializes each integration's existing typed rc configuration into this
-carrier and rejects a manifest/config predicate mismatch before emitting HTML. The
+The server serializes each integration's explicit browser-safe projection of its
+existing typed rc configuration into this carrier and rejects a manifest/config
+predicate mismatch before emitting HTML. Server credentials, secrets, auth headers,
+cookies, private endpoint policy, and unprojected configuration fields have no
+browser type and cannot enter the carrier. The
 bootstrap admits only a non-null plain outer object with exact `version` and
 `entries` keys, exact-shaped plain entries, unique ordered ids, and plain config
 objects. Recursion admits only finite numbers, booleans, null, strings, dense plain
