@@ -11,7 +11,7 @@ use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
 use trusted_server_core::ec::EcContext;
-use trusted_server_core::ec::admin::handle_admin_eids_lookup;
+use trusted_server_core::ec::admin::{deny_admin_diagnostic_fallback, handle_admin_eids_lookup};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::sanitize_forwarded_headers;
@@ -688,6 +688,9 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         ) -> Result<Response, EdgeError> {
             let services = build_runtime_services(&ctx);
             let mut req = ctx.into_request();
+            if let Some(response) = deny_admin_diagnostic_fallback(&req) {
+                return Ok(response);
+            }
             if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
                 &state.settings,
                 &mut req,

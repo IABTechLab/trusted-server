@@ -76,20 +76,14 @@ fn admin_diagnostic_shape(path: &str) -> Option<AdminDiagnosticShape> {
 /// reaches fallback return `404 Not Found`. Unrelated publisher paths return
 /// `None` so normal fallback behavior remains unchanged.
 #[must_use]
-pub fn deny_admin_diagnostic_fallback(
-    req: &Request<EdgeBody>,
-) -> Option<Response<EdgeBody>> {
+pub fn deny_admin_diagnostic_fallback(req: &Request<EdgeBody>) -> Option<Response<EdgeBody>> {
     let shape = admin_diagnostic_shape(req.uri().path())?;
-    let mut response = if shape == AdminDiagnosticShape::ValidResource
-        && req.method() != Method::GET
-    {
-        json_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
-    } else {
-        json_error(
-            StatusCode::NOT_FOUND,
-            "admin diagnostic route not found",
-        )
-    };
+    let mut response =
+        if shape == AdminDiagnosticShape::ValidResource && req.method() != Method::GET {
+            json_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+        } else {
+            json_error(StatusCode::NOT_FOUND, "admin diagnostic route not found")
+        };
 
     if response.status() == StatusCode::METHOD_NOT_ALLOWED {
         response

@@ -328,6 +328,82 @@ async fn authenticated_admin_eids_route_returns_200() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_admin_diagnostic_fallback_is_denied_locally() {
+    let ec_id = format!("{}.abc123", "a".repeat(64));
+    let valid_paths = [
+        "/_ts/admin/ec".to_owned(),
+        format!("/_ts/admin/ec/{ec_id}"),
+        "/_ts/admin/eids".to_owned(),
+    ];
+
+    for path in valid_paths {
+        for method in ["POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+            let request = Request::builder()
+                .method(method)
+                .uri(&path)
+                .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                .body(AxumBody::from("sensitive-admin-body"))
+                .expect("should build authenticated admin request");
+            let response = make_service()
+                .ready()
+                .await
+                .expect("should be ready")
+                .call(request)
+                .await
+                .expect("should respond");
+
+            assert_eq!(response.status().as_u16(), 405);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("allow")
+                    .and_then(|v| v.to_str().ok()),
+                Some("GET")
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store")
+            );
+        }
+    }
+
+    for path in [
+        "/_ts/admin/ec/".to_owned(),
+        format!("/_ts/admin/ec/{ec_id}/extra"),
+        "/_ts/admin/eids/".to_owned(),
+        "/_ts/admin/eids/extra".to_owned(),
+    ] {
+        for method in ["GET", "POST"] {
+            let request = Request::builder()
+                .method(method)
+                .uri(&path)
+                .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                .body(AxumBody::from("sensitive-admin-body"))
+                .expect("should build malformed admin request");
+            let response = make_service()
+                .ready()
+                .await
+                .expect("should be ready")
+                .call(request)
+                .await
+                .expect("should respond");
+
+            assert_eq!(response.status().as_u16(), 404);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store")
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
     // Regression for the credential-leak finding: the production basic-auth regex
     // `^/_ts/admin` does not match `/admin/keys/*`, so those aliases are not

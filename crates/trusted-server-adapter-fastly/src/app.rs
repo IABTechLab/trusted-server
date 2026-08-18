@@ -102,7 +102,9 @@ use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::EcContext;
-use trusted_server_core::ec::admin::{handle_admin_ec_lookup, handle_admin_eids_lookup};
+use trusted_server_core::ec::admin::{
+    deny_admin_diagnostic_fallback, handle_admin_ec_lookup, handle_admin_eids_lookup,
+};
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
@@ -724,6 +726,10 @@ async fn dispatch_fallback(
     services: &RuntimeServices,
     mut req: Request,
 ) -> Response {
+    if let Some(response) = deny_admin_diagnostic_fallback(&req) {
+        return response;
+    }
+
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
@@ -1814,6 +1820,78 @@ mod tests {
                     response.status(),
                     StatusCode::NOT_FOUND,
                     "{method} {path} with Authorization must be denied locally (404), not proxied to publisher"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn authenticated_admin_diagnostic_fallback_is_denied_locally() {
+        let router = test_router();
+        let ec_id = format!("{}.abc123", "a".repeat(64));
+        let valid_paths = [
+            "/_ts/admin/ec".to_owned(),
+            format!("/_ts/admin/ec/{ec_id}"),
+            "/_ts/admin/eids".to_owned(),
+        ];
+
+        for path in valid_paths {
+            for method in [
+                Method::POST,
+                Method::HEAD,
+                Method::OPTIONS,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+            ] {
+                let request = request_builder()
+                    .method(method.clone())
+                    .uri(format!("https://test-publisher.com{path}"))
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                    .body(Body::from("sensitive-admin-body"))
+                    .expect("should build authenticated admin request");
+                let response = route(&router, request);
+
+                assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::ALLOW)
+                        .and_then(|v| v.to_str().ok()),
+                    Some("GET")
+                );
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|v| v.to_str().ok()),
+                    Some("no-store")
+                );
+            }
+        }
+
+        for path in [
+            "/_ts/admin/ec/".to_owned(),
+            format!("/_ts/admin/ec/{ec_id}/extra"),
+            "/_ts/admin/eids/".to_owned(),
+            "/_ts/admin/eids/extra".to_owned(),
+        ] {
+            for method in [Method::GET, Method::POST] {
+                let request = request_builder()
+                    .method(method)
+                    .uri(format!("https://test-publisher.com{path}"))
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                    .body(Body::from("sensitive-admin-body"))
+                    .expect("should build malformed admin request");
+                let response = route(&router, request);
+
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|v| v.to_str().ok()),
+                    Some("no-store")
                 );
             }
         }

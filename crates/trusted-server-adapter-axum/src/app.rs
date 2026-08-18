@@ -12,7 +12,7 @@ use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
 use trusted_server_core::ec::EcContext;
-use trusted_server_core::ec::admin::handle_admin_eids_lookup;
+use trusted_server_core::ec::admin::{deny_admin_diagnostic_fallback, handle_admin_eids_lookup};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -180,6 +180,10 @@ async fn dispatch_fallback(
     services: &RuntimeServices,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
+    if let Some(response) = deny_admin_diagnostic_fallback(&req) {
+        return Ok(response);
+    }
+
     trusted_server_core::integrations::gpt_diagnostics::prepare_request(&state.settings, &mut req)?;
     let path = req.uri().path().to_string();
     let method = req.method().clone();

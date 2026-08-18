@@ -324,6 +324,70 @@ async fn authenticated_admin_eids_route_returns_200() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_admin_diagnostic_fallback_is_denied_locally() {
+    let ec_id = format!("{}.abc123", "a".repeat(64));
+    let valid_paths = [
+        "/_ts/admin/ec".to_owned(),
+        format!("/_ts/admin/ec/{ec_id}"),
+        "/_ts/admin/eids".to_owned(),
+    ];
+
+    for path in valid_paths {
+        for method in ["POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+            let request = request_builder()
+                .method(method)
+                .uri(&path)
+                .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                .body(edgezero_core::body::Body::from("sensitive-admin-body"))
+                .expect("should build authenticated admin request");
+            let response = route(test_router(), request).await;
+
+            assert_eq!(response.status().as_u16(), 405);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("allow")
+                    .and_then(|v| v.to_str().ok()),
+                Some("GET")
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store")
+            );
+        }
+    }
+
+    for path in [
+        "/_ts/admin/ec/".to_owned(),
+        format!("/_ts/admin/ec/{ec_id}/extra"),
+        "/_ts/admin/eids/".to_owned(),
+        "/_ts/admin/eids/extra".to_owned(),
+    ] {
+        for method in ["GET", "POST"] {
+            let request = request_builder()
+                .method(method)
+                .uri(&path)
+                .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                .body(edgezero_core::body::Body::from("sensitive-admin-body"))
+                .expect("should build malformed admin request");
+            let response = route(test_router(), request).await;
+
+            assert_eq!(response.status().as_u16(), 404);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store")
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_route_without_credentials_returns_401() {
     let router = test_router();
     let req = request_builder()
