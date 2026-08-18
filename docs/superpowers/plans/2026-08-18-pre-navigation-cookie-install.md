@@ -13,6 +13,7 @@
 ### Task 1: Reproduce the pre-navigation failure
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/commands/audit/browser.rs`
 
 - [ ] Add a Chrome-backed test that installs a host-only cookie before navigating away from `about:blank` and asserts it reaches the first document.
@@ -24,6 +25,7 @@
 ### Task 2: Install cookies at browser scope
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/commands/audit/browser.rs`
 - Modify: `crates/trusted-server-cli/src/commands/audit/generate/browser_collector.rs`
 
@@ -35,6 +37,7 @@
 ### Task 3: Verify the change
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/commands/audit/browser.rs`
 - Modify: `crates/trusted-server-cli/src/commands/audit/generate/browser_collector.rs`
 

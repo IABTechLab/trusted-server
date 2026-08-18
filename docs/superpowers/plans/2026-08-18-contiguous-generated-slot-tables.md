@@ -13,6 +13,7 @@
 ### Task 1: Reproduce the position collision
 
 **Files:**
+
 - Modify/Test: `crates/trusted-server-cli/src/commands/audit/generate/slot_toml.rs`
 
 - [ ] Add `splice_keeps_generated_slots_and_providers_contiguous` with a late creative section and unrelated tables at colliding positions.
@@ -23,6 +24,7 @@
 ### Task 2: Normalize imported table positions
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/commands/audit/generate/slot_toml.rs`
 
 - [ ] Add a small recursive helper using `Table::set_position`, `Table::iter_mut`, and `ArrayOfTables::iter_mut` to assign one anchor position to every table in the generated slot subtree.
@@ -34,6 +36,7 @@
 ### Task 3: Verify and deliver
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/commands/audit/generate/slot_toml.rs`
 
 - [ ] Run `./scripts/test-cli.sh`.
