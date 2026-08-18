@@ -16,7 +16,7 @@
 //! auth-gated and operator-facing, responses intentionally include full
 //! internal detail (raw consent strings, partner UIDs, parse errors).
 
-use http::{Request, Response, StatusCode, header};
+use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
@@ -41,6 +41,64 @@ use super::registry::PartnerRegistry;
 
 /// Route prefix shared by the cookie-based and explicit-ID lookup routes.
 const ADMIN_EC_PATH: &str = "/_ts/admin/ec";
+
+/// Route used by the request-only EID cookie diagnostic.
+const ADMIN_EIDS_PATH: &str = "/_ts/admin/eids";
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum AdminDiagnosticShape {
+    ValidResource,
+    Malformed,
+}
+
+fn admin_diagnostic_shape(path: &str) -> Option<AdminDiagnosticShape> {
+    if path == ADMIN_EC_PATH || path == ADMIN_EIDS_PATH {
+        return Some(AdminDiagnosticShape::ValidResource);
+    }
+
+    if let Some(remainder) = path.strip_prefix("/_ts/admin/ec/") {
+        return Some(if !remainder.is_empty() && !remainder.contains('/') {
+            AdminDiagnosticShape::ValidResource
+        } else {
+            AdminDiagnosticShape::Malformed
+        });
+    }
+
+    path.starts_with("/_ts/admin/eids/")
+        .then_some(AdminDiagnosticShape::Malformed)
+}
+
+/// Returns a local denial response when an admin diagnostic request reaches
+/// an adapter's publisher fallback.
+///
+/// Valid diagnostic resources reject non-GET methods with `405 Method Not
+/// Allowed`. Malformed, trailing, and any valid GET route that unexpectedly
+/// reaches fallback return `404 Not Found`. Unrelated publisher paths return
+/// `None` so normal fallback behavior remains unchanged.
+#[must_use]
+pub fn deny_admin_diagnostic_fallback(
+    req: &Request<EdgeBody>,
+) -> Option<Response<EdgeBody>> {
+    let shape = admin_diagnostic_shape(req.uri().path())?;
+    let mut response = if shape == AdminDiagnosticShape::ValidResource
+        && req.method() != Method::GET
+    {
+        json_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+    } else {
+        json_error(
+            StatusCode::NOT_FOUND,
+            "admin diagnostic route not found",
+        )
+    };
+
+    if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+        response
+            .headers_mut()
+            .insert(header::ALLOW, HeaderValue::from_static("GET"));
+    }
+
+    Some(response)
+}
 
 /// Successful admin EC lookup payload.
 #[derive(Debug, Serialize)]
@@ -520,6 +578,14 @@ mod tests {
             .expect("should build test request")
     }
 
+    fn request_with_method(method: http::Method, path: &str) -> Request<EdgeBody> {
+        Request::builder()
+            .method(method)
+            .uri(format!("https://edge.example.com{path}"))
+            .body(EdgeBody::empty())
+            .expect("should build test request")
+    }
+
     fn kv_with_entry(ec_id: &str, entry: &KvEntry) -> KvIdentityGraph {
         let kv = KvIdentityGraph::in_memory("test-store");
         kv.create(ec_id, entry).expect("should seed KV entry");
@@ -563,6 +629,80 @@ mod tests {
             },
         );
         entry
+    }
+
+    #[test]
+    fn admin_diagnostic_fallback_rejects_wrong_methods_locally() {
+        let ec_id = test_ec_id();
+        let paths = [
+            "/_ts/admin/ec".to_owned(),
+            format!("/_ts/admin/ec/{ec_id}"),
+            "/_ts/admin/eids".to_owned(),
+        ];
+        let methods = [
+            http::Method::POST,
+            http::Method::HEAD,
+            http::Method::OPTIONS,
+            http::Method::PUT,
+            http::Method::PATCH,
+            http::Method::DELETE,
+        ];
+
+        for path in paths {
+            for method in &methods {
+                let request = request_with_method(method.clone(), &path);
+                let response = deny_admin_diagnostic_fallback(&request)
+                    .unwrap_or_else(|| panic!("should deny {method} {path} locally"));
+
+                assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+                assert_eq!(
+                    response.headers().get(header::ALLOW),
+                    Some(&http::HeaderValue::from_static("GET")),
+                    "should advertise GET for {path}"
+                );
+                assert_eq!(
+                    response.headers().get(header::CACHE_CONTROL),
+                    Some(&http::HeaderValue::from_static("no-store")),
+                    "should prevent caching for {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn admin_diagnostic_fallback_rejects_malformed_paths_locally() {
+        let ec_id = test_ec_id();
+        let paths = [
+            "/_ts/admin/ec/".to_owned(),
+            format!("/_ts/admin/ec/{ec_id}/extra"),
+            "/_ts/admin/eids/".to_owned(),
+            "/_ts/admin/eids/extra".to_owned(),
+        ];
+
+        for path in paths {
+            for method in [http::Method::GET, http::Method::POST] {
+                let request = request_with_method(method.clone(), &path);
+                let response = deny_admin_diagnostic_fallback(&request)
+                    .unwrap_or_else(|| panic!("should deny {method} {path} locally"));
+
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                assert_eq!(
+                    response.headers().get(header::CACHE_CONTROL),
+                    Some(&http::HeaderValue::from_static("no-store")),
+                    "should prevent caching for {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn admin_diagnostic_fallback_ignores_unrelated_publisher_paths() {
+        let request = request_with_method(http::Method::POST, "/articles/example");
+
+        assert!(
+            deny_admin_diagnostic_fallback(&request).is_none(),
+            "should leave unrelated publisher fallback unchanged"
+        );
     }
 
     #[test]
