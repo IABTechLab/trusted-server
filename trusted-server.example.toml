@@ -187,6 +187,9 @@ metadata_keys = ["error_type", "http_status", "message"]
 # request or identity data. "full" additionally exposes all response metadata
 # and untruncated creatives. Never use either sensitive mode in production.
 verbosity = "redacted"
+# "compact" (default) or "pretty". Pretty formats only the outer dump;
+# JSON request/response bodies remain strings exactly as captured.
+format = "compact"
 
 [creative_opportunities]
 gam_network_id = "123456789"
