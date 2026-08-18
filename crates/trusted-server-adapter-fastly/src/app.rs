@@ -52,7 +52,8 @@
 //! `route_request` (tracked in issue #495):
 //!
 //! - [`build_ec_request_state`] runs before every dispatched route (except
-//!   batch-sync, which uses Bearer auth) and reproduces the legacy
+//!   batch-sync, which uses Bearer auth, and the read-only admin EIDs
+//!   diagnostic) and reproduces the legacy
 //!   pre-routing prelude: device signals, bot gate, `ts-eids`/`sharedid`
 //!   cookie capture, geo lookup, [`EcContext`] creation, and KV-graph gating.
 //! - `handle_auction` and integration proxy dispatch receive the same
@@ -531,6 +532,17 @@ async fn execute_named(
         return Ok(run_batch_sync(&state, &services, req));
     }
 
+    // This diagnostic only previews request cookies. Running the normal EC
+    // lifecycle would attach finalization state and could ingest those cookies
+    // into KV after the handler returns, violating the endpoint's read-only
+    // contract.
+    if matches!(handler, NamedRouteHandler::AdminEidsLookup) {
+        let response = PartnerRegistry::from_config(&state.settings.ec.partners)
+            .and_then(|registry| handle_admin_eids_lookup(&registry, &req))
+            .unwrap_or_else(|error| http_error(&error));
+        return Ok(response);
+    }
+
     if let Err(report) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
         &state.settings,
         &mut req,
@@ -589,8 +601,7 @@ async fn run_named_route(
             handle_admin_ec_lookup(kv.as_ref(), &partner_registry, &req)
         }
         NamedRouteHandler::AdminEidsLookup => {
-            let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
-            handle_admin_eids_lookup(&partner_registry, &req)
+            unreachable!("admin EIDs lookup should be handled before EC setup")
         }
         NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
         NamedRouteHandler::BatchSync => {
@@ -1284,6 +1295,7 @@ mod tests {
         AppState, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH,
         TrustedServerApp, build_state_from_settings, startup_error_router,
     };
+    use base64::Engine as _;
     use bytes::Bytes;
     use edgezero_core::body::Body;
     use edgezero_core::http::{Method, Response, StatusCode, header, request_builder};
@@ -2179,6 +2191,44 @@ mod tests {
                 .get::<super::EcFinalizeState>()
                 .is_some(),
             "named-route responses should carry EcFinalizeState for entry-point EC finalization"
+        );
+    }
+
+    #[test]
+    fn admin_eids_diagnostic_skips_ec_finalization() {
+        let router = test_router();
+        let ec_id = format!("{}.abc123", "a".repeat(64));
+        let eids = serde_json::json!([{
+            "source": "example.com",
+            "uids": [{ "id": "example-uid", "atype": 1 }]
+        }]);
+        let eids_cookie = base64::engine::general_purpose::STANDARD.encode(eids.to_string());
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("https://test-publisher.com/_ts/admin/eids")
+            .header(header::AUTHORIZATION, "Basic YWRtaW46YWRtaW4tcGFzcw==")
+            .header(
+                header::COOKIE,
+                format!("ts-ec={ec_id}; ts-eids={eids_cookie}; sharedId=example-shared-id"),
+            )
+            .body(Body::empty())
+            .expect("should build authenticated EIDs diagnostic request");
+        request.extensions_mut().insert(DeviceSignals::derive(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        ));
+
+        let response = route(&router, request);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .extensions()
+                .get::<super::EcFinalizeState>()
+                .is_none(),
+            "admin EIDs diagnostics should not attach EC finalization state"
         );
     }
 
