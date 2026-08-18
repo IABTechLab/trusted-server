@@ -118,7 +118,7 @@ mod tests {
         let patterns = patterns_for_paths(["/", "/news/story", "/car-research/x"], 0);
 
         for pattern in &patterns {
-            trusted_server_core::creative_opportunities::compile_page_pattern(pattern)
+            trusted_server_core::creative_opportunities::validate_page_pattern(pattern)
                 .unwrap_or_else(|error| {
                     panic!("emitted pattern `{pattern}` must compile: {error}")
                 });

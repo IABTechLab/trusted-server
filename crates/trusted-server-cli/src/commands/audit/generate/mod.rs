@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use trusted_server_core::creative_opportunities::{
-    CreativeOpportunitiesConfig, compile_page_pattern,
+    CreativeOpportunitiesConfig, validate_page_pattern,
 };
 use url::Url;
 
@@ -885,7 +885,7 @@ fn build_render_slots(
 fn validate_page_patterns(patterns: &[String]) -> CliResult<()> {
     let invalid: Vec<String> = patterns
         .iter()
-        .filter_map(|pattern| compile_page_pattern(pattern).err())
+        .filter_map(|pattern| validate_page_pattern(pattern).err())
         .collect();
     if invalid.is_empty() {
         return Ok(());
