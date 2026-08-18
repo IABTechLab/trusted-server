@@ -19,6 +19,7 @@
 ### Task 1: Add the configuration type
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/settings.rs:1945-2030`
 - Test: `crates/trusted-server-core/src/settings.rs:2710-2780`
 
@@ -104,6 +105,7 @@ git commit -m "Configure SSAT debug comment output format"
 ### Task 2: Render pretty outer JSON without transforming values
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/publisher.rs:2027-2130`
 - Test: `crates/trusted-server-core/src/publisher.rs:4330-4945`
 
@@ -167,6 +169,7 @@ git commit -m "Pretty print SSAT debug comment dumps"
 ### Task 3: Document and verify the completed feature
 
 **Files:**
+
 - Modify: `trusted-server.example.toml:180-190`
 
 - [ ] **Step 1: Document the setting**
