@@ -1892,7 +1892,7 @@ The successful outer response is an exact JSON string:
   message: 'Prebid Response'
   adId: string
   renderer: string
-  rendererVersion: '3'
+  rendererVersion: '4'
   tsOwner: {
     version: 1
     status: 'ready'
@@ -1902,7 +1902,10 @@ The successful outer response is an exact JSON string:
 }
 ```
 
-`renderer` is the checked-in TS dynamic-owner program. `lifecycleTicket` is
+`rendererVersion:'4'` is the hard-cutover top-mount owner protocol; the old
+renderer-version value is not accepted or aliased. `renderer` is the checked-in TS
+dynamic-owner program, which owns only PUC registration and Promise settlement.
+`lifecycleTicket` is
 `t1_` plus 22 unpadded base64url characters from 16 CSPRNG bytes, bound to the
 attempt, generation, source, and reservation, with a fixed three-second TTL from
 posting the outer response. No descriptor or ADM appears in the outer response. A
@@ -2007,6 +2010,36 @@ The mount has three document phases:
    from the exact outer `WindowProxy` with exactly one port, then sends the descriptor
    envelope once over that port. Neither the bootstrap nor outer container receives
    the descriptor.
+
+After bootstrap readiness, both the outer mount iframe and its inner renderer iframe
+use this exact permanent sandbox order:
+
+```text
+allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts allow-top-navigation-by-user-activation
+```
+
+`<TS_ORIGIN>` is the canonical ASCII HTTP(S) origin of the bootstrap URL and
+`<CREATIVE_ORIGIN>` is the canonical ASCII HTTPS origin of the validated creative
+URL. They contain no path, query, fragment, credentials, whitespace, quote, semicolon,
+or control character. The outer data container carries this exact meta-CSP after
+sentinel substitution:
+
+```text
+default-src 'none'; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline' <TS_ORIGIN>; connect-src https: <TS_ORIGIN>; frame-src data: <CREATIVE_ORIGIN>; img-src https: data: blob:; media-src https: blob:; style-src 'unsafe-inline' https:; font-src https: data:; worker-src https: blob:; form-action https:;
+```
+
+The inner data renderer carries the intersecting exact meta-CSP:
+
+```text
+default-src 'none'; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline' <TS_ORIGIN>; connect-src https: <TS_ORIGIN>; frame-src <CREATIVE_ORIGIN>; img-src https: data: blob:; media-src https: blob:; style-src 'unsafe-inline' https:; font-src https: data:; worker-src https: blob:; form-action https:;
+```
+
+The outer policy must permit the inner document's runner/resource contract because
+it is inherited by a `data:` child; the inner policy narrows external script and
+creative-frame authority again. Neither policy permits publisher origin as a frame
+target unless it is also the validated creative origin, which descriptor validation
+forbids. A loopback HTTP `<TS_ORIGIN>` is named explicitly for hermetic tests and does
+not broaden `https:` production sources.
 
 The generated outer-container document contains only the exact validated creative
 origin, exact Trusted Server origin, the two nonces, the permanent sandbox string,
