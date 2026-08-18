@@ -108,7 +108,7 @@ authentication:
 
 - A non-GET request to `/_ts/admin/ec`, a single-segment
   `/_ts/admin/ec/{id}`, or `/_ts/admin/eids` returns local `405 Method Not
-  Allowed` with `Allow: GET`.
+Allowed` with `Allow: GET`.
 - A path with a trailing slash, an extra segment, a missing segment structure,
   or an EIDs suffix returns local `404 Not Found` and never reaches the
   publisher.
