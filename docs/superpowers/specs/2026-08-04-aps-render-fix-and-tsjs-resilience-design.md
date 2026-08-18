@@ -2004,9 +2004,10 @@ The PUC overlay uses compare-restorable top-page style ownership: when computed
 `position` is `static`, it sets the host's inline `position:relative` only while the
 artifact owns that exact prior inline value. The outer mount iframe is the absolute,
 initially `visibility:hidden` child with `inset:0`, `z-index:2147483647`, the exact
-winning pixel width/height, and zero margin/border/scrolling/overflow. On acceptance
-it changes only its own visibility to reveal the child above the existing GPT/PUC
-content. It never hides, removes, reparents, or
+winning pixel width/height, and zero margin/border/scrolling/overflow. Document
+acceptance and runner load leave it hidden; only the valid `TS APS Render Completed`
+terminal transition changes its own visibility and publishes it above the existing
+GPT/PUC content. It never hides, removes, reparents, or
 traverses the GAM, PUC, SafeFrame, or bidder-controlled surface; that surface stays
 connected and inert behind the TS-owned overlay while the dynamic owner retains only
 Promise settlement authority. Direct rendering does not acquire overlay styling.
