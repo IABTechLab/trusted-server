@@ -110,6 +110,8 @@ pub struct AuctionObservationContext {
     pub is_mobile: u8,
     /// `0` = bot, `1` = browser, `2` = unknown.
     pub is_known_browser: u8,
+    /// Coarse browser family from the UA, when recognized.
+    pub browser_family: Option<String>,
     /// Whether GDPR applies.
     pub gdpr_applies: bool,
     /// Whether any consent signal was present.
@@ -172,6 +174,7 @@ impl AuctionObservationContext {
                 Some(false) => 0,
                 None => 2,
             },
+            browser_family: device.and_then(|signals| signals.browser_family.clone()),
             gdpr_applies: consent.gdpr_applies,
             consent_present: !consent.is_empty(),
             slot_count,
@@ -196,6 +199,7 @@ impl AuctionObservationContext {
             region: Some("CA".to_owned()),
             is_mobile: 0,
             is_known_browser: 1,
+            browser_family: Some("chrome".to_owned()),
             gdpr_applies: false,
             consent_present: false,
             slot_count,
@@ -282,6 +286,8 @@ pub struct AuctionEventRow {
     pub is_mobile: u8,
     /// `0` = bot, `1` = browser, `2` = unknown.
     pub is_known_browser: u8,
+    /// Coarse browser family from the UA, when recognized.
+    pub browser_family: Option<String>,
     /// `0` or `1`.
     pub gdpr_applies: u8,
     /// `0` or `1`.
@@ -341,6 +347,7 @@ impl AuctionEventRow {
             region: observation.region.clone(),
             is_mobile: observation.is_mobile,
             is_known_browser: observation.is_known_browser,
+            browser_family: observation.browser_family.clone(),
             gdpr_applies: u8::from(observation.gdpr_applies),
             consent_present: u8::from(observation.consent_present),
             terminal_status: None,

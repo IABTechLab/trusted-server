@@ -12,6 +12,7 @@ SCHEMA >
   `region` Nullable(String),
   `is_mobile` UInt8,
   `is_known_browser` UInt8,
+  `browser_family` LowCardinality(Nullable(String)),
   `gdpr_applies` UInt8,
   `consent_present` UInt8,
   `terminal_status` LowCardinality(Nullable(String)),
