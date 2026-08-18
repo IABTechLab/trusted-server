@@ -300,24 +300,24 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
             generate::run_generate(generate_args, &collector, &mut out)
                 .map(|()| RunOutcome::Success)
         }
-        None => match &args.legacy_url {
-            Some(_) => {
-                let generate_args = legacy_generate_args(args)
-                    .expect("should build generation args when legacy URL is present");
+        None => match args.legacy_url.as_ref() {
+            Some(url) => {
+                let generate_args = legacy_generate_args(args, url);
                 let stdout = std::io::stdout();
                 let mut out = stdout.lock();
                 let collector = generate::browser_collector::BrowserAuditCollector::default();
                 generate::run_generate(&generate_args, &collector, &mut out)
                     .map(|()| RunOutcome::Success)
             }
-            None => Err("provide a URL or a subcommand (`page`, `ad-templates`)".to_string()),
+            None => Err(
+                "provide a URL or a subcommand (`generate`, `page`, `ad-templates`)".to_string(),
+            ),
         },
     }
 }
 
-fn legacy_generate_args(args: &AuditArgs) -> Option<generate::GenerateArgs> {
-    let url = args.legacy_url.as_ref()?;
-    Some(generate::GenerateArgs {
+fn legacy_generate_args(args: &AuditArgs, url: &url::Url) -> generate::GenerateArgs {
+    generate::GenerateArgs {
         url: url.to_string(),
         js_assets: args.legacy_generate.js_assets.clone(),
         config: args.legacy_generate.config.clone(),
@@ -325,7 +325,7 @@ fn legacy_generate_args(args: &AuditArgs) -> Option<generate::GenerateArgs> {
         no_config: args.legacy_generate.no_config,
         force: args.legacy_generate.force,
         cookies: args.legacy_generate.cookies.clone(),
-    })
+    }
 }
 
 #[cfg(test)]
@@ -381,7 +381,10 @@ mod tests {
             },
         };
 
-        let generate = legacy_generate_args(&args).expect("should build generation args");
+        let generate = legacy_generate_args(
+            &args,
+            args.legacy_url.as_ref().expect("should have legacy URL"),
+        );
 
         assert_eq!(generate.url, "https://www.example.com/");
         assert_eq!(
