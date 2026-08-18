@@ -20,9 +20,9 @@ use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::sanitize_forwarded_headers;
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-use trusted_server_core::platform::PlatformConfigStore;
 use trusted_server_core::platform::RuntimeServices;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use trusted_server_core::platform::{PlatformConfigStore, StoreName};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
@@ -37,9 +37,7 @@ use trusted_server_core::request_signing::{
 };
 use trusted_server_core::settings::Settings;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-use trusted_server_core::settings_data::{
-    default_config_key, default_config_store_name, default_secret_store_name,
-};
+use trusted_server_core::settings_data::{default_config_key, default_secret_store_name};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, NormalizeMiddleware};
 use crate::platform::build_runtime_services;
@@ -49,6 +47,10 @@ use crate::platform::{ConfigStoreHandleAdapter, SpinSecretStoreAdapter};
 // ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
+
+/// Spin auto-provides this key-value store label without runtime configuration.
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+const SPIN_DEFAULT_CONFIG_STORE: &str = "default";
 
 /// Application state built once at startup and shared across all requests.
 pub struct AppState {
@@ -70,7 +72,7 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
-    let config_store_name = default_config_store_name();
+    let config_store_name = StoreName::from(SPIN_DEFAULT_CONFIG_STORE);
     let config_key = default_config_key();
     let config_store =
         futures::executor::block_on(SpinConfigStore::open(config_store_name.as_ref().to_owned()))

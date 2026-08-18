@@ -11,11 +11,13 @@ use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
 #[cfg(target_arch = "wasm32")]
-use trusted_server_core::config_payload::settings_from_config_blob;
+use trusted_server_core::config_payload::{DEFAULT_SECRET_STORE_ID, settings_from_config_blob};
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::RuntimeServices;
+#[cfg(target_arch = "wasm32")]
+use trusted_server_core::platform::StoreName;
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
@@ -29,8 +31,6 @@ use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
-#[cfg(target_arch = "wasm32")]
-use trusted_server_core::settings_data::default_secret_store_name;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::build_runtime_services;
@@ -121,7 +121,8 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
             })
         })?;
     let secret_store = crate::platform::CloudflareSecretStoreAdapter { env };
-    settings_from_config_blob(envelope, &secret_store, &default_secret_store_name())
+    let default_secret_store = StoreName::from(DEFAULT_SECRET_STORE_ID);
+    settings_from_config_blob(envelope, &secret_store, &default_secret_store)
 }
 
 /// Build the application state from explicit settings.
