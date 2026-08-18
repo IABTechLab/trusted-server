@@ -160,7 +160,7 @@ A network-loaded HTTPS creative does not inherit its ancestor's CSP and can crea
 
 Trusted Server generates independent 128-bit nonces for the container and renderer. Once the inner renderer is ready, the container transfers a dedicated `MessagePort` between trusted top-page TSJS and the inner renderer. The complete descriptor travels only over that port; the inner renderer revalidates it, rejects the publisher origin, and requires the creative origin to equal the origin bound in the container CSP. The container URL contains only that exact origin, static renderer source, and nonces—never the response envelope, bid ID, price, or creative URL path.
 
-The inner document initializes the account-keyed APS queue and loads only the fixed runner at `https://client.aps.amazon-adsystem.com/prebid-creative.js`. A `renderer-ready` acknowledgement still means that Amazon's runner loaded, not that the final creative painted. Existing slot content remains until that acknowledgement. The query-free `GET /integrations/aps/renderer` response remains available with its original stricter CSP and legacy message shape for cached clients and rollback.
+The inner document initializes the account-keyed APS queue and loads only the fixed runner at `https://client.aps.amazon-adsystem.com/prebid-creative.js`. A `renderer-ready` acknowledgement still means that Amazon's runner loaded, not that the final creative painted. Existing slot content remains until that acknowledgement. The query-free `GET /integrations/aps/renderer` response remains available with its original stricter CSP and legacy message shape for cached clients and rollback. If bootstrap readiness is delayed, TSJS posts that exact two-field legacy descriptor after a brief compatibility wait while continuing to accept a later modern bootstrap acknowledgement.
 
 ### Direct `/auction`
 
@@ -171,6 +171,8 @@ The TSJS auction client validates the typed renderer descriptor and mounts the n
 For initial navigation and page-bids, Trusted Server publishes the same descriptor in `window.tsjs.bids`. The source-checked Prebid Universal Creative bridge accepts requests only from the iframe that owns the matching `hb_adid`, validates the complete envelope, and returns a static dynamic-renderer program with a one-shot mount capability. That program asks trusted top-page TSJS to mount the nested data renderer as a sibling of the Universal Creative iframe, outside inherited GAM and Universal Creative sandbox restrictions.
 
 For client-side `trustedServer` adapter auctions, Prebid generates its own `hb_adid`. Trusted Server binds that generated ID to the validated APS descriptor in a bounded, expiring browser registry before GAM refresh. The bridge verifies that the requesting Universal Creative iframe belongs to the same ad unit, consumes both the renderer and mount capabilities once, and passes the APS bid ID separately to the Amazon runner.
+
+After a Universal Creative APS mount commits, TSJS keeps the controller connected but hidden and records its prior inline display value. GPT's next `slotRequested` event removes only the committed APS frame, restores the controller's exact display value, and revokes unconsumed mount work for that slot before the refreshed creative lifecycle begins.
 
 These paths do not fetch PBS Cache, fire generic APS win/billing beacons, or call `apstag.setDisplayBids()` for the Trusted Server winner. Publisher-owned native APS objects are otherwise left untouched.
 

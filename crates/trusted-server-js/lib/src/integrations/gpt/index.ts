@@ -10,6 +10,7 @@ import type {
 import {
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+  cancelPendingApsRender,
   consumeApsPrebidRenderer,
   getApsPrebidRenderer,
   registerApsUniversalCreativeMount,
@@ -77,9 +78,12 @@ interface GoogleTagSlot {
   getTargeting?(key: string): string[];
 }
 
-interface SlotRenderEndedEvent {
-  isEmpty: boolean;
+interface SlotRequestedEvent {
   slot: GoogleTagSlot;
+}
+
+interface SlotRenderEndedEvent extends SlotRequestedEvent {
+  isEmpty: boolean;
 }
 
 interface SlotElementResolution {
@@ -251,7 +255,8 @@ interface GoogleTagPubAdsService {
   setTargeting(key: string, value: string | string[]): GoogleTagPubAdsService;
   getTargeting(key: string): string[];
   enableSingleRequest(): void;
-  addEventListener(event: string, fn: (e: SlotRenderEndedEvent) => void): void;
+  addEventListener(event: 'slotRequested', fn: (e: SlotRequestedEvent) => void): void;
+  addEventListener(event: 'slotRenderEnded', fn: (e: SlotRenderEndedEvent) => void): void;
   refresh(slots?: GoogleTagSlot[], options?: GoogleTagRefreshOptions): void;
   getSlots?(): GoogleTagSlot[];
   disableInitialLoad?(): void;
@@ -395,6 +400,7 @@ export function installGptShim(): boolean {
 
   const tag = ensureGoogleTagStub(win);
   patchCommandQueue(tag);
+  installApsRefreshTeardownListener();
 
   log.info('GPT shim installed');
   return true;
@@ -1604,6 +1610,31 @@ function recordConsumedPrebidApsId(
   consumedIds.set(adId, { expiresAt });
 }
 
+let apsRefreshTeardownListenerInstalled = false;
+let apsRefreshTeardownCommandQueued = false;
+
+function installApsRefreshTeardownListener(): void {
+  if (apsRefreshTeardownListenerInstalled || apsRefreshTeardownCommandQueued) return;
+  const googletag = (window as GptWindow).googletag;
+  if (!googletag?.cmd) return;
+
+  apsRefreshTeardownCommandQueued = true;
+  googletag.cmd.push(() => {
+    apsRefreshTeardownCommandQueued = false;
+    if (apsRefreshTeardownListenerInstalled || typeof googletag.pubads !== 'function') return;
+    const pubads = googletag.pubads();
+    if (typeof pubads.addEventListener !== 'function') return;
+    pubads.addEventListener('slotRequested', (event: SlotRequestedEvent) => {
+      const elementId = event.slot?.getSlotElementId?.();
+      if (!elementId) return;
+      for (const container of candidateSlotRoots(elementId)) {
+        cancelPendingApsRender(container);
+      }
+    });
+    apsRefreshTeardownListenerInstalled = true;
+  });
+}
+
 /**
  * Install the TS → pbRender bridge.
  *
@@ -1626,6 +1657,8 @@ function recordConsumedPrebidApsId(
  */
 export function installTsRenderBridge(): void {
   if (typeof window === 'undefined') return;
+
+  installApsRefreshTeardownListener();
 
   // `slotId|adId` renders whose PBS Cache fetch is in flight. `fireWinBillingBeacons`
   // only dedups after the async fetch resolves, so two Prebid Request messages for

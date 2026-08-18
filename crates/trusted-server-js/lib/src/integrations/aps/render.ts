@@ -33,6 +33,14 @@ const DESCRIPTOR_KEYS = [
 const DESCRIPTOR_KEYS_WITH_CREATIVE_ID = [...DESCRIPTOR_KEYS, 'creativeId'].sort();
 const activeFrames = new WeakMap<HTMLElement, HTMLIFrameElement>();
 const pendingFrameCancels = new WeakMap<HTMLElement, () => void>();
+type CommittedApsMount = {
+  frame: HTMLIFrameElement;
+  hiddenSiblings: Array<{
+    element: HTMLElement;
+    display: { value: string; priority: string };
+  }>;
+};
+const committedApsMounts = new WeakMap<HTMLElement, CommittedApsMount>();
 const RENDERER_READY_MESSAGE = 'trusted-server/aps/renderer-ready';
 const RENDERER_FAILED_MESSAGE = 'trusted-server/aps/renderer-failed';
 const RENDERER_READY_TIMEOUT_MS = 10_000;
@@ -375,9 +383,10 @@ function mountApsRendererFrame(
   pendingFrameCancels.get(container)?.();
   activeFrames.set(container, iframe);
 
-  let phase: 'active' | 'bootstrap' | 'channel' | 'legacy' | 'renderer' = 'bootstrap';
+  let phase: 'active' | 'bootstrap' | 'channel' | 'renderer' = 'bootstrap';
   let rendererChannel: MessagePort | undefined;
   let settled = false;
+  let legacyDescriptorPosted = false;
   let legacyFallbackId: number | undefined;
   const cleanup = (): void => {
     window.removeEventListener('message', receive);
@@ -406,6 +415,7 @@ function mountApsRendererFrame(
     cleanup();
     if (pendingFrameCancels.get(container) === cancel) pendingFrameCancels.delete(container);
 
+    const hiddenSiblings: CommittedApsMount['hiddenSiblings'] = [];
     for (const child of Array.from(container.children)) {
       if (child === iframe) continue;
       if (options.mode === 'replace' || (child as HTMLElement).dataset.tsApsRenderer === 'true') {
@@ -413,9 +423,17 @@ function mountApsRendererFrame(
       } else if (child instanceof HTMLElement) {
         // Keep Universal Creative connected long enough to receive the success
         // acknowledgement, but never leave two visible rendering surfaces.
-        child.style.display = 'none';
+        hiddenSiblings.push({
+          element: child,
+          display: {
+            value: child.style.getPropertyValue('display'),
+            priority: child.style.getPropertyPriority('display'),
+          },
+        });
+        child.style.setProperty('display', 'none', 'important');
       }
     }
+    committedApsMounts.set(container, { frame: iframe, hiddenSiblings });
     iframe.style.display = '';
     options.onReady?.();
   };
@@ -425,7 +443,11 @@ function mountApsRendererFrame(
       fail();
       return;
     }
-    target.postMessage({ nonce, publisherOrigin, renderer }, '*');
+    // The query-free renderer retained for rollback accepts this exact legacy
+    // shape. Keep the modern bootstrap phase live in case its ready message is
+    // delayed past the compatibility timer.
+    legacyDescriptorPosted = true;
+    target.postMessage({ nonce, renderer }, '*');
   };
   function receiveChannel(event: MessageEvent): void {
     if (!hasExactKeys(event.data, ['message', 'nonce']) || event.data.nonce !== innerNonce) return;
@@ -460,7 +482,11 @@ function mountApsRendererFrame(
       rendererChannel = event.ports[0];
       rendererChannel.onmessage = receiveChannel;
       rendererChannel.start();
-    } else if (event.data.message === RENDERER_READY_MESSAGE && phase === 'legacy') {
+    } else if (
+      event.data.message === RENDERER_READY_MESSAGE &&
+      phase === 'bootstrap' &&
+      legacyDescriptorPosted
+    ) {
       commit();
     } else if (event.data.message === RENDERER_FAILED_MESSAGE) {
       fail();
@@ -469,12 +495,9 @@ function mountApsRendererFrame(
   function load(): void {
     if (settled || activeFrames.get(container) !== iframe || !iframe.isConnected) return;
     try {
-      if (phase === 'legacy') {
-        postLegacyDescriptor();
-      } else if (phase === 'bootstrap') {
+      if (phase === 'bootstrap' && legacyFallbackId === undefined) {
         legacyFallbackId = window.setTimeout(() => {
           if (phase !== 'bootstrap' || settled) return;
-          phase = 'legacy';
           postLegacyDescriptor();
         }, LEGACY_RENDERER_FALLBACK_MS);
       }
@@ -493,9 +516,30 @@ function mountApsRendererFrame(
   return true;
 }
 
-/** Cancel pending APS work before another renderer replaces this container. */
+/** Cancel pending or committed APS work before another renderer replaces this container. */
 export function cancelPendingApsRender(container: HTMLElement): void {
   pendingFrameCancels.get(container)?.();
+
+  const committed = committedApsMounts.get(container);
+  if (committed) {
+    committedApsMounts.delete(container);
+    if (activeFrames.get(container) === committed.frame) activeFrames.delete(container);
+    committed.frame.remove();
+    for (const sibling of committed.hiddenSiblings) {
+      if (sibling.element.parentElement === container) {
+        if (sibling.display.value) {
+          sibling.element.style.setProperty(
+            'display',
+            sibling.display.value,
+            sibling.display.priority
+          );
+        } else {
+          sibling.element.style.removeProperty('display');
+        }
+      }
+    }
+  }
+
   for (const [mountId, entry] of pendingUniversalMounts) {
     if (entry.container === container) pendingUniversalMounts.delete(mountId);
   }
@@ -526,11 +570,20 @@ export function registerApsUniversalCreativeMount(
 
   const now = Date.now();
   prunePendingUniversalMounts(now);
-  cancelPendingApsRender(container);
-  if (pendingUniversalMounts.size >= MAX_PENDING_UNIVERSAL_MOUNTS) return undefined;
 
+  // Validate every synchronous failure before replacing an already committed
+  // creative. A successful re-registration still revokes this container's old
+  // pending capability, but capacity consumed by other slots must not fork it.
   const mountId = createNonce();
   if (!mountId || pendingUniversalMounts.has(mountId)) return undefined;
+  const pendingForContainer = Array.from(pendingUniversalMounts.values()).filter(
+    (entry) => entry.container === container
+  ).length;
+  if (pendingUniversalMounts.size - pendingForContainer >= MAX_PENDING_UNIVERSAL_MOUNTS) {
+    return undefined;
+  }
+
+  cancelPendingApsRender(container);
   pendingUniversalMounts.set(mountId, {
     container,
     expiresAt: now + RENDERER_READY_TIMEOUT_MS,

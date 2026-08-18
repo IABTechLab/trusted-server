@@ -18,7 +18,15 @@ export default defineConfig({
       name: "chromium",
       use: { browserName: "chromium" },
     },
+    {
+      name: "firefox",
+      use: { browserName: "firefox" },
+    },
+    {
+      name: "webkit",
+      use: { browserName: "webkit" },
+    },
   ],
   reporter: [["list"], ["html", { open: "never" }]],
-  outputDir: "./test-results",
+  outputDir: process.env.PLAYWRIGHT_OUTPUT_DIR ?? "./test-results",
 });

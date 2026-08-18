@@ -2927,6 +2927,80 @@ describe('installTsRenderBridge', () => {
     return bridgeListener!;
   }
 
+  it('tears down APS state only for the exact GPT slot when a refresh is requested', async () => {
+    const cancelPendingApsRender = vi.fn();
+    vi.doMock('../../../src/integrations/aps/render', async () => {
+      const actual = await vi.importActual<typeof import('../../../src/integrations/aps/render')>(
+        '../../../src/integrations/aps/render'
+      );
+      return { ...actual, cancelPendingApsRender };
+    });
+
+    const matchingSlot = document.createElement('div');
+    matchingSlot.id = 'div-header';
+    const matchingContainer = document.createElement('div');
+    matchingContainer.id = 'div-header-container';
+    const otherSlot = document.createElement('div');
+    otherSlot.id = 'div-other';
+    document.body.append(matchingSlot, matchingContainer, otherSlot);
+
+    let slotRequested: ((event: { slot: { getSlotElementId(): string } }) => void) | undefined;
+    const pubads = {
+      addEventListener: vi.fn(
+        (event: string, listener: (event: { slot: { getSlotElementId(): string } }) => void) => {
+          if (event === 'slotRequested') slotRequested = listener;
+        }
+      ),
+    };
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      pubads: vi.fn().mockReturnValue(pubads),
+    };
+
+    try {
+      await import('../../../src/integrations/gpt/index');
+      expect(slotRequested).toBeDefined();
+
+      slotRequested!({ slot: { getSlotElementId: () => 'div-header' } });
+
+      expect(cancelPendingApsRender).toHaveBeenCalledTimes(2);
+      expect(cancelPendingApsRender).toHaveBeenCalledWith(matchingSlot);
+      expect(cancelPendingApsRender).toHaveBeenCalledWith(matchingContainer);
+      expect(cancelPendingApsRender).not.toHaveBeenCalledWith(otherSlot);
+    } finally {
+      vi.doUnmock('../../../src/integrations/aps/render');
+      matchingSlot.remove();
+      matchingContainer.remove();
+      otherSlot.remove();
+      delete (window as TestWindow).googletag;
+    }
+  });
+
+  it('installs refresh teardown when the GPT shim activates after the bundle loads', async () => {
+    delete (window as TestWindow).googletag;
+    const { installGptShim } = await import('../../../src/integrations/gpt/index');
+
+    let slotRequested: ((event: { slot: { getSlotElementId(): string } }) => void) | undefined;
+    const pubads = {
+      addEventListener: vi.fn(
+        (event: string, listener: (event: { slot: { getSlotElementId(): string } }) => void) => {
+          if (event === 'slotRequested') slotRequested = listener;
+        }
+      ),
+    };
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      pubads: vi.fn().mockReturnValue(pubads),
+    };
+
+    try {
+      expect(installGptShim()).toBe(true);
+      expect(slotRequested).toBeDefined();
+    } finally {
+      delete (window as TestWindow).googletag;
+    }
+  });
+
   it('records an inline creative request and response with the same opaque attempt ID', async () => {
     const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(41);
     const recordTrustedServerCreativeResponse = vi.fn();

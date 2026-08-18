@@ -391,6 +391,74 @@ describe('direct APS rendering', () => {
     expect(iframe.style.display).toBe('');
   });
 
+  it('continues the modern bootstrap when ready arrives after the legacy fallback', () => {
+    vi.useFakeTimers();
+    try {
+      expect(renderApsCreative({ slotId: 'fictional-slot', renderer: descriptor() })).toBe(true);
+      const slot = document.getElementById('fictional-slot')!;
+      const iframe = slot.querySelector<HTMLIFrameElement>('iframe')!;
+      const postMessage = vi.spyOn(iframe.contentWindow!, 'postMessage');
+      const nonce = new URL(iframe.src).hash.replace('#tsaps=', '');
+
+      iframe.dispatchEvent(new Event('load'));
+      vi.advanceTimersByTime(100);
+
+      expect(postMessage).toHaveBeenCalledWith({ nonce, renderer: descriptor() }, '*');
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          data: { message: 'trusted-server/aps/bootstrap-ready', nonce },
+          source: iframe.contentWindow,
+        })
+      );
+
+      const navigate = postMessage.mock.calls.find(
+        ([message]) =>
+          (message as { message?: string }).message === 'trusted-server/aps/bootstrap-navigate'
+      )?.[0] as { rendererUrl: string } | undefined;
+      expect(navigate?.rendererUrl).toMatch(
+        /^data:text\/html;charset=utf-8,.+#tsaps=[A-Za-z0-9_-]{22}$/
+      );
+      expect(iframe.getAttribute('sandbox')).toBe(APS_RENDERER_SANDBOX);
+    } finally {
+      const slot = document.getElementById('fictional-slot');
+      if (slot) cancelPendingApsRender(slot);
+      vi.useRealTimers();
+    }
+  });
+
+  it('accepts the exact two-key descriptor fallback for a legacy renderer', () => {
+    vi.useFakeTimers();
+    try {
+      expect(renderApsCreative({ slotId: 'fictional-slot', renderer: descriptor() })).toBe(true);
+      const slot = document.getElementById('fictional-slot')!;
+      const iframe = slot.querySelector<HTMLIFrameElement>('iframe')!;
+      const postMessage = vi.spyOn(iframe.contentWindow!, 'postMessage');
+      const nonce = new URL(iframe.src).hash.replace('#tsaps=', '');
+
+      iframe.dispatchEvent(new Event('load'));
+      vi.advanceTimersByTime(100);
+
+      expect(postMessage).toHaveBeenCalledOnce();
+      expect(postMessage).toHaveBeenCalledWith({ nonce, renderer: descriptor() }, '*');
+      expect(Object.keys(postMessage.mock.calls[0]![0] as object).sort()).toEqual([
+        'nonce',
+        'renderer',
+      ]);
+
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          data: { message: 'trusted-server/aps/renderer-ready', nonce },
+          source: iframe.contentWindow,
+        })
+      );
+
+      expect(slot.querySelector('span')).toBeNull();
+      expect(iframe.style.display).toBe('');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('accepts readiness only through the transferred renderer channel', () => {
     expect(renderApsCreative({ slotId: 'fictional-slot', renderer: descriptor() })).toBe(true);
 
@@ -539,6 +607,7 @@ describe('Universal Creative APS source', () => {
       '<div id="fictional-puc-slot"><iframe class="puc-controller"></iframe></div>';
     const container = document.getElementById('fictional-puc-slot')!;
     const controller = container.querySelector<HTMLIFrameElement>('.puc-controller')!;
+    controller.style.setProperty('display', 'inline-block', 'important');
     const requester = document.createElement('iframe');
     document.body.appendChild(requester);
     const resultPost = vi.spyOn(requester.contentWindow!, 'postMessage');
@@ -573,7 +642,8 @@ describe('Universal Creative APS source', () => {
     });
 
     expect(controller.isConnected).toBe(true);
-    expect(controller.style.display).toBe('none');
+    expect(controller.style.getPropertyValue('display')).toBe('none');
+    expect(controller.style.getPropertyPriority('display')).toBe('important');
     expect(rendererFrame.style.display).toBe('');
     expect(resultPost).toHaveBeenCalledWith(
       {
@@ -584,7 +654,110 @@ describe('Universal Creative APS source', () => {
       },
       '*'
     );
+
+    cancelPendingApsRender(container);
+
+    expect(rendererFrame.isConnected).toBe(false);
+    expect(controller.isConnected).toBe(true);
+    expect(controller.style.getPropertyValue('display')).toBe('inline-block');
+    expect(controller.style.getPropertyPriority('display')).toBe('important');
     document.body.innerHTML = '';
+  });
+
+  it('removes the forced display declaration when the controller had none', () => {
+    document.body.innerHTML =
+      '<div id="fictional-puc-no-display"><iframe class="puc-controller"></iframe></div>';
+    const container = document.getElementById('fictional-puc-no-display')!;
+    const controller = container.querySelector<HTMLIFrameElement>('.puc-controller')!;
+    const requester = document.createElement('iframe');
+    document.body.appendChild(requester);
+    const mountId = registerApsUniversalCreativeMount(container, descriptor())!;
+
+    window.dispatchEvent(
+      new MessageEvent('message', {
+        data: {
+          message: 'trusted-server/aps/mount-request',
+          mountId,
+          nonce: 'ZYXWVUTSRQPONMLKJIHGFE',
+        },
+        source: requester.contentWindow,
+      })
+    );
+
+    const rendererFrame = container.querySelector<HTMLIFrameElement>(
+      'iframe[data-ts-aps-renderer="true"]'
+    )!;
+    const { channel, sent } = advanceRendererToData(rendererFrame);
+    sendRendererMessage(channel, {
+      message: 'trusted-server/aps/renderer-ready',
+      nonce: sent.nonce,
+    });
+    expect(controller.style.getPropertyValue('display')).toBe('none');
+    expect(controller.style.getPropertyPriority('display')).toBe('important');
+
+    cancelPendingApsRender(container);
+
+    expect(controller.style.getPropertyValue('display')).toBe('');
+    expect(controller.style.getPropertyPriority('display')).toBe('');
+    expect(controller.style.cssText).toBe('');
+    document.body.innerHTML = '';
+  });
+
+  it('keeps a committed mount when other slots exhaust pending mount capacity', () => {
+    document.body.innerHTML =
+      '<div id="fictional-puc-capacity"><iframe class="puc-controller"></iframe></div>';
+    const container = document.getElementById('fictional-puc-capacity')!;
+    const controller = container.querySelector<HTMLIFrameElement>('.puc-controller')!;
+    controller.style.setProperty('display', 'inline-block', 'important');
+    const requester = document.createElement('iframe');
+    document.body.appendChild(requester);
+    const mountId = registerApsUniversalCreativeMount(container, descriptor())!;
+    const fillers: HTMLElement[] = [];
+
+    try {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          data: {
+            message: 'trusted-server/aps/mount-request',
+            mountId,
+            nonce: 'ZYXWVUTSRQPONMLKJIHGFE',
+          },
+          source: requester.contentWindow,
+        })
+      );
+      const rendererFrame = container.querySelector<HTMLIFrameElement>(
+        'iframe[data-ts-aps-renderer="true"]'
+      )!;
+      const { channel, sent } = advanceRendererToData(rendererFrame);
+      sendRendererMessage(channel, {
+        message: 'trusted-server/aps/renderer-ready',
+        nonce: sent.nonce,
+      });
+
+      for (let index = 0; index < 256; index += 1) {
+        const filler = document.createElement('div');
+        document.body.appendChild(filler);
+        fillers.push(filler);
+        expect(registerApsUniversalCreativeMount(filler, descriptor())).toMatch(
+          /^[A-Za-z0-9_-]{22}$/
+        );
+      }
+
+      expect(registerApsUniversalCreativeMount(container, descriptor())).toBeUndefined();
+      expect(container.querySelector('iframe[data-ts-aps-renderer="true"]')).toBe(rendererFrame);
+      expect(rendererFrame.isConnected).toBe(true);
+      expect(controller.isConnected).toBe(true);
+      expect(controller.style.getPropertyValue('display')).toBe('none');
+      expect(controller.style.getPropertyPriority('display')).toBe('important');
+    } finally {
+      for (const filler of fillers) {
+        cancelPendingApsRender(filler);
+        filler.remove();
+      }
+      cancelPendingApsRender(container);
+      requester.remove();
+      document.body.innerHTML = '';
+    }
   });
 
   it('revokes an older mount capability when the same container is registered again', () => {
