@@ -1,28 +1,30 @@
 # APS Render Fix and TSJS Resilience Architecture — Design
 
-- **Status:** revision 38 — hard-cutover contract with a lean first-display owner,
-  atomic persistent-runtime takeover, current-`main` authority, retired-branch
-  concept-gap coverage, and
+- **Status:** revision 39 — hard-cutover contract with a lean first-display owner,
+  atomic persistent-runtime takeover, an `rc/202608` implementation base,
+  retired-branch concept-gap coverage, rc behavior reconciliation, and
   merge-blocking load-time remediation
 - **Date:** 2026-08-04
-- **Implementation baseline:** current `origin/main` at design revision 38,
-  `5a76e59cd7939efd28b742eda4166bf53f10bb10` ("Preserve APS renderer
-  handshake behavior"). `main` is the sole source for starting code, behavior,
-  tests, APIs, CI, dependency state, and performance comparison. Implementation
-  refreshes and integrates current `main` again before resuming work and before
-  cutover; this recorded SHA is review provenance, not permission to ignore later
-  `main` changes.
+- **Implementation baseline:** fetched `origin/rc/202608` at
+  `f0825604ec6740111e99dd8a178e3b880e7d772b` on 2026-08-18. The implementation
+  branch is created directly from that commit. Existing feature history at
+  `ecd78a9d11680deece4d4ec13f84be04fdae6b0d` is integrated as the second parent
+  of merge commit `95b562ea820268d6f16da08863dfa9f71076e4d2`.
+  `origin/main` at the same fetch was
+  `2e85a1cdcfe3d23814bab5b2215dd6b096f871eb` and is already an ancestor of the
+  rc baseline; it is not a competing implementation authority.
 - **Retired-branch evidence:** the immutable historical snapshot
   `905984e62a0858c53d9f0ff6dd3a1bf190cf311d` from retired `rc/july` is only a
   finite TSJS concept-gap checklist. It is not a baseline, merge source, API
   authority, or reason to preserve retired mechanics.
 - **Compatibility:** this is a coordinated hard cutover. No backward-compatible
-  aliases, dual APIs, or N/N-1 browser/server protocol are required.
+  aliases, permissive defaults retained only for rollback, dual APIs, or N/N-1
+  browser/server protocol are required.
 - **Decision:** this document covers APS render correctness, the TSJS architecture
   needed to make that correctness durable, and preservation or explicit
-  architectural replacement of current-`main` behavior plus each explicitly
-  retained concept found by the retired-branch audit. It does not add an external
-  telemetry system or release experimentation.
+  architectural replacement of behavior in the exact rc baseline plus each
+  explicitly retained concept found by the retired-branch audit. It does not add
+  an external telemetry system or release experimentation.
 
 ## 0. Scope and constraints
 
@@ -47,10 +49,10 @@
    prior navigation.
 6. Existing non-APS rendering behavior remains correct unless this design
    explicitly replaces a shared lifecycle surface.
-7. Every affected TSJS behavior on current `main` is preserved, rebuilt behind the
+7. Every affected TSJS behavior in the exact rc baseline is preserved, rebuilt behind the
    new architecture, or explicitly superseded by a named and tested replacement
    contract. The retired-branch audit additionally identifies required TSJS
-   concepts that are not already present on `main`; the audit never makes retired
+   concepts that are not already present in the baseline; the audit never makes retired
    mechanics authoritative. No required behavior may disappear silently merely
    because its old global, wrapper, bootstrap, or carrier is deleted.
 8. A server-projected initial display pays only for one server-composed lean
@@ -66,12 +68,14 @@
 
 - No change to analytics/telemetry schemas, durable data systems, billing,
   experimentation, or deployment routing. Those belong to separate designs.
+- No DynamoDB, Tinybird, or other persistence/analytics dependency, schema, table,
+  sink, credential, workflow, or operational requirement.
 - No change to the APS upstream OpenRTB endpoint contract, including APS's
   deliberate absence of `nurl` and `burl`.
 - No rewrite of Prebid.js itself or of the decoupled Prebid strategy.
 - No refactor of unrelated integration internals. They receive only the thin
   registration/bootstrap changes required by the new TSJS runtime, plus any
-  mechanical disposal or adapter injection needed to preserve their current-main
+  mechanical disposal or adapter injection needed to preserve their baseline
   behavior.
 
 Existing local render tracing, GPT diagnostics, logging, counters, debug output,
@@ -103,55 +107,83 @@ Any new analytics contract requires a separate design.
   it cannot construct another runtime, adapter owner, slot registry, or message
   dispatcher.
 
-### 0.4 Current-`main` authority and retired-branch TSJS concept audit
+### 0.4 `rc/202608` authority and retired-branch TSJS concept audit
 
-Current `origin/main` is the only normative starting point. Before implementation
-resumes, the worktree fetches and integrates current `main`, records its exact SHA,
-and runs the existing `main` tests before behavior changes. The same refresh occurs
-before cutover. Every source edit, regression fixture, package/toolchain decision,
-bundle delta, performance ratio, and release artifact is based on that integrated
-`main`. When this design intentionally changes a `main` behavior, the relevant
-contract below is the authority; otherwise current `main` wins.
+The exact `origin/rc/202608` commit recorded above is the normative starting point.
+Its source, behavior, tests, APIs, CI, dependency state, and performance shape are
+the baseline. The implementation branch has that rc commit as its first parent and
+the previously reviewed APS/TSJS feature history as its second parent. A conflict
+resolution is not itself behavioral evidence: every overlapping rc behavior must be
+identified, assigned an owner, and proved after reconciliation. Unless this design
+explicitly supersedes an rc behavior, the rc behavior wins.
+
+Before release, the worktree fetches `origin/rc/202608` again. If it advanced, the
+new tip is merged, its SHA is recorded, and the same overlap audit and complete test
+gates run again. `main` is not separately merged: rc already carries the main
+ancestry chosen by the release branch. The PR targets `rc/202608`, not `main`.
 
 The `rc/july` branch is retired. It must not be fetched as an implementation input,
 merged, rebased, or cherry-picked into this work. The immutable historical snapshot
 `905984e62a0858c53d9f0ff6dd3a1bf190cf311d` is retained only because its TSJS tree,
 embedded bootstraps, tooling, and browser tests form a finite audit that can expose a
-required concept absent from current `main`. The in-spec manifest in §0.5 proves
+required concept absent from the rc baseline. The in-spec manifest in §0.5 proves
 that this historical checklist is complete. For each ledger row, implementation
-first identifies the current-`main` owner and tests and reuses them when they satisfy
+first identifies the baseline owner and tests and reuses them when they satisfy
 this design. Only a concept explicitly retained by the ledger and missing or
-incomplete on `main` becomes gap work. Historical source shape, names, incidental
+incomplete in the baseline becomes gap work. Historical source shape, names, incidental
 semantics, and unrelated retired-branch features are not requirements.
 
-The audit is behavioral, not commit-hash ancestry. `main` may contain a concept
+The audit is behavioral, not commit-hash ancestry. The rc baseline may contain a concept
 through a squash, reimplementation, or later replacement even when a historical
 commit is not its Git ancestor. Every retained ledger row starts **proof-pending**.
 The implementation identifies or authors a focused contract and runs it against a
-detached, otherwise untouched worktree at the recorded current-main SHA:
+detached, otherwise untouched worktree at the recorded rc baseline SHA:
 
-- **main-owned:** current source already has an owner and the focused contract
+- **baseline-owned:** baseline source already has an owner and the focused contract
   passes. Existing tests are reused; a newly authored test-only proof is retained in
   the candidate without changing production behavior.
 - **implementation-gap:** the focused contract runs and fails because the required
   behavior is absent or incomplete. Only that demonstrated gap becomes production
   implementation work.
 - **coverage-gap:** no adequate focused contract exists yet. The next action is to
-  author the test alone and rerun it against untouched current main; this is an
+  author the test alone and rerun it against the untouched rc baseline; this is an
   intermediate blocked classification, never permission to implement or import
   historical production code.
 
 An infrastructure/setup failure remains proof-pending rather than being relabeled as
-a behavioral failure. Each final classification records the main SHA, current owner
+a behavioral failure. Each final classification records the rc SHA, baseline owner
 paths, exact test path/command, result, and disposition. Every row must end as
-main-owned or implementation-gap before production edits for that row. The
+baseline-owned or implementation-gap before production edits for that row. The
 historical patch is never applied merely because its original hash is absent.
 
-Authority order is exact: this reviewed hard-cutover contract, then current `main`,
-then the retired snapshot as non-normative discovery evidence only. A contradiction
-is never resolved in favor of retired code implicitly. The implementation plan must
-contain no `rc/july` merge task and no release gate comparing the candidate to
-`rc/july`.
+The existing checked-in concept-audit classification was captured against historical
+main SHA `f6a2fb85ce623bf8a574e3941e1ee349acc3412d`; its `mainSha`, `main-owned`, and
+command fields remain immutable provenance only. They do not satisfy this rc gate.
+The same audit fixture gains a separate schema-bumped `rcBaseline` classification
+for every ledger row, bound to the exact recorded rc SHA and using
+`baseline-owned | implementation-gap`. The checker prints and validates both layers,
+but only complete passing rc classifications satisfy phase exit. It rejects a row
+whose baseline SHA, owner path, command, result, or disposition is missing; it never
+rewrites the historical main evidence or treats its old pass as proof of rc behavior.
+
+Authority order is exact: this reviewed hard-cutover contract, then the exact rc
+baseline, then the retired snapshot as non-normative discovery evidence only. A
+contradiction is never resolved in favor of retired code implicitly. The
+implementation plan contains no `rc/july` merge task and no release gate comparing
+the candidate to `rc/july`.
+
+The following rc changes receive explicit reconciliation because they overlap this
+design or its tests. This is an adoption ledger, not permission to broaden scope:
+
+| Baseline source                                                            | Required disposition in this design                                                                                                                                                                                                                                    |
+| -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| #1008 server-side ad-template switch and inactive HTML cache policy        | **Preserve/supersede:** keep the independent switch, page/page-bids suppression, direct `POST /auction`, and `max-age=60` inactive policy. Because this is a hard cutover, `creative_opportunities.enabled` is a required boolean rather than a compatibility default. |
+| #1013 shared C2 template cache, hybrid ESI, and streaming assembly         | **Preserve:** retain the baseline implementation and tests at the publisher/HTML/TSJS seams. This design adds no cache mechanism, policy, backend, or requirement.                                                                                                     |
+| #1025 and #1032 GPT diagnostics documentation and slot-size evidence       | **Preserve/rebuild:** retain requested formats, GPT-reported fill, observed outer slot size, documentation, and API/export behavior under the sole diagnostics owner defined in §5.8.                                                                                  |
+| #1033 APS opaque-data containment                                          | **Rebuild:** the baseline later reverted the original patch. Reintroduce the security properties through §4.4's hard-cutover protocol, without its legacy APIs or vendored PUC fixture.                                                                                |
+| #1034 GAM cohort attribution                                               | **Preserve:** retain the rc behavior and configuration through the new runtime's typed registration/disposal boundaries. This design adds no new cohort, analytics schema, or experiment.                                                                              |
+| #992 DataDome exclusion and staging-bypass behavior                        | **Preserve:** retain its exact guard, privacy, and logging behavior through the DataDome integration module.                                                                                                                                                           |
+| rc CLI, SSAT debug, admin, response-cache configuration, and EdgeZero work | **Exclude from active changes:** preserve the baseline code and tests where merge overlap requires it; add no APS/TSJS requirement. EdgeZero receives no feature work in this design.                                                                                  |
 
 Each ledger entry has one of these dispositions:
 
@@ -163,14 +195,14 @@ Each ledger entry has one of these dispositions:
   new owner makes the old compensation unnecessary or that the new terminal
   failure is complete, bounded, and preferable to a partial second runtime.
 - **Exclude:** keep the existing feature untouched because it is not TSJS work;
-  this disposition cannot hide affected current-main TSJS behavior or an explicitly
+  this disposition cannot hide affected baseline TSJS behavior or an explicitly
   retained ledger concept.
 
 Hard cutover authorizes removal of old mechanisms and names. It does not authorize
-silent loss of current-main behavior or a retained ledger outcome. An observable
+silent loss of baseline behavior or a retained ledger outcome. An observable
 outcome may change only through an explicit **Supersede** entry that names the old
 and final behavior, gives the architectural reason, and has boundary tests for the
-replacement contract. A source deletion is complete only when its current-main
+replacement contract. A source deletion is complete only when its baseline
 regression tests and ledger replacement/supersession proof pass.
 
 | ID                | Audited TSJS concept                                                                                                                                                                                          | Disposition and final owner                                                                                                                                                                                                                                                                    |
@@ -190,7 +222,7 @@ regression tests and ledger replacement/supersession proof pass.
 | `RCJ-APS-01`      | First-class APS OpenRTB admission, typed descriptor projection, direct rendering, Trusted Server Prebid-adapter rendering, and PUC rendering remain supported.                                                | **Preserve/Rebuild:** Rust admission plus the shared render lifecycle described in §§3–4.                                                                                                                                                                                                      |
 | `RCJ-APS-02`      | `bid.meta`, generated Prebid `adId`, upstream bid-id fallback, and old `hb_adid` precedence carried APS identity through lossy boundaries.                                                                    | **Supersede:** the server-minted `r1_` reservation is the only TS PUC authority; native Prebid IDs and PBS Cache UUIDs remain byte-preserved for their own purposes.                                                                                                                           |
 | `RCJ-APS-03`      | PUC uses one-use ports, APS callbacks—not script load—determine success, renderer tombstones are bounded, and lifecycle callbacks cannot corrupt later attempts.                                              | **Preserve/Rebuild:** bridge dispatcher, owner-control channel, reservation service, and terminal latch.                                                                                                                                                                                       |
-| `RCJ-APS-04`      | The PUC document, renderer document, and descendant creative receive the winning dimensions without default margins, scrollbars, overflow, or clipping.                                                       | **Preserve:** exact CSS/DOM sizing contract in §4.4 and three-level browser assertions.                                                                                                                                                                                                        |
+| `RCJ-APS-04`      | The APS presentation surface and descendant creative receive the winning dimensions without default margins, scrollbars, overflow, or clipping.                                                               | **Preserve/rebuild:** exact top-mount, outer-data, inner-renderer, and creative sizing contract in §4.4 and four-level browser assertions.                                                                                                                                                     |
 | `RCJ-CREATIVE-01` | Auction creative sanitization remains opt-in/default-off, rewriting retains its existing independent setting, and every delivery path observes the same configured processing boundary.                       | **Preserve:** creative integration module and server processing; this design does not silently enable sanitization or broaden rewriting.                                                                                                                                                       |
 | `RCJ-CREATIVE-02` | Opaque-origin click recovery accepts only validated absolute HTTP(S) navigation, persists the validated URL, rejects non-network schemes, and keeps creative sandbox isolation.                               | **Preserve/Rebuild:** creative integration module over shared origin/DOM helpers, with unit and real-browser sandbox coverage.                                                                                                                                                                 |
 | `RCJ-CREATIVE-03` | `tscreative.installGuards/setConfig/getConfig`, `tsCreativeConfig`, automatic install, click-guard default-on, and render-guard default-off control the creative browser guards.                              | **Preserve/supersede:** `CreativeBootV1` retains the defaults and the integration module auto-installs transactionally; mutable/install command globals are deleted and immutable `tsjs.boot.creative` is the only inspection/config surface.                                                  |
@@ -226,7 +258,7 @@ then requires every inventory path to match at least one `exact`, `prefix`, or
 matches no inventory path also fails. This proves only that the audit did not omit a
 historical TSJS concept; it needs no retired Git object and makes no historical
 source a build or behavior input. Separate ledger evidence maps every retained row
-to its current-main owner/test or records a specific gap to implement.
+to its rc-baseline owner/test or records a specific gap to implement.
 
 ```json retired-rcjuly-tsjs-concept-manifest-v1
 {
@@ -635,8 +667,8 @@ The initial role-correct implementation exposed material first-display transfer 
 request-time work that its own post-change capture could not legitimately approve.
 The first mechanical remediation reduced the `[core, render_runtime, creative,
 gpt]` response to roughly 395 kB raw, but paired evidence at candidate
-`8ef8a40df` still measured 2,163.6 ms p90 against a 473.3 ms current-`main`
-baseline: about 4.57×, where the release gate permits 1.10×. Co-bundling the
+`8ef8a40df` still measured 2,163.6 ms p90 against a 473.3 ms historical
+`main` reference: about 4.57×, where the release gate permits 1.10×. Co-bundling the
 same full ownership graph saves only duplicated module bytes and cannot close that
 gap. Both captures remain immutable evidence of reviewed intermediate states, not
 release baselines.
@@ -658,11 +690,12 @@ publisher `[[handlers]]`; operators place admission control, rate limiting, or
 request shielding at the platform boundary.
 
 DataDome and the other integrations in `RCJ-INT-01` remain in scope only where their
-current-main TSJS implementation is affected by runtime composition or where the
+rc-baseline TSJS implementation is affected by runtime composition or where the
 retired audit identifies an explicitly retained TSJS gap. This is preservation
 behind the common runtime, not permission to import unrelated retired-branch work or
-redesign their server-side behavior. The unrelated server-side ad-template
-cache-control proposal is excluded from this design.
+redesign their server-side behavior. The server-side template switch, inactive HTML
+cache policy, and C2/ESI implementation are inherited rc behavior governed by the
+adoption ledger; this design adds no new cache requirement.
 
 ## 1. Problem statement and evidence
 
@@ -690,16 +723,16 @@ work with no common owner.
 
 ### 1.2 Known failure surfaces
 
-| Area           | Failure                                                                                                                                                                                           |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Admission      | A configured mediator can discard direct-provider bids; scripts can be rejected by policy; strict dimensions and APS response validation can drop bids without a useful local reason.             |
-| Identity       | PBS Cache UUID, upstream APS bid id, Prebid `adId`, GAM `hb_adid`, DOM id, and server slot id are different identities and have been conflated. GAM targeting values are capped at 40 characters. |
-| GPT            | `display()` under disabled initial load does not request; event listeners can be installed too late; multiple refresh wrappers and concurrent requests race; SafeFrame obscures frame ancestry.   |
-| Bridge         | A `Prebid Request` can be duplicated, replayed, sent by a wrong frame, or arrive after navigation. A bare bid id is not enough to establish ownership.                                            |
-| Renderer       | The opaque sandbox cannot observe HTTP failure; descriptor validation exists in Rust, TypeScript, and embedded ES5; CSP or runner loading can fail after the iframe loads.                        |
-| Direct auction | One fetch can contain several slots, but current cancellation and result handling are not batch-aware; failures collapse to an empty array.                                                       |
-| Bootstrap      | Server bootstrap and bundle initialization can both believe they own runtime setup; a hung bundle can race the no-bundle fallback.                                                                |
-| Lifecycle      | There is no shared definition of attempt, ownership, supersession, terminal completion, or disposal.                                                                                              |
+| Area           | Failure                                                                                                                                                                                                               |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Admission      | A configured mediator can discard direct-provider bids; scripts can be rejected by policy; strict dimensions and APS response validation can drop bids without a useful local reason.                                 |
+| Identity       | PBS Cache UUID, upstream APS bid id, Prebid `adId`, GAM `hb_adid`, DOM id, and server slot id are different identities and have been conflated. GAM targeting values are capped at 40 characters.                     |
+| GPT            | `display()` under disabled initial load does not request; event listeners can be installed too late; multiple refresh wrappers and concurrent requests race; SafeFrame obscures frame ancestry.                       |
+| Bridge         | A `Prebid Request` can be duplicated, replayed, sent by a wrong frame, or arrive after navigation. A bare bid id is not enough to establish ownership.                                                                |
+| Renderer       | The opaque sandbox cannot observe HTTP failure; descriptor validation exists in Rust, TypeScript, and embedded ES5; nested-document containment, CSP, proxy, or runner loading can fail after the outer iframe loads. |
+| Direct auction | One fetch can contain several slots, but current cancellation and result handling are not batch-aware; failures collapse to an empty array.                                                                           |
+| Bootstrap      | Server bootstrap and bundle initialization can both believe they own runtime setup; a hung bundle can race the no-bundle fallback.                                                                                    |
+| Lifecycle      | There is no shared definition of attempt, ownership, supersession, terminal completion, or disposal.                                                                                                                  |
 
 ## 2. Required behavior
 
@@ -790,6 +823,33 @@ Every attempt owns one terminal latch. All competing callbacks, ports, iframe
 events, timers, aborts, and navigation disposal race through that latch. The first
 valid terminal transition wins, disposes attempt resources, and makes every later
 signal inert.
+
+#### Server-side template delivery switch
+
+When `[creative_opportunities]` exists, `enabled` is a required boolean. There is no
+serde default, omitted-field compatibility path, or serialization elision. Absence
+of the table means no configured server-side templates; `enabled = false` retains
+the typed slot definitions for operator tooling but disables publisher-HTML and
+`/_ts/page-bids` template delivery. The disabled state performs no slot matching,
+automatic auction dispatch, browser projection, initial ad-slot injection, or SPA
+ad initialization. Page-bids returns the exact valid empty slots/bids result. It does
+not disable direct `POST /auction`, whose caller-supplied request and ordinary
+auction gates remain authoritative.
+
+The switch does not weaken configuration validation. A present table and all of its
+slot/cache/assembly fields still parse, compile, and validate at startup even when
+disabled; disabling delivery is not a way to retain malformed configuration. Every
+checked-in example and test fixture states the boolean explicitly.
+
+For a successful publisher `GET` HTML response where Trusted Server injects no
+per-navigation auction state, the browser-facing policy becomes
+`Cache-Control: max-age=60` unless the origin already supplied a directive
+containing `private` or `no-store` case-insensitively. Origin validators and
+surrogate/CDN cache directives are preserved on this inactive path. A response that
+does receive synthesized per-navigation state retains the baseline private/no-store
+and validator-stripping policy. Non-HTML responses, failures, and direct auction
+responses are unchanged. This is the inherited #1008 behavior at the publisher
+boundary, not a new cache implementation.
 
 ### 2.2 Identity model
 
@@ -929,7 +989,7 @@ Its exact winner join creates the `RenderAttempt` with an immutable
 rendering. Thus the redesigned direct and PUC APS/ADM paths have the same CPM
 authority without inventing a bridge capability for direct rendering. Existing PBS
 Cache price expansion remains outside this contract and is regression-tested at its
-current-main behavior.
+rc-baseline behavior.
 
 The current `__tsRenderGeneration`, `__tsRenderBid`, and function-sentinel
 expandos are removed.
@@ -1107,12 +1167,12 @@ that cannot be represented in JSON Schema remains in small handwritten validator
 covered by the same corpus.
 
 For `adm`, markup is nonempty and at most 512 KiB. `BaselinePbsCacheSourceV1` is only
-a hard-cutover carrier for the current-main cache coordinates
+a hard-cutover carrier for the rc-baseline cache coordinates
 occupied `hb_adid`, `hb_cache_host`, and `hb_cache_path`. It introduces no cache
 policy, URL construction, response validation, price authority, dimensions,
 deadline, error taxonomy, direct-cache feature, or PUC protocol. The GPT integration
-delegates it to the preserved current-main cache implementation behind a thin
-generation/disposal boundary, and the current-main black-box corpus is the authority
+delegates it to the preserved rc-baseline cache implementation behind a thin
+generation/disposal boundary, and the rc-baseline black-box corpus is the authority
 for its behavior. A PBS bid with accepted ADM uses the ADM source even when cache
 coordinates coexist; that documents the current ADM-over-cache
 precedence. `pbs_cache` is used only when accepted ADM is absent. It retains its
@@ -1280,7 +1340,7 @@ interface TrustedServerOpenRtbBidExtV1 {
 ```
 
 For an APS/ADM source, the bid's standard `id` is the server-minted renderer
-reservation id from §2.2. A current-main `pbs_cache` source retains its cache-id
+reservation id from §2.2. An rc-baseline `pbs_cache` source retains its cache-id
 identity instead and never enters the reservation service. The provider's upstream
 id remains provenance and, for APS, the descriptor's `bidId`. The bid's standard `impid` must equal the request impression id mapped to
 `slot_id`. A winner decision joins by exact `slot`, `candidateId`, `impid`, and
@@ -1363,7 +1423,7 @@ targeting is applied first, bid targeting overrides a duplicate static key, and 
 runtime alone synthesizes `hb_adid` from `rendererReservationId` for APS/ADM or the
 native cache UUID for `pbs_cache`; neither server targeting object may provide that
 key.
-Targeting uses the APS/ADM reservation id or the current-main PBS Cache UUID according to
+Targeting uses the APS/ADM reservation id or the rc-baseline PBS Cache UUID according to
 the discriminated source and never truncates a value to fit GAM.
 If the chosen value cannot satisfy the 40-character targeting limit, the bid is
 rejected before targeting with an explicit local reason.
@@ -1490,7 +1550,7 @@ hold capacity until the 15-minute tombstone expiry as a live entry.
 ### 3.6 Static renderer and APS runner proxy endpoints
 
 `/integrations/aps/renderer/v1` and `/integrations/aps/runner.js` are always-reserved
-Trusted Server routes. When APS is enabled, `GET` returns the local static renderer
+Trusted Server routes. When APS is enabled, `GET` returns the local static bootstrap
 or proxies the APS-hosted creative runner respectively. When APS is disabled, `GET`
 returns a local `404 no-store`; neither route ever falls through to a publisher
 origin. The family is dispatched before publisher auth, EC, and generic integration
@@ -1505,37 +1565,47 @@ anonymous. A configured `[[handlers]]` pattern that matches
 renderer or runner. Operator-required admission control, rate limiting, and request
 shielding live at the deployment platform.
 
-The renderer v1 body and headers are immutable and served with a long-lived immutable
-cache policy; a renderer-body or CSP semantic change requires a new renderer route
-version. The document is static and contains no descriptor data. Its iframe
-`sandbox` attribute and response CSP `sandbox` directive contain exactly this token
-set, serialized in this order:
+The renderer v1 response is an immutable, descriptor-free bootstrap served with a
+long-lived immutable cache policy. It is not the document that receives the bid or
+loads the runner. Its TS-created iframe initially has exactly this sandbox token set,
+serialized in this order:
 
 ```text
 allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation
 ```
 
-They omit `allow-same-origin`, `allow-top-navigation`, downloads, modals,
-presentation, orientation lock, and storage-access escape. The exact renderer v1 CSP
-header is:
+It omits `allow-same-origin`, `allow-top-navigation`, downloads, modals,
+presentation, orientation lock, and storage-access escape. The bootstrap's exact
+response CSP is:
 
 ```text
-default-src 'none'; sandbox allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline' 'self' https:; connect-src https:; frame-src https: data: blob:; img-src https: data: blob:; media-src https: data: blob:; style-src 'unsafe-inline' https:; font-src https: data:; worker-src https: blob:; form-action https:;
+default-src 'none'; sandbox allow-scripts; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline'; frame-ancestors 'self'; form-action 'none';
 ```
 
-The broad HTTPS resource directives are confined below the opaque outer sandbox and
-are required for APS and bidder resources; `'self'` permits the local runner proxy in
-HTTP-based hermetic adapters as well as production HTTPS. The response also has
+The bootstrap can only validate its fragment nonce, receive one exact navigation
+instruction from its checked parent, and replace its own location with the supplied
+`data:text/html;charset=utf-8,` container URL. It has no descriptor, runner, creative
+URL path, price, bid id, network capability, child frame, or publisher DOM access.
+The response also has
 exactly `Content-Type: text/html; charset=utf-8`,
 `Cache-Control: public, max-age=31536000, immutable`,
 `X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer`. It deliberately
-omits both `X-Frame-Options` and a CSP `frame-ancestors` directive so publisher and GAM
-creative ancestors can embed it; the iframe/CSP sandbox, nonce, source-bound port,
-and descriptor validation are the embedding boundary. It does not forward publisher
-credentials or authorization in TS-owned fetches. Runner-created APS creative
-resources may use APS-origin cookies under ordinary browser policy. No cookie is
-authority. Any header or CSP change requires renderer v2; policy reporting is a
-separate observability design.
+omits `X-Frame-Options`; `frame-ancestors 'self'` is mandatory because both direct and
+PUC paths mount the bootstrap from the publisher top page, never beneath GAM,
+Universal Creative, or bidder content. The TS-authored container and inner renderer
+are checked-in templates encoded into per-attempt `data:` URLs by TSJS; they are not
+HTTP artifacts and contain no third-party bytes. Any shipped bootstrap body/header
+or data-document protocol change before this release updates the single v1 contract;
+after release it requires a new route/protocol version.
+
+When APS is enabled, final response privacy appends a separate
+`Content-Security-Policy: frame-ancestors 'self'` policy after operator headers. CSP
+policies intersect, so operator configuration cannot weaken it. This prevents an
+APS creative from framing a publisher document beneath the opaque data container
+and using a publisher-origin executable gadget to regain top-page access. It also
+means an APS-enabled publisher cannot itself be embedded cross-origin; an external
+embedder allowlist is a separate security design, not a compatibility exception.
+The policy is independent of cookies and cacheability.
 
 The runner endpoint is a thin runtime transport proxy, not an artifact store. Its
 only upstream is the fixed APS URL
@@ -1624,13 +1694,13 @@ cannot turn the runner into a repository or release artifact.
 
 Proxying does not make the runner trusted TS code or prove that it rendered. APS
 remains the runtime owner of those executable bytes and its resolve/reject semantics
-are a narrow external trust dependency. The outer opaque iframe, validated
+are a narrow external trust dependency. The nested opaque data documents, validated
 descriptor, one-shot lifecycle port, and completion deadline contain execution and
 reject missing, late, or misbound signals; they cannot determine whether APS told the
 truth when it invoked `resolve`. The proxy never rewrites, inspects, or repairs the
 JavaScript body.
 
-The renderer accepts one parent-provided, nonce-bound descriptor plus the publisher
+The inner data renderer accepts one port-delivered, nonce-bound descriptor plus the publisher
 origin captured by the kernel before iframe creation. Because its opaque origin has
 `location.origin === "null"`, it validates the supplied origin's shape and uses it
 only to repeat the descriptor's not-publisher-origin check. It clears the nonce from
@@ -1650,8 +1720,10 @@ new CustomEvent('prebid/creative/render', {
 ```
 
 `resolve` and `reject` are the Promise's one-shot functions and are the only
-non-serializable fields. The renderer resolves `/integrations/aps/runner.js` against
-its own absolute Trusted Server document URL and loads only that route. It creates the
+non-serializable fields. The top-page owner encodes its exact validated HTTP(S)
+Trusted Server origin and absolute `/integrations/aps/runner.js` URL into the
+TS-authored inner data document before navigation. The inner CSP permits that exact
+origin as its only external script source, and the renderer loads only that route. It creates the
 script with `crossOrigin='anonymous'` and `referrerPolicy='no-referrer'`; it does not
 set SRI because the proxy relays a live APS-owned artifact rather than immutable
 TS-owned bytes. Under the APS conformance contract, the runner consumes the queued
@@ -1659,7 +1731,7 @@ event and promises to call `resolve` only after its asynchronous handler commits
 nested creative iframe, and to call `reject` for validation, load, or render failure.
 Promise resolution sends one completed result; rejection, proxy/CORS error, runner
 error, or script-load error sends one failed result over the transferred lifecycle
-port. Runner `load` is intermediate progress only. The static renderer owns no APS
+port. Runner `load` is intermediate progress only. The inner renderer owns no APS
 completion timer. Proxy/CORS/script-load failure maps to `runner_no_load`; callback
 rejection maps to `runner_failed`.
 
@@ -1729,9 +1801,10 @@ Transitions are methods on `RenderAttempt`, not ad-hoc flag mutation. Each metho
 checks the expected state and terminal latch. Timers are created at the transition
 whose deadline they enforce and are cleared by the transition that settles them.
 `waiting_for_document` accepts only an APS source; `waiting_for_adm` accepts only an
-ADM source. A redesigned direct path stages only a `direct_iframe` artifact, while an
-owner-controlled PUC path stages only a `puc` artifact.
-The current-main PBS Cache path remains outside this new attempt-state expansion and is
+ADM source. Direct and PUC APS stage only a top-page `aps_mount` artifact; PUC APS
+also stages Promise/control metadata but no remote renderer node. Direct ADM stages
+only a `direct_iframe` artifact, while PUC ADM stages only a `puc` artifact.
+The baseline PBS Cache path remains outside this new attempt-state expansion and is
 covered by §4.5 parity tests.
 Construction owns an already-issued attempt scope: every rejection after scope
 issuance best-effort disposes that exact scope so session indexes cannot retain a
@@ -1741,11 +1814,11 @@ An accepted transition first atomically promotes durable DOM/targeting ownership
 from the attempt into one `CommittedRenderArtifact` owned by the exact slot and
 navigation. The attempt disposer removes only uncommitted resources; promotion
 detaches the committed iframe, targeting snapshot, and physical-slot metadata before
-the terminal latch disposes the attempt. Direct TS iframes are removed by artifact
-replacement or navigation disposal. PUC content remains owned by its physical GPT
-slot: for a TS-owned slot the artifact may dispose it only through safe GPT
-destroy/redefine, while publisher-owned slot DOM remains publisher-controlled and
-the artifact releases only TS metadata and compare-restorable targeting. Before a
+the terminal latch disposes the attempt. Direct and PUC APS top mounts are removed
+by artifact replacement or navigation disposal. The physical GPT/PUC surface remains
+owned by its GPT slot: for a TS-owned slot the artifact may dispose it only through
+safe GPT destroy/redefine, while publisher-owned slot DOM remains publisher-controlled
+and the artifact releases only TS metadata and compare-restorable targeting. Before a
 slot publishes another accepted artifact it disposes the prior artifact. Navigation
 disposes artifacts according to those same ownership/quarantine rules. Claim,
 registration, owner-control, and renderer-document ports/listeners that are no
@@ -1890,54 +1963,79 @@ settlement, or watchdog callbacks close their ports and remain inert.
 
 ### 4.4 APS document and runner acknowledgement
 
-After registration, the kernel posts this exact control message and transfers
-exactly one renderer-document port:
+Direct and PUC APS use one top-page mount service owned by the current
+`ActiveRenderOwner`. The PUC dynamic owner never creates, contains, or navigates an
+APS iframe; it retains only its PUC Promise, registration disposer, watchdog, and
+owner-control port. After PUC registration the kernel posts this informational
+control message with no descriptor, URL, nonce, or transferred port:
 
 ```ts
 {
-  message: 'TS APS Start'
+  message: 'TS APS Top Mount Started'
   version: 1
   lifecycleTicket: string
-  rendererUrl: string
-  envelope: {
-    version: 1
-    nonce: string
-    publisherOrigin: string
-    renderer: ApsRendererV1
-  }
 }
 ```
 
-The kernel owns the opposite document port. The owner creates exactly one iframe at
-the versioned renderer URL with the nonce in its fragment, reports exact
-`{message:"TS Owner Inserted",version:1,lifecycleTicket}` on the control port, and
-on iframe load transfers the envelope and document port once to that exact
-`contentWindow`. Direct APS uses the same document channel and envelope but has no
-PUC owner-control channel. The nonce is 128-bit CSPRNG, attempt-bound, and one-use.
+The mount service resolves the exact registered slot presentation container and
+inserts one sibling of the Universal Creative iframe for PUC, or one child of the
+direct caller's registered container. It never appends beneath GAM, PUC, SafeFrame,
+or bidder-controlled DOM. Existing content stays visible until document acceptance;
+commit hides only the exact superseded PUC surface and reveals the exact owned APS
+surface. Failure removes only the pending APS surface and rejects the PUC Promise.
 
-The enforceable direct-path binding is to one TS-created native iframe element, its
-unchanged `src` attribute, its browsing-context `WindowProxy`, and the one-use port;
-it is not browser attestation of the active opaque `Document`. Code executing in an
-embedding ancestor realm with DOM/navigation authority is trusted for this one
-navigation-integrity property. Such code can assign
-`iframe.contentWindow.location` without changing the iframe `src`, while the same
-`WindowProxy` survives and the opaque active document's URL and origin remain
-unreadable to the kernel. If it does so before handoff, that replacement document
-can receive the descriptor, nonce, and port and can forge the page-local document
-and completion messages. Native element creation plus exact parent/source/`src`
-checks still reject publisher-supplied frames, node replacement, removal, detectable
-`src` mutation, unrelated contexts, and stale ports; they make no claim about the
-undetectable ancestor-navigation case. APS has no synthetic notification or other
-trusted remote side effect derived from page-local completion.
+The mount has three document phases:
 
-Removing that trust boundary requires a separately operated renderer origin, adding
-`allow-same-origin` only for that cross-origin document, and using exact
-`targetOrigin`/`event.origin` checks. Adding `allow-same-origin` to the current
-publisher-origin renderer would defeat containment when combined with scripts, so
-that is not an acceptable implementation of this design and a dedicated-origin
-variant requires a separate architecture decision.
+1. Create one iframe at the immutable renderer-v1 bootstrap URL with an outer
+   128-bit CSPRNG nonce in its fragment and the initial sandbox from §3.6. The
+   bootstrap is publisher-origin by URL but opaque because `allow-same-origin` is
+   absent. It can only send exact
+   `{message:'TS APS Bootstrap Ready',version:1,nonce}` to its checked parent.
+2. After exact element, parent, `src`, `WindowProxy`, generation, and nonce checks,
+   add `allow-same-origin` to the sandbox and post exact
+   `{message:'TS APS Bootstrap Navigate',version:1,nonce,containerUrl}`. The URL must
+   be the attempt-owned `data:text/html;charset=utf-8,` container with the same
+   nonce fragment. The previously loaded bootstrap remains opaque while it performs
+   `location.replace`; the destination is naturally opaque because it is `data:`.
+3. The outer data container creates one inner data renderer with an independent
+   128-bit nonce and a permanent sandbox containing the §3.6 tokens plus
+   `allow-same-origin`. Both final documents remain naturally opaque. After the
+   inner renderer's exact ready message, the container creates a `MessageChannel`,
+   transfers one endpoint to the inner renderer, and transfers the other to the top
+   page in exact
+   `{message:'TS APS Container Ready',version:1,nonce}`. The top page accepts it only
+   from the exact outer `WindowProxy` with exactly one port, then sends the descriptor
+   envelope once over that port. Neither the bootstrap nor outer container receives
+   the descriptor.
 
-The static document sends only these exact document-port messages:
+The generated outer-container document contains only the exact validated creative
+origin, exact Trusted Server origin, the two nonces, the permanent sandbox string,
+and the percent-encoded TS-authored inner renderer template. It contains no response
+envelope, bid id, creative path, price, reservation, attempt id, or lifecycle ticket.
+Its CSP permits child frames only from `data:` and the exact creative origin. The
+inner document's intersecting CSP permits inline TS bootstrap code, the exact
+Trusted Server runner-proxy origin, and the resource categories required below the
+creative; it never permits publisher origin as a frame target. The outer policy
+therefore blocks the inner frame from replacing itself with a publisher document,
+while the independent publisher `frame-ancestors 'self'` policy blocks a
+network-loaded creative from framing the publisher beneath itself.
+
+`MAX_APS_CONTAINER_DOCUMENT_BYTES` and `MAX_APS_INNER_DOCUMENT_BYTES` are each
+65,536 UTF-8 bytes before percent encoding. Template substitution must replace each
+sentinel exactly once, leave no sentinel, escape values by context, and pass the cap
+before any DOM mutation. The exact Trusted Server origin is HTTP only for a loopback
+hermetic harness and HTTPS otherwise; the creative origin is always HTTPS and must
+equal the already validated descriptor origin. Any generation, cap, URL, CSP, nonce,
+or substitution failure is `descriptor_invalid`.
+
+The publisher realm remains trusted for top-page DOM availability because TSJS
+executes in that realm; publisher code can always remove or sabotage TSJS-owned DOM.
+No GAM, PUC, SafeFrame, bidder, or creative realm is trusted as an APS embedding
+ancestor. The sibling mount and nested-data CSP remove those third-party ancestor
+navigation paths from the authority chain. A separately operated renderer origin is
+not required by this design.
+
+The inner renderer sends only these exact document-port messages:
 
 - `{message:"TS APS Document Accepted",version:1,nonce}` after nonce and descriptor
   validation;
@@ -1948,15 +2046,16 @@ The static document sends only these exact document-port messages:
 - `{message:"TS APS Render Failed",version:1,nonce,reason}` where `reason` is
   `descriptor_invalid | runner_no_load | runner_failed`.
 
-Insertion has a one-second deadline, document acceptance has a three-second
-deadline from iframe insertion, and the kernel is the sole owner of the ten-second
-APS-completion deadline beginning at document acceptance. Callback silence at that
-deadline maps to `runner_failed`; the static renderer never starts a competing
+Insertion has a one-second deadline. Bootstrap readiness, data navigation,
+container-channel creation, descriptor transfer, and inner document acceptance share
+one three-second deadline from outer iframe insertion. The kernel is the sole owner
+of the ten-second APS-completion deadline beginning at inner document acceptance.
+Callback silence at that deadline maps to `runner_failed`; no document starts a competing
 completion timer. Script load never accepts. Failure, timeout, port error,
 supersession, or navigation disposal settles once. On a direct path the kernel
-removes its exact pending iframe. On a PUC path the iframe is remote DOM owned only
-by the dynamic owner; the kernel never claims it can remove that node and instead
-posts exactly one owner-control settlement:
+removes its exact pending iframe. On a PUC path the iframe is top-page DOM owned only
+by the mount service; it removes that exact pending node and posts exactly
+one owner-control settlement:
 
 ```ts
 type OwnerSettlementV1 =
@@ -1982,12 +2081,12 @@ type OwnerSettlementV1 =
     }
 ```
 
-The PUC owner owns the remote node, its DOM handlers, and its side of the control
-port. An accepted settlement promotes that exact iframe as committed, removes its
-temporary handlers, closes the control port, and resolves the renderer Promise once.
-A failed or cancelled settlement removes the exact uncommitted iframe, removes its
-handlers, closes the port, and rejects once so PUC emits its ordinary render-failure
-event. The same cleanup applies to the PUC ADM owner in §4.5.
+The top-page mount service owns the APS node, its DOM handlers, bootstrap listener,
+document port, and timers. An accepted settlement promotes that exact iframe into
+the slot's `CommittedRenderArtifact`; a failed or cancelled settlement removes it.
+The PUC owner owns no APS node: it closes its control port and resolves or rejects
+the renderer Promise exactly once so PUC emits its ordinary completion/failure
+event. The separate PUC ADM owner remains governed by §4.5.
 
 When registration accepts the transferred control port, before waiting for an APS or
 ADM start message, the owner arms one fail-closed 20-second settlement/channel
@@ -2002,23 +2101,22 @@ settlement-post throw is isolated in the kernel because the remote watchdog owns
 this failure path.
 
 A caller `AbortSignal` remains attempt-owned after owner registration. If it wins
-the terminal latch, the kernel closes its renderer-document channel and sends the
-exact cancelled/`caller_aborted` settlement; direct rendering also removes the
-kernel-owned iframe. The PUC owner performs the remote cleanup just specified. A
+the terminal latch, the kernel closes its renderer-document channel, removes the
+top-page mount, and sends the exact cancelled/`caller_aborted` settlement. The PUC
+owner performs its Promise/control cleanup just specified. A
 later insert, load, document message, APS callback, settlement, or watchdog is inert.
 
-The winning descriptor dimensions are also the exact layout contract across all
-three nested documents. Before inserting its renderer iframe, the PUC owner sets its
-own document root and body to zero margin/padding with hidden overflow, then creates
-one block iframe with matching positive width/height attributes and CSS pixels, zero
-border, and no scrollbars. The static renderer document has the same zero
-margin/padding and hidden-overflow root/body contract before loading the APS runner.
-The runner-created descendant creative is expected to occupy the same viewport. A
-300×250 winner therefore has 300×250 `clientWidth`, `clientHeight`, `scrollWidth`,
-and `scrollHeight` in the PUC owner and renderer documents, and a 300×250 descendant
-viewport, with no default eight-pixel body margin, clipping, or overflow. Equivalent
-assertions run for every boundary fixture dimension. This is layout correctness, not
-render completion; the callback contract above remains the acceptance authority.
+The winning descriptor dimensions are also the exact layout contract across the
+top-page mount iframe, outer data container, inner data renderer, and runner-created
+creative. The mount iframe is a block with matching positive width/height attributes
+and CSS pixels, zero border/margin, and no scrollbars. Both data documents set their
+root/body and sole child iframe to full width/height with zero margin/padding/border
+and hidden overflow. A 300×250 winner therefore has a 300×250 outer mount box,
+300×250 `clientWidth`, `clientHeight`, `scrollWidth`, and `scrollHeight` in both data
+documents, and a 300×250 descendant viewport, with no default body margin, clipping,
+or overflow. Equivalent assertions run for every boundary fixture dimension. This
+is layout correctness, not render completion; the callback contract above remains
+the acceptance authority.
 
 ### 4.5 ADM ownership and cache non-regression
 
@@ -2062,10 +2160,10 @@ the intended load. No secret or capability is injected into bidder-controlled
 markup.
 
 PBS Cache is not routed through this new owner protocol. The GPT integration retains
-the current-main cache request/parse/macro/PUC-response/collapsed-resize behavior
+the rc-baseline cache request/parse/macro/PUC-response/collapsed-resize behavior
 behind the runtime's generation check and disposer only. Cache success/failure,
 identity, price selection, response shapes, and timing are not redefined here. The
-black-box parity corpus runs the exact current-main fixtures before and after cutover and
+black-box parity corpus runs the exact rc-baseline fixtures before and after cutover and
 fails any observable change; APS/ADM reservation ids are never accepted as cache
 UUIDs and cache UUIDs never claim APS/ADM work.
 
@@ -2230,21 +2328,21 @@ The agent artifact has one base entry plus only these build-catalogued slices. A
 slice absent from this table cannot enter the artifact. “Initial” means the exact
 immutable batch; it does not authorize later work from the same product:
 
-| Slice id                     | Include iff                                            | Bounded obligation before transfer                                                                |
-| ---------------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
-| `first_display`              | an eligible initial batch exists                       | manifest/projection validation, provisional lifetime, timing, queue ingress, transfer coordinator |
-| `aps_initial`                | the initial GPT batch can contain APS                  | reservation, PUC owner protocol, APS document channel                                             |
-| `creative_initial`           | an enabled creative guard has a parser-time obligation | current guard defaults and initial creative observation only                                      |
-| `datadome_initial`           | DataDome is enabled                                    | initial script/preload route guard                                                                |
-| `didomi_initial`             | Didomi is enabled                                      | initial configured SDK-path installation                                                          |
-| `google_tag_manager_initial` | Google Tag Manager is enabled                          | initial script/preload/beacon/fetch guards                                                        |
-| `gpt_initial`                | GPT owns or may receive the initial batch              | sole provisional GPT adapter, listeners, slot targeting/request, handoff capture                  |
-| `lockr_initial`              | Lockr is enabled                                       | initial script guard and bounded readiness needed before SDK use                                  |
-| `osano_initial`              | Osano is enabled                                       | initial consent mirrors required by the initial batch                                             |
-| `permutive_initial`          | Permutive is enabled                                   | initial guard/readiness and normalized segments                                                   |
-| `sourcepoint_initial`        | Sourcepoint is enabled                                 | initial SDK guard and GPP mirror                                                                  |
-| `prebid_initial`             | Prebid participates in the initial batch               | artifact admission, publisher queue, bidder/user-ID/EID setup, initial TS bid/PUC path            |
-| `testlight_initial`          | Testlight is enabled                                   | capture preexisting callbacks before publisher replacement/drain                                  |
+| Slice id                     | Include iff                                                                        | Bounded obligation before transfer                                                                |
+| ---------------------------- | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `first_display`              | an eligible initial batch exists                                                   | manifest/projection validation, provisional lifetime, timing, queue ingress, transfer coordinator |
+| `aps_initial`                | the initial GPT batch can contain APS                                              | reservation, PUC owner protocol, APS document channel                                             |
+| `creative_initial`           | an enabled creative guard has a parser-time obligation                             | current guard defaults and initial creative observation only                                      |
+| `datadome_initial`           | DataDome is enabled                                                                | initial script/preload route guard                                                                |
+| `didomi_initial`             | Didomi is enabled                                                                  | initial configured SDK-path installation                                                          |
+| `google_tag_manager_initial` | Google Tag Manager is enabled                                                      | initial script/preload/beacon/fetch guards                                                        |
+| `gpt_initial`                | GPT owns/may receive the initial batch or has a parser-time attribution obligation | sole provisional GPT adapter, page targeting, listeners, slot targeting/request, handoff capture  |
+| `lockr_initial`              | Lockr is enabled                                                                   | initial script guard and bounded readiness needed before SDK use                                  |
+| `osano_initial`              | Osano is enabled                                                                   | initial consent mirrors required by the initial batch                                             |
+| `permutive_initial`          | Permutive is enabled                                                               | initial guard/readiness and normalized segments                                                   |
+| `sourcepoint_initial`        | Sourcepoint is enabled                                                             | initial SDK guard and GPP mirror                                                                  |
+| `prebid_initial`             | Prebid participates in the initial batch                                           | artifact admission, publisher queue, bidder/user-ID/EID setup, initial TS bid/PUC path            |
+| `testlight_initial`          | Testlight is enabled                                                               | capture preexisting callbacks before publisher replacement/drain                                  |
 
 Every slice registers into the bootstrap's release-private first-display sink from
 the expected parser-inserted artifact and `document.currentScript`. The build fixes
@@ -2615,7 +2713,7 @@ controller, the server may emit the existing fixed/configured live GPT tag as a 
 parser-blocking fetch early enough to overlap the first-display TSJS request when GPT is
 required for the first projected display. When Prebid integration is enabled, its
 external artifact tag is always emitted through that early overlap path because the
-current-main client readiness, bidder/user-ID/EID configuration, publisher queue, and
+rc-baseline client readiness, bidder/user-ID/EID configuration, publisher queue, and
 initial auction contract are required before the first action. It remains
 an external script, never a TSJS source input or TSJS generated artifact. Its adapter installs
 and owns all request-capable actions only after the agent transaction commits, so
@@ -2637,7 +2735,7 @@ unbounded implementation into the agent:
   initial GPT/Prebid admission, and parser-time guards live here only when selected;
 - **takeover** contains the complete persistent owner for enabled behavior, including
   programmatic/direct auctions, ongoing lifecycle state, publisher APIs, refresh,
-  later navigation, reconciliation, diagnostics data, current-main behavior, and
+  later navigation, reconciliation, diagnostics data, rc-baseline behavior, and
   retained audited concept gaps. On an agent page it prepares after paint and adopts initial state;
   on a no-agent page it is the ordinary runtime boot transaction; and
 - **deferred** remains restricted to independently loadable behavior that has no
@@ -2697,7 +2795,7 @@ remain separate.
 
 The release catalog records, for every module id, its product integration, phase,
 trigger, provided/consumed capability keys, and whether parser-time activation is a
-proved current-main or retained-gap obligation. The build rejects dependency cycles, a deferred
+proved rc-baseline or retained-gap obligation. The build rejects dependency cycles, a deferred
 provider consumed by another module, two providers for one key, a phase override
 from server or publisher data, provider-after-consumer manifest order, and any
 takeover entry that imports a catalogued deferred source area. GPT, the APS runner,
@@ -2751,7 +2849,7 @@ the page and is an accepted platform limitation, not a second-runtime recovery c
 After all takeover activations succeed, core commits the kernel API, runs takeover
 `afterCommit` callbacks in manifest order, and only then drains the bootstrap queue.
 Those callbacks may synchronously start required upstream scripts, timers, readiness
-work, and current-main DOM scans; publisher code they intentionally invoke therefore
+work, and rc-baseline DOM scans; publisher code they intentionally invoke therefore
 sees the complete kernel. A callback throw is isolated to its module, runs that
 module's remaining disposers, records a bounded local runtime failure, and makes
 affected operations fail through their existing typed readiness/render result; it
@@ -2805,7 +2903,7 @@ Deferred insertion preserves the publisher's script policy; it never rewrites a
 Content-Security-Policy header or meta element and never adds `unsafe-inline`,
 `unsafe-eval`, a source host, or a default Trusted Types policy. The parser-inserted
 bootstrap and parser-inserted first-display/runtime tags remain subject to the publisher's existing CSP and are
-a deployment precondition just as TSJS injection is on current main. When those
+a deployment precondition just as TSJS injection is on the rc baseline. When those
 tags carry a CSP nonce, they must carry the same response-local value, and core
 copies the authenticated parser-inserted element's `nonce` IDL value to the runtime
 and every deferred script before
@@ -3496,6 +3594,23 @@ release id.
   pass wins the latch, cancels TS reconciliation state, removes TS destroy ownership,
   and leaves physical/targeting cleanup to the publisher.
 
+- Preserve the rc `gam_attribution_enabled` behavior as one typed GPT boot field and
+  one owner. It defaults to `false` independently of GPT enablement. When true, the
+  parser-time GPT owner enqueues exactly one idempotent
+  `googletag.setConfig({targeting:{ts:'true'}})` command before publisher GPT commands
+  can issue a request; it does so even when `tsjs.adInit` already exists. If no
+  server-projected batch selects the lean agent, the one parser-blocking persistent
+  runtime performs that same obligation before publisher activity. The command
+  applies to initial, lazy, publisher-owned, refreshed, and SPA-route requests in the
+  document-local PubAds service. The slot-level `ts_initial` key keeps its existing
+  lifecycle, and neither Prebid refresh nor SPA cleanup clears page-level `ts`.
+  Targeting API absence or throw is isolated and cannot stop later queue work.
+  Hard cutover deletes the old raw-bootstrap global flag, bundle activation
+  attribute, and duplicate fallback enqueue; there is no dual marker path. Tests
+  prove enabled-before-publisher order, disabled zero side effects, pre-existing
+  `adInit`, takeover idempotence, refresh/SPA persistence, publisher-owned slots, and
+  error isolation. Existing GAM reporting semantics and documentation remain; this
+  design adds no router, key/value variant, beacon, telemetry schema, or analysis.
 - The Prebid refresh policy preserves the exact `excluded_gam_ad_unit_path_suffixes`
   behavior: path matching is literal/case-sensitive suffix matching; missing,
   non-string, or throwing `getAdUnitPath()` fails open; stale TS/Prebid keys are
@@ -3504,7 +3619,7 @@ release id.
 - Use one adapter-level refresh interception and one slot-service request path;
   remove the three independent integration wrappers without removing handoff or
   exclusion semantics.
-- Preserve the current-main collapsed-shell resize as a guarded exception tied to the
+- Preserve the rc-baseline collapsed-shell resize as a guarded exception tied to the
   current attempt. It runs only after a TS PUC response is posted and only when the
   source is the exact connected iframe, width/height attributes and computed size
   are still at most one pixel, dimensions are finite/positive, the frame/wrapper are
@@ -3897,6 +4012,7 @@ interface FirstDisplayGptFactV1 {
   readonly capturedAtMs: number
   readonly elementId: string | null
   readonly adUnitPath: string | null
+  readonly requestedSlotSizes: readonly (readonly [number, number])[] | null
   readonly isEmpty: boolean | null
   readonly renderedSize: readonly [number, number] | null
   readonly isBackfill: boolean | null
@@ -3917,7 +4033,10 @@ never reused, and remains paired with that physical token through takeover.
 `capturedAtMs` is a finite nonnegative `performance.now()` value; `elementId` and
 `adUnitPath` are null or the adapter's copied own 1–256-UTF-8-byte values with no
 NUL/control characters. GPT getter throws, nonstrings, empty values, and oversized
-values normalize to null. Rendered dimensions are null or integral 1–4096 values;
+values normalize to null. `requestedSlotSizes` is non-null only for the matched
+`slotRequested` fact carrying Trusted Server request-intent evidence, uses the
+16-entry copied/frozen 1–4096 contract below, and is null for publisher/native or
+event-inapplicable facts. Rendered dimensions are null or integral 1–4096 values;
 visibility is null or finite 0–100. Event-inapplicable fields are null. A matched
 request fact has its newly minted cycle ordinal; later cycle-bound facts use the exact
 uniquely attributed ordinal. A matched
@@ -3929,6 +4048,9 @@ reason, so a uniquely correlated invalid-order callback remains `matched` with
 `issueReason:'invalid_event_order'`. Unmatched and ambiguous facts use the applicable
 `no_request_cycle`, `overlapping_request_cycles`, or `unknown_prior_cycle` reason.
 The token and cycle retain the grammars/caps above.
+On replay, `requestedSlotSizes` becomes the public request cycle's field and
+`renderedSize` becomes its GPT-reported `size`; the names remain distinct at the
+handoff and public boundaries.
 The canonical UTF-8 encoding of the complete normalized record must be at most 1,000
 bytes. The handoff subsection is exactly
 `{facts:readonly FirstDisplayGptFactV1[],overflowCount:number,dropCount:number}`;
@@ -3990,6 +4112,39 @@ memory-only; neither diagnostics surface writes localStorage, sessionStorage,
 IndexedDB, or uploads data. The hard-cutover API is `tsjs.diagnostics.gpt`; the old
 flag/runtime expandos and `tsjs.gptDiagnostics` alias are deleted.
 
+Each exported `GptDiagnosticsRequestCycle` keeps three size concepts distinct:
+
+- `requestedSlotSizes?: readonly (readonly [number,number])[]` is the exact
+  Trusted Server placement-format evidence associated with that request intent,
+  capped at 16 entries. Each dimension is an integer in 1–4096. Admission copies and
+  freezes every tuple and the outer list; malformed entries are omitted and an empty
+  result is absent. Publisher/native requests do not inherit stale TS evidence.
+- `size?: readonly [number,number]` is GPT's reported filled creative size from the
+  exact matched `slotRenderEnded`. It retains the existing GPT normalization and is
+  never inferred from DOM geometry.
+- `observedSlotSize?: readonly [number,number]` is the finite, nonnegative CSS-pixel
+  width/height of the uniquely bound outer slot element measured after an explicitly
+  nonempty rendered cycle. Fractions and zero are valid observations; this is layout
+  evidence, not creative size or render acceptance.
+
+When GPT diagnostics is active, one dedicated slot-size observer subscribes to the
+bounded store and binding manager. It observes only connected, uniquely bound
+elements whose latest cycle is nonempty and has `renderAtMs`. Every scheduled
+measurement captures `{runtimeSlotNumber,requestNumber,element}` and revalidates the
+same exact binding, connected element, latest cycle, nonempty result, and render fact
+before committing. A refresh, rebind, ambiguity, disconnection, eviction, navigation,
+or disposal therefore makes a late measurement inert. `ResizeObserver` updates and
+an initial animation-frame measurement share this guard; absence of
+`ResizeObserver` leaves the initial measurement only. Disposal unsubscribes both
+sources, disconnects the observer, and makes scheduled callbacks inert.
+
+Snapshots, subscriptions, overlay, badges, and export use the exact field names and
+label the values independently as `Requested`, `GPT fill`, and `Outer box`; no UI or
+consumer may collapse them into one ambiguous “size.” Copy/freeze rules prevent a
+caller from mutating stored tuples. Focused tests cover all three present together,
+malformed/capped requested formats, refresh and rebind races, unavailable observers,
+fractional/zero boxes, unchanged-measurement deduplication, and teardown.
+
 GPT public subscriptions use a separate one-entry latest-snapshot notifier and never
 run from a GPT callback, adapter fan-out, store mutation, or binding observer. After
 each committed store/binding change, the controller builds one frozen
@@ -4029,9 +4184,9 @@ guard, and performs the bounded post-commit rescan. The creative takeover module
 prepares inertly and activates transactionally exactly once in the kernel barrier.
 Activation installs directly on a no-agent page and never stacks an agent guard. It enables the click guard when
 `clickGuard` is true and the image/iframe dynamic-source guards when `renderGuard` is
-true, but performs no current-main DOM rewrite. Only when
+true, but performs no rc-baseline DOM rewrite. Only when
 `clickGuard || renderGuard` is true, activation gives a still-loading document one
-owned `DOMContentLoaded` callback to perform the current-main idempotent rescan after the
+owned `DOMContentLoaded` callback to perform the rc-baseline idempotent rescan after the
 initial DOM completes; an already interactive/complete document gets no listener and
 performs that scan from one staged `afterCommit` callback. Its
 disposer removes that listener, observers, and owned DOM state and compare-restores a
@@ -4066,7 +4221,7 @@ work neither enables sanitization nor broadens creative privileges.
 
 Every other enabled TSJS integration becomes a thin transactional integration module without an
 internal feature rewrite. Its complete current unit suite runs unchanged against a
-current-main fixture and a module-composed fixture. At minimum the parity corpus
+rc-baseline fixture and a module-composed fixture. At minimum the parity corpus
 proves:
 
 | Integration        | Required preserved behavior                                                                                                                                            |
@@ -4113,7 +4268,7 @@ by line count:
 | `prebid/index.ts`                    | persistent Prebid owner that adopts initial artifact/queue/admission facts; the separate `prebid_initial` slice owns only initial readiness, bidder/user-ID/EID setup, and PUC admission         |
 | `prebid/later.ts`                    | deferred synthetic refresh and GAM-path exclusion only; it owns no initial admission, artifact-readiness, bidder, user-ID, EID, or publisher-queue behavior                                      |
 | `core/request.ts`                    | public validation, immutable selection, and thin `AuctionBatch` coordination; path implementations live behind injected capabilities                                                             |
-| `core/render.ts`                     | only minimum path-independent first-display DOM/lifecycle helpers; APS/ADM live with their owner, while cache stays the current-main GPT-integration implementation                              |
+| `core/render.ts`                     | only minimum path-independent first-display DOM/lifecycle helpers; APS/ADM live with their owner, while cache stays the rc-baseline GPT-integration implementation                               |
 | `kernel/diagnostics.ts`              | bounded data-tree snapshot ingress and one closure-private reducer callback; no integration subscriptions, pending queue, scheduler, timer, or presentation authority                            |
 | `core/trace.ts`                      | bounded correctness-fact reducer/store, public snapshots/subscriptions, and separately attenuated `trace.presentation.v1`; no DOM presentation code                                              |
 | APS maps in globals                  | runtime-owned bounded reservation capability supplied by the APS integration module                                                                                                              |
@@ -4210,14 +4365,14 @@ to authorize the duplicate. It also freezes the twenty largest rendered-source
 contributions and every repeated attribution so review can see, rather than infer,
 where transfer growth and shared-source duplication remain.
 
-In the same blocking job, a detached worktree at the exact freshly fetched
-`origin/main` SHA builds the real production page for the reference configuration
-with its current artifact model and default creative behavior. `mainReferenceTransfer`
+In the same blocking job, a detached worktree at the exact PR base SHA from
+`origin/rc/202608` builds the real production page for the reference configuration
+with its baseline artifact model and default creative behavior. `baselineReferenceTransfer`
 is the exact raw/gzip/Brotli sum of every Trusted Server JavaScript byte delivered or
 embedded from `tsjs:bids-script` through the first responsible GPT action. The
 candidate records the same semantic interval for its controller, upstream-independent
 TSJS transports, and agent; neither side relabels artifact names to manufacture
-membership parity. Candidate reference transfer must be at most the current-main
+membership parity. Candidate reference transfer must be at most the rc-baseline
 value for each encoding. This semantic transfer comparison is independent of, and in
 addition to, the paired 1.10 timing ratio below.
 
@@ -4236,7 +4391,7 @@ ceilings apply to the candidate and do not derive from any candidate capture:
 
 The first-display ceilings are selected from the fixed 200,000-byte/s profile; the
 post-paint and maximal limits prevent phase splitting or duplicated ownership from
-making total release growth unbounded. They are not substitutes for the current-main
+making total release growth unbounded. They are not substitutes for the rc-baseline
 semantic transfer or paired timing gates. Changing any ceiling requires a reviewed
 design rather than recapturing candidate history.
 
@@ -4248,9 +4403,9 @@ first-display mask and its generated size-admission decision (with named
 minimal/reference/APS/largest summaries), persistent runtime, and maximal. The
 generated catalog allowlist must exactly equal the measured admitted subset. It is
 evidence for that candidate, not a self-created baseline.
-After the cutover lands, subsequent work still compares against the then-current
-`origin/main` and the same independent ceilings; no candidate-side capture becomes
-permanent authority merely by being checked in.
+After the cutover lands, subsequent work chooses its own actual target-branch base
+and the same independent ceilings; no candidate-side capture becomes permanent
+authority merely by being checked in.
 
 The inline bootstrap-controller/fallback cannot be used to hide code outside those
 sets. It receives its independent ceiling above, appears
@@ -4262,15 +4417,15 @@ validation, generation/disposal, timing, and local logging primitives.
 
 1. the original and two intermediate candidate captures and their digests are
    validated and printed as immutable history, never as pass/fail ceilings;
-2. the freshly built exact current-main and candidate reference pages enforce the
+2. the freshly built exact rc-baseline and candidate reference pages enforce the
    semantic transfer comparison;
 3. candidate bootstrap/all-permitted-masks/persistent/maximal values enforce the
    independent absolute ceilings; and
 4. the one-time architecture/source-ownership assertions above remain blocking.
 
-A local main-less invocation enforces the absolute and architecture parts and marks
-the semantic comparison unavailable; CI and release evidence require the exact
-fresh-main comparison and fail if it is missing, stale, or not reproducible.
+A local baseline-less invocation enforces the absolute and architecture parts and
+marks the semantic comparison unavailable; CI and release evidence require the exact
+PR-base comparison and fail if it is missing, stale, or not reproducible.
 
 The gate also rejects an unclassified or multiply counted artifact, a missing
 production artifact, a test artifact, a maximal inventory that omits any split
@@ -4280,7 +4435,7 @@ implementation, overlapping agent/persistent side-effect ownership, and
 production reachability to fake/no-op/test or `*ForTest` sources. It reports the
 largest source contributions and repeated production attributions so later work
 cannot hide growth inside a passing aggregate. Changing historical evidence,
-semantic membership, the current-main comparison procedure, or an absolute ceiling
+semantic membership, the rc-baseline comparison procedure, or an absolute ceiling
 requires a separate reviewed design; it is not an implementation escape hatch.
 
 Boot-to-first-display uses real User Timing marks, not `__tsjsPerf` or a test-only
@@ -4304,7 +4459,7 @@ meaning.
 
 The standalone performance job uses pinned Chromium 145.0.7632.6, the
 `github-hosted:ubuntu-24.04` runner class, fixture
-`tsjs-main-paired-network-v2`, five warmups per variant, and 50 measured samples per
+`tsjs-baseline-paired-network-v3`, five warmups per variant, and 50 measured samples per
 variant. It runs automatically when a pull request changes the TSJS build/runtime,
 the server controller or projection path, the browser fixture, the evidence
 validator, or the workflow itself. Its existing `workflow_dispatch` and
@@ -4321,7 +4476,7 @@ observation for release identity, candidate marks, paint, takeover, and
 deferred-order evidence, followed by the separate paired heap contexts. Release
 identity is intentionally asserted there because it belongs to persistent takeover
 and need not exist at the earlier first-action measurement boundary. The budgets
-absorb hosted-runner variance, checkout, the candidate/current-`main` builds,
+absorb hosted-runner variance, checkout, the candidate/rc-baseline builds,
 browser setup, validation, finalization, and immutable upload. They do not reduce
 the five warmups, 50 measured samples per variant, fixed network profile, assertions,
 or evidence requirements, and they are not permission to repeat post-measurement
@@ -4333,16 +4488,18 @@ required heap context and evidence write. The ten-minute inner reserve covers th
 remaining required context plus evidence serialization; the outer reserve covers
 build/setup, validation, and immutable upload.
 
-The job declares a paired GPT-reference case and a candidate-only APS first-display
-case. Both variants of the GPT pair use the same projection, enabled behavior,
+The job declares paired GPT-reference and APS first-display cases. Both variants of
+each pair use the same projection, enabled behavior,
 upstream fictional stubs, page markup, creative policy, warm/cold cache state, and
 browser profile. The APS case drives the fictional APS/PUC contract through its
 actual first action, terminal result, and paint, and must satisfy the size, mark,
-ordering, deadline, and heap contracts; current `main` has no semantically equivalent
-first-class APS action, so APS cannot be assigned a fabricated relative ratio. A GPT
-pass never masks an APS failure.
+ordering, deadline, and heap contracts. The rc baseline has a first-class APS action,
+so its first responsible GPT action and delivered pre-action TSJS bytes are compared
+honestly; candidate-only terminal, paint, containment, and heap claims retain the
+absolute gates below because the document protocols intentionally differ. A GPT pass
+never masks an APS failure.
 
-The candidate-only APS case is nevertheless a blocking quantitative gate, not only
+The APS case is also a blocking absolute quantitative gate, not only
 a protocol-deadline check. Its checked-in fictional GPT, GAM creative, proxy, runner,
 and PUC bodies and schedules are invariant test inputs; the fictional runner invokes
 the real queued `prebid/creative/render` callback 50 ms after its API call. Across the
@@ -4362,20 +4519,24 @@ substitute. Every sample—not only p90—must still satisfy the narrower applic
 correctness deadline. Changing a fictional dependency body/schedule, a ceiling, a
 mark endpoint, or the network profile is a performance-contract change requiring
 review rather than a way to recapture a passing baseline. These deliberately broad
-absolute guardrails cover the candidate-only behavior that has no honest `main`
-ratio; the paired GPT current-`main` × 1.10 comparison remains the regression gate
-for shared first-action and persistent-runtime costs.
+absolute guardrails cover the candidate-only document lifecycle. For both GPT and
+APS, candidate first-action p90 and pre-action raw/gzip/Brotli transfer must be at
+most the rc-baseline value × 1.10; the reference GPT semantic transfer retains the
+stricter no-growth rule above.
 
-Each run fetches `origin/main`, resolves its exact current 40-character commit SHA,
-creates a detached worktree at that SHA, and builds `main` and the candidate
-independently. The main-side loader feature-detects and consumes the artifact shape
-that commit actually produced. While current `main` emits the legacy `tsjs-core.js`,
+On a pull request, each run reads `pull_request.base.sha` into the dedicated
+`TSJS_PERF_BASE_SHA`, verifies it is a 40-character commit reachable from the fetched
+`origin/rc/202608`, creates a detached worktree at that exact SHA, and builds the rc
+baseline and candidate independently. A manual/called run requires the same exact
+input; a moving branch name or candidate-generated fallback is invalid. The
+baseline-side loader feature-detects and consumes the artifact shape that commit
+actually produced. While the rc baseline emits the legacy `tsjs-core.js`,
 `tsjs-creative.js`, plus `tsjs-gpt.js` model and no release-v1 inventory/controller,
 the harness concatenates and serves those real built bytes, enables the same default
 creative policy, and drives their real legacy `adInit` surface. After the cutover
-reaches `main`, the same loader consumes that commit's release-v1 inventory/controller
+reaches the release branch, a later comparison consumes that base commit's release-v1 inventory/controller
 and that commit's real server-selected first-display artifact instead. It does not relabel an older phase-aware
-capture as `main` or require unavailable candidate-only metadata from a legacy
+capture as the baseline or require unavailable candidate-only metadata from a legacy
 commit. The candidate side consumes its generated server controller and release-v1
 first-display/takeover/deferred artifacts. One in-process `node:http` server per variant on an
 ephemeral `127.0.0.1` port serves that variant's exact page and bytes. Playwright
@@ -4402,18 +4563,18 @@ deferred loading waits for that paint or the no-attempt guard exactly as specifi
 for direct-to-runtime pages. It is not counted as an agent-mask sample or used to
 claim the agent's ≤90 kB transfer ceiling.
 
-The job alternates `main` then candidate / candidate then `main` in one Chromium
-process for every warmup and measured GPT pair. GPT candidate p90 must be at most
-current `main` p90 × 1.10. GitHub-hosted absolute timing is not stable enough for a
-tight fixed shared-regression ceiling, and a historical fixed comparison SHA is not
-an honest stand-in for current `main`; neither replaces that paired gate. The APS
-absolute ceilings above are separate fixture guardrails. The schema-5 artifact records
-the exact main and candidate SHAs, each actual artifact model, each exact served
+The job alternates baseline then candidate / candidate then baseline in one Chromium
+process for every warmup and measured GPT and APS pair. Candidate first-action p90
+must be at most the matching rc-baseline p90 × 1.10. GitHub-hosted absolute timing is
+not stable enough for a tight fixed shared-regression ceiling, and a historical fixed
+comparison SHA is not an honest stand-in for the PR base; neither replaces that
+paired gate. The APS absolute ceilings above are separate fixture guardrails. The
+schema-6 artifact records the exact baseline and candidate SHAs, each actual artifact model, each exact served
 first-display byte count, both full distributions and p90s, the alternating order, and
 the exact network profile. The workflow runs each declared pair once and never
 selectively reruns, drops, or reclassifies slow samples. Budget assertions are soft
 only in the Playwright sense: the run finishes all timing and heap collection and
-writes the complete schema-5 evidence before failing. Validation and upload run
+writes the complete schema-6 evidence before failing. Validation and upload run
 with `always()` so a failed gate retains its exact diagnostic artifact; neither the
 test nor the validator converts an exceeded budget into success.
 
@@ -4432,7 +4593,7 @@ call it **bids-script-to-first-action**, not paint latency. The same evidence re
 candidate terminal and paint distributions for GPT and APS. Every sample must remain
 inside the unchanged path-specific render deadline and §5.2 paint allowance; this
 prevents an agent from improving transfer latency by postponing completion or
-takeover without fabricating a non-equivalent current-`main` terminal/paint ratio.
+takeover without claiming a non-equivalent rc-baseline terminal/paint ratio.
 
 Retained heap for the paired GPT case uses forced-GC Chromium checkpoints after boot,
 first render, refresh, and SPA navigation. After the display samples, the job launches
@@ -4445,30 +4606,35 @@ once followed immediately by CDP `Runtime.getHeapUsage`; each GC, usage, detach,
 cleanup operation has an explicit 30-second local failure boundary. The single
 `usedSize` is the checkpoint statistic, with no hidden averaging, maximum selection,
 or rerun. Both variants must remain below the immutable 4 MiB hard ceiling. The
-schema records current-main values and identity for direct inspection, but does not
+schema records rc-baseline values and identity for direct inspection, but does not
 turn the smaller legacy runtime shape into an arbitrary multiplier for the
 hard-cutover kernel and deferred architecture. Any checkpoint over the absolute limit
 fails the one declared run; the job cannot replace only that measurement or rerun only
 the heap fixture. Correctness runs independently in Chromium, Firefox, and WebKit.
 Correctness failures are never waived by a performance pass.
 
-The paired SPA checkpoint changes the document pathname, not only its query. Current
-`main` and candidate use their respective real navigation hooks, and both must observe
+The paired SPA checkpoint changes the document pathname, not only its query. The rc
+baseline and candidate use their respective real navigation hooks, and both must observe
 that same pathname transition, request `/_ts/page-bids`, consume the response body,
 and finish GPT slot reconciliation before the final forced-GC measurement.
 
 ## 6. Security and privacy
 
-1. Renderer iframes omit `allow-same-origin`; cross-origin target `"*"` is permitted
-   only when transferring a one-use port to the exact native iframe's already-checked
-   browsing-context `WindowProxy`. As §4.4 states, this binds the context, not an
-   opaque active `Document`; embedding-ancestor code with navigation authority is
-   trusted for that navigation-integrity property.
+1. The publisher-origin bootstrap initially omits `allow-same-origin`; after its
+   exact readiness proof, the top-page owner adds that token only for navigation to
+   the naturally opaque data container. The final outer and inner documents are
+   `data:` documents and remain opaque while their permanent sandbox keeps
+   `allow-same-origin` so the HTTPS creative retains its real origin across browsers.
+   Target `"*"` is used only with exact source, nonce, shape, generation, element,
+   and one-use-port checks because opaque origins cannot be named as `targetOrigin`.
+   PUC/GAM/bidder content is never an ancestor of the APS mount.
 2. The initial global PUC request contains the opaque renderer reservation
    capability but no descriptor, ADM, lifecycle ticket, or nonce, and it establishes
    no success. The first compatible claim acquires the PUC source; render authority
    begins only after exact reservation/slot lookup, attributable nonempty GAM,
-   current generation, source binding, and atomic consumption.
+   current generation, source binding, and atomic consumption. Its dynamic owner
+   receives settlement authority only; it never receives descriptor data or APS DOM
+   authority.
 3. Lifecycle tickets and nonces are CSPRNG, one-use, TTL-bounded, never logged, and
    invalidated on supersession/navigation.
 4. Exact-key message parsing prevents confused-deputy extensions. Unknown versions
@@ -4484,10 +4650,13 @@ and finish GPT slot reconciliation before the final forced-GC measurement.
    before persistent activation and cannot claim committed DOM or a GPT object.
 7. The upstream APS runner URL, every creative URL, and production renderer/proxy
    routes must be HTTPS. HTTP is permitted only for loopback hermetic adapters; their
-   fixed local proxy route remains covered by CSP `'self'`. The runner executes only
+   fixed local proxy origin is injected as the inner document's sole external script
+   origin. The runner executes only
    through the fixed-target, anonymous-CORS Trusted Server proxy. The proxy relays the
    APS body unchanged but never stores it in source, forwards publisher credentials,
-   accepts a caller-selected target, or executes a fallback. Runner-created APS-origin
+   accepts a caller-selected target, or executes a fallback. No APS, GPT, PUC, or
+   other vendor bytes are stored in source or release artifacts; hermetic fixtures
+   are locally authored protocol doubles. Runner-created APS-origin
    resources may use their own origin cookies under browser policy. The renderer
    document accepts no cookie as authority.
 8. Script creatives remain opt-in because they materially broaden executable
@@ -4509,17 +4678,17 @@ and finish GPT slot reconciliation before the final forced-GC measurement.
 
 ### 7.1 Required test layers
 
-| Layer                 | Required proof                                                                                                                                                                                                                                                                                                                                                                                    |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Rust unit             | APS parsing/admission, dimensions, scripts, AAX projection, mediation provenance/order/timeouts, targeting identity, descriptor serialization, endpoint headers/body                                                                                                                                                                                                                              |
-| Main/gap audit        | current-main tests are the behavioral oracle; every retained `RCJ-*` row starts proof-pending, identifies/authors a focused contract, runs it on the untouched recorded-main worktree, and ends main-owned or demonstrated implementation-gap with recorded SHA/owner/test command/result; proof-pending/coverage-gap blocks phase exit and no retired source is built or merged                  |
-| Cross-language corpus | every positive/adversarial descriptor has the same Rust, TS, and embedded ES5 result; stale generation fails                                                                                                                                                                                                                                                                                      |
-| TS unit               | agent/takeover ownership, exact handoff/capsule admission, takeover/deferred transactions, fallback versus isolated deferred failure, trigger/disposal races, sessions, registries, selection/cycle/batch/latch APIs, adapter readiness, GPT handoff/reconciliation, Prebid artifact/refresh, creative security, diagnostics, and every remaining integration parity corpus                       |
-| Hermetic browser      | one parser-blocking first-display request, no pre-paint persistent/deferred traffic, authenticated atomic takeover into the one persistent runtime, all render paths, PUC bridge, three-level APS sizing, direct iframe races, owner/port/runner behavior, fallback, SafeFrame-shaped nesting, GPT handoff/hydration, creative clicks, diagnostics, and duplicate/replay/wrong-source/stale cases |
-| Real-GAM test network | SSAT APS-PUC, Prebid-adapter APS-PUC, page-bids APS-PUC, direct APS, direct ADM plus current-main PBS Cache regression, fallback after attributable empty GAM, SRA, refresh, SPA, handoff, hydrated DOM replacement, and collapsed shell                                                                                                                                                          |
-| Adapter parity        | exact renderer sandbox/CSP/header bytes plus runner-proxy routing, five-second deadline, closed response parsing, bounded relay, header filtering, and failures match on all adapters                                                                                                                                                                                                             |
-| Regression            | non-APS Cache/ADM and notifications, pure external Prebid/native bids/EIDs/user IDs/refresh exclusions, publisher GPT/handoff/SRA/SPA, creative processing/click recovery, render trace/GPT diagnostics, and every remaining integration remain correct                                                                                                                                           |
-| Quality               | full-package TypeScript/lint including tests/scripts/build code, ESLint and release-catalog dependency boundaries, production-metafile/test-hook exclusions, format, clippy, Rust adapter suites, Vitest, artifact integration, Playwright, immutable historical bundle reporting, role-correct transfer budgets, performance/heap budgets, and complete maximal inventory                        |
+| Layer                 | Required proof                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Rust unit             | APS parsing/admission, dimensions, scripts, AAX projection, mediation provenance/order/timeouts, targeting identity, descriptor serialization, endpoint headers/body                                                                                                                                                                                                                                                                                 |
+| Baseline/gap audit    | rc-baseline tests are the behavioral oracle; every retained `RCJ-*` row starts proof-pending, identifies/authors a focused contract, runs it on the untouched recorded-rc worktree, and ends baseline-owned or demonstrated implementation-gap with recorded SHA/owner/test command/result; proof-pending/coverage-gap blocks phase exit and no retired source is built or merged                                                                    |
+| Cross-language corpus | every positive/adversarial descriptor has the same Rust, TS, and embedded ES5 result; stale generation fails                                                                                                                                                                                                                                                                                                                                         |
+| TS unit               | agent/takeover ownership, exact handoff/capsule admission, takeover/deferred transactions, fallback versus isolated deferred failure, trigger/disposal races, sessions, registries, selection/cycle/batch/latch APIs, adapter readiness, GPT handoff/reconciliation, Prebid artifact/refresh, creative security, diagnostics, and every remaining integration parity corpus                                                                          |
+| Hermetic browser      | one parser-blocking first-display request, no pre-paint persistent/deferred traffic, authenticated atomic takeover into the one persistent runtime, all render paths, PUC bridge, sibling top mount, four-level APS sizing, data-document CSP containment, direct iframe races, owner/port/runner behavior, fallback, SafeFrame-shaped isolation, GPT handoff/hydration, creative clicks, diagnostics, and duplicate/replay/wrong-source/stale cases |
+| Real-GAM test network | SSAT APS-PUC, Prebid-adapter APS-PUC, page-bids APS-PUC, direct APS, direct ADM plus rc-baseline PBS Cache regression, fallback after attributable empty GAM, SRA, refresh, SPA, handoff, hydrated DOM replacement, and collapsed shell                                                                                                                                                                                                              |
+| Adapter parity        | exact bootstrap sandbox/CSP/header bytes plus runner-proxy routing, five-second deadline, closed response parsing, bounded relay, header filtering, and failures match on all adapters                                                                                                                                                                                                                                                               |
+| Regression            | non-APS Cache/ADM and notifications, pure external Prebid/native bids/EIDs/user IDs/refresh exclusions, publisher GPT/handoff/SRA/SPA, creative processing/click recovery, render trace/GPT diagnostics, and every remaining integration remain correct                                                                                                                                                                                              |
+| Quality               | full-package TypeScript/lint including tests/scripts/build code, ESLint and release-catalog dependency boundaries, production-metafile/test-hook exclusions, format, clippy, Rust adapter suites, Vitest, artifact integration, Playwright, immutable historical bundle reporting, role-correct transfer budgets, performance/heap budgets, and complete maximal inventory                                                                           |
 
 Feature-owned GitHub Actions YAML is declarative orchestration, not a program
 container. Multiline shell programs, generated configuration bodies, validation
@@ -4534,7 +4703,7 @@ focused scripts instead of one opaque dispatcher.
 
 Repository contract tests read both the workflow and the referenced script files.
 They reject feature-owned embedded workflow programs and missing script targets,
-then assert the security, release-binding, exact-main, performance, browser-matrix,
+then assert the security, release-binding, exact-rc-baseline, performance, browser-matrix,
 adapter-corpus, manifest, and evidence-scrubbing behavior in the scripts that own it.
 This source-shape rule changes only how CI logic is maintained; it does not weaken a
 gate, broaden secret exposure, alter protected-environment admission, or introduce a
@@ -4559,10 +4728,16 @@ Tests must cover at least:
   caller abort before/after registration/insertion/document acceptance, and owner
   watchdog racing a late kernel response; every winner produces exactly one
   encodable `OwnerSettlementV1` and one PUC Promise settlement; channel loss before
-  start and after insertion, settlement-post throw, and the 20-second remote cleanup
-  boundary prove the owner removes only its uncommitted iframe while accepted DOM
-  remains;
-- renderer document success followed by runner failure/timeout;
+  start and after top insertion, settlement-post throw, and the 20-second remote
+  cleanup boundary prove the PUC owner owns no APS node while the mount service
+  removes only its exact uncommitted iframe and leaves accepted DOM;
+- bootstrap ready before/after deadline; wrong source/nonce/shape; outer frame
+  removal, `src` mutation, replacement, and navigation; zero/two container ports;
+  inner-ready replay; descriptor transfer before/after channel creation; publisher,
+  GAM, PUC, and creative attempts to navigate or frame a publisher-origin document;
+  exact creative-origin CSP allow/deny; data-document 65,535/65,536/65,537-byte
+  boundaries; sentinel escaping/completeness; and renderer document success followed
+  by runner failure/timeout;
 - runner proxy stall and slow-drip across the five-second total deadline; redirect;
   absent/duplicate/malformed/mismatched/over-limit `Content-Length`;
   absent/accepted/parameterized/rejected `Content-Type`; absent/identity/listed/other
@@ -4591,6 +4766,12 @@ Tests must cover at least:
   byte/count boundaries; canonical projection just below/at/above 8 MiB with the
   exact all-winners-to-`winner_not_renderable` reduction; and all-or-nothing
   projection/slot/targeting commit;
+- required `[creative_opportunities].enabled` present/absent/wrong-type parsing;
+  disabled publisher HTML and page-bids produce no matching/auction/projection/client
+  initialization while direct `POST /auction` remains live; disabled configuration
+  still fully validates; inactive HTML public/no-header/private/no-store policies;
+  case-insensitive protection of private directives; preservation of validators and
+  surrogate/CDN fields; synthesized-state privacy; and non-HTML/error noninterference;
 - `display()` under disabled initial load from TS and publisher callers;
 - exact and hydration-renamed late `defineSlot` handoff, mismatch/ambiguity,
   duplicate publisher display, explicit/global initial-load-disabled refresh,
@@ -4605,6 +4786,11 @@ Tests must cover at least:
   and proof that publisher-owned slots are never destroyed;
 - SRA completion ordering, duplicate `responseIdentifier`, missing completion, and
   publisher/TS overlap;
+- `gam_attribution_enabled` false/true with missing and pre-existing `adInit`, GPT
+  queue absent/present, targeting API missing/throwing, initial/lazy/publisher-owned/
+  refresh/SPA requests, takeover, and direct-persistent boot; prove exactly one
+  parser-time `setConfig({targeting:{ts:'true'}})`, no `ts` cleanup, no old global or
+  activation attribute, and no behavior change while disabled;
 - missing/stub/late/duplicate/older/partial external Prebid artifacts, artifact
   queue-watchdog versus late module activation, ABI and release-identity boundaries,
   every manifest collection/string capacity, malformed/unsorted/duplicate members,
@@ -4803,8 +4989,13 @@ Tests must cover at least:
   overflow/drop counters,
   63/64/65 slots, 9/10/11 cycles, 127/128/129 issues,
   32/33 public subscribers, 0/1/2-update latest-snapshot coalescing,
-  subscribe/unsubscribe/disposal races and slow/throwing listeners, slot element
-  replacement, timing/frozen-export bounds, overlay disposal, inactive
+  subscribe/unsubscribe/disposal races and slow/throwing listeners; requested-format
+  tuple validation/copy/freeze and 15/16/17 cap; simultaneous requested/GPT-fill/
+  outer-box evidence and distinct labels; initial measurement, missing
+  `ResizeObserver`, resize update, fractional/zero/invalid boxes, unchanged-value
+  deduplication, stale-cycle refresh, binding replacement/ambiguity/disconnection,
+  eviction/navigation/disposal; slot element replacement, timing/frozen-export bounds,
+  overlay disposal, inactive
   zero-diagnostics-side-effect behavior, and diagnostics failure during live ads;
 - creative processing across sanitize/rewrite policy combinations and every delivery
   path; exact default/explicit `CreativeBootV1` validation; automatic immediate and
@@ -4832,14 +5023,14 @@ repository.
 Each required flow must demonstrate the expected DOM and lifecycle result, not an
 analytics row:
 
-- APS paths: one creative request, one bridge claim where applicable, one renderer
+- APS paths: one creative request, one bridge claim where applicable, one top mount
   iframe, one APS runner load, one APS render-completion callback, one accepted
-  result, no duplicate render. The PUC owner, static renderer, and descendant creative
-  each have the exact winning viewport with zero default margin, no clipping, and no
-  overflow.
+  result, no duplicate render. The top mount, outer data container, inner renderer,
+  and descendant creative each have the exact winning viewport with zero default
+  margin, no clipping, and no overflow.
 - Empty GAM fallback: parent settles empty/failure before exactly one child render.
 - Direct ADM: exact owned iframe reaches one accepted result. Existing PBS Cache
-  fixtures retain their current-main observable result without entering the new
+  fixtures retain their rc-baseline observable result without entering the new
   APS/ADM owner protocol.
 - Failure fixtures: wrong id, invalid descriptor, missing claim, missing owner,
   missing document acknowledgement, and runner failure each reach the specified
@@ -4863,16 +5054,16 @@ over once through the existing APS/TSJS release mechanism. No runtime flag,
 old/new selector, compatibility branch, or dual protocol is introduced in any
 deployable artifact.
 
-Operator configuration moves before the binary cutover. Canonical APS
-`account_id` is validated and pushed while the old binary still accepts it, as
-specified in §3.3. No unrelated creative-opportunity configuration switch is part
-of this cutover.
+Operator configuration moves atomically with the binary cutover. Canonical APS
+`account_id` and the required `[creative_opportunities].enabled` boolean are
+validated before deployment; the active binary exposes no legacy alias or
+omitted-field compatibility path.
 
-1. **Integrate current main:** fetch and integrate current `origin/main`, record its
+1. **Integrate the release base:** fetch and integrate current `origin/rc/202608`, record its
    exact SHA, run the unchanged affected Rust/TS/browser suites, and start every
    retained `RCJ-*` row proof-pending. Identify or author its focused contract, run
    that test against a detached otherwise-untouched worktree at the recorded SHA,
-   and record SHA/owner/test command/result. A passing contract is main-owned; a
+   and record SHA/owner/test command/result. A passing contract is baseline-owned; a
    behavioral failure is an implementation-gap; missing test coverage is a
    coverage-gap that blocks production edits until the test is authored and run.
    No row may remain proof-pending or coverage-gap at phase exit. Do not fetch,
@@ -4884,23 +5075,23 @@ of this cutover.
    phase metadata, and production-versus-test composition boundaries behind
    test-only construction.
 4. **Server APS path:** make admission, mediation, descriptor projection, targeting,
-   and renderer route conform to the contract.
+   bootstrap route, publisher frame policy, and runner proxy conform to the contract.
 5. **First-display extraction:** preserve the two immutable intermediate captures,
    build the server-composed first-display artifact plus authenticated post-paint
    takeover, move persistent/later behavior out of its graph, and make inventory,
    ownership, and production-metafile gates green. Record candidate evidence from
    its exact clean pushed parent; all historical/intermediate deltas remain
-   report-only, and fresh-current-main semantic transfer, independent absolute size,
+   report-only, and fresh-rc-baseline semantic transfer, independent absolute size,
    timing, and heap gates must be green before production wiring.
 6. **Browser integrations:** migrate APS, GPT, Prebid, direct auction, fallback,
    local diagnostics, creative processing, every remaining affected TSJS
    integration, and bootstrap to the catalogued first-display/takeover/deferred
-   modules while current-main regressions and retained `RCJ-*` gap contracts stay
+   modules while rc-baseline regressions and retained `RCJ-*` gap contracts stay
    green.
 7. **Delete legacy paths:** remove expandos, duplicate bridge branches, old
    `requestAds`, legacy globals, duplicated bootstrap behavior, and unused flags
    from the release candidate.
-8. **Pre-production:** refresh/integrate current `main` again, then pass all hermetic
+8. **Pre-production:** refresh/integrate current `rc/202608` again, then pass all hermetic
    suites and the protected real-GAM network
    in Chromium, Firefox, and WebKit; archive its console, network, DOM, and GPT-event
    evidence with the release artifact.
@@ -4953,33 +5144,40 @@ adding a hidden analytics subsystem here.
 11. **Check in or release a pinned APS runner:** rejected. Trusted Server owns only
     the fixed-target transport proxy and renderer contract; APS owns the live runner
     bytes.
-12. **Keep every enabled integration in one atomic boot barrier:** rejected. It makes
+12. **Mount APS beneath Universal Creative or another third-party ancestor:**
+    rejected. An ancestor with navigation authority can replace an opaque child while
+    preserving its `WindowProxy`. PUC receives only settlement authority; the
+    top-page owner mounts the nested data renderer as a sibling.
+13. **Vendor PUC, GPT, APS, or another upstream script for deterministic tests:**
+    rejected. Hermetic fixtures are independently authored protocol doubles and the
+    protected conformance suite exercises the named live external release.
+14. **Keep every enabled integration in one atomic boot barrier:** rejected. It makes
     first display pay for refresh, later navigation, diagnostics UI, and optional
     integrations that cannot affect that display. Atomicity remains mandatory for
     the takeover transaction and for each deferred module's local transaction.
-13. **Download a monolith early and merely postpone its callbacks:** rejected. It
+15. **Download a monolith early and merely postpone its callbacks:** rejected. It
     preserves transfer/parse contention and does not solve load time; deferred code
     is a separately requested release-owned artifact after its trigger.
-14. **Let integrations dynamically import arbitrary modules or upstream scripts:**
+16. **Let integrations dynamically import arbitrary modules or upstream scripts:**
     rejected. Core alone inserts exact same-origin release artifacts. GPT, APS,
     Prebid, PUC, and other upstream bytes remain live external dependencies and are
     never vendored into TSJS source or output.
-15. **Give each deferred bundle its own runtime or service locator:** rejected. A
+17. **Give each deferred bundle its own runtime or service locator:** rejected. A
     later module can join only the committed session through catalogued frozen
     capabilities and cannot replace an owner.
-16. **Keep optimizing the 395 kB full-runtime first-display graph:** rejected by
+18. **Keep optimizing the 395 kB full-runtime first-display graph:** rejected by
     measured evidence. Co-bundling removed duplicate emission but still produced a
-    4.57× p90 against current `main`; no credible local minification or shared-chunk
+    4.57× p90 against the historical main reference; no credible local minification or shared-chunk
     change closes that gap under the fixed network profile.
-17. **Create provider-specific independent mini-runtimes:** rejected. They reduce
+19. **Create provider-specific independent mini-runtimes:** rejected. They reduce
     bytes per path but multiply queue, adapter, message, slot, and fallback ownership.
     The one bounded agent has a single exact transfer into the one persistent runtime.
-18. **Relax the 1.10× gate or accept the 220 kB mechanical ceiling:** rejected. The
+20. **Relax the 1.10× gate or accept the 220 kB mechanical ceiling:** rejected. The
     automated paired gate is the user-visible load-time acceptance criterion; the
     90 kB agent ceiling is an additional architecture guard, not permission to
     self-baseline or waive the measured result.
-19. **Merge or cherry-pick retired `rc/july` to recover TSJS work:** rejected. Current
-    `main` already contains most required behavior, often through later or squashed
+21. **Merge or cherry-pick retired `rc/july` to recover TSJS work:** rejected. The rc
+    baseline already contains most required behavior, often through later or squashed
     implementations; importing the retired branch would add unrelated work and
     create a second behavioral authority. The immutable snapshot is used only to
     discover and test a specific missing concept.
@@ -4989,7 +5187,11 @@ adding a hidden analytics subsystem here.
 | Risk                                                               | Mitigation                                                                                                                                                                                                                                                                                                                                                    |
 | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | PUC behavior differs from the local contract harness               | keep the harness limited to the public message/helper contract, exercise `h.sendMessage`, and gate the actual externally hosted PUC release on real GAM; do not vendor PUC bytes                                                                                                                                                                              |
-| Same-realm publisher code can interfere                            | explicitly trust TS-authored owner code; capability checks defend unrelated frames, replays, and stale work, not arbitrary same-realm compromise                                                                                                                                                                                                              |
+| Same-realm publisher code can interfere                            | publisher-realm availability/DOM integrity is an explicit prerequisite; capability checks defend third-party frames, replays, and stale work, not arbitrary same-realm compromise                                                                                                                                                                             |
+| Third-party creative regains publisher-origin execution            | top-page sibling mount, naturally opaque nested data documents, outer exact-origin `frame-src`, independent publisher `frame-ancestors 'self'`, and three-browser hostile-navigation fixtures                                                                                                                                                                 |
+| Rc merge silently drops a release-branch behavior                  | first-parent rc ancestry, explicit adoption ledger, conflict inventory, focused baseline-versus-candidate contracts, and full rc suites before feature work                                                                                                                                                                                                   |
+| Required template switch breaks an old omitted-field config        | intentional hard cutover; startup rejects omission, examples/fixtures/operators move atomically, and whole-release rollback restores the prior binary/config together                                                                                                                                                                                         |
+| Late slot-size observation mutates a newer GPT cycle               | capture runtime-slot/request/element identity, revalidate exact latest filled cycle and live unique binding at commit, disconnect/unsubscribe on disposal, and keep evidence diagnostics-only                                                                                                                                                                 |
 | A module activation never returns                                  | activation is generated first-party code with boundary tests; elapsed returning calls fail through monotonic checks, but JavaScript cannot preempt a nonreturning same-thread function                                                                                                                                                                        |
 | Strict parsing rejects a future APS field                          | descriptor is versioned; outer transport remains tolerant; add a reviewed version/corpus update rather than silently accepting new semantics                                                                                                                                                                                                                  |
 | CSP blocks a legitimate APS creative                               | three-browser real-GAM suite; script creatives remain opt-in; CSP changes are explicit security work                                                                                                                                                                                                                                                          |
@@ -5007,7 +5209,7 @@ adding a hidden analytics subsystem here.
 | Phase splitting duplicates product ownership                       | one broker provider per capability, immutable interfaces, takeover-before-deferred dependency rule, agent capsule identity/disposal tests, and no public service locator                                                                                                                                                                                      |
 | Phase splitting reduces initial bytes but grows total release size | independent immutable maximal-total raw/gzip/Brotli budget and complete release inventory; splitting alone cannot make the gate pass                                                                                                                                                                                                                          |
 | One deferred module stalls unrelated later behavior                | start every independent deferred transaction after the common gate without awaiting siblings; separate deadlines and no deferred-to-deferred capability edges prevent head-of-line blocking                                                                                                                                                                   |
-| Retired `rc/july` is mistaken for an implementation source         | never fetch/merge/rebase/cherry-pick its head; validate only immutable `905984e62` as a concept checklist, map retained rows to current-main owners/gaps, and fail the plan/lint if a release or performance gate names `rc/july`                                                                                                                             |
+| Retired `rc/july` is mistaken for an implementation source         | never fetch/merge/rebase/cherry-pick its head; validate only immutable `905984e62` as a concept checklist, map retained rows to rc-baseline owners/gaps, and fail the plan/lint if a release or performance gate names `rc/july`                                                                                                                              |
 | Diagnostics change ad behavior or overclaim a render               | bounded core-only snapshot ingress, separately bounded GPT fact replay, consumer-specific private presentation capability, isolated public subscribers, honest `gam-only`/`ok` rules, inactive zero-side-effect tests, and no correctness dependency                                                                                                          |
 | Bounded registries refuse traffic under extreme churn              | explicit reservation `registry_full` and slot `registry_capacity`, lifecycle pruning, capacity stress tests; never trade correctness for eviction                                                                                                                                                                                                             |
 | GPT event attribution remains ambiguous                            | adapter-minted non-reused physical-slot plus per-object cycle identity joins diagnostics only after exact current-slot and unique-cycle resolution; unresolved, stale, or multi-cycle-ambiguous facts are dropped, while lifecycle authority still fails the TS attempt deterministically and never triggers fallback from ambiguous/publisher-owned activity |
@@ -5038,7 +5240,7 @@ The design is complete when all of the following are true:
    absent from server routes, tests, and documentation. Every bootstrap failure
    checkpoint commits the terminal non-rendering shell, drains work exactly once,
    and cannot construct or admit a second runtime.
-9. APS renderer and runner-proxy routing, security headers, bounded relay, and failure
+9. APS bootstrap and runner-proxy routing, security headers, bounded relay, and failure
    behavior are proven through each real adapter transport, are equivalent across all
    four adapters, and never fall through to publishers. APS runner bytes are neither
    stored in the repository nor required to be identical across different upstream
@@ -5047,8 +5249,9 @@ The design is complete when all of the following are true:
     real-GAM conformance suites pass.
 11. Non-APS Cache/ADM rendering, native Prebid handling, publisher-owned GPT, refresh,
     SRA, and SPA regression suites pass.
-12. No analytics, persistence, billing, experimentation, or deployment-routing
-    artifact is added by the implementation plan.
+12. No new analytics, persistence, billing, experimentation, or deployment-routing
+    artifact is added by the implementation plan; rc's existing optional GAM
+    attribution behavior is only preserved.
 13. `requestAds` accepts only exact server-projected or transactionally registered
     programmatic slot ids, omitted selection is an immutable invocation-time
     registration-order snapshot, and ambiguous internal aliases fail closed without
@@ -5056,8 +5259,8 @@ The design is complete when all of the following are true:
 14. Direct and PUC ADM acceptance is possible only for the exact current frame's one
     intended `srcdoc` navigation; initial blank, replacement, removal, stale, late,
     and duplicate events cannot accept.
-15. Every retained `RCJ-*` ledger entry finishes `main-owned` or demonstrated
-    `implementation-gap` with recorded current-main SHA, owner paths, focused test
+15. Every retained `RCJ-*` ledger entry finishes `baseline-owned` or demonstrated
+    `implementation-gap` with recorded rc-baseline SHA, owner paths, focused test
     path/command/result, one final owner, and a preserved/rebuilt/superseded
     disposition. No proof-pending or coverage-gap row crosses the phase boundary.
     The historical manifest has no unmapped retired TSJS concept, but no retired
@@ -5066,8 +5269,8 @@ The design is complete when all of the following are true:
     recovery and refresh exclusions, creative security, render trace, GPT
     diagnostics, and every remaining TSJS integration pass their complete parity
     suites after the hard cutover.
-17. PUC owner, renderer document, and descendant creative dimensions are exact and
-    unclipped for the winning size, while collapsed-shell correction cannot resize an
+17. Top mount, outer data container, inner renderer, and descendant creative
+    dimensions are exact and unclipped for the winning size, while collapsed-shell correction cannot resize an
     unrelated, anchor, fixed, sticky, disconnected, or already-expanded frame.
 18. Programmatic ad units register transactionally into the navigation slot service,
     participate in deterministic direct-auction snapshots, and render through the
@@ -5105,13 +5308,13 @@ The design is complete when all of the following are true:
     ceilings; all reachable masks are measured and any other closed configuration
     selects direct persistent boot. Bootstrap, persistent reference, and maximal total pass their
     independent §5.12 ceilings; and the candidate's semantic pre-action transfer is
-    no larger than a fresh current-main build in each encoding.
+    no larger than a fresh rc-baseline build in each encoding.
     Boot-to-first-display passes the automatic fixed-network-profile
-    candidate-versus-current-`main` timing gate, including the candidate's real-mark
-    and deferred-order assertions; the candidate-only APS fixture passes every named
-    action/completion/paint and 3/3.75 MiB heap ceiling; current-main and candidate
+    candidate-versus-rc-baseline timing gate, including the candidate's real-mark
+    and deferred-order assertions; the APS fixture passes every named
+    action/completion/paint and 3/3.75 MiB heap ceiling; rc-baseline and candidate
     retained-heap results are recorded at the same four lifecycle checkpoints and
-    each remains within the 4 MiB hard ceiling. The legacy-main heap shape is
+    each remains within the 4 MiB hard ceiling. The baseline heap shape is
     observability context, not a relative acceptance threshold for the hard-cutover
     kernel and deferred runtime. No gate permits disabled shaping, selective sample reruns,
     candidate self-baselining, or membership loopholes.
@@ -5152,6 +5355,25 @@ The design is complete when all of the following are true:
     disposal failure can drop only diagnostic projection; it cannot conflate old/new
     impressions or affect GPT behavior and the independently bounded object-identity
     `gpt.events.v1` stream.
+30. The implementation branch and replacement PR use the recorded `rc/202608` base;
+    the final rc refresh, adoption ledger, conflict inventory, and focused contracts
+    prove that no overlapping release-branch behavior was silently lost.
+31. `[creative_opportunities].enabled` is required under the hard-cutover schema;
+    false disables only publisher/page-bids template delivery, direct `/auction`
+    remains functional, all configuration still validates, and inactive HTML gets
+    the exact guarded 60-second browser policy without changing surrogate policy.
+32. GPT diagnostics expose requested formats, GPT fill, and observed outer size as
+    separate copied/frozen fields and labels. Stale cycle, binding, navigation,
+    observer, or disposal callbacks cannot alter a newer cycle or ad behavior.
+33. Rc GAM attribution remains disabled by default and, when enabled, has exactly one
+    parser-time GPT owner that installs `ts=true` before publisher requests without
+    a raw-bootstrap flag, activation attribute, duplicate fallback, cleanup on
+    refresh/SPA, new telemetry, or effect while disabled.
+34. Direct and PUC APS mount only from the trusted top-page owner through the
+    bootstrap → outer data container → inner data renderer protocol. No GAM, PUC,
+    SafeFrame, bidder, or creative document is an ancestor; the exact-origin CSP and
+    publisher `frame-ancestors 'self'` proofs block publisher-origin regain in all
+    three browsers.
 
 ## 12. Open implementation decisions
 
@@ -5164,12 +5386,12 @@ architecture:
   check;
 - exact operational thresholds for the existing binary deployment mechanism.
 
-Current-main authority; the retained `RCJ-*` concept-gap ledger membership and
+Rc-baseline authority; the retained `RCJ-*` concept-gap ledger membership and
 behavioral dispositions; the public diagnostics namespace; Prebid artifact
 independence; integration parity; the one-runtime rule; immutable budgets; and the
 first-display/takeover/deferred semantic boundaries are not open implementation
 decisions. The implementation plan must map every canonical release-catalog row
-above to exact current-main source/build/test steps and preserve each concrete
+above to exact rc-baseline source/build/test steps and preserve each concrete
 first-display, parser-time, or later-only obligation. It cannot add, remove, reorder,
 or reclassify modules opportunistically to make a budget pass, and it cannot merge or
 build retired `rc/july` source.
