@@ -825,7 +825,7 @@ async fn dispatch_fallback(
                 .ec_context
                 .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
         {
-            log::warn!("EC generation failed for publisher proxy: {err:?}");
+            log::error!("EC generation failed for publisher proxy: {err:?}");
         }
 
         // Publisher pages read consent data, so the consent KV store must be
@@ -1372,6 +1372,9 @@ mod tests {
                 allowed_domains = ["*.example", "*.example.com"]
 
                 [ec]
+                provider = "hmac"
+
+                [ec.providers.hmac]
                 passphrase = "test-passphrase-at-least-32-bytes!!"
 
                 [request_signing]
@@ -1441,6 +1444,9 @@ mod tests {
             allowed_domains = ["*.example", "*.example.com"]
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [request_signing]
@@ -1888,6 +1894,9 @@ mod tests {
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
             "#,
         )
@@ -2541,6 +2550,9 @@ mod tests {
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [request_signing]
@@ -2956,6 +2968,9 @@ mod tests {
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [request_signing]

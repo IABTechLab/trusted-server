@@ -33,6 +33,9 @@ fn test_router() -> edgezero_core::router::RouterService {
             proxy_secret = "integration-test-proxy-secret"
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
         "#,
     )
