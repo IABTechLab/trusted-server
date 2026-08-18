@@ -72,10 +72,14 @@ export function installGptDiagnosticsRuntime(
 
     observer.install();
     const api = apiController.api;
+    const recorder = apiController.recorder;
     const runtime: GptDiagnosticsRuntime = {
       api,
       destroy: () => {
         if (target.tsjs?.gptDiagnostics === api) delete target.tsjs.gptDiagnostics;
+        if (target.tsjs?.gptDiagnosticsRecorder === recorder) {
+          delete target.tsjs.gptDiagnosticsRecorder;
+        }
         apiController?.destroy();
         overlay?.destroy();
         badges?.destroy();
@@ -84,6 +88,7 @@ export function installGptDiagnosticsRuntime(
       },
     };
     target.tsjs.gptDiagnostics = api;
+    target.tsjs.gptDiagnosticsRecorder = recorder;
     target.__tsjs_gpt_diagnostics_runtime = runtime;
     return api;
   } catch (error) {

@@ -356,13 +356,13 @@ curl -X POST https://edge.example.com/first-party/sign \
 
 ### POST /first-party/proxy-rebuild
 
-URL mutation recovery endpoint. Rebuilds signed proxy URL after creative JavaScript modifies query parameters.
+URL mutation recovery endpoint. Re-signs a click URL after creative JavaScript modifies its query parameters. The original `tstoken` is validated first, and `tsurl`, `tstoken`, and `tsexp` can never be added or removed.
 
 **Request Body:**
 
 ```json
 {
-  "tsclick": "https://edge.example.com/first-party/click?tsurl=https://advertiser.com&campaign=123&tstoken=original...",
+  "tsclick": "/first-party/click?tsurl=https%3A%2F%2Fadvertiser.example&campaign=123&tstoken=original...",
   "add": {
     "utm_source": "banner"
   },
@@ -370,18 +370,43 @@ URL mutation recovery endpoint. Rebuilds signed proxy URL after creative JavaScr
 }
 ```
 
+`tsclick` may be root-relative (the form the rewriter emits) or absolute.
+
 **Response:**
 
 ```json
 {
-  "url": "https://edge.example.com/first-party/click?tsurl=https://advertiser.com&campaign=123&utm_source=banner&tstoken=new..."
+  "href": "/first-party/click?tsurl=https%3A%2F%2Fadvertiser.example&campaign=123&utm_source=banner&tstoken=new...",
+  "base": "https://advertiser.example",
+  "added": { "utm_source": "banner" },
+  "removed": ["old_param"]
 }
 ```
 
 **Use Cases:**
 
-- TSJS click guard (automatic URL repair)
+- TSJS click guard (automatic URL repair) on same-origin pages
 - Handling creative JavaScript that modifies tracking URLs
+
+---
+
+### GET /first-party/proxy-rebuild
+
+Navigation form of the same recovery, for creatives rendered in a sandboxed iframe without `allow-same-origin`. Their opaque origin makes the JSON POST a CORS-preflighted cross-origin request that the endpoint does not answer, so the click guard navigates here instead — navigations are not subject to CORS.
+
+**Query Parameters:**
+
+| Parameter | Required | Description                                       |
+| --------- | -------- | ------------------------------------------------- |
+| `tsclick` | Yes      | URL-encoded signed click URL                      |
+| `add`     | No       | URL-encoded JSON object of parameters to add      |
+| `del`     | No       | URL-encoded JSON array of parameter names to drop |
+
+**Response:** `302` with the rebuilt `/first-party/click?...` URL in `Location` and `Cache-Control: no-store, private`. The browser follows it to `/first-party/click`, which redirects on to the advertiser.
+
+Validation is identical to the POST form.
+
+**Form-encoded POST (navigation, no URL length limit):** when the GET recovery URL would exceed the platform's request-URL limit (Fastly Compute rejects request URLs over 8192 bytes before the handler runs), the click guard submits a form instead. A `POST` carrying `Content-Type: application/x-www-form-urlencoded` with the same `tsclick`/`add`/`del` fields is treated as a navigation and answered with the same `302`, not the JSON body.
 
 ---
 

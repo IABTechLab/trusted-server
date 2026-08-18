@@ -15,7 +15,7 @@ This guide covers:
 - Trusted Server deployed and reachable (example: `https://getpurpose.ai`)
 - Access to update `trusted-server.toml` / deployment configuration
 - Fastly CLI authenticated (for store verification)
-- A valid TCF consent string (`euconsent-v2`) for consent-required requests
+- A valid TCF v2 format string (`euconsent-v2`) for consent-required requests
 
 ## 1) Required Configuration
 

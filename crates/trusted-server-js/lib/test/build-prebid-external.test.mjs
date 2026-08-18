@@ -11,6 +11,7 @@ import {
   deriveBundleMetadata,
   main,
   parseArgs,
+  readAdapterBidderCodes,
   renderIncludedUserIdModulesExport,
 } from '../build-prebid-external.mjs';
 
@@ -31,6 +32,22 @@ describe('build-prebid-external metadata', () => {
     expect(renderIncludedUserIdModulesExport(['liveIntentIdSystem', 'pairIdSystem'])).toBe(
       'export const INCLUDED_PREBID_USER_ID_MODULES = ["liveIntentIdSystem","pairIdSystem"];'
     );
+  });
+
+  it('derives registered bidder codes including aliases from prebid metadata', () => {
+    // adfBidAdapter.js registers adf plus the adform/adformOpenRTB aliases.
+    expect(readAdapterBidderCodes(['adf'])).toEqual(['adf', 'adform', 'adformOpenRTB']);
+  });
+
+  it('maps a module file stem to its registered bidder code', () => {
+    // a1MediaBidAdapter.js registers a1media — the stem itself is not a code.
+    const bidderCodes = readAdapterBidderCodes(['a1Media']);
+    expect(bidderCodes).toContain('a1media');
+    expect(bidderCodes).not.toContain('a1Media');
+  });
+
+  it('falls back to the module stem when no metadata is shipped', () => {
+    expect(readAdapterBidderCodes(['noSuchAdapterEver'])).toEqual(['noSuchAdapterEver']);
   });
 
   it('includes generated User ID metadata in the production external bundle', async () => {
@@ -54,6 +71,7 @@ describe('build-prebid-external metadata', () => {
       const bundle = fs.readFileSync(path.join(outputDirectory, manifest.filename), 'utf8');
 
       expect(manifest.userIdModules).toEqual(['pairIdSystem', 'lockrAIMIdSystem']);
+      expect(manifest.bidderCodes).toEqual(['rubicon']);
       expect(bundle).toContain('"pairIdSystem"');
       expect(bundle).toContain('"lockrAIMIdSystem"');
     } finally {

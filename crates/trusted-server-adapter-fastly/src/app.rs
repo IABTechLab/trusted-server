@@ -32,6 +32,7 @@
 //! | GET | `/first-party/click` | [`handle_first_party_click`] |
 //! | GET | `/first-party/sign` | [`handle_first_party_proxy_sign`] |
 //! | POST | `/first-party/sign` | [`handle_first_party_proxy_sign`] |
+//! | GET | `/first-party/proxy-rebuild` | [`handle_first_party_proxy_rebuild`] |
 //! | POST | `/first-party/proxy-rebuild` | [`handle_first_party_proxy_rebuild`] |
 //! | GET | `/` and `/{*rest}` | tsjs (if `/static/tsjs=` prefix), integration proxy, or publisher fallback |
 //! | POST, HEAD, OPTIONS, PUT, PATCH, DELETE | `/` and `/{*rest}` | integration proxy or publisher fallback |
@@ -1127,7 +1128,10 @@ const NAMED_ROUTES: &[NamedRoute] = &[
     },
     NamedRoute {
         path: "/first-party/proxy-rebuild",
-        primary_methods: &[Method::POST],
+        // GET serves the click guard's navigation fallback: the creative iframe
+        // is an opaque origin (sandbox without `allow-same-origin`), so its JSON
+        // POST is blocked by CORS and the guard navigates here for a 302 instead.
+        primary_methods: &[Method::GET, Method::POST],
         handler: NamedRouteHandler::FirstPartyProxyRebuild,
     },
 ];

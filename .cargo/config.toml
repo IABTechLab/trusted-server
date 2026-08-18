@@ -9,10 +9,16 @@
 # default-members = [fastly] — required so Viceroy can locate the binary via `cargo run --bin`.
 # The aliases below are grouped by adapter; each targets its adapter with the
 # correct toolchain (build / check / test / clippy).
+#
+# Aliases use string form, not array form: in a worktree nested inside the
+# repo (e.g. .claude/worktrees/*) Cargo discovers this file twice — the
+# worktree's copy and the parent checkout's — and merges array values by
+# concatenation, doubling every token ("check ... check ...").
+# String values are overridden by the deeper config instead of merged.
 
 [alias]
 # Generic: native test with an explicit host target.
-test_details = ["test", "--target", "aarch64-apple-darwin"]
+test_details = "test --target aarch64-apple-darwin"
 
 # --- Fastly adapter (wasm32-wasip1, run via Viceroy) ---
 # Whitelist the wasm-buildable crates (the Fastly adapter + the shared crates it
@@ -20,43 +26,43 @@ test_details = ["test", "--target", "aarch64-apple-darwin"]
 # native crate needs no change here. Axum (native), Cloudflare
 # (wasm32-unknown-unknown), Spin, the CLI (native), and integration-tests
 # (native) are simply not listed.
-build-fastly = ["build", "-p", "trusted-server-core", "-p", "trusted-server-adapter-fastly", "-p", "trusted-server-js", "-p", "trusted-server-openrtb", "--target", "wasm32-wasip1"]
-check-fastly = ["check", "-p", "trusted-server-core", "-p", "trusted-server-adapter-fastly", "-p", "trusted-server-js", "-p", "trusted-server-openrtb", "--target", "wasm32-wasip1"]
-clippy-fastly = ["clippy", "-p", "trusted-server-core", "-p", "trusted-server-adapter-fastly", "-p", "trusted-server-js", "-p", "trusted-server-openrtb", "--all-targets", "--all-features", "--target", "wasm32-wasip1", "--", "-D", "warnings"]
-test-fastly = ["test", "-p", "trusted-server-core", "-p", "trusted-server-adapter-fastly", "-p", "trusted-server-js", "-p", "trusted-server-openrtb", "--target", "wasm32-wasip1"]
+build-fastly = "build -p trusted-server-core -p trusted-server-adapter-fastly -p trusted-server-js -p trusted-server-openrtb --target wasm32-wasip1"
+check-fastly = "check -p trusted-server-core -p trusted-server-adapter-fastly -p trusted-server-js -p trusted-server-openrtb --target wasm32-wasip1"
+clippy-fastly = "clippy -p trusted-server-core -p trusted-server-adapter-fastly -p trusted-server-js -p trusted-server-openrtb --all-targets --all-features --target wasm32-wasip1 -- -D warnings"
+test-fastly = "test -p trusted-server-core -p trusted-server-adapter-fastly -p trusted-server-js -p trusted-server-openrtb --target wasm32-wasip1"
 
 # --- Axum adapter (native dev server) ---
-build-axum = ["build", "-p", "trusted-server-adapter-axum"]
-check-axum = ["check", "-p", "trusted-server-adapter-axum"]
-clippy-axum = ["clippy", "-p", "trusted-server-adapter-axum", "--all-targets", "--all-features", "--", "-D", "warnings"]
-test-axum = ["test", "-p", "trusted-server-adapter-axum"]
+build-axum = "build -p trusted-server-adapter-axum"
+check-axum = "check -p trusted-server-adapter-axum"
+clippy-axum = "clippy -p trusted-server-adapter-axum --all-targets --all-features -- -D warnings"
+test-axum = "test -p trusted-server-adapter-axum"
 
 # --- Cloudflare adapter (native host + wasm32-unknown-unknown) ---
 # Build/check target the WASM runtime (requires the `cloudflare` feature);
 # tests run on the native host; clippy covers both native test code and the
 # production WASM feature.
-build-cloudflare = ["build", "-p", "trusted-server-adapter-cloudflare", "--target", "wasm32-unknown-unknown", "--features", "cloudflare"]
-check-cloudflare = ["check", "-p", "trusted-server-adapter-cloudflare", "--target", "wasm32-unknown-unknown", "--features", "cloudflare"]
+build-cloudflare = "build -p trusted-server-adapter-cloudflare --target wasm32-unknown-unknown --features cloudflare"
+check-cloudflare = "check -p trusted-server-adapter-cloudflare --target wasm32-unknown-unknown --features cloudflare"
 # No --all-features: the `cloudflare` feature has a compile_error! guard on
 # non-wasm32 targets.
-clippy-cloudflare = ["clippy", "-p", "trusted-server-adapter-cloudflare", "--all-targets", "--", "-D", "warnings"]
-clippy-cloudflare-wasm = ["clippy", "-p", "trusted-server-adapter-cloudflare", "--target", "wasm32-unknown-unknown", "--features", "cloudflare", "--lib", "--", "-D", "warnings"]
-test-cloudflare = ["test", "-p", "trusted-server-adapter-cloudflare"]
+clippy-cloudflare = "clippy -p trusted-server-adapter-cloudflare --all-targets -- -D warnings"
+clippy-cloudflare-wasm = "clippy -p trusted-server-adapter-cloudflare --target wasm32-unknown-unknown --features cloudflare --lib -- -D warnings"
+test-cloudflare = "test -p trusted-server-adapter-cloudflare"
 
 # --- Spin adapter (native host tests + wasm32-wasip1 target) ---
-check-spin = ["check", "-p", "trusted-server-adapter-spin", "--target", "wasm32-wasip1", "--features", "spin"]
-clippy-spin-native = ["clippy", "-p", "trusted-server-adapter-spin", "--all-targets", "--", "-D", "warnings"]
-clippy-spin-wasm = ["clippy", "-p", "trusted-server-adapter-spin", "--target", "wasm32-wasip1", "--features", "spin", "--lib", "--", "-D", "warnings"]
-test-spin = ["test", "-p", "trusted-server-adapter-spin"]
+check-spin = "check -p trusted-server-adapter-spin --target wasm32-wasip1 --features spin"
+clippy-spin-native = "clippy -p trusted-server-adapter-spin --all-targets -- -D warnings"
+clippy-spin-wasm = "clippy -p trusted-server-adapter-spin --target wasm32-wasip1 --features spin --lib -- -D warnings"
+test-spin = "test -p trusted-server-adapter-spin"
 
 # --- ts operator CLI (native host; install uses the current host platform) ---
-install-cli = ["install", "--path", "crates/trusted-server-cli", "--bin", "ts", "--locked", "--force"]
-build_cli_linux = ["build", "--package", "trusted-server-cli", "--target", "x86_64-unknown-linux-gnu"]
-build_cli_macos = ["build", "--package", "trusted-server-cli", "--target", "aarch64-apple-darwin"]
-run_cli_linux = ["run", "--package", "trusted-server-cli", "--target", "x86_64-unknown-linux-gnu", "--"]
-run_cli_macos = ["run", "--package", "trusted-server-cli", "--target", "aarch64-apple-darwin", "--"]
-test_cli_linux = ["test", "--package", "trusted-server-cli", "--target", "x86_64-unknown-linux-gnu"]
-test_cli_macos = ["test", "--package", "trusted-server-cli", "--target", "aarch64-apple-darwin"]
+install-cli = "install --path crates/trusted-server-cli --bin ts --locked --force"
+build_cli_linux = "build --package trusted-server-cli --target x86_64-unknown-linux-gnu"
+build_cli_macos = "build --package trusted-server-cli --target aarch64-apple-darwin"
+run_cli_linux = "run --package trusted-server-cli --target x86_64-unknown-linux-gnu --"
+run_cli_macos = "run --package trusted-server-cli --target aarch64-apple-darwin --"
+test_cli_linux = "test --package trusted-server-cli --target x86_64-unknown-linux-gnu"
+test_cli_macos = "test --package trusted-server-cli --target aarch64-apple-darwin"
 
 # When a wasm binary IS built, run it under Viceroy.
 [target.'cfg(all(target_arch = "wasm32"))']

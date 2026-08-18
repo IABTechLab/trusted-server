@@ -517,6 +517,16 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     handle_first_party_proxy_sign(&s.settings, &services, req).await
                 }),
             )
+            // GET serves the click guard's navigation fallback: the creative
+            // iframe is an opaque origin (sandbox without `allow-same-origin`),
+            // so its JSON POST is blocked by CORS and the guard navigates here
+            // for a 302 instead.
+            .get(
+                "/first-party/proxy-rebuild",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_first_party_proxy_rebuild(&s.settings, &services, req).await
+                }),
+            )
             .post(
                 "/first-party/proxy-rebuild",
                 make_handler(Arc::clone(&state), |s, services, req| async move {

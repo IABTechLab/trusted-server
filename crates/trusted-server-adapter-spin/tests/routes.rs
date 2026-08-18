@@ -517,6 +517,27 @@ async fn first_party_proxy_rebuild_is_routed() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_party_proxy_rebuild_get_is_routed() {
+    // The opaque-origin creative click guard recovers via GET navigation, so the
+    // route must be registered for GET and must not fall through to the
+    // publisher origin. This asserts routing only; the 302 and its rebuilt
+    // Location are covered by `proxy_rebuild_get_with_origin_form_uri_redirects`
+    // in the core crate, which can sign a real `tsclick`.
+    let router = test_router();
+    let req = request_builder()
+        .method("GET")
+        .uri("/first-party/proxy-rebuild?tsclick=%2Ffirst-party%2Fclick%3Ftsurl%3Dhttps%253A%252F%252Fexample.com")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build request");
+    let resp = route(router, req).await;
+    assert_ne!(
+        resp.status().as_u16(),
+        404,
+        "GET /first-party/proxy-rebuild must be routed"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // First-party absolute-URI regression — Spin delivers a path-only request URI
 // (built from IncomingRequest::path_with_query), so the shared proxy/click/sign

@@ -138,7 +138,7 @@ Edit `trusted-server.toml` to configure:
 - Ad server integrations
 - KV store mappings
 - EC configuration
-- GDPR settings
+- Consent settings (`[gdpr]`)
 
 Validate the config before pushing it to platform storage:
 

@@ -11,30 +11,110 @@
 // The shim on requestBids injects "trustedServer" into every ad unit so all
 // bids flow through the orchestrator.
 
-import pbjs from 'prebid.js';
-import adapterManager from 'prebid.js/src/adapterManager.js';
-import 'prebid.js/modules/consentManagementTcf.js';
-import 'prebid.js/modules/consentManagementGpp.js';
-import 'prebid.js/modules/consentManagementUsp.js';
-import 'prebid.js/modules/userId.js';
-
-// Client-side bid adapters — self-register with prebid.js on import.
-// The external bundle generator aliases these placeholder modules to temporary
-// modules built from its --adapters and --user-id-modules options. When a bidder
-// is listed in `client_side_bidders` in trusted-server.toml, the requestBids
-// shim leaves its bids untouched and the corresponding adapter handles them
-// natively in the browser.
-import './_adapters.generated';
+import type _pbjsDefault from 'prebid.js';
 
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
+import { registerApsPrebidRenderer, validateApsRenderer } from '../aps/render';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
-import type { AuctionSlot } from '../../core/types';
+import type { AuctionSlot, TsjsApi } from '../../core/types';
 
-import { INCLUDED_PREBID_USER_ID_MODULES } from './_user_ids.generated';
 import { PREBID_USER_ID_MODULE_REGISTRY } from './user_id_modules';
 
+/**
+ * Prebid.js public API surface (type-only; erased at build time).
+ *
+ * `getUserIdsAsEids` is added by the userId module at runtime, which the base
+ * package typing does not model.
+ */
+type PbjsGlobal = typeof _pbjsDefault & {
+  getUserIdsAsEids?: () => unknown[];
+};
+
+// Prebid.js itself is NOT bundled into this module. It is served as the
+// external bundle configured via `integrations.prebid.external_bundle_url`
+// (required whenever the prebid integration is enabled) and owns the
+// `window.pbjs` global. The Rust head injector emits a stub
+// (`window.pbjs = window.pbjs || {que:[],cmd:[]}`) before any script runs and
+// Prebid.js installs its API onto that same object, so capturing the reference
+// at module scope is safe regardless of evaluation order.
+const pbjs: PbjsGlobal = (
+  typeof window !== 'undefined'
+    ? // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ((window as any).pbjs ??= { que: [], cmd: [] })
+    : { que: [], cmd: [] }
+) as PbjsGlobal;
+
+/**
+ * Manifest stamped on `window.__tsjs_prebid_bundle` by the external Prebid.js
+ * bundle (see build-prebid-external.mjs): which client-side bid adapters and
+ * user ID modules were compiled into it.
+ */
+interface ExternalPrebidBundleManifest {
+  adapters?: string[];
+  bidderCodes?: string[];
+  userIdModules?: string[];
+}
+
+function sanitizeManifestList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  return value.filter((entry): entry is string => typeof entry === 'string');
+}
+
+function getExternalBundleManifest(): ExternalPrebidBundleManifest | undefined {
+  if (typeof window === 'undefined') {
+    return undefined;
+  }
+  // The manifest is a plain window global any page script can overwrite, so
+  // validate its shape instead of trusting the declared type: a non-array
+  // field must degrade to "not stamped" diagnostics, not a TypeError.
+  const raw = (window as { __tsjs_prebid_bundle?: unknown }).__tsjs_prebid_bundle;
+  if (raw === null || typeof raw !== 'object') {
+    return undefined;
+  }
+  const manifest = raw as Record<string, unknown>;
+  return {
+    adapters: sanitizeManifestList(manifest.adapters),
+    bidderCodes: sanitizeManifestList(manifest.bidderCodes),
+    userIdModules: sanitizeManifestList(manifest.userIdModules),
+  };
+}
+
+/**
+ * Whether the captured `window.pbjs` carries the real Prebid.js API rather
+ * than the head-injected `{ que, cmd }` stub left behind when the external
+ * bundle fails to load.
+ */
+function hasPrebidJsApi(): boolean {
+  return typeof (pbjs as { registerBidAdapter?: unknown }).registerBidAdapter === 'function';
+}
+
+function hasApsRendererApi(): boolean {
+  return typeof (pbjs as { markWinningBidAsUsed?: unknown }).markWinningBidAsUsed === 'function';
+}
+
 const ADAPTER_CODE = 'trustedServer';
+const APS_BIDDER_CODE = 'aps';
+// Carrier field for the APS bid-by-reference renderer descriptor: set by
+// `auctionBidsToPrebidBids` (interpretResponse), consumed and scrubbed by the
+// registry listener installed in `installApsBidResponseRegistry`.
+//
+// The descriptor is deliberately carried twice on each built bid — as this
+// custom top-level field and as `meta[APS_RENDERER_FIELD]`:
+// - `meta` is a first-class Prebid bid field (bidderFactory assigns
+//   `bid.meta = bidResponse.meta` onto the normalized bid, the same guarantee
+//   `requestId` has), so it survives builds whose normalization drops unknown
+//   top-level fields (observed in production: the top-level field was absent
+//   as early as `bidAccepted`).
+// - The top-level copy is kept as belt-and-braces for builds that preserve it
+//   (the vendored prebid.js does) against a future build filtering `meta`
+//   sub-keys instead.
+// The listener registers whichever copy it finds and unconditionally scrubs
+// both after the registration attempt.
+const APS_RENDERER_FIELD = 'trustedServerRenderer';
+const APS_BID_RESPONSE_LISTENER_SENTINEL = '__tsApsBidResponseListenerInstalled';
 // OpenRTB permits vendor-specific agent types; PAIR uses 571187.
 // Keep this range aligned with the signed 32-bit Rust/OpenRTB representation.
 const MAX_OPENRTB_ATYPE = 2_147_483_647;
@@ -73,6 +153,8 @@ interface InjectedPrebidConfig {
   bidders?: string[];
   /** Bidders that run client-side via native Prebid.js adapters. */
   clientSideBidders?: string[];
+  /** GAM ad-unit-path suffixes excluded from refresh auctions. */
+  excludedGamAdUnitPathSuffixes?: string[];
 }
 
 interface PrebidUserIdDiagnostics {
@@ -141,19 +223,39 @@ function readConfiguredUserIdNames(): string[] {
   );
 }
 
+/** Warn-once flag for an unstamped User ID manifest; reset by installPrebidNpm. */
+let warnedMissingUserIdManifest = false;
+
 function recordUserIdModuleDiagnostics(): PrebidUserIdDiagnostics {
+  const manifestUserIdModules = getExternalBundleManifest()?.userIdModules;
+  const includedUserIdModules = manifestUserIdModules ?? [];
   const configuredUserIdNames = [...new Set(readConfiguredUserIdNames())].sort();
   const coveredConfigNames = new Set(
     PREBID_USER_ID_MODULE_REGISTRY.filter((entry) =>
-      INCLUDED_PREBID_USER_ID_MODULES.includes(entry.moduleName)
+      includedUserIdModules.includes(entry.moduleName)
     ).flatMap((entry) => entry.configNames)
   );
-  const missingConfiguredUserIdNames = configuredUserIdNames.filter(
-    (name) => !coveredConfigNames.has(name)
-  );
+  // An older or unstamped bundle must not make every configured module look
+  // absent: warn once about the missing manifest instead of once per module,
+  // mirroring the client-side adapter validation in installPrebidNpm.
+  const missingConfiguredUserIdNames =
+    manifestUserIdModules === undefined
+      ? []
+      : configuredUserIdNames.filter((name) => !coveredConfigNames.has(name));
+  if (
+    manifestUserIdModules === undefined &&
+    configuredUserIdNames.length > 0 &&
+    !warnedMissingUserIdManifest
+  ) {
+    warnedMissingUserIdManifest = true;
+    log.warn(
+      '[tsjs-prebid] external Prebid bundle did not stamp a User ID module manifest; ' +
+        'cannot verify configured User ID modules'
+    );
+  }
 
   const diagnostics: PrebidUserIdDiagnostics = {
-    includedModules: [...INCLUDED_PREBID_USER_ID_MODULES],
+    includedModules: [...includedUserIdModules],
     configuredUserIdNames,
     missingConfiguredUserIdNames,
   };
@@ -195,11 +297,13 @@ let auctionEndpoint = '/auction';
  * Convert parsed {@link AuctionBid}s into Prebid bid response objects,
  * linking each bid back to the original BidRequest via `requestId`.
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function auctionBidsToPrebidBids(auctionBids: AuctionBid[], bidRequests: any[]): any[] {
+export function auctionBidsToPrebidBids(
+  auctionBids: AuctionBid[],
+  bidRequests: Array<{ adUnitCode?: string; code?: string; bidId?: string }>,
+  apsRendererSupported: boolean
+) {
   // Build a lookup from impid (adUnitCode) → original bidRequest
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const requestsByCode = new Map<string, any>();
+  const requestsByCode = new Map<string, (typeof bidRequests)[number]>();
   for (const br of bidRequests) {
     const code = br.adUnitCode ?? br.code ?? '';
     if (!requestsByCode.has(code)) {
@@ -207,23 +311,43 @@ export function auctionBidsToPrebidBids(auctionBids: AuctionBid[], bidRequests: 
     }
   }
 
-  return auctionBids.map((bid) => {
+  return auctionBids.flatMap((bid) => {
+    // A renderer bid cannot be delivered safely without Prebid's public
+    // lifecycle API. Ordinary Trusted Server bids remain eligible.
+    if (bid.renderer && !apsRendererSupported) {
+      return [];
+    }
+
+    // Prebid admission is the last point before the descriptor becomes a bid
+    // capability. Drop malformed APS bids rather than letting them participate
+    // in the auction without a render path.
+    const renderer = bid.renderer ? validateApsRenderer(bid.renderer) : undefined;
+    if (bid.renderer && !renderer) {
+      log.warn(`[tsjs-prebid] dropped invalid APS renderer bid for '${bid.impid}'`);
+      return [];
+    }
+
     const origReq = requestsByCode.get(bid.impid);
-    return {
-      requestId: origReq?.bidId ?? bid.impid,
-      cpm: bid.price,
-      width: bid.width,
-      height: bid.height,
-      ad: bid.adm,
-      ttl: 300,
-      creativeId: bid.creativeId,
-      netRevenue: true,
-      currency: 'USD',
-      bidderCode: bid.seat,
-      meta: {
-        advertiserDomains: bid.adomain,
+    return [
+      {
+        requestId: origReq?.bidId ?? bid.impid,
+        cpm: bid.price,
+        width: bid.width,
+        height: bid.height,
+        ad: renderer ? '' : bid.adm,
+        ...(renderer ? { [APS_RENDERER_FIELD]: renderer } : {}),
+        ttl: 300,
+        creativeId: bid.creativeId,
+        netRevenue: true,
+        currency: 'USD',
+        bidderCode: bid.seat,
+        meta: {
+          advertiserDomains: bid.adomain,
+          // Second descriptor carrier — see APS_RENDERER_FIELD for the rationale.
+          ...(renderer ? { [APS_RENDERER_FIELD]: renderer } : {}),
+        },
       },
-    };
+    ];
   });
 }
 
@@ -288,10 +412,56 @@ type PrebidUserIdEid = {
 
 type RefreshGptSlot = {
   getSlotElementId?: () => string;
+  getAdUnitPath?: () => string;
   getTargeting?: (key: string) => string[];
   clearTargeting?: (key?: string) => RefreshGptSlot;
   getSizes?: () => unknown[];
 };
+
+function recordPrebidRefreshForDiagnostics(slots: RefreshGptSlot[]): void {
+  try {
+    window.tsjs?.gptDiagnosticsRecorder?.recordPrebidRefresh(slots);
+  } catch {
+    // Diagnostics must not suppress the GAM request.
+  }
+}
+
+function dispatchPrebidRefresh<T>(
+  refresh: (slots?: unknown[], opts?: unknown) => T,
+  slots: unknown[] | undefined,
+  opts: unknown
+): T {
+  let tsjs: TsjsApi | undefined;
+  let hadOwnContext = false;
+  let previousContext: boolean | undefined;
+  let shouldRestoreContext = false;
+  try {
+    tsjs = window.tsjs;
+    if (tsjs) {
+      hadOwnContext = Object.prototype.hasOwnProperty.call(tsjs, 'prebidRefreshDispatchInProgress');
+      previousContext = tsjs.prebidRefreshDispatchInProgress;
+      shouldRestoreContext = true;
+      tsjs.prebidRefreshDispatchInProgress = true;
+    }
+  } catch {
+    // Diagnostics context must not affect refresh delegation.
+  }
+  try {
+    return refresh(slots, opts);
+  } finally {
+    if (shouldRestoreContext && tsjs) {
+      try {
+        if (hadOwnContext) {
+          tsjs.prebidRefreshDispatchInProgress = previousContext;
+        } else {
+          delete tsjs.prebidRefreshDispatchInProgress;
+        }
+      } catch {
+        // Diagnostics context restoration must not mask a refresh result or throw.
+      }
+    }
+  }
+}
 
 const DEFAULT_REFRESH_SIZES: BannerSize[] = [
   [728, 90],
@@ -614,6 +784,33 @@ function publisherZoneForRefresh(candidateCodes: Array<string | undefined>): str
   return match ? match.mediaTypes?.banner?.name : findRefreshSnapshot(candidateCodes)?.zone;
 }
 
+function isUsableRefreshAuctionExclusionSuffix(suffix: unknown): suffix is string {
+  return typeof suffix === 'string' && suffix.startsWith('/') && suffix.length > 1;
+}
+
+function refreshAuctionExclusionSuffixes(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter(isUsableRefreshAuctionExclusionSuffix) : [];
+}
+
+function isExcludedFromRefreshAuction(
+  slot: RefreshGptSlot,
+  excludedGamAdUnitPathSuffixes: readonly string[]
+): boolean {
+  if (excludedGamAdUnitPathSuffixes.length === 0) return false;
+
+  try {
+    const adUnitPath = slot.getAdUnitPath?.();
+    return (
+      typeof adUnitPath === 'string' &&
+      excludedGamAdUnitPathSuffixes.some((suffix) => adUnitPath.endsWith(suffix))
+    );
+  } catch {
+    // GPT path metadata is optional for this optimization. If it is unavailable,
+    // preserve normal refresh-auction behavior rather than suppressing demand.
+    return false;
+  }
+}
+
 function clearRefreshTargeting(slot: RefreshGptSlot): void {
   if (typeof slot.clearTargeting !== 'function') return;
 
@@ -802,8 +999,87 @@ function collectAuctionEids(): AuctionEid[] | undefined {
  * Config resolution (values from later sources override earlier ones):
  * 1. `window.__tsjs_prebid` — injected by the server from trusted-server.toml
  * 2. `config` argument — explicit overrides from the publisher's JS
+ *
+ * Idempotent per page: a `window.__tsjsPrebidShimInstalled` sentinel makes
+ * repeat calls (double script inclusion, a bundle that still carries a
+ * baked-in shim) a no-op instead of a double adapter registration.
  */
+function installApsBidResponseRegistry(): void {
+  const prebid = pbjs as typeof pbjs & Record<string, unknown>;
+  if (prebid[APS_BID_RESPONSE_LISTENER_SENTINEL] === true) return;
+
+  const registerFromBid = (rawBid: unknown): void => {
+    const bid = rawBid as Record<string, unknown>;
+    if (bid['adapterCode'] !== ADAPTER_CODE || bid['bidderCode'] !== APS_BIDDER_CODE) {
+      return;
+    }
+    // Prefer the custom top-level field; fall back to the per-bid copy in `meta`
+    // — see APS_RENDERER_FIELD for why both carriers exist. Guard the `meta`
+    // read: a module may have overwritten it with a non-object value.
+    const rawMeta = bid['meta'];
+    const meta =
+      typeof rawMeta === 'object' && rawMeta !== null
+        ? (rawMeta as Record<string, unknown>)
+        : undefined;
+    const renderer = bid[APS_RENDERER_FIELD] ?? meta?.[APS_RENDERER_FIELD];
+    const adId = bid['adId'];
+    if (renderer === undefined || typeof adId !== 'string') {
+      return;
+    }
+
+    const registered = registerApsPrebidRenderer(adId, bid['adUnitCode'], renderer, bid['ttl'], {
+      // Prebid exposes only a public combined winner/rendered API. Keep it
+      // at the existing rendered lifecycle point so the bid is not reported
+      // rendered before Universal Creative receives its response.
+      markUsed: () => pbjs.markWinningBidAsUsed({ adId, events: true }),
+    });
+    // Keep the executable capability only in the bounded, one-time registry. Prebid
+    // still owns the generated ad ID and ordinary GAM targeting on this bid object.
+    delete bid[APS_RENDERER_FIELD];
+    if (meta) {
+      delete meta[APS_RENDERER_FIELD];
+    }
+    if (!registered) {
+      // Prebid can admit zero-CPM bids when `allowZeroCpmBids` is enabled.
+      // Its targeting selection rejects every negative CPM, so this bid cannot
+      // displace a renderable GAM candidate after registration fails.
+      bid['cpm'] = -1;
+      log.warn('[tsjs-prebid] rejected APS renderer capability that failed registration');
+    }
+  };
+
+  // Register on `bidAccepted` — the first event after Prebid assigns `adId` — so
+  // the executable descriptor is scrubbed from the bid before `bidResponse` and
+  // analytics consumers of later events can observe it. The `bidResponse` pass
+  // is a fallback that no-ops when the `bidAccepted` pass already scrubbed.
+  pbjs.onEvent('bidAccepted', registerFromBid);
+  pbjs.onEvent('bidResponse', registerFromBid);
+  prebid[APS_BID_RESPONSE_LISTENER_SENTINEL] = true;
+}
+
 export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs {
+  // The prebid integration requires the external Prebid.js bundle
+  // (integrations.prebid.external_bundle_url). When it failed to load (network
+  // error, SRI mismatch) window.pbjs is still the head-injected stub with no
+  // API — installing the adapter is impossible, so bail out loudly.
+  if (!hasPrebidJsApi()) {
+    log.error(
+      '[tsjs-prebid] window.pbjs is missing the required Prebid.js API — the external ' +
+        'bundle failed to load or is incompatible. Prebid integration disabled.'
+    );
+    return pbjs;
+  }
+
+  const sentinelWindow =
+    typeof window === 'undefined' ? undefined : (window as { __tsjsPrebidShimInstalled?: boolean });
+  if (sentinelWindow?.__tsjsPrebidShimInstalled) {
+    return pbjs;
+  }
+  if (sentinelWindow) {
+    sentinelWindow.__tsjsPrebidShimInstalled = true;
+  }
+
+  warnedMissingUserIdManifest = false;
   publisherAdUnitSnapshots = new Map();
   pendingPublisherBids = new Map();
   pendingPublisherCodes = new Map();
@@ -831,6 +1107,12 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   };
 
   auctionEndpoint = merged.endpoint ?? '/auction';
+  const apsRendererSupported = hasApsRendererApi();
+  if (apsRendererSupported) {
+    installApsBidResponseRegistry();
+  } else {
+    log.warn('[tsjs-prebid] Prebid bundle lacks markWinningBidAsUsed; APS renderer bids disabled');
+  }
 
   // Register the trustedServer adapter using pbjs.registerBidAdapter(null, code, spec)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -872,7 +1154,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       log.debug('[tsjs-prebid] interpretResponse', { hasSeatbid: !!body?.seatbid });
       const auctionBids = parseAuctionResponse(body);
       const bidRequests = request?.tsjsBidRequests ?? request?.bidRequests ?? [];
-      return auctionBidsToPrebidBids(auctionBids, bidRequests);
+      return auctionBidsToPrebidBids(auctionBids, bidRequests, apsRendererSupported);
     },
   });
 
@@ -1030,24 +1312,31 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   pbjs.processQueue();
   recordUserIdModuleDiagnostics();
 
-  // Validate that every client-side bidder has its adapter registered.
-  // Adapters self-register on import, so a missing adapter means the bidder
-  // was listed in client_side_bidders but not included in the generated
-  // external Prebid bundle. Without the adapter the bidder is silently dropped
-  // from both server-side and client-side auctions.
-  for (const bidder of clientSideBidders) {
-    try {
-      if (!adapterManager.getBidAdapter(bidder)) {
+  // Validate that every client-side bidder has its adapter compiled into the
+  // external Prebid.js bundle. The bundle stamps the registered bidder codes
+  // (including aliases such as adform/adformOpenRTB for the adf module) on
+  // window.__tsjs_prebid_bundle; a missing code means the bidder was listed
+  // in client_side_bidders but not included in the generated bundle, so it is
+  // silently dropped from both server-side and client-side auctions. Fall
+  // back to the module-name list for bundles stamped before bidderCodes.
+  const manifest = getExternalBundleManifest();
+  const bundledBidderCodes = manifest?.bidderCodes ?? manifest?.adapters;
+  if (bundledBidderCodes === undefined) {
+    if (clientSideBidders.size > 0) {
+      log.warn(
+        '[tsjs-prebid] external Prebid bundle did not stamp an adapter manifest; ' +
+          'cannot verify client_side_bidders adapters'
+      );
+    }
+  } else {
+    for (const bidder of clientSideBidders) {
+      if (!bundledBidderCodes.includes(bidder)) {
         log.error(
-          `[tsjs-prebid] client-side bidder "${bidder}" has no adapter loaded. ` +
-            `Add it to build-prebid-external.mjs --adapters.`
+          `[tsjs-prebid] client-side bidder "${bidder}" has no adapter in the external ` +
+            'Prebid bundle. Add its adapter to [integrations.prebid.bundle].adapters in ' +
+            'trusted-server.toml and rebuild it with `ts prebid bundle`.'
         );
       }
-    } catch {
-      log.error(
-        `[tsjs-prebid] client-side bidder "${bidder}" has no adapter loaded. ` +
-          `Add it to build-prebid-external.mjs --adapters.`
-      );
     }
   }
 
@@ -1117,12 +1406,25 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       const deliverySlots = publisherDeliverySlots(targetSlots);
       const independentSlots = targetSlots.filter((slot) => !deliverySlots.has(slot));
       if (independentSlots.length === 0) {
+        recordPrebidRefreshForDiagnostics(targetSlots);
+        return dispatchPrebidRefresh(originalRefresh, slots, opts);
+      }
+
+      // Clear stale Trusted Server/Prebid targeting from independent slots before
+      // filtering so excluded slots still receive a clean GAM refresh.
+      independentSlots.forEach(clearRefreshTargeting);
+
+      const excludedGamAdUnitPathSuffixes = refreshAuctionExclusionSuffixes(
+        getInjectedConfig()?.excludedGamAdUnitPathSuffixes
+      );
+      const auctionSlots = independentSlots.filter(
+        (slot) => !isExcludedFromRefreshAuction(slot, excludedGamAdUnitPathSuffixes)
+      );
+      if (!auctionSlots.length) {
         return originalRefresh(slots, opts);
       }
 
-      independentSlots.forEach(clearRefreshTargeting);
-
-      const adUnits = independentSlots.map((slot) => {
+      const adUnits = auctionSlots.map((slot) => {
         const injectedSlot = findInjectedSlotForRefresh(slot);
         const code = refreshSlotElementId(slot) ?? 'refresh-slot';
         // A TS-owned slot may be defined on `${div_id}-container`, so the GPT
@@ -1182,7 +1484,12 @@ export function installRefreshHandler(timeoutMs = 1500): void {
             log.error('[tsjs-prebid] refresh targeting failed', error);
           }
         }
-        originalRefresh(slots, opts);
+        recordPrebidRefreshForDiagnostics(targetSlots);
+        // Preserve the publisher's original refresh form. In particular, a bare
+        // GPT refresh remains bare so GPT resolves its registered slot set when
+        // the auction completes; the dispatch wrapper only scopes the shared
+        // diagnostics context around the delegated call.
+        dispatchPrebidRefresh(originalRefresh, slots, opts);
       }
 
       try {
@@ -1210,8 +1517,8 @@ export function installRefreshHandler(timeoutMs = 1500): void {
 /**
  * Configure identity sync behavior for the generated Prebid User ID modules.
  *
- * The external bundle generator statically imports the selected modules through
- * `_user_ids.generated.ts`. This post-window-load configuration controls when
+ * The external bundle generator statically imports the selected modules into
+ * its generated entry. This post-window-load configuration controls when
  * those modules synchronize identities; it does not select or register modules.
  */
 export function installUserIdModules(): void {
@@ -1309,20 +1616,26 @@ function syncPrebidEidsCookie(): void {
 // Self-initialize when loaded in a browser (same pattern as other integrations).
 if (typeof window !== 'undefined') {
   installPrebidNpm();
-  installRefreshHandler();
-  // The slim-Prebid lazy loader appends this bundle from a window.load
-  // handler, so `load` may already have fired by the time this code runs —
-  // waiting for it again would skip user ID setup entirely on that path.
-  if (document.readyState === 'complete') {
-    installUserIdModules();
-  } else {
-    window.addEventListener(
-      'load',
-      () => {
-        installUserIdModules();
-      },
-      { once: true }
-    );
+  // When the external bundle failed to load, installPrebidNpm bailed out and
+  // pbjs.requestBids is undefined. Installing the refresh handler anyway
+  // would clear TS-applied GPT targeting on every publisher refresh and then
+  // fail to run the replacement auction — leave GPT untouched instead.
+  if (hasPrebidJsApi()) {
+    installRefreshHandler();
+    // The slim-Prebid lazy loader appends this bundle from a window.load
+    // handler, so `load` may already have fired by the time this code runs —
+    // waiting for it again would skip user ID setup entirely on that path.
+    if (document.readyState === 'complete') {
+      installUserIdModules();
+    } else {
+      window.addEventListener(
+        'load',
+        () => {
+          installUserIdModules();
+        },
+        { once: true }
+      );
+    }
   }
 }
 

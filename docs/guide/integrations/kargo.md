@@ -21,7 +21,7 @@ Kargo is a mobile-first SSP specializing in high-impact, brand-safe advertising 
 
 - **Direct Kargo Bidding**: Native Kargo bid adapter
 - **First-Party Creative Rendering**: All creatives served through publisher domain
-- **Enhanced Viewability Tracking**: Real-time viewability metrics
+- **Enhanced Viewability Measurement**: Real-time viewability metrics
 - **Brand Safety**: Pre-bid brand safety validation
 - **Custom Creative Formats**: Support for Kargo's rich media units
 

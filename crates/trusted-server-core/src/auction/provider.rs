@@ -1,5 +1,7 @@
 //! Trait definition for auction providers.
 
+use core::any::Any;
+
 use async_trait::async_trait;
 use error_stack::Report;
 
@@ -8,20 +10,56 @@ use crate::platform::{PlatformPendingRequest, PlatformResponse, RuntimeServices}
 
 use super::types::{AuctionContext, AuctionRequest, AuctionResponse};
 
+/// Provider-local state carried from request dispatch to response parsing.
+pub type ProviderParseState = Box<dyn Any + Send + Sync>;
+
+/// Result of asking a provider to start a bid request.
+pub enum ProviderRequestOutcome {
+    /// An upstream request is in flight and must be awaited by the orchestrator.
+    Pending {
+        /// Platform-specific pending request handle.
+        request: PlatformPendingRequest,
+        /// Optional provider-local state consumed when the response is parsed.
+        parse_state: Option<ProviderParseState>,
+    },
+    /// A complete provider response that required no upstream request.
+    Immediate(AuctionResponse),
+}
+
+impl ProviderRequestOutcome {
+    /// Wrap an ordinary pending provider request without parse state.
+    #[must_use]
+    pub fn pending(request: PlatformPendingRequest) -> Self {
+        Self::Pending {
+            request,
+            parse_state: None,
+        }
+    }
+
+    /// Wrap a pending provider request with provider-local parse state.
+    #[must_use]
+    pub fn pending_with_state(
+        request: PlatformPendingRequest,
+        parse_state: ProviderParseState,
+    ) -> Self {
+        Self::Pending {
+            request,
+            parse_state: Some(parse_state),
+        }
+    }
+}
+
 /// Trait implemented by all auction providers (Prebid, APS, GAM, etc.).
 #[async_trait(?Send)]
 pub trait AuctionProvider: Send + Sync {
     /// Unique identifier for this provider (e.g., "prebid", "aps", "gam").
     fn provider_name(&self) -> &'static str;
 
-    /// Submit a bid request to this provider and return a pending request.
+    /// Submit a bid request to this provider.
     ///
-    /// Implementations should:
-    /// - Transform `AuctionRequest` to provider-specific format
-    /// - Make an HTTP call through `context.services.http_client().send_async(...)`
-    /// - Return [`PlatformPendingRequest`] for the orchestrator to await
-    ///
-    /// The orchestrator will handle waiting for responses and parsing them.
+    /// Implementations normally return a pending upstream request, but may return
+    /// an immediate response for a legitimate outcome that requires no HTTP call.
+    /// The orchestrator handles waiting for and parsing pending responses.
     ///
     /// # Errors
     ///
@@ -32,7 +70,7 @@ pub trait AuctionProvider: Send + Sync {
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
-    ) -> Result<PlatformPendingRequest, Report<TrustedServerError>>;
+    ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>>;
 
     /// Parse the response from the provider into an `AuctionResponse`.
     ///
@@ -69,6 +107,27 @@ pub trait AuctionProvider: Send + Sync {
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
         let _ = (request, context);
         self.parse_response(response, response_time_ms).await
+    }
+
+    /// Parse a response with access to provider-local dispatch state.
+    ///
+    /// The default ignores `parse_state` and preserves the context-aware parser
+    /// contract. Providers should downcast only state they created themselves.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the response cannot be parsed into a valid [`AuctionResponse`].
+    async fn parse_response_with_context_and_state(
+        &self,
+        response: PlatformResponse,
+        response_time_ms: u64,
+        request: &AuctionRequest,
+        context: &AuctionContext<'_>,
+        parse_state: Option<&(dyn Any + Send + Sync)>,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        let _ = parse_state;
+        self.parse_response_with_context(response, response_time_ms, request, context)
+            .await
     }
 
     /// Check if this provider supports a specific media type.

@@ -115,6 +115,134 @@ describe('GptDiagnosticsBadgeManager', () => {
     manager.destroy();
   });
 
+  it('labels the delivery state the store derived rather than raw timestamps', () => {
+    // The store owns the delivery ladder; a badge that re-derived it from these
+    // timestamps could contradict the panel and the export.
+    const pendingBadge = gptDiagnosticsBadgeTextForTest({
+      requestNumber: 1,
+      isEmpty: false,
+      incompleteSequence: false,
+      durations: {},
+      requestPath: 'competing',
+      trustedServerOpportunity: 'renderable_candidate',
+      trustedServerCreativeRequestAtMs: 10,
+      trustedServerCreativeResponseAtMs: 11,
+      delivery: 'pending',
+    });
+    expect(pendingBadge).toBe('Filled · TS candidate (pending) · Competing paths');
+
+    const unconfirmedBadge = gptDiagnosticsBadgeTextForTest({
+      requestNumber: 1,
+      isEmpty: false,
+      incompleteSequence: false,
+      durations: {},
+      requestPath: 'trusted_server_direct',
+      trustedServerOpportunity: 'unrenderable_candidate',
+      trustedServerCreativeRequestAtMs: 10,
+      delivery: 'candidate_unconfirmed',
+    });
+    expect(unconfirmedBadge).toBe('Filled · TS unconfirmed');
+
+    const emptyBadge = gptDiagnosticsBadgeTextForTest({
+      requestNumber: 1,
+      isEmpty: true,
+      incompleteSequence: false,
+      durations: {},
+      trustedServerCreativeRequestAtMs: 10,
+      trustedServerCreativeResponseAtMs: 11,
+      delivery: 'not_applicable',
+    });
+    expect(emptyBadge, 'an empty cycle must not claim a Trusted Server response').toBe('Empty');
+  });
+
+  it('renders compact evidence-safe labels for every delivery state', () => {
+    const responseSentBadge = gptDiagnosticsBadgeTextForTest({
+      requestNumber: 1,
+      isEmpty: false,
+      incompleteSequence: false,
+      durations: {},
+      delivery: 'trusted_server_response_sent',
+    });
+    expect(responseSentBadge).toBe('Filled · TS response sent');
+
+    const selectedBadge = gptDiagnosticsBadgeTextForTest({
+      requestNumber: 1,
+      isEmpty: false,
+      incompleteSequence: false,
+      durations: {},
+      delivery: 'trusted_server_selected',
+    });
+    expect(selectedBadge).toBe('Filled · TS selected');
+
+    const pendingBadge = gptDiagnosticsBadgeTextForTest({
+      requestNumber: 1,
+      isEmpty: false,
+      incompleteSequence: false,
+      durations: {},
+      requestPath: 'trusted_server_direct',
+      trustedServerOpportunity: 'renderable_candidate',
+      delivery: 'pending',
+    });
+    expect(pendingBadge).toBe('Filled · TS candidate (pending)');
+
+    const unconfirmedBadge = gptDiagnosticsBadgeTextForTest({
+      requestNumber: 1,
+      isEmpty: false,
+      incompleteSequence: false,
+      durations: {},
+      requestPath: 'trusted_server_direct',
+      trustedServerOpportunity: 'renderable_candidate',
+      delivery: 'candidate_unconfirmed',
+    });
+    expect(unconfirmedBadge).toBe('Filled · TS unconfirmed');
+
+    const noCandidateBadge = gptDiagnosticsBadgeTextForTest({
+      requestNumber: 1,
+      isEmpty: false,
+      incompleteSequence: false,
+      durations: {},
+      requestPath: 'trusted_server_direct',
+      trustedServerOpportunity: 'no_candidate',
+      delivery: 'no_candidate',
+    });
+    expect(noCandidateBadge).toBe('Filled · No TS candidate');
+
+    const unknownBadge = gptDiagnosticsBadgeTextForTest({
+      requestNumber: 1,
+      isEmpty: false,
+      incompleteSequence: false,
+      durations: {},
+      requestPath: 'prebid_refresh',
+      delivery: 'unknown',
+      adManager: { lineItemId: 6543210987 },
+    });
+    expect(unknownBadge).toBe('Filled · Delivery unknown');
+    expect(unknownBadge).not.toMatch(/other demand|other GAM|6543210987/i);
+
+    const notApplicableBadge = gptDiagnosticsBadgeTextForTest({
+      requestNumber: 1,
+      incompleteSequence: false,
+      durations: {},
+      requestPath: 'unattributed',
+      delivery: 'not_applicable',
+    });
+    expect(notApplicableBadge).toBe('Pending');
+
+    for (const badge of [
+      responseSentBadge,
+      selectedBadge,
+      pendingBadge,
+      unconfirmedBadge,
+      noCandidateBadge,
+      unknownBadge,
+      notApplicableBadge,
+    ]) {
+      expect(badge).not.toMatch(
+        /creative rendered|other demand won|no Trusted Server creative ran|ad visible|pixels confirmed/i
+      );
+    }
+  });
+
   it('uses only GPT-observed lifecycle facts in badge text', () => {
     expect(
       gptDiagnosticsBadgeTextForTest({
@@ -156,9 +284,36 @@ describe('GptDiagnosticsBadgeManager', () => {
         durations: {},
       })
     ).toBe('Pending');
-    expect(gptDiagnosticsBadgeTextForTest.toString()).not.toMatch(
-      /Trusted Server|GAM winner|Prebid|bidder|provenance/i
-    );
+    expect(
+      gptDiagnosticsBadgeTextForTest({
+        requestNumber: 1,
+        isEmpty: false,
+        renderAtMs: 5,
+        incompleteSequence: true,
+        durations: {},
+      })
+    ).toBe('Filled\nIncomplete sequence');
+    // Assert over rendered text: the delivery vocabulary lives in a helper that
+    // a `toString()` of this function would not include.
+    for (const delivery of [
+      'trusted_server_response_sent',
+      'trusted_server_selected',
+      'candidate_unconfirmed',
+      'no_candidate',
+      'unknown',
+      'pending',
+      'not_applicable',
+    ] as const) {
+      expect(
+        gptDiagnosticsBadgeTextForTest({
+          requestNumber: 1,
+          isEmpty: false,
+          incompleteSequence: false,
+          durations: {},
+          delivery,
+        })
+      ).not.toMatch(/GAM winner|bidder|provenance/i);
+    }
   });
 
   it('positions in the overlay layer and coalesces scroll and resize updates', () => {
