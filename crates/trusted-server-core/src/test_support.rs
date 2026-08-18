@@ -31,7 +31,11 @@ pub mod tests {
             rewrite_attributes = ["href", "link", "url"]
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
             [request_signing]
             config_store_id = "test-config-store-id"
             secret_store_id = "test-secret-store-id"
