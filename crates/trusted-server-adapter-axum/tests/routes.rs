@@ -299,6 +299,18 @@ async fn authenticated_admin_ec_routes_return_501() {
             501,
             "{path} should report that Axum EC lookup is unsupported"
         );
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
     }
 }
 
@@ -375,6 +387,9 @@ async fn authenticated_admin_diagnostic_fallback_is_denied_locally() {
         format!("/_ts/admin/ec/{ec_id}/extra"),
         "/_ts/admin/eids/".to_owned(),
         "/_ts/admin/eids/extra".to_owned(),
+        "/_ts/admin/eids.json".to_owned(),
+        "/_ts/admin/ec;foo".to_owned(),
+        format!("/_ts/admin/ec%2F{ec_id}"),
     ] {
         for method in ["GET", "POST"] {
             let request = Request::builder()

@@ -64,7 +64,14 @@ fn admin_diagnostic_shape(path: &str) -> Option<AdminDiagnosticShape> {
         });
     }
 
-    path.starts_with("/_ts/admin/eids/")
+    if path.starts_with("/_ts/admin/eids/") {
+        return Some(AdminDiagnosticShape::Malformed);
+    }
+
+    // Reserve the complete admin namespace at the publisher-fallback boundary.
+    // A successfully authenticated malformed or future admin path must never
+    // forward its Authorization header or body to the publisher origin.
+    (path == "/_ts/admin" || path.starts_with("/_ts/admin/"))
         .then_some(AdminDiagnosticShape::Malformed)
 }
 
@@ -72,9 +79,9 @@ fn admin_diagnostic_shape(path: &str) -> Option<AdminDiagnosticShape> {
 /// an adapter's publisher fallback.
 ///
 /// Valid diagnostic resources reject non-GET methods with `405 Method Not
-/// Allowed`. Malformed, trailing, and any valid GET route that unexpectedly
-/// reaches fallback return `404 Not Found`. Unrelated publisher paths return
-/// `None` so normal fallback behavior remains unchanged.
+/// Allowed`. Malformed, trailing, unknown, and any valid GET admin route that
+/// unexpectedly reaches fallback return `404 Not Found`. Paths outside the
+/// reserved `/_ts/admin` namespace return `None`, preserving normal fallback.
 #[must_use]
 pub fn deny_admin_diagnostic_fallback(req: &Request<EdgeBody>) -> Option<Response<EdgeBody>> {
     let shape = admin_diagnostic_shape(req.uri().path())?;
@@ -178,10 +185,7 @@ pub fn handle_admin_ec_lookup(
     req: &Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let Some(kv) = kv else {
-        return Ok(json_error(
-            StatusCode::NOT_IMPLEMENTED,
-            "EC identity graph is not configured on this deployment",
-        ));
+        return Ok(admin_ec_lookup_not_supported());
     };
 
     let ec_id = match requested_ec_id(req) {
@@ -205,6 +209,15 @@ pub fn handle_admin_ec_lookup(
             message: "failed to serialize admin EC lookup response".to_owned(),
         })?;
     Ok(json_response(StatusCode::OK, body))
+}
+
+/// Returns the portable response used when an adapter has no EC KV backend.
+#[must_use]
+pub fn admin_ec_lookup_not_supported() -> Response<EdgeBody> {
+    json_error(
+        StatusCode::NOT_IMPLEMENTED,
+        "EC identity graph is not configured on this deployment",
+    )
 }
 
 /// Resolves the EC ID to look up from the path or the `ts-ec` cookie.
@@ -692,6 +705,10 @@ mod tests {
             format!("/_ts/admin/ec/{ec_id}/extra"),
             "/_ts/admin/eids/".to_owned(),
             "/_ts/admin/eids/extra".to_owned(),
+            "/_ts/admin/eids.json".to_owned(),
+            "/_ts/admin/ec;foo".to_owned(),
+            format!("/_ts/admin/ec%2F{ec_id}"),
+            "/_ts/admin/unknown".to_owned(),
         ];
 
         for path in paths {
@@ -1020,6 +1037,26 @@ mod tests {
             handle_admin_ec_lookup(None, &test_registry(), &req).expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[test]
+    fn unsupported_ec_lookup_response_is_json_and_no_store() {
+        let response = admin_ec_lookup_not_supported();
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/json"))
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        assert!(
+            response_json(response)["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("not configured"))
+        );
     }
 
     #[test]

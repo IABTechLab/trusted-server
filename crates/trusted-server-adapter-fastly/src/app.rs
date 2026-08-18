@@ -1887,6 +1887,9 @@ mod tests {
             format!("/_ts/admin/ec/{ec_id}/extra"),
             "/_ts/admin/eids/".to_owned(),
             "/_ts/admin/eids/extra".to_owned(),
+            "/_ts/admin/eids.json".to_owned(),
+            "/_ts/admin/ec;foo".to_owned(),
+            format!("/_ts/admin/ec%2F{ec_id}"),
         ] {
             for method in [Method::GET, Method::POST] {
                 let request = request_builder()
