@@ -14,6 +14,7 @@
 
 use serde::Deserialize;
 
+use trusted_server_core::auction::types::MediaType;
 use trusted_server_core::creative_opportunities::RuntimeAdStackExpected;
 
 use crate::ad_templates::expected::ExpectedSlot;
@@ -126,6 +127,8 @@ pub enum SlotStatus {
     Partial,
     /// No DOM or GPT evidence confirms the slot.
     Missing,
+    /// The checker cannot confirm this slot type; this is not page drift.
+    Unconfirmable,
 }
 
 /// The verification result for one audited page.
@@ -164,7 +167,7 @@ pub struct SlotResult {
     /// The confirmation status.
     pub status: SlotStatus,
     /// The phase the confirming evidence was observed in.
-    pub phase: EvidencePhase,
+    pub phase: Option<EvidencePhase>,
     /// The live evidence observed for this slot.
     pub evidence: SlotEvidence,
     /// Slot-level warnings (size, provider, etc.).
@@ -233,7 +236,7 @@ fn banner_sizes(expected: &ExpectedSlot) -> Vec<(u32, u32)> {
     expected
         .formats
         .iter()
-        .filter(|format| format.media_type == "banner")
+        .filter(|format| format.media_type == MediaType::Banner)
         .map(|format| (format.width, format.height))
         .collect()
 }
@@ -267,7 +270,7 @@ pub fn compare_page_evidence(
                 "gam_unit_path_unrenderable",
                 format!(
                     "slot `{}` gam_unit_path template renders past GAM's unit-path byte limit \
-                     for this page's section; the runtime rejects this config",
+                     for this page's section; the runtime omits this slot on this path",
                     slot.id
                 ),
             ));
@@ -285,7 +288,12 @@ pub fn compare_page_evidence(
                         slot.id
                     ),
                 ));
-                (SlotStatus::Partial, dom_id, Some(gpt.clone()), gpt.phase)
+                (
+                    SlotStatus::Unconfirmable,
+                    dom_id,
+                    Some(gpt.clone()),
+                    Some(gpt.phase),
+                )
             } else if gpt.sizes.is_empty() {
                 warnings.push(warning(
                     "out_of_page_slot",
@@ -294,7 +302,12 @@ pub fn compare_page_evidence(
                         slot.id
                     ),
                 ));
-                (SlotStatus::Partial, dom_id, Some(gpt.clone()), gpt.phase)
+                (
+                    SlotStatus::Unconfirmable,
+                    dom_id,
+                    Some(gpt.clone()),
+                    Some(gpt.phase),
+                )
             } else if banner.iter().any(|size| gpt.sizes.contains(size)) {
                 let extra: Vec<(u32, u32)> = gpt
                     .sizes
@@ -322,7 +335,12 @@ pub fn compare_page_evidence(
                         ),
                     ));
                 }
-                (SlotStatus::Confirmed, dom_id, Some(gpt.clone()), gpt.phase)
+                (
+                    SlotStatus::Confirmed,
+                    dom_id,
+                    Some(gpt.clone()),
+                    Some(gpt.phase),
+                )
             } else {
                 warnings.push(warning(
                     "incompatible_sizes",
@@ -331,7 +349,12 @@ pub fn compare_page_evidence(
                         slot.id
                     ),
                 ));
-                (SlotStatus::Partial, dom_id, Some(gpt.clone()), gpt.phase)
+                (
+                    SlotStatus::Partial,
+                    dom_id,
+                    Some(gpt.clone()),
+                    Some(gpt.phase),
+                )
             }
         } else if let Some(dom) = resolved {
             warnings.push(warning(
@@ -342,24 +365,11 @@ pub fn compare_page_evidence(
                 SlotStatus::Partial,
                 Some(dom.dom_id.clone()),
                 None,
-                dom.phase,
+                Some(dom.phase),
             )
         } else {
-            (SlotStatus::Missing, None, None, EvidencePhase::InitialLoad)
+            (SlotStatus::Missing, None, None, None)
         };
-
-        if let Some(aps_slot_id) = &slot.aps_slot_id {
-            let matched = evidence
-                .aps_calls
-                .iter()
-                .any(|call| &call.slot_id == aps_slot_id);
-            if !matched {
-                warnings.push(warning(
-                    "aps_evidence_missing",
-                    format!("configured APS slot `{aps_slot_id}` had no fetchBids evidence"),
-                ));
-            }
-        }
 
         slots.push(SlotResult {
             id: slot.id.clone(),
@@ -454,11 +464,10 @@ mod tests {
                 .map(|&(width, height)| ExpectedFormat {
                     width,
                     height,
-                    media_type: "banner".to_string(),
+                    media_type: MediaType::Banner,
                 })
                 .collect(),
             providers: providers.iter().copied().map(String::from).collect(),
-            aps_slot_id: providers.contains(&"aps").then(|| id.to_string()),
             page_patterns: Vec::new(),
         }
     }
@@ -471,10 +480,9 @@ mod tests {
             formats: vec![ExpectedFormat {
                 width: 0,
                 height: 0,
-                media_type: "video".to_string(),
+                media_type: MediaType::Video,
             }],
             providers: Vec::new(),
-            aps_slot_id: None,
             page_patterns: Vec::new(),
         }
     }
@@ -669,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn non_banner_only_slot_is_partial() {
+    fn non_banner_only_slot_is_unconfirmable_and_does_not_fail_strict() {
         let expected = expected_slot_video("video", "ad-video-", "/123/news/video");
         let evidence = evidence(
             vec![dom("ad-video-0")],
@@ -683,12 +691,16 @@ mod tests {
             RuntimeGateSummary::unknown_allowed(),
         );
 
-        assert_eq!(result.slots[0].status, SlotStatus::Partial);
+        assert_eq!(result.slots[0].status, SlotStatus::Unconfirmable);
         assert!(
             result.slots[0]
                 .warnings
                 .iter()
                 .any(|w| w.code == "unsupported_format")
+        );
+        assert!(
+            !result.strict_failed(),
+            "checker limitations should not fail strict"
         );
     }
 
@@ -739,12 +751,16 @@ mod tests {
             RuntimeGateSummary::unknown_allowed(),
         );
 
-        assert_ne!(result.slots[0].status, SlotStatus::Confirmed);
+        assert_eq!(result.slots[0].status, SlotStatus::Unconfirmable);
         assert!(
             result.slots[0]
                 .warnings
                 .iter()
                 .any(|w| w.code == "out_of_page_slot")
+        );
+        assert!(
+            !result.strict_failed(),
+            "out-of-page slots are not confirmable by this checker"
         );
     }
 
@@ -774,7 +790,7 @@ mod tests {
     }
 
     #[test]
-    fn aps_missing_warns_but_keeps_confirmed() {
+    fn server_side_aps_config_does_not_require_client_fetch_bids_evidence() {
         let expected = expected_slot("atf", "ad-atf-", "/123/news/atf", &[(300, 250)], &["aps"]);
         let evidence = evidence(
             vec![dom("ad-atf-0")],
@@ -793,12 +809,7 @@ mod tests {
             SlotStatus::Confirmed,
             "missing APS does not flip status"
         );
-        assert!(
-            result.slots[0]
-                .warnings
-                .iter()
-                .any(|w| w.code == "aps_evidence_missing")
-        );
+        assert!(result.slots[0].warnings.is_empty());
         assert!(
             !result.strict_failed(),
             "provider warning alone must not fail strict"
