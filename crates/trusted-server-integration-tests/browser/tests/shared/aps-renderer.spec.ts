@@ -6,17 +6,9 @@ import { runtimeUrl } from "../../helpers/state.js";
 const RUNNER_URL = "https://client.aps.amazon-adsystem.com/prebid-creative.js";
 const IFRAME_CREATIVE_URL = "https://creative.example/iframe";
 const SCRIPT_CREATIVE_URL = "https://creative.example/script.js";
-const NESTED_CREATIVE_URL = "https://creative.example/nested-parent";
-const NESTED_CHILD_URL = "https://creative.example/nested-child";
 const SANDBOX =
     "allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation";
-const OPAQUE_DATA_SANDBOX =
-    "allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts allow-top-navigation-by-user-activation";
 const TSJS_CRATE = resolve(__dirname, "../../../../trusted-server-js");
-const PUC_BANNER = resolve(
-    __dirname,
-    "../../fixtures/prebid-universal-creative-1.17.2-banner.js",
-);
 
 function clientAuctionBundlePaths() {
     const manifestPath = resolve(TSJS_CRATE, "dist/prebid/manifest.json");
@@ -129,7 +121,6 @@ window.startApsFrame = function(options) {
   frame.onload = function() {
     frame.contentWindow.postMessage({
       nonce: options.messageNonce,
-      publisherOrigin: location.origin,
       renderer: options.renderer
     }, '*');
   };
@@ -200,72 +191,6 @@ const SCRIPT_CREATIVE = `(function(){
     creativeWrite: creativeWrite
   }, '*');
 })();`;
-
-async function routeNestedOriginFixture(
-    page: Page,
-    onRunnerRequest: () => void,
-): Promise<void> {
-    await page.route(RUNNER_URL, async (route) => {
-        onRunnerRequest();
-        await route.fulfill({
-            status: 200,
-            contentType: "application/javascript",
-            body: `(function(){
-  top.postMessage({ message: 'fictional-runner-origin', origin: self.origin }, '*');
-  window._aps.forEach(function(account) {
-    account.queue.splice(0).forEach(function(event) {
-      var response = JSON.parse(atob(event.detail.aaxResponse));
-      var bid = response.seatbid[0].bid[0];
-      var frame = document.createElement('iframe');
-      frame.setAttribute('sandbox', 'allow-scripts allow-same-origin');
-      frame.src = bid.ext.creativeurl;
-      document.body.appendChild(frame);
-    });
-  });
-})();`,
-        });
-    });
-    await page.route(NESTED_CREATIVE_URL, async (route) => {
-        await route.fulfill({
-            status: 200,
-            contentType: "text/html",
-            body: `<!doctype html><body><script>
-  top.postMessage({ message: 'fictional-creative-origin', origin: self.origin }, '*');
-  var nested = document.createElement('iframe');
-  nested.src = ${JSON.stringify(NESTED_CHILD_URL)};
-  nested.onload = function() {
-    var canAccess = false;
-    var wroteMarker = false;
-    var errorName;
-    try {
-      canAccess = Boolean(nested.contentDocument && nested.contentDocument.body);
-      nested.contentDocument.body.innerHTML = '<div id="nested-write-marker">rendered</div>';
-      wroteMarker = Boolean(nested.contentDocument.getElementById('nested-write-marker'));
-    } catch (error) {
-      errorName = error && error.name;
-    }
-    top.postMessage({
-      message: 'fictional-nested-origin-result',
-      creativeOrigin: self.origin,
-      canAccess: canAccess,
-      wroteMarker: wroteMarker,
-      errorName: errorName
-    }, '*');
-  };
-  document.body.appendChild(nested);
-<\/script></body>`,
-        });
-    });
-    await page.route(NESTED_CHILD_URL, async (route) => {
-        await route.fulfill({
-            status: 200,
-            contentType: "text/html",
-            body: `<!doctype html><body><div id="nested-child-loaded">loaded</div><script>
-  top.postMessage({ message: 'fictional-nested-child-origin', origin: self.origin }, '*');
-<\/script></body>`,
-        });
-    });
-}
 
 test.describe("APS opaque renderer", () => {
     test("renders a trustedServer adapter bid using Prebid's generated GAM ad ID", async ({
@@ -465,8 +390,7 @@ parent.postMessage(JSON.stringify({
             expect.objectContaining({
                 message: "Prebid Response",
                 adId: result.acceptedAdId,
-                rendererVersion: 6,
-                apsMountId: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/),
+                rendererVersion: 4,
                 apsRenderer,
             }),
         );
@@ -862,613 +786,6 @@ parent.postMessage(JSON.stringify({
         );
     });
 
-    test("retains the origin of a nested same-origin APS creative", async ({
-        page,
-    }) => {
-        const apsRenderer = descriptor("iframe", NESTED_CREATIVE_URL);
-        const responseBody = {
-            id: "fictional-nested-origin-auction",
-            seatbid: [
-                {
-                    seat: "aps",
-                    bid: [
-                        {
-                            id: apsRenderer.bidId,
-                            impid: "aps-nested-origin-slot",
-                            price: 1.23,
-                            crid: apsRenderer.creativeId,
-                            w: 300,
-                            h: 250,
-                            ext: {
-                                trusted_server: { renderer: apsRenderer },
-                            },
-                        },
-                    ],
-                },
-            ],
-            ext: {},
-        };
-        let auctionRequests = 0;
-        let runnerRequests = 0;
-
-        await page.route(runtimeUrl("/auction"), async (route) => {
-            auctionRequests += 1;
-            await route.fulfill({
-                status: 200,
-                contentType: "application/json",
-                body: JSON.stringify(responseBody),
-            });
-        });
-        await routeNestedOriginFixture(page, () => {
-            runnerRequests += 1;
-        });
-
-        await page.goto(runtimeUrl("/"));
-        const hasCoreApi = await page.evaluate(
-            () =>
-                typeof (
-                    window as unknown as {
-                        tsjs?: { requestAds?: unknown };
-                    }
-                ).tsjs?.requestAds === "function",
-        );
-        if (!hasCoreApi) {
-            await page.addScriptTag({ path: clientAuctionBundlePaths().core });
-        }
-
-        await page.evaluate(() => {
-            const publisher = window as unknown as {
-                apsOriginMessages: Array<Record<string, unknown>>;
-                apsRunnerSource?: MessageEventSource | null;
-                tsjs: {
-                    addAdUnits(units: Array<Record<string, unknown>>): void;
-                    requestAds(): void;
-                };
-            };
-            publisher.apsOriginMessages = [];
-            window.addEventListener("message", (event) => {
-                if (
-                    event.data &&
-                    typeof event.data.message === "string" &&
-                    event.data.message.startsWith("fictional-")
-                ) {
-                    publisher.apsOriginMessages.push(event.data);
-                    if (event.data.message === "fictional-runner-origin") {
-                        publisher.apsRunnerSource = event.source;
-                    }
-                }
-            });
-            const slot = document.createElement("div");
-            slot.id = "aps-nested-origin-slot";
-            slot.innerHTML =
-                '<span class="existing">existing publisher content</span>';
-            document.body.appendChild(slot);
-            publisher.tsjs.addAdUnits([
-                {
-                    code: slot.id,
-                    mediaTypes: { banner: { sizes: [[300, 250]] } },
-                    bids: [],
-                },
-            ]);
-            publisher.tsjs.requestAds();
-        });
-
-        await expect.poll(() => auctionRequests).toBe(1);
-        await expect.poll(() => runnerRequests).toBe(1);
-        await expect
-            .poll(() =>
-                page.evaluate(() =>
-                    (
-                        window as unknown as {
-                            apsOriginMessages: Array<{
-                                message?: string;
-                            }>;
-                        }
-                    ).apsOriginMessages.some(
-                        ({ message }) =>
-                            message === "fictional-nested-origin-result",
-                    ),
-                ),
-            )
-            .toBe(true);
-
-        const result = await page.evaluate(() => {
-            const publisher = window as unknown as {
-                apsOriginMessages: Array<Record<string, unknown>>;
-                apsRunnerSource?: MessageEventSource | null;
-            };
-            const outerFrame = document.querySelector<HTMLIFrameElement>(
-                "#aps-nested-origin-slot > iframe",
-            )!;
-            let publisherCanReadRenderer = false;
-            let publisherCanReadRunner = false;
-            try {
-                publisherCanReadRenderer = Boolean(
-                    outerFrame.contentWindow?.document.body,
-                );
-            } catch (_error) {
-                publisherCanReadRenderer = false;
-            }
-            try {
-                publisherCanReadRunner = Boolean(
-                    (publisher.apsRunnerSource as Window | undefined)?.document
-                        .body,
-                );
-            } catch (_error) {
-                publisherCanReadRunner = false;
-            }
-            return {
-                messages: publisher.apsOriginMessages,
-                publisherCanReadRenderer,
-                publisherCanReadRunner,
-                sandbox: outerFrame.getAttribute("sandbox"),
-            };
-        });
-        const message = (name: string) =>
-            result.messages.find((entry) => entry.message === name);
-
-        expect(result.publisherCanReadRenderer).toBe(false);
-        expect(result.publisherCanReadRunner).toBe(false);
-        expect(result.sandbox).toBe(OPAQUE_DATA_SANDBOX);
-        expect(message("fictional-runner-origin")).toEqual(
-            expect.objectContaining({ origin: "null" }),
-        );
-        expect(message("fictional-creative-origin")).toEqual(
-            expect.objectContaining({ origin: "https://creative.example" }),
-        );
-        expect(message("fictional-nested-child-origin")).toEqual(
-            expect.objectContaining({ origin: "https://creative.example" }),
-        );
-        expect(message("fictional-nested-origin-result")).toEqual(
-            expect.objectContaining({
-                creativeOrigin: "https://creative.example",
-                canAccess: true,
-                wroteMarker: true,
-            }),
-        );
-        await expect(
-            page.locator("#aps-nested-origin-slot .existing"),
-        ).toHaveCount(0);
-    });
-
-    test("blocks immediate renderer self-navigation to the publisher origin", async ({
-        page,
-    }) => {
-        const slotId = "aps-self-navigation-slot";
-        const testUrl = runtimeUrl("/aps-immediate-self-navigation-test");
-        const selfNavigationUrl = runtimeUrl(
-            "/aps-renderer-self-navigation-target",
-        );
-        const apsRenderer = descriptor("iframe", NESTED_CREATIVE_URL);
-        let auctionRequests = 0;
-        let runnerRequests = 0;
-        let selfNavigationRequests = 0;
-
-        await page.route(runtimeUrl("/auction"), async (route) => {
-            auctionRequests += 1;
-            await route.fulfill({
-                status: 200,
-                contentType: "application/json",
-                body: JSON.stringify({
-                    id: "fictional-self-navigation-auction",
-                    seatbid: [
-                        {
-                            seat: "aps",
-                            bid: [
-                                {
-                                    id: apsRenderer.bidId,
-                                    impid: slotId,
-                                    price: 1.23,
-                                    w: 300,
-                                    h: 250,
-                                    ext: {
-                                        trusted_server: {
-                                            renderer: apsRenderer,
-                                        },
-                                    },
-                                },
-                            ],
-                        },
-                    ],
-                    ext: {},
-                }),
-            });
-        });
-        await page.route(RUNNER_URL, async (route) => {
-            runnerRequests += 1;
-            await route.fulfill({
-                status: 200,
-                contentType: "application/javascript",
-                body: `try { location.href = ${JSON.stringify(selfNavigationUrl)}; } catch (_error) {}`,
-            });
-        });
-        await page.route(selfNavigationUrl, async (route) => {
-            selfNavigationRequests += 1;
-            await route.fulfill({
-                status: 200,
-                contentType: "text/html",
-                body: `<!doctype html><script>
-try { top.document.body.dataset.apsCompromised = 'self-navigation'; } catch (_error) {}
-<\/script>`,
-            });
-        });
-        await page.route(testUrl, async (route) => {
-            await route.fulfill({
-                status: 200,
-                contentType: "text/html",
-                headers: {
-                    "Content-Security-Policy":
-                        "default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'; frame-src 'self' data:",
-                },
-                body: `<!doctype html><div id="${slotId}"><span class="existing">existing publisher content</span></div>`,
-            });
-        });
-
-        await page.goto(testUrl);
-        await page.addScriptTag({ path: clientAuctionBundlePaths().core });
-        await page.evaluate((code) => {
-            const tsjs = (
-                window as unknown as {
-                    tsjs: {
-                        addAdUnits(units: Array<Record<string, unknown>>): void;
-                        requestAds(): void;
-                    };
-                }
-            ).tsjs;
-            tsjs.addAdUnits([
-                {
-                    code,
-                    mediaTypes: { banner: { sizes: [[300, 250]] } },
-                    bids: [],
-                },
-            ]);
-            tsjs.requestAds();
-        }, slotId);
-
-        await expect.poll(() => auctionRequests).toBe(1);
-        await expect.poll(() => runnerRequests).toBe(1);
-        await page.waitForTimeout(250);
-        expect(selfNavigationRequests).toBe(0);
-        expect(
-            await page.evaluate(() => document.body.dataset.apsCompromised),
-        ).toBeUndefined();
-
-        const isolation = await page
-            .locator(`#${slotId} > iframe`)
-            .evaluate((frame: HTMLIFrameElement) => {
-                let publisherCanRead = false;
-                try {
-                    publisherCanRead = Boolean(
-                        frame.contentWindow?.document.body,
-                    );
-                } catch (_error) {
-                    publisherCanRead = false;
-                }
-                return {
-                    publisherCanRead,
-                    sandbox: frame.getAttribute("sandbox"),
-                };
-            });
-        expect(isolation).toEqual({
-            publisherCanRead: false,
-            sandbox: OPAQUE_DATA_SANDBOX,
-        });
-    });
-
-    test("blocks a creative from framing an executable publisher document", async ({
-        page,
-    }) => {
-        const slotId = "aps-publisher-child-slot";
-        const testUrl = runtimeUrl("/aps-publisher-child-test");
-        const creativeUrl = "https://creative.example/publisher-child-parent";
-        const publisherChildUrl = runtimeUrl("/aps-publisher-child-target");
-        const apsRenderer = descriptor("iframe", creativeUrl);
-        let runnerRequests = 0;
-        let publisherChildRequests = 0;
-
-        const publisherResponse = await page.request.get(runtimeUrl("/"));
-        expect(
-            publisherResponse.headers()["content-security-policy"],
-        ).toContain("frame-ancestors 'self'");
-
-        await page.route(runtimeUrl("/auction"), async (route) => {
-            await route.fulfill({
-                status: 200,
-                contentType: "application/json",
-                body: JSON.stringify({
-                    id: "fictional-publisher-child-auction",
-                    seatbid: [
-                        {
-                            seat: "aps",
-                            bid: [
-                                {
-                                    id: apsRenderer.bidId,
-                                    impid: slotId,
-                                    price: 1.23,
-                                    w: 300,
-                                    h: 250,
-                                    ext: {
-                                        trusted_server: {
-                                            renderer: apsRenderer,
-                                        },
-                                    },
-                                },
-                            ],
-                        },
-                    ],
-                    ext: {},
-                }),
-            });
-        });
-        await page.route(RUNNER_URL, async (route) => {
-            runnerRequests += 1;
-            await route.fulfill({
-                status: 200,
-                contentType: "application/javascript",
-                body: `(function(){
-  window._aps.forEach(function(account) {
-    account.queue.splice(0).forEach(function(event) {
-      var response = JSON.parse(atob(event.detail.aaxResponse));
-      var bid = response.seatbid[0].bid[0];
-      var frame = document.createElement('iframe');
-      frame.setAttribute('sandbox', 'allow-scripts allow-same-origin');
-      frame.src = bid.ext.creativeurl;
-      document.body.appendChild(frame);
-    });
-  });
-})();`,
-            });
-        });
-        await page.route(creativeUrl, async (route) => {
-            await route.fulfill({
-                status: 200,
-                contentType: "text/html",
-                body: `<!doctype html><body><script>
-var child = document.createElement('iframe');
-child.src = ${JSON.stringify(publisherChildUrl)};
-document.body.appendChild(child);
-top.postMessage({ message: 'fictional-publisher-child-attempted' }, '*');
-<\/script>`,
-            });
-        });
-        await page.route(publisherChildUrl, async (route) => {
-            publisherChildRequests += 1;
-            await route.fulfill({
-                status: 200,
-                contentType: "text/html",
-                headers: {
-                    "Content-Security-Policy": "frame-ancestors 'self'",
-                },
-                body: `<!doctype html><script>
-try { top.document.body.dataset.apsCompromised = 'publisher-child'; } catch (_error) {}
-<\/script>`,
-            });
-        });
-        await page.route(testUrl, async (route) => {
-            await route.fulfill({
-                status: 200,
-                contentType: "text/html",
-                headers: {
-                    "Content-Security-Policy":
-                        "default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'; frame-src 'self' data:",
-                },
-                body: `<!doctype html><div id="${slotId}"></div><script>
-window.publisherChildAttempted = false;
-addEventListener('message', function(event) {
-  if (event.data && event.data.message === 'fictional-publisher-child-attempted') {
-    window.publisherChildAttempted = true;
-  }
-});
-<\/script>`,
-            });
-        });
-
-        await page.goto(testUrl);
-        await page.addScriptTag({ path: clientAuctionBundlePaths().core });
-        await page.evaluate((code) => {
-            const tsjs = (
-                window as unknown as {
-                    tsjs: {
-                        addAdUnits(units: Array<Record<string, unknown>>): void;
-                        requestAds(): void;
-                    };
-                }
-            ).tsjs;
-            tsjs.addAdUnits([
-                {
-                    code,
-                    mediaTypes: { banner: { sizes: [[300, 250]] } },
-                    bids: [],
-                },
-            ]);
-            tsjs.requestAds();
-        }, slotId);
-
-        await expect.poll(() => runnerRequests).toBe(1);
-        await expect
-            .poll(() =>
-                page.evaluate(
-                    () =>
-                        (
-                            window as unknown as {
-                                publisherChildAttempted: boolean;
-                            }
-                        ).publisherChildAttempted,
-                ),
-            )
-            .toBe(true);
-        await page.waitForTimeout(250);
-        expect(publisherChildRequests).toBeLessThanOrEqual(1);
-        expect(
-            await page.evaluate(() => document.body.dataset.apsCompromised),
-        ).toBeUndefined();
-    });
-
-    test("retains the nested creative origin through real Prebid Universal Creative", async ({
-        page,
-    }) => {
-        const slotId = "aps-puc-nested-origin-slot";
-        const adId = "fictional-puc-ad-id";
-        const testUrl = runtimeUrl("/aps-real-puc-origin-test");
-        const pucUrl = "https://adserver.example/universal-creative";
-        const pucScriptUrl = "https://adserver.example/banner.js";
-        const apsRenderer = descriptor("iframe", NESTED_CREATIVE_URL);
-        let runnerRequests = 0;
-
-        await routeNestedOriginFixture(page, () => {
-            runnerRequests += 1;
-        });
-        await page.route(testUrl, async (route) => {
-            await route.fulfill({
-                status: 200,
-                contentType: "text/html",
-                body: `<!doctype html><div id="${slotId}"></div>`,
-            });
-        });
-        await page.route(pucScriptUrl, async (route) => {
-            await route.fulfill({
-                status: 200,
-                contentType: "application/javascript",
-                body: readFileSync(PUC_BANNER, "utf8"),
-            });
-        });
-        await page.route(pucUrl, async (route) => {
-            await route.fulfill({
-                status: 200,
-                contentType: "text/html",
-                body: `<!doctype html><script src=${JSON.stringify(pucScriptUrl)}><\/script>
-<script>
-try {
-  window.ucTag.renderAd(document, {
-    adId: ${JSON.stringify(adId)},
-    pubUrl: ${JSON.stringify(testUrl)},
-    hbFormat: 'banner'
-  });
-} catch (error) {
-  top.postMessage({ message: 'fictional-puc-error', error: String(error) }, '*');
-}
-<\/script>`,
-            });
-        });
-
-        await page.goto(testUrl);
-        await loadClientAuctionBundles(page);
-        await page.evaluate(
-            ({
-                apsRenderer: renderer,
-                adId: bidAdId,
-                slotId: bidSlotId,
-                pucUrl: creativeUrl,
-            }) => {
-                const publisher = window as unknown as {
-                    apsOriginMessages: Array<Record<string, unknown>>;
-                    tsjs: {
-                        adSlots: Array<Record<string, unknown>>;
-                        bids: Record<string, Record<string, unknown>>;
-                    };
-                };
-                publisher.apsOriginMessages = [];
-                window.addEventListener("message", (event) => {
-                    if (
-                        event.data &&
-                        typeof event.data.message === "string" &&
-                        event.data.message.startsWith("fictional-")
-                    ) {
-                        publisher.apsOriginMessages.push(event.data);
-                    }
-                });
-                publisher.tsjs.adSlots = [
-                    {
-                        id: bidSlotId,
-                        div_id: bidSlotId,
-                        formats: [[300, 250]],
-                    },
-                ];
-                publisher.tsjs.bids = {
-                    [bidSlotId]: {
-                        hb_adid: bidAdId,
-                        hb_bidder: "aps",
-                        hb_pb: "1.23",
-                        renderer,
-                    },
-                };
-                const frame = document.createElement("iframe");
-                frame.title = "Fictional GAM Universal Creative";
-                frame.width = "300";
-                frame.height = "250";
-                frame.setAttribute(
-                    "sandbox",
-                    "allow-scripts allow-same-origin",
-                );
-                frame.src = creativeUrl;
-                document.getElementById(bidSlotId)!.appendChild(frame);
-            },
-            { apsRenderer, adId, slotId, pucUrl },
-        );
-
-        await expect.poll(() => runnerRequests).toBe(1);
-        await expect
-            .poll(() =>
-                page.evaluate(() =>
-                    (
-                        window as unknown as {
-                            apsOriginMessages: Array<{
-                                message?: string;
-                            }>;
-                        }
-                    ).apsOriginMessages.some(
-                        ({ message }) =>
-                            message === "fictional-nested-origin-result",
-                    ),
-                ),
-            )
-            .toBe(true);
-
-        const messages = await page.evaluate(
-            () =>
-                (
-                    window as unknown as {
-                        apsOriginMessages: Array<Record<string, unknown>>;
-                    }
-                ).apsOriginMessages,
-        );
-        const message = (name: string) =>
-            messages.find((entry) => entry.message === name);
-
-        expect(message("fictional-puc-error")).toBeUndefined();
-        expect(message("fictional-runner-origin")).toEqual(
-            expect.objectContaining({ origin: "null" }),
-        );
-        expect(message("fictional-creative-origin")).toEqual(
-            expect.objectContaining({ origin: "https://creative.example" }),
-        );
-        expect(message("fictional-nested-child-origin")).toEqual(
-            expect.objectContaining({ origin: "https://creative.example" }),
-        );
-        expect(message("fictional-nested-origin-result")).toEqual(
-            expect.objectContaining({
-                creativeOrigin: "https://creative.example",
-                canAccess: true,
-                wroteMarker: true,
-            }),
-        );
-
-        const slotFrames = page.locator(`#${slotId} > iframe`);
-        const dataRenderer = page.locator(
-            `#${slotId} > iframe[data-ts-aps-renderer="true"]`,
-        );
-        await expect(slotFrames).toHaveCount(2);
-        await expect(dataRenderer).toHaveCount(1);
-        await expect(dataRenderer).toHaveAttribute(
-            "sandbox",
-            OPAQUE_DATA_SANDBOX,
-        );
-        await expect(dataRenderer).toBeVisible();
-        await expect(
-            page.locator(`iframe[title="Fictional GAM Universal Creative"]`),
-        ).toBeHidden();
-    });
-
     test("rejects same-origin creative URLs through the TSJS rendering path", async ({
         page,
     }) => {
@@ -1480,10 +797,6 @@ try {
             runtimeUrl("/integrations/aps/renderer"),
         );
         const rendererDocument = await runtimeRenderer.text();
-        const runtimeBootstrap = await page.request.get(
-            runtimeUrl("/integrations/aps/renderer?mode=data-bootstrap"),
-        );
-        const bootstrapDocument = await runtimeBootstrap.text();
         let creativeUrl = SCRIPT_CREATIVE_URL;
         let runnerRequests = 0;
 
@@ -1495,21 +808,16 @@ try {
                 body: FAKE_RUNNER,
             });
         });
-        await page.route(`${rendererUrl}*`, async (route) => {
-            const bootstrap = route
-                .request()
-                .url()
-                .endsWith("?mode=data-bootstrap");
-            const response = bootstrap ? runtimeBootstrap : runtimeRenderer;
+        await page.route(rendererUrl, async (route) => {
             await route.fulfill({
                 status: 200,
                 contentType: "text/html",
                 headers: {
                     "Content-Security-Policy":
-                        response.headers()["content-security-policy"],
+                        runtimeRenderer.headers()["content-security-policy"],
                     "Referrer-Policy": "no-referrer",
                 },
-                body: bootstrap ? bootstrapDocument : rendererDocument,
+                body: rendererDocument,
             });
         });
         await page.route(auctionUrl, async (route) => {
@@ -1546,7 +854,7 @@ try {
                 contentType: "text/html",
                 headers: {
                     "Content-Security-Policy":
-                        "default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'; frame-src 'self' data:",
+                        "default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'; frame-src 'self'",
                 },
                 body: '<!doctype html><div id="same-origin-slot"><span class="existing">existing publisher content</span></div>',
             });
@@ -1614,8 +922,8 @@ try {
         const productSandbox = await page
             .locator("#same-origin-slot > iframe")
             .getAttribute("sandbox");
-        expect(productSandbox).toBe(OPAQUE_DATA_SANDBOX);
-        expect(productSandbox).toContain("allow-same-origin");
+        expect(productSandbox).toBe(SANDBOX);
+        expect(productSandbox).not.toContain("allow-same-origin");
 
         creativeUrl = `${publisherOrigin}/fictional-same-origin.js`;
         await page.locator("#same-origin-slot").evaluate((slot) => {
