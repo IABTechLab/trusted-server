@@ -2,13 +2,22 @@ use std::collections::BTreeSet;
 use std::io::{self, Write};
 
 use crate::ad_templates::expected::normalize_path_or_url;
+use crate::ad_templates::output::escape_terminal_text;
 use crate::app_config::{AppConfigArgs, load_settings};
-use clap::{Args, Subcommand};
+use clap::{ArgGroup, Args, Subcommand};
+use http::Method;
 use trusted_server_core::auction::types::MediaType;
 use trusted_server_core::creative_opportunities::{
-    AdStackGateInput, CreativeOpportunityFormat, CreativeOpportunitySlot, RuntimeAdStackExpected,
-    evaluate_ad_stack_gate, match_slots,
+    AdStackGateInput, AdStackGateName, CreativeOpportunityFormat, CreativeOpportunitySlot,
+    RuntimeAdStackExpected, evaluate_ad_stack_gate, match_slots, validate_page_pattern,
 };
+
+use crate::run::RunOutcome;
+
+enum CheckFailure {
+    Tool(String),
+    Assertion(String),
+}
 
 #[derive(Debug, Subcommand)]
 pub enum AdTemplatesCommand {
@@ -40,6 +49,11 @@ pub struct AdTemplatesMatchArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("expectation")
+        .required(true)
+        .args(["expected_slots", "expect_no_slots"])
+))]
 pub struct AdTemplatesCheckArgs {
     #[command(flatten)]
     pub config: AppConfigArgs,
@@ -52,7 +66,7 @@ pub struct AdTemplatesCheckArgs {
     #[arg(long)]
     pub expect_no_slots: bool,
     /// Allow additional matched slots beyond --expected-slot values.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "expect_no_slots")]
     pub allow_extra_slots: bool,
 }
 
@@ -64,7 +78,7 @@ pub struct AdTemplatesExplainArgs {
     pub path_or_url: String,
     /// HTTP method to model.
     #[arg(long, default_value = "GET")]
-    pub method: String,
+    pub method: Method,
     /// Model a non-navigation request.
     #[arg(long)]
     pub non_navigation: bool,
@@ -77,9 +91,6 @@ pub struct AdTemplatesExplainArgs {
     /// Model consent denying server-side auction.
     #[arg(long)]
     pub consent_denied: bool,
-    /// Model Fastly `edgezero_enabled=true`.
-    #[arg(long)]
-    pub edgezero_enabled: bool,
 }
 
 /// Run an ad-template CLI command.
@@ -88,10 +99,22 @@ pub struct AdTemplatesExplainArgs {
 ///
 /// Returns a user-facing string when config loading, matching, or assertion
 /// checks fail.
-pub fn run_ad_templates(args: &AdTemplatesCommand) -> Result<(), String> {
+pub fn run_ad_templates(args: &AdTemplatesCommand) -> Result<RunOutcome, String> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    run_ad_templates_with_writer(args, &mut out)
+    if let AdTemplatesCommand::Check(args) = args {
+        return match run_check_classified(args, &mut out) {
+            Ok(()) => Ok(RunOutcome::Success),
+            Err(CheckFailure::Tool(error)) => Err(error),
+            Err(CheckFailure::Assertion(message)) => {
+                let stderr = io::stderr();
+                let mut err = stderr.lock();
+                writeln!(err, "{message}").map_err(output_error)?;
+                Ok(RunOutcome::AssertionFailed)
+            }
+        };
+    }
+    run_ad_templates_with_writer(args, &mut out).map(|()| RunOutcome::Success)
 }
 
 fn run_ad_templates_with_writer(
@@ -171,12 +194,18 @@ fn run_lint(args: &AdTemplatesLintArgs, out: &mut dyn Write) -> Result<(), Strin
             .map_err(output_error)?;
     }
 
-    if !config.slot.is_empty() {
-        writeln!(
-            out,
-            "edgezero: configured slots currently require Fastly legacy fallback"
-        )
-        .map_err(output_error)?;
+    for slot in &config.slot {
+        for pattern in &slot.page_patterns {
+            if let Err(error) = validate_page_pattern(pattern) {
+                writeln!(
+                    out,
+                    "invalid page pattern for slot `{}`: {}",
+                    escape_terminal_text(&slot.id),
+                    escape_terminal_text(&error),
+                )
+                .map_err(output_error)?;
+            }
+        }
     }
 
     Ok(())
@@ -206,15 +235,17 @@ fn run_match(args: &AdTemplatesMatchArgs, out: &mut dyn Write) -> Result<(), Str
 }
 
 fn run_check(args: &AdTemplatesCheckArgs, out: &mut dyn Write) -> Result<(), String> {
-    if args.expect_no_slots && !args.expected_slots.is_empty() {
-        return Err("--expect-no-slots cannot be combined with --expected-slot".to_string());
-    }
-    if !args.expect_no_slots && args.expected_slots.is_empty() {
-        return Err("provide --expected-slot at least once or pass --expect-no-slots".to_string());
-    }
+    run_check_classified(args, out).map_err(|failure| match failure {
+        CheckFailure::Tool(error) | CheckFailure::Assertion(error) => error,
+    })
+}
 
-    let loaded = load_settings(&args.config)?;
-    let path = normalize_path_or_url(&args.path_or_url)?;
+fn run_check_classified(
+    args: &AdTemplatesCheckArgs,
+    out: &mut dyn Write,
+) -> Result<(), CheckFailure> {
+    let loaded = load_settings(&args.config).map_err(CheckFailure::Tool)?;
+    let path = normalize_path_or_url(&args.path_or_url).map_err(CheckFailure::Tool)?;
     let matched = loaded
         .settings
         .creative_opportunities
@@ -225,13 +256,15 @@ fn run_check(args: &AdTemplatesCheckArgs, out: &mut dyn Write) -> Result<(), Str
 
     if args.expect_no_slots {
         if actual.is_empty() {
-            writeln!(out, "{path}: OK, no slots matched").map_err(output_error)?;
+            writeln!(out, "{path}: OK, no slots matched")
+                .map_err(output_error)
+                .map_err(CheckFailure::Tool)?;
             return Ok(());
         }
-        return Err(format!(
+        return Err(CheckFailure::Assertion(format!(
             "{path}: expected no slots, matched {}",
             join_set(&actual)
-        ));
+        )));
     }
 
     let expected: BTreeSet<&str> = args.expected_slots.iter().map(String::as_str).collect();
@@ -239,7 +272,9 @@ fn run_check(args: &AdTemplatesCheckArgs, out: &mut dyn Write) -> Result<(), Str
     let extra: BTreeSet<&str> = actual.difference(&expected).copied().collect();
 
     if missing.is_empty() && (args.allow_extra_slots || extra.is_empty()) {
-        writeln!(out, "{path}: OK, matched {}", join_set(&actual)).map_err(output_error)?;
+        writeln!(out, "{path}: OK, matched {}", join_set(&actual))
+            .map_err(output_error)
+            .map_err(CheckFailure::Tool)?;
         return Ok(());
     }
 
@@ -250,7 +285,10 @@ fn run_check(args: &AdTemplatesCheckArgs, out: &mut dyn Write) -> Result<(), Str
     if !args.allow_extra_slots && !extra.is_empty() {
         problems.push(format!("unexpected {}", join_set(&extra)));
     }
-    Err(format!("{path}: {}", problems.join("; ")))
+    Err(CheckFailure::Assertion(format!(
+        "{path}: {}",
+        problems.join("; ")
+    )))
 }
 
 fn run_explain(args: &AdTemplatesExplainArgs, out: &mut dyn Write) -> Result<(), String> {
@@ -274,27 +312,13 @@ fn run_explain(args: &AdTemplatesExplainArgs, out: &mut dyn Write) -> Result<(),
         true,
     )?;
 
-    let method_pass = args.method.eq_ignore_ascii_case("GET");
+    let method_pass = args.method == Method::GET;
     let navigation_pass = !args.non_navigation;
-    let prefetch_pass = !args.prefetch;
-    let bot_pass = !args.bot;
     let consent_pass = !args.consent_denied;
     let auction_enabled = loaded.settings.auction.enabled;
     let providers_configured = !loaded.settings.auction.providers.is_empty();
     let has_matches = !matched.is_empty();
 
-    write_gate(out, "method GET", method_pass)?;
-    write_gate(out, "navigation", navigation_pass)?;
-    write_gate(out, "not prefetch", prefetch_pass)?;
-    write_gate(out, "not bot", bot_pass)?;
-    write_gate(out, "consent allows auction", consent_pass)?;
-    write_gate(out, "auction.enabled", auction_enabled)?;
-    write_gate(out, "auction providers configured", providers_configured)?;
-    write_gate(out, "matched slots", has_matches)?;
-
-    // Share the runtime ad-stack decision with `publisher.rs` so explain cannot
-    // drift from the live gate. The "auction providers configured" gate is an
-    // explain-only supplementary check the runtime helper intentionally omits.
     let gate = evaluate_ad_stack_gate(AdStackGateInput {
         method_get: method_pass,
         navigation: navigation_pass,
@@ -304,21 +328,54 @@ fn run_explain(args: &AdTemplatesExplainArgs, out: &mut dyn Write) -> Result<(),
         consent_allows_auction: Some(consent_pass),
         auction_enabled,
     });
-    let runs_ad_stack = gate.expected == RuntimeAdStackExpected::Yes && providers_configured;
+    let blocked: Vec<AdStackGateName> = gate.blocking_gates().collect();
+    write_gate(
+        out,
+        "method GET",
+        !blocked.contains(&AdStackGateName::MethodGet),
+    )?;
+    write_gate(
+        out,
+        "navigation",
+        !blocked.contains(&AdStackGateName::Navigation),
+    )?;
+    write_gate(
+        out,
+        "not prefetch",
+        !blocked.contains(&AdStackGateName::NotPrefetch),
+    )?;
+    write_gate(out, "not bot", !blocked.contains(&AdStackGateName::NotBot))?;
+    write_gate(
+        out,
+        "consent allows auction",
+        !blocked.contains(&AdStackGateName::ConsentAllowsAuction),
+    )?;
+    write_gate(
+        out,
+        "auction.enabled",
+        !blocked.contains(&AdStackGateName::AuctionEnabled),
+    )?;
+    write_gate(
+        out,
+        "matched slots",
+        !blocked.contains(&AdStackGateName::MatchedSlots),
+    )?;
+    writeln!(
+        out,
+        "advisory auction providers configured: {}",
+        if providers_configured { "yes" } else { "no" }
+    )
+    .map_err(output_error)?;
     writeln!(
         out,
         "server-side ad stack: {}",
-        if runs_ad_stack { "yes" } else { "no" }
+        match gate.expected {
+            RuntimeAdStackExpected::Yes => "yes",
+            RuntimeAdStackExpected::No => "no",
+            RuntimeAdStackExpected::Unknown => "unknown",
+        }
     )
     .map_err(output_error)?;
-
-    if args.edgezero_enabled && !config.slot.is_empty() {
-        writeln!(
-            out,
-            "edgezero: configured slots require Fastly legacy fallback until buffered EdgeZero ad-template injection is wired"
-        )
-        .map_err(output_error)?;
-    }
 
     Ok(())
 }
@@ -562,10 +619,9 @@ mod tests {
     }
 
     #[test]
-    fn explain_reports_runtime_gates_and_edgezero_fallback() {
-        let config_text = config_with_slots()
-            .replace("[auction]\nenabled = false", "[auction]\nenabled = true")
-            .replace("providers = []", "providers = [\"prebid\"]");
+    fn explain_keeps_provider_state_separate_from_runtime_verdict() {
+        let config_text =
+            config_with_slots().replace("[auction]\nenabled = false", "[auction]\nenabled = true");
         let (_temp, config) = project_with_config(&config_text);
         let mut out = Vec::new();
 
@@ -573,12 +629,11 @@ mod tests {
             &AdTemplatesCommand::Explain(AdTemplatesExplainArgs {
                 config,
                 path_or_url: "/news/story".to_string(),
-                method: "GET".to_string(),
+                method: Method::GET,
                 non_navigation: false,
                 prefetch: false,
                 bot: false,
                 consent_denied: false,
-                edgezero_enabled: true,
             }),
             &mut out,
         )
@@ -587,11 +642,11 @@ mod tests {
         let output = String::from_utf8(out).expect("should be utf8");
         assert!(
             output.contains("server-side ad stack: yes"),
-            "should report ad stack enabled"
+            "runtime verdict should not include provider configuration"
         );
         assert!(
-            output.contains("configured slots require Fastly legacy fallback"),
-            "should report EdgeZero fallback"
+            output.contains("advisory auction providers configured: no"),
+            "provider state should be a separate advisory"
         );
     }
 
@@ -615,9 +670,45 @@ mod tests {
             output.contains("auction.enabled:"),
             "should report the auction kill-switch state"
         );
-        assert!(
-            output.contains("edgezero: configured slots currently require Fastly legacy fallback"),
-            "should report the EdgeZero legacy-fallback note"
+        assert!(!output.contains("legacy fallback"));
+    }
+
+    #[test]
+    fn lint_reports_page_patterns_the_runtime_drops() {
+        let config_text = config_with_slots().replace(
+            "page_patterns = [\"/news/*\", \"/\"]",
+            "page_patterns = [\"/news/*\", \"[\"]",
         );
+        let (_temp, config) = project_with_config(&config_text);
+        let mut out = Vec::new();
+
+        run_ad_templates_with_writer(
+            &AdTemplatesCommand::Lint(AdTemplatesLintArgs { config }),
+            &mut out,
+        )
+        .expect("should lint mixed valid and invalid patterns");
+        let output = String::from_utf8(out).expect("should be utf8");
+
+        assert!(
+            output.contains("invalid page pattern for slot `atf`")
+                && output.contains("page pattern '[' is not a valid glob"),
+            "lint should surface the runtime-dropped pattern: {output}"
+        );
+    }
+
+    #[test]
+    fn public_check_reports_drift_as_assertion_outcome() {
+        let (_temp, config) = project_with_config(&config_with_slots());
+
+        let outcome = run_ad_templates(&AdTemplatesCommand::Check(AdTemplatesCheckArgs {
+            config,
+            path_or_url: "/sports/game".to_string(),
+            expected_slots: vec!["atf".to_string()],
+            expect_no_slots: false,
+            allow_extra_slots: false,
+        }))
+        .expect("assertion drift should not be a tool error");
+
+        assert_eq!(outcome, RunOutcome::AssertionFailed);
     }
 }

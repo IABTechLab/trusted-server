@@ -70,37 +70,62 @@ enum PrebidCommand {
     Bundle(PrebidBundleArgs),
 }
 
+/// Process-level outcome for commands that distinguish drift from tool errors.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RunOutcome {
+    /// Command completed without drift.
+    Success,
+    /// Command ran successfully and found assertion drift.
+    AssertionFailed,
+}
+
+impl RunOutcome {
+    /// Stable process exit code for this outcome.
+    #[must_use]
+    pub const fn exit_code(self) -> i32 {
+        match self {
+            Self::Success => 0,
+            Self::AssertionFailed => 1,
+        }
+    }
+}
+
 /// Run the CLI using process arguments.
 ///
 /// # Errors
 ///
 /// Returns an error when command parsing, config validation, `EdgeZero`
 /// delegation, audit collection, config initialization, or Prebid bundle generation fails.
-pub fn run_from_env() -> Result<(), String> {
+pub fn run_from_env() -> Result<RunOutcome, String> {
     dispatch(Args::parse())
 }
 
-fn dispatch(args: Args) -> Result<(), String> {
+fn dispatch(args: Args) -> Result<RunOutcome, String> {
     match args.command {
-        Command::Auth(args) => edgezero_cli::run_auth(&args),
+        Command::Auth(args) => edgezero_cli::run_auth(&args).map(|()| RunOutcome::Success),
         Command::Audit(args) => run_audit(&args),
-        Command::Build(args) => edgezero_cli::run_build(&args),
+        Command::Build(args) => edgezero_cli::run_build(&args).map(|()| RunOutcome::Success),
         Command::Config(ConfigCommand::AdTemplates(args)) => run_ad_templates(&args),
-        Command::Config(ConfigCommand::Init(args)) => run_config_init(&args),
+        Command::Config(ConfigCommand::Init(args)) => {
+            run_config_init(&args).map(|()| RunOutcome::Success)
+        }
         Command::Config(ConfigCommand::Diff(args)) => {
             match edgezero_cli::run_config_diff_typed::<TrustedServerAppConfig>(&args) {
-                Ok(edgezero_cli::DiffExit { code: 0 }) => Ok(()),
+                Ok(edgezero_cli::DiffExit { code: 0 }) => Ok(RunOutcome::Success),
+                Ok(edgezero_cli::DiffExit { code: 1 }) => Ok(RunOutcome::AssertionFailed),
                 Ok(edgezero_cli::DiffExit { code }) => process::exit(code),
                 Err(err) => Err(err),
             }
         }
         Command::Config(ConfigCommand::Push(args)) => {
             edgezero_cli::run_config_push_typed::<TrustedServerAppConfig>(&args)
+                .map(|()| RunOutcome::Success)
         }
         Command::Config(ConfigCommand::Validate(args)) => {
             edgezero_cli::run_config_validate_typed::<TrustedServerAppConfig>(&args)
+                .map(|()| RunOutcome::Success)
         }
-        Command::Deploy(args) => edgezero_cli::run_deploy(&args),
+        Command::Deploy(args) => edgezero_cli::run_deploy(&args).map(|()| RunOutcome::Success),
         Command::Prebid(prebid) => {
             let mut generator = NpmPrebidBundleGenerator;
             let mut stdout = std::io::stdout();
@@ -108,12 +133,15 @@ fn dispatch(args: Args) -> Result<(), String> {
             match prebid.command {
                 PrebidCommand::Bundle(args) => {
                     run_bundle(&args, &mut generator, &mut stdout, &mut stderr)
+                        .map(|()| RunOutcome::Success)
                 }
             }
         }
-        Command::Provision(args) => edgezero_cli::run_provision(&args),
-        Command::Serve(args) => edgezero_cli::run_serve(&args),
-        Command::Dev(command) => crate::commands::dev::run(command),
+        Command::Provision(args) => {
+            edgezero_cli::run_provision(&args).map(|()| RunOutcome::Success)
+        }
+        Command::Serve(args) => edgezero_cli::run_serve(&args).map(|()| RunOutcome::Success),
+        Command::Dev(command) => crate::commands::dev::run(command).map(|()| RunOutcome::Success),
     }
 }
 
@@ -128,6 +156,12 @@ mod tests {
 
     fn parse(args: &[&str]) -> Args {
         Args::try_parse_from(args).expect("should parse args")
+    }
+
+    #[test]
+    fn run_outcomes_use_documented_exit_codes() {
+        assert_eq!(RunOutcome::Success.exit_code(), 0);
+        assert_eq!(RunOutcome::AssertionFailed.exit_code(), 1);
     }
 
     #[test]
@@ -283,6 +317,52 @@ mod tests {
         assert_eq!(check_args.expected_slots, ["atf", "sports-sidebar"]);
         assert!(check_args.allow_extra_slots);
         assert!(!check_args.expect_no_slots);
+    }
+
+    #[test]
+    fn config_ad_templates_check_requires_an_expectation_mode() {
+        assert!(Args::try_parse_from(["ts", "config", "ad-templates", "check", "/news"]).is_err());
+    }
+
+    #[test]
+    fn config_ad_templates_check_rejects_extra_slots_with_no_slots_mode() {
+        assert!(
+            Args::try_parse_from([
+                "ts",
+                "config",
+                "ad-templates",
+                "check",
+                "/news",
+                "--expect-no-slots",
+                "--allow-extra-slots",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn config_ad_templates_explain_rejects_removed_edgezero_model() {
+        assert!(
+            Args::try_parse_from([
+                "ts",
+                "config",
+                "ad-templates",
+                "explain",
+                "/news",
+                "--edgezero-enabled",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bare_audit_namespace_displays_help_as_an_error() {
+        let error = Args::try_parse_from(["ts", "audit"]).expect_err("should require audit mode");
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
     }
 
     #[test]

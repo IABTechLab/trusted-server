@@ -115,7 +115,14 @@ fn provider_names(
 ///
 /// Returns a user-facing string when a `scheme://` input cannot be parsed as a URL.
 pub fn normalize_path_or_url(input: &str) -> Result<String, String> {
-    if input.contains("://") {
+    let path_input = input.split(['?', '#']).next().unwrap_or(input);
+    let scheme_prefix = path_input.split_once("://").map(|(scheme, _)| scheme);
+    let has_url_scheme = scheme_prefix.is_some_and(|scheme| {
+        let mut chars = scheme.chars();
+        chars.next().is_some_and(|ch| ch.is_ascii_alphabetic())
+            && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+    });
+    if has_url_scheme {
         let url = Url::parse(input).map_err(|err| format!("invalid URL `{input}`: {err}"))?;
         let path = url.path();
         return Ok(if path.is_empty() {
@@ -125,18 +132,13 @@ pub fn normalize_path_or_url(input: &str) -> Result<String, String> {
         });
     }
 
-    let without_fragment = input.split('#').next().unwrap_or(input);
-    let path = without_fragment
-        .split('?')
-        .next()
-        .unwrap_or(without_fragment);
-    if path.is_empty() {
-        Ok("/".to_string())
-    } else if path.starts_with('/') {
-        Ok(path.to_string())
-    } else {
-        Ok(format!("/{path}"))
-    }
+    let base = Url::parse("https://path-normalizer.example/")
+        .expect("should parse static path normalization base");
+    let relative = input.trim_start_matches('/');
+    let normalized = base
+        .join(relative)
+        .map_err(|error| format!("invalid path `{input}`: {error}"))?;
+    Ok(normalized.path().to_string())
 }
 
 #[cfg(test)]
@@ -297,5 +299,27 @@ mod tests {
             "/"
         );
         assert_eq!(normalize_path_or_url("").expect("should normalize"), "/");
+    }
+
+    #[test]
+    fn normalize_path_or_url_uses_identical_url_rules_for_bare_paths() {
+        assert_eq!(
+            normalize_path_or_url("/a/../b").expect("should normalize bare dot segment"),
+            "/b"
+        );
+        assert_eq!(
+            normalize_path_or_url("https://example.com/a/../b")
+                .expect("should normalize URL dot segment"),
+            "/b"
+        );
+        assert_eq!(
+            normalize_path_or_url("/a b").expect("should encode bare path"),
+            "/a%20b"
+        );
+        assert_eq!(
+            normalize_path_or_url("/r?to=https://example.com")
+                .expect("query URL should not change input classification"),
+            "/r"
+        );
     }
 }

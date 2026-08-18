@@ -16,6 +16,7 @@ use clap::{Args, Subcommand};
 use crate::app_config::AppConfigArgs;
 use crate::commands::audit::collector::BrowserOpts;
 use crate::commands::audit::page::PageAuditArgs;
+use crate::run::RunOutcome;
 
 /// Parses and validates an `http`/`https` URL, rejecting all other schemes.
 ///
@@ -52,6 +53,7 @@ pub(crate) fn parse_cookie(raw: &str) -> Result<(String, String), String> {
 
 /// `ts audit` arguments: an optional subcommand plus a hidden legacy URL positional.
 #[derive(Debug, Args)]
+#[command(arg_required_else_help = true)]
 pub(crate) struct AuditArgs {
     #[command(subcommand)]
     pub(crate) command: Option<AuditSubcommand>,
@@ -272,9 +274,11 @@ pub(crate) struct AuditAdTemplatesVerifyArgs {
 ///
 /// Returns a user-facing string when no URL or subcommand is provided, or when
 /// the underlying command fails.
-pub(crate) fn run_audit(args: &AuditArgs) -> Result<(), String> {
+pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
     match &args.command {
-        Some(AuditSubcommand::Page(page_args)) => page::run_page(page_args),
+        Some(AuditSubcommand::Page(page_args)) => {
+            page::run_page(page_args).map(|()| RunOutcome::Success)
+        }
         Some(AuditSubcommand::AdTemplates(AuditAdTemplatesCommand::Generate(gen_args))) => {
             let loaded = crate::app_config::load_file_settings(&gen_args.config)?;
             let profiles = gen_args.profiles()?;
@@ -315,6 +319,7 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<(), String> {
                 &selected,
                 &mut out,
             )
+            .map(|()| RunOutcome::Success)
         }
         Some(AuditSubcommand::AdTemplates(AuditAdTemplatesCommand::Verify(verify_args))) => {
             ad_templates::run_verify(verify_args)
@@ -324,6 +329,7 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<(), String> {
             let mut out = stdout.lock();
             let collector = generate::browser_collector::BrowserAuditCollector::default();
             generate::run_generate(generate_args, &collector, &mut out)
+                .map(|()| RunOutcome::Success)
         }
         None => match &args.legacy_url {
             Some(_) => {
@@ -333,6 +339,7 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<(), String> {
                 let mut out = stdout.lock();
                 let collector = generate::browser_collector::BrowserAuditCollector::default();
                 generate::run_generate(&generate_args, &collector, &mut out)
+                    .map(|()| RunOutcome::Success)
             }
             None => Err("provide a URL or a subcommand (`page`, `ad-templates`)".to_string()),
         },

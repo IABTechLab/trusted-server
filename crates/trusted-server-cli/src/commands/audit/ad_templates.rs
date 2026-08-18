@@ -27,6 +27,7 @@ use crate::commands::audit::AuditAdTemplatesVerifyArgs;
 use crate::commands::audit::collector::{
     AdTemplateCollectorConfig, AuditCollector, BrowserCollectRequest, build_ad_template_init_script,
 };
+use crate::run::RunOutcome;
 
 /// Verifies configured ad-template slots against live page evidence.
 ///
@@ -34,7 +35,7 @@ use crate::commands::audit::collector::{
 ///
 /// Returns a user-facing string when config loading fails, or when verification
 /// surfaces a page-level error or a `--strict` failure (after writing output).
-pub(crate) fn run_verify(args: &AuditAdTemplatesVerifyArgs) -> Result<(), String> {
+pub(crate) fn run_verify(args: &AuditAdTemplatesVerifyArgs) -> Result<RunOutcome, String> {
     let loaded = crate::app_config::load_settings(&args.config)?;
     let collector = crate::commands::audit::browser::BrowserCollector::from_opts(&args.browser);
     let report = build_report(
@@ -58,10 +59,12 @@ pub(crate) fn run_verify(args: &AuditAdTemplatesVerifyArgs) -> Result<(), String
         write_human(&mut out, &report)?;
     }
 
-    if report.ok {
-        Ok(())
-    } else {
+    if report.pages.iter().any(|page| page.error.is_some()) {
         Err("ad-template verification reported problems".to_string())
+    } else if report.ok {
+        Ok(RunOutcome::Success)
+    } else {
+        Ok(RunOutcome::AssertionFailed)
     }
 }
 

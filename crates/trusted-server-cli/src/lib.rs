@@ -22,7 +22,7 @@ mod prebid_bundle;
 mod run;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use run::run_from_env;
+pub use run::{RunOutcome, run_from_env};
 
 // Every `ts` subcommand's implementation lives under `commands/<name>`. The
 // `ts dev` group is available on every host target; its only subcommand,
