@@ -107,23 +107,22 @@ struct AdminEcLookupResponse {
     /// (`consent.ok = false`). Absent when the body failed to parse.
     #[serde(skip_serializing_if = "Option::is_none")]
     tombstone: Option<bool>,
-    /// The stored entry, re-serialized verbatim except for derived
+    /// The stored entry, preserved as raw JSON except for derived
     /// `created_iso` / `updated_iso` companions added next to the stored
     /// unix-seconds timestamps for readability. Absent when the body
-    /// failed to deserialize (see `entry_error` / `raw_body`).
+    /// was not valid JSON (see `entry_error` / `raw_body`).
     #[serde(skip_serializing_if = "Option::is_none")]
     entry: Option<JsonValue>,
-    /// Deserialization or validation failure detail for the entry body.
+    /// JSON parsing, schema deserialization, or validation failure detail.
     #[serde(skip_serializing_if = "Option::is_none")]
     entry_error: Option<String>,
-    /// Raw entry body (lossy UTF-8) when it could not be deserialized.
+    /// Raw entry body (lossy UTF-8) when it was not valid JSON.
     #[serde(skip_serializing_if = "Option::is_none")]
     raw_body: Option<String>,
-    /// The stored KV metadata mirror, when present and parseable.
+    /// The stored KV metadata JSON, when present and parseable.
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<JsonValue>,
-    /// Deserialization failure detail for the metadata, including its raw
-    /// value.
+    /// JSON parsing or schema deserialization failure detail for metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata_error: Option<String>,
     /// Derived auction view. Present only when the entry deserializes and
@@ -268,36 +267,49 @@ fn build_lookup_response(
         auction: None,
     };
 
-    match serde_json::from_slice::<KvEntry>(&lookup.body) {
-        Ok(entry) => {
-            payload.tombstone = Some(!entry.consent.ok);
-            match entry.validate() {
-                Ok(()) => payload.auction = Some(build_auction_view(registry, &entry)),
-                Err(message) => {
-                    payload.entry_error = Some(format!(
-                        "entry failed validation (auction reads fail closed \
-                         and attach no EIDs): {message}"
-                    ));
+    match serde_json::from_slice::<JsonValue>(&lookup.body) {
+        Ok(mut entry_json) => {
+            add_iso_timestamp_companions(&mut entry_json);
+            payload.entry = Some(entry_json);
+
+            match serde_json::from_slice::<KvEntry>(&lookup.body) {
+                Ok(entry) => {
+                    payload.tombstone = Some(!entry.consent.ok);
+                    match entry.validate() {
+                        Ok(()) => payload.auction = Some(build_auction_view(registry, &entry)),
+                        Err(message) => {
+                            payload.entry_error = Some(format!(
+                                "entry failed validation (auction reads fail closed \
+                                 and attach no EIDs): {message}"
+                            ));
+                        }
+                    }
+                }
+                Err(error) => {
+                    payload.entry_error =
+                        Some(format!("failed to deserialize entry schema: {error}"));
                 }
             }
-            payload.entry = Some(entry_json_with_iso_timestamps(&entry));
         }
         Err(error) => {
-            payload.entry_error = Some(format!("failed to deserialize entry: {error}"));
+            payload.entry_error = Some(format!("failed to parse entry JSON: {error}"));
             payload.raw_body = Some(String::from_utf8_lossy(&lookup.body).into_owned());
         }
     }
 
     match &lookup.metadata {
         None => {}
-        Some(bytes) => match serde_json::from_slice::<KvMetadata>(bytes) {
-            Ok(metadata) => {
-                payload.metadata =
-                    Some(serde_json::to_value(&metadata).expect("should serialize KvMetadata"));
+        Some(bytes) => match serde_json::from_slice::<JsonValue>(bytes) {
+            Ok(metadata_json) => {
+                payload.metadata = Some(metadata_json);
+                if let Err(error) = serde_json::from_slice::<KvMetadata>(bytes) {
+                    payload.metadata_error =
+                        Some(format!("failed to deserialize metadata schema: {error}"));
+                }
             }
             Err(error) => {
                 payload.metadata_error = Some(format!(
-                    "failed to deserialize metadata: {error} (raw: {})",
+                    "failed to parse metadata JSON: {error} (raw: {})",
                     String::from_utf8_lossy(bytes)
                 ));
             }
@@ -307,26 +319,31 @@ fn build_lookup_response(
     payload
 }
 
-/// Serializes an entry, adding derived ISO 8601 companions next to the
+/// Adds derived ISO 8601 companions next to the
 /// stored unix-seconds timestamps (`created_iso`, `consent.updated_iso`).
 ///
-/// The stored numeric values stay untouched so the echo remains faithful to
-/// what is in KV; the ISO fields exist purely for operator readability.
-fn entry_json_with_iso_timestamps(entry: &KvEntry) -> JsonValue {
-    let mut entry_json = serde_json::to_value(entry).expect("should serialize KvEntry");
-
+/// Every stored value, including pre-existing ISO companions, stays untouched.
+/// The derived fields exist purely for operator readability when absent.
+fn add_iso_timestamp_companions(entry_json: &mut JsonValue) {
+    let created = entry_json.get("created").and_then(JsonValue::as_u64);
+    let updated = entry_json
+        .get("consent")
+        .and_then(|consent| consent.get("updated"))
+        .and_then(JsonValue::as_u64);
     if let Some(object) = entry_json.as_object_mut() {
-        if let Some(iso) = iso_timestamp(entry.created) {
-            object.insert("created_iso".to_owned(), JsonValue::String(iso));
+        if let Some(iso) = created.and_then(iso_timestamp) {
+            object
+                .entry("created_iso".to_owned())
+                .or_insert(JsonValue::String(iso));
         }
         if let Some(consent) = object.get_mut("consent").and_then(JsonValue::as_object_mut)
-            && let Some(iso) = iso_timestamp(entry.consent.updated)
+            && let Some(iso) = updated.and_then(iso_timestamp)
         {
-            consent.insert("updated_iso".to_owned(), JsonValue::String(iso));
+            consent
+                .entry("updated_iso".to_owned())
+                .or_insert(JsonValue::String(iso));
         }
     }
-
-    entry_json
 }
 
 /// Formats a unix-seconds timestamp as ISO 8601 (`yyyy-MM-ddTHH:mm:ss.SSSZ`).
@@ -588,6 +605,10 @@ mod tests {
 
     fn kv_with_raw_body(ec_id: &str, body: &str) -> KvIdentityGraph {
         let metadata = serde_json::json!({ "ok": true, "country": "US", "v": 1 }).to_string();
+        kv_with_raw_body_and_metadata(ec_id, body, &metadata)
+    }
+
+    fn kv_with_raw_body_and_metadata(ec_id: &str, body: &str, metadata: &str) -> KvIdentityGraph {
         let store = InMemoryEcKv::new("test-store");
         store
             .insert(
@@ -766,6 +787,84 @@ mod tests {
     }
 
     #[test]
+    fn preserves_raw_entry_and_metadata_shapes() {
+        let ec_id = test_ec_id();
+        let body = serde_json::json!({
+            "v": 1,
+            "created": 1_741_824_000_u64,
+            "created_iso": "stored-created-iso",
+            "future_top_level": { "enabled": true },
+            "consent": {
+                "ok": true,
+                "updated": 1_741_824_000_u64,
+                "updated_iso": "stored-updated-iso",
+                "future_consent": "preserve-me"
+            },
+            "geo": { "country": "US" },
+            "pub_properties": {
+                "origin_domain": "example.com",
+                "seen_domains": {
+                    "example.com": { "first": 1000, "last": 1200, "visits": 3 }
+                }
+            },
+            "ids": {
+                "bidstream.example": { "uid": "uid-live", "synced": 1100 }
+            }
+        })
+        .to_string();
+        let metadata = serde_json::json!({
+            "ok": true,
+            "country": "US",
+            "v": 1,
+            "future_metadata": { "source": "edge" }
+        })
+        .to_string();
+        let kv = kv_with_raw_body_and_metadata(&ec_id, &body, &metadata);
+        let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
+
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+            .expect("should handle lookup");
+        let json = response_json(response);
+
+        assert_eq!(json["entry"]["future_top_level"]["enabled"], true);
+        assert_eq!(json["entry"]["consent"]["future_consent"], "preserve-me");
+        assert_eq!(json["entry"]["ids"]["bidstream.example"]["synced"], 1100);
+        assert!(
+            json["entry"]["pub_properties"]["seen_domains"].is_object(),
+            "legacy map-shaped seen_domains should remain unchanged"
+        );
+        assert_eq!(json["entry"]["created_iso"], "stored-created-iso");
+        assert_eq!(
+            json["entry"]["consent"]["updated_iso"],
+            "stored-updated-iso"
+        );
+        assert_eq!(json["metadata"]["future_metadata"]["source"], "edge");
+        assert_eq!(json["auction"]["eids"][0]["source"], "bidstream.example");
+    }
+
+    #[test]
+    fn valid_json_with_invalid_entry_schema_remains_visible() {
+        let ec_id = test_ec_id();
+        let body = serde_json::json!({ "future": "value" }).to_string();
+        let kv = kv_with_raw_body(&ec_id, &body);
+        let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
+
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+            .expect("should handle lookup");
+        let json = response_json(response);
+
+        assert_eq!(json["entry"]["future"], "value");
+        assert!(
+            json["entry_error"]
+                .as_str()
+                .expect("should have entry_error")
+                .contains("failed to deserialize entry schema")
+        );
+        assert!(json.get("raw_body").is_none());
+        assert!(json.get("auction").is_none());
+    }
+
+    #[test]
     fn reports_tombstone_entries() {
         let ec_id = test_ec_id();
         let kv = KvIdentityGraph::in_memory("test-store");
@@ -829,7 +928,7 @@ mod tests {
             json["entry_error"]
                 .as_str()
                 .expect("should have entry_error")
-                .contains("failed to deserialize"),
+                .contains("failed to parse entry JSON"),
             "should describe the parse failure"
         );
         assert_eq!(json["raw_body"], "not json at all");
