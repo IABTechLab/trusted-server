@@ -1,6 +1,7 @@
 import type { GptDiagnosticsRequestCycle } from '../../core/types';
 
 import type { GptDiagnosticsBindingManager } from './binding';
+import { unhandledCase } from './exhaustive';
 import type {
   GptDiagnosticsBindingInput,
   GptDiagnosticsStoreSlotSnapshot,
@@ -76,12 +77,44 @@ function formatMilliseconds(value: number | undefined): string | undefined {
   return `${Math.round(value)} ms`;
 }
 
+/**
+ * Label the delivery state the store already derived.
+ *
+ * The badge must not re-derive precedence from raw timestamps: the store owns
+ * that ladder, and a second copy of it can disagree — for instance by claiming
+ * a Trusted Server response on a cycle GPT reported empty.
+ */
+function deliveryLabel(cycle: GptDiagnosticsRequestCycle): string | undefined {
+  switch (cycle.delivery) {
+    case 'trusted_server_response_sent':
+      return 'TS response sent';
+    case 'trusted_server_selected':
+      return 'TS selected';
+    case 'pending':
+      return 'TS candidate (pending)';
+    case 'candidate_unconfirmed':
+      return 'TS unconfirmed';
+    case 'no_candidate':
+      return 'No TS candidate';
+    case 'unknown':
+      return 'Delivery unknown';
+    case 'not_applicable':
+    case undefined:
+      return undefined;
+    default:
+      return unhandledCase(cycle.delivery);
+  }
+}
+
 function badgeText(cycle: GptDiagnosticsRequestCycle): string {
   const firstLine: string[] = [];
   if (cycle.isEmpty === true) firstLine.push('Empty');
   else if (cycle.isEmpty === false) firstLine.push('Filled');
   else if (cycle.renderAtMs !== undefined) firstLine.push('Rendered (fill unknown)');
   else firstLine.push('Pending');
+  const delivery = deliveryLabel(cycle);
+  if (delivery) firstLine.push(delivery);
+  if (cycle.requestPath === 'competing') firstLine.push('Competing paths');
   if (cycle.size) firstLine.push(`${cycle.size[0]}×${cycle.size[1]}`);
 
   const timingLine: string[] = [];

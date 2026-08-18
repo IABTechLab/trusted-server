@@ -1870,10 +1870,10 @@ fn validate_tinybird_secret(value: &str, setting: &str) -> Result<(), Report<Tru
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugConfig {
-    /// Expose the JA4/TLS fingerprint debug endpoint at `GET /_ts/debug/ja4`.
+    /// Expose the JA4/TLS probabilistic identifier debug endpoint at `GET /_ts/debug/ja4`.
     ///
     /// When `false` (the default), the endpoint returns 404. Enable only for
-    /// intentional Fastly/browser TLS investigation — the endpoint reflects
+    /// intentional Fastly/browser TLS investigation. The endpoint reflects
     /// Fastly-observed TLS details that browser JS cannot normally read.
     #[serde(default)]
     pub ja4_endpoint_enabled: bool,
@@ -2062,6 +2062,13 @@ impl Settings {
 
         if let Some(co) = &mut self.creative_opportunities {
             co.compile_slots();
+            // Parse `gam_unit_path` templates once here (mirrors the compiled
+            // glob cache) so request-time rendering is substitution-only.
+            co.compile_unit_templates().map_err(|err| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!("Invalid creative opportunity gam_unit_path template: {err}"),
+                })
+            })?;
             // Slots flow into injected HTML/JS, provider payloads, and GPT
             // calls. Env/private config can bypass static review, so validate
             // the full runtime shape on every load path.
@@ -3914,7 +3921,7 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
-    fn test_auction_rewrite_creatives_defaults_to_true_when_omitted() {
+    fn test_auction_creative_processing_defaults_when_omitted() {
         let toml_str = crate_test_settings_str()
             + r#"
             [auction]
@@ -3926,7 +3933,11 @@ origin_host_header_overide = "www.example.com""#,
 
         assert!(
             settings.auction.rewrite_creatives,
-            "should preserve creative rewriting when the setting is omitted"
+            "creative rewriting stays enabled when the setting is omitted"
+        );
+        assert!(
+            !settings.auction.sanitize_creatives,
+            "creative sanitization is opt-in when the setting is omitted"
         );
     }
 
@@ -4991,6 +5002,13 @@ passphrase = "test-secret-key-32-bytes-minimum"
 [creative_opportunities]
 gam_network_id = "21765378893"
 auction_timeout_ms = 500
+section_root = "home"
+
+[[creative_opportunities.slot]]
+id = "atf"
+gam_unit_path = "/{network_id}/example/{section}"
+page_patterns = ["/"]
+formats = [{ width = 300, height = 250 }]
 "#;
         let settings = Settings::from_toml(toml).expect("should parse");
         let co = settings
@@ -4998,6 +5016,11 @@ auction_timeout_ms = 500
             .expect("should have creative_opportunities");
         assert_eq!(co.gam_network_id, "21765378893");
         assert_eq!(co.auction_timeout_ms, Some(500));
+        assert_eq!(
+            co.section_segment,
+            Some(0),
+            "startup finalization should materialize the dynamic-template compatibility marker"
+        );
     }
 
     #[test]
@@ -5171,7 +5194,25 @@ gam_unit_path = ""
 page_patterns = ["/"]
 formats = [{ width = 300, height = 250 }]
 "#,
-            "resolved GAM unit path must not be empty",
+            "gam_unit_path template must not be empty",
+        );
+    }
+
+    #[test]
+    fn settings_rejects_dynamic_gam_unit_path_over_byte_limit_using_configured_values() {
+        let gam_unit_path = "{network_id}".repeat(10);
+        let slot_body = format!(
+            r#"
+id = "atf"
+gam_unit_path = "{gam_unit_path}"
+page_patterns = ["/"]
+formats = [{{ width = 300, height = 250 }}]
+"#
+        );
+
+        assert_creative_opportunity_slot_config_rejected(
+            &slot_body,
+            "must render to at most 100 UTF-8 bytes",
         );
     }
 

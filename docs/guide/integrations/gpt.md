@@ -6,7 +6,7 @@
 
 ## Overview
 
-The GPT integration enables first-party delivery of Google Publisher Tags by proxying GPT's entire script cascade through the publisher's domain. This eliminates third-party script loads, improving performance and reducing exposure to ad blockers and browser privacy restrictions.
+The GPT integration delivers Google Publisher Tags via the publisher's domain by proxying GPT's script cascade in first-party context. This avoids cross-origin script loads, improving performance and reducing friction with ad blockers and Intelligent Tracking Prevention.
 
 ## What is GPT?
 

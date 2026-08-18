@@ -1,7 +1,7 @@
 //! Permutive integration for first-party data collection and audience management.
 //!
 //! This module provides transparent proxying for Permutive's API and SDK,
-//! enabling first-party data collection while maintaining privacy controls.
+//! enabling first-party data collection.
 
 use std::sync::Arc;
 
