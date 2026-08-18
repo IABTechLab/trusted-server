@@ -25,6 +25,7 @@
 ### Task 1: Merge Current Main and Preserve Both Sides' Behavior
 
 **Files:**
+
 - Modify: `crates/trusted-server-adapter-fastly/src/app.rs`
 - Modify: `crates/trusted-server-core/src/publisher.rs`
 - Auto-merge/reconcile as needed: `crates/trusted-server-adapter-fastly/src/main.rs`
@@ -81,6 +82,7 @@ Keep `MERGE_HEAD` active through Tasks 2-5. Do not create intermediate commits: 
 ### Task 2: Specify the Pending Stream Contract with Failing Tests
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/platform/http.rs`
 - Modify: `crates/trusted-server-core/src/platform/test_support.rs`
 - Test: `crates/trusted-server-adapter-fastly/src/platform.rs`
@@ -111,6 +113,7 @@ Expected: FAIL because the capability and direct wait contract are not implement
 ### Task 3: Implement Single-Pending Stream Preservation
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/platform/http.rs`
 - Modify: `crates/trusted-server-core/src/platform/test_support.rs`
 - Modify: `crates/trusted-server-adapter-fastly/src/platform.rs`
@@ -152,6 +155,7 @@ Expected: PASS.
 ### Task 4: Reconcile SSAT Snapshot Scheduling with Current Streaming
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/publisher.rs`
 - Test: `crates/trusted-server-core/src/publisher.rs`
 
@@ -217,6 +221,7 @@ Expected: PASS.
 ### Task 5: Reconcile Finalization and Cross-Phase Snapshot Reuse
 
 **Files:**
+
 - Modify: `crates/trusted-server-adapter-fastly/src/app.rs`
 - Modify: `crates/trusted-server-adapter-fastly/src/main.rs`
 - Modify: `crates/trusted-server-core/src/auction/endpoints.rs`
@@ -261,6 +266,7 @@ Expected: PASS.
 ### Task 6: Complete the Main Merge and Run Full Verification
 
 **Files:**
+
 - Verify all merged files
 
 - [ ] **Step 1: Format**
@@ -330,6 +336,7 @@ Expected: no conflicts or unstaged changes outside the intended merge. Stage res
 ### Task 7: Verify #1013 Compatibility Without Polluting PR #885
 
 **Files:**
+
 - No committed changes expected
 
 - [ ] **Step 1: Preview conflicts without changing the primary checkout**
@@ -364,6 +371,7 @@ Abort the temporary merge if still active, remove the detached worktree with `gi
 ### Task 8: Review and PR Handoff
 
 **Files:**
+
 - Review final diff only
 
 - [ ] **Step 1: Review the branch diff against main**

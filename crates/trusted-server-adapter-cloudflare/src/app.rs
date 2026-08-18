@@ -21,8 +21,9 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PublisherResponse, buffer_publisher_response_async, handle_page_bids,
-    handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
+    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherResponse,
+    buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
+    handle_tsjs_dynamic, page_bids_preflight_denied,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
@@ -125,7 +126,7 @@ fn build_per_request_services(ctx: &RequestContext) -> RuntimeServices {
 }
 
 /// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
-/// `/__ts/page-bids`, and the publisher fallback).
+/// `/_ts/page-bids`, and the publisher fallback).
 ///
 /// Mirrors the Fastly entry point: `EcContext::default()` leaves jurisdiction
 /// Unknown, which fails the auction consent gate closed even for consented
@@ -172,7 +173,13 @@ where
         let f = f.clone();
         Box::pin(async move {
             let services = build_per_request_services(&ctx);
-            let req = ctx.into_request();
+            let mut req = ctx.into_request();
+            if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+                &s.settings,
+                &mut req,
+            ) {
+                return Ok(http_error(&error));
+            }
             Ok(f(s, services, req).await.unwrap_or_else(|e| http_error(&e)))
         })
     }
@@ -360,7 +367,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
             let services = build_per_request_services(&ctx);
-            let req = ctx.into_request();
+            let mut req = ctx.into_request();
+            if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+                &state.settings,
+                &mut req,
+            ) {
+                return Ok(http_error(&error));
+            }
             let path = req.uri().path().to_owned();
             let method = req.method().clone();
             // tsjs assets are served for GET only, matching the Axum/Fastly adapters.
@@ -480,28 +493,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     .await
                 }),
             )
-            // SPA re-auction endpoint. The OPTIONS preflight for this
-            // side-effecting GET is denied so the GET handler's `X-TSJS-Page-Bids`
-            // gate stays trustworthy.
-            .route(
-                "/__ts/page-bids",
-                Method::OPTIONS,
-                make_handler(Arc::clone(&state), |_s, _services, _req| async move {
-                    Ok(page_bids_preflight_denied())
-                }),
-            )
-            .get(
-                "/__ts/page-bids",
-                make_handler(Arc::clone(&state), |s, services, req| async move {
-                    let ec_context = build_ec_context(&s.settings, &services, &req);
-                    let auction = AuctionDispatch {
-                        orchestrator: &s.orchestrator,
-                        slots: s.settings.creative_opportunity_slots(),
-                        registry: None,
-                    };
-                    handle_page_bids(&s.settings, &services, None, auction, &ec_context, req).await
-                }),
-            )
             .get(
                 "/first-party/proxy",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
@@ -526,12 +517,49 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     handle_first_party_proxy_sign(&s.settings, &services, req).await
                 }),
             )
+            // GET serves the click guard's navigation fallback: the creative
+            // iframe is an opaque origin (sandbox without `allow-same-origin`),
+            // so its JSON POST is blocked by CORS and the guard navigates here
+            // for a 302 instead.
+            .get(
+                "/first-party/proxy-rebuild",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_first_party_proxy_rebuild(&s.settings, &services, req).await
+                }),
+            )
             .post(
                 "/first-party/proxy-rebuild",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
                     handle_first_party_proxy_rebuild(&s.settings, &services, req).await
                 }),
             );
+
+        // SPA re-auction endpoint, registered on the canonical path and on the
+        // deprecated `PAGE_BIDS_LEGACY_PATH` double-underscore alias. The alias
+        // keeps tsjs bundles served before the `/_ts/page-bids` rename getting
+        // ads on SPA navigations until they age out of browser caches.
+        //
+        // The OPTIONS preflight is denied on both so the GET handler's
+        // `X-TSJS-Page-Bids` gate stays trustworthy — an alias that let the
+        // preflight fall through to a permissive origin would reopen exactly
+        // the cross-site hole the canonical path closes.
+        let page_bids = make_handler(Arc::clone(&state), |s, services, req| async move {
+            let ec_context = build_ec_context(&s.settings, &services, &req);
+            let auction = AuctionDispatch {
+                orchestrator: &s.orchestrator,
+                slots: s.settings.creative_opportunity_slots(),
+                registry: None,
+            };
+            handle_page_bids(&s.settings, &services, None, auction, &ec_context, req).await
+        });
+        let page_bids_preflight =
+            make_handler(Arc::clone(&state), |_s, _services, _req| async move {
+                Ok(page_bids_preflight_denied())
+            });
+        for path in [PAGE_BIDS_PATH, PAGE_BIDS_LEGACY_PATH] {
+            router = router.route(path, Method::GET, page_bids.clone());
+            router = router.route(path, Method::OPTIONS, page_bids_preflight.clone());
+        }
 
         let legacy_admin_deny =
             make_handler(Arc::clone(&state), |_s, _services, _req| async move {

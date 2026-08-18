@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::fmt;
 
-use edgezero_core::http::{Request as EdgeRequest, Response as EdgeResponse};
+use edgezero_core::http::{Method, Request as EdgeRequest, Response as EdgeResponse};
 use error_stack::Report;
 
 use super::PlatformError;
@@ -23,6 +23,12 @@ pub struct PlatformHttpRequest {
     /// Adapters that cannot attach this metadata to their send path should
     /// return an error rather than silently dropping transformations.
     pub image_optimizer: Option<PlatformImageOptimizerOptions>,
+    /// Whether the platform's intermediary response cache must be bypassed.
+    ///
+    /// Adapters without an intermediary outbound cache may treat this as already
+    /// satisfied. The option defaults to `false` so existing call sites preserve
+    /// their current cache behavior.
+    pub bypass_cache: bool,
     /// Whether the response body should stay streaming in the platform response.
     ///
     /// Adapters that cannot preserve streaming response bodies should return an
@@ -38,6 +44,7 @@ impl PlatformHttpRequest {
             request,
             backend_name: backend_name.into(),
             image_optimizer: None,
+            bypass_cache: false,
             stream_response: false,
         }
     }
@@ -50,6 +57,13 @@ impl PlatformHttpRequest {
     #[must_use]
     pub fn with_image_optimizer(mut self, options: PlatformImageOptimizerOptions) -> Self {
         self.image_optimizer = Some(options);
+        self
+    }
+
+    /// Bypass the platform's intermediary response cache for this request.
+    #[must_use]
+    pub fn with_cache_bypass(mut self) -> Self {
+        self.bypass_cache = true;
         self
     }
 
@@ -112,6 +126,8 @@ impl PlatformResponse {
 pub struct PlatformPendingRequest {
     inner: Box<dyn Any>,
     backend_name: Option<String>,
+    stream_response: bool,
+    request_method: Option<Method>,
 }
 
 impl PlatformPendingRequest {
@@ -124,6 +140,8 @@ impl PlatformPendingRequest {
         Self {
             inner: Box::new(inner),
             backend_name: None,
+            stream_response: false,
+            request_method: None,
         }
     }
 
@@ -140,6 +158,26 @@ impl PlatformPendingRequest {
         self.backend_name.as_deref()
     }
 
+    /// Retain response-conversion metadata for direct single-handle waits.
+    #[must_use]
+    pub fn with_response_handling(mut self, stream_response: bool, request_method: Method) -> Self {
+        self.stream_response = stream_response;
+        self.request_method = Some(request_method);
+        self
+    }
+
+    /// Whether completion must preserve the response body as a stream.
+    #[must_use]
+    pub fn stream_response(&self) -> bool {
+        self.stream_response
+    }
+
+    /// Method of the originating request, when retained by the adapter.
+    #[must_use]
+    pub fn request_method(&self) -> Option<&Method> {
+        self.request_method.as_ref()
+    }
+
     /// Recover the adapter-specific pending request type.
     ///
     /// # Errors
@@ -153,6 +191,8 @@ impl PlatformPendingRequest {
         let Self {
             inner,
             backend_name,
+            stream_response,
+            request_method,
         } = self;
 
         match inner.downcast::<T>() {
@@ -160,6 +200,8 @@ impl PlatformPendingRequest {
             Err(inner) => Err(Self {
                 inner,
                 backend_name,
+                stream_response,
+                request_method,
             }),
         }
     }
@@ -169,6 +211,8 @@ impl fmt::Debug for PlatformPendingRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PlatformPendingRequest")
             .field("backend_name", &self.backend_name)
+            .field("stream_response", &self.stream_response)
+            .field("request_method", &self.request_method)
             .finish()
     }
 }
@@ -276,6 +320,28 @@ pub trait PlatformHttpClient: Send + Sync {
         true
     }
 
+    /// Whether [`send`](Self::send) can preserve upstream response bodies as
+    /// [`Body::Stream`](edgezero_core::body::Body::Stream) when requested via
+    /// [`PlatformHttpRequest::with_stream_response`].
+    ///
+    /// Adapters that cannot preserve streaming response bodies must keep the
+    /// default `false` so callers do not request a contract the adapter will
+    /// reject or silently buffer.
+    fn supports_streaming_responses(&self) -> bool {
+        false
+    }
+
+    /// Whether a request started by [`send_async`](Self::send_async) can be
+    /// completed directly by [`wait`](Self::wait) while preserving a streamed
+    /// response body.
+    ///
+    /// Supporting adapters must override `wait` with direct single-handle
+    /// completion. A pending request marked for streaming must never be passed
+    /// to [`select`](Self::select), whose fan-out contract remains buffered.
+    fn supports_pending_streaming_responses(&self) -> bool {
+        false
+    }
+
     /// Wait for one of the in-flight requests to complete.
     ///
     /// # Errors
@@ -306,7 +372,41 @@ pub trait PlatformHttpClient: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use edgezero_core::body::Body;
+    use edgezero_core::http::request_builder;
+
     use super::*;
+
+    #[test]
+    fn platform_http_request_cache_bypass_defaults_to_false() {
+        let request = PlatformHttpRequest::new(
+            request_builder()
+                .body(Body::empty())
+                .expect("should build request"),
+            "stub-backend",
+        );
+
+        assert!(
+            !request.bypass_cache,
+            "should preserve existing cache behavior by default"
+        );
+    }
+
+    #[test]
+    fn platform_http_request_cache_bypass_builder_enables_bypass() {
+        let request = PlatformHttpRequest::new(
+            request_builder()
+                .body(Body::empty())
+                .expect("should build request"),
+            "stub-backend",
+        )
+        .with_cache_bypass();
+
+        assert!(
+            request.bypass_cache,
+            "should enable intermediary cache bypass"
+        );
+    }
 
     // ---------------------------------------------------------------------------
     // Error-correlation interim scope (before EdgeZero #213)

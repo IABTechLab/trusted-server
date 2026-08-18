@@ -174,6 +174,7 @@ pub fn dispatch_pull_sync(
             certificate_check: settings.proxy.certificate_check,
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
             between_bytes_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+            discriminator: None,
         }) {
             Ok(name) => name,
             Err(err) => {

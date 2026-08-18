@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::auction::types::OrchestratorExt;
+use crate::auction::types::{BidRenderer, OrchestratorExt};
 
 pub type OpenRtbRequest = trusted_server_openrtb::BidRequest;
 pub type OpenRtbResponse = trusted_server_openrtb::BidResponse;
@@ -80,9 +80,9 @@ pub struct Eid {
 pub struct Uid {
     /// The identifier value.
     pub id: String,
-    /// Agent type: 1 = cookie/device, 2 = person, 3 = user-provided.
+    /// `OpenRTB` agent type, including vendor-specific values such as PAIR's `571187`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub atype: Option<u8>,
+    pub atype: Option<i32>,
     /// Provider-specific extension data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ext: Option<Value>,
@@ -172,6 +172,18 @@ pub struct ImpStoredRequest {
 }
 
 #[derive(Debug, Serialize)]
+pub struct BidExt<'a> {
+    pub trusted_server: BidTrustedServerExt<'a>,
+}
+
+impl ToExt for BidExt<'_> {}
+
+#[derive(Debug, Serialize)]
+pub struct BidTrustedServerExt<'a> {
+    pub renderer: &'a BidRenderer,
+}
+
+#[derive(Debug, Serialize)]
 pub struct ResponseExt {
     pub orchestrator: OrchestratorExt,
 }
@@ -210,6 +222,8 @@ mod tests {
                 total_bids: 3,
                 time_ms: 12,
                 provider_details: vec![],
+                dropped_winner_count: 0,
+                dropped_winner_reasons: Default::default(),
             },
         }
         .to_ext();
@@ -398,6 +412,25 @@ mod tests {
         assert!(
             serialized["uids"][0].get("ext").is_none(),
             "ext should be omitted when None"
+        );
+    }
+
+    #[test]
+    fn eid_serializes_vendor_specific_atype() {
+        let eid = Eid {
+            source: "google.com".to_owned(),
+            uids: vec![Uid {
+                id: "pair-id".to_owned(),
+                atype: Some(571187),
+                ext: None,
+            }],
+        };
+
+        let serialized = serde_json::to_value(&eid).expect("should serialize");
+
+        assert_eq!(
+            serialized["uids"][0]["atype"], 571187,
+            "should preserve PAIR's vendor-specific atype"
         );
     }
 }
