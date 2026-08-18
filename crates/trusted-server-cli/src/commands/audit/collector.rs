@@ -143,14 +143,34 @@ mod tests {
             !script.contains("ad-not-configured-"),
             "should not embed other prefixes"
         );
-        // Read-only instrumentation markers (googletag/apstag wrapping + on-demand scrape).
+        // Bounded instrumentation markers (googletag/apstag wrapping + on-demand scrape).
         assert!(
             script.contains("__ts_install(\"googletag\""),
             "should install googletag hook"
         );
-        assert!(script.contains("cmd.push"), "should wrap cmd.push");
+        assert!(
+            !script.contains("googletag.cmd.push = function"),
+            "must not replace the publisher's variadic cmd.push"
+        );
         assert!(script.contains("defineSlot"), "should record defineSlot");
         assert!(script.contains("fetchBids"), "should wrap apstag.fetchBids");
+        assert!(
+            script.contains("new WeakSet()"),
+            "should track wrapped objects without publisher-visible markers"
+        );
+        assert!(
+            script.contains("Object.defineProperty(googletag, \"defineSlot\"")
+                && script.contains("enumerable: false"),
+            "wrapped methods should be non-enumerable"
+        );
+        assert!(
+            script.contains("4294967295"),
+            "sizes above Rust's u32 range must be rejected in-page"
+        );
+        assert!(
+            script.contains("slice(0, __ts_max_string_length)"),
+            "publisher-controlled strings should be capped in-page"
+        );
         assert!(
             script.contains("window.__tsCollectAdTemplateEvidence"),
             "should expose the on-demand scrape function"

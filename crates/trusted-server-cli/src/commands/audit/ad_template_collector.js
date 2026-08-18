@@ -1,4 +1,4 @@
-// Read-only ad-template evidence collector, injected before publisher scripts run.
+// Bounded ad-template evidence collector, injected before publisher scripts run.
 //
 // This body runs inside an IIFE that defines `__TS_CONFIG` (configured div
 // prefixes + APS slot IDs). It records evidence into `window.__tsAdTemplateEvidence`
@@ -21,8 +21,20 @@ const __ts_phase = () => (window.__tsScrollPhase ? "scroll" : "initial_load")
 // Hard cap per evidence list so a hostile page cannot grow the store without
 // bound; the page controls how many slots/elements/warnings it produces.
 const __ts_max_entries = 1024
+const __ts_max_string_length = 512
+const __ts_wrapped_googletags = new WeakSet()
+const __ts_wrapped_apstags = new WeakSet()
+
+function __ts_text(value) {
+  return String(value).slice(0, __ts_max_string_length)
+}
+
 function __ts_push(list, entry) {
   if (list.length < __ts_max_entries) list.push(entry)
+}
+
+function __ts_warn(code, error) {
+  __ts_push(__ts_ev.warnings, { code, message: __ts_text(error) })
 }
 
 // GPT sizes reach Rust as u32 pairs, so anything non-integral (fluid slots,
@@ -31,7 +43,7 @@ function __ts_push(list, entry) {
 // every other slot's otherwise valid evidence.
 function __ts_size_pair(width, height) {
   if (!Number.isInteger(width) || !Number.isInteger(height)) return null
-  if (width < 0 || height < 0) return null
+  if (width < 0 || height < 0 || width > 4294967295 || height > 4294967295) return null
   return [width, height]
 }
 
@@ -57,58 +69,74 @@ function __ts_normalize_sizes(sizes) {
 
 function __ts_record_define_slot(adUnitPath, sizes, divId) {
   __ts_push(__ts_ev.gpt_slots, {
-    gam_unit_path: String(adUnitPath),
-    div_id: String(divId),
+    gam_unit_path: __ts_text(adUnitPath),
+    div_id: __ts_text(divId),
     sizes: __ts_normalize_sizes(sizes),
     phase: __ts_phase(),
   })
 }
 
 function __ts_wrap_googletag(googletag) {
-  if (!googletag || googletag.__tsWrapped) return googletag
-  googletag.__tsWrapped = true
-  googletag.cmd = googletag.cmd || []
-  // Wrap cmd.push without changing callback order (pass-through to the original).
-  const originalPush = googletag.cmd.push.bind(googletag.cmd)
-  googletag.cmd.push = function (callback) {
-    return originalPush(callback)
+  if (!googletag || (typeof googletag !== "object" && typeof googletag !== "function")) {
+    return googletag
   }
+  if (__ts_wrapped_googletags.has(googletag)) return googletag
+  __ts_wrapped_googletags.add(googletag)
   // Wrap defineSlot so both direct calls and calls dispatched from the cmd queue
   // are recorded (queued callbacks call this same wrapped function).
   const originalDefineSlot = googletag.defineSlot
   if (typeof originalDefineSlot === "function") {
-    googletag.defineSlot = function (adUnitPath, sizes, divId) {
-      const slot = originalDefineSlot.apply(this, arguments)
-      try {
-        __ts_record_define_slot(adUnitPath, sizes, divId)
-      } catch (error) {
-        __ts_push(__ts_ev.warnings, { code: "define_slot_capture_failed", message: String(error) })
-      }
-      return slot
+    try {
+      Object.defineProperty(googletag, "defineSlot", {
+        configurable: true,
+        enumerable: false,
+        writable: true,
+        value: function (adUnitPath, sizes, divId) {
+          const slot = originalDefineSlot.apply(this, arguments)
+          try {
+            __ts_record_define_slot(adUnitPath, sizes, divId)
+          } catch (error) {
+            __ts_warn("define_slot_capture_failed", error)
+          }
+          return slot
+        },
+      })
+    } catch (error) {
+      __ts_warn("define_slot_wrap_failed", error)
     }
   }
   return googletag
 }
 
 function __ts_wrap_apstag(apstag) {
-  if (!apstag || apstag.__tsWrapped) return apstag
-  apstag.__tsWrapped = true
+  if (!apstag || (typeof apstag !== "object" && typeof apstag !== "function")) return apstag
+  if (__ts_wrapped_apstags.has(apstag)) return apstag
+  __ts_wrapped_apstags.add(apstag)
   const originalFetchBids = apstag.fetchBids
   if (typeof originalFetchBids === "function") {
-    apstag.fetchBids = function (config, callback) {
-      try {
-        const slots = (config && config.slots) || []
-        for (const slot of slots) {
-          __ts_push(__ts_ev.aps_calls, {
-            slot_id: String(slot.slotID || slot.slotName || ""),
-            sizes: __ts_normalize_sizes(slot.sizes),
-            phase: __ts_phase(),
-          })
-        }
-      } catch (error) {
-        __ts_push(__ts_ev.warnings, { code: "aps_capture_failed", message: String(error) })
-      }
-      return originalFetchBids.apply(this, arguments)
+    try {
+      Object.defineProperty(apstag, "fetchBids", {
+        configurable: true,
+        enumerable: false,
+        writable: true,
+        value: function (config, callback) {
+          try {
+            const slots = (config && config.slots) || []
+            for (const slot of slots) {
+              __ts_push(__ts_ev.aps_calls, {
+                slot_id: __ts_text(slot.slotID || slot.slotName || ""),
+                sizes: __ts_normalize_sizes(slot.sizes),
+                phase: __ts_phase(),
+              })
+            }
+          } catch (error) {
+            __ts_warn("aps_capture_failed", error)
+          }
+          return originalFetchBids.apply(this, arguments)
+        },
+      })
+    } catch (error) {
+      __ts_warn("aps_wrap_failed", error)
     }
   }
   return apstag
@@ -117,7 +145,11 @@ function __ts_wrap_apstag(apstag) {
 // Wrap an existing global or intercept a later assignment of it.
 function __ts_install(name, wrap) {
   if (window[name]) {
-    wrap(window[name])
+    try {
+      wrap(window[name])
+    } catch (error) {
+      __ts_warn(name + "_wrap_failed", error)
+    }
     return
   }
   let internal
@@ -127,7 +159,12 @@ function __ts_install(name, wrap) {
       return internal
     },
     set(value) {
-      internal = wrap(value)
+      internal = value
+      try {
+        internal = wrap(value)
+      } catch (error) {
+        __ts_warn(name + "_wrap_failed", error)
+      }
     },
   })
 }
@@ -140,7 +177,7 @@ window.__tsCollectAdTemplateEvidence = function () {
   try {
     const seen = new Set(__ts_ev.dom_ids.map((entry) => entry.dom_id))
     for (const element of document.querySelectorAll("[id]")) {
-      const id = element.id
+      const id = __ts_text(element.id)
       if (id.endsWith("-container")) continue
       if (__ts_prefixes.some((prefix) => id.startsWith(prefix)) && !seen.has(id)) {
         __ts_push(__ts_ev.dom_ids, { dom_id: id, phase: __ts_phase() })
@@ -177,23 +214,23 @@ window.__tsCollectAdTemplateEvidence = function () {
             }
           }
           const exists = __ts_ev.gpt_slots.some(
-            (entry) => entry.gam_unit_path === String(path) && entry.div_id === String(divId)
+            (entry) => entry.gam_unit_path === __ts_text(path) && entry.div_id === __ts_text(divId)
           )
           if (!exists) {
             __ts_push(__ts_ev.gpt_slots, {
-              gam_unit_path: String(path),
-              div_id: String(divId),
+              gam_unit_path: __ts_text(path),
+              div_id: __ts_text(divId),
               sizes,
               phase: __ts_phase(),
             })
           }
         } catch (error) {
-          __ts_push(__ts_ev.warnings, { code: "gpt_scrape_failed", message: String(error) })
+          __ts_warn("gpt_scrape_failed", error)
         }
       }
     }
   } catch (error) {
-    __ts_push(__ts_ev.warnings, { code: "collect_failed", message: String(error) })
+    __ts_warn("collect_failed", error)
   }
   return __ts_ev
 }

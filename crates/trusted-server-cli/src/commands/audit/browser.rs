@@ -36,6 +36,8 @@ const NAVIGATION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Hard cap per decoded evidence list, mirroring the collector script's
 /// `__ts_max_entries`, so a hostile page cannot inflate CLI memory.
 const MAX_EVIDENCE_ENTRIES: usize = 1024;
+/// Hard cap on the UTF-8 JSON payload before CDP transfers it back to Rust.
+const MAX_EVIDENCE_PAYLOAD_BYTES: usize = 1024 * 1024;
 /// Hard cap on browser teardown so a wedged Chrome cannot hang the audit.
 const BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default quiet window (no new resources) marking the page settled.
@@ -410,43 +412,101 @@ async fn extract_ad_evidence(
     page: &Page,
     warnings: &mut Vec<Warning>,
 ) -> Option<BrowserAdEvidence> {
-    // Trigger the on-demand DOM + getSlots scrape, then read the evidence object.
-    let value = page
-        .evaluate(
-            "(typeof window.__tsCollectAdTemplateEvidence === 'function' \
-             ? window.__tsCollectAdTemplateEvidence() \
-             : (window.__tsAdTemplateEvidence || null))",
-        )
+    // Serialize and size-check in the page so a hostile publisher-controlled
+    // evidence object cannot force an unbounded CDP response and Rust decode.
+    let envelope = page
+        .evaluate(format!(
+            r#"(() => {{
+                    const evidence = typeof window.__tsCollectAdTemplateEvidence === 'function'
+                        ? window.__tsCollectAdTemplateEvidence()
+                        : (window.__tsAdTemplateEvidence || null)
+                    if (evidence === null) return {{ kind: 'absent' }}
+                    try {{
+                        const json = JSON.stringify(evidence)
+                        const bytes = new TextEncoder().encode(json).byteLength
+                        if (bytes > {MAX_EVIDENCE_PAYLOAD_BYTES}) return {{ kind: 'too_large' }}
+                        return {{ kind: 'evidence', json }}
+                    }} catch (error) {{
+                        return {{
+                            kind: 'serialization_failed',
+                            message: String(error).slice(0, 512),
+                        }}
+                    }}
+                }})()"#
+        ))
         .await
         .ok()
-        .and_then(|result| result.into_value::<serde_json::Value>().ok());
+        .and_then(|result| result.into_value::<EvidenceEnvelope>().ok());
 
-    match value {
-        Some(serde_json::Value::Null) | None => {
+    match envelope {
+        Some(envelope) => decode_ad_evidence_envelope(envelope, warnings),
+        None => {
             warnings.push(Warning {
                 code: "ad_evidence_absent".to_string(),
                 message: "no ad-template evidence was collected from the page".to_string(),
             });
             None
         }
-        Some(value) => match serde_json::from_value::<BrowserAdEvidence>(value) {
-            Ok(mut evidence) => {
-                // Defense in depth: the injected script caps these lists, but the
-                // page owns that store, so re-cap after decode.
-                evidence.dom_ids.truncate(MAX_EVIDENCE_ENTRIES);
-                evidence.gpt_slots.truncate(MAX_EVIDENCE_ENTRIES);
-                evidence.aps_calls.truncate(MAX_EVIDENCE_ENTRIES);
-                evidence.warnings.truncate(MAX_EVIDENCE_ENTRIES);
-                Some(evidence)
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum EvidenceEnvelope {
+    Absent,
+    TooLarge,
+    Evidence { json: String },
+    SerializationFailed { message: String },
+}
+
+fn decode_ad_evidence_envelope(
+    envelope: EvidenceEnvelope,
+    warnings: &mut Vec<Warning>,
+) -> Option<BrowserAdEvidence> {
+    match envelope {
+        EvidenceEnvelope::Absent => {
+            warnings.push(Warning {
+                code: "ad_evidence_absent".to_string(),
+                message: "no ad-template evidence was collected from the page".to_string(),
+            });
+            None
+        }
+        EvidenceEnvelope::TooLarge => {
+            warnings.push(Warning {
+                code: "ad_evidence_too_large".to_string(),
+                message: format!(
+                    "ad-template evidence exceeded the {MAX_EVIDENCE_PAYLOAD_BYTES}-byte limit"
+                ),
+            });
+            None
+        }
+        EvidenceEnvelope::SerializationFailed { message } => {
+            warnings.push(Warning {
+                code: "ad_evidence_encode_failed".to_string(),
+                message: format!("failed to serialize ad-template evidence in the page: {message}"),
+            });
+            None
+        }
+        EvidenceEnvelope::Evidence { json } => {
+            match serde_json::from_str::<BrowserAdEvidence>(&json) {
+                Ok(mut evidence) => {
+                    // Defense in depth: the injected script caps these lists, but the
+                    // page owns that store, so re-cap after decode.
+                    evidence.dom_ids.truncate(MAX_EVIDENCE_ENTRIES);
+                    evidence.gpt_slots.truncate(MAX_EVIDENCE_ENTRIES);
+                    evidence.aps_calls.truncate(MAX_EVIDENCE_ENTRIES);
+                    evidence.warnings.truncate(MAX_EVIDENCE_ENTRIES);
+                    Some(evidence)
+                }
+                Err(error) => {
+                    warnings.push(Warning {
+                        code: "ad_evidence_decode_failed".to_string(),
+                        message: format!("failed to decode ad-template evidence: {error}"),
+                    });
+                    None
+                }
             }
-            Err(error) => {
-                warnings.push(Warning {
-                    code: "ad_evidence_decode_failed".to_string(),
-                    message: format!("failed to decode ad-template evidence: {error}"),
-                });
-                None
-            }
-        },
+        }
     }
 }
 
@@ -473,6 +533,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn oversized_ad_evidence_is_an_explicit_warning() {
+        let mut warnings = Vec::new();
+        let evidence = decode_ad_evidence_envelope(EvidenceEnvelope::TooLarge, &mut warnings);
+
+        assert!(evidence.is_none());
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "ad_evidence_too_large");
+    }
+
     /// A self-contained page that stubs just enough of GPT (no network) for the
     /// collector to observe a defined slot via the wrapped `defineSlot` and the
     /// `getSlots()` scrape.
@@ -483,6 +553,9 @@ mod tests {
     <div id="ad-atf-0"></div>
     <script>
       (function () {
+        // A malformed early assignment must not break the collector's setter or
+        // prevent a later valid GPT object from being installed.
+        window.googletag = { cmd: { malformed: true } }
         var slots = []
         var gt = { cmd: [] }
         gt.defineSlot = function (path, sizes, div) {
@@ -503,6 +576,8 @@ mod tests {
         gt.cmd.push = function (cb) { originalPush(cb); cb() }
         window.googletag = gt
         window.googletag.cmd.push(function () {
+          // The out-of-u32 pair must be dropped without poisoning the valid slot.
+          window.googletag.defineSlot('/123/news/oversized', [[4294967296, 250]], 'ad-atf-bad')
           window.googletag.defineSlot('/123/news/atf', [[300, 250]], 'ad-atf-0')
         })
       })()
