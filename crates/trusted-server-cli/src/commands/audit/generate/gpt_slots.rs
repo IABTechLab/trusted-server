@@ -630,10 +630,10 @@ mod tests {
 
     #[test]
     fn volatile_guid_div_id_still_normalizes_to_a_usable_prefix() {
-        // The live autoblog shape: a GUID between two copies of the slot name.
-        // This must survive - only a stem that normalizes to *nothing* is dropped.
+        // A GUID between two copies of the placement name must still yield a
+        // usable stable stem; only an entirely ephemeral id is dropped.
         let registry = vec![registry_slot(
-            "/88059007/autoblog/homepage",
+            "/123456789/publisher/homepage",
             "ad-in_content-0949b6c5726343bf8bbec2ac47b494b4-in_content-0",
             &[(300, 250)],
         )];

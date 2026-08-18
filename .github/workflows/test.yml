@@ -214,8 +214,14 @@ jobs:
         run: |
           cargo clippy --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --all-targets -- -D warnings
 
+      - name: Set up Chrome for browser fixture tests
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v1
+
       - name: cargo test
         run: ./scripts/test-cli.sh
+        env:
+          CHROME: ${{ steps.setup-chrome.outputs.chrome-path }}
 
   test-typescript:
     name: vitest

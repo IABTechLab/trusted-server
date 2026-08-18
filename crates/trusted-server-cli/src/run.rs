@@ -21,10 +21,10 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Sign in / out / status against an `EdgeZero` adapter.
-    Auth(AuthArgs),
     /// Browser-backed page and ad-template audits.
     Audit(Box<AuditArgs>),
+    /// Sign in / out / status against an `EdgeZero` adapter.
+    Auth(AuthArgs),
     /// Build the project for a target adapter.
     Build(BuildArgs),
     /// Trusted Server app-config commands.
@@ -486,6 +486,20 @@ mod tests {
     #[test]
     fn audit_rejects_non_http_url() {
         assert!(Args::try_parse_from(["ts", "audit", "ftp://www.example.com/"]).is_err());
+    }
+
+    #[test]
+    fn audit_does_not_accept_adapter_option() {
+        let error = Args::try_parse_from([
+            "ts",
+            "audit",
+            "page",
+            "https://www.example.com/",
+            "--adapter",
+            "fastly",
+        ])
+        .expect_err("should reject audit adapter option");
+        assert!(error.to_string().contains("unexpected argument"));
     }
 
     #[test]

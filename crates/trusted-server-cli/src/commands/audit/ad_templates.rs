@@ -557,7 +557,7 @@ mod tests {
             pages.insert(
                 requested.to_string(),
                 Ok(CollectedPage {
-                    final_url: url::Url::parse(final_url).expect("valid final url"),
+                    final_url: url::Url::parse(final_url).expect("should parse final URL"),
                     title: String::new(),
                     script_count: 0,
                     resource_count: 0,
@@ -659,7 +659,7 @@ mod tests {
         let config = news_config();
         let parsed: Vec<url::Url> = urls
             .iter()
-            .map(|url| url::Url::parse(url).expect("valid url"))
+            .map(|url| url::Url::parse(url).expect("should parse URL"))
             .collect();
         build_report(
             collector,
@@ -685,7 +685,7 @@ mod tests {
         assert_eq!(json["pages"][0]["slots"][0]["status"], "confirmed");
         let warnings = json["pages"][0]["warnings"]
             .as_array()
-            .expect("warnings array");
+            .expect("should have warnings array");
         assert!(
             warnings.iter().any(|w| w["code"] == "redirected"),
             "redirect should emit a `redirected` warning"
@@ -715,7 +715,7 @@ mod tests {
         assert!(
             json["pages"][0]["slots"]
                 .as_array()
-                .expect("slots array")
+                .expect("should have slots array")
                 .is_empty(),
             "off-origin evidence must not be reported as slot verification"
         );

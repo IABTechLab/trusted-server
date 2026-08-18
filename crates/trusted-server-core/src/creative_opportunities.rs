@@ -1003,7 +1003,6 @@ pub struct AdStackGateResult {
 
 impl AdStackGateResult {
     /// Returns the gates that blocked the server-side ad stack.
-    #[must_use]
     pub fn blocking_gates(&self) -> impl Iterator<Item = AdStackGateName> + '_ {
         AdStackGateName::ALL
             .into_iter()

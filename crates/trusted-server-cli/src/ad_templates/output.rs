@@ -5,14 +5,8 @@
 //! Field names and declaration order are load-bearing: `serde` serializes struct
 //! fields in declaration order, so the order here must match the spec examples.
 //!
-//! The model is consumed by the `ts audit ad-templates verify` orchestrator
-//! (Task 9), which assembles these wire types from the URL/gate context and the
-//! pure comparison result. Until that consumer lands, the types are exercised only
-//! by tests, hence the module-scoped `dead_code` allow.
-#![allow(
-    dead_code,
-    reason = "wire model assembled by the audit verifier in a later task"
-)]
+//! The model is consumed by the `ts audit ad-templates verify` orchestrator,
+//! which assembles these wire types from the URL/gate context and comparison result.
 
 use std::borrow::Cow;
 

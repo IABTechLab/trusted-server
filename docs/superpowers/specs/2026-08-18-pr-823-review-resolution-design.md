@@ -188,31 +188,31 @@ unrelated cleanup.
 
 ## Inline Review Traceability
 
-| Thread | Resolution area |
-| --- | --- |
-| `3802056460`, `3802056470` | TOML-aware splice and comment/value preservation |
-| `3802056474` | Secret-safe dry-run and stderr diagnostics |
-| `3802056481` | Omit and explain refused slots |
-| `3802056488` | UTF-8-safe div prefix calculation |
-| `3802056494` | Same-page normalized-div collisions |
-| `3802056497` | Locale landing-page patterns |
-| `3802056502` | Multi-profile empty-page accounting |
-| `3802056508` | Close every browser tab |
-| `3802056513` | Enforce JavaScript-to-Rust `u32` bounds |
+| Thread                     | Resolution area                                                    |
+| -------------------------- | ------------------------------------------------------------------ |
+| `3802056460`, `3802056470` | TOML-aware splice and comment/value preservation                   |
+| `3802056474`               | Secret-safe dry-run and stderr diagnostics                         |
+| `3802056481`               | Omit and explain refused slots                                     |
+| `3802056488`               | UTF-8-safe div prefix calculation                                  |
+| `3802056494`               | Same-page normalized-div collisions                                |
+| `3802056497`               | Locale landing-page patterns                                       |
+| `3802056502`               | Multi-profile empty-page accounting                                |
+| `3802056508`               | Close every browser tab                                            |
+| `3802056513`               | Enforce JavaScript-to-Rust `u32` bounds                            |
 | `3802056521`, `3802056529` | Total GPT hook and removal of behavior-changing `cmd.push` wrapper |
-| `3802056539` | Shared faithful browser launch configuration |
-| `3802056549`, `3802056555` | Correct settling and load-timeout handling |
-| `3802056559` | Preserve injected collector warnings |
-| `3802056564`, `3802056571` | Runtime renderability parity and accurate diagnostics |
-| `3802056580`, `3802056584` | Unconfirmable status and removal of false APS warning |
-| `3802056586` | Identical URL and bare-path normalization |
-| `3802056593` | Fictional committed examples |
-| `3802056599` | Browser fixture CI must execute or fail loudly |
-| `3802056605` | Add-only merge of formats with broad-prefix diagnostics |
-| `3802056614` | Consent parity for generic and legacy generation |
-| `3802056623` | Refusal behavior, tests, and documentation agree |
-| `3802056628` | Safe same-host HTTP-to-HTTPS redirect handling |
-| `3802056638` | Remove ungrounded EdgeZero fallback model |
+| `3802056539`               | Shared faithful browser launch configuration                       |
+| `3802056549`, `3802056555` | Correct settling and load-timeout handling                         |
+| `3802056559`               | Preserve injected collector warnings                               |
+| `3802056564`, `3802056571` | Runtime renderability parity and accurate diagnostics              |
+| `3802056580`, `3802056584` | Unconfirmable status and removal of false APS warning              |
+| `3802056586`               | Identical URL and bare-path normalization                          |
+| `3802056593`               | Fictional committed examples                                       |
+| `3802056599`               | Browser fixture CI must execute or fail loudly                     |
+| `3802056605`               | Add-only merge of formats with broad-prefix diagnostics            |
+| `3802056614`               | Consent parity for generic and legacy generation                   |
+| `3802056623`               | Refusal behavior, tests, and documentation agree                   |
+| `3802056628`               | Safe same-host HTTP-to-HTTPS redirect handling                     |
+| `3802056638`               | Remove ungrounded EdgeZero fallback model                          |
 
 ## Error Handling and Compatibility
 

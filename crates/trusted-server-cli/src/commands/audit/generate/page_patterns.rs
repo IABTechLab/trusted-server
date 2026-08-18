@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn every_emitted_pattern_compiles_as_a_runtime_glob() {
-        let patterns = patterns_for_paths(["/", "/news/story", "/car-research/x"], 0);
+        let patterns = patterns_for_paths(["/", "/news/story", "/site-news/x"], 0);
 
         for pattern in &patterns {
             trusted_server_core::creative_opportunities::validate_page_pattern(pattern)

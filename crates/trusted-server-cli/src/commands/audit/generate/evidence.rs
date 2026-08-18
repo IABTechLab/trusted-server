@@ -225,7 +225,7 @@ impl EvidenceTable {
             if units.len() != 1 {
                 continue;
             }
-            let unit = (*units.iter().next().expect("one unit path")).to_string();
+            let unit = (*units.iter().next().expect("should have one unit path")).to_string();
             let formats: Vec<(u32, u32)> = slot.formats.iter().copied().collect();
             by_shape.entry((unit, formats)).or_default().push(slot);
         }
@@ -394,16 +394,13 @@ mod tests {
 
     #[test]
     fn one_placement_under_per_render_div_ids_is_detected() {
-        // The live shape: a timestamped token means each page yields a new key
+        // A timestamped token means each page yields a new key
         // for the same placement. Same unit, same formats, never co-occurring.
         let mut table = EvidenceTable::default();
         for (path, div) in [
-            (
-                "/features/a",
-                "rh-gam-kso_26329268ce6Bj0uc8sL0_ei_overlay_1",
-            ),
-            ("/news/b", "rh-gam-kso_26329269aoYmv4RQyN3n_ei_overlay_1"),
-            ("/deals/c", "rh-gam-kso_26329270mYPDB3tz8cpB_ei_overlay_1"),
+            ("/features/a", "ex_slot_26329268ce6Bj0uc8sL0_overlay_1"),
+            ("/news/b", "ex_slot_26329269aoYmv4RQyN3n_overlay_1"),
+            ("/deals/c", "ex_slot_26329270mYPDB3tz8cpB_overlay_1"),
         ] {
             table.fold_page(
                 path,
@@ -418,7 +415,7 @@ mod tests {
         assert_eq!(groups[0].unit_path, "/99/site_Overlay");
         assert_eq!(
             groups[0].suggested_prefix.as_deref(),
-            Some("rh-gam-kso"),
+            Some("ex_slot"),
             "the suggestion should be trimmed back off the volatile token"
         );
     }

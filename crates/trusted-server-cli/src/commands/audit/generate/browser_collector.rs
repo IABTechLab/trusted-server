@@ -558,7 +558,7 @@ async fn collect_open_page(
         )),
     }
 
-    if !wait_for_page_settle(&page, settle_quiet, settle_max).await? {
+    if !wait_for_page_settle(page, settle_quiet, settle_max).await? {
         warnings.push(
             "browser audit timed out while waiting for the page to settle; results may be partial"
                 .to_string(),

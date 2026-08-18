@@ -5,13 +5,6 @@
 //! [`PageVerificationResult`] with per-slot statuses, warnings, and unmatched
 //! extra evidence, mirroring spec §5.3–§5.6.
 //!
-//! Consumed by the browser collector decode (Task 8) and the audit verifier
-//! (Task 9); exercised by tests until then, hence the module-scoped allow.
-#![allow(
-    dead_code,
-    reason = "consumed by the browser collector and audit verifier in later tasks"
-)]
-
 use serde::Deserialize;
 
 use trusted_server_core::auction::types::MediaType;
@@ -54,6 +47,10 @@ pub struct GptSlotEvidence {
 
 /// An `apstag.fetchBids` call observed on the page (spec §5.5).
 #[derive(Debug, Clone, Deserialize)]
+#[allow(
+    dead_code,
+    reason = "decoded for compatibility; APS slot IDs are server-side metadata, not a client assertion"
+)]
 pub struct ApsFetchBidsEvidence {
     /// The APS slot ID requested.
     pub slot_id: String,
@@ -68,6 +65,10 @@ pub struct ApsFetchBidsEvidence {
 /// DEFERRED in Phase 1: kept as forward scaffolding so the decoded evidence shape
 /// stays forward-compatible. Not populated by the collector or surfaced in JSON.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(
+    dead_code,
+    reason = "reserved decoded shape for the optional bids phase"
+)]
 pub struct PageBidsEvidence {
     /// The slot ID present in the page-bids response.
     pub slot_id: String,
@@ -86,6 +87,7 @@ pub struct BrowserAdEvidence {
     pub aps_calls: Vec<ApsFetchBidsEvidence>,
     /// `/__ts/page-bids` observations (deferred; default empty).
     #[serde(default)]
+    #[allow(dead_code, reason = "reserved for the optional bids phase")]
     pub page_bids: Vec<PageBidsEvidence>,
     /// Collector-level warnings (no page HTML/cookies/storage).
     #[serde(default)]

@@ -385,7 +385,7 @@ fn build_template(slot: &SlotEvidence, varying: usize) -> String {
 /// Replays `template` through the runtime renderer against every observation.
 ///
 /// This is the gate that catches a section slug the path cannot reproduce — a
-/// publisher whose `/car-research` pages request `.../carresearch`, say, where
+/// publisher whose `/site-news` pages request `.../sitenews`, say, where
 /// the derived section and the observed segment differ.
 fn verify_round_trip(
     template: &str,
@@ -509,13 +509,13 @@ mod tests {
         let table = table_for(
             "ad-header",
             &[
-                ("/", "/88059007/autoblog/homepage"),
-                ("/news/story-abc", "/88059007/autoblog/news"),
-                ("/deals/thing", "/88059007/autoblog/deals"),
+                ("/", "/123456789/publisher/homepage"),
+                ("/news/story-abc", "/123456789/publisher/news"),
+                ("/deals/thing", "/123456789/publisher/deals"),
             ],
         );
 
-        let outcome = infer_unit_templates(&table, "88059007");
+        let outcome = infer_unit_templates(&table, "123456789");
 
         assert_eq!(
             outcome.policy,
@@ -526,7 +526,7 @@ mod tests {
         );
         assert_eq!(
             only_decision(&outcome),
-            &SlotDecision::Template("/{network_id}/autoblog/{section}".to_string())
+            &SlotDecision::Template("/{network_id}/publisher/{section}".to_string())
         );
     }
 
@@ -614,7 +614,7 @@ mod tests {
 
     #[test]
     fn a_slug_the_path_cannot_reproduce_stays_literal() {
-        // `/car-research` requests `.../carresearch`: the derived section and
+        // `/site-news` requests `.../sitenews`: the derived section and
         // the observed segment differ, so the template would render the wrong
         // unit. Round-trip verification is what catches this.
         let table = table_for(
@@ -622,7 +622,7 @@ mod tests {
             &[
                 ("/", "/123/site/homepage"),
                 ("/news/story", "/123/site/news"),
-                ("/car-research/x", "/123/site/carresearch"),
+                ("/site-news/x", "/123/site/sitenews"),
             ],
         );
 

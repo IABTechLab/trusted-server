@@ -19,5 +19,6 @@ if ! rustup target list --installed | awk -v target="$HOST_TARGET" '$0 == target
 fi
 
 cargo test --package trusted-server-cli --target "$HOST_TARGET"
+export TS_AUDIT_BROWSER_TESTS=1
 cargo test --package trusted-server-cli --target "$HOST_TARGET" \
   commands::audit::browser::tests:: -- --ignored --test-threads=1

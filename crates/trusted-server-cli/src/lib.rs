@@ -1,15 +1,3 @@
-#![cfg_attr(
-    test,
-    allow(
-        clippy::print_stdout,
-        clippy::print_stderr,
-        clippy::panic,
-        clippy::dbg_macro,
-        clippy::unwrap_used,
-        reason = "CLI tests use panic-on-failure helpers"
-    )
-)]
-
 #[cfg(not(target_arch = "wasm32"))]
 mod ad_templates;
 #[cfg(not(target_arch = "wasm32"))]

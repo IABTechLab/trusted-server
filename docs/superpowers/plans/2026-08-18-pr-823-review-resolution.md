@@ -24,6 +24,7 @@
 ## Task 1: Make the runtime gate API allocation-free and reusable
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/creative_opportunities.rs`
 - Modify: `crates/trusted-server-core/src/publisher.rs`
 
@@ -82,6 +83,7 @@ git commit -m "Align ad stack gate diagnostics with runtime"
 ## Task 2: Align expected-slot projection and comparison with runtime behavior
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/ad_templates/expected.rs`
 - Modify: `crates/trusted-server-cli/src/ad_templates/compare.rs`
 - Modify: `crates/trusted-server-cli/src/ad_templates/output.rs`
@@ -159,6 +161,7 @@ git commit -m "Match ad template verification to runtime behavior"
 ## Task 3: Correct static CLI contracts and process exit semantics
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/commands/config/ad_templates.rs`
 - Modify: `crates/trusted-server-cli/src/commands/audit/mod.rs`
 - Modify: `crates/trusted-server-cli/src/run.rs`
@@ -234,6 +237,7 @@ git commit -m "Define ad template CLI assertion contracts"
 ## Task 4: Make the injected collector bounded and behavior-preserving
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/commands/audit/ad_template_collector.js`
 - Modify: `crates/trusted-server-cli/src/commands/audit/collector.rs`
 - Modify: `crates/trusted-server-cli/src/commands/audit/browser.rs`
@@ -306,6 +310,7 @@ git commit -m "Bound browser ad template evidence collection"
 ## Task 5: Unify browser launch, session reuse, and settling
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/commands/audit/collector.rs`
 - Modify: `crates/trusted-server-cli/src/commands/audit/browser.rs`
 - Modify: `crates/trusted-server-cli/src/commands/audit/ad_templates.rs`
@@ -383,6 +388,7 @@ git commit -m "Share browser sessions across ad template audits"
 ## Task 6: Preserve crawl evidence and make inference conservative
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/commands/audit/generate/evidence.rs`
 - Modify: `crates/trusted-server-cli/src/commands/audit/generate/gpt_slots.rs`
 - Modify: `crates/trusted-server-cli/src/commands/audit/generate/page_patterns.rs`
@@ -456,6 +462,7 @@ git commit -m "Preserve ad template crawl evidence"
 ## Task 7: Make slot persistence and dry-run output safe
 
 **Files:**
+
 - Modify: `Cargo.toml`
 - Modify: `Cargo.lock`
 - Modify: `crates/trusted-server-cli/Cargo.toml`
@@ -551,6 +558,7 @@ git commit -m "Preserve operator config during slot generation"
 ## Task 8: Complete documentation, test hygiene, and CI enforcement
 
 **Files:**
+
 - Modify: `docs/guide/cli.md`
 - Modify: `scripts/test-cli.sh`
 - Modify: `.github/workflows/test.yml`
@@ -603,6 +611,7 @@ git commit -m "Document and enforce ad template audit contracts"
 ## Task 9: Run full verification and repair regressions
 
 **Files:**
+
 - Modify only files implicated by a failing check.
 
 - [ ] **Step 1: Run format and CLI/browser tests**
@@ -679,6 +688,7 @@ Skip this commit when verification required no changes.
 ## Task 10: Publish and answer GitHub review threads
 
 **Files:**
+
 - No repository files unless publication reveals a conflict.
 
 - [ ] **Step 1: Push the verified branch**

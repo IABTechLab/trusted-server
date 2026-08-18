@@ -1426,8 +1426,8 @@ mod tests {
         assert_eq!(outputs.ad_slot_count, 1, "should discover one slot");
 
         // The drafted config must be valid TOML with the reconstructed slot.
-        let value =
-            toml::from_str::<toml::Value>(&outputs.draft_config_toml).expect("draft parses");
+        let value = toml::from_str::<toml::Value>(&outputs.draft_config_toml)
+            .expect("should parse draft config");
         let creative = &value["creative_opportunities"];
         assert_eq!(creative["gam_network_id"].as_str(), Some("123456789"));
         let slot = &creative["slot"][0];
@@ -1510,12 +1510,12 @@ mod tests {
         .expect("should update slots");
 
         let written = fs::read_to_string(&config_path).expect("should read config");
-        let value = toml::from_str::<toml::Value>(&written).expect("valid TOML");
+        let value = toml::from_str::<toml::Value>(&written).expect("should parse valid TOML");
         let patterns: Vec<&str> = value["creative_opportunities"]["slot"][0]["page_patterns"]
             .as_array()
-            .expect("page_patterns array")
+            .expect("should have page_patterns array")
             .iter()
-            .map(|entry| entry.as_str().expect("pattern string"))
+            .map(|entry| entry.as_str().expect("should have pattern string"))
             .collect();
         // Patterns come from the post-redirect path: had the requested `/` been
         // used, this would be `["/"]`. They now cover the whole section rather
@@ -1756,7 +1756,7 @@ mod tests {
         trusted_server_core::settings::Settings::from_toml(&written)
             .expect("generated config must load through the runtime path");
 
-        let report = String::from_utf8(err).expect("utf8 output");
+        let report = String::from_utf8(err).expect("should produce UTF-8 output");
         assert!(
             report.contains("Deploy a template-aware binary BEFORE pushing"),
             "a templated config must warn about the rollback contract, got:\n{report}"

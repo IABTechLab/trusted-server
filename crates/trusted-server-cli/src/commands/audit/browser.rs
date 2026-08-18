@@ -59,6 +59,18 @@ struct SettleConfig {
     max: Duration,
 }
 
+/// Immutable browser/session settings shared by every URL in one audit batch.
+struct BrowserSessionOptions<'a> {
+    chrome: &'a std::path::Path,
+    profile_dir: &'a std::path::Path,
+    settle: SettleConfig,
+    accept_invalid_certs: bool,
+    headful: bool,
+    assume_consent: bool,
+    proxy: Option<&'a str>,
+    profile: BrowserProfile,
+}
+
 /// A `chromiumoxide`-backed page collector launching a local Chrome/Chromium.
 #[derive(Debug, Clone)]
 pub struct BrowserCollector {
@@ -361,18 +373,17 @@ impl AuditCollector for BrowserCollector {
         let request_count = requests.len();
         let requests = requests.to_vec();
         let result = runtime.block_on(async move {
-            collect(
-                &chrome,
-                profile.path(),
-                requests,
+            let options = BrowserSessionOptions {
+                chrome: &chrome,
+                profile_dir: profile.path(),
                 settle,
                 accept_invalid_certs,
                 headful,
                 assume_consent,
-                proxy.as_deref(),
-                browser_profile,
-            )
-            .await
+                proxy: proxy.as_deref(),
+                profile: browser_profile,
+            };
+            collect(requests, &options).await
         });
         log::set_max_level(previous_level);
         match result {
@@ -384,28 +395,21 @@ impl AuditCollector for BrowserCollector {
 
 /// Drives a single page collection on the current-thread runtime.
 async fn collect(
-    chrome: &std::path::Path,
-    profile_dir: &std::path::Path,
     requests: Vec<BrowserCollectRequest>,
-    settle_config: SettleConfig,
-    accept_invalid_certs: bool,
-    headful: bool,
-    assume_consent: bool,
-    proxy: Option<&str>,
-    profile: BrowserProfile,
+    options: &BrowserSessionOptions<'_>,
 ) -> Result<Vec<Result<CollectedPage, String>>, String> {
     // chromiumoxide defaults to ignoring TLS errors. The audit sends
     // operator-supplied session cookies and treats what it reads back as
     // verification evidence, so a certificate-invalid impersonator could both
     // harvest the session and fabricate the evidence. Validate certificates
     // unless the operator explicitly opts out.
-    let (viewport, user_agent) = browser_profile(profile);
+    let (viewport, user_agent) = browser_profile(options.profile);
     let config = build_browser_config(BrowserLaunchOptions {
-        chrome,
-        profile_dir,
-        headful,
-        proxy,
-        accept_invalid_certs,
+        chrome: options.chrome,
+        profile_dir: options.profile_dir,
+        headful: options.headful,
+        proxy: options.proxy,
+        accept_invalid_certs: options.accept_invalid_certs,
         viewport,
         user_agent,
     })?;
@@ -419,7 +423,9 @@ async fn collect(
 
     let mut results = Vec::with_capacity(requests.len());
     for request in requests {
-        results.push(collect_with_browser(&browser, request, settle_config, assume_consent).await);
+        results.push(
+            collect_with_browser(&browser, request, options.settle, options.assume_consent).await,
+        );
     }
 
     // Best-effort teardown; ignore errors since we already have a result, but
@@ -612,7 +618,7 @@ async fn collect_open_page(
     }
 
     let ad_evidence = if request.collect_ad_evidence {
-        extract_ad_evidence(&page, &mut warnings).await
+        extract_ad_evidence(page, &mut warnings).await
     } else {
         None
     };
@@ -880,9 +886,16 @@ mod tests {
         AdTemplateCollectorConfig, build_ad_template_init_script,
     };
 
-    /// Whether a local Chrome/Chromium is available to run browser fixture tests.
-    fn chrome_available() -> bool {
-        find_chrome().is_ok()
+    /// Skips optional local runs, but makes the scripted/CI contract fail loudly.
+    fn browser_fixture_available() -> bool {
+        if find_chrome().is_ok() {
+            return true;
+        }
+        assert!(
+            std::env::var_os("TS_AUDIT_BROWSER_TESTS").is_none(),
+            "TS_AUDIT_BROWSER_TESTS requires Chrome/Chromium; set CHROME to its executable"
+        );
+        false
     }
 
     #[test]
@@ -964,7 +977,7 @@ mod tests {
     #[test]
     #[ignore = "requires local Chrome/Chromium; run through scripts/test-cli.sh"]
     fn collects_gpt_slot_from_local_fixture() {
-        if !chrome_available() {
+        if !browser_fixture_available() {
             // Browser fixture test requires a local Chrome/Chromium; skipping.
             return;
         }
@@ -1011,7 +1024,7 @@ mod tests {
     #[test]
     #[ignore = "requires local Chrome/Chromium; run through scripts/test-cli.sh"]
     fn scroll_pass_keeps_initial_load_phase_for_load_time_evidence() {
-        if !chrome_available() {
+        if !browser_fixture_available() {
             // Browser fixture test requires a local Chrome/Chromium; skipping.
             return;
         }
