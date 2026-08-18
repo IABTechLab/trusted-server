@@ -1,7 +1,7 @@
 # Server-Side Ad Template CLI Design
 
-**Date:** 2026-06-26  
-**Status:** Draft design  
+**Date:** 2026-06-26
+**Status:** Draft design
 **Scope:** Static and browser-backed CLI diagnostics for server-side ad templates
 
 ## 1. Goal
