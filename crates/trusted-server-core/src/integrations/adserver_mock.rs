@@ -97,36 +97,43 @@ impl IntegrationConfig for AdServerMockConfig {
 /// mediation response to restore render/accounting fields that the mock
 /// mediator endpoint does not echo back.
 ///
-/// Keyed by `(provider_name, slot_id, bidder_name)`.
-type BidIndex = HashMap<(String, String, String), Bid>;
+/// Keyed only by the server-minted opaque candidate identifier.
+type BidIndex = HashMap<String, Bid>;
+
+fn optional_selection_field_matches<T: Serialize>(
+    selection: &serde_json::Map<String, Json>,
+    field: &str,
+    expected: &Option<T>,
+) -> bool {
+    let Some(actual) = selection.get(field) else {
+        return true;
+    };
+    expected
+        .as_ref()
+        .and_then(|expected| serde_json::to_value(expected).ok())
+        .is_some_and(|expected| expected == *actual)
+}
 
 /// Builds the SSP-bid lookup index from the orchestrator-provided
 /// bidder responses on the auction context.
-fn build_bid_index(bidder_responses: &[AuctionResponse]) -> BidIndex {
+fn build_bid_index(bidder_responses: &[AuctionResponse]) -> Option<BidIndex> {
     let mut index = BidIndex::new();
     for response in bidder_responses {
         for bid in &response.bids {
-            let key = (
-                response.provider.clone(),
-                bid.slot_id.clone(),
-                bid.bidder.clone(),
-            );
-            // OpenRTB permits a seat to return multiple bids per imp. This index
-            // is last-write-wins, so a collision means an earlier bid's
-            // nurl/burl/cache_* are dropped and win/billing-URL restoration can
-            // be mis-attributed during mediation. Low severity for the mock
-            // mediator, but log it so the collision is visible.
-            if index.insert(key, bid.clone()).is_some() {
+            let Some(candidate_id) = bid.candidate_id.as_ref() else {
                 log::warn!(
-                    "adserver_mock: duplicate bid for (provider '{}', slot '{}', bidder '{}'); keeping the last — win/billing URL restoration may be mis-attributed",
-                    response.provider,
-                    bid.slot_id,
-                    bid.bidder
+                    "adserver_mock: source bid from provider '{}' lacks a candidate id",
+                    response.provider
                 );
+                return None;
+            };
+            if index.insert(candidate_id.clone(), bid.clone()).is_some() {
+                log::warn!("adserver_mock: duplicate source candidate id");
+                return None;
             }
         }
     }
-    index
+    Some(index)
 }
 
 /// Mock ad server mediator provider.
@@ -179,14 +186,26 @@ impl AdServerMockProvider {
                             );
                             return None;
                         };
+                        let Some(candidate_id) = bid.candidate_id.as_deref() else {
+                            log::warn!(
+                                "adserver_mock: omitting source bid for slot '{}' without a candidate id",
+                                bid.slot_id
+                            );
+                            return None;
+                        };
                         Some(json!({
                             "imp_id": bid.slot_id,
                             "price": price,
                             "adm": bid.creative,
                             "w": bid.width,
                             "h": bid.height,
-                            "crid": format!("{}-creative", bid.bidder),
+                            "crid": bid.creative_id,
                             "adomain": bid.adomain,
+                            "ext": {
+                                "trusted_server": {
+                                    "candidate_id": candidate_id
+                                }
+                            }
                         }))
                     })
                     .collect();
@@ -254,90 +273,115 @@ impl AdServerMockProvider {
     /// Mediation returns decoded prices for all selected bids.
     ///
     /// `bid_index` is the SSP-bid lookup built from the auction context's
-    /// bidder responses. The mock mediator does not echo render/accounting
-    /// fields back, so they are restored from the index using
-    /// `(seat, impid, bidder)` where bidder is recovered from the echoed `crid`
-    /// field (`"{bidder}-creative"` format set during request construction).
+    /// bidder responses. The mediator may select only by echoing one exact
+    /// server-minted candidate id; all render and accounting authority is
+    /// restored from the indexed source candidate.
     fn parse_mediation_response(
         &self,
         json: &Json,
         response_time_ms: u64,
         bid_index: &BidIndex,
     ) -> AuctionResponse {
-        let empty_array = vec![];
-        let seatbid = json["seatbid"].as_array().unwrap_or(&empty_array);
-
+        let Some(seatbids) = json.get("seatbid").and_then(Json::as_array) else {
+            return AuctionResponse::error("adserver_mock", response_time_ms)
+                .with_metadata("mediation_error", json!("invalid_candidate_provenance"));
+        };
         let mut all_bids = Vec::new();
-
-        for seat in seatbid {
-            let seat_name = seat["seat"].as_str().unwrap_or("unknown");
-            let empty_bids = vec![];
-            let bids = seat["bid"].as_array().unwrap_or(&empty_bids);
-
+        let mut seen = std::collections::HashSet::new();
+        let mut seen_slots = std::collections::HashSet::new();
+        for seat in seatbids {
+            let Some(seat_object) = seat.as_object() else {
+                return AuctionResponse::error("adserver_mock", response_time_ms)
+                    .with_metadata("mediation_error", json!("invalid_candidate_provenance"));
+            };
+            if !seat_object
+                .keys()
+                .all(|key| matches!(key.as_str(), "seat" | "bid"))
+            {
+                return AuctionResponse::error("adserver_mock", response_time_ms)
+                    .with_metadata("mediation_error", json!("invalid_candidate_provenance"));
+            }
+            let Some(bids) = seat_object.get("bid").and_then(Json::as_array) else {
+                return AuctionResponse::error("adserver_mock", response_time_ms)
+                    .with_metadata("mediation_error", json!("invalid_candidate_provenance"));
+            };
             for bid in bids {
-                let slot_id = bid["impid"].as_str().unwrap_or("").to_string();
-
-                // Recover bidder name from crid ("{bidder}-creative") to look up the
-                // original SSP bid and restore render/accounting fields the mediator drops.
-                let crid = bid["crid"].as_str().unwrap_or("");
-                let bidder = crid.strip_suffix("-creative").unwrap_or_else(|| {
-                    log::debug!(
-                        "adserver_mock: crid '{crid}' does not match '<bidder>-creative'; render/accounting fields may be missing"
-                    );
-                    ""
-                });
-                let key = (seat_name.to_string(), slot_id.clone(), bidder.to_string());
-                let original = bid_index.get(&key);
-                let restored_bidder =
-                    original.map_or_else(|| seat_name.to_string(), |b| b.bidder.clone());
-
-                let width = bid["w"].as_u64().unwrap_or(0) as u32;
-                let height = bid["h"].as_u64().unwrap_or(0) as u32;
-                if width == 0 || height == 0 {
-                    log::debug!(
-                        "adserver_mock: bid for slot '{slot_id}' has zero dimension ({width}×{height}), skipping"
-                    );
-                    continue;
+                let Some(selection) = bid.as_object() else {
+                    return AuctionResponse::error("adserver_mock", response_time_ms)
+                        .with_metadata("mediation_error", json!("invalid_candidate_provenance"));
+                };
+                if !selection.keys().all(|key| {
+                    matches!(
+                        key.as_str(),
+                        "id" | "impid"
+                            | "price"
+                            | "ext"
+                            | "adm"
+                            | "w"
+                            | "h"
+                            | "crid"
+                            | "adomain"
+                            | "nurl"
+                            | "burl"
+                    )
+                }) {
+                    return AuctionResponse::error("adserver_mock", response_time_ms)
+                        .with_metadata("mediation_error", json!("invalid_candidate_provenance"));
+                }
+                let trusted = selection
+                    .get("ext")
+                    .and_then(Json::as_object)
+                    .filter(|ext| ext.len() == 1)
+                    .and_then(|ext| ext.get("trusted_server"))
+                    .and_then(Json::as_object);
+                let candidate_id = trusted
+                    .filter(|trusted| trusted.len() == 1)
+                    .and_then(|trusted| trusted.get("candidate_id"))
+                    .and_then(Json::as_str);
+                let Some(candidate_id) = candidate_id else {
+                    return AuctionResponse::error("adserver_mock", response_time_ms)
+                        .with_metadata("mediation_error", json!("invalid_candidate_provenance"));
+                };
+                let Some(original) = bid_index.get(candidate_id) else {
+                    return AuctionResponse::error("adserver_mock", response_time_ms)
+                        .with_metadata("mediation_error", json!("invalid_candidate_provenance"));
+                };
+                let seat_matches = seat_object
+                    .get("seat")
+                    .is_none_or(|seat| seat.as_str() == original.candidate_provider.as_deref());
+                let currency_matches = json
+                    .get("cur")
+                    .is_none_or(|currency| currency.as_str() == Some(original.currency.as_str()));
+                let authority_matches = selection
+                    .get("w")
+                    .is_none_or(|width| width.as_u64() == Some(u64::from(original.width)))
+                    && selection
+                        .get("h")
+                        .is_none_or(|height| height.as_u64() == Some(u64::from(original.height)))
+                    && optional_selection_field_matches(selection, "adm", &original.creative)
+                    && optional_selection_field_matches(selection, "crid", &original.creative_id)
+                    && optional_selection_field_matches(selection, "adomain", &original.adomain)
+                    && optional_selection_field_matches(selection, "nurl", &original.nurl)
+                    && optional_selection_field_matches(selection, "burl", &original.burl);
+                if !seen.insert(candidate_id)
+                    || !seen_slots.insert(original.slot_id.as_str())
+                    || selection.get("impid").and_then(Json::as_str)
+                        != Some(original.slot_id.as_str())
+                    || selection
+                        .get("price")
+                        .and_then(Json::as_f64)
+                        .is_none_or(|price| !price.is_finite() || price < 0.0)
+                    || !seat_matches
+                    || !currency_matches
+                    || !authority_matches
+                {
+                    return AuctionResponse::error("adserver_mock", response_time_ms)
+                        .with_metadata("mediation_error", json!("invalid_candidate_provenance"));
                 }
 
-                all_bids.push(Bid {
-                    slot_id,
-                    price: bid["price"].as_f64(),
-                    currency: "USD".to_string(),
-                    creative: if original.is_some_and(|bid| bid.renderer.is_some()) {
-                        None
-                    } else {
-                        bid["adm"].as_str().map(String::from)
-                    },
-                    width,
-                    height,
-                    bidder: restored_bidder,
-                    adomain: bid["adomain"].as_array().map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    }),
-                    nurl: original.and_then(|b| b.nurl.clone()),
-                    burl: original.and_then(|b| b.burl.clone()),
-                    // The mediation response is itself `OpenRTB`, so the mediated
-                    // bid's own `id` is this bid's identifier. Fall back to the
-                    // original SSP bid's id when the mediator omits one. Without
-                    // either, a mediated bid whose only `hb_adid` source is the bid
-                    // id would lose it and never render — including APS bids, which
-                    // carry no `ad_id` or `cache_id` for the restore to recover.
-                    bid_id: bid["id"]
-                        .as_str()
-                        .filter(|id| !id.is_empty())
-                        .map(String::from)
-                        .or_else(|| original.and_then(|bid| bid.bid_id.clone())),
-                    ad_id: original.and_then(|bid| bid.ad_id.clone()),
-                    creative_id: original.and_then(|bid| bid.creative_id.clone()),
-                    renderer: original.and_then(|bid| bid.renderer.clone()),
-                    cache_id: original.and_then(|b| b.cache_id.clone()),
-                    cache_host: original.and_then(|b| b.cache_host.clone()),
-                    cache_path: original.and_then(|b| b.cache_path.clone()),
-                    metadata: HashMap::new(),
-                });
+                let mut resolved = original.clone();
+                resolved.price = selection.get("price").and_then(Json::as_f64);
+                all_bids.push(resolved);
             }
         }
 
@@ -517,7 +561,10 @@ impl AuctionProvider for AdServerMockProvider {
         // Rebuild the SSP-bid lookup from the orchestrator-provided bidder
         // responses so nurl/burl/ad_id survive mediation. Request-scoped data
         // travels on the context instead of provider-instance state.
-        let bid_index = build_bid_index(context.provider_responses.unwrap_or(&[]));
+        let Some(bid_index) = build_bid_index(context.provider_responses.unwrap_or(&[])) else {
+            return Ok(AuctionResponse::error("adserver_mock", response_time_ms)
+                .with_metadata("mediation_error", json!("invalid_candidate_provenance")));
+        };
         self.parse_response_inner(response, response_time_ms, &bid_index)
             .await
     }
@@ -631,6 +678,12 @@ mod tests {
     fn aps_bid(bid_id: &str, price: f64) -> Bid {
         Bid {
             slot_id: "header-banner".to_string(),
+            candidate_id: Some(format!(
+                "{:012x}",
+                bid_id.bytes().map(u64::from).sum::<u64>()
+            )),
+            candidate_provider: Some("aps".to_string()),
+            renderer_reservation_id: None,
             price: Some(price),
             currency: "USD".to_string(),
             creative: None,
@@ -643,7 +696,7 @@ mod tests {
             bid_id: Some(bid_id.to_string()),
             ad_id: None,
             creative_id: Some(format!("creative-{bid_id}")),
-            renderer: Some(BidRenderer::Aps(ApsRendererV1 {
+            renderer: Some(BidRenderSourceV1::Aps(ApsRendererV1 {
                 version: 1,
                 account_id: "example-account".to_string(),
                 bid_id: bid_id.to_string(),
@@ -680,6 +733,9 @@ mod tests {
                 status: BidStatus::Success,
                 bids: vec![Bid {
                     slot_id: "header-banner".to_string(),
+                    candidate_id: Some("AAAAAAAAAAAA".to_string()),
+                    candidate_provider: Some("aps".to_string()),
+                    renderer_reservation_id: None,
                     price: Some(3.00),
                     currency: "USD".to_string(),
                     creative: Some("<div>APS Ad</div>".to_string()),
@@ -706,6 +762,9 @@ mod tests {
                 status: BidStatus::Success,
                 bids: vec![Bid {
                     slot_id: "header-banner".to_string(),
+                    candidate_id: Some("BBBBBBBBBBBB".to_string()),
+                    candidate_provider: Some("test-bidder".to_string()),
+                    renderer_reservation_id: None,
                     price: Some(3.50),
                     currency: "USD".to_string(),
                     creative: Some("<div>Test Ad</div>".to_string()),
@@ -750,28 +809,38 @@ mod tests {
             2
         );
         assert_eq!(mediation_req["ext"]["config"]["price_floor"], 1.00);
+        assert_eq!(
+            mediation_req["ext"]["bidder_responses"][0]["bids"][0]["ext"]["trusted_server"]["candidate_id"],
+            "AAAAAAAAAAAA"
+        );
+        assert_eq!(
+            mediation_req["ext"]["bidder_responses"][1]["bids"][0]["ext"]["trusted_server"]["candidate_id"],
+            "BBBBBBBBBBBB"
+        );
     }
 
     #[test]
     fn test_parse_mediation_response() {
         let config = AdServerMockConfig::default();
         let provider = AdServerMockProvider::new(config);
+        let source = aps_bid("selected", 1.0);
+        let candidate_id = source
+            .candidate_id
+            .clone()
+            .expect("source should have candidate id");
+        let bid_index = HashMap::from([(candidate_id.clone(), source)]);
 
         let mediation_response = json!({
             "id": "test-auction-123",
             "seatbid": [
                 {
-                    "seat": "test-bidder",
+                    "seat": "aps",
                     "bid": [
                         {
                             "id": "bid-001",
                             "impid": "header-banner",
                             "price": 3.50,
-                            "adm": "<div>Test Ad</div>",
-                            "w": 728,
-                            "h": 90,
-                            "crid": "test-creative",
-                            "adomain": ["test.com"]
+                            "ext": {"trusted_server": {"candidate_id": candidate_id}}
                         }
                     ]
                 }
@@ -780,7 +849,7 @@ mod tests {
         });
 
         let auction_response =
-            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new());
+            provider.parse_mediation_response(&mediation_response, 200, &bid_index);
 
         assert_eq!(auction_response.provider, "adserver_mock");
         assert_eq!(auction_response.status, BidStatus::Success);
@@ -790,7 +859,7 @@ mod tests {
         let bid = &auction_response.bids[0];
         assert_eq!(bid.slot_id, "header-banner");
         assert_eq!(bid.price, Some(3.50)); // Mediation returns decoded price
-        assert_eq!(bid.bidder, "test-bidder");
+        assert_eq!(bid.bidder, "aps");
         assert_eq!(bid.width, 728);
         assert_eq!(bid.height, 90);
     }
@@ -798,6 +867,7 @@ mod tests {
     #[test]
     fn parse_mediation_response_restores_original_bid_render_fields() {
         let provider = AdServerMockProvider::new(AdServerMockConfig::default());
+        let candidate_id = "AAAAAAAAAAAA";
         let mediation_response = json!({
             "id": "test-auction-123",
             "seatbid": [
@@ -808,11 +878,7 @@ mod tests {
                             "id": "mediated-bid-001",
                             "impid": "header-banner",
                             "price": 0.20,
-                            "adm": "<div>Mediated Ad</div>",
-                            "w": 728,
-                            "h": 90,
-                            "crid": "mocktioneer-creative",
-                            "adomain": ["example.com"]
+                            "ext": {"trusted_server": {"candidate_id": candidate_id}}
                         }
                     ]
                 }
@@ -821,13 +887,12 @@ mod tests {
         });
         let mut bid_index = BidIndex::new();
         bid_index.insert(
-            (
-                "prebid".to_string(),
-                "header-banner".to_string(),
-                "mocktioneer".to_string(),
-            ),
+            candidate_id.to_string(),
             Bid {
                 slot_id: "header-banner".to_string(),
+                candidate_id: Some(candidate_id.to_string()),
+                candidate_provider: Some("prebid".to_string()),
+                renderer_reservation_id: None,
                 price: Some(0.20),
                 currency: "USD".to_string(),
                 creative: Some("<div>Original Ad</div>".to_string()),
@@ -840,7 +905,7 @@ mod tests {
                 bid_id: Some("source-bid-id".to_string()),
                 ad_id: Some("bid-impression-id".to_string()),
                 creative_id: Some("source-creative-id".to_string()),
-                renderer: Some(BidRenderer::Aps(ApsRendererV1 {
+                renderer: Some(BidRenderSourceV1::Aps(ApsRendererV1 {
                     version: 1,
                     account_id: "example-account".to_string(),
                     bid_id: "source-bid-id".to_string(),
@@ -878,11 +943,7 @@ mod tests {
             Some("https://ssp.example/bill"),
             "should restore burl"
         );
-        assert_eq!(
-            bid.bid_id.as_deref(),
-            Some("mediated-bid-001"),
-            "should carry the mediated OpenRTB bid id so hb_adid always has a source"
-        );
+        assert_eq!(bid.bid_id.as_deref(), Some("source-bid-id"));
         assert_eq!(
             bid.ad_id.as_deref(),
             Some("bid-impression-id"),
@@ -908,104 +969,103 @@ mod tests {
     }
 
     #[test]
-    fn parse_mediation_response_falls_back_to_original_bid_id() {
-        // A mediator that omits the per-bid `id` must not strand a pass-through
-        // bid whose only hb_adid source is its OpenRTB bid id.
+    fn mediation_response_rejects_every_source_authority_substitution() {
         let provider = AdServerMockProvider::new(AdServerMockConfig::default());
-        let mediation_response = json!({
-            "id": "test-auction-123",
-            "seatbid": [{
-                "seat": "prebid",
-                "bid": [{
-                    "impid": "header-banner",
-                    "price": 0.20,
-                    "adm": "<div>Mediated Ad</div>",
-                    "w": 728,
-                    "h": 90,
-                    "crid": "example-bidder-creative"
-                }]
-            }],
-            "cur": "USD"
-        });
-        let mut bid_index = BidIndex::new();
-        bid_index.insert(
-            (
-                "prebid".to_string(),
-                "header-banner".to_string(),
-                "example-bidder".to_string(),
-            ),
-            Bid {
-                slot_id: "header-banner".to_string(),
-                price: Some(0.20),
-                currency: "USD".to_string(),
-                creative: Some("<div>Original Ad</div>".to_string()),
-                adomain: None,
-                bidder: "example-bidder".to_string(),
-                width: 728,
-                height: 90,
-                nurl: None,
-                burl: None,
-                bid_id: Some("019f7e2a-b45b-70b0-a2d1-b651c430700b".to_string()),
-                ad_id: None,
-                creative_id: None,
-                renderer: None,
-                cache_id: None,
-                cache_host: None,
-                cache_path: None,
-                metadata: HashMap::new(),
-            },
-        );
+        let candidate_id = "AAAAAAAAAAAA";
+        let mut source = aps_bid("source-bid", 1.0);
+        source.candidate_id = Some(candidate_id.to_string());
+        source.renderer = None;
+        source.creative = Some("<div>source creative</div>".to_string());
+        source.nurl = Some("https://ssp.example/win".to_string());
+        source.burl = Some("https://ssp.example/bill".to_string());
+        let bid_index = BidIndex::from([(candidate_id.to_string(), source)]);
 
-        let auction_response =
-            provider.parse_mediation_response(&mediation_response, 42, &bid_index);
+        for substitution in [
+            "seat", "w", "h", "crid", "adomain", "nurl", "burl", "adm", "native", "renderer",
+        ] {
+            let mut response = json!({
+                "id": "test-auction-123",
+                "seatbid": [{
+                    "seat": "aps",
+                    "bid": [{
+                        "id": "selection-1",
+                        "impid": "header-banner",
+                        "price": 2.0,
+                        "ext": {"trusted_server": {"candidate_id": candidate_id}}
+                    }]
+                }],
+                "cur": "USD"
+            });
+            match substitution {
+                "seat" => response["seatbid"][0]["seat"] = json!("substituted-provider"),
+                "w" => response["seatbid"][0]["bid"][0]["w"] = json!(1),
+                "h" => response["seatbid"][0]["bid"][0]["h"] = json!(1),
+                "crid" => response["seatbid"][0]["bid"][0]["crid"] = json!("other"),
+                "adomain" => {
+                    response["seatbid"][0]["bid"][0]["adomain"] = json!(["evil.example"]);
+                }
+                "nurl" => {
+                    response["seatbid"][0]["bid"][0]["nurl"] = json!("https://evil.example/win");
+                }
+                "burl" => {
+                    response["seatbid"][0]["bid"][0]["burl"] = json!("https://evil.example/bill");
+                }
+                "adm" => {
+                    response["seatbid"][0]["bid"][0]["adm"] =
+                        json!("<script>substituted()</script>");
+                }
+                "native" => {
+                    response["seatbid"][0]["bid"][0]["native"] = json!({"ver": "1.2"});
+                }
+                "renderer" => {
+                    response["seatbid"][0]["bid"][0]["renderer"] =
+                        json!({"url": "https://evil.example/render.js"});
+                }
+                _ => unreachable!("closed substitution corpus"),
+            }
 
-        assert_eq!(
-            auction_response.bids[0].bid_id.as_deref(),
-            Some("019f7e2a-b45b-70b0-a2d1-b651c430700b"),
-            "should restore the original SSP bid id when the mediator omits one"
-        );
+            let parsed = provider.parse_mediation_response(&response, 1, &bid_index);
+            assert_eq!(
+                parsed.status,
+                BidStatus::Error,
+                "{substitution} authority must not survive mediation"
+            );
+            assert!(parsed.bids.is_empty());
+        }
     }
 
     #[test]
-    fn reduced_aps_bid_avoids_mediation_index_renderer_collision() {
+    fn candidate_index_preserves_multiple_same_provider_slot_bids() {
         let provider = AdServerMockProvider::new(AdServerMockConfig::default());
-
-        // Document why APS must reduce before mediation: the mediator index is
-        // intentionally last-write-wins for identical provider/slot/bidder keys.
-        let unreduced = AuctionResponse::success(
+        let response = AuctionResponse::success(
             "aps",
-            vec![aps_bid("selected", 2.0), aps_bid("losing-last", 1.0)],
+            vec![aps_bid("selected", 2.0), aps_bid("losing", 1.0)],
             1,
         );
-        let collision_index = build_bid_index(&[unreduced]);
-        let key = (
-            "aps".to_string(),
-            "header-banner".to_string(),
-            "aps".to_string(),
-        );
-        assert_eq!(
-            collision_index
-                .get(&key)
-                .and_then(|bid| bid.bid_id.as_deref()),
-            Some("losing-last"),
-            "an unreduced response would restore the last candidate's renderer"
-        );
-
-        let reduced = AuctionResponse::success("aps", vec![aps_bid("selected", 2.0)], 1);
+        let index = build_bid_index(std::slice::from_ref(&response))
+            .expect("unique candidates should build an exact index");
+        assert_eq!(index.len(), 2);
+        let selected_candidate_id = response.bids[0]
+            .candidate_id
+            .clone()
+            .expect("selected bid should have candidate id");
         let mediation_request = provider
             .build_mediation_request(
                 &create_test_auction_request(),
-                std::slice::from_ref(&reduced),
+                std::slice::from_ref(&response),
             )
-            .expect("should build mediation request from reduced APS response");
+            .expect("should build mediation request with candidate provenance");
         assert_eq!(
             mediation_request["ext"]["bidder_responses"][0]["bids"]
                 .as_array()
                 .map(Vec::len),
-            Some(1)
+            Some(2)
+        );
+        assert_eq!(
+            mediation_request["ext"]["bidder_responses"][0]["bids"][0]["ext"]["trusted_server"]["candidate_id"],
+            selected_candidate_id
         );
 
-        let reduced_index = build_bid_index(&[reduced]);
         let mediated = provider.parse_mediation_response(
             &json!({
                 "seatbid": [{
@@ -1013,14 +1073,12 @@ mod tests {
                     "bid": [{
                         "impid": "header-banner",
                         "price": 2.0,
-                        "w": 728,
-                        "h": 90,
-                        "crid": "aps-creative"
+                        "ext": {"trusted_server": {"candidate_id": selected_candidate_id}}
                     }]
                 }]
             }),
             2,
-            &reduced_index,
+            &index,
         );
         let winner = mediated
             .bids
@@ -1056,6 +1114,19 @@ mod tests {
 
         assert_eq!(auction_response.status, BidStatus::NoBid);
         assert_eq!(auction_response.bids.len(), 0);
+    }
+
+    #[test]
+    fn missing_seatbid_is_mediation_failure_not_no_bid() {
+        let provider = AdServerMockProvider::new(AdServerMockConfig::default());
+
+        let response = provider.parse_mediation_response(&json!({}), 100, &BidIndex::new());
+
+        assert_eq!(response.status, BidStatus::Error);
+        assert_eq!(
+            response.metadata["mediation_error"],
+            "invalid_candidate_provenance"
+        );
     }
 
     #[test]
@@ -1096,6 +1167,9 @@ mod tests {
             status: BidStatus::Success,
             bids: vec![Bid {
                 slot_id: "slot-1".to_string(),
+                candidate_id: Some("CCCCCCCCCCCC".to_string()),
+                candidate_provider: Some("aps".to_string()),
+                renderer_reservation_id: None,
                 price: Some(1.75),
                 currency: "USD".to_string(),
                 creative: None,
@@ -1130,6 +1204,7 @@ mod tests {
 
         let bid = &bidder_resp["bids"][0];
         assert_eq!(bid["imp_id"], "slot-1");
+        assert_eq!(bid["ext"]["trusted_server"]["candidate_id"], "CCCCCCCCCCCC");
 
         assert_eq!(
             bid["price"].as_f64(),
@@ -1210,8 +1285,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_mediation_response_with_missing_prices() {
-        // A malformed mediator response can still omit a selected bid price.
+    fn malformed_mediator_selection_fails_closed() {
         let config = AdServerMockConfig::default();
         let provider = AdServerMockProvider::new(config);
 
@@ -1246,20 +1320,11 @@ mod tests {
         let auction_response =
             provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new());
 
-        assert_eq!(auction_response.status, BidStatus::Success);
-        assert_eq!(auction_response.bids.len(), 2);
-
-        // First bid should have decoded price
-        let bid1 = &auction_response.bids[0];
-        assert_eq!(bid1.slot_id, "header-banner");
-        assert_eq!(bid1.price, Some(3.50));
-
-        // Second bid should have None price (failed decode)
-        let bid2 = &auction_response.bids[1];
-        assert_eq!(bid2.slot_id, "sidebar");
+        assert_eq!(auction_response.status, BidStatus::Error);
+        assert!(auction_response.bids.is_empty());
         assert_eq!(
-            bid2.price, None,
-            "Bid without price field should have None price"
+            auction_response.metadata["mediation_error"],
+            "invalid_candidate_provenance"
         );
     }
 

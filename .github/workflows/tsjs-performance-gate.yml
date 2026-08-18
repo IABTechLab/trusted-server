@@ -1,0 +1,127 @@
+name: "TSJS Performance Gate"
+run-name: >-
+  TSJS Performance Gate / ${{ inputs.evidence_id || format('tsjs-pr-{0}', github.run_id) }} / ${{ inputs.mode || 'pull-request' }}
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/tsjs-performance-gate.yml"
+      - ".tool-versions"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/trusted-server-core/**"
+      - "crates/trusted-server-core/src/auction/**"
+      - "crates/trusted-server-core/src/html_processor.rs"
+      - "crates/trusted-server-core/src/publisher.rs"
+      - "crates/trusted-server-core/src/tsjs.rs"
+      - "crates/trusted-server-integration-tests/Cargo.toml"
+      - "crates/trusted-server-integration-tests/browser/**"
+      - "crates/trusted-server-integration-tests/src/bin/generate-tsjs-fixture.rs"
+      - "crates/trusted-server-js/**"
+      - "scripts/ci/read-toolchains.sh"
+      - "scripts/ci/tsjs-performance.sh"
+      - "scripts/validate-tsjs-performance-evidence.mjs"
+  workflow_dispatch:
+    inputs:
+      evidence_id:
+        description: Unique identifier bound to the uploaded evidence
+        required: true
+        type: string
+      mode:
+        description: Cutover side measured by this run
+        required: true
+        type: choice
+        options:
+          - preswitch
+          - postswitch
+  workflow_call:
+    inputs:
+      evidence_id:
+        description: Unique identifier bound to the uploaded evidence
+        required: true
+        type: string
+      mode:
+        description: Cutover side measured by this run (preswitch or postswitch)
+        required: true
+        type: string
+
+env:
+  TSJS_PERF_MACHINE_CLASS: github-hosted:ubuntu-24.04
+  TSJS_PERF_RUNNER_IMAGE: ubuntu-24.04
+  TSJS_PERF_WORKFLOW_NAME: TSJS Performance Gate
+  TSJS_PERF_WORKFLOW_FILE: .github/workflows/tsjs-performance-gate.yml
+  TSJS_PERF_HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  measure:
+    name: measure ${{ inputs.mode || 'pull-request' }} (${{ inputs.evidence_id || format('tsjs-pr-{0}', github.run_id) }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      TSJS_EVIDENCE_ID: ${{ inputs.evidence_id || format('tsjs-pr-{0}', github.run_id) }}
+      TSJS_PERF_MODE: ${{ inputs.mode || 'pull-request' }}
+      TSJS_PERF_ARTIFACT_NAME: tsjs-performance-${{ inputs.evidence_id || format('tsjs-pr-{0}', github.run_id) }}
+      TSJS_PERF_OUTPUT: crates/trusted-server-integration-tests/browser/test-results/tsjs-performance-${{ inputs.mode || 'pull-request' }}.json
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate immutable measurement inputs
+        shell: bash
+        run: bash scripts/ci/tsjs-performance.sh validate-inputs
+
+      - name: Read repository toolchain pins
+        id: toolchains
+        shell: bash
+        run: bash scripts/ci/read-toolchains.sh
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.toolchains.outputs.node }}
+          cache: npm
+          cache-dependency-path: |
+            crates/trusted-server-js/lib/package-lock.json
+            crates/trusted-server-integration-tests/browser/package-lock.json
+
+      - name: Set up pinned Rust for the generated controller fixture
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.toolchains.outputs.rust }}
+          cache-shared-key: cargo-${{ runner.os }}-tsjs-performance
+
+      - name: Verify installed toolchain pins
+        shell: bash
+        run: bash scripts/ci/tsjs-performance.sh verify-toolchains
+
+      - name: Build the real TSJS artifacts once
+        run: bash scripts/ci/tsjs-performance.sh build-candidate
+
+      - name: Build the exact current main artifacts
+        shell: bash
+        run: bash scripts/ci/tsjs-performance.sh build-main
+
+      - name: Install the lockfile-pinned Chromium setup
+        run: bash scripts/ci/tsjs-performance.sh install-browser
+
+      - name: Run the complete TSJS performance sample exactly once
+        env:
+          CI: "true"
+        run: bash scripts/ci/tsjs-performance.sh run-sample
+
+      - name: Validate the generated evidence before upload
+        if: always()
+        run: bash scripts/ci/tsjs-performance.sh validate-evidence
+
+      - name: Upload immutable TSJS performance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TSJS_PERF_ARTIFACT_NAME }}
+          path: ${{ env.TSJS_PERF_OUTPUT }}
+          if-no-files-found: error
+          retention-days: 30

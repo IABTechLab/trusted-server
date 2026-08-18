@@ -1,5 +1,5 @@
 use std::any::{Any, TypeId};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -698,6 +698,7 @@ struct IntegrationRegistryInner {
     patch_router: Router<RouteValue>,
     head_router: Router<RouteValue>,
     options_router: Router<RouteValue>,
+    reserved_proxies: Vec<(&'static str, Arc<dyn IntegrationProxy>)>,
 
     // Metadata for introspection
     routes: Vec<(IntegrationEndpoint, &'static str)>,
@@ -709,6 +710,7 @@ struct IntegrationRegistryInner {
     html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
     head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    tsjs_static_transport: TsjsStaticTransportV1,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -721,6 +723,7 @@ impl Default for IntegrationRegistryInner {
             patch_router: Router::new(),
             head_router: Router::new(),
             options_router: Router::new(),
+            reserved_proxies: Vec::new(),
             routes: Vec::new(),
             enabled_integration_ids: Vec::new(),
             deferred_js_ids: Vec::new(),
@@ -730,7 +733,78 @@ impl Default for IntegrationRegistryInner {
             html_post_processors: Vec::new(),
             head_injectors: Vec::new(),
             request_filters: Vec::new(),
+            tsjs_static_transport: TsjsStaticTransportV1::default(),
         }
+    }
+}
+
+#[derive(Default)]
+struct TsjsStaticTransportV1 {
+    artifacts_by_hash: HashMap<String, crate::tsjs::TsjsStaticArtifactV1>,
+    takeover_hash_by_selection: HashMap<TsjsCatalogSelectionV1, String>,
+    first_display_hash_by_mask: HashMap<u16, String>,
+    first_display_mask_by_hash: HashMap<String, u16>,
+}
+
+impl TsjsStaticTransportV1 {
+    fn new(
+        inner: &IntegrationRegistryInner,
+        creative_boot: crate::tsjs::CreativeBootConfigV1,
+    ) -> Self {
+        let mut transport = Self::default();
+        let creative_artifact = crate::tsjs::creative_tsjs_static_artifact_v1().clone();
+        transport
+            .artifacts_by_hash
+            .insert(creative_artifact.hash().to_owned(), creative_artifact);
+
+        for render_trace_overlay in [false, true] {
+            for selection in tsjs_static_transport_selections(inner, render_trace_overlay) {
+                let normalized_selection = normalize_tsjs_transport_selection(inner, selection);
+                let takeover_ids = tsjs_selected_catalog_metadata(inner, normalized_selection)
+                    .into_iter()
+                    .filter(|metadata| {
+                        metadata.phase == Some(trusted_server_js::TsjsModulePhase::Takeover)
+                    })
+                    .map(|metadata| metadata.id)
+                    .collect::<Vec<_>>();
+                let artifact = if takeover_ids.as_slice() == crate::tsjs::creative_tsjs_module_ids()
+                {
+                    crate::tsjs::creative_tsjs_static_artifact_v1().clone()
+                } else {
+                    crate::tsjs::TsjsStaticArtifactV1::new(&takeover_ids)
+                };
+                let hash = artifact.hash().to_owned();
+                transport
+                    .artifacts_by_hash
+                    .entry(hash.clone())
+                    .or_insert(artifact);
+                transport
+                    .takeover_hash_by_selection
+                    .insert(normalized_selection, hash);
+            }
+        }
+
+        for (mask, slices) in first_display_static_transport_selections(inner, creative_boot) {
+            let artifact = crate::tsjs::TsjsStaticArtifactV1::new_first_display(mask, &slices)
+                .expect("catalog-derived first-display selection should compose");
+            let hash = artifact.hash().to_owned();
+            transport
+                .artifacts_by_hash
+                .entry(hash.clone())
+                .or_insert(artifact);
+            transport
+                .first_display_hash_by_mask
+                .insert(mask, hash.clone());
+            assert!(
+                transport
+                    .first_display_mask_by_hash
+                    .insert(hash, mask)
+                    .is_none(),
+                "distinct first-display masks should have distinct exact bytes"
+            );
+        }
+
+        transport
     }
 }
 
@@ -743,6 +817,167 @@ pub struct IntegrationMetadata {
     pub script_selectors: Vec<&'static str>,
     pub head_injectors: usize,
     pub request_filters: usize,
+}
+
+/// Request/document-owned inputs for generated TSJS catalog predicates.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct TsjsCatalogSelectionV1 {
+    pub creative_enabled: bool,
+    pub creative_click_guard: bool,
+    pub creative_render_guard: bool,
+    pub gpt_diagnostics_active: bool,
+    pub render_trace_overlay: bool,
+}
+
+fn tsjs_static_transport_selections(
+    inner: &IntegrationRegistryInner,
+    render_trace_overlay: bool,
+) -> Vec<TsjsCatalogSelectionV1> {
+    let diagnostics_configured = inner.enabled_integration_ids.contains(&"gpt_diagnostics");
+    let diagnostics_values: &[bool] = if diagnostics_configured {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    let mut selections = Vec::with_capacity(diagnostics_values.len() * 2);
+    for creative_enabled in [false, true] {
+        for gpt_diagnostics_active in diagnostics_values {
+            selections.push(TsjsCatalogSelectionV1 {
+                creative_enabled,
+                creative_click_guard: creative_enabled,
+                creative_render_guard: false,
+                gpt_diagnostics_active: *gpt_diagnostics_active,
+                render_trace_overlay,
+            });
+        }
+    }
+    selections
+}
+
+fn first_display_static_transport_selections(
+    inner: &IntegrationRegistryInner,
+    creative: crate::tsjs::CreativeBootConfigV1,
+) -> Vec<(u16, Vec<&'static str>)> {
+    if !inner.enabled_integration_ids.contains(&"gpt") {
+        return Vec::new();
+    }
+    let aps_values: &[bool] = if inner.enabled_integration_ids.contains(&"aps") {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    let prebid_values: &[bool] = if inner.enabled_integration_ids.contains(&"prebid") {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    let creative_guard = creative.enabled && (creative.click_guard || creative.render_guard);
+    let mut selections = Vec::new();
+    for gpt_participates in [false, true] {
+        for aps_participates in aps_values {
+            if *aps_participates && !gpt_participates {
+                continue;
+            }
+            for prebid_participates in prebid_values {
+                if *prebid_participates && !gpt_participates {
+                    continue;
+                }
+                let mut mask = 0_u16;
+                let mut slices = Vec::new();
+                for (index, metadata) in trusted_server_js::all_first_display_metadata()
+                    .into_iter()
+                    .enumerate()
+                {
+                    let selected = match metadata.include {
+                        Some("eligible_batch") => true,
+                        Some("gpt_initial") => gpt_participates,
+                        Some("aps_participates") => *aps_participates,
+                        Some("creative_guard") => creative_guard,
+                        Some("prebid_participates") => *prebid_participates,
+                        Some(predicate) => predicate
+                            .strip_prefix("integration:")
+                            .is_some_and(|id| inner.enabled_integration_ids.contains(&id)),
+                        None => false,
+                    };
+                    if selected {
+                        mask |= 1_u16 << index;
+                        slices.push(metadata.id);
+                    }
+                }
+                if slices.first() == Some(&"first_display")
+                    && trusted_server_js::first_display_mask_is_permitted(mask)
+                {
+                    selections.push((mask, slices));
+                }
+            }
+        }
+    }
+    selections
+}
+
+fn normalize_tsjs_transport_selection(
+    inner: &IntegrationRegistryInner,
+    selection: TsjsCatalogSelectionV1,
+) -> TsjsCatalogSelectionV1 {
+    let creative_guard = selection.creative_enabled
+        && (selection.creative_click_guard || selection.creative_render_guard);
+    TsjsCatalogSelectionV1 {
+        creative_enabled: creative_guard,
+        creative_click_guard: creative_guard,
+        creative_render_guard: false,
+        gpt_diagnostics_active: selection.gpt_diagnostics_active
+            && inner.enabled_integration_ids.contains(&"gpt_diagnostics"),
+        render_trace_overlay: selection.render_trace_overlay,
+    }
+}
+
+fn tsjs_catalog_module_enabled(
+    inner: &IntegrationRegistryInner,
+    predicate: Option<&str>,
+    selection: TsjsCatalogSelectionV1,
+) -> bool {
+    match predicate {
+        Some("always") => true,
+        Some("creative_guard") => {
+            selection.creative_enabled
+                && (selection.creative_click_guard || selection.creative_render_guard)
+        }
+        Some("gpt_diagnostics_active") => selection.gpt_diagnostics_active,
+        Some("diagnostics_presentation") => {
+            selection.render_trace_overlay || selection.gpt_diagnostics_active
+        }
+        Some("prebid_and_gpt") => {
+            inner.enabled_integration_ids.contains(&"prebid")
+                && inner.enabled_integration_ids.contains(&"gpt")
+        }
+        Some(predicate) => predicate
+            .strip_prefix("integration:")
+            .is_some_and(|integration_id| inner.enabled_integration_ids.contains(&integration_id)),
+        None => false,
+    }
+}
+
+fn tsjs_selected_catalog_metadata(
+    inner: &IntegrationRegistryInner,
+    selection: TsjsCatalogSelectionV1,
+) -> Vec<trusted_server_js::TsjsArtifactMetadata> {
+    let mut selected = Vec::new();
+    let mut provided = std::collections::HashSet::from(["runtime.v1"]);
+    for metadata in trusted_server_js::all_integration_metadata() {
+        if !tsjs_catalog_module_enabled(inner, metadata.include, selection) {
+            continue;
+        }
+        let requirements_available = metadata
+            .inputs
+            .iter()
+            .all(|declaration| declaration.contains('?') || provided.contains(declaration));
+        if !requirements_available {
+            continue;
+        }
+        provided.extend(metadata.outputs.iter().copied());
+        selected.push(metadata);
+    }
+    selected
 }
 
 impl IntegrationMetadata {
@@ -774,9 +1009,22 @@ pub struct ProxyDispatchInput<'a> {
 }
 
 /// In-memory registry of integrations discovered from settings.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct IntegrationRegistry {
     inner: Arc<IntegrationRegistryInner>,
+    creative_boot: crate::tsjs::CreativeBootConfigV1,
+}
+
+impl Default for IntegrationRegistry {
+    fn default() -> Self {
+        let mut inner = IntegrationRegistryInner::default();
+        let creative_boot = crate::tsjs::CreativeBootConfigV1::default();
+        inner.tsjs_static_transport = TsjsStaticTransportV1::new(&inner, creative_boot);
+        Self {
+            inner: Arc::new(inner),
+            creative_boot,
+        }
+    }
 }
 
 impl IntegrationRegistry {
@@ -791,6 +1039,12 @@ impl IntegrationRegistry {
     /// Panics if a route path ends with `/*` but `strip_suffix` unexpectedly fails (invariant violation).
     pub fn new(settings: &Settings) -> Result<Self, Report<TrustedServerError>> {
         let mut inner = IntegrationRegistryInner::default();
+        let creative_boot = crate::tsjs::creative_boot_config_v1(settings)?;
+        let aps_proxy: Arc<dyn IntegrationProxy> =
+            Arc::new(super::aps::ApsV1Integration::from_settings(settings)?);
+        inner
+            .reserved_proxies
+            .push(("/integrations/aps", aps_proxy));
 
         for builder in crate::integrations::builders() {
             if let Some(registration) = (builder.build)(settings)? {
@@ -867,9 +1121,42 @@ impl IntegrationRegistry {
             }
         }
 
+        inner.tsjs_static_transport = TsjsStaticTransportV1::new(&inner, creative_boot);
         Ok(Self {
             inner: Arc::new(inner),
+            creative_boot,
         })
+    }
+
+    fn reserved_proxy(&self, path: &str) -> Option<&Arc<dyn IntegrationProxy>> {
+        self.inner
+            .reserved_proxies
+            .iter()
+            .find(|(family, _)| {
+                path == *family
+                    || path
+                        .strip_prefix(*family)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+            .map(|(_, proxy)| proxy)
+    }
+
+    /// Return true when a hard-cutover family owns this path.
+    #[must_use]
+    pub fn has_reserved_path(&self, path: &str) -> bool {
+        self.reserved_proxy(path).is_some()
+    }
+
+    /// Dispatch a hard-cutover family before auth, EC, filters, and fallback.
+    #[must_use]
+    pub async fn handle_reserved_proxy(
+        &self,
+        settings: &Settings,
+        services: &RuntimeServices,
+        req: Request<EdgeBody>,
+    ) -> Option<Result<Response<EdgeBody>, Report<TrustedServerError>>> {
+        let proxy = self.reserved_proxy(req.uri().path())?;
+        Some(proxy.handle(settings, services, req).await)
     }
 
     fn find_route(&self, method: &Method, path: &str) -> Option<&RouteValue> {
@@ -1125,6 +1412,12 @@ impl IntegrationRegistry {
         self.inner.enabled_integration_ids.contains(&integration_id)
     }
 
+    /// Return the exact server-owned creative browser boot policy.
+    #[must_use]
+    pub fn tsjs_creative_boot(&self) -> crate::tsjs::CreativeBootConfigV1 {
+        self.creative_boot
+    }
+
     /// Return JS module IDs that should be included in the tsjs bundle.
     ///
     /// Always includes JS-only modules with no Rust-side registration.
@@ -1180,11 +1473,125 @@ impl IntegrationRegistry {
             .collect()
     }
 
+    /// Return enabled TSJS catalog modules in the generated release order.
+    ///
+    /// This transport selector is deny-unknown and never accepts a phase or
+    /// ordering override from settings. Request-scoped diagnostics activation
+    /// may further filter the returned diagnostics rows when composing a manifest.
+    #[must_use]
+    pub fn tsjs_catalog_module_ids(&self, selection: TsjsCatalogSelectionV1) -> Vec<&'static str> {
+        tsjs_selected_catalog_metadata(&self.inner, selection)
+            .into_iter()
+            .map(|metadata| metadata.id)
+            .collect()
+    }
+
+    /// Return the enabled parser-blocking catalog slice in canonical order.
+    #[must_use]
+    pub fn tsjs_takeover_module_ids(&self, selection: TsjsCatalogSelectionV1) -> Vec<&'static str> {
+        tsjs_selected_catalog_metadata(&self.inner, selection)
+            .into_iter()
+            .filter(|metadata| metadata.phase == Some(trusted_server_js::TsjsModulePhase::Takeover))
+            .map(|metadata| metadata.id)
+            .collect()
+    }
+
+    /// Return the enabled post-paint catalog slice in canonical order.
+    #[must_use]
+    pub fn tsjs_deferred_module_ids(&self, selection: TsjsCatalogSelectionV1) -> Vec<&'static str> {
+        tsjs_selected_catalog_metadata(&self.inner, selection)
+            .into_iter()
+            .filter(|metadata| metadata.phase == Some(trusted_server_js::TsjsModulePhase::Deferred))
+            .map(|metadata| metadata.id)
+            .collect()
+    }
+
+    /// Return the bounded request-owned variants admitted by static transport.
+    ///
+    /// Integration predicates remain fixed by this registry. Creative guards and
+    /// diagnostics activity are document/session bits, so the content hash is
+    /// matched against only their configured, finite candidate combinations.
+    #[must_use]
+    pub fn tsjs_static_transport_selections(
+        &self,
+        render_trace_overlay: bool,
+    ) -> Vec<TsjsCatalogSelectionV1> {
+        tsjs_static_transport_selections(&self.inner, render_trace_overlay)
+    }
+
+    /// Return the precomputed takeover artifact for one document selection.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn tsjs_takeover_artifact(
+        &self,
+        selection: TsjsCatalogSelectionV1,
+    ) -> Option<&crate::tsjs::TsjsStaticArtifactV1> {
+        let normalized_selection = normalize_tsjs_transport_selection(&self.inner, selection);
+        let hash = self
+            .inner
+            .tsjs_static_transport
+            .takeover_hash_by_selection
+            .get(&normalized_selection)?;
+        self.tsjs_static_artifact(hash)
+    }
+
+    /// Resolve one admitted unified artifact by its exact content hash.
+    #[must_use]
+    pub(crate) fn tsjs_static_artifact(
+        &self,
+        hash: &str,
+    ) -> Option<&crate::tsjs::TsjsStaticArtifactV1> {
+        self.inner.tsjs_static_transport.artifacts_by_hash.get(hash)
+    }
+
+    /// Resolve one configuration-permitted first-display artifact by exact mask and hash.
+    #[must_use]
+    pub(crate) fn tsjs_first_display_artifact(
+        &self,
+        mask: u16,
+        hash: &str,
+    ) -> Option<&crate::tsjs::TsjsStaticArtifactV1> {
+        let indexed_hash = self
+            .inner
+            .tsjs_static_transport
+            .first_display_hash_by_mask
+            .get(&mask)?;
+        if indexed_hash != hash
+            || self
+                .inner
+                .tsjs_static_transport
+                .first_display_mask_by_hash
+                .get(hash)
+                != Some(&mask)
+        {
+            return None;
+        }
+        self.tsjs_static_artifact(hash)
+    }
+
+    /// Return the finite precomputed first-display masks admitted by this registry.
+    #[must_use]
+    pub fn tsjs_first_display_masks(&self) -> Vec<u16> {
+        let mut masks = self
+            .inner
+            .tsjs_static_transport
+            .first_display_hash_by_mask
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        masks.sort_unstable();
+        masks
+    }
+
     #[cfg(test)]
     #[must_use]
     pub fn empty_for_tests() -> Self {
+        let mut inner = IntegrationRegistryInner::default();
+        let creative_boot = crate::tsjs::CreativeBootConfigV1::default();
+        inner.tsjs_static_transport = TsjsStaticTransportV1::new(&inner, creative_boot);
         Self {
-            inner: Arc::new(IntegrationRegistryInner::default()),
+            inner: Arc::new(inner),
+            creative_boot,
         }
     }
 
@@ -1194,25 +1601,31 @@ impl IntegrationRegistry {
         attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
         script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
     ) -> Self {
+        let mut inner = IntegrationRegistryInner {
+            get_router: Router::new(),
+            post_router: Router::new(),
+            put_router: Router::new(),
+            delete_router: Router::new(),
+            patch_router: Router::new(),
+            head_router: Router::new(),
+            options_router: Router::new(),
+            reserved_proxies: Vec::new(),
+            routes: Vec::new(),
+            enabled_integration_ids: Vec::new(),
+            html_rewriters: attribute_rewriters,
+            script_rewriters,
+            html_post_processors: Vec::new(),
+            head_injectors: Vec::new(),
+            request_filters: Vec::new(),
+            deferred_js_ids: Vec::new(),
+            disabled_js_ids: Vec::new(),
+            tsjs_static_transport: TsjsStaticTransportV1::default(),
+        };
+        let creative_boot = crate::tsjs::CreativeBootConfigV1::default();
+        inner.tsjs_static_transport = TsjsStaticTransportV1::new(&inner, creative_boot);
         Self {
-            inner: Arc::new(IntegrationRegistryInner {
-                get_router: Router::new(),
-                post_router: Router::new(),
-                put_router: Router::new(),
-                delete_router: Router::new(),
-                patch_router: Router::new(),
-                head_router: Router::new(),
-                options_router: Router::new(),
-                routes: Vec::new(),
-                enabled_integration_ids: Vec::new(),
-                html_rewriters: attribute_rewriters,
-                script_rewriters,
-                html_post_processors: Vec::new(),
-                head_injectors: Vec::new(),
-                request_filters: Vec::new(),
-                deferred_js_ids: Vec::new(),
-                disabled_js_ids: Vec::new(),
-            }),
+            inner: Arc::new(inner),
+            creative_boot,
         }
     }
 
@@ -1223,50 +1636,62 @@ impl IntegrationRegistry {
         script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
         head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     ) -> Self {
+        let mut inner = IntegrationRegistryInner {
+            get_router: Router::new(),
+            post_router: Router::new(),
+            put_router: Router::new(),
+            delete_router: Router::new(),
+            patch_router: Router::new(),
+            head_router: Router::new(),
+            options_router: Router::new(),
+            reserved_proxies: Vec::new(),
+            routes: Vec::new(),
+            enabled_integration_ids: Vec::new(),
+            html_rewriters: attribute_rewriters,
+            script_rewriters,
+            html_post_processors: Vec::new(),
+            head_injectors,
+            request_filters: Vec::new(),
+            deferred_js_ids: Vec::new(),
+            disabled_js_ids: Vec::new(),
+            tsjs_static_transport: TsjsStaticTransportV1::default(),
+        };
+        let creative_boot = crate::tsjs::CreativeBootConfigV1::default();
+        inner.tsjs_static_transport = TsjsStaticTransportV1::new(&inner, creative_boot);
         Self {
-            inner: Arc::new(IntegrationRegistryInner {
-                get_router: Router::new(),
-                post_router: Router::new(),
-                put_router: Router::new(),
-                delete_router: Router::new(),
-                patch_router: Router::new(),
-                head_router: Router::new(),
-                options_router: Router::new(),
-                routes: Vec::new(),
-                enabled_integration_ids: Vec::new(),
-                html_rewriters: attribute_rewriters,
-                script_rewriters,
-                html_post_processors: Vec::new(),
-                head_injectors,
-                request_filters: Vec::new(),
-                deferred_js_ids: Vec::new(),
-                disabled_js_ids: Vec::new(),
-            }),
+            inner: Arc::new(inner),
+            creative_boot,
         }
     }
 
     #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
     pub fn from_request_filters(request_filters: Vec<Arc<dyn IntegrationRequestFilter>>) -> Self {
+        let mut inner = IntegrationRegistryInner {
+            get_router: Router::new(),
+            post_router: Router::new(),
+            put_router: Router::new(),
+            delete_router: Router::new(),
+            patch_router: Router::new(),
+            head_router: Router::new(),
+            options_router: Router::new(),
+            reserved_proxies: Vec::new(),
+            routes: Vec::new(),
+            enabled_integration_ids: Vec::new(),
+            html_rewriters: Vec::new(),
+            script_rewriters: Vec::new(),
+            html_post_processors: Vec::new(),
+            head_injectors: Vec::new(),
+            request_filters,
+            deferred_js_ids: Vec::new(),
+            disabled_js_ids: Vec::new(),
+            tsjs_static_transport: TsjsStaticTransportV1::default(),
+        };
+        let creative_boot = crate::tsjs::CreativeBootConfigV1::default();
+        inner.tsjs_static_transport = TsjsStaticTransportV1::new(&inner, creative_boot);
         Self {
-            inner: Arc::new(IntegrationRegistryInner {
-                get_router: Router::new(),
-                post_router: Router::new(),
-                put_router: Router::new(),
-                delete_router: Router::new(),
-                patch_router: Router::new(),
-                head_router: Router::new(),
-                options_router: Router::new(),
-                routes: Vec::new(),
-                enabled_integration_ids: Vec::new(),
-                html_rewriters: Vec::new(),
-                script_rewriters: Vec::new(),
-                html_post_processors: Vec::new(),
-                head_injectors: Vec::new(),
-                request_filters,
-                deferred_js_ids: Vec::new(),
-                disabled_js_ids: Vec::new(),
-            }),
+            inner: Arc::new(inner),
+            creative_boot,
         }
     }
 
@@ -1313,25 +1738,31 @@ impl IntegrationRegistry {
                 .expect("route registration should succeed");
         }
 
+        let mut inner = IntegrationRegistryInner {
+            get_router,
+            post_router,
+            put_router,
+            delete_router,
+            patch_router,
+            head_router,
+            options_router,
+            reserved_proxies: Vec::new(),
+            routes: Vec::new(),
+            enabled_integration_ids: Vec::new(),
+            html_rewriters: Vec::new(),
+            script_rewriters: Vec::new(),
+            html_post_processors: Vec::new(),
+            head_injectors: Vec::new(),
+            request_filters: Vec::new(),
+            deferred_js_ids: Vec::new(),
+            disabled_js_ids: Vec::new(),
+            tsjs_static_transport: TsjsStaticTransportV1::default(),
+        };
+        let creative_boot = crate::tsjs::CreativeBootConfigV1::default();
+        inner.tsjs_static_transport = TsjsStaticTransportV1::new(&inner, creative_boot);
         Self {
-            inner: Arc::new(IntegrationRegistryInner {
-                get_router,
-                post_router,
-                put_router,
-                delete_router,
-                patch_router,
-                head_router,
-                options_router,
-                routes: Vec::new(),
-                enabled_integration_ids: Vec::new(),
-                html_rewriters: Vec::new(),
-                script_rewriters: Vec::new(),
-                html_post_processors: Vec::new(),
-                head_injectors: Vec::new(),
-                request_filters: Vec::new(),
-                deferred_js_ids: Vec::new(),
-                disabled_js_ids: Vec::new(),
-            }),
+            inner: Arc::new(inner),
+            creative_boot,
         }
     }
 }
@@ -1565,6 +1996,34 @@ mod tests {
             "/integrations/test/echo",
             "should expose the HTTP request path to the proxy"
         );
+    }
+
+    #[test]
+    fn production_registry_always_reserves_the_aps_family() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("production registry should build");
+        assert!(registry.has_reserved_path("/integrations/aps"));
+        assert!(registry.has_reserved_path("/integrations/aps/runner.js"));
+        assert!(registry.has_reserved_path("/integrations/aps/malformed/path"));
+        assert!(!registry.has_reserved_path("/integrations/apsx/runner.js"));
+        assert!(!registry.has_reserved_path("/integrations/aps-legacy"));
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/integrations/aps/renderer/v1")
+            .header(HEADER_X_TS_EC.clone(), "caller-controlled")
+            .body(EdgeBody::empty())
+            .expect("should build reserved APS request");
+        let response = futures::executor::block_on(registry.handle_reserved_proxy(
+            &settings,
+            &noop_services(),
+            request,
+        ))
+        .expect("reserved family should be handled")
+        .expect("disabled APS response should be local");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     }
 
     #[test]
@@ -2115,6 +2574,181 @@ mod tests {
     }
 
     #[test]
+    fn tsjs_catalog_selector_uses_generated_predicates_and_request_bits() {
+        let registry = IntegrationRegistry::empty_for_tests();
+
+        assert_eq!(
+            registry.tsjs_catalog_module_ids(TsjsCatalogSelectionV1::default()),
+            vec!["render_runtime"],
+            "always must select only the mandatory runtime without other inputs"
+        );
+        assert_eq!(
+            registry.tsjs_catalog_module_ids(TsjsCatalogSelectionV1 {
+                creative_enabled: true,
+                creative_click_guard: true,
+                ..TsjsCatalogSelectionV1::default()
+            }),
+            vec!["render_runtime", "creative"],
+            "creative requires enabled plus one guard"
+        );
+        assert_eq!(
+            registry.tsjs_catalog_module_ids(TsjsCatalogSelectionV1 {
+                creative_enabled: true,
+                ..TsjsCatalogSelectionV1::default()
+            }),
+            vec!["render_runtime"],
+            "creative enabled without a guard must remain absent"
+        );
+        assert_eq!(
+            registry.tsjs_catalog_module_ids(TsjsCatalogSelectionV1 {
+                gpt_diagnostics_active: true,
+                ..TsjsCatalogSelectionV1::default()
+            }),
+            vec!["render_runtime", "diagnostics_presentation"],
+            "diagnostics capture is omitted when its mandatory GPT provider is absent"
+        );
+        assert_eq!(
+            registry.tsjs_catalog_module_ids(TsjsCatalogSelectionV1 {
+                render_trace_overlay: true,
+                ..TsjsCatalogSelectionV1::default()
+            }),
+            vec!["render_runtime", "diagnostics_presentation"],
+            "overlay alone selects only presentation"
+        );
+    }
+
+    #[test]
+    fn tsjs_static_transport_precomputes_every_admitted_takeover_artifact() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config("gpt_diagnostics", &serde_json::json!({ "enabled": true }))
+            .expect("should enable diagnostics");
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+
+        for render_trace_overlay in [false, true] {
+            for selection in registry.tsjs_static_transport_selections(render_trace_overlay) {
+                let module_ids = registry.tsjs_takeover_module_ids(selection);
+                let expected_body = trusted_server_js::concatenate_modules(&module_ids);
+                let expected_hash = trusted_server_js::concatenated_hash(&module_ids);
+                let artifact = registry
+                    .tsjs_takeover_artifact(selection)
+                    .expect("should precompute every admitted selection");
+
+                assert_eq!(artifact.hash(), expected_hash, "should preserve exact hash");
+                assert_eq!(
+                    artifact.body().as_ref(),
+                    expected_body.as_bytes(),
+                    "should preserve exact response bytes"
+                );
+                assert_eq!(
+                    artifact.src(),
+                    format!("/static/tsjs=tsjs-unified.min.js?v={expected_hash}"),
+                    "should precompute the exact takeover URL"
+                );
+                assert_eq!(
+                    registry
+                        .tsjs_static_artifact(&expected_hash)
+                        .expect("should index artifact by hash")
+                        .body()
+                        .as_ptr(),
+                    artifact.body().as_ptr(),
+                    "selection and transport lookups should share precomputed bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tsjs_static_transport_precomputes_every_configuration_permitted_first_display_mask() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config("gpt", &serde_json::json!({}))
+            .expect("should enable GPT");
+        settings
+            .integrations
+            .insert_config(
+                "aps",
+                &serde_json::json!({ "enabled": true, "account_id": "test-account" }),
+            )
+            .expect("should enable APS");
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let masks = registry.tsjs_first_display_masks();
+
+        let catalog = trusted_server_js::all_first_display_ids();
+        let bit = |id: &str| {
+            1_u16
+                << catalog
+                    .iter()
+                    .position(|candidate| *candidate == id)
+                    .expect("catalog should contain slice")
+        };
+        let fixed = bit("first_display") | bit("creative_initial");
+        let gpt = bit("gpt_initial");
+        let aps = bit("aps_initial");
+        let prebid = bit("prebid_initial");
+        assert_eq!(
+            masks,
+            vec![
+                fixed,
+                fixed | gpt,
+                fixed | gpt | aps,
+                fixed | gpt | prebid,
+                fixed | gpt | aps | prebid,
+            ],
+            "registry should enumerate every permitted participation combination"
+        );
+        for mask in masks {
+            let selected = trusted_server_js::all_first_display_ids()
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, id)| (mask & (1 << index) != 0).then_some(id))
+                .collect::<Vec<_>>();
+            let body = trusted_server_js::concatenate_first_display_slices(&selected[1..])
+                .expect("mask should select a closed composition");
+            let hash = trusted_server_js::concatenated_first_display_hash(&selected[1..])
+                .expect("mask should have a stable hash");
+            let artifact = registry
+                .tsjs_first_display_artifact(mask, &hash)
+                .expect("should resolve the precomputed mask/hash pair");
+
+            assert_eq!(artifact.body().as_ref(), body.as_bytes());
+            assert_eq!(
+                artifact.src(),
+                format!("/static/tsjs=tsjs-first-display.min.js?m={mask:04x}&v={hash}")
+            );
+            assert!(
+                registry
+                    .tsjs_first_display_artifact(mask ^ (1 << 1), &hash)
+                    .is_none(),
+                "hash-to-mask lookup must reject a mismatched selection"
+            );
+        }
+    }
+
+    #[test]
+    fn tsjs_static_transport_includes_creative_and_rejects_unknown_hash() {
+        let registry = IntegrationRegistry::empty_for_tests();
+        let creative_ids = crate::tsjs::creative_tsjs_module_ids();
+        let creative_hash = trusted_server_js::concatenated_hash(creative_ids);
+
+        assert_eq!(
+            registry
+                .tsjs_static_artifact(&creative_hash)
+                .expect("should precompute rewritten creative artifact")
+                .body()
+                .as_ref(),
+            trusted_server_js::concatenate_modules(creative_ids).as_bytes(),
+            "should admit the exact rewritten creative bundle"
+        );
+        assert!(
+            registry.tsjs_static_artifact(&"0".repeat(64)).is_none(),
+            "unknown hashes should be a lookup miss"
+        );
+    }
+
+    #[test]
     fn js_module_ids_skip_enabled_integrations_without_generated_js_module() {
         let mut settings = crate::test_support::tests::create_test_settings();
         settings
@@ -2140,7 +2774,7 @@ mod tests {
     }
 
     #[test]
-    fn js_module_ids_include_explicitly_enabled_cmp_mirrors() {
+    fn catalog_ids_split_explicitly_enabled_cmp_owners_by_phase() {
         let mut settings = crate::test_support::tests::create_test_settings();
         settings
             .integrations
@@ -2152,15 +2786,25 @@ mod tests {
             .expect("should insert osano config");
 
         let registry = IntegrationRegistry::new(&settings).expect("should create registry");
-        let immediate = registry.js_module_ids_immediate();
+        let selection = TsjsCatalogSelectionV1::default();
+        let takeover = registry.tsjs_takeover_module_ids(selection);
+        let deferred = registry.tsjs_deferred_module_ids(selection);
 
         assert!(
-            immediate.contains(&"sourcepoint"),
-            "should include Sourcepoint when explicitly enabled"
+            takeover.contains(&"sourcepoint_consent"),
+            "should include the Sourcepoint consent owner when explicitly enabled"
         );
         assert!(
-            immediate.contains(&"osano"),
-            "should include Osano when explicitly enabled"
+            takeover.contains(&"osano_consent"),
+            "should include the Osano consent owner when explicitly enabled"
+        );
+        assert!(
+            deferred.contains(&"sourcepoint_lifecycle"),
+            "should defer the Sourcepoint lifecycle owner"
+        );
+        assert!(
+            deferred.contains(&"osano_lifecycle"),
+            "should defer the Osano lifecycle owner"
         );
 
         let metadata = registry.registered_integrations();

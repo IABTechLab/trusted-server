@@ -189,57 +189,10 @@ pub fn derive_section(path: &str, section_root: &str, section_segment: usize) ->
     }
 }
 
-const fn default_enabled() -> bool {
-    true
-}
-
-const fn is_default_enabled(value: &bool) -> bool {
-    *value == default_enabled()
-}
-
-/// How per-user ad state reaches the page.
-///
-/// `Inline` is the shipped behaviour: the auction result is injected before
-/// `</body>` and the root document is therefore uncacheable. `Esi` stores a
-/// request-neutral shared template and fills its per-request byte seam at the edge.
-///
-/// Spike-only, for the #1009 ESI validation. Remove with the spike.
-///
-/// # Why the template must be request-neutral
-///
-/// Under `Esi` the template is shared across visitors, so
-/// nothing whose *presence* depends on the request may appear in it — not merely
-/// nothing whose *value* does. `tsjs.adSlots` is the trap: its content is derived
-/// from config and path, but whether it is emitted at all is gated on consent,
-/// bot classification, prefetch status and the auction kill switch. A template
-/// filled by the first request would freeze that request's decision for every
-/// later reader.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AssemblyMode {
-    /// Inject bids inline before `</body>`. Root uncacheable. Shipped behaviour.
-    #[default]
-    Inline,
-    /// Serve a shared template; assemble its inert marker with an exact byte split.
-    ///
-    /// The operator-facing spelling remains `esi` for continuity, but no general
-    /// purpose ESI parser executes on this path.
-    Esi,
-}
-
 /// Top-level configuration for the creative opportunities system.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreativeOpportunitiesConfig {
-    /// Enables server-side ad template delivery on publisher HTML and page-bids requests.
-    ///
-    /// This does not disable the direct `POST /auction` endpoint. The default is
-    /// `true` so existing creative-opportunity configurations retain their behavior.
-    #[serde(
-        default = "default_enabled",
-        skip_serializing_if = "is_default_enabled"
-    )]
-    pub enabled: bool,
     /// GAM network ID used to build default unit paths.
     pub gam_network_id: String,
     /// Maximum time in milliseconds to wait for the server-side auction before
@@ -297,62 +250,7 @@ pub struct CreativeOpportunitiesConfig {
     /// [`section_root`](Self::section_root) are omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section_segment: Option<usize>,
-    /// How per-user ad state reaches the page. Absent means
-    /// [`AssemblyMode::Inline`], the shipped behaviour.
-    ///
-    /// `Option` rather than a bare enum, and `skip_serializing_if`, deliberately:
-    /// these structs use `deny_unknown_fields`, so a pushed key makes an older
-    /// binary fail configuration load. Keeping it absent when unset means a
-    /// deployment that never sets it stays rollback-compatible.
-    ///
-    /// Spike-only. See [`AssemblyMode`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub assembly_mode: Option<AssemblyMode>,
-    /// Request headers the origin varies on, which the shared-template cache key must
-    /// cover.
-    ///
-    /// Operator-stated because a cache **lookup happens before the fetch**, so on a cold
-    /// key the origin's `Vary` is not yet known. See `VarySpec` for why the alternatives
-    /// (two-phase lookup, or storing the list and re-keying) were not taken.
-    ///
-    /// **Unset or empty means no operator-stated header is covered, so any origin
-    /// `Vary` other than structurally covered `Accept-Encoding` disqualifies the
-    /// response.** `Cookie` may never be configured: a per-cookie object violates the
-    /// reader-neutral template contract. This fail-closed default prevents a deployment
-    /// that has not stated what its origin varies on from gaining a shared cache by
-    /// omission.
-    ///
-    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub template_cache_vary: Option<Vec<String>>,
-    /// Maximum time a reader-neutral transformed template may remain in C2.
-    ///
-    /// This is a safety ceiling, not freshness authorization. The origin must still
-    /// provide positive shared freshness, and the stored lifetime is the smaller of
-    /// the origin's remaining edge freshness and this value. Defaults to 60 seconds
-    /// and may be configured from 1 second through 1 day.
-    ///
-    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub template_cache_max_age_seconds: Option<u32>,
-    /// Operator assertion that the origin's HTML does not depend on request cookies.
-    ///
-    /// Unset or `false` disqualifies **every cookie-bearing request** from the shared
-    /// template cache, in both directions. That is safe and it is also very nearly a
-    /// disable switch: Trusted Server sets its own identity cookie, so essentially every
-    /// repeat visitor carries one. Left at the default, the cache can only ever serve
-    /// first-ever page views and cookie-less clients.
-    ///
-    /// Setting `true` asserts the origin serves the same HTML with or without cookies.
-    /// It is not taken on trust alone — if the origin ever declares `Vary: Cookie`, the
-    /// response is refused regardless of this flag or the configured key. So a wrong
-    /// assertion is caught whenever the origin is honest about it, and this only widens
-    /// the window where the origin personalizes *silently*.
-    ///
-    /// Spike-only. Same `Option` + `skip_serializing_if` reasoning as `assembly_mode`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin_is_cookie_independent: Option<bool>,
-    /// Slot templates. An empty vec or `enabled = false` disables template delivery.
+    /// Slot templates. Empty vec = feature disabled (no auction fired, no globals injected).
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub slot: Vec<CreativeOpportunitySlot>,
 }
@@ -1535,39 +1433,12 @@ mod tests {
         assert_eq!(derive_section("/%%%/x", "home", 0), "_");
     }
 
-    #[test]
-    fn enabled_defaults_true_and_is_omitted_from_serialized_config() {
-        let config = make_config_with_section_template(None);
-        assert!(
-            config.enabled,
-            "template delivery should default to enabled"
-        );
-        let value = serde_json::to_value(&config).expect("should serialize config");
-        assert!(
-            value.get("enabled").is_none(),
-            "default enabled value should be omitted for rollback compatibility"
-        );
-    }
-
-    #[test]
-    fn disabled_template_switch_is_serialized() {
-        let mut config = make_config_with_section_template(None);
-        config.enabled = false;
-        let value = serde_json::to_value(&config).expect("should serialize config");
-        assert_eq!(
-            value.get("enabled"),
-            Some(&serde_json::Value::Bool(false)),
-            "explicitly disabled template delivery must remain in config blobs"
-        );
-    }
-
     fn make_config_with_section_template(
         section_root: Option<&str>,
     ) -> CreativeOpportunitiesConfig {
         let mut slot = make_slot("ad-header-0", vec!["/news/*"]);
         slot.gam_unit_path = Some("/{network_id}/example/{section}".to_string());
         CreativeOpportunitiesConfig {
-            enabled: true,
             gam_network_id: "99999".to_string(),
             auction_timeout_ms: None,
             price_granularity: PriceGranularity::default(),
@@ -1969,7 +1840,6 @@ mod tests {
         // Older binaries deserialize this struct with `deny_unknown_fields`, so
         // a pushed config blob must not carry `"section_root": null`.
         let config = CreativeOpportunitiesConfig {
-            enabled: true,
             gam_network_id: "99999".to_string(),
             auction_timeout_ms: None,
             price_granularity: PriceGranularity::default(),

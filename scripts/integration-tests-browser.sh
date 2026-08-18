@@ -7,9 +7,9 @@
 #
 # Prerequisites:
 #   - Docker running
-#   - Viceroy installed: cargo install viceroy --version 0.17.0 --locked --force
+#   - Viceroy installed: cargo install viceroy --version 0.19.0 --locked --force
 #   - wasm32-wasip1 target: rustup target add wasm32-wasip1
-#   - Node.js with npx available
+#   - Node.js with npm available
 #
 set -euo pipefail
 
@@ -17,14 +17,51 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 ORIGIN_PORT="${INTEGRATION_ORIGIN_PORT:-8888}"
+export ARTIFACTS_DIR="${ARTIFACTS_DIR:-$REPO_ROOT/target/integration-test-artifacts}"
 BROWSER_DIR="crates/trusted-server-integration-tests/browser"
 TSJS_LIB_DIR="crates/trusted-server-js/lib"
 NODE_VERSION="$(grep '^nodejs ' .tool-versions | awk '{print $2}')"
+FRAMEWORKS_VALUE="${TS_BROWSER_FRAMEWORKS:-nextjs wordpress}"
+FRAMEWORKS_VALUE="${FRAMEWORKS_VALUE//,/ }"
+read -r -a FRAMEWORKS <<< "$FRAMEWORKS_VALUE"
+PROJECTS_VALUE="${TS_BROWSER_PROJECTS:-chromium}"
+PROJECTS_VALUE="${PROJECTS_VALUE//,/ }"
+read -r -a BROWSER_PROJECTS <<< "$PROJECTS_VALUE"
 
 if [ -z "$NODE_VERSION" ]; then
     echo "Failed to detect Node.js version from .tool-versions" >&2
     exit 1
 fi
+
+if [ "${#FRAMEWORKS[@]}" -eq 0 ]; then
+    echo "TS_BROWSER_FRAMEWORKS must select at least one framework" >&2
+    exit 1
+fi
+
+if [ "${#BROWSER_PROJECTS[@]}" -eq 0 ]; then
+    echo "TS_BROWSER_PROJECTS must select at least one browser" >&2
+    exit 1
+fi
+
+for framework in "${FRAMEWORKS[@]}"; do
+    case "$framework" in
+        nextjs|wordpress) ;;
+        *)
+            echo "Unsupported browser framework: $framework" >&2
+            exit 1
+            ;;
+    esac
+done
+
+for project in "${BROWSER_PROJECTS[@]}"; do
+    case "$project" in
+        chromium|firefox|webkit) ;;
+        *)
+            echo "Unsupported browser project: $project" >&2
+            exit 1
+            ;;
+    esac
+done
 
 # --- Build WASM binary ---
 echo "==> Building WASM binary (origin=http://127.0.0.1:$ORIGIN_PORT)..."
@@ -37,32 +74,38 @@ TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK=false \
 
 echo "==> Generating Viceroy configs..."
 INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT" ./scripts/generate-integration-viceroy-configs.sh
-GENERATED_VICEROY_CONFIG_PATH="$REPO_ROOT/target/integration-test-artifacts/configs/viceroy.toml"
+GENERATED_VICEROY_CONFIG_PATH="$ARTIFACTS_DIR/configs/viceroy.toml"
 
 # --- Build Docker images ---
-echo "==> Building WordPress test container..."
-docker build -t test-wordpress:latest \
-    crates/trusted-server-integration-tests/fixtures/frameworks/wordpress/
-
-echo "==> Building Next.js test container..."
-docker build \
-    --build-arg NODE_VERSION="$NODE_VERSION" \
-    -t test-nextjs:latest \
-    crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/
+for framework in "${FRAMEWORKS[@]}"; do
+    if [ "$framework" = "wordpress" ]; then
+        echo "==> Building WordPress test container..."
+        docker build -t test-wordpress:latest \
+            crates/trusted-server-integration-tests/fixtures/frameworks/wordpress/
+    else
+        echo "==> Building Next.js test container..."
+        docker build \
+            --build-arg NODE_VERSION="$NODE_VERSION" \
+            -t test-nextjs:latest \
+            crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/
+    fi
+done
 
 # --- Install Playwright ---
 echo "==> Installing Playwright dependencies..."
-cd "$REPO_ROOT/$BROWSER_DIR"
-npm ci
-npx playwright install chromium
+npm --prefix "$BROWSER_DIR" ci
+PLAYWRIGHT_INSTALL_ARGS=(install)
+if [ "${CI:-}" = "true" ]; then
+    PLAYWRIGHT_INSTALL_ARGS+=(--with-deps)
+fi
+npm --prefix "$BROWSER_DIR" exec -- playwright \
+    "${PLAYWRIGHT_INSTALL_ARGS[@]}" "${BROWSER_PROJECTS[@]}"
 
 # --- Build browser-side Trusted Server and external Prebid fixtures ---
 echo "==> Building TSJS browser fixtures..."
-cd "$REPO_ROOT/$TSJS_LIB_DIR"
-npm ci
-npm run build
-npm run build:prebid-external
-cd "$REPO_ROOT/$BROWSER_DIR"
+npm --prefix "$TSJS_LIB_DIR" ci
+npm --prefix "$TSJS_LIB_DIR" run build
+npm --prefix "$TSJS_LIB_DIR" run build:prebid-external
 
 # --- Export env vars for global-setup.ts ---
 export WASM_BINARY_PATH="$REPO_ROOT/target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm"
@@ -80,15 +123,17 @@ stop_matching_containers() {
 }
 
 cleanup() {
-    stop_matching_containers test-nextjs:latest
-    stop_matching_containers test-wordpress:latest
+    for framework in "${FRAMEWORKS[@]}"; do
+        stop_matching_containers "test-$framework:latest"
+    done
 }
 trap cleanup EXIT
 
 # --- Run tests for each framework ---
-for framework in nextjs wordpress; do
+for framework in "${FRAMEWORKS[@]}"; do
     echo "==> Running Playwright tests for $framework..."
-    TEST_FRAMEWORK="$framework" npx playwright test "$@"
+    TEST_FRAMEWORK="$framework" npm --prefix "$BROWSER_DIR" exec -- \
+        playwright test --config "$REPO_ROOT/$BROWSER_DIR/playwright.config.ts" "$@"
 done
 
 echo "==> All browser tests passed."

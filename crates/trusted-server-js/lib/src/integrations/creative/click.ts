@@ -5,18 +5,12 @@ import { delay, queueTask } from '../../shared/async';
 import { hasOpaqueOrigin, TRUSTED_BASE_URL } from '../../shared/origin';
 import { createMutationScheduler } from '../../shared/scheduler';
 
+import type { CreativeGuardHandle } from './startup';
+
 type AnchorLike = HTMLAnchorElement | HTMLAreaElement;
 type Canon = { base: string; params: Record<string, string> };
 type Diff = { add: Record<string, string>; del: string[] };
-
-// Rebuild URLs already written to an anchor's href by an earlier repair pass
-// (the opaque-origin GET fallback). They are not `/first-party/click` URLs, so
-// they cannot be canonicalized and deliberately never replace the canonical
-// `data-tsclick`. Without remembering them, a later click would canonicalize
-// the fallback against the original signed click, fail the base comparison, and
-// navigate the pre-mutation URL — silently dropping the mutation the fallback
-// exists to carry.
-const pendingRebuilds = new WeakMap<AnchorLike, string>();
+type PendingRebuilds = WeakMap<AnchorLike, string>;
 
 // Allow query/localStorage flag to crank logging when debugging creatives.
 function enableDebugFromEnv(): void {
@@ -96,7 +90,7 @@ function equalCanon(a: Canon, b: Canon): boolean {
   const bk = Object.keys(b.params).sort();
   if (ak.length !== bk.length) return false;
   for (let i = 0; i < ak.length; i++) {
-    const k = ak[i];
+    const k = ak[i]!;
     if (k !== bk[i] || a.params[k] !== b.params[k]) return false;
   }
   return true;
@@ -163,7 +157,13 @@ function buildProxyRebuildUrl(tsClickStr: string, diff: Diff): string {
 // does not answer, and always fails — so the guard skips it and recovers via
 // the GET navigation fallback, which the edge answers with a 302 chain (no
 // CORS applies to navigations).
-async function rebuildClick(a: AnchorLike, tsClickStr: string, diff: Diff): Promise<string> {
+async function rebuildClick(
+  a: AnchorLike,
+  tsClickStr: string,
+  diff: Diff,
+  pendingRebuilds: PendingRebuilds,
+  isActive: () => boolean
+): Promise<string> {
   const addKeys = Object.keys(diff.add);
   const delKeys = diff.del;
   if (addKeys.length === 0 && delKeys.length === 0) {
@@ -173,6 +173,7 @@ async function rebuildClick(a: AnchorLike, tsClickStr: string, diff: Diff): Prom
   const fallback = buildProxyRebuildUrl(tsClickStr, diff);
 
   if (typeof fetch !== 'function' || hasOpaqueOrigin()) {
+    if (!isActive()) return tsClickStr;
     try {
       const el = a as Element;
       el.setAttribute('href', fallback);
@@ -193,6 +194,7 @@ async function rebuildClick(a: AnchorLike, tsClickStr: string, diff: Diff): Prom
       body: JSON.stringify(payload),
       credentials: 'same-origin',
     });
+    if (!isActive()) return tsClickStr;
     if (!resp.ok) {
       log.warn('tsjs-creative:click: proxy-rebuild HTTP error', resp.status);
       try {
@@ -204,9 +206,10 @@ async function rebuildClick(a: AnchorLike, tsClickStr: string, diff: Diff): Prom
       return fallback;
     }
     const data = (await resp.json()) as { href?: string; base?: string } | null;
+    if (!isActive()) return tsClickStr;
     const href = data && typeof data.href === 'string' ? data.href : null;
     if (href) {
-      persistRebuiltClick(a, href);
+      persistRebuiltClick(a, href, pendingRebuilds);
       log.info('tsjs-creative:click: rebuilt click', {
         added: addKeys,
         removed: delKeys,
@@ -214,9 +217,11 @@ async function rebuildClick(a: AnchorLike, tsClickStr: string, diff: Diff): Prom
       return href;
     }
   } catch (err) {
+    if (!isActive()) return tsClickStr;
     log.warn('tsjs-creative:click: proxy-rebuild request failed', err);
   }
 
+  if (!isActive()) return tsClickStr;
   try {
     const el = a as Element;
     el.setAttribute('href', fallback);
@@ -227,7 +232,12 @@ async function rebuildClick(a: AnchorLike, tsClickStr: string, diff: Diff): Prom
 }
 
 // Work out the href we should navigate to after accounting for creative rewrites.
-async function computeFinalUrl(a: AnchorLike, tsClickStr: string): Promise<string> {
+async function computeFinalUrl(
+  a: AnchorLike,
+  tsClickStr: string,
+  pendingRebuilds: PendingRebuilds,
+  isActive: () => boolean
+): Promise<string> {
   const orig = canonFromFirstPartyClick(tsClickStr);
   if (!orig) return tsClickStr;
 
@@ -264,7 +274,7 @@ async function computeFinalUrl(a: AnchorLike, tsClickStr: string): Promise<strin
     del: diff.del,
   });
 
-  return rebuildClick(a, tsClickStr, diff);
+  return rebuildClick(a, tsClickStr, diff, pendingRebuilds, isActive);
 }
 
 // Resolve a click URL against the pinned trusted base and require an http(s)
@@ -275,32 +285,36 @@ async function computeFinalUrl(a: AnchorLike, tsClickStr: string): Promise<strin
 function resolveSafeNavigationUrl(url: string): string | null {
   try {
     const resolved = new URL(url, TRUSTED_BASE_URL);
-    if (resolved.protocol === 'http:' || resolved.protocol === 'https:') {
+    if (
+      (resolved.protocol === 'http:' || resolved.protocol === 'https:') &&
+      resolved.username === '' &&
+      resolved.password === ''
+    ) {
       return resolved.toString();
     }
-    log.warn('tsjs-creative:click: refusing non-http(s) navigation', resolved.protocol);
+    log.warn('tsjs-creative:click: refusing unsafe navigation URL', resolved.protocol);
   } catch (err) {
     log.debug('tsjs-creative:click: could not resolve navigation URL', err);
   }
   return null;
 }
 
-// Longest rebuild URL we will navigate to. Fastly Compute rejects request URLs
-// over 8192 bytes before the handler runs, and a signed click with many
-// tracking parameters can exceed that once nested inside another query string.
-// The margin covers percent-encoding growth and the request line's own overhead.
+// Fastly rejects request URLs over 8192 bytes before the handler runs. Leave
+// room for request-line overhead and percent-encoding expansion.
 const MAX_REBUILD_URL_LENGTH = 7000;
-
 const REBUILD_PATH = '/first-party/proxy-rebuild';
 
-// Navigate the rebuild as a form POST rather than a GET URL.
-//
-// The click is too long to nest in a query string, but a request body has no
-// such bound, and a form submission is a navigation — so it is not subject to
-// the CORS rules that rule out `fetch` from an opaque origin. The sandbox grants
-// `allow-forms`, and the endpoint answers a form-encoded POST with the same 302
-// it gives a GET. Only ever called from a click handler: submitting outside a
-// user gesture would navigate the frame on its own.
+function isRebuildNavigationUrl(url: string): boolean {
+  try {
+    return new URL(url, TRUSTED_BASE_URL).pathname === REBUILD_PATH;
+  } catch {
+    return false;
+  }
+}
+
+// An opaque-origin creative cannot use the JSON fetch path. For a recovery URL
+// too long to navigate as GET, submit the same fields in a form body; this stays
+// a user-initiated navigation and therefore does not require CORS.
 function submitRebuildNavigation(anchor: AnchorLike, rebuildUrl: string): boolean {
   try {
     if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
@@ -311,6 +325,7 @@ function submitRebuildNavigation(anchor: AnchorLike, rebuildUrl: string): boolea
     form.method = 'POST';
     form.action = parsed.origin + parsed.pathname;
     form.target = anchor.getAttribute('target') || '_self';
+    form.rel = 'noopener noreferrer';
     form.style.display = 'none';
     for (const field of ['tsclick', 'add', 'del']) {
       const value = parsed.searchParams.get(field);
@@ -338,12 +353,10 @@ function submitRebuildNavigation(anchor: AnchorLike, rebuildUrl: string): boolea
 function navigate(a: AnchorLike, url: string, isMiddle: boolean): void {
   const resolved = resolveSafeNavigationUrl(url);
   if (!resolved) return;
-  // An over-long recovery URL would be rejected by the platform before the
-  // handler runs, losing the click entirely. Carry it in a form body instead.
   if (
     !isMiddle &&
     resolved.length > MAX_REBUILD_URL_LENGTH &&
-    resolved.includes(REBUILD_PATH) &&
+    isRebuildNavigationUrl(resolved) &&
     submitRebuildNavigation(a, resolved)
   ) {
     return;
@@ -361,10 +374,6 @@ function navigate(a: AnchorLike, url: string, isMiddle: boolean): void {
 // compare against — is only updated when the value is itself a signed
 // /first-party/click URL. Writing the GET proxy-rebuild fallback there would
 // make every later canonicalization fail and lose subsequent mutations.
-// Root-relative form of a first-party URL — the shape the server-side rewriter
-// emits and the shape `data-tsclick` must keep. `href` is absolutized so it
-// resolves inside the srcdoc frame, but the canonical attribute has to stay in
-// the server's format: it is echoed back as the rebuild payload's `tsclick`.
 function canonicalClickValue(resolved: string): string {
   try {
     const url = new URL(resolved, TRUSTED_BASE_URL);
@@ -374,7 +383,11 @@ function canonicalClickValue(resolved: string): string {
   }
 }
 
-function persistRebuiltClick(anchor: AnchorLike, finalUrl: string): void {
+function persistRebuiltClick(
+  anchor: AnchorLike,
+  finalUrl: string,
+  pendingRebuilds: PendingRebuilds
+): void {
   // Persist the validated, absolutized URL — never the raw input. Beyond
   // enforcing the http(s) allowlist, an absolute URL keeps the anchor's
   // default navigation working inside the srcdoc iframe, where a relative
@@ -403,11 +416,18 @@ function persistRebuiltClick(anchor: AnchorLike, finalUrl: string): void {
 }
 
 // Give the creative one microtask to finish mutations before we lock in the href.
-async function rebuildIfNeeded(anchor: AnchorLike, tsClickStr: string): Promise<string> {
-  let finalUrl = await computeFinalUrl(anchor, tsClickStr);
+async function rebuildIfNeeded(
+  anchor: AnchorLike,
+  tsClickStr: string,
+  pendingRebuilds: PendingRebuilds,
+  isActive: () => boolean
+): Promise<string> {
+  let finalUrl = await computeFinalUrl(anchor, tsClickStr, pendingRebuilds, isActive);
+  if (!isActive()) return tsClickStr;
   if (finalUrl === tsClickStr) {
     await delay();
-    finalUrl = await computeFinalUrl(anchor, tsClickStr);
+    if (!isActive()) return tsClickStr;
+    finalUrl = await computeFinalUrl(anchor, tsClickStr, pendingRebuilds, isActive);
   }
   return finalUrl;
 }
@@ -416,17 +436,25 @@ async function rebuildIfNeeded(anchor: AnchorLike, tsClickStr: string): Promise<
 async function guardNavigation(
   anchor: AnchorLike,
   tsClickStr: string,
-  isMiddle: boolean
+  isMiddle: boolean,
+  pendingRebuilds: PendingRebuilds,
+  isActive: () => boolean
 ): Promise<void> {
-  const finalUrl = await rebuildIfNeeded(anchor, tsClickStr);
+  const finalUrl = await rebuildIfNeeded(anchor, tsClickStr, pendingRebuilds, isActive);
+  if (!isActive()) return;
   if (finalUrl && finalUrl !== tsClickStr) {
-    persistRebuiltClick(anchor, finalUrl);
+    persistRebuiltClick(anchor, finalUrl, pendingRebuilds);
   }
   navigate(anchor, finalUrl || tsClickStr, isMiddle);
 }
 
 // Entry point for click/auxclick handlers: prevent default and queue guarded nav.
-function handleGuardedClick(ev: Event, isMiddle: boolean): void {
+function handleGuardedClick(
+  ev: Event,
+  isMiddle: boolean,
+  pendingRebuilds: PendingRebuilds,
+  isActive: () => boolean
+): void {
   const anchor = closestAnchor(ev.target);
   if (!anchor) return;
 
@@ -436,7 +464,9 @@ function handleGuardedClick(ev: Event, isMiddle: boolean): void {
   ev.preventDefault();
 
   const runNavigation = () => {
-    void guardNavigation(anchor, tsClickStr, isMiddle).catch((err) => {
+    if (!isActive()) return;
+    void guardNavigation(anchor, tsClickStr, isMiddle, pendingRebuilds, isActive).catch((err) => {
+      if (!isActive()) return;
       log.warn('tsjs-creative:click: failed to compute final URL', err);
       navigate(anchor, tsClickStr, isMiddle);
     });
@@ -446,16 +476,23 @@ function handleGuardedClick(ev: Event, isMiddle: boolean): void {
 }
 
 // Observe href/data-tsclick mutations and repair anchors that third parties touch.
-function monitorAnchorMutations(): void {
-  if (typeof document === 'undefined' || typeof MutationObserver === 'undefined') return;
+function monitorAnchorMutations(
+  pendingRebuilds: PendingRebuilds,
+  isActive: () => boolean
+): CreativeGuardHandle {
+  if (typeof document === 'undefined' || typeof MutationObserver === 'undefined') {
+    return Object.freeze({ dispose: () => undefined, scan: () => undefined });
+  }
 
   const schedule = createMutationScheduler<AnchorLike>((anchor) => {
+    if (!isActive()) return;
     const tsClickStr = anchor.getAttribute('data-tsclick') || '';
     if (!tsClickStr) return;
-    void rebuildIfNeeded(anchor, tsClickStr)
+    void rebuildIfNeeded(anchor, tsClickStr, pendingRebuilds, isActive)
       .then((finalUrl) => {
+        if (!isActive()) return;
         if (finalUrl && finalUrl !== tsClickStr) {
-          persistRebuiltClick(anchor, finalUrl);
+          persistRebuiltClick(anchor, finalUrl, pendingRebuilds);
         }
       })
       .catch((err) => {
@@ -463,14 +500,14 @@ function monitorAnchorMutations(): void {
       });
   });
 
-  const scan = () => {
+  const scan = (): void => {
+    if (!isActive()) return;
     const anchors = document.querySelectorAll<AnchorLike>('a[data-tsclick], area[data-tsclick]');
     anchors.forEach((anchor) => schedule(anchor));
   };
 
-  scan();
-
   const observer = new MutationObserver((records) => {
+    if (!isActive()) return;
     for (const record of records) {
       if (record.type !== 'attributes') continue;
       const target = record.target;
@@ -485,27 +522,64 @@ function monitorAnchorMutations(): void {
     attributes: true,
     attributeFilter: ['href', 'data-tsclick'],
   });
+
+  let disposed = false;
+  return Object.freeze({
+    dispose: (): void => {
+      if (disposed) return;
+      disposed = true;
+      observer.disconnect();
+      schedule.dispose();
+    },
+    scan,
+  });
 }
 
 // Wire up capture-phase click handlers + mutation observers to protect clicks.
-export function installClickGuard(): void {
+export function installClickGuard(scanInitially = true): CreativeGuardHandle {
   if (log.getLevel && log.getLevel() === 'warn') {
     log.setLevel('info');
   }
   enableDebugFromEnv();
   log.info('tsjs-creative:click: installing click guard');
 
+  // Opaque rebuild recognition belongs to this exact guard generation. A new
+  // installation must never inherit a disposed generation's anchor state.
+  const pendingRebuilds: PendingRebuilds = new WeakMap();
+  let active = true;
+  const isActive = (): boolean => active;
   const onClick = (ev: Event) => {
-    handleGuardedClick(ev, false);
+    if (!active) return;
+    handleGuardedClick(ev, false, pendingRebuilds, isActive);
   };
 
   const onAuxClick = (ev: MouseEvent) => {
+    if (!active) return;
     if (ev.button !== 1) return;
-    handleGuardedClick(ev, true);
+    handleGuardedClick(ev, true, pendingRebuilds, isActive);
   };
 
   document.addEventListener('click', onClick, true);
   document.addEventListener('auxclick', onAuxClick as EventListener, true);
 
-  monitorAnchorMutations();
+  let mutations: CreativeGuardHandle | undefined;
+  const dispose = (): void => {
+    if (!active) return;
+    active = false;
+    document.removeEventListener('click', onClick, true);
+    document.removeEventListener('auxclick', onAuxClick as EventListener, true);
+    mutations?.dispose();
+  };
+  try {
+    mutations = monitorAnchorMutations(pendingRebuilds, isActive);
+    const handle = Object.freeze({
+      dispose,
+      scan: (): void => mutations?.scan(),
+    });
+    if (scanInitially) handle.scan();
+    return handle;
+  } catch (error) {
+    dispose();
+    throw error;
+  }
 }

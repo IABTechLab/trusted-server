@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  disposeOsanoConsentMirror,
   initializeOsanoConsentMirror,
   mirrorOsanoConsent,
-  resetOsanoConsentMirrorForTest,
 } from '../../../src/integrations/osano';
 
 type TestWindow = Window & {
@@ -24,7 +24,7 @@ type UspCallback = (data?: { uspString?: string }, success?: boolean) => void;
 
 function clearAllCookies(): void {
   document.cookie.split(';').forEach((cookie) => {
-    const name = cookie.split('=')[0].trim();
+    const name = cookie.split('=')[0]?.trim() ?? '';
     if (name) document.cookie = `${name}=; path=/; Max-Age=0`;
   });
 }
@@ -80,7 +80,7 @@ function setOsanoStub(): Record<string, (payload?: unknown) => void> {
 
 describe('integrations/osano consent mirror', () => {
   beforeEach(() => {
-    resetOsanoConsentMirrorForTest();
+    disposeOsanoConsentMirror();
     clearAllCookies();
     delete (window as TestWindow).Osano;
     delete (window as TestWindow).__uspapi;
@@ -90,7 +90,7 @@ describe('integrations/osano consent mirror', () => {
 
   afterEach(() => {
     vi.useRealTimers();
-    resetOsanoConsentMirrorForTest();
+    disposeOsanoConsentMirror();
     clearAllCookies();
     delete (window as TestWindow).Osano;
     delete (window as TestWindow).__uspapi;
@@ -435,5 +435,34 @@ describe('integrations/osano consent mirror', () => {
     );
     expect(listeners['osano-cm-consent-saved']).toEqual(expect.any(Function));
     expect(getCookie('us_privacy')).toBe('1YN-');
+  });
+
+  it('cancels in-flight API timeouts and makes late callbacks inert on disposal', async () => {
+    vi.useFakeTimers();
+    const callbacks = setControlledUspApi();
+    const pending = mirrorOsanoConsent();
+
+    expect(vi.getTimerCount()).toBe(1);
+    disposeOsanoConsentMirror();
+    expect(vi.getTimerCount()).toBe(0);
+    await expect(pending).resolves.toBe(false);
+
+    callbacks[0]?.({ uspString: 'late-consent' }, true);
+    await Promise.resolve();
+    expect(getCookie('us_privacy')).toBeUndefined();
+    expect(getCookie(MARKER_COOKIE)).toBeUndefined();
+  });
+
+  it('does not retain Osano listeners when the vendor exposes no removal API', async () => {
+    vi.useFakeTimers();
+    const addEventListener = vi.fn();
+    (window as TestWindow).Osano = { cm: { addEventListener } };
+
+    initializeOsanoConsentMirror();
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(addEventListener).not.toHaveBeenCalled();
+    disposeOsanoConsentMirror();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

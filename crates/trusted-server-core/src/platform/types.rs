@@ -10,6 +10,15 @@ use super::{
     PlatformSecretStore,
 };
 
+/// Response-extension marker for routes whose security contract owns the
+/// complete application-header set.
+///
+/// Adapter finalizers must not append geo, deployment, or operator-configured
+/// headers to a marked response. HTTP runtimes may still add transport framing
+/// such as `Content-Length`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExactResponseHeadersV1;
+
 /// Geographic information extracted from a request.
 ///
 /// Serde derives are required because `GeoInfo` is embedded in

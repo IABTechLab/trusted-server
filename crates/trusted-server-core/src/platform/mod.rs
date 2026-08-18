@@ -48,7 +48,8 @@ pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformK
 pub use error::PlatformError;
 pub use http::{
     PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
-    PlatformSelectResult, UnavailableHttpClient,
+    PlatformSelectResult, ProxyHeaderEvidenceV1, ProxyResponseEvidenceV1, RawProxyPolicyV1,
+    RawProxyResponseV1, UnavailableHttpClient,
 };
 pub use image_optimizer::{
     PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions,
@@ -66,6 +67,7 @@ pub use template_cache::{
     VaryHeaderValues, VarySpec,
 };
 pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
+pub use types::ExactResponseHeadersV1;
 pub use types::{
     ClientInfo, GeoInfo, PlatformBackendSpec, RuntimeServices, RuntimeServicesBuilder, StoreId,
     StoreName,

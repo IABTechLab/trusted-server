@@ -328,10 +328,11 @@ impl<'a> BackendConfig<'a> {
 
     /// Ensure a dynamic backend exists for this configuration and return its name.
     ///
-    /// The name is a collision-resistant function of the complete backend spec
-    /// (see `Self::compute_name`), so different specs — for example, different
-    /// timeout values — always produce different backend registrations and a
-    /// tight deadline cannot be silently widened by an earlier registration.
+    /// The backend name is derived from the scheme, host, port, certificate
+    /// setting, `first_byte_timeout`, and `between_bytes_timeout` to avoid
+    /// collisions. Different timeout values produce different backend
+    /// registrations so that a tight deadline cannot be silently widened by an
+    /// earlier registration.
     ///
     /// # Errors
     ///

@@ -24,14 +24,14 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherResponse,
-    buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
-    handle_tsjs_dynamic, page_bids_preflight_denied,
+    AuctionDispatch, PAGE_BIDS_PATH, PublisherResponse, buffer_publisher_response_async,
+    handle_page_bids, handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
+use trusted_server_core::trace_cookie::handle_trace_mode;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::build_runtime_services;
@@ -118,6 +118,47 @@ fn build_state_with_settings(
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
     }))
+}
+
+async fn dispatch_reserved_for_state(state: &Arc<AppState>, req: Request) -> Option<Response> {
+    if !state.registry.has_reserved_path(req.uri().path()) {
+        return None;
+    }
+    let ctx = RequestContext::new(req, edgezero_core::params::PathParams::default());
+    let services = build_runtime_services(&ctx);
+    Some(
+        state
+            .registry
+            .handle_reserved_proxy(&state.settings, &services, ctx.into_request())
+            .await
+            .expect("reserved path should have a hard-cutover handler")
+            .unwrap_or_else(|report| http_error(&report)),
+    )
+}
+
+/// Dispatch a reserved request using explicit settings.
+///
+/// # Errors
+///
+/// Returns an error when the adapter state cannot be built from `settings`.
+pub async fn dispatch_reserved_with_settings(
+    settings: Settings,
+    req: Request,
+) -> Result<Option<Response>, Report<TrustedServerError>> {
+    let state = build_state_with_settings(settings)?;
+    Ok(dispatch_reserved_for_state(&state, req).await)
+}
+
+/// Dispatch a reserved request using the configured adapter state.
+///
+/// # Errors
+///
+/// Returns an error when the configured adapter state cannot be built.
+pub async fn dispatch_reserved(
+    req: Request,
+) -> Result<Option<Response>, Report<TrustedServerError>> {
+    let state = build_state()?;
+    Ok(dispatch_reserved_for_state(&state, req).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -378,7 +419,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
     {
         let state = Arc::clone(state);
 
-        // Shared fallback dispatch: routes to tsjs (GET only), integration proxy, or publisher.
+        // Shared fallback dispatch: routes to tsjs (GET/HEAD), integration proxy, or publisher.
         async fn dispatch(
             state: Arc<AppState>,
             ctx: RequestContext,
@@ -393,15 +434,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             }
             let path = req.uri().path().to_owned();
             let method = req.method().clone();
-            // tsjs assets are served for GET only, matching the Axum/Fastly adapters.
-            let allow_tsjs = method == Method::GET;
-
-            let result = if allow_tsjs && path.starts_with("/static/tsjs=") {
-                handle_tsjs_dynamic(
-                    &req,
-                    &state.registry,
-                    EdgeCacheHeader::CloudflareCdnCacheControl,
-                )
+            let result = if path.starts_with("/static/tsjs=") {
+                handle_tsjs_dynamic(&req, &state.registry)
             } else if state.registry.has_route(&method, &path) {
                 let mut ec_context = EcContext::default();
                 state
@@ -496,24 +530,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .post("/_ts/admin/keys/deactivate", |_ctx: RequestContext| async {
                 Ok::<Response, EdgeError>(admin_key_management_not_supported())
             })
-            // Admin EC lookup routes. Registered explicitly (like the key
-            // routes above) so they never fall through to the publisher
-            // fallback, and they match `Settings::ADMIN_ENDPOINTS` for auth
-            // coverage. The EC identity graph is Fastly KV backed, so this
-            // adapter has no store to read.
-            .get("/_ts/admin/ec", |_ctx: RequestContext| async {
-                Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
-            })
-            .get("/_ts/admin/ec/{id}", |_ctx: RequestContext| async {
-                Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
-            })
-            // Admin EIDs echo: pure request inspection (no KV), so this
-            // adapter serves the real handler.
+            // Render-trace toggle: arms/disarms the ts-trace cookie and
+            // redirects to `/`. Gated by [debug] trace_route_enabled (404 when
+            // off).
             .get(
-                "/_ts/admin/eids",
+                "/_ts/trace",
                 make_handler(Arc::clone(&state), |s, _services, req| async move {
-                    let partner_registry = PartnerRegistry::from_config(&s.settings.ec.partners)?;
-                    handle_admin_eids_lookup(&partner_registry, &req)
+                    handle_trace_mode(&s.settings, req.uri().query())
                 }),
             )
             .post(
@@ -576,15 +599,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 }),
             );
 
-        // SPA re-auction endpoint, registered on the canonical path and on the
-        // deprecated `PAGE_BIDS_LEGACY_PATH` double-underscore alias. The alias
-        // keeps tsjs bundles served before the `/_ts/page-bids` rename getting
-        // ads on SPA navigations until they age out of browser caches.
-        //
-        // The OPTIONS preflight is denied on both so the GET handler's
-        // `X-TSJS-Page-Bids` gate stays trustworthy — an alias that let the
-        // preflight fall through to a permissive origin would reopen exactly
-        // the cross-site hole the canonical path closes.
+        // SPA re-auction endpoint. OPTIONS is denied so the GET handler's
+        // `X-TSJS-Page-Bids` gate stays trustworthy.
         let page_bids = make_handler(Arc::clone(&state), |s, services, req| async move {
             let ec_context = build_ec_context(&s.settings, &services, &req);
             let auction = AuctionDispatch {
@@ -598,10 +614,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             make_handler(Arc::clone(&state), |_s, _services, _req| async move {
                 Ok(page_bids_preflight_denied())
             });
-        for path in [PAGE_BIDS_PATH, PAGE_BIDS_LEGACY_PATH] {
-            router = router.route(path, Method::GET, page_bids.clone());
-            router = router.route(path, Method::OPTIONS, page_bids_preflight.clone());
-        }
+        router = router.route(PAGE_BIDS_PATH, Method::GET, page_bids);
+        router = router.route(PAGE_BIDS_PATH, Method::OPTIONS, page_bids_preflight);
 
         let legacy_admin_deny =
             make_handler(Arc::clone(&state), |_s, _services, _req| async move {
@@ -614,6 +628,9 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 legacy_admin_deny.clone(),
             );
             router = router.route("/admin/keys/deactivate", method, legacy_admin_deny.clone());
+        }
+        for method in publisher_fallback_methods() {
+            router = router.route("/__ts/page-bids", method, legacy_admin_deny.clone());
         }
 
         for method in publisher_fallback_methods() {

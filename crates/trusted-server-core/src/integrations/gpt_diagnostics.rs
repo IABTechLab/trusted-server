@@ -1,9 +1,9 @@
 //! Query-activated, browser-session GPT runtime diagnostics integration.
 //!
-//! Deployment configuration makes the standalone browser module available.
-//! Exact `ts_console` directives establish or clear a host-only session cookie;
-//! active documents load the module synchronously without adding diagnostics to
-//! the ordinary unified bundle.
+//! Exact `ts_console` directives establish or clear a host-only session cookie.
+//! Active documents select `gpt_diagnostics` as a takeover member of the unified
+//! TSJS manifest, whose runtime owns diagnostics fact capture and delivery. No
+//! standalone diagnostics browser module or script tag is emitted.
 
 use error_stack::{Report, ResultExt};
 use http::{HeaderValue, Method, Request, Response, Uri, header, uri::PathAndQuery};
@@ -16,7 +16,6 @@ use crate::cache_policy::EDGE_CACHE_HEADER_NAMES;
 use crate::error::TrustedServerError;
 use crate::http_util::is_navigation_request;
 use crate::settings::{IntegrationConfig, Settings};
-use crate::tsjs;
 
 use super::IntegrationRegistration;
 
@@ -26,7 +25,6 @@ pub const GPT_DIAGNOSTICS_INTEGRATION_ID: &str = "gpt_diagnostics";
 pub const GPT_DIAGNOSTICS_QUERY: &str = "ts_console";
 /// Host-only browser-session activation cookie.
 pub const GPT_DIAGNOSTICS_COOKIE: &str = "__Host-ts-console";
-
 const SET_CONSOLE_COOKIE: &str = "__Host-ts-console=1; Path=/; Secure; HttpOnly; SameSite=Lax";
 const CLEAR_CONSOLE_COOKIE: &str =
     "__Host-ts-console=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0";
@@ -35,7 +33,7 @@ const CLEAR_CONSOLE_COOKIE: &str =
 #[derive(Debug, Clone, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct GptDiagnosticsConfig {
-    /// Whether the GPT diagnostics browser module is available.
+    /// Whether requests may activate the unified GPT diagnostics runtime.
     #[serde(default)]
     pub enabled: bool,
 }
@@ -62,6 +60,7 @@ pub enum GptDiagnosticsCookieAction {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GptDiagnosticsRequestDecision {
     active: bool,
+    reserved_directive: bool,
     clean_browser_path_and_query: Option<String>,
     cookie_action: GptDiagnosticsCookieAction,
 }
@@ -73,44 +72,31 @@ impl GptDiagnosticsRequestDecision {
         self.active
     }
 
+    /// Serialize the exact `DiagnosticsBootV1.gpt` value for the boot emitter.
+    #[must_use]
+    pub fn boot_config_json(&self) -> &'static str {
+        if self.active {
+            r#"{"active":true}"#
+        } else {
+            r#"{"active":false}"#
+        }
+    }
+
     /// Whether the response must be private and non-storeable.
     #[must_use]
     pub fn requires_private_no_store(&self) -> bool {
         self.active
             || self.cookie_action != GptDiagnosticsCookieAction::None
-            || self.clean_browser_path_and_query.is_some()
+            || self.reserved_directive
     }
 
-    /// Build the early activation/URL-cleanup bootstrap for an HTML document.
+    /// Build the one-time inline URL-cleanup tag after reserved input was consumed.
     #[must_use]
-    pub fn bootstrap_script(&self) -> Option<String> {
-        if !self.active && self.clean_browser_path_and_query.is_none() {
-            return None;
-        }
-
-        let mut script = String::from("<script>");
-        if self.active {
-            script.push_str("window.__tsjs_gpt_diagnostics_active=true;");
-        }
-        if let Some(clean_path) = &self.clean_browser_path_and_query {
-            let encoded = serde_json::to_string(clean_path).ok()?;
-            script.push_str("history.replaceState(history.state,'',");
-            script.push_str(&encoded);
-            script.push_str("+location.hash);");
-        }
-        script.push_str("</script>");
-        Some(script)
-    }
-
-    /// Build the synchronous standalone diagnostics module tag.
-    #[must_use]
-    pub fn module_script_tag(&self) -> Option<String> {
-        self.active.then(|| {
-            format!(
-                "<script src=\"{}\"></script>",
-                tsjs::tsjs_single_module_script_src(GPT_DIAGNOSTICS_INTEGRATION_ID)
-            )
-        })
+    pub fn url_cleanup_script_tag(&self) -> Option<String> {
+        let clean_path = serde_json::to_string(self.clean_browser_path_and_query.as_ref()?).ok()?;
+        Some(format!(
+            "<script>try{{history.replaceState(history.state,'',{clean_path}+location.hash)}}catch(_error){{}}</script>"
+        ))
     }
 }
 
@@ -275,9 +261,13 @@ pub fn prepare_request(
         replace_path_and_query(request, &clean_path)?;
     }
 
-    let mut decision = GptDiagnosticsRequestDecision::default();
+    let mut decision = GptDiagnosticsRequestDecision {
+        reserved_directive: had_reserved_query,
+        clean_browser_path_and_query: (eligible_navigation && had_reserved_query)
+            .then_some(clean_path),
+        ..GptDiagnosticsRequestDecision::default()
+    };
     if integration_enabled && eligible_navigation && had_reserved_query {
-        decision.clean_browser_path_and_query = Some(clean_path);
         match directive {
             QueryDirective::Enable => {
                 decision.active = true;
@@ -316,6 +306,7 @@ pub fn finalize_response(
     decision: &GptDiagnosticsRequestDecision,
     response: &mut Response<EdgeBody>,
 ) {
+    sanitize_console_set_cookie(response);
     let cookie = match decision.cookie_action {
         GptDiagnosticsCookieAction::None => None,
         GptDiagnosticsCookieAction::SetSession => {
@@ -376,9 +367,9 @@ fn console_cookie_state(request: &Request<EdgeBody>) -> ConsoleCookieState {
         for cookie in value.split(';') {
             let cookie = cookie.trim();
             match cookie.split_once('=') {
-                Some((name, value)) if name.trim() == GPT_DIAGNOSTICS_COOKIE => {
+                Some((name, value)) if name == GPT_DIAGNOSTICS_COOKIE => {
                     state.occurrences += 1;
-                    state.canonical |= value.trim() == "1";
+                    state.canonical |= value == "1";
                 }
                 None if cookie == GPT_DIAGNOSTICS_COOKIE => state.occurrences += 1,
                 _ => {}
@@ -386,6 +377,33 @@ fn console_cookie_state(request: &Request<EdgeBody>) -> ConsoleCookieState {
         }
     }
     state
+}
+
+fn sanitize_console_set_cookie(response: &mut Response<EdgeBody>) {
+    let retained = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter(|value| {
+            let pair = value
+                .as_bytes()
+                .split(|byte| *byte == b';')
+                .next()
+                .unwrap_or_default();
+            let name = pair
+                .split(|byte| *byte == b'=')
+                .next()
+                .unwrap_or_default()
+                .trim_ascii();
+            name != GPT_DIAGNOSTICS_COOKIE.as_bytes()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    response.headers_mut().remove(header::SET_COOKIE);
+    for value in retained {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
 }
 
 fn sanitize_console_cookie(request: &mut Request<EdgeBody>) {
@@ -463,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn register_excludes_diagnostics_from_unified_and_deferred_bundles() {
+    fn ts_console_register_defers_browser_delivery_to_the_unified_takeover_catalog() {
         let registry = IntegrationRegistry::new(&settings(true)).expect("should build registry");
 
         assert!(registry.integration_enabled(GPT_DIAGNOSTICS_INTEGRATION_ID));
@@ -480,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_directive_activates_cleans_and_strips_cookie() {
+    fn ts_console_exact_directive_activates_cleans_and_strips_cookie() {
         let mut request = navigation(
             "https://publisher.example/page?keep=%2F&ts_console=true#fragment",
             Some("other=value; __Host-ts-console=1"),
@@ -498,13 +516,18 @@ mod tests {
             "https://publisher.example/page?keep=%2F"
         );
         assert_eq!(request.headers()[header::COOKIE], "other=value");
-        let bootstrap = decision.bootstrap_script().expect("should bootstrap");
-        assert!(bootstrap.contains("__tsjs_gpt_diagnostics_active=true"));
-        assert!(bootstrap.contains("/page?keep=%2F"));
+        assert_eq!(decision.boot_config_json(), r#"{"active":true}"#);
+        let cleanup = decision
+            .url_cleanup_script_tag()
+            .expect("a server-consumed directive should authorize inline cleanup");
+        assert!(cleanup.starts_with("<script>"));
+        assert!(cleanup.ends_with("</script>"));
+        assert!(cleanup.contains("history.replaceState"));
+        assert!(!cleanup.contains(" src="));
     }
 
     #[test]
-    fn prefetch_directive_is_sanitized_without_activating_session() {
+    fn ts_console_prefetch_directive_is_sanitized_without_activating_session() {
         let mut request = navigation("https://publisher.example/page?ts_console=1&keep=1", None);
         request
             .headers_mut()
@@ -521,13 +544,14 @@ mod tests {
     }
 
     #[test]
-    fn active_cookie_enables_clean_navigation_but_duplicates_fail_closed() {
+    fn ts_console_active_cookie_enables_clean_navigation_but_duplicates_fail_closed() {
         let mut active = navigation(
             "https://publisher.example/page",
             Some("__Host-ts-console=1; other=value"),
         );
         let decision = prepare_request(&settings(true), &mut active).expect("should prepare");
         assert!(decision.active());
+        assert_eq!(decision.url_cleanup_script_tag(), None);
         assert_eq!(active.headers()[header::COOKIE], "other=value");
 
         let mut duplicate = navigation(
@@ -537,10 +561,17 @@ mod tests {
         let decision = prepare_request(&settings(true), &mut duplicate).expect("should prepare");
         assert!(!decision.active());
         assert_eq!(duplicate.headers()[header::COOKIE], "other=value");
+
+        for noncanonical in ["__Host-ts-console =1", "__Host-ts-console= 1"] {
+            let mut request = navigation("https://publisher.example/page", Some(noncanonical));
+            let decision = prepare_request(&settings(true), &mut request).expect("should prepare");
+            assert!(!decision.active(), "{noncanonical} must fail closed");
+            assert!(!request.headers().contains_key(header::COOKIE));
+        }
     }
 
     #[test]
-    fn invalid_duplicate_and_disable_directives_fail_closed() {
+    fn ts_console_invalid_duplicate_and_disable_directives_fail_closed() {
         for query in [
             "ts_console=True",
             "ts_console=",
@@ -569,7 +600,47 @@ mod tests {
     }
 
     #[test]
-    fn finalization_sets_cookie_and_strips_shared_cache_headers() {
+    fn ts_console_invalid_directive_is_private_without_mutating_the_session() {
+        let mut request = navigation(
+            "https://publisher.example/page?keep=1&ts_console=True",
+            Some("__Host-ts-console=1"),
+        );
+        let decision = prepare_request(&settings(true), &mut request).expect("should prepare");
+        let mut response = Response::builder()
+            .header(header::CACHE_CONTROL, "public, max-age=60")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+
+        finalize_response(&decision, &mut response);
+
+        assert!(!decision.active());
+        assert_eq!(request.uri().query(), Some("keep=1"));
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+    }
+
+    #[test]
+    fn ts_console_is_disabled_by_default_while_reserved_input_is_still_sanitized() {
+        let mut request = navigation(
+            "https://publisher.example/page?keep=1&ts_console=1",
+            Some("__Host-ts-console=1; other=value"),
+        );
+
+        let decision = prepare_request(&settings(false), &mut request).expect("should prepare");
+
+        assert!(!decision.active());
+        assert_eq!(decision.boot_config_json(), r#"{"active":false}"#);
+        assert_eq!(decision.cookie_action, GptDiagnosticsCookieAction::None);
+        assert_eq!(request.uri().query(), Some("keep=1"));
+        assert_eq!(request.headers()[header::COOKIE], "other=value");
+        assert!(decision.requires_private_no_store());
+    }
+
+    #[test]
+    fn ts_console_finalization_sets_cookie_and_strips_shared_cache_headers() {
         let mut request = navigation("https://publisher.example/?ts_console=1", None);
         let decision = prepare_request(&settings(true), &mut request).expect("should prepare");
         let mut response = Response::builder()
@@ -577,6 +648,11 @@ mod tests {
             .header("surrogate-control", "max-age=60")
             .header("fastly-surrogate-control", "max-age=60")
             .header("cloudflare-cdn-cache-control", "public, max-age=60")
+            .header(header::SET_COOKIE, "publisher=value; Path=/")
+            .header(
+                header::SET_COOKIE,
+                "__Host-ts-console=origin; Path=/; Secure",
+            )
             .body(EdgeBody::empty())
             .expect("should build response");
 
@@ -586,7 +662,13 @@ mod tests {
             response.headers()[header::CACHE_CONTROL],
             "private, no-store"
         );
-        assert_eq!(response.headers()[header::SET_COOKIE], SET_CONSOLE_COOKIE);
+        let cookies = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().expect("should emit valid cookie text"))
+            .collect::<Vec<_>>();
+        assert_eq!(cookies, vec!["publisher=value; Path=/", SET_CONSOLE_COOKIE]);
         assert!(!response.headers().contains_key("surrogate-control"));
         assert!(!response.headers().contains_key("fastly-surrogate-control"));
         assert!(
@@ -597,7 +679,51 @@ mod tests {
     }
 
     #[test]
-    fn config_rejects_unknown_fields() {
+    fn ts_console_only_eligible_get_document_navigations_activate() {
+        for (method, destination) in [(Method::POST, "document"), (Method::GET, "script")] {
+            let mut request = Request::builder()
+                .method(method.clone())
+                .uri("https://publisher.example/page?keep=1&ts_console=1")
+                .header("sec-fetch-dest", destination)
+                .header(header::COOKIE, "__Host-ts-console=1; other=value")
+                .body(EdgeBody::empty())
+                .expect("should build ineligible request");
+
+            let decision = prepare_request(&settings(true), &mut request)
+                .expect("should sanitize ineligible request");
+
+            assert!(
+                !decision.active(),
+                "{method} {destination} must not activate"
+            );
+            assert_eq!(decision.cookie_action, GptDiagnosticsCookieAction::None);
+            assert_eq!(request.uri().query(), Some("keep=1"));
+            assert_eq!(request.headers()[header::COOKIE], "other=value");
+        }
+    }
+
+    #[test]
+    fn ts_console_disable_emits_the_exact_session_cookie_clear() {
+        let mut request = navigation(
+            "https://publisher.example/page?ts_console=0&keep=1",
+            Some("__Host-ts-console=1"),
+        );
+        let decision = prepare_request(&settings(true), &mut request).expect("should prepare");
+        let mut response = Response::new(EdgeBody::empty());
+
+        finalize_response(&decision, &mut response);
+
+        assert!(!decision.active());
+        assert_eq!(request.uri().query(), Some("keep=1"));
+        assert_eq!(response.headers()[header::SET_COOKIE], CLEAR_CONSOLE_COOKIE);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+    }
+
+    #[test]
+    fn ts_console_config_rejects_unknown_fields() {
         let mut settings = create_test_settings();
         settings
             .integrations

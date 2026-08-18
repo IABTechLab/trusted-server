@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { GptDiagnosticsBinding } from '../../../src/core/types';
+import { DiagnosticsSubscriberLimitError } from '../../../src/core/trace';
 import { GptDiagnosticsApiController } from '../../../src/integrations/gpt_diagnostics/api';
 import { GptDiagnosticsStore } from '../../../src/integrations/gpt_diagnostics/store';
 
@@ -63,12 +64,22 @@ function fakeApiStore() {
         evictedRequestCycles: 0,
       },
     })),
-    subscribe: vi.fn(() => () => undefined),
+    subscribeCommits: vi.fn(() => () => undefined),
     recordTrustedServerOpportunity: vi.fn(),
     recordPrebidRefresh: vi.fn(),
     recordTrustedServerCreativeRequest: vi.fn((_auctionSlotId: string) => 41),
     recordTrustedServerCreativeResponse: vi.fn(),
     recordTrustedServerCreativeFailure: vi.fn(),
+  };
+}
+
+function scheduleInto(tasks: Array<() => void>): (callback: () => void) => () => void {
+  return (callback) => {
+    tasks.push(callback);
+    return () => {
+      const index = tasks.indexOf(callback);
+      if (index >= 0) tasks.splice(index, 1);
+    };
   };
 }
 
@@ -385,6 +396,11 @@ describe('GptDiagnosticsApiController', () => {
     const second = controller.api.snapshot();
     expect(second).not.toBe(snapshot);
     expect(second.slots).not.toBe(snapshot.slots);
+    expect(Object.isFrozen(snapshot)).toBe(true);
+    expect(Object.isFrozen(snapshot.page)).toBe(true);
+    expect(Object.isFrozen(snapshot.slots)).toBe(true);
+    expect(Object.isFrozen(snapshot.slots[0]?.requests)).toBe(true);
+    expect(Object.isFrozen(snapshot.slots[0]?.requests[0]?.durations)).toBe(true);
   });
 
   it('coalesces store and binding updates and isolates subscribers', () => {
@@ -400,7 +416,7 @@ describe('GptDiagnosticsApiController', () => {
       { show: vi.fn(), hide: vi.fn() },
       {
         now: () => new Date('2026-07-28T00:00:00.000Z'),
-        schedule: (callback) => scheduled.push(callback),
+        schedule: scheduleInto(scheduled),
       }
     );
     controller.api.subscribe(() => {
@@ -425,98 +441,136 @@ describe('GptDiagnosticsApiController', () => {
     expect(listener).toHaveBeenCalledTimes(1);
   });
 
-  it('gives subscribers isolated copies of one captured snapshot', () => {
+  it('captures subscriber membership per commit and coalesces to the latest snapshot', () => {
     const scheduled: Array<() => void> = [];
-    const sourceListeners = new Set<() => void>();
-    const store = fakeApiStore();
-    store.subscribe.mockImplementation((listener) => {
-      sourceListeners.add(listener);
-      return () => sourceListeners.delete(listener);
-    });
-    store.snapshot.mockReturnValue({
-      gptObserved: true,
-      slots: [
-        {
-          runtimeSlotNumber: 1,
-          slotElementId: 'ad-slot-example',
-          adUnitPath: '/example/site/banner',
-          requests: [
-            {
-              requestNumber: 1,
-              durations: { requestToResponseMs: 10 },
-              incompleteSequence: false,
-              requestedSlotSizes: [
-                [300, 250],
-                [728, 90],
-              ],
-              adManager: { yieldGroupIds: [10], companyIds: [20] },
-              trustedServerCreativeFailures: ['cache_fetch_failed' as const],
-            },
-          ],
-        },
-      ],
-      callbackIssues: [],
-      attributionIssues: [
-        {
-          reason: 'creative_attempt_expired' as const,
-          timestampMs: 30,
-        },
-      ],
-      coverage: emptyCoverage(),
-      metadata: {
-        droppedCallbacks: 0,
-        droppedAttributionIssues: 0,
-        evictedSlots: 0,
-        evictedRequestCycles: 0,
-      },
+    const store = new GptDiagnosticsStore({ now: () => 1, schedule: (callback) => callback() });
+    const bindings = new FakeBindings();
+    const controller = new GptDiagnosticsApiController(
+      store,
+      bindings,
+      { show: vi.fn(), hide: vi.fn() },
+      {
+        now: () => new Date('2026-07-28T00:00:00.000Z'),
+        schedule: scheduleInto(scheduled),
+      }
+    );
+    const first = vi.fn();
+    const second = vi.fn();
+    const releaseFirst = controller.api.subscribe(first);
+    const observedSlot = fakeSlot();
+
+    store.recordSlotRequested(observedSlot);
+    controller.api.subscribe(second);
+    releaseFirst();
+    expect(scheduled).toHaveLength(1);
+    scheduled.shift()?.();
+    expect(first).not.toHaveBeenCalled();
+    expect(second).not.toHaveBeenCalled();
+
+    store.recordSlotVisibilityChanged(observedSlot, 10);
+    store.recordSlotVisibilityChanged(observedSlot, 20);
+    expect(scheduled).toHaveLength(1);
+    scheduled.shift()?.();
+    expect(second).toHaveBeenCalledOnce();
+    expect(second.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({
+        slots: [expect.objectContaining({ currentVisibilityPercentage: 20 })],
+      })
+    );
+  });
+
+  it('excludes a subscriber registered after the store commit but before source microtasks', () => {
+    const sourceTasks: Array<() => void> = [];
+    const publicTasks: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({
+      now: () => 1,
+      schedule: (callback) => sourceTasks.push(callback),
     });
     const controller = new GptDiagnosticsApiController(
       store,
       new FakeBindings(),
       { show: vi.fn(), hide: vi.fn() },
-      {
-        now: () => new Date('2026-08-10T00:00:00.000Z'),
-        schedule: (callback) => scheduled.push(callback),
-      }
+      { schedule: scheduleInto(publicTasks) }
     );
-    let observedSnapshot: ReturnType<typeof controller.api.snapshot> | undefined;
 
-    controller.api.subscribe((snapshot) => {
-      const cycle = snapshot.slots[0]!.requests[0]!;
-      cycle.durations.requestToResponseMs = 999;
-      const requestedSlotSizes = cycle.requestedSlotSizes as unknown as Array<[number, number]>;
-      requestedSlotSizes[0]![0] = 1;
-      requestedSlotSizes.push([970, 250]);
-      cycle.adManager!.yieldGroupIds!.push(99);
-      cycle.trustedServerCreativeFailures!.push('response_post_failed');
-      snapshot.attributionIssues?.push({
-        reason: 'creative_attempt_unknown',
-        timestampMs: 40,
-      });
-      snapshot.coverage.slotRequested.observed = 99;
-      snapshot.metadata.droppedCallbacks = 99;
+    store.recordSlotRequested(fakeSlot());
+    const late = vi.fn();
+    controller.api.subscribe(late);
+    while (sourceTasks.length > 0) sourceTasks.shift()?.();
+    while (publicTasks.length > 0) publicTasks.shift()?.();
+
+    expect(late).not.toHaveBeenCalled();
+  });
+
+  it('includes a subscriber registered before the store commit without calling it inline', () => {
+    const sourceTasks: Array<() => void> = [];
+    const publicTasks: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({
+      now: () => 1,
+      schedule: (callback) => sourceTasks.push(callback),
     });
-    controller.api.subscribe((snapshot) => {
-      observedSnapshot = snapshot;
-    });
+    const controller = new GptDiagnosticsApiController(
+      store,
+      new FakeBindings(),
+      { show: vi.fn(), hide: vi.fn() },
+      { schedule: scheduleInto(publicTasks) }
+    );
+    const listener = vi.fn();
+    controller.api.subscribe(listener);
 
-    for (const listener of sourceListeners) listener();
-    expect(scheduled).toHaveLength(1);
-    scheduled.shift()!();
+    store.recordSlotRequested(fakeSlot());
+    expect(listener).not.toHaveBeenCalled();
+    while (sourceTasks.length > 0) sourceTasks.shift()?.();
+    expect(listener).not.toHaveBeenCalled();
+    while (publicTasks.length > 0) publicTasks.shift()?.();
 
-    expect(store.snapshot).toHaveBeenCalledTimes(1);
-    expect(observedSnapshot?.capturedAt).toBe('2026-08-10T00:00:00.000Z');
-    const observedCycle = observedSnapshot?.slots[0]?.requests[0];
-    expect(observedCycle?.durations.requestToResponseMs).toBe(10);
-    expect(observedCycle?.requestedSlotSizes).toEqual([
-      [300, 250],
-      [728, 90],
-    ]);
-    expect(observedCycle?.adManager?.yieldGroupIds).toEqual([10]);
-    expect(observedCycle?.trustedServerCreativeFailures).toEqual(['cache_fetch_failed']);
-    expect(observedSnapshot?.attributionIssues).toHaveLength(1);
-    expect(observedSnapshot?.coverage.slotRequested.observed).toBe(0);
-    expect(observedSnapshot?.metadata.droppedCallbacks).toBe(0);
+    expect(listener).toHaveBeenCalledOnce();
+  });
+
+  it('defers a subscriber registered during dispatch until the next commit', () => {
+    const publicTasks: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({ now: () => 1, schedule: (callback) => callback() });
+    const controller = new GptDiagnosticsApiController(
+      store,
+      new FakeBindings(),
+      { show: vi.fn(), hide: vi.fn() },
+      { schedule: scheduleInto(publicTasks) }
+    );
+    const second = vi.fn();
+    const first = vi.fn(() => controller.api.subscribe(second));
+    controller.api.subscribe(first);
+
+    const observedSlot = fakeSlot();
+    store.recordSlotRequested(observedSlot);
+    expect(first).not.toHaveBeenCalled();
+    publicTasks.shift()?.();
+    expect(first).toHaveBeenCalledOnce();
+    expect(second).not.toHaveBeenCalled();
+
+    store.recordSlotVisibilityChanged(observedSlot, 10);
+    publicTasks.shift()?.();
+    expect(first).toHaveBeenCalledTimes(2);
+    expect(second).toHaveBeenCalledOnce();
+  });
+
+  it('validates callability before enforcing the shared 32-subscriber cap', () => {
+    const controller = new GptDiagnosticsApiController(
+      new GptDiagnosticsStore({ now: () => 1 }),
+      new FakeBindings(),
+      { show: vi.fn(), hide: vi.fn() }
+    );
+    const releases = Array.from({ length: 32 }, () => controller.api.subscribe(() => undefined));
+
+    expect(() => controller.api.subscribe(null as never)).toThrow(TypeError);
+    expect(() => controller.api.subscribe(() => undefined)).toThrow(
+      DiagnosticsSubscriberLimitError
+    );
+    expect(() => controller.api.subscribe(() => undefined)).toThrow(
+      expect.objectContaining({ code: 'subscriber_capacity', surface: 'gpt' })
+    );
+    releases[0]?.();
+    releases[0]?.();
+    expect(controller.api.subscribe(() => undefined)).toEqual(expect.any(Function));
   });
 
   it('delegates show and hide without mutating diagnostics data', () => {
@@ -587,13 +641,17 @@ describe('GptDiagnosticsApiController', () => {
       store,
       bindings,
       { show: vi.fn(), hide: vi.fn() },
-      { schedule: (callback) => scheduled.push(callback) }
+      { schedule: scheduleInto(scheduled) }
     );
     const listener = vi.fn();
     controller.api.subscribe(listener);
 
-    controller.destroy();
     store.recordSlotRequested(fakeSlot());
+    expect(scheduled).toHaveLength(1);
+
+    controller.destroy();
+    while (scheduled.length > 0) scheduled.shift()?.();
+    store.recordSlotVisibilityChanged(fakeSlot(), 10);
     bindings.emit();
 
     expect(scheduled).toEqual([]);

@@ -1,95 +1,137 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { AuctionBidData, AuctionSlot, TsjsApi } from '../../src/core/types';
+import type { TsjsApi } from '../../src/core/types';
 
-const ORIGINAL_FETCH = global.fetch;
+const RELEASE = 'a'.repeat(64);
+const RUNTIME_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
 
-describe('core/index', () => {
+function boot() {
+  return {
+    abi: 1,
+    releaseId: RELEASE,
+    manifest: {
+      version: 1,
+      releaseId: RELEASE,
+      firstDisplay: null,
+      runtimeSrc: RUNTIME_SRC,
+      integrations: [{ id: 'render_runtime', phase: 'takeover' }],
+    },
+    auctionProjection: {
+      version: 1,
+      auction: { version: 1, auctionId: 'initial', results: [] },
+      slots: [],
+      bids: [],
+    },
+    creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+    diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+  };
+}
+
+async function loadMinimalProductionRuntime(): Promise<void> {
+  await import('../../src/composition/runtime_transport');
+  await import('../../src/integrations/render_runtime/index');
+}
+
+function installRuntimeScript(): void {
+  const script = document.createElement('script');
+  script.id = 'trustedserver-js';
+  script.src = new URL(RUNTIME_SRC, window.location.origin).href;
+  document.head.append(script);
+  Object.defineProperty(document, 'currentScript', { configurable: true, value: script });
+}
+
+describe('core production bootstrap', () => {
   beforeEach(async () => {
     await vi.resetModules();
+    document.head.replaceChildren();
     document.body.innerHTML = '';
-    delete window.tsjs;
+    delete (window as unknown as { tsjs?: unknown }).tsjs;
+    installRuntimeScript();
   });
 
-  afterEach(() => {
-    global.fetch = ORIGINAL_FETCH;
-  });
-
-  it('initializes tsjs API with expected surface', async () => {
-    await import('../../src/core/index');
-    const api = window.tsjs as TsjsApi;
-    expect(api).toBeDefined();
-    expect(typeof api.version).toBe('string');
-    expect(Array.isArray(api.que)).toBe(true);
-    expect(typeof api.addAdUnits).toBe('function');
-    expect(typeof api.renderAdUnit).toBe('function');
-    expect(typeof api.renderAllAdUnits).toBe('function');
-    expect(typeof api.setConfig).toBe('function');
-    expect(typeof api.getConfig).toBe('function');
-    expect(typeof api.requestAds).toBe('function');
-  });
-
-  it('defaults adSlots and bids so gated-off pages never see undefined', async () => {
-    await import('../../src/core/index');
-    const api = window.tsjs as TsjsApi;
-    expect(api.adSlots).toEqual([]);
-    expect(api.bids).toEqual({});
-  });
-
-  it('preserves edge-injected adSlots and bids set before the bundle loads', async () => {
-    window.tsjs = {
-      adSlots: [{ id: 'pre-injected' } as AuctionSlot],
-      bids: { 'pre-injected': { hb_pb: '1.00' } } as Record<string, AuctionBidData>,
-    } as TsjsApi;
-
-    await import('../../src/core/index');
-
-    expect(window.tsjs!.adSlots).toEqual([{ id: 'pre-injected' }]);
-    expect(window.tsjs!.bids).toEqual({ 'pre-injected': { hb_pb: '1.00' } });
-  });
-
-  it('flushes queued callbacks that existed before initialization', async () => {
-    const callback = vi.fn(function (this: TsjsApi) {
-      expect(this).toBe(window.tsjs);
+  it('commits the exact hard-cutover API and drains the retained preload queue', async () => {
+    const queued = vi.fn(function (this: TsjsApi) {
+      expect(this).toBe((window as unknown as { tsjs?: unknown }).tsjs);
     });
-    window.tsjs = { que: [callback] as Array<() => void> } as TsjsApi;
+    const preload = {
+      boot: boot(),
+      que: [queued],
+      _integrationConfig: {},
+      renderAdUnit: vi.fn(),
+      bids: { legacy: true },
+    };
+    (window as unknown as { tsjs?: unknown }).tsjs = preload;
 
-    await import('../../src/core/index');
+    await loadMinimalProductionRuntime();
+    await vi.waitFor(() =>
+      expect((window as unknown as { tsjs?: TsjsApi }).tsjs?._internal?.state).toBe('kernel')
+    );
 
-    expect(callback).toHaveBeenCalledTimes(1);
+    const api = (window as unknown as { tsjs: TsjsApi }).tsjs;
+    expect(api).toBe(preload);
+    expect(api.version).toBe('1.0.0');
+    expect(api.releaseId).toBe(RELEASE);
+    expect(api.boot.releaseId).toBe(RELEASE);
+    expect(api.boot.manifest.releaseId).toBe(RELEASE);
+    expect(Object.isFrozen(api.boot)).toBe(true);
+    expect(Object.isFrozen(api.que)).toBe(true);
+    expect(typeof api.addAdUnits).toBe('function');
+    expect(typeof api.requestAds).toBe('function');
+    expect(api._registerIntegration({})).toBe(false);
+    expect(queued).toHaveBeenCalledOnce();
+    expect(preload).not.toHaveProperty('_integrationConfig');
+    expect(preload).not.toHaveProperty('renderAdUnit');
+    expect(preload).not.toHaveProperty('bids');
+    expect(preload).not.toHaveProperty('renderAllAdUnits');
+    expect(preload).not.toHaveProperty('setConfig');
+    expect(preload).not.toHaveProperty('getConfig');
   });
 
-  it('installs queue that executes callbacks immediately with api context', async () => {
-    await import('../../src/core/index');
-    const api = window.tsjs as TsjsApi;
-    const fn = vi.fn();
+  it('starts installation in the combined bundle task without waiting for DOM readiness', async () => {
+    const readyState = vi.spyOn(document, 'readyState', 'get').mockReturnValue('loading');
+    const preload = { boot: boot(), que: [], _integrationConfig: {} };
+    (window as unknown as { tsjs?: unknown }).tsjs = preload;
 
-    api.que.push(fn);
-
-    expect(fn).toHaveBeenCalledTimes(1);
-    expect(fn.mock.instances[0]).toBe(api);
+    try {
+      await loadMinimalProductionRuntime();
+      await vi.waitFor(() =>
+        expect((window as unknown as { tsjs?: TsjsApi }).tsjs?._internal?.state).toBe('kernel')
+      );
+    } finally {
+      readyState.mockRestore();
+    }
   });
 
-  it('renders registered ad units using core rendering helpers', async () => {
-    await import('../../src/core/index');
-    const api = window.tsjs as TsjsApi;
+  it('publishes no terminal API when the transient integration-config transport is malformed', async () => {
+    const preload = {
+      boot: boot(),
+      que: [],
+      _integrationConfig: new (class Config {})(),
+    };
+    (window as unknown as { tsjs?: unknown }).tsjs = preload;
 
-    api.addAdUnits([
-      { code: 'slot-1', mediaTypes: { banner: { sizes: [[300, 250]] } } },
-      { code: 'slot-2', mediaTypes: { banner: { sizes: [[320, 50]] } } },
-    ]);
+    await import('../../src/composition/runtime_transport');
+    await Promise.resolve();
 
-    api.renderAllAdUnits();
-
-    expect(document.getElementById('slot-1')?.textContent).toContain('300x250');
-    expect(document.getElementById('slot-2')?.textContent).toContain('320x50');
+    expect(preload).not.toHaveProperty('_integrationConfig');
+    expect(preload).not.toHaveProperty('_internal');
+    expect(preload).not.toHaveProperty('requestAds');
   });
 
-  it('exposes requestAds from the core request module', async () => {
-    const { requestAds } = await import('../../src/core/request');
-    await import('../../src/core/index');
-    const api = window.tsjs as TsjsApi;
+  it('does not publish a fallback API over a non-configurable integration transport', async () => {
+    const preload = { boot: boot(), que: [] };
+    Object.defineProperty(preload, '_integrationConfig', {
+      configurable: false,
+      enumerable: true,
+      value: {},
+    });
+    (window as unknown as { tsjs?: unknown }).tsjs = preload;
 
-    expect(api.requestAds).toBe(requestAds);
+    await import('../../src/composition/runtime_transport');
+    await Promise.resolve();
+
+    expect(preload).toHaveProperty('_integrationConfig');
+    expect(preload).not.toHaveProperty('_internal');
+    expect(preload).not.toHaveProperty('requestAds');
   });
 });

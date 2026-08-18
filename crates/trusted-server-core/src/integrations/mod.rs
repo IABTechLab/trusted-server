@@ -35,8 +35,25 @@ pub use registry::{
     IntegrationRegistrationBuilder, IntegrationRegistry, IntegrationRequestFilter,
     IntegrationScriptContext, IntegrationScriptRewriter, ProxyDispatchInput, RequestFilterDecision,
     RequestFilterEffects, RequestFilterInput, RequestFilterRegistryInput,
-    RequestFilterRegistryOutcome, ScriptRewriteAction,
+    RequestFilterRegistryOutcome, ScriptRewriteAction, TsjsCatalogSelectionV1,
 };
+
+/// Emit one integration value into the sole transient pre-core config transport.
+///
+/// `config_json` must already be serialized and escaped for an inline script.
+/// The production core snapshots this object, freezes each value, deletes the
+/// transport, and then supplies the matching value only to its manifest module.
+pub(crate) fn integration_config_script(integration_id: &'static str, config_json: &str) -> String {
+    debug_assert!(
+        integration_id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+        "integration config id should be a trusted lowercase identifier"
+    );
+    format!(
+        "<script>(function(t){{var c=t._integrationConfig=t._integrationConfig||{{}};c.{integration_id}={config_json};}})(window.tsjs=window.tsjs||{{}});</script>"
+    )
+}
 
 /// Registers or retrieves a platform backend for the given URL.
 ///
@@ -93,6 +110,31 @@ pub(crate) fn ensure_integration_backend_with_timeout(
             true,
             first_byte_timeout,
         )?)
+        .change_context(TrustedServerError::Integration {
+            integration: integration.to_string(),
+            message: "Failed to register backend".to_string(),
+        })
+}
+
+/// Registers or retrieves a platform backend with separate response-header and
+/// response-body gap timeouts.
+///
+/// # Errors
+///
+/// Returns an error when `url` cannot be parsed, is missing a host, or the
+/// backend registration fails.
+pub(crate) fn ensure_integration_backend_with_transport_timeouts(
+    services: &RuntimeServices,
+    url: &str,
+    integration: &'static str,
+    first_byte_timeout: Duration,
+    between_bytes_timeout: Duration,
+) -> Result<String, Report<TrustedServerError>> {
+    let mut spec = integration_backend_spec(url, integration, true, first_byte_timeout)?;
+    spec.between_bytes_timeout = between_bytes_timeout;
+    services
+        .backend()
+        .ensure(&spec)
         .change_context(TrustedServerError::Integration {
             integration: integration.to_string(),
             message: "Failed to register backend".to_string(),

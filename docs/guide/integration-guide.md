@@ -224,15 +224,18 @@ impl IntegrationHeadInjector for MyIntegration {
     fn integration_id(&self) -> &'static str { "my_integration" }
 
     fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        vec![format!(
-            r#"<script>tsjs.setConfig({{ mode: "my_integration", host: "{}" }});</script>"#,
-            ctx.request_host
-        )]
+        let config_json = serde_json::to_string(&serde_json::json!({
+            "mode": "my_integration",
+            "host": ctx.request_host,
+        }))
+        .expect("should serialize integration config")
+        .replace("</", "<\\/");
+        vec![super::integration_config_script("my_integration", &config_json)]
     }
 }
 ```
 
-`html_processor.rs` calls `head_inserts` once per HTML response when the `<head>` element is first encountered. The returned snippets are concatenated before the unified script tag, so ordering between integrations is not guaranteed — keep snippets self-contained.
+`html_processor.rs` calls `head_inserts` once per HTML response when the `<head>` element is first encountered. The returned snippets are concatenated before the unified script tag, so ordering between integrations is not guaranteed — keep snippets self-contained. The core validates, snapshots, freezes, and consumes the matching manifest integration's value, then deletes the transient `_integrationConfig` transport before publishing the exact `TsjsApi`.
 
 ::: tip When to Use Head Injection
 Use `IntegrationHeadInjector` when you need to emit configuration, inline scripts, or `<meta>` tags that must appear early in `<head>`. For attribute or script content changes on existing elements, prefer `IntegrationAttributeRewriter` or `IntegrationScriptRewriter` instead.
@@ -331,7 +334,7 @@ Tests or scaffolding can inject configs by calling `settings.integrations.insert
 
 **3. HTML Rewrites Through the Registry**
 
-When the integration is enabled, the `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>` references that match `script_patterns`. Trusted Server injects `window.__tsjs_prebid` plus a same-origin `<script defer src="/integrations/prebid/bundle.js">` tag, so dropping publisher assets prevents duplicate downloads while configuration is available before the external bundle initializes.
+When the integration is enabled, the `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>` references that match `script_patterns`. Trusted Server emits the release-bound typed integration configuration and a same-origin `<script defer src="/integrations/prebid/bundle.js">` tag. The module loader validates, snapshots, freezes, and consumes that configuration before the public API commits, so no mutable window flag remains. Dropping publisher assets prevents duplicate downloads while configuration is available before the external bundle initializes.
 
 **4. External Bundle Assets & Testing**
 

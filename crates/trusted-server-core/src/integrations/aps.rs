@@ -1,6 +1,6 @@
 //! Amazon Publisher Services (APS/TAM) `OpenRTB` integration.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,7 +10,7 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::header::HeaderName;
 use http::{HeaderMap, Method, StatusCode, header};
-use serde::de::{self, Visitor};
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use url::Url;
@@ -18,10 +18,12 @@ use validator::{Validate, ValidationError};
 
 use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use crate::auction::types::{
-    AdSlot, ApsRendererV1, ApsTagType, AuctionContext, AuctionRequest, AuctionResponse, Bid,
-    BidRenderer, MediaType,
+    AdSlot, ApsRendererV1, ApsRendererValidationResult, ApsTagType, AuctionContext,
+    AuctionDropReason, AuctionDropReasons, AuctionRequest, AuctionResponse, Bid, BidRenderSourceV1,
+    MediaType, RENDER_DIMENSION_MAX, classify_aps_renderer_v1, record_auction_drop,
 };
 use crate::error::TrustedServerError;
+use crate::integrations::ensure_integration_backend_with_transport_timeouts;
 use crate::integrations::{
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
     UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
@@ -31,98 +33,167 @@ use crate::openrtb::{
     Banner, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs, RegsExt, Site, ToExt, User,
     UserExt, to_openrtb_i32,
 };
-use crate::platform::{PlatformHttpRequest, PlatformResponse, RuntimeServices};
+use crate::platform::{
+    PlatformHttpRequest, PlatformResponse, ProxyHeaderEvidenceV1, RawProxyPolicyV1,
+    RawProxyResponseV1, RuntimeServices,
+};
 use crate::settings::{IntegrationConfig, Settings};
 
 const APS_INTEGRATION_ID: &str = "aps";
-const APS_RENDERER_ROUTE: &str = "/integrations/aps/renderer";
+pub const APS_RENDERER_V1_ROUTE: &str = "/integrations/aps/renderer/v1";
+pub const APS_RUNNER_ROUTE: &str = "/integrations/aps/runner.js";
+pub const APS_RUNNER_UPSTREAM_URL: &str =
+    "https://client.aps.amazon-adsystem.com/prebid-creative.js";
+pub const APS_RUNNER_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+pub const APS_RENDERER_SANDBOX: &str = "allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation";
 const DEFAULT_CURRENCY: &str = "USD";
 const APS_SDK_SOURCE: &str = "prebid";
 const APS_SDK_VERSION: &str = "2.2.0";
 const MAX_ACCOUNT_ID_BYTES: usize = 1024;
+const MAX_BID_ID_BYTES: usize = 64;
 const MAX_CREATIVE_ID_BYTES: usize = 1024;
 const MAX_DEBUG_RESPONSE_PREVIEW_BYTES: usize = 512;
 const MAX_CREATIVE_URL_BYTES: usize = 4096;
 const MAX_LANGUAGE_BYTES: usize = 8;
 const MAX_PAGE_URL_BYTES: usize = 8192;
 const MAX_RENDER_ENVELOPE_BYTES: usize = 256 * 1024;
-const APS_RENDERER_CSP: &str = "default-src 'none'; sandbox allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation; script-src 'unsafe-inline' https:; connect-src https:; frame-src https:; img-src https: data:; media-src https: blob:; style-src 'unsafe-inline' https:; font-src https: data:;";
+// Exact transport window from dispatch through the final upstream byte.
+const APS_RUNNER_TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum wait for the APS runner response headers.
+pub const APS_RUNNER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(4);
+/// Maximum duration of one blocking APS runner response-body read.
+pub const APS_RUNNER_BLOCKING_READ_TIMEOUT: Duration = Duration::from_millis(250);
+/// Whether `path` belongs to the reserved APS integration family.
+#[must_use]
+pub fn is_aps_family_path(path: &str) -> bool {
+    path == "/integrations/aps" || path.starts_with("/integrations/aps/")
+}
+const APS_RENDERER_V1_CSP: &str = "default-src 'none'; sandbox allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline' 'self' https:; connect-src https:; frame-src https: data: blob:; img-src https: data: blob:; media-src https: data: blob:; style-src 'unsafe-inline' https:; font-src https: data:; worker-src https: blob:; form-action https:;";
 
-const APS_RENDERER_DOCUMENT: &str = r#"<!doctype html>
+// This document is served with an immutable v1 URL. Any semantic change must
+// ship at a new versioned route so cached v1 bytes retain their contract.
+const APS_RENDERER_V1_DOCUMENT: &str = concat!(
+    r#"<!doctype html>
 <meta charset="utf-8">
+<style>html,body{margin:0;padding:0;overflow:hidden}</style>
 <script>
 (function(){
 'use strict';
-var match=/^#tsaps=([A-Za-z0-9_-]{22,128})$/.exec(location.hash);
+"#,
+    include_str!("generated/aps_renderer_validator_v1.js"),
+    r#"
+var match=/^#tsaps=(n1_[A-Za-z0-9_-]{22})$/.exec(location.hash);
 var expected=match&&match[1];
 try{history.replaceState(null,'',location.pathname+location.search);}catch(_error){}
 if(!expected)return;
-function keys(value,expectedKeys){
- if(!value||typeof value!=='object'||Array.isArray(value))return false;
- var actual=Object.keys(value).sort();
- return actual.length===expectedKeys.length&&actual.every(function(key,index){return key===expectedKeys[index];});
+var port=null;
+var terminal=false;
+var runnerLoaded=false;
+var callbackOutcome=null;
+function send(message){
+ if(!port)return;
+ try{port.postMessage(message);}catch(_error){}
 }
-function validRenderer(renderer){
- if(!keys(renderer,['aaxResponse','accountId','bidId','creativeId','creativeUrl','height','tagType','type','version','width'])&&
-    !keys(renderer,['aaxResponse','accountId','bidId','creativeUrl','height','tagType','type','version','width']))return false;
- if(renderer.type!=='aps'||renderer.version!==1||typeof renderer.accountId!=='string'||!renderer.accountId||new TextEncoder().encode(renderer.accountId).length>1024)return false;
- if(typeof renderer.bidId!=='string'||!renderer.bidId||!Number.isInteger(renderer.width)||renderer.width<=0||!Number.isInteger(renderer.height)||renderer.height<=0)return false;
- if(Object.prototype.hasOwnProperty.call(renderer,'creativeId')&&(typeof renderer.creativeId!=='string'||!renderer.creativeId||new TextEncoder().encode(renderer.creativeId).length>1024))return false;
- if(renderer.tagType!=='iframe'&&renderer.tagType!=='script')return false;
- if(typeof renderer.creativeUrl!=='string'||new TextEncoder().encode(renderer.creativeUrl).length>4096)return false;
- if(typeof renderer.aaxResponse!=='string'||!renderer.aaxResponse||renderer.aaxResponse.length>349528)return false;
+function close(){
+ if(!port)return;
+ try{port.close();}catch(_error){}
+}
+function fail(reason){
+ if(terminal)return;
+ terminal=true;
+ send({message:'TS APS Render Failed',version:1,nonce:expected,reason:reason});
+ close();
+}
+function finishCallback(){
+ if(terminal||!runnerLoaded||callbackOutcome===null)return;
+ if(callbackOutcome==='rejected'){
+  fail('runner_failed');
+  return;
+ }
+ terminal=true;
+ send({message:'TS APS Render Completed',version:1,nonce:expected});
+ close();
+}
+function publisherOrigin(value){
+ if(typeof value!=='string'||value.length===0||value.length>2048)return false;
+ for(var index=0;index<value.length;index+=1){
+  var code=value.charCodeAt(index);
+  if(code<=31||code===127)return false;
+ }
  try{
-  var url=new URL(renderer.creativeUrl);
-  if(url.protocol!=='https:'||url.username||url.password)return false;
-  var binary=atob(renderer.aaxResponse);
-  if(binary.length>262144||btoa(binary)!==renderer.aaxResponse)return false;
-  var bytes=Uint8Array.from(binary,function(character){return character.charCodeAt(0);});
-  var decoded=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));
-  if(!keys(decoded,['seatbid'])||!Array.isArray(decoded.seatbid)||decoded.seatbid.length!==1)return false;
-  var seat=decoded.seatbid[0];
-  if(!keys(seat,['bid'])||!Array.isArray(seat.bid)||seat.bid.length!==1)return false;
-  var bid=seat.bid[0];
-  if(!keys(bid,['ext','h','id','price','w'])||!keys(bid.ext,['creativeurl','tagtype']))return false;
-  return bid.id===renderer.bidId&&bid.w===renderer.width&&bid.h===renderer.height&&
-   bid.ext.creativeurl===renderer.creativeUrl&&bid.ext.tagtype===renderer.tagType&&
-   typeof bid.price==='number'&&Number.isFinite(bid.price)&&bid.price>=0;
+  var parsed=new URL(value);
+  return (parsed.protocol==='https:'||parsed.protocol==='http:')&&
+   parsed.username===''&&parsed.password===''&&parsed.pathname==='/'&&
+   parsed.search===''&&parsed.hash===''&&parsed.origin===value;
  }catch(_error){return false;}
 }
 function receive(event){
- if(event.source!==parent)return;
- var message=event.data;
- if(!keys(message,['nonce','renderer'])||message.nonce!==expected||!validRenderer(message.renderer))return;
+ if(event.source!==parent||!event.ports||event.ports.length!==1)return;
+ port=event.ports[0];
  removeEventListener('message',receive);
- var acceptedNonce=expected;
- expected='';
- var renderer=message.renderer;
+ var envelope=event.data;
+ if(!apsExactRecord(envelope,['nonce','publisherOrigin','renderer','version'])||
+    envelope.version!==1||envelope.nonce!==expected||
+    !publisherOrigin(envelope.publisherOrigin)||
+    classifyApsRendererV1(envelope.renderer,envelope.publisherOrigin)!=='accepted'){
+  fail('descriptor_invalid');
+  return;
+ }
+ port.onmessageerror=function(){fail('descriptor_invalid');};
+ try{port.start();}catch(_error){}
+ var renderer=envelope.renderer;
+ send({message:'TS APS Document Accepted',version:1,nonce:expected});
  window._aps=window._aps instanceof Map?window._aps:new Map();
  var account=window._aps.get(renderer.accountId);
  if(!account){
   account={queue:[],store:new Map([['listeners',new Map()]])};
   window._aps.set(renderer.accountId,account);
  }
- account.queue.push(new CustomEvent('prebid/creative/render',{detail:{aaxResponse:renderer.aaxResponse,seatBidId:renderer.bidId}}));
+ var renderPromise=new Promise(function(resolve,reject){
+  account.queue.push(new CustomEvent('prebid/creative/render',{detail:{
+   aaxResponse:renderer.aaxResponse,
+   seatBidId:renderer.bidId,
+   source:'internal',
+   resolve:resolve,
+   reject:reject
+ }}));
+ });
+ renderPromise.then(function(){
+  callbackOutcome='resolved';
+  finishCallback();
+ },function(){
+  callbackOutcome='rejected';
+  finishCallback();
+ });
  var script=document.createElement('script');
- script.src='https://client.aps.amazon-adsystem.com/prebid-creative.js';
- script.onload=function(){parent.postMessage({message:'trusted-server/aps/renderer-ready',nonce:acceptedNonce},'*');};
- script.onerror=function(){parent.postMessage({message:'trusted-server/aps/renderer-failed',nonce:acceptedNonce},'*');};
+ script.src=new URL('/integrations/aps/runner.js',location.href).href;
+ script.crossOrigin='anonymous';
+ script.referrerPolicy='no-referrer';
+ script.onload=function(){
+  if(terminal)return;
+  runnerLoaded=true;
+  send({message:'TS APS Runner Loaded',version:1,nonce:expected});
+  finishCallback();
+ };
+ script.onerror=function(){fail('runner_no_load');};
  document.head.appendChild(script);
 }
 addEventListener('message',receive);
 })();
 </script>
-"#;
+"#
+);
 
 /// Configuration for the APS `OpenRTB` integration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 #[validate(schema(function = "validate_inventory_identity_override"))]
 pub struct ApsConfig {
     /// Whether APS integration is enabled.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
-    /// APS account ID. `pub_id` remains a deserialization alias only.
-    #[serde(alias = "pub_id", deserialize_with = "deserialize_account_id")]
+    /// APS account ID.
+    #[serde(deserialize_with = "deserialize_account_id")]
     pub account_id: String,
     /// APS `OpenRTB` endpoint.
     #[serde(default = "default_endpoint")]
@@ -155,52 +226,15 @@ fn deserialize_account_id<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    struct AccountIdVisitor;
-
-    impl Visitor<'_> for AccountIdVisitor {
-        type Value = String;
-
-        fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            formatter.write_str("a non-empty string or integer for account_id")
-        }
-
-        fn visit_str<E>(self, value: &str) -> Result<String, E>
-        where
-            E: de::Error,
-        {
-            let value = value.trim();
-            if value.is_empty() {
-                return Err(E::custom("account_id must not be empty"));
-            }
-            if value.len() > MAX_ACCOUNT_ID_BYTES {
-                return Err(E::custom("account_id is too large"));
-            }
-            Ok(value.to_string())
-        }
-
-        fn visit_string<E>(self, value: String) -> Result<String, E>
-        where
-            E: de::Error,
-        {
-            self.visit_str(&value)
-        }
-
-        fn visit_i64<E>(self, value: i64) -> Result<String, E>
-        where
-            E: de::Error,
-        {
-            Ok(value.to_string())
-        }
-
-        fn visit_u64<E>(self, value: u64) -> Result<String, E>
-        where
-            E: de::Error,
-        {
-            Ok(value.to_string())
-        }
+    let value = String::deserialize(deserializer)?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(D::Error::custom("account_id must not be empty"));
     }
-
-    deserializer.deserialize_any(AccountIdVisitor)
+    if value.len() > MAX_ACCOUNT_ID_BYTES {
+        return Err(D::Error::custom("account_id is too large"));
+    }
+    Ok(value.to_string())
 }
 
 fn validate_aps_endpoint(value: &str) -> Result<(), ValidationError> {
@@ -664,7 +698,7 @@ impl ApsAuctionProvider {
             })
     }
 
-    fn valid_creative_url(&self, value: &str, publisher_domain: &str) -> bool {
+    fn valid_creative_url(&self, value: &str, publisher_origin: &str) -> bool {
         if value.len() > MAX_CREATIVE_URL_BYTES {
             return false;
         }
@@ -672,14 +706,17 @@ impl ApsAuctionProvider {
             return false;
         };
         parsed.scheme() == "https"
-            && parsed
-                .host_str()
-                .is_some_and(|host| !host.eq_ignore_ascii_case(publisher_domain))
+            && parsed.host_str().is_some()
             && parsed.username().is_empty()
             && parsed.password().is_none()
+            && parsed.origin().ascii_serialization() != publisher_origin
     }
 
-    fn build_renderer(&self, input: ApsRendererInput<'_>) -> Option<BidRenderer> {
+    fn build_renderer(
+        &self,
+        input: ApsRendererInput<'_>,
+        publisher_origin: &str,
+    ) -> Result<BidRenderSourceV1, AuctionDropReason> {
         let tag_type_value = match input.tag_type {
             ApsTagType::Iframe => "iframe",
             ApsTagType::Script => "script",
@@ -698,11 +735,12 @@ impl ApsAuctionProvider {
                 }]
             }]
         });
-        let serialized = serde_json::to_vec(&envelope).ok()?;
+        let serialized = serde_json::to_vec(&envelope)
+            .map_err(|_| AuctionDropReason::InvalidProviderResponse)?;
         if serialized.len() > MAX_RENDER_ENVELOPE_BYTES {
-            return None;
+            return Err(AuctionDropReason::RenderPayloadTooLarge);
         }
-        Some(BidRenderer::Aps(ApsRendererV1 {
+        let renderer = BidRenderSourceV1::Aps(ApsRendererV1 {
             version: 1,
             account_id: self.config.account_id.clone(),
             bid_id: input.bid_id.to_string(),
@@ -712,83 +750,110 @@ impl ApsAuctionProvider {
             aax_response: BASE64_STANDARD.encode(serialized),
             width: input.width,
             height: input.height,
-        }))
-    }
-
-    fn increment_reason(reasons: &mut BTreeMap<String, u64>, reason: &'static str) {
-        *reasons.entry(reason.to_string()).or_default() += 1;
+        });
+        let value = serde_json::to_value(&renderer)
+            .map_err(|_| AuctionDropReason::InvalidProviderResponse)?;
+        if classify_aps_renderer_v1(&value, publisher_origin)
+            != ApsRendererValidationResult::Accepted
+        {
+            return Err(AuctionDropReason::InvalidProviderResponse);
+        }
+        Ok(renderer)
     }
 
     fn parse_bid(
         &self,
         value: &Json,
         slots: &HashMap<&str, &AdSlot>,
-        publisher_domain: &str,
-    ) -> Result<Bid, &'static str> {
-        let bid_id = value
-            .get("id")
-            .and_then(Json::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or("missing_render_source")?;
+        publisher_origin: &str,
+        duplicate_ids: &HashSet<String>,
+    ) -> Result<Bid, AuctionDropReason> {
+        let object = value.as_object().ok_or(AuctionDropReason::MalformedBid)?;
+        let Some(bid_id_value) = object.get("id") else {
+            return Err(AuctionDropReason::MissingUpstreamBidId);
+        };
+        let bid_id = bid_id_value
+            .as_str()
+            .ok_or(AuctionDropReason::InvalidUpstreamBidId)?;
+        if bid_id.is_empty() {
+            return Err(AuctionDropReason::MissingUpstreamBidId);
+        }
+        if bid_id.len() > MAX_BID_ID_BYTES {
+            return Err(AuctionDropReason::UpstreamBidIdTooLarge);
+        }
+        if bid_id.bytes().any(|byte| byte <= 0x1f || byte == 0x7f) {
+            return Err(AuctionDropReason::InvalidUpstreamBidId);
+        }
+        if duplicate_ids.contains(bid_id) {
+            return Err(AuctionDropReason::DuplicateUpstreamBidId);
+        }
         let slot_id = value
             .get("impid")
             .and_then(Json::as_str)
-            .ok_or("unknown_impid")?;
-        let slot = slots.get(slot_id).ok_or("unknown_impid")?;
+            .ok_or(AuctionDropReason::UnknownImpression)?;
+        let slot = slots
+            .get(slot_id)
+            .ok_or(AuctionDropReason::UnknownImpression)?;
         let price = value
             .get("price")
             .and_then(Json::as_f64)
             .filter(|price| price.is_finite() && *price >= 0.0)
-            .ok_or("invalid_price")?;
+            .ok_or(AuctionDropReason::InvalidPrice)?;
         if value
             .get("mtype")
             .is_some_and(|mtype| mtype.as_i64() != Some(1))
         {
-            return Err("unsupported_media_type");
+            return Err(AuctionDropReason::UnsupportedMediaType);
         }
-        let width = value
-            .get("w")
-            .and_then(Json::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .ok_or("invalid_dimensions")?;
-        let height = value
-            .get("h")
-            .and_then(Json::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .ok_or("invalid_dimensions")?;
+        let parse_dimension = |field: &str| {
+            let number = value
+                .get(field)
+                .and_then(Json::as_f64)
+                .filter(|number| number.is_finite() && number.fract() == 0.0 && *number > 0.0)
+                .ok_or(AuctionDropReason::InvalidDimensions)?;
+            if number > RENDER_DIMENSION_MAX as f64 {
+                return Err(AuctionDropReason::DimensionsOutOfRange);
+            }
+            u32::try_from(number as u64).map_err(|_| AuctionDropReason::DimensionsOutOfRange)
+        };
+        let width = parse_dimension("w")?;
+        let height = parse_dimension("h")?;
         if !Self::compatible_dimensions(slot, width, height) {
-            return Err("invalid_dimensions");
+            return Err(AuctionDropReason::InvalidDimensions);
         }
         let ext = value
             .get("ext")
             .and_then(Json::as_object)
-            .ok_or("missing_render_source")?;
-        let creative_url = ext
-            .get("creativeurl")
-            .and_then(Json::as_str)
-            .ok_or("missing_render_source")?;
-        if !self.valid_creative_url(creative_url, publisher_domain) {
-            return Err("invalid_creative_url");
+            .ok_or(AuctionDropReason::MissingCreativeUrl)?;
+        let Some(creative_url_value) = ext.get("creativeurl") else {
+            return Err(AuctionDropReason::MissingCreativeUrl);
+        };
+        let creative_url = creative_url_value
+            .as_str()
+            .ok_or(AuctionDropReason::InvalidCreativeUrl)?;
+        if !self.valid_creative_url(creative_url, publisher_origin) {
+            return Err(AuctionDropReason::InvalidCreativeUrl);
         }
         let tag_type = match ext.get("tagtype").and_then(Json::as_str) {
             Some("iframe") => ApsTagType::Iframe,
             Some("script") if self.config.allow_script_creatives => ApsTagType::Script,
-            Some("script") => return Err("script_rendering_disabled"),
-            _ => return Err("unsupported_tagtype"),
+            Some("script") => return Err(AuctionDropReason::ScriptRenderingDisabled),
+            _ => return Err(AuctionDropReason::InvalidTagType),
         };
-        let creative_id = value
-            .get("crid")
-            .and_then(Json::as_str)
-            .filter(|creative_id| !creative_id.is_empty())
-            .map(str::to_string);
+        let creative_id = match value.get("crid") {
+            None => None,
+            Some(Json::String(creative_id)) if creative_id.is_empty() => None,
+            Some(Json::String(creative_id)) => Some(creative_id.clone()),
+            Some(_) => return Err(AuctionDropReason::InvalidCreativeId),
+        };
         if creative_id
             .as_ref()
             .is_some_and(|creative_id| creative_id.len() > MAX_CREATIVE_ID_BYTES)
         {
-            return Err("creative_id_too_large");
+            return Err(AuctionDropReason::CreativeIdTooLarge);
         }
-        let renderer = self
-            .build_renderer(ApsRendererInput {
+        let renderer = self.build_renderer(
+            ApsRendererInput {
                 bid_id,
                 creative_id: creative_id.clone(),
                 tag_type,
@@ -796,8 +861,9 @@ impl ApsAuctionProvider {
                 price,
                 width,
                 height,
-            })
-            .ok_or("render_payload_too_large")?;
+            },
+            publisher_origin,
+        )?;
         let adomain = value
             .get("adomain")
             .and_then(Json::as_array)
@@ -811,6 +877,9 @@ impl ApsAuctionProvider {
 
         Ok(Bid {
             slot_id: slot_id.to_string(),
+            candidate_id: None,
+            candidate_provider: None,
+            renderer_reservation_id: None,
             price: Some(price),
             currency: DEFAULT_CURRENCY.to_string(),
             creative: None,
@@ -838,7 +907,6 @@ impl ApsAuctionProvider {
         request: &AuctionRequest,
     ) -> AuctionResponse {
         if !value.is_object()
-            || value.get("contextual").is_some()
             || value
                 .get("cur")
                 .is_some_and(|currency| !currency.is_string())
@@ -847,15 +915,15 @@ impl ApsAuctionProvider {
                 .is_some_and(|seatbids| !seatbids.is_array())
         {
             return AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms)
-                .with_metadata("drop_reasons", json!({"unexpected_response_shape": 1}));
+                .with_drop_reason(AuctionDropReason::InvalidProviderResponse);
         }
         if value
             .get("cur")
             .and_then(Json::as_str)
             .is_some_and(|currency| !currency.eq_ignore_ascii_case(DEFAULT_CURRENCY))
         {
-            return AuctionResponse::no_bid(APS_INTEGRATION_ID, response_time_ms)
-                .with_metadata("drop_reasons", json!({"unsupported_currency": 1}));
+            return AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms)
+                .with_drop_reason(AuctionDropReason::InvalidProviderResponse);
         }
 
         let slots: HashMap<&str, &AdSlot> = request
@@ -865,18 +933,54 @@ impl ApsAuctionProvider {
             .collect();
         let seatbids = value.get("seatbid").and_then(Json::as_array);
         let seatbid_count = seatbids.map_or(0, Vec::len);
-        let mut reasons = BTreeMap::new();
+        let mut reasons = AuctionDropReasons::new();
         let mut selected: HashMap<String, Bid> = HashMap::new();
         let mut dropped = 0_u64;
+        let mut invalid_slots = HashSet::new();
+        let mut global_invalid = false;
+        if value.get("contextual").is_some() {
+            dropped += 1;
+            global_invalid = true;
+            record_auction_drop(&mut reasons, AuctionDropReason::InvalidProviderResponse);
+        }
+
+        let mut id_counts = HashMap::<&str, usize>::new();
+        for candidate in seatbids
+            .into_iter()
+            .flatten()
+            .filter_map(|seatbid| seatbid.get("bid").and_then(Json::as_array))
+            .flatten()
+        {
+            if let Some(bid_id) = candidate.get("id").and_then(Json::as_str)
+                && !bid_id.is_empty()
+                && bid_id.len() <= MAX_BID_ID_BYTES
+                && !bid_id.bytes().any(|byte| byte <= 0x1f || byte == 0x7f)
+            {
+                *id_counts.entry(bid_id).or_default() += 1;
+            }
+        }
+        let duplicate_ids: HashSet<String> = id_counts
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|(bid_id, _)| bid_id.to_string())
+            .collect();
+
+        let publisher_origin = request
+            .publisher
+            .page_url
+            .as_deref()
+            .and_then(|page_url| Url::parse(page_url).ok())
+            .map(|page_url| page_url.origin().ascii_serialization())
+            .unwrap_or_else(|| format!("https://{}", request.publisher.domain));
 
         for seatbid in seatbids.into_iter().flatten() {
             let Some(bids) = seatbid.get("bid").and_then(Json::as_array) else {
                 dropped += 1;
-                Self::increment_reason(&mut reasons, "empty_seatbid_bids");
+                record_auction_drop(&mut reasons, AuctionDropReason::EmptySeatBidBids);
                 continue;
             };
             for value in bids {
-                match self.parse_bid(value, &slots, &request.publisher.domain) {
+                match self.parse_bid(value, &slots, &publisher_origin, &duplicate_ids) {
                     Ok(candidate) => {
                         let replace = selected.get(&candidate.slot_id).is_none_or(|current| {
                             let candidate_price = candidate.price.unwrap_or_default();
@@ -892,42 +996,69 @@ impl ApsAuctionProvider {
                                 .is_some()
                             {
                                 dropped += 1;
-                                Self::increment_reason(&mut reasons, "lost_to_higher_bid");
+                                record_auction_drop(
+                                    &mut reasons,
+                                    AuctionDropReason::LostToHigherBid,
+                                );
                             }
                         } else {
                             dropped += 1;
-                            Self::increment_reason(&mut reasons, "lost_to_higher_bid");
+                            record_auction_drop(&mut reasons, AuctionDropReason::LostToHigherBid);
                         }
                     }
                     Err(reason) => {
                         dropped += 1;
-                        Self::increment_reason(&mut reasons, reason);
+                        if let Some(slot_id) = value
+                            .get("impid")
+                            .and_then(Json::as_str)
+                            .filter(|slot_id| slots.contains_key(*slot_id))
+                        {
+                            invalid_slots.insert(slot_id.to_string());
+                        } else {
+                            global_invalid = true;
+                        }
+                        record_auction_drop(&mut reasons, reason);
                     }
                 }
             }
         }
 
         if seatbid_count == 0 {
-            Self::increment_reason(&mut reasons, "empty_seatbid");
+            record_auction_drop(&mut reasons, AuctionDropReason::EmptySeatBid);
         }
         let accepted = selected.len();
         let metadata = [
             ("seatbid_count".to_string(), json!(seatbid_count)),
             ("accepted_bid_count".to_string(), json!(accepted)),
             ("dropped_bid_count".to_string(), json!(dropped)),
-            ("drop_reasons".to_string(), json!(reasons)),
+            (
+                "invalid_slots".to_string(),
+                json!(
+                    invalid_slots
+                        .into_iter()
+                        .map(|slot| (slot, "invalid_provider_response"))
+                        .collect::<HashMap<_, _>>()
+                ),
+            ),
+            (
+                "global_invalid_provider_response".to_string(),
+                json!(global_invalid),
+            ),
         ];
-        let mut response = if selected.is_empty() {
+        let mut response = if selected.is_empty() && global_invalid {
+            AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms)
+        } else if selected.is_empty() {
             AuctionResponse::no_bid(APS_INTEGRATION_ID, response_time_ms)
         } else {
-            AuctionResponse::success(
-                APS_INTEGRATION_ID,
-                selected.into_values().collect(),
-                response_time_ms,
-            )
+            let bids = request
+                .slots
+                .iter()
+                .filter_map(|slot| selected.remove(&slot.id))
+                .collect();
+            AuctionResponse::success(APS_INTEGRATION_ID, bids, response_time_ms)
         };
         response.metadata.extend(metadata);
-        response
+        response.with_drop_reasons(&reasons)
     }
 
     async fn parse_response_inner(
@@ -999,7 +1130,7 @@ impl ApsAuctionProvider {
             Err(error) => {
                 log::warn!("Failed to parse APS response JSON: {error}");
                 let parsed = AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms)
-                    .with_metadata("drop_reasons", json!({"unexpected_response_shape": 1}));
+                    .with_drop_reason(AuctionDropReason::InvalidProviderResponse);
                 return Ok(self.attach_debug_metadata(
                     parsed,
                     debug_enabled,
@@ -1015,7 +1146,7 @@ impl ApsAuctionProvider {
                 "APS cannot parse a successful bid response without the original auction request context"
             );
             let response = AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms)
-                .with_metadata("drop_reasons", json!({"missing_request_context": 1}));
+                .with_drop_reason(AuctionDropReason::MissingRequestContext);
             return Ok(self.attach_debug_metadata(
                 response,
                 debug_enabled,
@@ -1184,44 +1315,273 @@ impl AuctionProvider for ApsAuctionProvider {
 }
 
 #[derive(Debug)]
-struct ApsRendererIntegration;
+pub(crate) struct ApsV1Integration {
+    enabled: bool,
+}
+
+impl ApsV1Integration {
+    fn mark_exact_headers(mut response: http::Response<EdgeBody>) -> http::Response<EdgeBody> {
+        response
+            .extensions_mut()
+            .insert(crate::platform::ExactResponseHeadersV1);
+        response
+    }
+
+    pub(crate) fn from_settings(settings: &Settings) -> Result<Self, Report<TrustedServerError>> {
+        Ok(Self {
+            enabled: settings
+                .integration_config::<ApsConfig>(APS_INTEGRATION_ID)?
+                .is_some(),
+        })
+    }
+
+    fn local_status(
+        status: StatusCode,
+        allow_get: bool,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        let mut builder = http::Response::builder()
+            .status(status)
+            .header(header::CACHE_CONTROL, "no-store");
+        if allow_get {
+            builder = builder.header(header::ALLOW, "GET");
+        }
+        builder
+            .body(EdgeBody::empty())
+            .change_context(TrustedServerError::Integration {
+                integration: APS_INTEGRATION_ID.to_string(),
+                message: "Failed to build local APS route response".to_string(),
+            })
+            .map(Self::mark_exact_headers)
+    }
+
+    fn renderer_response() -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        http::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+            .header("x-content-type-options", "nosniff")
+            .header("referrer-policy", "no-referrer")
+            .header(header::CONTENT_SECURITY_POLICY, APS_RENDERER_V1_CSP)
+            .body(EdgeBody::from(APS_RENDERER_V1_DOCUMENT))
+            .change_context(TrustedServerError::Integration {
+                integration: APS_INTEGRATION_ID.to_string(),
+                message: "Failed to build APS renderer v1 response".to_string(),
+            })
+            .map(Self::mark_exact_headers)
+    }
+
+    fn singleton_proxy_header(
+        evidence: &ProxyHeaderEvidenceV1,
+        required: bool,
+    ) -> Result<Option<&[u8]>, &'static str> {
+        match evidence {
+            ProxyHeaderEvidenceV1::Occurrences(values) => match values.as_slice() {
+                [] if !required => Ok(None),
+                [value] => Ok(Some(value.as_slice())),
+                [] => Err("missing_header"),
+                _ => Err("duplicate_header"),
+            },
+            ProxyHeaderEvidenceV1::Combined(value) if !value.contains(&b',') => {
+                Ok(Some(value.as_slice()))
+            }
+            ProxyHeaderEvidenceV1::Combined(_) => Err("listed_header"),
+            ProxyHeaderEvidenceV1::Unavailable => Err("unavailable_header"),
+        }
+    }
+
+    fn trim_http_ows(value: &[u8]) -> &[u8] {
+        let start = value
+            .iter()
+            .position(|byte| !matches!(byte, b' ' | b'\t'))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|byte| !matches!(byte, b' ' | b'\t'))
+            .map_or(start, |index| index + 1);
+        &value[start..end]
+    }
+
+    fn validate_runner_content_type(evidence: &ProxyHeaderEvidenceV1) -> Result<(), &'static str> {
+        let raw = Self::singleton_proxy_header(evidence, true)?;
+        let value = std::str::from_utf8(raw.ok_or("missing_content_type")?)
+            .map_err(|_| "invalid_content_type")?;
+        if !value.is_ascii() {
+            return Err("invalid_content_type");
+        }
+        if value.as_bytes().contains(&b',') {
+            return Err("listed_content_type");
+        }
+
+        let mut parts = value.split(';');
+        let essence = parts
+            .next()
+            .ok_or("missing_content_type")?
+            .trim_matches([' ', '\t']);
+        if !essence.eq_ignore_ascii_case("application/javascript")
+            && !essence.eq_ignore_ascii_case("text/javascript")
+        {
+            return Err("rejected_content_type");
+        }
+        let Some(parameter) = parts.next() else {
+            return Ok(());
+        };
+        if parts.next().is_some() {
+            return Err("duplicate_content_type_parameter");
+        }
+        let (name, value) = parameter
+            .split_once('=')
+            .ok_or("invalid_content_type_parameter")?;
+        if !name
+            .trim_matches([' ', '\t'])
+            .eq_ignore_ascii_case("charset")
+            || !value
+                .trim_matches([' ', '\t'])
+                .eq_ignore_ascii_case("utf-8")
+        {
+            return Err("rejected_content_type_parameter");
+        }
+        Ok(())
+    }
+
+    fn validate_runner_content_encoding(
+        evidence: &ProxyHeaderEvidenceV1,
+    ) -> Result<(), &'static str> {
+        let Some(raw) = Self::singleton_proxy_header(evidence, false)? else {
+            return Ok(());
+        };
+        let value = Self::trim_http_ows(raw);
+        if value.contains(&b',') || !value.eq_ignore_ascii_case(b"identity") {
+            return Err("rejected_content_encoding");
+        }
+        Ok(())
+    }
+
+    fn validate_runner_content_length(
+        evidence: &ProxyHeaderEvidenceV1,
+    ) -> Result<Option<usize>, &'static str> {
+        let Some(value) = Self::singleton_proxy_header(evidence, false)? else {
+            return Ok(None);
+        };
+        if value.is_empty()
+            || value.contains(&b',')
+            || !value.iter().all(u8::is_ascii_digit)
+            || (value.len() > 1 && value[0] == b'0')
+        {
+            return Err("invalid_content_length");
+        }
+        let value = std::str::from_utf8(value)
+            .map_err(|_| "invalid_content_length")?
+            .parse::<usize>()
+            .map_err(|_| "invalid_content_length")?;
+        if value > APS_RUNNER_MAX_RESPONSE_BYTES {
+            return Err("content_length_overflow");
+        }
+        Ok(Some(value))
+    }
+
+    fn validate_runner_response(response: &RawProxyResponseV1) -> Result<(), &'static str> {
+        if response.evidence.status != StatusCode::OK.as_u16() {
+            return Err("rejected_status");
+        }
+        Self::validate_runner_content_type(&response.evidence.content_type)?;
+        Self::validate_runner_content_encoding(&response.evidence.content_encoding)?;
+        let declared_length =
+            Self::validate_runner_content_length(&response.evidence.content_length)?;
+        if response.body.len() > APS_RUNNER_MAX_RESPONSE_BYTES {
+            return Err("body_overflow");
+        }
+        if declared_length.is_some_and(|length| length != response.body.len()) {
+            return Err("content_length_mismatch");
+        }
+        std::str::from_utf8(&response.body).map_err(|_| "invalid_utf8")?;
+        Ok(())
+    }
+
+    async fn runner_response(
+        services: &RuntimeServices,
+    ) -> Result<http::Response<EdgeBody>, &'static str> {
+        let outbound_request = http::Request::builder()
+            .method(Method::GET)
+            .uri(APS_RUNNER_UPSTREAM_URL)
+            .header(header::ACCEPT_ENCODING, "identity")
+            .body(EdgeBody::empty())
+            .map_err(|_| "request_build_failed")?;
+        let backend = ensure_integration_backend_with_transport_timeouts(
+            services,
+            APS_RUNNER_UPSTREAM_URL,
+            APS_INTEGRATION_ID,
+            APS_RUNNER_FIRST_BYTE_TIMEOUT,
+            APS_RUNNER_BLOCKING_READ_TIMEOUT,
+        )
+        .map_err(|_| "backend_unavailable")?;
+        let response = services
+            .http_client()
+            .send_raw_proxy_v1(
+                PlatformHttpRequest::new(outbound_request, backend),
+                RawProxyPolicyV1 {
+                    total_timeout: APS_RUNNER_TOTAL_TIMEOUT,
+                    first_byte_timeout: APS_RUNNER_FIRST_BYTE_TIMEOUT,
+                    blocking_read_timeout: APS_RUNNER_BLOCKING_READ_TIMEOUT,
+                    max_response_bytes: APS_RUNNER_MAX_RESPONSE_BYTES,
+                },
+            )
+            .await
+            .map_err(|_| "transport_failed")?;
+        Self::validate_runner_response(&response)?;
+
+        http::Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            )
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header("cross-origin-resource-policy", "cross-origin")
+            .header("x-content-type-options", "nosniff")
+            .header("referrer-policy", "no-referrer")
+            .body(EdgeBody::from(response.body))
+            .map(Self::mark_exact_headers)
+            .map_err(|_| "response_build_failed")
+    }
+}
 
 #[async_trait(?Send)]
-impl IntegrationProxy for ApsRendererIntegration {
+impl IntegrationProxy for ApsV1Integration {
     fn integration_name(&self) -> &'static str {
         APS_INTEGRATION_ID
     }
 
     fn routes(&self) -> Vec<IntegrationEndpoint> {
-        vec![IntegrationEndpoint::get(APS_RENDERER_ROUTE)]
+        Vec::new()
     }
 
     async fn handle(
         &self,
         _settings: &Settings,
-        _services: &RuntimeServices,
+        services: &RuntimeServices,
         request: http::Request<EdgeBody>,
     ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
-        if request.method() != Method::GET || request.uri().path() != APS_RENDERER_ROUTE {
-            return http::Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(EdgeBody::from("Not Found"))
-                .change_context(TrustedServerError::Integration {
-                    integration: APS_INTEGRATION_ID.to_string(),
-                    message: "Failed to build APS not-found response".to_string(),
-                });
+        let path = request.uri().path();
+        if !path.starts_with("/integrations/aps/") {
+            return Self::local_status(StatusCode::NOT_FOUND, false);
         }
-        http::Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .header("x-content-type-options", "nosniff")
-            .header("referrer-policy", "no-referrer")
-            .header(header::CONTENT_SECURITY_POLICY, APS_RENDERER_CSP)
-            .body(EdgeBody::from(APS_RENDERER_DOCUMENT))
-            .change_context(TrustedServerError::Integration {
-                integration: APS_INTEGRATION_ID.to_string(),
-                message: "Failed to build APS renderer response".to_string(),
-            })
+        if !self.enabled {
+            return Self::local_status(StatusCode::NOT_FOUND, false);
+        }
+        if request.method() != Method::GET {
+            return Self::local_status(StatusCode::METHOD_NOT_ALLOWED, true);
+        }
+        match path {
+            APS_RENDERER_V1_ROUTE => Self::renderer_response(),
+            APS_RUNNER_ROUTE => match Self::runner_response(services).await {
+                Ok(response) => Ok(response),
+                Err(reason) => {
+                    log::warn!("APS runner proxy failed closed: {reason}");
+                    Self::local_status(StatusCode::BAD_GATEWAY, false)
+                }
+            },
+            _ => Self::local_status(StatusCode::NOT_FOUND, false),
+        }
     }
 }
 
@@ -1236,10 +1596,8 @@ pub fn register(
     let Some(_config) = settings.integration_config::<ApsConfig>(APS_INTEGRATION_ID)? else {
         return Ok(None);
     };
-    let integration = Arc::new(ApsRendererIntegration);
     Ok(Some(
         IntegrationRegistration::builder(APS_INTEGRATION_ID)
-            .with_proxy(integration)
             .without_js()
             .build(),
     ))
@@ -1269,14 +1627,17 @@ pub fn register_providers(
 mod tests {
     use super::*;
     use crate::auction::types::{
-        AdFormat, AdSlot, AuctionContext, AuctionRequest, BidStatus, DeviceInfo, PublisherInfo,
-        UserInfo,
+        AdFormat, AdSlot, AuctionContext, AuctionDropReason, AuctionRequest, BidStatus, DeviceInfo,
+        PublisherInfo, UserInfo,
     };
     use crate::consent::ConsentContext;
     use crate::openrtb::{Eid, Uid};
-    use crate::platform::GeoInfo;
     use crate::platform::test_support::{
         StubHttpClient, build_services_with_http_client, noop_services,
+    };
+    use crate::platform::{
+        GeoInfo, ProxyHeaderEvidenceV1, ProxyResponseEvidenceV1, RawProxyPolicyV1,
+        RawProxyResponseV1,
     };
     use crate::test_support::tests::create_test_settings;
     use serde_json::json;
@@ -1342,6 +1703,386 @@ mod tests {
         })
     }
 
+    fn drop_count(response: &AuctionResponse, reason: AuctionDropReason) -> u64 {
+        response.metadata["drop_reasons"][reason.as_str()]
+            .as_u64()
+            .unwrap_or_default()
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RendererCorpus {
+        publisher_origin: String,
+        base_descriptor: Json,
+        vectors: Vec<RendererCorpusVector>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RendererCorpusVector {
+        id: String,
+        expected: String,
+        operation: Json,
+    }
+
+    fn corpus_value<'a>(operation: &'a Json, field: &str) -> &'a Json {
+        operation
+            .get(field)
+            .unwrap_or_else(|| panic!("should include corpus operation field {field}"))
+    }
+
+    fn corpus_string<'a>(operation: &'a Json, field: &str) -> &'a str {
+        corpus_value(operation, field)
+            .as_str()
+            .unwrap_or_else(|| panic!("corpus operation field {field} should be a string"))
+    }
+
+    fn corpus_usize(operation: &Json, field: &str) -> usize {
+        corpus_value(operation, field)
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or_else(|| panic!("corpus operation field {field} should be a usize"))
+    }
+
+    fn set_json_path(root: &mut Json, path: &[Json], value: Json) {
+        let (segment, tail) = path
+            .split_first()
+            .expect("corpus JSON path should not be empty");
+        if tail.is_empty() {
+            if let Some(field) = segment.as_str() {
+                root.as_object_mut()
+                    .expect("corpus string path should address an object")
+                    .insert(field.to_string(), value);
+            } else {
+                let index = segment
+                    .as_u64()
+                    .and_then(|index| usize::try_from(index).ok())
+                    .expect("corpus numeric path should be a usize");
+                let slot = root
+                    .as_array_mut()
+                    .and_then(|array| array.get_mut(index))
+                    .expect("corpus numeric path should address an array element");
+                *slot = value;
+            }
+            return;
+        }
+
+        let child = if let Some(field) = segment.as_str() {
+            root.as_object_mut()
+                .and_then(|object| object.get_mut(field))
+                .expect("corpus string path should address an object field")
+        } else {
+            let index = segment
+                .as_u64()
+                .and_then(|index| usize::try_from(index).ok())
+                .expect("corpus numeric path should be a usize");
+            root.as_array_mut()
+                .and_then(|array| array.get_mut(index))
+                .expect("corpus numeric path should address an array element")
+        };
+        set_json_path(child, tail, value);
+    }
+
+    fn delete_json_path(root: &mut Json, path: &[Json]) {
+        let (segment, tail) = path
+            .split_first()
+            .expect("corpus JSON path should not be empty");
+        if tail.is_empty() {
+            let field = segment
+                .as_str()
+                .expect("corpus delete path should end in an object field");
+            root.as_object_mut()
+                .expect("corpus delete path should address an object")
+                .remove(field);
+            return;
+        }
+
+        let child = if let Some(field) = segment.as_str() {
+            root.as_object_mut()
+                .and_then(|object| object.get_mut(field))
+                .expect("corpus string path should address an object field")
+        } else {
+            let index = segment
+                .as_u64()
+                .and_then(|index| usize::try_from(index).ok())
+                .expect("corpus numeric path should be a usize");
+            root.as_array_mut()
+                .and_then(|array| array.get_mut(index))
+                .expect("corpus numeric path should address an array element")
+        };
+        delete_json_path(child, tail);
+    }
+
+    fn descriptor_field(descriptor: &mut Json, field: &str, value: Json) {
+        descriptor
+            .as_object_mut()
+            .expect("corpus descriptor should be an object")
+            .insert(field.to_string(), value);
+    }
+
+    fn materialize_renderer_corpus_vector(
+        corpus: &RendererCorpus,
+        vector: &RendererCorpusVector,
+    ) -> Json {
+        let mut descriptor = corpus.base_descriptor.clone();
+        let mut envelope: Json = serde_json::from_str(include_str!(
+            "../../../trusted-server-js/lib/test/fixtures/aps-renderer-v1.json"
+        ))
+        .expect("should parse shared APS renderer fixture");
+        let operation = &vector.operation;
+        let kind = corpus_string(operation, "kind");
+        let mut encoded_envelope = None;
+
+        match kind {
+            "none" => {}
+            "descriptor-delete" => {
+                descriptor
+                    .as_object_mut()
+                    .expect("corpus descriptor should be an object")
+                    .remove(corpus_string(operation, "field"));
+            }
+            "descriptor-set" => descriptor_field(
+                &mut descriptor,
+                corpus_string(operation, "field"),
+                corpus_value(operation, "value").clone(),
+            ),
+            "descriptor-repeat" => {
+                let mut repeated =
+                    corpus_string(operation, "unit").repeat(corpus_usize(operation, "count"));
+                if let Some(suffix) = operation.get("suffix").and_then(Json::as_str) {
+                    repeated.push_str(suffix);
+                }
+                descriptor_field(
+                    &mut descriptor,
+                    corpus_string(operation, "field"),
+                    json!(repeated),
+                );
+            }
+            "bid-id-repeat" => {
+                let mut repeated =
+                    corpus_string(operation, "unit").repeat(corpus_usize(operation, "count"));
+                if let Some(suffix) = operation.get("suffix").and_then(Json::as_str) {
+                    repeated.push_str(suffix);
+                }
+                descriptor_field(&mut descriptor, "bidId", json!(repeated));
+                set_json_path(
+                    &mut envelope,
+                    &[
+                        json!("seatbid"),
+                        json!(0),
+                        json!("bid"),
+                        json!(0),
+                        json!("id"),
+                    ],
+                    json!(repeated),
+                );
+            }
+            "dimension" => {
+                let field = corpus_string(operation, "field");
+                let envelope_field = match field {
+                    "width" => "w",
+                    "height" => "h",
+                    _ => panic!("corpus dimension field should be width or height"),
+                };
+                let value = corpus_value(operation, "value").clone();
+                descriptor_field(&mut descriptor, field, value.clone());
+                set_json_path(
+                    &mut envelope,
+                    &[
+                        json!("seatbid"),
+                        json!(0),
+                        json!("bid"),
+                        json!(0),
+                        json!(envelope_field),
+                    ],
+                    value,
+                );
+            }
+            "dimensions" => {
+                let width = corpus_value(operation, "width").clone();
+                let height = corpus_value(operation, "height").clone();
+                descriptor_field(&mut descriptor, "width", width.clone());
+                descriptor_field(&mut descriptor, "height", height.clone());
+                set_json_path(
+                    &mut envelope,
+                    &[
+                        json!("seatbid"),
+                        json!(0),
+                        json!("bid"),
+                        json!(0),
+                        json!("w"),
+                    ],
+                    width,
+                );
+                set_json_path(
+                    &mut envelope,
+                    &[
+                        json!("seatbid"),
+                        json!(0),
+                        json!("bid"),
+                        json!(0),
+                        json!("h"),
+                    ],
+                    height,
+                );
+            }
+            "creative-url" => {
+                let value = corpus_string(operation, "value").to_string();
+                descriptor_field(&mut descriptor, "creativeUrl", json!(value));
+                set_json_path(
+                    &mut envelope,
+                    &[
+                        json!("seatbid"),
+                        json!(0),
+                        json!("bid"),
+                        json!(0),
+                        json!("ext"),
+                        json!("creativeurl"),
+                    ],
+                    json!(value),
+                );
+            }
+            "creative-url-bytes" => {
+                let prefix = "https://creative.example/";
+                let bytes = corpus_usize(operation, "bytes");
+                let value = format!(
+                    "{prefix}{}",
+                    "a".repeat(
+                        bytes
+                            .checked_sub(prefix.len())
+                            .expect("corpus URL size should include its prefix")
+                    )
+                );
+                descriptor_field(&mut descriptor, "creativeUrl", json!(value));
+                set_json_path(
+                    &mut envelope,
+                    &[
+                        json!("seatbid"),
+                        json!(0),
+                        json!("bid"),
+                        json!(0),
+                        json!("ext"),
+                        json!("creativeurl"),
+                    ],
+                    json!(value),
+                );
+            }
+            "aax-literal" => {
+                encoded_envelope = Some(corpus_string(operation, "value").to_string());
+            }
+            "aax-bytes" => {
+                let bytes: Vec<u8> = corpus_value(operation, "values")
+                    .as_array()
+                    .expect("corpus byte vector should be an array")
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_u64()
+                            .and_then(|value| u8::try_from(value).ok())
+                            .expect("corpus byte vector should contain u8 values")
+                    })
+                    .collect();
+                encoded_envelope = Some(BASE64_STANDARD.encode(bytes));
+            }
+            "aax-raw-json" => {
+                encoded_envelope =
+                    Some(BASE64_STANDARD.encode(corpus_string(operation, "value").as_bytes()));
+            }
+            "aax-decoded-bytes" => {
+                let mut serialized =
+                    serde_json::to_string(&envelope).expect("should serialize corpus envelope");
+                let target = corpus_usize(operation, "bytes");
+                serialized.push_str(
+                    &" ".repeat(
+                        target
+                            .checked_sub(serialized.len())
+                            .expect("corpus decoded size should exceed fixture size"),
+                    ),
+                );
+                encoded_envelope = Some(BASE64_STANDARD.encode(serialized.as_bytes()));
+            }
+            "aax-raw-price" => {
+                let serialized =
+                    serde_json::to_string(&envelope).expect("should serialize corpus envelope");
+                let replacement = format!("\"price\":{}", corpus_string(operation, "value"));
+                let raw = serialized.replacen("\"price\":1.23", &replacement, 1);
+                assert_ne!(raw, serialized, "should replace the corpus fixture price");
+                encoded_envelope = Some(BASE64_STANDARD.encode(raw.as_bytes()));
+            }
+            "envelope-set" => {
+                let path = corpus_value(operation, "path")
+                    .as_array()
+                    .expect("corpus path should be an array");
+                set_json_path(
+                    &mut envelope,
+                    path,
+                    corpus_value(operation, "value").clone(),
+                );
+            }
+            "envelope-delete" => {
+                let path = corpus_value(operation, "path")
+                    .as_array()
+                    .expect("corpus path should be an array");
+                delete_json_path(&mut envelope, path);
+            }
+            "duplicate-seat" => {
+                let seats = envelope
+                    .get_mut("seatbid")
+                    .and_then(Json::as_array_mut)
+                    .expect("corpus fixture should contain a seat array");
+                let first = seats
+                    .first()
+                    .cloned()
+                    .expect("corpus fixture should contain one seat");
+                seats.push(first);
+            }
+            "duplicate-bid" => {
+                let bids = envelope
+                    .get_mut("seatbid")
+                    .and_then(Json::as_array_mut)
+                    .and_then(|seats| seats.first_mut())
+                    .and_then(|seat| seat.get_mut("bid"))
+                    .and_then(Json::as_array_mut)
+                    .expect("corpus fixture should contain a bid array");
+                let first = bids
+                    .first()
+                    .cloned()
+                    .expect("corpus fixture should contain one bid");
+                bids.push(first);
+            }
+            _ => panic!("unknown APS renderer corpus operation: {kind}"),
+        }
+
+        let encoded = encoded_envelope.unwrap_or_else(|| {
+            BASE64_STANDARD.encode(
+                serde_json::to_vec(&envelope).expect("should serialize corpus renderer envelope"),
+            )
+        });
+        descriptor_field(&mut descriptor, "aaxResponse", json!(encoded));
+        descriptor
+    }
+
+    #[test]
+    fn aps_renderer_matches_shared_cross_language_contract_corpus() {
+        let corpus: RendererCorpus = serde_json::from_str(include_str!(
+            "../../../trusted-server-js/lib/test/fixtures/aps-renderer-v1-corpus.json"
+        ))
+        .expect("should parse shared APS renderer corpus");
+        assert_eq!(
+            corpus.publisher_origin, "https://publisher.example",
+            "should pin the corpus publisher origin"
+        );
+
+        for vector in &corpus.vectors {
+            let descriptor = materialize_renderer_corpus_vector(&corpus, vector);
+            let actual = classify_aps_renderer_v1(&descriptor, &corpus.publisher_origin).as_str();
+            assert_eq!(
+                actual, vector.expected,
+                "should match APS renderer corpus vector {}",
+                vector.id
+            );
+        }
+    }
+
     fn parse_with_context(
         provider: &ApsAuctionProvider,
         response: PlatformResponse,
@@ -1387,20 +2128,37 @@ mod tests {
     }
 
     #[test]
-    fn config_accepts_canonical_alias_and_integer_ids() {
+    fn config_accepts_only_canonical_string_account_id() {
         let canonical: ApsConfig = serde_json::from_value(json!({
             "account_id": "  example-account  "
         }))
         .expect("should parse canonical account ID");
-        let alias: ApsConfig =
-            serde_json::from_value(json!({"pub_id": 1234})).expect("should parse legacy alias");
+        let integer = serde_json::from_value::<ApsConfig>(json!({"account_id": 1234}));
+        let legacy_alias = serde_json::from_value::<ApsConfig>(json!({
+            "pub_id": "legacy-account"
+        }));
+        let mixed_fields = serde_json::from_value::<ApsConfig>(json!({
+            "account_id": "example-account",
+            "pub_id": "legacy-account"
+        }));
         let debug: ApsConfig = serde_json::from_value(json!({
             "account_id": "example-account",
             "debug": true
         }))
         .expect("should parse debug flag");
         assert_eq!(canonical.account_id, "example-account");
-        assert_eq!(alias.account_id, "1234");
+        assert!(
+            integer.is_err(),
+            "integer account IDs must fail the hard cutover"
+        );
+        assert!(
+            legacy_alias.is_err(),
+            "the legacy pub_id alias must fail the hard cutover"
+        );
+        assert!(
+            mixed_fields.is_err(),
+            "mixed account_id and pub_id fields must fail the hard cutover"
+        );
         assert!(!canonical.enabled);
         assert!(!canonical.debug);
         assert!(debug.debug);
@@ -1459,13 +2217,11 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            serde_json::from_value::<ApsConfig>(json!({
-                "account_id": "one",
-                "pub_id": "two"
-            }))
-            .is_err()
-        );
+        let legacy_alias = serde_json::Value::Object(serde_json::Map::from_iter([(
+            ["pub", "id"].join("_"),
+            json!("two"),
+        )]));
+        assert!(serde_json::from_value::<ApsConfig>(legacy_alias).is_err());
         for endpoint in [
             "http://aps.example/e/pb/bid",
             "https://",
@@ -1828,10 +2584,248 @@ mod tests {
             let response = provider.parse_aps_response(&value, 12, &request());
             assert!(response.bids.is_empty());
             assert_eq!(
-                response.metadata["drop_reasons"]["unexpected_response_shape"],
+                drop_count(&response, AuctionDropReason::InvalidProviderResponse),
                 1
             );
         }
+    }
+
+    #[test]
+    fn upstream_bid_ids_are_required_bounded_control_free_and_response_unique() {
+        let provider = ApsAuctionProvider::new(config());
+        let mut missing = bid("missing", 1.0, "iframe");
+        missing
+            .as_object_mut()
+            .expect("should build an object bid")
+            .remove("id");
+        let empty = bid("", 1.1, "iframe");
+        let oversized = bid(&format!("{}x", "é".repeat(32)), 1.2, "iframe");
+        let control = bid("control\u{0000}id", 1.3, "iframe");
+        let duplicate_low = bid("duplicate", 1.4, "iframe");
+        let duplicate_high = bid("duplicate", 9.0, "iframe");
+        let valid_boundary = bid(&"é".repeat(32), 2.0, "iframe");
+
+        let response = provider.parse_aps_response(
+            &json!({"seatbid": [{"bid": [
+                missing,
+                empty,
+                oversized,
+                control,
+                duplicate_low,
+                duplicate_high,
+                valid_boundary
+            ]}]}),
+            12,
+            &request(),
+        );
+
+        assert_eq!(response.status, BidStatus::Success);
+        assert_eq!(response.bids.len(), 1);
+        assert_eq!(
+            response.bids[0].bid_id.as_deref(),
+            Some("é".repeat(32).as_str())
+        );
+        assert_eq!(
+            drop_count(&response, AuctionDropReason::MissingUpstreamBidId),
+            2
+        );
+        assert_eq!(
+            drop_count(&response, AuctionDropReason::UpstreamBidIdTooLarge),
+            1
+        );
+        assert_eq!(
+            drop_count(&response, AuctionDropReason::InvalidUpstreamBidId),
+            1
+        );
+        assert_eq!(
+            drop_count(&response, AuctionDropReason::DuplicateUpstreamBidId),
+            2
+        );
+    }
+
+    #[test]
+    fn bid_validation_is_typed_and_isolated_from_a_valid_sibling() {
+        let provider = ApsAuctionProvider::new(config());
+        let mut unknown_imp = bid("unknown-imp", 1.0, "iframe");
+        unknown_imp["impid"] = json!("not-requested");
+        let negative_price = bid("negative-price", -0.1, "iframe");
+        let mut wrong_price = bid("wrong-price", 1.0, "iframe");
+        wrong_price["price"] = json!("1.0");
+        let mut zero_width = bid("zero-width", 1.0, "iframe");
+        zero_width["w"] = json!(0);
+        let mut over_height = bid("over-height", 1.0, "iframe");
+        over_height["h"] = json!(4097);
+        let mut unmatched_size = bid("unmatched-size", 1.0, "iframe");
+        unmatched_size["w"] = json!(728);
+        unmatched_size["h"] = json!(90);
+        let mut missing_url = bid("missing-url", 1.0, "iframe");
+        missing_url["ext"]
+            .as_object_mut()
+            .expect("should build a bid extension")
+            .remove("creativeurl");
+        let mut invalid_url = bid("invalid-url", 1.0, "iframe");
+        invalid_url["ext"]["creativeurl"] = json!("http://creative.example/render");
+        let invalid_tag = bid("invalid-tag", 1.0, "video");
+        let mut invalid_creative_id = bid("invalid-creative-id", 1.0, "iframe");
+        invalid_creative_id["crid"] = json!(42);
+        let mut unsupported_media = bid("unsupported-media", 1.0, "iframe");
+        unsupported_media["mtype"] = json!(2);
+        let valid = bid("valid-sibling", 2.0, "iframe");
+
+        let response = provider.parse_aps_response(
+            &json!({"seatbid": [{"bid": [
+                "malformed",
+                unknown_imp,
+                negative_price,
+                wrong_price,
+                zero_width,
+                over_height,
+                unmatched_size,
+                missing_url,
+                invalid_url,
+                invalid_tag,
+                invalid_creative_id,
+                unsupported_media,
+                valid
+            ]}]}),
+            12,
+            &request(),
+        );
+
+        assert_eq!(response.bids.len(), 1);
+        assert_eq!(response.bids[0].bid_id.as_deref(), Some("valid-sibling"));
+        for reason in [
+            AuctionDropReason::MalformedBid,
+            AuctionDropReason::UnknownImpression,
+            AuctionDropReason::DimensionsOutOfRange,
+            AuctionDropReason::MissingCreativeUrl,
+            AuctionDropReason::InvalidCreativeUrl,
+            AuctionDropReason::InvalidTagType,
+            AuctionDropReason::InvalidCreativeId,
+            AuctionDropReason::UnsupportedMediaType,
+        ] {
+            assert_eq!(drop_count(&response, reason), 1, "should report {reason:?}");
+        }
+        assert_eq!(drop_count(&response, AuctionDropReason::InvalidPrice), 2);
+        assert_eq!(
+            drop_count(&response, AuctionDropReason::InvalidDimensions),
+            2
+        );
+    }
+
+    #[test]
+    fn dimensions_accept_exact_requested_membership_at_contract_boundaries() {
+        let provider = ApsAuctionProvider::new(config());
+        let mut auction_request = request();
+        auction_request.slots = vec![
+            AdSlot {
+                id: "minimum-slot".to_string(),
+                formats: vec![AdFormat {
+                    media_type: MediaType::Banner,
+                    width: 1,
+                    height: 1,
+                }],
+                floor_price: None,
+                targeting: HashMap::new(),
+                bidders: HashMap::new(),
+            },
+            AdSlot {
+                id: "maximum-slot".to_string(),
+                formats: vec![AdFormat {
+                    media_type: MediaType::Banner,
+                    width: 4096,
+                    height: 4096,
+                }],
+                floor_price: None,
+                targeting: HashMap::new(),
+                bidders: HashMap::new(),
+            },
+        ];
+        let mut minimum = bid("minimum", 1.0, "iframe");
+        minimum["impid"] = json!("minimum-slot");
+        minimum["w"] = json!(1);
+        minimum["h"] = json!(1);
+        let mut maximum = bid("maximum", 1.0, "iframe");
+        maximum["impid"] = json!("maximum-slot");
+        maximum["w"] = json!(4096);
+        maximum["h"] = json!(4096);
+
+        let response = provider.parse_aps_response(
+            &json!({"seatbid": [{"bid": [minimum, maximum]}]}),
+            12,
+            &auction_request,
+        );
+
+        assert_eq!(response.status, BidStatus::Success);
+        assert_eq!(response.bids.len(), 2);
+        assert_eq!(response.bids[0].slot_id, "minimum-slot");
+        assert_eq!(response.bids[1].slot_id, "maximum-slot");
+        assert_eq!(response.metadata["dropped_bid_count"], 0);
+    }
+
+    #[test]
+    fn contextual_isolated_from_valid_bids_while_currency_and_nonfinite_json_are_global() {
+        let provider = ApsAuctionProvider::new(config());
+        let contextual = provider.parse_aps_response(
+            &json!({"contextual": {"slots": []}, "seatbid": [{"bid": [bid("valid", 1.0, "iframe")]}]}),
+            12,
+            &request(),
+        );
+        assert_eq!(contextual.status, BidStatus::Success);
+        assert_eq!(contextual.bids.len(), 1);
+        assert_eq!(
+            drop_count(&contextual, AuctionDropReason::InvalidProviderResponse),
+            1
+        );
+
+        let value = json!({
+            "cur": "EUR",
+            "seatbid": [{"bid": [bid("eur", 1.0, "iframe")]}]
+        });
+        let response = provider.parse_aps_response(&value, 12, &request());
+        assert_eq!(response.status, BidStatus::Error);
+        assert_eq!(
+            drop_count(&response, AuctionDropReason::InvalidProviderResponse),
+            1
+        );
+
+        let body = br#"{"seatbid":[{"bid":[{"id":"overflow","impid":"fictional-slot","price":1e400,"w":300,"h":250,"ext":{"creativeurl":"https://creative.example/render","tagtype":"iframe"}}]}]}"#;
+        let response = futures::executor::block_on(
+            provider.parse_response_inner(
+                PlatformResponse::new(
+                    edgezero_core::http::response_builder()
+                        .status(StatusCode::OK)
+                        .body(EdgeBody::from(body.to_vec()))
+                        .expect("should build nonfinite APS response"),
+                ),
+                12,
+                Some(&request()),
+                None,
+                false,
+            ),
+        )
+        .expect("should reject nonfinite APS JSON safely");
+        assert_eq!(response.status, BidStatus::Error);
+        assert_eq!(
+            drop_count(&response, AuctionDropReason::InvalidProviderResponse),
+            1
+        );
+    }
+
+    #[test]
+    fn invalid_only_bid_retains_its_attributable_slot_failure() {
+        let provider = ApsAuctionProvider::new(config());
+        let mut invalid = bid("invalid", 1.0, "iframe");
+        invalid["ext"]["creativeurl"] = json!("http://creative.example/render");
+
+        let response =
+            provider.parse_aps_response(&json!({"seatbid": [{"bid": [invalid]}]}), 12, &request());
+
+        assert_eq!(response.status, BidStatus::NoBid);
+        assert_eq!(
+            response.metadata["invalid_slots"]["fictional-slot"],
+            "invalid_provider_response"
+        );
     }
 
     #[test]
@@ -2021,7 +3015,7 @@ mod tests {
         let oversized = parse_with_context(&provider, oversized);
 
         assert_eq!(
-            malformed.metadata["drop_reasons"]["unexpected_response_shape"],
+            drop_count(&malformed, AuctionDropReason::InvalidProviderResponse),
             1
         );
         assert_eq!(
@@ -2101,7 +3095,7 @@ mod tests {
 
         assert!(response.bids.is_empty());
         assert_eq!(
-            response.metadata["drop_reasons"]["unexpected_response_shape"],
+            drop_count(&response, AuctionDropReason::InvalidProviderResponse),
             1
         );
     }
@@ -2181,15 +3175,18 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_currency_is_a_no_bid() {
+    fn unsupported_currency_is_an_invalid_provider_response() {
         let provider = ApsAuctionProvider::new(config());
         let response = provider.parse_aps_response(
             &json!({"cur": "EUR", "seatbid": [{"bid": [bid("eur-bid", 1.0, "iframe")]}]}),
             12,
             &request(),
         );
-        assert_eq!(response.status, BidStatus::NoBid);
-        assert_eq!(response.metadata["drop_reasons"]["unsupported_currency"], 1);
+        assert_eq!(response.status, BidStatus::Error);
+        assert_eq!(
+            drop_count(&response, AuctionDropReason::InvalidProviderResponse),
+            1
+        );
     }
 
     #[test]
@@ -2202,10 +3199,7 @@ mod tests {
         );
         assert_eq!(response.bids.len(), 1);
         assert_eq!(response.bids[0].bid_id.as_deref(), Some("valid"));
-        assert_eq!(
-            response.metadata["drop_reasons"]["missing_render_source"],
-            1
-        );
+        assert_eq!(drop_count(&response, AuctionDropReason::MalformedBid), 1);
     }
 
     #[test]
@@ -2281,7 +3275,7 @@ mod tests {
         );
         assert!(response.bids.is_empty());
         assert_eq!(
-            response.metadata["drop_reasons"]["missing_render_source"],
+            drop_count(&response, AuctionDropReason::MissingCreativeUrl),
             1
         );
         assert_eq!(response.metadata["drop_reasons"]["invalid_dimensions"], 1);
@@ -2308,6 +3302,8 @@ mod tests {
 
         let mut uppercase_publisher = request();
         uppercase_publisher.publisher.domain = "Creative.Example".to_string();
+        uppercase_publisher.publisher.page_url =
+            Some("https://Creative.Example/article".to_string());
         let response = provider.parse_aps_response(
             &json!({"seatbid": [{"bid": [bid("same-origin", 1.0, "iframe")]}]}),
             12,
@@ -2318,47 +3314,7 @@ mod tests {
     }
 
     #[test]
-    fn registers_and_serves_only_static_renderer_route() {
-        let integration = ApsRendererIntegration;
-        let routes = integration.routes();
-        assert_eq!(routes.len(), 1, "should register one route");
-        assert_eq!(routes[0].method, Method::GET);
-        assert_eq!(routes[0].path, APS_RENDERER_ROUTE);
-
-        let settings = create_test_settings();
-        let services = noop_services();
-        let request = http::Request::builder()
-            .method(Method::GET)
-            .uri(APS_RENDERER_ROUTE)
-            .body(EdgeBody::empty())
-            .expect("should build renderer request");
-        let response =
-            futures::executor::block_on(integration.handle(&settings, &services, request))
-                .expect("should serve renderer");
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers()[header::CONTENT_TYPE],
-            "text/html; charset=utf-8"
-        );
-        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
-        assert_eq!(response.headers()["referrer-policy"], "no-referrer");
-        assert_eq!(
-            response.headers()[header::CONTENT_SECURITY_POLICY],
-            APS_RENDERER_CSP
-        );
-
-        let post = http::Request::builder()
-            .method(Method::POST)
-            .uri(APS_RENDERER_ROUTE)
-            .body(EdgeBody::empty())
-            .expect("should build method rejection request");
-        let response = futures::executor::block_on(integration.handle(&settings, &services, post))
-            .expect("should reject unsupported method");
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn enabled_config_registers_renderer_proxy() {
+    fn enabled_config_does_not_register_a_second_renderer_proxy() {
         let mut settings = create_test_settings();
         settings
             .integrations
@@ -2373,12 +3329,12 @@ mod tests {
             .expect("should return enabled registration");
 
         assert_eq!(registration.integration_id, APS_INTEGRATION_ID);
-        assert_eq!(registration.proxies.len(), 1);
+        assert!(registration.proxies.is_empty());
         assert!(registration.js_disabled);
     }
 
     #[test]
-    fn config_without_enabled_does_not_register_provider_or_renderer() {
+    fn config_without_enabled_registers_neither_integration_nor_provider() {
         let mut settings = create_test_settings();
         settings
             .integrations
@@ -2390,15 +3346,15 @@ mod tests {
 
         assert!(
             register(&settings)
-                .expect("should evaluate renderer registration")
+                .expect("should evaluate APS integration registration")
                 .is_none(),
-            "omitted enabled should not register the renderer route"
+            "omitted enabled should not register APS browser routes"
         );
         assert!(
             register_providers(&settings)
-                .expect("should evaluate provider registration")
+                .expect("should evaluate APS provider registration")
                 .is_empty(),
-            "omitted enabled should not register the auction provider"
+            "omitted enabled should not register the APS auction provider"
         );
     }
 
@@ -2423,34 +3379,477 @@ mod tests {
     }
 
     #[test]
-    fn renderer_document_is_static_and_nonce_bound() {
-        assert!(APS_RENDERER_DOCUMENT.contains("^#tsaps="));
-        assert!(APS_RENDERER_DOCUMENT.contains("event.source!==parent"));
-        assert!(APS_RENDERER_DOCUMENT.contains("message.nonce!==expected"));
-        assert!(APS_RENDERER_DOCUMENT.contains("prebid/creative/render"));
-        assert!(APS_RENDERER_DOCUMENT.contains("window._aps instanceof Map"));
-        assert!(APS_RENDERER_DOCUMENT.contains("store:new Map([['listeners',new Map()]])"));
-        assert!(APS_RENDERER_DOCUMENT.contains("account.queue.push(new CustomEvent"));
-        assert!(
-            APS_RENDERER_DOCUMENT.contains("trusted-server/aps/renderer-ready")
-                && APS_RENDERER_DOCUMENT.contains("trusted-server/aps/renderer-failed")
+    fn coordinated_cutover_routes_are_reserved_with_exact_local_method_policy() {
+        let enabled = ApsV1Integration { enabled: true };
+        let disabled = ApsV1Integration { enabled: false };
+        let settings = create_test_settings();
+        let services = noop_services();
+
+        for path in [APS_RENDERER_V1_ROUTE, APS_RUNNER_ROUTE] {
+            let disabled_get = http::Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .body(EdgeBody::empty())
+                .expect("should build disabled APS request");
+            let response =
+                futures::executor::block_on(disabled.handle(&settings, &services, disabled_get))
+                    .expect("disabled APS family should answer locally");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+
+            let disabled_post = http::Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .body(EdgeBody::empty())
+                .expect("should build disabled APS POST request");
+            let response =
+                futures::executor::block_on(disabled.handle(&settings, &services, disabled_post))
+                    .expect("disabled APS family should remain absent for every method");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert!(!response.headers().contains_key(header::ALLOW));
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+
+            for method in [
+                Method::HEAD,
+                Method::OPTIONS,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+                Method::TRACE,
+                Method::CONNECT,
+                Method::from_bytes(b"PROPFIND").expect("PROPFIND should be a valid method"),
+            ] {
+                let request = http::Request::builder()
+                    .method(method.clone())
+                    .uri(path)
+                    .body(EdgeBody::empty())
+                    .expect("should build APS method rejection");
+                let response =
+                    futures::executor::block_on(enabled.handle(&settings, &services, request))
+                        .expect("reserved APS family should reject unsupported methods locally");
+                assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+                assert_eq!(response.headers()[header::ALLOW], "GET");
+                assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+                assert_eq!(response.headers().len(), 2, "method={method} path={path}");
+                assert!(
+                    response
+                        .into_body()
+                        .into_bytes()
+                        .unwrap_or_default()
+                        .is_empty()
+                );
+            }
+        }
+
+        for path in [
+            "/integrations/aps/renderer",
+            "/integrations/aps/renderer/v2",
+            "/integrations/aps/runner/v1.js",
+            "/integrations/aps/renderer/v1/extra",
+            "/integrations/aps/not-a-route",
+        ] {
+            let request = http::Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .body(EdgeBody::empty())
+                .expect("should build unknown APS family request");
+            let response =
+                futures::executor::block_on(enabled.handle(&settings, &services, request))
+                    .expect("unknown APS family path should answer locally");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "path={path}");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        }
+    }
+
+    #[test]
+    fn aps_family_classifier_has_an_exact_segment_boundary() {
+        assert!(is_aps_family_path("/integrations/aps"));
+        assert!(is_aps_family_path("/integrations/aps/renderer/v1"));
+        assert!(!is_aps_family_path("/integrations/apsx"));
+        assert!(!is_aps_family_path("/integrations/ap"));
+    }
+
+    #[test]
+    fn coordinated_cutover_renderer_has_exact_immutable_embedding_policy() {
+        let integration = ApsV1Integration { enabled: true };
+        let request = http::Request::builder()
+            .method(Method::GET)
+            .uri(APS_RENDERER_V1_ROUTE)
+            .body(EdgeBody::empty())
+            .expect("should build versioned renderer request");
+        let response = futures::executor::block_on(integration.handle(
+            &create_test_settings(),
+            &noop_services(),
+            request,
+        ))
+        .expect("versioned renderer should be served");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
         );
-        assert!(!APS_RENDERER_DOCUMENT.contains("window.apstag"));
-        assert!(
-            APS_RENDERER_DOCUMENT
-                .contains("https://client.aps.amazon-adsystem.com/prebid-creative.js")
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
         );
-        assert!(!APS_RENDERER_DOCUMENT.contains("<script src="));
-        let queue_index = APS_RENDERER_DOCUMENT
-            .find("account.queue.push(new CustomEvent")
-            .expect("should queue render event");
-        let runner_index = APS_RENDERER_DOCUMENT
-            .find("document.head.appendChild(script)")
-            .expect("should dynamically load the APS runner");
-        assert!(queue_index < runner_index);
-        assert!(!APS_RENDERER_DOCUMENT.contains("allow-same-origin"));
-        assert!(APS_RENDERER_CSP.contains("default-src 'none'"));
-        assert!(APS_RENDERER_CSP.contains("sandbox allow-forms"));
-        assert!(!APS_RENDERER_CSP.contains("allow-same-origin"));
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+        assert_eq!(
+            response.headers()[header::CONTENT_SECURITY_POLICY],
+            APS_RENDERER_V1_CSP
+        );
+        assert!(!response.headers().contains_key("x-frame-options"));
+        assert!(!APS_RENDERER_V1_CSP.contains("frame-ancestors"));
+        assert_eq!(
+            APS_RENDERER_SANDBOX,
+            "allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation"
+        );
+
+        let body = futures::executor::block_on(
+            response
+                .into_body()
+                .into_bytes_bounded(APS_RUNNER_MAX_RESPONSE_BYTES),
+        )
+        .expect("renderer body should stay within the runner cap");
+        assert_eq!(body.as_ref(), APS_RENDERER_V1_DOCUMENT.as_bytes());
+        assert!(APS_RENDERER_V1_DOCUMENT.contains("/integrations/aps/runner.js"));
+        assert!(!APS_RENDERER_V1_DOCUMENT.contains("client.aps.amazon-adsystem.com"));
+    }
+
+    fn raw_runner_response(
+        body: impl Into<Vec<u8>>,
+        content_type: ProxyHeaderEvidenceV1,
+        content_encoding: ProxyHeaderEvidenceV1,
+        content_length: ProxyHeaderEvidenceV1,
+    ) -> RawProxyResponseV1 {
+        RawProxyResponseV1 {
+            evidence: ProxyResponseEvidenceV1 {
+                status: 200,
+                content_type,
+                content_encoding,
+                content_length,
+            },
+            body: body.into(),
+        }
+    }
+
+    fn request_runner(
+        stub: &Arc<StubHttpClient>,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        let services = build_services_with_http_client(
+            Arc::clone(stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let request = http::Request::builder()
+            .method(Method::GET)
+            .uri(APS_RUNNER_ROUTE)
+            .body(EdgeBody::empty())
+            .expect("should build APS runner request");
+        futures::executor::block_on(ApsV1Integration { enabled: true }.handle(
+            &create_test_settings(),
+            &services,
+            request,
+        ))
+    }
+
+    #[test]
+    fn coordinated_cutover_runner_proxies_exact_valid_identity_bytes() {
+        let body = b"window.fictionalApsRunner = true;".to_vec();
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_raw_proxy_response(raw_runner_response(
+            body.clone(),
+            ProxyHeaderEvidenceV1::one("application/javascript; charset=utf-8"),
+            ProxyHeaderEvidenceV1::absent(),
+            ProxyHeaderEvidenceV1::one(body.len().to_string()),
+        ));
+
+        let response = request_runner(&stub).expect("valid runner should be proxied");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/javascript; charset=utf-8"
+        );
+        assert_eq!(response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert_eq!(
+            response.headers()["cross-origin-resource-policy"],
+            "cross-origin"
+        );
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+        assert_eq!(response.headers().len(), 5);
+        let returned = futures::executor::block_on(
+            response
+                .into_body()
+                .into_bytes_bounded(APS_RUNNER_MAX_RESPONSE_BYTES),
+        )
+        .expect("valid runner body should remain bounded");
+        assert_eq!(returned.as_ref(), body.as_slice());
+
+        assert_eq!(stub.recorded_backend_names(), vec!["stub-backend"]);
+        assert_eq!(stub.recorded_request_uris(), vec![APS_RUNNER_UPSTREAM_URL]);
+        assert_eq!(stub.recorded_request_methods(), vec!["GET"]);
+        assert_eq!(
+            stub.recorded_request_headers(),
+            vec![vec![(
+                "accept-encoding".to_string(),
+                "identity".to_string()
+            )]]
+        );
+        assert_eq!(stub.recorded_request_bodies(), vec![Vec::<u8>::new()]);
+        assert_eq!(APS_RUNNER_TOTAL_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(
+            stub.recorded_raw_proxy_policies(),
+            vec![RawProxyPolicyV1 {
+                total_timeout: APS_RUNNER_TOTAL_TIMEOUT,
+                first_byte_timeout: Duration::from_secs(4),
+                blocking_read_timeout: Duration::from_millis(250),
+                max_response_bytes: APS_RUNNER_MAX_RESPONSE_BYTES,
+            }]
+        );
+    }
+
+    #[test]
+    fn coordinated_cutover_runner_rejects_ambiguous_or_invalid_upstream_evidence() {
+        let valid_body = b"window.fictionalApsRunner = true;".to_vec();
+        let valid_length = valid_body.len().to_string();
+        let cases = [
+            (
+                "redirect",
+                RawProxyResponseV1 {
+                    evidence: ProxyResponseEvidenceV1 {
+                        status: 302,
+                        content_type: ProxyHeaderEvidenceV1::one("application/javascript"),
+                        content_encoding: ProxyHeaderEvidenceV1::absent(),
+                        content_length: ProxyHeaderEvidenceV1::one(valid_length.clone()),
+                    },
+                    body: valid_body.clone(),
+                },
+            ),
+            (
+                "missing content type",
+                raw_runner_response(
+                    valid_body.clone(),
+                    ProxyHeaderEvidenceV1::absent(),
+                    ProxyHeaderEvidenceV1::absent(),
+                    ProxyHeaderEvidenceV1::one(valid_length.clone()),
+                ),
+            ),
+            (
+                "duplicate content type",
+                raw_runner_response(
+                    valid_body.clone(),
+                    ProxyHeaderEvidenceV1::Occurrences(vec![
+                        b"application/javascript".to_vec(),
+                        b"text/javascript".to_vec(),
+                    ]),
+                    ProxyHeaderEvidenceV1::absent(),
+                    ProxyHeaderEvidenceV1::one(valid_length.clone()),
+                ),
+            ),
+            (
+                "combined content type list",
+                raw_runner_response(
+                    valid_body.clone(),
+                    ProxyHeaderEvidenceV1::Combined(
+                        b"application/javascript, text/javascript".to_vec(),
+                    ),
+                    ProxyHeaderEvidenceV1::absent(),
+                    ProxyHeaderEvidenceV1::one(valid_length.clone()),
+                ),
+            ),
+            (
+                "wrong charset",
+                raw_runner_response(
+                    valid_body.clone(),
+                    ProxyHeaderEvidenceV1::one("application/javascript; charset=iso-8859-1"),
+                    ProxyHeaderEvidenceV1::absent(),
+                    ProxyHeaderEvidenceV1::one(valid_length.clone()),
+                ),
+            ),
+            (
+                "encoded body",
+                raw_runner_response(
+                    valid_body.clone(),
+                    ProxyHeaderEvidenceV1::one("application/javascript"),
+                    ProxyHeaderEvidenceV1::one("gzip"),
+                    ProxyHeaderEvidenceV1::one(valid_length.clone()),
+                ),
+            ),
+            (
+                "unavailable encoding evidence",
+                raw_runner_response(
+                    valid_body.clone(),
+                    ProxyHeaderEvidenceV1::one("application/javascript"),
+                    ProxyHeaderEvidenceV1::Unavailable,
+                    ProxyHeaderEvidenceV1::one(valid_length.clone()),
+                ),
+            ),
+            (
+                "leading-zero length",
+                raw_runner_response(
+                    valid_body.clone(),
+                    ProxyHeaderEvidenceV1::one("application/javascript"),
+                    ProxyHeaderEvidenceV1::absent(),
+                    ProxyHeaderEvidenceV1::one(format!("0{valid_length}")),
+                ),
+            ),
+            (
+                "mismatched length",
+                raw_runner_response(
+                    valid_body.clone(),
+                    ProxyHeaderEvidenceV1::one("application/javascript"),
+                    ProxyHeaderEvidenceV1::absent(),
+                    ProxyHeaderEvidenceV1::one("1"),
+                ),
+            ),
+            (
+                "invalid utf-8",
+                raw_runner_response(
+                    vec![0xff],
+                    ProxyHeaderEvidenceV1::one("application/javascript"),
+                    ProxyHeaderEvidenceV1::absent(),
+                    ProxyHeaderEvidenceV1::one("1"),
+                ),
+            ),
+        ];
+
+        for (name, response) in cases {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_raw_proxy_response(response);
+            let response = request_runner(&stub).expect("invalid runner should fail locally");
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "case={name}");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert_eq!(response.headers().len(), 1, "case={name}");
+            let body = futures::executor::block_on(
+                response
+                    .into_body()
+                    .into_bytes_bounded(APS_RUNNER_MAX_RESPONSE_BYTES),
+            )
+            .expect("local failure body should be bounded");
+            assert!(body.is_empty(), "case={name}");
+        }
+    }
+
+    #[test]
+    fn coordinated_cutover_runner_header_grammars_are_closed_and_complete() {
+        for content_type in [
+            ProxyHeaderEvidenceV1::one("application/javascript"),
+            ProxyHeaderEvidenceV1::one("text/javascript"),
+            ProxyHeaderEvidenceV1::one(" Application/JavaScript ; Charset = UTF-8 "),
+            ProxyHeaderEvidenceV1::Combined(b"text/javascript; charset=utf-8".to_vec()),
+        ] {
+            assert!(
+                ApsV1Integration::validate_runner_content_type(&content_type).is_ok(),
+                "accepted content type: {content_type:?}"
+            );
+        }
+        for content_type in [
+            ProxyHeaderEvidenceV1::Unavailable,
+            ProxyHeaderEvidenceV1::absent(),
+            ProxyHeaderEvidenceV1::one("application/ecmascript"),
+            ProxyHeaderEvidenceV1::one("application/javascript; charset=\"utf-8\""),
+            ProxyHeaderEvidenceV1::one("application/javascript; charset=utf-8; level=1"),
+            ProxyHeaderEvidenceV1::one("application/javascript; boundary=x"),
+            ProxyHeaderEvidenceV1::one("application/javascript,"),
+            ProxyHeaderEvidenceV1::one("application/javascript\u{a0}"),
+        ] {
+            assert!(
+                ApsV1Integration::validate_runner_content_type(&content_type).is_err(),
+                "rejected content type: {content_type:?}"
+            );
+        }
+
+        for encoding in [
+            ProxyHeaderEvidenceV1::absent(),
+            ProxyHeaderEvidenceV1::one("identity"),
+            ProxyHeaderEvidenceV1::Combined(b" IDENTITY\t".to_vec()),
+        ] {
+            assert!(
+                ApsV1Integration::validate_runner_content_encoding(&encoding).is_ok(),
+                "accepted encoding: {encoding:?}"
+            );
+        }
+        for encoding in [
+            ProxyHeaderEvidenceV1::Unavailable,
+            ProxyHeaderEvidenceV1::one(""),
+            ProxyHeaderEvidenceV1::one("gzip"),
+            ProxyHeaderEvidenceV1::one("identity, identity"),
+            ProxyHeaderEvidenceV1::Occurrences(vec![b"identity".to_vec(), b"identity".to_vec()]),
+        ] {
+            assert!(
+                ApsV1Integration::validate_runner_content_encoding(&encoding).is_err(),
+                "rejected encoding: {encoding:?}"
+            );
+        }
+
+        assert_eq!(
+            ApsV1Integration::validate_runner_content_length(&ProxyHeaderEvidenceV1::absent()),
+            Ok(None)
+        );
+        assert_eq!(
+            ApsV1Integration::validate_runner_content_length(&ProxyHeaderEvidenceV1::one("0")),
+            Ok(Some(0))
+        );
+        assert_eq!(
+            ApsV1Integration::validate_runner_content_length(&ProxyHeaderEvidenceV1::Combined(
+                APS_RUNNER_MAX_RESPONSE_BYTES.to_string().into_bytes()
+            )),
+            Ok(Some(APS_RUNNER_MAX_RESPONSE_BYTES))
+        );
+        for length in [
+            ProxyHeaderEvidenceV1::Unavailable,
+            ProxyHeaderEvidenceV1::one(""),
+            ProxyHeaderEvidenceV1::one("00"),
+            ProxyHeaderEvidenceV1::one("01"),
+            ProxyHeaderEvidenceV1::one("+1"),
+            ProxyHeaderEvidenceV1::one(" 1"),
+            ProxyHeaderEvidenceV1::one("1 "),
+            ProxyHeaderEvidenceV1::one("1, 1"),
+            ProxyHeaderEvidenceV1::one((APS_RUNNER_MAX_RESPONSE_BYTES + 1).to_string()),
+            ProxyHeaderEvidenceV1::Occurrences(vec![b"1".to_vec(), b"1".to_vec()]),
+        ] {
+            assert!(
+                ApsV1Integration::validate_runner_content_length(&length).is_err(),
+                "rejected length: {length:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn coordinated_cutover_runner_accepts_exact_cap_and_rejects_one_byte_over() {
+        let exact = raw_runner_response(
+            vec![b' '; APS_RUNNER_MAX_RESPONSE_BYTES],
+            ProxyHeaderEvidenceV1::one("application/javascript"),
+            ProxyHeaderEvidenceV1::absent(),
+            ProxyHeaderEvidenceV1::absent(),
+        );
+        assert!(ApsV1Integration::validate_runner_response(&exact).is_ok());
+
+        let over = raw_runner_response(
+            vec![b' '; APS_RUNNER_MAX_RESPONSE_BYTES + 1],
+            ProxyHeaderEvidenceV1::one("application/javascript"),
+            ProxyHeaderEvidenceV1::absent(),
+            ProxyHeaderEvidenceV1::absent(),
+        );
+        assert_eq!(
+            ApsV1Integration::validate_runner_response(&over),
+            Err("body_overflow")
+        );
+    }
+
+    #[test]
+    fn coordinated_cutover_runner_transport_failure_is_empty_and_non_leaking() {
+        let stub = Arc::new(StubHttpClient::new());
+        let response = request_runner(&stub).expect("transport failure should answer locally");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers().len(), 1);
+        let body = futures::executor::block_on(
+            response
+                .into_body()
+                .into_bytes_bounded(APS_RUNNER_MAX_RESPONSE_BYTES),
+        )
+        .expect("local failure body should be bounded");
+        assert!(body.is_empty());
     }
 }

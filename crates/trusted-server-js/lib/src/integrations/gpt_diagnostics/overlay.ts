@@ -20,16 +20,16 @@ interface OverlayBindings {
 }
 
 type OverlayWindow = Window & {
-  MutationObserver?: typeof MutationObserver;
+  MutationObserver?: typeof MutationObserver | undefined;
 };
 
 interface OverlayOptions {
-  window?: OverlayWindow;
-  document?: Document;
-  scheduleFrame?: (callback: () => void) => void;
-  onExport?: () => void;
-  onShadowRoot?: (root: ShadowRoot) => void;
-  onBadgeLayerChange?: (layer: HTMLElement | undefined) => void;
+  window?: OverlayWindow | undefined;
+  document?: Document | undefined;
+  scheduleFrame?: ((callback: () => void) => () => void) | undefined;
+  onExport?: (() => void) | undefined;
+  onShadowRoot?: ((root: ShadowRoot) => void) | undefined;
+  onBadgeLayerChange?: ((layer: HTMLElement | undefined) => void) | undefined;
 }
 
 const PANEL_STYLES = `
@@ -99,12 +99,18 @@ const PANEL_STYLES = `
   }
 `;
 
-function defaultScheduleFrame(callback: () => void): void {
-  if (typeof requestAnimationFrame === 'function') {
-    requestAnimationFrame(() => callback());
-  } else {
-    queueMicrotask(callback);
+function defaultScheduleFrame(callback: () => void): () => void {
+  if (typeof requestAnimationFrame === 'function' && typeof cancelAnimationFrame === 'function') {
+    const frame = requestAnimationFrame(() => callback());
+    return () => cancelAnimationFrame(frame);
   }
+  let active = true;
+  queueMicrotask(() => {
+    if (active) callback();
+  });
+  return () => {
+    active = false;
+  };
 }
 
 function latestCycle(
@@ -163,6 +169,9 @@ function requestPathFact(cycle: GptDiagnosticsRequestCycle): string {
       return 'Request path: Unattributed';
     case undefined:
       return 'Request path: Unknown (not observed)';
+    default:
+      unhandledCase(cycle.requestPath);
+      return 'Request path: Unknown (not observed)';
   }
 }
 
@@ -175,6 +184,9 @@ function trustedServerOpportunityFact(cycle: GptDiagnosticsRequestCycle): string
     case 'no_candidate':
       return 'Direct opportunity: No candidate';
     case undefined:
+      return 'Direct opportunity: Unknown (not observed)';
+    default:
+      unhandledCase(cycle.trustedServerOpportunity);
       return 'Direct opportunity: Unknown (not observed)';
   }
 }
@@ -344,15 +356,16 @@ export class GptDiagnosticsOverlay {
   private readonly bindings: OverlayBindings;
   private readonly window: OverlayWindow;
   private readonly document: Document;
-  private readonly scheduleFrame: (callback: () => void) => void;
+  private readonly scheduleFrame: (callback: () => void) => () => void;
   private readonly onExport: () => void;
-  private readonly onShadowRoot?: (root: ShadowRoot) => void;
-  private readonly onBadgeLayerChange?: (layer: HTMLElement | undefined) => void;
+  private readonly onShadowRoot: ((root: ShadowRoot) => void) | undefined;
+  private readonly onBadgeLayerChange: ((layer: HTMLElement | undefined) => void) | undefined;
   private readonly unsubscribeStore: () => void;
   private readonly unsubscribeBindings: () => void;
-  private host?: HTMLElement;
-  private panel?: HTMLElement;
+  private host: HTMLElement | undefined;
+  private panel: HTMLElement | undefined;
   private lifecycleObserver?: MutationObserver;
+  private readonly cancelScheduledFrames = new Set<() => void>();
   private visualReady = false;
   private mountWaitStarted = false;
   private renderScheduled = false;
@@ -395,6 +408,14 @@ export class GptDiagnosticsOverlay {
     if (this.destroyed) return;
     this.destroyed = true;
     this.dismissed = true;
+    for (const cancelFrame of [...this.cancelScheduledFrames]) {
+      this.cancelScheduledFrames.delete(cancelFrame);
+      try {
+        cancelFrame();
+      } catch {
+        // Continue releasing every independently owned overlay resource.
+      }
+    }
     this.unsubscribeStore();
     this.unsubscribeBindings();
     this.lifecycleObserver?.disconnect();
@@ -417,8 +438,8 @@ export class GptDiagnosticsOverlay {
 
     this.mountWaitStarted = true;
     this.document.removeEventListener('readystatechange', this.handleReadyStateChange);
-    this.scheduleFrame(() => {
-      this.scheduleFrame(() => {
+    this.scheduleOwnedFrame(() => {
+      this.scheduleOwnedFrame(() => {
         this.visualReady = true;
         if (!this.dismissed) this.mount();
       });
@@ -486,10 +507,14 @@ export class GptDiagnosticsOverlay {
         this.hostCollision = false;
       }
       this.remountScheduled = true;
-      this.scheduleFrame(() => {
+      if (
+        !this.scheduleOwnedFrame(() => {
+          this.remountScheduled = false;
+          this.mount();
+        })
+      ) {
         this.remountScheduled = false;
-        this.mount();
-      });
+      }
     });
     this.lifecycleObserver.observe(this.document.documentElement, {
       childList: true,
@@ -500,10 +525,50 @@ export class GptDiagnosticsOverlay {
   private scheduleRender(): void {
     if (this.destroyed || this.renderScheduled) return;
     this.renderScheduled = true;
-    this.scheduleFrame(() => {
+    if (
+      !this.scheduleOwnedFrame(() => {
+        this.renderScheduled = false;
+        this.render();
+      })
+    ) {
       this.renderScheduled = false;
-      this.render();
-    });
+    }
+  }
+
+  private scheduleOwnedFrame(callback: () => void): boolean {
+    if (this.destroyed) return false;
+    let active = true;
+    let cancelFrame: (() => void) | undefined;
+    let release: (() => void) | undefined;
+    const run = (): void => {
+      if (!active) return;
+      active = false;
+      if (release) this.cancelScheduledFrames.delete(release);
+      try {
+        cancelFrame?.();
+      } catch {
+        // A completed frame remains authoritative when scheduler cleanup fails.
+      }
+      if (!this.destroyed) callback();
+    };
+    try {
+      cancelFrame = this.scheduleFrame(run);
+      if (typeof cancelFrame !== 'function') {
+        throw new TypeError('Invalid overlay frame scheduler');
+      }
+      release = (): void => {
+        if (!active) return;
+        active = false;
+        cancelFrame?.();
+      };
+      if (active) this.cancelScheduledFrames.add(release);
+      else cancelFrame();
+      return true;
+    } catch {
+      active = false;
+      if (release) this.cancelScheduledFrames.delete(release);
+      return false;
+    }
   }
 
   private render(): void {
@@ -570,7 +635,7 @@ export class GptDiagnosticsOverlay {
 
     const summary = this.document.createElement('div');
     summary.className = 'tsgd-summary';
-    summary.textContent = `${snapshot.slots.length} slots · ${snapshot.callbackIssues.length} callback issues · ${snapshot.attributionIssues?.length ?? 0} attribution issues`;
+    summary.textContent = `${snapshot.slots.length} slots · ${snapshot.callbackIssues.length} callback issues · ${snapshot.attributionIssues.length} attribution issues`;
     const coverage = this.document.createElement('ul');
     coverage.className = 'tsgd-coverage';
     for (const [kind, counters] of Object.entries(snapshot.coverage)) {

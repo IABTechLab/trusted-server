@@ -35,7 +35,8 @@ covered by deterministic tests rather than an unstable external page.
 - Clear stale Trusted Server/Prebid targeting from every independent slot before its
   GAM refresh, including excluded slots, while preserving targeting on publisher
   delivery slots.
-- Preserve the existing `adInitRefreshInProgress` direct-GAM bypass exactly.
+- Preserve the slot service's protected initial-display decision before optional
+  refresh-auction work.
 
 ### Non-goals
 
@@ -49,31 +50,21 @@ covered by deterministic tests rather than an unstable external page.
 
 ## 3. Current call flow
 
-1. `installPrebidNpm()` registers the `trustedServer` Prebid adapter and wraps
-   `pbjs.requestBids()` so server-side bidder requests flow through it
-   (`crates/trusted-server-js/lib/src/integrations/prebid/index.ts:514-669`).
-2. The adapter's `buildRequests()` serializes auction inputs and returns a POST to
-   `auctionEndpoint`, which defaults to `/auction`
-   (`index.ts:524-535`).
-3. `installRefreshHandler()` wraps `googletag.pubads().refresh()` after GPT loads
-   (`index.ts:726-818`). The wrapper:
-   - immediately passes through `adInitRefreshInProgress` requests;
-   - resolves explicit slots, or `pubads.getSlots()` for bare refreshes;
-   - partitions the resolved slots into publisher delivery slots and independent
-     slots;
-   - clears `ts_initial`, `hb_pb`, `hb_bidder`, `hb_adid`, `hb_cache_host`, and
-     `hb_cache_path` from every independent slot (`index.ts:43-50, 461-467`);
-   - creates one synthetic refresh ad unit per eligible independent slot;
-   - calls `pbjs.requestBids()`;
-   - scopes `setTargetingForGPTAsync()` to the synthetic codes; and
-   - calls the original GPT refresh after bids return.
-4. The refresh-slot type currently represents only element ID, targeting cleanup,
-   and sizes (`index.ts:260-265`). It does not expose GAM path metadata.
-5. Rust reads `integrations.prebid` into `PrebidIntegrationConfig`
+1. The critical Prebid registration validates injected configuration and publishes
+   one frozen `prebid.v1` capability (`module.ts`).
+2. The deferred `prebid_later` registration installs one optional policy into the
+   sole GPT publisher-call observer (`later.ts`, `gpt/startup.ts`).
+3. The slot service evaluates protected publisher refresh ownership first. Only
+   forwardable or replaced slots reach `createPrebidRefreshPolicy()`.
+4. The policy clears the fixed Trusted Server/Prebid targeting keys, filters exact
+   GAM-path suffix matches, and runs one synthetic auction for the remaining slots
+   (`refresh.ts`).
+5. Deferred GPT and Prebid adapters own vendor calls; navigation replacement or
+   disposal cancels pending work and ignores late completion.
+6. Rust reads `integrations.prebid` into `PrebidIntegrationConfig`
    (`crates/trusted-server-core/src/integrations/prebid.rs:203-343`) and injects
-   browser config into `window.__tsjs_prebid` through the head injector
-   (`prebid.rs:1006-1041`). The injected TypeScript shape is declared at
-   `index.ts:62-87`.
+   browser config through the head injector. The critical Prebid registrar consumes
+   that boot-owned value once and publishes the validated capability.
 
 ## 4. Configuration contract
 
@@ -140,100 +131,79 @@ For a non-empty normalized list the server injects:
 
 ```html
 <script>
-  window.__tsjs_prebid={"excludedGamAdUnitPathSuffixes":["/trackingonly","/measurement-only"],...};
+  window.tsjs._integrationConfig.prebid={"excludedGamAdUnitPathSuffixes":["/trackingonly","/measurement-only"],...};
 </script>
 ```
 
 For `[]`, omit the property with `skip_serializing_if`, matching the existing
-`clientSideBidders` convention. A browser that receives no property treats it as an
-empty list. This makes upgrade and rollback backwards compatible: old configuration
-has no behavior change; an older shim safely ignores the extra injected property;
-and a newer shim with old configuration has no exclusions.
+`clientSideBidders` convention. The registrar treats an absent property as an empty
+list, so every otherwise eligible refresh slot remains auctionable.
 
 ## 5. Matching and refresh behavior
 
 ### 5.1 Match predicate
 
-Extend `RefreshGptSlot` with:
-
-```ts
-getAdUnitPath?: () => string;
-```
-
-At each publisher refresh, read the injected readonly array from
-`getInjectedConfig()?.excludedGamAdUnitPathSuffixes ?? []`. A slot is excluded only
+At each publisher refresh, snapshot the validated readonly array from the
+`prebid.v1` capability. A slot is excluded only
 when all of the following hold:
 
 1. The array is non-empty.
-2. `slot.getAdUnitPath` is a function.
-3. Calling it returns a string.
+2. The deferred GPT adapter can read the slot's GAM ad-unit path.
+3. Reading it returns a string.
 4. The returned GAM path `endsWith()` at least one configured suffix, using exact,
    case-sensitive JavaScript string comparison.
 
-Do not derive paths from the element ID or injected `adSlots` metadata. Do not use
-`getSizes()` as a fallback. A missing getter, a non-string return value, an empty
-path, or a getter that throws is **fail-open**: the slot remains auction-eligible.
-The implementation catches only the getter failure around that call; it neither
-suppresses the GPT refresh nor broadens an exclusion because telemetry is absent.
+Do not derive paths from the element ID or projected slot metadata. Do not use sizes
+as a fallback. A missing getter, a non-string return value, an empty path, or a
+getter that throws is **fail-open**: the slot remains auction-eligible.
 
 A matching path is excluded only from the synthetic refresh auction. It is not
 removed from GPT's target list.
 
 ### 5.2 Required algorithm
 
-Keep the existing `adInitRefreshInProgress` check as the first branch, before slot
-resolution, targeting cleanup, and path inspection:
+The slot service's publisher-refresh decision must run before the optional policy:
 
 ```text
-if adInitRefreshInProgress:
-    originalRefresh(slots, options)
+slotDecision = slotService.preparePublisherRefresh(call)
+if slotDecision is suppress:
+    suppress the publisher call
     return
 
-targetSlots = explicit slots, or pubads.getSlots() for bare refresh
-if targetSlots is empty:
-    originalRefresh(slots, options)
+targetSlots = slotDecision replacement slots, otherwise observed call slots
+if targetSlots is invalid or empty:
+    preserve slotDecision
     return
 
-deliverySlots = publisher delivery slots in targetSlots
-independentSlots = targetSlots excluding deliverySlots
-if independentSlots is empty:
-    originalRefresh(slots, options)
-    return
-
-clear TS/Prebid refresh-targeting keys from every independent slot
-auctionSlots = independentSlots excluding suffix-matched slots
+defer the publisher call
+clear TS/Prebid refresh-targeting keys from every target slot
+auctionSlots = targetSlots excluding suffix-matched slots
 
 if auctionSlots is empty:
-    originalRefresh(slots, options)
+    settle the deferred call immediately
     return
 
-adUnits = synthetic refresh ad units for auctionSlots only
-pbjs.requestBids({ adUnits, timeout, bidsBackHandler })
-bidsBackHandler:
-    pbjs.setTargetingForGPTAsync(auction-slot codes only)
-    originalRefresh(slots, options)
+run one adapter-backed synthetic auction for auctionSlots
+settle after completion, the 1.5-second watchdog, disposal, or navigation replacement
 ```
 
 Build candidate codes, recover publisher bidder params, and recover client-side bids
 only for `auctionSlots`; excluded slots must not be represented in `adUnits` at all.
-The existing scoped targeting behavior therefore continues to affect only eligible
-slots.
+The adapter-backed auction scopes targeting to eligible synthetic codes only.
 
 ### 5.3 Refresh sequences
 
-| Call and slot set                                        | Prebid behavior                                                                   | GPT behavior                                                            |
-| -------------------------------------------------------- | --------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| `refresh([normal], options)`                             | Auction `normal`, target its synthetic code after bids return.                    | Refresh `[normal]` with the same options after the callback.            |
-| `refresh([excluded], options)`                           | Clear TS/Prebid keys; do not call `requestBids()` or `setTargetingForGPTAsync()`. | Immediately refresh `[excluded]` with the same options.                 |
-| Bare `refresh(options)`; all slots excluded              | Resolve slots; clear independent keys; skip Prebid.                               | Immediately pass through the original bare refresh and options.         |
-| Bare `refresh(options)`; mixed normal and excluded slots | Clear independent slots; auction eligible slots.                                  | After the callback, pass through the original bare refresh and options. |
-| Any refresh while `adInitRefreshInProgress` is true      | No cleanup, match, auction, or targeting.                                         | Directly pass through the original `slots` and options unchanged.       |
-| Missing/throwing `getAdUnitPath()`                       | Treat the slot as normal and auction it.                                          | Existing post-auction refresh behavior.                                 |
+| Call and slot set                                        | Prebid behavior                                                                   | GPT behavior                                                 |
+| -------------------------------------------------------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| `refresh([normal], options)`                             | Auction `normal`, target its synthetic code after bids return.                    | Refresh `[normal]` with the same options after the callback. |
+| `refresh([excluded], options)`                           | Clear TS/Prebid keys; do not call `requestBids()` or `setTargetingForGPTAsync()`. | Immediately refresh `[excluded]` with the same options.      |
+| Bare `refresh(options)`; all slots excluded              | Clear observed targets; skip Prebid.                                              | Resume when policy cleanup settles.                          |
+| Bare `refresh(options)`; mixed normal and excluded slots | Clear targets; auction eligible slots only.                                       | Resume after auction completion or watchdog.                 |
+| Slot-service protected initial display                   | No cleanup, match, auction, or targeting.                                         | Preserve the slot-service decision.                          |
+| Missing/throwing `getAdUnitPath()`                       | Treat the slot as normal and auction it.                                          | Existing post-auction refresh behavior.                      |
 
-The resolved list is used only for cleanup and synthetic-auction selection. The
-wrapper preserves the publisher's original refresh form, so GPT itself resolves the
-registered slots for bare calls. The original options object is passed through
-unchanged.
+The sole GPT adapter retains the publisher call and options while the policy owns
+only its asynchronous completion latch.
 
 ### 5.4 Targeting and initial-load invariants
 
@@ -242,22 +212,22 @@ The cleanup step remains before filtering and is limited to the existing
 from excluded slots so GAM cannot serve using an obsolete header-bid winner, while
 preserving GAM path metadata and every unrelated publisher targeting key.
 
-`adInitRefreshInProgress` continues to bypass cleanup and auctioning directly. This
-preserves `disableInitialLoad()` and the initial Trusted Server targeting handoff:
-that one internal refresh must deliver already-applied targeting to GAM instead of
-being converted into a client-side refresh auction.
+The slot service continues to protect initial Trusted Server targeting handoff before
+the Prebid policy runs, so it cannot be converted into a client-side refresh auction.
 
 ## 6. Implementation areas
 
-| File                                                                          | Planned change                                                                                                      |
-| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `crates/trusted-server-core/src/integrations/prebid.rs`                       | Add config field, validation/canonicalization, head-injected camel-case array, and Rust tests.                      |
-| `crates/trusted-server-js/lib/src/integrations/prebid/index.ts`               | Add injected config/type support, guarded path matcher, and filter `targetSlots` into `auctionSlots` after cleanup. |
-| `crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts`         | Add explicit/global/mixed/fail-open refresh tests.                                                                  |
-| `trusted-server.example.toml`                                                 | Add a commented fictional configuration example.                                                                    |
-| `docs/guide/integrations/prebid.md`                                           | Document the field, exact matcher semantics, and GAM-preservation caveat.                                           |
-| `docs/superpowers/specs/2026-07-24-prebid-refresh-gam-path-opt-out-design.md` | Update only if implementation exposes a necessary design correction.                                                |
-| `docs/superpowers/plans/2026-07-24-prebid-refresh-gam-path-opt-out.md`        | Mark implementation evidence/status only if project practice requires it.                                           |
+| File                                                                          | Planned change                                                                                 |
+| ----------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `crates/trusted-server-core/src/integrations/prebid.rs`                       | Add config field, validation/canonicalization, head-injected camel-case array, and Rust tests. |
+| `crates/trusted-server-js/lib/src/integrations/prebid/module.ts`              | Validate boot config and publish the frozen `prebid.v1` capability.                            |
+| `crates/trusted-server-js/lib/src/integrations/prebid/refresh.ts`             | Implement guarded path matching and the cancellable synthetic-refresh policy.                  |
+| `crates/trusted-server-js/lib/src/integrations/prebid/later.ts`               | Register the policy through the single GPT observer.                                           |
+| `crates/trusted-server-js/lib/test/integrations/prebid/module.test.ts`        | Cover literal filtering, fail-open behavior, cancellation, and adapter-backed auctions.        |
+| `trusted-server.example.toml`                                                 | Add a commented fictional configuration example.                                               |
+| `docs/guide/integrations/prebid.md`                                           | Document the field, exact matcher semantics, and GAM-preservation caveat.                      |
+| `docs/superpowers/specs/2026-07-24-prebid-refresh-gam-path-opt-out-design.md` | Update only if implementation exposes a necessary design correction.                           |
+| `docs/superpowers/plans/2026-07-24-prebid-refresh-gam-path-opt-out.md`        | Mark implementation evidence/status only if project practice requires it.                      |
 
 No generated `dist` file, minified external bundle, or publisher source file is a
 source-of-truth edit target.
@@ -292,24 +262,23 @@ source-of-truth edit target.
   the normal auction path without throwing from the wrapper.
 - Case mismatch and a trailing-slash mismatch do not exclude, proving literal
   case-sensitive suffix behavior.
-- Existing `adInitRefreshInProgress` test still proves direct pass-through without
-  cleanup or auction; existing normal refresh and client-side-bid recovery tests
-  remain green.
+- Existing GPT protected-refresh tests still prove bypass without cleanup or auction;
+  normal refresh and client-side-bid recovery tests remain green.
 
 ## 8. External bundle and browser verification
 
 `crates/trusted-server-js/lib/build-prebid-external.mjs` remains the supported source
 build path for the immutable external Prebid bundle; `build-all.mjs` intentionally
 does not build Prebid. This feature does not change that external bundle: its refresh
-filter lives in the server-served `tsjs-prebid` shim. Implementers must change the
-shim source rather than editing generated/minified assets.
+filter lives in the release-bound `prebid_later` registrar module. Implementers
+change TypeScript source rather than generated/minified assets.
 
 Roll out the Trusted Server application and its configuration together:
 
 1. Build and test the source change.
 2. Deploy the application/config containing the suffix list.
-3. Verify the injected `window.__tsjs_prebid.excludedGamAdUnitPathSuffixes` has the
-   expected values.
+3. Verify the consumed Prebid integration config has the expected suffixes; the
+   transient `_integrationConfig` transport must be deleted before runtime commit.
 4. In browser instrumentation, verify a matching slot calls GPT refresh without a
    corresponding Trusted Server refresh `/auction` request, while a normal display
    slot in the same global refresh still produces `/auction` and receives refreshed
@@ -317,9 +286,8 @@ Roll out the Trusted Server application and its configuration together:
 5. Verify GAM records the excluded slot's request/impression with a controlled
    staging page or harness.
 
-No new external Prebid bundle is required for this option. A bundle generated before
-the shim split is the separate migration exception described in the Prebid guide;
-changes to external adapters or User ID modules still use the normal bundle workflow.
+No new external Prebid bundle is required for this option. Changes to external
+adapters or User ID modules still use the normal bundle workflow.
 
 ## 9. Operational caveats and risks
 

@@ -1,23 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import type {
+  GoogletagDiagnosticsFact,
+  GoogletagDiagnosticsSlotSnapshot,
+} from '../../../src/adapters/googletag';
 import {
   GptDiagnosticsObserver,
   type GptDiagnosticsObserverStore,
-  type GptObserverWindow,
 } from '../../../src/integrations/gpt_diagnostics/observer';
-import type { GptDiagnosticsSlotLike } from '../../../src/integrations/gpt_diagnostics/store';
-
-const EVENT_NAMES = [
-  'slotRequested',
-  'slotResponseReceived',
-  'slotRenderEnded',
-  'slotOnload',
-  'impressionViewable',
-  'slotVisibilityChanged',
-] as const;
-
-type EventName = (typeof EVENT_NAMES)[number];
-type EventListener = (event: { slot: GptDiagnosticsSlotLike; [key: string]: unknown }) => void;
 
 function fakeStore(): GptDiagnosticsObserverStore {
   return {
@@ -28,411 +18,114 @@ function fakeStore(): GptDiagnosticsObserverStore {
     recordSlotOnload: vi.fn(),
     recordImpressionViewable: vi.fn(),
     recordSlotVisibilityChanged: vi.fn(),
-    recordPublisherRefresh: vi.fn(),
   };
 }
 
-function fakeSlot(): GptDiagnosticsSlotLike {
-  return {
-    getSlotElementId: () => 'ad-slot-example',
-    getAdUnitPath: () => '/example/site/banner',
-  };
-}
-
-function controlledGpt() {
-  const listeners = new Map<EventName, EventListener[]>();
-  const addEventListener = vi.fn((name: EventName, listener: EventListener) => {
-    const current = listeners.get(name) ?? [];
-    current.push(listener);
-    listeners.set(name, current);
+function fakeSlot(): GoogletagDiagnosticsSlotSnapshot {
+  return Object.freeze({
+    token: Object.freeze(Object.create(null) as object),
+    elementId: 'ad-slot-example',
+    adUnitPath: '/example/site/banner',
   });
-  const pubads = {
-    addEventListener,
-    refresh: vi.fn(),
-  };
-  const display = vi.fn();
-  const defineSlot = vi.fn();
-  const cmd: Array<() => void> = [];
-  const googletag = {
-    cmd,
-    pubads: () => pubads,
-    display,
-    defineSlot,
-  };
+}
 
-  return {
-    window: { googletag },
-    googletag,
-    pubads,
-    listeners,
-    emit(name: EventName, event: Parameters<EventListener>[0]) {
-      for (const listener of listeners.get(name) ?? []) listener(event);
-    },
-  };
+function fact(
+  kind: GoogletagDiagnosticsFact['kind'],
+  slot: GoogletagDiagnosticsFact['slot'],
+  fields: Partial<GoogletagDiagnosticsFact> = {}
+): Readonly<GoogletagDiagnosticsFact> {
+  return Object.freeze({ kind, observedAtMs: 1, slot, ...fields });
 }
 
 describe('GptDiagnosticsObserver', () => {
-  it('installs exactly the six documented listeners through googletag.cmd', () => {
+  it('does not claim GPT observation merely because the diagnostics module activated', () => {
     const store = fakeStore();
-    const gpt = controlledGpt();
-    const observer = new GptDiagnosticsObserver(store, { window: gpt.window });
+    const observer = new GptDiagnosticsObserver(store);
 
-    observer.install();
+    observer.start();
+    observer.start();
 
-    expect(gpt.googletag.cmd).toHaveLength(1);
-    expect(gpt.pubads.addEventListener).not.toHaveBeenCalled();
-
-    gpt.googletag.cmd[0]();
-
-    expect(gpt.pubads.addEventListener).toHaveBeenCalledTimes(EVENT_NAMES.length);
-    expect(gpt.pubads.addEventListener.mock.calls.map(([name]) => name)).toEqual(EVENT_NAMES);
-    expect(store.markGptObserved).toHaveBeenCalledTimes(1);
+    expect(store.markGptObserved).not.toHaveBeenCalled();
   });
 
-  it('is idempotent before and after command queue execution', () => {
+  it('consumes all six normalized adapter facts', () => {
     const store = fakeStore();
-    const gpt = controlledGpt();
-    const observer = new GptDiagnosticsObserver(store, { window: gpt.window });
-
-    observer.install();
-    observer.install();
-    expect(gpt.googletag.cmd).toHaveLength(1);
-
-    gpt.googletag.cmd[0]();
-    observer.install();
-    gpt.googletag.cmd[0]();
-
-    expect(gpt.pubads.addEventListener).toHaveBeenCalledTimes(EVENT_NAMES.length);
-    expect(store.markGptObserved).toHaveBeenCalledTimes(1);
-  });
-
-  it('observes publisher refresh slots without changing the delegated call', () => {
-    const store = fakeStore();
-    const gpt = controlledGpt();
     const slot = fakeSlot();
-    const receiver = { refresh: gpt.pubads.refresh };
-    const originalRefresh = vi.fn(function (this: unknown, ...args: unknown[]) {
-      return { receiver: this, args };
-    });
-    gpt.pubads.refresh = originalRefresh;
-    const observer = new GptDiagnosticsObserver(store, { window: gpt.window });
-    observer.install();
-    gpt.googletag.cmd[0]();
+    const observer = new GptDiagnosticsObserver(store);
 
-    const result = Reflect.apply(gpt.pubads.refresh, receiver, [
-      [slot],
-      { changeCorrelator: false },
-    ]);
-
-    expect(store.recordPublisherRefresh).toHaveBeenCalledWith([slot]);
-    expect(originalRefresh).toHaveBeenCalledTimes(1);
-    expect(result).toEqual({ receiver, args: [[slot], { changeCorrelator: false }] });
-  });
-
-  it('preserves bare, explicit-undefined, malformed, throwing, and nested refresh behavior', () => {
-    const store = fakeStore();
-    const gpt = controlledGpt();
-    const slot = fakeSlot();
-    const secondSlot = fakeSlot();
-    const originalRefresh = vi.fn(function (this: unknown, ...args: unknown[]) {
-      if (args[0] === 'throw') throw new Error('refresh failure');
-      return { receiver: this, args };
-    });
-    const getSlots = vi.fn(() => [slot, null, secondSlot]);
-    gpt.pubads.refresh = originalRefresh;
-    Object.assign(gpt.pubads, { getSlots });
-    const runtime = { tsjs: {} };
-    const observer = new GptDiagnosticsObserver(store, { window: { ...gpt.window, ...runtime } });
-    observer.install();
-    gpt.googletag.cmd[0]();
-    observer.install();
-
-    expect(gpt.pubads.refresh()).toEqual({ receiver: gpt.pubads, args: [] });
-    expect(store.recordPublisherRefresh).toHaveBeenLastCalledWith([slot, secondSlot]);
-
-    // GPT treats an omitted, undefined, or null slot list as "refresh all", and
-    // `refresh(null, opts)` is the documented way to pass options while doing so.
-    expect(gpt.pubads.refresh(undefined)).toEqual({ receiver: gpt.pubads, args: [undefined] });
-    expect(gpt.pubads.refresh(null, { changeCorrelator: false })).toEqual({
-      receiver: gpt.pubads,
-      args: [null, { changeCorrelator: false }],
-    });
-    expect(store.recordPublisherRefresh).toHaveBeenCalledTimes(3);
-    expect(store.recordPublisherRefresh).toHaveBeenLastCalledWith([slot, secondSlot]);
-
-    getSlots.mockImplementationOnce(() => {
-      throw new Error('getSlots failure');
-    });
-    expect(gpt.pubads.refresh()).toEqual({ receiver: gpt.pubads, args: [] });
-    expect(() => gpt.pubads.refresh('throw')).toThrow('refresh failure');
-    expect(
-      store.recordPublisherRefresh,
-      'a failed slot lookup records nothing'
-    ).toHaveBeenCalledTimes(3);
-
-    (
-      observer as unknown as { window: { tsjs: { prebidRefreshDispatchInProgress?: boolean } } }
-    ).window.tsjs.prebidRefreshDispatchInProgress = true;
-    gpt.pubads.refresh([slot]);
-    expect(
-      store.recordPublisherRefresh,
-      'a Prebid-delegated refresh is not publisher intent'
-    ).toHaveBeenCalledTimes(3);
-    expect(originalRefresh).toHaveBeenCalledTimes(6);
-  });
-
-  it('delegates when the shared diagnostics context accessor throws', () => {
-    const store = fakeStore();
-    const gpt = controlledGpt();
-    const slot = fakeSlot();
-    const originalRefresh = vi.fn(() => 'delegated');
-    gpt.pubads.refresh = originalRefresh;
-    Object.assign(gpt.pubads, { getSlots: () => [slot] });
-    const target = { googletag: gpt.googletag } as unknown as GptObserverWindow;
-    Object.defineProperty(target, 'tsjs', {
-      get: () => {
-        throw new Error('context unavailable');
-      },
-    });
-    const observer = new GptDiagnosticsObserver(store, { window: target });
-    observer.install();
-    gpt.googletag.cmd[0]();
-
-    expect(gpt.pubads.refresh()).toBe('delegated');
-    expect(originalRefresh).toHaveBeenCalledTimes(1);
-    expect(store.recordPublisherRefresh).not.toHaveBeenCalled();
-  });
-
-  it('creates a command queue and waits when GPT is absent', () => {
-    const store = fakeStore();
-    const delayedWindow: {
-      googletag?: {
-        cmd: Array<() => void>;
-        pubads?: () => { addEventListener: (name: EventName, listener: EventListener) => void };
-      };
-    } = {};
-    const observer = new GptDiagnosticsObserver(store, { window: delayedWindow });
-
-    observer.install();
-
-    expect(delayedWindow.googletag?.cmd).toHaveLength(1);
-    const gpt = controlledGpt();
-    delayedWindow.googletag!.pubads = gpt.googletag.pubads;
-    delayedWindow.googletag!.cmd[0]();
-
-    expect(gpt.pubads.addEventListener).toHaveBeenCalledTimes(EVENT_NAMES.length);
-  });
-
-  it('preserves an already-loaded custom command push contract', () => {
-    const store = fakeStore();
-    const gpt = controlledGpt();
-    const callbacks: Array<() => void> = [];
-    const customPush = vi.fn((...next: Array<() => void>) => {
-      callbacks.push(...next);
-      for (const callback of next) callback();
-      return callbacks.length;
-    });
-    const observer = new GptDiagnosticsObserver(store, {
-      window: {
-        googletag: {
-          cmd: { push: customPush },
-          pubads: gpt.googletag.pubads,
-        },
-      },
-    });
-
-    observer.install();
-
-    expect(customPush).toHaveBeenCalledTimes(1);
-    expect(gpt.pubads.addEventListener).toHaveBeenCalledTimes(EVENT_NAMES.length);
-  });
-
-  it('normalizes allowed callback facts and forwards every event kind', () => {
-    const store = fakeStore();
-    const gpt = controlledGpt();
-    const slot = fakeSlot();
-    const observer = new GptDiagnosticsObserver(store, { window: gpt.window });
-    observer.install();
-    gpt.googletag.cmd[0]();
-
-    gpt.emit('slotRequested', { slot });
-    gpt.emit('slotResponseReceived', { slot });
-    gpt.emit('slotRenderEnded', {
-      slot,
-      isEmpty: false,
-      size: [300, 250],
-      isBackfill: true,
-      slotContentChanged: false,
-      creativeId: 'must-not-pass-through',
-    });
-    gpt.emit('slotOnload', { slot });
-    gpt.emit('impressionViewable', { slot });
-    gpt.emit('slotVisibilityChanged', { slot, inViewPercentage: 42 });
-
-    expect(store.recordSlotRequested).toHaveBeenCalledWith(slot);
-    expect(store.recordSlotResponseReceived).toHaveBeenCalledWith(slot);
-    expect(store.recordSlotRenderEnded).toHaveBeenCalledWith(slot, {
-      isEmpty: false,
-      size: [300, 250],
-      isBackfill: true,
-      slotContentChanged: false,
-    });
-    expect(store.recordSlotOnload).toHaveBeenCalledWith(slot);
-    expect(store.recordImpressionViewable).toHaveBeenCalledWith(slot);
-    expect(store.recordSlotVisibilityChanged).toHaveBeenCalledWith(slot, 42);
-  });
-
-  it('forwards the Ad Manager identifiers GPT reports for the delivered ad', () => {
-    const store = fakeStore();
-    const gpt = controlledGpt();
-    const slot = fakeSlot();
-    const observer = new GptDiagnosticsObserver(store, { window: gpt.window });
-    observer.install();
-    gpt.googletag.cmd[0]();
-
-    gpt.emit('slotRenderEnded', {
-      slot,
-      isEmpty: false,
-      lineItemId: 6543210987,
-      creativeId: 1234567890,
-      campaignId: 2345678901,
-      advertiserId: 3456789012,
-      sourceAgnosticLineItemId: 6543210987,
-      yieldGroupIds: [11, 12],
-      companyIds: [],
-    });
-
-    expect(store.recordSlotRenderEnded).toHaveBeenCalledWith(
-      slot,
-      expect.objectContaining({
-        adManager: {
-          lineItemId: 6543210987,
-          creativeId: 1234567890,
-          campaignId: 2345678901,
-          advertiserId: 3456789012,
-          sourceAgnosticLineItemId: 6543210987,
-          yieldGroupIds: [11, 12],
-        },
+    observer.consume(fact('slotRequested', slot));
+    observer.consume(fact('slotResponseReceived', slot));
+    observer.consume(
+      fact('slotRenderEnded', slot, {
+        isEmpty: false,
+        size: Object.freeze([300, 250]),
+        isBackfill: true,
+        slotContentChanged: false,
       })
     );
+    observer.consume(fact('slotOnload', slot));
+    observer.consume(fact('impressionViewable', slot));
+    observer.consume(fact('slotVisibilityChanged', slot, { inViewPercentage: 42 }));
+
+    expect(store.markGptObserved).toHaveBeenCalledOnce();
+    expect(store.recordSlotRequested).toHaveBeenCalledWith(slot, 1);
+    expect(store.recordSlotResponseReceived).toHaveBeenCalledWith(slot, 1);
+    expect(store.recordSlotRenderEnded).toHaveBeenCalledWith(
+      slot,
+      {
+        isEmpty: false,
+        size: [300, 250],
+        isBackfill: true,
+        slotContentChanged: false,
+      },
+      1
+    );
+    expect(store.recordSlotOnload).toHaveBeenCalledWith(slot, 1);
+    expect(store.recordImpressionViewable).toHaveBeenCalledWith(slot, 1);
+    expect(store.recordSlotVisibilityChanged).toHaveBeenCalledWith(slot, 42, 1);
   });
 
-  it('drops malformed Ad Manager identifiers instead of reporting them', () => {
+  it('passes the immutable adapter callback timestamp through to every store mutation', () => {
     const store = fakeStore();
-    const gpt = controlledGpt();
+    const observer = new GptDiagnosticsObserver(store);
     const slot = fakeSlot();
-    const observer = new GptDiagnosticsObserver(store, { window: gpt.window });
-    observer.install();
-    gpt.googletag.cmd[0]();
-
-    gpt.emit('slotRenderEnded', {
+    const timestamped = Object.freeze({
+      kind: 'slotRequested' as const,
       slot,
-      isEmpty: false,
-      lineItemId: null,
-      creativeId: '1234567890',
-      campaignId: 0,
-      advertiserId: 1.5,
-      yieldGroupIds: 'not-a-list',
+      observedAtMs: 123.5,
     });
 
-    expect(store.recordSlotRenderEnded).toHaveBeenCalledWith(
-      slot,
-      expect.objectContaining({ adManager: undefined })
-    );
+    observer.consume(timestamped as Readonly<GoogletagDiagnosticsFact>);
+
+    expect(store.recordSlotRequested).toHaveBeenCalledWith(slot, 123.5);
   });
 
-  it('drops unsupported or invalid rendered sizes', () => {
+  it('records a malformed visibility fact as unmatched instead of dropping its coverage', () => {
     const store = fakeStore();
-    const gpt = controlledGpt();
-    const slot = fakeSlot();
-    const observer = new GptDiagnosticsObserver(store, { window: gpt.window });
-    observer.install();
-    gpt.googletag.cmd[0]();
+    const observer = new GptDiagnosticsObserver(store);
 
-    gpt.emit('slotRenderEnded', { slot, isEmpty: false, size: 'fluid' });
+    observer.consume(fact('slotVisibilityChanged', fakeSlot()));
 
-    expect(store.recordSlotRenderEnded).toHaveBeenCalledWith(
-      slot,
-      expect.objectContaining({ size: undefined })
-    );
+    expect(store.recordSlotVisibilityChanged).toHaveBeenCalledWith(expect.any(Object), NaN, 1);
   });
 
-  it('contains callback and Slot accessor failures and warns', () => {
+  it('contains store and logger failures without interrupting later facts', () => {
     const store = fakeStore();
     vi.mocked(store.recordSlotRequested).mockImplementation(() => {
       throw new Error('store failed');
     });
-    const logger = { warn: vi.fn() };
-    const gpt = controlledGpt();
-    const observer = new GptDiagnosticsObserver(store, { window: gpt.window, logger });
-    observer.install();
-    gpt.googletag.cmd[0]();
-    const event = {
-      get slot(): GptDiagnosticsSlotLike {
-        throw new Error('slot accessor failed');
-      },
+    const logger = {
+      warn: vi.fn(() => {
+        throw new Error('logger failed');
+      }),
     };
+    const observer = new GptDiagnosticsObserver(store, { logger });
+    const slot = fakeSlot();
 
-    expect(() => gpt.emit('slotRequested', { slot: fakeSlot() })).not.toThrow();
-    expect(() => gpt.emit('slotOnload', event)).not.toThrow();
-    expect(logger.warn).toHaveBeenCalledTimes(2);
-  });
+    expect(() => observer.consume(fact('slotRequested', slot))).not.toThrow();
+    expect(() => observer.consume(fact('slotOnload', slot))).not.toThrow();
 
-  it('contains command queue and listener installation failures', () => {
-    const store = fakeStore();
-    const logger = { warn: vi.fn() };
-    const queueObserver = new GptDiagnosticsObserver(store, {
-      window: {
-        googletag: {
-          cmd: {
-            push: () => {
-              throw new Error('queue failed');
-            },
-          },
-        },
-      },
-      logger,
-    });
-
-    expect(() => queueObserver.install()).not.toThrow();
-
-    const gpt = controlledGpt();
-    gpt.pubads.addEventListener.mockImplementation(() => {
-      throw new Error('listener failed');
-    });
-    const listenerObserver = new GptDiagnosticsObserver(store, {
-      window: gpt.window,
-      logger,
-    });
-    listenerObserver.install();
-
-    expect(() => gpt.googletag.cmd[0]()).not.toThrow();
-    expect(logger.warn).toHaveBeenCalledTimes(2);
-  });
-
-  it('wraps only PubAds refresh and leaves unrelated GPT and browser methods intact', () => {
-    const store = fakeStore();
-    const gpt = controlledGpt();
-    const observer = new GptDiagnosticsObserver(store, { window: gpt.window });
-    const references = {
-      display: gpt.googletag.display,
-      defineSlot: gpt.googletag.defineSlot,
-      refresh: gpt.pubads.refresh,
-      fetch: window.fetch,
-      XMLHttpRequest: window.XMLHttpRequest,
-      pushState: window.history.pushState,
-      replaceState: window.history.replaceState,
-    };
-
-    observer.install();
-    gpt.googletag.cmd[0]();
-
-    expect(gpt.googletag.display).toBe(references.display);
-    expect(gpt.googletag.defineSlot).toBe(references.defineSlot);
-    expect(gpt.pubads.refresh).not.toBe(references.refresh);
-    expect(window.fetch).toBe(references.fetch);
-    expect(window.XMLHttpRequest).toBe(references.XMLHttpRequest);
-    expect(window.history.pushState).toBe(references.pushState);
-    expect(window.history.replaceState).toBe(references.replaceState);
+    expect(logger.warn).toHaveBeenCalledOnce();
+    expect(store.recordSlotOnload).toHaveBeenCalledWith(slot, 1);
   });
 });

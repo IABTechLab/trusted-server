@@ -1,433 +1,689 @@
-import { log } from '../../core/log';
-import type { ApsPrebidRendererEntry, ApsRendererV1, TsjsApi } from '../../core/types';
+import type { ApsRendererV1 } from '../../core/types';
+import { validateApsRenderer } from '../../core/contracts/aps_renderer';
+import type { MessagingAdapter, MessagingChannel } from '../../adapters/messaging';
+import type {
+  CommittedRenderArtifact,
+  RenderAttempt,
+  RenderFailureReason,
+  RendererNonceRegistry,
+} from '../../services/render';
 
-export const APS_RENDERER_PATH = '/integrations/aps/renderer';
+const objectFreezeIntrinsic = Object.freeze;
+const objectGetPrototypeOfIntrinsic = Object.getPrototypeOf;
+const regexpTestIntrinsic = RegExp.prototype.test;
+const rendererNoncePattern = /^n1_[A-Za-z0-9_-]{22}$/;
+const loopbackIpv4Pattern = /^127(?:\.\d{1,3}){3}$/;
+const iframeNamespace = 'http://www.w3.org/1999/xhtml';
+const directDomAvailable =
+  typeof document !== 'undefined' &&
+  typeof HTMLIFrameElement !== 'undefined' &&
+  typeof Document !== 'undefined' &&
+  typeof Node !== 'undefined' &&
+  typeof Element !== 'undefined' &&
+  typeof EventTarget !== 'undefined' &&
+  typeof HTMLCollection !== 'undefined';
+const directRenderDocument = directDomAvailable ? document : undefined;
+const directIframePrototype = directDomAvailable ? HTMLIFrameElement.prototype : undefined;
+const documentCreateElementIntrinsic = directDomAvailable
+  ? Document.prototype.createElement
+  : undefined;
+const nodeAppendChildIntrinsic = directDomAvailable ? Node.prototype.appendChild : undefined;
+const nodeRemoveChildIntrinsic = directDomAvailable ? Node.prototype.removeChild : undefined;
+const elementRemoveIntrinsic = directDomAvailable ? Element.prototype.remove : undefined;
+const elementSetAttributeIntrinsic = directDomAvailable
+  ? Element.prototype.setAttribute
+  : undefined;
+const elementGetAttributeIntrinsic = directDomAvailable
+  ? Element.prototype.getAttribute
+  : undefined;
+const eventTargetAddListenerIntrinsic = directDomAvailable
+  ? EventTarget.prototype.addEventListener
+  : undefined;
+const eventTargetRemoveListenerIntrinsic = directDomAvailable
+  ? EventTarget.prototype.removeEventListener
+  : undefined;
+const htmlCollectionItemIntrinsic = directDomAvailable ? HTMLCollection.prototype.item : undefined;
+const nodeOwnerDocumentGetter = directDomAvailable
+  ? Object.getOwnPropertyDescriptor(Node.prototype, 'ownerDocument')?.get
+  : undefined;
+const nodeParentNodeGetter = directDomAvailable
+  ? Object.getOwnPropertyDescriptor(Node.prototype, 'parentNode')?.get
+  : undefined;
+const nodeIsConnectedGetter = directDomAvailable
+  ? Object.getOwnPropertyDescriptor(Node.prototype, 'isConnected')?.get
+  : undefined;
+const elementLocalNameGetter = directDomAvailable
+  ? Object.getOwnPropertyDescriptor(Element.prototype, 'localName')?.get
+  : undefined;
+const elementNamespaceGetter = directDomAvailable
+  ? Object.getOwnPropertyDescriptor(Element.prototype, 'namespaceURI')?.get
+  : undefined;
+const elementChildrenGetter = directDomAvailable
+  ? Object.getOwnPropertyDescriptor(Element.prototype, 'children')?.get
+  : undefined;
+const htmlCollectionLengthGetter = directDomAvailable
+  ? Object.getOwnPropertyDescriptor(HTMLCollection.prototype, 'length')?.get
+  : undefined;
+const iframeContentWindowGetter = directDomAvailable
+  ? Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow')?.get
+  : undefined;
+const iframeSourceGetter = directDomAvailable
+  ? Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'src')?.get
+  : undefined;
+
+export { parseApsRendererDescriptor, validateApsRenderer } from '../../core/contracts/aps_renderer';
+
+export const APS_RENDERER_V1_PATH = '/integrations/aps/renderer/v1';
 export const APS_RENDERER_SANDBOX =
   'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation';
-export const APS_UNIVERSAL_CREATIVE_RENDERER_VERSION = 4;
 
-const MAX_ACCOUNT_ID_BYTES = 1024;
-const MAX_CREATIVE_ID_BYTES = 1024;
-const MAX_CREATIVE_URL_BYTES = 4096;
-const MAX_RENDER_ENVELOPE_BYTES = 256 * 1024;
-const MAX_RENDER_ENVELOPE_BASE64_BYTES = 4 * Math.ceil(MAX_RENDER_ENVELOPE_BYTES / 3);
-const DESCRIPTOR_KEYS = [
-  'aaxResponse',
-  'accountId',
-  'bidId',
-  'creativeUrl',
-  'height',
-  'tagType',
-  'type',
-  'version',
-  'width',
-] as const;
-const DESCRIPTOR_KEYS_WITH_CREATIVE_ID = [...DESCRIPTOR_KEYS, 'creativeId'].sort();
-const activeFrames = new WeakMap<HTMLElement, HTMLIFrameElement>();
-const pendingFrameCancels = new WeakMap<HTMLElement, () => void>();
-const RENDERER_READY_MESSAGE = 'trusted-server/aps/renderer-ready';
-const RENDERER_FAILED_MESSAGE = 'trusted-server/aps/renderer-failed';
-const RENDERER_READY_TIMEOUT_MS = 10_000;
-const MAX_PREBID_RENDERER_ENTRIES = 256;
-const DEFAULT_PREBID_RENDERER_TTL_SECONDS = 300;
-const MAX_PREBID_RENDERER_TTL_SECONDS = 3600;
-const MAX_PREBID_ID_BYTES = 1024;
-
-type ValidatedRendererCacheEntry = {
-  publisherOrigin: string;
-  renderer: ApsRendererV1;
-};
-const validatedRendererCache = new WeakMap<object, ValidatedRendererCacheEntry>();
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function hasExactKeys(
-  value: unknown,
-  expected: readonly string[]
-): value is Record<string, unknown> {
-  if (!isRecord(value)) return false;
-  const actual = Object.keys(value).sort();
-  const sortedExpected = [...expected].sort();
-  return (
-    actual.length === sortedExpected.length &&
-    actual.every((key, index) => key === sortedExpected[index])
-  );
-}
-
-/** Parse only the versioned descriptor shape; decoded-envelope trust checks happen separately. */
-export function parseApsRendererDescriptor(value: unknown): ApsRendererV1 | undefined {
-  if (
-    !hasExactKeys(value, DESCRIPTOR_KEYS) &&
-    !hasExactKeys(value, DESCRIPTOR_KEYS_WITH_CREATIVE_ID)
-  ) {
-    return undefined;
-  }
-
-  if (
-    value.type !== 'aps' ||
-    value.version !== 1 ||
-    typeof value.accountId !== 'string' ||
-    value.accountId.length === 0 ||
-    new TextEncoder().encode(value.accountId).length > MAX_ACCOUNT_ID_BYTES ||
-    typeof value.bidId !== 'string' ||
-    value.bidId.length === 0 ||
-    (Object.prototype.hasOwnProperty.call(value, 'creativeId') &&
-      (typeof value.creativeId !== 'string' ||
-        value.creativeId.length === 0 ||
-        new TextEncoder().encode(value.creativeId).length > MAX_CREATIVE_ID_BYTES)) ||
-    (value.tagType !== 'iframe' && value.tagType !== 'script') ||
-    typeof value.creativeUrl !== 'string' ||
-    typeof value.aaxResponse !== 'string' ||
-    value.aaxResponse.length > MAX_RENDER_ENVELOPE_BASE64_BYTES ||
-    !Number.isSafeInteger(value.width) ||
-    (value.width as number) <= 0 ||
-    !Number.isSafeInteger(value.height) ||
-    (value.height as number) <= 0
-  ) {
-    return undefined;
-  }
-
-  return value as unknown as ApsRendererV1;
-}
-
-function decodeStandardBase64(value: string): Uint8Array | undefined {
-  if (
-    value.length === 0 ||
-    value.length % 4 !== 0 ||
-    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)
-  ) {
-    return undefined;
-  }
-
-  try {
-    const binary = atob(value);
-    if (binary.length > MAX_RENDER_ENVELOPE_BYTES || btoa(binary) !== value) return undefined;
-    return Uint8Array.from(binary, (character) => character.charCodeAt(0));
-  } catch {
-    return undefined;
-  }
-}
-
-function validCreativeUrl(value: string, publisherOrigin: string): boolean {
-  if (new TextEncoder().encode(value).length > MAX_CREATIVE_URL_BYTES) return false;
-
-  try {
-    const url = new URL(value);
-    return (
-      url.protocol === 'https:' &&
-      url.username === '' &&
-      url.password === '' &&
-      url.origin !== publisherOrigin
-    );
-  } catch {
-    return false;
-  }
-}
-
-/** Fully validate the exact APS envelope and cross-check every duplicated descriptor field. */
-export function validateApsRenderer(
-  value: unknown,
-  publisherOrigin = window.location.origin
-): ApsRendererV1 | undefined {
-  if (isRecord(value)) {
-    const cached = validatedRendererCache.get(value);
-    if (cached?.publisherOrigin === publisherOrigin) return cached.renderer;
-  }
-
-  const renderer = parseApsRendererDescriptor(value);
-  if (!renderer || !validCreativeUrl(renderer.creativeUrl, publisherOrigin)) return undefined;
-
-  const bytes = decodeStandardBase64(renderer.aaxResponse);
-  if (!bytes) return undefined;
-
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
-  } catch {
-    return undefined;
-  }
-
-  if (!hasExactKeys(decoded, ['seatbid'])) return undefined;
-  const seatbids = decoded.seatbid;
-  if (!Array.isArray(seatbids) || seatbids.length !== 1) return undefined;
-  const seat = seatbids[0];
-  if (!hasExactKeys(seat, ['bid']) || !Array.isArray(seat.bid) || seat.bid.length !== 1) {
-    return undefined;
-  }
-
-  const bid = seat.bid[0];
-  if (!hasExactKeys(bid, ['ext', 'h', 'id', 'price', 'w'])) return undefined;
-  if (!hasExactKeys(bid.ext, ['creativeurl', 'tagtype'])) return undefined;
-
-  if (
-    bid.id !== renderer.bidId ||
-    bid.w !== renderer.width ||
-    bid.h !== renderer.height ||
-    bid.ext.creativeurl !== renderer.creativeUrl ||
-    bid.ext.tagtype !== renderer.tagType ||
-    typeof bid.price !== 'number' ||
-    !Number.isFinite(bid.price) ||
-    bid.price < 0
-  ) {
-    return undefined;
-  }
-
-  const validated = Object.freeze({ ...renderer }) as ApsRendererV1;
-  validatedRendererCache.set(value as object, { publisherOrigin, renderer: validated });
-  validatedRendererCache.set(validated, { publisherOrigin, renderer: validated });
-  return validated;
-}
-
-function validPrebidIdentity(value: unknown): value is string {
-  return (
-    typeof value === 'string' &&
-    value.length > 0 &&
-    new TextEncoder().encode(value).length <= MAX_PREBID_ID_BYTES
-  );
-}
-
-function validPrebidAdId(value: unknown): value is string {
-  return validPrebidIdentity(value) && /^[A-Za-z0-9-]+$/.test(value);
-}
-
-function prunePrebidRenderers(registry: Record<string, ApsPrebidRendererEntry>, now: number): void {
-  for (const [adId, entry] of Object.entries(registry)) {
-    if (!Number.isFinite(entry.expiresAt) || entry.expiresAt <= now) delete registry[adId];
-  }
-
-  const entries = Object.entries(registry);
-  if (entries.length <= MAX_PREBID_RENDERER_ENTRIES) return;
-  entries
-    .sort(([, left], [, right]) => left.registeredAt - right.registeredAt)
-    .slice(0, entries.length - MAX_PREBID_RENDERER_ENTRIES)
-    .forEach(([adId]) => delete registry[adId]);
-}
-
-/** Bind Prebid's generated ad ID to a fully validated APS renderer capability. */
-export function registerApsPrebidRenderer(
-  adId: unknown,
-  adUnitCode: unknown,
+/** Validate, copy, and freeze one APS tagged render source. */
+export function prepareApsRenderSource(
   input: unknown,
-  ttlSeconds: unknown = DEFAULT_PREBID_RENDERER_TTL_SECONDS,
-  lifecycle?: { markUsed(): void }
-): boolean {
-  if (
-    !validPrebidAdId(adId) ||
-    !validPrebidIdentity(adUnitCode) ||
-    typeof lifecycle?.markUsed !== 'function'
-  ) {
-    return false;
-  }
-  const renderer = validateApsRenderer(input);
-  if (!renderer) return false;
-
-  const now = Date.now();
-  const boundedTtlSeconds =
-    typeof ttlSeconds === 'number' && Number.isFinite(ttlSeconds) && ttlSeconds > 0
-      ? Math.min(ttlSeconds, MAX_PREBID_RENDERER_TTL_SECONDS)
-      : DEFAULT_PREBID_RENDERER_TTL_SECONDS;
-  const tsjs = (window.tsjs ??= {} as TsjsApi);
-  const registry = (tsjs.apsPrebidRenderers ??= Object.create(null) as Record<
-    string,
-    ApsPrebidRendererEntry
-  >);
-  prunePrebidRenderers(registry, now);
-
-  if (!(adId in registry) && Object.keys(registry).length >= MAX_PREBID_RENDERER_ENTRIES) {
-    const oldest = Object.entries(registry).sort(
-      ([, left], [, right]) => left.registeredAt - right.registeredAt
-    )[0];
-    if (oldest) delete registry[oldest[0]];
-  }
-
-  registry[adId] = {
-    adUnitCode,
-    renderer,
-    registeredAt: now,
-    expiresAt: now + boundedTtlSeconds * 1000,
-    markUsed: lifecycle.markUsed,
-  };
-  return true;
-}
-
-/** Return an unexpired Prebid APS capability without consuming it. */
-export function getApsPrebidRenderer(adId: string): ApsPrebidRendererEntry | undefined {
-  if (!validPrebidAdId(adId)) return undefined;
-  const registry = window.tsjs?.apsPrebidRenderers;
-  const entry = registry?.[adId];
-  if (!entry) return undefined;
-  if (
-    !Number.isFinite(entry.expiresAt) ||
-    entry.expiresAt <= Date.now() ||
-    typeof entry.markUsed !== 'function'
-  ) {
-    delete registry![adId];
-    return undefined;
-  }
-  return entry;
-}
-
-/** Atomically consume the exact capability previously returned by the registry. */
-export function consumeApsPrebidRenderer(adId: string, expected: ApsPrebidRendererEntry): boolean {
-  const registry = window.tsjs?.apsPrebidRenderers;
-  if (!registry || registry[adId] !== expected) return false;
-  delete registry[adId];
-  return true;
-}
-
-function createNonce(): string | undefined {
-  if (typeof crypto === 'undefined' || typeof crypto.getRandomValues !== 'function')
-    return undefined;
-  const bytes = new Uint8Array(16);
-  crypto.getRandomValues(bytes);
-  let binary = '';
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-}
-
-/**
- * Return the absolute same-publisher URL used by direct and Universal Creative rendering.
- *
- * This intentionally inherits the publisher page scheme for same-origin deployments,
- * including local development. APS endpoints and third-party creative URLs remain
- * HTTPS-only.
- */
-export function apsRendererUrl(pageOrigin = window.location.origin): string | undefined {
+  publisherOrigin?: string
+): Readonly<ApsRendererV1> | undefined {
   try {
-    const origin = new URL(pageOrigin);
-    const url = new URL(APS_RENDERER_PATH, origin);
+    const renderer = validateApsRenderer(input, publisherOrigin);
+    return renderer
+      ? (Reflect.apply(objectFreezeIntrinsic, Object, [renderer]) as Readonly<ApsRendererV1>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export interface DirectApsAttemptOptions {
+  readonly attempt: RenderAttempt;
+  readonly container: HTMLElement;
+  readonly messaging: MessagingAdapter;
+  readonly nonces: RendererNonceRegistry;
+  readonly publisherOrigin: string;
+}
+
+function freeze<Value extends object>(value: Value): Readonly<Value> {
+  return Reflect.apply(objectFreezeIntrinsic, Object, [value]) as Readonly<Value>;
+}
+
+export function resolveApsRendererV1Url(publisherOrigin: string): string | undefined {
+  try {
+    const origin = new URL(publisherOrigin);
+    const loopbackHttp =
+      origin.protocol === 'http:' &&
+      (origin.hostname === 'localhost' ||
+        origin.hostname === '[::1]' ||
+        (Reflect.apply(regexpTestIntrinsic, loopbackIpv4Pattern, [origin.hostname]) as boolean));
     if (
-      url.origin !== origin.origin ||
-      url.pathname !== APS_RENDERER_PATH ||
-      url.search !== '' ||
-      url.hash !== ''
+      origin.origin !== publisherOrigin ||
+      (origin.protocol !== 'https:' && !loopbackHttp) ||
+      origin.username !== '' ||
+      origin.password !== ''
     ) {
       return undefined;
     }
-    return url.href;
+    const rendererUrl = new URL(APS_RENDERER_V1_PATH, origin);
+    if (
+      rendererUrl.origin !== origin.origin ||
+      rendererUrl.pathname !== APS_RENDERER_V1_PATH ||
+      rendererUrl.search !== '' ||
+      rendererUrl.hash !== ''
+    ) {
+      return undefined;
+    }
+    return rendererUrl.href;
   } catch {
     return undefined;
   }
 }
 
-export interface RenderApsCreativeOptions {
-  slotId: string;
-  renderer: unknown;
+function closeChannel(channel: MessagingChannel | undefined): void {
+  try {
+    channel?.transferred.close();
+  } catch {
+    // The second endpoint must still be attempted when the first close is hostile.
+  }
+  try {
+    channel?.retained.close();
+  } catch {
+    // Failed construction cleanup remains best-effort.
+  }
 }
 
-/** Render APS through the static endpoint under an outer opaque-origin sandbox. */
-export function renderApsCreative({ slotId, renderer: input }: RenderApsCreativeOptions): boolean {
-  const renderer = validateApsRenderer(input);
-  const rendererUrl = apsRendererUrl();
-  const nonce = createNonce();
-  if (!renderer || !rendererUrl || !nonce) {
-    log.warn('APS renderer: rejected descriptor');
+function mapNonceIssueFailure(
+  reason: 'capability_registry_full' | 'identity_generation_failed' | 'invalid_attempt'
+): RenderFailureReason {
+  return reason === 'invalid_attempt' ? 'internal_error' : reason;
+}
+
+function mapRunnerFailure(reason: unknown): RenderFailureReason | undefined {
+  if (reason === 'descriptor_invalid') return 'winner_not_renderable';
+  if (reason === 'runner_no_load' || reason === 'runner_failed') return reason;
+  return undefined;
+}
+
+function readNonceIssueResult(value: unknown):
+  | Readonly<{ ok: true; nonce: string }>
+  | Readonly<{
+      ok: false;
+      reason: 'capability_registry_full' | 'identity_generation_failed' | 'invalid_attempt';
+    }>
+  | undefined {
+  try {
+    if (
+      typeof value !== 'object' ||
+      value === null ||
+      !Object.isFrozen(value) ||
+      Object.getPrototypeOf(value) !== Object.prototype ||
+      Object.getOwnPropertySymbols(value).length !== 0
+    ) {
+      return undefined;
+    }
+    const names = Object.getOwnPropertyNames(value);
+    if (names.length !== 2) return undefined;
+    const ok = Object.getOwnPropertyDescriptor(value, 'ok');
+    if (!ok || !ok.enumerable || !('value' in ok)) return undefined;
+    if (ok.value === true) {
+      const nonce = Object.getOwnPropertyDescriptor(value, 'nonce');
+      if (
+        !nonce ||
+        !nonce.enumerable ||
+        !('value' in nonce) ||
+        typeof nonce.value !== 'string' ||
+        !(Reflect.apply(regexpTestIntrinsic, rendererNoncePattern, [nonce.value]) as boolean)
+      ) {
+        return undefined;
+      }
+      return freeze({ ok: true as const, nonce: nonce.value });
+    }
+    if (ok.value !== false) return undefined;
+    const reason = Object.getOwnPropertyDescriptor(value, 'reason');
+    if (
+      !reason ||
+      !reason.enumerable ||
+      !('value' in reason) ||
+      (reason.value !== 'capability_registry_full' &&
+        reason.value !== 'identity_generation_failed' &&
+        reason.value !== 'invalid_attempt')
+    ) {
+      return undefined;
+    }
+    return freeze({ ok: false as const, reason: reason.value });
+  } catch {
+    return undefined;
+  }
+}
+
+/** Drive one direct APS attempt through the versioned static renderer document. */
+export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolean {
+  if (
+    !directRenderDocument ||
+    !directIframePrototype ||
+    typeof documentCreateElementIntrinsic !== 'function' ||
+    typeof nodeAppendChildIntrinsic !== 'function' ||
+    typeof nodeRemoveChildIntrinsic !== 'function' ||
+    typeof elementRemoveIntrinsic !== 'function' ||
+    typeof elementSetAttributeIntrinsic !== 'function' ||
+    typeof elementGetAttributeIntrinsic !== 'function' ||
+    typeof eventTargetAddListenerIntrinsic !== 'function' ||
+    typeof eventTargetRemoveListenerIntrinsic !== 'function' ||
+    typeof htmlCollectionItemIntrinsic !== 'function' ||
+    typeof nodeOwnerDocumentGetter !== 'function' ||
+    typeof nodeParentNodeGetter !== 'function' ||
+    typeof nodeIsConnectedGetter !== 'function' ||
+    typeof elementLocalNameGetter !== 'function' ||
+    typeof elementNamespaceGetter !== 'function' ||
+    typeof elementChildrenGetter !== 'function' ||
+    typeof htmlCollectionLengthGetter !== 'function' ||
+    typeof iframeContentWindowGetter !== 'function' ||
+    typeof iframeSourceGetter !== 'function'
+  ) {
+    return false;
+  }
+  let attempt: RenderAttempt;
+  let messaging: MessagingAdapter;
+  let nonces: RendererNonceRegistry;
+  let container: HTMLElement;
+  let publisherOrigin: string;
+  let sourceCandidate: unknown;
+  let attemptId: string;
+  let attemptSlot: string;
+  let attemptGeneration: object;
+  let navigationGeneration: object;
+  let ownerDocument: Document;
+  try {
+    attempt = options.attempt;
+    messaging = options.messaging;
+    nonces = options.nonces;
+    container = options.container;
+    publisherOrigin = options.publisherOrigin;
+    sourceCandidate = attempt.renderSource;
+    attemptId = attempt.id;
+    attemptSlot = attempt.slot;
+    attemptGeneration = attempt.generation;
+    navigationGeneration = attempt.navigationGeneration;
+    if (typeof nodeOwnerDocumentGetter !== 'function') return false;
+    ownerDocument = Reflect.apply(nodeOwnerDocumentGetter, container, []) as Document;
+  } catch {
+    return false;
+  }
+  let exactDocumentOrigin: boolean;
+  try {
+    exactDocumentOrigin =
+      ownerDocument === directRenderDocument &&
+      ownerDocument.defaultView?.location.origin === publisherOrigin;
+  } catch {
+    exactDocumentOrigin = false;
+  }
+  const renderer = prepareApsRenderSource(sourceCandidate, publisherOrigin);
+  const rendererUrl = resolveApsRendererV1Url(publisherOrigin);
+  if (!exactDocumentOrigin || !renderer || !rendererUrl) {
+    try {
+      attempt.fail('winner_not_renderable');
+    } catch {
+      // Invalid input remains rejected even when the attempt boundary is hostile.
+    }
+    return false;
+  }
+  let createChannelMethod: MessagingAdapter['createChannel'];
+  let postWindowMethod: MessagingAdapter['postWindow'];
+  let parseMessageMethod: MessagingAdapter['parseProtocolMessage'];
+  let issueMethod: RendererNonceRegistry['issue'];
+  let bindSourceMethod: RendererNonceRegistry['bindSource'];
+  let consumeMethod: RendererNonceRegistry['consume'];
+  let beginDirectMethod: RenderAttempt['beginDirect'];
+  let beginDocumentMethod: RenderAttempt['beginApsDocument'];
+  let documentAcceptedMethod: RenderAttempt['apsDocumentAccepted'];
+  let acceptMethod: RenderAttempt['accept'];
+  let failMethod: RenderAttempt['fail'];
+  let snapshotMethod: RenderAttempt['snapshot'];
+  try {
+    createChannelMethod = messaging.createChannel;
+    postWindowMethod = messaging.postWindow;
+    parseMessageMethod = messaging.parseProtocolMessage;
+    issueMethod = nonces.issue;
+    bindSourceMethod = nonces.bindSource;
+    consumeMethod = nonces.consume;
+    beginDirectMethod = attempt.beginDirect;
+    beginDocumentMethod = attempt.beginApsDocument;
+    documentAcceptedMethod = attempt.apsDocumentAccepted;
+    acceptMethod = attempt.accept;
+    failMethod = attempt.fail;
+    snapshotMethod = attempt.snapshot;
+    if (
+      typeof createChannelMethod !== 'function' ||
+      typeof postWindowMethod !== 'function' ||
+      typeof parseMessageMethod !== 'function' ||
+      typeof issueMethod !== 'function' ||
+      typeof bindSourceMethod !== 'function' ||
+      typeof consumeMethod !== 'function' ||
+      typeof beginDirectMethod !== 'function' ||
+      typeof beginDocumentMethod !== 'function' ||
+      typeof documentAcceptedMethod !== 'function' ||
+      typeof acceptMethod !== 'function' ||
+      typeof failMethod !== 'function' ||
+      typeof snapshotMethod !== 'function' ||
+      Reflect.apply(beginDirectMethod, attempt, []) !== true
+    ) {
+      return false;
+    }
+  } catch {
     return false;
   }
 
-  const container = document.getElementById(slotId);
-  if (!container) {
-    log.warn('APS renderer: slot not found');
+  const fail = (reason: RenderFailureReason): false => {
+    try {
+      Reflect.apply(failMethod, attempt, [reason]);
+    } catch {
+      // The attempt's terminal latch owns failure authority.
+    }
     return false;
+  };
+
+  const attemptState = (): ReturnType<RenderAttempt['snapshot']>['state'] | undefined => {
+    try {
+      return Reflect.apply(snapshotMethod, attempt, []).state;
+    } catch {
+      return undefined;
+    }
+  };
+
+  let iframe: HTMLIFrameElement;
+  try {
+    if (
+      typeof nodeParentNodeGetter !== 'function' ||
+      typeof nodeIsConnectedGetter !== 'function' ||
+      typeof elementLocalNameGetter !== 'function' ||
+      typeof elementNamespaceGetter !== 'function' ||
+      typeof elementChildrenGetter !== 'function' ||
+      typeof htmlCollectionLengthGetter !== 'function' ||
+      typeof iframeContentWindowGetter !== 'function' ||
+      typeof iframeSourceGetter !== 'function'
+    ) {
+      return fail('renderer_document_no_load');
+    }
+    iframe = Reflect.apply(documentCreateElementIntrinsic, ownerDocument, [
+      'iframe',
+    ]) as HTMLIFrameElement;
+    if (
+      typeof iframe !== 'object' ||
+      iframe === null ||
+      Reflect.apply(objectGetPrototypeOfIntrinsic, Object, [iframe]) !== directIframePrototype ||
+      Reflect.apply(nodeOwnerDocumentGetter, iframe, []) !== ownerDocument ||
+      Reflect.apply(elementLocalNameGetter, iframe, []) !== 'iframe' ||
+      Reflect.apply(elementNamespaceGetter, iframe, []) !== iframeNamespace ||
+      Reflect.apply(nodeParentNodeGetter, iframe, []) !== null ||
+      Reflect.apply(nodeIsConnectedGetter, iframe, []) === true
+    ) {
+      return fail('renderer_document_no_load');
+    }
+    const attributes = [
+      ['title', 'Ad content'],
+      ['scrolling', 'no'],
+      ['frameborder', '0'],
+      ['width', String(renderer.width)],
+      ['height', String(renderer.height)],
+      ['aria-label', 'Advertisement'],
+      ['marginheight', '0'],
+      ['marginwidth', '0'],
+      ['sandbox', APS_RENDERER_SANDBOX],
+      [
+        'style',
+        `border: 0; display: block; height: ${renderer.height}px; margin: 0; overflow: hidden; width: ${renderer.width}px`,
+      ],
+    ] as const;
+    for (let index = 0; index < attributes.length; index += 1) {
+      const attribute = attributes[index];
+      if (attribute) {
+        Reflect.apply(elementSetAttributeIntrinsic, iframe, [attribute[0], attribute[1]]);
+      }
+    }
+  } catch {
+    return fail('renderer_document_no_load');
   }
 
-  const iframe = document.createElement('iframe');
-  iframe.title = 'Ad content';
-  iframe.width = String(renderer.width);
-  iframe.height = String(renderer.height);
-  iframe.style.border = '0';
-  iframe.style.display = 'none';
-  iframe.setAttribute('sandbox', APS_RENDERER_SANDBOX);
-  iframe.src = `${rendererUrl}#tsaps=${nonce}`;
-
-  // A replacement must cancel a pending frame, not merely detach it: its
-  // message listener and ready timeout would otherwise remain live until expiry.
-  pendingFrameCancels.get(container)?.();
-  activeFrames.set(container, iframe);
-
-  let settled = false;
-  const cleanup = (): void => {
-    window.removeEventListener('message', receive);
-    window.clearTimeout(timeoutId);
-  };
-  const cancel = (): void => {
-    if (settled) return;
-    settled = true;
-    cleanup();
-    if (pendingFrameCancels.get(container) === cancel) pendingFrameCancels.delete(container);
-    if (activeFrames.get(container) === iframe) activeFrames.delete(container);
-    iframe.remove();
-  };
-  const fail = (): void => {
-    if (settled) return;
-    cancel();
-    log.warn('APS renderer: frame load failed');
-  };
-  const commit = (): void => {
-    if (settled || activeFrames.get(container) !== iframe || !iframe.isConnected) return;
-    settled = true;
-    cleanup();
-    if (pendingFrameCancels.get(container) === cancel) pendingFrameCancels.delete(container);
-    for (const child of Array.from(container.children)) {
-      if (child !== iframe) child.remove();
-    }
-    iframe.style.display = '';
-  };
-  function receive(event: MessageEvent): void {
-    if (event.source !== iframe.contentWindow || !hasExactKeys(event.data, ['message', 'nonce'])) {
-      return;
-    }
-    if (event.data.nonce !== nonce) return;
-    if (event.data.message === RENDERER_READY_MESSAGE) commit();
-    else if (event.data.message === RENDERER_FAILED_MESSAGE) fail();
+  let channel: MessagingChannel | undefined;
+  try {
+    channel = Reflect.apply(createChannelMethod, messaging, []);
+  } catch {
+    channel = undefined;
   }
+  if (!channel) return fail('internal_error');
+  let issueResult: unknown;
+  try {
+    issueResult = Reflect.apply(issueMethod, nonces, [{ attempt, port: channel.retained }]);
+  } catch {
+    closeChannel(channel);
+    return fail('identity_generation_failed');
+  }
+  const issued = readNonceIssueResult(issueResult);
+  if (!issued) {
+    closeChannel(channel);
+    return fail('identity_generation_failed');
+  }
+  if (!issued.ok) {
+    closeChannel(channel);
+    return fail(mapNonceIssueFailure(issued.reason));
+  }
+  const nonce = issued.nonce;
+  let boundSource: object | undefined;
+  let documentAccepted = false;
+  let disposed = false;
+  let sourceAssigned = false;
+  let appendInProgress = false;
+  let insertionCommitted = false;
+  let loadObserved = false;
+  let errorObserved = false;
+  let envelopeTransferred = false;
+  let artifactOwnedByAttempt = false;
+  let insertionPredecessors: readonly Element[] = [];
+  const expectedFrameSource = `${rendererUrl}#tsaps=${nonce}`;
 
-  window.addEventListener('message', receive);
-  iframe.addEventListener(
-    'load',
-    () => {
-      if (settled || activeFrames.get(container) !== iframe || !iframe.isConnected) return;
+  const removeFrameListeners = (): void => {
+    try {
+      Reflect.apply(eventTargetRemoveListenerIntrinsic, iframe, ['load', onLoad]);
+    } catch {
+      // Listener removal cannot interrupt terminal resource cleanup.
+    }
+    try {
+      Reflect.apply(eventTargetRemoveListenerIntrinsic, iframe, ['error', onError]);
+    } catch {
+      // The second listener is always attempted.
+    }
+  };
+
+  const artifact: CommittedRenderArtifact = freeze({
+    kind: 'direct_iframe' as const,
+    attemptId,
+    slot: attemptSlot,
+    navigationGeneration,
+    dispose: (): void => {
+      if (disposed) return;
+      disposed = true;
+      removeFrameListeners();
       try {
-        const target = iframe.contentWindow;
-        if (!target) {
-          fail();
-          return;
-        }
-        target.postMessage({ nonce, renderer }, '*');
+        channel?.transferred.close();
       } catch {
-        fail();
+        // A transferred endpoint is inert; an untransferred endpoint is locally closed.
+      }
+      try {
+        Reflect.apply(elementRemoveIntrinsic, iframe, []);
+      } catch {
+        // DOM removal remains best-effort under a hostile page.
       }
     },
-    { once: true }
-  );
-  iframe.addEventListener('error', fail, { once: true });
+  });
 
-  const timeoutId = window.setTimeout(fail, RENDERER_READY_TIMEOUT_MS);
-  pendingFrameCancels.set(container, cancel);
-  container.appendChild(iframe);
-  return true;
+  const startupFailure = (reason: RenderFailureReason): false => {
+    if (!artifactOwnedByAttempt) artifact.dispose();
+    return fail(reason);
+  };
+
+  const nonceExpectation = (source: object) =>
+    freeze({ nonce, attempt, generation: attemptGeneration, source, port: channel!.retained });
+
+  const messageData = (event: unknown): unknown => {
+    try {
+      return typeof event === 'object' && event !== null ? Reflect.get(event, 'data') : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const snapshotContainerPredecessors = (): readonly Element[] => {
+    const predecessors: Element[] = [];
+    try {
+      const children = Reflect.apply(elementChildrenGetter!, container, []) as HTMLCollection;
+      const length = Reflect.apply(htmlCollectionLengthGetter!, children, []) as number;
+      for (let index = 0; index < length; index += 1) {
+        const child = Reflect.apply(htmlCollectionItemIntrinsic, children, [
+          index,
+        ]) as Element | null;
+        if (child && child !== iframe) predecessors[predecessors.length] = child;
+      }
+    } catch {
+      // Failure to inspect publisher siblings cannot expand cleanup authority.
+    }
+    return predecessors;
+  };
+
+  const commitContainer = (predecessors: readonly Element[]): void => {
+    try {
+      for (let index = predecessors.length - 1; index >= 0; index -= 1) {
+        const child = predecessors[index];
+        if (
+          child &&
+          child !== iframe &&
+          Reflect.apply(nodeParentNodeGetter!, child, []) === container
+        ) {
+          Reflect.apply(nodeRemoveChildIntrinsic, container, [child]);
+        }
+      }
+    } catch {
+      // The accepted artifact remains authoritative if publisher sibling cleanup is hostile.
+    }
+  };
+
+  const exactFrameBinding = (): boolean => {
+    try {
+      // This binds the native element and browsing context. An opaque Document cannot
+      // be attested after ancestor-controlled contentWindow.location navigation (§4.4).
+      return (
+        insertionCommitted &&
+        Reflect.apply(nodeParentNodeGetter!, iframe, []) === container &&
+        Reflect.apply(nodeIsConnectedGetter!, iframe, []) === true &&
+        Reflect.apply(iframeContentWindowGetter!, iframe, []) === boundSource &&
+        Reflect.apply(elementGetAttributeIntrinsic, iframe, ['src']) === expectedFrameSource &&
+        Reflect.apply(iframeSourceGetter!, iframe, []) === expectedFrameSource
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  const receive = (event: unknown): void => {
+    if (disposed || !boundSource || !envelopeTransferred) return;
+    if (!exactFrameBinding()) {
+      fail(documentAccepted ? 'runner_failed' : 'renderer_document_no_load');
+      return;
+    }
+    const data = messageData(event);
+    const accepted = Reflect.apply(parseMessageMethod, messaging, ['apsDocumentAccepted', data]);
+    if (accepted?.['nonce'] === nonce) {
+      if (documentAccepted || attemptState() !== 'waiting_for_document') return;
+      const expectation = nonceExpectation(boundSource);
+      if (
+        Reflect.apply(consumeMethod, nonces, [expectation]) === true &&
+        Reflect.apply(documentAcceptedMethod, attempt, []) === true
+      ) {
+        documentAccepted = true;
+      }
+      return;
+    }
+    const loaded = Reflect.apply(parseMessageMethod, messaging, ['apsRunnerLoaded', data]);
+    if (loaded?.['nonce'] === nonce) return;
+    const completed = Reflect.apply(parseMessageMethod, messaging, ['apsRenderCompleted', data]);
+    if (completed?.['nonce'] === nonce) {
+      if (documentAccepted && Reflect.apply(acceptMethod, attempt, []) === true) {
+        if (!disposed && exactFrameBinding()) commitContainer(insertionPredecessors);
+      }
+      return;
+    }
+    const failed = Reflect.apply(parseMessageMethod, messaging, ['apsRenderFailed', data]);
+    if (failed?.['nonce'] !== nonce) return;
+    const reason = mapRunnerFailure(failed['reason']);
+    if (reason) Reflect.apply(failMethod, attempt, [reason]);
+  };
+
+  const receiveError = (): void => {
+    if (disposed || !envelopeTransferred) return;
+    fail(documentAccepted ? 'runner_failed' : 'renderer_document_no_load');
+  };
+
+  const transferEnvelope = (): void => {
+    if (disposed || envelopeTransferred || !loadObserved || !boundSource) return;
+    if (!exactFrameBinding()) {
+      fail('renderer_document_no_load');
+      return;
+    }
+    if (attemptState() !== 'waiting_for_document') {
+      fail('internal_error');
+      return;
+    }
+    const envelope = freeze({ version: 1 as const, nonce, publisherOrigin, renderer });
+    const posted = Reflect.apply(postWindowMethod, messaging, [
+      boundSource,
+      envelope,
+      '*',
+      [channel!.transferred],
+    ]);
+    if (posted !== true || !exactFrameBinding()) {
+      fail('renderer_document_no_load');
+      return;
+    }
+    envelopeTransferred = true;
+    removeFrameListeners();
+  };
+
+  function onLoad(): void {
+    if (
+      disposed ||
+      !sourceAssigned ||
+      (!insertionCommitted &&
+        !(appendInProgress && Reflect.apply(nodeParentNodeGetter!, iframe, []) === container))
+    ) {
+      return;
+    }
+    loadObserved = true;
+    transferEnvelope();
+  }
+
+  function onError(): void {
+    if (
+      disposed ||
+      envelopeTransferred ||
+      !sourceAssigned ||
+      (!insertionCommitted &&
+        !(appendInProgress && Reflect.apply(nodeParentNodeGetter!, iframe, []) === container))
+    ) {
+      return;
+    }
+    errorObserved = true;
+    if (artifactOwnedByAttempt) fail('renderer_document_no_load');
+  }
+
+  try {
+    channel.retained.listen(receive, receiveError);
+    Reflect.apply(eventTargetAddListenerIntrinsic, iframe, ['load', onLoad, { once: true }]);
+    Reflect.apply(eventTargetAddListenerIntrinsic, iframe, ['error', onError, { once: true }]);
+    Reflect.apply(elementSetAttributeIntrinsic, iframe, ['src', expectedFrameSource]);
+    if (
+      Reflect.apply(elementGetAttributeIntrinsic, iframe, ['src']) !== expectedFrameSource ||
+      Reflect.apply(iframeSourceGetter!, iframe, []) !== expectedFrameSource
+    ) {
+      return startupFailure('renderer_document_no_load');
+    }
+    sourceAssigned = true;
+    if (
+      disposed ||
+      attemptState() !== 'rendering_direct' ||
+      Reflect.apply(nodeIsConnectedGetter, container, []) !== true
+    ) {
+      return startupFailure('renderer_document_no_load');
+    }
+    insertionPredecessors = snapshotContainerPredecessors();
+    if (
+      disposed ||
+      attemptState() !== 'rendering_direct' ||
+      Reflect.apply(nodeIsConnectedGetter, container, []) !== true
+    ) {
+      return startupFailure('renderer_document_no_load');
+    }
+    appendInProgress = true;
+    try {
+      Reflect.apply(nodeAppendChildIntrinsic, container, [iframe]);
+    } finally {
+      appendInProgress = false;
+    }
+    if (Reflect.apply(nodeParentNodeGetter!, iframe, []) !== container) {
+      return startupFailure('renderer_document_no_load');
+    }
+    insertionCommitted = true;
+    if (Reflect.apply(beginDocumentMethod, attempt, [artifact]) !== true) {
+      return startupFailure('internal_error');
+    }
+    artifactOwnedByAttempt = true;
+    if (disposed) return false;
+    if (errorObserved) return fail('renderer_document_no_load');
+    if (attemptState() !== 'waiting_for_document') return fail('internal_error');
+    const source = Reflect.apply(iframeContentWindowGetter!, iframe, []) as Window | null;
+    if (!source) return fail('renderer_document_no_load');
+    boundSource = source;
+    if (!exactFrameBinding()) return fail('renderer_document_no_load');
+    if (Reflect.apply(bindSourceMethod, nonces, [nonceExpectation(source)]) !== true) {
+      return fail('renderer_document_no_load');
+    }
+    transferEnvelope();
+    return true;
+  } catch {
+    return startupFailure('renderer_document_no_load');
+  }
 }
-
-/**
- * Static source executed by Prebid Universal Creative's dynamic-renderer frame.
- * It reads only the validated descriptor and trusted absolute endpoint URL from data.
- */
-export const APS_UNIVERSAL_CREATIVE_RENDERER = String.raw`(function(){window.render=function(d,_h,w){return new Promise(function(resolve,reject){
-try{var r=d&&d.apsRenderer,u=d&&d.rendererUrl;if(!r||typeof u!=="string")throw new Error("invalid APS renderer data");
-var p=new URL(u);if((p.protocol!=="https:"&&p.protocol!=="http:")||p.username||p.password||p.pathname!=="${APS_RENDERER_PATH}"||p.search||p.hash)throw new Error("invalid APS renderer URL");
-var c=w.crypto;if(!c||typeof c.getRandomValues!=="function")throw new Error("APS renderer randomness unavailable");
-var b=new Uint8Array(16);c.getRandomValues(b);var s="";for(var i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);
-var n=w.btoa(s).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/g,"");
-var f=w.document.createElement("iframe"),done=false,t;
-function clean(){w.removeEventListener("message",receive);if(t)w.clearTimeout(t);}
-function fail(){if(done)return;done=true;clean();f.remove();reject(new Error("APS renderer frame failed"));}
-function receive(e){var m=e.data;if(e.source!==f.contentWindow||!m||m.nonce!==n)return;
-if(m.message==="${RENDERER_READY_MESSAGE}"){done=true;clean();resolve();}
-else if(m.message==="${RENDERER_FAILED_MESSAGE}")fail();}
-f.width=String(r.width);f.height=String(r.height);f.style.border="0";
-f.setAttribute("sandbox","${APS_RENDERER_SANDBOX}");
-f.src=p.href+"#tsaps="+n;f.onload=function(){if(!done&&f.contentWindow)f.contentWindow.postMessage({nonce:n,renderer:r},"*");};
-f.onerror=fail;w.addEventListener("message",receive);t=w.setTimeout(fail,${RENDERER_READY_TIMEOUT_MS});w.document.body.appendChild(f);
-}catch(e){reject(e);}});};})();`;

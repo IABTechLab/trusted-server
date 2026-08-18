@@ -1,5 +1,7 @@
 import { log } from '../../core/log';
-import { createMutationScheduler } from '../../shared/scheduler';
+import { createMutationScheduler, type MutationScheduler } from '../../shared/scheduler';
+
+import type { CreativeGuardHandle } from './startup';
 
 type ElementWithSrc = Element & { src: string };
 
@@ -14,6 +16,11 @@ type FactoryFunction<E extends ElementWithSrc> = {
   new (...args: unknown[]): E;
 } & ((...args: unknown[]) => E);
 
+interface InstancePatch {
+  readonly installed: PropertyDescriptor;
+  readonly original: PropertyDescriptor | undefined;
+}
+
 export interface DynamicSrcProxyOptions<E extends ElementWithSrc> {
   elementConstructor: ElementCtor<E> | undefined;
   selector: string;
@@ -26,302 +33,412 @@ export interface DynamicSrcProxyOptions<E extends ElementWithSrc> {
   signProxy(raw: string, element: E): Promise<string | null>;
 }
 
+function sameDescriptor(
+  left: PropertyDescriptor | undefined,
+  right: PropertyDescriptor | undefined
+): boolean {
+  if (!left || !right) return left === right;
+  return (
+    left.configurable === right.configurable &&
+    left.enumerable === right.enumerable &&
+    left.get === right.get &&
+    left.set === right.set &&
+    left.value === right.value &&
+    left.writable === right.writable
+  );
+}
+
+function inertHandle(): CreativeGuardHandle {
+  return Object.freeze({ dispose: () => undefined, scan: () => undefined });
+}
+
 export function createDynamicSrcProxy<E extends ElementWithSrc>(
   options: DynamicSrcProxyOptions<E>
-): () => void {
+): (scanInitially?: boolean) => CreativeGuardHandle {
   const attr = (options.attributeName ?? 'src').toLowerCase();
   const tagName = options.tagName.toLowerCase();
+  let installedHandle: CreativeGuardHandle | undefined;
 
-  const assignments = new WeakMap<E, { raw: string; requestId: number }>();
-  const lastProcessed = new WeakMap<E, string>();
-  let sequence = 0;
-  let proxyInstalled = false;
-  let observerInstalled = false;
-  let nativeSet: ((this: E, value: string) => void) | undefined;
-  let nativeGet: ((this: E) => string) | undefined;
-  let nativeSetAttribute: (this: E, name: string, value: string) => void = () => undefined;
-  let nativeSetAttributeNS:
-    | ((this: E, namespace: string | null, name: string, value: string) => void)
-    | undefined;
-  const wrappedInstances = new WeakSet<E>();
-  let createElementPatched = false;
-  let factoryPatched = false;
-  const nativeCreateElement =
-    typeof document === 'undefined' ? undefined : document.createElement.bind(document);
+  return function install(scanInitially = true): CreativeGuardHandle {
+    if (installedHandle) return installedHandle;
+    const ctor = options.elementConstructor;
+    if (typeof ctor !== 'function') {
+      installedHandle = inertHandle();
+      return installedHandle;
+    }
 
-  function apply(element: E, value: string): void {
-    try {
-      if (typeof nativeSet === 'function') {
-        nativeSet.call(element, value);
-      } else {
-        nativeSetAttribute.call(element, attr, value);
+    const sourceDescriptor = Object.getOwnPropertyDescriptor(ctor.prototype, attr);
+    if (!sourceDescriptor || typeof sourceDescriptor.set !== 'function') {
+      log.debug(`${options.logPrefix}: ${ctor.name} proxy install skipped (no setter)`);
+      installedHandle = inertHandle();
+      return installedHandle;
+    }
+
+    const assignments = new WeakMap<E, { raw: string; requestId: number }>();
+    const lastProcessed = new WeakMap<E, string>();
+    const instancePatches = new Map<E, InstancePatch>();
+    const nativeSet = sourceDescriptor.set as (this: E, value: string) => void;
+    const nativeGet =
+      typeof sourceDescriptor.get === 'function'
+        ? (sourceDescriptor.get as (this: E) => string)
+        : undefined;
+    const nativeSetAttribute = ctor.prototype.setAttribute as (
+      this: E,
+      name: string,
+      value: string
+    ) => void;
+    const nativeSetAttributeNS =
+      typeof ctor.prototype.setAttributeNS === 'function'
+        ? (ctor.prototype.setAttributeNS as (
+            this: E,
+            namespace: string | null,
+            name: string,
+            value: string
+          ) => void)
+        : undefined;
+    const originalSetAttribute = Object.getOwnPropertyDescriptor(ctor.prototype, 'setAttribute');
+    const originalSetAttributeNS = Object.getOwnPropertyDescriptor(
+      ctor.prototype,
+      'setAttributeNS'
+    );
+    const targetDocument = typeof document === 'undefined' ? undefined : document;
+    const nativeCreateElement = targetDocument?.createElement;
+    const originalCreateElement = targetDocument
+      ? Object.getOwnPropertyDescriptor(targetDocument, 'createElement')
+      : undefined;
+    let active = true;
+    let sequence = 0;
+    let observer: MutationObserver | undefined;
+    let scheduler: MutationScheduler<E> | undefined;
+    let installedSource: PropertyDescriptor | undefined;
+    let installedSetAttribute: PropertyDescriptor | undefined;
+    let installedSetAttributeNS: PropertyDescriptor | undefined;
+    let installedCreateElement: PropertyDescriptor | undefined;
+    let factoryTarget: Record<string, unknown> | undefined;
+    let factoryOriginal: PropertyDescriptor | undefined;
+    let installedFactory: PropertyDescriptor | undefined;
+
+    const restore = (
+      target: object,
+      key: PropertyKey,
+      owned: PropertyDescriptor | undefined,
+      original: PropertyDescriptor | undefined
+    ): void => {
+      try {
+        if (!sameDescriptor(Object.getOwnPropertyDescriptor(target, key), owned)) return;
+        if (original) Object.defineProperty(target, key, original);
+        else Reflect.deleteProperty(target, key);
+      } catch (error) {
+        log.debug(`${options.logPrefix}: failed to restore ${String(key)}`, error);
       }
-    } catch (err) {
-      log.debug(`${options.logPrefix}: failed to apply ${options.resourceName} ${attr}`, err);
-    }
-  }
+    };
 
-  function proxyAssignment(element: E, rawInput: string): void {
-    const raw = String(rawInput || '');
-    const last = lastProcessed.get(element);
-    if (last === raw) return;
-    lastProcessed.set(element, raw);
-
-    const requestId = ++sequence;
-    assignments.set(element, { raw, requestId });
-
-    const proxyable = options.shouldProxy(raw, element);
-    if (!proxyable || typeof fetch !== 'function') {
-      log.info(`${options.logPrefix}: skipping proxy for ${attr}`, {
-        reason: proxyable ? 'no-fetch' : 'non-proxyable',
-        raw,
-      });
-      assignments.delete(element);
-      apply(element, raw);
-      return;
-    }
-
-    log.info(`${options.logPrefix}: signing ${options.resourceName} ${attr}`, { raw });
-    void options
-      .signProxy(raw, element)
-      .then((signed) => {
-        const current = assignments.get(element);
-        if (!current || current.requestId !== requestId) return;
-        assignments.delete(element);
-        const finalUrl = signed || raw;
-        if (signed) {
-          log.info(`${options.logPrefix}: proxied dynamic ${options.resourceName}`, {
-            base: raw,
-            finalUrl,
-          });
+    const apply = (element: E, value: string): void => {
+      try {
+        nativeSet.call(element, value);
+      } catch (error) {
+        try {
+          nativeSetAttribute.call(element, attr, value);
+        } catch (fallbackError) {
+          log.debug(
+            `${options.logPrefix}: failed to apply ${options.resourceName} ${attr}`,
+            error,
+            fallbackError
+          );
         }
-        lastProcessed.set(element, finalUrl);
-        apply(element, finalUrl);
-      })
-      .catch((err) => {
-        const current = assignments.get(element);
-        if (!current || current.requestId !== requestId) return;
+      }
+    };
+
+    const proxyAssignment = (element: E, rawInput: string): void => {
+      if (!active) {
+        apply(element, String(rawInput ?? ''));
+        return;
+      }
+      const raw = String(rawInput || '');
+      const last = lastProcessed.get(element);
+      if (last === raw) return;
+      lastProcessed.set(element, raw);
+
+      const requestId = ++sequence;
+      assignments.set(element, { raw, requestId });
+
+      let proxyable = false;
+      try {
+        proxyable = options.shouldProxy(raw, element);
+      } catch (error) {
+        log.warn(`${options.logPrefix}: ${options.resourceName} policy failed`, error);
+      }
+      if (!proxyable || typeof fetch !== 'function') {
+        log.info(`${options.logPrefix}: skipping proxy for ${attr}`, {
+          reason: proxyable ? 'no-fetch' : 'non-proxyable',
+          raw,
+        });
+        assignments.delete(element);
+        apply(element, raw);
+        return;
+      }
+
+      log.info(`${options.logPrefix}: signing ${options.resourceName} ${attr}`, { raw });
+      let signing: Promise<string | null>;
+      try {
+        signing = options.signProxy(raw, element);
+      } catch (error) {
         assignments.delete(element);
         log.warn(
           `${options.logPrefix}: failed to proxy dynamic ${options.resourceName}; using raw ${attr}`,
-          err
+          error
         );
-        lastProcessed.set(element, raw);
         apply(element, raw);
-      });
-  }
-
-  function monitorMutations(ctor: ElementCtor<E>): void {
-    if (observerInstalled) return;
-    if (typeof document === 'undefined' || typeof MutationObserver === 'undefined') return;
-
-    const schedule = createMutationScheduler<E>((element) => {
-      ensureInstancePatched(element);
-      const fromAttr = element.getAttribute(attr) || '';
-      const liveValue = (element as unknown as { [key: string]: string | undefined })[attr] || '';
-      const raw = fromAttr || liveValue;
-      if (!raw) return;
-      log.info(`${options.logPrefix}: observed ${attr} set`, { raw });
-      proxyAssignment(element, raw);
-    });
-
-    const scan = () => {
-      document.querySelectorAll(options.selector).forEach((el) => {
-        schedule(el as E);
-      });
-    };
-
-    log.info(`${options.logPrefix}: initial ${options.resourceName} scan`);
-    scan();
-
-    const observer = new MutationObserver((records) => {
-      for (const record of records) {
-        if (record.type === 'attributes') {
-          const target = record.target;
-          if (target instanceof ctor && record.attributeName === attr) {
-            schedule(target as E);
+        return;
+      }
+      void signing
+        .then((signed) => {
+          if (!active) return;
+          const current = assignments.get(element);
+          if (!current || current.requestId !== requestId) return;
+          assignments.delete(element);
+          const finalUrl = signed || raw;
+          if (signed) {
+            log.info(`${options.logPrefix}: proxied dynamic ${options.resourceName}`, {
+              base: raw,
+              finalUrl,
+            });
           }
-          continue;
-        }
-
-        if (record.type === 'childList') {
-          record.addedNodes.forEach((node) => {
-            if (node instanceof ctor) {
-              schedule(node as E);
-              return;
-            }
-            if (!(node instanceof Element)) return;
-            node.querySelectorAll(options.selector).forEach((el) => schedule(el as E));
-          });
-        }
-      }
-    });
-
-    observer.observe(document, {
-      subtree: true,
-      childList: true,
-      attributes: true,
-      attributeFilter: [attr],
-    });
-
-    observerInstalled = true;
-    log.info(`${options.logPrefix}: mutation observer active`);
-  }
-
-  function ensureInstancePatched(element: E | null | undefined): void {
-    if (!element || wrappedInstances.has(element)) return;
-    wrappedInstances.add(element);
-    try {
-      Object.defineProperty(element, attr, {
-        configurable: true,
-        enumerable: true,
-        get(this: E) {
-          const pending = assignments.get(this);
-          if (pending) return pending.raw;
-          return nativeGet ? nativeGet.call(this) : '';
-        },
-        set(this: E, value: string) {
-          log.info(`${options.logPrefix}: ${tagName} instance ${attr} set`, value);
-          proxyAssignment(this, String(value ?? ''));
-        },
-      });
-    } catch (err) {
-      log.debug(`${options.logPrefix}: failed to patch ${tagName} instance ${attr}`, err);
-    }
-  }
-
-  function patchDocumentCreateElement(): void {
-    if (createElementPatched || typeof document === 'undefined' || !nativeCreateElement) return;
-    createElementPatched = true;
-    document.createElement = function patchedCreateElement(
-      this: Document,
-      name: string,
-      options?: ElementCreationOptions
-    ): HTMLElement {
-      const el = nativeCreateElement(name, options);
-      if (typeof name === 'string' && name.toLowerCase() === tagName) {
-        ensureInstancePatched(el as unknown as E);
-      }
-      return el;
-    } as typeof document.createElement;
-  }
-
-  function patchFactory(): void {
-    if (!options.factoryName || factoryPatched) return;
-    const globalObj = globalThis as Record<string, unknown>;
-    const factory = globalObj[options.factoryName];
-    if (typeof factory !== 'function') return;
-    const factoryFn = factory as FactoryFunction<E>;
-
-    const WrappedFactory = function (this: unknown, ...args: unknown[]) {
-      const instance = Reflect.construct(factoryFn, args, new.target ?? WrappedFactory) as E;
-      ensureInstancePatched(instance);
-      return instance;
+          lastProcessed.set(element, finalUrl);
+          apply(element, finalUrl);
+        })
+        .catch((error) => {
+          if (!active) return;
+          const current = assignments.get(element);
+          if (!current || current.requestId !== requestId) return;
+          assignments.delete(element);
+          log.warn(
+            `${options.logPrefix}: failed to proxy dynamic ${options.resourceName}; using raw ${attr}`,
+            error
+          );
+          lastProcessed.set(element, raw);
+          apply(element, raw);
+        });
     };
 
-    Object.defineProperty(WrappedFactory, 'length', {
-      value: factoryFn.length,
-      configurable: true,
-    });
-    Object.defineProperty(WrappedFactory, 'name', {
-      value: options.factoryName,
-      configurable: true,
-    });
-    WrappedFactory.prototype = factoryFn.prototype;
-    Object.setPrototypeOf(WrappedFactory, factoryFn);
-
-    globalObj[options.factoryName] = WrappedFactory as unknown;
-    factoryPatched = true;
-  }
-
-  return function install(): void {
-    if (proxyInstalled) return;
-    const ctor = options.elementConstructor;
-    if (typeof ctor !== 'function') return;
-
-    log.info(`${options.logPrefix}: installing dynamic ${options.resourceName} proxy hooks`);
-
-    const descriptor = Object.getOwnPropertyDescriptor(ctor.prototype, attr);
-    if (!descriptor || typeof descriptor.set !== 'function') {
-      log.debug(`${options.logPrefix}: ${ctor.name} proxy install skipped (no setter)`);
-      return;
-    }
-
-    nativeSet = descriptor.set as typeof nativeSet;
-    nativeGet =
-      typeof descriptor.get === 'function' ? (descriptor.get as typeof nativeGet) : undefined;
-    nativeSetAttribute = ctor.prototype.setAttribute as typeof nativeSetAttribute;
-    nativeSetAttributeNS =
-      typeof ctor.prototype.setAttributeNS === 'function'
-        ? (ctor.prototype.setAttributeNS as typeof nativeSetAttributeNS)
-        : undefined;
-
-    let prototypePatched = false;
-    if (descriptor.configurable !== false) {
+    const ensureInstancePatched = (element: E | null | undefined): void => {
+      if (!active || !element || instancePatches.has(element)) return;
+      const original = Object.getOwnPropertyDescriptor(element, attr);
       try {
-        Object.defineProperty(ctor.prototype, attr, {
+        Object.defineProperty(element, attr, {
           configurable: true,
-          enumerable: descriptor.enumerable ?? true,
+          enumerable: true,
           get(this: E) {
-            log.info(`${options.logPrefix}: ${ctor.name} ${attr} get`);
             const pending = assignments.get(this);
             if (pending) return pending.raw;
             return nativeGet ? nativeGet.call(this) : '';
           },
           set(this: E, value: string) {
+            if (!active) {
+              apply(this, String(value ?? ''));
+              return;
+            }
+            log.info(`${options.logPrefix}: ${tagName} instance ${attr} set`, value);
+            proxyAssignment(this, String(value ?? ''));
+          },
+        });
+        const installed = Object.getOwnPropertyDescriptor(element, attr);
+        if (installed) instancePatches.set(element, { installed, original });
+      } catch (error) {
+        log.debug(`${options.logPrefix}: failed to patch ${tagName} instance ${attr}`, error);
+      }
+    };
+
+    const scan = (): void => {
+      if (!active || !targetDocument || !scheduler) return;
+      targetDocument.querySelectorAll(options.selector).forEach((element) => {
+        scheduler?.(element as E);
+      });
+    };
+
+    const dispose = (): void => {
+      if (!active) return;
+      active = false;
+      observer?.disconnect();
+      scheduler?.dispose();
+      for (const [element, patch] of instancePatches) {
+        restore(element, attr, patch.installed, patch.original);
+      }
+      instancePatches.clear();
+      if (targetDocument) {
+        restore(targetDocument, 'createElement', installedCreateElement, originalCreateElement);
+      }
+      if (factoryTarget && options.factoryName) {
+        restore(factoryTarget, options.factoryName, installedFactory, factoryOriginal);
+      }
+      restore(ctor.prototype, 'setAttributeNS', installedSetAttributeNS, originalSetAttributeNS);
+      restore(ctor.prototype, 'setAttribute', installedSetAttribute, originalSetAttribute);
+      restore(ctor.prototype, attr, installedSource, sourceDescriptor);
+      if (installedHandle === handle) installedHandle = undefined;
+    };
+
+    const handle = Object.freeze({ dispose, scan });
+
+    try {
+      log.info(`${options.logPrefix}: installing dynamic ${options.resourceName} proxy hooks`);
+      let prototypePatched = false;
+      if (sourceDescriptor.configurable !== false) {
+        Object.defineProperty(ctor.prototype, attr, {
+          configurable: true,
+          enumerable: sourceDescriptor.enumerable ?? true,
+          get(this: E) {
+            const pending = assignments.get(this);
+            if (pending) return pending.raw;
+            return nativeGet ? nativeGet.call(this) : '';
+          },
+          set(this: E, value: string) {
+            if (!active) {
+              apply(this, String(value ?? ''));
+              return;
+            }
             log.info(`${options.logPrefix}: ${ctor.name} ${attr} set`, value);
             proxyAssignment(this, String(value ?? ''));
           },
         });
+        installedSource = Object.getOwnPropertyDescriptor(ctor.prototype, attr);
         prototypePatched = true;
-      } catch (err) {
-        log.debug(`${options.logPrefix}: failed to patch prototype ${attr}`, err);
+      } else {
+        log.debug(`${options.logPrefix}: prototype ${attr} not configurable; using fallback`);
       }
-    } else {
-      log.debug(`${options.logPrefix}: prototype ${attr} not configurable; using fallback`);
-    }
 
-    ctor.prototype.setAttribute = function patchedSetAttribute(
-      this: E,
-      name: string,
-      value: string
-    ) {
-      log.debug(`${options.logPrefix}: ${ctor.name} setAttribute`, { name, value });
-      if (typeof name === 'string' && name.toLowerCase() === attr) {
-        proxyAssignment(this, String(value ?? ''));
-        return;
-      }
-      nativeSetAttribute.call(this, name, value);
-    };
-
-    if (nativeSetAttributeNS) {
-      ctor.prototype.setAttributeNS = function patchedSetAttributeNS(
+      ctor.prototype.setAttribute = function patchedSetAttribute(
         this: E,
-        namespace: string | null,
         name: string,
         value: string
       ): void {
-        log.debug(`${options.logPrefix}: ${ctor.name} setAttributeNS`, { namespace, name, value });
-        if (typeof name === 'string' && name.toLowerCase() === attr) {
-          proxyAssignment(this, String(value ?? ''));
+        if (!active || typeof name !== 'string' || name.toLowerCase() !== attr) {
+          nativeSetAttribute.call(this, name, value);
           return;
         }
-        nativeSetAttributeNS!.call(this, namespace, name, value);
+        log.debug(`${options.logPrefix}: ${ctor.name} setAttribute`, { name, value });
+        proxyAssignment(this, String(value ?? ''));
       };
-    }
+      installedSetAttribute = Object.getOwnPropertyDescriptor(ctor.prototype, 'setAttribute');
 
-    proxyInstalled = true;
-    log.info(`${options.logPrefix}: dynamic ${options.resourceName} proxy installed`);
-
-    if (!prototypePatched) {
-      log.info(`${options.logPrefix}: using instance-level proxy fallback`);
-      if (typeof document !== 'undefined') {
-        document.querySelectorAll(options.selector).forEach((el) => ensureInstancePatched(el as E));
+      if (nativeSetAttributeNS) {
+        ctor.prototype.setAttributeNS = function patchedSetAttributeNS(
+          this: E,
+          namespace: string | null,
+          name: string,
+          value: string
+        ): void {
+          if (!active || typeof name !== 'string' || name.toLowerCase() !== attr) {
+            nativeSetAttributeNS.call(this, namespace, name, value);
+            return;
+          }
+          log.debug(`${options.logPrefix}: ${ctor.name} setAttributeNS`, {
+            namespace,
+            name,
+            value,
+          });
+          proxyAssignment(this, String(value ?? ''));
+        };
+        installedSetAttributeNS = Object.getOwnPropertyDescriptor(ctor.prototype, 'setAttributeNS');
       }
-      patchDocumentCreateElement();
-      patchFactory();
-    }
 
-    monitorMutations(ctor);
+      if (!prototypePatched) {
+        if (targetDocument && nativeCreateElement) {
+          targetDocument
+            .querySelectorAll(options.selector)
+            .forEach((element) => ensureInstancePatched(element as E));
+          targetDocument.createElement = function patchedCreateElement(
+            this: Document,
+            name: string,
+            creationOptions?: ElementCreationOptions
+          ): HTMLElement {
+            const element = nativeCreateElement.call(this, name, creationOptions);
+            if (active && typeof name === 'string' && name.toLowerCase() === tagName) {
+              ensureInstancePatched(element as unknown as E);
+            }
+            return element;
+          } as typeof targetDocument.createElement;
+          installedCreateElement = Object.getOwnPropertyDescriptor(targetDocument, 'createElement');
+        }
+
+        if (options.factoryName) {
+          const globalObject = globalThis as Record<string, unknown>;
+          const factory = globalObject[options.factoryName];
+          if (typeof factory === 'function') {
+            const factoryFunction = factory as FactoryFunction<E>;
+            factoryTarget = globalObject;
+            factoryOriginal = Object.getOwnPropertyDescriptor(globalObject, options.factoryName);
+            const WrappedFactory = function (this: unknown, ...args: unknown[]) {
+              const instance = Reflect.construct(
+                factoryFunction,
+                args,
+                new.target ?? WrappedFactory
+              ) as E;
+              if (active) ensureInstancePatched(instance);
+              return instance;
+            };
+            Object.defineProperty(WrappedFactory, 'length', {
+              value: factoryFunction.length,
+              configurable: true,
+            });
+            Object.defineProperty(WrappedFactory, 'name', {
+              value: options.factoryName,
+              configurable: true,
+            });
+            WrappedFactory.prototype = factoryFunction.prototype;
+            Object.setPrototypeOf(WrappedFactory, factoryFunction);
+            globalObject[options.factoryName] = WrappedFactory;
+            installedFactory = Object.getOwnPropertyDescriptor(globalObject, options.factoryName);
+          }
+        }
+      }
+
+      if (targetDocument && typeof MutationObserver !== 'undefined') {
+        scheduler = createMutationScheduler<E>((element) => {
+          if (!active) return;
+          ensureInstancePatched(element);
+          const fromAttribute = element.getAttribute(attr) || '';
+          const liveValue =
+            (element as unknown as { [key: string]: string | undefined })[attr] || '';
+          const raw = fromAttribute || liveValue;
+          if (!raw) return;
+          log.info(`${options.logPrefix}: observed ${attr} set`, { raw });
+          proxyAssignment(element, raw);
+        });
+        observer = new MutationObserver((records) => {
+          if (!active) return;
+          for (const record of records) {
+            if (record.type === 'attributes') {
+              const target = record.target;
+              if (target instanceof ctor && record.attributeName === attr) scheduler?.(target as E);
+              continue;
+            }
+            if (record.type !== 'childList') continue;
+            record.addedNodes.forEach((node) => {
+              if (node instanceof ctor) {
+                scheduler?.(node as E);
+                return;
+              }
+              if (!(node instanceof Element)) return;
+              node
+                .querySelectorAll(options.selector)
+                .forEach((element) => scheduler?.(element as E));
+            });
+          }
+        });
+        observer.observe(targetDocument, {
+          subtree: true,
+          childList: true,
+          attributes: true,
+          attributeFilter: [attr],
+        });
+      }
+
+      installedHandle = handle;
+      if (scanInitially) scan();
+      return handle;
+    } catch (error) {
+      dispose();
+      throw error;
+    }
   };
 }
