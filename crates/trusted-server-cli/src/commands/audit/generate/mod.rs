@@ -561,7 +561,7 @@ pub(crate) fn run_update_slots(
     // one page, which inference already refuses to represent.
     for (index, (label, collector)) in collectors.iter().enumerate() {
         if index > 0 {
-            let repeat = first_collector.collect_page(&root_url, request.cookies);
+            let repeat = collector.collect_page(&root_url, request.cookies);
             match repeat {
                 Ok(page) => fold_collected(&mut table, &root_url, &page, &mut notes)?,
                 Err(error) => notes.push(format!("skipped `{root_url}` on {label}: {error}")),
@@ -1711,6 +1711,67 @@ mod tests {
             "no ad-unit path is better than one that is wrong on mobile, got:\n{written}"
         );
         // What was written must still load.
+        trusted_server_core::settings::Settings::from_toml(&written)
+            .expect("a slot without an explicit unit path must still load");
+    }
+
+    #[test]
+    fn a_root_only_site_is_still_collected_on_every_device_profile() {
+        // A site whose root offers no crawl targets is audited on the root page
+        // alone. If the later profiles never load it, a device split there is
+        // invisible and the first profile's literal path gets written as if
+        // every device agreed with it.
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        fs::write(&config_path, loadable_config()).expect("should write config");
+
+        let desktop = SiteCollector::new(vec![(
+            "https://publisher.example/",
+            site_page(
+                "https://publisher.example/",
+                "/123456789/desktop/homepage",
+                &[],
+            ),
+        )]);
+        let mobile = SiteCollector::new(vec![(
+            "https://publisher.example/",
+            site_page(
+                "https://publisher.example/",
+                "/123456789/mobile/homepage",
+                &[],
+            ),
+        )]);
+        let mut out = Vec::new();
+
+        run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &desktop), ("mobile", &mobile)],
+            &mut out,
+        )
+        .expect("the run should complete and report the conflict");
+
+        assert_eq!(
+            mobile.visited.borrow().as_slice(),
+            ["https://publisher.example/"],
+            "the mobile profile must load the root even when there is nothing else to crawl"
+        );
+        let written = fs::read_to_string(&config_path).expect("read config");
+        let value = toml::from_str::<toml::Value>(&written).expect("valid TOML");
+        assert!(
+            value["creative_opportunities"]["slot"][0]
+                .get("gam_unit_path")
+                .is_none(),
+            "a root-only device split must not write either device's literal path, got:\n{written}"
+        );
         trusted_server_core::settings::Settings::from_toml(&written)
             .expect("a slot without an explicit unit path must still load");
     }
