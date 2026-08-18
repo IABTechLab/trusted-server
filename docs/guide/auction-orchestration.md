@@ -823,3 +823,72 @@ Every auction response includes structured metadata in `ext.orchestrator`:
   "time_ms": 145
 }
 ```
+
+### SSAT HTML Debug Comment
+
+For local server-side auction template (SSAT) investigation, Trusted Server can
+insert a `<!-- ts-debug: ... -->` comment before the page's bids script. Enable
+it in `trusted-server.toml`, push the local configuration, restart the local
+server, and search the page source for `ts-debug`:
+
+```toml
+[debug]
+auction_html_comment = true
+
+[debug.auction_html_comment_options]
+include_provider_responses = true
+include_mediator_response = false
+include_bids = false
+metadata_keys = ["error_type", "http_status", "message"]
+verbosity = "full"
+format = "pretty"
+```
+
+```bash
+ts config validate
+ts config push --adapter fastly --local
+fastly compute serve
+```
+
+This example is useful when investigating raw Prebid Server requests and
+responses without spending the dump budget on winning creatives. Raw PBS
+`debug.httpcalls` and `resolvedrequest` metadata also require
+`debug = true` under `[integrations.prebid]`.
+
+| Option                       | Default                                | Behavior                                                                |
+| ---------------------------- | -------------------------------------- | ----------------------------------------------------------------------- |
+| `include_provider_responses` | `true`                                 | Include the provider response array                                     |
+| `include_mediator_response`  | `true`                                 | Include the mediator response when a mediator ran                       |
+| `include_bids`               | `true`                                 | Include bid objects; when `false`, provider status and metadata remain  |
+| `metadata_keys`              | `error_type`, `http_status`, `message` | Select a subset of the fixed validated metadata keys in `redacted` mode |
+| `verbosity`                  | `redacted`                             | Select `redacted`, `upstream`, or `full` sensitivity                    |
+| `format`                     | `compact`                              | Use compact outer JSON or indented outer JSON with `pretty`             |
+
+The verbosity modes form an explicit sensitivity ladder:
+
+- `redacted` reconstructs only validated `error_type`, `http_status`, and a
+  server-generated `message`, intersected with `metadata_keys`. A successful
+  provider response can therefore have `metadata: {}`.
+- `upstream` adds provider-controlled errors, warnings, response timings, bid
+  statuses, and bounded upstream-message fields. It does not include raw PBS
+  `httpcalls` or `resolvedrequest`.
+- `full` includes raw response metadata and untruncated creatives. It can expose
+  IP addresses, geo data, identifiers, consent strings, request signatures, and
+  complete provider request/response bodies.
+
+`format = "pretty"` indents only the outer dump. JSON-looking fields such as
+`requestbody` and `responsebody` remain strings exactly as captured, so their
+contents still appear escaped. Use a local JSON inspection tool when those
+nested values need additional formatting.
+
+The summary line's `winning=N` count is computed before section filtering, so
+it can be nonzero while `include_bids = false` produces empty bid arrays. Every
+mode and format neutralizes HTML-comment terminators and enforces a 256 KiB
+total dump cap. A capped dump ends with `…(truncated N bytes)` and is no longer
+valid JSON.
+
+::: danger Local debugging only
+Do not enable the auction HTML comment in production. Even `redacted` can
+contain bid-level data and creative previews, while `upstream` and `full` may
+expose identity-bearing request data to anyone who can view the page source.
+:::
