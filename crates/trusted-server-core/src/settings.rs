@@ -1984,6 +1984,10 @@ pub struct AuctionDebugCommentOptions {
     /// request/response data may become visible via view-source.
     #[serde(default)]
     pub verbosity: AuctionDebugCommentVerbosity,
+
+    /// JSON representation used for the outer auction dump.
+    #[serde(default)]
+    pub format: AuctionDebugCommentFormat,
 }
 
 impl Default for AuctionDebugCommentOptions {
@@ -1994,6 +1998,7 @@ impl Default for AuctionDebugCommentOptions {
             include_bids: true,
             metadata_keys: default_auction_debug_metadata_keys(),
             verbosity: AuctionDebugCommentVerbosity::Redacted,
+            format: AuctionDebugCommentFormat::Compact,
         }
     }
 }
@@ -2018,6 +2023,15 @@ pub enum AuctionDebugCommentVerbosity {
     Redacted,
     Upstream,
     Full,
+}
+
+/// JSON representation used for the outer `ts-debug` auction dump.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuctionDebugCommentFormat {
+    #[default]
+    Compact,
+    Pretty,
 }
 
 /// Tester-cookie endpoint configuration.
@@ -2733,6 +2747,11 @@ mod tests {
             AuctionDebugCommentVerbosity::Redacted,
             "should default to Redacted"
         );
+        assert_eq!(
+            opts.format,
+            AuctionDebugCommentFormat::Compact,
+            "should default to compact output"
+        );
     }
 
     #[test]
@@ -2757,6 +2776,23 @@ mod tests {
         let options: AuctionDebugCommentOptions = toml::from_str(r#"verbosity = "upstream""#)
             .expect("should deserialize upstream verbosity");
         assert_eq!(options.verbosity, AuctionDebugCommentVerbosity::Upstream);
+    }
+
+    #[test]
+    fn auction_debug_comment_options_deserializes_pretty_format() {
+        let options: AuctionDebugCommentOptions = toml::from_str(r#"format = "pretty""#)
+            .expect("should deserialize pretty format");
+        assert_eq!(options.format, AuctionDebugCommentFormat::Pretty);
+    }
+
+    #[test]
+    fn auction_debug_comment_options_bad_format_fails_config_load() {
+        let result: Result<AuctionDebugCommentOptions, _> =
+            toml::from_str(r#"format = "expanded""#);
+        assert!(
+            result.is_err(),
+            "unrecognized format must fail to deserialize, not silently fall back"
+        );
     }
 
     #[test]
