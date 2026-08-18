@@ -60,15 +60,23 @@ PR #928 adds authenticated operator diagnostics at `/_ts/admin/ec`,
 ### 1. Parameter-aware startup authentication coverage
 
 Keep the canonical admin route templates as the source used for coverage
-errors and route-consistency tests. When testing whether a configured handler
-covers `/_ts/admin/ec/{id}`, match the handler against a fixed representative
-valid EC path instead of the literal template. The representative ID will use
-fictional test data and satisfy the production `{64hex}.{6alnum}` format.
+errors and route-consistency tests. Define one canonical mapping from each
+template to its concrete authentication probe. When testing whether a
+configured handler covers `/_ts/admin/ec/{id}`, match the handler against a
+fixed representative valid EC path instead of the literal template. The
+representative ID will use fictional test data and satisfy the production
+`{64hex}.{6alnum}` format.
 
 All non-parameterized admin routes continue to use their canonical paths as
 their coverage probes. A prefix handler such as `^/_ts/admin` therefore remains
 valid, while a regex matching only literal braces is rejected at startup and
 reported as failing to cover `/_ts/admin/ec/{id}`.
+
+Use the same template-to-probe mapping everywhere settings validation decides
+whether a handler protects an admin endpoint. This includes both uncovered
+endpoint detection and placeholder-password rejection. A handler that protects
+concrete EC IDs must therefore be recognized as an admin handler for credential
+strength validation even when it does not match the literal router template.
 
 ### 2. Runtime authentication fails closed for admin paths
 
@@ -174,7 +182,7 @@ Add an Admin Diagnostic Endpoints section to
 - `GET /_ts/admin/ec` with ID resolution from the `ts-ec` cookie.
 - `GET /_ts/admin/ec/{id}` and its explicit ID format.
 - EC success fields, raw/typed error outcomes, auction derivation, `400`,
-  `404`, `405`, and `501` responses.
+  `401`, `404`, `405`, and `501` responses.
 - Fastly-only EC lookup support and authenticated `501` responses from Axum,
   Cloudflare, and Spin.
 - `GET /_ts/admin/eids`, its cookie inputs, always-`200` diagnostic payload,
@@ -192,6 +200,8 @@ Implementation follows red-green-refactor, one behavior at a time.
 
 - A template-only handler configuration fails startup coverage for the
   parameterized EC route.
+- A concrete-ID handler with a placeholder password is still rejected as an
+  admin handler through the shared template-to-probe mapping.
 - A concrete valid EC request under that configuration cannot be treated as
   public by runtime auth.
 - Existing broad and exact non-parameterized handler coverage remains valid.
