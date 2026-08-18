@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use toml_edit::{DocumentMut, Item};
+use toml_edit::{DocumentMut, Item, Table};
 use trusted_server_core::auction::types::MediaType;
 use trusted_server_core::creative_opportunities::{
     CreativeOpportunitiesConfig, CreativeOpportunitySlot,
@@ -439,6 +439,32 @@ pub(super) struct CreativeSectionKeys<'a> {
     pub(super) section_segment: Option<usize>,
 }
 
+fn max_table_position(table: &Table) -> Option<isize> {
+    table.iter().fold(table.position(), |maximum, (_, item)| {
+        let child_maximum = match item {
+            Item::Table(child) => max_table_position(child),
+            Item::ArrayOfTables(array) => array.iter().filter_map(max_table_position).max(),
+            Item::None | Item::Value(_) => None,
+        };
+        maximum.max(child_maximum)
+    })
+}
+
+fn set_table_position_recursive(table: &mut Table, position: isize) {
+    table.set_position(position);
+    for (_, item) in table.iter_mut() {
+        match item {
+            Item::Table(child) => set_table_position_recursive(child, position),
+            Item::ArrayOfTables(array) => {
+                for child in array.iter_mut() {
+                    set_table_position_recursive(child, position);
+                }
+            }
+            Item::None | Item::Value(_) => {}
+        }
+    }
+}
+
 /// Structurally replaces the generator-managed creative-opportunities fields.
 ///
 /// All unrelated TOML items and their decorations remain in the parsed
@@ -455,6 +481,12 @@ pub(super) fn splice_creative_slots(
         ))
     })?;
     let had_section = document.get("creative_opportunities").is_some();
+    let existing_section_position = document
+        .get("creative_opportunities")
+        .and_then(Item::as_table)
+        .and_then(Table::position);
+    let section_position = existing_section_position
+        .unwrap_or_else(|| max_table_position(document.as_table()).unwrap_or(0) + 1);
     if !had_section && keys.network_id.is_none() {
         return cli_error(
             "refusing to create a `[creative_opportunities]` section without a \
@@ -471,10 +503,15 @@ pub(super) fn splice_creative_slots(
     let mut generated = generated
         .parse::<DocumentMut>()
         .map_err(|error| report_error(format!("failed to parse generated slot tables: {error}")))?;
-    let generated_slots = generated["creative_opportunities"]
+    let mut generated_slots = generated["creative_opportunities"]
         .as_table_mut()
         .and_then(|table| table.remove("slot"))
         .unwrap_or_else(|| Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
+    if let Item::ArrayOfTables(array) = &mut generated_slots {
+        for table in array.iter_mut() {
+            set_table_position_recursive(table, section_position);
+        }
+    }
 
     if !had_section {
         document["creative_opportunities"] = Item::Table(toml_edit::Table::new());
@@ -487,6 +524,10 @@ pub(super) fn splice_creative_slots(
                  rewrite it as a `[creative_opportunities]` table and re-run",
             )
         })?;
+    // `toml_edit` stably sorts tables by document position. Imported tables
+    // retain positions from their source document, so anchor the whole subtree
+    // here to keep the parent, slots, and provider tables together.
+    creative.set_position(section_position);
     if let Some(network_id) = keys.network_id {
         creative["gam_network_id"] = toml_edit::value(network_id);
     }
@@ -709,6 +750,39 @@ mod tests {
         render_slots(&merged)
     }
 
+    fn two_provider_slots_rendered() -> &'static str {
+        r#"
+# Slots managed by `ts audit ad-templates generate`.
+# Review page_patterns and formats before validating/pushing.
+
+[[creative_opportunities.slot]]
+id = "header"
+div_id = "header"
+gam_unit_path = "/222/{section}/header"
+page_patterns = ["/"]
+formats = [{ width = 728, height = 90 }]
+[creative_opportunities.slot.providers.prebid]
+bidders = {}
+
+[[creative_opportunities.slot]]
+id = "sidebar"
+div_id = "sidebar"
+gam_unit_path = "/222/{section}/sidebar"
+page_patterns = ["/"]
+formats = [{ width = 300, height = 250 }]
+[creative_opportunities.slot.providers.aps]
+slot_id = "sidebar"
+"#
+    }
+
+    fn table_headers(document: &str) -> Vec<&str> {
+        document
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with('['))
+            .collect()
+    }
+
     /// Section keys carrying only a network id, the common test case.
     fn network_keys(network_id: &str) -> CreativeSectionKeys<'_> {
         CreativeSectionKeys {
@@ -795,6 +869,63 @@ mod tests {
                 .as_array()
                 .map(Vec::len),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn splice_keeps_generated_slots_and_providers_contiguous() {
+        let existing = "[publisher]\ndomain = \"example.com\"\n\n\
+            [tester_cookie]\nenabled = true\n\n\
+            [creative_opportunities]\ngam_network_id = \"111\"\n\n\
+            [debug]\nauction_html_comment = true\n";
+
+        let updated = splice_creative_slots(
+            existing,
+            &network_keys("222"),
+            two_provider_slots_rendered(),
+        )
+        .expect("should splice slots");
+
+        assert_eq!(
+            table_headers(&updated),
+            vec![
+                "[publisher]",
+                "[tester_cookie]",
+                "[creative_opportunities]",
+                "[[creative_opportunities.slot]]",
+                "[creative_opportunities.slot.providers.prebid]",
+                "[[creative_opportunities.slot]]",
+                "[creative_opportunities.slot.providers.aps]",
+                "[debug]",
+            ]
+        );
+    }
+
+    #[test]
+    fn splice_groups_a_new_creative_section_with_its_slots() {
+        let existing = "[publisher]\ndomain = \"example.com\"\n\n\
+            [debug]\nauction_html_comment = true\n\n\
+            [auction]\nenabled = true\n";
+
+        let updated = splice_creative_slots(
+            existing,
+            &network_keys("222"),
+            two_provider_slots_rendered(),
+        )
+        .expect("should create creative section and splice slots");
+
+        assert_eq!(
+            table_headers(&updated),
+            vec![
+                "[publisher]",
+                "[debug]",
+                "[auction]",
+                "[creative_opportunities]",
+                "[[creative_opportunities.slot]]",
+                "[creative_opportunities.slot.providers.prebid]",
+                "[[creative_opportunities.slot]]",
+                "[creative_opportunities.slot.providers.aps]",
+            ]
         );
     }
 
