@@ -2191,6 +2191,13 @@ impl Settings {
         Ok(None)
     }
 
+    /// Returns whether `path` is within the reserved Trusted Server admin
+    /// namespace.
+    #[must_use]
+    pub(crate) fn is_admin_path(path: &str) -> bool {
+        path == "/_ts/admin" || path.starts_with("/_ts/admin/")
+    }
+
     /// Known admin endpoint paths that must be covered by a handler.
     ///
     /// [`from_toml`](Self::from_toml) rejects configurations
@@ -2199,10 +2206,10 @@ impl Settings {
     /// Update [`ADMIN_ENDPOINTS`](Self::ADMIN_ENDPOINTS) when adding new
     /// admin routes to `crates/trusted-server-adapter-fastly/src/app.rs`.
     ///
-    /// The `/_ts/admin/ec/{id}` entry is the literal router pattern; handler
-    /// path regexes are matched against it verbatim, so prefix-style admin
-    /// regexes (e.g. `^/_ts/admin`) cover it while regexes too narrow to
-    /// cover the parameterized route are rejected fail-closed.
+    /// The `/_ts/admin/ec/{id}` entry is the canonical router pattern. Handler
+    /// coverage is checked against a representative concrete EC ID via
+    /// [`admin_auth_probe`](Self::admin_auth_probe), while validation errors
+    /// continue to report this operator-facing route template.
     pub(crate) const ADMIN_ENDPOINTS: &[&str] = &[
         "/_ts/admin/keys/rotate",
         "/_ts/admin/keys/deactivate",
@@ -2210,6 +2217,19 @@ impl Settings {
         "/_ts/admin/ec/{id}",
         "/_ts/admin/eids",
     ];
+
+    const ADMIN_EC_ID_AUTH_PROBE: &str = concat!(
+        "/_ts/admin/ec/",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ".abc123",
+    );
+
+    fn admin_auth_probe(path: &'static str) -> &'static str {
+        match path {
+            "/_ts/admin/ec/{id}" => Self::ADMIN_EC_ID_AUTH_PROBE,
+            path => path,
+        }
+    }
 
     /// Returns admin endpoint paths that no configured handler covers.
     ///
@@ -2227,7 +2247,7 @@ impl Settings {
         for &path in Self::ADMIN_ENDPOINTS {
             let mut covered = false;
             for h in &self.handlers {
-                if h.matches_path(path)? {
+                if h.matches_path(Self::admin_auth_probe(path))? {
                     covered = true;
                     break;
                 }
@@ -2265,7 +2285,9 @@ impl Settings {
             let covers_admin = Self::ADMIN_ENDPOINTS
                 .iter()
                 .try_fold(false, |covered, path| {
-                    handler.matches_path(path).map(|matches| covered || matches)
+                    handler
+                        .matches_path(Self::admin_auth_probe(path))
+                        .map(|matches| covered || matches)
                 })?;
 
             if covers_admin && is_admin_placeholder_password(handler.password.expose()) {
@@ -4931,6 +4953,56 @@ origin_host_header_overide = "www.example.com""#,
                 "/_ts/admin/eids",
             ],
             "should detect the admin endpoints not covered by the narrow handler"
+        );
+    }
+
+    #[test]
+    fn from_toml_rejects_literal_parameter_template_auth_coverage() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/_ts/admin/ec/[{]id[}]$"
+            username = "admin"
+            password = "strong-test-password""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject literal parameter-template auth coverage");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("/_ts/admin/ec/{id}"),
+            "should identify the concrete EC route as uncovered, got: {message}"
+        );
+    }
+
+    #[test]
+    fn from_toml_rejects_placeholder_password_for_concrete_admin_ec_handler() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass""#,
+            r#"path = "^/_ts/admin/(keys/rotate|keys/deactivate|ec|eids)$"
+            username = "admin"
+            password = "strong-test-password"
+
+            [[handlers]]
+            path = "^/_ts/admin/ec/[a-f0-9]{64}[.][a-z0-9]{6}$"
+            username = "admin"
+            password = "change-me-admin-password""#,
+        );
+
+        let error = Settings::from_toml(&toml_str)
+            .expect_err("should reject placeholder password on concrete EC handler");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("placeholder password"),
+            "should identify the placeholder admin password, got: {message}"
         );
     }
 
