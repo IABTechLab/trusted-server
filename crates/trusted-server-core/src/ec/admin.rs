@@ -615,7 +615,7 @@ mod tests {
                 ec_id,
                 EcKvWrite {
                     body,
-                    metadata: &metadata,
+                    metadata,
                     ttl: Duration::from_secs(60),
                     mode: EcKvWriteMode::Add,
                 },
