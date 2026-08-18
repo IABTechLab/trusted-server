@@ -49,7 +49,7 @@ const NOISE_SEGMENTS: &[&str] = &[
 /// File extensions that are assets rather than pages.
 const NON_PAGE_EXTENSIONS: &[&str] = &[
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".svg", ".ico", ".css", ".js", ".json",
-    ".xml", ".pdf", ".zip", ".mp4", ".mp3", ".rss",
+    ".xml", ".pdf", ".zip", ".mp4", ".mp3", ".rss", ".html", ".htm", ".php",
 ];
 
 /// Bounds on how much of a site a single run will load.
@@ -97,6 +97,8 @@ pub(super) struct CrawlPlan {
     pub(super) dropped_sections: Vec<String>,
     /// Human-readable notes about how the plan was reached.
     pub(super) notes: Vec<String>,
+    /// Path segment used to distinguish sections in this crawl.
+    pub(super) section_segment: usize,
 }
 
 impl CrawlPlan {
@@ -146,6 +148,7 @@ pub(super) fn plan_crawl(
     sitemap_locs: &[String],
     budget: CrawlBudget,
 ) -> CrawlPlan {
+    let section_segment = usize::from(segment_count(root) == 1);
     let mut candidates: BTreeMap<String, SectionCandidate> = BTreeMap::new();
     let mut notes = Vec::new();
 
@@ -153,13 +156,13 @@ pub(super) fn plan_crawl(
         let Some(url) = same_origin_page_url(root, &link.url) else {
             continue;
         };
-        let Some(segment) = first_segment(&url) else {
+        let Some(segment) = section_at(&url, section_segment) else {
             continue;
         };
         let entry = candidates.entry(segment).or_default();
         entry.in_nav |= link.in_nav;
         entry.link_count += 1;
-        record_url(entry, &url);
+        record_url(entry, &url, section_segment);
     }
 
     let mut sitemap_pages = 0_usize;
@@ -167,13 +170,13 @@ pub(super) fn plan_crawl(
         let Some(url) = same_origin_page_url(root, loc) else {
             continue;
         };
-        let Some(segment) = first_segment(&url) else {
+        let Some(segment) = section_at(&url, section_segment) else {
             continue;
         };
         sitemap_pages += 1;
         let entry = candidates.entry(segment).or_default();
         entry.in_sitemap = true;
-        record_url(entry, &url);
+        record_url(entry, &url, section_segment);
     }
 
     if !sitemap_locs.is_empty() {
@@ -223,10 +226,21 @@ pub(super) fn plan_crawl(
     }
 
     if !dropped_sections.is_empty() {
+        let shown = dropped_sections
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let remainder = dropped_sections.len().saturating_sub(10);
+        let suffix = if remainder == 0 {
+            String::new()
+        } else {
+            format!(", and {remainder} more")
+        };
         notes.push(format!(
-            "budget reached: {} section(s) not sampled ({}); raise --max-sections/--max-pages to include them",
+            "budget reached: {} section(s) not sampled ({shown}{suffix}); raise --max-sections/--max-pages to include them",
             dropped_sections.len(),
-            dropped_sections.join(", ")
         ));
     }
 
@@ -234,14 +248,15 @@ pub(super) fn plan_crawl(
         sections,
         dropped_sections,
         notes,
+        section_segment,
     }
 }
 
 /// Files a URL as the section's landing page or its representative article.
 ///
 /// The first candidate of each kind wins, so a run is stable given stable input.
-fn record_url(entry: &mut SectionCandidate, url: &Url) {
-    if segment_count(url) == 1 {
+fn record_url(entry: &mut SectionCandidate, url: &Url, section_segment: usize) {
+    if segment_count(url) == section_segment + 1 {
         if entry.landing.is_none() {
             entry.landing = Some(url.clone());
         }
@@ -263,7 +278,7 @@ fn same_origin_page_url(root: &Url, raw: &str) -> Option<Url> {
     url.set_query(None);
     url.set_fragment(None);
 
-    let path = url.path().to_ascii_lowercase();
+    let path = percent_decode_for_filtering(url.path()).to_ascii_lowercase();
     if NON_PAGE_EXTENSIONS
         .iter()
         .any(|extension| path.ends_with(extension))
@@ -286,11 +301,41 @@ fn same_origin_page_url(root: &Url, raw: &str) -> Option<Url> {
 }
 
 /// The first non-empty path segment, lowercased.
-fn first_segment(url: &Url) -> Option<String> {
+fn section_at(url: &Url, index: usize) -> Option<String> {
     url.path()
         .split('/')
-        .find(|part| !part.is_empty())
+        .filter(|part| !part.is_empty())
+        .nth(index)
         .map(str::to_ascii_lowercase)
+}
+
+fn percent_decode_for_filtering(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+        {
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Count of non-empty path segments.
@@ -513,5 +558,65 @@ mod tests {
 
         assert!(plan.sections.is_empty());
         assert!(plan.targets().is_empty());
+    }
+
+    #[test]
+    fn locale_root_plans_sections_from_the_second_segment() {
+        let locale_root = Url::parse("https://publisher.example/en").expect("should parse root");
+        let plan = plan_crawl(
+            &locale_root,
+            &[nav("/en/news"), nav("/en/deals")],
+            &[
+                "https://publisher.example/en/news/story".to_string(),
+                "https://publisher.example/en/deals/item".to_string(),
+            ],
+            CrawlBudget::default(),
+        );
+
+        assert_eq!(plan.section_segment, 1);
+        assert_eq!(segments(&plan), ["deals", "news"]);
+        assert_eq!(plan.targets().len(), 4);
+    }
+
+    #[test]
+    fn encoded_noise_and_page_extensions_are_filtered() {
+        let plan = plan_crawl(
+            &root(),
+            &[
+                nav("/%70rivacy"),
+                nav("/index.html"),
+                nav("/archive.htm"),
+                nav("/story.php"),
+                nav("/news"),
+            ],
+            &[],
+            CrawlBudget::default(),
+        );
+
+        assert_eq!(segments(&plan), ["news"]);
+    }
+
+    #[test]
+    fn dropped_section_note_is_capped() {
+        let links: Vec<_> = (0..15)
+            .map(|index| nav(&format!("/section-{index:02}")))
+            .collect();
+        let plan = plan_crawl(
+            &root(),
+            &links,
+            &[],
+            CrawlBudget {
+                max_sections: 0,
+                max_pages: 1,
+            },
+        );
+        let note = plan
+            .notes
+            .iter()
+            .find(|note| note.contains("budget reached"))
+            .expect("should report dropped sections");
+
+        assert!(note.contains("and 5 more"));
+        assert!(!note.contains("section-14"));
     }
 }

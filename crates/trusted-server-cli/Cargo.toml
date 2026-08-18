@@ -20,6 +20,7 @@ clap = { workspace = true }
 edgezero-core = { workspace = true }
 edgezero-cli = { workspace = true }
 futures = { workspace = true }
+glob = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
 regex = { workspace = true }

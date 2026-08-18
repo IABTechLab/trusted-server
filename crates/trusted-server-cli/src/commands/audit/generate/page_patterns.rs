@@ -20,7 +20,8 @@ const ROOT_PATTERN: &str = "/";
 /// `section_segment` is the index the section is taken from, matching the
 /// config key of the same name: a path is reduced to its first
 /// `section_segment + 1` segments, which is the prefix every page of that
-/// section shares. Paths shorter than that are root pages and contribute `/`.
+/// section shares. A shorter observed landing path is emitted literally; only
+/// the actual site root contributes `/`.
 ///
 /// Results are deduplicated and ordered with `/` first, then alphabetically, so
 /// re-running against unchanged evidence produces an unchanged file.
@@ -34,10 +35,14 @@ pub(super) fn patterns_for_paths<'a>(
     for path in paths {
         let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
         if segments.len() <= section_segment {
-            has_root = true;
+            if segments.is_empty() {
+                has_root = true;
+            } else {
+                patterns.insert(glob::Pattern::escape(path));
+            }
             continue;
         }
-        let prefix = format!("/{}", segments[..=section_segment].join("/"));
+        let prefix = glob::Pattern::escape(&format!("/{}", segments[..=section_segment].join("/")));
         // The landing page and everything beneath it.
         patterns.insert(prefix.clone());
         patterns.insert(format!("{prefix}/*"));
@@ -90,8 +95,21 @@ mod tests {
 
         assert_eq!(
             patterns,
-            ["/", "/en/deals", "/en/deals/*", "/en/news", "/en/news/*"]
+            ["/en", "/en/deals", "/en/deals/*", "/en/news", "/en/news/*"]
         );
+    }
+
+    #[test]
+    fn literal_glob_metacharacters_are_escaped_and_match_the_source() {
+        let source = "/news[local]/story";
+        let patterns = patterns_for_paths([source], 0);
+
+        assert_eq!(patterns, ["/news[[]local[]]", "/news[[]local[]]/*"]);
+        assert!(patterns.iter().any(|pattern| {
+            glob::Pattern::new(pattern)
+                .expect("should compile emitted glob")
+                .matches(source)
+        }));
     }
 
     #[test]

@@ -133,9 +133,6 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
         if roots.len() > 1 {
             continue;
         }
-        if !witnessed(&slots, &analyses, segment) {
-            continue;
-        }
         qualifying.push((segment, root.to_string(), analyses));
     }
 
@@ -228,40 +225,6 @@ pub(super) fn infer_unit_templates(table: &EvidenceTable, network_id: &str) -> I
     }
 }
 
-/// Whether the accepted analyses actually witnessed section variation.
-///
-/// Requires two rows with both a different derived section and a different
-/// value in the varying unit segment. Round-trip verification cannot supply
-/// this: one observation is reproduced equally well by a literal path, a
-/// `{network_id}`-only template, and a `{section}` template.
-fn witnessed(
-    slots: &[&SlotEvidence],
-    analyses: &BTreeMap<String, SlotAnalysis>,
-    section_segment: usize,
-) -> bool {
-    for slot in slots {
-        let Some(SlotAnalysis::Templatable {
-            varying,
-            section_root,
-        }) = analyses.get(&slot.div_id)
-        else {
-            continue;
-        };
-        let mut sections = BTreeSet::new();
-        let mut units = BTreeSet::new();
-        for row in &slot.rows {
-            sections.insert(derive_section(&row.path, section_root, section_segment));
-            if let Some(value) = segment_at(&row.unit_path, *varying) {
-                units.insert(value.to_string());
-            }
-        }
-        if sections.len() >= 2 && units.len() >= 2 {
-            return true;
-        }
-    }
-    false
-}
-
 /// Checks the properties of a slot's observations that do not depend on which
 /// `section_segment` is being considered.
 ///
@@ -332,6 +295,11 @@ fn structural_check(slot: &SlotEvidence) -> Result<Option<usize>, String> {
 }
 
 /// Analyses one slot under a candidate `section_segment`.
+///
+/// [`structural_check`] has already established that a templatable candidate
+/// contains more than one observed unit path. Therefore a successful derived
+/// section match here is itself the required variation witness; a second
+/// witness predicate would only restate that invariant.
 fn analyse_slot(slot: &SlotEvidence, network_id: &str, section_segment: usize) -> SlotAnalysis {
     let varying = match structural_check(slot) {
         Err(reason) => return SlotAnalysis::Refuse(reason),
@@ -508,11 +476,6 @@ fn segments(unit_path: &str) -> Vec<&str> {
 /// Non-empty path segments of a request path.
 fn path_segments(path: &str) -> Vec<&str> {
     path.split('/').filter(|part| !part.is_empty()).collect()
-}
-
-/// The ad-unit path segment at `index`, if present.
-fn segment_at(unit_path: &str, index: usize) -> Option<&str> {
-    segments(unit_path).into_iter().nth(index)
 }
 
 #[cfg(test)]

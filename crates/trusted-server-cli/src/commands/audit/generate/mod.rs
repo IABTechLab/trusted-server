@@ -673,6 +673,7 @@ pub(crate) fn run_update_slots(
         policy.as_ref(),
         request,
         &fragmented,
+        &mut notes,
     )?;
     let merged = slot_toml::merge_render_slots(request.existing_creative, slots, request.replace);
     let rendered_slots = render_slots(&merged);
@@ -870,6 +871,7 @@ fn build_render_slots(
     policy: Option<&unit_template::SectionPolicy>,
     request: &UpdateSlotsRequest<'_>,
     fragmented: &[evidence::FragmentGroup],
+    notes: &mut Vec<String>,
 ) -> CliResult<Vec<slot_toml::RenderSlot>> {
     let skip: std::collections::BTreeSet<&str> = fragmented
         .iter()
@@ -898,8 +900,16 @@ fn build_render_slots(
         let unit_path = match inference.and_then(|outcome| outcome.decision(&slot.div_id)) {
             Some(unit_template::SlotDecision::Template(template)) => Some(template.clone()),
             Some(unit_template::SlotDecision::Literal(path)) => Some(path.clone()),
-            // Refused: write the slot without a path rather than a wrong one.
-            Some(unit_template::SlotDecision::Refuse { .. }) | None => None,
+            Some(unit_template::SlotDecision::Refuse { reasons }) => {
+                notes.push(format!(
+                    "skipped refused slot `{}` (`{}`): {}",
+                    slot.id,
+                    slot.div_id,
+                    reasons.join("; ")
+                ));
+                continue;
+            }
+            None => None,
         };
         slots.push(slot_toml::RenderSlot::from_evidence(
             &slot.id,
@@ -1747,12 +1757,19 @@ mod tests {
             "a device split must not produce a section template"
         );
         assert!(
-            creative["slot"][0].get("gam_unit_path").is_none(),
-            "no ad-unit path is better than one that is wrong on mobile, got:\n{written}"
+            creative
+                .get("slot")
+                .and_then(toml::Value::as_array)
+                .is_none_or(Vec::is_empty),
+            "a refused device-split slot must be omitted, got:\n{written}"
+        );
+        assert!(
+            String::from_utf8_lossy(&out).contains("skipped refused slot"),
+            "the refusal reason should be reported"
         );
         // What was written must still load.
         trusted_server_core::settings::Settings::from_toml(&written)
-            .expect("a slot without an explicit unit path must still load");
+            .expect("a config with the refused slot omitted should still load");
     }
 
     #[test]
@@ -1807,13 +1824,14 @@ mod tests {
         let written = fs::read_to_string(&config_path).expect("read config");
         let value = toml::from_str::<toml::Value>(&written).expect("valid TOML");
         assert!(
-            value["creative_opportunities"]["slot"][0]
-                .get("gam_unit_path")
-                .is_none(),
-            "a root-only device split must not write either device's literal path, got:\n{written}"
+            value["creative_opportunities"]
+                .get("slot")
+                .and_then(toml::Value::as_array)
+                .is_none_or(Vec::is_empty),
+            "a root-only device split must omit the refused slot, got:\n{written}"
         );
         trusted_server_core::settings::Settings::from_toml(&written)
-            .expect("a slot without an explicit unit path must still load");
+            .expect("a config with the refused slot omitted should still load");
     }
 
     #[test]

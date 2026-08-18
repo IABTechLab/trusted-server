@@ -16,7 +16,7 @@
 //! Neither source executes the page's ad-stack logic ourselves; both read state
 //! the page's own GPT/Prebid setup produced.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -32,6 +32,10 @@ use crate::commands::audit::generate::collector::{CollectedGptSlot, CollectedReq
 /// characters (only `start()` of the match is used).
 static HEX_HASH_SEGMENT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"-[0-9a-f]{16,}(?:-|$)").expect("should compile hex hash regex"));
+static UUID_SEGMENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:-|$)")
+        .expect("should compile UUID regex")
+});
 
 /// Matches a React `useId` token, which changes on every render.
 ///
@@ -102,38 +106,58 @@ pub(crate) fn discover_gpt_slots(
 ) -> DiscoveredSlots {
     let mut slots = Vec::new();
     let mut gam_network_id = None;
-    let mut seen_divs = BTreeSet::new();
+    let mut seen_divs: BTreeMap<String, String> = BTreeMap::new();
 
     for entry in registry {
         let Some(slot) = slot_from_registry(entry, page_has_prebid) else {
             continue;
         };
-        if !seen_divs.insert(slot.div_id.clone()) {
-            continue;
-        }
+        push_slot_preserving_collisions(&mut slots, &mut seen_divs, slot, &entry.div_id);
         if gam_network_id.is_none() {
-            gam_network_id = network_id_from_unit_path(&slot.gam_unit_path);
+            gam_network_id = network_id_from_unit_path(&entry.gam_unit_path);
         }
-        slots.push(slot);
     }
 
     for request in requests {
-        let Some((network_id, slot)) = parse_gampad_request(&request.url) else {
+        let Some((network_id, slot, raw_div)) = parse_gampad_request(&request.url) else {
             continue;
         };
-        if !seen_divs.insert(slot.div_id.clone()) {
-            continue;
-        }
+        push_slot_preserving_collisions(&mut slots, &mut seen_divs, slot, &raw_div);
         if gam_network_id.is_none() {
             gam_network_id = Some(network_id);
         }
-        slots.push(slot);
     }
     make_slot_ids_unique(&mut slots);
 
     DiscoveredSlots {
         gam_network_id,
         slots,
+    }
+}
+
+fn push_slot_preserving_collisions(
+    slots: &mut Vec<DiscoveredSlot>,
+    seen_divs: &mut BTreeMap<String, String>,
+    mut slot: DiscoveredSlot,
+    raw_div: &str,
+) {
+    let normalized = slot.div_id.clone();
+    let raw_div = raw_div.strip_suffix("-container").unwrap_or(raw_div);
+    match seen_divs.get(&normalized) {
+        None => {
+            seen_divs.insert(normalized, raw_div.to_string());
+            slots.push(slot);
+        }
+        Some(previous_raw) if previous_raw == raw_div => {}
+        Some(previous_raw) => {
+            if let Some(previous) = slots.iter_mut().find(|entry| entry.div_id == normalized) {
+                previous.div_id.clone_from(previous_raw);
+                previous.id = slot_id_from_div(previous_raw);
+            }
+            slot.div_id = raw_div.to_string();
+            slot.id = slot_id_from_div(raw_div);
+            slots.push(slot);
+        }
     }
 }
 
@@ -208,7 +232,14 @@ fn normalize_div_stem(div_id: &str) -> String {
     if let Some(matched) = REACT_USE_ID.find(stem) {
         cut = cut.min(matched.start());
     }
-    if let Some(matched) = HEX_HASH_SEGMENT.find(stem) {
+    if let Some(matched) = UUID_SEGMENT.find(stem).or_else(|| {
+        HEX_HASH_SEGMENT.find_iter(stem).find(|matched| {
+            matched
+                .as_str()
+                .bytes()
+                .any(|byte| matches!(byte, b'a'..=b'f'))
+        })
+    }) {
         cut = cut.min(matched.start());
     }
     stem[..cut].trim_end_matches('-').to_string()
@@ -225,7 +256,7 @@ fn network_id_from_unit_path(path: &str) -> Option<String> {
 ///
 /// Returns `None` when the URL is not a GPT ad request or is missing the fields
 /// needed to describe a slot (ad-unit path, div id, and at least one size).
-fn parse_gampad_request(raw_url: &str) -> Option<(String, DiscoveredSlot)> {
+fn parse_gampad_request(raw_url: &str) -> Option<(String, DiscoveredSlot, String)> {
     let url = Url::parse(raw_url).ok()?;
     let host = url.host_str()?;
     if !GAMPAD_HOSTS.contains(&host) || !url.path().ends_with("/gampad/ads") {
@@ -264,11 +295,14 @@ fn parse_gampad_request(raw_url: &str) -> Option<(String, DiscoveredSlot)> {
     // A usable unit path needs the network id plus at least one path segment.
     parts.next()?;
 
-    let raw_div = dids?
-        .split(',')
-        .map(str::trim)
-        .find(|did| !did.is_empty())?
-        .to_string();
+    let raw_div = dids?;
+    if raw_div.contains(',') {
+        return None;
+    }
+    let raw_div = raw_div.trim().to_string();
+    if raw_div.is_empty() {
+        return None;
+    }
     if is_multi_slot_div(&raw_div) {
         return None;
     }
@@ -296,6 +330,7 @@ fn parse_gampad_request(raw_url: &str) -> Option<(String, DiscoveredSlot)> {
             formats,
             has_prebid,
         },
+        raw_div,
     ))
 }
 
@@ -376,8 +411,13 @@ fn make_slot_ids_unique(slots: &mut [DiscoveredSlot]) {
 
 /// Detects Prebid/header-bidding signals in a slot's `prev_scp` targeting.
 fn scp_shows_prebid(scp: &str) -> bool {
-    let scp = scp.to_ascii_lowercase();
-    scp.contains("test=prebid") || scp.contains("tude=true") || scp.contains("prebid")
+    url::form_urlencoded::parse(scp.as_bytes()).any(|(key, value)| {
+        let key = key.to_ascii_lowercase();
+        let value = value.to_ascii_lowercase();
+        (key == "test" && value == "prebid")
+            || (key == "tude" && value == "true")
+            || key.starts_with("prebid")
+    })
 }
 
 #[cfg(test)]
@@ -424,6 +464,12 @@ mod tests {
             "should keep pixel sizes and drop 4x1/8x1 fluid markers"
         );
         assert!(slot.has_prebid, "prev_scp test=prebid should flag prebid");
+    }
+
+    #[test]
+    fn prebid_detection_requires_a_targeting_key_not_a_substring() {
+        assert!(scp_shows_prebid("test=prebid"));
+        assert!(!scp_shows_prebid("noprebid=true"));
     }
 
     #[test]
@@ -817,8 +863,24 @@ mod tests {
     }
 
     #[test]
-    fn hex_normalized_in_content_slots_dedup() {
-        // Same in_content placement, different per-render hex — one stable slot.
+    fn long_numeric_segments_are_stable_ids_not_hex_hashes() {
+        assert_eq!(
+            normalize_div_stem("ad-slot-1234567890123456-tail"),
+            "ad-slot-1234567890123456-tail"
+        );
+    }
+
+    #[test]
+    fn comma_separated_sra_dids_are_ignored() {
+        let discovered = from_requests(&[request(
+            "https://securepubads.g.doubleclick.net/gampad/ads?iu_parts=123%2Cnews%2Catf&dids=ad-a%2Cad-b&prev_iu_szs=300x250",
+        )]);
+
+        assert!(discovered.slots.is_empty());
+    }
+
+    #[test]
+    fn same_page_hex_normalization_collision_retains_both_raw_slots() {
         let registry = vec![
             registry_slot(
                 "/987654321/site/homepage",
@@ -834,11 +896,19 @@ mod tests {
 
         let discovered = discover_gpt_slots(&registry, &[], false);
 
+        assert_eq!(discovered.slots.len(), 2);
         assert_eq!(
-            discovered.slots.len(),
-            1,
-            "hex variants collapse to one slot"
+            discovered
+                .slots
+                .iter()
+                .map(|slot| slot.div_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "ad-in_content-de669245b2ea4b05826dc96f07a36272-in_content-0",
+                "ad-in_content-8aec8129a83d4e5abc197423120cb19e-in_content-0",
+            ]
         );
-        assert_eq!(discovered.slots[0].div_id, "ad-in_content");
+        assert_eq!(discovered.slots[0].formats, vec![(300, 250)]);
+        assert_ne!(discovered.slots[0].id, discovered.slots[1].id);
     }
 }

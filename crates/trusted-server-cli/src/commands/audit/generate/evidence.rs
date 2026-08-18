@@ -104,13 +104,14 @@ fn pages_are_disjoint(slots: &[&SlotEvidence]) -> bool {
 fn shared_div_prefix(slots: &[&SlotEvidence]) -> Option<String> {
     let mut prefix: &str = slots.first()?.div_id.as_str();
     for slot in &slots[1..] {
-        let shared = slot
-            .div_id
-            .char_indices()
-            .zip(prefix.chars())
-            .take_while(|((_, left), right)| left == right)
-            .count();
-        prefix = &prefix[..shared];
+        let mut shared_end = 0;
+        for ((byte_index, left), right) in prefix.char_indices().zip(slot.div_id.chars()) {
+            if left != right {
+                break;
+            }
+            shared_end = byte_index + left.len_utf8();
+        }
+        prefix = &prefix[..shared_end];
     }
     let trimmed = prefix.trim_end_matches(|ch: char| ch != '-' && ch != '_');
     let candidate = trimmed.trim_end_matches(['-', '_']);
@@ -146,6 +147,7 @@ impl EvidenceTable {
             self.empty_pages.insert(path.to_string());
             return;
         }
+        self.empty_pages.remove(path);
 
         for slot in &discovered.slots {
             let entry = self.slots.entry(slot.div_id.clone()).or_insert_with(|| {
@@ -232,10 +234,13 @@ impl EvidenceTable {
             .into_iter()
             .filter(|(_, slots)| slots.len() > 1)
             .filter(|(_, slots)| pages_are_disjoint(slots))
-            .map(|((unit_path, _), slots)| FragmentGroup {
-                div_ids: slots.iter().map(|slot| slot.div_id.clone()).collect(),
-                unit_path,
-                suggested_prefix: shared_div_prefix(&slots),
+            .filter_map(|((unit_path, _), slots)| {
+                let suggested_prefix = shared_div_prefix(&slots);
+                (suggested_prefix.is_some() || slots.len() >= 3).then(|| FragmentGroup {
+                    div_ids: slots.iter().map(|slot| slot.div_id.clone()).collect(),
+                    unit_path,
+                    suggested_prefix,
+                })
             })
             .collect()
     }
@@ -484,11 +489,51 @@ mod tests {
 
         let groups = table.fragmented_slots();
 
-        assert_eq!(groups.len(), 1);
-        assert_eq!(
-            groups[0].suggested_prefix, None,
-            "unrelated ids should not produce a misleading suggestion"
+        assert!(
+            groups.is_empty(),
+            "two unrelated placements are too ambiguous to classify as fragments"
         );
+    }
+
+    #[test]
+    fn three_disjoint_same_shape_ids_are_fragment_evidence_without_a_prefix() {
+        let mut table = EvidenceTable::default();
+        for (path, div_id) in [("/a", "alpha"), ("/b", "bravo"), ("/c", "charlie")] {
+            table.fold_page(path, &page(&[("/99/site/x", div_id, &[(300, 250)])], false));
+        }
+
+        let groups = table.fragmented_slots();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].suggested_prefix, None);
+    }
+
+    #[test]
+    fn unicode_shared_prefix_uses_a_utf8_boundary() {
+        let mut table = EvidenceTable::default();
+        table.fold_page(
+            "/a",
+            &page(&[("/99/site/x", "ünicode-ad-a", &[(300, 250)])], false),
+        );
+        table.fold_page(
+            "/b",
+            &page(&[("/99/site/x", "ünicode-ad-b", &[(300, 250)])], false),
+        );
+
+        let groups = table.fragmented_slots();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].suggested_prefix.as_deref(), Some("ünicode-ad"));
+    }
+
+    #[test]
+    fn a_later_non_empty_profile_clears_the_empty_page_marker() {
+        let mut table = EvidenceTable::default();
+        table.fold_page("/news", &page(&[], false));
+        table.fold_page(
+            "/news",
+            &page(&[("/99/site/news", "ad-atf", &[(300, 250)])], false),
+        );
+
+        assert!(table.empty_pages().is_empty());
     }
 
     #[test]
