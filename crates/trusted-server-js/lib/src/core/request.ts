@@ -1,5 +1,5 @@
 // Request orchestration for tsjs: unified auction endpoint with iframe-based creative rendering.
-import { cancelPendingApsRender, renderApsCreative } from '../integrations/aps/render';
+import { renderApsCreative } from '../integrations/aps/render';
 
 import { buildAdRequest, sendAuction } from './auction';
 import { collectContext } from './context';
@@ -116,7 +116,6 @@ function renderCreativeInline({
     }
 
     // Clear the slot only after sanitization succeeds so rejected creatives never blank existing content.
-    cancelPendingApsRender(container);
     container.innerHTML = '';
 
     // Determine size with fallback chain: creative size → ad unit size → 300x250

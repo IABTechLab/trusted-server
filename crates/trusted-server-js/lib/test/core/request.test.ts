@@ -69,7 +69,7 @@ describe('request.requestAds', () => {
     );
   });
 
-  it('dispatches a valid APS descriptor through the opaque data renderer bootstrap', async () => {
+  it('dispatches a valid APS descriptor to the opaque static renderer route', async () => {
     const apsBid = envelope.seatbid[0].bid[0];
     const renderer = {
       type: 'aps',
@@ -117,55 +117,21 @@ describe('request.requestAds', () => {
 
     const iframe = document.querySelector('#slot1 iframe') as HTMLIFrameElement | null;
     expect(iframe).not.toBeNull();
-    expect(iframe!.src).toContain('/integrations/aps/renderer?mode=data-bootstrap#tsaps=');
+    expect(iframe!.src).toContain('/integrations/aps/renderer#tsaps=');
     expect(iframe!.srcdoc).toBe('');
     expect(iframe!.getAttribute('sandbox')).not.toContain('allow-same-origin');
     expect(document.querySelector('#slot1 span')).not.toBeNull();
 
     const postMessage = vi.spyOn(iframe!.contentWindow!, 'postMessage');
-    const nonce = new URL(iframe!.src).hash.replace('#tsaps=', '');
-    window.dispatchEvent(
-      new MessageEvent('message', {
-        data: { message: 'trusted-server/aps/bootstrap-ready', nonce },
-        source: iframe!.contentWindow,
-      })
-    );
-    const navigate = postMessage.mock.calls[0][0] as { rendererUrl: string };
-    const containerDocument = decodeURIComponent(
-      navigate.rendererUrl
-        .slice('data:text/html;charset=utf-8,'.length)
-        .replace(/#tsaps=[A-Za-z0-9_-]{22}$/, '')
-    );
-    const innerNonce = containerDocument.match(
-      /data:text\/html;charset=utf-8,.+#tsaps=([A-Za-z0-9_-]{22})/
-    )?.[1];
-    expect(innerNonce).toMatch(/^[A-Za-z0-9_-]{22}$/);
-
-    const channel = {
-      close: vi.fn(),
-      onmessage: null,
-      postMessage: vi.fn(),
-      start: vi.fn(),
-    } as unknown as MessagePort;
-    window.dispatchEvent(
-      new MessageEvent('message', {
-        data: { message: 'trusted-server/aps/container-ready', nonce },
-        source: iframe!.contentWindow,
-        ports: [channel],
-      })
-    );
-    channel.onmessage?.(
-      new MessageEvent('message', {
-        data: { message: 'trusted-server/aps/channel-ready', nonce: innerNonce },
-      })
-    );
+    iframe!.dispatchEvent(new Event('load'));
     expect(document.querySelector('#slot1 span')).not.toBeNull();
-    expect(channel.postMessage).toHaveBeenCalledWith(expect.objectContaining({ renderer }));
+    expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ renderer }), '*');
 
-    const message = vi.mocked(channel.postMessage).mock.calls[0][0] as { nonce: string };
-    channel.onmessage?.(
+    const message = postMessage.mock.calls[0][0] as { nonce: string };
+    window.dispatchEvent(
       new MessageEvent('message', {
         data: { message: 'trusted-server/aps/renderer-ready', nonce: message.nonce },
+        source: iframe!.contentWindow,
       })
     );
     expect(document.querySelector('#slot1 span')).toBeNull();
