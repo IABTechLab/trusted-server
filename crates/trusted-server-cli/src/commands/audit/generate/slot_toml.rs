@@ -2,7 +2,7 @@
 //! and in-place `[creative_opportunities]` splicing for `ts audit ad-templates
 //! generate`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use toml_edit::{DocumentMut, Item};
 use trusted_server_core::auction::types::MediaType;
@@ -142,8 +142,8 @@ fn media_type_label(media_type: &MediaType) -> Option<&'static str> {
 ///
 /// - `--replace` (or no existing slots): the result is exactly the discovered set.
 /// - Otherwise existing slots are preserved (covering other pages / hand-tuned
-///   fields); a slot re-seen this run has `run_patterns` unioned into its
-///   `page_patterns`; slots seen only this run are appended.
+///   fields); a slot re-seen this run has its page patterns and formats unioned;
+///   slots seen only this run are appended.
 #[cfg(test)]
 pub(super) fn merge_slots(
     existing: Option<&CreativeOpportunitiesConfig>,
@@ -166,26 +166,52 @@ pub(super) fn merge_slots(
 /// page's discoveries. A slot re-seen this run keeps its configured fields and
 /// gains this run's patterns; a genuinely new slot is appended with a
 /// non-colliding id.
+#[cfg(test)]
 pub(super) fn merge_render_slots(
     existing: Option<&CreativeOpportunitiesConfig>,
     discovered_slots: Vec<RenderSlot>,
     replace: bool,
 ) -> Vec<RenderSlot> {
+    merge_render_slots_with_diagnostics(existing, discovered_slots, replace).0
+}
+
+/// Merges slots and reports configured prefixes that claimed several live divs.
+pub(super) fn merge_render_slots_with_diagnostics(
+    existing: Option<&CreativeOpportunitiesConfig>,
+    discovered_slots: Vec<RenderSlot>,
+    replace: bool,
+) -> (Vec<RenderSlot>, Vec<String>) {
     let existing_slots = existing.map(|config| config.slot.as_slice()).unwrap_or(&[]);
     if replace || existing_slots.is_empty() {
-        return discovered_slots;
+        return (discovered_slots, Vec::new());
     }
 
     let mut merged: Vec<RenderSlot> = existing_slots
         .iter()
         .map(RenderSlot::from_existing)
         .collect();
+    let mut prefix_claims: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
     for mut slot in discovered_slots {
         if let Some(index) = matching_slot_index(&merged, &slot) {
+            if index < existing_slots.len()
+                && let (Some(prefix), Some(discovered_div)) =
+                    (merged[index].div_id.as_deref(), slot.div_id.as_deref())
+                && discovered_div.starts_with(prefix)
+            {
+                prefix_claims
+                    .entry(index)
+                    .or_default()
+                    .insert(discovered_div.to_string());
+            }
             let present = &mut merged[index];
             for pattern in &slot.page_patterns {
                 if !present.page_patterns.contains(pattern) {
                     present.page_patterns.push(pattern.clone());
+                }
+            }
+            for format in &slot.formats {
+                if !present.formats.contains(format) {
+                    present.formats.push(*format);
                 }
             }
         } else {
@@ -193,7 +219,28 @@ pub(super) fn merge_render_slots(
             merged.push(slot);
         }
     }
-    merged
+    let diagnostics = prefix_claims
+        .into_iter()
+        .filter(|(_, divs)| divs.len() > 1)
+        .map(|(index, divs)| {
+            let slot = &merged[index];
+            let sample = divs.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+            let remainder = divs.len().saturating_sub(5);
+            let suffix = if remainder == 0 {
+                String::new()
+            } else {
+                format!(", and {remainder} more")
+            };
+            format!(
+                "configured slot `{}` with div_id prefix `{}` matched {} discovered divs \
+                 ({sample}{suffix}); review whether they are distinct placements",
+                slot.id,
+                slot.div_id.as_deref().unwrap_or_default(),
+                divs.len(),
+            )
+        })
+        .collect();
+    (merged, diagnostics)
 }
 
 fn unique_slot_id(candidate: &str, existing: &[RenderSlot]) -> String {
@@ -381,12 +428,6 @@ fn toml_inline_value(value: &serde_json::Value) -> String {
     }
 }
 
-/// Rewrites the `[creative_opportunities]` slot array of `existing` with the
-/// pre-rendered `rendered_slots` text, updating `gam_network_id` and preserving
-/// all other sections and comments.
-///
-/// If the config has no `[creative_opportunities]` section, a fresh one is
-/// appended so `generate` works against a config that omits it.
 /// The config-level values a splice writes alongside the slot array.
 #[derive(Debug, Clone, Default)]
 pub(super) struct CreativeSectionKeys<'a> {
@@ -398,206 +439,104 @@ pub(super) struct CreativeSectionKeys<'a> {
     pub(super) section_segment: Option<usize>,
 }
 
-impl CreativeSectionKeys<'_> {
-    /// The `key = value` lines this policy contributes, in config order.
-    fn lines(&self) -> Vec<(&'static str, String)> {
-        let mut out = Vec::new();
-        if let Some(network_id) = self.network_id {
-            out.push((
-                "gam_network_id",
-                format!("gam_network_id = {}", toml_string(network_id)),
-            ));
-        }
-        // Both keys are omitted unless a template needs them. They are
-        // `deny_unknown_fields` additions, so writing them into a config that
-        // does not need them would make it unloadable by an older binary for no
-        // benefit.
-        if let Some(section_root) = self.section_root {
-            out.push((
-                "section_root",
-                format!("section_root = {}", toml_string(section_root)),
-            ));
-            if let Some(segment) = self.section_segment {
-                out.push(("section_segment", format!("section_segment = {segment}")));
-            }
-        }
-        out
-    }
-}
-
+/// Structurally replaces the generator-managed creative-opportunities fields.
+///
+/// All unrelated TOML items and their decorations remain in the parsed
+/// document. Missing inferred scalar values preserve their existing values; a
+/// fresh section is created only when a network id is available.
 pub(super) fn splice_creative_slots(
     existing: &str,
     keys: &CreativeSectionKeys<'_>,
     rendered_slots: &str,
 ) -> CliResult<String> {
-    let network_id = keys.network_id;
-    let rendered = rendered_slots.trim_matches('\n');
-    let existing = remove_inline_slot_value(existing)?;
-
-    // Presence is decided structurally (toml_edit), but the splice below is a
-    // line edit that only recognises a canonical `[creative_opportunities]`
-    // header. Reconciling the two here keeps a valid-but-unrecognised form —
-    // a quoted `["creative_opportunities"]` header, a top-level
-    // `creative_opportunities = { ... }` inline table, or a section implied
-    // only by its subtables — from being treated as absent and getting a
-    // duplicate table appended, which would produce invalid TOML.
-    let has_canonical_header = existing
-        .lines()
-        .any(|line| is_table_header(line, "[creative_opportunities]"));
-    if section_is_present(&existing)? && !has_canonical_header {
+    let mut document = existing.parse::<DocumentMut>().map_err(|error| {
+        report_error(format!(
+            "failed to parse target config before updating slots: {error}"
+        ))
+    })?;
+    let had_section = document.get("creative_opportunities").is_some();
+    if !had_section && keys.network_id.is_none() {
         return cli_error(
-            "target config declares `creative_opportunities` in a form this updater cannot \
-             edit safely; rewrite it as a `[creative_opportunities]` table (with \
-             `[[creative_opportunities.slot]]` entries) and re-run",
+            "refusing to create a `[creative_opportunities]` section without a \
+             GAM network id: none could be determined from the audited page, and \
+             the key is required. Add `[creative_opportunities]` with a \
+             `gam_network_id` to the config and re-run",
         );
     }
 
-    // No section yet — append a fresh one with the network id and slots.
-    if !has_canonical_header {
-        // `gam_network_id` is a required field, so creating the section without
-        // one writes a config that cannot load at all. This is reachable: the
-        // network id is only recovered when the scraped unit path starts with an
-        // all-digit segment, which an MCM/child-network path like
-        // `/1234,5678/home/header` does not.
-        let Some(network_id) = network_id else {
-            return cli_error(
-                "refusing to create a `[creative_opportunities]` section without a \
-                 GAM network id: none could be determined from the audited page, and \
-                 the key is required. Add `[creative_opportunities]` with a \
-                 `gam_network_id` to the config and re-run",
-            );
-        };
-        let _ = network_id;
-        let mut result = existing;
-        if !result.is_empty() && !result.ends_with('\n') {
-            result.push('\n');
-        }
-        result.push_str("\n[creative_opportunities]\n");
-        for (_, line) in keys.lines() {
-            result.push_str(&line);
-            result.push('\n');
-        }
-        result.push_str(rendered);
-        result.push('\n');
-        return Ok(result);
-    }
+    let generated = format!(
+        "[creative_opportunities]\n{}\n",
+        rendered_slots.trim_matches('\n')
+    );
+    let mut generated = generated
+        .parse::<DocumentMut>()
+        .map_err(|error| report_error(format!("failed to parse generated slot tables: {error}")))?;
+    let generated_slots = generated["creative_opportunities"]
+        .as_table_mut()
+        .and_then(|table| table.remove("slot"))
+        .unwrap_or_else(|| Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
 
-    // Section exists — set the scalar keys, then replace the slot array.
-    // `upsert` rather than `replace`: `section_root`/`section_segment` are new
-    // keys that a config predating templating simply does not have.
-    let mut document = existing.clone();
-    for (key, line) in keys.lines() {
-        document = upsert_key_in_section(&document, "creative_opportunities", key, &line)?;
+    if !had_section {
+        document["creative_opportunities"] = Item::Table(toml_edit::Table::new());
     }
-
-    let lines: Vec<&str> = document.lines().collect();
-    let header = lines
-        .iter()
-        .position(|line| is_table_header(line, "[creative_opportunities]"))
+    let creative = document["creative_opportunities"]
+        .as_table_mut()
         .ok_or_else(|| {
-            report_error("target config has no [creative_opportunities] section to update")
+            report_error(
+                "target config's `creative_opportunities` value is not an editable table; \
+                 rewrite it as a `[creative_opportunities]` table and re-run",
+            )
         })?;
+    if let Some(network_id) = keys.network_id {
+        creative["gam_network_id"] = toml_edit::value(network_id);
+    }
+    if let Some(section_root) = keys.section_root {
+        creative["section_root"] = toml_edit::value(section_root);
+        if let Some(section_segment) = keys.section_segment {
+            creative["section_segment"] = toml_edit::value(section_segment as i64);
+        }
+    }
+    creative.insert("slot", generated_slots);
 
-    let is_slot_table = |line: &str| {
-        let trimmed = line.trim_start();
-        trimmed.starts_with("[[creative_opportunities.slot]]")
-            || trimmed.starts_with("[creative_opportunities.slot.")
-    };
-    let is_unrelated_table = |line: &str| {
-        let trimmed = line.trim_start();
-        trimmed.starts_with('[')
-            && !is_slot_table(line)
-            && !is_table_header(line, "[creative_opportunities]")
-    };
-
-    // Where the existing slot array begins (first slot table after the header),
-    // else the end of the scalar block (first unrelated table, or EOF).
-    let existing_start = lines[header + 1..]
-        .iter()
-        .position(|line| is_slot_table(line))
-        .map(|offset| header + 1 + offset);
-    let start = existing_start.unwrap_or_else(|| {
-        lines[header + 1..]
-            .iter()
-            .position(|line| is_unrelated_table(line))
-            .map_or(lines.len(), |offset| header + 1 + offset)
-    });
-    // Where the slot array ends: first unrelated top-level table, or EOF.
-    let end = lines[start..]
-        .iter()
-        .position(|line| is_unrelated_table(line))
-        .map_or(lines.len(), |offset| start + offset);
-
-    // Preserve everything before the slot array, but drop any prior managed
-    // header comment (and the blank lines it leaves behind): `rendered` re-emits
-    // it, so keeping the old copy would duplicate it on every re-splice.
-    let mut head_lines: Vec<&str> = lines[..start]
-        .iter()
-        .copied()
-        .filter(|line| !is_managed_comment_line(line))
-        .collect();
-    while head_lines.last().is_some_and(|line| line.trim().is_empty()) {
-        head_lines.pop();
+    let mut result = document.to_string();
+    if uses_crlf(existing) {
+        result = result.replace("\r\n", "\n").replace('\n', "\r\n");
     }
-    let mut result = head_lines.join("\n");
-    if !result.is_empty() {
-        result.push_str("\n\n");
-    }
-    result.push_str(rendered);
-    result.push('\n');
-    let tail = lines[end..].join("\n");
-    if !tail.is_empty() {
-        result.push('\n');
-        result.push_str(&tail);
-    }
-    if existing.ends_with('\n') && !result.ends_with('\n') {
-        result.push('\n');
-    }
-    if uses_crlf(&existing) {
-        result = result.replace('\n', "\r\n");
-    }
+    ensure_only_managed_fields_changed(existing, &result)?;
     Ok(result)
 }
 
-/// Whether `document` declares `creative_opportunities` at all, in any valid
-/// TOML representation (canonical table, quoted header, inline table, or a
-/// section implied only by its subtables).
-///
-/// # Errors
-///
-/// Returns an error when the document does not parse as TOML.
-fn section_is_present(document: &str) -> CliResult<bool> {
-    let parsed = document.parse::<DocumentMut>().map_err(|error| {
-        report_error(format!(
-            "failed to parse target config before updating slots: {error}"
-        ))
-    })?;
-    Ok(parsed.get("creative_opportunities").is_some())
-}
-
-/// Removes a scalar `creative_opportunities.slot` value so it can be replaced
-/// with the generated array-of-tables representation.
-fn remove_inline_slot_value(document: &str) -> CliResult<String> {
-    let mut parsed = document.parse::<DocumentMut>().map_err(|error| {
-        report_error(format!(
-            "failed to parse target config before updating slots: {error}"
-        ))
-    })?;
-    let Some(creative) = parsed.get_mut("creative_opportunities") else {
-        return Ok(document.to_string());
-    };
-    let Some(table) = creative.as_table_like_mut() else {
-        return Ok(document.to_string());
-    };
-    let has_inline_slot = table
-        .get("slot")
-        .is_some_and(|slot| matches!(slot, Item::Value(_)));
-    if !has_inline_slot {
-        return Ok(document.to_string());
+/// Verifies that the structural update changed only generator-managed fields.
+fn ensure_only_managed_fields_changed(before: &str, after: &str) -> CliResult<()> {
+    fn unmanaged(document: &str) -> CliResult<toml::Value> {
+        let mut value = toml::from_str::<toml::Value>(document)
+            .map_err(|error| report_error(format!("failed to validate updated config: {error}")))?;
+        if let Some(root) = value.as_table_mut() {
+            let remove_empty = if let Some(creative) = root
+                .get_mut("creative_opportunities")
+                .and_then(toml::Value::as_table_mut)
+            {
+                for key in ["slot", "gam_network_id", "section_root", "section_segment"] {
+                    creative.remove(key);
+                }
+                creative.is_empty()
+            } else {
+                false
+            };
+            if remove_empty {
+                root.remove("creative_opportunities");
+            }
+        }
+        Ok(value)
     }
 
-    table.remove("slot");
-    Ok(parsed.to_string())
+    if unmanaged(before)? != unmanaged(after)? {
+        return cli_error(
+            "refusing to update config because fields outside the managed \
+             creative-opportunities keys would change",
+        );
+    }
+    Ok(())
 }
 
 /// Whether `document` uses CRLF line endings (so edits preserve them).
@@ -620,16 +559,9 @@ fn strip_inline_comment(line: &str) -> &str {
 /// Whether `line` is exactly the `section_header` table header (for example
 /// `[creative_opportunities]`), tolerating surrounding whitespace and a
 /// trailing inline `# comment` — both valid TOML.
+#[cfg(test)]
 fn is_table_header(line: &str, section_header: &str) -> bool {
     strip_inline_comment(line.trim()) == section_header
-}
-
-/// Whether `line` is one of the managed header comment lines emitted by
-/// [`render_slots`]. Used to strip the prior copy on re-splice so repeated
-/// `generate` runs keep exactly one header comment.
-fn is_managed_comment_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    trimmed == MANAGED_SLOTS_COMMENT || trimmed == MANAGED_SLOTS_REVIEW_COMMENT
 }
 
 pub(super) fn replace_key_in_section(
@@ -694,6 +626,7 @@ pub(super) fn replace_key_in_section(
 /// # Errors
 ///
 /// Returns an error when `section` is not present in the document.
+#[cfg(test)]
 pub(super) fn upsert_key_in_section(
     document: &str,
     section: &str,
@@ -821,18 +754,47 @@ mod tests {
     }
 
     #[test]
-    fn splice_rejects_quoted_section_header_instead_of_duplicating_it() {
-        // A quoted header is valid TOML but the line-based splice does not
-        // recognise it; appending a second `[creative_opportunities]` would
-        // produce a document that no longer parses.
+    fn splice_updates_a_quoted_section_header_structurally() {
         let existing = "[\"creative_opportunities\"]\ngam_network_id = \"111\"\n";
 
-        let error = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
-            .expect_err("should refuse an unrecognised section form");
+        let updated = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
+            .expect("should update quoted table structurally");
 
-        assert!(
-            format!("{error:?}").contains("cannot edit safely"),
-            "error should tell the operator to rewrite the section, got {error:?}"
+        assert_eq!(updated.matches("creative_opportunities").count(), 2);
+        assert!(updated.contains("gam_network_id = \"222\""));
+        toml::from_str::<toml::Value>(&updated).expect("should remain valid TOML");
+    }
+
+    #[test]
+    fn splice_preserves_multiline_values_comments_and_noncontiguous_tables() {
+        let existing = "title = \"publisher\" # keep this comment\n\
+            description = \"\"\"a line that looks like [creative_opportunities]\n\
+            and another [[creative_opportunities.slot]] line\"\"\"\n\
+            dimensions = [\n  300,\n  250,\n]\n\n\
+            [creative_opportunities] # managed section\n\
+            gam_network_id = \"111\" # old network\n\n\
+            [[creative_opportunities.slot]]\nid = \"old-a\"\ndiv_id = \"old-a\"\n\
+            gam_unit_path = \"/111/a\"\npage_patterns = [\"/\"]\n\
+            formats = [{ width = 300, height = 250 }]\n\n\
+            [auction]\nenabled = true # keep auction comment\n\n\
+            [[creative_opportunities.slot]]\nid = \"old-b\"\ndiv_id = \"old-b\"\n\
+            gam_unit_path = \"/111/b\"\npage_patterns = [\"/b\"]\n\
+            formats = [{ width = 320, height = 50 }]\n";
+
+        let updated = splice_creative_slots(existing, &network_keys("222"), &header_rendered())
+            .expect("should update structurally");
+
+        assert!(updated.contains("looks like [creative_opportunities]"));
+        assert!(updated.contains("dimensions = [\n  300,\n  250,\n]"));
+        assert!(updated.contains("enabled = true # keep auction comment"));
+        assert!(!updated.contains("id = \"old-a\""));
+        assert!(!updated.contains("id = \"old-b\""));
+        let value = toml::from_str::<toml::Value>(&updated).expect("should remain valid TOML");
+        assert_eq!(
+            value["creative_opportunities"]["slot"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
         );
     }
 
@@ -844,7 +806,7 @@ mod tests {
             .expect_err("should refuse a top-level inline table");
 
         assert!(
-            format!("{error:?}").contains("cannot edit safely"),
+            format!("{error:?}").contains("rewrite it as"),
             "error should tell the operator to rewrite the section, got {error:?}"
         );
     }
@@ -1282,6 +1244,30 @@ mod tests {
     }
 
     #[test]
+    fn merge_second_run_unions_formats() {
+        let existing = existing_config(
+            "gam_network_id = \"222\"\n\n\
+             [[slot]]\nid = \"header\"\ndiv_id = \"div-gpt-ad-header\"\n\
+             gam_unit_path = \"/222/homepage/header\"\npage_patterns = [\"/\"]\n\
+             formats = [{ width = 728, height = 90 }]\n",
+        );
+        let registry = vec![collector::CollectedGptSlot {
+            gam_unit_path: "/222/homepage/header".to_string(),
+            div_id: "div-gpt-ad-header".to_string(),
+            sizes: vec![(728, 90), (970, 250)],
+        }];
+        let discovered = gpt_slots::discover_gpt_slots(&registry, &[], false);
+
+        let merged = merge_slots(Some(&existing), &discovered, &["/".to_string()], false);
+
+        assert_eq!(
+            merged[0].formats,
+            [(728, 90, None), (970, 250, None)],
+            "a later audit must retain newly observed formats"
+        );
+    }
+
+    #[test]
     fn merge_uses_longest_existing_div_prefix() {
         let existing = existing_config(
             "gam_network_id = \"222\"\n\n\
@@ -1329,6 +1315,47 @@ mod tests {
             ["/", "/news/*"],
             "longest matching prefix should receive this run's pattern"
         );
+    }
+
+    #[test]
+    fn merge_reports_when_a_broad_prefix_claims_multiple_discovered_divs() {
+        let existing = existing_config(
+            "gam_network_id = \"222\"\n\n\
+             [[slot]]\nid = \"broad\"\ndiv_id = \"ad-\"\n\
+             gam_unit_path = \"/222/broad\"\npage_patterns = [\"/\"]\n\
+             formats = [{ width = 300, height = 250 }]\n",
+        );
+        let discovered = vec![
+            RenderSlot::from_evidence(
+                "header",
+                "ad-header",
+                Some("/222/header".to_string()),
+                [(728, 90)],
+                vec!["/".to_string()],
+                false,
+            ),
+            RenderSlot::from_evidence(
+                "footer",
+                "ad-footer",
+                Some("/222/footer".to_string()),
+                [(300, 250)],
+                vec!["/".to_string()],
+                false,
+            ),
+        ];
+
+        let (merged, diagnostics) =
+            merge_render_slots_with_diagnostics(Some(&existing), discovered, false);
+
+        assert_eq!(
+            merged.len(),
+            1,
+            "the configured prefix still controls merging"
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("matched 2 discovered divs"));
+        assert!(diagnostics[0].contains("ad-footer"));
+        assert!(diagnostics[0].contains("ad-header"));
     }
 
     #[test]

@@ -533,6 +533,7 @@ pub(crate) fn run_update_slots(
     request: &UpdateSlotsRequest<'_>,
     collectors: &[(&str, &dyn AuditCollector)],
     out: &mut dyn Write,
+    err: &mut dyn Write,
 ) -> CliResult<()> {
     let Some((first_label, first_collector)) = collectors.first() else {
         return cli_error("no device profile was selected to audit with");
@@ -618,7 +619,7 @@ pub(crate) fn run_update_slots(
     // Emit what the crawl learned before any refusal below can return early.
     // The guards exist precisely for runs that went wrong, so that is when the
     // per-page reasons matter most.
-    emit_notes(out, &mut notes)?;
+    emit_notes(err, &mut notes)?;
 
     if table.is_empty() {
         return cli_error(format!(
@@ -675,7 +676,12 @@ pub(crate) fn run_update_slots(
         &fragmented,
         &mut notes,
     )?;
-    let merged = slot_toml::merge_render_slots(request.existing_creative, slots, request.replace);
+    let (merged, merge_diagnostics) = slot_toml::merge_render_slots_with_diagnostics(
+        request.existing_creative,
+        slots,
+        request.replace,
+    );
+    notes.extend(merge_diagnostics);
     let rendered_slots = render_slots(&merged);
     let updated = splice_creative_slots(
         &existing,
@@ -693,10 +699,10 @@ pub(crate) fn run_update_slots(
     // preview looked fine" would not be evidence that the config loads.
     notes.extend(validate::check_candidate(&updated, &existing)?);
 
-    emit_notes(out, &mut notes)?;
+    emit_notes(err, &mut notes)?;
     if policy.is_some() {
         writeln!(
-            out,
+            err,
             "note: this config now uses a {{section}} ad-unit template. Deploy a \
              template-aware binary BEFORE pushing it, and do not roll that binary \
              back while this config is live — an older binary rejects the whole \
@@ -706,9 +712,31 @@ pub(crate) fn run_update_slots(
     }
 
     if request.dry_run {
-        writeln!(out, "{updated}")
-            .map_err(|error| report_error(format!("failed to write preview: {error}")))?;
+        let old_managed = managed_creative_projection(&existing)?;
+        let new_managed = managed_creative_projection(&updated)?;
+        let diff = similar::TextDiff::from_lines(&old_managed, &new_managed);
+        writeln!(
+            out,
+            "{}",
+            diff.unified_diff().context_radius(0).header(
+                "configured creative opportunities",
+                "generated creative opportunities"
+            )
+        )
+        .map_err(|error| report_error(format!("failed to write preview diff: {error}")))?;
         return Ok(());
+    }
+    let current = fs::read_to_string(request.config_path).map_err(|error| {
+        report_error(format!(
+            "failed to re-read config {} before writing: {error}",
+            request.config_path.display()
+        ))
+    })?;
+    if current != existing {
+        return cli_error(format!(
+            "refusing to overwrite {} because it changed during the browser audit; re-run against the current file",
+            request.config_path.display()
+        ));
     }
     write_file_atomically(request.config_path, &updated).map_err(|error| {
         report_error(format!(
@@ -725,6 +753,32 @@ pub(crate) fn run_update_slots(
         table.pages().len(),
     )
     .map_err(|error| report_error(format!("failed to write command output: {error}")))
+}
+
+/// Renders only fields managed by ad-template generation, excluding secrets and
+/// unrelated operator configuration from dry-run output.
+fn managed_creative_projection(document: &str) -> CliResult<String> {
+    let value = toml::from_str::<toml::Value>(document).map_err(|error| {
+        report_error(format!("failed to parse config for dry-run diff: {error}"))
+    })?;
+    let creative = value
+        .get("creative_opportunities")
+        .and_then(toml::Value::as_table);
+    let mut managed = toml::map::Map::new();
+    if let Some(creative) = creative {
+        for key in ["gam_network_id", "section_root", "section_segment", "slot"] {
+            if let Some(value) = creative.get(key) {
+                managed.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    let mut root = toml::map::Map::new();
+    root.insert(
+        "creative_opportunities".to_string(),
+        toml::Value::Table(managed),
+    );
+    toml::to_string_pretty(&toml::Value::Table(root))
+        .map_err(|error| report_error(format!("failed to render dry-run projection: {error}")))
 }
 
 /// A page carrying fewer scripts than this is not a real publisher page.
@@ -962,6 +1016,24 @@ mod tests {
     struct FakeCollector {
         collected: CollectedPage,
         calls: Cell<usize>,
+    }
+
+    struct MutatingCollector {
+        collected: CollectedPage,
+        config_path: std::path::PathBuf,
+        replacement: String,
+    }
+
+    impl AuditCollector for MutatingCollector {
+        fn collect_page(
+            &self,
+            _target_url: &Url,
+            _cookies: &[(String, String)],
+        ) -> CliResult<CollectedPage> {
+            fs::write(&self.config_path, &self.replacement)
+                .map_err(|error| report_error(format!("failed to mutate test config: {error}")))?;
+            Ok(self.collected.clone())
+        }
     }
 
     impl FakeCollector {
@@ -1433,6 +1505,7 @@ mod tests {
             },
             &[("desktop", &collector)],
             &mut out,
+            &mut std::io::sink(),
         )
         .expect("should update slots");
 
@@ -1476,6 +1549,7 @@ mod tests {
             },
             &[("desktop", &collector)],
             &mut out,
+            &mut std::io::sink(),
         )
         .expect_err("should reject an invalid glob");
 
@@ -1517,6 +1591,7 @@ mod tests {
             },
             &[("desktop", &collector)],
             &mut out,
+            &mut std::io::sink(),
         )
         .expect("should accept a runtime-normalisable pattern");
 
@@ -1553,6 +1628,7 @@ mod tests {
             },
             &[("desktop", &collector)],
             &mut out,
+            &mut std::io::sink(),
         )
         .expect("should update slots");
 
@@ -1629,6 +1705,7 @@ mod tests {
             ),
         ]);
         let mut out = Vec::new();
+        let mut err = Vec::new();
 
         run_update_slots(
             &UpdateSlotsRequest {
@@ -1643,6 +1720,7 @@ mod tests {
             },
             &[("desktop", &collector)],
             &mut out,
+            &mut err,
         )
         .expect("should crawl and update slots");
 
@@ -1678,7 +1756,7 @@ mod tests {
         trusted_server_core::settings::Settings::from_toml(&written)
             .expect("generated config must load through the runtime path");
 
-        let report = String::from_utf8(out).expect("utf8 output");
+        let report = String::from_utf8(err).expect("utf8 output");
         assert!(
             report.contains("Deploy a template-aware binary BEFORE pushing"),
             "a templated config must warn about the rollback contract, got:\n{report}"
@@ -1732,6 +1810,7 @@ mod tests {
             ),
         ]);
         let mut out = Vec::new();
+        let mut err = Vec::new();
 
         run_update_slots(
             &UpdateSlotsRequest {
@@ -1746,6 +1825,7 @@ mod tests {
             },
             &[("desktop", &desktop), ("mobile", &mobile)],
             &mut out,
+            &mut err,
         )
         .expect("the run should complete and report the conflict");
 
@@ -1764,7 +1844,7 @@ mod tests {
             "a refused device-split slot must be omitted, got:\n{written}"
         );
         assert!(
-            String::from_utf8_lossy(&out).contains("skipped refused slot"),
+            String::from_utf8_lossy(&err).contains("skipped refused slot"),
             "the refusal reason should be reported"
         );
         // What was written must still load.
@@ -1813,6 +1893,7 @@ mod tests {
             },
             &[("desktop", &desktop), ("mobile", &mobile)],
             &mut out,
+            &mut std::io::sink(),
         )
         .expect("the run should complete and report the conflict");
 
@@ -1876,6 +1957,7 @@ mod tests {
             },
             &[("desktop", &collector)],
             &mut out,
+            &mut std::io::sink(),
         )
         .expect_err("a mostly-challenged crawl should refuse");
 
@@ -1923,6 +2005,7 @@ mod tests {
             },
             &[("desktop", &collector)],
             &mut out,
+            &mut std::io::sink(),
         )
         .expect("should update from the single page");
 
@@ -1973,6 +2056,7 @@ mod tests {
             },
             &[("desktop", &collector)],
             &mut out,
+            &mut std::io::sink(),
         )
         .expect("should update slots");
 
@@ -2022,7 +2106,7 @@ mod tests {
              page_patterns = [\"/\"]\n\
              formats = [{{ width = 728, height = 90 }}]\n"
         );
-        fs::write(&config_path, config).expect("should write config");
+        fs::write(&config_path, &config).expect("should write config");
         let args = AppConfigArgs {
             app_config: Some(config_path.clone()),
             manifest: manifest_path,
@@ -2069,23 +2153,65 @@ mod tests {
                     },
                     &[("desktop", &collector)],
                     &mut out,
+                    &mut std::io::sink(),
                 )
                 .expect("should render dry-run update");
 
                 let output = String::from_utf8(out).expect("output should be UTF-8");
+                assert!(output.starts_with("--- configured creative opportunities\n"));
+                assert!(output.contains("+++ generated creative opportunities\n"));
                 assert!(
-                    output.contains("id = \"file-only\""),
-                    "dry run should preserve the file-backed slot"
-                );
-                assert!(
-                    output.contains("gam_network_id = \"123456789\""),
-                    "dry run should preserve the file-backed network id"
+                    !output.contains("test-admin-password-32-bytes-minimum"),
+                    "dry run must not expose unrelated secrets"
                 );
                 assert!(
                     !output.contains("987654321"),
                     "dry run must not persist environment-only config"
                 );
+                assert_eq!(
+                    fs::read_to_string(&config_path).expect("should re-read config"),
+                    config,
+                    "dry run must not modify the config file"
+                );
             },
+        );
+    }
+
+    #[test]
+    fn update_slots_refuses_to_overwrite_a_config_changed_during_collection() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        let original = loadable_config();
+        let replacement = format!("{original}\n# edited while the browser was running\n");
+        fs::write(&config_path, &original).expect("should write config");
+        let collector = MutatingCollector {
+            collected: collected_page_with_header_slot(),
+            config_path: config_path.clone(),
+            replacement: replacement.clone(),
+        };
+
+        let error = run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &collector)],
+            &mut std::io::sink(),
+            &mut std::io::sink(),
+        )
+        .expect_err("a stale update should be refused");
+
+        assert!(format!("{error:?}").contains("changed during the browser audit"));
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("should re-read config"),
+            replacement,
+            "the concurrent edit must not be overwritten"
         );
     }
 }

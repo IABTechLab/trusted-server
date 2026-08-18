@@ -271,6 +271,8 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
                 .collect();
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
+            let stderr = std::io::stderr();
+            let mut err = stderr.lock();
             generate::run_update_slots(
                 &generate::UpdateSlotsRequest {
                     url: gen_args.url.as_str(),
@@ -284,6 +286,7 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
                 },
                 &selected,
                 &mut out,
+                &mut err,
             )
             .map(|()| RunOutcome::Success)
         }

@@ -5338,6 +5338,7 @@ dependencies = [
  "scraper",
  "serde",
  "serde_json",
+ "similar",
  "temp-env",
  "tempfile",
  "time",
