@@ -1,9 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use chromiumoxide::ArcHttpRequest;
-use chromiumoxide::browser::{Browser, BrowserConfig};
-use chromiumoxide::cdp::browser_protocol::network::CookieParam;
+use chromiumoxide::browser::Browser;
 use chromiumoxide::handler::viewport::Viewport;
 use futures::StreamExt as _;
 use serde::Deserialize;
@@ -11,11 +10,15 @@ use tempfile::TempDir;
 use tokio::runtime::Builder;
 use tokio::time::{sleep, timeout};
 use url::Url;
-use which::which;
 
+use crate::commands::audit::browser::{
+    BrowserLaunchOptions, CONSENT_STUB_SCRIPT as SHARED_CONSENT_STUB_SCRIPT, build_browser_config,
+    host_cookie, resolve_chrome,
+};
+use crate::commands::audit::collector::BrowserOpts;
 use crate::commands::audit::generate::collector::{
     AuditCollector, CollectedGptSlot, CollectedLink, CollectedPage, CollectedRequest,
-    CollectedScriptTag, ControlFlow, PageSink,
+    CollectedScriptTag, ControlFlow, PageSink, RootPlanner,
 };
 use crate::error::{CliResult, report_error};
 
@@ -29,6 +32,7 @@ const SETTLE_MAX_WAIT: Duration = Duration::from_secs(12);
 /// whatever rendered by then.
 const NAVIGATION_LOAD_TIMEOUT: Duration = Duration::from_secs(12);
 const BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const PAGE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const RESOURCE_TIMING_BUFFER_WARNING_THRESHOLD: usize = 250;
 const RESOURCE_TIMING_BUFFER_WARNING: &str =
     "browser resource timing buffer reached its default size; some network assets may be missing";
@@ -111,7 +115,7 @@ impl DeviceProfile {
 }
 
 /// Collects pages through a local Chrome, emulating one device profile.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct BrowserAuditCollector {
     profile: Option<DeviceProfile>,
     /// Pause between page loads during a crawl.
@@ -124,9 +128,42 @@ pub(crate) struct BrowserAuditCollector {
     proxy: Option<String>,
     /// Accept TLS certificates that do not validate.
     accept_invalid_certs: bool,
+    /// Explicit Chrome executable, ahead of `$CHROME` and discovery.
+    chrome: Option<PathBuf>,
+    /// Quiet interval and hard settle cap shared with verification.
+    settle_quiet: Duration,
+    settle_max: Duration,
+}
+
+impl Default for BrowserAuditCollector {
+    fn default() -> Self {
+        Self {
+            profile: None,
+            page_delay: Duration::ZERO,
+            headful: false,
+            assume_consent: true,
+            proxy: None,
+            accept_invalid_certs: false,
+            chrome: None,
+            settle_quiet: SETTLE_QUIET_PERIOD,
+            settle_max: SETTLE_MAX_WAIT,
+        }
+    }
 }
 
 impl BrowserAuditCollector {
+    /// Applies the browser options shared by generate, verify, and page audit.
+    #[must_use]
+    pub(crate) fn with_browser_options(mut self, options: &BrowserOpts) -> Self {
+        self.chrome.clone_from(&options.chrome);
+        self.headful = options.headful;
+        self.assume_consent = !options.no_assume_consent;
+        self.proxy.clone_from(&options.browser_proxy);
+        self.accept_invalid_certs = options.danger_accept_invalid_certs;
+        self.settle_quiet = Duration::from_millis(options.settle_quiet_ms);
+        self.settle_max = Duration::from_millis(options.settle_max_ms);
+        self
+    }
     /// A collector emulating `profile`.
     #[must_use]
     pub(crate) fn with_profile(profile: DeviceProfile) -> Self {
@@ -147,48 +184,6 @@ impl BrowserAuditCollector {
         self.page_delay = delay;
         self
     }
-
-    /// Runs a visible browser rather than a headless one.
-    ///
-    /// Headless Chrome is trivially detectable and is scored heavily by bot
-    /// protection, so an origin that serves a real page to a normal browser may
-    /// answer the same request headless with a challenge.
-    #[must_use]
-    pub(crate) fn headful(mut self, headful: bool) -> Self {
-        self.headful = headful;
-        self
-    }
-
-    /// Answers the IAB consent APIs so a gated ad stack initialises.
-    ///
-    /// See [`CONSENT_STUB_SCRIPT`] for what is answered and why.
-    #[must_use]
-    pub(crate) fn assume_consent(mut self, assume_consent: bool) -> Self {
-        self.assume_consent = assume_consent;
-        self
-    }
-
-    /// Routes the browser through `proxy` (`host:port`).
-    ///
-    /// Lets the audit run against a production hostname served by a local
-    /// MITM proxy, so the page's origin, cookie scope, and any origin checks in
-    /// the ad stack match production rather than `localhost`.
-    #[must_use]
-    pub(crate) fn with_proxy(mut self, proxy: Option<String>) -> Self {
-        self.proxy = proxy;
-        self
-    }
-
-    /// Accepts TLS certificates that do not validate.
-    ///
-    /// Needed when a MITM proxy presents a certificate from a CA the browser
-    /// profile does not trust. Dangerous against a real origin: see the flag
-    /// documentation.
-    #[must_use]
-    pub(crate) fn accept_invalid_certs(mut self, accept: bool) -> Self {
-        self.accept_invalid_certs = accept;
-        self
-    }
 }
 
 /// The browser-session knobs one crawl runs under.
@@ -200,6 +195,9 @@ struct SessionSettings {
     assume_consent: bool,
     proxy: Option<String>,
     accept_invalid_certs: bool,
+    chrome: Option<PathBuf>,
+    settle_quiet: Duration,
+    settle_max: Duration,
 }
 
 impl BrowserAuditCollector {
@@ -211,95 +209,12 @@ impl BrowserAuditCollector {
             assume_consent: self.assume_consent,
             proxy: self.proxy.clone(),
             accept_invalid_certs: self.accept_invalid_certs,
+            chrome: self.chrome.clone(),
+            settle_quiet: self.settle_quiet,
+            settle_max: self.settle_max,
         }
     }
 }
-
-/// Answers the consent APIs as a consenting, non-GDPR reader.
-///
-/// Publishers gate slot definition behind their consent platform, so a browser
-/// with no consent cookie never reaches `googletag.defineSlot` and the audit
-/// sees a page with no ad stack. That is indistinguishable from a page that
-/// genuinely has none, and it is the state every fresh audit profile starts in.
-///
-/// Rather than special-casing each vendor, this answers the two IAB interfaces
-/// every compliant platform exposes — TCF v2 (`__tcfapi`) and US Privacy
-/// (`__uspapi`) — installed before any page script runs so the real platform
-/// finds them already defined. `gdprApplies: false` is used deliberately: it
-/// needs no fabricated consent string, and it is the same signal the ad stack
-/// receives for genuinely out-of-scope traffic.
-///
-/// This makes the audit behave like a consenting reader; it does not alter what
-/// the publisher's own readers experience.
-const CONSENT_STUB_SCRIPT: &str = r#"(() => {
-    const tcData = {
-        tcString: '',
-        tcfPolicyVersion: 2,
-        cmpId: 0,
-        cmpVersion: 1,
-        gdprApplies: false,
-        eventStatus: 'tcloaded',
-        cmpStatus: 'loaded',
-        listenerId: 1,
-        isServiceSpecific: true,
-        useNonStandardTexts: false,
-        purposeOneTreatment: false,
-        publisherCC: 'US',
-        purpose: { consents: {}, legitimateInterests: {} },
-        vendor: { consents: {}, legitimateInterests: {} },
-        specialFeatureOptins: {},
-    };
-    for (let index = 1; index <= 10; index += 1) {
-        tcData.purpose.consents[index] = true;
-        tcData.purpose.legitimateInterests[index] = true;
-    }
-
-    const tcfapi = (command, version, callback, parameter) => {
-        if (typeof callback !== 'function') return;
-        switch (command) {
-            case 'ping':
-                callback({
-                    gdprApplies: false,
-                    cmpLoaded: true,
-                    cmpStatus: 'loaded',
-                    displayStatus: 'hidden',
-                    apiVersion: '2.0',
-                    cmpId: 0,
-                }, true);
-                break;
-            case 'addEventListener':
-            case 'getTCData':
-                callback(tcData, true);
-                break;
-            case 'removeEventListener':
-                callback(true, true);
-                break;
-            default:
-                callback(tcData, true);
-        }
-    };
-
-    const uspapi = (command, version, callback) => {
-        if (typeof callback !== 'function') return;
-        callback({ version: 1, uspString: '1---' }, true);
-    };
-
-    // Non-writable so the real platform cannot replace these and re-gate the
-    // page; a failed assignment is the intended outcome.
-    const pin = (name, value) => {
-        try {
-            Object.defineProperty(window, name, {
-                value,
-                writable: false,
-                configurable: false,
-            });
-        } catch (error) {
-            /* already pinned */
-        }
-    };
-    pin('__tcfapi', tcfapi);
-    pin('__uspapi', uspapi);
-})();"#;
 
 impl AuditCollector for BrowserAuditCollector {
     fn collect_page(
@@ -320,9 +235,10 @@ impl AuditCollector for BrowserAuditCollector {
         runtime.block_on(async {
             let mut collected = None;
             with_browser(
-                std::slice::from_ref(target_url),
+                vec![target_url.clone()],
                 cookies,
                 settings,
+                None,
                 &mut |_, result| {
                     collected = Some(result);
                     Ok(ControlFlow::Stop)
@@ -351,7 +267,60 @@ impl AuditCollector for BrowserAuditCollector {
                 ))
             })?;
 
-        runtime.block_on(with_browser(targets, cookies, self.session(), on_page))
+        // Keep synchronous HTML analysis out of the current-thread runtime that
+        // drives Chromium's websocket event pump. Collect browser results first,
+        // close the session, then hand them to the caller for parsing.
+        let mut collected_pages = Vec::with_capacity(targets.len());
+        runtime.block_on(with_browser(
+            targets.to_vec(),
+            cookies,
+            self.session(),
+            None,
+            &mut |url, result| {
+                collected_pages.push((url.clone(), result));
+                Ok(ControlFlow::Continue)
+            },
+        ))?;
+        for (url, collected) in collected_pages {
+            if on_page(&url, collected)? == ControlFlow::Stop {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_site(
+        &self,
+        root: &Url,
+        cookies: &[(String, String)],
+        planner: RootPlanner<'_>,
+        on_page: PageSink<'_>,
+    ) -> CliResult<()> {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                report_error(format!(
+                    "failed to build Tokio runtime for browser audit: {error}"
+                ))
+            })?;
+        let mut collected_pages = Vec::new();
+        runtime.block_on(with_browser(
+            vec![root.clone()],
+            cookies,
+            self.session(),
+            Some(planner),
+            &mut |url, result| {
+                collected_pages.push((url.clone(), result));
+                Ok(ControlFlow::Continue)
+            },
+        ))?;
+        for (url, collected) in collected_pages {
+            if on_page(&url, collected)? == ControlFlow::Stop {
+                break;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -364,9 +333,10 @@ impl AuditCollector for BrowserAuditCollector {
 /// multi-section walk of a protected site viable at all. The tradeoff is that
 /// paywall meters and personalization also accumulate across the run.
 async fn with_browser(
-    targets: &[Url],
+    mut targets: Vec<Url>,
     cookies: &[(String, String)],
     settings: SessionSettings,
+    mut root_planner: Option<RootPlanner<'_>>,
     sink: PageSink<'_>,
 ) -> CliResult<()> {
     let SessionSettings {
@@ -376,66 +346,27 @@ async fn with_browser(
         assume_consent,
         proxy,
         accept_invalid_certs,
+        chrome,
+        settle_quiet,
+        settle_max,
     } = settings;
-    let chrome_executable = find_browser_executable()?;
+    let chrome_executable = resolve_chrome(chrome.as_deref()).map_err(report_error)?;
     let user_data_dir = TempDir::new().map_err(|error| {
         report_error(format!(
             "failed to create temporary browser profile for audit: {error}"
         ))
     })?;
-    // chromiumoxide ignores TLS errors by default. `generate` sends operator
-    // cookies and writes what it scrapes into the operator's config, so a
-    // certificate-invalid impersonator could both harvest the session and seed
-    // the config with slots of its choosing. Validate certificates.
-    let mut builder = BrowserConfig::builder()
-        .chrome_executable(chrome_executable)
-        .user_data_dir(user_data_dir.path());
-    if !accept_invalid_certs {
-        builder = builder.respect_https_errors();
-    }
-    if let Some(proxy) = &proxy {
-        // Chrome ignores a scheme-less `--proxy-server` value, silently sending
-        // traffic direct instead, so normalise it. `<-loopback>` keeps Chrome
-        // from bypassing the proxy for loopback hosts, which is exactly the case
-        // a local MITM proxy serves.
-        let endpoint = if proxy.contains("://") {
-            proxy.clone()
-        } else {
-            format!("http://{proxy}")
-        };
-        // Keys carry no `--`: chromiumoxide adds it, so a pre-formatted
-        // `--flag=value` string becomes `----flag=value` and is ignored.
-        builder = builder
-            .arg(("proxy-server", endpoint.as_str()))
-            .arg(("proxy-bypass-list", "<-loopback>"));
-    }
-    // `BrowserConfig` defaults to the *old* headless mode, which is both more
-    // detectable and less faithful than either alternative — so both branches
-    // must be explicit. Omitting the call is not the same as running headful.
-    builder = if headful {
-        builder.with_head()
-    } else {
-        builder.new_headless_mode()
-    };
-    if let Some(profile) = profile {
-        let viewport = profile.viewport();
-        builder = builder
-            .window_size(viewport.width, viewport.height)
-            .viewport(viewport);
-        if let Some(user_agent) = profile.user_agent() {
-            // Ad stacks branch on the user agent as well as the viewport, so
-            // emulating size alone can still return desktop ad units.
-            // Key without the `--`: chromiumoxide prefixes it, so passing a
-            // pre-formatted `--flag=value` string yields `----flag=value`,
-            // which Chrome silently ignores.
-            builder = builder.arg(("user-agent", user_agent));
-        }
-    }
-    let config = builder.build().map_err(|error| {
-        report_error(format!(
-            "failed to build Chromium configuration for audit: {error}"
-        ))
-    })?;
+    let profile = profile.unwrap_or(DeviceProfile::Desktop);
+    let config = build_browser_config(BrowserLaunchOptions {
+        chrome: &chrome_executable,
+        profile_dir: user_data_dir.path(),
+        headful,
+        proxy: proxy.as_deref(),
+        accept_invalid_certs,
+        viewport: profile.viewport(),
+        user_agent: profile.user_agent(),
+    })
+    .map_err(report_error)?;
 
     let (mut browser, mut handler) = Browser::launch(config).await.map_err(|error| {
         report_error(format!(
@@ -453,16 +384,37 @@ async fn with_browser(
 
     // Sitemap discovery is a whole-site fact, so only the first target pays for it.
     let mut result = Ok(());
-    for (index, target) in targets.iter().enumerate() {
+    let mut index = 0;
+    while index < targets.len() {
+        let target = targets[index].clone();
         // Pace the crawl. Back-to-back navigations are both discourteous to the
         // origin and a signal bot protection scores against the session.
         if index > 0 && !page_delay.is_zero() {
             sleep(page_delay).await;
         }
-        let collected =
-            collect_page_from_browser(&mut browser, target, cookies, index == 0, assume_consent)
-                .await;
-        match sink(target, collected) {
+        let collected = collect_page_from_browser(
+            &mut browser,
+            &target,
+            cookies,
+            index == 0,
+            assume_consent,
+            settle_quiet,
+            settle_max,
+        )
+        .await;
+        if index == 0
+            && let Some(planner) = root_planner.as_deref_mut()
+            && let Ok(root_page) = &collected
+        {
+            match planner(&target, root_page) {
+                Ok(planned) => targets.extend(planned),
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            }
+        }
+        match sink(&target, collected) {
             Ok(ControlFlow::Continue) => {}
             Ok(ControlFlow::Stop) => break,
             Err(error) => {
@@ -470,6 +422,7 @@ async fn with_browser(
                 break;
             }
         }
+        index += 1;
     }
 
     let close_result = timeout(BROWSER_CLOSE_TIMEOUT, browser.close())
@@ -502,27 +455,69 @@ async fn collect_page_from_browser(
     cookies: &[(String, String)],
     discover_sitemap: bool,
     assume_consent: bool,
+    settle_quiet: Duration,
+    settle_max: Duration,
 ) -> CliResult<CollectedPage> {
     let page = browser.new_page("about:blank").await.map_err(|error| {
         report_error(format!("failed to create browser page for audit: {error}"))
     })?;
 
+    let result = collect_open_page(
+        &page,
+        target_url,
+        cookies,
+        discover_sitemap,
+        assume_consent,
+        settle_quiet,
+        settle_max,
+    )
+    .await;
+    let close_result = timeout(BROWSER_CLOSE_TIMEOUT, page.close()).await;
+
+    match (result, close_result) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(_)) => Err(report_error(
+            "timed out closing browser tab after page collection",
+        )),
+        (Ok(_), Ok(Err(error))) => Err(report_error(format!(
+            "failed to close browser tab after page collection: {error}"
+        ))),
+        (Ok(collected), Ok(Ok(_))) => Ok(collected),
+    }
+}
+
+/// Collects one open tab; its caller closes the tab on every return path.
+async fn collect_open_page(
+    page: &chromiumoxide::Page,
+    target_url: &Url,
+    cookies: &[(String, String)],
+    discover_sitemap: bool,
+    assume_consent: bool,
+    settle_quiet: Duration,
+    settle_max: Duration,
+) -> CliResult<CollectedPage> {
     // Must run before any page script, so the consent platform finds the APIs
     // already answered rather than installing its own gate.
     if assume_consent {
-        page.evaluate_on_new_document(CONSENT_STUB_SCRIPT)
+        page.evaluate_on_new_document(SHARED_CONSENT_STUB_SCRIPT)
             .await
             .map_err(|error| {
                 report_error(format!("failed to install the consent stub: {error}"))
             })?;
     }
+    page.evaluate_on_new_document("performance.setResourceTimingBufferSize(100000)")
+        .await
+        .map_err(|error| {
+            report_error(format!(
+                "failed to increase the resource timing buffer: {error}"
+            ))
+        })?;
 
     // Set operator-supplied cookies before navigating so the origin sees an
     // authenticated session on the first request. Scoping each to the target URL
     // lets Chrome infer domain/path.
     for (name, value) in cookies {
-        let mut cookie = CookieParam::new(name.clone(), value.clone());
-        cookie.url = Some(target_url.to_string());
+        let cookie = host_cookie(name, value, target_url).map_err(report_error)?;
         page.set_cookie(cookie)
             .await
             .map_err(|error| report_error(format!("failed to set cookie `{name}`: {error}")))?;
@@ -563,62 +558,78 @@ async fn collect_page_from_browser(
         )),
     }
 
-    if !wait_for_page_settle(&page).await? {
+    if !wait_for_page_settle(&page, settle_quiet, settle_max).await? {
         warnings.push(
             "browser audit timed out while waiting for the page to settle; results may be partial"
                 .to_string(),
         );
     }
 
-    let final_url = page
-        .url()
+    match timeout(PAGE_OPERATION_TIMEOUT, page.frames()).await {
+        Ok(Ok(frames)) if frames.len() > 1 => warnings.push(format!(
+            "browser evidence inspects only the main frame; {} child frame(s) were present",
+            frames.len() - 1
+        )),
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => warnings.push(format!("failed to inspect browser frames: {error}")),
+        Err(_) => warnings.push("timed out inspecting browser frames".to_string()),
+    }
+
+    let final_url = timeout(PAGE_OPERATION_TIMEOUT, page.url())
         .await
+        .map_err(|_| report_error("timed out reading final page URL"))?
         .map_err(|error| report_error(format!("failed to read final page URL: {error}")))?
         .ok_or_else(|| report_error("browser page URL was empty after navigation"))?;
-    let page_title = page
-        .get_title()
+    let page_title = timeout(PAGE_OPERATION_TIMEOUT, page.get_title())
         .await
+        .map_err(|_| report_error("timed out reading page title"))?
         .map_err(|error| report_error(format!("failed to read page title: {error}")))?;
-    let html = page
-        .content()
+    let html = timeout(PAGE_OPERATION_TIMEOUT, page.content())
         .await
+        .map_err(|_| report_error("timed out reading rendered page HTML"))?
         .map_err(|error| report_error(format!("failed to read rendered page HTML: {error}")))?;
 
-    let script_tags: Vec<BrowserScriptTag> = page
-        .evaluate(
+    let script_tags: Vec<BrowserScriptTag> = timeout(
+        PAGE_OPERATION_TIMEOUT,
+        page.evaluate(
             r#"() => Array.from(document.scripts).map((script) => ({
                 src: script.src || null,
                 inline_text: script.src ? null : (script.textContent || null),
             }))"#,
-        )
-        .await
-        .map_err(|error| report_error(format!("failed to read rendered script tags: {error}")))?
-        .into_value()
-        .map_err(|error| {
-            report_error(format!(
-                "failed to decode rendered script tag data: {error}"
-            ))
-        })?;
+        ),
+    )
+    .await
+    .map_err(|_| report_error("timed out reading rendered script tags"))?
+    .map_err(|error| report_error(format!("failed to read rendered script tags: {error}")))?
+    .into_value()
+    .map_err(|error| {
+        report_error(format!(
+            "failed to decode rendered script tag data: {error}"
+        ))
+    })?;
 
-    let network_requests: Vec<BrowserPerformanceEntry> = page
-        .evaluate(
+    let network_requests: Vec<BrowserPerformanceEntry> = timeout(
+        PAGE_OPERATION_TIMEOUT,
+        page.evaluate(
             r#"() => performance.getEntriesByType('resource').map((entry) => ({
                 url: entry.name,
                 initiator_type: entry.initiatorType || null,
             }))"#,
-        )
-        .await
-        .map_err(|error| {
-            report_error(format!(
-                "failed to read browser performance resource entries: {error}"
-            ))
-        })?
-        .into_value()
-        .map_err(|error| {
-            report_error(format!(
-                "failed to decode browser performance resource data: {error}"
-            ))
-        })?;
+        ),
+    )
+    .await
+    .map_err(|_| report_error("timed out reading browser performance entries"))?
+    .map_err(|error| {
+        report_error(format!(
+            "failed to read browser performance resource entries: {error}"
+        ))
+    })?
+    .into_value()
+    .map_err(|error| {
+        report_error(format!(
+            "failed to decode browser performance resource data: {error}"
+        ))
+    })?;
 
     if let Some(warning) = resource_timing_buffer_warning(network_requests.len()) {
         warnings.push(warning.to_string());
@@ -627,10 +638,24 @@ async fn collect_page_from_browser(
     // Best-effort read of the live GPT slot registry. This is the authoritative
     // source for slot path/div/size, so a failure here downgrades to empty
     // rather than failing the whole audit.
-    let gpt_slots: Vec<CollectedGptSlot> = match page.evaluate(GPT_SLOTS_SCRIPT).await {
-        Ok(result) => result.into_value().unwrap_or_default(),
-        Err(_) => Vec::new(),
-    };
+    let gpt_slots: Vec<CollectedGptSlot> =
+        match timeout(PAGE_OPERATION_TIMEOUT, page.evaluate(GPT_SLOTS_SCRIPT)).await {
+            Ok(Ok(result)) => match result.into_value() {
+                Ok(slots) => slots,
+                Err(error) => {
+                    warnings.push(format!("failed to decode live GPT slots: {error}"));
+                    Vec::new()
+                }
+            },
+            Ok(Err(error)) => {
+                warnings.push(format!("failed to evaluate live GPT slots: {error}"));
+                Vec::new()
+            }
+            Err(_) => {
+                warnings.push("timed out evaluating live GPT slots".to_string());
+                Vec::new()
+            }
+        };
 
     // Links come from the hydrated DOM, not the served markup: an app-router
     // page keeps its link graph in the framework payload, so parsing the raw
@@ -640,27 +665,66 @@ async fn collect_page_from_browser(
     // empty registry has several very different causes — the library never
     // loaded, it loaded but the command queue never drained, or slots really
     // are absent — and the operator's next move differs for each.
-    if gpt_slots.is_empty()
-        && let Ok(result) = page.evaluate(GPT_DIAGNOSTIC_SCRIPT).await
-        && let Ok(state) = result.into_value::<serde_json::Value>()
-    {
-        warnings.push(format!(
-            "no GPT slots in the registry; googletag state: {state}"
-        ));
+    if gpt_slots.is_empty() {
+        match timeout(PAGE_OPERATION_TIMEOUT, page.evaluate(GPT_DIAGNOSTIC_SCRIPT)).await {
+            Ok(Ok(result)) => match result.into_value::<serde_json::Value>() {
+                Ok(state) => warnings.push(format!(
+                    "no GPT slots in the registry; googletag state: {state}"
+                )),
+                Err(error) => warnings.push(format!("failed to decode GPT diagnostics: {error}")),
+            },
+            Ok(Err(error)) => warnings.push(format!("failed to evaluate GPT diagnostics: {error}")),
+            Err(_) => warnings.push("timed out evaluating GPT diagnostics".to_string()),
+        }
     }
 
-    let links: Vec<CollectedLink> = match page.evaluate(LINKS_SCRIPT).await {
-        Ok(result) => result.into_value().unwrap_or_default(),
-        Err(_) => Vec::new(),
-    };
+    let links: Vec<CollectedLink> =
+        match timeout(PAGE_OPERATION_TIMEOUT, page.evaluate(LINKS_SCRIPT)).await {
+            Ok(Ok(result)) => match result.into_value() {
+                Ok(links) => links,
+                Err(error) => {
+                    warnings.push(format!("failed to decode page links: {error}"));
+                    Vec::new()
+                }
+            },
+            Ok(Err(error)) => {
+                warnings.push(format!("failed to evaluate page links: {error}"));
+                Vec::new()
+            }
+            Err(_) => {
+                warnings.push("timed out evaluating page links".to_string());
+                Vec::new()
+            }
+        };
 
     // Sitemap discovery is a whole-site fact, so it runs once per crawl. A miss
     // is normal (no sitemap, robots 404, fetch blocked) and leaves planning to
     // the link graph alone.
     let mut sitemap_locs: Vec<String> = if discover_sitemap {
-        match page.evaluate(SITEMAP_SCRIPT).await {
-            Ok(result) => result.into_value().unwrap_or_default(),
-            Err(_) => Vec::new(),
+        let evaluation = chromiumoxide::cdp::js_protocol::runtime::CallFunctionOnParams::builder()
+            .function_declaration(SITEMAP_SCRIPT)
+            .await_promise(true)
+            .return_by_value(true)
+            .build()
+            .map_err(|error| {
+                report_error(format!("failed to build sitemap evaluation: {error}"))
+            })?;
+        match timeout(PAGE_OPERATION_TIMEOUT, page.evaluate(evaluation)).await {
+            Ok(Ok(result)) => match result.into_value() {
+                Ok(locations) => locations,
+                Err(error) => {
+                    warnings.push(format!("failed to decode sitemap locations: {error}"));
+                    Vec::new()
+                }
+            },
+            Ok(Err(error)) => {
+                warnings.push(format!("failed to evaluate sitemap discovery: {error}"));
+                Vec::new()
+            }
+            Err(_) => {
+                warnings.push("timed out discovering sitemap locations".to_string());
+                Vec::new()
+            }
         }
     } else {
         Vec::new()
@@ -851,26 +915,36 @@ const GPT_SLOTS_SCRIPT: &str = r#"() => {
     }
 }"#;
 
-async fn wait_for_page_settle(page: &chromiumoxide::Page) -> CliResult<bool> {
-    let mut elapsed = Duration::ZERO;
+async fn wait_for_page_settle(
+    page: &chromiumoxide::Page,
+    quiet_target: Duration,
+    max_wait: Duration,
+) -> CliResult<bool> {
+    let start = std::time::Instant::now();
     let mut previous_count = None;
-    let mut stable_for = Duration::ZERO;
+    let mut quiet_since = None;
 
-    while elapsed < SETTLE_MAX_WAIT {
-        let ready_state: String = page
-            .evaluate("document.readyState")
-            .await
-            .map_err(|error| report_error(format!("failed to read document ready state: {error}")))?
-            .into_value()
-            .map_err(|error| {
-                report_error(format!("failed to decode document ready state: {error}"))
-            })?;
-        let resource_count: usize = page
-            .evaluate("performance.getEntriesByType('resource').length")
-            .await
-            .map_err(|error| report_error(format!("failed to read resource count: {error}")))?
-            .into_value()
-            .map_err(|error| report_error(format!("failed to decode resource count: {error}")))?;
+    while start.elapsed() < max_wait {
+        let ready_state: String =
+            timeout(PAGE_OPERATION_TIMEOUT, page.evaluate("document.readyState"))
+                .await
+                .map_err(|_| report_error("timed out reading document ready state"))?
+                .map_err(|error| {
+                    report_error(format!("failed to read document ready state: {error}"))
+                })?
+                .into_value()
+                .map_err(|error| {
+                    report_error(format!("failed to decode document ready state: {error}"))
+                })?;
+        let resource_count: usize = timeout(
+            PAGE_OPERATION_TIMEOUT,
+            page.evaluate("performance.getEntriesByType('resource').length"),
+        )
+        .await
+        .map_err(|_| report_error("timed out reading resource count"))?
+        .map_err(|error| report_error(format!("failed to read resource count: {error}")))?
+        .into_value()
+        .map_err(|error| report_error(format!("failed to decode resource count: {error}")))?;
 
         // Accept `interactive` as well as `complete`: ad-heavy pages often never
         // reach `complete` (the `load` event never fires), but their GPT slots
@@ -878,19 +952,28 @@ async fn wait_for_page_settle(page: &chromiumoxide::Page) -> CliResult<bool> {
         // `interactive` is a valid settle signal for the slot scrape.
         if ready_state == "complete" || ready_state == "interactive" {
             if previous_count == Some(resource_count) {
-                stable_for += SETTLE_POLL_INTERVAL;
+                let quiet_start = quiet_since.get_or_insert_with(std::time::Instant::now);
+                if quiet_start.elapsed() >= quiet_target {
+                    return Ok(true);
+                }
             } else {
-                stable_for = Duration::ZERO;
+                quiet_since = None;
             }
-
-            if stable_for >= SETTLE_QUIET_PERIOD {
-                return Ok(true);
-            }
+        } else {
+            quiet_since = None;
         }
 
         previous_count = Some(resource_count);
-        sleep(SETTLE_POLL_INTERVAL).await;
-        elapsed += SETTLE_POLL_INTERVAL;
+        let remaining_max = max_wait.saturating_sub(start.elapsed());
+        let remaining_quiet = quiet_since
+            .map(|quiet_start| quiet_target.saturating_sub(quiet_start.elapsed()))
+            .unwrap_or(quiet_target);
+        sleep(
+            SETTLE_POLL_INTERVAL
+                .min(remaining_max)
+                .min(remaining_quiet.max(Duration::from_millis(1))),
+        )
+        .await;
     }
 
     Ok(false)
@@ -927,64 +1010,6 @@ fn is_successful_navigation_status(status: i64) -> bool {
 fn resource_timing_buffer_warning(resource_count: usize) -> Option<&'static str> {
     (resource_count >= RESOURCE_TIMING_BUFFER_WARNING_THRESHOLD)
         .then_some(RESOURCE_TIMING_BUFFER_WARNING)
-}
-
-fn find_browser_executable() -> CliResult<PathBuf> {
-    for candidate in browser_executable_path_candidates() {
-        if let Ok(path) = which(candidate) {
-            return Ok(path);
-        }
-    }
-
-    for candidate in browser_executable_fallbacks() {
-        let candidate_path = Path::new(candidate);
-        if candidate_path.is_file() {
-            return Ok(candidate_path.to_path_buf());
-        }
-    }
-
-    Err(report_error(
-        "Chrome/Chromium was not found on PATH or in the standard local install locations checked by `ts audit`. Install a local Chrome or Chromium binary before running `ts audit`.",
-    ))
-}
-
-fn browser_executable_path_candidates() -> &'static [&'static str] {
-    &[
-        "google-chrome",
-        "google-chrome-stable",
-        "chromium",
-        "chromium-browser",
-        "chrome",
-        "Google Chrome",
-        "Google Chrome for Testing",
-    ]
-}
-
-fn browser_executable_fallbacks() -> &'static [&'static str] {
-    #[cfg(target_os = "macos")]
-    {
-        &[
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
-            "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
-        ]
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        &[
-            "/usr/bin/google-chrome",
-            "/usr/bin/google-chrome-stable",
-            "/usr/bin/chromium",
-            "/usr/bin/chromium-browser",
-            "/snap/bin/chromium",
-        ]
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        &[]
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1049,7 +1074,7 @@ mod tests {
 
     #[test]
     fn browser_path_candidates_include_common_names() {
-        let candidates = browser_executable_path_candidates();
+        let candidates = crate::commands::audit::browser::CHROME_NAMES;
 
         assert!(candidates.contains(&"google-chrome"));
         assert!(candidates.contains(&"chromium"));

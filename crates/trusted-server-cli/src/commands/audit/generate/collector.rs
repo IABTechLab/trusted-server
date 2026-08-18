@@ -10,6 +10,9 @@ use crate::error::CliResult;
 pub(crate) type PageSink<'a> =
     &'a mut dyn FnMut(&Url, CliResult<CollectedPage>) -> CliResult<ControlFlow>;
 
+/// Plans follow-up URLs from the successfully collected root page.
+pub(crate) type RootPlanner<'a> = &'a mut dyn FnMut(&Url, &CollectedPage) -> CliResult<Vec<Url>>;
+
 /// Whether a batch crawl should keep going after a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ControlFlow {
@@ -59,6 +62,26 @@ pub(crate) trait AuditCollector {
             }
         }
         Ok(())
+    }
+
+    /// Collects a root and follow-up URLs planned from it in one logical crawl.
+    ///
+    /// The browser implementation overrides this so planning happens while the
+    /// root's browser/profile remains open. Simple collectors retain equivalent
+    /// behavior through the default implementation.
+    fn collect_site(
+        &self,
+        root: &Url,
+        cookies: &[(String, String)],
+        planner: RootPlanner<'_>,
+        on_page: PageSink<'_>,
+    ) -> CliResult<()> {
+        let root_page = self.collect_page(root, cookies)?;
+        let targets = planner(root, &root_page)?;
+        if on_page(root, Ok(root_page))? == ControlFlow::Stop {
+            return Ok(());
+        }
+        self.collect_pages(&targets, cookies, on_page)
     }
 }
 

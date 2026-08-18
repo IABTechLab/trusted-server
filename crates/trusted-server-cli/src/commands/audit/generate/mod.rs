@@ -534,7 +534,7 @@ pub(crate) fn run_update_slots(
     collectors: &[(&str, &dyn AuditCollector)],
     out: &mut dyn Write,
 ) -> CliResult<()> {
-    let Some((_, first_collector)) = collectors.first() else {
+    let Some((first_label, first_collector)) = collectors.first() else {
         return cli_error("no device profile was selected to audit with");
     };
     let target_url = parse_audit_url(request.url)?;
@@ -545,29 +545,63 @@ pub(crate) fn run_update_slots(
         ))
     })?;
 
-    let root = first_collector.collect_page(&target_url, request.cookies)?;
-    let root_url = root.final_url().unwrap_or_else(|_| target_url.clone());
     let mut table = evidence::EvidenceTable::default();
     let mut notes = Vec::new();
-    fold_collected(&mut table, &root_url, &root, &mut notes)?;
+    let mut root_url = target_url.clone();
+    let mut planned = None;
+    let mut fold_error = None;
 
-    // One page per section is enough: ad slots repeat per section, so the crawl
-    // is sized by the publisher's taxonomy rather than its catalogue.
-    let plan = crawl_plan::plan_crawl(&root_url, &root.links, &root.sitemap_locs, request.budget);
+    first_collector.collect_site(
+        &target_url,
+        request.cookies,
+        &mut |_, root| {
+            root_url = root.final_url().unwrap_or_else(|_| target_url.clone());
+            let plan =
+                crawl_plan::plan_crawl(&root_url, &root.links, &root.sitemap_locs, request.budget);
+            let targets = plan.targets();
+            planned = Some(plan);
+            Ok(targets)
+        },
+        &mut |url, collected| {
+            match collected {
+                Ok(page) => {
+                    let final_url = page.final_url().unwrap_or_else(|_| url.clone());
+                    if let Err(error) = fold_collected(&mut table, &final_url, &page, &mut notes) {
+                        fold_error = Some(error);
+                        return Ok(collector::ControlFlow::Stop);
+                    }
+                }
+                Err(error) => {
+                    fold_error = Some(error);
+                    return Ok(collector::ControlFlow::Stop);
+                }
+            }
+            Ok(collector::ControlFlow::Continue)
+        },
+    )?;
+    if let Some(error) = fold_error {
+        return Err(error);
+    }
+    let plan = planned.ok_or_else(|| {
+        report_error(format!(
+            "the {first_label} browser session did not produce a root page"
+        ))
+    })?;
     notes.extend(plan.notes.iter().cloned());
 
     // Every profile walks the same pages into the same table. When two profiles
     // disagree about a slot's ad-unit path, that shows up as two observations of
     // one page, which inference already refuses to represent.
-    for (index, (label, collector)) in collectors.iter().enumerate() {
-        if index > 0 {
-            let repeat = collector.collect_page(&root_url, request.cookies);
-            match repeat {
-                Ok(page) => fold_collected(&mut table, &root_url, &page, &mut notes)?,
-                Err(error) => notes.push(format!("skipped `{root_url}` on {label}: {error}")),
-            }
-        }
-        crawl_sections(*collector, &plan, request.cookies, &mut table, &mut notes)?;
+    for (label, collector) in collectors.iter().skip(1) {
+        crawl_sections(
+            *collector,
+            &root_url,
+            &plan,
+            request.cookies,
+            &mut table,
+            &mut notes,
+            label,
+        )?;
     }
     if collectors.len() > 1 {
         notes.push(format!(
@@ -772,20 +806,26 @@ fn fold_collected(
 /// of them failed that the result is untrustworthy.
 fn crawl_sections(
     collector: &dyn AuditCollector,
+    root_url: &Url,
     plan: &crawl_plan::CrawlPlan,
     cookies: &[(String, String)],
     table: &mut evidence::EvidenceTable,
     notes: &mut Vec<String>,
+    profile_label: &str,
 ) -> CliResult<()> {
-    let targets = plan.targets();
-    if targets.is_empty() {
+    let additional_targets = plan.targets();
+    if additional_targets.is_empty() {
         notes.push(
             "no additional site sections were discovered, so only the requested page was \
              audited; pass explicit --page-pattern values or more URLs to widen coverage"
                 .to_string(),
         );
-        return Ok(());
     }
+    // The root is deliberately part of every profile's shared batch: browser
+    // clearance/session state established there then carries into section pages.
+    let mut targets = Vec::with_capacity(additional_targets.len() + 1);
+    targets.push(root_url.clone());
+    targets.extend(additional_targets);
 
     let mut fold_error = None;
     collector.collect_pages(&targets, cookies, &mut |url, collected| {
@@ -797,7 +837,7 @@ fn crawl_sections(
                     return Ok(collector::ControlFlow::Stop);
                 }
             }
-            Err(error) => notes.push(format!("skipped `{url}`: {error}")),
+            Err(error) => notes.push(format!("skipped `{url}` on {profile_label}: {error}")),
         }
         Ok(collector::ControlFlow::Continue)
     })?;

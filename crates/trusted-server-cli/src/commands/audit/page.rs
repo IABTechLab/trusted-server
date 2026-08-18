@@ -29,6 +29,7 @@ pub(crate) struct PageAuditArgs {
 ///
 /// Returns a user-facing string when the browser cannot collect the page.
 pub(crate) fn run_page(args: &PageAuditArgs) -> Result<(), String> {
+    args.browser.validate()?;
     run_with_collector(
         &BrowserCollector::from_opts(&args.browser),
         &args.url,
@@ -37,7 +38,7 @@ pub(crate) fn run_page(args: &PageAuditArgs) -> Result<(), String> {
 }
 
 fn run_with_collector(
-    collector: &BrowserCollector,
+    collector: &dyn AuditCollector,
     url: &url::Url,
     scroll: bool,
 ) -> Result<(), String> {

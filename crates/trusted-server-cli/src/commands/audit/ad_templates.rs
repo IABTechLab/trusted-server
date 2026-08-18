@@ -36,6 +36,7 @@ use crate::run::RunOutcome;
 /// Returns a user-facing string when config loading fails, or when verification
 /// surfaces a page-level error or a `--strict` failure (after writing output).
 pub(crate) fn run_verify(args: &AuditAdTemplatesVerifyArgs) -> Result<RunOutcome, String> {
+    args.browser.validate()?;
     let loaded = crate::app_config::load_settings(&args.config)?;
     let collector = crate::commands::audit::browser::BrowserCollector::from_opts(&args.browser);
     let report = build_report(
@@ -93,20 +94,24 @@ fn build_report(
 ) -> VerificationReport {
     let init_script = build_init_script(creative);
 
-    let mut pages = Vec::with_capacity(urls.len());
-    let mut any_error = false;
-    let mut any_strict_fail = false;
-
-    for url in urls {
-        let request = BrowserCollectRequest {
+    let requests: Vec<_> = urls
+        .iter()
+        .map(|url| BrowserCollectRequest {
             url: url.clone(),
             init_scripts: init_script.clone().into_iter().collect(),
             scroll: options.scroll,
             collect_ad_evidence: true,
             cookies: cookies.to_vec(),
-        };
+        })
+        .collect();
+    let collected_pages = collector.collect_pages(&requests);
 
-        match collector.collect_page(request) {
+    let mut pages = Vec::with_capacity(urls.len());
+    let mut any_error = false;
+    let mut any_strict_fail = false;
+
+    for (url, collected) in urls.iter().zip(collected_pages) {
+        match collected {
             Err(message) => {
                 any_error = true;
                 pages.push(error_page(url, &message));
@@ -143,7 +148,23 @@ fn build_report(
 
 /// Whether navigation left the requested URL's origin (scheme, host, or port).
 fn origin_changed(requested: &url::Url, final_url: &url::Url) -> bool {
-    requested.origin() != final_url.origin()
+    if requested.host_str() != final_url.host_str() {
+        return true;
+    }
+
+    match (requested.scheme(), final_url.scheme()) {
+        ("http", "https") => {
+            requested.port_or_known_default() != Some(80)
+                || final_url.port_or_known_default() != Some(443)
+        }
+        (requested_scheme @ ("http" | "https"), final_scheme)
+            if requested_scheme == final_scheme =>
+        {
+            requested.port_or_known_default() != final_url.port_or_known_default()
+        }
+        // Refuse HTTPS downgrades and any unexpected scheme transition.
+        _ => true,
+    }
 }
 
 /// Builds the read-only collector init script from the configured slots.
@@ -518,6 +539,7 @@ fn write_err(error: io::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashMap;
 
     use super::*;
@@ -526,6 +548,7 @@ mod tests {
 
     struct FakeCollector {
         pages: HashMap<String, Result<CollectedPage, String>>,
+        batch_calls: Cell<usize>,
     }
 
     impl FakeCollector {
@@ -542,7 +565,10 @@ mod tests {
                     ad_evidence: Some(evidence),
                 }),
             );
-            Self { pages }
+            Self {
+                pages,
+                batch_calls: Cell::new(0),
+            }
         }
 
         fn with_error(mut self, requested: &str, message: &str) -> Self {
@@ -558,6 +584,18 @@ mod tests {
                 .get(request.url.as_str())
                 .cloned()
                 .unwrap_or_else(|| Err(format!("no fake page for {}", request.url)))
+        }
+
+        fn collect_pages(
+            &self,
+            requests: &[BrowserCollectRequest],
+        ) -> Vec<Result<CollectedPage, String>> {
+            self.batch_calls.set(self.batch_calls.get() + 1);
+            requests
+                .iter()
+                .cloned()
+                .map(|request| self.collect_page(request))
+                .collect()
         }
     }
 
@@ -724,6 +762,45 @@ mod tests {
     }
 
     #[test]
+    fn same_host_http_to_https_upgrade_is_accepted() {
+        let collector = FakeCollector::page(
+            "http://www.example.com/news/story",
+            "https://www.example.com/news/story",
+            confirmed_news_evidence(),
+        );
+        let report = report_for(
+            &collector,
+            true,
+            true,
+            &["http://www.example.com/news/story"],
+        );
+
+        assert!(report.ok, "a default-port HTTPS upgrade should be accepted");
+    }
+
+    #[test]
+    fn downgrade_and_port_changes_are_rejected() {
+        for (requested, final_url) in [
+            (
+                "https://www.example.com/news/story",
+                "http://www.example.com/news/story",
+            ),
+            (
+                "https://www.example.com:8443/news/story",
+                "https://www.example.com:9443/news/story",
+            ),
+            (
+                "http://www.example.com:8080/news/story",
+                "https://www.example.com:8443/news/story",
+            ),
+        ] {
+            let collector = FakeCollector::page(requested, final_url, confirmed_news_evidence());
+            let report = report_for(&collector, true, true, &[requested]);
+            assert!(!report.ok, "redirect {requested} -> {final_url} must fail");
+        }
+    }
+
+    #[test]
     fn confirmed_page_is_ok_in_default_mode() {
         let collector = FakeCollector::page(
             "https://www.example.com/news/story",
@@ -865,6 +942,11 @@ mod tests {
         );
 
         assert!(!report.ok, "a page-level error sets ok=false");
+        assert_eq!(
+            collector.batch_calls.get(),
+            1,
+            "all verifier URLs should use one collector batch"
+        );
         let json = serde_json::to_value(&report).expect("should serialize");
         assert_eq!(json["pages"][1]["error"]["code"], "navigation_failed");
         assert!(json["pages"][1]["final_url"].is_null());

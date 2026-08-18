@@ -416,6 +416,69 @@ mod tests {
     }
 
     #[test]
+    fn audit_browser_options_are_shared_by_generate_and_verify() {
+        for mode in ["generate", "verify"] {
+            let args = parse(&[
+                "ts",
+                "audit",
+                "ad-templates",
+                mode,
+                "https://www.example.com/",
+                "--chrome",
+                "/tmp/test-chrome",
+                "--headful",
+                "--browser-proxy",
+                "127.0.0.1:8080",
+                "--no-assume-consent",
+                "--settle-quiet-ms",
+                "100",
+                "--settle-max-ms",
+                "200",
+            ]);
+            let Command::Audit(audit) = args.command else {
+                panic!("expected audit command");
+            };
+            let browser = match audit.command.expect("should parse audit subcommand") {
+                crate::commands::audit::AuditSubcommand::AdTemplates(
+                    crate::commands::audit::AuditAdTemplatesCommand::Generate(args),
+                ) => args.browser,
+                crate::commands::audit::AuditSubcommand::AdTemplates(
+                    crate::commands::audit::AuditAdTemplatesCommand::Verify(args),
+                ) => args.browser,
+                _ => panic!("expected ad-template mode"),
+            };
+            assert_eq!(browser.chrome, Some(PathBuf::from("/tmp/test-chrome")));
+            assert!(browser.headful);
+            assert!(browser.no_assume_consent);
+            assert_eq!(browser.browser_proxy.as_deref(), Some("127.0.0.1:8080"));
+            browser.validate().expect("should validate settle bounds");
+        }
+    }
+
+    #[test]
+    fn browser_settle_quiet_cannot_exceed_maximum() {
+        let args = parse(&[
+            "ts",
+            "audit",
+            "page",
+            "https://www.example.com/",
+            "--settle-quiet-ms",
+            "201",
+            "--settle-max-ms",
+            "200",
+        ]);
+        let Command::Audit(audit) = args.command else {
+            panic!("expected audit command");
+        };
+        let crate::commands::audit::AuditSubcommand::Page(page) =
+            audit.command.expect("should parse page subcommand")
+        else {
+            panic!("expected page audit");
+        };
+        assert!(page.browser.validate().is_err());
+    }
+
+    #[test]
     fn audit_ad_templates_without_verify_is_error() {
         assert!(Args::try_parse_from(["ts", "audit", "ad-templates"]).is_err());
     }

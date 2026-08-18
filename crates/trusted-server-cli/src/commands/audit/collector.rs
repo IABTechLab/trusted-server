@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 
 use crate::ad_templates::compare::BrowserAdEvidence;
 
@@ -21,6 +21,18 @@ pub struct BrowserOpts {
     /// auto-detection on `PATH` and standard install locations.
     #[arg(long)]
     pub chrome: Option<PathBuf>,
+    /// Browser device profile used for viewport and user-agent emulation.
+    #[arg(long = "browser-profile", value_enum, default_value_t = BrowserProfile::Desktop)]
+    pub profile: BrowserProfile,
+    /// Run a visible browser instead of Chrome's new headless mode.
+    #[arg(long)]
+    pub headful: bool,
+    /// Do not answer the standard IAB consent APIs for the fresh audit profile.
+    #[arg(long)]
+    pub no_assume_consent: bool,
+    /// Route the browser through this proxy, as `host:port` or a full URL.
+    #[arg(long, value_name = "HOST:PORT")]
+    pub browser_proxy: Option<String>,
     /// Quiet window in milliseconds (no new network resources) that marks the
     /// page settled.
     #[arg(long, default_value_t = 750)]
@@ -37,6 +49,29 @@ pub struct BrowserOpts {
     /// known self-signed certificate.
     #[arg(long)]
     pub danger_accept_invalid_certs: bool,
+}
+
+/// Browser device profile shared by page audits and ad-template verification.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum BrowserProfile {
+    /// Desktop Chrome at 1280×800.
+    #[default]
+    Desktop,
+    /// Mobile-sized viewport with a mobile user agent.
+    Mobile,
+}
+
+impl BrowserOpts {
+    /// Validates relationships between independently parsed browser flags.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.settle_quiet_ms > self.settle_max_ms {
+            return Err(format!(
+                "--settle-quiet-ms ({}) cannot exceed --settle-max-ms ({})",
+                self.settle_quiet_ms, self.settle_max_ms
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// A request to collect a single page.
@@ -85,6 +120,22 @@ pub trait AuditCollector {
     /// Returns a user-facing string when the browser cannot be launched or the
     /// navigation fails before any result can be produced.
     fn collect_page(&self, request: BrowserCollectRequest) -> Result<CollectedPage, String>;
+
+    /// Collects several pages, preserving request order.
+    ///
+    /// Browser-backed implementations override this to reuse one runtime,
+    /// browser, and profile. The default keeps in-memory test collectors and
+    /// other simple implementations source-compatible.
+    fn collect_pages(
+        &self,
+        requests: &[BrowserCollectRequest],
+    ) -> Vec<Result<CollectedPage, String>> {
+        requests
+            .iter()
+            .cloned()
+            .map(|request| self.collect_page(request))
+            .collect()
+    }
 }
 
 /// Configuration handed to the read-only ad-template collector script.

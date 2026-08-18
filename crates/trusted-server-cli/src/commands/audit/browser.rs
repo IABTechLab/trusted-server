@@ -11,28 +11,33 @@ use std::time::Duration;
 
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::network::CookieParam;
+use chromiumoxide::handler::viewport::Viewport;
 use chromiumoxide::page::Page;
 use futures::StreamExt as _;
 
 use crate::ad_templates::compare::BrowserAdEvidence;
 use crate::ad_templates::output::Warning;
 use crate::commands::audit::collector::{
-    AuditCollector, BrowserCollectRequest, BrowserOpts, CollectedPage,
+    AuditCollector, BrowserCollectRequest, BrowserOpts, BrowserProfile, CollectedPage,
 };
 
 /// Candidate Chrome/Chromium executable names searched on `PATH`.
-const CHROME_NAMES: &[&str] = &[
+pub(crate) const CHROME_NAMES: &[&str] = &[
     "google-chrome",
     "google-chrome-stable",
     "chromium",
     "chromium-browser",
     "chrome",
+    "Google Chrome",
+    "Google Chrome for Testing",
 ];
 
 /// Poll interval while waiting for the page network to settle, in milliseconds.
 const SETTLE_POLL_MS: u64 = 250;
 /// Hard cap on page navigation so a stalled load cannot hang the audit.
 const NAVIGATION_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound for each CDP operation after navigation.
+const CDP_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Hard cap per decoded evidence list, mirroring the collector script's
 /// `__ts_max_entries`, so a hostile page cannot inflate CLI memory.
 const MAX_EVIDENCE_ENTRIES: usize = 1024;
@@ -65,6 +70,14 @@ pub struct BrowserCollector {
     settle_max: Duration,
     /// Navigate to origins with invalid TLS certificates (dangerous opt-in).
     accept_invalid_certs: bool,
+    /// Run visible Chrome rather than new headless Chrome.
+    headful: bool,
+    /// Install the standard consent API stub before publisher scripts.
+    assume_consent: bool,
+    /// Optional browser proxy endpoint.
+    proxy: Option<String>,
+    /// Device viewport/user-agent profile.
+    profile: BrowserProfile,
 }
 
 impl Default for BrowserCollector {
@@ -82,6 +95,10 @@ impl BrowserCollector {
             settle_quiet: Duration::from_millis(DEFAULT_SETTLE_QUIET_MS),
             settle_max: Duration::from_millis(DEFAULT_SETTLE_MAX_MS),
             accept_invalid_certs: false,
+            headful: false,
+            assume_consent: true,
+            proxy: None,
+            profile: BrowserProfile::Desktop,
         }
     }
 
@@ -93,7 +110,91 @@ impl BrowserCollector {
             settle_quiet: Duration::from_millis(opts.settle_quiet_ms),
             settle_max: Duration::from_millis(opts.settle_max_ms),
             accept_invalid_certs: opts.danger_accept_invalid_certs,
+            headful: opts.headful,
+            assume_consent: !opts.no_assume_consent,
+            proxy: opts.browser_proxy.clone(),
+            profile: opts.profile,
         }
+    }
+}
+
+/// Pre-document consent behavior shared with the generation crawler.
+pub(crate) const CONSENT_STUB_SCRIPT: &str = include_str!("consent_stub.js");
+
+/// Shared browser launch inputs used by both audit collectors.
+pub(crate) struct BrowserLaunchOptions<'a> {
+    pub(crate) chrome: &'a std::path::Path,
+    pub(crate) profile_dir: &'a std::path::Path,
+    pub(crate) headful: bool,
+    pub(crate) proxy: Option<&'a str>,
+    pub(crate) accept_invalid_certs: bool,
+    pub(crate) viewport: Viewport,
+    pub(crate) user_agent: Option<&'a str>,
+}
+
+/// Builds the common Chrome configuration for all browser-backed audits.
+pub(crate) fn build_browser_config(
+    options: BrowserLaunchOptions<'_>,
+) -> Result<BrowserConfig, String> {
+    let mut builder = BrowserConfig::builder()
+        .chrome_executable(options.chrome)
+        .user_data_dir(options.profile_dir);
+    if !options.accept_invalid_certs {
+        builder = builder.respect_https_errors();
+    }
+    if let Some(proxy) = options.proxy {
+        let endpoint = if proxy.contains("://") {
+            proxy.to_string()
+        } else {
+            format!("http://{proxy}")
+        };
+        builder = builder
+            .arg(("proxy-server", endpoint.as_str()))
+            .arg(("proxy-bypass-list", "<-loopback>"));
+    }
+    builder = if options.headful {
+        builder.with_head()
+    } else {
+        builder.new_headless_mode()
+    };
+    builder = builder
+        .window_size(options.viewport.width, options.viewport.height)
+        .viewport(options.viewport);
+    if let Some(user_agent) = options.user_agent {
+        builder = builder.arg(("user-agent", user_agent));
+    }
+    builder
+        .build()
+        .map_err(|error| format!("failed to build browser config: {error}"))
+}
+
+fn browser_profile(profile: BrowserProfile) -> (Viewport, Option<&'static str>) {
+    match profile {
+        BrowserProfile::Desktop => (
+            Viewport {
+                width: 1280,
+                height: 800,
+                device_scale_factor: Some(1.0),
+                emulating_mobile: false,
+                is_landscape: true,
+                has_touch: false,
+            },
+            None,
+        ),
+        BrowserProfile::Mobile => (
+            Viewport {
+                width: 390,
+                height: 844,
+                device_scale_factor: Some(3.0),
+                emulating_mobile: true,
+                is_landscape: false,
+                has_touch: true,
+            },
+            Some(
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) \
+                 AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            ),
+        ),
     }
 }
 
@@ -101,7 +202,9 @@ impl BrowserCollector {
 ///
 /// Precedence: explicit `--chrome` override, then the `CHROME` environment
 /// variable, then auto-detection on `PATH` and standard install locations.
-fn resolve_chrome(override_path: Option<&std::path::Path>) -> Result<std::path::PathBuf, String> {
+pub(crate) fn resolve_chrome(
+    override_path: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf, String> {
     if let Some(path) = override_path {
         return if path.is_file() {
             Ok(path.to_path_buf())
@@ -121,6 +224,17 @@ fn resolve_chrome(override_path: Option<&std::path::Path>) -> Result<std::path::
         };
     }
     find_chrome()
+}
+
+/// Builds a host-only cookie that applies to every path on `url`'s host.
+pub(crate) fn host_cookie(name: &str, value: &str, url: &url::Url) -> Result<CookieParam, String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| format!("cannot scope cookie `{name}` because {} has no host", url))?;
+    let mut cookie = CookieParam::new(name.to_string(), value.to_string());
+    cookie.domain = Some(host.to_string());
+    cookie.path = Some("/".to_string());
+    Ok(cookie)
 }
 
 /// Auto-detects a Chrome/Chromium executable.
@@ -192,15 +306,42 @@ fn well_known_chrome_paths() -> Vec<std::path::PathBuf> {
 
 impl AuditCollector for BrowserCollector {
     fn collect_page(&self, request: BrowserCollectRequest) -> Result<CollectedPage, String> {
-        // HTTP(S) scheme is enforced by the CLI value parser before we get here.
-        let chrome = resolve_chrome(self.chrome.as_deref())?;
-        let profile = tempfile::tempdir()
-            .map_err(|error| format!("failed to create browser profile dir: {error}"))?;
+        self.collect_pages(std::slice::from_ref(&request))
+            .into_iter()
+            .next()
+            .expect("should return one result for one browser request")
+    }
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
+    fn collect_pages(
+        &self,
+        requests: &[BrowserCollectRequest],
+    ) -> Vec<Result<CollectedPage, String>> {
+        if requests.is_empty() {
+            return Vec::new();
+        }
+        // HTTP(S) scheme is enforced by the CLI value parser before we get here.
+        let chrome = match resolve_chrome(self.chrome.as_deref()) {
+            Ok(chrome) => chrome,
+            Err(error) => return vec![Err(error); requests.len()],
+        };
+        let profile = match tempfile::tempdir() {
+            Ok(profile) => profile,
+            Err(error) => {
+                let error = format!("failed to create browser profile dir: {error}");
+                return vec![Err(error); requests.len()];
+            }
+        };
+
+        let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|error| format!("failed to build browser runtime: {error}"))?;
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let error = format!("failed to build browser runtime: {error}");
+                return vec![Err(error); requests.len()];
+            }
+        };
 
         let settle = SettleConfig {
             quiet: self.settle_quiet,
@@ -213,18 +354,31 @@ impl AuditCollector for BrowserCollector {
         let previous_level = log::max_level();
         log::set_max_level(log::LevelFilter::Error);
         let accept_invalid_certs = self.accept_invalid_certs;
+        let headful = self.headful;
+        let assume_consent = self.assume_consent;
+        let proxy = self.proxy.clone();
+        let browser_profile = self.profile;
+        let request_count = requests.len();
+        let requests = requests.to_vec();
         let result = runtime.block_on(async move {
             collect(
                 &chrome,
                 profile.path(),
-                request,
+                requests,
                 settle,
                 accept_invalid_certs,
+                headful,
+                assume_consent,
+                proxy.as_deref(),
+                browser_profile,
             )
             .await
         });
         log::set_max_level(previous_level);
-        result
+        match result {
+            Ok(results) => results,
+            Err(error) => vec![Err(error); request_count],
+        }
     }
 }
 
@@ -232,24 +386,29 @@ impl AuditCollector for BrowserCollector {
 async fn collect(
     chrome: &std::path::Path,
     profile_dir: &std::path::Path,
-    request: BrowserCollectRequest,
+    requests: Vec<BrowserCollectRequest>,
     settle_config: SettleConfig,
     accept_invalid_certs: bool,
-) -> Result<CollectedPage, String> {
+    headful: bool,
+    assume_consent: bool,
+    proxy: Option<&str>,
+    profile: BrowserProfile,
+) -> Result<Vec<Result<CollectedPage, String>>, String> {
     // chromiumoxide defaults to ignoring TLS errors. The audit sends
     // operator-supplied session cookies and treats what it reads back as
     // verification evidence, so a certificate-invalid impersonator could both
     // harvest the session and fabricate the evidence. Validate certificates
     // unless the operator explicitly opts out.
-    let mut builder = BrowserConfig::builder()
-        .chrome_executable(chrome)
-        .user_data_dir(profile_dir);
-    if !accept_invalid_certs {
-        builder = builder.respect_https_errors();
-    }
-    let config = builder
-        .build()
-        .map_err(|error| format!("failed to build browser config: {error}"))?;
+    let (viewport, user_agent) = browser_profile(profile);
+    let config = build_browser_config(BrowserLaunchOptions {
+        chrome,
+        profile_dir,
+        headful,
+        proxy,
+        accept_invalid_certs,
+        viewport,
+        user_agent,
+    })?;
 
     let (mut browser, mut handler) = Browser::launch(config)
         .await
@@ -258,7 +417,10 @@ async fn collect(
     // Drive the CDP event loop for the duration of the session.
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
-    let result = collect_with_browser(&browser, request, settle_config).await;
+    let mut results = Vec::with_capacity(requests.len());
+    for request in requests {
+        results.push(collect_with_browser(&browser, request, settle_config, assume_consent).await);
+    }
 
     // Best-effort teardown; ignore errors since we already have a result, but
     // bound it so a Chrome that ignores `close` cannot hang the command.
@@ -266,22 +428,63 @@ async fn collect(
     let _ = tokio::time::timeout(BROWSER_CLOSE_TIMEOUT, browser.wait()).await;
     handler_task.abort();
 
-    result
+    Ok(results)
 }
 
 async fn collect_with_browser(
     browser: &Browser,
     request: BrowserCollectRequest,
     settle_config: SettleConfig,
+    assume_consent: bool,
 ) -> Result<CollectedPage, String> {
-    let mut warnings = Vec::new();
-
     // Open a blank page first so init scripts are installed before the real
     // document loads (evaluate-on-new-document applies to subsequent navigations).
     let page = browser
         .new_page("about:blank")
         .await
         .map_err(|error| format!("failed to open browser page: {error}"))?;
+
+    let result = collect_open_page(&page, &request, settle_config, assume_consent).await;
+    let close_result = tokio::time::timeout(BROWSER_CLOSE_TIMEOUT, page.close()).await;
+
+    match (result, close_result) {
+        (Err(error), _) => Err(error),
+        (Ok(mut collected), Err(_)) => {
+            collected.warnings.push(Warning {
+                code: "page_close_timeout".to_string(),
+                message: "timed out closing the browser tab after collection".to_string(),
+            });
+            Ok(collected)
+        }
+        (Ok(mut collected), Ok(Err(error))) => {
+            collected.warnings.push(Warning {
+                code: "page_close_failed".to_string(),
+                message: format!("failed to close the browser tab after collection: {error}"),
+            });
+            Ok(collected)
+        }
+        (Ok(collected), Ok(Ok(_))) => Ok(collected),
+    }
+}
+
+/// Collects from an open tab. The caller owns tab teardown so every return path,
+/// including an error from this function, closes the page before continuing.
+async fn collect_open_page(
+    page: &Page,
+    request: &BrowserCollectRequest,
+    settle_config: SettleConfig,
+    assume_consent: bool,
+) -> Result<CollectedPage, String> {
+    let mut warnings = Vec::new();
+
+    if assume_consent {
+        page.evaluate_on_new_document(CONSENT_STUB_SCRIPT)
+            .await
+            .map_err(|error| format!("failed to install consent init script: {error}"))?;
+    }
+    page.evaluate_on_new_document("performance.setResourceTimingBufferSize(100000)")
+        .await
+        .map_err(|error| format!("failed to increase resource timing buffer: {error}"))?;
 
     for script in &request.init_scripts {
         page.evaluate_on_new_document(script.clone())
@@ -293,8 +496,7 @@ async fn collect_with_browser(
     // origin sees an authenticated session on the first request. Scoping each to
     // the request URL lets Chrome infer domain/path.
     for (name, value) in &request.cookies {
-        let mut cookie = CookieParam::new(name.clone(), value.clone());
-        cookie.url = Some(request.url.to_string());
+        let cookie = host_cookie(name, value, &request.url)?;
         page.set_cookie(cookie)
             .await
             .map_err(|error| format!("failed to set cookie `{name}`: {error}"))?;
@@ -304,36 +506,110 @@ async fn collect_with_browser(
         .await
         .map_err(|_| format!("navigation to {} timed out", request.url))?
         .map_err(|error| format!("failed to navigate to {}: {error}", request.url))?;
-    tokio::time::timeout(NAVIGATION_TIMEOUT, page.wait_for_navigation())
-        .await
-        .map_err(|_| format!("navigation to {} timed out", request.url))?
-        .map_err(|error| format!("failed to read main document navigation response: {error}"))?;
+    match tokio::time::timeout(NAVIGATION_TIMEOUT, page.wait_for_navigation()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => warnings.push(Warning {
+            code: "navigation_wait_failed".to_string(),
+            message: format!(
+                "navigation load event could not be read ({error}); continuing with settled page evidence"
+            ),
+        }),
+        Err(_) => warnings.push(Warning {
+            code: "navigation_wait_timeout".to_string(),
+            message: format!(
+                "navigation did not fire its load event within {} seconds; continuing with settled page evidence",
+                NAVIGATION_TIMEOUT.as_secs()
+            ),
+        }),
+    }
 
-    settle(&page, settle_config).await;
+    settle(page, settle_config, &mut warnings).await;
 
     if request.scroll {
         if request.collect_ad_evidence {
             // Snapshot evidence before scrolling so entries already present at
             // initial load keep phase "load"; the store dedups first-seen, so
             // the post-scroll scrape only adds genuinely scroll-phase entries.
-            let _ = page
-                .evaluate(
+            if tokio::time::timeout(
+                CDP_OPERATION_TIMEOUT,
+                page.evaluate(
                     "(typeof window.__tsCollectAdTemplateEvidence === 'function' \
                      && window.__tsCollectAdTemplateEvidence(), null)",
-                )
-                .await;
+                ),
+            )
+            .await
+            .is_err()
+            {
+                warnings.push(Warning {
+                    code: "ad_evidence_snapshot_timeout".to_string(),
+                    message: "timed out snapshotting ad evidence before scroll".to_string(),
+                });
+            }
         }
-        scroll_page(&page).await;
-        settle(&page, settle_config).await;
+        scroll_page(page, &mut warnings).await;
+        settle(page, settle_config, &mut warnings).await;
     }
 
-    let final_url = match page.url().await {
-        Ok(Some(url)) => url::Url::parse(&url).unwrap_or_else(|_| request.url.clone()),
-        _ => request.url.clone(),
+    let final_url_text = tokio::time::timeout(CDP_OPERATION_TIMEOUT, page.url())
+        .await
+        .map_err(|_| "timed out reading final page URL".to_string())?
+        .map_err(|error| format!("failed to read final page URL: {error}"))?
+        .ok_or_else(|| "browser page URL was empty after navigation".to_string())?;
+    let final_url = url::Url::parse(&final_url_text).map_err(|error| {
+        format!("browser returned invalid final URL `{final_url_text}`: {error}")
+    })?;
+    let title = match tokio::time::timeout(CDP_OPERATION_TIMEOUT, page.get_title()).await {
+        Ok(Ok(title)) => title.unwrap_or_default(),
+        Ok(Err(error)) => {
+            warnings.push(Warning {
+                code: "page_title_failed".to_string(),
+                message: format!("failed to read page title: {error}"),
+            });
+            String::new()
+        }
+        Err(_) => {
+            warnings.push(Warning {
+                code: "page_title_timeout".to_string(),
+                message: "timed out reading page title".to_string(),
+            });
+            String::new()
+        }
     };
-    let title = page.get_title().await.ok().flatten().unwrap_or_default();
-    let script_count = eval_usize(&page, "document.querySelectorAll('script').length").await;
-    let resource_count = resource_count(&page).await;
+    let script_count = eval_usize(page, "document.querySelectorAll('script').length")
+        .await
+        .unwrap_or_else(|message| {
+            warnings.push(Warning {
+                code: "script_count_failed".to_string(),
+                message,
+            });
+            0
+        });
+    let resource_count = resource_count(page).await.unwrap_or_else(|message| {
+        warnings.push(Warning {
+            code: "resource_count_failed".to_string(),
+            message,
+        });
+        0
+    });
+
+    if resource_count >= 250 {
+        warnings.push(Warning {
+            code: "resource_timing_heavy".to_string(),
+            message: format!("page recorded {resource_count} network resources"),
+        });
+    }
+
+    if let Ok(Ok(frames)) = tokio::time::timeout(CDP_OPERATION_TIMEOUT, page.frames()).await
+        && frames.len() > 1
+    {
+        warnings.push(Warning {
+            code: "child_frames_not_inspected".to_string(),
+            message: format!(
+                "ad-template evidence inspected only the main frame; {} child frame(s) were present",
+                frames.len() - 1
+            ),
+        });
+    }
 
     let ad_evidence = if request.collect_ad_evidence {
         extract_ad_evidence(&page, &mut warnings).await
@@ -356,54 +632,112 @@ async fn collect_with_browser(
 /// Polls the resource-entry count and returns once it stays unchanged for a
 /// quiet window, or when the hard cap elapses — so ad-heavy pages finish loading
 /// before evidence is read, without hanging on pages that never go idle.
-async fn settle(page: &Page, config: SettleConfig) {
+async fn settle(page: &Page, config: SettleConfig, warnings: &mut Vec<Warning>) {
     let start = std::time::Instant::now();
-    let quiet_target = config.quiet;
-    let max = config.max;
-    let mut last = resource_count(page).await;
-    let mut quiet = Duration::ZERO;
-    while start.elapsed() < max {
-        tokio::time::sleep(Duration::from_millis(SETTLE_POLL_MS)).await;
-        let current = resource_count(page).await;
-        if current == last {
-            quiet += Duration::from_millis(SETTLE_POLL_MS);
-            if quiet >= quiet_target {
-                break;
+    let mut last = None;
+    let mut quiet_since = None;
+
+    loop {
+        if start.elapsed() >= config.max {
+            warnings.push(Warning {
+                code: "settle_timeout".to_string(),
+                message: "page did not settle before the configured maximum wait".to_string(),
+            });
+            return;
+        }
+
+        let ready_state = match eval_string(page, "document.readyState").await {
+            Ok(state) => state,
+            Err(message) => {
+                warnings.push(Warning {
+                    code: "settle_read_failed".to_string(),
+                    message,
+                });
+                return;
+            }
+        };
+        let current = match resource_count(page).await {
+            Ok(count) => count,
+            Err(message) => {
+                warnings.push(Warning {
+                    code: "settle_read_failed".to_string(),
+                    message,
+                });
+                return;
+            }
+        };
+        let ready = matches!(ready_state.as_str(), "interactive" | "complete");
+        if ready && last == Some(current) {
+            let quiet_start = quiet_since.get_or_insert_with(std::time::Instant::now);
+            if quiet_start.elapsed() >= config.quiet {
+                return;
             }
         } else {
-            quiet = Duration::ZERO;
-            last = current;
+            quiet_since = None;
         }
+        last = Some(current);
+
+        let remaining_max = config.max.saturating_sub(start.elapsed());
+        let remaining_quiet = quiet_since
+            .map(|quiet_start| config.quiet.saturating_sub(quiet_start.elapsed()))
+            .unwrap_or(config.quiet);
+        let sleep_for = Duration::from_millis(SETTLE_POLL_MS)
+            .min(remaining_max)
+            .min(remaining_quiet.max(Duration::from_millis(1)));
+        tokio::time::sleep(sleep_for).await;
     }
 }
 
 /// Reads the number of resource timing entries observed so far.
-async fn resource_count(page: &Page) -> usize {
+async fn resource_count(page: &Page) -> Result<usize, String> {
     eval_usize(page, "performance.getEntriesByType('resource').length").await
 }
 
 /// Performs a deterministic stepped scroll to trigger lazy ad loading.
-async fn scroll_page(page: &Page) {
+async fn scroll_page(page: &Page, warnings: &mut Vec<Warning>) {
     // Mark subsequent observations as scroll-phase for the collector.
-    let _ = page.evaluate("window.__tsScrollPhase = true").await;
+    eval_discard(page, "window.__tsScrollPhase = true", warnings).await;
     for fraction in ["0.33", "0.66", "1"] {
         let script = format!(
             "window.scrollTo(0, Math.floor(Math.max(document.body.scrollHeight, \
              document.documentElement.scrollHeight) * {fraction}))"
         );
-        let _ = page.evaluate(script).await;
+        eval_discard(page, script, warnings).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    let _ = page.evaluate("window.scrollTo(0, 0)").await;
+    eval_discard(page, "window.scrollTo(0, 0)", warnings).await;
 }
 
-/// Evaluates a numeric expression, returning 0 on any failure.
-async fn eval_usize(page: &Page, expression: &str) -> usize {
-    page.evaluate(expression)
+async fn eval_discard(page: &Page, expression: impl Into<String>, warnings: &mut Vec<Warning>) {
+    match tokio::time::timeout(CDP_OPERATION_TIMEOUT, page.evaluate(expression.into())).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => warnings.push(Warning {
+            code: "page_evaluation_failed".to_string(),
+            message: format!("browser page evaluation failed: {error}"),
+        }),
+        Err(_) => warnings.push(Warning {
+            code: "page_evaluation_timeout".to_string(),
+            message: "browser page evaluation timed out".to_string(),
+        }),
+    }
+}
+
+async fn eval_usize(page: &Page, expression: &str) -> Result<usize, String> {
+    tokio::time::timeout(CDP_OPERATION_TIMEOUT, page.evaluate(expression))
         .await
-        .ok()
-        .and_then(|result| result.into_value::<usize>().ok())
-        .unwrap_or(0)
+        .map_err(|_| format!("timed out evaluating `{expression}`"))?
+        .map_err(|error| format!("failed to evaluate `{expression}`: {error}"))?
+        .into_value::<usize>()
+        .map_err(|error| format!("failed to decode `{expression}`: {error}"))
+}
+
+async fn eval_string(page: &Page, expression: &str) -> Result<String, String> {
+    tokio::time::timeout(CDP_OPERATION_TIMEOUT, page.evaluate(expression))
+        .await
+        .map_err(|_| format!("timed out evaluating `{expression}`"))?
+        .map_err(|error| format!("failed to evaluate `{expression}`: {error}"))?
+        .into_value::<String>()
+        .map_err(|error| format!("failed to decode `{expression}`: {error}"))
 }
 
 /// Reads and decodes `window.__tsAdTemplateEvidence`, warning (not failing) on a
@@ -414,8 +748,9 @@ async fn extract_ad_evidence(
 ) -> Option<BrowserAdEvidence> {
     // Serialize and size-check in the page so a hostile publisher-controlled
     // evidence object cannot force an unbounded CDP response and Rust decode.
-    let envelope = page
-        .evaluate(format!(
+    let evaluation = tokio::time::timeout(
+        CDP_OPERATION_TIMEOUT,
+        page.evaluate(format!(
             r#"(() => {{
                     const evidence = typeof window.__tsCollectAdTemplateEvidence === 'function'
                         ? window.__tsCollectAdTemplateEvidence()
@@ -433,10 +768,36 @@ async fn extract_ad_evidence(
                         }}
                     }}
                 }})()"#
-        ))
-        .await
-        .ok()
-        .and_then(|result| result.into_value::<EvidenceEnvelope>().ok());
+        )),
+    )
+    .await;
+
+    let envelope = match evaluation {
+        Ok(Ok(result)) => match result.into_value::<EvidenceEnvelope>() {
+            Ok(envelope) => Some(envelope),
+            Err(error) => {
+                warnings.push(Warning {
+                    code: "ad_evidence_decode_failed".to_string(),
+                    message: format!("failed to decode ad-template evidence envelope: {error}"),
+                });
+                return None;
+            }
+        },
+        Ok(Err(error)) => {
+            warnings.push(Warning {
+                code: "ad_evidence_read_failed".to_string(),
+                message: format!("failed to read ad-template evidence: {error}"),
+            });
+            return None;
+        }
+        Err(_) => {
+            warnings.push(Warning {
+                code: "ad_evidence_read_timeout".to_string(),
+                message: "timed out reading ad-template evidence".to_string(),
+            });
+            return None;
+        }
+    };
 
     match envelope {
         Some(envelope) => decode_ad_evidence_envelope(envelope, warnings),
@@ -541,6 +902,20 @@ mod tests {
         assert!(evidence.is_none());
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].code, "ad_evidence_too_large");
+    }
+
+    #[test]
+    fn supplied_cookie_is_host_only_and_root_scoped() {
+        let url =
+            url::Url::parse("https://publisher.example/news/story").expect("should parse test URL");
+        let cookie = host_cookie("clearance", "token", &url).expect("should build cookie");
+
+        assert_eq!(cookie.domain.as_deref(), Some("publisher.example"));
+        assert_eq!(cookie.path.as_deref(), Some("/"));
+        assert!(
+            cookie.url.is_none(),
+            "domain/path and URL must not be combined"
+        );
     }
 
     /// A self-contained page that stubs just enough of GPT (no network) for the
