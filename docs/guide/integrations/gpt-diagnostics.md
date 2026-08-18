@@ -45,10 +45,10 @@ and non-storeable.
 
 ### Auction correlation token
 
-Enabling the integration has one server-side effect that does not depend on browser
-activation. For each server-side auction that produced winning bids, Trusted Server
-mints a fresh correlation token and publishes it as `hb_auction_id` on each winning bid
-in `window.tsjs.bids`:
+Enabling the integration has one further server-side effect, beyond module
+availability, that does not depend on browser activation. For each server-side auction
+that produced winning bids, Trusted Server mints a fresh correlation token and publishes
+it as `hb_auction_id` on each winning bid in `window.tsjs.bids`:
 
 ```text
 ts-auc-2f8c1d5a4b7e4c0f9a3d6b1e8c5f2a7d
@@ -202,22 +202,22 @@ that acknowledgement is outside the zero-publisher-change design.
 
 The derived `delivery` value uses these evidence-safe meanings:
 
-| Delivery state                 | Panel wording                                                                                      |
-| ------------------------------ | -------------------------------------------------------------------------------------------------- |
-| `trusted_server_response_sent` | Trusted Server selected; markup response sent to PUC                                               |
-| `trusted_server_selected`      | Trusted Server selected; no markup response confirmed                                              |
-| `candidate_unconfirmed`        | Trusted Server candidate unconfirmed — another GAM result or a creative/bridge failure is possible |
-| `no_candidate`                 | adInit observed no direct Trusted Server candidate for this request                                |
-| `unknown`                      | Delivery status unknown — required GPT or direct-candidate evidence was not observed               |
-| `pending`                      | Waiting for Trusted Server creative evidence                                                       |
-| `not_applicable`               | No delivery conclusion is displayed before render or for an explicitly empty result.               |
+| Delivery state                 | Panel wording                                                                                                                                               |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `trusted_server_response_sent` | Trusted Server selected; markup response sent to PUC                                                                                                        |
+| `trusted_server_selected`      | Trusted Server selected; no markup response confirmed                                                                                                       |
+| `candidate_unconfirmed`        | Trusted Server candidate unconfirmed — another GAM result or a creative/bridge failure is possible                                                          |
+| `no_candidate`                 | adInit observed no direct Trusted Server candidate for this request                                                                                         |
+| `unknown`                      | Delivery status unknown — required GPT or direct-candidate evidence was not observed                                                                        |
+| `pending`                      | Waiting for Trusted Server creative evidence                                                                                                                |
+| `not_applicable`               | No delivery conclusion is displayed before render or for an explicitly empty result, provided no Trusted Server creative evidence was stamped on the cycle. |
 
 For an explicit non-empty candidate, diagnostics wait five seconds from
 `slotRenderEnded` for positive creative evidence. If no matched PUC request arrives,
 the state becomes `candidate_unconfirmed`. Possible explanations include a different
 GAM result, targeting overwrite, PUC configuration or ID mismatch, and bridge failure;
-the missing request does not select among them. A late positive observation upgrades
-the state.
+the missing request does not select among them. A late positive observation inside the
+30-second attempt window upgrades the state.
 
 ### Creative-bridge failures
 
@@ -226,7 +226,7 @@ A matched creative attempt can report these safe, non-terminal categories:
 | Failure                 | Observed at the bridge                                                                         |
 | ----------------------- | ---------------------------------------------------------------------------------------------- |
 | `missing_render_source` | The bid carried neither inline markup nor a complete PBS Cache host and path.                  |
-| `cache_fetch_failed`    | The PBS Cache fetch was rejected or returned a non-OK status.                                  |
+| `cache_fetch_failed`    | The PBS Cache fetch was rejected, failed while reading the body, or returned a non-OK status.  |
 | `invalid_cache_payload` | The cache response was read but held no renderable creative, so nothing was posted.            |
 | `response_post_failed`  | `port.postMessage` threw while posting markup, on either the inline or the cached-markup path. |
 
@@ -511,24 +511,26 @@ cycle's other facts before concluding anything:
 - No evidence at all is consistent with a different GAM result, a targeting overwrite,
   and a PUC configuration or ID mismatch alike.
 
-A late positive observation upgrades the state, so re-read the panel rather than
-exporting immediately after render.
+A late positive observation within the 30-second attempt window — measured from the
+cycle's GPT request, and only while that cycle is still retained — upgrades the state,
+so re-read the panel rather than exporting immediately after render.
 
 ### Correlation evidence is missing
 
 Attribution issues record why creative evidence could not be attached. They never
-increment callback coverage and never produce a delivery claim:
+increment callback coverage and never create a delivery claim of their own, though
+evidence already stamped on a cycle still resolves that cycle's delivery state:
 
-| Reason                             | What was observed                                                                                                                |
-| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `creative_request_without_slot`    | The markup request carried no auction slot ID, or no retained association mapped it to a GPT slot.                               |
-| `creative_request_without_cycle`   | The slot had no retained request cycle inside the 30-second attempt window, or its most recent cycle was already reported empty. |
-| `creative_request_ambiguous_cycle` | An earlier non-empty cycle for the same slot was still in window before render, so no cycle was chosen.                          |
-| `creative_request_on_empty_cycle`  | GPT later reported the matched cycle empty, so the attempt was dropped instead of claiming delivery.                             |
-| `creative_attempt_capacity`        | The 128-attempt bound was reached with every retained attempt still live.                                                        |
-| `creative_attempt_unknown`         | A response or failure referenced an attempt no longer retained.                                                                  |
-| `creative_attempt_expired`         | The attempt passed its 30-second lifetime before its response or failure was observed.                                           |
-| `creative_attempt_evicted`         | The attempt's slot or request cycle was dropped first, by a retention bound or by GPT reporting that cycle empty.                |
+| Reason                             | What was observed                                                                                                                                                                             |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `creative_request_without_slot`    | The markup request carried no auction slot ID, or no retained association mapped it to a GPT slot.                                                                                            |
+| `creative_request_without_cycle`   | The slot had no retained request cycle inside the 30-second attempt window, or its most recent cycle was already reported empty.                                                              |
+| `creative_request_ambiguous_cycle` | An earlier non-empty cycle for the same slot was still in window before render, so no cycle was chosen.                                                                                       |
+| `creative_request_on_empty_cycle`  | GPT later reported the matched cycle empty, so the attempt was dropped and cannot complete; selection or response evidence already stamped on that cycle still appears as its delivery state. |
+| `creative_attempt_capacity`        | The 128-attempt bound was reached with every retained attempt still live.                                                                                                                     |
+| `creative_attempt_unknown`         | A request, response, or failure referenced an attempt no longer retained.                                                                                                                     |
+| `creative_attempt_expired`         | The attempt passed its 30-second lifetime before its response or failure was observed.                                                                                                        |
+| `creative_attempt_evicted`         | The attempt's slot or request cycle was dropped first, by a retention bound or by GPT reporting that cycle empty.                                                                             |
 
 Repeated issues on a busy page usually mean retention bounds, not delivery failure.
 Reduce refresh overlap or capture a shorter session, then re-read the cycle.
