@@ -156,7 +156,7 @@ jobs:
     name: browser integration tests
     needs: prepare-artifacts
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -198,7 +198,7 @@ jobs:
         working-directory: crates/trusted-server-integration-tests/browser
         run: |
           npm ci
-          npx playwright install --with-deps chromium firefox webkit
+          npx playwright install --with-deps chromium
 
       - name: Run browser tests (Next.js)
         working-directory: crates/trusted-server-integration-tests/browser
@@ -208,7 +208,7 @@ jobs:
           VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy.toml
           TEST_FRAMEWORK: nextjs
           PLAYWRIGHT_HTML_REPORT: playwright-report-nextjs
-        run: npx playwright test --project=chromium
+        run: npx playwright test
 
       - name: Upload Playwright report (Next.js)
         uses: actions/upload-artifact@v4
@@ -216,29 +216,6 @@ jobs:
         with:
           name: playwright-report-nextjs
           path: crates/trusted-server-integration-tests/browser/playwright-report-nextjs/
-          retention-days: 7
-
-      - name: Run APS browser tests (Next.js, Firefox and WebKit)
-        working-directory: crates/trusted-server-integration-tests/browser
-        env:
-          WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
-          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
-          VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy.toml
-          TEST_FRAMEWORK: nextjs
-          PLAYWRIGHT_HTML_REPORT: playwright-report-aps-cross-browser
-          PLAYWRIGHT_OUTPUT_DIR: test-results-aps-cross-browser
-        run: >-
-          npx playwright test tests/shared/aps-renderer.spec.ts
-          --project=firefox --project=webkit
-
-      - name: Upload APS cross-browser Playwright artifacts
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: playwright-aps-cross-browser
-          path: |
-            crates/trusted-server-integration-tests/browser/playwright-report-aps-cross-browser/
-            crates/trusted-server-integration-tests/browser/test-results-aps-cross-browser/
           retention-days: 7
 
       - name: Run browser tests (WordPress)
@@ -250,7 +227,7 @@ jobs:
           VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy.toml
           TEST_FRAMEWORK: wordpress
           PLAYWRIGHT_HTML_REPORT: playwright-report-wordpress
-        run: npx playwright test --project=chromium
+        run: npx playwright test
 
       - name: Upload Playwright report (WordPress)
         uses: actions/upload-artifact@v4

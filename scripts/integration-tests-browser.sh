@@ -88,7 +88,7 @@ trap cleanup EXIT
 # --- Run tests for each framework ---
 for framework in nextjs wordpress; do
     echo "==> Running Playwright tests for $framework..."
-    TEST_FRAMEWORK="$framework" npx playwright test --project=chromium "$@"
+    TEST_FRAMEWORK="$framework" npx playwright test "$@"
 done
 
 echo "==> All browser tests passed."

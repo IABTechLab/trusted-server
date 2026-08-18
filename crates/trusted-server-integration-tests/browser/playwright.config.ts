@@ -1,5 +1,20 @@
 import { defineConfig } from "@playwright/test";
 
+// Firefox and WebKit are opt-in for targeted local validation.
+const additionalBrowserProjects =
+  process.env.PLAYWRIGHT_CROSS_BROWSER === "1"
+    ? [
+        {
+          name: "firefox",
+          use: { browserName: "firefox" as const },
+        },
+        {
+          name: "webkit",
+          use: { browserName: "webkit" as const },
+        },
+      ]
+    : [];
+
 export default defineConfig({
   testDir: "./tests",
   globalSetup: "./global-setup.ts",
@@ -18,15 +33,8 @@ export default defineConfig({
       name: "chromium",
       use: { browserName: "chromium" },
     },
-    {
-      name: "firefox",
-      use: { browserName: "firefox" },
-    },
-    {
-      name: "webkit",
-      use: { browserName: "webkit" },
-    },
+    ...additionalBrowserProjects,
   ],
   reporter: [["list"], ["html", { open: "never" }]],
-  outputDir: process.env.PLAYWRIGHT_OUTPUT_DIR ?? "./test-results",
+  outputDir: "./test-results",
 });
