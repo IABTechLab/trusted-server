@@ -63,7 +63,7 @@ use crate::response_privacy::enforce_synthesized_html_cache_privacy;
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::{
     AUCTION_DEBUG_METADATA_ALLOWLIST, AUCTION_DEBUG_UPSTREAM_METADATA_KEYS,
-    AuctionDebugCommentOptions, AuctionDebugCommentVerbosity, Settings,
+    AuctionDebugCommentFormat, AuctionDebugCommentOptions, AuctionDebugCommentVerbosity, Settings,
 };
 use crate::streaming_processor::{
     BodyStreamDecoder, BodyStreamEncoder, Compression, GzipDecodeReader, PipelineConfig,
@@ -2112,10 +2112,13 @@ pub(crate) fn prepend_auction_debug_comment(
         }
     };
     // Single serialize → single neutralise → single total-budget cap.
-    let dump = render_dump(
-        serde_json::to_string(&serde_json::Value::Object(dump))
-            .unwrap_or_else(|e| format!("<dump serialize error: {e}>")),
-    );
+    let dump = serde_json::Value::Object(dump);
+    let serialized = match options.format {
+        AuctionDebugCommentFormat::Compact => serde_json::to_string(&dump),
+        AuctionDebugCommentFormat::Pretty => serde_json::to_string_pretty(&dump),
+    };
+    let dump =
+        render_dump(serialized.unwrap_or_else(|error| format!("<dump serialize error: {error}>")));
     let debug_comment = format!(
         "<!-- ts-debug: path={path_label} ssp={ssp_count} mediator={mediator_info} winning={} time={}ms\n\
          dump={dump}\n\
@@ -4388,15 +4391,20 @@ mod tests {
         comment
     }
 
-    fn response_metadata_from_comment(comment: &str) -> serde_json::Value {
+    fn dump_from_comment(comment: &str) -> (&str, serde_json::Value) {
         let (_, after_dump) = comment
             .split_once("dump=")
             .expect("should contain dump marker");
         let (dump, _) = after_dump
             .rsplit_once("\n-->")
             .expect("should contain comment terminator");
-        let dump: serde_json::Value =
+        let value: serde_json::Value =
             serde_json::from_str(dump).expect("should contain valid untruncated JSON");
+        (dump, value)
+    }
+
+    fn response_metadata_from_comment(comment: &str) -> serde_json::Value {
+        let (_, dump) = dump_from_comment(comment);
         dump["provider_responses"][0]["metadata"].clone()
     }
 
@@ -4416,6 +4424,59 @@ mod tests {
         assert!(
             !comment.contains("mediator_response"),
             "should omit mediator_response when no mediator ran: {comment}"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_pretty_formats_outer_json_without_changing_value() {
+        let compact_comment = dump_comment_for_creative("<div>plain</div>");
+        let pretty_options = AuctionDebugCommentOptions {
+            format: AuctionDebugCommentFormat::Pretty,
+            ..AuctionDebugCommentOptions::default()
+        };
+        let pretty_comment =
+            dump_comment_for_creative_with_options("<div>plain</div>", &pretty_options);
+
+        assert!(
+            compact_comment.contains("dump={\"provider_responses\":"),
+            "default output should remain compact: {compact_comment}"
+        );
+        assert!(
+            pretty_comment.contains("dump={\n  \"provider_responses\":"),
+            "pretty output should indent the outer dump: {pretty_comment}"
+        );
+
+        let (_, compact_dump) = dump_from_comment(&compact_comment);
+        let (_, pretty_dump) = dump_from_comment(&pretty_comment);
+        assert_eq!(
+            pretty_dump, compact_dump,
+            "formatting should not change the dump value"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_pretty_preserves_nested_json_as_string() {
+        let metadata = std::collections::HashMap::from([(
+            "debug".to_string(),
+            serde_json::json!({
+                "httpcalls": {
+                    "openx": [{ "requestbody": "{\"id\":\"request-1\"}" }]
+                }
+            }),
+        )]);
+        let options = AuctionDebugCommentOptions {
+            verbosity: AuctionDebugCommentVerbosity::Full,
+            format: AuctionDebugCommentFormat::Pretty,
+            ..AuctionDebugCommentOptions::default()
+        };
+
+        let comment = dump_comment_for_metadata_with_options(metadata, &options);
+        let response_metadata = response_metadata_from_comment(&comment);
+        let request_body = &response_metadata["debug"]["httpcalls"]["openx"][0]["requestbody"];
+        assert_eq!(request_body, "{\"id\":\"request-1\"}");
+        assert!(
+            request_body.is_string(),
+            "nested request body should remain a string"
         );
     }
 
@@ -4827,16 +4888,22 @@ mod tests {
     #[test]
     fn verbosity_full_still_hits_overall_byte_cap() {
         let huge_creative = "z".repeat(MAX_AUCTION_DEBUG_DUMP_BYTES * 2);
-        let options = AuctionDebugCommentOptions {
-            verbosity: AuctionDebugCommentVerbosity::Full,
-            ..AuctionDebugCommentOptions::default()
-        };
-        let comment = dump_comment_for_creative_with_options(&huge_creative, &options);
-        assert!(
-            comment.contains("(truncated"),
-            "even Full verbosity must respect the total dump byte cap: {}",
-            &comment[..comment.len().min(200)]
-        );
+        for format in [
+            AuctionDebugCommentFormat::Compact,
+            AuctionDebugCommentFormat::Pretty,
+        ] {
+            let options = AuctionDebugCommentOptions {
+                verbosity: AuctionDebugCommentVerbosity::Full,
+                format,
+                ..AuctionDebugCommentOptions::default()
+            };
+            let comment = dump_comment_for_creative_with_options(&huge_creative, &options);
+            assert!(
+                comment.contains("(truncated"),
+                "even Full verbosity must respect the total dump byte cap for {format:?}: {}",
+                &comment[..comment.len().min(200)]
+            );
+        }
     }
 
     #[test]
@@ -4913,27 +4980,33 @@ mod tests {
             AuctionDebugCommentVerbosity::Redacted,
             AuctionDebugCommentVerbosity::Full,
         ] {
-            let options = AuctionDebugCommentOptions {
-                verbosity,
-                ..AuctionDebugCommentOptions::default()
-            };
-            for creative in [
-                "<div>evil-->break</div>",
-                "--!><img src=x onerror=alert(1)>",
-                "<!--><img src=x onerror=alert(1)>",
-                "<!--!><img src=x onerror=alert(1)>",
-                "----!><img src=x onerror=alert(1)>",
+            for format in [
+                AuctionDebugCommentFormat::Compact,
+                AuctionDebugCommentFormat::Pretty,
             ] {
-                let comment = dump_comment_for_creative_with_options(creative, &options);
-                assert_eq!(
-                    comment.matches("-->").count(),
-                    1,
-                    "exactly one terminator must survive for {verbosity:?}, {creative:?}: {comment}"
-                );
-                assert!(
-                    !comment.contains("--!>"),
-                    "nested terminator must not survive for {verbosity:?}, {creative:?}: {comment}"
-                );
+                let options = AuctionDebugCommentOptions {
+                    verbosity,
+                    format,
+                    ..AuctionDebugCommentOptions::default()
+                };
+                for creative in [
+                    "<div>evil-->break</div>",
+                    "--!><img src=x onerror=alert(1)>",
+                    "<!--><img src=x onerror=alert(1)>",
+                    "<!--!><img src=x onerror=alert(1)>",
+                    "----!><img src=x onerror=alert(1)>",
+                ] {
+                    let comment = dump_comment_for_creative_with_options(creative, &options);
+                    assert_eq!(
+                        comment.matches("-->").count(),
+                        1,
+                        "exactly one terminator must survive for {verbosity:?}, {format:?}, {creative:?}: {comment}"
+                    );
+                    assert!(
+                        !comment.contains("--!>"),
+                        "nested terminator must not survive for {verbosity:?}, {format:?}, {creative:?}: {comment}"
+                    );
+                }
             }
         }
     }

@@ -2780,8 +2780,8 @@ mod tests {
 
     #[test]
     fn auction_debug_comment_options_deserializes_pretty_format() {
-        let options: AuctionDebugCommentOptions = toml::from_str(r#"format = "pretty""#)
-            .expect("should deserialize pretty format");
+        let options: AuctionDebugCommentOptions =
+            toml::from_str(r#"format = "pretty""#).expect("should deserialize pretty format");
         assert_eq!(options.format, AuctionDebugCommentFormat::Pretty);
     }
 
