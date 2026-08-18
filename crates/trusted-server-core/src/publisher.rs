@@ -68,7 +68,10 @@ use crate::platform::{
 use crate::price_bucket::{PriceGranularity, price_bucket};
 use crate::response_privacy::{enforce_private_no_store, enforce_synthesized_html_cache_privacy};
 use crate::rsc_flight::RscFlightUrlRewriter;
-use crate::settings::Settings;
+use crate::settings::{
+    AUCTION_DEBUG_METADATA_ALLOWLIST, AUCTION_DEBUG_UPSTREAM_METADATA_KEYS,
+    AuctionDebugCommentFormat, AuctionDebugCommentOptions, AuctionDebugCommentVerbosity, Settings,
+};
 use crate::streaming_processor::{
     BodyStreamDecoder, BodyStreamEncoder, Compression, GzipDecodeReader, PipelineConfig,
     STREAM_CHUNK_SIZE, StreamProcessor, StreamingPipeline,
@@ -3101,24 +3104,6 @@ pub(crate) fn write_bids_to_state(
 /// enabled cannot bloat every page render without bound.
 const MAX_AUCTION_DEBUG_DUMP_BYTES: usize = 256 * 1024;
 
-/// Provider-metadata keys safe to surface in the on-page `ts-debug` dump.
-///
-/// Fail-closed allowlist: any key not listed — notably `debug`, which carries
-/// the resolved `OpenRTB` request (EC ID, `user.ext.eids`, the TC consent string,
-/// `device.ip`, and `device.geo`) plus per-bidder `httpcalls` — is dropped so a
-/// visitor's identity graph cannot reach the client-readable DOM even when
-/// `[integration.prebid].debug` is also enabled. Full debug detail remains
-/// available server-side via `log::trace!`.
-const DEBUG_DUMP_METADATA_ALLOWLIST: &[&str] = &[
-    "error_type",
-    "status",
-    "message",
-    "responsetimemillis",
-    "errors",
-    "warnings",
-    "bidstatus",
-];
-
 /// Per-bid creative preview length (in bytes) in the `ts-debug` dump. Mirrors
 /// the 512-byte upstream-body preview the prebid provider logs on an HTTP error
 /// (`integrations/prebid.rs`): enough to identify a creative without copying
@@ -3136,19 +3121,114 @@ fn truncate_with_marker(value: &str, max: usize) -> String {
     format!("{}…(truncated {} bytes)", &value[..end], value.len() - end)
 }
 
-/// Build a redacted JSON view of a single provider response for the `ts-debug`
-/// dump: only [`DEBUG_DUMP_METADATA_ALLOWLIST`] metadata keys survive, and each
-/// bid's creative is previewed to [`MAX_BID_CREATIVE_DUMP_BYTES`].
+/// Return a recognized server-owned provider error classification.
+fn validated_error_type(
+    metadata: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<&str> {
+    let value = metadata.get("error_type")?.as_str()?;
+    matches!(
+        value,
+        "parse_response" | "launch_failed" | "transport" | "timeout" | "http_status"
+    )
+    .then_some(value)
+}
+
+/// Return a valid HTTP response status from provider metadata.
+fn validated_http_status(
+    metadata: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<u64> {
+    metadata
+        .get("http_status")?
+        .as_u64()
+        .filter(|status| (100..=599).contains(status))
+}
+
+/// Generate public diagnostic wording without copying provider-controlled text.
+fn safe_error_message(error_type: &str, http_status: Option<u64>) -> Option<String> {
+    match error_type {
+        "parse_response" => Some("Provider response could not be parsed".to_string()),
+        "launch_failed" => Some("Provider launch failed".to_string()),
+        "transport" => Some("Provider request failed".to_string()),
+        "timeout" => Some("Provider request timed out".to_string()),
+        "http_status" => Some(http_status.map_or_else(
+            || "Provider returned an HTTP error".to_string(),
+            |status| format!("Provider returned HTTP {status}"),
+        )),
+        _ => None,
+    }
+}
+
+/// Reconstruct the configured response metadata from validated values.
+fn redacted_metadata_for_dump(
+    metadata: &std::collections::HashMap<String, serde_json::Value>,
+    options: &AuctionDebugCommentOptions,
+) -> serde_json::Map<String, serde_json::Value> {
+    let selected = |key: &str| {
+        AUCTION_DEBUG_METADATA_ALLOWLIST.contains(&key)
+            && options
+                .metadata_keys
+                .iter()
+                .any(|candidate| candidate == key)
+    };
+    let error_type = validated_error_type(metadata);
+    let http_status = validated_http_status(metadata);
+    let mut safe = serde_json::Map::new();
+
+    if selected("error_type")
+        && let Some(value) = error_type
+    {
+        safe.insert("error_type".to_string(), serde_json::json!(value));
+    }
+    if selected("http_status")
+        && let Some(value) = http_status
+    {
+        safe.insert("http_status".to_string(), serde_json::json!(value));
+    }
+    if selected("message")
+        && let Some(value) = error_type.and_then(|kind| safe_error_message(kind, http_status))
+    {
+        safe.insert("message".to_string(), serde_json::json!(value));
+    }
+
+    safe
+}
+
+/// Build a JSON view of a single provider response for the `ts-debug` dump.
+///
+/// `Redacted` reconstructs only schema-validated response metadata, `Upstream`
+/// adds six named provider diagnostics, and `Full` copies every metadata value.
 fn redact_response_for_dump(
     response: &crate::auction::types::AuctionResponse,
+    options: &AuctionDebugCommentOptions,
 ) -> serde_json::Value {
-    let metadata: serde_json::Map<String, serde_json::Value> = response
-        .metadata
-        .iter()
-        .filter(|(key, _)| DEBUG_DUMP_METADATA_ALLOWLIST.contains(&key.as_str()))
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    let bids: Vec<serde_json::Value> = response.bids.iter().map(redact_bid_for_dump).collect();
+    let metadata: serde_json::Map<String, serde_json::Value> = match options.verbosity {
+        AuctionDebugCommentVerbosity::Redacted => {
+            redacted_metadata_for_dump(&response.metadata, options)
+        }
+        AuctionDebugCommentVerbosity::Upstream => {
+            let mut metadata = redacted_metadata_for_dump(&response.metadata, options);
+            for key in AUCTION_DEBUG_UPSTREAM_METADATA_KEYS {
+                if let Some(value) = response.metadata.get(*key) {
+                    metadata.insert((*key).to_string(), value.clone());
+                }
+            }
+            metadata
+        }
+        AuctionDebugCommentVerbosity::Full => response
+            .metadata
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    };
+    let bids: Vec<serde_json::Value> = if options.include_bids {
+        response
+            .bids
+            .iter()
+            .map(|bid| redact_bid_for_dump(bid, options))
+            .collect()
+    } else {
+        Vec::new()
+    };
     serde_json::json!({
         "provider": response.provider,
         "status": response.status,
@@ -3158,23 +3238,31 @@ fn redact_response_for_dump(
     })
 }
 
-/// Build a redacted JSON view of a single bid: every field except `creative`,
-/// which is previewed to [`MAX_BID_CREATIVE_DUMP_BYTES`].
-fn redact_bid_for_dump(bid: &crate::auction::types::Bid) -> serde_json::Value {
+/// Build a JSON view of a single bid. `Redacted` and `Upstream` preview the
+/// creative to [`MAX_BID_CREATIVE_DUMP_BYTES`]; `Full` passes it through.
+fn redact_bid_for_dump(
+    bid: &crate::auction::types::Bid,
+    options: &AuctionDebugCommentOptions,
+) -> serde_json::Value {
     let mut value = serde_json::to_value(bid).unwrap_or(serde_json::Value::Null);
-    if let Some(creative) = &bid.creative {
+    if options.verbosity != AuctionDebugCommentVerbosity::Full
+        && let Some(creative) = &bid.creative
+    {
         value["creative"] =
             serde_json::Value::String(truncate_with_marker(creative, MAX_BID_CREATIVE_DUMP_BYTES));
     }
     value
 }
 
-/// Prepend a `<!-- ts-debug: ... -->` HTML comment carrying a redacted view of
-/// the auction result — pipeline stats plus, per provider, its status, bids
-/// (each creative previewed to [`MAX_BID_CREATIVE_DUMP_BYTES`]), and allowlisted
-/// metadata — onto the shared `ad_bids_state` so it lands directly before the
-/// injected bids `<script>`. Identity-bearing metadata (notably prebid's `debug`
-/// subtree) is dropped; see [`DEBUG_DUMP_METADATA_ALLOWLIST`]. Gated by
+/// Prepend a `<!-- ts-debug: ... -->` HTML comment carrying a view of the
+/// auction result — pipeline stats plus, per provider, its status, bids, and
+/// metadata, shaped by `options` — onto the shared `ad_bids_state` so it
+/// lands directly before the injected bids `<script>`. In
+/// [`AuctionDebugCommentVerbosity::Redacted`] (the default), response metadata
+/// is reconstructed from validated server-owned fields; provider diagnostics
+/// and prebid's `debug` subtree are dropped. Bid-level fields and bounded
+/// creative previews remain visible, so this is not a fully anonymized dump.
+/// Gated by
 /// [`auction_html_comment`](crate::settings::DebugConfig::auction_html_comment);
 /// never enable in production.
 ///
@@ -3185,25 +3273,26 @@ pub(crate) fn prepend_auction_debug_comment(
     path_label: &str,
     result: &crate::auction::orchestrator::OrchestrationResult,
     ad_bids_state: &AdBidsState,
+    options: &AuctionDebugCommentOptions,
 ) {
     let ssp_count = result.provider_responses.len();
     let mediator_info = match &result.mediator_response {
         Some(r) => format!("ok({}_bids)", r.bids.len()),
         None => "none".to_string(),
     };
-    // Redacted, bounded, deterministic dump so an operator can see each
-    // provider's status, bids, and safe metadata without needing log access.
+    // Bounded, deterministic dump so an operator can see each provider's
+    // status, bids, and mode-appropriate metadata without needing log access.
     //
     // SECURITY: `Bid.creative` and provider metadata are attacker/partner-
     // influenced. Two layers protect the DOM:
-    //   1. `redact_response_for_dump` drops all non-allowlisted *response-level*
-    //      metadata (notably the identity-bearing `debug` subtree) and previews
-    //      each creative, so the visitor's identity graph never enters the
-    //      comment and one large creative cannot dominate the payload. Bid-level
-    //      fields (`Bid.metadata`, `nurl`, `burl`) are NOT yet allowlisted; they
-    //      pass through today because the only writer (`integrations/aps.rs`)
-    //      emits opaque targeting keys. Tightening this to a fail-closed bid
-    //      allowlist is tracked in #925.
+    //   1. In Redacted mode, `redact_response_for_dump` reconstructs only
+    //      schema-validated response metadata and previews each creative, so
+    //      untyped provider diagnostics cannot cross that boundary and one
+    //      large creative cannot dominate the payload. Bid-level fields
+    //      (`Bid.metadata`, `nurl`, `burl`) are NOT yet allowlisted; they pass
+    //      through today because the only writer (`integrations/aps.rs`) emits
+    //      opaque targeting keys. Tightening this to a fail-closed bid allowlist
+    //      is tracked in #925.
     //   2. `render_dump` below neutralises HTML comment terminators and caps the
     //      total serialized size.
     //
@@ -3211,22 +3300,26 @@ pub(crate) fn prepend_auction_debug_comment(
     // the rendered metadata keys are sorted — the dump is deterministic even
     // though `AuctionResponse.metadata` is a `HashMap`.
     let mut dump = serde_json::Map::new();
-    dump.insert(
-        "provider_responses".to_string(),
-        serde_json::Value::Array(
-            result
-                .provider_responses
-                .iter()
-                .map(redact_response_for_dump)
-                .collect(),
-        ),
-    );
+    if options.include_provider_responses {
+        dump.insert(
+            "provider_responses".to_string(),
+            serde_json::Value::Array(
+                result
+                    .provider_responses
+                    .iter()
+                    .map(|r| redact_response_for_dump(r, options))
+                    .collect(),
+            ),
+        );
+    }
     // Only include the mediator response when one actually ran; otherwise the
     // `mediator=none` on the summary line already conveys it.
-    if let Some(mediator_response) = &result.mediator_response {
+    if options.include_mediator_response
+        && let Some(mediator_response) = &result.mediator_response
+    {
         dump.insert(
             "mediator_response".to_string(),
-            redact_response_for_dump(mediator_response),
+            redact_response_for_dump(mediator_response, options),
         );
     }
     // A single `replace("--", …)` is deliberately NOT used — because
@@ -3249,10 +3342,13 @@ pub(crate) fn prepend_auction_debug_comment(
         }
     };
     // Single serialize → single neutralise → single total-budget cap.
-    let dump = render_dump(
-        serde_json::to_string(&serde_json::Value::Object(dump))
-            .unwrap_or_else(|e| format!("<dump serialize error: {e}>")),
-    );
+    let dump = serde_json::Value::Object(dump);
+    let serialized = match options.format {
+        AuctionDebugCommentFormat::Compact => serde_json::to_string(&dump),
+        AuctionDebugCommentFormat::Pretty => serde_json::to_string_pretty(&dump),
+    };
+    let dump =
+        render_dump(serialized.unwrap_or_else(|error| format!("<dump serialize error: {error}>")));
     let debug_comment = format!(
         "<!-- ts-debug: path={path_label} ssp={ssp_count} mediator={mediator_info} winning={} time={}ms\n\
          dump={dump}\n\
@@ -3780,7 +3876,12 @@ async fn collect_stream_auction(
     }
 
     if settings.debug.auction_html_comment {
-        prepend_auction_debug_comment("stream", &result, ad_bids_state);
+        prepend_auction_debug_comment(
+            "stream",
+            &result,
+            ad_bids_state,
+            &settings.debug.auction_html_comment_options,
+        );
     }
 }
 
@@ -6514,7 +6615,10 @@ mod tests {
 
     /// Build the ts-debug comment for a one-bid auction whose creative is
     /// `creative`, so tests can assert on the rendered dump.
-    fn dump_comment_for_creative(creative: &str) -> String {
+    fn dump_comment_for_creative_with_options(
+        creative: &str,
+        options: &AuctionDebugCommentOptions,
+    ) -> String {
         let mut bid = make_test_bid_with_creative(creative);
         bid.slot_id = "ad-header-0".to_string();
         let result = OrchestrationResult {
@@ -6528,7 +6632,7 @@ mod tests {
             metadata: std::collections::HashMap::new(),
         };
         let state = AdBidsState::with_script("BIDS_SCRIPT");
-        prepend_auction_debug_comment("stream", &result, &state);
+        prepend_auction_debug_comment("stream", &result, &state, options);
         let comment = state
             .script_cell()
             .lock()
@@ -6537,6 +6641,52 @@ mod tests {
             .expect("should have comment");
         drop(state);
         comment
+    }
+
+    fn dump_comment_for_creative(creative: &str) -> String {
+        dump_comment_for_creative_with_options(creative, &AuctionDebugCommentOptions::default())
+    }
+
+    fn dump_comment_for_metadata_with_options(
+        metadata: std::collections::HashMap<String, serde_json::Value>,
+        options: &AuctionDebugCommentOptions,
+    ) -> String {
+        let mut response = AuctionResponse::error("prebid", 12);
+        response.metadata = metadata;
+        let result = OrchestrationResult {
+            provider_responses: vec![response],
+            mediator_response: None,
+            winning_bids: std::collections::HashMap::new(),
+            total_time_ms: 12,
+            metadata: std::collections::HashMap::new(),
+        };
+        let state = AdBidsState::with_script("BIDS_SCRIPT");
+        prepend_auction_debug_comment("stream", &result, &state, options);
+        let comment = state
+            .script_cell()
+            .lock()
+            .expect("should lock state")
+            .clone()
+            .expect("should have comment");
+        drop(state);
+        comment
+    }
+
+    fn dump_from_comment(comment: &str) -> (&str, serde_json::Value) {
+        let (_, after_dump) = comment
+            .split_once("dump=")
+            .expect("should contain dump marker");
+        let (dump, _) = after_dump
+            .rsplit_once("\n-->")
+            .expect("should contain comment terminator");
+        let value: serde_json::Value =
+            serde_json::from_str(dump).expect("should contain valid untruncated JSON");
+        (dump, value)
+    }
+
+    fn response_metadata_from_comment(comment: &str) -> serde_json::Value {
+        let (_, dump) = dump_from_comment(comment);
+        dump["provider_responses"][0]["metadata"].clone()
     }
 
     #[test]
@@ -6568,7 +6718,12 @@ mod tests {
             metadata: std::collections::HashMap::new(),
         };
         let state = AdBidsState::with_script("BIDS_SCRIPT");
-        prepend_auction_debug_comment("stream", &result, &state);
+        prepend_auction_debug_comment(
+            "stream",
+            &result,
+            &state,
+            &AuctionDebugCommentOptions::default(),
+        );
 
         let seam = state.build_seam_script("[]");
 
@@ -6579,6 +6734,59 @@ mod tests {
         assert!(
             seam.find("<!-- ts-debug:") < seam.find("<script>"),
             "the diagnostic comment should precede the executable seam: {seam}"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_pretty_formats_outer_json_without_changing_value() {
+        let compact_comment = dump_comment_for_creative("<div>plain</div>");
+        let pretty_options = AuctionDebugCommentOptions {
+            format: AuctionDebugCommentFormat::Pretty,
+            ..AuctionDebugCommentOptions::default()
+        };
+        let pretty_comment =
+            dump_comment_for_creative_with_options("<div>plain</div>", &pretty_options);
+
+        assert!(
+            compact_comment.contains("dump={\"provider_responses\":"),
+            "default output should remain compact: {compact_comment}"
+        );
+        assert!(
+            pretty_comment.contains("dump={\n  \"provider_responses\":"),
+            "pretty output should indent the outer dump: {pretty_comment}"
+        );
+
+        let (_, compact_dump) = dump_from_comment(&compact_comment);
+        let (_, pretty_dump) = dump_from_comment(&pretty_comment);
+        assert_eq!(
+            pretty_dump, compact_dump,
+            "formatting should not change the dump value"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_pretty_preserves_nested_json_as_string() {
+        let metadata = std::collections::HashMap::from([(
+            "debug".to_string(),
+            serde_json::json!({
+                "httpcalls": {
+                    "openx": [{ "requestbody": "{\"id\":\"request-1\"}" }]
+                }
+            }),
+        )]);
+        let options = AuctionDebugCommentOptions {
+            verbosity: AuctionDebugCommentVerbosity::Full,
+            format: AuctionDebugCommentFormat::Pretty,
+            ..AuctionDebugCommentOptions::default()
+        };
+
+        let comment = dump_comment_for_metadata_with_options(metadata, &options);
+        let response_metadata = response_metadata_from_comment(&comment);
+        let request_body = &response_metadata["debug"]["httpcalls"]["openx"][0]["requestbody"];
+        assert_eq!(request_body, "{\"id\":\"request-1\"}");
+        assert!(
+            request_body.is_string(),
+            "nested request body should remain a string"
         );
     }
 
@@ -6614,7 +6822,12 @@ mod tests {
             metadata: std::collections::HashMap::new(),
         };
         let state = AdBidsState::with_script("BIDS_SCRIPT");
-        prepend_auction_debug_comment("stream", &result, &state);
+        prepend_auction_debug_comment(
+            "stream",
+            &result,
+            &state,
+            &AuctionDebugCommentOptions::default(),
+        );
         let comment = state
             .script_cell()
             .lock()
@@ -6642,6 +6855,419 @@ mod tests {
     }
 
     #[test]
+    fn default_options_apply_safe_response_metadata_schema() {
+        let metadata = std::collections::HashMap::from([
+            ("error_type".to_string(), serde_json::json!("http_status")),
+            ("http_status".to_string(), serde_json::json!(422)),
+            (
+                "message".to_string(),
+                serde_json::json!("raw-message-example-user-123"),
+            ),
+            (
+                "errors".to_string(),
+                serde_json::json!(["errors-example-user-123"]),
+            ),
+            (
+                "warnings".to_string(),
+                serde_json::json!(["warnings-example-user-123"]),
+            ),
+            (
+                "responsetimemillis".to_string(),
+                serde_json::json!({"timing-example-user-123": 12}),
+            ),
+            (
+                "bidstatus".to_string(),
+                serde_json::json!([{"bidder": "bidstatus-example-user-123"}]),
+            ),
+            (
+                "upstream_message".to_string(),
+                serde_json::json!("upstream-example-user-123"),
+            ),
+            (
+                "upstream_message_truncated".to_string(),
+                serde_json::json!("truncated-example-user-123"),
+            ),
+            (
+                "debug".to_string(),
+                serde_json::json!({"resolvedrequest": {"user": {"id": "debug-example-user-123"}}}),
+            ),
+        ]);
+
+        let comment = dump_comment_for_metadata_with_options(
+            metadata,
+            &AuctionDebugCommentOptions::default(),
+        );
+
+        assert_eq!(
+            response_metadata_from_comment(&comment),
+            serde_json::json!({
+                "error_type": "http_status",
+                "http_status": 422,
+                "message": "Provider returned HTTP 422",
+            })
+        );
+    }
+
+    #[test]
+    fn configured_metadata_subset_only_includes_selected_safe_keys() {
+        let metadata = std::collections::HashMap::from([
+            ("error_type".to_string(), serde_json::json!("http_status")),
+            ("http_status".to_string(), serde_json::json!(418)),
+            (
+                "errors".to_string(),
+                serde_json::json!(["errors-example-user-123"]),
+            ),
+            (
+                "debug".to_string(),
+                serde_json::json!({"identity": "debug-example-user-123"}),
+            ),
+        ]);
+        let options = AuctionDebugCommentOptions {
+            metadata_keys: vec![
+                "http_status".to_string(),
+                "errors".to_string(),
+                "debug".to_string(),
+            ],
+            ..AuctionDebugCommentOptions::default()
+        };
+
+        let comment = dump_comment_for_metadata_with_options(metadata, &options);
+
+        assert_eq!(
+            response_metadata_from_comment(&comment),
+            serde_json::json!({"http_status": 418})
+        );
+    }
+
+    #[test]
+    fn redacted_mode_rejects_wrong_types_and_unknown_error_classifications() {
+        let invalid_cases = [
+            std::collections::HashMap::from([(
+                "error_type".to_string(),
+                serde_json::json!({"identity": "example-user-123"}),
+            )]),
+            std::collections::HashMap::from([
+                (
+                    "error_type".to_string(),
+                    serde_json::json!("provider_supplied_unknown"),
+                ),
+                ("message".to_string(), serde_json::json!("example-user-123")),
+            ]),
+            std::collections::HashMap::from([(
+                "http_status".to_string(),
+                serde_json::json!("200 example-user-123"),
+            )]),
+            std::collections::HashMap::from([("http_status".to_string(), serde_json::json!(99))]),
+            std::collections::HashMap::from([("http_status".to_string(), serde_json::json!(600))]),
+            std::collections::HashMap::from([(
+                "http_status".to_string(),
+                serde_json::json!(200.5),
+            )]),
+            std::collections::HashMap::from([(
+                "message".to_string(),
+                serde_json::json!({"identity": "example-user-123"}),
+            )]),
+        ];
+        for metadata in invalid_cases {
+            let comment = dump_comment_for_metadata_with_options(
+                metadata,
+                &AuctionDebugCommentOptions::default(),
+            );
+            assert_eq!(
+                response_metadata_from_comment(&comment),
+                serde_json::json!({})
+            );
+            assert!(!comment.contains("example-user-123"));
+            assert!(!comment.contains("provider_supplied_unknown"));
+        }
+
+        for status in [100_u64, 599] {
+            let metadata = std::collections::HashMap::from([(
+                "http_status".to_string(),
+                serde_json::json!(status),
+            )]);
+            let comment = dump_comment_for_metadata_with_options(
+                metadata,
+                &AuctionDebugCommentOptions::default(),
+            );
+            assert_eq!(
+                response_metadata_from_comment(&comment),
+                serde_json::json!({"http_status": status})
+            );
+        }
+    }
+
+    #[test]
+    fn redacted_mode_generates_fixed_safe_messages() {
+        let cases = [
+            (
+                "parse_response",
+                None,
+                "Provider response could not be parsed",
+            ),
+            ("launch_failed", None, "Provider launch failed"),
+            ("transport", None, "Provider request failed"),
+            ("timeout", None, "Provider request timed out"),
+            ("http_status", Some(418_u64), "Provider returned HTTP 418"),
+            ("http_status", None, "Provider returned an HTTP error"),
+        ];
+        for (error_type, status, expected) in cases {
+            let mut metadata = std::collections::HashMap::from([
+                ("error_type".to_string(), serde_json::json!(error_type)),
+                (
+                    "message".to_string(),
+                    serde_json::json!("raw-example-user-123"),
+                ),
+            ]);
+            if let Some(status) = status {
+                metadata.insert("http_status".to_string(), serde_json::json!(status));
+            }
+            let comment = dump_comment_for_metadata_with_options(
+                metadata,
+                &AuctionDebugCommentOptions::default(),
+            );
+            let rendered = response_metadata_from_comment(&comment);
+            assert_eq!(rendered["message"], serde_json::json!(expected));
+            assert!(!comment.contains("raw-example-user-123"));
+        }
+    }
+
+    #[test]
+    fn metadata_keys_empty_yields_empty_safe_metadata_in_redacted() {
+        let options = AuctionDebugCommentOptions {
+            metadata_keys: vec![],
+            ..AuctionDebugCommentOptions::default()
+        };
+        let comment = dump_comment_for_creative_with_options("<div>x</div>", &options);
+        assert!(
+            comment.contains("\"metadata\":{}"),
+            "empty metadata_keys should yield an empty metadata object: {comment}"
+        );
+    }
+
+    #[test]
+    fn metadata_keys_attack_vector_debug_key_never_surfaces_in_redacted_mode() {
+        // Configuring "debug" in metadata_keys must have zero effect in Redacted
+        // mode — the allowlist intersection is the actual security boundary, not
+        // the config value. This is the load-bearing test for this whole design.
+        let response = AuctionResponse::error("prebid", 12).with_metadata(
+            "debug",
+            serde_json::json!({"resolvedrequest": {"user": {"id": "EC-ID-abc123"}}}),
+        );
+        let result = OrchestrationResult {
+            provider_responses: vec![response],
+            mediator_response: None,
+            winning_bids: std::collections::HashMap::new(),
+            total_time_ms: 12,
+            metadata: std::collections::HashMap::new(),
+        };
+        let options = AuctionDebugCommentOptions {
+            metadata_keys: vec!["debug".to_string()],
+            ..AuctionDebugCommentOptions::default()
+        };
+        let state = AdBidsState::with_script("BIDS_SCRIPT");
+        prepend_auction_debug_comment("stream", &result, &state, &options);
+        let comment = state
+            .script_cell()
+            .lock()
+            .expect("should lock state")
+            .clone()
+            .expect("should have comment");
+        assert!(
+            !comment.contains("EC-ID-abc123"),
+            "debug key must never surface in Redacted mode even if configured: {comment}"
+        );
+    }
+
+    #[test]
+    fn upstream_mode_includes_provider_diagnostics_but_not_debug_subtree() {
+        let metadata = std::collections::HashMap::from([
+            ("error_type".to_string(), serde_json::json!("timeout")),
+            (
+                "errors".to_string(),
+                serde_json::json!(["errors-example-user-123"]),
+            ),
+            (
+                "warnings".to_string(),
+                serde_json::json!(["warnings-example-user-123"]),
+            ),
+            (
+                "responsetimemillis".to_string(),
+                serde_json::json!({"example-bidder": 12}),
+            ),
+            (
+                "bidstatus".to_string(),
+                serde_json::json!([{"bidder": "example-bidder", "status": "timeout"}]),
+            ),
+            (
+                "upstream_message".to_string(),
+                serde_json::json!("upstream-example-user-123"),
+            ),
+            (
+                "upstream_message_truncated".to_string(),
+                serde_json::json!(true),
+            ),
+            (
+                "debug".to_string(),
+                serde_json::json!({"resolvedrequest": {"user": {"id": "debug-example-user-123"}}}),
+            ),
+        ]);
+        let options = AuctionDebugCommentOptions {
+            verbosity: AuctionDebugCommentVerbosity::Upstream,
+            metadata_keys: vec!["error_type".to_string()],
+            ..AuctionDebugCommentOptions::default()
+        };
+
+        let comment = dump_comment_for_metadata_with_options(metadata, &options);
+        let rendered = response_metadata_from_comment(&comment);
+
+        for key in [
+            "error_type",
+            "errors",
+            "warnings",
+            "responsetimemillis",
+            "bidstatus",
+            "upstream_message",
+            "upstream_message_truncated",
+        ] {
+            assert!(
+                rendered.get(key).is_some(),
+                "should include {key}: {comment}"
+            );
+        }
+        assert!(rendered.get("debug").is_none());
+        assert!(!comment.contains("debug-example-user-123"));
+    }
+
+    #[test]
+    fn verbosity_upstream_still_truncates_creative() {
+        let big_creative = "u".repeat(MAX_BID_CREATIVE_DUMP_BYTES * 2);
+        let options = AuctionDebugCommentOptions {
+            verbosity: AuctionDebugCommentVerbosity::Upstream,
+            ..AuctionDebugCommentOptions::default()
+        };
+
+        let comment = dump_comment_for_creative_with_options(&big_creative, &options);
+
+        assert!(comment.contains("(truncated"));
+        assert!(!comment.contains(&big_creative));
+    }
+
+    #[test]
+    fn verbosity_full_includes_raw_debug_subtree_when_present() {
+        let response = AuctionResponse::error("prebid", 12).with_metadata(
+            "debug",
+            serde_json::json!({"httpcalls": {"aps": [{"status": 200}]}}),
+        );
+        let result = OrchestrationResult {
+            provider_responses: vec![response],
+            mediator_response: None,
+            winning_bids: std::collections::HashMap::new(),
+            total_time_ms: 12,
+            metadata: std::collections::HashMap::new(),
+        };
+        let options = AuctionDebugCommentOptions {
+            verbosity: AuctionDebugCommentVerbosity::Full,
+            ..AuctionDebugCommentOptions::default()
+        };
+        let state = AdBidsState::with_script("BIDS_SCRIPT");
+        prepend_auction_debug_comment("stream", &result, &state, &options);
+        let comment = state
+            .script_cell()
+            .lock()
+            .expect("should lock state")
+            .clone()
+            .expect("should have comment");
+        assert!(
+            comment.contains("httpcalls"),
+            "Full verbosity should surface the raw debug subtree: {comment}"
+        );
+    }
+
+    #[test]
+    fn verbosity_full_skips_creative_truncation() {
+        let big_creative = "y".repeat(MAX_BID_CREATIVE_DUMP_BYTES * 2);
+        let options = AuctionDebugCommentOptions {
+            verbosity: AuctionDebugCommentVerbosity::Full,
+            ..AuctionDebugCommentOptions::default()
+        };
+        let comment = dump_comment_for_creative_with_options(&big_creative, &options);
+        assert!(
+            comment.contains(&big_creative),
+            "Full verbosity should not truncate the creative preview"
+        );
+    }
+
+    #[test]
+    fn verbosity_full_still_hits_overall_byte_cap() {
+        let huge_creative = "z".repeat(MAX_AUCTION_DEBUG_DUMP_BYTES * 2);
+        for format in [
+            AuctionDebugCommentFormat::Compact,
+            AuctionDebugCommentFormat::Pretty,
+        ] {
+            let options = AuctionDebugCommentOptions {
+                verbosity: AuctionDebugCommentVerbosity::Full,
+                format,
+                ..AuctionDebugCommentOptions::default()
+            };
+            let comment = dump_comment_for_creative_with_options(&huge_creative, &options);
+            assert!(
+                comment.contains("(truncated"),
+                "even Full verbosity must respect the total dump byte cap for {format:?}: {}",
+                &comment[..comment.len().min(200)]
+            );
+        }
+    }
+
+    #[test]
+    fn include_provider_responses_false_omits_section_entirely() {
+        let options = AuctionDebugCommentOptions {
+            include_provider_responses: false,
+            ..AuctionDebugCommentOptions::default()
+        };
+        let comment = dump_comment_for_creative_with_options("<div>x</div>", &options);
+        assert!(!comment.contains("provider_responses"));
+    }
+
+    #[test]
+    fn include_mediator_response_false_omits_even_when_mediator_ran() {
+        let response = AuctionResponse::success("aps", vec![], 10);
+        let mediator = AuctionResponse::success("mediator", vec![], 5);
+        let result = OrchestrationResult {
+            provider_responses: vec![response],
+            mediator_response: Some(mediator),
+            winning_bids: std::collections::HashMap::new(),
+            total_time_ms: 10,
+            metadata: std::collections::HashMap::new(),
+        };
+        let options = AuctionDebugCommentOptions {
+            include_mediator_response: false,
+            ..AuctionDebugCommentOptions::default()
+        };
+        let state = AdBidsState::with_script("BIDS_SCRIPT");
+        prepend_auction_debug_comment("stream", &result, &state, &options);
+        let comment = state
+            .script_cell()
+            .lock()
+            .expect("should lock state")
+            .clone()
+            .expect("should have comment");
+        assert!(!comment.contains("mediator_response"));
+    }
+
+    #[test]
+    fn include_bids_false_yields_empty_bids_array_not_omitted_response() {
+        let options = AuctionDebugCommentOptions {
+            include_bids: false,
+            ..AuctionDebugCommentOptions::default()
+        };
+        let comment = dump_comment_for_creative_with_options("<div>x</div>", &options);
+        assert!(comment.contains("\"bids\":[]"));
+        // The provider entry itself (status/provider name) must still be present.
+        assert!(comment.contains("\"provider\":\"aps\""));
+    }
+
+    #[test]
     fn auction_debug_comment_truncates_oversized_creative() {
         // A creative larger than the per-bid preview cap must be truncated with a
         // marker rather than copied verbatim into the page.
@@ -6664,23 +7290,38 @@ mod tests {
         // path. A single `replace("--", …)` would re-form a terminator on the
         // odd-dash-run cases; the targeted two-replace must leave the comment's
         // own trailing `-->` as the only surviving terminator and drop `--!>`.
-        for creative in [
-            "<div>evil-->break</div>",
-            "--!><img src=x onerror=alert(1)>",
-            "<!--><img src=x onerror=alert(1)>",
-            "<!--!><img src=x onerror=alert(1)>",
-            "----!><img src=x onerror=alert(1)>",
+        for verbosity in [
+            AuctionDebugCommentVerbosity::Redacted,
+            AuctionDebugCommentVerbosity::Full,
         ] {
-            let comment = dump_comment_for_creative(creative);
-            assert_eq!(
-                comment.matches("-->").count(),
-                1,
-                "exactly one `-->` (the terminator) must survive for {creative:?}: {comment}"
-            );
-            assert!(
-                !comment.contains("--!>"),
-                "the `--!>` nested terminator must not survive for {creative:?}: {comment}"
-            );
+            for format in [
+                AuctionDebugCommentFormat::Compact,
+                AuctionDebugCommentFormat::Pretty,
+            ] {
+                let options = AuctionDebugCommentOptions {
+                    verbosity,
+                    format,
+                    ..AuctionDebugCommentOptions::default()
+                };
+                for creative in [
+                    "<div>evil-->break</div>",
+                    "--!><img src=x onerror=alert(1)>",
+                    "<!--><img src=x onerror=alert(1)>",
+                    "<!--!><img src=x onerror=alert(1)>",
+                    "----!><img src=x onerror=alert(1)>",
+                ] {
+                    let comment = dump_comment_for_creative_with_options(creative, &options);
+                    assert_eq!(
+                        comment.matches("-->").count(),
+                        1,
+                        "exactly one terminator must survive for {verbosity:?}, {format:?}, {creative:?}: {comment}"
+                    );
+                    assert!(
+                        !comment.contains("--!>"),
+                        "nested terminator must not survive for {verbosity:?}, {format:?}, {creative:?}: {comment}"
+                    );
+                }
+            }
         }
     }
 

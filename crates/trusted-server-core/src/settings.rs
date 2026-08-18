@@ -2351,15 +2351,17 @@ pub struct DebugConfig {
     #[serde(default)]
     pub ja4_endpoint_enabled: bool,
 
-    /// Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` dumping a
-    /// redacted per-provider auction result: pipeline stats (SSP count, mediator
-    /// status, winning bid count) plus every provider response — each bid's
-    /// creative previewed (not the full `adm` markup) and provider metadata
-    /// filtered to a fail-closed allowlist that drops identity-bearing keys.
-    /// Never enable in production — visible in page source and injects (bounded)
-    /// raw HTML from SSPs.
+    /// Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` dumping
+    /// per-provider auction diagnostics. The default validates response-level
+    /// metadata, but bid fields and bounded creative previews remain visible;
+    /// this is not a fully anonymized dump. Never enable in production.
     #[serde(default)]
     pub auction_html_comment: bool,
+
+    /// Content and verbosity of the `auction_html_comment` dump. Ignored
+    /// when `auction_html_comment` is false.
+    #[serde(default)]
+    pub auction_html_comment_options: AuctionDebugCommentOptions,
 
     /// Enable the testing-only direct GAM-replace path and the verbose per-bid
     /// `debug_bid` blob in `window.tsjs.bids`.
@@ -2374,6 +2376,135 @@ pub struct DebugConfig {
     /// un-sanitized creative for diagnostics, so never enable in production.
     #[serde(default)]
     pub inject_adm_for_testing: bool,
+}
+
+/// Metadata keys safe to surface in the `ts-debug` auction comment.
+///
+/// Fail-closed superset: any key not listed here — notably `debug`, which
+/// carries the resolved `OpenRTB` request (EC ID, `user.ext.eids`, the TC
+/// consent string, `device.ip`, `device.geo`) plus per-bidder `httpcalls` —
+/// is dropped in [`AuctionDebugCommentVerbosity::Redacted`] mode regardless
+/// of what an operator lists in [`AuctionDebugCommentOptions::metadata_keys`].
+/// `metadata_keys` is a subset selector against this const, never a way to
+/// add new keys.
+pub(crate) const AUCTION_DEBUG_METADATA_ALLOWLIST: &[&str] =
+    &["error_type", "http_status", "message"];
+
+/// Provider-controlled diagnostic keys exposed only by `Upstream` or `Full`.
+///
+/// Values remain untyped upstream JSON and may contain request or identity
+/// data. Keeping this list separate prevents [`AuctionDebugCommentOptions::metadata_keys`]
+/// from widening the default response-metadata boundary.
+pub(crate) const AUCTION_DEBUG_UPSTREAM_METADATA_KEYS: &[&str] = &[
+    "errors",
+    "warnings",
+    "responsetimemillis",
+    "bidstatus",
+    "upstream_message",
+    "upstream_message_truncated",
+];
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_auction_debug_metadata_keys() -> Vec<String> {
+    AUCTION_DEBUG_METADATA_ALLOWLIST
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect()
+}
+
+/// Behavior of the `<!-- ts-debug: ... -->` auction dump. Only consulted when
+/// [`DebugConfig::auction_html_comment`] is true.
+///
+/// `deny_unknown_fields` matches the convention used by sibling config
+/// structs in this file, including the `DebugConfig` this struct nests
+/// under: an operator typo (e.g. `metadata_key` instead of `metadata_keys`)
+/// must fail config load loudly, not be silently ignored.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuctionDebugCommentOptions {
+    /// Include the `provider_responses` section at all.
+    #[serde(default = "default_true")]
+    pub include_provider_responses: bool,
+
+    /// Include `mediator_response` when a mediator ran.
+    #[serde(default = "default_true")]
+    pub include_mediator_response: bool,
+
+    /// Include each provider's `bids` array (vs. status/metadata only).
+    #[serde(default = "default_true")]
+    pub include_bids: bool,
+
+    /// Subset of [`AUCTION_DEBUG_METADATA_ALLOWLIST`] to surface in
+    /// [`AuctionDebugCommentVerbosity::Redacted`] mode. Keys outside the
+    /// fixed allowlist are always dropped, config or not. This selector cannot
+    /// unlock provider diagnostics. Ignored when `verbosity` is `Full`.
+    #[serde(default = "default_auction_debug_metadata_keys")]
+    pub metadata_keys: Vec<String>,
+
+    /// `Redacted` (default): validated `metadata_keys` subset only, with
+    /// creative previews truncated to `MAX_BID_CREATIVE_DUMP_BYTES`.
+    /// `Upstream`: redacted fields plus six untyped provider diagnostics;
+    /// creative previews remain truncated.
+    /// `Full`: raw `response.metadata` verbatim, including the `debug`
+    /// subtree (httpcalls/resolvedrequest) when present, and no creative
+    /// truncation. The total dump byte cap and comment-terminator
+    /// neutralization still apply unconditionally.
+    ///
+    /// NEVER enable `Upstream` or `Full` in production — identity-bearing
+    /// request/response data may become visible via view-source.
+    #[serde(default)]
+    pub verbosity: AuctionDebugCommentVerbosity,
+
+    /// JSON representation used for the outer auction dump.
+    #[serde(default)]
+    pub format: AuctionDebugCommentFormat,
+}
+
+impl Default for AuctionDebugCommentOptions {
+    fn default() -> Self {
+        Self {
+            include_provider_responses: true,
+            include_mediator_response: true,
+            include_bids: true,
+            metadata_keys: default_auction_debug_metadata_keys(),
+            verbosity: AuctionDebugCommentVerbosity::Redacted,
+            format: AuctionDebugCommentFormat::Compact,
+        }
+    }
+}
+
+impl AuctionDebugCommentOptions {
+    pub(crate) fn normalize(&mut self) {
+        self.metadata_keys = self
+            .metadata_keys
+            .drain(..)
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty())
+            .collect();
+    }
+}
+
+/// Verbosity of the `ts-debug` auction comment. See
+/// [`AuctionDebugCommentOptions::verbosity`].
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuctionDebugCommentVerbosity {
+    #[default]
+    Redacted,
+    Upstream,
+    Full,
+}
+
+/// JSON representation used for the outer `ts-debug` auction dump.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuctionDebugCommentFormat {
+    #[default]
+    Compact,
+    Pretty,
 }
 
 /// Tester-cookie endpoint configuration.
@@ -2497,6 +2628,7 @@ impl Settings {
         settings.cache.normalize();
         settings.proxy.normalize();
         settings.image_optimizer.normalize();
+        settings.debug.auction_html_comment_options.normalize();
         settings.consent.validate();
 
         settings.prepare_runtime()?;
@@ -3094,6 +3226,89 @@ mod tests {
     };
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+
+    #[test]
+    fn auction_debug_comment_options_default_matches_serde_defaults() {
+        let opts = AuctionDebugCommentOptions::default();
+        assert!(opts.include_provider_responses, "should default to true");
+        assert!(opts.include_mediator_response, "should default to true");
+        assert!(opts.include_bids, "should default to true");
+        assert_eq!(
+            opts.metadata_keys,
+            vec![
+                "error_type".to_string(),
+                "http_status".to_string(),
+                "message".to_string(),
+            ],
+            "should default to only schema-validated response metadata"
+        );
+        assert_eq!(
+            opts.verbosity,
+            AuctionDebugCommentVerbosity::Redacted,
+            "should default to Redacted"
+        );
+        assert_eq!(
+            opts.format,
+            AuctionDebugCommentFormat::Compact,
+            "should default to compact output"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_normalize_trims_and_drops_empty_keys() {
+        let mut opts = AuctionDebugCommentOptions {
+            metadata_keys: vec![
+                " http_status ".to_string(),
+                "".to_string(),
+                "debug".to_string(),
+            ],
+            ..AuctionDebugCommentOptions::default()
+        };
+        opts.normalize();
+        assert_eq!(
+            opts.metadata_keys,
+            vec!["http_status".to_string(), "debug".to_string()]
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_options_deserializes_upstream_verbosity() {
+        let options: AuctionDebugCommentOptions = toml::from_str(r#"verbosity = "upstream""#)
+            .expect("should deserialize upstream verbosity");
+        assert_eq!(options.verbosity, AuctionDebugCommentVerbosity::Upstream);
+    }
+
+    #[test]
+    fn auction_debug_comment_options_deserializes_pretty_format() {
+        let options: AuctionDebugCommentOptions =
+            toml::from_str(r#"format = "pretty""#).expect("should deserialize pretty format");
+        assert_eq!(options.format, AuctionDebugCommentFormat::Pretty);
+    }
+
+    #[test]
+    fn auction_debug_comment_options_bad_format_fails_config_load() {
+        let result: Result<AuctionDebugCommentOptions, _> =
+            toml::from_str(r#"format = "expanded""#);
+        assert!(
+            result.is_err(),
+            "unrecognized format must fail to deserialize, not silently fall back"
+        );
+    }
+
+    #[test]
+    fn bad_verbosity_string_fails_config_load() {
+        // Deserialize AuctionDebugCommentOptions directly, not a full Settings —
+        // Settings has required fields with no #[serde(default)] (e.g.
+        // `publisher`), so a full-Settings fixture missing them would fail with
+        // "missing field `publisher`" regardless of whether `verbosity` itself
+        // deserialized correctly, testing the wrong thing.
+        let result: Result<AuctionDebugCommentOptions, _> =
+            toml::from_str(r#"verbosity = "everything""#);
+        assert!(
+            result.is_err(),
+            "unrecognized verbosity must fail to deserialize, not silently fall back"
+        );
+    }
 
     #[test]
     fn tinybird_defaults_to_disabled_placeholders() {
