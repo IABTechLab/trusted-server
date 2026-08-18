@@ -1,6 +1,6 @@
 # APS Render Fix and TSJS Resilience Architecture — Design
 
-- **Status:** revision 39 — hard-cutover contract with a lean first-display owner,
+- **Status:** revision 40 — hard-cutover contract with a lean first-display owner,
   atomic persistent-runtime takeover, an `rc/202608` implementation base,
   retired-branch concept-gap coverage, rc behavior reconciliation, and
   merge-blocking load-time remediation
@@ -241,12 +241,12 @@ commits `1929dc83a`, `fde835110`, `9b21ba450`, `20977105f`, `1db074d4b`, and
 admission/rendering commits from `f916ddf90` through `a08bebfbd`; and the final
 PUC/sizing chain `248fe9558`, `ed38f3e13`, `905984e62`. The executable tree
 inventory, not this illustrative hash list, is the completeness authority for the
-retired concept checklist only. Current `main` and this design remain the behavior
-authorities.
+retired concept checklist only. The exact rc baseline and this design remain the
+behavior authorities.
 
 ### 0.5 In-spec retired concept-inventory manifest
 
-To keep this a one-file design and make the audit runnable from a main-only shallow
+To keep this a one-file design and make the audit runnable from an ordinary shallow
 checkout, the retired concept-inventory manifest embeds the complete materialized
 historical path list. No test resolves the retired commit or invokes `git ls-tree`.
 A contract test extracts `retired-rcjuly-tsjs-concept-manifest-v1`, requires the
@@ -867,7 +867,8 @@ The implementation keeps these identities distinct:
 | renderer reservation id | every TS-owned PUC capability    | `r1_` plus 22 base64url characters; exact `hb_adid`/TS `adId`  |
 | attempt id              | in-page lifecycle ownership      | `a1_` plus 22 base64url characters; navigation-unique          |
 | lifecycle ticket        | cross-window capability          | `t1_` plus 22 base64url characters; one-use and attempt-bound  |
-| renderer nonce          | renderer-document capability     | `n1_` plus 22 base64url characters; one-use and attempt-bound  |
+| bootstrap nonce         | outer-document capability        | `b1_` plus 22 base64url characters; one-use and attempt-bound  |
+| renderer nonce          | inner-document capability        | `n1_` plus 22 base64url characters; one-use and attempt-bound  |
 | GPT trace slot token    | diagnostic physical-object join  | adapter-minted canonical `gt1_` form; runtime-local, nonreused |
 | GPT trace cycle ordinal | diagnostic impression join       | 1..2^32-1 per physical object; valid only with its slot token  |
 
@@ -905,12 +906,18 @@ draw refuses the outer PUC response and fails the attempt with
 `capability_registry_full`. Consumption/disposal replaces the live entry with a
 tombstone carrying the same original expiry; it never extends the lifetime.
 
-Renderer nonces use the same eight-draw CSPRNG/collision rule in a separate live
-registry capped at 256, at most one `n1_` value per active attempt. They need no
-tombstone: the exact frame, port, attempt id, and generation remain mandatory, and
-attempt disposal closes the channel and removes the live nonce before any later
-attempt can act. Nonce capacity fails the attempt with `capability_registry_full`;
-collision exhaustion is `identity_generation_failed`. Neither registry falls back
+APS document nonces use the same eight-draw CSPRNG/collision rule in two separate
+live registries capped at 256 entries each. Every active APS attempt owns exactly
+one `b1_` bootstrap nonce and one independent `n1_` renderer nonce. The bootstrap
+nonce authenticates only the outer bootstrap/window-message/navigation phase; the
+renderer nonce authenticates only the inner renderer/port-envelope phase. Their
+different prefixes are mandatory, and a value is never converted, reused, or
+accepted in the other role. Neither registry needs tombstones: the exact outer or
+inner `WindowProxy`, exact port where applicable, attempt id, and generation remain
+mandatory, and attempt disposal removes both live entries, removes the bootstrap
+listener, and closes the renderer channel before any later attempt can act. Either
+registry's capacity failure is `capability_registry_full`; collision exhaustion is
+`identity_generation_failed`. The ticket and both nonce registries never fall back
 to timestamps, `Math.random`, truncation, or eviction.
 
 ### 2.3 Slot registry and bounded reservations
@@ -1582,8 +1589,9 @@ response CSP is:
 default-src 'none'; sandbox allow-scripts; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline'; frame-ancestors 'self'; form-action 'none';
 ```
 
-The bootstrap can only validate its fragment nonce, receive one exact navigation
-instruction from its checked parent, and replace its own location with the supplied
+The bootstrap can only validate its exact `b1_` fragment nonce, receive one exact
+navigation instruction from its checked parent carrying that same
+`bootstrapNonce`, and replace its own location with the supplied
 `data:text/html;charset=utf-8,` container URL. It has no descriptor, runner, creative
 URL path, price, bid id, network capability, child frame, or publisher DOM access.
 The response also has
@@ -1751,7 +1759,7 @@ global `postMessage` acknowledgement.
 
 The **ActiveRenderOwner** is one logical owner with non-overlapping agent and
 persistent epochs. On an eligible initial page, the agent epoch instantiates the
-§4 dispatcher, reservation/ticket/nonce registries, terminal latches, provisional
+§4 dispatcher, reservation/ticket/bootstrap-nonce/renderer-nonce registries, terminal latches, provisional
 GPT adapter/listeners, and APS/ADM channels for only the immutable projected batch.
 Every “kernel” or “runtime” action in this section is performed by that active epoch.
 At §5.2.1 takeover, all attempts and ports are terminal, tombstones/counters/facts
@@ -1980,36 +1988,80 @@ control message with no descriptor, URL, nonce, or transferred port:
 }
 ```
 
-The mount service resolves the exact registered slot presentation container and
-inserts one sibling of the Universal Creative iframe for PUC, or one child of the
-direct caller's registered container. It never appends beneath GAM, PUC, SafeFrame,
-or bidder-controlled DOM. Existing content stays visible until document acceptance;
-commit hides only the exact superseded PUC surface and reveals the exact owned APS
-surface. Failure removes only the pending APS surface and rejects the PUC Promise.
+The PUC claim's authenticated `WindowProxy` authorizes only the reservation claim
+and later owner messages; it is never mapped back to an iframe element and is never
+used to locate DOM. The reservation already joins one exact `SlotRecord`, physical
+GPT object, active GPT cycle, and binding epoch. For PUC, the mount service asks the
+slot service for that record's one connected, uniquely bound top-page slot element,
+then revalidates the exact record, physical object, cycle, generation, element, and
+binding epoch before insertion and again before commit. It appends one TS-owned
+overlay child inside that element. For direct rendering it appends one ordinary
+child inside the exact registered caller container. An absent, disconnected,
+ambiguous, changed, or multiply claimed binding fails `slot_unresolved` before
+publication; registration order and the PUC frame tree are never fallback locators.
+
+The PUC overlay uses compare-restorable top-page style ownership: when computed
+`position` is `static`, it sets the host's inline `position:relative` only while the
+artifact owns that exact prior inline value. The outer mount iframe is the absolute,
+initially `visibility:hidden` child with `inset:0`, `z-index:2147483647`, the exact
+winning pixel width/height, and zero margin/border/scrolling/overflow. On acceptance
+it changes only its own visibility to reveal the child above the existing GPT/PUC
+content. It never hides, removes, reparents, or
+traverses the GAM, PUC, SafeFrame, or bidder-controlled surface; that surface stays
+connected and inert behind the TS-owned overlay while the dynamic owner retains only
+Promise settlement authority. Direct rendering does not acquire overlay styling.
+Failure removes only the pending TS child, compare-restores only style values still
+owned by the attempt, and rejects the PUC Promise. Accepted style/DOM ownership is
+promoted to the `CommittedRenderArtifact` and released by exact replacement or
+navigation disposal.
 
 The mount has three document phases:
 
-1. Create one iframe at the immutable renderer-v1 bootstrap URL with an outer
-   128-bit CSPRNG nonce in its fragment and the initial sandbox from §3.6. The
+1. Create one iframe at the immutable renderer-v1 bootstrap URL with the attempt's
+   `b1_` bootstrap nonce in its fragment and the initial sandbox from §3.6. The
    bootstrap is publisher-origin by URL but opaque because `allow-same-origin` is
    absent. It can only send exact
-   `{message:'TS APS Bootstrap Ready',version:1,nonce}` to its checked parent.
-2. After exact element, parent, `src`, `WindowProxy`, generation, and nonce checks,
+   `{message:'TS APS Bootstrap Ready',version:1,bootstrapNonce}` to its checked
+   parent.
+2. After exact element, parent, `src`, `WindowProxy`, generation, and bootstrap-nonce
+   checks,
    add `allow-same-origin` to the sandbox and post exact
-   `{message:'TS APS Bootstrap Navigate',version:1,nonce,containerUrl}`. The URL must
-   be the attempt-owned `data:text/html;charset=utf-8,` container with the same
-   nonce fragment. The previously loaded bootstrap remains opaque while it performs
-   `location.replace`; the destination is naturally opaque because it is `data:`.
-3. The outer data container creates one inner data renderer with an independent
-   128-bit nonce and a permanent sandbox containing the §3.6 tokens plus
+   `{message:'TS APS Bootstrap Navigate',version:1,bootstrapNonce,containerUrl}`.
+   The URL must be the attempt-owned `data:text/html;charset=utf-8,` container with
+   that same `b1_` fragment. The previously loaded bootstrap remains opaque while it
+   performs `location.replace`; the destination is naturally opaque because it is
+   `data:`.
+3. The outer data container creates one inner data renderer whose `data:` URL
+   fragment is the independent `n1_` renderer nonce and whose permanent sandbox
+   contains the §3.6 tokens plus
    `allow-same-origin`. Both final documents remain naturally opaque. After the
-   inner renderer's exact ready message, the container creates a `MessageChannel`,
-   transfers one endpoint to the inner renderer, and transfers the other to the top
-   page in exact
-   `{message:'TS APS Container Ready',version:1,nonce}`. The top page accepts it only
-   from the exact outer `WindowProxy` with exactly one port, then sends the descriptor
-   envelope once over that port. Neither the bootstrap nor outer container receives
-   the descriptor.
+   exact inner `WindowProxy` sends
+   `{message:'TS APS Inner Ready',version:1,rendererNonce}` to the outer container,
+   the container creates a `MessageChannel`, transfers `port1` to that exact inner
+   window in `{message:'TS APS Inner Bind',version:1,rendererNonce}`, and transfers
+   `port2` to the top page in exact
+   `{message:'TS APS Container Ready',version:1,bootstrapNonce,rendererNonce}`. The
+   top page accepts that message only from the exact outer `WindowProxy`, for its
+   live `b1_` and `n1_` entries, with exactly one port, then retains `port2` and sends
+   the descriptor envelope once over it. Neither the bootstrap nor outer container
+   receives the descriptor. The inner accepts only `port1` from its exact outer
+   parent and only once.
+
+The descriptor envelope sent over retained `port2` is the exact structured-clone
+object below. `publisherOrigin` is the same canonical trusted-document HTTP(S)
+origin captured before mount creation, and `nonce` is the attempt's live `n1_`
+renderer nonce. The inner document validates all four own data properties and the
+complete §3.1 descriptor before acknowledging; it accepts no message discriminator,
+reservation id, attempt id, lifecycle ticket, CPM, callback, or extra field.
+
+```ts
+interface ApsDocumentEnvelopeV1 {
+  readonly version: 1
+  readonly nonce: string
+  readonly publisherOrigin: string
+  readonly renderer: Readonly<ApsRendererV1>
+}
+```
 
 After bootstrap readiness, both the outer mount iframe and its inner renderer iframe
 use this exact permanent sandbox order:
@@ -2042,7 +2094,8 @@ forbids. A loopback HTTP `<TS_ORIGIN>` is named explicitly for hermetic tests an
 not broaden `https:` production sources.
 
 The generated outer-container document contains only the exact validated creative
-origin, exact Trusted Server origin, the two nonces, the permanent sandbox string,
+origin, exact Trusted Server origin, the `b1_` bootstrap nonce, the independent
+`n1_` renderer nonce, the permanent sandbox string,
 and the percent-encoded TS-authored inner renderer template. It contains no response
 envelope, bid id, creative path, price, reservation, attempt id, or lifecycle ticket.
 Its CSP permits child frames only from `data:` and the exact creative origin. The
@@ -2064,19 +2117,20 @@ or substitution failure is `descriptor_invalid`.
 The publisher realm remains trusted for top-page DOM availability because TSJS
 executes in that realm; publisher code can always remove or sabotage TSJS-owned DOM.
 No GAM, PUC, SafeFrame, bidder, or creative realm is trusted as an APS embedding
-ancestor. The sibling mount and nested-data CSP remove those third-party ancestor
-navigation paths from the authority chain. A separately operated renderer origin is
-not required by this design.
+ancestor. The exact top-page slot-host mount and nested-data CSP remove those
+third-party ancestor navigation paths from the authority chain. A separately
+operated renderer origin is not required by this design.
 
 The inner renderer sends only these exact document-port messages:
 
-- `{message:"TS APS Document Accepted",version:1,nonce}` after nonce and descriptor
-  validation;
-- `{message:"TS APS Runner Loaded",version:1,nonce}` when the runner script loads,
-  as nonterminal progress;
-- `{message:"TS APS Render Completed",version:1,nonce}` when the queued APS render
-  event invokes its one-shot success callback;
-- `{message:"TS APS Render Failed",version:1,nonce,reason}` where `reason` is
+- `{message:"TS APS Document Accepted",version:1,nonce}` after the envelope's exact
+  `n1_` renderer nonce and descriptor validate;
+- `{message:"TS APS Runner Loaded",version:1,nonce}` with that renderer nonce when
+  the runner script loads, as nonterminal progress;
+- `{message:"TS APS Render Completed",version:1,nonce}` with that renderer nonce
+  when the queued APS render event invokes its one-shot success callback;
+- `{message:"TS APS Render Failed",version:1,nonce,reason}` with that renderer nonce,
+  where `reason` is
   `descriptor_invalid | runner_no_load | runner_failed`.
 
 Insertion has a one-second deadline. Bootstrap readiness, data navigation,
@@ -2202,12 +2256,13 @@ UUIDs and cache UUIDs never claim APS/ADM work.
 
 ### 4.6 Channel ownership and parsing
 
-| Channel               | Creator                   | Retained endpoint   | Transferred endpoint                      | Lifetime                                          |
-| --------------------- | ------------------------- | ------------------- | ----------------------------------------- | ------------------------------------------------- |
-| outer PUC response    | PUC `prebidMessenger`     | original PUC frame  | kernel global listener                    | one ready/refused response or claim disposal      |
-| registration response | PUC `h.sendMessage`       | original PUC helper | kernel global listener                    | one registered/refused response or owner watchdog |
-| owner control         | kernel after registration | kernel attempt      | hidden TS dynamic owner                   | insertion through final owner settlement          |
-| renderer document     | kernel before APS start   | kernel attempt      | exact static APS renderer `contentWindow` | document acceptance through APS completion        |
+| Channel                  | Creator                                | Retained endpoint             | Transferred endpoint                     | Lifetime                                          |
+| ------------------------ | -------------------------------------- | ----------------------------- | ---------------------------------------- | ------------------------------------------------- |
+| outer PUC response       | PUC `prebidMessenger`                  | original PUC frame            | kernel global listener                   | one ready/refused response or claim disposal      |
+| registration response    | PUC `h.sendMessage`                    | original PUC helper           | kernel global listener                   | one registered/refused response or owner watchdog |
+| owner control            | kernel after registration              | kernel attempt                | hidden TS dynamic owner                  | insertion through final owner settlement          |
+| bootstrap window channel | bootstrap/outer documents via `parent` | exact top-page mount listener | no `MessagePort`; source-bound messages  | bootstrap readiness through container readiness   |
+| renderer document        | outer data container after inner ready | top-page kernel retains port2 | exact inner data renderer receives port1 | document acceptance through APS completion        |
 
 Global window messages are JSON strings with the exact keys specified above. Port
 payloads are structured-clone objects with the exact keys specified above. Every
@@ -2218,18 +2273,25 @@ owned ports where possible, and makes queued callbacks generation-inert.
 
 The shared protocol corpus fixes these bounds and encodings:
 
-- before `JSON.parse`, an inbound global-dispatcher string is at most 4,096 UTF-8
-  bytes; a larger value is unrecognizable and causes no property access or state
-  lookup;
+- before `JSON.parse`, an inbound top-page global-dispatcher string is at most 4,096
+  UTF-8 bytes; a larger value is unrecognizable and causes no property access or
+  state lookup. The distinct top-page-to-bootstrap navigation parser accepts only
+  its exact expected parent and `b1_` nonce and caps the complete JSON instruction at
+  `MAX_APS_BOOTSTRAP_NAVIGATION_MESSAGE_BYTES = 196_800`; its `containerUrl` is at
+  most 196,663 UTF-8 bytes (29-byte data prefix + worst-case 3 × 65,536-byte encoded
+  document + 26-byte `#b1_…` fragment). No other global message receives this larger
+  allowance;
 - a TS `adId` is exactly the 25-character `r1_` reservation form; a lifecycle ticket,
-  renderer nonce, and attempt id are exactly the respective 25-character `t1_`,
-  `n1_`, and `a1_` forms from §2.2;
+  bootstrap nonce, renderer nonce, and attempt id are exactly the respective
+  25-character `t1_`, `b1_`, `n1_`, and `a1_` forms from §2.2;
 - `adServerDomain` is nonempty and at most 2,048 UTF-8 bytes. It is retained only for
   exact PUC-shape conformance and is never a fetch target or authority;
 - `publisherOrigin` and `rendererUrl` are at most 2,048 UTF-8 bytes. The former must
   serialize an exact HTTP(S) origin with no path/query/fragment; the latter must equal
   the current generation's absolute `/integrations/aps/renderer/v1` URL with no query
-  or fragment, after which the owner appends the exact `n1_` nonce fragment;
+  or fragment, after which the mount service appends the exact `b1_` bootstrap-nonce
+  fragment. The generated inner `data:` URL independently appends its exact `n1_`
+  renderer-nonce fragment;
 - a navigation/refresh generation is a nonnegative safe integer; and
 - the generated dynamic-owner `renderer` program is at most 64 KiB UTF-8 and the
   complete successful outer-response JSON is at most 72 KiB. Build tests enforce
@@ -2422,8 +2484,9 @@ actual request action; an empty batch cannot manufacture `tsjs:first-display` or
 included in the timing distribution.
 
 The runtime bundle first performs an effect-inert **static takeover preparation**
-against only immutable boot configuration and a frozen `TakeoverOutlineV1`: exact
-release/generation, projection digest, selected slice ids, counts, and the
+against only the bootstrap controller's exact immutable `TsjsBootV1` snapshot and a
+frozen `TakeoverOutlineV1`: exact release/generation, projection digest, canonical
+integration-config digest, selected slice ids, counts, and the
 capabilities/object kinds that final adoption must support. The outline contains no
 slot outcome, mutable publisher/GPT state, artifact object, wrapper, observer, or
 time-sensitive expiry. Preparation constructs generic inert persistent owners and
@@ -2446,7 +2509,8 @@ task; any mutation callback that arrives afterward sees only the new epoch.
 
 `FirstDisplayHandoffV1` is an exact-shaped, recursively frozen data tree containing:
 
-- release/generation identity and the canonical initial projection digest;
+- release/generation identity plus the canonical initial-projection and
+  integration-config digests;
 - each slot's canonical id, aliases, DOM id, GAM path, normalized formats,
   TS/publisher ownership, request-cycle outcome, and installed targeting snapshot;
 - every terminal attempt and reservation/ticket tombstone still inside its original
@@ -2463,7 +2527,15 @@ task; any mutation callback that arrives afterward sees only the new epoch.
 - the next trace sequence, per-slot impression counters, retained trace bindings,
   and the final `mutationRevision`.
 
-It contains no function, accessor, custom prototype, Promise, listener, timer,
+The integration configuration is not recopied from the agent into the handoff. The
+bootstrap controller passes the same closure-retained, recursively frozen
+`TsjsBootV1` snapshot to the agent and prepared runtime; the handoff digest must equal
+that snapshot's canonical config digest before adoption. No slice or module re-reads
+`window.tsjs.boot`, and replacing the public pre-load object therefore cannot change
+the retained snapshot. The eventual committed `tsjs.boot` exposes that same frozen
+snapshot for inspection.
+
+The handoff contains no function, accessor, custom prototype, Promise, listener, timer,
 observer, `MessagePort`, `WindowProxy`, network handle, or mutable collection. A
 release-private one-use `FirstDisplayOwnershipCapsuleV1` accompanies it only during
 the same synchronous takeover call. The capsule may carry the exact already-
@@ -2581,18 +2653,60 @@ only the frozen status described in §5.4, never the broker or phase loader.
 Every integration module registers through:
 
 ```ts
-interface IntegrationRegistrationV1 {
-  readonly abi: 1
-  readonly id: string
-  readonly phase: 'takeover' | 'deferred'
-  readonly releaseId: string
-  readonly prepare: (
-    ctx: Readonly<IntegrationPrepareContextV1>
-  ) => PreparedIntegrationV1 | Promise<PreparedIntegrationV1>
+interface IntegrationPrepareContextV1 {
+  readonly config: unknown
+  readonly interfaces: Readonly<Record<string, unknown>>
+  readonly signal: AbortSignal
+  readonly onDispose: (callback: () => void) => void
 }
 
-tsjs._registerIntegration({ abi: 1, id, phase, releaseId, prepare })
+interface IntegrationActivationContextV1 {
+  readonly signal: AbortSignal
+  readonly onDispose: (callback: () => void) => void
+  readonly afterCommit: (callback: () => void) => void
+  readonly adoption?: unknown
+}
+
+interface PreparedIntegrationV1 {
+  readonly activate: (ctx: Readonly<IntegrationActivationContextV1>) => void
+  readonly interfaces?: Readonly<Record<string, unknown>>
+}
+
+type IntegrationRegistrationV1 =
+  | Readonly<{
+      abi: 1
+      id: string
+      phase: 'takeover'
+      releaseId: string
+      prepareSync: (
+        ctx: Readonly<IntegrationPrepareContextV1>
+      ) => PreparedIntegrationV1
+      prepare: (
+        ctx: Readonly<IntegrationPrepareContextV1>
+      ) => PreparedIntegrationV1 | Promise<PreparedIntegrationV1>
+    }>
+  | Readonly<{
+      abi: 1
+      id: string
+      phase: 'deferred'
+      releaseId: string
+      prepare: (
+        ctx: Readonly<IntegrationPrepareContextV1>
+      ) => PreparedIntegrationV1 | Promise<PreparedIntegrationV1>
+    }>
+
+tsjs._registerIntegration(registration)
 ```
+
+Every takeover module supplies both entry points because the same release-owned
+implementation has two boot contexts. A no-agent parser-blocking runtime calls only
+`prepareSync`; returning a Promise/thenable, throwing, or crossing the owning
+monotonic deadline fails the transaction before the parser resumes. An agent-page
+post-paint takeover calls only `prepare`, which may await effect-inert work under the
+same deadline. A deferred module has only `prepare`; supplying `prepareSync` is an
+unknown key and fails registration. Shared pure construction may sit behind the two
+takeover entry points, but neither entry point may activate twice or retain a
+detached continuation.
 
 This is a release-internal bundle handshake, not a publisher extension API. An
 **integration** remains the product capability; an **integration module** is only
@@ -2639,7 +2753,70 @@ interface BootManifestV1 {
   readonly runtimeSrc: string
   readonly integrations: readonly BootManifestIntegrationV1[]
 }
+
+type IntegrationConfigIdV1 =
+  | 'aps'
+  | 'datadome'
+  | 'didomi'
+  | 'google_tag_manager'
+  | 'gpt'
+  | 'lockr'
+  | 'osano'
+  | 'permutive'
+  | 'prebid'
+  | 'sourcepoint'
+  | 'testlight'
+
+type BootJsonPrimitiveV1 = null | boolean | number | string
+type BootJsonValueV1 =
+  | BootJsonPrimitiveV1
+  | readonly BootJsonValueV1[]
+  | Readonly<{ readonly [key: string]: BootJsonValueV1 }>
+
+interface IntegrationConfigEntryV1 {
+  readonly id: IntegrationConfigIdV1
+  readonly config: Readonly<{ readonly [key: string]: BootJsonValueV1 }>
+}
+
+interface IntegrationConfigsV1 {
+  readonly version: 1
+  readonly entries: readonly Readonly<IntegrationConfigEntryV1>[]
+}
 ```
+
+`IntegrationConfigsV1` is the only generic browser configuration carrier. Its
+entries appear once each in the union order above, contain exactly the enabled
+product integrations for the document, and are capped at 11. APS emits `{}` when it
+is enabled but has no browser-selectable setting; an absent/disabled integration has
+no entry. The `gpt_later`, `prebid_later`, and consent/lifecycle deferred modules use
+their product's one existing entry rather than receiving a second config. Creative
+and diagnostics remain the dedicated typed `creative` and `diagnostics` boot fields
+because they are also stable public inspection surfaces. `render_runtime` and
+`diagnostics_presentation` have no independent config entry.
+
+The server serializes each integration's existing typed rc configuration into this
+carrier and rejects a manifest/config predicate mismatch before emitting HTML. The
+bootstrap admits only a non-null plain outer object with exact `version` and
+`entries` keys, exact-shaped plain entries, unique ordered ids, and plain config
+objects. Recursion admits only finite numbers, booleans, null, strings, dense plain
+Arrays, and non-null plain objects with own enumerable data properties. It rejects
+accessors, symbols, holes, custom prototypes, cycles or repeated object/Array
+aliases, non-finite numbers, duplicate
+or unknown ids/keys, depth above 16, more than 4,096 total values, a key or string
+above 4,096 UTF-8 bytes, an entry's canonical UTF-8 JSON above 65,536 bytes, or the
+complete carrier above 524,288 bytes. The bootstrap copies every admitted value into
+new ordinary objects/Arrays, recursively freezes the copy, retains that exact
+snapshot in its closure, and never again reads the server literal or a public global.
+Copy, validation, or freeze failure is `abi_mismatch` before effects.
+
+The release catalog binds every module id to exactly one config source: its product
+entry, `creative`, `diagnostics`, or none. The integration's generated exact typed
+validator runs during preparation and rejects unknown/missing fields or a
+manifest/config inclusion mismatch as `abi_mismatch`; it does not silently default
+browser data. `IntegrationPrepareContextV1.config` is only that module's frozen value,
+never the complete map, and deferred modules receive the same frozen product value
+captured at bootstrap. The first-display base likewise supplies each selected slice
+only its own attenuated value.
 
 Integration ids match `^[a-z0-9][a-z0-9_-]{0,63}$`, are unique, and appear in the actual
 server phase/injection order. Takeover entries precede deferred entries, the list
@@ -2693,9 +2870,10 @@ Every deferred `src` is an exact same-origin `/static/tsjs=tsjs-<id>.min.js?v=<h
 URL generated by the server for that release; accessors, arbitrary hosts, fragments,
 duplicate URLs, and mismatched ids/hashes fail manifest validation. That local
 static route must return the exact release artifact directly and never redirect.
-The persistent registration value must be a non-null plain object with exactly those five own
-enumerable data properties; accessors, unknown/missing/inherited keys, a custom
-prototype, wrong literals/types, or a non-callable `prepare` are rejected before the
+The persistent registration value must be a non-null plain object with exactly the
+six own enumerable data properties shown for takeover or the five shown for
+deferred; accessors, unknown/missing/inherited keys, a custom prototype, wrong
+literals/types, or a non-callable required entry point are rejected before the
 factory is retained. Registration requires exact id membership, phase, `releaseId` equality, expected script
 element identity, and `document.currentScript` identity. Integrations obtain stateful
 capabilities from the closure-private broker; they never construct a second runtime
@@ -2838,18 +3016,21 @@ bundle; only Trusted Server-owned adapters, contracts, and lifecycle code may be
 these artifacts.
 
 Both persistent phases use the same module-transaction rules. Registration stores
-code but does not execute it. During the takeover transaction, core calls `prepare(ctx)` in
-manifest order. Each deferred transaction calls its own `prepare(ctx)` independently
+code but does not execute it. On an agent page, the post-paint takeover transaction
+calls `prepare(ctx)` in manifest order. On a no-agent page, the one parser-blocking
+runtime calls `prepareSync(ctx)` in manifest order and never opens an asynchronous
+preparation gap. Each deferred transaction calls its own `prepare(ctx)` independently
 after that module's accepted registration and `load` checkpoint, without awaiting or
-ordering against a deferred sibling. `prepare(ctx)` may be synchronous or asynchronous;
-its only legal effects are validating frozen configuration,
+ordering against a deferred sibling. `prepare` may be synchronous or asynchronous;
+`prepareSync` must be synchronous. Their only legal effects are validating frozen configuration,
 obtaining declared capability interfaces, allocating private inert data/closures,
 and registering private-memory disposers. Preparation cannot read or write ad-tech
 globals, attach a listener/observer/wrapper, touch live DOM, inject a script, start a
 timer/fetch, schedule detached work, invoke publisher code, or call a stateful
-adapter/service method. The one Promise returned to and awaited by the phase owner,
-including its ordinary `await`/settlement continuations, is permitted; no
-continuation may be detached from that Promise or survive its settlement/abort.
+adapter/service method. For `prepare` only, the one Promise returned to and awaited
+by the phase owner, including its ordinary `await`/settlement continuations, is
+permitted; no continuation may be detached from that Promise or survive its
+settlement/abort. `prepareSync` returning a Promise or any thenable is an ABI failure.
 Preparation returns exactly one prepared module with a synchronous `activate(ctx)`
 function and its declared frozen capability interfaces. Core validates and stages a
 provider's interfaces immediately after that provider prepares, so later consumers
@@ -2859,7 +3040,20 @@ call a staged stateful capability. Takeover activation order is the same
 provider-before-consumer order, so no consumer becomes live first.
 
 After every takeover module prepares, core enters one synchronous takeover
-activation barrier in manifest order. `activate(ctx)` may install only synchronously
+activation barrier in manifest order. On the no-agent path this barrier runs in the
+same classic parser-blocking script evaluation as every `prepareSync` call and the
+kernel commit; no Promise, microtask, timer, network wait, or publisher task can occur
+between preparation, activation, and commit. Every catalogued parser-time obligation
+therefore installs before the script returns. In particular, the GPT module installs
+correctness listeners and, when `gamAttributionEnabled`, synchronously enqueues the
+one `googletag.setConfig({targeting:{ts:'true'}})` command during activation. If the
+GPT command queue is already live it executes before activation returns; otherwise
+it precedes publisher parser work after the TSJS tag. Async SDK readiness and all
+request-capable work start only through `afterCommit`. On an agent page the
+first-display slice already owns those parser-time obligations; post-paint takeover
+adopts them through §5.2.1 instead of installing a competing guard.
+
+`activate(ctx)` may install only synchronously
 compare-restorable wrappers, listeners, observers, guards, provider live-state
 transitions, and service subscriptions. It registers the disposer before each mutation and may stage bounded
 post-commit work through `ctx.afterCommit(fn)`, but cannot inject/load a script,
@@ -3084,9 +3278,11 @@ It installs only the queue ingress, immutable boot/manifest inputs, generation l
 artifact error/watchdog observation, both release-internal registration sinks,
 User Timing start mark, and terminal fallback commit. It owns no adapter, slot,
 auction, renderer, integration feature, upstream loader, DOM scan, or publisher
-callback execution before handoff. The server follows it with only first-display
-configuration transports, any first-display-required live upstream tags described
-in §5.2, and the one parser-blocking agent-or-runtime tag.
+callback execution before handoff. The server follows it with only any
+first-display-required live upstream tags described in §5.2 and the one
+parser-blocking agent-or-runtime tag. There are no separate integration-configuration
+script tags or globals: all configuration is already inside the captured
+`TsjsBootV1` value.
 
 The old `gpt_bootstrap.js` asset and its initial-load hooks, handoff wrappers,
 hydration scheduler, slot definition, targeting, display, and refresh are deleted
@@ -3119,7 +3315,9 @@ constructs no runtime session, slot registry, GPT/Prebid adapter, bridge dispatc
 timer, listener, port, or iframe. It never exposes a compatibility API.
 
 The safe fallback boot uses the independently embedded release and exact selected
-URLs in `manifest:{version:1,releaseId,firstDisplay,runtimeSrc,integrations:[]}`. It retains the
+URLs in `manifest:{version:1,releaseId,firstDisplay,runtimeSrc,integrations:[]}` and
+uses `integrations:{version:1,entries:[]}` because fallback activates no integration.
+It retains the
 server auction projection only when that projection passes its exact shape, full ordered
 placement coverage, 256-slot bounds,
 field grammars, render limits, and 8 MiB aggregate cap from §§3.1–3.2, and otherwise substitutes exactly
@@ -3184,6 +3382,7 @@ interface TsjsBootV1 {
   readonly releaseId: string
   readonly manifest: Readonly<BootManifestV1>
   readonly auctionProjection: Readonly<BrowserAuctionProjectionV1>
+  readonly integrations: Readonly<IntegrationConfigsV1>
   readonly creative: Readonly<CreativeBootV1>
   readonly diagnostics: Readonly<DiagnosticsBootV1>
 }
@@ -3227,11 +3426,14 @@ type TsjsApi = TsjsKernelApi | TsjsFallbackApi
 
 `version` is the semantic public-API generation and changes only with a reviewed API
 contract; `releaseId` identifies the exact bundle set and equals
-`boot.releaseId`/`boot.manifest.releaseId`. Core recursively freezes the boot value
-before installing integrations. Integration-specific configuration is not a public
-mutable bag: the composition root validates each server-projected, deny-unknown
-config against that integration's typed schema and passes the frozen value only in
-its preparation/activation contexts. `_internal` is a frozen, non-enumerable status
+`boot.releaseId`/`boot.manifest.releaseId`. The bootstrap, not a later module,
+validates, copies, and recursively freezes the complete boot snapshot before
+installing integrations. `boot.integrations` is immutable public inspection data,
+not a mutable service locator: the composition root passes only the owning frozen
+entry through each module's preparation/activation context. The hard cutover emits
+no `window.__tsjs_*` integration-config value and deletes the old per-integration
+bootstrap globals/templates in the same release; no module aliases or falls back to
+them. `_internal` is a frozen, non-enumerable status
 value; the service registry remains in the composition closure and is available to
 integration modules only through those contexts during startup.
 
@@ -3878,11 +4080,7 @@ subscription methods. The final schema is:
 ```ts
 type RenderTracePathV1 = 'auction' | 'ssat' | 'gam-refresh'
 type RenderTraceServedFromV1 =
-  | 'inline'
-  | 'gam'
-  | 'debug-adm'
-  | 'pbs-cache'
-  | 'prebid'
+  'inline' | 'gam' | 'debug-adm' | 'pbs-cache' | 'prebid'
 
 interface RenderTraceRecord {
   readonly slotId: string
@@ -4008,10 +4206,203 @@ origin handling, preserves unrelated path/query/fragment data, and emits only th
 resolved `gpt.active` boolean. The old
 `window.__tsjs_gpt_diagnostics_active` flag and browser storage bootstrap are deleted.
 
-The GPT diagnostics integration module preserves the behavioral contract in
-`docs/superpowers/specs/2026-07-28-gpt-runtime-diagnostics-overlay-design.md` unless
-this design explicitly changes ownership or activation transport. It consumes raw
-facts from the sole GPT adapter rather than registering another control wrapper.
+The GPT diagnostics integration consumes raw facts from the sole GPT adapter rather
+than registering another control wrapper. This document is the complete normative
+contract; the earlier GPT-diagnostics design is historical rationale only.
+
+```ts
+type GptDiagnosticsCallbackKind =
+  | 'slotRequested'
+  | 'slotResponseReceived'
+  | 'slotRenderEnded'
+  | 'slotOnload'
+  | 'impressionViewable'
+  | 'slotVisibilityChanged'
+
+type GptDiagnosticsCallbackDisposition = 'matched' | 'unmatched' | 'ambiguous'
+type GptDiagnosticsSize = readonly [number, number]
+
+type GptDiagnosticsBindingReason =
+  | 'missing_slot_element_id'
+  | 'missing_element'
+  | 'duplicate_dom_id'
+  | 'dom_uniqueness_unverifiable'
+  | 'duplicate_gpt_slot_id'
+
+interface GptDiagnosticsBinding {
+  readonly status: 'bound' | 'unbound' | 'ambiguous'
+  readonly reason?: GptDiagnosticsBindingReason
+}
+
+interface GptDiagnosticsDurations {
+  readonly requestToResponseMs?: number
+  readonly responseToRenderMs?: number
+  readonly requestToRenderMs?: number
+  readonly renderToLoadMs?: number
+  readonly renderToViewableMs?: number
+}
+
+interface GptDiagnosticsAdManagerIdentity {
+  readonly lineItemId?: number
+  readonly creativeId?: number
+  readonly campaignId?: number
+  readonly advertiserId?: number
+  readonly sourceAgnosticLineItemId?: number
+  readonly sourceAgnosticCreativeId?: number
+  readonly yieldGroupIds?: readonly number[]
+  readonly companyIds?: readonly number[]
+}
+
+type GptDiagnosticsResponseClass =
+  'empty' | 'backfill' | 'reservation' | 'unclassified_non_empty'
+
+type GptDiagnosticsRequestPath =
+  | 'trusted_server_direct'
+  | 'prebid_refresh'
+  | 'publisher_refresh'
+  | 'competing'
+  | 'unattributed'
+
+type GptDiagnosticsTrustedServerOpportunity =
+  'renderable_candidate' | 'unrenderable_candidate' | 'no_candidate'
+
+type GptDiagnosticsCreativeFailure =
+  | 'missing_render_source'
+  | 'cache_fetch_failed'
+  | 'invalid_cache_payload'
+  | 'response_post_failed'
+
+type GptDiagnosticsDelivery =
+  | 'trusted_server_response_sent'
+  | 'trusted_server_selected'
+  | 'candidate_unconfirmed'
+  | 'no_candidate'
+  | 'unknown'
+  | 'pending'
+  | 'not_applicable'
+
+interface GptDiagnosticsRequestCycle {
+  readonly requestNumber: number
+  readonly requestedAtMs?: number
+  readonly responseAtMs?: number
+  readonly renderAtMs?: number
+  readonly loadAtMs?: number
+  readonly viewableAtMs?: number
+  readonly durations: Readonly<GptDiagnosticsDurations>
+  readonly requestedSlotSizes?: readonly GptDiagnosticsSize[]
+  readonly size?: GptDiagnosticsSize
+  readonly observedSlotSize?: GptDiagnosticsSize
+  readonly isEmpty?: boolean
+  readonly isBackfill?: boolean
+  readonly slotContentChanged?: boolean
+  readonly incompleteSequence: boolean
+  readonly adManager?: Readonly<GptDiagnosticsAdManagerIdentity>
+  readonly responseClass?: GptDiagnosticsResponseClass
+  readonly requestPath?: GptDiagnosticsRequestPath
+  readonly requestIntentId?: number
+  readonly trustedServerAuctionId?: string
+  readonly opportunityToRequestMs?: number
+  readonly replacedRequestNumber?: number
+  readonly previousRenderToRequestMs?: number
+  readonly creativeChanged?: boolean
+  readonly previousCreativeId?: number
+  readonly loadObservedBeforeRender?: boolean
+  readonly trustedServerOpportunity?: GptDiagnosticsTrustedServerOpportunity
+  readonly trustedServerCreativeRequestAtMs?: number
+  readonly trustedServerCreativeResponseAtMs?: number
+  readonly trustedServerCreativeFailures?: readonly GptDiagnosticsCreativeFailure[]
+  readonly delivery?: GptDiagnosticsDelivery
+}
+
+interface GptDiagnosticsSlotExport {
+  readonly runtimeSlotNumber: number
+  readonly slotElementId?: string
+  readonly adUnitPath?: string
+  readonly binding: Readonly<GptDiagnosticsBinding>
+  readonly currentVisibilityPercentage?: number
+  readonly maximumVisibilityPercentage?: number
+  readonly requests: readonly Readonly<GptDiagnosticsRequestCycle>[]
+}
+
+interface GptDiagnosticsCallbackIssue {
+  readonly kind: GptDiagnosticsCallbackKind
+  readonly runtimeSlotNumber: number
+  readonly slotElementId?: string
+  readonly timestampMs: number
+  readonly disposition: GptDiagnosticsCallbackDisposition
+  readonly reason: GptDiagnosticIssueReasonV1
+}
+
+type GptDiagnosticsAttributionIssueReason =
+  | 'creative_request_without_slot'
+  | 'creative_request_without_cycle'
+  | 'creative_request_ambiguous_cycle'
+  | 'creative_request_on_empty_cycle'
+  | 'creative_attempt_capacity'
+  | 'creative_attempt_unknown'
+  | 'creative_attempt_expired'
+  | 'creative_attempt_evicted'
+
+interface GptDiagnosticsAttributionIssue {
+  readonly reason: GptDiagnosticsAttributionIssueReason
+  readonly timestampMs: number
+  readonly runtimeSlotNumber?: number
+  readonly slotElementId?: string
+}
+
+interface GptDiagnosticsCoverageCounters {
+  readonly observed: number
+  readonly matched: number
+  readonly unmatched: number
+  readonly ambiguous: number
+}
+
+interface GptDiagnosticsExportV1 {
+  readonly version: 1
+  readonly capturedAt: string
+  readonly page: Readonly<{ origin: string; pathname: string }>
+  readonly slots: readonly Readonly<GptDiagnosticsSlotExport>[]
+  readonly callbackIssues: readonly Readonly<GptDiagnosticsCallbackIssue>[]
+  readonly attributionIssues: readonly Readonly<GptDiagnosticsAttributionIssue>[]
+  readonly coverage: Readonly<
+    Record<GptDiagnosticsCallbackKind, Readonly<GptDiagnosticsCoverageCounters>>
+  >
+  readonly metadata: Readonly<{
+    droppedCallbacks: number
+    droppedAttributionIssues: number
+    evictedSlots: number
+    evictedRequestCycles: number
+  }>
+}
+
+interface GptDiagnosticsApi {
+  snapshot(): Readonly<GptDiagnosticsExportV1>
+  export(): void
+  subscribe(
+    listener: (snapshot: Readonly<GptDiagnosticsExportV1>) => void
+  ): () => void
+  show(): void
+  hide(): void
+}
+```
+
+All arrays, tuples, nested objects, and the root returned by `snapshot()` are fresh
+recursively frozen copies. `capturedAt` is a valid UTC ISO timestamp generated for
+that snapshot; `page` contains only the current origin and pathname, never query,
+fragment, referrer, cookies, targeting, bid payload, or creative markup. Optional
+fields mean the fact was unavailable or inapplicable, never that a false/zero value
+was elided. Public counters are nonnegative safe integers and saturate rather than
+wrap; timestamps/durations/percentages and exported numeric identifiers are finite
+and preserve zero. The store normalizes and bounds strings/arrays before retention,
+and every snapshot reuses only copied primitive data.
+
+The frozen `tsjs.diagnostics.gpt` API exists iff `diagnostics.gpt.active` is true.
+Before the deferred presentation attaches, `show`, `hide`, and `export` are safe
+no-ops; they do not queue a later UI action. After attachment, `show`/`hide` control
+only the Shadow DOM overlay and `export()` downloads the current snapshot as local
+JSON using a short-lived object URL that is always revoked; none performs a network
+request or changes ad state. The internal evidence recorder is a closure-private
+`gpt.events.v1` consumer and is never a property of this API.
 
 The buffer does not retain GPT event objects or arbitrary publisher data. Before
 admission, the current owner normalizes each observation to one exact ordinary-data
@@ -4711,17 +5102,17 @@ and finish GPT slot reconciliation before the final forced-GC measurement.
 
 ### 7.1 Required test layers
 
-| Layer                 | Required proof                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Rust unit             | APS parsing/admission, dimensions, scripts, AAX projection, mediation provenance/order/timeouts, targeting identity, descriptor serialization, endpoint headers/body                                                                                                                                                                                                                                                                                 |
-| Baseline/gap audit    | rc-baseline tests are the behavioral oracle; every retained `RCJ-*` row starts proof-pending, identifies/authors a focused contract, runs it on the untouched recorded-rc worktree, and ends baseline-owned or demonstrated implementation-gap with recorded SHA/owner/test command/result; proof-pending/coverage-gap blocks phase exit and no retired source is built or merged                                                                    |
-| Cross-language corpus | every positive/adversarial descriptor has the same Rust, TS, and embedded ES5 result; stale generation fails                                                                                                                                                                                                                                                                                                                                         |
-| TS unit               | agent/takeover ownership, exact handoff/capsule admission, takeover/deferred transactions, fallback versus isolated deferred failure, trigger/disposal races, sessions, registries, selection/cycle/batch/latch APIs, adapter readiness, GPT handoff/reconciliation, Prebid artifact/refresh, creative security, diagnostics, and every remaining integration parity corpus                                                                          |
-| Hermetic browser      | one parser-blocking first-display request, no pre-paint persistent/deferred traffic, authenticated atomic takeover into the one persistent runtime, all render paths, PUC bridge, sibling top mount, four-level APS sizing, data-document CSP containment, direct iframe races, owner/port/runner behavior, fallback, SafeFrame-shaped isolation, GPT handoff/hydration, creative clicks, diagnostics, and duplicate/replay/wrong-source/stale cases |
-| Real-GAM test network | SSAT APS-PUC, Prebid-adapter APS-PUC, page-bids APS-PUC, direct APS, direct ADM plus rc-baseline PBS Cache regression, fallback after attributable empty GAM, SRA, refresh, SPA, handoff, hydrated DOM replacement, and collapsed shell                                                                                                                                                                                                              |
-| Adapter parity        | exact bootstrap sandbox/CSP/header bytes plus runner-proxy routing, five-second deadline, closed response parsing, bounded relay, header filtering, and failures match on all adapters                                                                                                                                                                                                                                                               |
-| Regression            | non-APS Cache/ADM and notifications, pure external Prebid/native bids/EIDs/user IDs/refresh exclusions, publisher GPT/handoff/SRA/SPA, creative processing/click recovery, render trace/GPT diagnostics, and every remaining integration remain correct                                                                                                                                                                                              |
-| Quality               | full-package TypeScript/lint including tests/scripts/build code, ESLint and release-catalog dependency boundaries, production-metafile/test-hook exclusions, format, clippy, Rust adapter suites, Vitest, artifact integration, Playwright, immutable historical bundle reporting, role-correct transfer budgets, performance/heap budgets, and complete maximal inventory                                                                           |
+| Layer                 | Required proof                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Rust unit             | APS parsing/admission, dimensions, scripts, AAX projection, mediation provenance/order/timeouts, targeting identity, descriptor serialization, endpoint headers/body                                                                                                                                                                                                                                                                                          |
+| Baseline/gap audit    | rc-baseline tests are the behavioral oracle; every retained `RCJ-*` row starts proof-pending, identifies/authors a focused contract, runs it on the untouched recorded-rc worktree, and ends baseline-owned or demonstrated implementation-gap with recorded SHA/owner/test command/result; proof-pending/coverage-gap blocks phase exit and no retired source is built or merged                                                                             |
+| Cross-language corpus | every positive/adversarial descriptor has the same Rust, TS, and embedded ES5 result; stale generation fails                                                                                                                                                                                                                                                                                                                                                  |
+| TS unit               | agent/takeover ownership, exact handoff/capsule admission, takeover/deferred transactions, fallback versus isolated deferred failure, trigger/disposal races, sessions, registries, selection/cycle/batch/latch APIs, adapter readiness, GPT handoff/reconciliation, Prebid artifact/refresh, creative security, diagnostics, and every remaining integration parity corpus                                                                                   |
+| Hermetic browser      | one parser-blocking first-display request, no pre-paint persistent/deferred traffic, authenticated atomic takeover into the one persistent runtime, all render paths, PUC bridge, exact-bound-slot top mount, four-level APS sizing, data-document CSP containment, direct iframe races, owner/port/runner behavior, fallback, SafeFrame-shaped isolation, GPT handoff/hydration, creative clicks, diagnostics, and duplicate/replay/wrong-source/stale cases |
+| Real-GAM test network | SSAT APS-PUC, Prebid-adapter APS-PUC, page-bids APS-PUC, direct APS, direct ADM plus rc-baseline PBS Cache regression, fallback after attributable empty GAM, SRA, refresh, SPA, handoff, hydrated DOM replacement, and collapsed shell                                                                                                                                                                                                                       |
+| Adapter parity        | exact bootstrap sandbox/CSP/header bytes plus runner-proxy routing, five-second deadline, closed response parsing, bounded relay, header filtering, and failures match on all adapters                                                                                                                                                                                                                                                                        |
+| Regression            | non-APS Cache/ADM and notifications, pure external Prebid/native bids/EIDs/user IDs/refresh exclusions, publisher GPT/handoff/SRA/SPA, creative processing/click recovery, render trace/GPT diagnostics, and every remaining integration remain correct                                                                                                                                                                                                       |
+| Quality               | full-package TypeScript/lint including tests/scripts/build code, ESLint and release-catalog dependency boundaries, production-metafile/test-hook exclusions, format, clippy, Rust adapter suites, Vitest, artifact integration, Playwright, immutable historical bundle reporting, role-correct transfer budgets, performance/heap budgets, and complete maximal inventory                                                                                    |
 
 Feature-owned GitHub Actions YAML is declarative orchestration, not a program
 container. Multiline shell programs, generated configuration bodies, validation
@@ -4751,10 +5142,11 @@ Tests must cover at least:
   navigation/supersession at each side of that two-condition join;
 - replay after consumption and after tombstone expiry boundary;
 - attempt-id navigation prefix failure, ordinal uniqueness and exhaustion without an
-  issued-id set; forced lifecycle-ticket/renderer-nonce collisions through the
-  eighth draw; 255/256/257 live nonces and 319/320/321 ticket/tombstone entries;
-  capacity versus expiry pruning; and proof that neither overflow path posts a usable
-  capability;
+  issued-id set; forced lifecycle-ticket, `b1_` bootstrap-nonce, and `n1_`
+  renderer-nonce collisions through the eighth draw; independent 255/256/257 live
+  boundaries for each nonce registry and 319/320/321 ticket/tombstone entries;
+  capacity versus expiry pruning; cross-role nonce substitution; and proof that no
+  overflow path posts a usable capability;
 - valid id from wrong slot/source, altered id from the expected source, and a native
   Prebid id;
 - PUC registration before/after timeout, wrong source, zero/two ports, replay,
@@ -4764,9 +5156,11 @@ Tests must cover at least:
   start and after top insertion, settlement-post throw, and the 20-second remote
   cleanup boundary prove the PUC owner owns no APS node while the mount service
   removes only its exact uncommitted iframe and leaves accepted DOM;
-- bootstrap ready before/after deadline; wrong source/nonce/shape; outer frame
+- bootstrap ready before/after deadline; wrong source/`b1_`/shape; outer frame
   removal, `src` mutation, replacement, and navigation; zero/two container ports;
-  inner-ready replay; descriptor transfer before/after channel creation; publisher,
+  wrong-outer `n1_`, inner-ready replay, port swap/reuse, and descriptor transfer
+  before/after channel creation; a nested SafeFrame-shaped PUC source proving claim
+  authentication never performs WindowProxy-to-DOM mapping; publisher,
   GAM, PUC, and creative attempts to navigate or frame a publisher-origin document;
   exact creative-origin CSP allow/deny; data-document 65,535/65,536/65,537-byte
   boundaries; sentinel escaping/completeness; and renderer document success followed
@@ -4856,8 +5250,12 @@ Tests must cover at least:
   from `trace.v1` and denied to APS, GPT, and `gpt_later`, while only
   `diagnostics_presentation` can consume `trace.presentation.v1`;
 - exactly one parser-blocking network request and manifest-order registration;
-  first-display/takeover module missing/wrong-release/duplicate/prepare
-  throw/reject/abort/activation throw at each checkpoint, late continuation after fallback, and takeover
+  takeover exact-six-key and deferred exact-five-key registration; no-agent
+  `prepareSync` success/throw/thenable/deadline behavior with no task or microtask
+  before activation and commit; agent takeover and deferred synchronous/async
+  `prepare` success/reject/abort; first-display/takeover module
+  missing/wrong-release/duplicate/activation throw at each checkpoint, late
+  continuation after fallback, and takeover
   `afterCommit` throw; 9,999/10,000/10,001 ms synchronous activation returns plus
   the pre/post-call and pre-handoff monotonic checks; nonreturning activation
   documented as unpreemptable; duplicate `afterCommit` registration,
@@ -4938,7 +5336,12 @@ Tests must cover at least:
   `load_error`, while node removal/replacement may have initiated a request but
   cannot register and becomes `registration_rejected` unless load failure wins;
 - exact kernel/fallback `TsjsApi` own surfaces; semantic version and release-id
-  equality; boot deep-copy/freeze and malformed-field safe fallback; actual-Array
+  equality; boot deep-copy/freeze and malformed-field safe fallback; exact ordered
+  integration-config id inclusion, manifest/product matching, attenuated per-module
+  delivery, bootstrap-snapshot identity through agent takeover/deferred load, raw
+  pre-load-object replacement, old-global absence, accessor/symbol/prototype/cycle/
+  sparse-array/alias rejection, depth/node/string/key/per-entry/aggregate boundaries,
+  and fallback empty config entries; actual-Array
   queue identity; pushes before/during/at activation and commit completion; retained ingress
   references after swap; snapshot-versus-forward exactly-once behavior; nested push
   ordering; frozen final-queue `length:0` under native/borrowed mutators, index and
@@ -5087,10 +5490,10 @@ over once through the existing APS/TSJS release mechanism. No runtime flag,
 old/new selector, compatibility branch, or dual protocol is introduced in any
 deployable artifact.
 
-Operator configuration moves atomically with the binary cutover. Canonical APS
-`account_id` and the required `[creative_opportunities].enabled` boolean are
-validated before deployment; the active binary exposes no legacy alias or
-omitted-field compatibility path.
+Operator configuration moves before the binary cutover. The rc baseline already
+accepts canonical APS `account_id` and `[creative_opportunities].enabled`, so both
+are validated and pushed as release prerequisites. The new binary requires the
+boolean and exposes no legacy alias or omitted-field compatibility path.
 
 1. **Integrate the release base:** fetch and integrate current `origin/rc/202608`, record its
    exact SHA, run the unchanged affected Rust/TS/browser suites, and start every
@@ -5180,7 +5583,8 @@ adding a hidden analytics subsystem here.
 12. **Mount APS beneath Universal Creative or another third-party ancestor:**
     rejected. An ancestor with navigation authority can replace an opaque child while
     preserving its `WindowProxy`. PUC receives only settlement authority; the
-    top-page owner mounts the nested data renderer as a sibling.
+    top-page owner mounts the nested data renderer as an owned overlay child of the
+    exact slot service binding without traversing or hiding the PUC surface.
 13. **Vendor PUC, GPT, APS, or another upstream script for deterministic tests:**
     rejected. Hermetic fixtures are independently authored protocol doubles and the
     protected conformance suite exercises the named live external release.
@@ -5221,7 +5625,7 @@ adding a hidden analytics subsystem here.
 | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | PUC behavior differs from the local contract harness               | keep the harness limited to the public message/helper contract, exercise `h.sendMessage`, and gate the actual externally hosted PUC release on real GAM; do not vendor PUC bytes                                                                                                                                                                              |
 | Same-realm publisher code can interfere                            | publisher-realm availability/DOM integrity is an explicit prerequisite; capability checks defend third-party frames, replays, and stale work, not arbitrary same-realm compromise                                                                                                                                                                             |
-| Third-party creative regains publisher-origin execution            | top-page sibling mount, naturally opaque nested data documents, outer exact-origin `frame-src`, independent publisher `frame-ancestors 'self'`, and three-browser hostile-navigation fixtures                                                                                                                                                                 |
+| Third-party creative regains publisher-origin execution            | top-page mount inside the exact trusted slot binding, naturally opaque nested data documents, outer exact-origin `frame-src`, independent publisher `frame-ancestors 'self'`, and three-browser hostile-navigation fixtures                                                                                                                                   |
 | Rc merge silently drops a release-branch behavior                  | first-parent rc ancestry, explicit adoption ledger, conflict inventory, focused baseline-versus-candidate contracts, and full rc suites before feature work                                                                                                                                                                                                   |
 | Required template switch breaks an old omitted-field config        | intentional hard cutover; startup rejects omission, examples/fixtures/operators move atomically, and whole-release rollback restores the prior binary/config together                                                                                                                                                                                         |
 | Late slot-size observation mutates a newer GPT cycle               | capture runtime-slot/request/element identity, revalidate exact latest filled cycle and live unique binding at commit, disconnect/unsubscribe on disposal, and keep evidence diagnostics-only                                                                                                                                                                 |
@@ -5310,11 +5714,13 @@ The design is complete when all of the following are true:
     same lifecycle; placeholder rendering and mutable generic runtime configuration
     are absent rather than silently retained as a second path.
 19. The committed `TsjsApi` kernel/fallback surfaces, semantic version, exact
-    release identity, queue, logger, immutable boot data, and diagnostics presence are
-    executable contracts; creative guards auto-install from `CreativeBootV1` with no
-    mutable/install global API.
-20. Attempt ids require no issued-id history, and reservation/ticket/nonce registries
-    refuse capacity or collision exhaustion without exposing a reusable capability.
+    release identity, queue, logger, immutable boot data, exact ordered integration-
+    config carrier, attenuated per-module config delivery, and diagnostics presence
+    are executable contracts; creative guards auto-install from `CreativeBootV1`
+    with no mutable/install global API or separate config transport.
+20. Attempt ids require no issued-id history, and reservation/ticket/bootstrap-
+    nonce/renderer-nonce registries refuse capacity or collision exhaustion without
+    exposing a reusable or cross-role capability.
 21. The external Prebid artifact remains free of TS auction/render behavior, exposes
     only its exact own frozen 10.26.0 build stamp, and the TS-owned adapter admits a
     fully prepared bid without partial publication.
@@ -5407,6 +5813,11 @@ The design is complete when all of the following are true:
     SafeFrame, bidder, or creative document is an ancestor; the exact-origin CSP and
     publisher `frame-ancestors 'self'` proofs block publisher-origin regain in all
     three browsers.
+35. A no-agent runtime validates and prepares every takeover module synchronously,
+    activates parser-time guards and GAM attribution, and commits the one kernel in
+    the parser-blocking evaluation before publisher parsing resumes. Agent-page
+    takeover may prepare asynchronously only after protected paint and still adopts
+    those already-live first-display obligations without overlap.
 
 ## 12. Open implementation decisions
 
