@@ -58,15 +58,28 @@ Migrate an existing deployment in this order:
 1. Create/populate `trusted_server_secrets` with the existing credential values
    without printing them in shell history, logs, or CI output.
 2. Replace the five config values with stable key names.
-3. Run `ts config validate`, then `ts config push --adapter fastly`.
+3. Run `ts config validate`, then `ts config push --adapter fastly --no-diff`.
 4. Restart/redeploy instances as needed to load the new values. Rotation is
    startup-scoped; changing a store value does not alter already-built state.
 
+`--no-diff` prevents `config push` from rendering the previous plaintext
+configuration during this migration.
+
 Keep `publisher.proxy_secret` and `ec.passphrase` stable unless intentionally
-rotating signed URLs or EC identifiers. On Spin, declare a component variable
-for each chosen key name using the encoder documented in `spin.toml`. Missing
-stores, keys, invalid UTF-8, and empty values fail closed; inline plaintext
-fallback is not supported.
+rotating signed URLs or EC identifiers. On Spin, the app-config blob is stored
+under the `trusted_server_config` key in Spin's built-in `default` key-value
+store. Set the corresponding CLI store mapping before pushing so the write
+matches the runtime lookup:
+
+```bash
+export EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=default
+ts config push --adapter spin
+```
+
+For local Spin development, add `--local` to the push command. Also declare a
+component variable for each chosen secret key name using the encoder documented
+in `spin.toml`. Missing stores, keys, invalid UTF-8, and empty values fail
+closed; inline plaintext fallback is not supported.
 
 ### Generate Secure Secrets
 
