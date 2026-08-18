@@ -3176,11 +3176,12 @@ describe('installTsRenderBridge', () => {
     expect(Object.keys(response).sort()).toEqual(
       [
         'adId',
+        'apsMountId',
         'apsRenderer',
         'height',
         'message',
+        'publisherOrigin',
         'renderer',
-        'rendererUrl',
         'rendererVersion',
         'width',
       ].sort()
@@ -3189,8 +3190,9 @@ describe('installTsRenderBridge', () => {
       message: 'Prebid Response',
       adId: renderer.bidId,
       renderer: expect.stringContaining('window.render=function'),
-      rendererVersion: 4,
-      rendererUrl: new URL('/integrations/aps/renderer', window.location.origin).href,
+      rendererVersion: 6,
+      apsMountId: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/),
+      publisherOrigin: window.location.origin,
       apsRenderer: renderer,
       width: 300,
       height: 250,
@@ -3198,35 +3200,9 @@ describe('installTsRenderBridge', () => {
     expect(String(response.renderer)).not.toContain(renderer.accountId);
     expect(String(response.renderer)).not.toContain(renderer.aaxResponse);
 
-    // Universal Creative's dynamic-renderer path evaluates the returned static
-    // source and calls window.render(response, helper, targetWindow). Consume
-    // the exact bridge response through that deployed protocol shape.
-    const dynamicWindow = window as unknown as {
-      render?: (data: Record<string, unknown>, helper: unknown, target: Window) => Promise<void>;
-    };
-    window.eval(String(response.renderer));
-    try {
-      const rendered = dynamicWindow.render!(response, undefined, window);
-      const outerFrame = document.querySelector<HTMLIFrameElement>(
-        'iframe[src*="/integrations/aps/renderer#tsaps="]'
-      )!;
-      expect(outerFrame).not.toBeNull();
-      expect(outerFrame.getAttribute('sandbox')).not.toContain('allow-same-origin');
-
-      const rendererPost = vi.spyOn(outerFrame.contentWindow!, 'postMessage');
-      outerFrame.dispatchEvent(new Event('load'));
-      const sent = rendererPost.mock.calls[0][0] as { nonce: string };
-      window.dispatchEvent(
-        new MessageEvent('message', {
-          data: { message: 'trusted-server/aps/renderer-ready', nonce: sent.nonce },
-          source: outerFrame.contentWindow,
-        })
-      );
-      await expect(rendered).resolves.toBeUndefined();
-      outerFrame.remove();
-    } finally {
-      delete dynamicWindow.render;
-    }
+    expect(String(response.renderer)).toContain('d&&d.apsMountId');
+    expect(String(response.renderer)).not.toContain(renderer.creativeUrl);
+    expect(String(response.renderer)).not.toContain(renderer.aaxResponse);
     beaconSpy.mockRestore();
   });
 

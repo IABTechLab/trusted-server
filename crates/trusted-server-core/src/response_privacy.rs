@@ -28,6 +28,33 @@ pub const CDN_CACHE_HEADERS: &[&str] = &[
     "cloudflare-cdn-cache-control",
 ];
 
+const APS_INTEGRATION_ID: &str = "aps";
+const APS_PUBLISHER_FRAME_ANCESTORS_CSP: &str = "frame-ancestors 'self';";
+
+fn enforce_aps_publisher_frame_ancestors(settings: &Settings, response: &mut Response) {
+    let aps_enabled = settings
+        .integrations
+        .get(APS_INTEGRATION_ID)
+        .and_then(|value| value.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    if !aps_enabled {
+        return;
+    }
+
+    let already_present = response
+        .headers()
+        .get_all(header::CONTENT_SECURITY_POLICY)
+        .iter()
+        .any(|value| value.as_bytes() == APS_PUBLISHER_FRAME_ANCESTORS_CSP.as_bytes());
+    if !already_present {
+        response.headers_mut().append(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(APS_PUBLISHER_FRAME_ANCESTORS_CSP),
+        );
+    }
+}
+
 fn strip_cdn_cache_headers(response: &mut Response) {
     for name in CDN_CACHE_HEADERS {
         response.headers_mut().remove(*name);
@@ -172,6 +199,12 @@ pub fn apply_response_headers_with_cache_privacy(settings: &Settings, response: 
     // the pre-apply pass could not see. Re-run the downgrade so the final
     // response can never pair Set-Cookie with shared cacheability.
     enforce_set_cookie_cache_privacy(response);
+
+    // APS creatives retain their HTTPS origin. A creative can therefore frame
+    // a publisher URL beneath the opaque renderer unless every publisher
+    // response rejects the cross-origin ancestor chain. Append this independent
+    // policy after operator headers so configuration cannot weaken it.
+    enforce_aps_publisher_frame_ancestors(settings, response);
 }
 
 #[cfg(test)]
@@ -384,6 +417,37 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("value"),
             "operator headers should still apply to cacheable responses"
+        );
+    }
+
+    #[test]
+    fn aps_enabled_appends_an_independent_publisher_frame_policy() {
+        let mut settings =
+            settings_with_response_headers(&[("content-security-policy", "default-src 'self'")]);
+        settings
+            .integrations
+            .insert_config(
+                APS_INTEGRATION_ID,
+                &serde_json::json!({"enabled": true, "account_id": "example-account"}),
+            )
+            .expect("should enable APS");
+        let mut response = response_builder()
+            .header(header::CONTENT_SECURITY_POLICY, "script-src 'self'")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build response");
+
+        apply_response_headers_with_cache_privacy(&settings, &mut response);
+        apply_response_headers_with_cache_privacy(&settings, &mut response);
+
+        let policies = response
+            .headers()
+            .get_all(header::CONTENT_SECURITY_POLICY)
+            .iter()
+            .map(|value| value.to_str().expect("should contain valid CSP"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            policies,
+            vec!["default-src 'self'", APS_PUBLISHER_FRAME_ANCESTORS_CSP]
         );
     }
 
