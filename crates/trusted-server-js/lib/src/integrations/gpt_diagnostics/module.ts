@@ -71,56 +71,58 @@ function gptEventsCapability(
 export function createGptDiagnosticsIntegrationRegistration(
   releaseId: string
 ): IntegrationRegistration {
+  const prepare = (context: IntegrationPrepareContext) => {
+    if (!activeConfiguration(context.config)) {
+      throw new TypeError('GPT diagnostics integration config is invalid');
+    }
+    const runtime = frozenCapability(context.interfaces, 'runtime.v1');
+    const runtimeDocument = realmOwnedDocument(runtime?.['document']);
+    const runtimeWindow = runtimeDocument?.defaultView;
+    if (!runtime || !runtimeWindow) {
+      throw new TypeError('GPT diagnostics requires runtime.v1');
+    }
+    const events = gptEventsCapability(context.interfaces);
+    if (!events) throw new TypeError('GPT diagnostics requires gpt.events.v1');
+
+    const store = new GptDiagnosticsStore();
+    const observer = new GptDiagnosticsObserver(store);
+    const controller = new GptDiagnosticsDataApiController(store, {
+      location: runtimeWindow.location,
+    });
+    context.onDispose(() => controller.destroy());
+    let active = false;
+    const dataCapability = Object.freeze({
+      api: controller.api,
+      attachPresentation: (factory: GptDiagnosticsPresentationFactory): (() => void) =>
+        controller.attachPresentation(factory),
+    });
+
+    return Object.freeze({
+      activate: ({ onDispose }: IntegrationActivationContext) => {
+        if (active) throw new Error('GPT diagnostics already activated');
+        const ownership: { release?: () => void } = {};
+        onDispose(() => {
+          active = false;
+          ownership.release?.();
+        });
+        active = true;
+        const release = events.subscribe((fact) => {
+          if (active) observer.consume(fact as unknown as Readonly<GoogletagDiagnosticsFact>);
+        });
+        if (typeof release !== 'function') {
+          throw new TypeError('GPT diagnostics event disposer is unavailable');
+        }
+        ownership.release = release;
+      },
+      interfaces: Object.freeze({ 'gpt_diag.v1': dataCapability }),
+    });
+  };
   return Object.freeze({
     abi: 1,
     id: GPT_DIAGNOSTICS_INTEGRATION_ID,
     phase: 'takeover',
     releaseId,
-    prepare: (context: IntegrationPrepareContext) => {
-      if (!activeConfiguration(context.config)) {
-        throw new TypeError('GPT diagnostics integration config is invalid');
-      }
-      const runtime = frozenCapability(context.interfaces, 'runtime.v1');
-      const runtimeDocument = realmOwnedDocument(runtime?.['document']);
-      const runtimeWindow = runtimeDocument?.defaultView;
-      if (!runtime || !runtimeWindow) {
-        throw new TypeError('GPT diagnostics requires runtime.v1');
-      }
-      const events = gptEventsCapability(context.interfaces);
-      if (!events) throw new TypeError('GPT diagnostics requires gpt.events.v1');
-
-      const store = new GptDiagnosticsStore();
-      const observer = new GptDiagnosticsObserver(store);
-      const controller = new GptDiagnosticsDataApiController(store, {
-        location: runtimeWindow.location,
-      });
-      context.onDispose(() => controller.destroy());
-      let active = false;
-      const dataCapability = Object.freeze({
-        api: controller.api,
-        attachPresentation: (factory: GptDiagnosticsPresentationFactory): (() => void) =>
-          controller.attachPresentation(factory),
-      });
-
-      return Object.freeze({
-        activate: ({ onDispose }: IntegrationActivationContext) => {
-          if (active) throw new Error('GPT diagnostics already activated');
-          const ownership: { release?: () => void } = {};
-          onDispose(() => {
-            active = false;
-            ownership.release?.();
-          });
-          active = true;
-          const release = events.subscribe((fact) => {
-            if (active) observer.consume(fact as unknown as Readonly<GoogletagDiagnosticsFact>);
-          });
-          if (typeof release !== 'function') {
-            throw new TypeError('GPT diagnostics event disposer is unavailable');
-          }
-          ownership.release = release;
-        },
-        interfaces: Object.freeze({ 'gpt_diag.v1': dataCapability }),
-      });
-    },
+    prepareSync: prepare,
+    prepare,
   });
 }

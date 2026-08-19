@@ -86,179 +86,181 @@ function exactCapability<Value extends object>(
 
 /** Build the release-bound Prebid module registered by the coordinated runtime. */
 export function createPrebidIntegrationRegistration(releaseId: string): IntegrationRegistration {
+  const prepare = ({ config, interfaces, onDispose }: IntegrationPrepareContext) => {
+    if (!isPrebidIntegrationConfigV1(config)) {
+      throw new TypeError('Prebid integration config is invalid');
+    }
+    const runtime = exactCapability<RuntimeCapabilityV1>(interfaces, 'runtime.v1');
+    const render = exactCapability<ProductionRenderCapability>(interfaces, 'render.v1');
+    exactCapability(interfaces, 'slots.v1');
+    exactCapability(interfaces, 'messages.v1');
+    const runtimeWindow = runtime?.document?.defaultView;
+    if (
+      !runtimeWindow ||
+      typeof render.navigation?.isCurrent !== 'function' ||
+      !Object.isFrozen(render.projection) ||
+      typeof render.createAttempt !== 'function' ||
+      typeof render.registerPucGamAttempt !== 'function' ||
+      typeof render.reservations?.registerPrebidLease !== 'function'
+    ) {
+      throw new TypeError('Prebid capability graph is malformed');
+    }
+    const clientSideBidders = configStringArray(config, 'clientSideBidders');
+    const excludedGamAdUnitPathSuffixes = configStringArray(
+      config,
+      'excludedGamAdUnitPathSuffixes'
+    );
+    const adapter = createBrowserPrebidAdapter(
+      runtimeWindow as unknown as Parameters<typeof createBrowserPrebidAdapter>[0],
+      { configuredClientSideBidders: clientSideBidders, requiredUserIdModules: Object.freeze([]) }
+    );
+    let active = false;
+    let runtimeRelease: (() => void) | undefined;
+    const coordinator = createPrebidSelectionCoordinator({
+      activateAttempt: ({ attempt, owner, preparedBid }): boolean =>
+        render.registerPucGamAttempt(
+          Object.freeze({
+            artifact: Object.freeze({
+              kind: 'puc' as const,
+              attemptId: attempt.id,
+              slot: attempt.slot,
+              navigationGeneration: attempt.navigationGeneration,
+              dispose: () => undefined,
+            }),
+            attempt,
+            owner,
+            reservationId: preparedBid.bid.adId,
+          })
+        ),
+      createAttempt: render.createAttempt,
+      reservations: render.reservations,
+    });
+    const completeAuction = (auctionRequest: Readonly<PrebidTrustedServerAuctionV1>): void => {
+      try {
+        auctionRequest.complete();
+      } catch {
+        // Publisher completion remains isolated from the owned auction transaction.
+      }
+    };
+    const publishAuction = (auctionRequest: Readonly<PrebidTrustedServerAuctionV1>): void => {
+      const navigation = render.navigation;
+      if (!active || !navigation.isCurrent()) {
+        completeAuction(auctionRequest);
+        return;
+      }
+      try {
+        const projection = navigation.currentAuctionProjection as
+          Readonly<BrowserAuctionProjectionV1> | undefined;
+        if (!projection || projection !== render.projection) return;
+        if (projection.auction.auctionId !== auctionRequest.auctionId) return;
+        for (let index = 0; index < auctionRequest.bids.length; index += 1) {
+          const request = auctionRequest.bids[index];
+          if (!request) continue;
+          const winners = projection.auction.results.filter(
+            (result) => result.slot === request.adUnitCode && result.outcome === 'winner'
+          );
+          if (winners.length !== 1) continue;
+          const winner = winners[0];
+          if (!winner || winner.outcome !== 'winner') continue;
+          const bids = projection.bids.filter(
+            (bid) => bid.slot === request.adUnitCode && bid.candidateId === winner.candidateId
+          );
+          if (bids.length !== 1) continue;
+          const bid = bids[0];
+          if (!bid) continue;
+          const publication = publishPrebidBid({
+            admitTrustedBid: adapter.admitTrustedBid,
+            auctionId: auctionRequest.auctionId,
+            adUnitCode: request.adUnitCode,
+            bid,
+            generatedBid: Object.freeze({
+              requestId: request.requestId,
+              adId: request.requestId,
+              cpm: bid.cpm,
+              width: bid.renderSource.width,
+              height: bid.renderSource.height,
+            }),
+            navigation,
+            reservations: render.reservations,
+            trackAdmittedBid: coordinator.track,
+          });
+          if (
+            !publication.ok &&
+            (publication.reason === 'prebid_admission_failed' ||
+              publication.reason === 'prebid_contract_violation')
+          ) {
+            coordinator.settlePublicationFailure(
+              navigation,
+              auctionRequest.auctionId,
+              request.adUnitCode,
+              publication.reason
+            );
+          }
+        }
+      } catch {
+        // Invalid or stale projection state publishes no TS bid.
+      } finally {
+        completeAuction(auctionRequest);
+      }
+    };
+    const startup = createPrebidStartup({
+      dispose: () => undefined,
+      onAuction: publishAuction,
+      onAuctionEnd: coordinator.auctionEnded,
+      prebid: adapter,
+    });
+    const dispose = (): void => {
+      active = false;
+      const release = runtimeRelease;
+      runtimeRelease = undefined;
+      release?.();
+      coordinator.dispose();
+      adapter.dispose();
+    };
+    onDispose(dispose);
+    const capability: PrebidCapabilityV1 = Object.freeze({
+      adapter,
+      clientSideBidders,
+      excludedGamAdUnitPathSuffixes,
+    });
+
+    return Object.freeze({
+      activate: ({ adoption, afterCommit, onDispose }: IntegrationActivationContext) => {
+        if (active) throw new Error('Prebid integration is already active');
+        if (adoption !== undefined) {
+          const selected = persistentFirstDisplaySliceSelectedV1(adoption, 'prebid_initial');
+          const initialState = selected
+            ? snapshotPersistentFirstDisplaySliceStateV1(adoption, 'prebid_initial')
+            : undefined;
+          if (
+            selected === undefined ||
+            (selected &&
+              (!initialState ||
+                initialState.values.length !== 1 ||
+                initialState.values[0]?.[0] !== 'protocol_version' ||
+                initialState.values[0][1] !== 1))
+          ) {
+            throw new TypeError('Prebid first-display adoption is invalid');
+          }
+        }
+        active = true;
+        onDispose(dispose);
+        afterCommit(() => {
+          if (!active) return;
+          runtimeRelease = startup.activate();
+          startup.start(config);
+        });
+      },
+      interfaces: Object.freeze({ 'prebid.v1': capability }),
+    });
+  };
   return Object.freeze({
     abi: 1,
     id: PREBID_INTEGRATION_ID,
     phase: 'takeover',
     releaseId,
-    prepare: ({ config, interfaces, onDispose }: IntegrationPrepareContext) => {
-      if (!isPrebidIntegrationConfigV1(config)) {
-        throw new TypeError('Prebid integration config is invalid');
-      }
-      const runtime = exactCapability<RuntimeCapabilityV1>(interfaces, 'runtime.v1');
-      const render = exactCapability<ProductionRenderCapability>(interfaces, 'render.v1');
-      exactCapability(interfaces, 'slots.v1');
-      exactCapability(interfaces, 'messages.v1');
-      const runtimeWindow = runtime?.document?.defaultView;
-      if (
-        !runtimeWindow ||
-        typeof render.navigation?.isCurrent !== 'function' ||
-        !Object.isFrozen(render.projection) ||
-        typeof render.createAttempt !== 'function' ||
-        typeof render.registerPucGamAttempt !== 'function' ||
-        typeof render.reservations?.registerPrebidLease !== 'function'
-      ) {
-        throw new TypeError('Prebid capability graph is malformed');
-      }
-      const clientSideBidders = configStringArray(config, 'clientSideBidders');
-      const excludedGamAdUnitPathSuffixes = configStringArray(
-        config,
-        'excludedGamAdUnitPathSuffixes'
-      );
-      const adapter = createBrowserPrebidAdapter(
-        runtimeWindow as unknown as Parameters<typeof createBrowserPrebidAdapter>[0],
-        { configuredClientSideBidders: clientSideBidders, requiredUserIdModules: Object.freeze([]) }
-      );
-      let active = false;
-      let runtimeRelease: (() => void) | undefined;
-      const coordinator = createPrebidSelectionCoordinator({
-        activateAttempt: ({ attempt, owner, preparedBid }): boolean =>
-          render.registerPucGamAttempt(
-            Object.freeze({
-              artifact: Object.freeze({
-                kind: 'puc' as const,
-                attemptId: attempt.id,
-                slot: attempt.slot,
-                navigationGeneration: attempt.navigationGeneration,
-                dispose: () => undefined,
-              }),
-              attempt,
-              owner,
-              reservationId: preparedBid.bid.adId,
-            })
-          ),
-        createAttempt: render.createAttempt,
-        reservations: render.reservations,
-      });
-      const completeAuction = (auctionRequest: Readonly<PrebidTrustedServerAuctionV1>): void => {
-        try {
-          auctionRequest.complete();
-        } catch {
-          // Publisher completion remains isolated from the owned auction transaction.
-        }
-      };
-      const publishAuction = (auctionRequest: Readonly<PrebidTrustedServerAuctionV1>): void => {
-        const navigation = render.navigation;
-        if (!active || !navigation.isCurrent()) {
-          completeAuction(auctionRequest);
-          return;
-        }
-        try {
-          const projection = navigation.currentAuctionProjection as
-            Readonly<BrowserAuctionProjectionV1> | undefined;
-          if (!projection || projection !== render.projection) return;
-          if (projection.auction.auctionId !== auctionRequest.auctionId) return;
-          for (let index = 0; index < auctionRequest.bids.length; index += 1) {
-            const request = auctionRequest.bids[index];
-            if (!request) continue;
-            const winners = projection.auction.results.filter(
-              (result) => result.slot === request.adUnitCode && result.outcome === 'winner'
-            );
-            if (winners.length !== 1) continue;
-            const winner = winners[0];
-            if (!winner || winner.outcome !== 'winner') continue;
-            const bids = projection.bids.filter(
-              (bid) => bid.slot === request.adUnitCode && bid.candidateId === winner.candidateId
-            );
-            if (bids.length !== 1) continue;
-            const bid = bids[0];
-            if (!bid) continue;
-            const publication = publishPrebidBid({
-              admitTrustedBid: adapter.admitTrustedBid,
-              auctionId: auctionRequest.auctionId,
-              adUnitCode: request.adUnitCode,
-              bid,
-              generatedBid: Object.freeze({
-                requestId: request.requestId,
-                adId: request.requestId,
-                cpm: bid.cpm,
-                width: bid.renderSource.width,
-                height: bid.renderSource.height,
-              }),
-              navigation,
-              reservations: render.reservations,
-              trackAdmittedBid: coordinator.track,
-            });
-            if (
-              !publication.ok &&
-              (publication.reason === 'prebid_admission_failed' ||
-                publication.reason === 'prebid_contract_violation')
-            ) {
-              coordinator.settlePublicationFailure(
-                navigation,
-                auctionRequest.auctionId,
-                request.adUnitCode,
-                publication.reason
-              );
-            }
-          }
-        } catch {
-          // Invalid or stale projection state publishes no TS bid.
-        } finally {
-          completeAuction(auctionRequest);
-        }
-      };
-      const startup = createPrebidStartup({
-        dispose: () => undefined,
-        onAuction: publishAuction,
-        onAuctionEnd: coordinator.auctionEnded,
-        prebid: adapter,
-      });
-      const dispose = (): void => {
-        active = false;
-        const release = runtimeRelease;
-        runtimeRelease = undefined;
-        release?.();
-        coordinator.dispose();
-        adapter.dispose();
-      };
-      onDispose(dispose);
-      const capability: PrebidCapabilityV1 = Object.freeze({
-        adapter,
-        clientSideBidders,
-        excludedGamAdUnitPathSuffixes,
-      });
-
-      return Object.freeze({
-        activate: ({ adoption, afterCommit, onDispose }: IntegrationActivationContext) => {
-          if (active) throw new Error('Prebid integration is already active');
-          if (adoption !== undefined) {
-            const selected = persistentFirstDisplaySliceSelectedV1(adoption, 'prebid_initial');
-            const initialState = selected
-              ? snapshotPersistentFirstDisplaySliceStateV1(adoption, 'prebid_initial')
-              : undefined;
-            if (
-              selected === undefined ||
-              (selected &&
-                (!initialState ||
-                  initialState.values.length !== 1 ||
-                  initialState.values[0]?.[0] !== 'protocol_version' ||
-                  initialState.values[0][1] !== 1))
-            ) {
-              throw new TypeError('Prebid first-display adoption is invalid');
-            }
-          }
-          active = true;
-          onDispose(dispose);
-          afterCommit(() => {
-            if (!active) return;
-            runtimeRelease = startup.activate();
-            startup.start(config);
-          });
-        },
-        interfaces: Object.freeze({ 'prebid.v1': capability }),
-      });
-    },
+    prepareSync: prepare,
+    prepare,
   });
 }
 

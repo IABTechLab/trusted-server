@@ -91,99 +91,101 @@ export function createSourcepointRuntime(
 }
 
 export function createSourcepointIntegrationRegistration(release: string): IntegrationRegistration {
+  const prepare = ({ config, interfaces, onDispose }: IntegrationPrepareContext) => {
+    const runtimeCapability = interfaces['runtime.v1'];
+    if (
+      !sourcepointBootConfig(config) ||
+      typeof runtimeCapability !== 'object' ||
+      runtimeCapability === null ||
+      !Object.isFrozen(runtimeCapability)
+    ) {
+      throw new TypeError('Sourcepoint consent capability graph is invalid');
+    }
+    const lifecycle = createSourcepointRuntime({
+      initializeConsentMirror: initializeSourcepointConsentMirror,
+      installGuard: () => undefined,
+      resetConsentMirror: disposeSourcepointConsentMirror,
+      resetGuard: () => undefined,
+    });
+    let takeoverActive = false;
+    let guardInstalled = false;
+    let lifecycleRelease: (() => void) | undefined;
+    const capability: SourcepointConsentCapabilityV1 = Object.freeze({
+      activateLifecycle: () => {
+        if (!takeoverActive || lifecycleRelease) {
+          throw new TypeError('Sourcepoint lifecycle is unavailable');
+        }
+        lifecycleRelease = lifecycle.activate(config);
+        return (): void => {
+          const releaseLifecycle = lifecycleRelease;
+          lifecycleRelease = undefined;
+          releaseLifecycle?.();
+        };
+      },
+      startLifecycle: () => {
+        if (!takeoverActive || !lifecycleRelease) {
+          throw new TypeError('Sourcepoint lifecycle is not active');
+        }
+        lifecycle.start(config);
+      },
+    });
+    const releaseOwnedState = (): void => {
+      takeoverActive = false;
+      const releaseLifecycle = lifecycleRelease;
+      lifecycleRelease = undefined;
+      releaseLifecycle?.();
+      disposeSourcepointConsentMirror();
+      if (guardInstalled) {
+        guardInstalled = false;
+        resetGuardState();
+      }
+    };
+    onDispose(releaseOwnedState);
+    return Object.freeze({
+      activate: ({
+        adoption,
+        afterCommit,
+        onDispose: onActivationDispose,
+      }: IntegrationActivationContext) => {
+        if (takeoverActive) throw new Error('Sourcepoint consent is already active');
+        if (
+          adoption !== undefined &&
+          !validatePersistentFirstDisplaySliceAdoptionV1(
+            adoption,
+            'sourcepoint_initial',
+            (state) => {
+              const value = state.values[0]?.[1];
+              return (
+                state.values.length === 1 &&
+                state.values[0]?.[0] === 'gpp_snapshot' &&
+                typeof value === 'number' &&
+                Number.isInteger(value) &&
+                value >= 0
+              );
+            }
+          )
+        ) {
+          throw new TypeError('Sourcepoint first-display parser state is invalid');
+        }
+        if (config.rewriteSdk) {
+          installSourcepointGuard();
+          guardInstalled = true;
+        }
+        takeoverActive = true;
+        onActivationDispose(releaseOwnedState);
+        afterCommit(() => {
+          mirrorSourcepointConsent();
+        });
+      },
+      interfaces: Object.freeze({ 'sourcepoint_consent.v1': capability }),
+    });
+  };
   return Object.freeze({
     abi: 1,
     id: SOURCEPOINT_INTEGRATION_ID,
     phase: 'takeover',
     releaseId: release,
-    prepare: ({ config, interfaces, onDispose }: IntegrationPrepareContext) => {
-      const runtimeCapability = interfaces['runtime.v1'];
-      if (
-        !sourcepointBootConfig(config) ||
-        typeof runtimeCapability !== 'object' ||
-        runtimeCapability === null ||
-        !Object.isFrozen(runtimeCapability)
-      ) {
-        throw new TypeError('Sourcepoint consent capability graph is invalid');
-      }
-      const lifecycle = createSourcepointRuntime({
-        initializeConsentMirror: initializeSourcepointConsentMirror,
-        installGuard: () => undefined,
-        resetConsentMirror: disposeSourcepointConsentMirror,
-        resetGuard: () => undefined,
-      });
-      let takeoverActive = false;
-      let guardInstalled = false;
-      let lifecycleRelease: (() => void) | undefined;
-      const capability: SourcepointConsentCapabilityV1 = Object.freeze({
-        activateLifecycle: () => {
-          if (!takeoverActive || lifecycleRelease) {
-            throw new TypeError('Sourcepoint lifecycle is unavailable');
-          }
-          lifecycleRelease = lifecycle.activate(config);
-          return (): void => {
-            const releaseLifecycle = lifecycleRelease;
-            lifecycleRelease = undefined;
-            releaseLifecycle?.();
-          };
-        },
-        startLifecycle: () => {
-          if (!takeoverActive || !lifecycleRelease) {
-            throw new TypeError('Sourcepoint lifecycle is not active');
-          }
-          lifecycle.start(config);
-        },
-      });
-      const releaseOwnedState = (): void => {
-        takeoverActive = false;
-        const releaseLifecycle = lifecycleRelease;
-        lifecycleRelease = undefined;
-        releaseLifecycle?.();
-        disposeSourcepointConsentMirror();
-        if (guardInstalled) {
-          guardInstalled = false;
-          resetGuardState();
-        }
-      };
-      onDispose(releaseOwnedState);
-      return Object.freeze({
-        activate: ({
-          adoption,
-          afterCommit,
-          onDispose: onActivationDispose,
-        }: IntegrationActivationContext) => {
-          if (takeoverActive) throw new Error('Sourcepoint consent is already active');
-          if (
-            adoption !== undefined &&
-            !validatePersistentFirstDisplaySliceAdoptionV1(
-              adoption,
-              'sourcepoint_initial',
-              (state) => {
-                const value = state.values[0]?.[1];
-                return (
-                  state.values.length === 1 &&
-                  state.values[0]?.[0] === 'gpp_snapshot' &&
-                  typeof value === 'number' &&
-                  Number.isInteger(value) &&
-                  value >= 0
-                );
-              }
-            )
-          ) {
-            throw new TypeError('Sourcepoint first-display parser state is invalid');
-          }
-          if (config.rewriteSdk) {
-            installSourcepointGuard();
-            guardInstalled = true;
-          }
-          takeoverActive = true;
-          onActivationDispose(releaseOwnedState);
-          afterCommit(() => {
-            mirrorSourcepointConsent();
-          });
-        },
-        interfaces: Object.freeze({ 'sourcepoint_consent.v1': capability }),
-      });
-    },
+    prepareSync: prepare,
+    prepare,
   });
 }

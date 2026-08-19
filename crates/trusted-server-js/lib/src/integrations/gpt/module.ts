@@ -1938,11 +1938,13 @@ function prepareProductionGpt(context: IntegrationPrepareContext): PreparedInteg
 
 /** Build the release-bound GPT module registered by the coordinated runtime. */
 export function createGptIntegrationRegistration(releaseId: string): IntegrationRegistration {
+  const prepare = (context: IntegrationPrepareContext) => prepareProductionGpt(context);
   return Object.freeze({
     abi: 1,
     id: GPT_INTEGRATION_ID,
     phase: 'takeover',
     releaseId,
-    prepare: (context: IntegrationPrepareContext) => prepareProductionGpt(context),
+    prepareSync: prepare,
+    prepare,
   });
 }

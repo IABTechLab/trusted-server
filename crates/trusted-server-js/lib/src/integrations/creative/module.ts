@@ -89,48 +89,50 @@ function readRuntimeCapability(
 
 /** Build the inert, release-bound creative module for the coordinated runtime. */
 export function createCreativeIntegrationRegistration(releaseId: string): IntegrationRegistration {
+  const prepare = ({ config, interfaces }: IntegrationPrepareContext) => {
+    const creative = readCreativeBoot(config);
+    if (!creative) throw new TypeError('Creative boot configuration is invalid');
+    const runtimeCapability = readRuntimeCapability(interfaces);
+    const runtimeDocument = runtimeCapability?.document;
+    if (!runtimeDocument) throw new TypeError('Creative runtime capability is unavailable');
+    if (!creative.enabled || (!creative.clickGuard && !creative.renderGuard)) {
+      return Object.freeze({
+        activate: ({ adoption }: IntegrationActivationContext) => {
+          if (adoption !== undefined && !validFirstDisplayAdoption(adoption)) {
+            throw new TypeError('Creative first-display parser state is invalid');
+          }
+        },
+      });
+    }
+    const runtime = createCreativeStartup({
+      document: runtimeDocument,
+      installClickGuard: () => installClickGuard(false),
+      installDynamicIframeProxy: () => installDynamicIframeProxy(false),
+      installDynamicImageProxy: () => installDynamicImageProxy(false),
+    });
+
+    return Object.freeze({
+      activate: ({ adoption, afterCommit, onDispose }: IntegrationActivationContext) => {
+        if (adoption !== undefined && !validFirstDisplayAdoption(adoption)) {
+          throw new TypeError('Creative first-display parser state is invalid');
+        }
+        const runtimeRelease: { value?: () => void } = {};
+        onDispose(() => runtimeRelease.value?.());
+        const releaseRuntime = runtime.activate(creative);
+        if (typeof releaseRuntime !== 'function') {
+          throw new TypeError('Creative integration activation disposer is unavailable');
+        }
+        runtimeRelease.value = releaseRuntime;
+        afterCommit(() => runtime.start(creative));
+      },
+    });
+  };
   return Object.freeze({
     abi: 1,
     id: CREATIVE_INTEGRATION_ID,
     phase: 'takeover',
     releaseId,
-    prepare: ({ config, interfaces }: IntegrationPrepareContext) => {
-      const creative = readCreativeBoot(config);
-      if (!creative) throw new TypeError('Creative boot configuration is invalid');
-      const runtimeCapability = readRuntimeCapability(interfaces);
-      const runtimeDocument = runtimeCapability?.document;
-      if (!runtimeDocument) throw new TypeError('Creative runtime capability is unavailable');
-      if (!creative.enabled || (!creative.clickGuard && !creative.renderGuard)) {
-        return Object.freeze({
-          activate: ({ adoption }: IntegrationActivationContext) => {
-            if (adoption !== undefined && !validFirstDisplayAdoption(adoption)) {
-              throw new TypeError('Creative first-display parser state is invalid');
-            }
-          },
-        });
-      }
-      const runtime = createCreativeStartup({
-        document: runtimeDocument,
-        installClickGuard: () => installClickGuard(false),
-        installDynamicIframeProxy: () => installDynamicIframeProxy(false),
-        installDynamicImageProxy: () => installDynamicImageProxy(false),
-      });
-
-      return Object.freeze({
-        activate: ({ adoption, afterCommit, onDispose }: IntegrationActivationContext) => {
-          if (adoption !== undefined && !validFirstDisplayAdoption(adoption)) {
-            throw new TypeError('Creative first-display parser state is invalid');
-          }
-          const runtimeRelease: { value?: () => void } = {};
-          onDispose(() => runtimeRelease.value?.());
-          const releaseRuntime = runtime.activate(creative);
-          if (typeof releaseRuntime !== 'function') {
-            throw new TypeError('Creative integration activation disposer is unavailable');
-          }
-          runtimeRelease.value = releaseRuntime;
-          afterCommit(() => runtime.start(creative));
-        },
-      });
-    },
+    prepareSync: prepare,
+    prepare,
   });
 }

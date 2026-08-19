@@ -54,29 +54,31 @@ function runtime(interfaces: Readonly<Record<string, unknown>>): TestGptRuntime 
 
 /** Legacy composition seam retained only in tests; never reachable from a shipped entry point. */
 export function createLegacyGptRegistrationForTest(releaseId: string): IntegrationRegistration {
+  const prepare = ({ config, interfaces }: IntegrationPrepareContext) => {
+    if (!recursivelyFrozen(config)) throw new TypeError('GPT integration config is invalid');
+    const preparedRuntime = runtime(interfaces);
+    if (!preparedRuntime) throw new TypeError('GPT integration runtime is unavailable');
+    return Object.freeze({
+      activate: ({ afterCommit, onDispose }: IntegrationActivationContext) => {
+        onDispose(resetGuardState);
+        const releaseHolder: { current?: () => void } = {};
+        onDispose(() => releaseHolder.current?.());
+        const release = preparedRuntime.activate();
+        if (typeof release !== 'function') {
+          throw new TypeError('GPT integration activation disposer is unavailable');
+        }
+        releaseHolder.current = release;
+        installGptGuard();
+        afterCommit(() => preparedRuntime.start(config));
+      },
+    });
+  };
   return Object.freeze({
     abi: 1,
     id: 'gpt',
     phase: 'takeover',
     releaseId,
-    prepare: ({ config, interfaces }: IntegrationPrepareContext) => {
-      if (!recursivelyFrozen(config)) throw new TypeError('GPT integration config is invalid');
-      const preparedRuntime = runtime(interfaces);
-      if (!preparedRuntime) throw new TypeError('GPT integration runtime is unavailable');
-      return Object.freeze({
-        activate: ({ afterCommit, onDispose }: IntegrationActivationContext) => {
-          onDispose(resetGuardState);
-          const releaseHolder: { current?: () => void } = {};
-          onDispose(() => releaseHolder.current?.());
-          const release = preparedRuntime.activate();
-          if (typeof release !== 'function') {
-            throw new TypeError('GPT integration activation disposer is unavailable');
-          }
-          releaseHolder.current = release;
-          installGptGuard();
-          afterCommit(() => preparedRuntime.start(config));
-        },
-      });
-    },
+    prepareSync: prepare,
+    prepare,
   });
 }

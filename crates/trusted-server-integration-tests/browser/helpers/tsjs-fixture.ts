@@ -105,6 +105,34 @@ export async function loadRuntimeTsjsFixture(
   await page.evaluate(
     (src) =>
       new Promise<void>((resolveLoad, rejectLoad) => {
+        const target = (window as unknown as { tsjs: Record<string, unknown> })
+          .tsjs;
+        const freeze = (value: unknown): void => {
+          if (
+            typeof value !== "object" ||
+            value === null ||
+            Object.isFrozen(value)
+          )
+            return;
+          for (const key of Reflect.ownKeys(value)) {
+            const descriptor = Object.getOwnPropertyDescriptor(value, key);
+            if (descriptor && "value" in descriptor) freeze(descriptor.value);
+          }
+          Object.freeze(value);
+        };
+        const retainedBoot = target.boot;
+        freeze(retainedBoot);
+        const claim = (source: unknown): unknown => {
+          if (source !== document.currentScript) return undefined;
+          Reflect.deleteProperty(target, "_claimBootSnapshot");
+          return retainedBoot;
+        };
+        Object.defineProperty(target, "_claimBootSnapshot", {
+          configurable: true,
+          enumerable: false,
+          value: claim,
+          writable: false,
+        });
         const script = document.createElement("script");
         script.id = "trustedserver-js";
         script.src = src;

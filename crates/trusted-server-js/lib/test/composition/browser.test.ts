@@ -64,6 +64,7 @@ import type {
   IntegrationActivationContext,
   IntegrationPrepareContext,
   IntegrationRegistration,
+  PreparedIntegration,
 } from '../../src/kernel/integration_registry';
 import { RELEASE_CATALOG } from '../../src/kernel/release_catalog';
 import {
@@ -169,49 +170,70 @@ function exactLegacyRuntime(
   }>;
 }
 
+function testTakeoverRegistration(
+  id: string,
+  releaseId: string,
+  prepare: (
+    context: IntegrationPrepareContext
+  ) => PreparedIntegration | PromiseLike<PreparedIntegration>
+): IntegrationRegistration {
+  return Object.freeze({
+    abi: 1,
+    id,
+    phase: 'takeover',
+    releaseId,
+    prepareSync: (context: IntegrationPrepareContext) => prepare(context) as PreparedIntegration,
+    prepare,
+  });
+}
+
 function createLegacyPrebidIntegrationRegistration(releaseId: string): IntegrationRegistration {
+  const prepare = ({ config, interfaces }: IntegrationPrepareContext) => {
+    const runtime = exactLegacyRuntime(interfaces, 'prebid');
+    return Object.freeze({
+      activate: ({ afterCommit, onDispose }: IntegrationActivationContext) => {
+        const release = runtime.activate();
+        onDispose(release);
+        afterCommit(() => runtime.start(config));
+      },
+    });
+  };
   return Object.freeze({
     abi: 1,
     id: 'prebid',
     phase: 'takeover',
     releaseId,
-    prepare: ({ config, interfaces }: IntegrationPrepareContext) => {
-      const runtime = exactLegacyRuntime(interfaces, 'prebid');
-      return Object.freeze({
-        activate: ({ afterCommit, onDispose }: IntegrationActivationContext) => {
-          const release = runtime.activate();
-          onDispose(release);
-          afterCommit(() => runtime.start(config));
-        },
-      });
-    },
+    prepareSync: prepare,
+    prepare,
   });
 }
 
 function createLegacyCreativeIntegrationRegistration(releaseId: string): IntegrationRegistration {
+  const prepare = ({ config, interfaces }: IntegrationPrepareContext) => {
+    const creative = config as Readonly<{
+      clickGuard?: unknown;
+      enabled?: unknown;
+      renderGuard?: unknown;
+    }>;
+    if (!creative.enabled || (!creative.clickGuard && !creative.renderGuard)) {
+      return Object.freeze({ activate: () => undefined });
+    }
+    const runtime = exactLegacyRuntime(interfaces, 'creative');
+    return Object.freeze({
+      activate: ({ afterCommit, onDispose }: IntegrationActivationContext) => {
+        const release = runtime.activate(config);
+        onDispose(release);
+        afterCommit(() => runtime.start(config));
+      },
+    });
+  };
   return Object.freeze({
     abi: 1,
     id: 'creative',
     phase: 'takeover',
     releaseId,
-    prepare: ({ config, interfaces }: IntegrationPrepareContext) => {
-      const creative = config as Readonly<{
-        clickGuard?: unknown;
-        enabled?: unknown;
-        renderGuard?: unknown;
-      }>;
-      if (!creative.enabled || (!creative.clickGuard && !creative.renderGuard)) {
-        return Object.freeze({ activate: () => undefined });
-      }
-      const runtime = exactLegacyRuntime(interfaces, 'creative');
-      return Object.freeze({
-        activate: ({ afterCommit, onDispose }: IntegrationActivationContext) => {
-          const release = runtime.activate(config);
-          onDispose(release);
-          afterCommit(() => runtime.start(config));
-        },
-      });
-    },
+    prepareSync: prepare,
+    prepare,
   });
 }
 
@@ -1361,12 +1383,10 @@ describe('browser composition', () => {
     expect(composition.runtime.start()).toBe(true);
     expect(
       composition.runtime.registerIntegration(
-        Object.freeze({
-          abi: 1,
-          id: 'test',
-          phase: 'takeover',
-          releaseId: 'a'.repeat(64),
-          prepare: ({
+        testTakeoverRegistration(
+          'test',
+          'a'.repeat(64),
+          ({
             interfaces,
             onDispose,
           }: {
@@ -1376,8 +1396,8 @@ describe('browser composition', () => {
             expect(interfaces).not.toHaveProperty('diagnostics');
             onDispose(() => order.push('dispose-module'));
             return Object.freeze({ activate: () => order.push('module') });
-          },
-        })
+          }
+        )
       )
     ).toBe(true);
     await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
@@ -1640,12 +1660,10 @@ describe('browser composition', () => {
       ).toBe(true);
       expect(
         composition.runtime.registerIntegration(
-          Object.freeze({
-            abi: 1,
-            id: 'diagnostics_probe',
-            phase: 'takeover',
+          testTakeoverRegistration(
+            'diagnostics_probe',
             releaseId,
-            prepare: ({ interfaces }: IntegrationPrepareContext) => {
+            ({ interfaces }: IntegrationPrepareContext) => {
               expect(interfaces).not.toHaveProperty('diagnostics');
               const trace = interfaces['trace.v1'] as Readonly<Record<string, unknown>>;
               expect(Reflect.ownKeys(trace).sort()).toEqual(
@@ -1654,8 +1672,8 @@ describe('browser composition', () => {
               expect(Reflect.ownKeys(trace['observations'] as object)).toEqual(['publish']);
               expect(trace).not.toHaveProperty('attachPresentation');
               return Object.freeze({ activate: vi.fn() });
-            },
-          })
+            }
+          )
         )
       ).toBe(true);
       expect(
@@ -2742,16 +2760,14 @@ describe('browser composition', () => {
         ).toBe(true);
         expect(
           composition.runtime.registerIntegration(
-            Object.freeze({
-              abi: 1,
-              id: 'lifecycle_probe',
-              phase: 'takeover',
+            testTakeoverRegistration(
+              'lifecycle_probe',
               releaseId,
-              prepare: ({ interfaces }: { interfaces: Readonly<Record<string, unknown>> }) => {
+              ({ interfaces }: { interfaces: Readonly<Record<string, unknown>> }) => {
                 expect(interfaces).not.toHaveProperty('diagnostics');
                 return Object.freeze({ activate: vi.fn() });
-              },
-            })
+              }
+            )
           )
         ).toBe(true);
         await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
@@ -3695,13 +3711,9 @@ describe('browser composition', () => {
       expect(composition.runtime.start()).toBe(true);
       expect(
         composition.runtime.registerIntegration(
-          Object.freeze({
-            abi: 1,
-            id: 'context_test',
-            phase: 'takeover',
-            releaseId,
-            prepare: () => Object.freeze({ activate: vi.fn() }),
-          })
+          testTakeoverRegistration('context_test', releaseId, () =>
+            Object.freeze({ activate: vi.fn() })
+          )
         )
       ).toBe(true);
       await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
@@ -3921,13 +3933,9 @@ describe('browser composition', () => {
     ).toBe(true);
     expect(
       composition.runtime.registerIntegration(
-        Object.freeze({
-          abi: 1,
-          id: 'context_test',
-          phase: 'takeover',
-          releaseId,
-          prepare: () => Object.freeze({ activate: vi.fn() }),
-        })
+        testTakeoverRegistration('context_test', releaseId, () =>
+          Object.freeze({ activate: vi.fn() })
+        )
       )
     ).toBe(true);
     await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });

@@ -139,30 +139,45 @@ function tracedRegistration(
   events: string[],
   failAfterActivation?: string
 ): IntegrationRegistration {
+  const tracePrepared = (prepared: PreparedIntegration): PreparedIntegration => {
+    const traced: PreparedIntegration = {
+      activate: (activationContext: IntegrationActivationContext): void => {
+        events.push(`activate:${registration.id}`);
+        activationContext.onDispose(() => events.push(`dispose:${registration.id}`));
+        prepared.activate(activationContext);
+        if (registration.id === failAfterActivation) {
+          throw new Error(`injected ${registration.id} activation failure`);
+        }
+      },
+    };
+    const interfacesDescriptor = Object.getOwnPropertyDescriptor(prepared, 'interfaces');
+    if (interfacesDescriptor) Object.defineProperty(traced, 'interfaces', interfacesDescriptor);
+    return Object.freeze(traced);
+  };
+  const prepare = async (context: IntegrationPrepareContext): Promise<PreparedIntegration> => {
+    events.push(`prepare:${registration.id}`);
+    return tracePrepared(await registration.prepare(context));
+  };
+  if (registration.phase === 'deferred') {
+    return Object.freeze({
+      abi: registration.abi,
+      id: registration.id,
+      phase: registration.phase,
+      releaseId: registration.releaseId,
+      prepare,
+    });
+  }
+  const prepareSync = (context: IntegrationPrepareContext): PreparedIntegration => {
+    events.push(`prepare:${registration.id}`);
+    return tracePrepared(registration.prepareSync(context));
+  };
   return Object.freeze({
     abi: registration.abi,
     id: registration.id,
     phase: registration.phase,
     releaseId: registration.releaseId,
-    prepare: async (context: IntegrationPrepareContext) => {
-      events.push(`prepare:${registration.id}`);
-      const prepared = await registration.prepare(context);
-      const traced: PreparedIntegration = {
-        activate: (activationContext: IntegrationActivationContext): void => {
-          events.push(`activate:${registration.id}`);
-          activationContext.onDispose(() => events.push(`dispose:${registration.id}`));
-          prepared.activate(activationContext);
-          if (registration.id === failAfterActivation) {
-            throw new Error(`injected ${registration.id} activation failure`);
-          }
-        },
-      };
-      const interfacesDescriptor = Object.getOwnPropertyDescriptor(prepared, 'interfaces');
-      if (interfacesDescriptor) {
-        Object.defineProperty(traced, 'interfaces', interfacesDescriptor);
-      }
-      return Object.freeze(traced);
-    },
+    prepareSync,
+    prepare,
   });
 }
 
@@ -661,6 +676,10 @@ describe('generated maximal browser runtime transaction', () => {
         id: 'fixture',
         phase: 'takeover',
         releaseId: TEST_RELEASE_ID,
+        prepareSync: () =>
+          provider
+            ? Object.freeze({ activate, interfaces: providerInterfaces })
+            : Object.freeze({ activate }),
         prepare: async () =>
           provider
             ? Object.freeze({ activate, interfaces: providerInterfaces })

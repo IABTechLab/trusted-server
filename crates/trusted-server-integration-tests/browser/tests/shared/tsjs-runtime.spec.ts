@@ -19,6 +19,7 @@ function boot(fixture: RuntimeTsjsFixture) {
       slots: [],
       bids: [],
     },
+    integrations: { version: 1, entries: [] },
     creative: {
       version: 1,
       enabled: false,
@@ -74,14 +75,14 @@ test.describe("TSJS hard-cutover runtime", () => {
         status: 200,
         contentType: "application/javascript; charset=utf-8",
         headers: { "x-content-type-options": "nosniff" },
-        body: KERNEL_FIXTURE.runtimeBody,
+        body: `queueMicrotask(()=>window.__runtimeOrder.push("publisher-microtask"));${KERNEL_FIXTURE.runtimeBody}`,
       });
     });
     await page.route("https://runtime.test/direct", (route) =>
       route.fulfill({
         status: 200,
         contentType: "text/html; charset=utf-8",
-        body: `<!doctype html><head><script>const __TSJS_SERVER_BOOT_INPUT_V1__={target:(window.tsjs=window.tsjs||{}),boot:${JSON.stringify(boot(KERNEL_FIXTURE))},outline:null};${KERNEL_FIXTURE.bootstrapBody}</script><script src="${KERNEL_FIXTURE.runtimeSrc}" id="trustedserver-js"></script></head><body></body>`,
+        body: `<!doctype html><head><script>window.__runtimeOrder=[];window.tsjs={que:[()=>window.__runtimeOrder.push("kernel-commit")]};const __TSJS_SERVER_BOOT_INPUT_V1__={target:window.tsjs,boot:${JSON.stringify(boot(KERNEL_FIXTURE))},outline:null};${KERNEL_FIXTURE.bootstrapBody}</script><script src="${KERNEL_FIXTURE.runtimeSrc}" id="trustedserver-js"></script><script>window.__runtimeOrder.push("publisher-parser:"+window.tsjs?._internal?.state)</script></head><body></body>`,
       }),
     );
 
@@ -97,6 +98,9 @@ test.describe("TSJS hard-cutover runtime", () => {
         .length,
       bidsMarks: performance.getEntriesByName("tsjs:bids-script", "mark")
         .length,
+      order: (
+        window as unknown as { __runtimeOrder: string[] }
+      ).__runtimeOrder.slice(),
       state: (window as unknown as { tsjs: { _internal: { state: string } } })
         .tsjs._internal.state,
     }));
@@ -106,6 +110,11 @@ test.describe("TSJS hard-cutover runtime", () => {
       claimPresent: false,
       runtimeScripts: 1,
       bidsMarks: 1,
+      order: [
+        "kernel-commit",
+        "publisher-microtask",
+        "publisher-parser:kernel",
+      ],
       state: "kernel",
     });
   });

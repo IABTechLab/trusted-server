@@ -9,10 +9,36 @@ import {
 import { createRuntime as createRuntimeOwner, type RuntimeOptions } from '../../src/kernel/runtime';
 import { snapshotTsjsBootV1 } from '../../src/core/contracts/boot';
 import { createDiagnosticsPresentationIntegrationRegistration } from '../../src/integrations/gpt_diagnostics/presentation';
+import type {
+  IntegrationPrepareContext,
+  PreparedIntegration,
+} from '../../src/kernel/integration_registry';
 import { createLifecycleIntegrationRegistration } from '../../src/kernel/lifecycle_module';
 
 const RELEASE = 'a'.repeat(64);
 const TRUSTED_RUNTIME_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
+
+function takeoverRegistration(
+  candidate: Readonly<{
+    abi: 1;
+    id: string;
+    phase: 'takeover';
+    releaseId: string;
+    prepare: (
+      context: IntegrationPrepareContext
+    ) => PreparedIntegration | PromiseLike<PreparedIntegration>;
+  }>
+) {
+  return Object.freeze({
+    abi: candidate.abi,
+    id: candidate.id,
+    phase: candidate.phase,
+    releaseId: candidate.releaseId,
+    prepareSync: (context: IntegrationPrepareContext) =>
+      candidate.prepare(context) as PreparedIntegration,
+    prepare: candidate.prepare,
+  });
+}
 
 function installTestRuntimeScript(runtimeDocument: Document, takeover = false): void {
   if (runtimeDocument.currentScript) return;
@@ -458,18 +484,20 @@ describe('Runtime bootstrap owner', () => {
     expect(runtime.state).toBe('installing');
     expect(target.config).toEqual({ publisher: true });
     expect(
-      runtime.registerIntegration({
-        abi: 1,
-        id: 'gpt',
-        phase: 'takeover',
-        releaseId: RELEASE,
-        prepare: () => ({
-          activate: ({ afterCommit }: { afterCommit(callback: () => void): void }) => {
-            order.push('integration');
-            afterCommit(() => order.push('after-commit'));
-          },
-        }),
-      })
+      runtime.registerIntegration(
+        takeoverRegistration({
+          abi: 1,
+          id: 'gpt',
+          phase: 'takeover',
+          releaseId: RELEASE,
+          prepare: () => ({
+            activate: ({ afterCommit }: { afterCommit(callback: () => void): void }) => {
+              order.push('integration');
+              afterCommit(() => order.push('after-commit'));
+            },
+          }),
+        })
+      )
     ).toBe(true);
 
     await expect(runtime.install()).resolves.toMatchObject({ state: 'kernel' });
@@ -524,16 +552,18 @@ describe('Runtime bootstrap owner', () => {
     expect(runtime.start()).toBe(true);
     target.boot = Object.freeze({ publisherReplacement: true });
     expect(
-      runtime.registerIntegration({
-        abi: 1,
-        id: 'test_module',
-        phase: 'takeover',
-        releaseId: RELEASE,
-        prepare: ({ config }: { config: unknown }) => {
-          expect(config).toBeUndefined();
-          return Object.freeze({ activate: () => undefined });
-        },
-      })
+      runtime.registerIntegration(
+        takeoverRegistration({
+          abi: 1,
+          id: 'test_module',
+          phase: 'takeover',
+          releaseId: RELEASE,
+          prepare: ({ config }: { config: unknown }) => {
+            expect(config).toBeUndefined();
+            return Object.freeze({ activate: () => undefined });
+          },
+        })
+      )
     ).toBe(true);
     await expect(runtime.install()).resolves.toMatchObject({ state: 'kernel' });
     expect(target.boot).toBe(acceptedBoot);
@@ -565,36 +595,38 @@ describe('Runtime bootstrap owner', () => {
     });
     expect(runtime.start()).toBe(true);
     expect(
-      runtime.registerIntegration({
-        abi: 1,
-        id: 'render_runtime',
-        phase: 'takeover',
-        releaseId: RELEASE,
-        prepare: ({ interfaces }: { interfaces: Readonly<Record<string, unknown>> }) => {
-          expect(Reflect.ownKeys(interfaces)).toEqual(['runtime.v1']);
-          return Object.freeze({
-            activate: ({ onDispose }: { onDispose(callback: () => void): void }) => {
-              active = true;
-              onDispose(() => {
-                active = false;
-              });
-            },
-            interfaces: Object.freeze({
-              'direct.v1': Object.freeze({
-                addAdUnits: (candidate: unknown) => {
-                  if (!active) throw new Error('inactive');
-                  return addAdUnits(candidate);
-                },
-                requestAds: async (candidate?: unknown) => {
-                  if (!active) throw new Error('inactive');
-                  return requestAds(candidate);
-                },
-                diagnostics: Object.freeze({ owner: 'render_runtime' }),
+      runtime.registerIntegration(
+        takeoverRegistration({
+          abi: 1,
+          id: 'render_runtime',
+          phase: 'takeover',
+          releaseId: RELEASE,
+          prepare: ({ interfaces }: { interfaces: Readonly<Record<string, unknown>> }) => {
+            expect(Reflect.ownKeys(interfaces)).toEqual(['runtime.v1']);
+            return Object.freeze({
+              activate: ({ onDispose }: { onDispose(callback: () => void): void }) => {
+                active = true;
+                onDispose(() => {
+                  active = false;
+                });
+              },
+              interfaces: Object.freeze({
+                'direct.v1': Object.freeze({
+                  addAdUnits: (candidate: unknown) => {
+                    if (!active) throw new Error('inactive');
+                    return addAdUnits(candidate);
+                  },
+                  requestAds: async (candidate?: unknown) => {
+                    if (!active) throw new Error('inactive');
+                    return requestAds(candidate);
+                  },
+                  diagnostics: Object.freeze({ owner: 'render_runtime' }),
+                }),
               }),
-            }),
-          });
-        },
-      })
+            });
+          },
+        })
+      )
     ).toBe(true);
 
     await expect(runtime.install()).resolves.toMatchObject({ state: 'kernel' });
@@ -660,38 +692,42 @@ describe('Runtime bootstrap owner', () => {
     });
     expect(runtime.start()).toBe(true);
     expect(
-      runtime.registerIntegration({
-        abi: 1,
-        id: 'render_runtime',
-        phase: 'takeover',
-        releaseId: RELEASE,
-        prepare: () =>
-          Object.freeze({
-            activate: () => undefined,
-            interfaces: Object.freeze({
-              'direct.v1': Object.freeze({
-                addAdUnits: vi.fn(),
-                requestAds: vi.fn(),
-                diagnostics: Object.freeze({ renderTrace }),
+      runtime.registerIntegration(
+        takeoverRegistration({
+          abi: 1,
+          id: 'render_runtime',
+          phase: 'takeover',
+          releaseId: RELEASE,
+          prepare: () =>
+            Object.freeze({
+              activate: () => undefined,
+              interfaces: Object.freeze({
+                'direct.v1': Object.freeze({
+                  addAdUnits: vi.fn(),
+                  requestAds: vi.fn(),
+                  diagnostics: Object.freeze({ renderTrace }),
+                }),
               }),
             }),
-          }),
-      })
+        })
+      )
     ).toBe(true);
     expect(
-      runtime.registerIntegration({
-        abi: 1,
-        id: 'gpt_diagnostics',
-        phase: 'takeover',
-        releaseId: RELEASE,
-        prepare: () =>
-          Object.freeze({
-            activate: () => undefined,
-            interfaces: Object.freeze({
-              'gpt_diag.v1': Object.freeze({ api: gpt, attachPresentation: vi.fn() }),
+      runtime.registerIntegration(
+        takeoverRegistration({
+          abi: 1,
+          id: 'gpt_diagnostics',
+          phase: 'takeover',
+          releaseId: RELEASE,
+          prepare: () =>
+            Object.freeze({
+              activate: () => undefined,
+              interfaces: Object.freeze({
+                'gpt_diag.v1': Object.freeze({ api: gpt, attachPresentation: vi.fn() }),
+              }),
             }),
-          }),
-      })
+        })
+      )
     ).toBe(true);
 
     await expect(runtime.install()).resolves.toMatchObject({ state: 'kernel' });
@@ -752,32 +788,34 @@ describe('Runtime bootstrap owner', () => {
     expect(runtime.start()).toBe(true);
     for (const id of ['creative', 'gpt_diagnostics']) {
       expect(
-        runtime.registerIntegration({
-          abi: 1,
-          id,
-          phase: 'takeover',
-          releaseId: RELEASE,
-          prepare: ({ config }: { config: unknown }) => {
-            prepared.set(id, config);
-            return id === 'gpt_diagnostics'
-              ? Object.freeze({
-                  activate: () => undefined,
-                  interfaces: Object.freeze({
-                    'gpt_diag.v1': Object.freeze({
-                      api: Object.freeze({
-                        snapshot: vi.fn(),
-                        export: vi.fn(),
-                        subscribe: vi.fn(),
-                        show: vi.fn(),
-                        hide: vi.fn(),
+        runtime.registerIntegration(
+          takeoverRegistration({
+            abi: 1,
+            id,
+            phase: 'takeover',
+            releaseId: RELEASE,
+            prepare: ({ config }: { config: unknown }) => {
+              prepared.set(id, config);
+              return id === 'gpt_diagnostics'
+                ? Object.freeze({
+                    activate: () => undefined,
+                    interfaces: Object.freeze({
+                      'gpt_diag.v1': Object.freeze({
+                        api: Object.freeze({
+                          snapshot: vi.fn(),
+                          export: vi.fn(),
+                          subscribe: vi.fn(),
+                          show: vi.fn(),
+                          hide: vi.fn(),
+                        }),
+                        attachPresentation: vi.fn(),
                       }),
-                      attachPresentation: vi.fn(),
                     }),
-                  }),
-                })
-              : Object.freeze({ activate: () => undefined });
-          },
-        })
+                  })
+                : Object.freeze({ activate: () => undefined });
+            },
+          })
+        )
       ).toBe(true);
     }
 
@@ -870,13 +908,15 @@ describe('Runtime bootstrap owner', () => {
 
     expect(runtime.start()).toBe(true);
     expect(
-      runtime.registerIntegration({
-        abi: 1,
-        id: 'render_runtime',
-        phase: 'takeover',
-        releaseId: RELEASE,
-        prepare: () => Object.freeze({ activate: () => undefined }),
-      })
+      runtime.registerIntegration(
+        takeoverRegistration({
+          abi: 1,
+          id: 'render_runtime',
+          phase: 'takeover',
+          releaseId: RELEASE,
+          prepare: () => Object.freeze({ activate: () => undefined }),
+        })
+      )
     ).toBe(true);
     await expect(runtime.install()).resolves.toMatchObject({ state: 'kernel' });
     expect(Object.getOwnPropertyDescriptor(target, '_registerIntegration')).toMatchObject({
@@ -1062,20 +1102,22 @@ describe('Runtime bootstrap owner', () => {
 
     expect(runtime.start()).toBe(true);
     expect(
-      runtime.registerIntegration({
-        abi: 1,
-        id: 'trace_provider',
-        phase: 'takeover',
-        releaseId: RELEASE,
-        prepare: () =>
-          Object.freeze({
-            activate: () => undefined,
-            interfaces: Object.freeze({
-              'trace.v1': traceDataCapability,
-              'trace.presentation.v1': tracePresentationCapability,
+      runtime.registerIntegration(
+        takeoverRegistration({
+          abi: 1,
+          id: 'trace_provider',
+          phase: 'takeover',
+          releaseId: RELEASE,
+          prepare: () =>
+            Object.freeze({
+              activate: () => undefined,
+              interfaces: Object.freeze({
+                'trace.v1': traceDataCapability,
+                'trace.presentation.v1': tracePresentationCapability,
+              }),
             }),
-          }),
-      })
+        })
+      )
     ).toBe(true);
     expect(Reflect.ownKeys(traceDataCapability)).toEqual(['diagnostics']);
     expect(traceDataCapability).not.toHaveProperty('attachPresentation');
@@ -1204,22 +1246,24 @@ describe('Runtime bootstrap owner', () => {
 
     expect(runtime.start()).toBe(true);
     expect(
-      runtime.registerIntegration({
-        abi: 1,
-        id: 'gpt',
-        phase: 'takeover',
-        releaseId: RELEASE,
-        prepare: ({ onDispose }: { onDispose(callback: () => void): void }) => {
-          order.push('module:prepare');
-          onDispose(() => order.push('module:dispose'));
-          return {
-            activate: ({ afterCommit }: { afterCommit(callback: () => void): void }) => {
-              order.push('module:activate');
-              afterCommit(() => order.push('after-commit'));
-            },
-          };
-        },
-      })
+      runtime.registerIntegration(
+        takeoverRegistration({
+          abi: 1,
+          id: 'gpt',
+          phase: 'takeover',
+          releaseId: RELEASE,
+          prepare: ({ onDispose }: { onDispose(callback: () => void): void }) => {
+            order.push('module:prepare');
+            onDispose(() => order.push('module:dispose'));
+            return {
+              activate: ({ afterCommit }: { afterCommit(callback: () => void): void }) => {
+                order.push('module:activate');
+                afterCommit(() => order.push('after-commit'));
+              },
+            };
+          },
+        })
+      )
     ).toBe(true);
 
     const result = await runtime.install();
@@ -1311,13 +1355,15 @@ describe('Runtime bootstrap owner', () => {
 
     expect(runtime.start()).toBe(true);
     expect(
-      runtime.registerIntegration({
-        abi: 1,
-        id: 'gpt',
-        phase: 'takeover',
-        releaseId: RELEASE,
-        prepare: () => ({ activate: activateModule }),
-      })
+      runtime.registerIntegration(
+        takeoverRegistration({
+          abi: 1,
+          id: 'gpt',
+          phase: 'takeover',
+          releaseId: RELEASE,
+          prepare: () => ({ activate: activateModule }),
+        })
+      )
     ).toBe(true);
 
     await expect(runtime.install()).resolves.toEqual({
@@ -1374,23 +1420,25 @@ describe('Runtime bootstrap owner', () => {
 
     expect(runtime.start()).toBe(true);
     expect(
-      runtime.registerIntegration({
-        abi: 1,
-        id: 'gpt',
-        phase: 'takeover',
-        releaseId: RELEASE,
-        prepare: () => ({
-          activate: ({ afterCommit }: { afterCommit(callback: () => void): void }) => {
-            order.push('module-activation');
-            target.que?.push(() => order.push('module-enqueued'));
-            afterCommit(() => {
-              order.push('after-commit-start');
-              target.que?.push(() => order.push('after-commit-enqueued'));
-              order.push('after-commit-end');
-            });
-          },
-        }),
-      })
+      runtime.registerIntegration(
+        takeoverRegistration({
+          abi: 1,
+          id: 'gpt',
+          phase: 'takeover',
+          releaseId: RELEASE,
+          prepare: () => ({
+            activate: ({ afterCommit }: { afterCommit(callback: () => void): void }) => {
+              order.push('module-activation');
+              target.que?.push(() => order.push('module-enqueued'));
+              afterCommit(() => {
+                order.push('after-commit-start');
+                target.que?.push(() => order.push('after-commit-enqueued'));
+                order.push('after-commit-end');
+              });
+            },
+          }),
+        })
+      )
     ).toBe(true);
 
     await expect(runtime.install()).resolves.toMatchObject({ state: 'kernel' });
@@ -1641,7 +1689,7 @@ describe('Runtime bootstrap owner', () => {
     expect(first.generation).not.toBe(second.generation);
   });
 
-  it('self-discards a stale async preparation before activation when a later owner commits', async () => {
+  it('rejects a detached async no-agent preparation before activation', async () => {
     const target = {};
     const staleCoreActivation = vi.fn();
     const staleModuleActivation = vi.fn();
@@ -1663,7 +1711,6 @@ describe('Runtime bootstrap owner', () => {
         requestAds: vi.fn(),
       },
     });
-    const secondRequestAds = vi.fn();
     const second = createRuntime({
       target,
       releaseId: RELEASE,
@@ -1673,51 +1720,41 @@ describe('Runtime bootstrap owner', () => {
       kernel: {
         addAdUnits: vi.fn(),
         diagnostics: Object.freeze({}),
-        requestAds: secondRequestAds,
+        requestAds: vi.fn(),
       },
     });
 
     expect(first.start()).toBe(true);
     expect(
-      first.registerIntegration({
-        abi: 1,
-        id: 'gpt',
-        phase: 'takeover',
-        releaseId: RELEASE,
-        prepare: ({ onDispose }: { onDispose(callback: () => void): void }) => {
-          onDispose(staleDisposal);
-          return stalePreparation.then(() => ({ activate: staleModuleActivation }));
-        },
-      })
+      first.registerIntegration(
+        takeoverRegistration({
+          abi: 1,
+          id: 'gpt',
+          phase: 'takeover',
+          releaseId: RELEASE,
+          prepare: ({ onDispose }: { onDispose(callback: () => void): void }) => {
+            onDispose(staleDisposal);
+            return stalePreparation.then(() => ({ activate: staleModuleActivation }));
+          },
+        })
+      )
     ).toBe(true);
     const staleInstall = first.install();
-    await Promise.resolve();
-
-    expect(Reflect.deleteProperty(target, '_registerIntegration')).toBe(true);
-    expect(second.start()).toBe(true);
-    expect(
-      second.registerIntegration({
-        abi: 1,
-        id: 'gpt',
-        phase: 'takeover',
-        releaseId: RELEASE,
-        prepare: () => ({ activate: vi.fn() }),
-      })
-    ).toBe(true);
-    await expect(second.install()).resolves.toMatchObject({ state: 'kernel' });
-
+    expect(first.state).toBe('fallback');
+    expect(Reflect.deleteProperty(target, '_registerIntegration')).toBe(false);
+    expect(second.start()).toBe(false);
     resolveStalePreparation?.();
     await expect(staleInstall).resolves.toEqual({ state: 'fallback', reason: 'bundle_partial' });
 
     expect(staleCoreActivation).not.toHaveBeenCalled();
     expect(staleModuleActivation).not.toHaveBeenCalled();
     expect(staleDisposal).toHaveBeenCalledOnce();
-    expect(first.state).toBe('failed');
-    expect(second.state).toBe('kernel');
-    expect((target as { requestAds?: unknown }).requestAds).toBe(secondRequestAds);
+    expect(first.state).toBe('fallback');
+    expect(second.state).toBe('unclaimed');
     expect((target as { _internal?: unknown })._internal).toEqual({
-      state: 'kernel',
+      state: 'fallback',
       releaseId: RELEASE,
+      reason: 'bundle_partial',
     });
   });
 
@@ -1747,6 +1784,7 @@ describe('Runtime bootstrap owner', () => {
         id: 'gpt',
         phase: 'takeover',
         releaseId: RELEASE,
+        prepareSync: () => ({ activate: staleModuleActivation }),
         prepare: () => ({ activate: staleModuleActivation }),
       },
       {
@@ -1760,13 +1798,15 @@ describe('Runtime bootstrap owner', () => {
     expect(first.registerIntegration(registration)).toBe(false);
     expect(second.start()).toBe(true);
     expect(
-      second.registerIntegration({
-        abi: 1,
-        id: 'gpt',
-        phase: 'takeover',
-        releaseId: RELEASE,
-        prepare: () => ({ activate: vi.fn() }),
-      })
+      second.registerIntegration(
+        takeoverRegistration({
+          abi: 1,
+          id: 'gpt',
+          phase: 'takeover',
+          releaseId: RELEASE,
+          prepare: () => ({ activate: vi.fn() }),
+        })
+      )
     ).toBe(true);
     await expect(second.install()).resolves.toMatchObject({ state: 'kernel' });
     await expect(first.install()).resolves.toEqual({
@@ -1842,10 +1882,21 @@ describe('Runtime bootstrap owner', () => {
         id: 'gpt',
         phase: 'takeover',
         releaseId: 'b'.repeat(64),
+        prepareSync: vi.fn(),
         prepare: vi.fn(),
       },
     ],
-    ['unknown id', { abi: 1, id: 'aps', phase: 'takeover', releaseId: RELEASE, prepare: vi.fn() }],
+    [
+      'unknown id',
+      {
+        abi: 1,
+        id: 'aps',
+        phase: 'takeover',
+        releaseId: RELEASE,
+        prepareSync: vi.fn(),
+        prepare: vi.fn(),
+      },
+    ],
   ])(
     'classifies %s registration as abi_mismatch without invoking module code',
     async (_name, registration) => {
@@ -1874,13 +1925,13 @@ describe('Runtime bootstrap owner', () => {
 
   it('classifies duplicate registration as abi_mismatch', async () => {
     const prepare = vi.fn(() => ({ activate: vi.fn() }));
-    const registration = {
+    const registration = takeoverRegistration({
       abi: 1,
       id: 'gpt',
       phase: 'takeover',
       releaseId: RELEASE,
       prepare,
-    };
+    });
     const runtime = createRuntime({
       target: {},
       releaseId: RELEASE,
@@ -1932,13 +1983,15 @@ describe('Runtime bootstrap owner', () => {
         kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
       });
       runtime.start();
-      runtime.registerIntegration({
-        abi: 1,
-        id: 'gpt',
-        phase: 'takeover',
-        releaseId: RELEASE,
-        prepare,
-      });
+      runtime.registerIntegration(
+        takeoverRegistration({
+          abi: 1,
+          id: 'gpt',
+          phase: 'takeover',
+          releaseId: RELEASE,
+          prepare,
+        })
+      );
 
       await expect(runtime.install()).resolves.toEqual({
         state: 'fallback',
@@ -1962,16 +2015,18 @@ describe('Runtime bootstrap owner', () => {
       kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
     });
     runtime.start();
-    runtime.registerIntegration({
-      abi: 1,
-      id: 'gpt',
-      phase: 'takeover',
-      releaseId: RELEASE,
-      prepare: () =>
-        new Promise<{ activate(): void }>((resolve) => {
-          finish = resolve;
-        }),
-    });
+    runtime.registerIntegration(
+      takeoverRegistration({
+        abi: 1,
+        id: 'gpt',
+        phase: 'takeover',
+        releaseId: RELEASE,
+        prepare: () =>
+          new Promise<{ activate(): void }>((resolve) => {
+            finish = resolve;
+          }),
+      })
+    );
     const installed = runtime.install();
 
     await vi.advanceTimersByTimeAsync(10_000);
@@ -1993,18 +2048,20 @@ describe('Runtime bootstrap owner', () => {
       kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
     });
     runtime.start();
-    runtime.registerIntegration({
-      abi: 1,
-      id: 'gpt',
-      phase: 'takeover',
-      releaseId: RELEASE,
-      prepare: () => ({
-        activate: ({ afterCommit }: { afterCommit(callback: () => void): void }) =>
-          afterCommit(() => {
-            throw new Error('post commit');
-          }),
-      }),
-    });
+    runtime.registerIntegration(
+      takeoverRegistration({
+        abi: 1,
+        id: 'gpt',
+        phase: 'takeover',
+        releaseId: RELEASE,
+        prepare: () => ({
+          activate: ({ afterCommit }: { afterCommit(callback: () => void): void }) =>
+            afterCommit(() => {
+              throw new Error('post commit');
+            }),
+        }),
+      })
+    );
 
     await expect(runtime.install()).resolves.toMatchObject({
       state: 'kernel',
