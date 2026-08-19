@@ -583,7 +583,7 @@ curl -X POST https://edge.example.com/_ts/admin/keys/deactivate \
 
 ## Admin Diagnostic Endpoints
 
-These endpoints expose sensitive identity and cookie data and require HTTP Basic Authentication. Configure a handler that covers the entire `/_ts/admin` namespace; startup rejects configurations that do not protect every admin route. After successful authentication, diagnostic-handler responses are JSON with `Cache-Control: no-store`. Missing or invalid credentials receive the shared plaintext `401 Unauthorized` Basic-auth challenge, which is outside that JSON and cache-header contract.
+These endpoints expose sensitive identity and cookie data and require HTTP Basic Authentication. Configure a handler that covers the entire `/_ts/admin` namespace; startup rejects configurations that do not protect every admin route. Normal diagnostic-handler responses after successful authentication are JSON with `Cache-Control: no-store`. Missing or invalid credentials receive the shared plaintext `401 Unauthorized` Basic-auth challenge. Unexpected configuration or KV failures use the adapter's shared plaintext `5xx` error response. Those authentication and internal-error responses are outside the diagnostic JSON and cache-header contract.
 
 The examples below use fictional IDs and values only.
 
@@ -600,7 +600,7 @@ This lookup is implemented only by the Fastly adapter because the identity graph
 - `ec_id`, `store`, and `generation` identify the raw KV lookup.
 - `entry` preserves the stored JSON shape, including unknown and legacy fields. Derived `created_iso` and `consent.updated_iso` fields are added only when absent.
 - `metadata` preserves the stored metadata JSON shape.
-- `tombstone` reports whether consent has been withdrawn.
+- `tombstone` reports whether consent has been withdrawn. It is absent when the entry body cannot be parsed as JSON or deserialized as the typed EC schema.
 - `auction.eids` previews the partner EIDs the stored record can contribute; `auction.skipped` explains filtered IDs.
 - `entry_error`, `metadata_error`, and `raw_body` keep malformed or schema-incompatible records inspectable.
 
@@ -616,6 +616,7 @@ The auction preview validates the stored record and partner configuration, but c
 | `404`  | Record not found, or the bare route has no `ts-ec` cookie   |
 | `405`  | Method other than `GET` (`Allow: GET`)                      |
 | `501`  | EC identity graph unavailable on this adapter or deployment |
+| `5xx`  | Unexpected configuration or KV failure (plaintext)          |
 
 ```bash
 curl -u admin:secure-password \

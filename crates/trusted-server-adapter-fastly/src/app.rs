@@ -2267,6 +2267,11 @@ mod tests {
 
         let response = route(&router, request);
 
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "configured admin EC handler should run and report the unavailable test KV graph"
+        );
         assert!(
             response
                 .extensions()
