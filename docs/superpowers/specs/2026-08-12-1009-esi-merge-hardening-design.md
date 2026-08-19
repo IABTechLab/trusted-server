@@ -18,7 +18,7 @@ as `private, no-store`.
 ## Non-goals
 
 - Restoring a top-level HTTP `x-cache: HIT`. Compute still executes for every assembled
-  navigation; the hit is in the internal C2 template cache.
+  navigation; the hit is in the internal shared template cache.
 - Shipping `client_fill`. That comparison arm is incomplete and outside the requested ESI
   scope.
 - Retaining a general-purpose ESI parser. One known marker does not justify a second HTML
@@ -73,7 +73,7 @@ and platform length limits.
 
 ### Origin freshness is authoritative
 
-C2 never invents freshness. Eligibility requires a positive remaining shared lifetime derived
+The template cache never invents freshness. Eligibility requires a positive remaining shared lifetime derived
 from the origin's cache directives. `private`, `no-store`, `no-cache`, zero freshness, malformed
 directives, or already-consumed freshness all bypass storage. The stored max age is capped by the
 operator's `creative_opportunities.template_cache_max_age_seconds` safety ceiling and reduced by
@@ -81,26 +81,26 @@ operator's `creative_opportunities.template_cache_max_age_seconds` safety ceilin
 ceiling defaults to 60 seconds for rollback compatibility and is constrained to 1–86,400 seconds.
 
 Requests carrying `Cache-Control: no-cache`, `no-store`, a positive or malformed `max-age`, or
-`min-fresh`, `Pragma: no-cache`, range headers, or conditional validators bypass C2 lookup. A
+`min-fresh`, `Pragma: no-cache`, range headers, or conditional validators bypass template-cache lookup. A
 browser reload's valid `max-age=0` is the deliberate exception: TS still builds a new private
-response and runs a new per-reader auction, but may reuse a fresh reader-neutral C2 template. C2
+response and runs a new per-reader auction, but may reuse a fresh reader-neutral shared template. The template cache
 does not expose object age to the core layer, so it cannot prove a positive request-side age
 constraint is met. Authentication, cookie independence, and diagnostics privacy remain
 request-side gates.
 
 Fastly `Surrogate-Control` is interpreted through a deliberately narrow grammar: exactly one
 positive `max-age` is required, while optional `stale-while-revalidate` and `stale-if-error`
-delta-seconds are validated but never extend C2's fresh lifetime. `private`, `no-store`, and
+delta-seconds are validated but never extend the template cache's fresh lifetime. `private`, `no-store`, and
 `no-cache` refuse sharing; duplicate, missing-value, unknown, or malformed directives fail closed.
 Freshness follows Fastly's documented edge precedence: `Surrogate-Control: max-age`, then
 `Cache-Control: s-maxage`, `Cache-Control: max-age`, then `Expires`. Standard and surrogate
 `private`, `no-store`, and `no-cache` directives remain hard refusals even when a higher-priority
-field supplies positive freshness. C2 deducts `Age`/apparent age from the selected freshness and
+field supplies positive freshness. The template cache deducts `Age`/apparent age from the selected freshness and
 then applies the configured ceiling. Other vendor CDN cache-policy fields remain unsupported and
 disqualify the response. This covers the publisher's observed Fastly policy without pretending to
 implement every CDN's precedence rules.
 
-Request `no-cache` and `no-store` conservatively bypass both C2 lookup and insertion; the origin
+Request `no-cache` and `no-store` conservatively bypass both template-cache lookup and insertion; the origin
 response is delivered through the inline path. On adapters without a shared-template cache, or
 when the cache backend fails before reservation, `esi` likewise degrades to the existing inline
 path so an optimization outage does not add full-document buffering.
@@ -146,7 +146,7 @@ Warm responses preserve repeated CSP/CSP-Report-Only and other per-document secu
 headers such as COOP, COEP, CORP, HSTS, Origin-Agent-Cluster, reporting headers, and `Link`.
 Privacy is stamped after replay so metadata cannot override it.
 
-A nonce-bearing CSP or CSP-Report-Only response is rejected from C2. The nonce is commonly minted
+A nonce-bearing CSP or CSP-Report-Only response is rejected from the template cache. The nonce is commonly minted
 per response; replaying it with a transformed shared document would create an unnecessary and
 fragile coupling even if the origin accidentally left public freshness headers in place.
 
@@ -164,7 +164,7 @@ it as edge byte-seam assembly and makes its Fastly-only cache acceleration expli
 
 ## Observability and operations
 
-Every ESI request reports a bounded `X-TS-C2-Cache` state: `hit`, `miss-stored`,
+Every ESI request reports a bounded `X-TS-Template-Cache` state: `hit`, `miss-stored`,
 `miss-store-error`, `miss-reserved`, `bypass-request`, `bypass-response`, `unsupported`, `invalid`,
 or `backend-error`. Backend read errors are not collapsed into ordinary misses, and no key or
 request value is exposed.
@@ -191,5 +191,5 @@ Required gates after implementation:
 - JS tests/build/format under Node 24.12.0;
 - documentation format/build;
 - cross-adapter parity suite;
-- local C2 harness in `esi` and `inline` modes when Viceroy can access the local certificate
+- local template-cache harness in `esi` and `inline` modes when Viceroy can access the local certificate
   store.

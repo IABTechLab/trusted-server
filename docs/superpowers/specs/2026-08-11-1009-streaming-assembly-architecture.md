@@ -6,9 +6,9 @@
 stands.
 **Issue:** IABTechLab/trusted-server#1009
 
-> **Implementation update, 2026-08-14.** Warm C2 hits still use Design C exactly as
+> **Implementation update, 2026-08-14.** Warm template-cache hits still use Design C exactly as
 > specified here. Authorized cold misses now also validate the repaired
-> `stackpop/esi` parser, pinned by commit: the inert C2 marker becomes one synthetic
+> `stackpop/esi` parser, pinned by commit: the inert template-cache marker becomes one synthetic
 > include only in a private working copy, resolved from the already-built reader
 > fragment without an HTTP request. Parser failure falls back to the byte seam. See
 > [the hybrid implementation design](./2026-08-14-1009-esi-parser-assembly-design.md).
@@ -49,7 +49,7 @@ Two distinct problems get bundled in the issue as one blocker. They need differe
 
 ## 2. What the current implementation gets wrong
 
-On a C2 hit, `collect_and_assemble_cached_template` awaits the auction, then assembles,
+On a template-cache hit, `collect_and_assemble_cached_template` awaits the auction, then assembles,
 then returns a fully buffered `PublisherResponse::Buffered`. The reader receives nothing
 until bids resolve.
 
@@ -75,7 +75,7 @@ measurement of any real deployment, and not comparable to publisher data.
 
 Two things are visible, and both matter more than the absolute values:
 
-1. **The cache works.** One origin fetch across three requests; the C2 log shows one
+1. **The cache works.** One origin fetch across three requests; the template-cache log shows one
    miss, one store, two hits.
 2. **The reader waits exactly as long anyway.** Time-to-first-byte equals total on every
    request, so nothing streams — the entire response lands at once, after the auction.
@@ -89,7 +89,7 @@ assembly, TTFB must fall away from total by approximately the injected delay.
 
 ## 2c. Measured against the shipped path — a ~100x TTFB regression
 
-`scripts/c2-local-test.sh` runs both modes against the same stub, with a self-imposed
+`scripts/template-cache-local-test.sh` runs both modes against the same stub, with a self-imposed
 1.5 s bid endpoint. Synthetic numbers, not a measurement of any deployment.
 
 | Mode                      | TTFB              | Total   |
@@ -172,7 +172,7 @@ bids go, emitted by the existing `Marker` variant:
 <!--ts-ad-seam-->
 ```
 
-On a C2 hit:
+On a template-cache hit:
 
 ```
 commit headers (private, no-store; no Content-Length)   ← must precede any byte on Fastly
@@ -201,7 +201,7 @@ seam and nothing else.
 ## 5. Two simplifications that fall out
 
 **Store the template decoded.** The current key includes `accept_encoding` because the
-pipeline pairs input to output encoding. If C2 stores identity bytes and encodes at serve
+pipeline pairs input to output encoding. If the template cache stores identity bytes and encodes at serve
 time, that key dimension disappears: one entry per URL instead of one per encoding —
 better hit rate, smaller key, and one fewer thing to get wrong.
 
@@ -215,7 +215,7 @@ The issue's gating decision is: _is Fastly-first acceptable for the flagship per
 with a portable fallback?_
 
 Design C keeps the latency-critical warm path portable, but only Fastly currently supplies
-the shared C2 cache; the other adapters degrade to their existing inline origin transform.
+the shared template cache; the other adapters degrade to their existing inline origin transform.
 No self-referencing backend or browser-visible fragment surface exists.
 
 The `esi` mode uses a hybrid implementation. A cold miss is already buffered for cache
@@ -234,19 +234,19 @@ working copy and can dispatch only TS's synthetic completed fragment.
 ## 7. Sequencing
 
 1. Emit the schema-bound comment sentinel instead of an executable ESI include tag.
-2. Add the seam split to the C2 hit path, returning `PublisherResponse::Stream` rather than
+2. Add the seam split to the template-cache hit path, returning `PublisherResponse::Stream` rather than
    `Buffered`. Strip `Content-Length`.
 3. Store decoded identity; negotiate and encode the assembled response per reader.
 4. **Verify first byte arrives before the auction resolves.** This is the measurement that
    distinguishes C from A, and it is the point of the whole exercise. A delayed-response
    stub origin plus a slow auction makes it observable locally.
-5. Re-run every Task 6 gate against the streaming path — the C3 gate especially, because
+5. Re-run every Task 6 gate against the streaming path — the forbidden final assembled-response cache gate especially, because
    headers now commit before any byte and cannot be corrected afterwards.
 
 ## 8. Open risks
 
 - **Ordering is enforced by statement order, not by types.** Three properties already
-  depend on it: the C2 gate must run before the app stamps its own `private, no-store`
+  depend on it: the template-cache gate must run before the app stamps its own `private, no-store`
   (a bug already hit and fixed), the store must precede assembly, and headers must be
   final before the first byte. Streaming adds no new ordering hazard but makes the third
   unrecoverable rather than merely wrong.

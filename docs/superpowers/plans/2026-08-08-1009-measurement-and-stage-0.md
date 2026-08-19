@@ -796,7 +796,7 @@ cache poisoning, where minutes of exposure are worse than a slow rollout.
 
 **But a config push is not a full rollback.** It stops HTML navigations reading from
 cache; it evicts nothing already stored. See Step 4's rollback sequence — flip, then purge
-or roll a versioned namespace, then observe past the origin TTL. Until a C1 purge path
+or roll a versioned namespace, then observe past the origin TTL. Until a raw origin cache purge path
 exists, the tail is "wait out the origin TTL," and that must be an accepted, recorded
 risk before the flip.
 
@@ -918,9 +918,10 @@ expire. The origin's `max-age=60` bounds that, but does not remove it.
 Full rollback:
 
 1. Push `bypass_origin_cache = true`.
-2. Purge — **and note this is C1, not C2.** `InsertBuilder::surrogate_keys` belongs to
-   the Core Cache API and applies to the transformed-template cache the ESI spike builds.
-   It has no effect on the HTTP read-through cache that Stage 0 turns on. Purging C1
+2. Purge — **and note this is the raw origin cache, not the shared transformed-template cache.**
+   `InsertBuilder::surrogate_keys` belongs to the Core Cache API and applies to the
+   transformed-template cache the ESI spike builds. It has no effect on the HTTP read-through
+   cache that Stage 0 turns on. Purging the raw origin cache
    requires either surrogate keys the **origin** supplies on its responses, or the HTTP
    cache's own request/candidate surrogate-key surface. Confirm which is available before
    relying on it.

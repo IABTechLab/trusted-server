@@ -11,14 +11,14 @@ The remediation covers the two blocking regressions, the terminal-privacy behavi
 Three explicitly separate follow-ups remain outside this PR:
 
 - dependency-version deduplication introduced by the pinned ESI fork;
-- gating C2 diagnostic headers before a production rollout;
+- gating template-cache diagnostic headers before a production rollout;
 - upstreaming the ESI parser fixes or publishing a tagged fork release.
 
 Suggestions that do not fit the current runtime architecture will receive a technical response instead of speculative code. In particular, Fastly constructs `AppState` inside a per-request Wasm instance, so a cache attached to that state does not eliminate cross-request fingerprint work. Fingerprint memoization will be added only if investigation identifies a genuinely longer-lived owner that preserves configuration invalidation.
 
 ## Approach
 
-Use narrow, test-driven changes grouped by behavioral boundary. Preserve the existing C2 architecture and fail-open/fail-closed contracts. Avoid a general response-policy or template-cache redesign.
+Use narrow, test-driven changes grouped by behavioral boundary. Preserve the existing shared template-cache architecture and fail-open/fail-closed contracts. Avoid a general response-policy or template-cache redesign.
 
 ### Cache read and storage safety
 
@@ -42,7 +42,7 @@ Tests will pin both directions: late effects cannot make an assembled response p
 
 ### Publisher-content refusal
 
-C2 authorization will reject documents that already contain the inert TS seam marker rather than rewriting publisher bytes. It will also recognize both case-insensitive `<esi:` directives and `<!--esi` comment blocks.
+Template-cache authorization will reject documents that already contain the inert TS seam marker rather than rewriting publisher bytes. It will also recognize both case-insensitive `<esi:` directives and `<!--esi` comment blocks.
 
 The directive detector will have one shared implementation used by core authorization and the Fastly parser adapter. Existing last-line assembly validation remains as defense in depth. Tests will cover script-string seam collisions, ordinary ESI tags, ESI comment blocks, and case variants.
 
@@ -75,12 +75,12 @@ The remediation will:
 - repair non-test rustdoc links;
 - document the local harness coupling at `build_seam_script`;
 - list `PlatformTemplateCache` in the platform module roster and consolidate exports;
-- run both C2 workflow invocations with `BID_DELAY=3`, keep the `first_body_byte < complete / 3` assertion, and stop after one diagnostic failure when probe timings are non-numeric instead of performing a second comparison with fabricated zero values;
+- run both template-cache workflow invocations with `BID_DELAY=3`, keep the `first_body_byte < complete / 3` assertion, and stop after one diagnostic failure when probe timings are non-numeric instead of performing a second comparison with fabricated zero values;
 - move both self-labeled historical #1009 documents directly into `docs/superpowers/archive/`, then update every reference found by `rg` including links inside the moved documents.
 
 ## Error Handling
 
-Runtime failures continue to use the existing concrete error types and `error-stack` boundaries. Cache corruption and backend read failures degrade to origin processing. Invalid publisher content bypasses C2 rather than failing the page. Metadata encoding validation is handled before storage and cannot introduce a new panic path.
+Runtime failures continue to use the existing concrete error types and `error-stack` boundaries. Cache corruption and backend read failures degrade to origin processing. Invalid publisher content bypasses the template cache rather than failing the page. Metadata encoding validation is handled before storage and cannot introduce a new panic path.
 
 ## Verification
 
@@ -93,6 +93,6 @@ Each behavioral fix starts with a regression test and runs the narrowest relevan
 - Fastly template-cache and ESI assembly suites;
 - JavaScript Vitest, build, and formatting;
 - `cd docs && npm run format` and the target-matched documentation command selected during planning after checking the workspace target guards;
-- `BID_DELAY=3 ./scripts/c2-local-test.sh esi` and `BID_DELAY=3 ./scripts/c2-local-test.sh inline` when Viceroy and the required local artifact are available.
+- `BID_DELAY=3 ./scripts/template-cache-local-test.sh esi` and `BID_DELAY=3 ./scripts/template-cache-local-test.sh inline` when Viceroy and the required local artifact are available.
 
 Any unavailable local prerequisite will be reported explicitly rather than represented as a passing check.

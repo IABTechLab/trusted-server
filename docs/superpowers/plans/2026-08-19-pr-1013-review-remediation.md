@@ -25,7 +25,7 @@
 - `crates/trusted-server-core/src/creative_opportunities.rs` and `src/integrations/gpt_diagnostics.rs`: consolidate adjacent impl blocks and test conventions.
 - `crates/trusted-server-js/lib/src/integrations/gpt/index.ts` and `crates/trusted-server-core/src/integrations/gpt_bootstrap.js`: one-shot initial scheduler contract.
 - `crates/trusted-server-js/lib/test/integrations/gpt/*.test.ts`: executable scheduling contracts.
-- `Cargo.toml`, `crates/trusted-server-adapter-fastly/Cargo.toml`, `.github/workflows/test.yml`, `scripts/c2-local-test.sh`, `trusted-server.example.toml`, and `docs/guide/configuration.md`: dependency, CI, harness, and operator-facing cleanup.
+- `Cargo.toml`, `crates/trusted-server-adapter-fastly/Cargo.toml`, `.github/workflows/test.yml`, `scripts/template-cache-local-test.sh`, `trusted-server.example.toml`, and `docs/guide/configuration.md`: dependency, CI, harness, and operator-facing cleanup.
 - `docs/superpowers/archive/` plus cross-references: archive the two superseded documents.
 
 ### Task 1: Make Fastly cache I/O fail safely
@@ -158,7 +158,7 @@ git commit -m "Scope terminal privacy to synthesized responses"
 
 - [ ] **Step 1: Rewrite the collision test to express the desired behavior**
 
-Change `an_origin_marker_collision_is_normalized_before_store` into a regression asserting the cold response preserves the publisher marker bytes, C2 stores no entry, and a second request reaches origin again. Add a script-string collision fixture so the test proves no HTML-comment-only neutralizer is involved.
+Change `an_origin_marker_collision_is_normalized_before_store` into a regression asserting the cold response preserves the publisher marker bytes, the template cache stores no entry, and a second request reaches origin again. Add a script-string collision fixture so the test proves no HTML-comment-only neutralizer is involved.
 
 - [ ] **Step 2: Add failing ESI-comment tests**
 
@@ -305,7 +305,7 @@ Expected: existing behavior tests PASS; this is a characterization refactor, so 
 
 - [ ] **Step 3: Apply mechanical cleanup**
 
-Remove `PageBidsFormat` and use a direct `matches!(format, None | Some("json"))` guard. Remove the unused `RuntimeServices` parameter from `store_template_if_authorized` and its call sites. Remove the dead non-identity cached-response encoding branch. Change rustdoc links to the test-only `c2_bypass_reason` into code formatting. Add a comment at `build_seam_script` pointing to the harness literals. Fold adjacent impl blocks, remove test-only `#[must_use]`, and add `"should ..."` messages to the noted assertions.
+Remove `PageBidsFormat` and use a direct `matches!(format, None | Some("json"))` guard. Remove the unused `RuntimeServices` parameter from `store_template_if_authorized` and its call sites. Remove the dead non-identity cached-response encoding branch. Change rustdoc links to the test-only `template_cache_bypass_reason` into code formatting. Add a comment at `build_seam_script` pointing to the harness literals. Fold adjacent impl blocks, remove test-only `#[must_use]`, and add `"should ..."` messages to the noted assertions.
 
 - [ ] **Step 4: Verify core behavior and documentation**
 
@@ -331,7 +331,7 @@ git commit -m "Remove ESI spike residue"
 - Modify: `Cargo.toml`
 - Modify: `crates/trusted-server-adapter-fastly/Cargo.toml`
 - Modify: `.github/workflows/test.yml`
-- Modify: `scripts/c2-local-test.sh`
+- Modify: `scripts/template-cache-local-test.sh`
 - Modify: `trusted-server.example.toml`
 - Modify: `docs/guide/configuration.md`
 - Move the #1009 validation spike and cacheable-root design into the flat `docs/superpowers/archive/` directory.
@@ -372,7 +372,7 @@ Expected: formatters PASS and the stale-path search returns no matches.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add Cargo.toml crates/trusted-server-adapter-fastly/Cargo.toml .github/workflows/test.yml scripts/c2-local-test.sh trusted-server.example.toml docs crates/trusted-server-core/src/html_processor.rs crates/trusted-server-core/src/platform/template_cache.rs crates/trusted-server-core/src/publisher.rs
+git add Cargo.toml crates/trusted-server-adapter-fastly/Cargo.toml .github/workflows/test.yml scripts/template-cache-local-test.sh trusted-server.example.toml docs crates/trusted-server-core/src/html_processor.rs crates/trusted-server-core/src/platform/template_cache.rs crates/trusted-server-core/src/publisher.rs
 git commit -m "Align ESI spike documentation and tooling"
 ```
 
@@ -448,11 +448,11 @@ npx vitest run
 node build-all.mjs
 ```
 
-- [ ] **Step 5: Run the C2 local harness when prerequisites exist**
+- [ ] **Step 5: Run the template-cache local harness when prerequisites exist**
 
 ```bash
-BID_DELAY=3 ./scripts/c2-local-test.sh esi
-BID_DELAY=3 ./scripts/c2-local-test.sh inline
+BID_DELAY=3 ./scripts/template-cache-local-test.sh esi
+BID_DELAY=3 ./scripts/template-cache-local-test.sh inline
 ```
 
 Expected: both report zero failures. If Viceroy or the production Wasm artifact is unavailable, record the exact prerequisite failure and rely on the matching CI jobs after push.
