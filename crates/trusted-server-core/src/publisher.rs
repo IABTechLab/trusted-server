@@ -2039,7 +2039,7 @@ fn build_cached_template_response(
 /// request stores nothing.
 ///
 /// Failures are logged and swallowed. A cache that cannot be written is a slower
-/// service, not a broken one, and the whole point of template cache is that the response is
+/// service, not a broken one, and the whole point of the template cache is that the response is
 /// reproducible without it.
 ///
 /// Spike-only, for the #1009 ESI validation.
@@ -5208,7 +5208,7 @@ pub(crate) enum TemplateCacheBypassReason {
     /// happens after the cache has already stored the origin's.
     #[display("origin response carries Set-Cookie")]
     OriginSetCookie,
-    /// The origin declared the response non-shareable, or supplied a CDN-specific
+    /// The origin declared the response non-shareable, or supplied CDN-specific
     /// policy directives the template-cache path does not interpret and therefore cannot safely override.
     #[display("origin cache policy is not eligible for template cache sharing")]
     OriginNotShareable,
@@ -5216,7 +5216,7 @@ pub(crate) enum TemplateCacheBypassReason {
     /// parser disagreement from extending a representation's lifetime.
     #[display("origin cache policy is malformed")]
     MalformedCachePolicy,
-    /// Core Cache has no HTTP heuristic freshness. template cache therefore requires an explicit,
+    /// Core Cache has no HTTP heuristic freshness. Template cache therefore requires an explicit,
     /// still-positive origin lifetime rather than inventing one.
     #[display("origin response has no positive shared freshness")]
     NoPositiveFreshness,
@@ -5465,7 +5465,7 @@ fn parse_delta_seconds(value: &str) -> Result<u64, TemplateCacheBypassReason> {
 /// Parse the Fastly-specific freshness policy used by template cache's hosting platform.
 ///
 /// Fastly documents `max-age`, `stale-while-revalidate`, and `stale-if-error` for
-/// `Surrogate-Control`. template cache uses only `max-age` as fresh lifetime; the stale windows
+/// `Surrogate-Control`. Template cache uses only `max-age` as fresh lifetime; the stale windows
 /// are validated so malformed policy cannot hide beside a valid max age, but Core
 /// Cache assembly does not serve stale templates under either extension.
 ///
