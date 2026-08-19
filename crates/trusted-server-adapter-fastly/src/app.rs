@@ -548,9 +548,7 @@ async fn execute_named(
                     let kv = crate::maybe_identity_graph(&state.settings);
                     handle_admin_ec_lookup(kv.as_ref(), &registry, &req)
                 }
-                NamedRouteHandler::AdminEidsLookup => {
-                    handle_admin_eids_lookup(&registry, &req)
-                }
+                NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
                 _ => unreachable!("admin diagnostics should use early dispatch"),
             })
             .unwrap_or_else(|error| http_error(&error));
@@ -2252,9 +2250,7 @@ mod tests {
         let eids_cookie = base64::engine::general_purpose::STANDARD.encode(eids.to_string());
         let mut request = request_builder()
             .method(Method::GET)
-            .uri(format!(
-                "https://test-publisher.com/_ts/admin/ec/{ec_id}"
-            ))
+            .uri(format!("https://test-publisher.com/_ts/admin/ec/{ec_id}"))
             .header(header::AUTHORIZATION, "Basic YWRtaW46YWRtaW4tcGFzcw==")
             .header(
                 header::COOKIE,

@@ -16,6 +16,8 @@
 //! auth-gated and operator-facing, responses intentionally include full
 //! internal detail (raw consent strings, partner UIDs, parse errors).
 
+use std::collections::BTreeMap;
+
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -34,8 +36,7 @@ use super::kv_backend::EcKvLookup;
 use super::kv_types::{KvEntry, KvMetadata};
 use super::log_id;
 use super::prebid_eids::{
-    collect_prebid_eid_updates, collect_sharedid_update, dedupe_partner_updates,
-    parse_prebid_eids_cookie,
+    analyze_prebid_eids_cookie, collect_sharedid_update, dedupe_partner_updates, is_valid_eid_uid,
 };
 use super::registry::PartnerRegistry;
 
@@ -421,8 +422,8 @@ struct IngestPreview {
     /// Cookie sources matched to a configured partner, with the UID that
     /// would be stored (deduplicated exactly like the ingestion path).
     matched: Vec<MatchedPartnerId>,
-    /// `ts-eids` sources with no configured partner; dropped on ingestion.
-    unmatched: Vec<String>,
+    /// `ts-eids` sources dropped on ingestion, with the reason.
+    unmatched: Vec<DroppedEidSource>,
 }
 
 /// A cookie-derived partner UID that ingestion would store.
@@ -432,6 +433,21 @@ struct MatchedPartnerId {
     source_domain: String,
     /// The UID that would be stored.
     uid: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DroppedEidSource {
+    /// EID source from the cookie.
+    source: String,
+    /// Why ingestion would drop the source.
+    reason: DroppedEidReason,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DroppedEidReason {
+    NoPartner,
+    NoValidUid,
 }
 
 /// Handles `GET /_ts/admin/eids`.
@@ -455,13 +471,20 @@ pub fn handle_admin_eids_lookup(
     let eids_cookie = extract_cookie_value(req, COOKIE_TS_EIDS);
     let sharedid_cookie = extract_cookie_value(req, COOKIE_SHAREDID);
 
-    let (eids, parse_error) = match &eids_cookie {
-        None => (None, None),
-        Some(value) => match parse_prebid_eids_cookie(value) {
-            Ok(parsed) => (Some(parsed), None),
+    let (eids, parse_error, diagnostic_sources, mut updates) = match &eids_cookie {
+        None => (None, None, Vec::new(), Vec::new()),
+        Some(value) => match analyze_prebid_eids_cookie(value, registry) {
+            Ok(analysis) => (
+                Some(analysis.eids),
+                None,
+                analysis.diagnostic_sources,
+                analysis.updates,
+            ),
             Err(error) => (
                 None,
                 Some(format!("failed to parse ts-eids cookie: {error}")),
+                Vec::new(),
+                Vec::new(),
             ),
         },
     };
@@ -469,10 +492,6 @@ pub fn handle_admin_eids_lookup(
     // Mirror the ingestion path (`ingest_eid_cookies`): collect matches from
     // both cookies, then dedupe the same way so the preview reports exactly
     // what a navigation would store.
-    let mut updates = Vec::new();
-    if let Some(value) = &eids_cookie {
-        updates.extend(collect_prebid_eid_updates(value, registry));
-    }
     if let Some(value) = &sharedid_cookie
         && let Some(update) = collect_sharedid_update(value, registry)
     {
@@ -486,16 +505,30 @@ pub fn handle_admin_eids_lookup(
         })
         .collect();
 
-    let unmatched = eids
-        .as_ref()
-        .map(|parsed| {
-            parsed
-                .iter()
-                .filter(|eid| registry.find_by_source_domain(&eid.source).is_none())
-                .map(|eid| eid.source.clone())
-                .collect()
+    let mut source_has_valid_uid = BTreeMap::new();
+    for diagnostic_source in diagnostic_sources {
+        let has_valid_uid = diagnostic_source
+            .uids
+            .iter()
+            .any(|uid| is_valid_eid_uid(uid));
+        source_has_valid_uid
+            .entry(diagnostic_source.source)
+            .and_modify(|source_has_valid_uid| *source_has_valid_uid |= has_valid_uid)
+            .or_insert(has_valid_uid);
+    }
+    let unmatched = source_has_valid_uid
+        .into_iter()
+        .filter_map(|(source, has_valid_uid)| {
+            let reason = if registry.find_by_source_domain(&source).is_none() {
+                DroppedEidReason::NoPartner
+            } else if !has_valid_uid {
+                DroppedEidReason::NoValidUid
+            } else {
+                return None;
+            };
+            Some(DroppedEidSource { source, reason })
         })
-        .unwrap_or_default();
+        .collect();
 
     let payload = AdminEidsResponse {
         cookie_present: eids_cookie.is_some(),
@@ -1134,7 +1167,72 @@ mod tests {
             .as_array()
             .expect("should have unmatched list");
         assert_eq!(unmatched.len(), 1, "should report the unregistered source");
-        assert_eq!(unmatched[0], "unknown.example");
+        assert_eq!(unmatched[0]["source"], "unknown.example");
+        assert_eq!(unmatched[0]["reason"], "no_partner");
+    }
+
+    #[test]
+    fn eids_lookup_reports_configured_source_without_valid_uid() {
+        let oversized_uid = "x".repeat(513);
+        let cookie = eids_cookie_for(&serde_json::json!([{
+            "source": "bidstream.example",
+            "uids": [
+                { "id": "", "atype": 1 },
+                { "id": "   ", "atype": 1 },
+                { "id": oversized_uid, "atype": 1 }
+            ]
+        }]));
+        let req = get_request_with_cookie("/_ts/admin/eids", &format!("ts-eids={cookie}"));
+
+        let response =
+            handle_admin_eids_lookup(&test_registry(), &req).expect("should handle eids lookup");
+        let json = response_json(response);
+
+        assert!(
+            json["ingest"]["matched"]
+                .as_array()
+                .expect("should have matched list")
+                .is_empty(),
+            "invalid UIDs should not be matched"
+        );
+        let unmatched = json["ingest"]["unmatched"]
+            .as_array()
+            .expect("should have unmatched list");
+        assert_eq!(unmatched.len(), 1, "should report one dropped source");
+        assert_eq!(unmatched[0]["source"], "bidstream.example");
+        assert_eq!(unmatched[0]["reason"], "no_valid_uid");
+    }
+
+    #[test]
+    fn eids_lookup_does_not_drop_duplicate_source_with_valid_uid() {
+        let cookie = eids_cookie_for(&serde_json::json!([
+            {
+                "source": "bidstream.example",
+                "uids": [{ "id": "   ", "atype": 1 }]
+            },
+            {
+                "source": "bidstream.example",
+                "uids": [{ "id": "uid-valid", "atype": 1 }]
+            }
+        ]));
+        let req = get_request_with_cookie("/_ts/admin/eids", &format!("ts-eids={cookie}"));
+
+        let response =
+            handle_admin_eids_lookup(&test_registry(), &req).expect("should handle eids lookup");
+        let json = response_json(response);
+
+        let matched = json["ingest"]["matched"]
+            .as_array()
+            .expect("should have matched list");
+        assert_eq!(matched.len(), 1, "should match the valid duplicate source");
+        assert_eq!(matched[0]["uid"], "uid-valid");
+        assert!(
+            json["ingest"]["unmatched"]
+                .as_array()
+                .expect("should have unmatched list")
+                .is_empty(),
+            "a valid duplicate should suppress no_valid_uid"
+        );
     }
 
     #[test]

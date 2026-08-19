@@ -2293,18 +2293,19 @@ impl Settings {
 
     fn validate_admin_handler_passwords(&self) -> Result<(), Report<TrustedServerError>> {
         for handler in &self.handlers {
-            let covers_admin = Self::ADMIN_ENDPOINTS
-                .iter()
-                .try_fold(false, |covers_any_endpoint, path| {
-                    Self::admin_auth_probes(path).iter().try_fold(
-                        covers_any_endpoint,
-                        |covers_any_probe, probe| {
-                            handler
-                                .matches_path(probe)
-                                .map(|matches| covers_any_probe || matches)
-                        },
-                    )
-                })?;
+            let covers_admin =
+                Self::ADMIN_ENDPOINTS
+                    .iter()
+                    .try_fold(false, |covers_any_endpoint, path| {
+                        Self::admin_auth_probes(path).iter().try_fold(
+                            covers_any_endpoint,
+                            |covers_any_probe, probe| {
+                                handler
+                                    .matches_path(probe)
+                                    .map(|matches| covers_any_probe || matches)
+                            },
+                        )
+                    })?;
 
             if covers_admin && is_admin_placeholder_password(handler.password.expose()) {
                 return Err(Report::new(TrustedServerError::Configuration {
