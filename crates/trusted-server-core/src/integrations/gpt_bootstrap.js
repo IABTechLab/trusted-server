@@ -27,10 +27,13 @@
         var gpt = window.googletag;
         if (gpt && typeof gpt.setConfig === "function") {
           // "ts" is the fixed GAM key, not the local window.tsjs alias.
-          gpt.setConfig({ targeting: { ts: 'true' } });
+          gpt.setConfig({ targeting: { ts: "true" } });
         }
-      } catch (_) {
+      } catch (error) {
         // Attribution must not interrupt the existing bootstrap queue.
+        ts.log &&
+          ts.log.warn &&
+          ts.log.warn("GAM attribution targeting failed", error);
       }
     });
   }
