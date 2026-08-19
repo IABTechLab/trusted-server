@@ -150,4 +150,12 @@ pub trait PlatformGeo: Send + Sync {
     /// Returns [`PlatformError::Geo`] when the platform geo lookup fails
     /// unexpectedly. Returns `Ok(None)` when no data is available for the IP.
     fn lookup(&self, client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>>;
+
+    /// The permissions this provider's data use requires.
+    ///
+    /// The default is empty, so the default (disabled) geo provider requires no
+    /// permission.
+    fn required_permissions(&self) -> crate::permissions::PermissionSet {
+        crate::permissions::PermissionSet::none()
+    }
 }

@@ -139,6 +139,9 @@ mod tests {
 
                 [ec.providers.hmac]
                 passphrase = "test-secret-key-32-bytes-minimum"
+
+                [geo]
+                default_country = "FR"
             "#,
         )
         .expect("should load test settings");

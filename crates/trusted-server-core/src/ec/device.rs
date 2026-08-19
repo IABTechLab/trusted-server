@@ -140,6 +140,14 @@ pub trait DeviceProvider: Send + Sync {
     /// so this is infallible: a provider that cannot determine a signal returns
     /// the unknown variant rather than failing the request.
     fn detect(&self, request_info: &dyn RequestInfo) -> DeviceSignals;
+
+    /// The permissions this provider's data use requires.
+    ///
+    /// The default is empty, so the built-in User-Agent-only provider requires
+    /// no permission.
+    fn required_permissions(&self) -> crate::permissions::PermissionSet {
+        crate::permissions::PermissionSet::none()
+    }
 }
 
 /// The built-in device provider, the default.
@@ -807,6 +815,16 @@ mod tests {
         fn detect(&self, _request_info: &dyn RequestInfo) -> DeviceSignals {
             DeviceSignals::derive_ua_only("")
         }
+    }
+
+    #[test]
+    fn builtin_device_provider_requires_no_permissions() {
+        assert!(
+            BuiltinDeviceProvider::new()
+                .required_permissions()
+                .is_empty(),
+            "the built-in User-Agent-only device provider requires no permissions"
+        );
     }
 
     #[test]

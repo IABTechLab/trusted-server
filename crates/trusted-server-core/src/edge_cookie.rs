@@ -67,9 +67,8 @@ pub fn generate_ec_id(
     // The provider reads request data (the client IP, and on a fingerprinting
     // host the TLS/HTTP-2 signals) borrowed at call time, so nothing is cloned.
     let request_info = BorrowedRequestInfo::new(&client_ip, request_headers);
-    // The publisher path gates creation on the request's consent context at
-    // the call site, and the built-in provider reads neither that result nor
-    // the consent context, so
+    // The publisher path applies the permission gate at the call site, and the
+    // built-in provider reads neither the resolved permissions nor consent, so
     // they are not threaded here.
     let generated = provider.generate(&request_info, &IdentityInput::default())?;
     Ok(generated.id)

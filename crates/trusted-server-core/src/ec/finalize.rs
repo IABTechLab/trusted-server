@@ -11,7 +11,7 @@ use http::Response;
 use crate::settings::Settings;
 
 use super::EcContext;
-use super::consent::ec_consent_withdrawn;
+use super::consent::ec_storage_withdrawn;
 use super::cookies::{expire_ec_cookie, set_ec_cookie};
 use super::kv::KvIdentityGraph;
 use super::log_id;
@@ -28,7 +28,7 @@ const EC_RESPONSE_HEADERS: &[&str] = &[
 
 /// Finalizes EC response behavior for all routes.
 ///
-/// Applies the resolved consent gate, last-seen updates, cookie
+/// Applies the resolved permission state, last-seen updates, cookie
 /// reconciliation, Prebid EID ingestion, and cookie writes for new EC generation.
 ///
 /// When the request carries an explicit withdrawal signal (a storage opt-out or
@@ -67,10 +67,10 @@ pub fn ec_finalize_response(
 
         // Only expire the browser cookie and tombstone the identity-graph row
         // when the request carries an explicit withdrawal signal. A pre-consent
-        // or fail-closed state (consent is simply not granted) strips headers
+        // or fail-closed state (the permission is simply not set) strips headers
         // but must not destroy an already-issued identifier, or a returning user
         // would be permanently withdrawn before they ever get to consent.
-        if ec_consent_withdrawn(ec_context.consent()) && ec_context.cookie_was_present() {
+        if ec_storage_withdrawn(ec_context.consent()) && ec_context.cookie_was_present() {
             expire_ec_cookie(settings, response);
 
             // Compute once for the authoritative identity-graph tombstones.
@@ -679,10 +679,10 @@ mod tests {
     }
 
     #[test]
-    fn closed_consent_gate_writes_no_ec_cookie() {
-        // The gate: with the consent gate closed (ec_allowed = false), no
+    fn closed_permission_gate_writes_no_ec_cookie() {
+        // The gate: with the permission gate closed (ec_allowed = false), no
         // ts-ec cookie is written, even when an EC value and a generated flag are
-        // present. The consent gate is what suppresses the cookie.
+        // present. The permission model is what suppresses the cookie.
         let settings = create_test_settings();
         let ec_id = sample_ec_id("gated1");
         let ec_context = make_context(
@@ -711,7 +711,7 @@ mod tests {
 
         assert!(
             get_header(&response, "set-cookie").is_none(),
-            "a closed consent gate must not write a ts-ec cookie"
+            "a closed permission gate must not write a ts-ec cookie"
         );
     }
 }

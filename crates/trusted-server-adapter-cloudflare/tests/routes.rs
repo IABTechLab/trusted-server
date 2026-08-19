@@ -40,6 +40,9 @@ fn test_router() -> RouterService {
 
             [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            default_country = "FR"
         "#,
     )
     .expect("should parse route test settings");
@@ -86,6 +89,9 @@ fn make_router() -> RouterService {
             cookie_domain = ".test-publisher.example.com"
             origin_url = "https://origin.test-publisher.example.com"
             proxy_secret = "integration-test-proxy-secret"
+
+            [geo]
+            default_country = "FR"
 
             [ec]
             provider = "hmac"

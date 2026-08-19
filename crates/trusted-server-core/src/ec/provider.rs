@@ -3,7 +3,8 @@
 //! An [`EdgeCookieProvider`] derives an Edge Cookie identifier. Providers are
 //! wired by dependency injection: a provider's constructor takes the services it
 //! needs (for example [`RequestInfo`] for the client IP, or [`HostSignals`] for
-//! the TLS/HTTP-2 fingerprints)//! (the adapter, through [`build_provider`]) supplies instances per request. A
+//! the TLS/HTTP-2 fingerprints) as `Arc<dyn Trait>`, and the composition root
+//! (the adapter, through [`build_provider`]) supplies instances per request. A
 //! provider that needs a service the host does not supply cannot be built, so
 //! the request stops rather than silently degrading.
 //!
@@ -18,6 +19,7 @@ use error_stack::Report;
 use crate::consent::ConsentContext;
 use crate::error::TrustedServerError;
 use crate::evidence::{HostSignals, RequestInfo};
+use crate::permissions::{Permission, PermissionSet, PermissionState};
 use crate::redacted::Redacted;
 use crate::settings::Ec;
 
@@ -28,14 +30,18 @@ use super::generation;
 /// Request data (client IP, User-Agent, headers, host signals) reaches a
 /// provider through the services injected into its constructor, not through this
 /// struct. This carries only the per-request gating context a provider may read
-/// for behavior beyond gating. The gate has already confirmed Edge Cookie
-/// storage is allowed before `generate` is called.
+/// for behavior beyond gating. The gate has already confirmed the provider's
+/// required permissions are set before `generate` is called.
 #[derive(Default)]
 pub struct IdentityInput<'a> {
+    /// The permissions resolved for this request, when the calling path carries
+    /// them. A provider reads this only for behavior beyond gating. The main
+    /// organic path supplies them; the publisher path passes `None`.
+    pub permissions: Option<&'a PermissionState>,
+
     /// The request's consent context, when available, for provider-specific
-    /// logic. The core gates generation before calling the provider, so a
-    /// provider reads this only to forward or record consent. [`HmacProvider`]
-    /// ignores it.
+    /// logic. The core gates on permissions, not consent, so a provider reads
+    /// this only to forward or record consent. [`HmacProvider`] ignores it.
     pub consent: Option<&'a ConsentContext>,
 }
 
@@ -57,9 +63,12 @@ pub struct GeneratedEdgeCookie {
 
 /// A strategy for deriving an Edge Cookie identifier.
 ///
-/// Implementations are selected by configuration. A provider derives the
-/// identifier at the edge in [`generate`](Self::generate), and the page
-/// response sets the `ts-ec` cookie.
+/// Implementations are selected by configuration and come in two types, which
+/// reach the same outcome (a `ts-ec` cookie) by different routes:
+///
+/// - **Server-side** (for example [`HmacProvider`]): derives the identifier at
+///   the edge in [`generate`](Self::generate), and the page response sets the
+///   cookie. Nothing client-side is involved.
 ///
 /// A provider returns `Ok(None)` from [`generate`](Self::generate) when it
 /// cannot derive an identifier at the edge, so the request proceeds without an
@@ -71,6 +80,7 @@ pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
 
     /// Derives an Edge Cookie identifier from the provider's injected services
     /// and the request's gating context.
+    ///
     ///
     /// # Errors
     ///
@@ -123,6 +133,17 @@ pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
     fn normalize_id_for_kv(&self, value: &str) -> String {
         generation::normalize_ec_id_for_kv(value)
     }
+
+    /// The permissions this provider's data use requires.
+    ///
+    /// Trusted Server executes the provider only when every permission returned
+    /// here is set. The default is empty, so a vendor-neutral provider requires
+    /// no permission. A provider that stores identity on the device, or shares it
+    /// onward, declares the matching permission so the request's country and
+    /// signal rules can gate it.
+    fn required_permissions(&self) -> PermissionSet {
+        PermissionSet::none()
+    }
 }
 
 /// The built-in HMAC Edge Cookie provider.
@@ -158,6 +179,13 @@ impl EdgeCookieProvider for HmacProvider {
             id: Some(id),
             response_headers: Vec::new(),
         })
+    }
+
+    fn required_permissions(&self) -> PermissionSet {
+        // The HMAC provider writes the Edge Cookie to the device, so it requires
+        // permission to store on the device (TCF Purpose 1). Whether that needs a
+        // signal is decided by the country rules, not by the provider.
+        PermissionSet::none().with(Permission::StoreOnDevice)
     }
 }
 
@@ -213,6 +241,12 @@ impl EdgeCookieProvider for HostSignalProvider {
             response_headers: Vec::new(),
         })
     }
+
+    fn required_permissions(&self) -> PermissionSet {
+        // Writes the Edge Cookie to the device, so it requires necessary.operations.storage
+        // (TCF Purpose 1), the same gate as the HMAC provider.
+        PermissionSet::none().with(Permission::StoreOnDevice)
+    }
 }
 
 /// Builds the Edge Cookie provider named by the `[ec] provider` selector,
@@ -229,9 +263,8 @@ impl EdgeCookieProvider for HostSignalProvider {
 ///
 /// Returns [`TrustedServerError::EdgeCookie`] when the selected provider requires
 /// a service the host did not supply (for example the host-signal provider on a
-/// host that exposes no [`HostSignals`]), or when a selected vendor provider is
-/// not injected by the adapter, so a misconfigured deployment fails loudly
-/// rather than minting a degraded identifier or silently running stateless.
+/// host that exposes no [`HostSignals`]), so a misconfigured deployment fails
+/// loudly rather than minting a degraded identifier.
 pub fn build_provider(
     ec: &Ec,
     host_signals: Option<Arc<dyn HostSignals>>,
@@ -317,12 +350,17 @@ impl EdgeCookieProvider for SharedProvider {
     fn normalize_id_for_kv(&self, value: &str) -> String {
         self.0.normalize_id_for_kv(value)
     }
+
+    fn required_permissions(&self) -> PermissionSet {
+        self.0.required_permissions()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::evidence::OwnedRequestInfo;
+    use crate::permissions::PermissionMaps;
     use crate::redacted::Redacted;
 
     fn test_passphrase() -> Redacted<String> {
@@ -478,7 +516,21 @@ mod tests {
     }
 
     #[test]
-    fn host_signal_provider_mints_from_fingerprints() {
+    fn hmac_provider_requires_store_on_device() {
+        let provider = HmacProvider::new(test_passphrase());
+        let required = provider.required_permissions();
+        assert!(
+            required.contains(Permission::StoreOnDevice),
+            "the HMAC provider writes a cookie, so it requires necessary.operations.storage"
+        );
+        assert!(
+            !required.contains(Permission::SelectPersonalisedAds),
+            "the HMAC provider requires no advertising permissions"
+        );
+    }
+
+    #[test]
+    fn host_signal_provider_mints_from_fingerprints_and_requires_store_on_device() {
         let signals = Arc::new(TestHostSignals {
             ja4: Some("t13d1516h2_8daaf6152771_e5627efa2ab1".to_owned()),
             h2: Some("1:65536;4:6291456".to_owned()),
@@ -491,6 +543,59 @@ mod tests {
         assert!(
             generated.id.is_some(),
             "the host-signal provider mints an identifier from the fingerprints"
+        );
+        assert!(
+            provider
+                .required_permissions()
+                .contains(Permission::StoreOnDevice),
+            "the host-signal provider writes a cookie, so it requires necessary.operations.storage"
+        );
+    }
+
+    #[test]
+    fn a_neutral_provider_requires_no_permissions_by_default() {
+        // The wrapped-payload stub does not override required_permissions, so it
+        // inherits the trait default of none and requires no permission.
+        assert!(
+            WrappedPayloadProvider.required_permissions().is_empty(),
+            "a vendor-neutral provider requires nothing by default"
+        );
+    }
+
+    #[test]
+    fn the_edge_cookie_gate_blocks_until_the_permission_is_set() {
+        let required = HmacProvider::new(test_passphrase()).required_permissions();
+        // Empty maps with no default: every permission is the requires-signal
+        // floor.
+        let maps = PermissionMaps::empty();
+
+        // No signal: the provider's required permission is not set, so Trusted
+        // Server would not commit the Edge Cookie.
+        assert!(
+            !maps.resolve(None, None, |_| false).all_set(required),
+            "the floor should not run the Edge Cookie provider without the permission set"
+        );
+
+        // A grant signal for necessary.operations.storage: the provider's permission is now set.
+        assert!(
+            maps.resolve(None, None, |p| p == Permission::StoreOnDevice)
+                .all_set(required),
+            "the Edge Cookie provider runs once necessary.operations.storage is set"
+        );
+    }
+
+    #[test]
+    fn a_selected_but_uninjected_vendor_provider_fails_loudly() {
+        let ec = Ec {
+            provider: Some("acme".to_owned()),
+            ..Ec::default()
+        };
+
+        let err = build_provider(&ec, None, None)
+            .expect_err("selecting a provider the adapter does not inject should error");
+        assert!(
+            err.to_string().contains("acme"),
+            "the error should name the selected provider, got: {err}"
         );
     }
 
@@ -508,21 +613,6 @@ mod tests {
         assert!(
             generated.id.is_none(),
             "with no host fingerprints the provider should defer rather than              mint an IP-only identifier"
-        );
-    }
-
-    #[test]
-    fn a_selected_but_uninjected_vendor_provider_fails_loudly() {
-        let ec = Ec {
-            provider: Some("acme".to_owned()),
-            ..Ec::default()
-        };
-
-        let err = build_provider(&ec, None, None)
-            .expect_err("selecting a provider the adapter does not inject should error");
-        assert!(
-            err.to_string().contains("acme"),
-            "the error should name the selected provider, got: {err}"
         );
     }
 }

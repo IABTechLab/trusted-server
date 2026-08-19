@@ -9,11 +9,14 @@ cookie_domain = "localhost"
 origin_url = "http://127.0.0.1:8888"
 proxy_secret = "integration-test-proxy-secret"
 
-# The lifecycle scenarios need a resolved jurisdiction for the consent gate,
-# and Viceroy supplies the host geo lookup. The permission model replaces this
-# with a [geo] default_country baseline in the next PR of the series.
+# Viceroy does not resolve geolocation for the loopback test client, so the
+# request carries no country and default_country supplies the baseline the
+# permission model uses. US/CA is a US opt-out state (every purpose granted
+# without a signal), so the EC lifecycle scenarios can assert
+# permission-driven behavior, for example GPC revoking necessary.operations.storage so the
+# EC is no longer permitted and the ts-ec cookie is expired.
 [geo]
-provider = "platform"
+default_country = "US/CA"
 
 [ec]
 provider = "hmac"

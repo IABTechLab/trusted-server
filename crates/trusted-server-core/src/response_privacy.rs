@@ -156,6 +156,9 @@ mod tests {
                 origin_url = "https://origin.test-publisher.example.com"
                 proxy_secret = "unit-test-proxy-secret"
 
+                [geo]
+                default_country = "US"
+
                 [ec]
                 provider = "hmac"
 

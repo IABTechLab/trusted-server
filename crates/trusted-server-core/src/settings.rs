@@ -724,6 +724,19 @@ pub struct GeoConfig {
     /// [`validate_provider_selection`](Self::validate_provider_selection).
     #[serde(default)]
     pub provider: Option<String>,
+
+    /// The country, or country and region, whose permission rules apply when the
+    /// geo provider returns no country, or returns a country/region that has no
+    /// rule in `permissions.yaml`. One value, the same form as a
+    /// `permissions.yaml` rule key, a country code (`US`) or country/region
+    /// (`US/CA`), matched case-insensitively.
+    ///
+    /// Required. There must always be a default permission set, so startup fails
+    /// when this is unset. The value must resolve to a rule in `permissions.yaml`,
+    /// both checked at startup by
+    /// [`validate_default_country`](Self::validate_default_country).
+    #[serde(default)]
+    pub default_country: Option<String>,
 }
 
 impl GeoConfig {
@@ -744,6 +757,45 @@ impl GeoConfig {
                 message: format!("Geo provider `{key}` is not available in this build"),
             })),
         }
+    }
+
+    /// Validates that `default_country` is set and resolves to a rule in the
+    /// compiled `permissions.yaml`.
+    ///
+    /// A default is required: it is the permission baseline for a request the geo
+    /// provider leaves unmatched, so there must always be one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when `default_country` is
+    /// unset, or is set but matches no country or country/region rule.
+    pub fn validate_default_country(&self) -> Result<(), Report<TrustedServerError>> {
+        let Some(spec) = self.default_country.as_deref() else {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "[geo] default_country is required. There must always be a default \
+                          permission set, so set the country (`US`) or country/region \
+                          (`US/CA`) whose permissions.yaml rule applies to a request the geo \
+                          provider leaves unmatched"
+                    .to_owned(),
+            }));
+        };
+        let (country, region) = match spec.split_once('/') {
+            Some((country, region)) => (Some(country), Some(region)),
+            None => (Some(spec), None),
+        };
+        if crate::permissions::PermissionMaps::standard()
+            .rules_for(country, region)
+            .is_none()
+        {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[geo] default_country `{spec}` matches no rule in permissions.yaml \
+                     (use a country code like `US` or country/region like `US/CA` that \
+                     has a rule)"
+                ),
+            }));
+        }
+        Ok(())
     }
 }
 
@@ -2275,12 +2327,34 @@ impl Settings {
         settings.ec.validate_provider_selection()?;
         settings.device.validate_provider_selection()?;
         settings.geo.validate_provider_selection()?;
+        settings.geo.validate_default_country()?;
         settings.validate_admin_coverage()?;
         settings.validate_admin_handler_passwords()?;
 
         if settings.auction.enabled && !settings.auction.rewrite_creatives {
             log::warn!(
                 "Auction creative rewriting disabled; creative assets and clicks may contact third-party hosts directly"
+            );
+        }
+
+        // Log the configured default jurisdiction baseline once per settings
+        // load, so an operator can see which permissions the unmatched-request
+        // default grants without a signal.
+        if let Some(spec) = settings.geo.default_country.as_deref() {
+            let (country, region) = match spec.split_once('/') {
+                Some((country, region)) => (Some(country), Some(region)),
+                None => (Some(spec), None),
+            };
+            let baseline = crate::permissions::PermissionMaps::standard()
+                .baseline(country, region, country, region);
+            let granted: Vec<String> = baseline
+                .permissions()
+                .iter()
+                .map(|permission| permission.to_string())
+                .collect();
+            log::info!(
+                "Permission baseline: [geo] default_country = {spec}; granted without a signal: [{}]",
+                granted.join(", ")
             );
         }
 
@@ -3077,6 +3151,7 @@ mod tests {
 
         let platform = GeoConfig {
             provider: Some("platform".to_owned()),
+            default_country: None,
         };
         platform
             .validate_provider_selection()
@@ -3084,10 +3159,42 @@ mod tests {
 
         let unknown = GeoConfig {
             provider: Some("acme".to_owned()),
+            default_country: None,
         };
         assert!(
             unknown.validate_provider_selection().is_err(),
             "an unknown geo provider should be rejected at startup"
+        );
+    }
+
+    #[test]
+    fn validate_default_country_checks_against_permissions_yaml() {
+        // Unset is rejected: a default permission set is required, so startup
+        // fails without one.
+        assert!(
+            GeoConfig::default().validate_default_country().is_err(),
+            "an unset default country should be rejected"
+        );
+
+        // A country, and a country/region, that have a rule are accepted.
+        for spec in ["US", "FR", "US/CA"] {
+            let config = GeoConfig {
+                provider: None,
+                default_country: Some(spec.to_owned()),
+            };
+            config
+                .validate_default_country()
+                .unwrap_or_else(|e| panic!("default `{spec}` should validate, got {e:?}"));
+        }
+
+        // A code with no rule is rejected at startup.
+        let bad = GeoConfig {
+            provider: None,
+            default_country: Some("ZZ".to_owned()),
+        };
+        assert!(
+            bad.validate_default_country().is_err(),
+            "a default country with no rule should be rejected"
         );
     }
 
@@ -4038,6 +4145,8 @@ origin_host_header_overide = "www.example.com""#,
             [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
+            [geo]
+            default_country = "FR"
             "#,
         )
         .expect("should parse settings without max_buffered_body_bytes");
@@ -4066,6 +4175,9 @@ origin_host_header_overide = "www.example.com""#,
             origin_url = "https://origin.example.com"
             proxy_secret = "unit-test-proxy-secret"
             max_buffered_body_bytes = 0
+
+            [geo]
+            default_country = "FR"
 
             [ec]
             provider = "hmac"
@@ -5231,6 +5343,9 @@ origin_host_header_overide = "www.example.com""#,
             [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
+            [geo]
+            default_country = "FR"
+
             [request_signing]
             config_store_id = "test-config-store-id"
             secret_store_id = "test-secret-store-id"
@@ -5371,6 +5486,9 @@ cookie_domain = ".example.com"
 origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
+[geo]
+default_country = "US"
+
 [ec]
 provider = "hmac"
 
@@ -5415,6 +5533,9 @@ cookie_domain = ".example.com"
 origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
+[geo]
+default_country = "US"
+
 [ec]
 provider = "hmac"
 
@@ -5453,6 +5574,9 @@ domain = "example.com"
 cookie_domain = ".example.com"
 origin_url = "https://origin.example.com"
 proxy_secret = "secret"
+
+[geo]
+default_country = "US"
 
 [ec]
 provider = "hmac"
@@ -5498,6 +5622,9 @@ domain = "example.com"
 cookie_domain = ".example.com"
 origin_url = "https://origin.example.com"
 proxy_secret = "secret"
+
+[geo]
+default_country = "US"
 
 [ec]
 provider = "hmac"

@@ -173,6 +173,14 @@ mod tests {
     }
 
     #[test]
+    fn disabled_geo_requires_no_permissions() {
+        assert!(
+            DisabledGeo.required_permissions().is_empty(),
+            "the default disabled geo provider requires no permissions"
+        );
+    }
+
+    #[test]
     fn runtime_services_can_be_constructed_and_cloned() {
         let services = noop_services();
         let cloned = services.clone();

@@ -100,7 +100,7 @@ use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
-use trusted_server_core::ec::consent::ec_consent_withdrawn;
+use trusted_server_core::ec::consent::ec_storage_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
@@ -440,11 +440,14 @@ fn build_ec_request_state(
         };
 
     // Bot gate: suppress KV-backed EC writes for unrecognized clients, except
-    // consent withdrawals. Revocations keep the write path so tombstones stay
-    // authoritative even for privacy-extension-heavy clients.
+    // when the request carries an explicit withdrawal signal. The write path
+    // stays open for withdrawal so tombstones remain authoritative even for
+    // privacy-extension-heavy clients that do not look like known browsers. A
+    // merely not-permitted (pre-consent or fail-closed) request writes nothing,
+    // so it does not need the graph.
     let kv_graph = crate::maybe_identity_graph(settings);
     let finalize_kv_graph = if setup_error.is_none()
-        && (is_real_browser || ec_consent_withdrawn(ec_context.consent()))
+        && (is_real_browser || ec_storage_withdrawn(ec_context.consent()))
     {
         kv_graph.clone()
     } else {
@@ -1211,7 +1214,7 @@ impl TrustedServerApp {
         let mut router = RouterService::builder()
             .middleware(FinalizeResponseMiddleware::new(
                 Arc::clone(&state.settings),
-                Arc::new(FastlyPlatformGeo),
+                build_geo_provider(&state.settings, Arc::new(FastlyPlatformGeo)),
             ))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
 
@@ -1314,6 +1317,9 @@ mod tests {
                 [ec.providers.hmac]
                 passphrase = "test-passphrase-at-least-32-bytes!!"
 
+                [geo]
+                default_country = "FR"
+
                 [request_signing]
                 enabled = false
                 config_store_id = "test-config-store-id"
@@ -1385,6 +1391,9 @@ mod tests {
 
             [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            default_country = "FR"
 
             [request_signing]
             enabled = false
@@ -1752,6 +1761,9 @@ mod tests {
 
             [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            default_country = "FR"
             "#,
         )
         .expect("should parse production-shaped settings");
@@ -2211,6 +2223,9 @@ mod tests {
             [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
+            [geo]
+            default_country = "FR"
+
             [request_signing]
             enabled = false
             config_store_id = "test-config-store-id"
@@ -2338,6 +2353,9 @@ mod tests {
 
             [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            default_country = "FR"
 
             [request_signing]
             enabled = false

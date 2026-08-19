@@ -39,6 +39,9 @@ fn test_router() -> RouterService {
 
             [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            default_country = "FR"
         "#,
     )
     .expect("should parse route test settings");
