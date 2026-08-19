@@ -9,7 +9,9 @@ use std::io::Cursor;
 use esi::{CacheConfig, Configuration, DcaMode, PendingFragmentContent, Processor};
 use fastly::http::StatusCode;
 use fastly::{Request, Response};
-use trusted_server_core::platform::{PlatformTemplateAssembler, TemplateAssemblyError};
+use trusted_server_core::platform::{
+    PlatformTemplateAssembler, TemplateAssemblyError, contains_publisher_esi_directive,
+};
 use trusted_server_core::publisher::AD_ASSEMBLY_SEAM;
 
 const INTERNAL_FRAGMENT_PATH: &str = "/_ts/internal/reader-ad-state";
@@ -55,12 +57,6 @@ fn assembly_configuration() -> Configuration {
         })
 }
 
-fn contains_esi_directive(bytes: &[u8]) -> bool {
-    bytes
-        .windows(b"<esi:".len())
-        .any(|window| window.eq_ignore_ascii_case(b"<esi:"))
-}
-
 fn template_with_synthetic_include(template: &[u8]) -> Result<(Vec<u8>, usize), EsiAssemblyError> {
     let marker = AD_ASSEMBLY_SEAM.as_bytes();
     let positions = template
@@ -73,7 +69,7 @@ fn template_with_synthetic_include(template: &[u8]) -> Result<(Vec<u8>, usize), 
             count: positions.len(),
         });
     }
-    if contains_esi_directive(template) {
+    if contains_publisher_esi_directive(template) {
         return Err(EsiAssemblyError::PublisherEsiDirective);
     }
 
@@ -231,6 +227,8 @@ mod tests {
             "<esi:vars>$(HTTP_HOST)</esi:vars>",
             "<esi:text>text</esi:text>",
             "<esi:eval src=\"/publisher\"/>",
+            "<!--esi anything-->",
+            "<!--ESI anything-->",
         ] {
             let error = assemble(&template(directive), FRAGMENT)
                 .expect_err("should reject publisher-authored ESI");

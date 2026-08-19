@@ -57,6 +57,7 @@ pub use image_optimizer::{
 pub use kv::UnavailableKvStore;
 pub use template_assembly::{
     PlatformTemplateAssembler, TemplateAssemblyError, UnavailableTemplateAssembler,
+    contains_publisher_esi_directive,
 };
 pub use template_cache::REPLAYABLE_POLICY_HEADERS;
 pub use template_cache::{

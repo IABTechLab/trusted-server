@@ -61,6 +61,7 @@ use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_eta
 use crate::integrations::IntegrationRegistry;
 use crate::platform::{
     GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices, VarySpec,
+    contains_publisher_esi_directive,
 };
 use crate::price_bucket::{PriceGranularity, price_bucket};
 use crate::response_privacy::enforce_synthesized_html_cache_privacy;
@@ -1248,7 +1249,7 @@ fn configured_assembly_mode(settings: &Settings) -> AssemblyMode {
         .unwrap_or_default()
 }
 
-/// Whether this mode's `</body>` seam emits [`AD_ASSEMBLY_SEAM`].
+/// Whether this mode's completed template receives [`AD_ASSEMBLY_SEAM`].
 ///
 /// The property that decides whether a template is *expected* to have a hole in it, and
 /// therefore whether the absence of one is a defect or the design. Only `Esi` splices per
@@ -1291,16 +1292,16 @@ fn effective_assembly_mode(settings: &Settings, shared_template_authorized: bool
     AssemblyMode::Inline
 }
 
-/// What the `</body>` seam should inject, given the assembly mode.
+/// What the streaming HTML processor should inject at `</body>`.
 ///
 /// Explicit rather than inferred. The previous shape read
 /// `ad_slots_script.is_some()` inside the element handler, which silently coupled
 /// two independent decisions: once [`template_ad_slots_script`] stopped emitting a
 /// head script under a shared mode, body-close injection stopped with it.
 ///
-/// `Esi` emits [`AD_ASSEMBLY_SEAM`], an inert HTML comment marking where this reader's
-/// slots and bids are spliced in. Assembly is a byte split on that comment, performed by
-/// this crate on both the miss and the hit path; no ESI layer is involved.
+/// `Esi` emits nothing here. Its inert marker is inserted only after the completed
+/// transform has been checked for publisher collisions and ESI directives, so TS never
+/// has to guess which identical marker belongs to the publisher.
 pub(crate) fn body_close_injection(
     mode: AssemblyMode,
     head_script_present: bool,
@@ -1314,9 +1315,7 @@ pub(crate) fn body_close_injection(
                 BodyCloseInjection::None
             }
         }
-        // Constant across every request that reaches the transform — which is what
-        // makes it safe in a shared template.
-        AssemblyMode::Esi => BodyCloseInjection::Marker(AD_ASSEMBLY_SEAM.to_string()),
+        AssemblyMode::Esi => BodyCloseInjection::None,
     }
 }
 
@@ -1618,8 +1617,29 @@ pub async fn buffer_publisher_response_async(
             // request cannot store twice, which would leave nothing for assembly to gate
             // on.
             let was_authorized = params.template_cache_key.is_some();
-            let bytes = if response_carries_a_seam_marker(was_authorized, settings) {
-                normalize_fresh_template_seam(bytes)
+            let contains_publisher_marker = was_authorized
+                && bytes
+                    .windows(AD_ASSEMBLY_SEAM.len())
+                    .any(|window| window == AD_ASSEMBLY_SEAM.as_bytes());
+            let contains_publisher_esi = was_authorized && contains_publisher_esi_directive(&bytes);
+            let bypasses_shared_template = contains_publisher_marker || contains_publisher_esi;
+            if bypasses_shared_template {
+                log::warn!(
+                    "c2_template_cache bypass: transformed response contains publisher-authored {}",
+                    if contains_publisher_marker {
+                        "seam bytes"
+                    } else {
+                        "ESI"
+                    }
+                );
+                params.template_cache_key.take();
+            }
+            let shared_response_authorized = was_authorized && !bypasses_shared_template;
+            let bytes = if shared_response_authorized {
+                insert_before_body_close(bytes, AD_ASSEMBLY_SEAM.as_bytes())
+            } else if was_authorized {
+                let seam = seam_script_for(&params);
+                insert_before_body_close(bytes, seam.as_bytes())
             } else {
                 bytes
             };
@@ -1634,7 +1654,7 @@ pub async fn buffer_publisher_response_async(
             // The scan runs twice on a miss as a result. A miss is already paying an
             // origin fetch and a full `lol_html` transform, and a wrong entry in a
             // shared cache outlives the request that wrote it.
-            if response_carries_a_seam_marker(was_authorized, settings) {
+            if response_carries_a_seam_marker(shared_response_authorized, settings) {
                 split_template_at_seam(&bytes).change_context_lazy(|| {
                     crate::error::TrustedServerError::Proxy {
                         message: "refusing to store a template with no usable seam marker"
@@ -1642,22 +1662,11 @@ pub async fn buffer_publisher_response_async(
                     }
                 })?;
             }
-            // Publisher-authored ESI is outside TS's template schema. If it entered C2,
-            // a warm hit would stream it without passing through the cold parser that
-            // rejects it. Revoke the reservation before storage and keep this response
-            // on the portable byte-seam path.
-            let contains_publisher_esi = was_authorized && contains_esi_directive(&bytes);
-            if contains_publisher_esi {
-                log::warn!(
-                    "c2_template_cache bypass: transformed response contains publisher-authored ESI"
-                );
-                params.template_cache_key.take();
-            }
             let store_outcome = store_template_if_authorized(services, &mut params, &bytes).await;
             if was_authorized {
                 set_c2_response_state(
                     &mut response,
-                    match (contains_publisher_esi, store_outcome) {
+                    match (bypasses_shared_template, store_outcome) {
                         (true, _) => C2ResponseState::BypassResponse,
                         (false, Some(TemplateStoreOutcome::Stored)) => C2ResponseState::MissStored,
                         (false, Some(TemplateStoreOutcome::Expired)) => {
@@ -1669,14 +1678,18 @@ pub async fn buffer_publisher_response_async(
                     },
                 );
             }
-            let (bytes, assembly_state) = assemble_if_shared(
-                was_authorized,
-                !contains_publisher_esi,
-                settings,
-                &params,
-                services,
-                bytes,
-            )?;
+            let (bytes, assembly_state) = if bypasses_shared_template {
+                (bytes, Some(AssemblyResponseState::ByteSeamFallback))
+            } else {
+                assemble_if_shared(
+                    shared_response_authorized,
+                    shared_response_authorized,
+                    settings,
+                    &params,
+                    services,
+                    bytes,
+                )?
+            };
             if let Some(state) = assembly_state {
                 set_assembly_response_state(&mut response, state);
             }
@@ -1846,17 +1859,6 @@ fn response_carries_a_seam_marker(was_authorized: bool, settings: &Settings) -> 
     was_authorized && mode_emits_seam_marker(configured_assembly_mode(settings))
 }
 
-/// Whether bytes contain an ESI directive that came from publisher content.
-///
-/// TS's stored seam is an inert HTML comment, so any `<esi:` sequence is outside the
-/// cache schema. The conservative scan also rejects the sequence inside scripts and
-/// comments: bypassing an optimization is safer than sharing edge instructions.
-fn contains_esi_directive(bytes: &[u8]) -> bool {
-    bytes
-        .windows(b"<esi:".len())
-        .any(|window| window.eq_ignore_ascii_case(b"<esi:"))
-}
-
 /// What this request splices into the seam marker: a `<script>`, or nothing at all.
 ///
 /// `seam_ad_slots` is `None` exactly when the ad stack did not run — bot, prefetch,
@@ -1931,42 +1933,20 @@ fn split_template_at_seam(template: &[u8]) -> Result<(&[u8], &[u8]), SeamError> 
     Ok((&template[..at], &template[at + marker.len()..]))
 }
 
-/// Make a freshly transformed ESI template contain one unambiguous seam.
+/// Insert a reader payload at the document's final body close, or append it to a fragment.
 ///
-/// `lol_html` emits the marker at `</body>`. HTML fragments and malformed-but-browser-
-/// renderable documents may have no body handler, so append a terminal seam rather than
-/// converting a valid origin 200 into a TS 500. If any later processing creates an
-/// ambiguous result, neutralize every existing marker and mint a new terminal seam. That
-/// avoids guessing which occurrence belongs to this transform.
-fn normalize_fresh_template_seam(mut template: Vec<u8>) -> Vec<u8> {
-    let marker = AD_ASSEMBLY_SEAM.as_bytes();
-    let positions = template
-        .windows(marker.len())
-        .enumerate()
-        .filter_map(|(at, window)| (window == marker).then_some(at))
-        .collect::<Vec<_>>();
-
-    if positions.is_empty() {
-        log::warn!("c2_template_cache transform emitted no body seam; appending a terminal seam");
-        template.extend_from_slice(marker);
-        return template;
+/// The final case-insensitive close matches the streaming pipeline's body-tail convention
+/// while avoiding an earlier `"</body>"` string in script data.
+fn insert_before_body_close(mut document: Vec<u8>, payload: &[u8]) -> Vec<u8> {
+    if payload.is_empty() {
+        return document;
     }
-
-    if positions.len() > 1 {
-        let mut escaped = marker.to_vec();
-        // Byte 4 is the first byte inside `<!-- ... -->`; changing it preserves an
-        // invisible comment and keeps offsets stable.
-        escaped[4] = b'x';
-        for at in &positions {
-            template[*at..*at + marker.len()].copy_from_slice(&escaped);
-        }
-        template.extend_from_slice(marker);
-        log::warn!(
-            "c2_template_cache neutralized {} ambiguous seam markers and appended a terminal seam",
-            positions.len()
-        );
-    }
-    template
+    let insertion_at = document
+        .windows(BODY_CLOSE_PREFIX.len())
+        .rposition(|window| window.eq_ignore_ascii_case(BODY_CLOSE_PREFIX))
+        .unwrap_or(document.len());
+    document.splice(insertion_at..insertion_at, payload.iter().copied());
+    document
 }
 
 /// Why a template could not be split at its seam.
@@ -6980,15 +6960,17 @@ mod tests {
 
         #[test]
         fn shared_template_ad_seam_is_readable_and_versioned() {
-            let BodyCloseInjection::Marker(marker) = body_close_injection(AssemblyMode::Esi, false)
-            else {
-                panic!("ESI mode should emit a shared-template marker");
-            };
-
             assert_eq!(
-                (crate::platform::TEMPLATE_SCHEMA_VERSION, marker.as_str(),),
+                (crate::platform::TEMPLATE_SCHEMA_VERSION, AD_ASSEMBLY_SEAM,),
                 (4, "<!--ts-ad-seam-->"),
                 "the readable seam and its cache schema must move together"
+            );
+            assert!(
+                matches!(
+                    body_close_injection(AssemblyMode::Esi, false),
+                    BodyCloseInjection::None
+                ),
+                "should insert the shared seam only after checking completed publisher bytes"
             );
         }
 
@@ -8209,7 +8191,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn publisher_esi_is_never_stored_or_executed() {
+        async fn publisher_esi_comment_is_never_stored_or_executed() {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let assembler = Arc::new(RecordingTemplateAssembler::default());
@@ -8221,8 +8203,7 @@ mod tests {
             );
             stub.push_response_with_headers(
                 200,
-                b"<html><head></head><body><ESI:remove>publisher</ESI:remove></body></html>"
-                    .to_vec(),
+                b"<html><head></head><body><!--ESI publisher--></body></html>".to_vec(),
                 vec![
                     ("content-type", "text/html; charset=utf-8"),
                     ("cache-control", "public, max-age=300"),
@@ -8241,7 +8222,11 @@ mod tests {
             let document = String::from_utf8(body_of(response).await)
                 .expect("served document should be UTF-8");
 
-            assert!(document.to_ascii_lowercase().contains("<esi:remove>"));
+            assert!(
+                document
+                    .to_ascii_lowercase()
+                    .contains("<!--esi publisher-->")
+            );
             assert!(document.contains("scheduleInitialAdInit"));
             assert!(
                 cache
@@ -8499,9 +8484,7 @@ mod tests {
             let mut request = navigation_request();
             request.headers_mut().insert(
                 header::ACCEPT_ENCODING,
-                HeaderValue::from_static(
-                    "zstd, gzip;q=0, deflate;q=0, br;q=0, identity;q=0",
-                ),
+                HeaderValue::from_static("zstd, gzip;q=0, deflate;q=0, br;q=0, identity;q=0"),
             );
 
             let body = String::from_utf8(body_of(run(&settings, &services, request).await).await)
@@ -8634,21 +8617,26 @@ mod tests {
         }
 
         #[test]
-        fn repeated_fresh_markers_are_all_neutralized_before_a_new_terminal_seam_is_added() {
-            let input = format!("prefix{AD_ASSEMBLY_SEAM}middle{AD_ASSEMBLY_SEAM}publisher-tail");
+        fn seam_payload_is_inserted_before_the_last_body_close() {
+            let document = br#"<script>const text = "</body>";</script><p>article</p></BoDy>"#;
 
-            let normalized = normalize_fresh_template_seam(input.into_bytes());
+            let inserted = insert_before_body_close(document.to_vec(), b"<script>seam</script>");
 
             assert_eq!(
-                normalized
-                    .windows(AD_ASSEMBLY_SEAM.len())
-                    .filter(|window| *window == AD_ASSEMBLY_SEAM.as_bytes())
-                    .count(),
-                1
+                inserted,
+                br#"<script>const text = "</body>";</script><p>article</p><script>seam</script></BoDy>"#,
+                "should ignore body-close text inside an earlier script and preserve tag casing"
             );
-            assert!(
-                normalized.ends_with(AD_ASSEMBLY_SEAM.as_bytes()),
-                "normalization must mint its own unambiguous terminal seam"
+        }
+
+        #[test]
+        fn seam_payload_is_appended_when_the_document_has_no_body_close() {
+            let inserted =
+                insert_before_body_close(b"<div>fragment</div>".to_vec(), b"<script>seam</script>");
+
+            assert_eq!(
+                inserted, b"<div>fragment</div><script>seam</script>",
+                "should append the seam payload to an HTML fragment"
             );
         }
 
@@ -8656,7 +8644,9 @@ mod tests {
         fn parser_validation_does_not_change_the_cached_schema() {
             assert_eq!(crate::platform::TEMPLATE_SCHEMA_VERSION, 4);
             assert_eq!(AD_ASSEMBLY_SEAM, "<!--ts-ad-seam-->");
-            assert!(!contains_esi_directive(AD_ASSEMBLY_SEAM.as_bytes()));
+            assert!(!contains_publisher_esi_directive(
+                AD_ASSEMBLY_SEAM.as_bytes()
+            ));
         }
 
         /// Shareable HTML that already contains the seam marker.
@@ -8667,8 +8657,8 @@ mod tests {
             stub.push_response_with_headers(
                 200,
                 format!(
-                    "<html><head></head><body>origin{AD_ASSEMBLY_SEAM}</body></html>\
-                     {AD_ASSEMBLY_SEAM}"
+                    "<html><head></head><body><script>window.publisherMarker=\
+                     \"{AD_ASSEMBLY_SEAM}\";</script><p>origin</p></body></html>"
                 )
                 .into_bytes(),
                 vec![
@@ -8679,11 +8669,12 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn an_origin_marker_collision_is_normalized_before_store() {
+        async fn origin_marker_collision_bypasses_c2_without_mutating_publisher_bytes() {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let settings = Arc::new(settings_with_mode("esi"));
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
+            queue_html_that_collides_with_the_marker(&stub);
             queue_html_that_collides_with_the_marker(&stub);
 
             let cold = String::from_utf8(
@@ -8699,34 +8690,20 @@ mod tests {
                 cold.contains("origin") && cold.contains("window.tsjs"),
                 "a reserved-comment collision must not turn a valid origin 200 into a 500"
             );
-            assert!(!cold.contains(AD_ASSEMBLY_SEAM));
-            assert!(!warm.contains(AD_ASSEMBLY_SEAM));
-            assert_eq!(stub.recorded_request_uris().len(), 1);
-            let entries = cache.entries.lock().expect("should lock entries");
-            let template = &entries
-                .values()
-                .next()
-                .expect("template should be stored")
-                .body;
-            assert_eq!(
-                template
-                    .windows(AD_ASSEMBLY_SEAM.len())
-                    .filter(|window| *window == AD_ASSEMBLY_SEAM.as_bytes())
-                    .count(),
-                1,
-                "the stored template must retain exactly the transform-owned seam"
-            );
-            let seam_at = template
-                .windows(AD_ASSEMBLY_SEAM.len())
-                .position(|window| window == AD_ASSEMBLY_SEAM.as_bytes())
-                .expect("stored template should contain its seam");
-            let body_close_at = template
-                .windows(b"</body>".len())
-                .position(|window| window.eq_ignore_ascii_case(b"</body>"))
-                .expect("fixture should retain its body close");
+            for document in [&cold, &warm] {
+                assert!(
+                    document.contains(&format!("window.publisherMarker=\"{AD_ASSEMBLY_SEAM}\"")),
+                    "should preserve a publisher marker inside script data: {document}"
+                );
+            }
+            assert_eq!(stub.recorded_request_uris().len(), 2);
             assert!(
-                seam_at < body_close_at,
-                "publisher content after </body> must not be mistaken for TS's seam"
+                cache
+                    .entries
+                    .lock()
+                    .expect("should lock entries")
+                    .is_empty(),
+                "should not store a template with a publisher marker collision"
             );
         }
 
