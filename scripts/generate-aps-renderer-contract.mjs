@@ -308,7 +308,7 @@ const typescriptOutput =
 
 const documentValidatorOutput =
   generatedHeader +
-  "export const APS_RENDERER_VALIDATOR_ES5_V1 = " +
+  "export const APS_RENDERER_VALIDATOR_ES5_V1 =\n  " +
   JSON.stringify(es5Output) +
   ";\n";
 

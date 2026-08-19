@@ -127,12 +127,14 @@ import {
 import { createReservationService, type ReservationService } from '../services/reservations';
 import {
   createCommittedArtifactStore,
+  createBootstrapNonceRegistry,
   createRenderAttempt,
   createRendererNonceRegistry,
   createSlotOperation,
   renderDirectAdmAttempt,
   type RenderAttempt,
   type CommittedArtifactStore,
+  type BootstrapNonceRegistry,
   type RendererNonceRegistry,
   type SlotOperationCreationResult,
 } from '../services/render';
@@ -199,6 +201,7 @@ function installBrowserTestRuntimeScript(runtimeDocument: Document): void {
 export interface BrowserServices {
   readonly artifacts: CommittedArtifactStore;
   readonly auctionBatches: AuctionBatchService;
+  readonly bootstrapNonces: BootstrapNonceRegistry;
   readonly pucBridge: PucBridge;
   readonly reservations: ReservationService;
   readonly rendererNonces: RendererNonceRegistry;
@@ -1568,6 +1571,7 @@ export function createTestBrowserRuntimeComposition(
           return source?.type === 'pbs_cache' ? undefined : source;
         },
       });
+      const bootstrapNonces = createBootstrapNonceRegistry();
       const rendererNonces = createRendererNonceRegistry();
       // A real document origin is authoritative. Only an opaque srcdoc may
       // fall back to the server-stamped base; publisher script must not be able
@@ -1594,6 +1598,7 @@ export function createTestBrowserRuntimeComposition(
           try {
             return renderDirectApsAttempt({
               attempt,
+              bootstrapNonces,
               container,
               messaging: composition.adapters.messaging,
               nonces: rendererNonces,
@@ -1662,6 +1667,7 @@ export function createTestBrowserRuntimeComposition(
       const services = Object.freeze({
         artifacts,
         auctionBatches: batchCoordinator,
+        bootstrapNonces,
         reservations: reservationService,
         rendererNonces,
         renderDirectAdm,
@@ -1731,6 +1737,7 @@ export function createTestBrowserRuntimeComposition(
         session.dispose();
         artifacts.dispose();
         reservationService.dispose();
+        bootstrapNonces.dispose();
         rendererNonces.dispose();
         slotService.dispose();
         targetingService.dispose();

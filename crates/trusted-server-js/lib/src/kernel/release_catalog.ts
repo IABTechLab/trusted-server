@@ -148,6 +148,10 @@ export const FIRST_DISPLAY_CATALOG: readonly FirstDisplayCatalogEntry[] = Object
     id: 'aps_initial',
     include: 'aps_participates',
     allowedImports: [
+      'core/contracts/aps_renderer',
+      'core/contracts/generated/renderer_validator_document_v1',
+      'core/contracts/generated/renderer_validator_v1',
+      'shared/aps_documents',
       'shared/first_display_contracts',
       'first_display/registration_client',
       'first_display/slices/definition',

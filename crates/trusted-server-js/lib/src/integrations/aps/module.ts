@@ -5,12 +5,17 @@ import type {
   IntegrationPrepareContext,
   IntegrationRegistration,
 } from '../../kernel/integration_registry';
-import type { RendererNonceRegistry, RenderAttempt } from '../../services/render';
+import type {
+  BootstrapNonceRegistry,
+  RendererNonceRegistry,
+  RenderAttempt,
+} from '../../services/render';
 import { validatePersistentFirstDisplaySliceAdoptionV1 } from '../../shared/takeover';
 
 import { renderDirectApsAttempt, resolveApsRendererV1Url, validateApsRenderer } from './render';
 
 interface RenderCapability {
+  readonly bootstrapNonces: BootstrapNonceRegistry;
   readonly publisherOrigin: string;
   readonly rendererNonces: RendererNonceRegistry;
   readonly registerRenderer: (
@@ -65,6 +70,7 @@ export function createApsIntegrationRegistration(releaseId: string): Integration
       active &&
       renderDirectApsAttempt({
         attempt,
+        bootstrapNonces: render.bootstrapNonces,
         container,
         messaging: messages.messaging,
         nonces: render.rendererNonces,

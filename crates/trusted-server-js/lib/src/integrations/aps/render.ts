@@ -1,16 +1,20 @@
 import type { ApsRendererV1 } from '../../core/types';
 import { validateApsRenderer } from '../../core/contracts/aps_renderer';
-import type { MessagingAdapter, MessagingChannel } from '../../adapters/messaging';
+import type { MessagingAdapter, MessagingPort } from '../../adapters/messaging';
 import type {
+  BootstrapNonceRegistry,
   CommittedRenderArtifact,
   RenderAttempt,
   RenderFailureReason,
   RendererNonceRegistry,
 } from '../../services/render';
 
+import { APS_PERMANENT_SANDBOX, generateApsDataDocumentsV1 } from './documents';
+
 const objectFreezeIntrinsic = Object.freeze;
 const objectGetPrototypeOfIntrinsic = Object.getPrototypeOf;
 const regexpTestIntrinsic = RegExp.prototype.test;
+const bootstrapNoncePattern = /^b1_[A-Za-z0-9_-]{22}$/;
 const rendererNoncePattern = /^n1_[A-Za-z0-9_-]{22}$/;
 const loopbackIpv4Pattern = /^127(?:\.\d{1,3}){3}$/;
 const iframeNamespace = 'http://www.w3.org/1999/xhtml';
@@ -72,7 +76,7 @@ const iframeSourceGetter = directDomAvailable
   : undefined;
 
 export { parseApsRendererDescriptor, validateApsRenderer } from '../../core/contracts/aps_renderer';
-export { APS_PERMANENT_SANDBOX, generateApsDataDocumentsV1 } from './documents';
+export { APS_PERMANENT_SANDBOX, generateApsDataDocumentsV1 };
 
 export const APS_RENDERER_V1_PATH = '/integrations/aps/renderer/v1';
 export const APS_RENDERER_SANDBOX =
@@ -95,6 +99,7 @@ export function prepareApsRenderSource(
 
 export interface DirectApsAttemptOptions {
   readonly attempt: RenderAttempt;
+  readonly bootstrapNonces: BootstrapNonceRegistry;
   readonly container: HTMLElement;
   readonly messaging: MessagingAdapter;
   readonly nonces: RendererNonceRegistry;
@@ -136,19 +141,6 @@ export function resolveApsRendererV1Url(publisherOrigin: string): string | undef
   }
 }
 
-function closeChannel(channel: MessagingChannel | undefined): void {
-  try {
-    channel?.transferred.close();
-  } catch {
-    // The second endpoint must still be attempted when the first close is hostile.
-  }
-  try {
-    channel?.retained.close();
-  } catch {
-    // Failed construction cleanup remains best-effort.
-  }
-}
-
 function mapNonceIssueFailure(
   reason: 'capability_registry_full' | 'identity_generation_failed' | 'invalid_attempt'
 ): RenderFailureReason {
@@ -161,7 +153,10 @@ function mapRunnerFailure(reason: unknown): RenderFailureReason | undefined {
   return undefined;
 }
 
-function readNonceIssueResult(value: unknown):
+function readNonceIssueResult(
+  value: unknown,
+  pattern: RegExp
+):
   | Readonly<{ ok: true; nonce: string }>
   | Readonly<{
       ok: false;
@@ -189,7 +184,7 @@ function readNonceIssueResult(value: unknown):
         !nonce.enumerable ||
         !('value' in nonce) ||
         typeof nonce.value !== 'string' ||
-        !(Reflect.apply(regexpTestIntrinsic, rendererNoncePattern, [nonce.value]) as boolean)
+        !(Reflect.apply(regexpTestIntrinsic, pattern, [nonce.value]) as boolean)
       ) {
         return undefined;
       }
@@ -213,7 +208,7 @@ function readNonceIssueResult(value: unknown):
   }
 }
 
-/** Drive one direct APS attempt through the versioned static renderer document. */
+/** Drive one direct APS attempt through the three-phase top-page mount protocol. */
 export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolean {
   if (
     !directRenderDocument ||
@@ -239,9 +234,11 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
   ) {
     return false;
   }
+
   let attempt: RenderAttempt;
+  let bootstrapNonces: BootstrapNonceRegistry;
+  let rendererNonces: RendererNonceRegistry;
   let messaging: MessagingAdapter;
-  let nonces: RendererNonceRegistry;
   let container: HTMLElement;
   let publisherOrigin: string;
   let sourceCandidate: unknown;
@@ -252,8 +249,9 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
   let ownerDocument: Document;
   try {
     attempt = options.attempt;
+    bootstrapNonces = options.bootstrapNonces;
+    rendererNonces = options.nonces;
     messaging = options.messaging;
-    nonces = options.nonces;
     container = options.container;
     publisherOrigin = options.publisherOrigin;
     sourceCandidate = attempt.renderSource;
@@ -261,11 +259,11 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
     attemptSlot = attempt.slot;
     attemptGeneration = attempt.generation;
     navigationGeneration = attempt.navigationGeneration;
-    if (typeof nodeOwnerDocumentGetter !== 'function') return false;
     ownerDocument = Reflect.apply(nodeOwnerDocumentGetter, container, []) as Document;
   } catch {
     return false;
   }
+
   let exactDocumentOrigin: boolean;
   try {
     exactDocumentOrigin =
@@ -284,12 +282,17 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
     }
     return false;
   }
-  let createChannelMethod: MessagingAdapter['createChannel'];
+
+  let installCaptureMethod: MessagingAdapter['installCaptureListener'];
+  let extractPortsMethod: MessagingAdapter['extractTransferredPorts'];
   let postWindowMethod: MessagingAdapter['postWindow'];
   let parseMessageMethod: MessagingAdapter['parseProtocolMessage'];
-  let issueMethod: RendererNonceRegistry['issue'];
-  let bindSourceMethod: RendererNonceRegistry['bindSource'];
-  let consumeMethod: RendererNonceRegistry['consume'];
+  let issueBootstrapMethod: BootstrapNonceRegistry['issue'];
+  let bindBootstrapMethod: BootstrapNonceRegistry['bindSource'];
+  let consumeBootstrapMethod: BootstrapNonceRegistry['consume'];
+  let issueRendererMethod: RendererNonceRegistry['issue'];
+  let bindRendererMethod: RendererNonceRegistry['bindSource'];
+  let consumeRendererMethod: RendererNonceRegistry['consume'];
   let beginDirectMethod: RenderAttempt['beginDirect'];
   let beginDocumentMethod: RenderAttempt['beginApsDocument'];
   let documentAcceptedMethod: RenderAttempt['apsDocumentAccepted'];
@@ -297,12 +300,16 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
   let failMethod: RenderAttempt['fail'];
   let snapshotMethod: RenderAttempt['snapshot'];
   try {
-    createChannelMethod = messaging.createChannel;
+    installCaptureMethod = messaging.installCaptureListener;
+    extractPortsMethod = messaging.extractTransferredPorts;
     postWindowMethod = messaging.postWindow;
     parseMessageMethod = messaging.parseProtocolMessage;
-    issueMethod = nonces.issue;
-    bindSourceMethod = nonces.bindSource;
-    consumeMethod = nonces.consume;
+    issueBootstrapMethod = bootstrapNonces.issue;
+    bindBootstrapMethod = bootstrapNonces.bindSource;
+    consumeBootstrapMethod = bootstrapNonces.consume;
+    issueRendererMethod = rendererNonces.issue;
+    bindRendererMethod = rendererNonces.bindSource;
+    consumeRendererMethod = rendererNonces.consume;
     beginDirectMethod = attempt.beginDirect;
     beginDocumentMethod = attempt.beginApsDocument;
     documentAcceptedMethod = attempt.apsDocumentAccepted;
@@ -310,12 +317,16 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
     failMethod = attempt.fail;
     snapshotMethod = attempt.snapshot;
     if (
-      typeof createChannelMethod !== 'function' ||
+      typeof installCaptureMethod !== 'function' ||
+      typeof extractPortsMethod !== 'function' ||
       typeof postWindowMethod !== 'function' ||
       typeof parseMessageMethod !== 'function' ||
-      typeof issueMethod !== 'function' ||
-      typeof bindSourceMethod !== 'function' ||
-      typeof consumeMethod !== 'function' ||
+      typeof issueBootstrapMethod !== 'function' ||
+      typeof bindBootstrapMethod !== 'function' ||
+      typeof consumeBootstrapMethod !== 'function' ||
+      typeof issueRendererMethod !== 'function' ||
+      typeof bindRendererMethod !== 'function' ||
+      typeof consumeRendererMethod !== 'function' ||
       typeof beginDirectMethod !== 'function' ||
       typeof beginDocumentMethod !== 'function' ||
       typeof documentAcceptedMethod !== 'function' ||
@@ -338,7 +349,6 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
     }
     return false;
   };
-
   const attemptState = (): ReturnType<RenderAttempt['snapshot']>['state'] | undefined => {
     try {
       return Reflect.apply(snapshotMethod, attempt, []).state;
@@ -346,21 +356,51 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
       return undefined;
     }
   };
+  const exactAttemptIdentity = (): boolean => {
+    try {
+      return (
+        attempt.id === attemptId &&
+        attempt.slot === attemptSlot &&
+        attempt.generation === attemptGeneration &&
+        attempt.navigationGeneration === navigationGeneration
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  let bootstrapIssue: unknown;
+  try {
+    bootstrapIssue = Reflect.apply(issueBootstrapMethod, bootstrapNonces, [{ attempt }]);
+  } catch {
+    return fail('identity_generation_failed');
+  }
+  const issuedBootstrap = readNonceIssueResult(bootstrapIssue, bootstrapNoncePattern);
+  if (!issuedBootstrap) return fail('identity_generation_failed');
+  if (!issuedBootstrap.ok) return fail(mapNonceIssueFailure(issuedBootstrap.reason));
+
+  let rendererIssue: unknown;
+  try {
+    rendererIssue = Reflect.apply(issueRendererMethod, rendererNonces, [{ attempt }]);
+  } catch {
+    return fail('identity_generation_failed');
+  }
+  const issuedRenderer = readNonceIssueResult(rendererIssue, rendererNoncePattern);
+  if (!issuedRenderer) return fail('identity_generation_failed');
+  if (!issuedRenderer.ok) return fail(mapNonceIssueFailure(issuedRenderer.reason));
+
+  const bootstrapNonce = issuedBootstrap.nonce;
+  const rendererNonce = issuedRenderer.nonce;
+  const documents = generateApsDataDocumentsV1({
+    renderer,
+    publisherOrigin,
+    bootstrapNonce,
+    rendererNonce,
+  });
+  if (!documents) return fail('winner_not_renderable');
 
   let iframe: HTMLIFrameElement;
   try {
-    if (
-      typeof nodeParentNodeGetter !== 'function' ||
-      typeof nodeIsConnectedGetter !== 'function' ||
-      typeof elementLocalNameGetter !== 'function' ||
-      typeof elementNamespaceGetter !== 'function' ||
-      typeof elementChildrenGetter !== 'function' ||
-      typeof htmlCollectionLengthGetter !== 'function' ||
-      typeof iframeContentWindowGetter !== 'function' ||
-      typeof iframeSourceGetter !== 'function'
-    ) {
-      return fail('renderer_document_no_load');
-    }
     iframe = Reflect.apply(documentCreateElementIntrinsic, ownerDocument, [
       'iframe',
     ]) as HTMLIFrameElement;
@@ -388,11 +428,15 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
       ['sandbox', APS_RENDERER_SANDBOX],
       [
         'style',
-        `border: 0; display: block; height: ${renderer.height}px; margin: 0; overflow: hidden; width: ${renderer.width}px`,
+        'border: 0; display: block; height: ' +
+          String(renderer.height) +
+          'px; margin: 0; overflow: hidden; width: ' +
+          String(renderer.width) +
+          'px',
       ],
     ] as const;
-    for (let index = 0; index < attributes.length; index += 1) {
-      const attribute = attributes[index];
+    for (let attributeIndex = 0; attributeIndex < attributes.length; attributeIndex += 1) {
+      const attribute = attributes[attributeIndex];
       if (attribute) {
         Reflect.apply(elementSetAttributeIntrinsic, iframe, [attribute[0], attribute[1]]);
       }
@@ -401,53 +445,40 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
     return fail('renderer_document_no_load');
   }
 
-  let channel: MessagingChannel | undefined;
-  try {
-    channel = Reflect.apply(createChannelMethod, messaging, []);
-  } catch {
-    channel = undefined;
-  }
-  if (!channel) return fail('internal_error');
-  let issueResult: unknown;
-  try {
-    issueResult = Reflect.apply(issueMethod, nonces, [{ attempt, port: channel.retained }]);
-  } catch {
-    closeChannel(channel);
-    return fail('identity_generation_failed');
-  }
-  const issued = readNonceIssueResult(issueResult);
-  if (!issued) {
-    closeChannel(channel);
-    return fail('identity_generation_failed');
-  }
-  if (!issued.ok) {
-    closeChannel(channel);
-    return fail(mapNonceIssueFailure(issued.reason));
-  }
-  const nonce = issued.nonce;
-  let boundSource: object | undefined;
-  let documentAccepted = false;
   let disposed = false;
-  let sourceAssigned = false;
-  let appendInProgress = false;
-  let insertionCommitted = false;
-  let loadObserved = false;
-  let errorObserved = false;
-  let envelopeTransferred = false;
   let artifactOwnedByAttempt = false;
+  let insertionCommitted = false;
+  let appendInProgress = false;
+  let frameErrorObserved = false;
+  let frameSource: object | undefined;
+  let bootstrapBound = false;
+  let navigationPosted = false;
+  let containerReady = false;
+  let envelopeSent = false;
+  let documentAccepted = false;
+  let documentPort: MessagingPort | undefined;
+  let releaseGlobalListener: (() => void) | undefined;
   let insertionPredecessors: readonly Element[] = [];
-  const expectedFrameSource = `${rendererUrl}#tsaps=${nonce}`;
+  const expectedFrameSource = rendererUrl + '#' + bootstrapNonce;
 
-  const removeFrameListeners = (): void => {
+  const bootstrapListenerResource = freeze({
+    close: (): void => {
+      const release = releaseGlobalListener;
+      releaseGlobalListener = undefined;
+      if (!release) return;
+      try {
+        release();
+      } catch {
+        // Capture-listener removal remains best-effort and exact-once.
+      }
+    },
+  });
+
+  const removeFrameErrorListener = (): void => {
     try {
-      Reflect.apply(eventTargetRemoveListenerIntrinsic, iframe, ['load', onLoad]);
+      Reflect.apply(eventTargetRemoveListenerIntrinsic, iframe, ['error', onFrameError]);
     } catch {
-      // Listener removal cannot interrupt terminal resource cleanup.
-    }
-    try {
-      Reflect.apply(eventTargetRemoveListenerIntrinsic, iframe, ['error', onError]);
-    } catch {
-      // The second listener is always attempted.
+      // Listener cleanup cannot interrupt terminal resource disposal.
     }
   };
 
@@ -459,16 +490,17 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
     dispose: (): void => {
       if (disposed) return;
       disposed = true;
-      removeFrameListeners();
+      removeFrameErrorListener();
+      bootstrapListenerResource.close();
       try {
-        channel?.transferred.close();
+        documentPort?.close();
       } catch {
-        // A transferred endpoint is inert; an untransferred endpoint is locally closed.
+        // The renderer registry also owns exact-once retained-port cleanup.
       }
       try {
         Reflect.apply(elementRemoveIntrinsic, iframe, []);
       } catch {
-        // DOM removal remains best-effort under a hostile page.
+        // DOM removal remains best-effort under a hostile publisher realm.
       }
     },
   });
@@ -478,25 +510,14 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
     return fail(reason);
   };
 
-  const nonceExpectation = (source: object) =>
-    freeze({ nonce, attempt, generation: attemptGeneration, source, port: channel!.retained });
-
-  const messageData = (event: unknown): unknown => {
-    try {
-      return typeof event === 'object' && event !== null ? Reflect.get(event, 'data') : undefined;
-    } catch {
-      return undefined;
-    }
-  };
-
   const snapshotContainerPredecessors = (): readonly Element[] => {
     const predecessors: Element[] = [];
     try {
-      const children = Reflect.apply(elementChildrenGetter!, container, []) as HTMLCollection;
-      const length = Reflect.apply(htmlCollectionLengthGetter!, children, []) as number;
-      for (let index = 0; index < length; index += 1) {
+      const children = Reflect.apply(elementChildrenGetter, container, []) as HTMLCollection;
+      const length = Reflect.apply(htmlCollectionLengthGetter, children, []) as number;
+      for (let childIndex = 0; childIndex < length; childIndex += 1) {
         const child = Reflect.apply(htmlCollectionItemIntrinsic, children, [
-          index,
+          childIndex,
         ]) as Element | null;
         if (child && child !== iframe) predecessors[predecessors.length] = child;
       }
@@ -508,143 +529,270 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
 
   const commitContainer = (predecessors: readonly Element[]): void => {
     try {
-      for (let index = predecessors.length - 1; index >= 0; index -= 1) {
-        const child = predecessors[index];
+      for (let childIndex = predecessors.length - 1; childIndex >= 0; childIndex -= 1) {
+        const child = predecessors[childIndex];
         if (
           child &&
           child !== iframe &&
-          Reflect.apply(nodeParentNodeGetter!, child, []) === container
+          Reflect.apply(nodeParentNodeGetter, child, []) === container
         ) {
           Reflect.apply(nodeRemoveChildIntrinsic, container, [child]);
         }
       }
     } catch {
-      // The accepted artifact remains authoritative if publisher sibling cleanup is hostile.
+      // A hostile predecessor cannot revoke the accepted artifact.
     }
   };
 
-  const exactFrameBinding = (): boolean => {
+  const exactFrameBinding = (permanent: boolean): boolean => {
     try {
-      // This binds the native element and browsing context. An opaque Document cannot
-      // be attested after ancestor-controlled contentWindow.location navigation (§4.4).
       return (
         insertionCommitted &&
-        Reflect.apply(nodeParentNodeGetter!, iframe, []) === container &&
-        Reflect.apply(nodeIsConnectedGetter!, iframe, []) === true &&
-        Reflect.apply(iframeContentWindowGetter!, iframe, []) === boundSource &&
+        !disposed &&
+        exactAttemptIdentity() &&
+        Reflect.apply(nodeOwnerDocumentGetter, iframe, []) === ownerDocument &&
+        Reflect.apply(nodeParentNodeGetter, iframe, []) === container &&
+        Reflect.apply(nodeIsConnectedGetter, iframe, []) === true &&
+        Reflect.apply(iframeContentWindowGetter, iframe, []) === frameSource &&
         Reflect.apply(elementGetAttributeIntrinsic, iframe, ['src']) === expectedFrameSource &&
-        Reflect.apply(iframeSourceGetter!, iframe, []) === expectedFrameSource
+        Reflect.apply(iframeSourceGetter, iframe, []) === expectedFrameSource &&
+        Reflect.apply(elementGetAttributeIntrinsic, iframe, ['sandbox']) ===
+          (permanent ? APS_PERMANENT_SANDBOX : APS_RENDERER_SANDBOX)
       );
     } catch {
       return false;
     }
   };
 
-  const receive = (event: unknown): void => {
-    if (disposed || !boundSource || !envelopeTransferred) return;
-    if (!exactFrameBinding()) {
-      fail(documentAccepted ? 'runner_failed' : 'renderer_document_no_load');
+  const eventField = (event: unknown, key: 'data' | 'origin' | 'source'): unknown => {
+    try {
+      return typeof event === 'object' && event !== null ? Reflect.get(event, key) : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const exactGlobalMessage = (
+    kind: 'apsBootstrapReady' | 'apsContainerReady',
+    data: unknown,
+    expected: Readonly<Record<string, unknown>>
+  ): boolean => {
+    if (typeof data !== 'string' || data !== JSON.stringify(expected)) return false;
+    const parsed = Reflect.apply(parseMessageMethod, messaging, [kind, data]);
+    if (!parsed) return false;
+    const expectedKeys = Object.keys(expected);
+    for (let keyIndex = 0; keyIndex < expectedKeys.length; keyIndex += 1) {
+      const key = expectedKeys[keyIndex];
+      if (!key || parsed[key] !== expected[key]) return false;
+    }
+    return Object.keys(parsed).length === expectedKeys.length;
+  };
+
+  const bootstrapExpectation = () =>
+    freeze({
+      nonce: bootstrapNonce,
+      attempt,
+      generation: attemptGeneration,
+      source: frameSource!,
+      port: bootstrapListenerResource,
+    });
+  const rendererExpectation = (port: MessagingPort) =>
+    freeze({
+      nonce: rendererNonce,
+      attempt,
+      generation: attemptGeneration,
+      source: frameSource!,
+      port,
+    });
+
+  const receiveDocument = (event: unknown): void => {
+    if (
+      disposed ||
+      !containerReady ||
+      !envelopeSent ||
+      !documentPort ||
+      !frameSource ||
+      !exactFrameBinding(true)
+    ) {
+      if (!disposed && containerReady && frameSource && !exactFrameBinding(true)) {
+        fail(documentAccepted ? 'runner_failed' : 'renderer_document_no_load');
+      }
       return;
     }
-    const data = messageData(event);
+    const data = eventField(event, 'data');
     const accepted = Reflect.apply(parseMessageMethod, messaging, ['apsDocumentAccepted', data]);
-    if (accepted?.['nonce'] === nonce) {
+    if (accepted?.['nonce'] === rendererNonce) {
       if (documentAccepted || attemptState() !== 'waiting_for_document') return;
-      const expectation = nonceExpectation(boundSource);
       if (
-        Reflect.apply(consumeMethod, nonces, [expectation]) === true &&
+        Reflect.apply(consumeRendererMethod, rendererNonces, [
+          rendererExpectation(documentPort),
+        ]) === true &&
         Reflect.apply(documentAcceptedMethod, attempt, []) === true
       ) {
         documentAccepted = true;
+      } else {
+        fail('renderer_document_no_load');
       }
       return;
     }
     const loaded = Reflect.apply(parseMessageMethod, messaging, ['apsRunnerLoaded', data]);
-    if (loaded?.['nonce'] === nonce) return;
+    if (loaded?.['nonce'] === rendererNonce) return;
     const completed = Reflect.apply(parseMessageMethod, messaging, ['apsRenderCompleted', data]);
-    if (completed?.['nonce'] === nonce) {
-      if (documentAccepted && Reflect.apply(acceptMethod, attempt, []) === true) {
-        if (!disposed && exactFrameBinding()) commitContainer(insertionPredecessors);
+    if (completed?.['nonce'] === rendererNonce) {
+      if (
+        documentAccepted &&
+        Reflect.apply(acceptMethod, attempt, []) === true &&
+        !disposed &&
+        exactFrameBinding(true)
+      ) {
+        commitContainer(insertionPredecessors);
       }
       return;
     }
     const failed = Reflect.apply(parseMessageMethod, messaging, ['apsRenderFailed', data]);
-    if (failed?.['nonce'] !== nonce) return;
+    if (failed?.['nonce'] !== rendererNonce) return;
     const reason = mapRunnerFailure(failed['reason']);
     if (reason) Reflect.apply(failMethod, attempt, [reason]);
   };
 
-  const receiveError = (): void => {
-    if (disposed || !envelopeTransferred) return;
+  const receiveDocumentError = (): void => {
+    if (disposed || !containerReady) return;
     fail(documentAccepted ? 'runner_failed' : 'renderer_document_no_load');
   };
 
-  const transferEnvelope = (): void => {
-    if (disposed || envelopeTransferred || !loadObserved || !boundSource) return;
-    if (!exactFrameBinding()) {
+  const receiveGlobal = (event: MessageEvent): void => {
+    if (
+      disposed ||
+      !frameSource ||
+      eventField(event, 'source') !== frameSource ||
+      eventField(event, 'origin') !== 'null'
+    ) {
+      return;
+    }
+    const data = eventField(event, 'data');
+
+    if (!bootstrapBound) {
+      const expectedReady = freeze({
+        message: 'TS APS Bootstrap Ready',
+        version: 1,
+        bootstrapNonce,
+      });
+      if (!exactGlobalMessage('apsBootstrapReady', data, expectedReady)) return;
+      const ports = Reflect.apply(extractPortsMethod, messaging, [event, 0]);
+      if (!ports) {
+        fail('renderer_document_no_load');
+        return;
+      }
+      if (!exactFrameBinding(false) || attemptState() !== 'waiting_for_document') {
+        fail('renderer_document_no_load');
+        return;
+      }
+      if (Reflect.apply(bindBootstrapMethod, bootstrapNonces, [bootstrapExpectation()]) !== true) {
+        fail('renderer_document_no_load');
+        return;
+      }
+      bootstrapBound = true;
+      try {
+        Reflect.apply(elementSetAttributeIntrinsic, iframe, ['sandbox', APS_PERMANENT_SANDBOX]);
+      } catch {
+        fail('renderer_document_no_load');
+        return;
+      }
+      if (!exactFrameBinding(true)) {
+        fail('renderer_document_no_load');
+        return;
+      }
+      const navigation = JSON.stringify({
+        message: 'TS APS Bootstrap Navigate',
+        version: 1,
+        bootstrapNonce,
+        containerUrl: documents.outerUrl,
+      });
+      if (
+        Reflect.apply(postWindowMethod, messaging, [frameSource, navigation, '*', []]) !== true ||
+        !exactFrameBinding(true)
+      ) {
+        fail('renderer_document_no_load');
+        return;
+      }
+      navigationPosted = true;
+      return;
+    }
+
+    if (!navigationPosted || containerReady) return;
+    const expectedContainerReady = freeze({
+      message: 'TS APS Container Ready',
+      version: 1,
+      bootstrapNonce,
+      rendererNonce,
+    });
+    if (!exactGlobalMessage('apsContainerReady', data, expectedContainerReady)) return;
+    if (!exactFrameBinding(true) || attemptState() !== 'waiting_for_document') {
       fail('renderer_document_no_load');
       return;
     }
-    if (attemptState() !== 'waiting_for_document') {
-      fail('internal_error');
-      return;
-    }
-    const envelope = freeze({ version: 1 as const, nonce, publisherOrigin, renderer });
-    const posted = Reflect.apply(postWindowMethod, messaging, [
-      boundSource,
-      envelope,
-      '*',
-      [channel!.transferred],
-    ]);
-    if (posted !== true || !exactFrameBinding()) {
+    const ports = Reflect.apply(extractPortsMethod, messaging, [event, 1]);
+    const port = ports?.[0];
+    if (!port) {
       fail('renderer_document_no_load');
       return;
     }
-    envelopeTransferred = true;
-    removeFrameListeners();
+    documentPort = port;
+    if (
+      Reflect.apply(bindRendererMethod, rendererNonces, [rendererExpectation(port)]) !== true ||
+      Reflect.apply(consumeBootstrapMethod, bootstrapNonces, [bootstrapExpectation()]) !== true
+    ) {
+      try {
+        port.close();
+      } catch {
+        // A rejected transferred endpoint remains locally owned.
+      }
+      fail('renderer_document_no_load');
+      return;
+    }
+    containerReady = true;
+    bootstrapListenerResource.close();
+    try {
+      port.listen(receiveDocument, receiveDocumentError);
+    } catch {
+      fail('renderer_document_no_load');
+      return;
+    }
+    const envelope = freeze({
+      version: 1 as const,
+      nonce: rendererNonce,
+      publisherOrigin,
+      renderer,
+    });
+    if (port.post(envelope, []) !== true || !exactFrameBinding(true)) {
+      fail('renderer_document_no_load');
+      return;
+    }
+    envelopeSent = true;
   };
 
-  function onLoad(): void {
+  function onFrameError(): void {
     if (
       disposed ||
-      !sourceAssigned ||
       (!insertionCommitted &&
         !(appendInProgress && Reflect.apply(nodeParentNodeGetter!, iframe, []) === container))
     ) {
       return;
     }
-    loadObserved = true;
-    transferEnvelope();
-  }
-
-  function onError(): void {
-    if (
-      disposed ||
-      envelopeTransferred ||
-      !sourceAssigned ||
-      (!insertionCommitted &&
-        !(appendInProgress && Reflect.apply(nodeParentNodeGetter!, iframe, []) === container))
-    ) {
-      return;
+    frameErrorObserved = true;
+    if (artifactOwnedByAttempt) {
+      fail(documentAccepted ? 'runner_failed' : 'renderer_document_no_load');
     }
-    errorObserved = true;
-    if (artifactOwnedByAttempt) fail('renderer_document_no_load');
   }
 
   try {
-    channel.retained.listen(receive, receiveError);
-    Reflect.apply(eventTargetAddListenerIntrinsic, iframe, ['load', onLoad, { once: true }]);
-    Reflect.apply(eventTargetAddListenerIntrinsic, iframe, ['error', onError, { once: true }]);
+    releaseGlobalListener = Reflect.apply(installCaptureMethod, messaging, [receiveGlobal]);
+    if (!releaseGlobalListener) return startupFailure('renderer_document_no_load');
+    Reflect.apply(eventTargetAddListenerIntrinsic, iframe, ['error', onFrameError]);
     Reflect.apply(elementSetAttributeIntrinsic, iframe, ['src', expectedFrameSource]);
     if (
       Reflect.apply(elementGetAttributeIntrinsic, iframe, ['src']) !== expectedFrameSource ||
-      Reflect.apply(iframeSourceGetter!, iframe, []) !== expectedFrameSource
-    ) {
-      return startupFailure('renderer_document_no_load');
-    }
-    sourceAssigned = true;
-    if (
-      disposed ||
+      Reflect.apply(iframeSourceGetter!, iframe, []) !== expectedFrameSource ||
       attemptState() !== 'rendering_direct' ||
       Reflect.apply(nodeIsConnectedGetter, container, []) !== true
     ) {
@@ -664,25 +812,30 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
     } finally {
       appendInProgress = false;
     }
-    if (Reflect.apply(nodeParentNodeGetter!, iframe, []) !== container) {
+    if (Reflect.apply(nodeParentNodeGetter, iframe, []) !== container) {
       return startupFailure('renderer_document_no_load');
     }
     insertionCommitted = true;
+    const insertedSource = Reflect.apply(iframeContentWindowGetter, iframe, []) as Window | null;
+    if (!insertedSource) {
+      return startupFailure('renderer_document_no_load');
+    }
+    frameSource = insertedSource;
+    if (!exactFrameBinding(false)) {
+      return startupFailure('renderer_document_no_load');
+    }
     if (Reflect.apply(beginDocumentMethod, attempt, [artifact]) !== true) {
       return startupFailure('internal_error');
     }
     artifactOwnedByAttempt = true;
-    if (disposed) return false;
-    if (errorObserved) return fail('renderer_document_no_load');
-    if (attemptState() !== 'waiting_for_document') return fail('internal_error');
-    const source = Reflect.apply(iframeContentWindowGetter!, iframe, []) as Window | null;
-    if (!source) return fail('renderer_document_no_load');
-    boundSource = source;
-    if (!exactFrameBinding()) return fail('renderer_document_no_load');
-    if (Reflect.apply(bindSourceMethod, nonces, [nonceExpectation(source)]) !== true) {
+    if (
+      disposed ||
+      frameErrorObserved ||
+      attemptState() !== 'waiting_for_document' ||
+      !exactFrameBinding(false)
+    ) {
       return fail('renderer_document_no_load');
     }
-    transferEnvelope();
     return true;
   } catch {
     return startupFailure('renderer_document_no_load');

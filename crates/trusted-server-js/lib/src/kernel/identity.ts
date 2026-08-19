@@ -242,7 +242,7 @@ export function createTestNavigationIdentityIssuer(
 }
 
 function mintFreshIdentity(
-  prefix: 't1_' | 'n1_',
+  prefix: 't1_' | 'b1_' | 'n1_',
   source: RandomValuesSource | undefined,
   observer?: IdentityFailureObserver
 ): IdentityGenerationResult<string> {
@@ -256,6 +256,11 @@ export function mintBrowserLifecycleTicket(): IdentityGenerationResult<string> {
   return mintFreshIdentity('t1_', browserRandomSource());
 }
 
+/** Mint one production bootstrap nonce from sixteen browser Web Crypto bytes. */
+export function mintBrowserBootstrapNonce(): IdentityGenerationResult<string> {
+  return mintFreshIdentity('b1_', browserRandomSource());
+}
+
 /** Mint one production renderer nonce from sixteen browser Web Crypto bytes. */
 export function mintBrowserRendererNonce(): IdentityGenerationResult<string> {
   return mintFreshIdentity('n1_', browserRandomSource());
@@ -267,6 +272,14 @@ export function mintTestLifecycleTicket(
   observer?: IdentityFailureObserver
 ): IdentityGenerationResult<string> {
   return mintFreshIdentity('t1_', source, observer);
+}
+
+/** Mint one deterministic bootstrap nonce for tests only. */
+export function mintTestBootstrapNonce(
+  source: RandomValuesSource,
+  observer?: IdentityFailureObserver
+): IdentityGenerationResult<string> {
+  return mintFreshIdentity('b1_', source, observer);
 }
 
 /** Mint one deterministic renderer nonce for tests only. */

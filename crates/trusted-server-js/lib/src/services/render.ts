@@ -1,4 +1,4 @@
-import { mintBrowserRendererNonce } from '../kernel/identity';
+import { mintBrowserBootstrapNonce, mintBrowserRendererNonce } from '../kernel/identity';
 import type { IdentityGenerationResult } from '../kernel/identity';
 import type { RenderAttemptScope, WinnerContext } from '../kernel/sessions';
 
@@ -11,9 +11,10 @@ import type {
 } from './reservations';
 
 const ATTEMPT_ID = /^a1_[A-Za-z0-9_-]{22}$/;
+const BOOTSTRAP_NONCE = /^b1_[A-Za-z0-9_-]{22}$/;
 const RENDERER_NONCE = /^n1_[A-Za-z0-9_-]{22}$/;
-const MAX_RENDERER_NONCES = 256;
-const MAX_RENDERER_NONCE_DRAWS = 8;
+const MAX_APS_NONCES_PER_ROLE = 256;
+const MAX_APS_NONCE_DRAWS = 8;
 const MAX_ADM_BODY_BYTES = 512 * 1024;
 const reflectApplyIntrinsic = Reflect.apply;
 const directAdmDocument = typeof document === 'undefined' ? undefined : document;
@@ -473,13 +474,15 @@ export interface RendererNoncePort {
 export interface RendererNonceIssueInput {
   readonly attempt: RenderAttempt;
   readonly source?: object;
-  readonly port: RendererNoncePort;
+  readonly port?: RendererNoncePort;
 }
 
-export interface RendererNonceExpectation extends RendererNonceIssueInput {
+export interface RendererNonceExpectation {
+  readonly attempt: RenderAttempt;
   readonly nonce: string;
   readonly generation: object;
   readonly source: object;
+  readonly port: RendererNoncePort;
 }
 
 export type RendererNonceIssueResult =
@@ -508,6 +511,14 @@ export interface RendererNonceRegistry {
 export interface RendererNonceRegistryOptions {
   readonly mintNonce?: () => IdentityGenerationResult<string>;
 }
+
+export type BootstrapNoncePort = RendererNoncePort;
+export type BootstrapNonceIssueInput = RendererNonceIssueInput;
+export type BootstrapNonceExpectation = RendererNonceExpectation;
+export type BootstrapNonceIssueResult = RendererNonceIssueResult;
+export type BootstrapNonceRegistrySnapshot = RendererNonceRegistrySnapshot;
+export type BootstrapNonceRegistry = RendererNonceRegistry;
+export type BootstrapNonceRegistryOptions = RendererNonceRegistryOptions;
 
 export interface SlotOperationResult {
   readonly path: 'primary' | 'fallback';
@@ -1794,8 +1805,8 @@ interface RendererNonceBinding {
   readonly attemptId: string;
   readonly generation: object;
   source: object | undefined;
-  readonly port: RendererNoncePort;
-  readonly closeMethod: RendererNoncePort['close'];
+  port: RendererNoncePort | undefined;
+  closeMethod: RendererNoncePort['close'] | undefined;
   consumed: boolean;
   closed: boolean;
 }
@@ -1804,7 +1815,14 @@ function validRendererNonce(value: unknown): value is string {
   return typeof value === 'string' && RENDERER_NONCE.test(value);
 }
 
-function readMintedRendererNonce(value: unknown): string | undefined {
+function validBootstrapNonce(value: unknown): value is string {
+  return typeof value === 'string' && BOOTSTRAP_NONCE.test(value);
+}
+
+function readMintedNonce(
+  value: unknown,
+  validNonce: (candidate: unknown) => candidate is string
+): string | undefined {
   try {
     if (typeof value !== 'object' || value === null || !Object.isFrozen(value)) return undefined;
     if (Object.getPrototypeOf(value) !== Object.prototype) return undefined;
@@ -1815,7 +1833,7 @@ function readMintedRendererNonce(value: unknown): string | undefined {
     if (ok.value === true) {
       if (names.length !== 2 || names[0] !== 'ok' || names[1] !== 'value') return undefined;
       const nonce = Object.getOwnPropertyDescriptor(value, 'value');
-      return nonce && nonce.enumerable && 'value' in nonce && validRendererNonce(nonce.value)
+      return nonce && nonce.enumerable && 'value' in nonce && validNonce(nonce.value)
         ? nonce.value
         : undefined;
     }
@@ -1863,10 +1881,11 @@ function readRendererNonceExpectation(value: unknown): RendererNonceExpectation 
   }
 }
 
-/** Own the bounded, one-use capabilities for APS renderer-document acceptance. */
-export function createRendererNonceRegistry(
-  options: RendererNonceRegistryOptions = {}
+function createApsNonceRegistry(
+  role: 'bootstrap' | 'renderer',
+  options: RendererNonceRegistryOptions
 ): RendererNonceRegistry {
+  const validNonce = role === 'bootstrap' ? validBootstrapNonce : validRendererNonce;
   const liveByNonce = new Map<string, RendererNonceBinding>();
   const bindingByAttempt = new WeakMap<RenderAttempt, RendererNonceBinding>();
   const bindingByGeneration = new WeakMap<object, RendererNonceBinding>();
@@ -1881,7 +1900,9 @@ export function createRendererNonceRegistry(
   let disposed = false;
   let mintNonce: () => IdentityGenerationResult<string>;
   try {
-    mintNonce = options.mintNonce ?? mintBrowserRendererNonce;
+    mintNonce =
+      options.mintNonce ??
+      (role === 'bootstrap' ? mintBrowserBootstrapNonce : mintBrowserRendererNonce);
   } catch {
     mintNonce = () => frozen({ ok: false, reason: 'identity_generation_failed' });
   }
@@ -1899,13 +1920,17 @@ export function createRendererNonceRegistry(
     if (weakMapGet(bindingByGeneration, binding.generation) === binding) {
       weakMapDelete(bindingByGeneration, binding.generation);
     }
-    weakSetAdd(retiredPorts, binding.port);
-    if (weakMapGet(bindingByPort, binding.port) === binding) {
-      weakMapDelete(bindingByPort, binding.port);
+    if (binding.port) {
+      weakSetAdd(retiredPorts, binding.port);
+      if (weakMapGet(bindingByPort, binding.port) === binding) {
+        weakMapDelete(bindingByPort, binding.port);
+      }
     }
     setDelete(bindings, binding);
     try {
-      Reflect.apply(binding.closeMethod, binding.port, []);
+      if (binding.port && binding.closeMethod) {
+        Reflect.apply(binding.closeMethod, binding.port, []);
+      }
     } catch {
       // Closing a retained browser port is best-effort and exact-once.
     }
@@ -1923,7 +1948,7 @@ export function createRendererNonceRegistry(
     if (weakMapGet(bindingByGeneration, binding.generation) === binding) {
       weakMapDelete(bindingByGeneration, binding.generation);
     }
-    if (weakMapGet(bindingByPort, binding.port) === binding) {
+    if (binding.port && weakMapGet(bindingByPort, binding.port) === binding) {
       weakMapDelete(bindingByPort, binding.port);
     }
     setDelete(bindings, binding);
@@ -1937,8 +1962,8 @@ export function createRendererNonceRegistry(
     issue(input): RendererNonceIssueResult {
       let attempt: RenderAttempt;
       let source: object | undefined;
-      let port: RendererNoncePort;
-      let closeMethod: RendererNoncePort['close'];
+      let port: RendererNoncePort | undefined;
+      let closeMethod: RendererNoncePort['close'] | undefined;
       let attemptId: string;
       let generation: object;
       let onSettledMethod: RenderAttempt['onSettled'];
@@ -1947,7 +1972,7 @@ export function createRendererNonceRegistry(
         attempt = input.attempt;
         source = input.source;
         port = input.port;
-        closeMethod = port.close;
+        closeMethod = port?.close;
         attemptId = attempt.id;
         generation = attempt.generation;
         onSettledMethod = attempt.onSettled;
@@ -1957,9 +1982,10 @@ export function createRendererNonceRegistry(
           !weakSetHas(renderAttempts, attempt) ||
           (source !== undefined &&
             ((typeof source !== 'object' && typeof source !== 'function') || source === null)) ||
-          (typeof port !== 'object' && typeof port !== 'function') ||
-          port === null ||
-          typeof closeMethod !== 'function' ||
+          (port !== undefined &&
+            ((typeof port !== 'object' && typeof port !== 'function') ||
+              port === null ||
+              typeof closeMethod !== 'function')) ||
           !validAttemptId(attemptId) ||
           (typeof generation !== 'object' && typeof generation !== 'function') ||
           generation === null ||
@@ -1970,27 +1996,28 @@ export function createRendererNonceRegistry(
           weakSetHas(pendingAttempts, attempt) ||
           weakMapHas(bindingByGeneration, generation) ||
           weakSetHas(pendingGenerations, generation) ||
-          weakMapHas(bindingByPort, port) ||
-          weakSetHas(pendingPorts, port) ||
-          weakSetHas(retiredPorts, port)
+          (port !== undefined &&
+            (weakMapHas(bindingByPort, port) ||
+              weakSetHas(pendingPorts, port) ||
+              weakSetHas(retiredPorts, port)))
         ) {
           return invalidIssue('invalid_attempt');
         }
       } catch {
         return invalidIssue('invalid_attempt');
       }
-      if (setSize(bindings) + pendingCount >= MAX_RENDERER_NONCES) {
+      if (setSize(bindings) + pendingCount >= MAX_APS_NONCES_PER_ROLE) {
         return invalidIssue('capability_registry_full');
       }
       try {
         weakSetAdd(pendingAttempts, attempt);
         weakSetAdd(pendingGenerations, generation);
-        weakSetAdd(pendingPorts, port);
+        if (port) weakSetAdd(pendingPorts, port);
         pendingCount += 1;
       } catch {
         weakSetDelete(pendingAttempts, attempt);
         weakSetDelete(pendingGenerations, generation);
-        weakSetDelete(pendingPorts, port);
+        if (port) weakSetDelete(pendingPorts, port);
         return invalidIssue('invalid_attempt');
       }
 
@@ -2000,8 +2027,7 @@ export function createRendererNonceRegistry(
             !disposed &&
             !weakMapHas(bindingByAttempt, attempt) &&
             !weakMapHas(bindingByGeneration, generation) &&
-            !weakMapHas(bindingByPort, port) &&
-            !weakSetHas(retiredPorts, port) &&
+            (!port || (!weakMapHas(bindingByPort, port) && !weakSetHas(retiredPorts, port))) &&
             attempt.id === attemptId &&
             attempt.generation === generation &&
             Reflect.apply(snapshotMethod, attempt, []).outcome === undefined
@@ -2013,16 +2039,16 @@ export function createRendererNonceRegistry(
 
       let nonce: string | undefined;
       try {
-        for (let draw = 0; draw < MAX_RENDERER_NONCE_DRAWS; draw += 1) {
+        for (let draw = 0; draw < MAX_APS_NONCE_DRAWS; draw += 1) {
           let minted: unknown;
           try {
             minted = Reflect.apply(mintNonce, undefined, []);
           } catch {
             return invalidIssue('identity_generation_failed');
           }
-          const candidate = readMintedRendererNonce(minted);
+          const candidate = readMintedNonce(minted, validNonce);
           if (!attemptStillIssuable()) return invalidIssue('invalid_attempt');
-          if (setSize(bindings) + pendingCount > MAX_RENDERER_NONCES) {
+          if (setSize(bindings) + pendingCount > MAX_APS_NONCES_PER_ROLE) {
             return invalidIssue('capability_registry_full');
           }
           if (!candidate) return invalidIssue('identity_generation_failed');
@@ -2056,7 +2082,7 @@ export function createRendererNonceRegistry(
           if (
             registered !== true ||
             !attemptStillIssuable() ||
-            setSize(bindings) + pendingCount > MAX_RENDERER_NONCES ||
+            setSize(bindings) + pendingCount > MAX_APS_NONCES_PER_ROLE ||
             mapGet(liveByNonce, nonce) !== undefined ||
             !setHas(pendingNonces, nonce)
           ) {
@@ -2065,13 +2091,13 @@ export function createRendererNonceRegistry(
           mapSet(liveByNonce, nonce, binding);
           weakMapSet(bindingByAttempt, attempt, binding);
           weakMapSet(bindingByGeneration, generation, binding);
-          weakMapSet(bindingByPort, port, binding);
+          if (port) weakMapSet(bindingByPort, port, binding);
           setAdd(bindings, binding);
           if (
             mapGet(liveByNonce, nonce) !== binding ||
             weakMapGet(bindingByAttempt, attempt) !== binding ||
             weakMapGet(bindingByGeneration, generation) !== binding ||
-            weakMapGet(bindingByPort, port) !== binding ||
+            (port !== undefined && weakMapGet(bindingByPort, port) !== binding) ||
             !setHas(bindings, binding)
           ) {
             rollbackProvisionalBinding(binding);
@@ -2087,7 +2113,7 @@ export function createRendererNonceRegistry(
         if (nonce) setDelete(pendingNonces, nonce);
         weakSetDelete(pendingAttempts, attempt);
         weakSetDelete(pendingGenerations, generation);
-        weakSetDelete(pendingPorts, port);
+        if (port) weakSetDelete(pendingPorts, port);
         pendingCount -= 1;
       }
     },
@@ -2097,7 +2123,7 @@ export function createRendererNonceRegistry(
         if (
           disposed ||
           !fields ||
-          !validRendererNonce(fields.nonce) ||
+          !validNonce(fields.nonce) ||
           (typeof fields.source !== 'object' && typeof fields.source !== 'function') ||
           fields.source === null
         ) {
@@ -2112,8 +2138,10 @@ export function createRendererNonceRegistry(
           !setHas(bindings, binding) ||
           fields.attempt !== binding.attempt ||
           fields.generation !== binding.generation ||
-          fields.port !== binding.port ||
-          weakMapGet(bindingByPort, binding.port) !== binding ||
+          (binding.port !== undefined && fields.port !== binding.port) ||
+          (binding.port !== undefined && weakMapGet(bindingByPort, binding.port) !== binding) ||
+          (binding.port === undefined &&
+            (weakMapHas(bindingByPort, fields.port) || weakSetHas(retiredPorts, fields.port))) ||
           binding.attempt.id !== binding.attemptId ||
           binding.attempt.generation !== binding.generation ||
           Reflect.apply(binding.attempt.snapshot, binding.attempt, []).outcome !== undefined ||
@@ -2121,8 +2149,15 @@ export function createRendererNonceRegistry(
         ) {
           return false;
         }
+        const closeMethod = fields.port.close;
+        if (typeof closeMethod !== 'function') return false;
         binding.source = fields.source;
-        return true;
+        if (!binding.port) {
+          binding.port = fields.port;
+          binding.closeMethod = closeMethod;
+          weakMapSet(bindingByPort, fields.port, binding);
+        }
+        return binding.port === fields.port && weakMapGet(bindingByPort, fields.port) === binding;
       } catch {
         return false;
       }
@@ -2130,13 +2165,14 @@ export function createRendererNonceRegistry(
     consume(expectation): boolean {
       try {
         const fields = readRendererNonceExpectation(expectation);
-        if (disposed || !fields || !validRendererNonce(fields.nonce)) return false;
+        if (disposed || !fields || !validNonce(fields.nonce)) return false;
         const binding = mapGet(liveByNonce, fields.nonce);
         if (
           !binding ||
           binding.closed ||
           binding.consumed ||
           binding.source === undefined ||
+          binding.port === undefined ||
           !setHas(bindings, binding) ||
           fields.attempt !== binding.attempt ||
           fields.generation !== binding.generation ||
@@ -2182,6 +2218,20 @@ export function createRendererNonceRegistry(
       }),
   };
   return frozen(registry);
+}
+
+/** Own the bounded, live-only capabilities for APS bootstrap navigation. */
+export function createBootstrapNonceRegistry(
+  options: BootstrapNonceRegistryOptions = {}
+): BootstrapNonceRegistry {
+  return createApsNonceRegistry('bootstrap', options);
+}
+
+/** Own the bounded, live-only capabilities for APS renderer-document acceptance. */
+export function createRendererNonceRegistry(
+  options: RendererNonceRegistryOptions = {}
+): RendererNonceRegistry {
+  return createApsNonceRegistry('renderer', options);
 }
 
 /** Own one public per-slot result without overwriting either child attempt result. */

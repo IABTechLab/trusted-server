@@ -22,6 +22,7 @@ const MAX_OWNER_BYTES = 64 * 1_024;
 const MAX_RESPONSE_BYTES = 72 * 1_024;
 const RESERVATION_ID = /^r1_[A-Za-z0-9_-]{22}$/;
 const TICKET_ID = /^t1_[A-Za-z0-9_-]{22}$/;
+const BOOTSTRAP_NONCE_ID = /^b1_[A-Za-z0-9_-]{22}$/;
 const NONCE_ID = /^n1_[A-Za-z0-9_-]{22}$/;
 const BASE64URL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
 const textEncoder = new TextEncoder();
@@ -61,6 +62,10 @@ interface Attempt {
   readonly onTerminal: (result: 'accepted' | 'failed' | 'cancelled', reason: string | null) => void;
   readonly reservationId: string;
   active: boolean;
+  apsContainerUrl: string | undefined;
+  bootstrapNavigated: boolean;
+  bootstrapNonce: string | undefined;
+  bootstrapSource: object | undefined;
   claim: PendingClaim | undefined;
   claimTimer: unknown;
   completionTimer: unknown;
@@ -80,7 +85,7 @@ interface Attempt {
   rendererNonce: string | undefined;
   ownerSource: object | undefined;
   pendingDocumentTerminal:
-    'completed' | 'descriptor_invalid' | 'runner_no_load' | 'runner_failed' | undefined;
+    'completed' | 'winner_not_renderable' | 'runner_no_load' | 'runner_failed' | undefined;
   phaseValue:
     | 'waiting_for_gam_and_claim'
     | 'waiting_for_owner'
@@ -299,7 +304,7 @@ function exactOwnerRegistration(data: unknown): Record<string, unknown> | undefi
 
 function eventField(
   event: unknown,
-  name: 'data' | 'ports' | 'source',
+  name: 'data' | 'origin' | 'ports' | 'source',
   trustedPrototype: object | undefined
 ): unknown {
   try {
@@ -561,7 +566,8 @@ export function createFirstDisplayRenderBridge(
   const attempts = new Map<string, Attempt>();
   const reservations = new Map<string, ReservationEntry>();
   const tickets = new Map<string, TicketEntry>();
-  const nonces = new Map<string, Attempt>();
+  const bootstrapNonces = new Map<string, Attempt>();
+  const rendererNonces = new Map<string, Attempt>();
   const committedFrames = new Map<
     string,
     Readonly<{
@@ -642,7 +648,7 @@ export function createFirstDisplayRenderBridge(
   };
 
   const mint = (
-    prefix: 't1_' | 'n1_',
+    prefix: 't1_' | 'b1_' | 'n1_',
     registry: ReadonlyMap<string, unknown>
   ): string | undefined => {
     for (let draw = 0; draw < MAX_DRAWS; draw += 1) {
@@ -706,9 +712,16 @@ export function createFirstDisplayRenderBridge(
     attempt.controlPort = undefined;
     attempt.documentPort = undefined;
     attempt.documentTransferred = undefined;
-    if (attempt.rendererNonce && nonces.get(attempt.rendererNonce) === attempt) {
-      nonces.delete(attempt.rendererNonce);
+    if (attempt.bootstrapNonce && bootstrapNonces.get(attempt.bootstrapNonce) === attempt) {
+      bootstrapNonces.delete(attempt.bootstrapNonce);
     }
+    if (attempt.rendererNonce && rendererNonces.get(attempt.rendererNonce) === attempt) {
+      rendererNonces.delete(attempt.rendererNonce);
+    }
+    attempt.bootstrapNavigated = false;
+    attempt.bootstrapNonce = undefined;
+    attempt.bootstrapSource = undefined;
+    attempt.apsContainerUrl = undefined;
     attempt.rendererNonce = undefined;
     retireTicket(attempt);
     retireReservation(attempt);
@@ -775,18 +788,196 @@ export function createFirstDisplayRenderBridge(
     return settle(attempt, 'failed', reason);
   };
 
-  const issueNonce = (attempt: Attempt): string | undefined => {
-    if (nonces.size >= MAX_NONCES || attempt.rendererNonce) return undefined;
-    const nonce = mint('n1_', nonces);
+  const issueBootstrapNonce = (attempt: Attempt): string | undefined => {
+    if (bootstrapNonces.size >= MAX_NONCES || attempt.bootstrapNonce) return undefined;
+    const nonce = mint('b1_', bootstrapNonces);
+    if (!nonce || !BOOTSTRAP_NONCE_ID.test(nonce)) return undefined;
+    bootstrapNonces.set(nonce, attempt);
+    attempt.bootstrapNonce = nonce;
+    return nonce;
+  };
+
+  const issueRendererNonce = (attempt: Attempt): string | undefined => {
+    if (rendererNonces.size >= MAX_NONCES || attempt.rendererNonce) return undefined;
+    const nonce = mint('n1_', rendererNonces);
     if (!nonce || !NONCE_ID.test(nonce)) return undefined;
-    nonces.set(nonce, attempt);
+    rendererNonces.set(nonce, attempt);
     attempt.rendererNonce = nonce;
     return nonce;
   };
 
-  const handleApsDocument = (attempt: Attempt, event: unknown): void => {
+  const exactDirectApsFrame = (attempt: Attempt, permanent: boolean): boolean => {
+    const aps = apsProtocol();
+    const frame = attempt.directFrame;
+    const bootstrapNonce = attempt.bootstrapNonce;
+    if (!aps || !frame || !bootstrapNonce || !attempt.bootstrapSource) return false;
+    try {
+      return (
+        attempt.active &&
+        attempt.phaseValue === 'rendering_direct' &&
+        attempt.inserted &&
+        frame.isConnected &&
+        frame.parentNode === attempt.cycle.element &&
+        frame.contentWindow === attempt.bootstrapSource &&
+        frame.getAttribute('src') === aps.rendererUrl + '#' + bootstrapNonce &&
+        frame.src === aps.rendererUrl + '#' + bootstrapNonce &&
+        frame.getAttribute('sandbox') === (permanent ? aps.permanentSandbox : aps.sandbox)
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  const postWindow = (target: object, message: string): boolean => {
+    try {
+      const postMessage = Reflect.get(target, 'postMessage');
+      if (typeof postMessage !== 'function') return false;
+      Reflect.apply(postMessage, target, [message, '*', []]);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const handleApsWindowMessage = (
+    event: unknown,
+    data: unknown,
+    message: string | undefined
+  ): boolean => {
+    if (message !== 'TS APS Bootstrap Ready' && message !== 'TS APS Container Ready') {
+      return false;
+    }
+    if (typeof data !== 'string') return true;
+    const origin = eventField(event, 'origin', messageEventPrototype);
+    const source = eventSource(event, messageEventPrototype);
+    if (origin !== 'null' || !source) return true;
+
+    if (message === 'TS APS Bootstrap Ready') {
+      const fields = exactRecord(parseJson(data), ['message', 'version', 'bootstrapNonce']);
+      const bootstrapNonce = fields?.bootstrapNonce;
+      if (
+        fields?.message !== message ||
+        fields.version !== 1 ||
+        typeof bootstrapNonce !== 'string' ||
+        !BOOTSTRAP_NONCE_ID.test(bootstrapNonce) ||
+        data !== JSON.stringify({ message, version: 1, bootstrapNonce })
+      ) {
+        return true;
+      }
+      const attempt = bootstrapNonces.get(bootstrapNonce);
+      if (!attempt || source !== attempt.bootstrapSource) return true;
+      const inspection = inspectPorts(event, messageEventPrototype);
+      if (!inspection?.exact || inspection.originalCount !== 0 || inspection.ports.length !== 0) {
+        for (const port of inspection?.ports ?? []) closePort(port);
+        fail(attempt, 'renderer_document_no_load');
+        return true;
+      }
+      const aps = apsProtocol();
+      if (!aps || attempt.bootstrapNavigated || !exactDirectApsFrame(attempt, false)) {
+        fail(attempt, 'renderer_document_no_load');
+        return true;
+      }
+      const containerUrl = attempt.apsContainerUrl;
+      if (!containerUrl) {
+        fail(attempt, 'winner_not_renderable');
+        return true;
+      }
+      try {
+        attempt.directFrame?.setAttribute('sandbox', aps.permanentSandbox);
+      } catch {
+        fail(attempt, 'renderer_document_no_load');
+        return true;
+      }
+      const navigation = JSON.stringify({
+        message: 'TS APS Bootstrap Navigate',
+        version: 1,
+        bootstrapNonce,
+        containerUrl,
+      });
+      if (!exactDirectApsFrame(attempt, true) || !postWindow(source, navigation)) {
+        fail(attempt, 'renderer_document_no_load');
+        return true;
+      }
+      attempt.bootstrapNavigated = true;
+      return true;
+    }
+
+    const fields = exactRecord(parseJson(data), [
+      'message',
+      'version',
+      'bootstrapNonce',
+      'rendererNonce',
+    ]);
+    const bootstrapNonce = fields?.bootstrapNonce;
+    const rendererNonce = fields?.rendererNonce;
+    if (
+      fields?.message !== message ||
+      fields.version !== 1 ||
+      typeof bootstrapNonce !== 'string' ||
+      !BOOTSTRAP_NONCE_ID.test(bootstrapNonce) ||
+      typeof rendererNonce !== 'string' ||
+      !NONCE_ID.test(rendererNonce) ||
+      data !== JSON.stringify({ message, version: 1, bootstrapNonce, rendererNonce })
+    ) {
+      return true;
+    }
+    const attempt = bootstrapNonces.get(bootstrapNonce);
+    if (
+      !attempt ||
+      rendererNonces.get(rendererNonce) !== attempt ||
+      source !== attempt.bootstrapSource
+    ) {
+      return true;
+    }
+    const inspection = inspectPorts(event, messageEventPrototype);
+    const port = inspection?.ports[0];
+    if (
+      !inspection?.exact ||
+      inspection.originalCount !== 1 ||
+      inspection.ports.length !== 1 ||
+      !port ||
+      !attempt.bootstrapNavigated ||
+      attempt.documentPort ||
+      !exactDirectApsFrame(attempt, true)
+    ) {
+      for (const candidate of inspection?.ports ?? []) closePort(candidate);
+      fail(attempt, 'renderer_document_no_load');
+      return true;
+    }
+    attempt.documentPort = port;
+    attempt.documentRelease = listen(
+      port,
+      (portEvent) => handleApsDocument(attempt, portEvent),
+      () => fail(attempt, attempt.documentAccepted ? 'runner_failed' : 'renderer_document_no_load')
+    );
+    if (!attempt.documentRelease) {
+      fail(attempt, 'renderer_document_no_load');
+      return true;
+    }
+    bootstrapNonces.delete(bootstrapNonce);
+    const aps = apsProtocol();
+    if (
+      !aps ||
+      !post(port, {
+        version: 1,
+        nonce: rendererNonce,
+        publisherOrigin: aps.publisherOrigin,
+        renderer: attempt.cycle.bid.renderSource,
+      }) ||
+      !exactDirectApsFrame(attempt, true)
+    ) {
+      fail(attempt, 'renderer_document_no_load');
+    }
+    return true;
+  };
+
+  function handleApsDocument(attempt: Attempt, event: unknown): void {
     const aps = apsProtocol();
     if (!attempt.active || !attempt.rendererNonce || !aps) return;
+    if (attempt.phaseValue === 'rendering_direct' && !exactDirectApsFrame(attempt, true)) {
+      fail(attempt, attempt.documentAccepted ? 'runner_failed' : 'renderer_document_no_load');
+      return;
+    }
     const inspection = inspectPorts(event, messageEventPrototype);
     if (!inspection?.exact || inspection.originalCount !== 0 || inspection.ports.length !== 0) {
       fail(attempt, attempt.documentAccepted ? 'runner_failed' : 'renderer_document_no_load');
@@ -803,6 +994,9 @@ export function createFirstDisplayRenderBridge(
     const acceptDocument = (): void => {
       if (!attempt.active || attempt.documentAccepted || !attempt.inserted) return;
       attempt.documentAccepted = true;
+      if (rendererNonces.get(attempt.rendererNonce!) === attempt) {
+        rendererNonces.delete(attempt.rendererNonce!);
+      }
       attempt.documentAcceptancePending = false;
       clearOwnedTimer(attempt.documentTimer);
       attempt.documentTimer = undefined;
@@ -822,9 +1016,6 @@ export function createFirstDisplayRenderBridge(
       return;
     }
     if (parsed.kind === 'runner_loaded') {
-      if (!attempt.documentAccepted && !attempt.documentAcceptancePending) {
-        fail(attempt, 'renderer_document_no_load');
-      }
       return;
     }
     if (parsed.kind === 'render_completed') {
@@ -834,11 +1025,13 @@ export function createFirstDisplayRenderBridge(
       } else fail(attempt, 'renderer_document_no_load');
       return;
     }
-    if (attempt.documentAccepted) fail(attempt, parsed.reason);
+    const failureReason =
+      parsed.reason === 'descriptor_invalid' ? 'winner_not_renderable' : parsed.reason;
+    if (attempt.documentAccepted) fail(attempt, failureReason);
     else if (attempt.documentAcceptancePending && !attempt.pendingDocumentTerminal) {
-      attempt.pendingDocumentTerminal = parsed.reason;
+      attempt.pendingDocumentTerminal = failureReason;
     } else fail(attempt, 'renderer_document_no_load');
-  };
+  }
 
   const ownerInserted = (attempt: Attempt): void => {
     if (!attempt.active || attempt.inserted) return;
@@ -928,7 +1121,7 @@ export function createFirstDisplayRenderBridge(
       });
     }
     if (!aps) return fail(attempt, 'winner_not_renderable');
-    const nonce = issueNonce(attempt);
+    const nonce = issueRendererNonce(attempt);
     if (!nonce) return fail(attempt, 'capability_registry_full');
     let channel: ChannelLike;
     try {
@@ -1185,68 +1378,44 @@ export function createFirstDisplayRenderBridge(
     const source = attempt.cycle.bid.renderSource;
     const aps = apsProtocol();
     if (source.type !== 'aps' || !aps) return false;
-    const nonce = issueNonce(attempt);
-    if (!nonce) return fail(attempt, 'capability_registry_full');
-    let channel: ChannelLike | undefined;
+    attempt.insertionTimer = arm(
+      () => fail(attempt, 'owner_insertion_timeout'),
+      aps.deadlines.insertionMs
+    );
+    if (attempt.insertionTimer === undefined) return fail(attempt, 'internal_error');
+    const bootstrapNonce = issueBootstrapNonce(attempt);
+    const rendererNonce = issueRendererNonce(attempt);
+    if (!bootstrapNonce || !rendererNonce) return fail(attempt, 'capability_registry_full');
+    let documents: ReturnType<FirstDisplayApsProtocolV1['generateDocuments']>;
     try {
-      channel = options.createChannel();
+      documents = aps.generateDocuments(source, bootstrapNonce, rendererNonce);
+    } catch {
+      documents = undefined;
+    }
+    if (
+      !documents ||
+      typeof documents.outerUrl !== 'string' ||
+      !documents.outerUrl.startsWith('data:text/html;charset=utf-8,') ||
+      !documents.outerUrl.endsWith('#' + bootstrapNonce) ||
+      utf8Length(documents.outerUrl) > 196_663
+    ) {
+      return fail(attempt, 'winner_not_renderable');
+    }
+    try {
       const frame = options.document.createElement('iframe');
       configureFrame(frame, source.width, source.height, aps.sandbox);
-      const intended = `${aps.rendererUrl}#tsaps=${nonce}`;
-      let intendedWindow: Window | null = null;
-      attempt.documentPort = channel.port1;
-      attempt.documentTransferred = channel.port2;
-      attempt.documentRelease = listen(
-        channel.port1,
-        (event) => handleApsDocument(attempt, event),
-        () =>
-          fail(attempt, attempt.documentAccepted ? 'runner_failed' : 'renderer_document_no_load')
-      );
-      if (!attempt.documentRelease) throw new Error('tsjs');
-      frame.onload = () => {
-        if (
-          !attempt.active ||
-          attempt.directFrame !== frame ||
-          frame.parentNode !== attempt.cycle.element ||
-          frame.getAttribute('src') !== intended ||
-          frame.contentWindow !== intendedWindow ||
-          !intendedWindow ||
-          !attempt.documentTransferred
-        ) {
-          return;
-        }
-        const transferred = attempt.documentTransferred;
-        attempt.documentTransferred = undefined;
-        try {
-          intendedWindow.postMessage(
-            {
-              version: 1,
-              nonce,
-              publisherOrigin: aps.publisherOrigin,
-              renderer: source,
-            },
-            '*',
-            [transferred as unknown as Transferable]
-          );
-          closePort(transferred);
-        } catch {
-          fail(attempt, 'renderer_document_no_load');
-        }
-      };
+      const intended = aps.rendererUrl + '#' + bootstrapNonce;
       frame.onerror = () => fail(attempt, 'renderer_document_no_load');
       frame.src = intended;
+      attempt.apsContainerUrl = documents.outerUrl;
       attempt.directFrame = frame;
-      attempt.inserted = true;
-      attempt.documentTimer = arm(
-        () => fail(attempt, 'renderer_document_no_load'),
-        aps.deadlines.documentAcceptanceMs
-      );
       attempt.cycle.element.appendChild(frame);
-      intendedWindow = frame.contentWindow;
-      return true;
+      const intendedWindow = frame.contentWindow;
+      if (!intendedWindow) return fail(attempt, 'renderer_document_no_load');
+      attempt.bootstrapSource = intendedWindow;
+      ownerInserted(attempt);
+      return exactDirectApsFrame(attempt, false) || fail(attempt, 'renderer_document_no_load');
     } catch {
-      closePort(channel?.port1);
-      closePort(channel?.port2);
       return fail(attempt, 'renderer_document_no_load');
     }
   };
@@ -1269,6 +1438,7 @@ export function createFirstDisplayRenderBridge(
     if (disposed || ingressClosed) return;
     const data = eventField(event, 'data', messageEventPrototype);
     const routing = routingMessage(data);
+    if (handleApsWindowMessage(event, data, routing.message)) return;
     if (routing.message === 'TS Render Owner Register') {
       notifyNativeMutation();
       handleOwnerRegistration(event, data, routing);
@@ -1347,6 +1517,10 @@ export function createFirstDisplayRenderBridge(
       }
       const attempt: Attempt = {
         active: true,
+        apsContainerUrl: undefined,
+        bootstrapNavigated: false,
+        bootstrapNonce: undefined,
+        bootstrapSource: undefined,
         claim: undefined,
         claimTimer: undefined,
         completionTimer: undefined,
@@ -1513,7 +1687,8 @@ export function createFirstDisplayRenderBridge(
       attempts.clear();
       reservations.clear();
       tickets.clear();
-      nonces.clear();
+      bootstrapNonces.clear();
+      rendererNonces.clear();
     },
   });
 }

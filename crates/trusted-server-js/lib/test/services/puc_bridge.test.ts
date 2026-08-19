@@ -5,7 +5,6 @@ import {
   createPucBridge,
   PUC_DYNAMIC_OWNER,
   type PucBridgeOptions,
-  type PucRenderAttempt,
 } from '../../src/services/puc_bridge';
 import type { RenderFailureReason, RenderOutcome } from '../../src/services/render';
 import type {
@@ -2830,11 +2829,10 @@ describe('Universal Creative bridge dispatcher', () => {
     ];
     let channelIndex = 0;
     const issue = vi.fn(
-      (input: {
-        readonly attempt: PucRenderAttempt;
-        readonly port: { readonly close: () => void };
-      }) => {
-        expect(input.attempt.onSettled(() => input.port.close())).toBe(true);
+      (input: Parameters<NonNullable<PucBridgeOptions['rendererNonces']>['issue']>[0]) => {
+        const port = input.port;
+        if (!port) throw new Error('should receive the PUC renderer port');
+        expect(input.attempt.onSettled(() => port.close())).toBe(true);
         return Object.freeze({ ok: true as const, nonce: 'n1_abcdefghijklmnopqrstuv' });
       }
     );
@@ -2971,11 +2969,10 @@ describe('Universal Creative bridge dispatcher', () => {
     ];
     let channelIndex = 0;
     const issue = vi.fn(
-      (input: {
-        readonly attempt: PucRenderAttempt;
-        readonly port: { readonly close: () => void };
-      }) => {
-        expect(input.attempt.onSettled(() => input.port.close())).toBe(true);
+      (input: Parameters<NonNullable<PucBridgeOptions['rendererNonces']>['issue']>[0]) => {
+        const port = input.port;
+        if (!port) throw new Error('should receive the PUC renderer port');
+        expect(input.attempt.onSettled(() => port.close())).toBe(true);
         return Object.freeze({ ok: true as const, nonce: 'n1_abcdefghijklmnopqrstuv' });
       }
     );
