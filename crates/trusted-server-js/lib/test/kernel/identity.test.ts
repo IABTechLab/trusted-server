@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   createBrowserNavigationIdentityIssuer,
   createTestNavigationIdentityIssuer,
+  mintTestBootstrapNonce,
   mintTestLifecycleTicket,
   mintTestRendererNonce,
   type RandomValuesSource,
@@ -267,6 +268,20 @@ describe('fresh capability identities', () => {
     expect(calls.mock.calls[0]?.[0]).toHaveLength(16);
   });
 
+  it('keeps bootstrap and renderer nonce roles cryptographically distinct', () => {
+    const { source, calls } = deterministicSource([
+      15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
+    ]);
+
+    const bootstrap = mintTestBootstrapNonce(source);
+    const renderer = mintTestRendererNonce(source);
+
+    expect(bootstrap).toEqual({ ok: true, value: 'b1_Dw4NDAsKCQgHBgUEAwIBAA' });
+    expect(renderer).toEqual({ ok: true, value: 'n1_Dw4NDAsKCQgHBgUEAwIBAA' });
+    expect(bootstrap.ok && bootstrap.value).not.toBe(renderer.ok && renderer.value);
+    expect(calls).toHaveBeenCalledTimes(2);
+  });
+
   it('maps ticket and nonce source failures without leaking source values', () => {
     const failure = vi.fn();
     const source = () => {
@@ -277,11 +292,16 @@ describe('fresh capability identities', () => {
       ok: false,
       reason: 'identity_generation_failed',
     });
+    expect(mintTestBootstrapNonce(source, failure)).toEqual({
+      ok: false,
+      reason: 'identity_generation_failed',
+    });
     expect(mintTestRendererNonce(source, failure)).toEqual({
       ok: false,
       reason: 'identity_generation_failed',
     });
     expect(failure.mock.calls).toEqual([
+      ['identity_generation_failed'],
       ['identity_generation_failed'],
       ['identity_generation_failed'],
     ]);

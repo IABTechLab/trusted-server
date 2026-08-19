@@ -59,6 +59,7 @@ import { createReservationService, type ReservationService } from '../../service
 import type { PucGamAttemptInput } from '../../services/puc_bridge';
 import {
   createCommittedArtifactStore,
+  createBootstrapNonceRegistry,
   createRenderAttempt,
   createRendererNonceRegistry,
   createSlotOperation,
@@ -732,6 +733,8 @@ export function createRenderRuntimeIntegrationRegistration(
       },
     });
     scope.onDispose(() => reservations.dispose());
+    const bootstrapNonces = createBootstrapNonceRegistry();
+    scope.onDispose(() => bootstrapNonces.dispose());
     const rendererNonces = createRendererNonceRegistry();
     scope.onDispose(() => rendererNonces.dispose());
     const session = createRuntimeSession({
@@ -985,6 +988,7 @@ export function createRenderRuntimeIntegrationRegistration(
         };
       },
       artifacts,
+      bootstrapNonces,
       createAttempt,
       createSlotOperation,
       commitPageBids: (

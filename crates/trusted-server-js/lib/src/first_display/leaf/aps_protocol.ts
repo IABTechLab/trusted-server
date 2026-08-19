@@ -1,4 +1,5 @@
 import type { FirstDisplaySliceActivationContext } from '../../shared/first_display_transaction';
+import { generateApsDataDocumentsV1 } from '../../shared/aps_documents';
 import {
   createFirstDisplayRenderBridge,
   type FirstDisplayRenderBridgeOptionsV1,
@@ -12,6 +13,10 @@ export type FirstDisplayApsDocumentMessageV1 =
       kind: 'render_failed';
       reason: 'descriptor_invalid' | 'runner_no_load' | 'runner_failed';
     }>;
+
+export interface FirstDisplayApsDocumentsV1 {
+  readonly outerUrl: string;
+}
 
 export interface FirstDisplayApsProtocolV1 {
   readonly version: 1;
@@ -30,6 +35,11 @@ export interface FirstDisplayApsProtocolV1 {
   readonly isLifecycleTicket: (candidate: unknown) => candidate is string;
   readonly isBootstrapNonce: (candidate: unknown) => candidate is string;
   readonly isRendererNonce: (candidate: unknown) => candidate is string;
+  readonly generateDocuments: (
+    renderer: unknown,
+    bootstrapNonce: string,
+    rendererNonce: string
+  ) => Readonly<FirstDisplayApsDocumentsV1> | undefined;
   readonly parseDocumentMessage: (
     candidate: unknown,
     expectedNonce: string
@@ -187,6 +197,15 @@ export function installApsInitial(
     isLifecycleTicket: (input: unknown): input is string => exactOpaqueId(input, 't1_'),
     isBootstrapNonce: (input: unknown): input is string => exactOpaqueId(input, 'b1_'),
     isRendererNonce: (input: unknown): input is string => exactOpaqueId(input, 'n1_'),
+    generateDocuments: (renderer: unknown, bootstrapNonce: string, rendererNonce: string) => {
+      const documents = generateApsDataDocumentsV1({
+        renderer,
+        publisherOrigin: value.publisherOrigin,
+        bootstrapNonce,
+        rendererNonce,
+      });
+      return documents ? Object.freeze({ outerUrl: documents.outerUrl }) : undefined;
+    },
     parseDocumentMessage,
     createRenderBridge: (options: Omit<FirstDisplayRenderBridgeOptionsV1, 'getAps'>) =>
       createFirstDisplayRenderBridge({ ...options, getAps: () => protocol }),

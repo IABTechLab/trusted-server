@@ -134,6 +134,17 @@ function harness(kind: 'adm' | 'aps' = 'adm', onNativeMutation?: () => boolean) 
               typeof candidate === 'string' && /^b1_[A-Za-z0-9_-]{22}$/.test(candidate),
             isRendererNonce: (candidate: unknown): candidate is string =>
               typeof candidate === 'string' && /^n1_[A-Za-z0-9_-]{22}$/.test(candidate),
+            generateDocuments: (
+              _renderer: unknown,
+              bootstrapNonce: string,
+              rendererNonce: string
+            ) =>
+              Object.freeze({
+                outerUrl:
+                  'data:text/html;charset=utf-8,' +
+                  encodeURIComponent(`rendererNonce=${rendererNonce}`) +
+                  `#${bootstrapNonce}`,
+              }),
             createRenderBridge: () => {
               throw new Error('the full bridge fixture already owns construction');
             },
@@ -543,35 +554,76 @@ describe('bounded first-display render bridge', () => {
     expect(h.bridge.recordGam(h.cycle, 'gam_empty')).toBe(true);
     const frame = h.element.querySelector('iframe');
     expect(frame).not.toBeNull();
-    const nonce = new URL(frame?.src ?? '').hash.slice('#tsaps='.length);
-    expect(nonce).toMatch(/^n1_[A-Za-z0-9_-]{22}$/);
+    const bootstrapNonce = new URL(frame?.src ?? '').hash.slice(1);
+    expect(bootstrapNonce).toMatch(/^b1_[A-Za-z0-9_-]{22}$/);
+    expect(h.channels).toHaveLength(0);
     const postMessage = vi
       .spyOn(frame!.contentWindow!, 'postMessage')
       .mockImplementation(() => undefined);
-
-    frame?.dispatchEvent(new h.dom.window.Event('load'));
-    expect(postMessage).toHaveBeenCalledWith(
+    h.dispatch({
+      data: JSON.stringify({
+        message: 'TS APS Bootstrap Ready',
+        version: 1,
+        bootstrapNonce,
+      }),
+      origin: 'null',
+      ports: [],
+      source: frame?.contentWindow,
+    });
+    const navigation = JSON.parse(postMessage.mock.calls[0]?.[0] as string) as Record<
+      string,
+      unknown
+    >;
+    expect(navigation).toMatchObject({
+      message: 'TS APS Bootstrap Navigate',
+      version: 1,
+      bootstrapNonce,
+      containerUrl: expect.stringMatching(/^data:text\/html;charset=utf-8,/),
+    });
+    expect(postMessage.mock.calls[0]?.slice(1)).toEqual(['*', []]);
+    expect(frame?.getAttribute('sandbox')).toBe(
+      'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts allow-top-navigation-by-user-activation'
+    );
+    const decodedOuter = decodeURIComponent(
+      (navigation.containerUrl as string)
+        .slice('data:text/html;charset=utf-8,'.length)
+        .split('#')[0] ?? ''
+    );
+    const nonce = /rendererNonce=(n1_[A-Za-z0-9_-]{22})/.exec(decodedOuter)?.[1];
+    expect(nonce).toMatch(/^n1_[A-Za-z0-9_-]{22}$/);
+    const documentPort = new FakePort();
+    h.dispatch({
+      data: JSON.stringify({
+        message: 'TS APS Container Ready',
+        version: 1,
+        bootstrapNonce,
+        rendererNonce: nonce,
+      }),
+      origin: 'null',
+      ports: [documentPort],
+      source: frame?.contentWindow,
+    });
+    expect(documentPort.postMessage).toHaveBeenCalledWith(
       {
         version: 1,
         nonce,
         publisherOrigin: 'https://publisher.example',
         renderer: h.cycle.bid.renderSource,
       },
-      '*',
-      [h.channels[0]?.port2]
+      []
     );
-    h.channels[0]?.port1.dispatch({
+    documentPort.dispatch({
       message: 'TS APS Document Accepted',
       version: 1,
       nonce,
     });
-    h.channels[0]?.port1.dispatch({
+    documentPort.dispatch({
       message: 'TS APS Runner Loaded',
       version: 1,
       nonce,
     });
     expect(h.terminals).toEqual([]);
-    h.channels[0]?.port1.dispatch({
+    documentPort.dispatch({
       message: 'TS APS Render Completed',
       version: 1,
       nonce,
@@ -585,7 +637,44 @@ describe('bounded first-display render bridge', () => {
   it('fails closed when an APS document port reports a clone error', () => {
     const h = harness('aps');
     expect(h.bridge.recordGam(h.cycle, 'gam_empty')).toBe(true);
-    h.channels[0]?.port1.dispatchError();
+    const frame = h.element.querySelector('iframe');
+    const bootstrapNonce = new URL(frame?.src ?? '').hash.slice(1);
+    const postMessage = vi
+      .spyOn(frame!.contentWindow!, 'postMessage')
+      .mockImplementation(() => undefined);
+    h.dispatch({
+      data: JSON.stringify({
+        message: 'TS APS Bootstrap Ready',
+        version: 1,
+        bootstrapNonce,
+      }),
+      origin: 'null',
+      ports: [],
+      source: frame?.contentWindow,
+    });
+    const navigation = JSON.parse(postMessage.mock.calls[0]?.[0] as string) as Record<
+      string,
+      unknown
+    >;
+    const decodedOuter = decodeURIComponent(
+      (navigation.containerUrl as string)
+        .slice('data:text/html;charset=utf-8,'.length)
+        .split('#')[0] ?? ''
+    );
+    const rendererNonce = /rendererNonce=(n1_[A-Za-z0-9_-]{22})/.exec(decodedOuter)?.[1];
+    const documentPort = new FakePort();
+    h.dispatch({
+      data: JSON.stringify({
+        message: 'TS APS Container Ready',
+        version: 1,
+        bootstrapNonce,
+        rendererNonce,
+      }),
+      origin: 'null',
+      ports: [documentPort],
+      source: frame?.contentWindow,
+    });
+    documentPort.dispatchError();
     expect(h.terminals).toEqual(['failed']);
     expect(h.element.querySelector('iframe')).toBeNull();
   });

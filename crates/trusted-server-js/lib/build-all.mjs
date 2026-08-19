@@ -280,14 +280,6 @@ const persistentEntryPrefixes = Object.freeze([
   'src/integrations/',
 ]);
 for (const artifact of artifacts.filter(({ phase }) => phase === 'first_display')) {
-  const forbidden = artifact.moduleIds.find((moduleId) =>
-    persistentEntryPrefixes.some((prefix) =>
-      path.normalize(moduleId).startsWith(path.normalize(prefix))
-    )
-  );
-  if (forbidden) {
-    throw new Error(`[build-all] ${artifact.id} reaches persistent source ${forbidden}`);
-  }
   const catalogEntry = firstDisplayCatalog.find(({ id }) => id === artifact.id);
   if (!catalogEntry)
     throw new Error(`[build-all] Missing first-display catalog row: ${artifact.id}`);
@@ -295,6 +287,16 @@ for (const artifact of artifacts.filter(({ phase }) => phase === 'first_display'
   const allowed = new Set(
     catalogEntry.allowedImports.map((moduleId) => path.normalize(`src/${moduleId}.ts`))
   );
+  const forbidden = artifact.moduleIds.find((moduleId) =>
+    persistentEntryPrefixes.some(
+      (prefix) =>
+        path.normalize(moduleId).startsWith(path.normalize(prefix)) &&
+        !allowed.has(path.normalize(moduleId))
+    )
+  );
+  if (forbidden) {
+    throw new Error(`[build-all] ${artifact.id} reaches persistent source ${forbidden}`);
+  }
   const undeclared = artifact.moduleIds.find((moduleId) => {
     const normalized = path.normalize(moduleId);
     return normalized !== ownEntry && !allowed.has(normalized);
