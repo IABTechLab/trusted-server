@@ -10,6 +10,7 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::cache_policy::EdgeCacheHeader;
 #[cfg(all(feature = "aps-runner-proxy-integration-test", target_arch = "wasm32"))]
 use trusted_server_core::config_payload::settings_from_config_blob;
 use trusted_server_core::ec::EcContext;
@@ -204,7 +205,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 14] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 17] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
@@ -775,7 +776,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let method = req.method().clone();
 
             let result = if path.starts_with("/static/tsjs=") {
-                handle_tsjs_dynamic(&req, &state.registry)
+                handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SMaxageFallback)
             } else if state.registry.has_route(&method, &path) {
                 let mut ec_context = EcContext::default();
                 state
@@ -869,6 +870,9 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // credentials and key-management payloads to the origin.
             .post("/_ts/admin/keys/rotate", admin_not_supported_handler)
             .post("/_ts/admin/keys/deactivate", admin_not_supported_handler)
+            .get("/_ts/admin/ec", admin_ec_not_supported_handler)
+            .get("/_ts/admin/ec/{id}", admin_ec_not_supported_handler)
+            .get("/_ts/admin/eids", admin_eids_handler)
             .get("/_ts/trace", trace_mode_handler)
             .post("/auction", auction_handler)
             .get(PAGE_BIDS_PATH, page_bids_handler)

@@ -272,7 +272,7 @@ async fn dispatch_fallback(
     let method = req.method().clone();
 
     if path.starts_with("/static/tsjs=") {
-        return handle_tsjs_dynamic(&req, &state.registry);
+        return handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SMaxageFallback);
     }
 
     if state.registry.has_route(&method, &path) {
@@ -379,7 +379,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 14] {
+fn named_routes() -> [NamedRoute; 17] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
