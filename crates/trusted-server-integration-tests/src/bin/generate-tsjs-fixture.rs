@@ -4,9 +4,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::PathBuf;
 
-use trusted_server_core::tsjs::{
-    CreativeBootConfigV1, TsjsBootScriptConfigV1, tsjs_bootstrap_fragment_v1,
-};
+use trusted_server_core::tsjs::{CreativeBootConfigV1, tsjs_bootstrap_fixture_fragment_v1};
 
 type DynError = Box<dyn Error + Send + Sync + 'static>;
 const PERFORMANCE_ORIGIN: &str = "https://performance.example";
@@ -34,18 +32,16 @@ fn run(args: &Args) -> Result<String, DynError> {
         ))
     })?;
     let ids = args.ids.iter().map(String::as_str).collect::<Vec<_>>();
-    let controller = tsjs_bootstrap_fragment_v1(
-        TsjsBootScriptConfigV1 {
-            module_ids: &ids,
-            auction_projection_json: &projection,
-            creative: CreativeBootConfigV1 {
-                enabled: true,
-                click_guard: ids.contains(&"creative"),
-                render_guard: false,
-            },
-            render_trace_overlay: true,
-            gpt_diagnostics_active: false,
+    let controller = tsjs_bootstrap_fixture_fragment_v1(
+        &ids,
+        &projection,
+        CreativeBootConfigV1 {
+            enabled: true,
+            click_guard: ids.contains(&"creative"),
+            render_guard: false,
         },
+        true,
+        false,
         PERFORMANCE_ORIGIN,
     )
     .map_err(|error| {

@@ -447,6 +447,63 @@ pub fn tsjs_bootstrap_fragment_v1(
     ))
 }
 
+/// Serialize a production boot fragment with deterministic browser-safe fixture config.
+///
+/// This is available only to workspace integration-test tools. It exercises the
+/// production manifest and immutable boot serializer without exposing the internal
+/// [`IntegrationConfigsV1`] representation to downstream crates.
+///
+/// # Errors
+///
+/// Returns an error when the selected module inventory, projection, creative bits,
+/// diagnostics bits, or generated fixture configuration violates the production ABI.
+#[cfg(feature = "test-utils")]
+pub fn tsjs_bootstrap_fixture_fragment_v1(
+    module_ids: &[&str],
+    auction_projection_json: &str,
+    creative: CreativeBootConfigV1,
+    render_trace_overlay: bool,
+    gpt_diagnostics_active: bool,
+    publisher_origin: &str,
+) -> Result<String, Report<TrustedServerError>> {
+    let entries = INTEGRATION_CONFIG_IDS_V1
+        .iter()
+        .copied()
+        .filter(|product_id| {
+            module_ids.iter().any(|module_id| {
+                integration_config_product_for_module_v1(module_id) == Some(*product_id)
+            })
+        })
+        .map(|product_id| {
+            let config = match product_id {
+                "didomi" => serde_json::json!({ "proxyPath": "/integrations/didomi/" }),
+                "gpt" => serde_json::json!({ "gamAttributionEnabled": false }),
+                "prebid" => serde_json::json!({
+                    "accountId": "fixture",
+                    "timeout": 1_000,
+                    "debug": false,
+                    "bidders": [],
+                }),
+                "sourcepoint" => serde_json::json!({ "rewriteSdk": false }),
+                _ => serde_json::json!({}),
+            };
+            (product_id, config)
+        })
+        .collect::<Vec<_>>();
+    let integration_configs = IntegrationConfigsV1::new(entries)?;
+    tsjs_bootstrap_fragment_v1(
+        TsjsBootScriptConfigV1 {
+            module_ids,
+            integration_configs: &integration_configs,
+            auction_projection_json,
+            creative,
+            render_trace_overlay,
+            gpt_diagnostics_active,
+        },
+        publisher_origin,
+    )
+}
+
 fn selected_metadata(
     module_ids: &[&str],
 ) -> Result<Vec<trusted_server_js::TsjsArtifactMetadata>, Report<TrustedServerError>> {
