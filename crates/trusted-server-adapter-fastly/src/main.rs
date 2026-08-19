@@ -23,6 +23,7 @@ use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::platform::PlatformGeo as _;
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
+use trusted_server_core::response_privacy::TerminalPrivateResponse;
 use trusted_server_core::settings::Settings;
 
 mod app;
@@ -364,8 +365,10 @@ fn apply_terminal_response_effects(
     response: &mut HttpResponse,
     request_filter_effects: Option<&RequestFilterEffects>,
 ) {
-    let must_remain_private =
-        trusted_server_core::response_privacy::is_private_or_no_store(response.headers());
+    let must_remain_private = response
+        .extensions()
+        .get::<TerminalPrivateResponse>()
+        .is_some();
     if let Some(effects) = request_filter_effects {
         effects.apply_to_response(response);
     }
@@ -580,6 +583,7 @@ mod tests {
             .header("etag", "\"reader-document\"")
             .body(EdgeBody::empty())
             .expect("should build response");
+        response.extensions_mut().insert(TerminalPrivateResponse);
         let effects = RequestFilterEffects {
             request_headers: Vec::new(),
             response_headers: vec![
@@ -601,6 +605,43 @@ mod tests {
         assert!(response.headers().get("surrogate-control").is_none());
         assert!(response.headers().get("cdn-cache-control").is_none());
         assert!(response.headers().get("etag").is_none());
+    }
+
+    #[test]
+    fn terminal_response_preserves_unmarked_origin_private_policy() {
+        let mut response = response_builder()
+            .header("cache-control", "private, max-age=600")
+            .header("etag", "\"origin\"")
+            .header("last-modified", "Wed, 12 Aug 2026 00:00:00 GMT")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+
+        apply_terminal_response_effects(&mut response, None);
+
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("private, max-age=600"),
+            "should preserve the origin browser-cache policy"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("etag")
+                .and_then(|value| value.to_str().ok()),
+            Some("\"origin\""),
+            "should preserve the origin validator"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("last-modified")
+                .and_then(|value| value.to_str().ok()),
+            Some("Wed, 12 Aug 2026 00:00:00 GMT"),
+            "should preserve the origin modification date"
+        );
     }
 
     #[test]

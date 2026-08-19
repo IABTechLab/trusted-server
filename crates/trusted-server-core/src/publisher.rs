@@ -63,7 +63,7 @@ use crate::platform::{
     GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices, VarySpec,
 };
 use crate::price_bucket::{PriceGranularity, price_bucket};
-use crate::response_privacy::{enforce_private_no_store, enforce_synthesized_html_cache_privacy};
+use crate::response_privacy::enforce_synthesized_html_cache_privacy;
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{
@@ -2047,7 +2047,7 @@ fn build_cached_template_response(
     }
     // Last, after replay. Metadata decoding rejects cache-controlling names, and this
     // terminal stamp is defense in depth for direct/test entries and future format bugs.
-    enforce_private_no_store(&mut response);
+    enforce_synthesized_html_cache_privacy(&mut response);
     set_response_compression(&mut response, reader_compression);
     set_c2_response_state(&mut response, C2ResponseState::Hit);
     set_assembly_response_state(&mut response, AssemblyResponseState::ByteSeam);

@@ -13,6 +13,13 @@ use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Response, header};
 
 use crate::settings::Settings;
 
+/// Marks a response whose `private, no-store` policy belongs to Trusted Server.
+///
+/// Platform terminal hooks use this out-of-band marker to re-enforce the policy after
+/// late integrations run without rewriting unrelated origin-private responses.
+#[derive(Clone, Copy, Debug)]
+pub struct TerminalPrivateResponse;
+
 /// CDN-targeted cache headers stripped from every cookie-bearing response.
 ///
 /// A single source of truth so the adapter copies of the privacy downgrade
@@ -89,6 +96,7 @@ pub fn enforce_private_no_store(response: &mut Response) {
 /// remove origin validators, and remove all CDN-targeted cache directives.
 pub(crate) fn enforce_synthesized_html_cache_privacy(response: &mut Response) {
     enforce_private_no_store(response);
+    response.extensions_mut().insert(TerminalPrivateResponse);
 }
 
 /// Forces cookie-bearing responses to stay private to shared caches.
@@ -221,6 +229,13 @@ mod tests {
             response.headers()[header::CACHE_CONTROL],
             "private, no-store",
             "synthesized HTML should always be non-storable"
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<TerminalPrivateResponse>()
+                .is_some(),
+            "should mark synthesized HTML for terminal privacy re-enforcement"
         );
         for header_name in [header::ETAG.as_str(), header::LAST_MODIFIED.as_str()]
             .into_iter()
