@@ -11,6 +11,13 @@ origin_url = "https://origin.example.com"
 # origin_host_header_override = "www.example.com"
 proxy_secret = "change-me-proxy-secret"
 
+# Optional: trust a fronting CDN's reader IP only when it also supplies the
+# matching shared secret. The front door must overwrite both headers.
+# [trusted_client_ip]
+# ip_header = "fastly-client-ip"
+# auth_header = "x-ts-client-ip-auth"
+# shared_secret = "replace-with-a-random-shared-secret"
+
 [ec]
 passphrase = "trusted-server-placeholder-secret"
 ec_store = "ec_identity_store"

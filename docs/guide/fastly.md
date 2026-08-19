@@ -72,6 +72,53 @@ When you're ready to use your own domain:
 - Fastly Compute **only accepts client traffic via TLS** (HTTPS)
 - Origins and backends can be non-TLS if needed
 
+## CDN-fronted Client IP
+
+When another CDN or Fastly service fronts Trusted Server, the Fastly Compute
+client address identifies the immediate edge node rather than the original
+reader. Trusted Server can instead consume an authenticated reader-IP header,
+but only after the public front door is configured to overwrite both the IP and
+authentication headers on every backend request. Preserving values supplied by
+the browser is unsafe because a caller could choose the IP used for geolocation
+and other request processing.
+
+For a VCL-to-Compute [service chain](https://www.fastly.com/documentation/guides/getting-started/services/service-chaining/),
+overwrite [`Fastly-Client-IP`](https://www.fastly.com/documentation/reference/http/http-headers/Fastly-Client-IP/)
+from the initial [`client.ip`](https://www.fastly.com/documentation/reference/vcl/variables/client-connection/client-ip/)
+and set a dedicated authentication header in the fronting service. For example:
+
+```vcl
+sub vcl_recv {
+  if (fastly.ff.visits_this_service == 0 && req.restarts == 0) {
+    set req.http.Fastly-Client-IP = client.ip;
+  }
+  set req.http.X-TS-Client-IP-Auth = "replace-with-a-random-shared-secret";
+}
+```
+
+Use a cryptographically random secret in production; the value above is only a
+placeholder. Configure the identical header names and secret in Trusted Server:
+
+```toml
+[trusted_client_ip]
+ip_header = "fastly-client-ip"
+auth_header = "x-ts-client-ip-auth"
+shared_secret = "replace-with-a-random-shared-secret"
+```
+
+`Fastly-Client-IP` is not protected from modification when it first enters
+Fastly, which is why overwriting it and authenticating the handoff are both
+required. Trusted Server removes both trust headers before routing. Direct
+requests and requests with missing, invalid, or duplicated trust headers remain
+available and use the immediate peer address instead.
+
+::: warning No-code request routing limitation
+Fastly no-code request routing does not provide a point to inject these headers.
+If that routing path does not preserve the original reader IP, Trusted Server
+cannot recover it with this mechanism. Use a fronting service that can overwrite
+both headers before forwarding the request.
+:::
+
 ## Create Config and Secret Stores
 
 For features like request signing, you'll need to create Fastly stores:

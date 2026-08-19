@@ -66,16 +66,17 @@ fail and the service will return its startup-error response.
 
 ## Key Sections
 
-| Section             | Purpose                                      |
-| ------------------- | -------------------------------------------- |
-| `[publisher]`       | Domain, origin, proxy settings               |
-| `[ec]`              | Edge Cookie (EC) ID generation               |
-| `[tester_cookie]`   | Optional tester-cookie endpoint              |
-| `[proxy]`           | Proxy SSRF allowlist and asset routes        |
-| `[image_optimizer]` | Reusable Image Optimizer profile sets        |
-| `[request_signing]` | Ed25519 request signing                      |
-| `[auction]`         | Auction orchestration                        |
-| `[integrations.*]`  | Partner integrations (Prebid, Next.js, etc.) |
+| Section               | Purpose                                      |
+| --------------------- | -------------------------------------------- |
+| `[publisher]`         | Domain, origin, proxy settings               |
+| `[trusted_client_ip]` | Authenticated client-IP forwarding           |
+| `[ec]`                | Edge Cookie (EC) ID generation               |
+| `[tester_cookie]`     | Optional tester-cookie endpoint              |
+| `[proxy]`             | Proxy SSRF allowlist and asset routes        |
+| `[image_optimizer]`   | Reusable Image Optimizer profile sets        |
+| `[request_signing]`   | Ed25519 request signing                      |
+| `[auction]`           | Auction orchestration                        |
+| `[integrations.*]`    | Partner integrations (Prebid, Next.js, etc.) |
 
 ## Example: Production Setup
 
@@ -351,6 +352,61 @@ a zero-byte cap fails every non-empty publisher response.
 ```bash
 TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
 ```
+
+## Trusted Client IP Configuration
+
+Use this optional section when a trusted CDN service forwards requests to the
+Fastly service running Trusted Server. It lets Trusted Server use the reader's
+address instead of the immediate fronting edge node's address.
+
+### `[trusted_client_ip]`
+
+| Field           | Type   | Required | Description                                       |
+| --------------- | ------ | -------- | ------------------------------------------------- |
+| `ip_header`     | String | Yes      | Header containing exactly one reader IP address   |
+| `auth_header`   | String | Yes      | Header containing exactly one shared-secret value |
+| `shared_secret` | String | Yes      | Secret shared with the trusted front door         |
+
+All three fields are required when the section exists. When the section is
+absent, Trusted Server continues to use the immediate peer address.
+
+```toml
+[trusted_client_ip]
+ip_header = "fastly-client-ip"
+auth_header = "x-ts-client-ip-auth"
+shared_secret = "replace-with-a-random-shared-secret"
+```
+
+The front door must overwrite both headers on every request. Trusted Server
+accepts the forwarded address only when the request has exactly one
+`auth_header` value that matches `shared_secret` byte-for-byte and exactly one
+`ip_header` value that parses directly as IPv4 or IPv6. Values are not trimmed
+or normalized. Missing, empty, duplicate, non-UTF-8, mismatched, or malformed
+values do not reject the request; Trusted Server safely falls back to the
+immediate peer address. Both configured headers are removed before routing.
+
+Header names are validated case-insensitively. `ip_header` must be
+`fastly-client-ip` or start with `x-`, while `auth_header` must start with `x-`.
+The names must differ. Neither field may use the reserved
+`x-ts-tls-protocol` or `x-ts-tls-cipher` header. These restrictions prevent the
+configuration from consuming routing, framing, cookie, authorization, or
+Trusted Server TLS bridge headers.
+
+Generate `shared_secret` with a cryptographically secure random generator,
+store the same value only in the front door and Trusted Server configuration,
+and never commit it. The value is redacted from configuration debug output.
+
+**Environment Overrides**:
+
+```bash
+TRUSTED_SERVER__TRUSTED_CLIENT_IP__IP_HEADER=fastly-client-ip
+TRUSTED_SERVER__TRUSTED_CLIENT_IP__AUTH_HEADER=x-ts-client-ip-auth
+TRUSTED_SERVER__TRUSTED_CLIENT_IP__SHARED_SECRET=replace-with-a-random-shared-secret
+```
+
+Because the typed environment overlay cannot create a missing section, add
+`[trusted_client_ip]` and all three fields to the TOML before using these
+overrides.
 
 ## Tester Cookie Configuration
 
