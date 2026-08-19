@@ -68,121 +68,11 @@ pub const APS_RUNNER_BLOCKING_READ_TIMEOUT: Duration = Duration::from_millis(250
 pub fn is_aps_family_path(path: &str) -> bool {
     path == "/integrations/aps" || path.starts_with("/integrations/aps/")
 }
-const APS_RENDERER_V1_CSP: &str = "default-src 'none'; sandbox allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline' 'self' https:; connect-src https:; frame-src https: data: blob:; img-src https: data: blob:; media-src https: data: blob:; style-src 'unsafe-inline' https:; font-src https: data:; worker-src https: blob:; form-action https:;";
+const APS_RENDERER_V1_CSP: &str = "default-src 'none'; sandbox allow-scripts; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline'; frame-ancestors 'self'; form-action 'none';";
 
 // This document is served with an immutable v1 URL. Any semantic change must
 // ship at a new versioned route so cached v1 bytes retain their contract.
-const APS_RENDERER_V1_DOCUMENT: &str = concat!(
-    r#"<!doctype html>
-<meta charset="utf-8">
-<style>html,body{margin:0;padding:0;overflow:hidden}</style>
-<script>
-(function(){
-'use strict';
-"#,
-    include_str!("generated/aps_renderer_validator_v1.js"),
-    r#"
-var match=/^#tsaps=(n1_[A-Za-z0-9_-]{22})$/.exec(location.hash);
-var expected=match&&match[1];
-try{history.replaceState(null,'',location.pathname+location.search);}catch(_error){}
-if(!expected)return;
-var port=null;
-var terminal=false;
-var runnerLoaded=false;
-var callbackOutcome=null;
-function send(message){
- if(!port)return;
- try{port.postMessage(message);}catch(_error){}
-}
-function close(){
- if(!port)return;
- try{port.close();}catch(_error){}
-}
-function fail(reason){
- if(terminal)return;
- terminal=true;
- send({message:'TS APS Render Failed',version:1,nonce:expected,reason:reason});
- close();
-}
-function finishCallback(){
- if(terminal||!runnerLoaded||callbackOutcome===null)return;
- if(callbackOutcome==='rejected'){
-  fail('runner_failed');
-  return;
- }
- terminal=true;
- send({message:'TS APS Render Completed',version:1,nonce:expected});
- close();
-}
-function publisherOrigin(value){
- if(typeof value!=='string'||value.length===0||value.length>2048)return false;
- for(var index=0;index<value.length;index+=1){
-  var code=value.charCodeAt(index);
-  if(code<=31||code===127)return false;
- }
- try{
-  var parsed=new URL(value);
-  return (parsed.protocol==='https:'||parsed.protocol==='http:')&&
-   parsed.username===''&&parsed.password===''&&parsed.pathname==='/'&&
-   parsed.search===''&&parsed.hash===''&&parsed.origin===value;
- }catch(_error){return false;}
-}
-function receive(event){
- if(event.source!==parent||!event.ports||event.ports.length!==1)return;
- port=event.ports[0];
- removeEventListener('message',receive);
- var envelope=event.data;
- if(!apsExactRecord(envelope,['nonce','publisherOrigin','renderer','version'])||
-    envelope.version!==1||envelope.nonce!==expected||
-    !publisherOrigin(envelope.publisherOrigin)||
-    classifyApsRendererV1(envelope.renderer,envelope.publisherOrigin)!=='accepted'){
-  fail('descriptor_invalid');
-  return;
- }
- port.onmessageerror=function(){fail('descriptor_invalid');};
- try{port.start();}catch(_error){}
- var renderer=envelope.renderer;
- send({message:'TS APS Document Accepted',version:1,nonce:expected});
- window._aps=window._aps instanceof Map?window._aps:new Map();
- var account=window._aps.get(renderer.accountId);
- if(!account){
-  account={queue:[],store:new Map([['listeners',new Map()]])};
-  window._aps.set(renderer.accountId,account);
- }
- var renderPromise=new Promise(function(resolve,reject){
-  account.queue.push(new CustomEvent('prebid/creative/render',{detail:{
-   aaxResponse:renderer.aaxResponse,
-   seatBidId:renderer.bidId,
-   source:'internal',
-   resolve:resolve,
-   reject:reject
- }}));
- });
- renderPromise.then(function(){
-  callbackOutcome='resolved';
-  finishCallback();
- },function(){
-  callbackOutcome='rejected';
-  finishCallback();
- });
- var script=document.createElement('script');
- script.src=new URL('/integrations/aps/runner.js',location.href).href;
- script.crossOrigin='anonymous';
- script.referrerPolicy='no-referrer';
- script.onload=function(){
-  if(terminal)return;
-  runnerLoaded=true;
-  send({message:'TS APS Runner Loaded',version:1,nonce:expected});
-  finishCallback();
- };
- script.onerror=function(){fail('runner_no_load');};
- document.head.appendChild(script);
-}
-addEventListener('message',receive);
-})();
-</script>
-"#
-);
+const APS_RENDERER_V1_DOCUMENT: &str = include_str!("generated/aps_renderer_bootstrap_v1.html");
 
 /// Configuration for the APS `OpenRTB` integration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
@@ -3501,7 +3391,10 @@ mod tests {
             APS_RENDERER_V1_CSP
         );
         assert!(!response.headers().contains_key("x-frame-options"));
-        assert!(!APS_RENDERER_V1_CSP.contains("frame-ancestors"));
+        assert_eq!(
+            APS_RENDERER_V1_CSP,
+            "default-src 'none'; sandbox allow-scripts; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline'; frame-ancestors 'self'; form-action 'none';"
+        );
         assert_eq!(
             APS_RENDERER_SANDBOX,
             "allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation"
@@ -3514,8 +3407,24 @@ mod tests {
         )
         .expect("renderer body should stay within the runner cap");
         assert_eq!(body.as_ref(), APS_RENDERER_V1_DOCUMENT.as_bytes());
-        assert!(APS_RENDERER_V1_DOCUMENT.contains("/integrations/aps/runner.js"));
-        assert!(!APS_RENDERER_V1_DOCUMENT.contains("client.aps.amazon-adsystem.com"));
+        assert!(APS_RENDERER_V1_DOCUMENT.contains("TS APS Bootstrap Ready"));
+        assert!(APS_RENDERER_V1_DOCUMENT.contains("TS APS Bootstrap Navigate"));
+        assert!(APS_RENDERER_V1_DOCUMENT.contains("data:text/html;charset=utf-8,"));
+        for forbidden in [
+            "runner",
+            "aaxResponse",
+            "accountId",
+            "bidId",
+            "creativeId",
+            "creativeUrl",
+            "createElement",
+            "iframe",
+        ] {
+            assert!(
+                !APS_RENDERER_V1_DOCUMENT.contains(forbidden),
+                "renderer bootstrap should not contain {forbidden}"
+            );
+        }
     }
 
     fn raw_runner_response(

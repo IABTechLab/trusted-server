@@ -349,8 +349,7 @@ fn send_edgezero_response(
     mut response: HttpResponse,
     request_filter_effects: Option<&RequestFilterEffects>,
 ) {
-    apply_terminal_response_effects(&mut response, request_filter_effects);
-    crate::middleware::enforce_uncacheable_cache_privacy(&mut response);
+    apply_send_response_effects(&mut response, request_filter_effects);
 
     let (parts, body) = response.into_parts();
 
@@ -377,6 +376,21 @@ fn send_edgezero_response(
             compat::to_fastly_response(HttpResponse::from_parts(parts, once)).send_to_client();
         }
     }
+}
+
+fn apply_send_response_effects(
+    response: &mut HttpResponse,
+    request_filter_effects: Option<&RequestFilterEffects>,
+) {
+    if response
+        .extensions()
+        .get::<trusted_server_core::platform::ExactResponseHeadersV1>()
+        .is_some()
+    {
+        return;
+    }
+    apply_terminal_response_effects(response, request_filter_effects);
+    crate::middleware::enforce_uncacheable_cache_privacy(response);
 }
 
 /// Apply every late response mutation, then restore privacy invariants before headers commit.
@@ -591,6 +605,21 @@ mod tests {
             response.headers().get("x-ts-finalized").is_none(),
             "sentinel should not be sent to clients"
         );
+    }
+
+    #[test]
+    fn exact_route_headers_bypass_terminal_cache_rewriting() {
+        let mut response = response_builder()
+            .header("cache-control", "no-store")
+            .body(EdgeBody::empty())
+            .expect("should build exact route response");
+        response
+            .extensions_mut()
+            .insert(trusted_server_core::platform::ExactResponseHeadersV1);
+
+        apply_send_response_effects(&mut response, None);
+
+        assert_eq!(response.headers()["cache-control"], "no-store");
     }
 
     #[test]

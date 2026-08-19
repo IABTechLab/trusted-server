@@ -62,6 +62,7 @@ use crate::error::TrustedServerError;
 use crate::html_processor::BodyCloseInjection;
 use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
 use crate::integrations::IntegrationRegistry;
+use crate::integrations::aps::ApsConfig;
 use crate::platform::{
     GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices, VarySpec,
 };
@@ -82,6 +83,30 @@ const SUPPORTED_ENCODING_VALUES: [&str; 3] = ["gzip", "deflate", "br"];
 const DEFAULT_PUBLISHER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 const HEADER_X_TS_C2_CACHE: &str = "x-ts-c2-cache";
 const HEADER_X_TS_ASSEMBLY: &str = "x-ts-assembly";
+const APS_PUBLISHER_FRAME_POLICY: &str = "frame-ancestors 'self'";
+
+fn append_aps_publisher_frame_policy(response: &mut Response<EdgeBody>, aps_enabled: bool) {
+    if aps_enabled {
+        response.headers_mut().append(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(APS_PUBLISHER_FRAME_POLICY),
+        );
+    }
+}
+
+fn ensure_aps_publisher_frame_policy(response: &mut Response<EdgeBody>, aps_enabled: bool) {
+    if !aps_enabled {
+        return;
+    }
+    let already_present = response
+        .headers()
+        .get_all(header::CONTENT_SECURITY_POLICY)
+        .iter()
+        .any(|value| value.as_bytes() == APS_PUBLISHER_FRAME_POLICY.as_bytes());
+    if !already_present {
+        append_aps_publisher_frame_policy(response, true);
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum C2ResponseState {
@@ -3274,6 +3299,9 @@ pub async fn handle_publisher_request(
     let gpt_diagnostics =
         crate::integrations::gpt_diagnostics::prepare_request(settings, &mut req)?;
     let render_trace_overlay = crate::trace_cookie::render_trace_overlay_active(&req);
+    let aps_enabled = settings
+        .integration_config::<ApsConfig>("aps")?
+        .is_some_and(|config| config.enabled);
 
     // Prebid.js requests are not intercepted here anymore. The HTML processor removes
     // publisher-supplied Prebid scripts; the unified TSJS bundle includes Prebid.js when enabled.
@@ -3709,7 +3737,8 @@ pub async fn handle_publisher_request(
                     //
                     // Headers are constructed rather than replayed, so no origin header
                     // can reach a second reader through the cache.
-                    let response = build_cached_template_response(&entry, reader_compression)?;
+                    let mut response = build_cached_template_response(&entry, reader_compression)?;
+                    ensure_aps_publisher_frame_policy(&mut response, aps_enabled);
                     let mut params = build_template_assembly_params(
                         &entry,
                         settings,
@@ -3820,10 +3849,12 @@ pub async fn handle_publisher_request(
                 message: "failed to build unexpected origin 304 response".to_string(),
             })?;
         crate::integrations::gpt_diagnostics::finalize_response(&gpt_diagnostics, &mut response);
+        append_aps_publisher_frame_policy(&mut response, aps_enabled);
         return Ok(PublisherResponse::Buffered(response));
     }
 
     crate::integrations::gpt_diagnostics::finalize_response(&gpt_diagnostics, &mut response);
+    append_aps_publisher_frame_policy(&mut response, aps_enabled);
 
     // A request key only authorizes lookup. The origin response must separately
     // prove that the transformed representation is safe and fresh enough to
@@ -8748,6 +8779,110 @@ mod tests {
             vec!["stub-backend".to_string()],
             "should proxy through the platform http client"
         );
+    }
+
+    #[tokio::test]
+    async fn aps_enabled_publisher_response_appends_an_independent_frame_policy() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "aps",
+                &serde_json::json!({ "enabled": true, "account_id": "test-account" }),
+            )
+            .expect("should enable APS");
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"<html><head></head><body>origin</body></html>".to_vec(),
+            vec![
+                ("content-type", "text/html; charset=utf-8"),
+                (
+                    "content-security-policy",
+                    "default-src 'self'; frame-ancestors https://operator.example",
+                ),
+            ],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/article")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build publisher request");
+
+        let response = run_publisher_proxy(&settings, &services, request).await;
+        let headers = match response {
+            PublisherResponse::Buffered(response)
+            | PublisherResponse::PassThrough { response, .. }
+            | PublisherResponse::Stream { response, .. }
+            | PublisherResponse::AssembleTemplate { response, .. } => {
+                response.into_parts().0.headers
+            }
+        };
+        let policies = headers
+            .get_all(header::CONTENT_SECURITY_POLICY)
+            .iter()
+            .map(|value| value.to_str().expect("policy should be ASCII"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            policies,
+            [
+                "default-src 'self'; frame-ancestors https://operator.example",
+                "frame-ancestors 'self'",
+            ],
+            "APS framing policy should append after and intersect operator policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn aps_disabled_publisher_response_does_not_add_a_frame_policy() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "aps",
+                &serde_json::json!({ "enabled": false, "account_id": "test-account" }),
+            )
+            .expect("should configure disabled APS");
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"<html><head></head><body>origin</body></html>".to_vec(),
+            vec![
+                ("content-type", "text/html; charset=utf-8"),
+                ("content-security-policy", "default-src 'self'"),
+            ],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/article")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build publisher request");
+
+        let response = run_publisher_proxy(&settings, &services, request).await;
+        let headers = match response {
+            PublisherResponse::Buffered(response)
+            | PublisherResponse::PassThrough { response, .. }
+            | PublisherResponse::Stream { response, .. }
+            | PublisherResponse::AssembleTemplate { response, .. } => {
+                response.into_parts().0.headers
+            }
+        };
+        let policies = headers
+            .get_all(header::CONTENT_SECURITY_POLICY)
+            .iter()
+            .map(|value| value.to_str().expect("policy should be ASCII"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(policies, ["default-src 'self'"]);
     }
 
     #[tokio::test]

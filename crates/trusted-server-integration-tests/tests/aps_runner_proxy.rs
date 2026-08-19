@@ -27,6 +27,12 @@ const SUCCESS_HEADERS: [&str; 5] = [
 // dispatch, local error serialization, and response delivery, so retain a
 // bounded allowance for work outside the transport window.
 const DOWNSTREAM_DEADLINE_OBSERVATION_ALLOWANCE: Duration = Duration::from_millis(250);
+const RENDERER_V1_PATH: &str = "/integrations/aps/renderer/v1";
+const CLOUDFLARE_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+const RENDERER_V1_CSP: &str = "default-src 'none'; sandbox allow-scripts; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline'; frame-ancestors 'self'; form-action 'none';";
+const RENDERER_V1_DOCUMENT: &str = include_str!(
+    "../../trusted-server-core/src/integrations/generated/aps_renderer_bootstrap_v1.html"
+);
 
 struct CorpusCase {
     name: &'static str,
@@ -444,6 +450,92 @@ fn assert_success(case_name: &str, response: &Response) {
     );
 }
 
+fn exact_renderer_method_response(response: Response) -> bool {
+    if response.status().as_u16() != 405
+        || response.headers().get_all("allow").iter().count() != 1
+        || response
+            .headers()
+            .get("allow")
+            .is_none_or(|value| value != "GET")
+        || response.headers().get_all("cache-control").iter().count() != 1
+        || response
+            .headers()
+            .get("cache-control")
+            .is_none_or(|value| value != "no-store")
+    {
+        return false;
+    }
+    let semantic_headers: BTreeSet<&str> = response
+        .headers()
+        .keys()
+        .map(reqwest::header::HeaderName::as_str)
+        .filter(|name| {
+            !matches!(
+                *name,
+                "connection" | "content-length" | "date" | "server" | "transfer-encoding"
+            )
+        })
+        .collect();
+    semantic_headers == BTreeSet::from(["allow", "cache-control"])
+        && response.bytes().is_ok_and(|body| body.is_empty())
+}
+
+fn assert_exact_local_failure(response: Response, status: u16, allow_get: bool) {
+    assert_eq!(response.status().as_u16(), status);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    if allow_get {
+        assert_eq!(response.headers()["allow"], "GET");
+    } else {
+        assert!(!response.headers().contains_key("allow"));
+    }
+    let semantic_headers: BTreeSet<&str> = response
+        .headers()
+        .keys()
+        .map(reqwest::header::HeaderName::as_str)
+        .filter(|name| {
+            !matches!(
+                *name,
+                "connection" | "content-length" | "date" | "server" | "transfer-encoding"
+            )
+        })
+        .collect();
+    let expected = if allow_get {
+        BTreeSet::from(["allow", "cache-control"])
+    } else {
+        BTreeSet::from(["cache-control"])
+    };
+    assert_eq!(semantic_headers, expected);
+    assert!(
+        response
+            .bytes()
+            .expect("local failure body should be readable")
+            .is_empty()
+    );
+}
+
+fn wait_for_cloudflare_renderer_readiness(client: &Client, base_url: &str) {
+    let deadline = Instant::now() + CLOUDFLARE_READINESS_TIMEOUT;
+    let mut consecutive = 0_u8;
+    while consecutive < 2 {
+        let exact = client
+            .request(
+                reqwest::Method::from_bytes(b"PROPFIND").expect("PROPFIND should be valid"),
+                format!("{base_url}{RENDERER_V1_PATH}"),
+            )
+            .send()
+            .is_ok_and(exact_renderer_method_response);
+        consecutive = if exact { consecutive + 1 } else { 0 };
+        if consecutive == 2 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Cloudflare renderer route did not produce two consecutive exact readiness responses"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[test]
 #[ignore = "requires a feature-gated adapter artifact and its local runtime"]
 fn actual_adapter_proxy_corpus() {
@@ -465,18 +557,42 @@ fn actual_adapter_proxy_corpus() {
         .build()
         .expect("should build downstream client");
 
+    if runtime_id == "cloudflare" {
+        wait_for_cloudflare_renderer_readiness(&client, &process.base_url);
+    }
+
+    // Independent corpus assertion: readiness never substitutes for endpoint acceptance.
     let response = client
         .request(
             reqwest::Method::from_bytes(b"PROPFIND").expect("PROPFIND should be valid"),
-            format!("{}{}", process.base_url, "/integrations/aps/renderer/v1"),
+            format!("{}{}", process.base_url, RENDERER_V1_PATH),
         )
         .header("authorization", "Bearer must-not-reach-publisher")
         .send()
         .expect("PROPFIND reserved request should complete");
-    assert_eq!(response.status().as_u16(), 405);
-    assert_eq!(response.headers()["allow"], "GET");
-    assert_eq!(response.headers()["cache-control"], "no-store");
-    let semantic_headers: BTreeSet<&str> = response
+    assert_exact_local_failure(response, 405, true);
+
+    let renderer = client
+        .get(format!("{}{}", process.base_url, RENDERER_V1_PATH))
+        .send()
+        .expect("renderer request should complete");
+    assert_eq!(renderer.status().as_u16(), 200);
+    assert_eq!(
+        renderer.headers()["content-type"],
+        "text/html; charset=utf-8"
+    );
+    assert_eq!(
+        renderer.headers()["cache-control"],
+        "public, max-age=31536000, immutable"
+    );
+    assert_eq!(renderer.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(renderer.headers()["referrer-policy"], "no-referrer");
+    assert_eq!(
+        renderer.headers()["content-security-policy"],
+        RENDERER_V1_CSP
+    );
+    assert!(!renderer.headers().contains_key("x-frame-options"));
+    let semantic_headers: BTreeSet<&str> = renderer
         .headers()
         .keys()
         .map(reqwest::header::HeaderName::as_str)
@@ -487,13 +603,34 @@ fn actual_adapter_proxy_corpus() {
             )
         })
         .collect();
-    assert_eq!(semantic_headers, BTreeSet::from(["allow", "cache-control"]));
-    assert!(
-        response
-            .bytes()
-            .expect("405 body should be readable")
-            .is_empty()
+    assert_eq!(
+        semantic_headers,
+        BTreeSet::from([
+            "cache-control",
+            "content-security-policy",
+            "content-type",
+            "referrer-policy",
+            "x-content-type-options",
+        ])
     );
+    assert_eq!(
+        renderer
+            .bytes()
+            .expect("renderer body should be readable")
+            .as_ref(),
+        RENDERER_V1_DOCUMENT.as_bytes()
+    );
+
+    for path in [
+        "/integrations/aps/renderer/v2",
+        "/integrations/aps/runner/v1.js",
+    ] {
+        let response = client
+            .get(format!("{}{path}", process.base_url))
+            .send()
+            .expect("unknown APS route request should complete");
+        assert_exact_local_failure(response, 404, false);
+    }
     fixture.assert_no_proxy_observation(0, Duration::from_millis(150));
 
     for (observation_index, case) in corpus(runtime_id).into_iter().enumerate() {

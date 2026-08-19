@@ -5,6 +5,7 @@ const packageRoot = path.resolve(import.meta.dirname, '..');
 const repositoryRoot = path.resolve(packageRoot, '../../..');
 const extensions = new Set([
   '.css',
+  '.html',
   '.js',
   '.json',
   '.md',

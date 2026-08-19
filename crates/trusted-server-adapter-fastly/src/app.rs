@@ -1484,7 +1484,10 @@ mod tests {
         assert!(!response.headers().contains_key("x-frame-options"));
         let body = response.into_body().into_bytes().unwrap_or_default();
         let body = std::str::from_utf8(&body).expect("renderer should be UTF-8");
-        assert!(body.contains("/integrations/aps/runner.js"));
+        assert!(body.contains("TS APS Bootstrap Ready"));
+        assert!(!body.contains("/integrations/aps/runner.js"));
+        assert!(!body.contains("aaxResponse"));
+        assert!(!body.contains("creativeUrl"));
         assert!(!body.contains("client.aps.amazon-adsystem.com"));
 
         for (method, path, expected) in [
