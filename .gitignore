@@ -49,6 +49,7 @@ src/*.html
 
 /guest-profiles
 /benchmark-results/**
+/.worktrees/
 
 # Playwright browser tests
 /crates/trusted-server-integration-tests/browser/node_modules/
