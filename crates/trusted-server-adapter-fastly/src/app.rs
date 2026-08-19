@@ -52,8 +52,8 @@
 //! `route_request` (tracked in issue #495):
 //!
 //! - [`build_ec_request_state`] runs before every dispatched route (except
-//!   batch-sync, which uses Bearer auth, and the read-only admin EIDs
-//!   diagnostic) and reproduces the legacy
+//!   batch-sync, which uses Bearer auth, and the read-only admin diagnostics)
+//!   and reproduces the legacy
 //!   pre-routing prelude: device signals, bot gate, `ts-eids`/`sharedid`
 //!   cookie capture, geo lookup, [`EcContext`] creation, and KV-graph gating.
 //! - `handle_auction` and integration proxy dispatch receive the same
@@ -532,13 +532,27 @@ async fn execute_named(
         return Ok(run_batch_sync(&state, &services, req));
     }
 
-    // This diagnostic only previews request cookies. Running the normal EC
-    // lifecycle would attach finalization state and could ingest those cookies
-    // into KV after the handler returns, violating the endpoint's read-only
-    // contract.
-    if matches!(handler, NamedRouteHandler::AdminEidsLookup) {
+    // These diagnostics are read-only. Running the normal EC lifecycle would
+    // attach finalization state and could ingest request cookies into KV after
+    // the handler returns, violating that contract.
+    if matches!(
+        handler,
+        NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup
+    ) {
         let response = PartnerRegistry::from_config(&state.settings.ec.partners)
-            .and_then(|registry| handle_admin_eids_lookup(&registry, &req))
+            .and_then(|registry| match handler {
+                NamedRouteHandler::AdminEcLookup => {
+                    // Deliberately do not use an EC request-state graph: that
+                    // copy is bot-gated, while operators use curl for this
+                    // authenticated diagnostic.
+                    let kv = crate::maybe_identity_graph(&state.settings);
+                    handle_admin_ec_lookup(kv.as_ref(), &registry, &req)
+                }
+                NamedRouteHandler::AdminEidsLookup => {
+                    handle_admin_eids_lookup(&registry, &req)
+                }
+                _ => unreachable!("admin diagnostics should use early dispatch"),
+            })
             .unwrap_or_else(|error| http_error(&error));
         return Ok(response);
     }
@@ -592,16 +606,8 @@ async fn run_named_route(
         }
         NamedRouteHandler::RotateKey => handle_rotate_key(&state.settings, services, req),
         NamedRouteHandler::DeactivateKey => handle_deactivate_key(&state.settings, services, req),
-        NamedRouteHandler::AdminEcLookup => {
-            // Deliberately NOT `ec.kv_graph`: that copy is bot-gated (None for
-            // non-browser clients), and operators hit this auth-gated endpoint
-            // with curl. Build the graph directly from settings instead.
-            let kv = crate::maybe_identity_graph(&state.settings);
-            let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
-            handle_admin_ec_lookup(kv.as_ref(), &partner_registry, &req)
-        }
-        NamedRouteHandler::AdminEidsLookup => {
-            unreachable!("admin EIDs lookup should be handled before EC setup")
+        NamedRouteHandler::AdminEcLookup | NamedRouteHandler::AdminEidsLookup => {
+            unreachable!("admin diagnostics should be handled before EC setup")
         }
         NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
         NamedRouteHandler::BatchSync => {
@@ -2232,6 +2238,49 @@ mod tests {
                 .get::<super::EcFinalizeState>()
                 .is_none(),
             "admin EIDs diagnostics should not attach EC finalization state"
+        );
+    }
+
+    #[test]
+    fn admin_ec_diagnostic_skips_ec_finalization() {
+        let router = test_router();
+        let ec_id = format!("{}.abc123", "a".repeat(64));
+        let eids = serde_json::json!([{
+            "source": "example.com",
+            "uids": [{ "id": "example-uid", "atype": 1 }]
+        }]);
+        let eids_cookie = base64::engine::general_purpose::STANDARD.encode(eids.to_string());
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri(format!(
+                "https://test-publisher.com/_ts/admin/ec/{ec_id}"
+            ))
+            .header(header::AUTHORIZATION, "Basic YWRtaW46YWRtaW4tcGFzcw==")
+            .header(
+                header::COOKIE,
+                format!("ts-ec={ec_id}; ts-eids={eids_cookie}; sharedId=example-shared-id"),
+            )
+            .body(Body::empty())
+            .expect("should build authenticated EC diagnostic request");
+        request.extensions_mut().insert(DeviceSignals::derive(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        ));
+
+        let response = route(&router, request);
+
+        assert!(
+            response
+                .extensions()
+                .get::<super::EcFinalizeState>()
+                .is_none(),
+            "admin EC diagnostics should not attach EC finalization state"
+        );
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "admin EC diagnostics should not mutate the EC cookie"
         );
     }
 
