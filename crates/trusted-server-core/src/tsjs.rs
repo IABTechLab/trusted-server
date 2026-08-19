@@ -5,14 +5,17 @@ use error_stack::Report;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use trusted_server_js::{
-    TsjsModulePhase, all_integration_metadata, all_module_ids, concatenated_hash, release_id,
-    single_module_hash,
+    TsjsModulePhase, all_integration_metadata, concatenated_hash, release_id, single_module_hash,
 };
 use validator::Validate;
 
 use crate::auction::types::{BidRenderSourceV1, BrowserAuctionProjectionV1, SlotAuctionDecisionV1};
 use crate::error::TrustedServerError;
 use crate::settings::{IntegrationConfig, Settings};
+
+/// Canonical empty initial auction projection used when no auction ran or a
+/// projection fails closed.
+pub(crate) const EMPTY_AUCTION_PROJECTION_JSON_V1: &str = r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"slots":[],"bids":[]}"#;
 
 /// Serialize the production size-admitted first-display bootstrap transport.
 ///
@@ -742,7 +745,7 @@ mod tests {
                 .all(|character| character.is_ascii_digit() || ('a'..='f').contains(&character)),
             "should use lowercase hexadecimal"
         );
-        for id in all_module_ids() {
+        for id in trusted_server_js::all_module_ids() {
             let bundle = trusted_server_js::module_bundle(id).expect("should include known module");
             assert_eq!(
                 bundle.matches(release).count(),
@@ -1023,24 +1026,6 @@ mod tests {
             )
             .is_ok(),
             "creative membership is required only when a guard has browser work"
-        );
-    }
-
-    #[test]
-    fn tsjs_unified_helpers_use_all_module_ids() {
-        let ids = all_module_ids();
-
-        assert_eq!(
-            tsjs_script_tag_with_attributes(&module_ids, &[("data-ts-gam-attribution", "true")]),
-            format!(
-                "<script src=\"{src}\" id=\"trustedserver-js\" data-ts-gam-attribution=\"true\"></script>"
-            ),
-            "should render trusted static attributes on the publisher bundle tag"
-        );
-        assert_eq!(
-            tsjs_script_tag(&module_ids),
-            format!("<script src=\"{src}\" id=\"trustedserver-js\"></script>"),
-            "should keep the generic tag byte-for-byte unmarked"
         );
     }
 

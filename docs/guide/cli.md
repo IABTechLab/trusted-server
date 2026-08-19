@@ -167,6 +167,7 @@ Given a site whose ad units track the section, the run produces:
 
 ```toml
 [creative_opportunities]
+enabled = true
 gam_network_id = "99999"
 section_root = "homepage"
 section_segment = 0

@@ -1135,35 +1135,6 @@ mod tests {
     }
 
     #[test]
-    fn head_inserts_queue_gam_attribution_before_guard_and_ad_requests() {
-        let targeting_index = GPT_BOOTSTRAP_JS
-            .find("gpt.setConfig({ targeting: { ts: 'true' } })")
-            .expect("should apply the fixed page-level GAM targeting pair");
-        let guard_index = GPT_BOOTSTRAP_JS
-            .find("if (ts.adInit) return;")
-            .expect("should retain the preinstalled adInit guard");
-        let display_index = GPT_BOOTSTRAP_JS
-            .find("googletag.display(divId);")
-            .expect("should retain the executable GPT display call");
-        let refresh_index = GPT_BOOTSTRAP_JS
-            .find("googletag.pubads().refresh(slotsNeedingRefresh);")
-            .expect("should retain the bounded GPT refresh call");
-
-        assert!(
-            targeting_index < guard_index,
-            "should enqueue attribution before the preinstalled adInit guard"
-        );
-        assert!(
-            targeting_index < display_index,
-            "should enqueue attribution before the executable display call"
-        );
-        assert!(
-            targeting_index < refresh_index,
-            "should enqueue attribution before the executable refresh call"
-        );
-    }
-
-    #[test]
     fn head_injector_integration_id() {
         let integration = GptIntegration::new(test_config());
         assert_eq!(

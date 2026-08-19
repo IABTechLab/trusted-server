@@ -145,7 +145,7 @@ describe('GPT diagnostics public types', () => {
     expectTypeOf(evidenceCycle.requestIntentId).toEqualTypeOf<number | undefined>();
     expectTypeOf(evidenceCycle.trustedServerAuctionId).toEqualTypeOf<string | undefined>();
     expectTypeOf(evidenceSnapshot.attributionIssues).toEqualTypeOf<
-      GptDiagnosticsAttributionIssue[]
+      readonly Readonly<GptDiagnosticsAttributionIssue>[]
     >();
     expectTypeOf(evidenceSnapshot.metadata.droppedAttributionIssues).toEqualTypeOf<number>();
     expectTypeOf<GptDiagnosticsAttributionIssueReason>().toEqualTypeOf<

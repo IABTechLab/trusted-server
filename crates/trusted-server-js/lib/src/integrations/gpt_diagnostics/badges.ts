@@ -117,6 +117,10 @@ function deliveryLabel(cycle: GptDiagnosticsRequestCycle): string | undefined {
   }
 }
 
+function formatSizes(sizes: ReadonlyArray<readonly [number, number]>): string {
+  return sizes.map((size) => `${size[0]}×${size[1]}`).join(', ');
+}
+
 /** Format one observed GPT request cycle for both badge and accessible text surfaces. */
 export function formatGptDiagnosticsBadgeText(cycle: GptDiagnosticsRequestCycle): string {
   const firstLine: string[] = [];

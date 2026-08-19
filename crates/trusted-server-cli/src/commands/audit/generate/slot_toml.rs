@@ -452,10 +452,11 @@ pub(super) fn splice_creative_slots(
         );
     }
 
-    // No section yet — append a fresh one with the network id and slots.
+    // No section yet — append a fresh explicitly enabled one with the network id and slots.
     if !has_canonical_header {
-        // `gam_network_id` is a required field, so creating the section without
-        // one writes a config that cannot load at all. This is reachable: the
+        // `enabled` and `gam_network_id` are required fields. Enablement is known
+        // because this command was explicitly asked to create discovered slots;
+        // a missing network id would still write a config that cannot load. This is reachable: the
         // network id is only recovered when the scraped unit path starts with an
         // all-digit segment, which an MCM/child-network path like
         // `/1234,5678/home/header` does not.
@@ -472,7 +473,7 @@ pub(super) fn splice_creative_slots(
         if !result.is_empty() && !result.ends_with('\n') {
             result.push('\n');
         }
-        result.push_str("\n[creative_opportunities]\n");
+        result.push_str("\n[creative_opportunities]\nenabled = true\n");
         for (_, line) in keys.lines() {
             result.push_str(&line);
             result.push('\n');
@@ -785,7 +786,8 @@ mod tests {
     }
 
     fn existing_config(toml_str: &str) -> CreativeOpportunitiesConfig {
-        toml::from_str::<CreativeOpportunitiesConfig>(toml_str).expect("valid creative config")
+        toml::from_str::<CreativeOpportunitiesConfig>(&format!("enabled = true\n{toml_str}"))
+            .expect("valid creative config")
     }
 
     #[test]
@@ -803,6 +805,10 @@ mod tests {
         assert!(
             out.contains("gam_network_id = \"222\""),
             "network id updated"
+        );
+        assert!(
+            out.contains("enabled = true"),
+            "hard-cutover enablement should be preserved"
         );
         assert!(!out.contains("id = \"old\""), "old slot removed");
         assert!(

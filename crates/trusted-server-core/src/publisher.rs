@@ -44,15 +44,13 @@ use crate::auction::telemetry::{
     emit_auction_events_best_effort_lazy,
 };
 use crate::auction::types::{
-    AdmRenderSourceV1, AuctionContext, AuctionDecisionSetV1, AuctionIdentityGenerator,
-    AuctionRequest, AuctionSlotFailureReason, BaselinePbsCacheSourceV1, Bid, BidRenderSourceV1,
-    BrowserAuctionBidV1, BrowserAuctionProjectionV1, BrowserAuctionSlotV1, DeviceInfo,
-    PublisherInfo, SiteInfo, SlotAuctionDecisionV1, SystemAuctionIdentityGenerator, UserInfo,
-    mint_response_unique_base64url_identity,
+    AdmRenderSourceV1, AuctionContext, AuctionDecisionSetV1, AuctionDropReasons,
+    AuctionIdentityGenerator, AuctionRequest, AuctionSlotFailureReason, BaselinePbsCacheSourceV1,
+    Bid, BidRenderSourceV1, BrowserAuctionBidV1, BrowserAuctionProjectionV1, BrowserAuctionSlotV1,
+    DeviceInfo, PublisherInfo, SiteInfo, SlotAuctionDecisionV1, SystemAuctionIdentityGenerator,
+    UserInfo, mint_response_unique_base64url_identity,
 };
-use crate::cache_policy::{
-    CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
-};
+use crate::cache_policy::{EdgeCacheHeader, cache_control_headers_are_private_or_no_store};
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
@@ -360,6 +358,154 @@ fn accept_encoding_qvalue(header_value: &str, target: &str) -> Option<f32> {
     matched_qvalue
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderEncodingError {
+    Malformed,
+    NoAcceptableEncoding,
+}
+
+fn parse_quality_value(value: &str) -> Option<f32> {
+    let value = value.trim();
+    let (whole, fraction) = value
+        .split_once('.')
+        .map_or((value, None), |(whole, fraction)| (whole, Some(fraction)));
+    if fraction.is_some_and(|fraction| {
+        fraction.len() > 3 || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    }) {
+        return None;
+    }
+    match whole {
+        "0" => value.parse().ok(),
+        "1" if fraction.is_none_or(|fraction| fraction.bytes().all(|byte| byte == b'0')) => {
+            Some(1.0)
+        }
+        _ => None,
+    }
+}
+
+fn negotiate_reader_compression(
+    headers: &edgezero_core::http::HeaderMap,
+) -> Result<Compression, ReaderEncodingError> {
+    if !headers.contains_key(header::ACCEPT_ENCODING) {
+        return Ok(Compression::None);
+    }
+
+    let mut qualities = Vec::<(String, f32)>::new();
+    for field in headers.get_all(header::ACCEPT_ENCODING) {
+        let field = field.to_str().map_err(|_| ReaderEncodingError::Malformed)?;
+        for item in field
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+        {
+            let mut parts = item.split(';');
+            let token = parts
+                .next()
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .ok_or(ReaderEncodingError::Malformed)?
+                .to_ascii_lowercase();
+            if token != "*" && http::HeaderName::from_bytes(token.as_bytes()).is_err() {
+                return Err(ReaderEncodingError::Malformed);
+            }
+            let mut quality = 1.0;
+            let mut saw_quality = false;
+            for parameter in parts {
+                let (name, value) = parameter
+                    .trim()
+                    .split_once('=')
+                    .ok_or(ReaderEncodingError::Malformed)?;
+                if !name.trim().eq_ignore_ascii_case("q") || saw_quality {
+                    return Err(ReaderEncodingError::Malformed);
+                }
+                quality = parse_quality_value(value).ok_or(ReaderEncodingError::Malformed)?;
+                saw_quality = true;
+            }
+            if qualities.iter().any(|(seen, _)| seen == &token) {
+                return Err(ReaderEncodingError::Malformed);
+            }
+            qualities.push((token, quality));
+        }
+    }
+
+    let explicit = |name: &str| {
+        qualities
+            .iter()
+            .find_map(|(candidate, quality)| (candidate == name).then_some(*quality))
+    };
+    let wildcard = explicit("*");
+    let quality_for = |name: &str| explicit(name).or(wildcard).unwrap_or(0.0);
+    let identity_quality =
+        explicit("identity").unwrap_or_else(|| if wildcard == Some(0.0) { 0.0 } else { 1.0 });
+    let candidates = [
+        (Compression::Brotli, quality_for("br")),
+        (Compression::Gzip, quality_for("gzip")),
+        (Compression::Deflate, quality_for("deflate")),
+        (Compression::None, identity_quality),
+    ];
+    let mut selected = None;
+    for (compression, quality) in candidates {
+        if quality > 0.0 && selected.is_none_or(|(_, best)| quality > best) {
+            selected = Some((compression, quality));
+        }
+    }
+    selected
+        .map(|(compression, _)| compression)
+        .ok_or(ReaderEncodingError::NoAcceptableEncoding)
+}
+
+fn set_response_compression(response: &mut Response<EdgeBody>, compression: Compression) {
+    let encoding = match compression {
+        Compression::None => None,
+        Compression::Gzip => Some("gzip"),
+        Compression::Deflate => Some("deflate"),
+        Compression::Brotli => Some("br"),
+    };
+    if let Some(encoding) = encoding {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_ENCODING, HeaderValue::from_static(encoding));
+    } else {
+        response.headers_mut().remove(header::CONTENT_ENCODING);
+    }
+    let varies_on_encoding = response
+        .headers()
+        .get_all(header::VARY)
+        .iter()
+        .any(|value| {
+            value.to_str().is_ok_and(|value| {
+                value
+                    .split(',')
+                    .any(|name| name.trim().eq_ignore_ascii_case("accept-encoding"))
+            })
+        });
+    if !varies_on_encoding {
+        response
+            .headers_mut()
+            .append(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+    }
+    response.headers_mut().remove(header::CONTENT_LENGTH);
+}
+
+fn response_compression(response: &Response<EdgeBody>) -> Compression {
+    response
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(Compression::from_content_encoding)
+        .unwrap_or(Compression::None)
+}
+
+fn encode_complete_body(
+    body: Vec<u8>,
+    compression: Compression,
+) -> Result<Vec<u8>, Report<TrustedServerError>> {
+    let mut encoder = BodyStreamEncoder::new(compression);
+    let mut encoded = encoder.encode_chunk(body)?;
+    encoded.extend_from_slice(&encoder.finish()?);
+    Ok(encoded)
+}
+
 /// Exact content-addressed TSJS release transport.
 ///
 /// # Errors
@@ -424,8 +570,12 @@ pub fn handle_tsjs_dynamic(
             && trusted_server_js::single_module_hash(module_id).as_deref() == Some(requested_hash)
             && let Some(content) = trusted_server_js::module_bundle(module_id)
         {
-            let mut resp =
-                serve_static_with_etag(content, req, "application/javascript; charset=utf-8");
+            let mut resp = serve_static_with_etag(
+                content,
+                req,
+                "application/javascript; charset=utf-8",
+                edge_header,
+            );
             strip_tsjs_head_body(&mut resp, req.method());
             apply_tsjs_success_headers(&mut resp);
             return Ok(resp);
@@ -548,6 +698,7 @@ struct ProcessResponseParams<'a> {
     gpt_diagnostics:
         Option<&'a crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
     render_trace_overlay: bool,
+    shared_template_authorized: bool,
 }
 
 struct PublisherBodyProcessor {
@@ -575,6 +726,10 @@ impl PublisherBodyProcessor {
                 suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
                 gpt_diagnostics: params.gpt_diagnostics.clone(),
                 render_trace_overlay: params.render_trace_overlay,
+                assembly_mode: effective_assembly_mode(
+                    settings,
+                    params.template_cache_key.is_some(),
+                ),
             })?)
         } else if is_rsc_flight {
             Box::new(RscFlightUrlRewriter::new(
@@ -655,6 +810,10 @@ fn process_response_streaming<W: Write>(
             suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
             gpt_diagnostics: params.gpt_diagnostics.cloned(),
             render_trace_overlay: params.render_trace_overlay,
+            assembly_mode: effective_assembly_mode(
+                params.settings,
+                params.shared_template_authorized,
+            ),
         })?;
         StreamingPipeline::new(config, processor)
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
@@ -880,6 +1039,43 @@ impl Drop for DispatchedAuctionGuard {
     }
 }
 
+/// The single inert marker stored in a reader-neutral C2 template.
+pub const AD_ASSEMBLY_SEAM: &str = "<!--ts-ad-seam-->";
+
+fn configured_assembly_mode(settings: &Settings) -> AssemblyMode {
+    settings
+        .creative_opportunities
+        .as_ref()
+        .map(CreativeOpportunitiesConfig::assembly_mode)
+        .unwrap_or_default()
+}
+
+fn mode_emits_seam_marker(mode: AssemblyMode) -> bool {
+    match mode {
+        AssemblyMode::Inline => false,
+        AssemblyMode::Esi => true,
+    }
+}
+
+fn effective_assembly_mode(settings: &Settings, shared_template_authorized: bool) -> AssemblyMode {
+    let configured = configured_assembly_mode(settings);
+    if matches!(configured, AssemblyMode::Inline) || shared_template_authorized {
+        configured
+    } else {
+        log::debug!(
+            "assembly mode {configured:?} is unavailable for this response; falling back to inline"
+        );
+        AssemblyMode::Inline
+    }
+}
+
+fn template_injection(mode: AssemblyMode) -> BodyCloseInjection {
+    match mode {
+        AssemblyMode::Inline => BodyCloseInjection::None,
+        AssemblyMode::Esi => BodyCloseInjection::Marker(AD_ASSEMBLY_SEAM.to_string()),
+    }
+}
+
 /// Create a unified HTML stream processor.
 ///
 /// Builds the config via [`HtmlProcessorConfig::from_settings`] and then
@@ -903,6 +1099,7 @@ struct HtmlStreamProcessorParams<'a> {
     suppress_datadome_client_side_tag: bool,
     gpt_diagnostics: Option<crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision>,
     render_trace_overlay: bool,
+    assembly_mode: AssemblyMode,
 }
 
 fn create_html_stream_processor(
@@ -919,6 +1116,7 @@ fn create_html_stream_processor(
     )
     .with_ad_state(params.ad_slots_script, params.ad_bids_state)
     .with_gpt_diagnostics(params.gpt_diagnostics)
+    .with_body_close(template_injection(params.assembly_mode))
     .with_render_trace_overlay(params.render_trace_overlay)
     .with_datadome_client_tag_suppression(params.suppress_datadome_client_side_tag);
 
@@ -1281,6 +1479,7 @@ pub async fn buffer_publisher_response_async(
                 was_authorized,
                 !contains_publisher_esi,
                 settings,
+                integration_registry,
                 &params,
                 services,
                 bytes,
@@ -1317,6 +1516,7 @@ pub async fn buffer_publisher_response_async(
                     &AuctionCollectDeps {
                         price_granularity: params.price_granularity,
                         ad_bids_state: &params.ad_bids_state,
+                        browser_slots_json: params.ad_slots_script.as_deref(),
                         orchestrator,
                         services,
                         settings,
@@ -1333,7 +1533,7 @@ pub async fn buffer_publisher_response_async(
                     message: "cached template has no usable seam marker".to_string(),
                 }
             })?;
-            let seam = seam_script_for(&params);
+            let seam = seam_script_for(&params, settings, integration_registry);
             let mut assembled = Vec::with_capacity(head.len() + seam.len() + tail.len());
             assembled.extend_from_slice(head);
             assembled.extend_from_slice(seam.as_bytes());
@@ -1369,6 +1569,7 @@ fn assemble_if_shared(
     was_authorized: bool,
     platform_assembly_allowed: bool,
     settings: &Settings,
+    integration_registry: &IntegrationRegistry,
     params: &OwnedProcessResponseParams,
     services: &RuntimeServices,
     bytes: Vec<u8>,
@@ -1382,7 +1583,7 @@ fn assemble_if_shared(
             message: "shared template has no usable seam marker".to_string(),
         }
     })?;
-    let seam = seam_script_for(params);
+    let seam = seam_script_for(params, settings, integration_registry);
 
     let platform_result = platform_assembly_allowed.then(|| {
         services
@@ -1465,22 +1666,89 @@ fn contains_esi_directive(bytes: &[u8]) -> bool {
         .any(|window| window.eq_ignore_ascii_case(b"<esi:"))
 }
 
-/// What this request splices into the seam marker: a `<script>`, or nothing at all.
-///
-/// `seam_ad_slots` is `None` exactly when the ad stack did not run — bot, prefetch,
-/// consent-denied, auction kill switch. Emitting a seam anyway, with `[]` slots, still
-/// calls `scheduleInitialAdInit`, which schedules `adInit` for precisely the traffic
-/// that opted out. Absent is not the same as empty here.
-///
-/// Shared by the miss path and by **both** hit finalizers. They previously each spelled
-/// the decision out, and the two hit paths spelled it `unwrap_or("[]")` — so the gate
-/// held on a cache miss and was ignored on every cache hit.
-fn seam_script_for(params: &OwnedProcessResponseParams) -> String {
-    params
-        .seam_ad_slots
-        .as_deref()
-        .map(|slots| params.ad_bids_state.build_seam_script(slots))
-        .unwrap_or_default()
+/// Build the complete hard-cutover boot fragment inserted into a reader-neutral
+/// C2 template. The template contains neither request projection nor runtime
+/// bytes; both arrive atomically at this one per-reader seam.
+fn seam_script_for(
+    params: &OwnedProcessResponseParams,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) -> String {
+    let state = params
+        .ad_bids_state
+        .lock()
+        .expect("should lock C2 boot projection")
+        .clone();
+    let (debug_comment, projection_json) = match state.as_deref() {
+        Some(value) if value.starts_with("<!-- ts-debug:") => value.rsplit_once('\n').map_or(
+            (Some(value), crate::tsjs::EMPTY_AUCTION_PROJECTION_JSON_V1),
+            |(debug, json)| (Some(debug), json),
+        ),
+        Some(value) => (None, value),
+        None => (None, crate::tsjs::EMPTY_AUCTION_PROJECTION_JSON_V1),
+    };
+    let diagnostics_requested = params
+        .gpt_diagnostics
+        .as_ref()
+        .is_some_and(crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision::active);
+    let creative = integration_registry.tsjs_creative_boot();
+    let selection = crate::integrations::TsjsCatalogSelectionV1 {
+        creative_enabled: creative.enabled,
+        creative_click_guard: creative.click_guard,
+        creative_render_guard: creative.render_guard,
+        gpt_diagnostics_active: diagnostics_requested,
+        render_trace_overlay: params.render_trace_overlay,
+    };
+    let module_ids = integration_registry.tsjs_catalog_module_ids(selection);
+    let diagnostics_active = module_ids.contains(&"gpt_diagnostics");
+    let publisher_origin = request_origin(&params.request_scheme, &params.request_host);
+    let boot = crate::tsjs::tsjs_bootstrap_fragment_v1(
+        crate::tsjs::TsjsBootScriptConfigV1 {
+            module_ids: &module_ids,
+            auction_projection_json: projection_json,
+            creative,
+            render_trace_overlay: params.render_trace_overlay,
+            gpt_diagnostics_active: diagnostics_active,
+        },
+        &publisher_origin,
+    )
+    .or_else(|error| {
+        log::error!("invalid C2 TSJS boot projection: {error:?}");
+        crate::tsjs::tsjs_bootstrap_fragment_v1(
+            crate::tsjs::TsjsBootScriptConfigV1 {
+                module_ids: &module_ids,
+                auction_projection_json: crate::tsjs::EMPTY_AUCTION_PROJECTION_JSON_V1,
+                creative,
+                render_trace_overlay: params.render_trace_overlay,
+                gpt_diagnostics_active: diagnostics_active,
+            },
+            &publisher_origin,
+        )
+    })
+    .unwrap_or_default();
+
+    let mut seam = String::new();
+    if let Some(debug_comment) = debug_comment {
+        seam.push_str(debug_comment);
+        seam.push('\n');
+    }
+    let document_state = crate::integrations::IntegrationDocumentState::default();
+    let fallback_origin_host = settings.publisher.origin_host();
+    let context = crate::integrations::IntegrationHtmlContext {
+        request_host: &params.request_host,
+        request_scheme: &params.request_scheme,
+        origin_host: if params.origin_host.is_empty() {
+            &fallback_origin_host
+        } else {
+            &params.origin_host
+        },
+        document_state: &document_state,
+    };
+    for insert in integration_registry.head_inserts(&context) {
+        seam.push_str(&insert);
+    }
+    seam.push_str(&boot);
+    seam
 }
 
 /// Builds the injection state a cached template needs on the way out.
@@ -1494,6 +1762,7 @@ fn build_template_assembly_params(
     request_scheme: &str,
     price_granularity: PriceGranularity,
     ad_bids_state: AdBidsState,
+    render_trace_overlay: bool,
 ) -> OwnedProcessResponseParams {
     OwnedProcessResponseParams {
         // Already stored; storing again on a hit would be pointless work.
@@ -1515,6 +1784,7 @@ fn build_template_assembly_params(
         price_granularity,
         gpt_diagnostics: None,
         suppress_datadome_client_side_tag: false,
+        render_trace_overlay,
     }
 }
 
@@ -1801,6 +2071,7 @@ pub async fn publisher_response_into_streaming_response(
             let services = services.clone();
             let settings = Arc::clone(&settings);
             let orchestrator = Arc::clone(&orchestrator);
+            let integration_registry = integration_registry.clone();
             let compression = response_compression(&response);
             // Arm the drop warning before constructing the lazy body. A reader can
             // disconnect after receiving the cached article prefix but before the seam
@@ -1837,6 +2108,7 @@ pub async fn publisher_response_into_streaming_response(
                         &AuctionCollectDeps {
                             price_granularity: params.price_granularity,
                             ad_bids_state: &params.ad_bids_state,
+                            browser_slots_json: params.ad_slots_script.as_deref(),
                             orchestrator: &orchestrator,
                             services: &services,
                             settings: &settings,
@@ -1850,7 +2122,7 @@ pub async fn publisher_response_into_streaming_response(
                     guard.disarm();
                 }
 
-                let seam = seam_script_for(&params);
+                let seam = seam_script_for(&params, &settings, &integration_registry);
                 if !seam.is_empty() {
                     let encoded_seam = encoder
                         .encode_chunk(seam.into_bytes())
@@ -2155,6 +2427,7 @@ pub fn stream_publisher_body<W: Write>(
         suppress_datadome_client_side_tag: params.suppress_datadome_client_side_tag,
         gpt_diagnostics: params.gpt_diagnostics.as_ref(),
         render_trace_overlay: params.render_trace_overlay,
+        shared_template_authorized: params.template_cache_key.is_some(),
     };
     let input_compression = Compression::from_content_encoding(&params.content_encoding);
     let output_compression = if params.template_cache_key.is_some() {
@@ -2326,8 +2599,10 @@ pub(crate) fn should_run_server_side_ad_stack(
     has_matched_slots: bool,
     consent_allows_auction: bool,
     auction_enabled: bool,
+    ad_templates_enabled: bool,
 ) -> bool {
-    is_get
+    ad_templates_enabled
+        && is_get
         && is_navigation
         && !is_prefetch
         && !is_bot
@@ -2356,6 +2631,46 @@ fn request_origin(scheme: &str, host: &str) -> String {
         String::new()
     } else {
         format!("{scheme}://{host}")
+    }
+}
+
+/// Shared, single-writer initial browser projection for HTML processing and
+/// per-reader C2 assembly.
+#[derive(Clone, Default)]
+pub(crate) struct AdBidsState {
+    projection: Arc<Mutex<Option<String>>>,
+}
+
+impl core::ops::Deref for AdBidsState {
+    type Target = Mutex<Option<String>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.projection
+    }
+}
+
+#[cfg(test)]
+impl AdBidsState {
+    fn with_script(value: &str) -> Self {
+        let state = Self::default();
+        *state.lock().expect("should lock projection state") = Some(value.to_string());
+        state
+    }
+}
+
+impl AdBidsState {
+    pub(crate) fn script_cell(&self) -> &Arc<Mutex<Option<String>>> {
+        &self.projection
+    }
+
+    fn prepend_to_script(&self, comment: &str) {
+        let mut state = self
+            .lock()
+            .expect("should lock projection state for debug prefix");
+        match &mut *state {
+            Some(projection) => *projection = format!("{comment}\n{projection}"),
+            None => *state = Some(comment.to_string()),
+        }
     }
 }
 
@@ -2484,25 +2799,6 @@ pub(crate) fn write_projection_to_state(
 /// enabled cannot bloat every page render without bound.
 const MAX_AUCTION_DEBUG_DUMP_BYTES: usize = 256 * 1024;
 
-/// Provider-metadata keys safe to surface in the on-page `ts-debug` dump.
-///
-/// Fail-closed allowlist: any key not listed — notably `debug`, which carries
-/// the resolved `OpenRTB` request (EC ID, `user.ext.eids`, the TC consent string,
-/// `device.ip`, and `device.geo`) plus per-bidder `httpcalls` — is dropped so a
-/// visitor's identity graph cannot reach the client-readable DOM even when
-/// `[integration.prebid].debug` is also enabled. Full debug detail remains
-/// available server-side via `log::trace!`.
-const DEBUG_DUMP_METADATA_ALLOWLIST: &[&str] = &[
-    "drop_reasons",
-    "error_type",
-    "status",
-    "message",
-    "responsetimemillis",
-    "errors",
-    "warnings",
-    "bidstatus",
-];
-
 /// Per-bid creative preview length (in bytes) in the `ts-debug` dump. Mirrors
 /// the 512-byte upstream-body preview the prebid provider logs on an HTTP error
 /// (`integrations/prebid.rs`): enough to identify a creative without copying
@@ -2542,6 +2838,20 @@ fn validated_http_status(
         .filter(|status| (100..=599).contains(status))
 }
 
+/// Return only the closed, typed local drop-reason map emitted by TS itself.
+/// Unknown names, non-integer counts, zero counts, and mixed-validity maps are
+/// rejected as a whole rather than copying provider-controlled JSON into HTML.
+fn validated_drop_reasons(
+    metadata: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let reasons =
+        serde_json::from_value::<AuctionDropReasons>(metadata.get("drop_reasons")?.clone()).ok()?;
+    if reasons.is_empty() || reasons.values().any(|count| *count == 0) {
+        return None;
+    }
+    serde_json::to_value(reasons).ok()
+}
+
 /// Generate public diagnostic wording without copying provider-controlled text.
 fn safe_error_message(error_type: &str, http_status: Option<u64>) -> Option<String> {
     match error_type {
@@ -2573,6 +2883,11 @@ fn redacted_metadata_for_dump(
     let http_status = validated_http_status(metadata);
     let mut safe = serde_json::Map::new();
 
+    if selected("drop_reasons")
+        && let Some(value) = validated_drop_reasons(metadata)
+    {
+        safe.insert("drop_reasons".to_string(), value);
+    }
     if selected("error_type")
         && let Some(value) = error_type
     {
@@ -2771,7 +3086,7 @@ struct AuctionTelemetryCarry {
 /// streaming loop.
 struct AuctionCollectDeps<'a> {
     price_granularity: PriceGranularity,
-    ad_bids_state: &'a Arc<Mutex<Option<String>>>,
+    ad_bids_state: &'a AdBidsState,
     browser_slots_json: Option<&'a str>,
     orchestrator: &'a AuctionOrchestrator,
     services: &'a RuntimeServices,
@@ -3061,6 +3376,10 @@ pub async fn handle_publisher_request(
         !matched_slots.is_empty(),
         consent_allows_auction,
         auction.orchestrator.is_enabled(),
+        settings
+            .creative_opportunities
+            .as_ref()
+            .is_some_and(|config| config.enabled),
     );
     let should_run_auction = should_run_ad_stack;
     // Diagnostic: shows which gate suppresses the server-side auction. Pair with
@@ -3318,15 +3637,17 @@ pub async fn handle_publisher_request(
         })?,
     );
 
-    // The slots the head seam deliberately withheld, routed to the `</body>` seam so they
-    // travel per request instead of into a template shared between readers.
-    let seam_ad_slots = seam_ad_slots_json(
-        assembly_mode,
-        should_run_ad_stack,
-        settings,
-        &matched_slots,
-        &request_path,
-    );
+    // Exact ordered placements are request state. Inline processing carries
+    // them in the head boot; C2 carries the same JSON in its per-reader seam.
+    let browser_slots_json = should_run_ad_stack
+        .then(|| {
+            settings
+                .creative_opportunities
+                .as_ref()
+                .map(|config| build_browser_slots_json(&matched_slots, config, &request_path))
+        })
+        .flatten();
+    let seam_ad_slots = browser_slots_json.clone();
 
     // C2 lookup, before the origin fetch — the whole point is to skip it.
     //
@@ -3387,8 +3708,10 @@ pub async fn handle_publisher_request(
                         request_scheme,
                         price_granularity,
                         ad_bids_state.clone(),
+                        render_trace_overlay,
                     );
                     params.seam_ad_slots = seam_ad_slots.clone();
+                    params.ad_slots_script = browser_slots_json.clone();
                     params.dispatched_auction = dispatched_auction.take();
                     params.auction_observation = auction_observation.take();
                     params.auction_request = auction_request_for_telemetry.clone();
@@ -3493,11 +3816,49 @@ pub async fn handle_publisher_request(
 
     crate::integrations::gpt_diagnostics::finalize_response(&gpt_diagnostics, &mut response);
 
-    let ad_slots_script = if should_run_ad_stack {
-        settings
-            .creative_opportunities
-            .as_ref()
-            .map(|co_config| build_browser_slots_json(&matched_slots, co_config, &request_path))
+    // A request key only authorizes lookup. The origin response must separately
+    // prove that the transformed representation is safe and fresh enough to
+    // store before the reservation becomes an authorized C2 write.
+    let c2_cache_policy = C2CachePolicy::from_settings(settings);
+    let gate_content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let mut template_cache_key = template_cache_reservation.and_then(|reservation| {
+        match c2_cache_ttl(
+            assembly_mode,
+            request_had_authorization,
+            cookie_disqualifies,
+            response.status(),
+            &gate_content_type,
+            response.headers(),
+            &c2_cache_policy,
+        ) {
+            Err(reason) => {
+                log::debug!("c2_template_cache bypass: {reason}");
+                None
+            }
+            Ok(ttl) => Instant::now()
+                .checked_add(ttl)
+                .map(|expires_at| AuthorizedTemplateStore {
+                    reservation,
+                    expires_at,
+                }),
+        }
+    });
+    let policy_headers = if template_cache_key.is_some() {
+        match replayable_policy_headers(response.headers()) {
+            Ok(headers) => headers,
+            Err(reason) => {
+                log::warn!(
+                    "c2_template_cache bypass: policy metadata changed after validation ({reason})"
+                );
+                template_cache_key = None;
+                Vec::new()
+            }
+        }
     } else {
         Vec::new()
     };
@@ -3512,15 +3873,7 @@ pub async fn handle_publisher_request(
     // from configuration. Deciding them independently is what produced a document with
     // unresolved executable ESI markup and no bids: the body seam saw `Esi` and emitted
     // a marker, the head seam emitted no `adSlots`, and nothing assembled either.
-    let assembly_mode = effective_assembly_mode(settings, template_cache_key.is_some());
-
-    let ad_slots_script = template_ad_slots_script(
-        assembly_mode,
-        should_run_ad_stack,
-        settings,
-        &matched_slots,
-        &request_path,
-    );
+    let ad_slots_script = browser_slots_json.clone();
 
     // §4.7: HTML with synthesized per-navigation auction state must not be
     // stored or validated as an origin representation. Strip both browser and
@@ -4118,6 +4471,447 @@ fn match_renderable_slots(
         .collect()
 }
 
+/// Why a response cannot enter the shared transformed-template cache.
+#[derive(Debug, Clone, PartialEq, Eq, derive_more::Display)]
+pub(crate) enum C2BypassReason {
+    #[display("assembly mode is inline")]
+    InlineMode,
+    #[display("origin response carries Set-Cookie")]
+    OriginSetCookie,
+    #[display("origin cache policy is not eligible for C2 sharing")]
+    OriginNotShareable,
+    #[display("origin cache policy is malformed")]
+    MalformedCachePolicy,
+    #[display("origin response has no positive shared freshness")]
+    NoPositiveFreshness,
+    #[display("request carried Authorization")]
+    AuthorizedRequest,
+    #[display("status was not 200 OK")]
+    NonOkStatus,
+    #[display("content type is not text/html")]
+    NotHtml,
+    #[display("origin representation headers are ambiguous or malformed")]
+    MalformedRepresentationHeaders,
+    #[display("origin content encoding is not supported by the template transform")]
+    UnsupportedContentEncoding,
+    #[display("request carried Cookie and the origin's Vary does not cover it")]
+    CookieForwarded,
+    #[display("origin varies on {_0}, which the cache key does not cover")]
+    VaryNotCovered(VaryGap),
+    #[display("origin sent Vary: *, so no request key can select this response")]
+    VaryWildcard,
+    #[display("origin sent Vary: Cookie, contradicting cookie independence")]
+    VaryCookie,
+    #[display("origin CSP contains a response-bound nonce")]
+    CspNonce,
+    #[display("origin policy header is malformed")]
+    MalformedPolicyHeader,
+}
+
+fn request_bypasses_c2(headers: &edgezero_core::http::HeaderMap) -> bool {
+    const CONDITIONAL_OR_PARTIAL: &[&str] = &[
+        "range",
+        "if-range",
+        "if-match",
+        "if-none-match",
+        "if-modified-since",
+        "if-unmodified-since",
+    ];
+    if CONDITIONAL_OR_PARTIAL
+        .iter()
+        .any(|name| headers.contains_key(*name))
+    {
+        return true;
+    }
+    for value in headers.get_all(header::CACHE_CONTROL) {
+        let Ok(value) = value.to_str() else {
+            return true;
+        };
+        for directive in value.split(',').map(str::trim) {
+            let (name, argument) = directive
+                .split_once('=')
+                .map_or((directive, None), |(name, argument)| (name, Some(argument)));
+            match name.trim().to_ascii_lowercase().as_str() {
+                "no-cache" | "no-store" => return true,
+                "max-age"
+                    if argument.and_then(|value| parse_delta_seconds(value).ok()) != Some(0) =>
+                {
+                    return true;
+                }
+                "min-fresh" => return true,
+                _ => {}
+            }
+        }
+    }
+    headers.get_all(header::PRAGMA).iter().any(|value| {
+        value.to_str().map_or(true, |value| {
+            value.split(',').any(|directive| {
+                directive
+                    .split_once('=')
+                    .map_or(directive, |(name, _)| name)
+                    .trim()
+                    .eq_ignore_ascii_case("no-cache")
+            })
+        })
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VaryGap(Vec<String>);
+
+impl core::fmt::Display for VaryGap {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0.join(", "))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct C2CachePolicy {
+    key_vary: VarySpec,
+    max_age: Duration,
+}
+
+impl C2CachePolicy {
+    fn from_settings(settings: &Settings) -> Self {
+        settings.creative_opportunities.as_ref().map_or_else(
+            || Self {
+                key_vary: VarySpec::new([]),
+                max_age: Duration::from_secs(60),
+            },
+            |config| Self {
+                key_vary: config.template_cache_vary(),
+                max_age: config.template_cache_max_age(),
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn for_test(key_vary: &VarySpec, max_age: Duration) -> Self {
+        Self {
+            key_vary: key_vary.clone(),
+            max_age,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn c2_bypass_reason(
+    mode: AssemblyMode,
+    request_had_authorization: bool,
+    cookie_disqualifies: bool,
+    status: StatusCode,
+    content_type: &str,
+    response_headers: &edgezero_core::http::HeaderMap,
+    key_vary: &VarySpec,
+) -> Option<C2BypassReason> {
+    c2_cache_ttl(
+        mode,
+        request_had_authorization,
+        cookie_disqualifies,
+        status,
+        content_type,
+        response_headers,
+        &C2CachePolicy::for_test(key_vary, Duration::from_secs(60)),
+    )
+    .err()
+}
+
+fn single_header_value(
+    headers: &edgezero_core::http::HeaderMap,
+    name: header::HeaderName,
+) -> Result<Option<&str>, C2BypassReason> {
+    let mut values = headers.get_all(name).iter();
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(C2BypassReason::MalformedCachePolicy);
+    }
+    first
+        .to_str()
+        .map(Some)
+        .map_err(|_| C2BypassReason::MalformedCachePolicy)
+}
+
+fn single_representation_header_value(
+    headers: &edgezero_core::http::HeaderMap,
+    name: header::HeaderName,
+) -> Result<Option<&str>, C2BypassReason> {
+    let mut values = headers.get_all(name).iter();
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(C2BypassReason::MalformedRepresentationHeaders);
+    }
+    first
+        .to_str()
+        .map(Some)
+        .map_err(|_| C2BypassReason::MalformedRepresentationHeaders)
+}
+
+fn parse_delta_seconds(value: &str) -> Result<u64, C2BypassReason> {
+    let value = value.trim();
+    let digits = match (value.starts_with('"'), value.ends_with('"')) {
+        (true, true) if value.len() >= 2 => &value[1..value.len() - 1],
+        (false, false) => value,
+        _ => return Err(C2BypassReason::MalformedCachePolicy),
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(C2BypassReason::MalformedCachePolicy);
+    }
+    digits
+        .parse::<u64>()
+        .map_err(|_| C2BypassReason::MalformedCachePolicy)
+}
+
+fn surrogate_control_freshness(
+    headers: &edgezero_core::http::HeaderMap,
+) -> Result<Option<Duration>, C2BypassReason> {
+    let mut saw_header = false;
+    let mut max_age = None;
+    let mut stale_while_revalidate = None;
+    let mut stale_if_error = None;
+    for value in headers.get_all("surrogate-control") {
+        saw_header = true;
+        let value = value
+            .to_str()
+            .map_err(|_| C2BypassReason::MalformedCachePolicy)?;
+        if value.trim().is_empty() {
+            return Err(C2BypassReason::MalformedCachePolicy);
+        }
+        for directive in value.split(',') {
+            let directive = directive.trim();
+            if directive.is_empty() {
+                return Err(C2BypassReason::MalformedCachePolicy);
+            }
+            let (name, value) = directive
+                .split_once('=')
+                .map_or((directive, None), |(name, value)| (name, Some(value)));
+            match name.trim().to_ascii_lowercase().as_str() {
+                "private" | "no-store" | "no-cache" => {
+                    return Err(C2BypassReason::OriginNotShareable);
+                }
+                "max-age" => {
+                    let parsed =
+                        parse_delta_seconds(value.ok_or(C2BypassReason::MalformedCachePolicy)?)?;
+                    if max_age.replace(parsed).is_some() {
+                        return Err(C2BypassReason::MalformedCachePolicy);
+                    }
+                }
+                "stale-while-revalidate" => {
+                    let parsed =
+                        parse_delta_seconds(value.ok_or(C2BypassReason::MalformedCachePolicy)?)?;
+                    if stale_while_revalidate.replace(parsed).is_some() {
+                        return Err(C2BypassReason::MalformedCachePolicy);
+                    }
+                }
+                "stale-if-error" => {
+                    let parsed =
+                        parse_delta_seconds(value.ok_or(C2BypassReason::MalformedCachePolicy)?)?;
+                    if stale_if_error.replace(parsed).is_some() {
+                        return Err(C2BypassReason::MalformedCachePolicy);
+                    }
+                }
+                _ => return Err(C2BypassReason::MalformedCachePolicy),
+            }
+        }
+    }
+    if !saw_header {
+        return Ok(None);
+    }
+    let max_age = max_age.ok_or(C2BypassReason::NoPositiveFreshness)?;
+    if max_age == 0 {
+        return Err(C2BypassReason::NoPositiveFreshness);
+    }
+    Ok(Some(Duration::from_secs(max_age)))
+}
+
+fn origin_shared_ttl(
+    headers: &edgezero_core::http::HeaderMap,
+    max_age: Duration,
+) -> Result<Duration, C2BypassReason> {
+    origin_shared_ttl_at(headers, SystemTime::now(), max_age)
+}
+
+fn origin_shared_ttl_at(
+    headers: &edgezero_core::http::HeaderMap,
+    now: SystemTime,
+    template_cache_max_age: Duration,
+) -> Result<Duration, C2BypassReason> {
+    let mut max_age = None;
+    let mut shared_max_age = None;
+    for value in headers.get_all(header::CACHE_CONTROL) {
+        let value = value
+            .to_str()
+            .map_err(|_| C2BypassReason::MalformedCachePolicy)?;
+        for directive in value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let (name, value) = directive
+                .split_once('=')
+                .map_or((directive, None), |(name, value)| (name, Some(value)));
+            match name.trim().to_ascii_lowercase().as_str() {
+                "private" | "no-store" | "no-cache" => {
+                    return Err(C2BypassReason::OriginNotShareable);
+                }
+                "max-age" => {
+                    let parsed =
+                        parse_delta_seconds(value.ok_or(C2BypassReason::MalformedCachePolicy)?)?;
+                    if max_age.replace(parsed).is_some() {
+                        return Err(C2BypassReason::MalformedCachePolicy);
+                    }
+                }
+                "s-maxage" => {
+                    let parsed =
+                        parse_delta_seconds(value.ok_or(C2BypassReason::MalformedCachePolicy)?)?;
+                    if shared_max_age.replace(parsed).is_some() {
+                        return Err(C2BypassReason::MalformedCachePolicy);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let date = single_header_value(headers, header::DATE)?
+        .map(httpdate::parse_http_date)
+        .transpose()
+        .map_err(|_| C2BypassReason::MalformedCachePolicy)?;
+    let standard_freshness = match shared_max_age.or(max_age) {
+        Some(seconds) => Some(Duration::from_secs(seconds)),
+        None => single_header_value(headers, header::EXPIRES)?
+            .map(|value| {
+                let expires = httpdate::parse_http_date(value)
+                    .map_err(|_| C2BypassReason::MalformedCachePolicy)?;
+                expires
+                    .duration_since(date.unwrap_or(now))
+                    .map_err(|_| C2BypassReason::NoPositiveFreshness)
+            })
+            .transpose()?,
+    };
+    let freshness = surrogate_control_freshness(headers)?
+        .or(standard_freshness)
+        .ok_or(C2BypassReason::NoPositiveFreshness)?;
+    let age = single_header_value(headers, header::AGE)?
+        .map(parse_delta_seconds)
+        .transpose()?
+        .unwrap_or(0);
+    let apparent_age = date
+        .and_then(|date| now.duration_since(date).ok())
+        .unwrap_or_default();
+    let remaining = freshness
+        .checked_sub(Duration::from_secs(age).max(apparent_age))
+        .filter(|duration| !duration.is_zero())
+        .ok_or(C2BypassReason::NoPositiveFreshness)?;
+    let capped = remaining.min(template_cache_max_age);
+    if capped.is_zero() {
+        return Err(C2BypassReason::NoPositiveFreshness);
+    }
+    Ok(capped)
+}
+
+fn replayable_policy_headers(
+    headers: &edgezero_core::http::HeaderMap,
+) -> Result<Vec<(String, String)>, C2BypassReason> {
+    let mut captured = Vec::new();
+    for name in crate::platform::REPLAYABLE_POLICY_HEADERS {
+        for value in headers.get_all(*name) {
+            let value = value
+                .to_str()
+                .map_err(|_| C2BypassReason::MalformedPolicyHeader)?;
+            if (*name == "content-security-policy"
+                || *name == "content-security-policy-report-only")
+                && value.to_ascii_lowercase().contains("'nonce-")
+            {
+                return Err(C2BypassReason::CspNonce);
+            }
+            captured.push(((*name).to_string(), value.to_string()));
+        }
+    }
+    Ok(captured)
+}
+
+fn c2_cache_ttl(
+    mode: AssemblyMode,
+    request_had_authorization: bool,
+    cookie_disqualifies: bool,
+    status: StatusCode,
+    content_type: &str,
+    response_headers: &edgezero_core::http::HeaderMap,
+    policy: &C2CachePolicy,
+) -> Result<Duration, C2BypassReason> {
+    if matches!(mode, AssemblyMode::Inline) {
+        return Err(C2BypassReason::InlineMode);
+    }
+    if request_had_authorization {
+        return Err(C2BypassReason::AuthorizedRequest);
+    }
+    if cookie_disqualifies {
+        return Err(C2BypassReason::CookieForwarded);
+    }
+    if response_headers.contains_key(header::SET_COOKIE) {
+        return Err(C2BypassReason::OriginSetCookie);
+    }
+    if crate::response_privacy::CDN_CACHE_HEADERS
+        .iter()
+        .filter(|name| **name != "surrogate-control")
+        .any(|name| response_headers.contains_key(*name))
+    {
+        return Err(C2BypassReason::OriginNotShareable);
+    }
+    let mut vary_values = Vec::new();
+    for value in response_headers.get_all(header::VARY) {
+        let value = value
+            .to_str()
+            .map_err(|_| C2BypassReason::MalformedCachePolicy)?;
+        for name in value
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            if name == "*" {
+                return Err(C2BypassReason::VaryWildcard);
+            }
+            if name.eq_ignore_ascii_case(header::COOKIE.as_str()) {
+                return Err(C2BypassReason::VaryCookie);
+            }
+            header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| C2BypassReason::MalformedCachePolicy)?;
+        }
+        vary_values.push(value);
+    }
+    let uncovered = policy.key_vary.uncovered_by(vary_values);
+    if !uncovered.is_empty() {
+        return Err(C2BypassReason::VaryNotCovered(VaryGap(uncovered)));
+    }
+    if status != StatusCode::OK {
+        return Err(C2BypassReason::NonOkStatus);
+    }
+    let declared_content_type =
+        single_representation_header_value(response_headers, header::CONTENT_TYPE)?;
+    if declared_content_type.is_some_and(|declared| declared != content_type)
+        || !is_html_content_type(content_type)
+    {
+        return Err(C2BypassReason::NotHtml);
+    }
+    let content_encoding =
+        single_representation_header_value(response_headers, header::CONTENT_ENCODING)?
+            .map_or_else(
+                || "identity".to_string(),
+                |value| value.trim().to_ascii_lowercase(),
+            );
+    if content_encoding.is_empty() {
+        return Err(C2BypassReason::MalformedRepresentationHeaders);
+    }
+    if !is_supported_content_encoding(&content_encoding) {
+        return Err(C2BypassReason::UnsupportedContentEncoding);
+    }
+    replayable_policy_headers(response_headers)?;
+    origin_shared_ttl(response_headers, policy.max_age)
+}
+
 /// Whether the content type requires processing (URL rewriting, HTML injection).
 ///
 /// Text-based and JavaScript/JSON responses are processable; binary types
@@ -4202,49 +4996,11 @@ pub fn page_bids_preflight_denied() -> Response<EdgeBody> {
     response
 }
 
-/// Builds the `400 Bad Request` returned for an unrecognized `format`.
-///
-/// `private, no-store` like every other response from this endpoint, so an error
-/// cannot be cached and replayed.
-fn page_bids_unknown_format() -> Response<EdgeBody> {
-    let mut response = Response::new(EdgeBody::from("Unknown format"));
-    *response.status_mut() = StatusCode::BAD_REQUEST;
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("private, no-store"),
-    );
-    response
-}
-
 /// Normalizes the client-supplied `path` query parameter before glob matching.
 ///
 /// The SPA hook sends `location.pathname + location.search`, but the parameter
 /// is client-controlled: strip any query string or fragment and force a leading
 /// `/` so slot `page_patterns` always match against a canonical path shape.
-/// How the page-bids endpoint serializes its answer.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum PageBidsFormat {
-    /// `application/json`. What the SPA navigation hook consumes.
-    #[default]
-    Json,
-}
-
-impl PageBidsFormat {
-    /// Parse the `format` query parameter.
-    ///
-    /// # Errors
-    ///
-    /// Returns the offending value if it names no known format. Unknown values are
-    /// rejected rather than defaulting so callers cannot silently negotiate a response
-    /// representation the endpoint no longer supports.
-    fn parse(raw: Option<&str>) -> Result<Self, String> {
-        match raw {
-            None | Some("json") => Ok(Self::Json),
-            Some(other) => Err(other.to_string()),
-        }
-    }
-}
-
 fn normalize_page_bids_path(raw: &str) -> String {
     let path = raw.split(['?', '#']).next().unwrap_or("");
     if path.starts_with('/') {
@@ -4820,7 +5576,7 @@ mod tests {
         #[test]
         fn initial_html_state_uses_the_exact_projection_json_without_a_legacy_script() {
             let result = result_with_winners(vec![tagged_adm_bid("slot-1", "AAAAAAAAAAAA", 2.75)]);
-            let state: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            let state = AdBidsState::default();
             let slots = serde_json::to_string(&vec![BrowserAuctionSlotV1 {
                 slot: "slot-1".to_string(),
                 gam_unit_path: "/123/slot-1".to_string(),
@@ -4888,7 +5644,7 @@ mod tests {
         #[test]
         fn initial_projection_failure_preserves_exact_slot_coverage() {
             let result = result_with_winners(vec![tagged_adm_bid("slot-1", "AAAAAAAAAAAA", 2.75)]);
-            let state: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            let state = AdBidsState::default();
             let slots = serde_json::to_string(&vec![BrowserAuctionSlotV1 {
                 slot: "slot-1".to_string(),
                 gam_unit_path: "/123/slot-1".to_string(),
@@ -5338,6 +6094,11 @@ mod tests {
             provider_responses: vec![response],
             mediator_response: None,
             winning_bids: std::collections::HashMap::new(),
+            decision_set: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: "debug-auction".to_string(),
+                results: Vec::new(),
+            },
             total_time_ms: 12,
             metadata: std::collections::HashMap::new(),
         };
@@ -5405,11 +6166,17 @@ mod tests {
             total_time_ms: 12,
             metadata: std::collections::HashMap::new(),
         };
-        let state = Arc::new(Mutex::new(Some("BIDS_SCRIPT".to_string())));
+        let state = AdBidsState::with_script("BIDS_SCRIPT");
 
-        prepend_auction_debug_comment("stream", &result, &state);
+        prepend_auction_debug_comment(
+            "stream",
+            &result,
+            &state,
+            &AuctionDebugCommentOptions::default(),
+        );
 
         let comment = state
+            .script_cell()
             .lock()
             .expect("should lock state")
             .clone()
@@ -5693,6 +6460,11 @@ mod tests {
             provider_responses: vec![response],
             mediator_response: None,
             winning_bids: std::collections::HashMap::new(),
+            decision_set: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: "debug-auction".to_string(),
+                results: Vec::new(),
+            },
             total_time_ms: 12,
             metadata: std::collections::HashMap::new(),
         };
@@ -5798,6 +6570,11 @@ mod tests {
             provider_responses: vec![response],
             mediator_response: None,
             winning_bids: std::collections::HashMap::new(),
+            decision_set: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: "debug-auction".to_string(),
+                results: Vec::new(),
+            },
             total_time_ms: 12,
             metadata: std::collections::HashMap::new(),
         };
@@ -5872,6 +6649,11 @@ mod tests {
             provider_responses: vec![response],
             mediator_response: Some(mediator),
             winning_bids: std::collections::HashMap::new(),
+            decision_set: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: "debug-auction".to_string(),
+                results: Vec::new(),
+            },
             total_time_ms: 10,
             metadata: std::collections::HashMap::new(),
         };
@@ -6036,6 +6818,37 @@ mod tests {
             render_trace_overlay: false,
             suppress_datadome_client_side_tag: false,
         }
+    }
+
+    #[test]
+    fn c2_reader_seam_inserts_one_complete_hard_cutover_boot() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let projection = r#"{"version":1,"auction":{"version":1,"auctionId":"auction-c2-reader","results":[]},"slots":[],"bids":[]}"#;
+        let mut params = make_stream_params(&settings, "");
+        params.content_type = "text/html; charset=utf-8".to_string();
+        params.ad_bids_state = AdBidsState::with_script(projection);
+
+        let seam = seam_script_for(&params, &settings, &registry);
+        let boot = seam
+            .find("const __TSJS_SERVER_BOOT_INPUT_V1__=")
+            .expect("should emit one immutable boot input");
+        let runtime = seam
+            .find("id=\"trustedserver-js\"")
+            .expect("should emit the selected parser-time runtime");
+
+        assert!(boot < runtime, "boot input must precede runtime execution");
+        assert_eq!(
+            seam.matches("const __TSJS_SERVER_BOOT_INPUT_V1__=").count(),
+            1,
+            "reader seam must carry exactly one complete boot"
+        );
+        assert!(seam.contains(r#""auctionId":"auction-c2-reader""#));
+        assert!(seam.contains(r#"performance.mark("tsjs:bids-script")"#));
+        assert!(!seam.contains(AD_ASSEMBLY_SEAM));
+        assert!(!seam.contains(".adSlots"));
+        assert!(!seam.contains(".bids="));
     }
 
     fn test_auction_request() -> AuctionRequest {
@@ -6318,6 +7131,885 @@ mod tests {
         }
     }
 
+    mod c2_gate_tests {
+        //! `cache::core` stores whatever it is handed and rejects nothing, so every
+        //! one of these conditions is the caller's to enforce. Each is a leak vector
+        //! or an eligibility rule, not a preference.
+
+        use super::*;
+        use crate::creative_opportunities::AssemblyMode;
+        use edgezero_core::http::HeaderName;
+
+        fn headers(pairs: &[(HeaderName, &str)]) -> edgezero_core::http::HeaderMap {
+            let mut map = edgezero_core::http::HeaderMap::new();
+            for (name, value) in pairs {
+                map.insert(
+                    name.clone(),
+                    HeaderValue::from_str(value).expect("should build header value"),
+                );
+            }
+            map
+        }
+
+        fn shareable() -> edgezero_core::http::HeaderMap {
+            headers(&[(header::CACHE_CONTROL, "max-age=60")])
+        }
+
+        /// The shipped default: no operator has stated what the origin varies on, so the
+        /// key covers nothing. Responses without a `Vary` are unaffected; any `Vary` at
+        /// all disqualifies.
+        fn nothing_covered() -> VarySpec {
+            VarySpec::new([])
+        }
+
+        #[test]
+        fn an_unconfigured_deployment_never_caches_a_varying_response() {
+            // The fail-closed default. An operator who has not stated the origin's Vary
+            // must not acquire a shared cache by omission — and a real origin varies on
+            // something, so this is the common path, not an edge case.
+            // Deliberately not `Accept-Encoding`: the shared path normalizes supported
+            // content codings to one identity template, so that header is covered
+            // whatever the operator configured. Using it here would test the
+            // structural-coverage carve-out rather than the drift guard.
+            let mut varying = shareable();
+            varying.insert(header::VARY, HeaderValue::from_static("rsc"));
+
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &varying,
+                    &nothing_covered(),
+                ),
+                Some(C2BypassReason::VaryNotCovered(VaryGap(vec![
+                    "rsc".to_string()
+                ]))),
+                "an unstated Vary must disqualify rather than silently under-key"
+            );
+        }
+
+        #[test]
+        fn an_origin_that_varies_on_cookie_is_refused_even_when_declared_independent() {
+            // The backstop that makes `origin_is_cookie_independent` safe to offer. The
+            // operator asserts their origin ignores cookies; if the origin then says
+            // otherwise, the assertion loses. Without this, a wrong assertion would
+            // silently cross-serve personalized HTML.
+            let mut varying = shareable();
+            varying.insert(header::VARY, HeaderValue::from_static("Cookie"));
+
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    // The operator's assertion has already been applied here: this is
+                    // `false` precisely because they declared independence.
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &varying,
+                    &VarySpec::new(["cookie".to_string()]),
+                ),
+                Some(C2BypassReason::VaryCookie),
+                "the origin's declaration must override both cookie independence and an \
+                 accidentally configured per-cookie key"
+            );
+        }
+
+        #[test]
+        fn a_private_directive_on_a_second_cache_control_line_is_refused() {
+            // `HeaderMap::get` returns the first value only. An origin that sends
+            // `Cache-Control: public, max-age=300` and then `Cache-Control: private` on a
+            // separate line means exactly what one comma-joined line would mean, but the
+            // second line was invisible — so a response the origin marked private was
+            // written to a cache shared between readers. The `Vary` reads a few lines up
+            // already use `get_all` for the same reason.
+            let mut split = edgezero_core::http::HeaderMap::new();
+            split.append(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=300"),
+            );
+            split.append(header::CACHE_CONTROL, HeaderValue::from_static("private"));
+
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &split,
+                    &nothing_covered(),
+                ),
+                Some(C2BypassReason::OriginNotShareable),
+                "a directive on any Cache-Control line must disqualify the response"
+            );
+        }
+
+        #[test]
+        fn a_no_store_directive_on_a_second_cache_control_line_is_refused() {
+            // Same defect, the other directive that matters — `no-store` is the one an
+            // origin uses for a response that must not be written down anywhere.
+            let mut split = edgezero_core::http::HeaderMap::new();
+            split.append(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("max-age=60"),
+            );
+            split.append(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &split,
+                    &nothing_covered(),
+                ),
+                Some(C2BypassReason::OriginNotShareable)
+            );
+        }
+
+        #[test]
+        fn cdn_specific_cache_policy_cannot_be_overridden_by_public_cache_control() {
+            for name in crate::response_privacy::CDN_CACHE_HEADERS {
+                let mut split = shareable();
+                split.insert(
+                    header::HeaderName::from_static(name),
+                    HeaderValue::from_static("no-store"),
+                );
+
+                assert_eq!(
+                    c2_bypass_reason(
+                        AssemblyMode::Esi,
+                        false,
+                        false,
+                        StatusCode::OK,
+                        "text/html",
+                        &split,
+                        &nothing_covered(),
+                    ),
+                    Some(C2BypassReason::OriginNotShareable),
+                    "C2 must fail closed on the CDN-specific policy header {name}"
+                );
+            }
+        }
+
+        #[test]
+        fn unsupported_vendor_freshness_does_not_authorize_c2() {
+            for name in crate::response_privacy::CDN_CACHE_HEADERS
+                .iter()
+                .filter(|name| **name != "surrogate-control")
+            {
+                let mut split = shareable();
+                split.insert(
+                    header::HeaderName::from_static(name),
+                    HeaderValue::from_static("max-age=60"),
+                );
+
+                assert_eq!(
+                    c2_bypass_reason(
+                        AssemblyMode::Esi,
+                        false,
+                        false,
+                        StatusCode::OK,
+                        "text/html",
+                        &split,
+                        &nothing_covered(),
+                    ),
+                    Some(C2BypassReason::OriginNotShareable),
+                    "the Fastly exception must not authorize the vendor policy {name}"
+                );
+            }
+        }
+
+        #[test]
+        fn observed_fastly_surrogate_policy_uses_edge_freshness_capped_by_configuration() {
+            let publisher_headers = headers(&[
+                (header::CACHE_CONTROL, "public, max-age=60"),
+                (
+                    header::HeaderName::from_static("surrogate-control"),
+                    "max-age=1200, stale-while-revalidate=21600, stale-if-error=604800",
+                ),
+            ]);
+
+            assert_eq!(
+                c2_cache_ttl(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &publisher_headers,
+                    &C2CachePolicy::for_test(&nothing_covered(), Duration::from_secs(300),),
+                ),
+                Ok(Duration::from_secs(300)),
+                "Fastly's edge freshness should take precedence over the shorter browser \
+                 lifetime, while the configured safety ceiling remains authoritative"
+            );
+        }
+
+        #[test]
+        fn fastly_surrogate_freshness_takes_precedence_over_standard_freshness() {
+            for (cache_control, surrogate_control, expected) in [
+                ("public, max-age=300", "max-age=30", 30),
+                ("public, max-age=30", "max-age=300", 300),
+            ] {
+                let publisher_headers = headers(&[
+                    (header::CACHE_CONTROL, cache_control),
+                    (
+                        header::HeaderName::from_static("surrogate-control"),
+                        surrogate_control,
+                    ),
+                ]);
+
+                assert_eq!(
+                    c2_cache_ttl(
+                        AssemblyMode::Esi,
+                        false,
+                        false,
+                        StatusCode::OK,
+                        "text/html",
+                        &publisher_headers,
+                        &C2CachePolicy::for_test(&nothing_covered(), Duration::from_secs(600),),
+                    ),
+                    Ok(Duration::from_secs(expected))
+                );
+            }
+        }
+
+        #[test]
+        fn surrogate_stale_windows_do_not_extend_fresh_reuse() {
+            let publisher_headers = headers(&[
+                (header::CACHE_CONTROL, "public, max-age=300"),
+                (
+                    header::HeaderName::from_static("surrogate-control"),
+                    "max-age=20, stale-while-revalidate=600, stale-if-error=1200",
+                ),
+                (header::AGE, "10"),
+            ]);
+
+            assert_eq!(
+                c2_cache_ttl(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &publisher_headers,
+                    &C2CachePolicy::for_test(&nothing_covered(), Duration::from_secs(600),),
+                ),
+                Ok(Duration::from_secs(10)),
+                "stale windows are validated metadata, not fresh C2 lifetime"
+            );
+        }
+
+        #[test]
+        fn ambiguous_or_unsupported_surrogate_policy_fails_closed() {
+            for (policy, expected) in [
+                ("max-age", C2BypassReason::MalformedCachePolicy),
+                (
+                    "max-age=30, max-age=60",
+                    C2BypassReason::MalformedCachePolicy,
+                ),
+                ("max-age=tomorrow", C2BypassReason::MalformedCachePolicy),
+                ("max-age=30, public", C2BypassReason::MalformedCachePolicy),
+                ("stale-if-error=60", C2BypassReason::NoPositiveFreshness),
+                ("max-age=0", C2BypassReason::NoPositiveFreshness),
+                ("max-age=30,", C2BypassReason::MalformedCachePolicy),
+            ] {
+                let mut publisher_headers = shareable();
+                publisher_headers.insert(
+                    header::HeaderName::from_static("surrogate-control"),
+                    HeaderValue::from_str(policy).expect("should build Surrogate-Control"),
+                );
+
+                assert_eq!(
+                    c2_bypass_reason(
+                        AssemblyMode::Esi,
+                        false,
+                        false,
+                        StatusCode::OK,
+                        "text/html",
+                        &publisher_headers,
+                        &nothing_covered(),
+                    ),
+                    Some(expected),
+                    "`{policy}` must fail closed"
+                );
+            }
+        }
+
+        #[test]
+        fn restrictive_surrogate_policy_is_never_overridden_by_standard_freshness() {
+            for directive in ["private", "no-store", "no-cache"] {
+                let mut publisher_headers = shareable();
+                publisher_headers.insert(
+                    header::HeaderName::from_static("surrogate-control"),
+                    HeaderValue::from_str(directive).expect("should build Surrogate-Control"),
+                );
+
+                assert_eq!(
+                    c2_bypass_reason(
+                        AssemblyMode::Esi,
+                        false,
+                        false,
+                        StatusCode::OK,
+                        "text/html",
+                        &publisher_headers,
+                        &nothing_covered(),
+                    ),
+                    Some(C2BypassReason::OriginNotShareable),
+                    "`{directive}` must remain authoritative"
+                );
+            }
+        }
+
+        #[test]
+        fn restrictive_standard_policy_is_never_overridden_by_surrogate_freshness() {
+            for directive in ["private", "no-store", "no-cache"] {
+                let publisher_headers = headers(&[
+                    (
+                        header::CACHE_CONTROL,
+                        &format!("public, max-age=60, {directive}"),
+                    ),
+                    (
+                        header::HeaderName::from_static("surrogate-control"),
+                        "max-age=1200",
+                    ),
+                ]);
+
+                assert_eq!(
+                    c2_bypass_reason(
+                        AssemblyMode::Esi,
+                        false,
+                        false,
+                        StatusCode::OK,
+                        "text/html",
+                        &publisher_headers,
+                        &nothing_covered(),
+                    ),
+                    Some(C2BypassReason::OriginNotShareable),
+                    "standard `{directive}` must refuse C2 even with positive edge freshness"
+                );
+            }
+        }
+
+        #[test]
+        fn surrogate_control_can_authorize_fastly_edge_freshness_without_browser_freshness() {
+            let publisher_headers = headers(&[(
+                header::HeaderName::from_static("surrogate-control"),
+                "max-age=1200",
+            )]);
+
+            assert_eq!(
+                c2_cache_ttl(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &publisher_headers,
+                    &C2CachePolicy::for_test(&nothing_covered(), Duration::from_secs(300),),
+                ),
+                Ok(Duration::from_secs(300)),
+                "Fastly edge freshness should not require browser freshness"
+            );
+        }
+
+        #[test]
+        fn repeated_cache_control_lines_without_a_disqualifier_still_cache() {
+            // The other direction: reading every value must not turn an ordinary
+            // multi-line `Cache-Control` into a bypass, or the fix would disable the
+            // cache instead of tightening it.
+            let mut split = edgezero_core::http::HeaderMap::new();
+            split.append(header::CACHE_CONTROL, HeaderValue::from_static("public"));
+            split.append(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("max-age=60"),
+            );
+
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &split,
+                    &nothing_covered(),
+                ),
+                None
+            );
+        }
+
+        #[test]
+        fn origin_freshness_is_positive_age_adjusted_and_capped() {
+            let fresh_headers = headers(&[(header::CACHE_CONTROL, "public, max-age=300")]);
+            assert_eq!(
+                c2_cache_ttl(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &fresh_headers,
+                    &C2CachePolicy::for_test(&nothing_covered(), Duration::from_secs(60),),
+                ),
+                Ok(Duration::from_secs(60))
+            );
+
+            let aged = headers(&[
+                (header::CACHE_CONTROL, "s-maxage=50, max-age=300"),
+                (header::AGE, "35"),
+            ]);
+            assert_eq!(
+                c2_cache_ttl(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &aged,
+                    &C2CachePolicy::for_test(&nothing_covered(), Duration::from_secs(60),),
+                ),
+                Ok(Duration::from_secs(15))
+            );
+
+            let old_date_without_age = headers(&[
+                (header::CACHE_CONTROL, "public, max-age=60"),
+                (header::DATE, "Wed, 12 Aug 2026 08:00:00 GMT"),
+            ]);
+            let one_minute_later = httpdate::parse_http_date("Wed, 12 Aug 2026 08:01:00 GMT")
+                .expect("should parse fixture time");
+            assert_eq!(
+                origin_shared_ttl_at(
+                    &old_date_without_age,
+                    one_minute_later,
+                    Duration::from_secs(60),
+                ),
+                Err(C2BypassReason::NoPositiveFreshness),
+                "an old Date is apparent age even when an upstream omitted Age"
+            );
+        }
+
+        #[test]
+        fn zero_exhausted_missing_and_malformed_freshness_are_refused() {
+            for (map, expected) in [
+                (
+                    headers(&[(header::CACHE_CONTROL, "max-age=0")]),
+                    C2BypassReason::NoPositiveFreshness,
+                ),
+                (
+                    headers(&[(header::CACHE_CONTROL, "max-age=60"), (header::AGE, "60")]),
+                    C2BypassReason::NoPositiveFreshness,
+                ),
+                (
+                    headers(&[(header::CACHE_CONTROL, "public")]),
+                    C2BypassReason::NoPositiveFreshness,
+                ),
+                (
+                    headers(&[(header::CACHE_CONTROL, "max-age=tomorrow")]),
+                    C2BypassReason::MalformedCachePolicy,
+                ),
+                (
+                    headers(&[(header::CACHE_CONTROL, "max-age=\"60")]),
+                    C2BypassReason::MalformedCachePolicy,
+                ),
+                (
+                    headers(&[(header::CACHE_CONTROL, "max-age=+60")]),
+                    C2BypassReason::MalformedCachePolicy,
+                ),
+            ] {
+                assert_eq!(
+                    c2_bypass_reason(
+                        AssemblyMode::Esi,
+                        false,
+                        false,
+                        StatusCode::OK,
+                        "text/html",
+                        &map,
+                        &nothing_covered(),
+                    ),
+                    Some(expected)
+                );
+            }
+        }
+
+        #[test]
+        fn expires_can_authorize_but_never_extend_an_expired_response() {
+            let now = httpdate::parse_http_date("Wed, 12 Aug 2026 08:00:00 GMT")
+                .expect("should parse fixture time");
+            let fresh = headers(&[
+                (header::DATE, "Wed, 12 Aug 2026 08:00:00 GMT"),
+                (header::EXPIRES, "Wed, 12 Aug 2026 08:00:30 GMT"),
+            ]);
+            assert_eq!(
+                origin_shared_ttl_at(&fresh, now, Duration::from_secs(60)),
+                Ok(Duration::from_secs(30))
+            );
+
+            let expired = headers(&[
+                (header::DATE, "Wed, 12 Aug 2026 08:01:00 GMT"),
+                (header::EXPIRES, "Wed, 12 Aug 2026 08:00:30 GMT"),
+            ]);
+            assert_eq!(
+                origin_shared_ttl_at(&expired, now, Duration::from_secs(60)),
+                Err(C2BypassReason::NoPositiveFreshness)
+            );
+        }
+
+        #[test]
+        fn request_semantics_bypass_c2_except_for_a_max_age_zero_reload() {
+            for (name, value) in [
+                (header::CACHE_CONTROL, "no-cache"),
+                (header::CACHE_CONTROL, "max-age=30"),
+                (header::CACHE_CONTROL, "max-age=\"0"),
+                (header::CACHE_CONTROL, "min-fresh=10"),
+                (header::CACHE_CONTROL, "no-store"),
+                (header::PRAGMA, "no-cache"),
+                (header::PRAGMA, "legacy-extension, no-cache"),
+                (header::RANGE, "bytes=0-99"),
+                (header::IF_NONE_MATCH, "\"etag\""),
+                (header::IF_MODIFIED_SINCE, "Wed, 12 Aug 2026 08:00:00 GMT"),
+            ] {
+                let map = headers(&[(name.clone(), value)]);
+                assert!(request_bypasses_c2(&map), "{name}: {value} must bypass");
+            }
+            assert!(
+                !request_bypasses_c2(&headers(&[(header::CACHE_CONTROL, "max-age=0")])),
+                "a browser reload may reuse C2 because the assembled response and auction \
+                 are still rebuilt for this reader"
+            );
+            assert!(!request_bypasses_c2(&headers(&[(
+                header::CACHE_CONTROL,
+                "public"
+            )])));
+        }
+
+        #[test]
+        fn a_wildcard_vary_is_refused() {
+            // `VarySpec::uncovered_by` filters `*` out, with a comment saying the
+            // eligibility gate handles it. It did not — nothing rejected the wildcard, so
+            // a response the origin said no key can select was shareable.
+            let mut varying = shareable();
+            varying.insert(header::VARY, HeaderValue::from_static("*"));
+
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &varying,
+                    &nothing_covered(),
+                ),
+                Some(C2BypassReason::VaryWildcard)
+            );
+        }
+
+        #[test]
+        fn a_fully_covered_vary_is_cacheable() {
+            let mut varying = shareable();
+            varying.insert(
+                header::VARY,
+                HeaderValue::from_static("rsc, Accept-Encoding"),
+            );
+
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &varying,
+                    &VarySpec::new(["rsc".to_string(), "accept-encoding".to_string()]),
+                ),
+                None,
+                "a key covering everything the origin varies on is safe to store"
+            );
+        }
+
+        #[test]
+        fn config_drift_names_the_missing_header() {
+            // The failure this guards: the origin adds a header to its Vary, nobody
+            // updates config, and requests differing only in that header start sharing a
+            // template. The reason must name it, or diagnosing means a bisect.
+            let mut varying = shareable();
+            varying.insert(
+                header::VARY,
+                HeaderValue::from_static("rsc, next-router-prefetch"),
+            );
+
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &varying,
+                    &VarySpec::new(["rsc".to_string()]),
+                ),
+                Some(C2BypassReason::VaryNotCovered(VaryGap(vec![
+                    "next-router-prefetch".to_string()
+                ]))),
+                "the uncovered header must be named"
+            );
+        }
+
+        #[test]
+        fn a_vary_split_across_repeated_headers_is_still_checked() {
+            // Vary is a list header, so an origin may send it once or many times. Reading
+            // only the first would let the rest through unkeyed.
+            let mut varying = shareable();
+            varying.append(header::VARY, HeaderValue::from_static("rsc"));
+            varying.append(header::VARY, HeaderValue::from_static("cookie"));
+
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &varying,
+                    &VarySpec::new(["rsc".to_string()]),
+                ),
+                Some(C2BypassReason::VaryCookie),
+                "a repeated Vary header must not hide names behind the first value"
+            );
+        }
+
+        #[test]
+        fn a_plain_shareable_html_200_is_cacheable() {
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &shareable(),
+                    &nothing_covered(),
+                ),
+                None,
+                "ESI shareable HTML 200 should be eligible"
+            );
+        }
+
+        #[test]
+        fn inline_mode_never_writes_a_template() {
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Inline,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &shareable(),
+                    &nothing_covered(),
+                ),
+                Some(C2BypassReason::InlineMode),
+                "inline has no shared template to write"
+            );
+        }
+
+        #[test]
+        fn an_authorized_request_is_never_cached() {
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    true,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &shareable(),
+                    &nothing_covered(),
+                ),
+                Some(C2BypassReason::AuthorizedRequest),
+                "an authenticated response must not enter a shared cache"
+            );
+        }
+
+        #[test]
+        fn a_forwarded_request_cookie_disqualifies_even_without_set_cookie() {
+            // The dangerous case: session established on an earlier request, so this
+            // response carries no Set-Cookie, has no Cache-Control at all, is a 200,
+            // and is HTML — yet is personalized because TS forwarded the Cookie to
+            // origin unchanged. Every other condition reports it cacheable.
+            let no_cache_control = edgezero_core::http::HeaderMap::new();
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    true,
+                    StatusCode::OK,
+                    "text/html",
+                    &no_cache_control,
+                    &nothing_covered(),
+                ),
+                Some(C2BypassReason::CookieForwarded),
+                "cookie-personalized HTML must not become a shared template"
+            );
+        }
+
+        #[test]
+        fn an_origin_set_cookie_is_never_cached() {
+            let with_cookie = headers(&[
+                (header::CACHE_CONTROL, "max-age=60"),
+                (header::SET_COOKIE, "sid=abc; Path=/"),
+            ]);
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &with_cookie,
+                    &nothing_covered(),
+                ),
+                Some(C2BypassReason::OriginSetCookie),
+                "caching this would replay one visitor's cookie to the next"
+            );
+        }
+
+        #[test]
+        fn non_shareable_cache_control_is_refused_case_insensitively() {
+            for directive in [
+                "private",
+                "no-store",
+                "no-cache",
+                "Private, max-age=60",
+                "NO-STORE",
+                "public, No-Cache",
+            ] {
+                let map = headers(&[(header::CACHE_CONTROL, directive)]);
+                assert_eq!(
+                    c2_bypass_reason(
+                        AssemblyMode::Esi,
+                        false,
+                        false,
+                        StatusCode::OK,
+                        "text/html",
+                        &map,
+                        &nothing_covered(),
+                    ),
+                    Some(C2BypassReason::OriginNotShareable),
+                    "`{directive}` should disqualify the response"
+                );
+            }
+        }
+
+        #[test]
+        fn a_datadome_block_is_refused_by_the_status_check() {
+            // DataDome replaces the document with a 403
+            // (`integrations/datadome/protection.rs:778`). There is no separate
+            // marker to detect, and none is needed.
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::FORBIDDEN,
+                    "text/html",
+                    &shareable(),
+                    &nothing_covered(),
+                ),
+                Some(C2BypassReason::NonOkStatus),
+                "a blocked document must not become the shared template"
+            );
+        }
+
+        #[test]
+        fn non_html_is_refused() {
+            for content_type in ["text/x-component", "application/json", ""] {
+                assert_eq!(
+                    c2_bypass_reason(
+                        AssemblyMode::Esi,
+                        false,
+                        false,
+                        StatusCode::OK,
+                        content_type,
+                        &shareable(),
+                        &nothing_covered(),
+                    ),
+                    Some(C2BypassReason::NotHtml),
+                    "`{content_type}` has no HTML template to transform"
+                );
+            }
+        }
+
+        #[test]
+        fn unsupported_content_encoding_is_refused_before_representation_headers_change() {
+            let map = headers(&[
+                (header::CACHE_CONTROL, "public, max-age=60"),
+                (header::CONTENT_ENCODING, "zstd"),
+            ]);
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &map,
+                    &nothing_covered(),
+                ),
+                Some(C2BypassReason::UnsupportedContentEncoding)
+            );
+
+            let mut repeated = headers(&[(header::CACHE_CONTROL, "public, max-age=60")]);
+            repeated.append(header::CONTENT_TYPE, HeaderValue::from_static("text/html"));
+            repeated.append(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    false,
+                    false,
+                    StatusCode::OK,
+                    "text/html",
+                    &repeated,
+                    &nothing_covered(),
+                ),
+                Some(C2BypassReason::MalformedRepresentationHeaders)
+            );
+        }
+
+        #[test]
+        fn leak_vectors_are_reported_before_mere_ineligibility() {
+            // A response that fails several conditions should name the most serious
+            // one, so an operator reading the log sees the security reason rather
+            // than a content-type quibble.
+            let map = headers(&[
+                (header::CACHE_CONTROL, "private"),
+                (header::SET_COOKIE, "sid=abc"),
+            ]);
+            assert_eq!(
+                c2_bypass_reason(
+                    AssemblyMode::Esi,
+                    true,
+                    false,
+                    StatusCode::FORBIDDEN,
+                    "application/json",
+                    &map,
+                    &nothing_covered(),
+                ),
+                Some(C2BypassReason::AuthorizedRequest),
+                "authorization is the most serious disqualifier and should win"
+            );
+        }
+    }
+
     mod ssat_cache_policy_tests {
         use super::*;
         use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
@@ -6465,7 +8157,7 @@ mod tests {
         fn settings_with_enabled_auction_and_creative_opportunities() -> Settings {
             let toml = format!(
                 "{}\n[auction]\nenabled = true\n\n\
-                 [creative_opportunities]\ngam_network_id = \"12345\"\n",
+                 [creative_opportunities]\nenabled = true\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );
             Settings::from_toml(&toml)
@@ -6475,7 +8167,7 @@ mod tests {
         fn settings_with_dispatching_provider() -> Settings {
             let toml = format!(
                 "{}\n[auction]\nenabled = true\nproviders = [\"{UNEXPECTED_304_PROVIDER}\"]\n\n\
-                 [creative_opportunities]\ngam_network_id = \"12345\"\n",
+                 [creative_opportunities]\nenabled = true\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );
             Settings::from_toml(&toml)
@@ -6911,7 +8603,9 @@ mod tests {
             let response = run_with_slots(&settings, &services, &slots, req).await;
             let response = match response {
                 PublisherResponse::Buffered(response) => response,
-                PublisherResponse::PassThrough { .. } | PublisherResponse::Stream { .. } => {
+                PublisherResponse::PassThrough { .. }
+                | PublisherResponse::Stream { .. }
+                | PublisherResponse::AssembleTemplate { .. } => {
                     panic!("unexpected origin 304 should return a buffered response")
                 }
             };
@@ -7083,7 +8777,10 @@ mod tests {
         let headers = match response {
             PublisherResponse::Buffered(response)
             | PublisherResponse::PassThrough { response, .. }
-            | PublisherResponse::Stream { response, .. } => response.into_parts().0.headers,
+            | PublisherResponse::Stream { response, .. }
+            | PublisherResponse::AssembleTemplate { response, .. } => {
+                response.into_parts().0.headers
+            }
         };
 
         let origin_uri = stub
@@ -7835,37 +9532,41 @@ mod tests {
     #[test]
     fn server_side_ad_stack_runs_only_when_all_auction_gates_pass() {
         assert!(
-            should_run_server_side_ad_stack(true, true, false, false, true, true, true),
+            should_run_server_side_ad_stack(true, true, false, false, true, true, true, true),
             "GET, real navigation, matched slots, and consent should run TS ad stack"
         );
 
         assert!(
-            !should_run_server_side_ad_stack(false, true, false, false, true, true, true),
+            !should_run_server_side_ad_stack(false, true, false, false, true, true, true, true),
             "non-GET requests should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, false, false, false, true, true, true),
+            !should_run_server_side_ad_stack(true, false, false, false, true, true, true, true),
             "non-document requests should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, true, false, true, true, true),
+            !should_run_server_side_ad_stack(true, true, true, false, true, true, true, true),
             "prefetch requests should skip TS ad stack and injection"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, true, true, true, true),
+            !should_run_server_side_ad_stack(true, true, false, true, true, true, true, true),
             "bot requests should skip TS ad stack and injection"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, false, true, true),
+            !should_run_server_side_ad_stack(true, true, false, false, false, true, true, true),
             "requests with no matching slots should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, true, false, true),
+            !should_run_server_side_ad_stack(true, true, false, false, true, false, true, true),
             "requests without required consent should skip TS ad stack and injection"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, true, true, false),
+            !should_run_server_side_ad_stack(true, true, false, false, true, true, false, true),
             "disabled [auction].enabled kill switch should skip TS ad stack and injection"
+        );
+        assert!(
+            !should_run_server_side_ad_stack(true, true, false, false, true, true, true, false),
+            "disabled creative-opportunity delivery should skip publisher template work"
         );
     }
 
@@ -8368,9 +10069,10 @@ mod tests {
         let get = build_request(Method::GET, &format!("https://publisher.example{src}"));
         let head = build_request(Method::HEAD, &format!("https://publisher.example{src}"));
 
-        let get_response = handle_tsjs_dynamic(&get, &registry).expect("should serve GET metadata");
-        let head_response =
-            handle_tsjs_dynamic(&head, &registry).expect("should serve HEAD metadata");
+        let get_response = handle_tsjs_dynamic(&get, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should serve GET metadata");
+        let head_response = handle_tsjs_dynamic(&head, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should serve HEAD metadata");
 
         assert_eq!(head_response.status(), get_response.status());
         assert_eq!(head_response.headers(), get_response.headers());
@@ -8392,7 +10094,8 @@ mod tests {
             .src();
         let req = build_request(Method::GET, &format!("https://publisher.example{src}"));
 
-        let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
+        let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should handle tsjs request");
 
         assert_eq!(
             response.status(),
@@ -8414,7 +10117,8 @@ mod tests {
         let src = crate::tsjs::tsjs_script_src(&ids);
         let first = build_request(Method::GET, &format!("https://publisher.example{src}"));
         let first_response =
-            handle_tsjs_dynamic(&first, &registry).expect("should serve current release");
+            handle_tsjs_dynamic(&first, &registry, EdgeCacheHeader::SMaxageFallback)
+                .expect("should serve current release");
         let etag = first_response
             .headers()
             .get(header::ETAG)
@@ -8426,8 +10130,9 @@ mod tests {
             .headers_mut()
             .insert(header::IF_NONE_MATCH, etag.clone());
 
-        let response = handle_tsjs_dynamic(&conditional, &registry)
-            .expect("should handle conditional request");
+        let response =
+            handle_tsjs_dynamic(&conditional, &registry, EdgeCacheHeader::SMaxageFallback)
+                .expect("should handle conditional request");
 
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(response.headers().get(header::ETAG), Some(&etag));
@@ -8460,7 +10165,8 @@ mod tests {
         let src = format!("/static/tsjs=tsjs-first-display.min.js?m={mask:04x}&v={hash}");
 
         let request = build_request(Method::GET, &format!("https://publisher.example{src}"));
-        let response = handle_tsjs_dynamic(&request, &registry).expect("should serve artifact");
+        let response = handle_tsjs_dynamic(&request, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should serve artifact");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(header::CONTENT_TYPE),
@@ -8480,7 +10186,8 @@ mod tests {
         );
 
         let head = build_request(Method::HEAD, &format!("https://publisher.example{src}"));
-        let response = handle_tsjs_dynamic(&head, &registry).expect("should serve HEAD metadata");
+        let response = handle_tsjs_dynamic(&head, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should serve HEAD metadata");
         assert_eq!(response.status(), StatusCode::OK);
         assert!(
             response
@@ -8507,7 +10214,9 @@ mod tests {
                 Method::GET,
                 &format!("https://publisher.example/static/tsjs={suffix}"),
             );
-            let response = handle_tsjs_dynamic(&request, &registry).expect("should reject locally");
+            let response =
+                handle_tsjs_dynamic(&request, &registry, EdgeCacheHeader::SMaxageFallback)
+                    .expect("should reject locally");
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "case {suffix}");
             assert_eq!(
                 response.headers().get(header::CACHE_CONTROL),
@@ -8563,7 +10272,8 @@ mod tests {
                 method,
                 &format!("https://publisher.example/static/tsjs={suffix}"),
             );
-            let response = handle_tsjs_dynamic(&req, &registry).expect("should reject locally");
+            let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)
+                .expect("should reject locally");
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "case {suffix}");
             assert_eq!(
                 response.headers().get(header::CACHE_CONTROL),
@@ -8616,7 +10326,8 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build cleanup asset request");
 
-        let response = handle_tsjs_dynamic(&req, &registry).expect("should serve cleanup asset");
+        let response = handle_tsjs_dynamic(&req, &registry, EdgeCacheHeader::SMaxageFallback)
+            .expect("should serve cleanup asset");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     }
@@ -9490,7 +11201,7 @@ mod tests {
                 IntegrationRegistry::new(&settings).expect("should create integration registry");
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
-            let state = Arc::new(Mutex::new(None));
+            let state = AdBidsState::default();
             let auction_request = test_auction_request();
             let mut params = OwnedProcessResponseParams {
                 template_cache_key: None,
@@ -9878,7 +11589,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_finalize_emits_gam_attribution_head_before_origin_eof() {
+    fn streaming_finalize_emits_tsjs_head_before_origin_eof_without_legacy_gam_transport() {
         let mut settings = create_test_settings();
         settings
             .integrations
@@ -9902,12 +11613,13 @@ mod tests {
             .expect("should emit UTF-8 HTML");
 
         assert!(
-            html.contains("__tsjs_gam_attribution_enabled=true"),
-            "first rewritten head chunk should carry the primary activation flag: {html}"
+            html.contains("id=\"trustedserver-js\""),
+            "first rewritten head chunk should carry the parser-time TSJS runtime: {html}"
         );
         assert!(
-            html.contains("data-ts-gam-attribution=\"true\""),
-            "first rewritten head chunk should authorize the bundle fallback: {html}"
+            !html.contains("__tsjs_gam_attribution_enabled")
+                && !html.contains("data-ts-gam-attribution"),
+            "hard cutover must not retain either legacy GAM activation transport: {html}"
         );
     }
 
@@ -10800,6 +12512,7 @@ mod tests {
 
         fn make_config() -> CreativeOpportunitiesConfig {
             CreativeOpportunitiesConfig {
+                enabled: true,
                 gam_network_id: "21765378893".to_string(),
                 auction_timeout_ms: Some(500),
                 price_granularity: PriceGranularity::Dense,
@@ -11013,7 +12726,7 @@ mod tests {
 
         fn settings_with_co() -> Settings {
             let toml = format!(
-                "{}\n[auction]\nenabled = true\n\n[creative_opportunities]\ngam_network_id = \"12345\"\n",
+                "{}\n[auction]\nenabled = true\n\n[creative_opportunities]\nenabled = true\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );
             Settings::from_toml(&toml).expect("should parse settings with creative_opportunities")
@@ -11029,7 +12742,7 @@ mod tests {
 
         fn settings_with_co_auction_disabled() -> Settings {
             let toml = format!(
-                "{}\n[auction]\nenabled = false\n\n[creative_opportunities]\ngam_network_id = \"12345\"\n",
+                "{}\n[auction]\nenabled = false\n\n[creative_opportunities]\nenabled = true\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );
             Settings::from_toml(&toml).expect("should parse settings with creative_opportunities")
@@ -11600,7 +13313,7 @@ mod tests {
         fn settings_with_capturing_provider() -> Settings {
             let toml = format!(
                 "{}\n[auction]\nenabled = true\nproviders = [\"{CAPTURING_PROVIDER}\"]\n\n\
-                 [creative_opportunities]\ngam_network_id = \"12345\"\n",
+                 [creative_opportunities]\nenabled = true\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );
             Settings::from_toml(&toml).expect("should parse settings with a capturing provider")

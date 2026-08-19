@@ -226,6 +226,7 @@ mod tests {
     #[serde(deny_unknown_fields)]
     #[allow(dead_code)]
     struct LegacyCreativeOpportunitiesConfig {
+        enabled: bool,
         gam_network_id: String,
         #[serde(default)]
         auction_timeout_ms: Option<u32>,
@@ -241,6 +242,7 @@ mod tests {
             r#"
 
 [creative_opportunities]
+enabled = true
 gam_network_id = "99999"
 
 [[creative_opportunities.slot]]

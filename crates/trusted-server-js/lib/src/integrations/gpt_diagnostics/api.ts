@@ -126,7 +126,13 @@ export class GptDiagnosticsApiController {
       hide: () => this.presentation.hide(),
     });
     const recorder: GptDiagnosticsRecorder = {
-      recordTrustedServerOpportunity: (slot, auctionSlotId, opportunity, trustedServerAuctionId) =>
+      recordTrustedServerOpportunity: (
+        slot,
+        auctionSlotId,
+        opportunity,
+        trustedServerAuctionId,
+        requestedSlotSizes
+      ) =>
         safelyRecord(() => {
           this.store.recordTrustedServerOpportunity(
             slot,
@@ -163,7 +169,15 @@ export class GptDiagnosticsApiController {
               Object.freeze({
                 ...cycle,
                 durations: Object.freeze({ ...cycle.durations }),
+                requestedSlotSizes: cycle.requestedSlotSizes
+                  ? Object.freeze(
+                      cycle.requestedSlotSizes.map((size) => Object.freeze([...size]))
+                    )
+                  : undefined,
                 size: cycle.size ? Object.freeze([...cycle.size]) : undefined,
+                observedSlotSize: cycle.observedSlotSize
+                  ? Object.freeze([...cycle.observedSlotSize])
+                  : undefined,
                 adManager: cycle.adManager
                   ? Object.freeze({
                       ...cycle.adManager,

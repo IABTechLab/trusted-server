@@ -88,6 +88,7 @@ impl GptDiagnosticsRequestDecision {
         self.active
             || self.cookie_action != GptDiagnosticsCookieAction::None
             || self.reserved_directive
+            || self.clean_browser_path_and_query.is_some()
     }
 
     /// Build the one-time inline URL-cleanup tag after reserved input was consumed.
@@ -97,23 +98,6 @@ impl GptDiagnosticsRequestDecision {
         Some(format!(
             "<script>try{{history.replaceState(history.state,'',{clean_path}+location.hash)}}catch(_error){{}}</script>"
         ))
-    }
-}
-
-impl GptDiagnosticsRequestDecision {
-    /// An active decision, for tests in other modules that need one.
-    ///
-    /// The fields are private and built by `prepare_request` from a cookie or query
-    /// parameter; there is no other way to obtain an active decision across a module
-    /// boundary.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn active_for_tests() -> Self {
-        Self {
-            active: true,
-            clean_browser_path_and_query: None,
-            cookie_action: GptDiagnosticsCookieAction::None,
-        }
     }
 }
 
@@ -131,11 +115,14 @@ mod head_seam_invariant_tests {
                     GptDiagnosticsCookieAction::SetSession,
                     GptDiagnosticsCookieAction::ClearSession,
                 ] {
-                    out.push(GptDiagnosticsRequestDecision {
-                        active,
-                        clean_browser_path_and_query: clean.clone(),
-                        cookie_action,
-                    });
+                    for reserved_directive in [false, true] {
+                        out.push(GptDiagnosticsRequestDecision {
+                            active,
+                            clean_browser_path_and_query: clean.clone(),
+                            cookie_action,
+                            reserved_directive,
+                        });
+                    }
                 }
             }
         }
@@ -153,8 +140,7 @@ mod head_seam_invariant_tests {
         // If a future change makes a script emit without also requiring the stamp,
         // this fails here rather than silently in a cached template.
         for decision in all_decisions() {
-            let injects =
-                decision.bootstrap_script().is_some() || decision.module_script_tag().is_some();
+            let injects = decision.url_cleanup_script_tag().is_some();
             if injects {
                 assert!(
                     decision.requires_private_no_store(),
@@ -168,8 +154,7 @@ mod head_seam_invariant_tests {
     #[test]
     fn a_default_decision_injects_nothing() {
         let decision = GptDiagnosticsRequestDecision::default();
-        assert_eq!(decision.bootstrap_script(), None);
-        assert_eq!(decision.module_script_tag(), None);
+        assert_eq!(decision.url_cleanup_script_tag(), None);
         assert!(
             !decision.requires_private_no_store(),
             "an inert decision should not force the response private"

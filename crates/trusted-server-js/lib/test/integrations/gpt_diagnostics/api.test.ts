@@ -3,7 +3,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { GptDiagnosticsBinding } from '../../../src/core/types';
 import { DiagnosticsSubscriberLimitError } from '../../../src/core/trace';
 import { GptDiagnosticsApiController } from '../../../src/integrations/gpt_diagnostics/api';
-import { GptDiagnosticsStore } from '../../../src/integrations/gpt_diagnostics/store';
+import {
+  GptDiagnosticsStore,
+  type GptDiagnosticsStoreSnapshot,
+} from '../../../src/integrations/gpt_diagnostics/store';
 
 class FakeBindings {
   private readonly listeners = new Set<() => void>();
@@ -218,7 +221,7 @@ describe('GptDiagnosticsApiController', () => {
   });
 
   it('detaches nested attribution evidence from the store snapshot', () => {
-    const source = {
+    const source: GptDiagnosticsStoreSnapshot = {
       gptObserved: true,
       slots: [
         {
@@ -285,11 +288,11 @@ describe('GptDiagnosticsApiController', () => {
     );
     expect(cycle?.adManager?.yieldGroupIds).toEqual([10]);
     expect(cycle?.adManager?.yieldGroupIds).not.toBe(
-      source.slots[0]?.requests[0]?.adManager.yieldGroupIds
+      source.slots[0]?.requests[0]?.adManager?.yieldGroupIds
     );
     expect(cycle?.adManager?.companyIds).toEqual([20]);
     expect(cycle?.adManager?.companyIds).not.toBe(
-      source.slots[0]?.requests[0]?.adManager.companyIds
+      source.slots[0]?.requests[0]?.adManager?.companyIds
     );
     expect(snapshot.metadata).not.toBe(source.metadata);
     expect(snapshot.metadata.droppedAttributionIssues).toBe(2);

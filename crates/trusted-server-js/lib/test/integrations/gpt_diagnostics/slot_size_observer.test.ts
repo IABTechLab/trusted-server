@@ -69,7 +69,7 @@ describe('GptDiagnosticsSlotSizeObserver', () => {
     const getBoundingClientRect = vi.spyOn(element, 'getBoundingClientRect');
     getBoundingClientRect.mockReturnValue({ width: 728, height: 90 } as DOMRect);
     const requests = [cycle(1, false)];
-    requests[0].size = [1, 1];
+    requests[0]!.size = [1, 1];
     const store = {
       snapshot: () => snapshot(requests),
       recordObservedSlotSize: vi.fn(),
@@ -86,10 +86,10 @@ describe('GptDiagnosticsSlotSizeObserver', () => {
     });
 
     expect(store.recordObservedSlotSize).toHaveBeenCalledWith(1, 1, [728, 90]);
-    expect(requests[0].size).toEqual([1, 1]);
+    expect(requests[0]!.size).toEqual([1, 1]);
 
     getBoundingClientRect.mockReturnValue({ width: 970, height: 250 } as DOMRect);
-    ResizeObserverMock.instances.at(-1)!.emit(element);
+    ResizeObserverMock.instances[ResizeObserverMock.instances.length - 1]!.emit(element);
     expect(store.recordObservedSlotSize).toHaveBeenLastCalledWith(1, 1, [970, 250]);
     observer.destroy();
   });
@@ -113,7 +113,9 @@ describe('GptDiagnosticsSlotSizeObserver', () => {
     });
 
     expect(store.recordObservedSlotSize).not.toHaveBeenCalled();
-    expect(ResizeObserverMock.instances.at(-1)!.observe).not.toHaveBeenCalled();
+    expect(
+      ResizeObserverMock.instances[ResizeObserverMock.instances.length - 1]!.observe
+    ).not.toHaveBeenCalled();
     observer.destroy();
   });
 
@@ -143,10 +145,10 @@ describe('GptDiagnosticsSlotSizeObserver', () => {
       window: { HTMLElement, ResizeObserver: ResizeObserverMock } as unknown as Window,
       scheduleFrame: (callback) => frames.push(callback),
     });
-    const firstObserver = ResizeObserverMock.instances[0];
+    const firstObserver = ResizeObserverMock.instances[0]!;
 
     requests.push(cycle(2, false));
-    listeners[0]();
+    listeners[0]!();
     frames.shift()!();
     firstObserver.emit(element);
     while (frames.length > 0) frames.shift()!();

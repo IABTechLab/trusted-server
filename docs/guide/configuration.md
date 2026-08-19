@@ -1477,6 +1477,7 @@ unit it maps to (`gam_unit_path`).
 
 ```toml
 [creative_opportunities]
+enabled = true
 gam_network_id = "123456789"
 price_granularity = "dense"
 
@@ -1548,8 +1549,9 @@ publisher-specific. Startup fails if `{section}` is used without a valid
 `section_root`. Startup rejects a blank `gam_network_id` only when an absent
 path/default or a `{network_id}` template consumes it; static paths and
 templates without `{network_id}` do not consume it. A
-`[creative_opportunities]` block with no slots is disabled, so its
-`gam_network_id` is not checked.
+`enabled = false` explicitly disables publisher and page-bids template delivery.
+An enabled block with no slots has no templates to match, so its `gam_network_id`
+is not checked. The `enabled` key is required whenever the table is present.
 
 Both knobs are config-driven, so the URL→section convention stays with the
 publisher: `section_segment` selects which segment names the section, and

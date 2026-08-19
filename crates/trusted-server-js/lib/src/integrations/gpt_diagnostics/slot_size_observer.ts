@@ -1,4 +1,5 @@
 import type { Size } from '../../core/types';
+import { realmOwnedHtmlElement } from '../../shared/realm';
 
 import type { GptDiagnosticsBindingManager } from './binding';
 import type { GptDiagnosticsStoreSnapshot } from './store';
@@ -101,8 +102,8 @@ export class GptDiagnosticsSlotSizeObserver {
     if (typeof ResizeObserverConstructor === 'function') {
       this.resizeObserver = new ResizeObserverConstructor((entries) => {
         for (const entry of entries) {
-          const element = entry.target;
-          if (!(element instanceof this.window.HTMLElement)) continue;
+          const element = realmOwnedHtmlElement(entry.target, this.window);
+          if (!element) continue;
           const cycle = observations.get(element);
           if (cycle) this.scheduleMeasure(element, cycle);
         }

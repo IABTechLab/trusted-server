@@ -182,7 +182,15 @@ export interface GptDiagnosticsRequestCycle {
   viewableAtMs?: number | undefined;
   durations: GptDiagnosticsDurations;
   isEmpty?: boolean | undefined;
+  /** Configured sizes Trusted Server supplied to GPT for this request. */
+  requestedSlotSizes?: ReadonlyArray<Size> | undefined;
+  /** Exact fill size fact GPT reported in `slotRenderEnded`. */
   size?: Size | undefined;
+  /**
+   * Outer CSS box observed on the uniquely bound, connected slot element after
+   * a filled GPT render. This does not assert the internal creative pixel size.
+   */
+  observedSlotSize?: Size | undefined;
   isBackfill?: boolean | undefined;
   slotContentChanged?: boolean | undefined;
   incompleteSequence: boolean;
@@ -212,7 +220,7 @@ export interface GptDiagnosticsSlotExport {
   binding: GptDiagnosticsBinding;
   currentVisibilityPercentage?: number | undefined;
   maximumVisibilityPercentage?: number | undefined;
-  requests: GptDiagnosticsRequestCycle[];
+  requests: readonly Readonly<GptDiagnosticsRequestCycle>[];
 }
 
 export interface GptDiagnosticsCallbackIssue {
@@ -251,22 +259,24 @@ export interface GptDiagnosticsCoverageCounters {
 }
 
 export interface GptDiagnosticsExportV1 {
-  version: 1;
-  capturedAt: string;
-  page: {
+  readonly version: 1;
+  readonly capturedAt: string;
+  readonly page: Readonly<{
     origin: string;
     pathname: string;
-  };
-  slots: GptDiagnosticsSlotExport[];
-  callbackIssues: GptDiagnosticsCallbackIssue[];
-  attributionIssues: GptDiagnosticsAttributionIssue[];
-  coverage: Record<GptDiagnosticsCallbackKind, GptDiagnosticsCoverageCounters>;
-  metadata: {
+  }>;
+  readonly slots: readonly Readonly<GptDiagnosticsSlotExport>[];
+  readonly callbackIssues: readonly Readonly<GptDiagnosticsCallbackIssue>[];
+  readonly attributionIssues: readonly Readonly<GptDiagnosticsAttributionIssue>[];
+  readonly coverage: Readonly<
+    Record<GptDiagnosticsCallbackKind, Readonly<GptDiagnosticsCoverageCounters>>
+  >;
+  readonly metadata: Readonly<{
     droppedCallbacks: number;
     droppedAttributionIssues: number;
     evictedSlots: number;
     evictedRequestCycles: number;
-  };
+  }>;
 }
 
 /** GPT slot object identity, the only key diagnostics correlates slots by. */
@@ -277,9 +287,9 @@ export interface GptDiagnosticsSlotHandle {
 
 /** The documented, read-only operator API. It records no evidence. */
 export interface GptDiagnosticsApi {
-  snapshot(): GptDiagnosticsExportV1;
+  snapshot(): Readonly<GptDiagnosticsExportV1>;
   export(): void;
-  subscribe(listener: (snapshot: GptDiagnosticsExportV1) => void): () => void;
+  subscribe(listener: (snapshot: Readonly<GptDiagnosticsExportV1>) => void): () => void;
   show(): void;
   hide(): void;
 }
