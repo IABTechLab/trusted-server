@@ -1096,6 +1096,12 @@ describe('first-display initial slice definitions', () => {
     );
     expect(protocol?.rendererUrl).toBe('https://publisher.example/integrations/aps/renderer/v1');
     expect(protocol?.publisherOrigin).toBe('https://publisher.example');
+    expect(protocol?.sandbox).toBe(
+      'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation'
+    );
+    expect(protocol?.permanentSandbox).toBe(
+      'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts allow-top-navigation-by-user-activation'
+    );
     expect(protocol?.deadlines).toEqual({
       insertionMs: 1_000,
       documentAcceptanceMs: 3_000,
@@ -1104,7 +1110,9 @@ describe('first-display initial slice definitions', () => {
     });
     expect(protocol?.isReservationId(`r1_${'a'.repeat(22)}`)).toBe(true);
     expect(protocol?.isLifecycleTicket(`t1_${'a'.repeat(22)}`)).toBe(true);
+    expect(protocol?.isBootstrapNonce(`b1_${'a'.repeat(22)}`)).toBe(true);
     expect(protocol?.isRendererNonce(`n1_${'a'.repeat(22)}`)).toBe(true);
+    expect(protocol?.isBootstrapNonce(`n1_${'a'.repeat(22)}`)).toBe(false);
     expect(protocol?.isReservationId(`r1_${'a'.repeat(21)}`)).toBe(false);
     const nonce = `n1_${'b'.repeat(22)}`;
     expect(

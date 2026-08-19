@@ -19,6 +19,7 @@ export interface FirstDisplayApsProtocolV1 {
   readonly publisherOrigin: string;
   readonly rendererUrl: string;
   readonly sandbox: string;
+  readonly permanentSandbox: string;
   readonly deadlines: Readonly<{
     insertionMs: 1_000;
     documentAcceptanceMs: 3_000;
@@ -27,6 +28,7 @@ export interface FirstDisplayApsProtocolV1 {
   }>;
   readonly isReservationId: (candidate: unknown) => candidate is string;
   readonly isLifecycleTicket: (candidate: unknown) => candidate is string;
+  readonly isBootstrapNonce: (candidate: unknown) => candidate is string;
   readonly isRendererNonce: (candidate: unknown) => candidate is string;
   readonly parseDocumentMessage: (
     candidate: unknown,
@@ -43,11 +45,13 @@ interface ApsInitialBindings {
   readonly register: (protocol: FirstDisplayApsProtocolV1) => () => void;
 }
 
-const OPAQUE_ID = /^[artn]1_[A-Za-z0-9_-]{22}$/;
+const OPAQUE_ID = /^[abrtn]1_[A-Za-z0-9_-]{22}$/;
 const LOOPBACK_IPV4 = /^127(?:\.\d{1,3}){3}$/;
 const FAILURE_REASONS = new Set(['descriptor_invalid', 'runner_no_load', 'runner_failed']);
 const SANDBOX =
   'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation';
+const PERMANENT_SANDBOX =
+  'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts allow-top-navigation-by-user-activation';
 
 function exactRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | undefined {
   try {
@@ -118,7 +122,10 @@ function bindings(candidate: unknown): ApsInitialBindings | undefined {
   }
 }
 
-function exactOpaqueId(candidate: unknown, prefix: 'r1_' | 't1_' | 'n1_'): candidate is string {
+function exactOpaqueId(
+  candidate: unknown,
+  prefix: 'r1_' | 't1_' | 'b1_' | 'n1_'
+): candidate is string {
   return typeof candidate === 'string' && candidate.startsWith(prefix) && OPAQUE_ID.test(candidate);
 }
 
@@ -169,6 +176,7 @@ export function installApsInitial(
     publisherOrigin: value.publisherOrigin,
     rendererUrl,
     sandbox: SANDBOX,
+    permanentSandbox: PERMANENT_SANDBOX,
     deadlines: Object.freeze({
       insertionMs: 1_000,
       documentAcceptanceMs: 3_000,
@@ -177,6 +185,7 @@ export function installApsInitial(
     }),
     isReservationId: (input: unknown): input is string => exactOpaqueId(input, 'r1_'),
     isLifecycleTicket: (input: unknown): input is string => exactOpaqueId(input, 't1_'),
+    isBootstrapNonce: (input: unknown): input is string => exactOpaqueId(input, 'b1_'),
     isRendererNonce: (input: unknown): input is string => exactOpaqueId(input, 'n1_'),
     parseDocumentMessage,
     createRenderBridge: (options: Omit<FirstDisplayRenderBridgeOptionsV1, 'getAps'>) =>
