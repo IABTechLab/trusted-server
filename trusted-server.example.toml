@@ -155,6 +155,9 @@ debug = false
 # inventory_page_origin = "https://www.publisher.example"
 # Script creatives require separate security validation before opt-in.
 allow_script_creatives = false
+# Default: Trusted Server's opaque static renderer route. Set publisher_native only
+# when the publisher installs the documented tsjs.apsNativeRenderer hook.
+rendering_mode = "trusted_server"
 
 [integrations.google_tag_manager]
 enabled = false

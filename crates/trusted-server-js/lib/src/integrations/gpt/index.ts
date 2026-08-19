@@ -11,6 +11,7 @@ import {
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
   apsRendererUrl,
+  dispatchApsRendering,
   consumeApsPrebidRenderer,
   getApsPrebidRenderer,
   validateApsRenderer,
@@ -1676,29 +1677,49 @@ export function installTsRenderBridge(): void {
       e.stopImmediatePropagation();
       if (!messageSourceBelongsToAdUnit(e.source, prebidRendererEntry.adUnitCode)) return;
       const renderer = validateApsRenderer(prebidRendererEntry.renderer);
-      const rendererUrl = apsRendererUrl();
-      if (!renderer || !rendererUrl) return;
-      if (!hasConsumedPrebidApsIdCapacity(consumedPrebidApsIds, adId)) return;
+      if (!renderer || !hasConsumedPrebidApsIdCapacity(consumedPrebidApsIds, adId)) return;
       if (!consumeApsPrebidRenderer(adId, prebidRendererEntry)) return;
       recordConsumedPrebidApsId(consumedPrebidApsIds, adId, prebidRendererEntry.expiresAt);
 
-      port.postMessage(
-        JSON.stringify({
-          message: 'Prebid Response',
-          adId,
-          renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
-          rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
-          rendererUrl,
-          apsRenderer: renderer,
-          width: renderer.width,
-          height: renderer.height,
-        })
-      );
-
-      try {
-        prebidRendererEntry.markUsed();
-      } catch (err) {
-        log.warn(`[tsjs-gpt] APS Prebid markUsed callback threw for '${adId}'`, err);
+      const markUsed = (): void => {
+        try {
+          prebidRendererEntry.markUsed();
+        } catch (err) {
+          log.warn(`[tsjs-gpt] APS Prebid markUsed callback threw for '${adId}'`, err);
+        }
+      };
+      const dispatched = dispatchApsRendering({
+        slotId: prebidRendererEntry.adUnitCode,
+        renderer,
+        trustedServer: (validatedRenderer) => {
+          const rendererUrl = apsRendererUrl();
+          if (!rendererUrl) return false;
+          try {
+            port.postMessage(
+              JSON.stringify({
+                message: 'Prebid Response',
+                adId,
+                renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+                rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+                rendererUrl,
+                apsRenderer: validatedRenderer,
+                width: validatedRenderer.width,
+                height: validatedRenderer.height,
+              })
+            );
+            return true;
+          } catch (err) {
+            log.warn(`[tsjs-gpt] APS Prebid response post failed for '${adId}'`, err);
+            return false;
+          }
+        },
+      });
+      if (typeof dispatched === 'boolean') {
+        if (dispatched) markUsed();
+      } else {
+        void dispatched.then((accepted) => {
+          if (accepted) markUsed();
+        });
       }
       return;
     }
@@ -1727,19 +1748,34 @@ export function installTsRenderBridge(): void {
       e.stopImmediatePropagation();
       if (consumedServerApsBySlot.get(slotId) === adId) return;
       const renderer = validateApsRenderer(matchedBid.renderer);
-      const rendererUrl = apsRendererUrl();
-      if (!renderer || !rendererUrl) return;
+      if (!renderer) return;
       consumedServerApsBySlot.set(slotId, adId);
-      port.postMessage(
-        JSON.stringify({
-          message: 'Prebid Response',
-          adId,
-          renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
-          rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
-          rendererUrl,
-          apsRenderer: renderer,
-          width: renderer.width,
-          height: renderer.height,
+      void Promise.resolve(
+        dispatchApsRendering({
+          slotId,
+          renderer,
+          trustedServer: (validatedRenderer) => {
+            const rendererUrl = apsRendererUrl();
+            if (!rendererUrl) return false;
+            try {
+              port.postMessage(
+                JSON.stringify({
+                  message: 'Prebid Response',
+                  adId,
+                  renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+                  rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+                  rendererUrl,
+                  apsRenderer: validatedRenderer,
+                  width: validatedRenderer.width,
+                  height: validatedRenderer.height,
+                })
+              );
+              return true;
+            } catch (err) {
+              log.warn(`[tsjs-gpt] APS server response post failed for '${slotId}'`, err);
+              return false;
+            }
+          },
         })
       );
       return;

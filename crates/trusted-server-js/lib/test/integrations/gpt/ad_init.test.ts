@@ -7,6 +7,15 @@ import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vites
 
 import envelope from '../../fixtures/aps-renderer-v1.json';
 import type { AuctionBidData, TsjsApi } from '../../../src/core/types';
+import { APS_RENDERING_MODE_META_NAME } from '../../../src/integrations/aps/render';
+
+function enablePublisherNativeMode(): HTMLMetaElement {
+  const marker = document.createElement('meta');
+  marker.name = APS_RENDERING_MODE_META_NAME;
+  marker.content = 'publisher_native';
+  document.head.appendChild(marker);
+  return marker;
+}
 
 function apsRenderer() {
   const bid = envelope.seatbid[0].bid[0];
@@ -3197,6 +3206,79 @@ describe('installTsRenderBridge', () => {
     beaconSpy.mockRestore();
   });
 
+  it('contract test: delegates a server APS owner to the native hook without a Universal Creative response', async () => {
+    const renderer = apsRenderer();
+    const render = vi.fn().mockResolvedValue({ accepted: true });
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: renderer.bidId,
+      renderer,
+    };
+    (window as TestWindow).tsjs.apsNativeRenderer = { render };
+    const marker = enablePublisherNativeMode();
+
+    try {
+      const bridgeListener = await captureBridgeListener();
+      const source = createTrustedSlotIframe();
+      const portMessages: string[] = [];
+      const request = Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent;
+
+      bridgeListener(request);
+      bridgeListener(request);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(render).toHaveBeenCalledOnce();
+      expect(render).toHaveBeenCalledWith({
+        version: 1,
+        slotId: 'homepage_header',
+        renderer,
+      });
+      expect(portMessages).toEqual([]);
+      expect(document.querySelector('iframe[src*="/integrations/aps/renderer"]')).toBeNull();
+    } finally {
+      marker.remove();
+    }
+  });
+
+  it('contract test: declines a server APS owner without a Universal Creative response or fallback', async () => {
+    const renderer = apsRenderer();
+    const render = vi.fn().mockResolvedValue({ accepted: false });
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: renderer.bidId,
+      renderer,
+    };
+    (window as TestWindow).tsjs.apsNativeRenderer = { render };
+    const marker = enablePublisherNativeMode();
+
+    try {
+      const bridgeListener = await captureBridgeListener();
+      const source = createTrustedSlotIframe();
+      const portMessages: string[] = [];
+      const request = Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent;
+
+      bridgeListener(request);
+      await Promise.resolve();
+      await Promise.resolve();
+      bridgeListener(request);
+
+      expect(render).toHaveBeenCalledOnce();
+      expect(portMessages).toEqual([]);
+      expect(document.querySelector('iframe[src*="/integrations/aps/renderer"]')).toBeNull();
+    } finally {
+      marker.remove();
+    }
+  });
+
   it('serves a registered Prebid APS renderer when its generated ad ID differs from the APS bid ID', async () => {
     const renderer = apsRenderer();
     const prebidAdId = 'prebid-generated-ad-id';
@@ -3250,6 +3332,92 @@ describe('installTsRenderBridge', () => {
     expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
     expect(fetchStub).not.toHaveBeenCalled();
     foreignIframe.remove();
+  });
+
+  it('contract test: declines a registered APS capability without a Universal Creative response or markUsed', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'native-prebid-decline-ad-id';
+    const markUsed = vi.fn();
+    const render = vi.fn().mockResolvedValue({ accepted: false });
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markUsed,
+      },
+    };
+    (window as TestWindow).tsjs.apsNativeRenderer = { render };
+    const marker = enablePublisherNativeMode();
+
+    try {
+      const bridgeListener = await captureBridgeListener();
+      const source = createTrustedSlotIframe();
+      const portMessages: string[] = [];
+      const request = Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent;
+
+      bridgeListener(request);
+      await Promise.resolve();
+      await Promise.resolve();
+      bridgeListener(request);
+
+      expect(render).toHaveBeenCalledOnce();
+      expect(markUsed).not.toHaveBeenCalled();
+      expect(portMessages).toEqual([]);
+      expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
+      expect(document.querySelector('iframe[src*="/integrations/aps/renderer"]')).toBeNull();
+    } finally {
+      marker.remove();
+    }
+  });
+
+  it('contract test: consumes a registered APS capability and marks it used only after native acceptance', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'native-prebid-ad-id';
+    const markUsed = vi.fn();
+    const render = vi.fn().mockResolvedValue({ accepted: true });
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markUsed,
+      },
+    };
+    (window as TestWindow).tsjs.apsNativeRenderer = { render };
+    const marker = enablePublisherNativeMode();
+
+    try {
+      const bridgeListener = await captureBridgeListener();
+      const source = createTrustedSlotIframe();
+      const portMessages: string[] = [];
+      const request = Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent;
+
+      bridgeListener(request);
+      expect(markUsed).not.toHaveBeenCalled();
+      await Promise.resolve();
+      await Promise.resolve();
+      bridgeListener(request);
+
+      expect(render).toHaveBeenCalledOnce();
+      expect(markUsed).toHaveBeenCalledOnce();
+      expect(portMessages).toEqual([]);
+      expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
+    } finally {
+      marker.remove();
+    }
   });
 
   it('still serves the APS renderer when markUsed throws', async () => {

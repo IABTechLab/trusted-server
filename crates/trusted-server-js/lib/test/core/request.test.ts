@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AdUnit } from '../../src/core/types';
+import { APS_RENDERING_MODE_META_NAME } from '../../src/integrations/aps/render';
 import envelope from '../fixtures/aps-renderer-v1.json';
 
 async function flushRequestAds(): Promise<void> {
@@ -135,6 +136,57 @@ describe('request.requestAds', () => {
       })
     );
     expect(document.querySelector('#slot1 span')).toBeNull();
+  });
+
+  it('contract test: dispatches a direct APS bid to the native publisher hook without an iframe', async () => {
+    const apsBid = envelope.seatbid[0].bid[0];
+    const renderer = {
+      type: 'aps' as const,
+      version: 1 as const,
+      accountId: 'example-account-id',
+      bidId: apsBid.id,
+      tagType: apsBid.ext.tagtype as 'iframe',
+      creativeUrl: apsBid.ext.creativeurl,
+      aaxResponse: btoa(JSON.stringify(envelope)),
+      width: apsBid.w,
+      height: apsBid.h,
+    };
+    const render = vi.fn().mockResolvedValue({ accepted: true });
+    window.tsjs = { apsNativeRenderer: { render } } as typeof window.tsjs;
+    const marker = document.createElement('meta');
+    marker.name = APS_RENDERING_MODE_META_NAME;
+    marker.content = 'publisher_native';
+    document.head.appendChild(marker);
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      json: async () => ({
+        seatbid: [
+          {
+            seat: 'aps',
+            bid: [{ impid: 'slot1', ext: { trusted_server: { renderer } } }],
+          },
+        ],
+      }),
+    });
+
+    try {
+      const { addAdUnits } = await import('../../src/core/registry');
+      const { requestAds } = await import('../../src/core/request');
+      document.body.innerHTML = '<div id="slot1"><span>existing</span></div>';
+      addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } });
+
+      requestAds();
+      await flushRequestAds();
+      await Promise.resolve();
+
+      expect(render).toHaveBeenCalledWith({ version: 1, slotId: 'slot1', renderer });
+      expect(document.querySelector('#slot1 iframe')).toBeNull();
+      expect(document.querySelector('#slot1 span')).not.toBeNull();
+    } finally {
+      marker.remove();
+    }
   });
 
   it('does not mutate the slot for an invalid APS descriptor', async () => {

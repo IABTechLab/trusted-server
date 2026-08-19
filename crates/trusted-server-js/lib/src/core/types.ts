@@ -68,6 +68,21 @@ export interface ApsRendererV1 {
 
 export type AuctionBidRenderer = ApsRendererV1;
 
+/** Explicit acknowledgement returned by the opt-in publisher-native APS hook. */
+export interface ApsNativeRendererResult {
+  accepted: boolean;
+  reason?: string;
+}
+
+/** Publisher-owned rendering seam for a fully validated APS descriptor. */
+export interface ApsNativeRendererHook {
+  render(input: {
+    version: 1;
+    slotId: string;
+    renderer: ApsRendererV1;
+  }): ApsNativeRendererResult | Promise<ApsNativeRendererResult>;
+}
+
 /** A client-side Prebid bid's generated ad ID bound to its APS render capability. */
 export interface ApsPrebidRendererEntry {
   adUnitCode: string;
@@ -388,6 +403,8 @@ export interface TsjsApi {
    * `hb_adid`. The Universal Creative bridge consumes each entry at most once.
    */
   apsPrebidRenderers?: Record<string, ApsPrebidRendererEntry>;
+  /** Opt-in publisher-owned renderer for exact, validated APS descriptors. */
+  apsNativeRenderer?: ApsNativeRendererHook;
   /** Initialises GPT slots with server-side bid targeting and calls refresh(). */
   adInit?: () => void;
   /** GPT slot objects TS defined — used to destroy stale slots on SPA navigation. */
