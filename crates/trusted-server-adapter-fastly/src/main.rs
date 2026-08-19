@@ -607,6 +607,94 @@ mod tests {
         assert!(response.headers().get("etag").is_none());
     }
 
+    fn diagnostics_settings() -> Settings {
+        Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+
+            [integrations.gpt_diagnostics]
+            enabled = true
+            "#,
+        )
+        .expect("should parse diagnostics settings")
+    }
+
+    #[test]
+    fn late_filter_effects_cannot_make_an_active_diagnostics_response_public() {
+        // The narrowest hole: an established diagnostics session sets no new cookie, so
+        // the `Set-Cookie` privacy net never fires, and before this the decision only
+        // stamped `Cache-Control` without leaving a marker for the terminal guard.
+        let mut request = edgezero_core::http::request_builder()
+            .method(fastly::http::Method::GET)
+            .uri("https://test-publisher.com/article")
+            .header("sec-fetch-dest", "document")
+            .header("cookie", "__Host-ts-console=1")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let decision = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+            &diagnostics_settings(),
+            &mut request,
+        )
+        .expect("should prepare the diagnostics decision");
+        assert!(
+            decision.active(),
+            "the session cookie should activate diagnostics"
+        );
+
+        let mut response = response_builder()
+            .header("cache-control", "public, max-age=600")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        trusted_server_core::integrations::gpt_diagnostics::finalize_response(
+            &decision,
+            &mut response,
+        );
+
+        let effects = RequestFilterEffects {
+            request_headers: Vec::new(),
+            response_headers: vec![
+                HeaderMutation::set("cache-control", "public, s-maxage=3600"),
+                HeaderMutation::set("surrogate-control", "max-age=3600"),
+            ],
+        };
+
+        apply_terminal_response_effects(&mut response, Some(&effects));
+
+        assert!(
+            response.headers().get("set-cookie").is_none(),
+            "the case under test is the one with no Set-Cookie to protect it"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("private, no-store"),
+            "request-scoped diagnostics HTML must never become shared-cacheable"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "should strip CDN cache directives a late filter added"
+        );
+    }
+
     #[test]
     fn terminal_response_preserves_unmarked_origin_private_policy() {
         let mut response = response_builder()
