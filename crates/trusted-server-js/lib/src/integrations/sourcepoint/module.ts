@@ -4,6 +4,7 @@ import type {
   IntegrationRegistration,
 } from '../../kernel/integration_registry';
 import type { IntegrationLifecycleRuntime } from '../../kernel/lifecycle_module';
+import { isSourcepointIntegrationConfigV1 } from '../../shared/integration_config_validators';
 import { validatePersistentFirstDisplaySliceAdoptionV1 } from '../../shared/takeover';
 
 import {
@@ -31,26 +32,8 @@ export interface SourcepointConsentCapabilityV1 {
   readonly startLifecycle: () => void;
 }
 
-function sourcepointBootConfig(candidate: unknown): candidate is SourcepointBootConfig {
-  try {
-    if (
-      typeof candidate !== 'object' ||
-      candidate === null ||
-      Array.isArray(candidate) ||
-      !Object.isFrozen(candidate) ||
-      Object.getPrototypeOf(candidate) !== Object.prototype ||
-      Reflect.ownKeys(candidate).length !== 1
-    ) {
-      return false;
-    }
-    const rewriteSdk = Object.getOwnPropertyDescriptor(candidate, 'rewriteSdk');
-    return Boolean(
-      rewriteSdk?.enumerable && 'value' in rewriteSdk && typeof rewriteSdk.value === 'boolean'
-    );
-  } catch {
-    return false;
-  }
-}
+const sourcepointBootConfig = (candidate: unknown): candidate is SourcepointBootConfig =>
+  isSourcepointIntegrationConfigV1(candidate);
 
 /** Own Sourcepoint's optional guard and consent mirror as one release-bound unit. */
 export function createSourcepointRuntime(

@@ -43,7 +43,7 @@ describe('APS provider', () => {
     const registration = createApsIntegrationRegistration(RELEASE_ID);
     const prepared = registration.prepare(
       Object.freeze({
-        config: undefined,
+        config: Object.freeze({}),
         interfaces: Object.freeze({ 'render.v1': render, 'messages.v1': messages }),
         signal: new AbortController().signal,
         onDispose: (callback: () => void) => preparationRelease.push(callback),
@@ -98,7 +98,7 @@ describe('APS provider', () => {
     });
     const prepared = createApsIntegrationRegistration(RELEASE_ID).prepare(
       Object.freeze({
-        config: undefined,
+        config: Object.freeze({}),
         interfaces: Object.freeze({ 'render.v1': render, 'messages.v1': messages }),
         signal: new AbortController().signal,
         onDispose: vi.fn(),

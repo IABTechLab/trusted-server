@@ -9,7 +9,6 @@ import {
   PrebidAdmissionContractError,
   createBrowserPrebidAdapter,
   type PrebidAdapter,
-  type PrebidArtifactRequirements,
   type PrebidEventFacade,
   type PrebidTrustedServerAuctionV1,
   type PreparedTrustedBidV1,
@@ -36,21 +35,15 @@ import type {
 import type { ReservationService } from '../../services/reservations';
 import type { PucGamAttemptInput } from '../../services/puc_bridge';
 import type { RuntimeCapabilityV1 } from '../../kernel/runtime';
+import { isPrebidIntegrationConfigV1 } from '../../shared/integration_config_validators';
 
 import { createPrebidStartup } from './startup';
 
 export const PREBID_INTEGRATION_ID = 'prebid' as const;
 export type { PreparedTrustedBidV1 } from '../../adapters/prebid';
 
-const MAX_CONFIG_DEPTH = 16;
-const MAX_CONFIG_NODES = 512;
-const MAX_CONFIG_MEMBERS = 256;
 const arrayIsArrayIntrinsic = Array.isArray;
-const numberIsFiniteIntrinsic = Number.isFinite;
 const objectGetOwnPropertyDescriptorIntrinsic = Object.getOwnPropertyDescriptor;
-const objectGetOwnPropertyNamesIntrinsic = Object.getOwnPropertyNames;
-const objectGetOwnPropertySymbolsIntrinsic = Object.getOwnPropertySymbols;
-const objectGetPrototypeOfIntrinsic = Object.getPrototypeOf;
 const objectIsFrozenIntrinsic = Object.isFrozen;
 
 export interface PrebidCapabilityV1 {
@@ -67,59 +60,6 @@ interface ProductionRenderCapability {
   readonly reservations: ReservationService;
 }
 
-function validFrozenConfig(candidate: unknown): boolean {
-  const seen = new Set<object>();
-  let nodes = 0;
-  const visit = (value: unknown, depth: number, topLevel: boolean): boolean => {
-    if (value === undefined) return topLevel;
-    if (value === null || typeof value === 'string' || typeof value === 'boolean') return true;
-    if (typeof value === 'number') return numberIsFiniteIntrinsic(value);
-    if (typeof value !== 'object' || depth > MAX_CONFIG_DEPTH || nodes >= MAX_CONFIG_NODES) {
-      return false;
-    }
-    if (seen.has(value) || !objectIsFrozenIntrinsic(value)) return false;
-    seen.add(value);
-    nodes += 1;
-
-    const array = arrayIsArrayIntrinsic(value);
-    const prototype = objectGetPrototypeOfIntrinsic(value);
-    if (
-      (!array && prototype !== Object.prototype && prototype !== null) ||
-      (array && prototype !== Array.prototype)
-    ) {
-      return false;
-    }
-    if (objectGetOwnPropertySymbolsIntrinsic(value).length !== 0) return false;
-    const names = objectGetOwnPropertyNamesIntrinsic(value);
-    if (names.length > MAX_CONFIG_MEMBERS + (array ? 1 : 0)) return false;
-    if (array) {
-      const length = objectGetOwnPropertyDescriptorIntrinsic(value, 'length');
-      if (!length || !('value' in length) || names.length !== length.value + 1) return false;
-      for (let index = 0; index < length.value; index += 1) {
-        const descriptor = objectGetOwnPropertyDescriptorIntrinsic(value, String(index));
-        if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return false;
-        if (!visit(descriptor.value, depth + 1, false)) return false;
-      }
-      return true;
-    }
-
-    for (let index = 0; index < names.length; index += 1) {
-      const name = names[index];
-      if (name === undefined) return false;
-      const descriptor = objectGetOwnPropertyDescriptorIntrinsic(value, name);
-      if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return false;
-      if (!visit(descriptor.value, depth + 1, false)) return false;
-    }
-    return true;
-  };
-
-  try {
-    return visit(candidate, 0, true);
-  } catch {
-    return false;
-  }
-}
-
 function configStringArray(config: unknown, key: string): readonly string[] {
   if (typeof config !== 'object' || config === null) return Object.freeze([]);
   const descriptor = objectGetOwnPropertyDescriptorIntrinsic(config, key);
@@ -131,64 +71,6 @@ function configStringArray(config: unknown, key: string): readonly string[] {
     if (typeof value === 'string') accepted.push(value);
   }
   return Object.freeze(accepted);
-}
-
-function configUserIdRequirements(
-  config: unknown
-): NonNullable<PrebidArtifactRequirements['requiredUserIdModules']> {
-  if (typeof config !== 'object' || config === null) return Object.freeze([]);
-  const descriptor = objectGetOwnPropertyDescriptorIntrinsic(config, 'requiredUserIdModules');
-  if (!descriptor) return Object.freeze([]);
-  if (!('value' in descriptor) || !arrayIsArrayIntrinsic(descriptor.value)) {
-    throw new TypeError('Prebid user-ID requirements are invalid');
-  }
-  const requirements: NonNullable<PrebidArtifactRequirements['requiredUserIdModules']>[number][] =
-    [];
-  for (const candidate of descriptor.value as readonly unknown[]) {
-    if (
-      typeof candidate !== 'object' ||
-      candidate === null ||
-      arrayIsArrayIntrinsic(candidate) ||
-      objectGetPrototypeOfIntrinsic(candidate) !== Object.prototype
-    ) {
-      throw new TypeError('Prebid user-ID requirement is invalid');
-    }
-    const keys = objectGetOwnPropertyNamesIntrinsic(candidate).sort();
-    if (
-      keys.length !== 3 ||
-      keys[0] !== 'configNames' ||
-      keys[1] !== 'eidSources' ||
-      keys[2] !== 'moduleName'
-    ) {
-      throw new TypeError('Prebid user-ID requirement shape is invalid');
-    }
-    const moduleName = objectGetOwnPropertyDescriptorIntrinsic(candidate, 'moduleName');
-    const configNames = objectGetOwnPropertyDescriptorIntrinsic(candidate, 'configNames');
-    const eidSources = objectGetOwnPropertyDescriptorIntrinsic(candidate, 'eidSources');
-    if (
-      !moduleName ||
-      !('value' in moduleName) ||
-      typeof moduleName.value !== 'string' ||
-      !configNames ||
-      !('value' in configNames) ||
-      !arrayIsArrayIntrinsic(configNames.value) ||
-      !eidSources ||
-      !('value' in eidSources) ||
-      !arrayIsArrayIntrinsic(eidSources.value) ||
-      !(configNames.value as readonly unknown[]).every((value) => typeof value === 'string') ||
-      !(eidSources.value as readonly unknown[]).every((value) => typeof value === 'string')
-    ) {
-      throw new TypeError('Prebid user-ID requirement values are invalid');
-    }
-    requirements.push(
-      Object.freeze({
-        moduleName: moduleName.value,
-        configNames: Object.freeze([...(configNames.value as readonly string[])]),
-        eidSources: Object.freeze([...(eidSources.value as readonly string[])]),
-      })
-    );
-  }
-  return Object.freeze(requirements);
 }
 
 function exactCapability<Value extends object>(
@@ -210,7 +92,9 @@ export function createPrebidIntegrationRegistration(releaseId: string): Integrat
     phase: 'takeover',
     releaseId,
     prepare: ({ config, interfaces, onDispose }: IntegrationPrepareContext) => {
-      if (!validFrozenConfig(config)) throw new TypeError('Prebid integration config is invalid');
+      if (!isPrebidIntegrationConfigV1(config)) {
+        throw new TypeError('Prebid integration config is invalid');
+      }
       const runtime = exactCapability<RuntimeCapabilityV1>(interfaces, 'runtime.v1');
       const render = exactCapability<ProductionRenderCapability>(interfaces, 'render.v1');
       exactCapability(interfaces, 'slots.v1');
@@ -227,14 +111,13 @@ export function createPrebidIntegrationRegistration(releaseId: string): Integrat
         throw new TypeError('Prebid capability graph is malformed');
       }
       const clientSideBidders = configStringArray(config, 'clientSideBidders');
-      const requiredUserIdModules = configUserIdRequirements(config);
       const excludedGamAdUnitPathSuffixes = configStringArray(
         config,
         'excludedGamAdUnitPathSuffixes'
       );
       const adapter = createBrowserPrebidAdapter(
         runtimeWindow as unknown as Parameters<typeof createBrowserPrebidAdapter>[0],
-        { configuredClientSideBidders: clientSideBidders, requiredUserIdModules }
+        { configuredClientSideBidders: clientSideBidders, requiredUserIdModules: Object.freeze([]) }
       );
       let active = false;
       let runtimeRelease: (() => void) | undefined;

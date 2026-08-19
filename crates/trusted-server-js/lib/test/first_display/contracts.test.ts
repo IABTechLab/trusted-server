@@ -18,6 +18,7 @@ function outline(overrides: Record<string, unknown> = {}): Record<string, unknow
     releaseId: HASH,
     generation: 1,
     projectionDigest: 'b'.repeat(64),
+    integrationConfigDigest: 'c'.repeat(64),
     slices: ['first_display', 'gpt_initial'],
     slotCount: 1,
     outcomeCount: 1,
@@ -33,6 +34,7 @@ function handoff(overrides: Record<string, unknown> = {}): Record<string, unknow
     releaseId: HASH,
     generation: 1,
     projectionDigest: 'b'.repeat(64),
+    integrationConfigDigest: 'c'.repeat(64),
     slices: ['first_display', 'gpt_initial'],
     slots: [
       {

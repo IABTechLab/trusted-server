@@ -128,8 +128,8 @@ function maximalManifest(): Readonly<BootManifestV1> {
 
 function maximalRegistryCatalog(): readonly IntegrationCatalogEntry[] {
   return Object.freeze(
-    RELEASE_CATALOG.map(({ id, phase, trigger, consumes, provides }) =>
-      Object.freeze({ id, phase, trigger, consumes, provides })
+    RELEASE_CATALOG.map(({ id, phase, trigger, config, consumes, provides }) =>
+      Object.freeze({ id, phase, trigger, config, consumes, provides })
     )
   );
 }
@@ -168,15 +168,65 @@ function tracedRegistration(
 
 function integrationConfig(id: string): unknown {
   if (id === 'didomi') return Object.freeze({ proxyPath: '/integrations/didomi/consent/' });
-  if (id === 'gpt') return Object.freeze({});
+  if (id === 'gpt') return Object.freeze({ gamAttributionEnabled: false });
   if (id === 'prebid') {
     return Object.freeze({
+      accountId: 'test',
+      timeout: 1_000,
+      debug: false,
+      bidders: Object.freeze([]),
       clientSideBidders: Object.freeze([]),
       excludedGamAdUnitPathSuffixes: Object.freeze([]),
     });
   }
   if (id === 'sourcepoint_consent') return Object.freeze({ rewriteSdk: true });
+  if (
+    [
+      'aps',
+      'datadome',
+      'google_tag_manager',
+      'lockr',
+      'osano_consent',
+      'permutive_context',
+      'testlight',
+    ].includes(id)
+  ) {
+    return Object.freeze({});
+  }
   return undefined;
+}
+
+const MAXIMAL_CONFIG_PRODUCTS = Object.freeze([
+  ['aps', 'aps'],
+  ['datadome', 'datadome'],
+  ['didomi', 'didomi'],
+  ['google_tag_manager', 'google_tag_manager'],
+  ['gpt', 'gpt'],
+  ['lockr', 'lockr'],
+  ['osano', 'osano_consent'],
+  ['permutive', 'permutive_context'],
+  ['prebid', 'prebid'],
+  ['sourcepoint', 'sourcepoint_consent'],
+  ['testlight', 'testlight'],
+] as const);
+
+function maximalIntegrationConfigs(
+  overrides: Readonly<Record<string, unknown>> | undefined
+): Readonly<Record<string, unknown>> {
+  return Object.freeze({
+    version: 1,
+    entries: Object.freeze(
+      MAXIMAL_CONFIG_PRODUCTS.map(([id, moduleId]) =>
+        Object.freeze({
+          id,
+          config:
+            overrides && Object.prototype.hasOwnProperty.call(overrides, moduleId)
+              ? overrides[moduleId]
+              : integrationConfig(moduleId),
+        })
+      )
+    ),
+  });
 }
 
 interface MaximalHarnessOptions {
@@ -378,6 +428,7 @@ function createMaximalHarness(options: MaximalHarnessOptions = {}) {
           slots: [],
           bids: [],
         },
+        integrations: maximalIntegrationConfigs(options.configOverrides),
         creative: { version: 1, enabled: true, clickGuard: true, renderGuard: false },
         diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: true } },
       },

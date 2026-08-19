@@ -12,10 +12,11 @@ export default defineConfig({
     __TSJS_EMBEDDED_INTEGRATION_IDS_V1__: JSON.stringify(integrationIds),
     __TSJS_EMBEDDED_MAX_MANIFEST_MODULES_V1__: JSON.stringify(integrationIds.length),
     __TSJS_EMBEDDED_RUNTIME_CATALOG_V1__: JSON.stringify(
-      RELEASE_CATALOG.map(({ id, phase, trigger, consumes, provides }) => ({
+      RELEASE_CATALOG.map(({ id, phase, trigger, config, consumes, provides }) => ({
         id,
         phase,
         trigger,
+        config,
         consumes,
         provides,
       }))

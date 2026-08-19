@@ -31,7 +31,7 @@ const registrations: ReadonlyArray<
 const configFor = (id: string): unknown => {
   if (id === 'didomi') return Object.freeze({ proxyPath: '/integrations/didomi/sdk' });
   if (id === 'sourcepoint_consent') return Object.freeze({ rewriteSdk: true });
-  return undefined;
+  return Object.freeze({});
 };
 
 function catalogFor(ids: readonly string[]) {
@@ -43,6 +43,7 @@ function catalogFor(ids: readonly string[]) {
         id: entry.id,
         phase: entry.phase,
         trigger: entry.trigger,
+        config: entry.config,
         consumes: Object.freeze([...entry.consumes]),
         provides: Object.freeze([...entry.provides]),
       });

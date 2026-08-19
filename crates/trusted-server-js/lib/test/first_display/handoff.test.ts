@@ -14,6 +14,7 @@ function handoff(
     releaseId: RELEASE_ID,
     generation: 1,
     projectionDigest: 'b'.repeat(64),
+    integrationConfigDigest: 'c'.repeat(64),
     slices: ['first_display'],
     slots: [],
     attempts: [],

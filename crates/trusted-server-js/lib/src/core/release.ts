@@ -3,6 +3,7 @@ declare const __TSJS_EMBEDDED_RUNTIME_CATALOG_V1__: readonly Readonly<{
   id: string;
   phase: 'takeover' | 'deferred';
   trigger: 'first_display_or_idle' | null;
+  config: import('../kernel/release_catalog').ReleaseConfigSourceV1;
   consumes: readonly string[];
   provides: readonly string[];
 }>[];
@@ -19,6 +20,7 @@ export const EMBEDDED_RUNTIME_CATALOG = Object.freeze(
       id: entry.id,
       phase: entry.phase,
       trigger: entry.trigger,
+      config: entry.config,
       consumes: Object.freeze([...entry.consumes]),
       provides: Object.freeze([...entry.provides]),
     })

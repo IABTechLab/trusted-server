@@ -4,6 +4,7 @@ import type {
   IntegrationRegistration,
 } from '../../kernel/integration_registry';
 import type { IntegrationLifecycleRuntime } from '../../kernel/lifecycle_module';
+import { isEmptyIntegrationConfigV1 } from '../../shared/integration_config_validators';
 import { validatePersistentFirstDisplaySliceAdoptionV1 } from '../../shared/takeover';
 
 import {
@@ -65,7 +66,7 @@ export function createOsanoIntegrationRegistration(release: string): Integration
     phase: 'takeover',
     releaseId: release,
     prepare: ({ config, interfaces, onDispose }: IntegrationPrepareContext) => {
-      if (config !== undefined || !runtimeCapability(interfaces)) {
+      if (!isEmptyIntegrationConfigV1(config) || !runtimeCapability(interfaces)) {
         throw new TypeError('Osano takeover capability graph is invalid');
       }
       const lifecycle = createOsanoRuntime();
@@ -76,7 +77,7 @@ export function createOsanoIntegrationRegistration(release: string): Integration
           if (!takeoverActive || lifecycleRelease) {
             throw new TypeError('Osano lifecycle is unavailable');
           }
-          lifecycleRelease = lifecycle.activate(undefined);
+          lifecycleRelease = lifecycle.activate(config);
           return (): void => {
             const releaseLifecycle = lifecycleRelease;
             lifecycleRelease = undefined;
@@ -87,7 +88,7 @@ export function createOsanoIntegrationRegistration(release: string): Integration
           if (!takeoverActive || !lifecycleRelease) {
             throw new TypeError('Osano lifecycle is not active');
           }
-          lifecycle.start(undefined);
+          lifecycle.start(config);
         },
       });
       onDispose(() => {

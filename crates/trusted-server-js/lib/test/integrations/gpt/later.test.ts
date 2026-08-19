@@ -40,7 +40,7 @@ function harness() {
   });
   const prepared = createGptLaterIntegrationRegistration(RELEASE_ID).prepare(
     Object.freeze({
-      config: undefined,
+      config: Object.freeze({ gamAttributionEnabled: false }),
       interfaces,
       onDispose: (callback: () => void) => preparationDisposers.push(callback),
       signal: new AbortController().signal,

@@ -484,6 +484,7 @@ describe('bounded first-display agent', () => {
       handoff: {
         releaseId: 'a'.repeat(64),
         generation: 1,
+        integrationConfigDigest: 'c'.repeat(64),
         slices: ['first_display'],
       },
       identityIssuer: issuer.value,
@@ -672,6 +673,7 @@ describe('bounded first-display agent', () => {
       handoff: Object.freeze({
         releaseId: 'a'.repeat(64),
         generation: 1,
+        integrationConfigDigest: 'c'.repeat(64),
         slices: Object.freeze(['first_display', 'gpt_initial'] as const),
       }),
     });

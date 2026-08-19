@@ -11,6 +11,14 @@ import {
 } from '../shared/first_display_registration';
 import type { FirstDisplaySliceActivationContext } from '../shared/first_display_transaction';
 import {
+  isCreativeBootConfigV1,
+  isDidomiIntegrationConfigV1,
+  isEmptyIntegrationConfigV1,
+  isGptIntegrationConfigV1,
+  isPrebidIntegrationConfigV1,
+  isSourcepointIntegrationConfigV1,
+} from '../shared/integration_config_validators';
+import {
   createFirstDisplayHandoffOwner,
   type FinalizedFirstDisplayHandoffV1,
   type FirstDisplayHandoffOwner,
@@ -130,6 +138,7 @@ export interface FirstDisplayAgentOptions {
   readonly handoff?: Readonly<{
     releaseId: string;
     generation: number;
+    integrationConfigDigest: string;
     slices: readonly FirstDisplaySliceId[];
   }>;
 }
@@ -787,6 +796,7 @@ class FirstDisplayAgentOwner implements FirstDisplayAgent {
       releaseId: handoff.releaseId,
       generation: handoff.generation,
       projectionDigest: batch.projectionDigest,
+      integrationConfigDigest: handoff.integrationConfigDigest,
       slices: [...handoff.slices],
       slots,
       attempts,
@@ -962,6 +972,14 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
     const fullProtocols = new Map<FirstDisplayAuctionProtocolId, unknown>();
     const parserState = createFirstDisplayParserStateCollector();
     let agent: FirstDisplayAgent | undefined;
+    const sliceConfigValid = (id: OptionalFirstDisplaySliceId, candidate: unknown): boolean => {
+      if (id === 'creative_initial') return isCreativeBootConfigV1(candidate);
+      if (id === 'didomi_initial') return isDidomiIntegrationConfigV1(candidate);
+      if (id === 'gpt_initial') return isGptIntegrationConfigV1(candidate);
+      if (id === 'prebid_initial') return isPrebidIntegrationConfigV1(candidate);
+      if (id === 'sourcepoint_initial') return isSourcepointIntegrationConfigV1(candidate);
+      return isEmptyIntegrationConfigV1(candidate);
+    };
     const sliceHost: FirstDisplaySliceHost = Object.freeze({
       activate: (
         id: OptionalFirstDisplaySliceId,
@@ -977,8 +995,30 @@ function prepareRegisteredAgent(host: unknown): PreparedFirstDisplayBaseV1 {
         const protocolId = id.endsWith('_initial')
           ? (id.slice(0, -'_initial'.length) as FirstDisplayAuctionProtocolId)
           : undefined;
+        const transported = sliceBindings(id);
+        if (
+          typeof transported !== 'object' ||
+          transported === null ||
+          Array.isArray(transported) ||
+          Object.getPrototypeOf(transported) !== Object.prototype ||
+          !Object.isFrozen(transported) ||
+          Reflect.ownKeys(transported).length !== 2
+        ) {
+          throw new TypeError('tsjs');
+        }
+        const bindings = Object.getOwnPropertyDescriptor(transported, 'bindings');
+        const config = Object.getOwnPropertyDescriptor(transported, 'config');
+        if (
+          !bindings?.enumerable ||
+          !('value' in bindings) ||
+          !config?.enumerable ||
+          !('value' in config) ||
+          !sliceConfigValid(id, config.value)
+        ) {
+          throw new TypeError('tsjs');
+        }
         const candidate = captureMutationObservedBindings(
-          sliceBindings(id),
+          bindings.value,
           () => agent?.observeNativeMutation() === true,
           (key, value) => {
             if (!parserState.observe(id, key, value)) {

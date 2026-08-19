@@ -1,6 +1,6 @@
 import { prepareQueue, publishQueue, type PublishedQueue } from '../core/queue';
-import { EMBEDDED_RELEASE_ID } from '../core/release';
-import type { GptDiagnosticsApi } from '../core/types';
+import { EMBEDDED_RELEASE_ID, EMBEDDED_RUNTIME_CATALOG } from '../core/release';
+import type { GptDiagnosticsApi, IntegrationConfigIdV1, TsjsBootV1 } from '../core/types';
 
 import {
   buildFallbackBoot,
@@ -45,6 +45,16 @@ const TERMINAL_FIELDS = Object.freeze([
   '_internal',
   'que',
 ]);
+
+function retainedProductConfig(
+  boot: Readonly<TsjsBootV1>,
+  id: IntegrationConfigIdV1
+): TsjsBootV1['integrations']['entries'][number]['config'] | undefined {
+  for (const entry of boot.integrations.entries) {
+    if (entry.id === id) return entry.config;
+  }
+  return undefined;
+}
 
 function canClaimRuntimeTarget(target: RuntimeTarget): boolean {
   try {
@@ -242,7 +252,7 @@ class RuntimeOwner implements Runtime {
   private registry: IntegrationRegistry | undefined;
   private ingress: unknown[] | undefined;
   private installPromise: Promise<IntegrationInstallResult> | undefined;
-  private kernelBoot: Readonly<object> | undefined;
+  private kernelBoot: Readonly<TsjsBootV1> | undefined;
   private fallbackBoot: Readonly<object> | undefined;
   private selectedScript: HTMLScriptElement | undefined;
   private trustedRuntimeSrc: string | undefined;
@@ -320,6 +330,7 @@ class RuntimeOwner implements Runtime {
                 id,
                 phase: 'takeover' as const,
                 trigger: null,
+                config: EMBEDDED_RUNTIME_CATALOG.find((entry) => entry.id === id)?.config ?? null,
                 consumes: Object.freeze([]),
                 provides: Object.freeze([]),
               })
@@ -421,7 +432,7 @@ class RuntimeOwner implements Runtime {
       if (this.registry.manifest) {
         this.kernelBoot = buildKernelBoot(
           EMBEDDED_RELEASE_ID,
-          this.registry.manifest,
+          this.options.manifest as TsjsBootV1['manifest'],
           bootCandidate
         );
       }
@@ -742,23 +753,34 @@ class RuntimeOwner implements Runtime {
   }
 
   private bootCandidate(): unknown {
-    if (this.options.boot !== undefined) return this.options.boot;
-    const descriptor = Object.getOwnPropertyDescriptor(this.options.target, 'boot');
-    return descriptor && 'value' in descriptor ? descriptor.value : undefined;
+    return this.options.boot;
   }
 
   private integrationBindings(id: string): IntegrationBindings {
     const fallback = Object.freeze({ config: undefined, interfaces: Object.freeze({}) });
     const bindings = this.options.getBindings?.(id) ?? fallback;
-    if (id !== 'creative' && id !== 'gpt_diagnostics') return bindings;
+    const source = this.options.catalog?.find((entry) => entry.id === id)?.config;
+    if (source === undefined) {
+      if (id !== 'creative' && id !== 'gpt_diagnostics') return bindings;
+    } else if (source === null) {
+      return Object.freeze({ config: undefined, interfaces: bindings.interfaces });
+    }
     const boot = this.kernelBoot;
     if (!boot) return bindings;
     try {
-      if (id === 'creative') {
+      if (source === 'creative' || (source === undefined && id === 'creative')) {
         const creative = Object.getOwnPropertyDescriptor(boot, 'creative');
         return creative && 'value' in creative
           ? Object.freeze({ config: creative.value, interfaces: bindings.interfaces })
           : bindings;
+      }
+      if (source && source !== 'diagnostics') {
+        const integrations = Object.getOwnPropertyDescriptor(boot, 'integrations');
+        const config =
+          integrations && 'value' in integrations
+            ? retainedProductConfig(boot, source as IntegrationConfigIdV1)
+            : undefined;
+        return Object.freeze({ config, interfaces: bindings.interfaces });
       }
       const diagnostics = Object.getOwnPropertyDescriptor(boot, 'diagnostics');
       const gpt =

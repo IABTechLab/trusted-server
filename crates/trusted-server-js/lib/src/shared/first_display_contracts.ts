@@ -43,6 +43,7 @@ export interface TakeoverOutlineV1 {
   readonly releaseId: string;
   readonly generation: number;
   readonly projectionDigest: string;
+  readonly integrationConfigDigest: string;
   readonly slices: readonly FirstDisplaySliceId[];
   readonly slotCount: number;
   readonly outcomeCount: number;
@@ -55,6 +56,7 @@ export interface FirstDisplayHandoffV1 {
   readonly releaseId: string;
   readonly generation: number;
   readonly projectionDigest: string;
+  readonly integrationConfigDigest: string;
   readonly slices: readonly FirstDisplaySliceId[];
   readonly slots: readonly Readonly<Record<string, unknown>>[];
   readonly attempts: readonly Readonly<Record<string, unknown>>[];
@@ -219,6 +221,7 @@ export function snapshotTakeoverOutlineV1(candidate: unknown): TakeoverOutlineV1
       'releaseId',
       'generation',
       'projectionDigest',
+      'integrationConfigDigest',
       'slices',
       'slotCount',
       'outcomeCount',
@@ -240,6 +243,8 @@ export function snapshotTakeoverOutlineV1(candidate: unknown): TakeoverOutlineV1
       !isU32(fields.generation, false) ||
       typeof fields.projectionDigest !== 'string' ||
       !HASH.test(fields.projectionDigest) ||
+      typeof fields.integrationConfigDigest !== 'string' ||
+      !HASH.test(fields.integrationConfigDigest) ||
       !slices ||
       !isU32(fields.slotCount, false) ||
       fields.slotCount > MAX_FIRST_DISPLAY_SLOTS ||
@@ -254,6 +259,7 @@ export function snapshotTakeoverOutlineV1(candidate: unknown): TakeoverOutlineV1
       releaseId: fields.releaseId,
       generation: fields.generation,
       projectionDigest: fields.projectionDigest,
+      integrationConfigDigest: fields.integrationConfigDigest,
       slices,
       slotCount: fields.slotCount,
       outcomeCount: fields.outcomeCount,
@@ -851,6 +857,7 @@ export function snapshotFirstDisplayHandoffV1(
       'releaseId',
       'generation',
       'projectionDigest',
+      'integrationConfigDigest',
       'slices',
       'slots',
       'attempts',
@@ -887,6 +894,8 @@ export function snapshotFirstDisplayHandoffV1(
       !isU32(fields.generation, false) ||
       typeof fields.projectionDigest !== 'string' ||
       !HASH.test(fields.projectionDigest) ||
+      typeof fields.integrationConfigDigest !== 'string' ||
+      !HASH.test(fields.integrationConfigDigest) ||
       !slices ||
       !slots ||
       !attempts ||
@@ -1068,6 +1077,7 @@ export function snapshotFirstDisplayHandoffV1(
       releaseId: fields.releaseId,
       generation: fields.generation,
       projectionDigest: fields.projectionDigest,
+      integrationConfigDigest: fields.integrationConfigDigest,
       slices,
       slots,
       attempts,
@@ -1125,6 +1135,7 @@ export function snapshotOutlinedFirstDisplayHandoffV1(
     outline.releaseId !== handoff.releaseId ||
     outline.generation !== handoff.generation ||
     outline.projectionDigest !== handoff.projectionDigest ||
+    outline.integrationConfigDigest !== handoff.integrationConfigDigest ||
     outline.slotCount !== handoff.slots.length ||
     outline.outcomeCount !== handoff.slots.length ||
     outline.slices.length !== handoff.slices.length ||

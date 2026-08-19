@@ -20,6 +20,7 @@ import {
   type PrebidTrustedServerAuctionV1,
 } from '../adapters/prebid';
 import { parseTrustedServerAuctionResponseV1 } from '../core/auction';
+import { snapshotTsjsBootV1 } from '../core/contracts/boot';
 import type {
   BootManifestV1,
   BrowserAuctionProjectionV1,
@@ -102,8 +103,10 @@ import { createRuntimeSession } from '../kernel/sessions';
 import { trustedDocumentHttpOrigin } from '../shared/origin';
 import type {
   CoreActivationContext,
+  IntegrationCatalogEntry,
   IntegrationRegistration,
 } from '../kernel/integration_registry';
+import { RELEASE_CATALOG } from '../kernel/release_catalog';
 import { createRuntime, type Runtime, type RuntimeOptions } from '../kernel/runtime';
 import {
   createAuctionContextRegistry,
@@ -275,6 +278,109 @@ export interface TestBrowserRuntimeCompositionOptions extends BrowserComposition
   readonly pageBidsFetcherForTest?: PageBidsFetcher;
   readonly prebidStartupForTest?: (config: unknown) => void;
   readonly pucSchedulerForTest?: PucBridgeOptions['scheduler'];
+}
+
+const TEST_CONFIG_ORDER = Object.freeze([
+  'aps',
+  'datadome',
+  'didomi',
+  'google_tag_manager',
+  'gpt',
+  'lockr',
+  'osano',
+  'permutive',
+  'prebid',
+  'sourcepoint',
+  'testlight',
+]);
+
+function testConfigProduct(id: string): string | undefined {
+  if (id === 'gpt' || id === 'gpt_later') return 'gpt';
+  if (id === 'osano_consent' || id === 'osano_lifecycle') return 'osano';
+  if (id === 'permutive_context' || id === 'permutive_lifecycle') return 'permutive';
+  if (id === 'prebid' || id === 'prebid_later') return 'prebid';
+  if (id === 'sourcepoint_consent' || id === 'sourcepoint_lifecycle') return 'sourcepoint';
+  return TEST_CONFIG_ORDER.includes(id) ? id : undefined;
+}
+
+function defaultBrowserTestConfig(id: string): Readonly<Record<string, unknown>> {
+  if (id === 'didomi') return { proxyPath: '/integrations/didomi/consent/' };
+  if (id === 'gpt') return { gamAttributionEnabled: false };
+  if (id === 'prebid') {
+    return {
+      accountId: 'test',
+      timeout: 1_000,
+      debug: false,
+      bidders: [],
+      clientSideBidders: [],
+      excludedGamAdUnitPathSuffixes: [],
+    };
+  }
+  if (id === 'sourcepoint') return { rewriteSdk: true };
+  return {};
+}
+
+function testIntegrationConfigs(manifest: unknown): Readonly<Record<string, unknown>> {
+  const integrations =
+    typeof manifest === 'object' &&
+    manifest !== null &&
+    Array.isArray((manifest as { integrations?: unknown }).integrations)
+      ? (manifest as { integrations: Array<{ id?: unknown }> }).integrations
+      : [];
+  const selected = new Set(
+    integrations.flatMap(({ id }) => (typeof id === 'string' ? [testConfigProduct(id)] : []))
+  );
+  return {
+    version: 1,
+    entries: TEST_CONFIG_ORDER.filter((id) => selected.has(id)).map((id) => ({
+      id,
+      config: defaultBrowserTestConfig(id),
+    })),
+  };
+}
+
+function capturedBrowserTestRuntimeOptions(options: RuntimeOptions): RuntimeOptions {
+  try {
+    if (
+      typeof options.boot !== 'object' ||
+      options.boot === null ||
+      Array.isArray(options.boot) ||
+      Object.getPrototypeOf(options.boot) !== Object.prototype
+    ) {
+      return options;
+    }
+    const fields = options.boot as Readonly<Record<string, unknown>>;
+    const candidate = Object.prototype.hasOwnProperty.call(fields, 'abi')
+      ? fields
+      : {
+          abi: 1,
+          releaseId: options.releaseId,
+          manifest: options.manifest,
+          auctionProjection: fields['auctionProjection'],
+          integrations: Object.prototype.hasOwnProperty.call(fields, 'integrations')
+            ? fields['integrations']
+            : testIntegrationConfigs(options.manifest),
+          creative: fields['creative'],
+          diagnostics: fields['diagnostics'],
+        };
+    const boot = snapshotTsjsBootV1(candidate, options.releaseId);
+    if (!boot) return options;
+    const catalog = options.catalog?.map((entry): IntegrationCatalogEntry => {
+      const canonical = RELEASE_CATALOG.find(({ id }) => id === entry.id);
+      return Object.freeze({
+        ...entry,
+        config: canonical?.config ?? entry.config ?? null,
+      });
+    });
+    return {
+      ...options,
+      boot,
+      manifest: boot.manifest,
+      ...(catalog === undefined ? {} : { catalog: Object.freeze(catalog) }),
+    };
+  } catch {
+    return options;
+  }
 }
 
 interface AcceptedBrowserBoot {
@@ -698,9 +804,10 @@ export function createNoopBrowserComposition(): BrowserComposition {
  * same composition against explicit targets and adapters.
  */
 export function createTestBrowserRuntimeComposition(
-  runtimeOptions: RuntimeOptions,
+  providedRuntimeOptions: RuntimeOptions,
   compositionOptions: TestBrowserRuntimeCompositionOptions
 ): BrowserRuntimeComposition {
+  const runtimeOptions = capturedBrowserTestRuntimeOptions(providedRuntimeOptions);
   const runtimeDocument =
     runtimeOptions.document ?? (typeof document === 'undefined' ? undefined : document);
   if (runtimeDocument) installBrowserTestRuntimeScript(runtimeDocument);

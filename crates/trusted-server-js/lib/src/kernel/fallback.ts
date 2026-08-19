@@ -1,8 +1,7 @@
 import { parseBrowserAuctionProjectionV1 } from '../core/contracts/auction_projection';
 import { validateRequestAdsOptions } from '../core/contracts/request_ads';
 import { prepareProgrammaticAdUnits } from '../core/registry';
-import { EMBEDDED_MAX_MANIFEST_MODULES } from '../core/release_capacity';
-import type { BootManifestV1 } from '../core/types';
+import type { BootManifestV1, TsjsBootV1 } from '../core/types';
 
 import { publicLog, TsjsUnavailableError, type BootFailureReason } from './fallback_surface';
 
@@ -70,16 +69,6 @@ function ownDataRecord(value: unknown): Record<string, unknown> | undefined {
   }
 }
 
-function ownPlainDataRecord(value: unknown): Record<string, unknown> | undefined {
-  const record = ownDataRecord(value);
-  if (!record) return undefined;
-  try {
-    return Object.getPrototypeOf(value) === Object.prototype ? record : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 function exactKeys(record: Record<string, unknown>, keys: readonly string[]): boolean {
   const actual = Object.keys(record);
   return actual.length === keys.length && actual.every((key) => keys.includes(key));
@@ -103,49 +92,6 @@ function snapshotOwnArray(value: unknown, maximum: number): readonly unknown[] |
   } catch {
     return undefined;
   }
-}
-
-function manifestMatches(candidate: unknown, expected: BootManifestV1): boolean {
-  const record = ownDataRecord(candidate);
-  if (
-    !record ||
-    !exactKeys(record, ['version', 'releaseId', 'firstDisplay', 'runtimeSrc', 'integrations'])
-  ) {
-    return false;
-  }
-  if (
-    record.version !== 1 ||
-    record.releaseId !== expected.releaseId ||
-    record.runtimeSrc !== expected.runtimeSrc
-  ) {
-    return false;
-  }
-  const firstDisplay = snapshotFirstDisplay(record.firstDisplay);
-  if (
-    (expected.firstDisplay === null && firstDisplay !== null) ||
-    (expected.firstDisplay !== null &&
-      (firstDisplay === null ||
-        firstDisplay === undefined ||
-        firstDisplay.src !== expected.firstDisplay.src ||
-        firstDisplay.slices.length !== expected.firstDisplay.slices.length ||
-        firstDisplay.slices.some((id, index) => id !== expected.firstDisplay?.slices[index])))
-  ) {
-    return false;
-  }
-  const integrations = snapshotOwnArray(record.integrations, EMBEDDED_MAX_MANIFEST_MODULES);
-  if (!integrations || integrations.length !== expected.integrations.length) return false;
-  return integrations.every((entry, index) => {
-    const fields = ownDataRecord(entry);
-    const accepted = expected.integrations[index];
-    if (!accepted || !fields || fields.id !== accepted.id || fields.phase !== accepted.phase) {
-      return false;
-    }
-    return accepted.phase === 'takeover'
-      ? exactKeys(fields, ['id', 'phase'])
-      : exactKeys(fields, ['id', 'phase', 'trigger', 'src']) &&
-          fields.trigger === accepted.trigger &&
-          fields.src === accepted.src;
-  });
 }
 
 function snapshotFirstDisplay(candidate: unknown): BootManifestV1['firstDisplay'] | undefined {
@@ -238,76 +184,37 @@ export function buildKernelBoot(
   releaseId: string,
   manifest: BootManifestV1,
   candidate: unknown
-): Readonly<object> | undefined {
-  const record = ownDataRecord(candidate);
-  if (!record) return undefined;
-  const transportKeys = ['auctionProjection', 'creative', 'diagnostics'];
-  const completeKeys = ['abi', 'releaseId', 'manifest', ...transportKeys];
-  if (!exactKeys(record, transportKeys) && !exactKeys(record, completeKeys)) return undefined;
-  if (
-    completeKeys.length === Object.keys(record).length &&
-    (record.abi !== 1 ||
+): Readonly<TsjsBootV1> | undefined {
+  try {
+    const record = ownDataRecord(candidate);
+    if (
+      !record ||
+      Object.getPrototypeOf(candidate) !== Object.prototype ||
+      !Object.isFrozen(candidate) ||
+      !exactKeys(record, [
+        'abi',
+        'releaseId',
+        'manifest',
+        'auctionProjection',
+        'integrations',
+        'creative',
+        'diagnostics',
+      ]) ||
+      record.abi !== 1 ||
       record.releaseId !== releaseId ||
-      !manifestMatches(record.manifest, manifest))
-  ) {
+      record.manifest !== manifest ||
+      !Object.isFrozen(manifest) ||
+      !Object.isFrozen(record.auctionProjection) ||
+      !Object.isFrozen(record.integrations) ||
+      !Object.isFrozen(record.creative) ||
+      !Object.isFrozen(record.diagnostics)
+    ) {
+      return undefined;
+    }
+    return candidate as Readonly<TsjsBootV1>;
+  } catch {
     return undefined;
   }
-  const auctionProjection = parseBrowserAuctionProjectionV1(record.auctionProjection);
-  const creative = ownPlainDataRecord(record.creative);
-  const diagnostics = ownPlainDataRecord(record.diagnostics);
-  const gptDiagnostics = ownPlainDataRecord(diagnostics?.gpt);
-  if (
-    !auctionProjection ||
-    !creative ||
-    !exactKeys(creative, ['version', 'enabled', 'clickGuard', 'renderGuard']) ||
-    creative.version !== 1 ||
-    typeof creative.enabled !== 'boolean' ||
-    typeof creative.clickGuard !== 'boolean' ||
-    typeof creative.renderGuard !== 'boolean' ||
-    (!creative.enabled && (creative.clickGuard || creative.renderGuard)) ||
-    !diagnostics ||
-    !exactKeys(diagnostics, ['version', 'renderTraceOverlay', 'gpt']) ||
-    diagnostics.version !== 1 ||
-    typeof diagnostics.renderTraceOverlay !== 'boolean' ||
-    !gptDiagnostics ||
-    !exactKeys(gptDiagnostics, ['active']) ||
-    typeof gptDiagnostics.active !== 'boolean'
-  ) {
-    return undefined;
-  }
-  const diagnosticsModule = manifest.integrations.filter(({ id }) => id === 'gpt_diagnostics');
-  const diagnosticsPresentationModule = manifest.integrations.filter(
-    ({ id }) => id === 'diagnostics_presentation'
-  );
-  const creativeModule = manifest.integrations.filter(({ id }) => id === 'creative');
-  const diagnosticsPresentationRequired = diagnostics.renderTraceOverlay || gptDiagnostics.active;
-  if (
-    (creative.enabled && creativeModule.length !== 1) ||
-    (!creative.enabled && creativeModule.length !== 0) ||
-    (gptDiagnostics.active && diagnosticsModule.length !== 1) ||
-    (!gptDiagnostics.active && diagnosticsModule.length !== 0) ||
-    (diagnosticsPresentationRequired && diagnosticsPresentationModule.length !== 1) ||
-    (!diagnosticsPresentationRequired && diagnosticsPresentationModule.length !== 0)
-  ) {
-    return undefined;
-  }
-  return deepFreeze({
-    abi: 1,
-    releaseId,
-    manifest,
-    auctionProjection,
-    creative: {
-      version: 1,
-      enabled: creative.enabled,
-      clickGuard: creative.clickGuard,
-      renderGuard: creative.renderGuard,
-    },
-    diagnostics: {
-      version: 1,
-      renderTraceOverlay: diagnostics.renderTraceOverlay,
-      gpt: { active: gptDiagnostics.active },
-    },
-  });
 }
 
 /** Build the immutable boot snapshot shared by every terminal fallback. */
@@ -336,6 +243,7 @@ export function buildFallbackBoot(
     releaseId,
     manifest,
     auctionProjection: projection,
+    integrations: { version: 1, entries: [] },
     creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
     diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
   });

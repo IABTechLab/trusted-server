@@ -170,9 +170,7 @@ export class GptDiagnosticsApiController {
                 ...cycle,
                 durations: Object.freeze({ ...cycle.durations }),
                 requestedSlotSizes: cycle.requestedSlotSizes
-                  ? Object.freeze(
-                      cycle.requestedSlotSizes.map((size) => Object.freeze([...size]))
-                    )
+                  ? Object.freeze(cycle.requestedSlotSizes.map((size) => Object.freeze([...size])))
                   : undefined,
                 size: cycle.size ? Object.freeze([...cycle.size]) : undefined,
                 observedSlotSize: cycle.observedSlotSize

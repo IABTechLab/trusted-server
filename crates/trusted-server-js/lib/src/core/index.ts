@@ -16,18 +16,12 @@ export type { Runtime, RuntimeOptions, RuntimeState } from '../kernel/runtime';
 import type { Runtime, RuntimeOptions } from '../kernel/runtime';
 import { consumeFirstDisplayTakeoverTransport } from '../shared/takeover';
 
+import type { TsjsBootV1 } from './types';
 import { EMBEDDED_INTEGRATION_IDS, EMBEDDED_RELEASE_ID, EMBEDDED_RUNTIME_CATALOG } from './release';
-
-const KNOWN_INTEGRATIONS = new Set(EMBEDDED_INTEGRATION_IDS);
-const MAX_CONFIG_DEPTH = 16;
-const MAX_CONFIG_NODES = 512;
-const MAX_CONFIG_MEMBERS = 256;
-const INVALID_CONFIG = Symbol('invalid-config');
 
 type BootstrapTarget = object & {
   boot?: unknown;
   que?: unknown;
-  _integrationConfig?: unknown;
 };
 
 type DirectRuntimeCompletion = (outcome: 'kernel' | 'runtime_fallback' | 'failed_start') => void;
@@ -75,135 +69,24 @@ function bootstrapTarget(): BootstrapTarget | undefined {
   }
 }
 
-function snapshotConfigValue(
-  candidate: unknown,
-  seen: Set<object>,
-  state: { nodes: number },
-  depth = 0
-): unknown | typeof INVALID_CONFIG {
-  if (candidate === null || typeof candidate === 'string' || typeof candidate === 'boolean') {
-    return candidate;
-  }
-  if (typeof candidate === 'number') {
-    return Number.isFinite(candidate) ? candidate : INVALID_CONFIG;
-  }
-  if (typeof candidate !== 'object' || depth > MAX_CONFIG_DEPTH || seen.has(candidate)) {
-    return INVALID_CONFIG;
-  }
-  if (state.nodes >= MAX_CONFIG_NODES) return INVALID_CONFIG;
-  seen.add(candidate);
-  state.nodes += 1;
-  try {
-    const isArray = Array.isArray(candidate);
-    const prototype = Object.getPrototypeOf(candidate) as unknown;
-    if (
-      (isArray && prototype !== Array.prototype) ||
-      (!isArray && prototype !== Object.prototype && prototype !== null) ||
-      Object.getOwnPropertySymbols(candidate).length !== 0
-    ) {
-      return INVALID_CONFIG;
-    }
-    const names = Object.getOwnPropertyNames(candidate);
-    if (names.length > MAX_CONFIG_MEMBERS + (isArray ? 1 : 0)) return INVALID_CONFIG;
-    if (isArray) {
-      const length = Object.getOwnPropertyDescriptor(candidate, 'length');
-      if (!length || !('value' in length) || names.length !== length.value + 1) {
-        return INVALID_CONFIG;
-      }
-      const values: unknown[] = [];
-      for (let index = 0; index < length.value; index += 1) {
-        const descriptor = Object.getOwnPropertyDescriptor(candidate, String(index));
-        if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) {
-          return INVALID_CONFIG;
-        }
-        const value = snapshotConfigValue(descriptor.value, seen, state, depth + 1);
-        if (value === INVALID_CONFIG) return INVALID_CONFIG;
-        values.push(value);
-      }
-      return Object.freeze(values);
-    }
-    const copy: Record<string, unknown> = {};
-    for (const name of names) {
-      const descriptor = Object.getOwnPropertyDescriptor(candidate, name);
-      if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) {
-        return INVALID_CONFIG;
-      }
-      const value = snapshotConfigValue(descriptor.value, seen, state, depth + 1);
-      if (value === INVALID_CONFIG) return INVALID_CONFIG;
-      copy[name] = value;
-    }
-    return Object.freeze(copy);
-  } catch {
-    return INVALID_CONFIG;
-  }
-}
-
-function snapshotIntegrationConfig(
-  candidate: unknown
-): Readonly<Record<string, unknown>> | undefined {
-  try {
-    if (
-      typeof candidate !== 'object' ||
-      candidate === null ||
-      Array.isArray(candidate) ||
-      (Object.getPrototypeOf(candidate) !== Object.prototype &&
-        Object.getPrototypeOf(candidate) !== null) ||
-      Object.getOwnPropertySymbols(candidate).length !== 0
-    ) {
-      return undefined;
-    }
-    const names = Object.getOwnPropertyNames(candidate);
-    if (names.length > EMBEDDED_INTEGRATION_IDS.length) return undefined;
-    const configs: Record<string, unknown> = {};
-    const seen = new Set<object>();
-    const state = { nodes: 0 };
-    for (const name of names) {
-      if (!KNOWN_INTEGRATIONS.has(name)) return undefined;
-      const configDescriptor = Object.getOwnPropertyDescriptor(candidate, name);
-      if (!configDescriptor || !configDescriptor.enumerable || !('value' in configDescriptor)) {
-        return undefined;
-      }
-      const value = snapshotConfigValue(configDescriptor.value, seen, state);
-      if (value === INVALID_CONFIG) return undefined;
-      configs[name] = value;
-    }
-    return Object.freeze(configs);
-  } catch {
-    return undefined;
-  }
-}
-
-function consumeIntegrationConfig(
+function bootSnapshotClaim(
   target: BootstrapTarget
-): Readonly<Record<string, unknown>> | undefined {
-  let descriptor: PropertyDescriptor | undefined;
+): ((source: unknown) => Readonly<TsjsBootV1> | undefined) | null | undefined {
   try {
-    descriptor = Object.getOwnPropertyDescriptor(target, '_integrationConfig');
-  } catch {
-    return undefined;
-  }
-  if (!descriptor) return Object.freeze({});
-  if (!('value' in descriptor) || !descriptor.configurable) return undefined;
-
-  const configs = snapshotIntegrationConfig(descriptor.value);
-  try {
-    if (!Reflect.deleteProperty(target, '_integrationConfig')) return undefined;
-  } catch {
-    return undefined;
-  }
-  return configs;
-}
-
-function bootManifest(target: BootstrapTarget): unknown {
-  try {
-    const boot = Object.getOwnPropertyDescriptor(target, 'boot');
-    if (!boot || !('value' in boot) || typeof boot.value !== 'object' || boot.value === null) {
-      return undefined;
+    const descriptor = Object.getOwnPropertyDescriptor(target, '_claimBootSnapshot');
+    if (!descriptor) return undefined;
+    if (
+      !descriptor.configurable ||
+      descriptor.enumerable ||
+      descriptor.writable ||
+      !('value' in descriptor) ||
+      typeof descriptor.value !== 'function'
+    ) {
+      return null;
     }
-    const manifest = Object.getOwnPropertyDescriptor(boot.value, 'manifest');
-    return manifest && 'value' in manifest ? manifest.value : undefined;
+    return descriptor.value as (source: unknown) => Readonly<TsjsBootV1> | undefined;
   } catch {
-    return undefined;
+    return null;
   }
 }
 
@@ -211,26 +94,22 @@ function bootManifest(target: BootstrapTarget): unknown {
 export function startProductionRuntime(createComposition: BrowserRuntimeCompositionFactory): void {
   const target = bootstrapTarget();
   if (!target) return;
+  const claimBoot = bootSnapshotClaim(target);
+  if (!claimBoot) return;
+  const boot = claimBoot(document.currentScript);
+  if (!boot) return;
   const takeover = consumeFirstDisplayTakeoverTransport(target);
   if (takeover.status === 'invalid') return;
   const claimDirect = takeover.status === 'absent' ? directRuntimeClaim(target) : undefined;
   if (claimDirect === null) return;
-  const configs = consumeIntegrationConfig(target);
-  // A malformed, accessor-backed, or undeletable transport must not survive
-  // beneath either terminal namespace. Leave the namespace unclaimed.
-  if (!configs) return;
   const composition = createComposition(
     {
       target,
       releaseId: EMBEDDED_RELEASE_ID,
-      manifest: bootManifest(target),
+      manifest: boot.manifest,
       knownIntegrationIds: EMBEDDED_INTEGRATION_IDS,
       catalog: EMBEDDED_RUNTIME_CATALOG,
-      getBindings: (id) =>
-        Object.freeze({
-          config: configs?.[id],
-          interfaces: Object.freeze({}),
-        }),
+      boot,
       ...(takeover.status === 'accepted' ? { coordinateTakeover: takeover.coordinate } : {}),
       kernel: {
         addAdUnits: () => Object.freeze({ registered: Object.freeze([]) }),

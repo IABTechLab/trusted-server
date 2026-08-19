@@ -1,4 +1,5 @@
 import { EMBEDDED_RELEASE_ID } from '../../core/release';
+import { isPrebidIntegrationConfigV1 } from '../../shared/integration_config_validators';
 import type {
   IntegrationActivationContext,
   IntegrationPrepareContext,
@@ -43,7 +44,7 @@ export function createPrebidLaterIntegrationRegistration(
       const gpt = interfaces['gpt.v1'] as GptLaterCapabilityV1 | undefined;
       const prebid = interfaces['prebid.v1'] as PrebidLaterCapabilityV1 | undefined;
       if (
-        config !== undefined ||
+        !isPrebidIntegrationConfigV1(config) ||
         typeof runtime !== 'object' ||
         runtime === null ||
         !Object.isFrozen(runtime) ||

@@ -61,7 +61,7 @@ describe('transactional Google Tag Manager integration module', () => {
       startedAtMs: 0,
       now: () => 0,
       getBindings: () => ({
-        config: undefined,
+        config: Object.freeze({}),
         interfaces: Object.freeze({}),
       }),
     });

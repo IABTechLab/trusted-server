@@ -1,4 +1,5 @@
 import type { IntegrationRegistration } from '../../kernel/integration_registry';
+import { isEmptyIntegrationConfigV1 } from '../../shared/integration_config_validators';
 import {
   createLifecycleIntegrationRegistration,
   type IntegrationLifecycleRuntime,
@@ -50,7 +51,7 @@ export function createDataDomeIntegrationRegistration(release: string): Integrat
   return createLifecycleIntegrationRegistration(DATADOME_INTEGRATION_ID, release, {
     createOwnedRuntime: () => createDataDomeRuntime(),
     firstDisplaySliceId: 'datadome_initial',
-    validateConfig: (candidate) => candidate === undefined,
+    validateConfig: isEmptyIntegrationConfigV1,
     validateFirstDisplayState: (state) =>
       state.values.length === 1 &&
       state.values[0]?.[0] === 'route_guard' &&

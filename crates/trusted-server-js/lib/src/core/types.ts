@@ -456,11 +456,43 @@ export interface DiagnosticsBootV1 {
   readonly gpt: Readonly<{ readonly active: boolean }>;
 }
 
+export const INTEGRATION_CONFIG_IDS_V1 = Object.freeze([
+  'aps',
+  'datadome',
+  'didomi',
+  'google_tag_manager',
+  'gpt',
+  'lockr',
+  'osano',
+  'permutive',
+  'prebid',
+  'sourcepoint',
+  'testlight',
+] as const);
+
+export type IntegrationConfigIdV1 = (typeof INTEGRATION_CONFIG_IDS_V1)[number];
+export type BootJsonPrimitiveV1 = null | boolean | number | string;
+export type BootJsonValueV1 =
+  | BootJsonPrimitiveV1
+  | readonly BootJsonValueV1[]
+  | Readonly<{ readonly [key: string]: BootJsonValueV1 }>;
+
+export interface IntegrationConfigEntryV1 {
+  readonly id: IntegrationConfigIdV1;
+  readonly config: Readonly<{ readonly [key: string]: BootJsonValueV1 }>;
+}
+
+export interface IntegrationConfigsV1 {
+  readonly version: 1;
+  readonly entries: readonly Readonly<IntegrationConfigEntryV1>[];
+}
+
 export interface TsjsBootV1 {
   readonly abi: 1;
   readonly releaseId: string;
   readonly manifest: Readonly<BootManifestV1>;
   readonly auctionProjection: Readonly<BrowserAuctionProjectionV1>;
+  readonly integrations: Readonly<IntegrationConfigsV1>;
   readonly creative: Readonly<CreativeBootV1>;
   readonly diagnostics: Readonly<DiagnosticsBootV1>;
 }

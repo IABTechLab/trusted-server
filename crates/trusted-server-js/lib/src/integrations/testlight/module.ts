@@ -1,4 +1,5 @@
 import type { IntegrationRegistration } from '../../kernel/integration_registry';
+import { isEmptyIntegrationConfigV1 } from '../../shared/integration_config_validators';
 import type { RuntimeCapabilityV1 } from '../../kernel/runtime';
 import {
   createLifecycleIntegrationRegistration,
@@ -244,7 +245,7 @@ export function createTestlightIntegrationRegistration(release: string): Integra
       });
     },
     firstDisplaySliceId: 'testlight_initial',
-    validateConfig: (candidate) => candidate === undefined,
+    validateConfig: isEmptyIntegrationConfigV1,
     validateFirstDisplayState: (state) => {
       const value = state.values[0]?.[1];
       return (

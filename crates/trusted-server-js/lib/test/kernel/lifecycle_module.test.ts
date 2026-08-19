@@ -120,6 +120,7 @@ describe('shared integration lifecycle module', () => {
           releaseId: RELEASE_ID,
           generation: 1,
           projectionDigest: 'b'.repeat(64),
+          integrationConfigDigest: 'c'.repeat(64),
           slices: Object.freeze(
             selected ? ['first_display', 'datadome_initial'] : ['first_display']
           ),
@@ -190,6 +191,7 @@ describe('shared integration lifecycle module', () => {
             releaseId: RELEASE_ID,
             generation: 1,
             projectionDigest: 'b'.repeat(64),
+            integrationConfigDigest: 'c'.repeat(64),
             slices,
             slotCount: 1,
             outcomeCount: 1,

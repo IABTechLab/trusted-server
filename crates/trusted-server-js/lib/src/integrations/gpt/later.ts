@@ -1,4 +1,5 @@
 import { EMBEDDED_RELEASE_ID } from '../../core/release';
+import { isGptIntegrationConfigV1 } from '../../shared/integration_config_validators';
 import type {
   IntegrationActivationContext,
   IntegrationPrepareContext,
@@ -61,7 +62,7 @@ export function createGptLaterIntegrationRegistration(releaseId: string): Integr
         }
       }
       if (
-        config !== undefined ||
+        !isGptIntegrationConfigV1(config) ||
         !runtime ||
         !Object.isFrozen(runtime) ||
         !runtime.document?.defaultView ||

@@ -195,16 +195,14 @@ function productionPrebidBinding(userIdModules: readonly object[]) {
   });
 }
 
-function requiredUserIdConfig() {
+function projectedPrebidConfig() {
   return Object.freeze({
+    accountId: 'publisher',
+    timeout: 1_000,
+    debug: false,
+    bidders: Object.freeze(['alpha']),
     clientSideBidders: Object.freeze(['alpha']),
-    requiredUserIdModules: Object.freeze([
-      Object.freeze({
-        moduleName: 'sharedIdSystem',
-        configNames: Object.freeze(['sharedId']),
-        eidSources: Object.freeze(['sharedid.org']),
-      }),
-    ]),
+    excludedGamAdUnitPathSuffixes: Object.freeze(['/excluded']),
   });
 }
 
@@ -288,7 +286,7 @@ function initialProductionPrebidHarness(userIdModules: readonly object[]) {
     afterCommit,
     bid,
     binding,
-    config: requiredUserIdConfig(),
+    config: projectedPrebidConfig(),
     dispose: () => {
       for (let index = activationDisposers.length - 1; index >= 0; index -= 1) {
         activationDisposers[index]?.();
@@ -316,7 +314,7 @@ function initialProductionPrebidHarness(userIdModules: readonly object[]) {
     }),
     navigation,
     prepareContext: Object.freeze({
-      config: requiredUserIdConfig(),
+      config: projectedPrebidConfig(),
       interfaces: Object.freeze({
         'runtime.v1': Object.freeze({ document }),
         'slots.v1': Object.freeze({}),
@@ -343,7 +341,7 @@ describe('production Prebid takeover registration', () => {
     delete (window as unknown as { pbjs?: unknown }).pbjs;
   });
 
-  it('passes exact configured user-ID/EID requirements into artifact admission', async () => {
+  it('accepts only the exact server-projected Prebid browser configuration', async () => {
     const harness = initialProductionPrebidHarness([]);
     try {
       const prepared = await createPrebidIntegrationRegistration(RELEASE_ID).prepare(
@@ -351,7 +349,24 @@ describe('production Prebid takeover registration', () => {
       );
       const capability = prepared.interfaces?.['prebid.v1'] as
         Readonly<{ adapter?: PrebidAdapter }> | undefined;
-      expect(capability?.adapter?.bindingStatus()).toBe('incompatible');
+      expect(capability?.adapter?.bindingStatus()).toBe('present');
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it('rejects legacy or publisher-only Prebid config fields during preparation', async () => {
+    const harness = initialProductionPrebidHarness([]);
+    try {
+      const config = Object.freeze({
+        ...projectedPrebidConfig(),
+        requiredUserIdModules: Object.freeze([]),
+      });
+      expect(() =>
+        createPrebidIntegrationRegistration(RELEASE_ID).prepare(
+          Object.freeze({ ...harness.prepareContext, config })
+        )
+      ).toThrow('Prebid integration config is invalid');
     } finally {
       harness.dispose();
     }

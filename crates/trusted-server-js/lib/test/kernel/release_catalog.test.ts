@@ -17,43 +17,60 @@ import {
 } from '../../src/kernel/release_catalog';
 
 const EXPECTED = [
-  ['render_runtime', 'runtime', 'takeover', null, 'always'],
-  ['aps', 'APS', 'takeover', null, 'integration:aps'],
-  ['creative', 'creative', 'takeover', null, 'creative_guard'],
-  ['datadome', 'DataDome', 'takeover', null, 'integration:datadome'],
-  ['didomi', 'Didomi', 'takeover', null, 'integration:didomi'],
-  ['google_tag_manager', 'GTM/GA', 'takeover', null, 'integration:google_tag_manager'],
-  ['gpt', 'GPT', 'takeover', null, 'integration:gpt'],
-  ['gpt_diagnostics', 'diagnostics', 'takeover', null, 'gpt_diagnostics_active'],
-  ['lockr', 'Lockr', 'takeover', null, 'integration:lockr'],
-  ['osano_consent', 'Osano', 'takeover', null, 'integration:osano'],
-  ['permutive_context', 'Permutive', 'takeover', null, 'integration:permutive'],
-  ['sourcepoint_consent', 'Sourcepoint', 'takeover', null, 'integration:sourcepoint'],
-  ['prebid', 'Prebid', 'takeover', null, 'integration:prebid'],
-  ['testlight', 'Testlight', 'takeover', null, 'integration:testlight'],
+  ['render_runtime', 'runtime', 'takeover', null, 'always', null],
+  ['aps', 'APS', 'takeover', null, 'integration:aps', 'aps'],
+  ['creative', 'creative', 'takeover', null, 'creative_guard', 'creative'],
+  ['datadome', 'DataDome', 'takeover', null, 'integration:datadome', 'datadome'],
+  ['didomi', 'Didomi', 'takeover', null, 'integration:didomi', 'didomi'],
+  [
+    'google_tag_manager',
+    'GTM/GA',
+    'takeover',
+    null,
+    'integration:google_tag_manager',
+    'google_tag_manager',
+  ],
+  ['gpt', 'GPT', 'takeover', null, 'integration:gpt', 'gpt'],
+  ['gpt_diagnostics', 'diagnostics', 'takeover', null, 'gpt_diagnostics_active', 'diagnostics'],
+  ['lockr', 'Lockr', 'takeover', null, 'integration:lockr', 'lockr'],
+  ['osano_consent', 'Osano', 'takeover', null, 'integration:osano', 'osano'],
+  ['permutive_context', 'Permutive', 'takeover', null, 'integration:permutive', 'permutive'],
+  [
+    'sourcepoint_consent',
+    'Sourcepoint',
+    'takeover',
+    null,
+    'integration:sourcepoint',
+    'sourcepoint',
+  ],
+  ['prebid', 'Prebid', 'takeover', null, 'integration:prebid', 'prebid'],
+  ['testlight', 'Testlight', 'takeover', null, 'integration:testlight', 'testlight'],
   [
     'diagnostics_presentation',
     'diagnostics',
     'deferred',
     'first_display_or_idle',
     'diagnostics_presentation',
+    null,
   ],
-  ['gpt_later', 'GPT', 'deferred', 'first_display_or_idle', 'integration:gpt'],
-  ['osano_lifecycle', 'Osano', 'deferred', 'first_display_or_idle', 'integration:osano'],
+  ['gpt_later', 'GPT', 'deferred', 'first_display_or_idle', 'integration:gpt', 'gpt'],
+  ['osano_lifecycle', 'Osano', 'deferred', 'first_display_or_idle', 'integration:osano', 'osano'],
   [
     'permutive_lifecycle',
     'Permutive',
     'deferred',
     'first_display_or_idle',
     'integration:permutive',
+    'permutive',
   ],
-  ['prebid_later', 'Prebid', 'deferred', 'first_display_or_idle', 'prebid_and_gpt'],
+  ['prebid_later', 'Prebid', 'deferred', 'first_display_or_idle', 'prebid_and_gpt', 'prebid'],
   [
     'sourcepoint_lifecycle',
     'Sourcepoint',
     'deferred',
     'first_display_or_idle',
     'integration:sourcepoint',
+    'sourcepoint',
   ],
 ] as const;
 
@@ -100,12 +117,13 @@ describe('canonical release catalog', () => {
   });
   it('pins the exact twenty rows, phases, triggers, products, predicates, and order', () => {
     expect(
-      RELEASE_CATALOG.map(({ id, product, phase, trigger, include }) => [
+      RELEASE_CATALOG.map(({ id, product, phase, trigger, include, config }) => [
         id,
         product,
         phase,
         trigger,
         include,
+        config,
       ])
     ).toEqual(EXPECTED);
     expect(RELEASE_CATALOG.map(({ order }) => order)).toEqual(
@@ -275,6 +293,10 @@ describe('canonical release catalog', () => {
       trigger: 'first_display_or_idle',
     };
     expect(() => validateReleaseCatalog(phaseOverride)).toThrow(/phase override/i);
+
+    const configOverride = clone();
+    configOverride[15] = { ...configOverride[15]!, config: 'prebid' };
+    expect(() => validateReleaseCatalog(configOverride)).toThrow(/config|catalog/i);
 
     const invalidConditionalEdge = clone();
     invalidConditionalEdge[12] = {

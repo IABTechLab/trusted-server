@@ -524,13 +524,14 @@ export function createDiagnosticsPresentationIntegrationRegistration(
     id: 'diagnostics_presentation',
     phase: 'deferred',
     releaseId,
-    prepare: ({ interfaces }: IntegrationPrepareContext) => {
+    prepare: ({ config, interfaces }: IntegrationPrepareContext) => {
       const runtime = interfaces['runtime.v1'] as Readonly<Record<string, unknown>> | undefined;
       const targetDocument = realmOwnedDocument(runtime?.['document']);
       const targetWindow = targetDocument?.defaultView;
       const trace = runtime ? renderTraceCapability(interfaces) : undefined;
       const selection = runtime ? diagnosticsSelection(runtime) : undefined;
       if (
+        config !== undefined ||
         !runtime ||
         !Object.isFrozen(runtime) ||
         !targetDocument ||

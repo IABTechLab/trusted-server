@@ -4,6 +4,7 @@ import type {
   IntegrationRegistration,
 } from '../../kernel/integration_registry';
 import type { IntegrationLifecycleRuntime } from '../../kernel/lifecycle_module';
+import { isEmptyIntegrationConfigV1 } from '../../shared/integration_config_validators';
 import type { RuntimeCapabilityV1 } from '../../kernel/runtime';
 import { log } from '../../core/log';
 import { validatePersistentFirstDisplaySliceAdoptionV1 } from '../../shared/takeover';
@@ -221,7 +222,7 @@ export function createPermutiveIntegrationRegistration(release: string): Integra
     prepare: ({ config, interfaces, onDispose }: IntegrationPrepareContext) => {
       const runtimeCapability = interfaces['runtime.v1'];
       if (
-        config !== undefined ||
+        !isEmptyIntegrationConfigV1(config) ||
         typeof runtimeCapability !== 'object' ||
         runtimeCapability === null ||
         !Object.isFrozen(runtimeCapability) ||
@@ -243,7 +244,7 @@ export function createPermutiveIntegrationRegistration(release: string): Integra
           if (!takeoverActive || lifecycleRelease) {
             throw new TypeError('Permutive lifecycle is unavailable');
           }
-          lifecycleRelease = lifecycle.activate(undefined);
+          lifecycleRelease = lifecycle.activate(config);
           return (): void => {
             const releaseLifecycle = lifecycleRelease;
             lifecycleRelease = undefined;
@@ -256,7 +257,7 @@ export function createPermutiveIntegrationRegistration(release: string): Integra
           if (!takeoverActive || !lifecycleRelease) {
             throw new TypeError('Permutive lifecycle is not active');
           }
-          lifecycle.start(undefined);
+          lifecycle.start(config);
         },
       });
       onDispose(() => {

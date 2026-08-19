@@ -7,6 +7,7 @@ import {
   type AdUnitRegistrationErrorCode,
 } from '../../src/kernel/fallback';
 import { createRuntime as createRuntimeOwner, type RuntimeOptions } from '../../src/kernel/runtime';
+import { snapshotTsjsBootV1 } from '../../src/core/contracts/boot';
 import { createDiagnosticsPresentationIntegrationRegistration } from '../../src/integrations/gpt_diagnostics/presentation';
 import { createLifecycleIntegrationRegistration } from '../../src/kernel/lifecycle_module';
 
@@ -27,7 +28,102 @@ function installTestRuntimeScript(runtimeDocument: Document, takeover = false): 
 
 function createRuntime(options: RuntimeOptions) {
   installTestRuntimeScript(options.document ?? document, options.coordinateTakeover !== undefined);
-  return createRuntimeOwner(options);
+  let acceptedOptions = options;
+  try {
+    if (
+      typeof options.boot === 'object' &&
+      options.boot !== null &&
+      !Array.isArray(options.boot) &&
+      Object.getPrototypeOf(options.boot) === Object.prototype
+    ) {
+      const descriptors = Object.getOwnPropertyDescriptors(options.boot);
+      if (Object.values(descriptors).every((descriptor) => 'value' in descriptor)) {
+        const fields = Object.fromEntries(
+          Object.entries(descriptors).map(([key, descriptor]) => [key, descriptor.value])
+        );
+        const carrier = Object.prototype.hasOwnProperty.call(fields, 'integrations')
+          ? fields['integrations']
+          : defaultIntegrationConfigs(options.manifest);
+        const candidate = Object.prototype.hasOwnProperty.call(fields, 'abi')
+          ? options.boot
+          : {
+              abi: 1,
+              releaseId: RELEASE,
+              manifest: options.manifest,
+              auctionProjection: fields['auctionProjection'],
+              integrations: carrier,
+              creative: fields['creative'],
+              diagnostics: fields['diagnostics'],
+            };
+        const snapshot = snapshotTsjsBootV1(candidate, RELEASE);
+        if (snapshot) {
+          const retained =
+            Object.prototype.hasOwnProperty.call(fields, 'abi') && Object.isFrozen(options.boot);
+          const acceptedBoot = retained ? options.boot : snapshot;
+          acceptedOptions = {
+            ...options,
+            manifest: retained ? fields['manifest'] : snapshot.manifest,
+            boot: acceptedBoot,
+          };
+        }
+      }
+    }
+  } catch {
+    // Hostile values remain untouched so production boundary tests can reject them.
+  }
+  return createRuntimeOwner(acceptedOptions);
+}
+
+const CONFIG_ORDER = Object.freeze([
+  'aps',
+  'datadome',
+  'didomi',
+  'google_tag_manager',
+  'gpt',
+  'lockr',
+  'osano',
+  'permutive',
+  'prebid',
+  'sourcepoint',
+  'testlight',
+]);
+
+function configProduct(id: string): string | undefined {
+  if (id === 'gpt' || id === 'gpt_later') return 'gpt';
+  if (id === 'osano_consent' || id === 'osano_lifecycle') return 'osano';
+  if (id === 'permutive_context' || id === 'permutive_lifecycle') return 'permutive';
+  if (id === 'prebid' || id === 'prebid_later') return 'prebid';
+  if (id === 'sourcepoint_consent' || id === 'sourcepoint_lifecycle') return 'sourcepoint';
+  return CONFIG_ORDER.includes(id) ? id : undefined;
+}
+
+function defaultConfig(id: string): Readonly<Record<string, unknown>> {
+  if (id === 'didomi') return { proxyPath: '/integrations/didomi/sdk.js' };
+  if (id === 'gpt') return { gamAttributionEnabled: false };
+  if (id === 'prebid') {
+    return { accountId: 'test', timeout: 1_000, debug: false, bidders: [] };
+  }
+  if (id === 'sourcepoint') return { rewriteSdk: false };
+  return {};
+}
+
+function defaultIntegrationConfigs(candidateManifest: unknown): Readonly<Record<string, unknown>> {
+  const entries =
+    typeof candidateManifest === 'object' &&
+    candidateManifest !== null &&
+    Array.isArray((candidateManifest as { integrations?: unknown }).integrations)
+      ? (candidateManifest as { integrations: Array<{ id?: unknown }> }).integrations
+      : [];
+  const selected = new Set(
+    entries.flatMap(({ id }) => (typeof id === 'string' ? [configProduct(id)] : []))
+  );
+  return {
+    version: 1,
+    entries: CONFIG_ORDER.filter((id) => selected.has(id)).map((id) => ({
+      id,
+      config: defaultConfig(id),
+    })),
+  };
 }
 
 function boot(results: readonly object[] = []) {
@@ -60,6 +156,7 @@ function takeoverHandoff() {
       releaseId: RELEASE,
       generation: 1,
       projectionDigest,
+      integrationConfigDigest: 'c'.repeat(64),
       slices: ['first_display'],
       slots: [
         {
@@ -111,6 +208,7 @@ function takeoverHandoff() {
       releaseId: RELEASE,
       generation: 1,
       projectionDigest,
+      integrationConfigDigest: 'c'.repeat(64),
       slices: ['first_display'],
       slotCount: 1,
       outcomeCount: 1,
@@ -389,6 +487,56 @@ describe('Runtime bootstrap owner', () => {
         id: 'late',
       })
     ).toBe(false);
+  });
+
+  it('publishes the exact closure-supplied immutable boot snapshot without rereading the target', async () => {
+    const target: Record<string, unknown> = {};
+    const acceptedBoot = snapshotTsjsBootV1(
+      {
+        abi: 1,
+        releaseId: RELEASE,
+        manifest: manifest(['test_module']),
+        ...boot(),
+        integrations: { version: 1, entries: [] },
+      },
+      RELEASE
+    );
+    expect(acceptedBoot).toBeDefined();
+    const runtime = createRuntime({
+      target,
+      releaseId: RELEASE,
+      manifest: acceptedBoot!.manifest,
+      knownIntegrationIds: Object.freeze(['test_module']),
+      catalog: Object.freeze([
+        Object.freeze({
+          id: 'test_module',
+          phase: 'takeover' as const,
+          trigger: null,
+          config: null,
+          consumes: Object.freeze([]),
+          provides: Object.freeze([]),
+        }),
+      ]),
+      boot: acceptedBoot,
+      kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+    });
+
+    expect(runtime.start()).toBe(true);
+    target.boot = Object.freeze({ publisherReplacement: true });
+    expect(
+      runtime.registerIntegration({
+        abi: 1,
+        id: 'test_module',
+        phase: 'takeover',
+        releaseId: RELEASE,
+        prepare: ({ config }: { config: unknown }) => {
+          expect(config).toBeUndefined();
+          return Object.freeze({ activate: () => undefined });
+        },
+      })
+    ).toBe(true);
+    await expect(runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+    expect(target.boot).toBe(acceptedBoot);
   });
 
   it('publishes direct.v1 through stable public closures only after provider activation', async () => {
@@ -794,6 +942,8 @@ describe('Runtime bootstrap owner', () => {
     const tracePresentationCapability = Object.freeze({ attachPresentation: traceAttach });
     const gptLaterRelease = vi.fn();
     const prebidLaterRelease = vi.fn();
+    const gptConfig = { gamAttributionEnabled: true };
+    const prebidConfig = { accountId: 'publisher' };
     const gptLater = Object.freeze({
       activate: vi.fn(() => gptLaterRelease),
       start: vi.fn(),
@@ -832,6 +982,7 @@ describe('Runtime bootstrap owner', () => {
           id: 'trace_provider',
           phase: 'takeover' as const,
           trigger: null,
+          config: null,
           consumes: Object.freeze([]),
           provides: Object.freeze(['trace.v1', 'trace.presentation.v1']),
         }),
@@ -839,6 +990,7 @@ describe('Runtime bootstrap owner', () => {
           id: 'optional_gpt_diag_provider',
           phase: 'takeover' as const,
           trigger: null,
+          config: null,
           consumes: Object.freeze([]),
           provides: Object.freeze(['gpt_diag.v1']),
         }),
@@ -846,6 +998,7 @@ describe('Runtime bootstrap owner', () => {
           id: 'diagnostics_presentation',
           phase: 'deferred' as const,
           trigger: 'first_display_or_idle' as const,
+          config: null,
           consumes: Object.freeze([
             'runtime.v1',
             'trace.presentation.v1',
@@ -858,6 +1011,7 @@ describe('Runtime bootstrap owner', () => {
             id,
             phase: 'deferred' as const,
             trigger: 'first_display_or_idle' as const,
+            config: id === 'gpt_later' ? ('gpt' as const) : ('prebid' as const),
             consumes: Object.freeze([]),
             provides: Object.freeze([]),
           })
@@ -865,6 +1019,13 @@ describe('Runtime bootstrap owner', () => {
       ]),
       boot: {
         ...boot(),
+        integrations: {
+          version: 1,
+          entries: [
+            { id: 'gpt', config: gptConfig },
+            { id: 'prebid', config: prebidConfig },
+          ],
+        },
         diagnostics: { version: 1, renderTraceOverlay: true, gpt: { active: false } },
       },
       getBindings: (id) =>
@@ -962,6 +1123,19 @@ describe('Runtime bootstrap owner', () => {
     expect(loadedSources.every((source) => !source.includes('tsjs-unified'))).toBe(true);
     expect(gptLater.activate).toHaveBeenCalledOnce();
     expect(prebidLater.activate).toHaveBeenCalledOnce();
+    const acceptedCarrier = (
+      target['boot'] as {
+        integrations: { entries: readonly { id: string; config: unknown }[] };
+      }
+    ).integrations;
+    const acceptedGpt = acceptedCarrier.entries.find(({ id }) => id === 'gpt')?.config;
+    const acceptedPrebid = acceptedCarrier.entries.find(({ id }) => id === 'prebid')?.config;
+    expect(gptLater.activate).toHaveBeenCalledWith(acceptedGpt);
+    expect(gptLater.start).toHaveBeenCalledWith(acceptedGpt);
+    expect(prebidLater.activate).toHaveBeenCalledWith(acceptedPrebid);
+    expect(prebidLater.start).toHaveBeenCalledWith(acceptedPrebid);
+    expect(acceptedGpt).not.toBe(gptConfig);
+    expect(acceptedPrebid).not.toBe(prebidConfig);
 
     runtime.dispose();
     expect(gptLaterRelease).toHaveBeenCalledOnce();
@@ -1913,6 +2087,7 @@ describe('Runtime bootstrap owner', () => {
       releaseId: RELEASE,
       manifest: { version: 2 },
       knownIntegrationIds: Object.freeze([]),
+      boot: target.boot,
       kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
     });
     expect(runtime.start()).toBe(true);

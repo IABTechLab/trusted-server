@@ -13,6 +13,7 @@ const HANDOFF_FIELDS = Object.freeze([
   'releaseId',
   'generation',
   'projectionDigest',
+  'integrationConfigDigest',
   'slices',
   'slots',
   'attempts',
@@ -49,6 +50,7 @@ function snapshotFirstDisplayHandoffEnvelopeV1(
       handoff.generation < 1 ||
       handoff.generation > MAX_U32 ||
       !HASH.test(handoff.projectionDigest) ||
+      !HASH.test(handoff.integrationConfigDigest) ||
       !Number.isInteger(handoff.mutationRevision) ||
       handoff.mutationRevision < 0 ||
       handoff.mutationRevision > MAX_U32 ||

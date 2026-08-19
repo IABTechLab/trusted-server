@@ -53,7 +53,7 @@ describe('transactional DataDome integration module', () => {
       startedAtMs: 0,
       now: () => 0,
       getBindings: () => ({
-        config: undefined,
+        config: Object.freeze({}),
         interfaces: Object.freeze({}),
       }),
     });
@@ -72,35 +72,38 @@ describe('transactional DataDome integration module', () => {
     expect(order[order.length - 1]).toBe('datadome:release');
   });
 
-  it.each([null, Object.freeze({}), false])('rejects non-absent config %j', async (config) => {
-    const activate = vi.fn(() => vi.fn());
-    const registry = createIntegrationRegistry({
-      manifest: {
-        version: 1,
+  it.each([undefined, null, false, Object.freeze({ extra: true })])(
+    'rejects non-exact config %j',
+    async (config) => {
+      const activate = vi.fn(() => vi.fn());
+      const registry = createIntegrationRegistry({
+        manifest: {
+          version: 1,
+          releaseId: RELEASE_ID,
+          firstDisplay: null,
+          runtimeSrc: RUNTIME_SRC,
+          integrations: [{ id: 'datadome', phase: 'takeover' }],
+        },
         releaseId: RELEASE_ID,
-        firstDisplay: null,
-        runtimeSrc: RUNTIME_SRC,
-        integrations: [{ id: 'datadome', phase: 'takeover' }],
-      },
-      releaseId: RELEASE_ID,
-      knownIntegrationIds: Object.freeze(['datadome']),
-      startedAtMs: 0,
-      now: () => 0,
-      getBindings: () => ({
-        config,
-        interfaces: Object.freeze({
-          datadome: Object.freeze({ activate, start: vi.fn() }),
+        knownIntegrationIds: Object.freeze(['datadome']),
+        startedAtMs: 0,
+        now: () => 0,
+        getBindings: () => ({
+          config,
+          interfaces: Object.freeze({
+            datadome: Object.freeze({ activate, start: vi.fn() }),
+          }),
         }),
-      }),
-    });
-    registry.register(createDataDomeIntegrationRegistration(RELEASE_ID));
+      });
+      registry.register(createDataDomeIntegrationRegistration(RELEASE_ID));
 
-    await expect(registry.install(callbacks([]))).resolves.toMatchObject({
-      state: 'fallback',
-      reason: 'bundle_partial',
-    });
-    expect(activate).not.toHaveBeenCalled();
-  });
+      await expect(registry.install(callbacks([]))).resolves.toMatchObject({
+        state: 'fallback',
+        reason: 'bundle_partial',
+      });
+      expect(activate).not.toHaveBeenCalled();
+    }
+  );
 
   it('owns and reverses the concrete DataDome guard', () => {
     const order: string[] = [];

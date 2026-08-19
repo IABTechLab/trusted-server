@@ -1,30 +1,35 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { TsjsApi } from '../../src/core/types';
+import { snapshotTsjsBootV1 } from '../../src/core/contracts/boot';
+import type { TsjsApi, TsjsBootV1 } from '../../src/core/types';
 
 const RELEASE = 'a'.repeat(64);
 const RUNTIME_SRC = `/static/tsjs=tsjs-unified.min.js?v=${'c'.repeat(64)}`;
 
 function boot() {
-  return {
-    abi: 1,
-    releaseId: RELEASE,
-    manifest: {
-      version: 1,
+  return snapshotTsjsBootV1(
+    {
+      abi: 1,
       releaseId: RELEASE,
-      firstDisplay: null,
-      runtimeSrc: RUNTIME_SRC,
-      integrations: [{ id: 'render_runtime', phase: 'takeover' }],
+      manifest: {
+        version: 1,
+        releaseId: RELEASE,
+        firstDisplay: null,
+        runtimeSrc: RUNTIME_SRC,
+        integrations: [{ id: 'render_runtime', phase: 'takeover' }],
+      },
+      auctionProjection: {
+        version: 1,
+        auction: { version: 1, auctionId: 'initial', results: [] },
+        slots: [],
+        bids: [],
+      },
+      integrations: { version: 1, entries: [] },
+      creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+      diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
     },
-    auctionProjection: {
-      version: 1,
-      auction: { version: 1, auctionId: 'initial', results: [] },
-      slots: [],
-      bids: [],
-    },
-    creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
-    diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
-  };
+    RELEASE
+  )!;
 }
 
 async function loadMinimalProductionRuntime(): Promise<void> {
@@ -40,6 +45,19 @@ function installRuntimeScript(): void {
   Object.defineProperty(document, 'currentScript', { configurable: true, value: script });
 }
 
+function installBootClaim(target: object, acceptedBoot: Readonly<TsjsBootV1>): void {
+  Object.defineProperty(target, '_claimBootSnapshot', {
+    configurable: true,
+    enumerable: false,
+    value: (source: unknown) => {
+      if (source !== document.currentScript) return undefined;
+      Reflect.deleteProperty(target, '_claimBootSnapshot');
+      return acceptedBoot;
+    },
+    writable: false,
+  });
+}
+
 describe('hard-cutover requestAds API', () => {
   beforeEach(async () => {
     await vi.resetModules();
@@ -50,12 +68,13 @@ describe('hard-cutover requestAds API', () => {
 
   it('replaces a callback-era request function with the exact Promise result surface', async () => {
     const legacyCallback = vi.fn();
-    (window as unknown as { tsjs?: unknown }).tsjs = {
+    const preload = {
       boot: boot(),
       que: [],
-      _integrationConfig: {},
       requestAds: legacyCallback,
     };
+    installBootClaim(preload, preload.boot);
+    (window as unknown as { tsjs?: unknown }).tsjs = preload;
 
     await loadMinimalProductionRuntime();
     await vi.waitFor(() =>
