@@ -111,7 +111,11 @@ use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
     RequestFilterRegistryOutcome,
 };
-use trusted_server_core::platform::{ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices};
+use trusted_server_core::platform::{
+    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, build_geo_provider,
+};
+use trusted_server_device_fastly::FastlyHostSignals;
+
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
     handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
@@ -253,15 +257,36 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
             ..ClientInfo::default()
         });
 
+    // The TLS JA4 and HTTP/2 fingerprints arrive as trusted internal headers
+    // injected by the entry point. They build the host-signal service a
+    // host-signal provider reads; Fastly always supplies the capability, so the
+    // service is always set even when a request carried no fingerprint.
+    let tls_ja4 = ctx
+        .request()
+        .headers()
+        .get("x-ts-tls-ja4")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let h2_fingerprint = ctx
+        .request()
+        .headers()
+        .get("x-ts-h2-fingerprint")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
     RuntimeServices::builder()
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
         .kv_store(Arc::clone(&state.default_kv_store))
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
-        .geo(Arc::new(FastlyPlatformGeo))
+        .geo(build_geo_provider(
+            &state.settings,
+            Arc::new(FastlyPlatformGeo),
+        ))
         .auction_telemetry_sink(Arc::clone(&state.auction_telemetry_sink))
         .client_info(client_info)
+        .host_signals(Arc::new(FastlyHostSignals::new(tls_ja4, h2_fingerprint)))
         .build()
 }
 
@@ -384,7 +409,7 @@ fn build_ec_request_state(
     req: &Request,
 ) -> EcRequestState {
     let device_signals = device_signals_for(req);
-    let is_real_browser = device_signals.looks_like_browser();
+    let is_real_browser = device_signals.looks_like_browser;
     if !is_real_browser {
         log::info!(
             "Bot gate: blocking EC operations (ja4={:?}, platform={:?}, is_mobile={})",
@@ -670,7 +695,7 @@ async fn run_named_route(
 /// response finalization.
 fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
     let device_signals = device_signals_for(&req);
-    let is_real_browser = device_signals.looks_like_browser();
+    let is_real_browser = device_signals.looks_like_browser;
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 

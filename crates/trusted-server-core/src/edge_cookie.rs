@@ -54,13 +54,18 @@ pub fn generate_ec_id(
 
     log::trace!("Generating fresh EC ID from normalized client context");
 
-    let Some(provider) = build_provider(&settings.ec, services.ec_provider())? else {
+    let Some(provider) = build_provider(
+        &settings.ec,
+        services.host_signals(),
+        services.ec_provider(),
+    )?
+    else {
         log::info!("No Edge Cookie provider configured; running statelessly");
         return Ok(None);
     };
 
-    // The provider reads request data (for example the client IP) borrowed at
-    // call time, so nothing is cloned.
+    // The provider reads request data (the client IP, and on a fingerprinting
+    // host the TLS/HTTP-2 signals) borrowed at call time, so nothing is cloned.
     let request_info = BorrowedRequestInfo::new(&client_ip, request_headers);
     // The publisher path gates creation on the request's consent context at
     // the call site, and the built-in provider reads neither that result nor

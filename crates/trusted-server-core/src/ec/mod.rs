@@ -232,9 +232,10 @@ impl EcContext {
         // Build the selected provider once. It is used here to decide whether
         // the incoming cookie value is a usable identifier. Building it needs
         // no request data, so nothing is cloned from the request.
+        let host_signals = services.host_signals();
         let ec_provider = services.ec_provider();
         let selected_provider: Option<Arc<dyn crate::ec::provider::EdgeCookieProvider>> =
-            build_provider(&settings.ec, ec_provider.clone())?.map(Arc::from);
+            build_provider(&settings.ec, host_signals, ec_provider)?.map(Arc::from);
 
         // Read back an existing identifier only when the selected provider
         // accepts its shape, so an opaque vendor identifier (for example a signed

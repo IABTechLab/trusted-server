@@ -216,6 +216,20 @@ impl RequestInfo for BorrowedRequestInfo<'_> {
     }
 }
 
+/// Host-computed client fingerprints that are not carried in request headers.
+///
+/// A host that can compute them supplies an implementation (Fastly exposes the
+/// TLS JA4 and HTTP/2 fingerprints). A provider that needs them takes
+/// `Arc<dyn HostSignals>` in its constructor; on a host that supplies none, the
+/// provider cannot be built and the request stops.
+pub trait HostSignals: Send + Sync + core::fmt::Debug {
+    /// The full JA4 TLS fingerprint, or `None` when unavailable.
+    fn ja4(&self) -> Option<&str>;
+
+    /// The raw HTTP/2 SETTINGS fingerprint, or `None` when unavailable.
+    fn h2(&self) -> Option<&str>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

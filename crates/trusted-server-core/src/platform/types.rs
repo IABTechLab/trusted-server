@@ -10,6 +10,7 @@ use super::{
     PlatformSecretStore,
 };
 use crate::ec::provider::EdgeCookieProvider;
+use crate::evidence::HostSignals;
 
 /// Geographic information extracted from a request.
 ///
@@ -180,11 +181,15 @@ pub struct RuntimeServices {
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
     /// Per-request client metadata extracted at the entry point.
     pub(crate) client_info: ClientInfo,
+    /// Host-computed client fingerprints (TLS JA4, HTTP/2), when the host
+    /// supplies them. `None` on a host that exposes none, so a provider that
+    /// requires them cannot be built and the request stops.
+    pub(crate) host_signals: Option<Arc<dyn HostSignals>>,
     /// A vendor or host Edge Cookie provider the adapter injects, selected when
     /// `[ec] provider` names it. `None` when only the built-in providers are in
     /// use. This is the seam that lets a vendor Edge Cookie provider live in its
-    /// own crate and be injected, so core never names a vendor (the same
-    /// pattern as [`geo`](Self::geo)).
+    /// own crate and be injected, so core never names a vendor (the same pattern
+    /// as [`geo`](Self::geo) and [`host_signals`](Self::host_signals)).
     pub(crate) ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
 }
 
@@ -261,6 +266,18 @@ impl RuntimeServices {
         &self.client_info
     }
 
+    /// Returns the host-computed client fingerprints, when the host supplies
+    /// them.
+    ///
+    /// A provider that derives identity from the TLS JA4 or HTTP/2 fingerprints
+    /// takes these as an injected service. The result is `None` on a host that
+    /// exposes none, so such a provider cannot be built there and the request
+    /// stops rather than minting a degraded identifier.
+    #[must_use]
+    pub fn host_signals(&self) -> Option<Arc<dyn HostSignals>> {
+        self.host_signals.clone()
+    }
+
     /// Returns the adapter-injected Edge Cookie provider, when one is wired.
     ///
     /// `None` when the deployment uses only the built-in providers (which core
@@ -314,6 +331,7 @@ pub struct RuntimeServicesBuilder {
     geo: Option<Arc<dyn PlatformGeo>>,
     auction_telemetry_sink: Option<Arc<dyn AuctionTelemetrySink>>,
     client_info: Option<ClientInfo>,
+    host_signals: Option<Arc<dyn HostSignals>>,
     ec_provider: Option<Arc<dyn EdgeCookieProvider>>,
 }
 
@@ -328,6 +346,7 @@ impl RuntimeServicesBuilder {
             geo: None,
             auction_telemetry_sink: None,
             client_info: None,
+            host_signals: None,
             ec_provider: None,
         }
     }
@@ -391,6 +410,17 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Set the host-computed client fingerprints service.
+    ///
+    /// Optional: a host that exposes no TLS/HTTP-2 fingerprints leaves this
+    /// unset, so a provider that requires them cannot be built and the request
+    /// stops.
+    #[must_use]
+    pub fn host_signals(mut self, host_signals: Arc<dyn HostSignals>) -> Self {
+        self.host_signals = Some(host_signals);
+        self
+    }
+
     /// Set the adapter-injected Edge Cookie provider.
     ///
     /// Optional: leave it unset for a deployment that uses only the built-in
@@ -435,6 +465,7 @@ impl RuntimeServicesBuilder {
             client_info: self
                 .client_info
                 .expect("should set client_info before building RuntimeServices"),
+            host_signals: self.host_signals,
             ec_provider: self.ec_provider,
         }
     }

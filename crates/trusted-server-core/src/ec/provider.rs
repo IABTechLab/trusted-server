@@ -2,8 +2,8 @@
 //!
 //! An [`EdgeCookieProvider`] derives an Edge Cookie identifier. Providers are
 //! wired by dependency injection: a provider's constructor takes the services it
-//! needs (for example [`RequestInfo`] for the client IP)
-//! (the adapter, through [`build_provider`]) supplies instances per request. A
+//! needs (for example [`RequestInfo`] for the client IP, or [`HostSignals`] for
+//! the TLS/HTTP-2 fingerprints)//! (the adapter, through [`build_provider`]) supplies instances per request. A
 //! provider that needs a service the host does not supply cannot be built, so
 //! the request stops rather than silently degrading.
 //!
@@ -17,7 +17,7 @@ use error_stack::Report;
 
 use crate::consent::ConsentContext;
 use crate::error::TrustedServerError;
-use crate::evidence::RequestInfo;
+use crate::evidence::{HostSignals, RequestInfo};
 use crate::redacted::Redacted;
 use crate::settings::Ec;
 
@@ -161,23 +161,80 @@ impl EdgeCookieProvider for HmacProvider {
     }
 }
 
+/// The built-in host-signal Edge Cookie provider.
+///
+/// Derives the identifier from the host fingerprints (TLS JA4 and HTTP/2, read
+/// from the injected [`HostSignals`]) plus the client IP (from [`RequestInfo`]),
+/// keyed by the configured passphrase. It is host-agnostic: it depends on the
+/// `HostSignals` capability, so any host that supplies one can use it. A host
+/// that supplies no `HostSignals` cannot build it, and the request stops.
+#[derive(Debug, Clone)]
+pub struct HostSignalProvider {
+    passphrase: Redacted<String>,
+    host_signals: Arc<dyn HostSignals>,
+}
+
+impl HostSignalProvider {
+    /// Creates the provider with the passphrase and its injected host signals.
+    #[must_use]
+    pub fn new(passphrase: Redacted<String>, host_signals: Arc<dyn HostSignals>) -> Self {
+        Self {
+            passphrase,
+            host_signals,
+        }
+    }
+}
+
+impl EdgeCookieProvider for HostSignalProvider {
+    fn id(&self) -> &'static str {
+        "host-signals"
+    }
+
+    fn generate(
+        &self,
+        request_info: &dyn RequestInfo,
+        _input: &IdentityInput<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        let ja4 = self.host_signals.ja4().unwrap_or_default();
+        let h2 = self.host_signals.h2().unwrap_or_default();
+        // With no fingerprint at all, minting would silently degrade to an
+        // IP-only identifier under the host-signals name. Defer instead: no
+        // identity this request, and the request proceeds.
+        if ja4.is_empty() && h2.is_empty() {
+            log::warn!("Host-signal EC provider found no TLS/HTTP-2 fingerprints; deferring");
+            return Ok(GeneratedEdgeCookie::default());
+        }
+        let id = generation::generate_hmac_ec_id(
+            self.passphrase.expose(),
+            &[ja4, h2, request_info.client_ip()],
+        )?;
+        Ok(GeneratedEdgeCookie {
+            id: Some(id),
+            response_headers: Vec::new(),
+        })
+    }
+}
+
 /// Builds the Edge Cookie provider named by the `[ec] provider` selector,
 /// injecting the services it needs.
 ///
-/// This is the composition root for the built-in providers. The per-request
-/// [`RequestInfo`] is passed borrowed to
+/// This is the composition root for the built-in providers: the adapter supplies
+/// the [`HostSignals`] when the host can produce them, and this constructs the
+/// selected provider. The per-request [`RequestInfo`] is passed borrowed to
 /// [`generate`](EdgeCookieProvider::generate) at call time rather than stored, so
 /// no request snapshot is cloned here. Returns `Ok(None)` when no provider is
 /// selected, so the caller stays stateless.
 ///
 /// # Errors
 ///
-/// None of the built-in constructions fail today. The `Result` is the seam for
-/// a provider whose construction can fail (for example one requiring a host
-/// service the deployment does not supply), so such a misconfiguration fails
-/// loudly rather than minting a degraded identifier.
+/// Returns [`TrustedServerError::EdgeCookie`] when the selected provider requires
+/// a service the host did not supply (for example the host-signal provider on a
+/// host that exposes no [`HostSignals`]), or when a selected vendor provider is
+/// not injected by the adapter, so a misconfigured deployment fails loudly
+/// rather than minting a degraded identifier or silently running stateless.
 pub fn build_provider(
     ec: &Ec,
+    host_signals: Option<Arc<dyn HostSignals>>,
     injected: Option<Arc<dyn EdgeCookieProvider>>,
 ) -> Result<Option<Box<dyn EdgeCookieProvider>>, Report<TrustedServerError>> {
     let Some(key) = ec.provider.as_deref() else {
@@ -189,6 +246,18 @@ pub fn build_provider(
             .hmac
             .as_ref()
             .map(|config| Box::new(HmacProvider::new(config.passphrase.clone())) as _),
+        "host-signals" => {
+            let signals = host_signals.ok_or_else(|| {
+                Report::new(TrustedServerError::EdgeCookie {
+                    message: "The host-signals Edge Cookie provider requires a host that supplies \
+                              TLS/HTTP-2 fingerprints, which this host does not"
+                        .to_owned(),
+                })
+            })?;
+            ec.providers.host_signals.as_ref().map(|config| {
+                Box::new(HostSignalProvider::new(config.passphrase.clone(), signals)) as _
+            })
+        }
         // Any other key names a vendor or host provider the adapter injects
         // through [`RuntimeServices`](crate::platform::RuntimeServices), the same
         // seam the device and geo providers use, so core never names a vendor.
@@ -253,10 +322,31 @@ impl EdgeCookieProvider for SharedProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::evidence::OwnedRequestInfo;
     use crate::redacted::Redacted;
 
     fn test_passphrase() -> Redacted<String> {
         Redacted::from("a-test-passphrase-32-bytes-minimum".to_owned())
+    }
+
+    fn test_request_info() -> OwnedRequestInfo {
+        OwnedRequestInfo::new("203.0.113.1".to_owned(), http::HeaderMap::new())
+    }
+
+    /// Test host signals with fixed JA4/H2 values.
+    #[derive(Debug)]
+    struct TestHostSignals {
+        ja4: Option<String>,
+        h2: Option<String>,
+    }
+
+    impl HostSignals for TestHostSignals {
+        fn ja4(&self) -> Option<&str> {
+            self.ja4.as_deref()
+        }
+        fn h2(&self) -> Option<&str> {
+            self.h2.as_deref()
+        }
     }
 
     /// A provider whose identifiers wrap a payload after a `:` separator, so two
@@ -388,13 +478,47 @@ mod tests {
     }
 
     #[test]
+    fn host_signal_provider_mints_from_fingerprints() {
+        let signals = Arc::new(TestHostSignals {
+            ja4: Some("t13d1516h2_8daaf6152771_e5627efa2ab1".to_owned()),
+            h2: Some("1:65536;4:6291456".to_owned()),
+        });
+        let provider = HostSignalProvider::new(test_passphrase(), signals);
+        let request_info = test_request_info();
+        let generated = provider
+            .generate(&request_info, &IdentityInput::default())
+            .expect("should generate");
+        assert!(
+            generated.id.is_some(),
+            "the host-signal provider mints an identifier from the fingerprints"
+        );
+    }
+
+    #[test]
+    fn host_signal_provider_defers_without_fingerprints() {
+        let signals = Arc::new(TestHostSignals {
+            ja4: None,
+            h2: None,
+        });
+        let provider = HostSignalProvider::new(test_passphrase(), signals);
+        let request_info = test_request_info();
+        let generated = provider
+            .generate(&request_info, &IdentityInput::default())
+            .expect("should generate");
+        assert!(
+            generated.id.is_none(),
+            "with no host fingerprints the provider should defer rather than              mint an IP-only identifier"
+        );
+    }
+
+    #[test]
     fn a_selected_but_uninjected_vendor_provider_fails_loudly() {
         let ec = Ec {
             provider: Some("acme".to_owned()),
             ..Ec::default()
         };
 
-        let err = build_provider(&ec, None)
+        let err = build_provider(&ec, None, None)
             .expect_err("selecting a provider the adapter does not inject should error");
         assert!(
             err.to_string().contains("acme"),
