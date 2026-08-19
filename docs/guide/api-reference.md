@@ -583,7 +583,7 @@ curl -X POST https://edge.example.com/_ts/admin/keys/deactivate \
 
 ## Admin Diagnostic Endpoints
 
-These endpoints expose sensitive identity and cookie data and require HTTP Basic Authentication. Configure a handler that covers the entire `/_ts/admin` namespace; startup rejects configurations that do not protect every admin route. All responses are JSON with `Cache-Control: no-store`.
+These endpoints expose sensitive identity and cookie data and require HTTP Basic Authentication. Configure a handler that covers the entire `/_ts/admin` namespace; startup rejects configurations that do not protect every admin route. After successful authentication, diagnostic-handler responses are JSON with `Cache-Control: no-store`. Missing or invalid credentials receive the shared plaintext `401 Unauthorized` Basic-auth challenge, which is outside that JSON and cache-header contract.
 
 The examples below use fictional IDs and values only.
 
@@ -630,7 +630,26 @@ curl -u admin:secure-password \
 
 Parses the request's `ts-eids` and `sharedId` cookies and previews which configured partner IDs cookie ingestion would match or drop. It performs request inspection only: it does not read or write KV and is available on every adapter.
 
-After successful authentication this endpoint always returns `200 OK`; missing or malformed cookies are represented by `cookie_present`, `sharedid_present`, and `parse_error`. The `ingest.matched` and `ingest.unmatched` arrays show the ingestion preview.
+After successful authentication this endpoint always returns `200 OK`; missing or malformed cookies are represented by `cookie_present`, `sharedid_present`, and `parse_error`. The `ingest.matched` and `ingest.unmatched` arrays show the ingestion preview. Each unmatched entry contains its `source` and either a `no_partner` reason when no configured partner recognizes it or `no_valid_uid` when the partner exists but every supplied UID is empty or exceeds the storage limit.
+
+```json
+{
+  "ingest": {
+    "matched": [
+      {
+        "source_domain": "configured.example",
+        "uid": "fictional-uid"
+      }
+    ],
+    "unmatched": [
+      {
+        "source": "unknown.example",
+        "reason": "no_partner"
+      }
+    ]
+  }
+}
+```
 
 ```bash
 curl -u admin:secure-password \

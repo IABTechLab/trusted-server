@@ -183,7 +183,7 @@ git commit -m "Validate mixed-case admin EC auth coverage"
 Update the existing unmatched assertion to expect:
 
 ```json
-{"source":"unknown.example","reason":"no_partner"}
+{ "source": "unknown.example", "reason": "no_partner" }
 ```
 
 Add a test whose configured source has only whitespace/empty and over-limit
