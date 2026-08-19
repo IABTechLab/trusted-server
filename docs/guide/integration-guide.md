@@ -215,30 +215,50 @@ impl IntegrationScriptRewriter for MyIntegration {
 Returning `AttributeRewriteAction::remove_element()` (or `ScriptRewriteAction::RemoveNode` for inline content) removes the element entirely, so integrations can drop publisher-provided markup when the Trusted Server already injects a safe alternative. Prebid, for example, removes publisher `prebid.js` tags because Trusted Server injects a first-party `/integrations/prebid/bundle.js` URL for the configured external bundle.
 :::
 
-### 5b. Implement Head Injection (Optional)
+### 5b. Project Browser Configuration (When TSJS Needs It)
 
-If the integration needs to inject HTML snippets at the start of `<head>` (for example, configuration scripts or global bootstraps), implement `IntegrationHeadInjector`. Snippets are prepended into `<head>` before the TSJS bundle tags, so they run first.
+Browser configuration is part of the immutable version-1 boot document. Define a
+small serializable projection containing only browser-safe fields and attach it to
+the registration. Products with no browser-selectable fields must attach the exact
+empty projection.
+
+```rust
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MyBrowserConfigV1 {
+    mode: String,
+}
+
+IntegrationRegistration::builder("my_integration")
+    .with_browser_config_v1(&MyBrowserConfigV1 {
+        mode: "strict".to_string(),
+    })?
+    .build()
+```
+
+The registry validates the selected product set, serializes entries in canonical
+order, and places the exact carrier inside `BootV1`. The runtime snapshots and
+freezes that boot document, then attenuates each product's entry to its own module.
+Do not emit a separate mutable configuration global or inline configuration script.
+
+### 5c. Implement Head Injection (Optional)
+
+If the integration needs to inject unrelated HTML snippets at the start of `<head>`, implement `IntegrationHeadInjector`. Snippets are prepended into `<head>` before the TSJS bundle tags, so they run first. Browser configuration belongs in the immutable boot projection described above, not in this hook.
 
 ```rust
 impl IntegrationHeadInjector for MyIntegration {
     fn integration_id(&self) -> &'static str { "my_integration" }
 
-    fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        let config_json = serde_json::to_string(&serde_json::json!({
-            "mode": "my_integration",
-            "host": ctx.request_host,
-        }))
-        .expect("should serialize integration config")
-        .replace("</", "<\\/");
-        vec![super::integration_config_script("my_integration", &config_json)]
+    fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        vec![r#"<meta name="my-integration" content="enabled">"#.to_string()]
     }
 }
 ```
 
-`html_processor.rs` calls `head_inserts` once per HTML response when the `<head>` element is first encountered. The returned snippets are concatenated before the unified script tag, so ordering between integrations is not guaranteed — keep snippets self-contained. The core validates, snapshots, freezes, and consumes the matching manifest integration's value, then deletes the transient `_integrationConfig` transport before publishing the exact `TsjsApi`.
+`html_processor.rs` calls `head_inserts` once per HTML response when the `<head>` element is first encountered. The returned snippets are concatenated before the unified script tag, so ordering between integrations is not guaranteed — keep snippets self-contained.
 
 ::: tip When to Use Head Injection
-Use `IntegrationHeadInjector` when you need to emit configuration, inline scripts, or `<meta>` tags that must appear early in `<head>`. For attribute or script content changes on existing elements, prefer `IntegrationAttributeRewriter` or `IntegrationScriptRewriter` instead.
+Use `IntegrationHeadInjector` when you need to emit metadata or other markup that must appear early in `<head>`. For attribute or script content changes on existing elements, prefer `IntegrationAttributeRewriter` or `IntegrationScriptRewriter` instead.
 :::
 
 ### 6. Register the Module
