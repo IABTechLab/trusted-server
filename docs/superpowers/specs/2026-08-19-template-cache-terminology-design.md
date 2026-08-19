@@ -27,14 +27,16 @@ Rename the active implementation and its interfaces consistently:
 - Active test fixtures such as `reserved-c2-seam`, diagnostic identifiers, assertions,
   and comments are renamed even when they are not externally visible.
 
-Only three categories may retain the old spelling:
+Only four categories may retain the old spelling:
 
 1. the exact `<!--ts-c2-v3-seam-7f4c9e2d-bids-->` marker in the template schema-version
    history;
 2. before/after compatibility references in this migration design and its implementation
    plan; and
 3. documents already under `docs/superpowers/archive/`, which remain unchanged as
-   historical records.
+   historical records; and
+4. negative compatibility-test literals that prove the old `x-ts-c2-cache` header
+   is absent on both cold and warm responses.
 
 Unrelated `c2` substrings in creative fixtures, cookie or EC identifiers, lockfiles,
 checksums, styling, or third-party content are outside scope.

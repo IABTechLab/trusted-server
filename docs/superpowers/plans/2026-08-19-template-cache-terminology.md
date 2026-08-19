@@ -247,12 +247,13 @@ cd ..
 rg -n -i --glob '!docs/superpowers/archive/**' --glob '!docs/superpowers/specs/2026-08-19-template-cache-terminology-design.md' --glob '!docs/superpowers/plans/2026-08-19-template-cache-terminology.md' 'X-TS-C2-Cache|x-ts-c2-cache|ts-c2|c2_template_cache|C2Response|C2Bypass|C2Cache|c2_bypass|c2_cache|c2-local-test|reserved-c2-seam|\bC2\b|\bc2\b' crates/trusted-server-core/src/platform/template_cache.rs crates/trusted-server-core/src/publisher.rs crates/trusted-server-core/src/html_processor.rs crates/trusted-server-core/src/creative_opportunities.rs crates/trusted-server-core/src/platform/types.rs crates/trusted-server-core/src/response_privacy.rs crates/trusted-server-adapter-fastly/src scripts trusted-server.example.toml docs/guide docs/superpowers/plans docs/superpowers/specs
 ```
 
-Expected: the only result is the exact retained
+Expected: exactly three results are retained: the exact
 `<!--ts-c2-v3-seam-7f4c9e2d-bids-->` schema-history marker in
-`platform/template_cache.rs`. Inspect that single result rather than weakening the
-search. The excluded migration design and implementation plan may retain their explicit
-old/new compatibility references; archived documents and unrelated substrings are not
-migration failures.
+`platform/template_cache.rs`, plus the two negative `x-ts-c2-cache` compatibility-test
+literals in `publisher.rs` that prove the old header is absent on cold and warm
+responses. Inspect those three results rather than weakening the search. The excluded
+migration design and implementation plan may retain their explicit old/new compatibility
+references; archived documents and unrelated substrings are not migration failures.
 
 - [ ] **Step 4: Commit the documentation boundary.**
 
@@ -313,9 +314,10 @@ git diff --check
 git status --short
 ```
 
-Expected: both harness modes PASS; the active-cache search returns only the exact
-retained v3 schema-history marker; `git diff --check` PASS; and `git status --short` is
-empty (no stale `scripts/c2-local-test.sh`, generated artifacts, or unrelated edits).
+Expected: both harness modes PASS; the active-cache search returns exactly the three
+retained results (the v3 schema-history marker and the two negative `x-ts-c2-cache`
+compatibility-test literals); `git diff --check` PASS; and `git status --short` is empty
+(no stale `scripts/c2-local-test.sh`, generated artifacts, or unrelated edits).
 Confirm the only other retained old spellings live in the excluded migration design,
 implementation plan, archived records, and explicitly unrelated substrings.
 
