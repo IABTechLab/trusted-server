@@ -3,9 +3,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { BootManifestV1 } from '../../src/core/types';
 import {
   createIntegrationRegistry as createIntegrationRegistryOwner,
+  snapshotIntegrationRegistration,
   type IntegrationPrepareContext,
-  type IntegrationRegistration,
   type IntegrationRegistryOptions,
+  type TakeoverIntegrationRegistration,
 } from '../../src/kernel/integration_registry';
 import { snapshotPersistentFirstDisplayAdoptionV1 } from '../../src/shared/takeover';
 
@@ -60,14 +61,16 @@ function manifest(ids: readonly string[]): BootManifestV1 {
 
 function registration(
   id: string,
-  hooks: Partial<IntegrationRegistration> = {}
-): IntegrationRegistration {
+  hooks: Partial<TakeoverIntegrationRegistration> = {}
+): TakeoverIntegrationRegistration {
+  const prepare = hooks.prepare ?? (() => Object.freeze({ activate: () => undefined }));
   return {
     abi: 1,
     id,
     phase: 'takeover',
     releaseId: RELEASE_ID,
-    prepare: () => ({ activate: () => undefined }),
+    prepareSync: hooks.prepareSync ?? (() => Object.freeze({ activate: () => undefined })),
+    prepare,
     ...hooks,
   };
 }
@@ -101,6 +104,9 @@ describe('integration manifest and registration admission', () => {
     });
     registry.register(
       registration('gpt', {
+        prepareSync: () => {
+          throw new Error('agent takeover must not use prepareSync');
+        },
         prepare: () => {
           order.push('module:prepare');
           return {
@@ -225,6 +231,77 @@ describe('integration manifest and registration admission', () => {
     ]);
   });
 
+  it('prepares, activates, and commits a no-agent runtime without yielding', async () => {
+    const order: string[] = [];
+    const registry = createIntegrationRegistry({
+      manifest: manifest(['gpt', 'prebid']),
+      releaseId: RELEASE_ID,
+      startedAtMs: 0,
+      now: () => 0,
+    });
+    for (const id of ['gpt', 'prebid']) {
+      expect(
+        registry.register(
+          registration(id, {
+            prepareSync: () => {
+              order.push(`prepareSync:${id}`);
+              return Object.freeze({
+                activate: () => order.push(`activate:${id}`),
+              });
+            },
+            prepare: () => {
+              throw new Error('no-agent runtime must not use prepare');
+            },
+          })
+        )
+      ).toBe(true);
+    }
+    queueMicrotask(() => order.push('microtask'));
+
+    const result = registry.installSync({
+      activateCore: () => order.push('activate:core'),
+      publish: () => order.push('publish'),
+      drainPreload: () => order.push('drain'),
+    });
+
+    expect(result).toMatchObject({ state: 'kernel' });
+    expect(order).toEqual([
+      'prepareSync:gpt',
+      'prepareSync:prebid',
+      'activate:core',
+      'activate:gpt',
+      'activate:prebid',
+      'publish',
+      'drain',
+    ]);
+    await Promise.resolve();
+    expect(order[order.length - 1]).toBe('microtask');
+  });
+
+  it('rejects a thenable returned by no-agent prepareSync before activation', () => {
+    const activate = vi.fn();
+    const registry = createIntegrationRegistry({
+      manifest: manifest(['gpt']),
+      releaseId: RELEASE_ID,
+      startedAtMs: 0,
+      now: () => 0,
+    });
+    registry.register(
+      registration('gpt', {
+        prepareSync: () => Promise.resolve(Object.freeze({ activate })) as never,
+      })
+    );
+
+    expect(
+      registry.installSync({
+        activateCore: activate,
+        publish: vi.fn(),
+        drainPreload: vi.fn(),
+      })
+    ).toEqual({ state: 'fallback', reason: 'bundle_partial' });
+    expect(activate).not.toHaveBeenCalled();
+  });
+
   it('fails closed when a takeover coordinator returns without committing', async () => {
     const activate = vi.fn();
     const publish = vi.fn();
@@ -252,7 +329,7 @@ describe('integration manifest and registration admission', () => {
     expect(publish).not.toHaveBeenCalled();
   });
 
-  it('accepts only the exact five-field release-bound registrar ABI', () => {
+  it('accepts only the exact six-field takeover registrar ABI', () => {
     const registry = createIntegrationRegistry({
       manifest: manifest(['gpt']),
       releaseId: RELEASE_ID,
@@ -261,13 +338,39 @@ describe('integration manifest and registration admission', () => {
     });
     const exact = registration('gpt');
 
-    expect(Reflect.ownKeys(exact)).toEqual(['abi', 'id', 'phase', 'releaseId', 'prepare']);
+    expect(Reflect.ownKeys(exact)).toEqual([
+      'abi',
+      'id',
+      'phase',
+      'releaseId',
+      'prepareSync',
+      'prepare',
+    ]);
     expect(registry.register(exact)).toBe(true);
+  });
+
+  it('admits the exact five-field deferred shape and rejects prepareSync on deferred code', () => {
+    const deferred = Object.freeze({
+      abi: 1 as const,
+      id: 'gpt_later',
+      phase: 'deferred' as const,
+      releaseId: RELEASE_ID,
+      prepare: () => Object.freeze({ activate: () => undefined }),
+    });
+
+    expect(snapshotIntegrationRegistration(deferred)).toMatchObject({
+      id: 'gpt_later',
+      phase: 'deferred',
+    });
+    expect(
+      snapshotIntegrationRegistration({ ...deferred, prepareSync: deferred.prepare })
+    ).toBeUndefined();
   });
 
   it.each([
     ['old three-field ABI', { id: 'gpt', release: RELEASE_ID, prepare: vi.fn() }],
     ['missing abi', { id: 'gpt', phase: 'takeover', releaseId: RELEASE_ID, prepare: vi.fn() }],
+    ['missing prepareSync', { ...registration('gpt'), prepareSync: undefined }],
     ['unknown field', { ...registration('gpt'), unexpected: true }],
     ['wrong phase', { ...registration('gpt'), phase: 'deferred' }],
     ['custom prototype', Object.assign(Object.create({ inherited: true }), registration('gpt'))],
@@ -377,6 +480,7 @@ describe('integration manifest and registration admission', () => {
     expect(Reflect.ownKeys(registry).sort()).toEqual([
       'dispose',
       'install',
+      'installSync',
       'manifest',
       'prepareDeferred',
       'register',
@@ -574,6 +678,7 @@ describe('integration manifest and registration admission', () => {
       id: 'gpt',
       phase: 'takeover' as const,
       releaseId: RELEASE_ID,
+      prepareSync: acceptedPrepare,
       prepare: acceptedPrepare,
     };
     const registry = createIntegrationRegistry({
@@ -586,6 +691,7 @@ describe('integration manifest and registration admission', () => {
     expect(registry.register(candidate)).toBe(true);
     candidate.id = 'unknown';
     candidate.releaseId = OTHER_RELEASE_ID;
+    candidate.prepareSync = swappedPrepare;
     candidate.prepare = swappedPrepare;
 
     await expect(install(registry)).resolves.toMatchObject({ state: 'kernel' });
@@ -1520,18 +1626,24 @@ describe('integration preparation and activation transaction', () => {
         startedAtMs: 0,
         now: () => now,
       });
+      const prepare = () => ({
+        activate: () => {
+          order.push('activate');
+          now = activationReturnMs;
+        },
+      });
       registry.register(
         registration('gpt', {
-          prepare: () => ({
-            activate: () => {
-              order.push('activate');
-              now = activationReturnMs;
-            },
-          }),
+          prepareSync: prepare,
+          prepare,
         })
       );
 
-      const result = await install(registry, order);
+      const result = registry.installSync({
+        activateCore: () => undefined,
+        publish: () => order.push('publish'),
+        drainPreload: () => order.push('drain'),
+      });
       if (activationReturnMs < 10_000) {
         expect(result).toMatchObject({ state: 'kernel' });
         expect(order).toEqual(['activate', 'publish', 'drain']);
@@ -1553,13 +1665,13 @@ describe('integration preparation and activation transaction', () => {
       now: () => (checks++ < 5 ? 9_999 : 10_000),
     });
 
-    await expect(
-      registry.install({
+    expect(
+      registry.installSync({
         activateCore,
         publish,
         drainPreload: vi.fn(),
       })
-    ).resolves.toMatchObject({
+    ).toMatchObject({
       state: 'fallback',
       reason: 'bundle_partial',
     });

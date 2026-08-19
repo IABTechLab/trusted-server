@@ -512,6 +512,24 @@ test('generated integration artifacts execute their release-bound catalog entryp
     )) {
       executeGeneratedArtifact(dom.window, artifact.file, registrations);
     }
+    const integrationArtifacts = release.artifacts.filter(
+      ({ role, id }) => role === 'integration' && id !== 'render_runtime'
+    );
+    for (let index = 0; index < integrationArtifacts.length; index += 1) {
+      const artifact = integrationArtifacts[index];
+      const registration = registrations[index + 1];
+      assert.deepEqual(
+        Reflect.ownKeys(registration),
+        artifact.phase === 'takeover'
+          ? ['abi', 'id', 'phase', 'releaseId', 'prepareSync', 'prepare']
+          : ['abi', 'id', 'phase', 'releaseId', 'prepare']
+      );
+      assert.equal(typeof registration.prepare, 'function');
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(registration, 'prepareSync'),
+        artifact.phase === 'takeover'
+      );
+    }
     assert.deepEqual(
       registrations.map(({ id }) => id),
       release.artifacts.filter(({ role }) => role === 'integration').map(({ id }) => id)
@@ -751,14 +769,24 @@ test('co-bundled render_runtime and independent GPT start one branded display fl
       configurable: true,
       value: runtimeScript,
     });
+    let publisherMicrotaskRan = false;
+    dom.window.queueMicrotask(() => {
+      publisherMicrotaskRan = true;
+    });
     dom.window.eval(takeoverBody);
     executeGeneratedArtifact(dom.window, 'tsjs-gpt.js', registrations, { preserveTarget: true });
-    await new Promise((resolve) => queueMicrotask(resolve));
     assert.equal(
       dom.window.tsjs?._internal?.state,
       'kernel',
       `takeover transport should commit: ${JSON.stringify(dom.window.tsjs?._internal)}`
     );
+    assert.equal(
+      publisherMicrotaskRan,
+      false,
+      'no-agent preparation, activation, and commit must not yield to publisher microtasks'
+    );
+    await new Promise((resolve) => queueMicrotask(resolve));
+    assert.equal(publisherMicrotaskRan, true);
     for (let index = 0; index < 10 && displayCalls.length === 0; index += 1) {
       await new Promise((resolve) => setTimeout(resolve, 0));
     }

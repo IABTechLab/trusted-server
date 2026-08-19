@@ -17,6 +17,7 @@ import {
   type CorePreparationContext,
   type IntegrationBindings,
   type IntegrationCatalogEntry,
+  type IntegrationInstallCallbacks,
   type IntegrationInstallResult,
   type IntegrationRegistry,
   type PreparedKernelTakeover,
@@ -119,6 +120,9 @@ export interface RuntimeOptions {
   readonly activateCore?: (context: CoreActivationContext) => void;
   /** Runs the prepared persistent activation and publication inside an old-owner handoff. */
   readonly coordinateTakeover?: (prepared: PreparedKernelTakeover) => void;
+  /** Production monolith hook: install inline when its final registration arrives. */
+  readonly autoInstall?: boolean;
+  readonly onInstallComplete?: (result: IntegrationInstallResult) => void;
   readonly kernel: RuntimeKernel;
 }
 
@@ -422,6 +426,9 @@ class RuntimeOwner implements Runtime {
         ...(this.options.now ? { now: this.options.now } : {}),
         getBindings: (id) => this.integrationBindings(id),
         isCurrentOwner: () => this.ownsRegistrationHandshake(),
+        onTakeoverRegistrationsReady: () => {
+          if (this.options.autoInstall && !this.installPromise) void this.install();
+        },
       });
       this.fallbackBoot = buildFallbackBoot(
         EMBEDDED_RELEASE_ID,
@@ -446,6 +453,12 @@ class RuntimeOwner implements Runtime {
         throw new Error('Runtime owner handshake changed during claim');
       }
       this.runtimeState = 'installing';
+      if (
+        this.options.autoInstall &&
+        !this.registry.manifest?.integrations.some((entry) => entry.phase === 'takeover')
+      ) {
+        void this.install();
+      }
       return true;
     } catch {
       try {
@@ -494,67 +507,82 @@ class RuntimeOwner implements Runtime {
       return this.installPromise;
     }
     let published: PublishedQueue | undefined;
-    this.installPromise = this.registry
-      .install({
-        prepareCore: (context) => {
-          if (!this.ownsInstallingPreparation(context)) {
-            throw new Error('Runtime owner generation changed');
-          }
-          const ownerContext: RuntimeOwnerPreparationContext = Object.freeze({
-            boot: this.kernelBoot as Readonly<object>,
-            generation: this.generation,
-            onDispose: context.onDispose,
-            signal: context.signal,
-          });
-          this.invokeSynchronousActivation(this.options.prepareOwner, ownerContext);
-          if (!this.ownsInstallingPreparation(context)) {
-            throw new Error('Runtime owner generation changed');
-          }
-        },
-        activateCore: (context) => {
-          if (!this.ownsInstallingActivation(context)) {
-            throw new Error('Runtime owner generation changed');
-          }
-          const ownerContext: RuntimeOwnerActivationContext = Object.freeze({
-            boot: this.kernelBoot as Readonly<object>,
-            generation: this.generation,
-            onDispose: context.onDispose,
-            signal: context.signal,
-          });
-          this.invokeSynchronousActivation(this.options.activateOwner, ownerContext);
-          if (!this.ownsInstallingActivation(context)) {
-            throw new Error('Runtime owner generation changed');
-          }
-          this.invokeSynchronousActivation(this.options.activateCore, context);
-          if (!this.ownsInstallingActivation(context)) {
-            throw new Error('Runtime owner generation changed');
-          }
-        },
-        publish: () => {
-          if (!this.ownsRegistrationHandshake()) {
-            throw new Error('Runtime owner generation changed');
-          }
-          published = publishQueue(
-            this.options.target,
-            this.ingress as unknown[],
-            this.kernelFields()
-          );
-          this.startDeferredPhase();
-        },
-        drainPreload: () => published?.drain(),
-        ...(this.options.coordinateTakeover
-          ? { coordinateTakeover: this.options.coordinateTakeover }
-          : {}),
-      })
-      .then((result) => {
-        if (result.state === 'kernel') {
-          this.runtimeState = 'kernel';
-          return result;
+    const callbacks: IntegrationInstallCallbacks = {
+      prepareCore: (context) => {
+        if (!this.ownsInstallingPreparation(context)) {
+          throw new Error('Runtime owner generation changed');
         }
+        const ownerContext: RuntimeOwnerPreparationContext = Object.freeze({
+          boot: this.kernelBoot as Readonly<object>,
+          generation: this.generation,
+          onDispose: context.onDispose,
+          signal: context.signal,
+        });
+        this.invokeSynchronousActivation(this.options.prepareOwner, ownerContext);
+        if (!this.ownsInstallingPreparation(context)) {
+          throw new Error('Runtime owner generation changed');
+        }
+      },
+      activateCore: (context) => {
+        if (!this.ownsInstallingActivation(context)) {
+          throw new Error('Runtime owner generation changed');
+        }
+        const ownerContext: RuntimeOwnerActivationContext = Object.freeze({
+          boot: this.kernelBoot as Readonly<object>,
+          generation: this.generation,
+          onDispose: context.onDispose,
+          signal: context.signal,
+        });
+        this.invokeSynchronousActivation(this.options.activateOwner, ownerContext);
+        if (!this.ownsInstallingActivation(context)) {
+          throw new Error('Runtime owner generation changed');
+        }
+        this.invokeSynchronousActivation(this.options.activateCore, context);
+        if (!this.ownsInstallingActivation(context)) {
+          throw new Error('Runtime owner generation changed');
+        }
+      },
+      publish: () => {
+        if (!this.ownsRegistrationHandshake()) {
+          throw new Error('Runtime owner generation changed');
+        }
+        published = publishQueue(
+          this.options.target,
+          this.ingress as unknown[],
+          this.kernelFields()
+        );
+        this.startDeferredPhase();
+      },
+      drainPreload: () => published?.drain(),
+      ...(this.options.coordinateTakeover
+        ? { coordinateTakeover: this.options.coordinateTakeover }
+        : {}),
+    };
+    let resolveInstall: ((result: IntegrationInstallResult) => void) | undefined;
+    this.installPromise = new Promise<IntegrationInstallResult>((resolve) => {
+      resolveInstall = resolve;
+    });
+    const settle = (result: IntegrationInstallResult): void => {
+      if (result.state === 'kernel') {
+        this.runtimeState = 'kernel';
+      } else {
         this.runtimeState = 'failed';
         this.commitFallback(result.reason);
-        return result;
-      });
+      }
+      try {
+        this.options.onInstallComplete?.(result);
+      } catch {
+        // Completion observation cannot change the already committed terminal state.
+      }
+      resolveInstall?.(result);
+    };
+    if (!this.options.coordinateTakeover) {
+      settle(this.registry.installSync(callbacks));
+      return this.installPromise;
+    }
+    void this.registry.install(callbacks).then(settle, () => {
+      settle(Object.freeze({ state: 'fallback', reason: 'bundle_partial' }));
+    });
     return this.installPromise;
   }
 

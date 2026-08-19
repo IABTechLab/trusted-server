@@ -111,6 +111,10 @@ export function startProductionRuntime(createComposition: BrowserRuntimeComposit
       catalog: EMBEDDED_RUNTIME_CATALOG,
       boot,
       ...(takeover.status === 'accepted' ? { coordinateTakeover: takeover.coordinate } : {}),
+      autoInstall: true,
+      onInstallComplete: (result) => {
+        completeDirect?.(result.state === 'kernel' ? 'kernel' : 'runtime_fallback');
+      },
       kernel: {
         addAdUnits: () => Object.freeze({ registered: Object.freeze([]) }),
         diagnostics: Object.freeze({}),
@@ -123,16 +127,5 @@ export function startProductionRuntime(createComposition: BrowserRuntimeComposit
   if (claimDirect && !completeDirect) return;
   if (!composition.runtime.start()) {
     completeDirect?.('failed_start');
-    return;
   }
-
-  let requested = false;
-  const install = (): void => {
-    if (requested) return;
-    requested = true;
-    void composition.runtime.install().then((result) => {
-      completeDirect?.(result.state === 'kernel' ? 'kernel' : 'runtime_fallback');
-    });
-  };
-  queueMicrotask(install);
 }

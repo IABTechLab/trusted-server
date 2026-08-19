@@ -214,109 +214,107 @@ export function createPermutiveRuntime(
 }
 
 export function createPermutiveIntegrationRegistration(release: string): IntegrationRegistration {
+  const prepare = ({ config, interfaces, onDispose }: IntegrationPrepareContext) => {
+    const runtimeCapability = interfaces['runtime.v1'];
+    if (
+      !isEmptyIntegrationConfigV1(config) ||
+      typeof runtimeCapability !== 'object' ||
+      runtimeCapability === null ||
+      !Object.isFrozen(runtimeCapability) ||
+      typeof (runtimeCapability as RuntimeCapabilityV1).registerAuctionContext !== 'function'
+    ) {
+      throw new TypeError('Permutive context capability graph is invalid');
+    }
+    const runtime = runtimeCapability as RuntimeCapabilityV1;
+    const lifecycle = createPermutiveRuntime({
+      installGuard: () => undefined,
+      registerContext: () => () => undefined,
+      resetGuard: () => undefined,
+    });
+    let takeoverActive = false;
+    let releaseContext: (() => void) | undefined;
+    let lifecycleRelease: (() => void) | undefined;
+    const capability: PermutiveContextCapabilityV1 = Object.freeze({
+      activateLifecycle: () => {
+        if (!takeoverActive || lifecycleRelease) {
+          throw new TypeError('Permutive lifecycle is unavailable');
+        }
+        lifecycleRelease = lifecycle.activate(config);
+        return (): void => {
+          const releaseLifecycle = lifecycleRelease;
+          lifecycleRelease = undefined;
+          releaseLifecycle?.();
+        };
+      },
+      segments: () =>
+        takeoverActive ? snapshotSegments(getPermutiveSegments()) : Object.freeze([]),
+      startLifecycle: () => {
+        if (!takeoverActive || !lifecycleRelease) {
+          throw new TypeError('Permutive lifecycle is not active');
+        }
+        lifecycle.start(config);
+      },
+    });
+    onDispose(() => {
+      takeoverActive = false;
+      const releaseLifecycle = lifecycleRelease;
+      lifecycleRelease = undefined;
+      releaseLifecycle?.();
+      const release = releaseContext;
+      releaseContext = undefined;
+      release?.();
+      resetGuardState();
+    });
+    return Object.freeze({
+      activate: ({ adoption, onDispose: onActivationDispose }: IntegrationActivationContext) => {
+        if (takeoverActive) throw new Error('Permutive context is already active');
+        if (
+          adoption !== undefined &&
+          !validatePersistentFirstDisplaySliceAdoptionV1(adoption, 'permutive_initial', (state) => {
+            const row = state.values[0];
+            return (
+              state.values.length === 0 ||
+              (state.values.length === 1 &&
+                (row?.[0] === 'sdk_config'
+                  ? typeof row[1] === 'string' && row[1].length > 0
+                  : row?.[0] === 'readiness_timeout' && row[1] === 50))
+            );
+          })
+        ) {
+          throw new TypeError('Permutive first-display parser state is invalid');
+        }
+        try {
+          installPermutiveGuard();
+          releaseContext = runtime.registerAuctionContext(PERMUTIVE_INTEGRATION_ID, () => {
+            const segments = snapshotSegments(getPermutiveSegments());
+            return segments.length === 0
+              ? undefined
+              : Object.freeze({ permutive_segments: segments });
+          });
+          if (!releaseContext) throw new Error('Permutive context registration failed');
+        } catch (error) {
+          releaseContext = undefined;
+          resetGuardState();
+          throw error;
+        }
+        takeoverActive = true;
+        onActivationDispose(() => {
+          takeoverActive = false;
+          const release = releaseContext;
+          releaseContext = undefined;
+          release?.();
+          resetGuardState();
+        });
+      },
+      interfaces: Object.freeze({ 'permutive_context.v1': capability }),
+    });
+  };
   return Object.freeze({
     abi: 1,
     id: PERMUTIVE_INTEGRATION_ID,
     phase: 'takeover',
     releaseId: release,
-    prepare: ({ config, interfaces, onDispose }: IntegrationPrepareContext) => {
-      const runtimeCapability = interfaces['runtime.v1'];
-      if (
-        !isEmptyIntegrationConfigV1(config) ||
-        typeof runtimeCapability !== 'object' ||
-        runtimeCapability === null ||
-        !Object.isFrozen(runtimeCapability) ||
-        typeof (runtimeCapability as RuntimeCapabilityV1).registerAuctionContext !== 'function'
-      ) {
-        throw new TypeError('Permutive context capability graph is invalid');
-      }
-      const runtime = runtimeCapability as RuntimeCapabilityV1;
-      const lifecycle = createPermutiveRuntime({
-        installGuard: () => undefined,
-        registerContext: () => () => undefined,
-        resetGuard: () => undefined,
-      });
-      let takeoverActive = false;
-      let releaseContext: (() => void) | undefined;
-      let lifecycleRelease: (() => void) | undefined;
-      const capability: PermutiveContextCapabilityV1 = Object.freeze({
-        activateLifecycle: () => {
-          if (!takeoverActive || lifecycleRelease) {
-            throw new TypeError('Permutive lifecycle is unavailable');
-          }
-          lifecycleRelease = lifecycle.activate(config);
-          return (): void => {
-            const releaseLifecycle = lifecycleRelease;
-            lifecycleRelease = undefined;
-            releaseLifecycle?.();
-          };
-        },
-        segments: () =>
-          takeoverActive ? snapshotSegments(getPermutiveSegments()) : Object.freeze([]),
-        startLifecycle: () => {
-          if (!takeoverActive || !lifecycleRelease) {
-            throw new TypeError('Permutive lifecycle is not active');
-          }
-          lifecycle.start(config);
-        },
-      });
-      onDispose(() => {
-        takeoverActive = false;
-        const releaseLifecycle = lifecycleRelease;
-        lifecycleRelease = undefined;
-        releaseLifecycle?.();
-        const release = releaseContext;
-        releaseContext = undefined;
-        release?.();
-        resetGuardState();
-      });
-      return Object.freeze({
-        activate: ({ adoption, onDispose: onActivationDispose }: IntegrationActivationContext) => {
-          if (takeoverActive) throw new Error('Permutive context is already active');
-          if (
-            adoption !== undefined &&
-            !validatePersistentFirstDisplaySliceAdoptionV1(
-              adoption,
-              'permutive_initial',
-              (state) => {
-                const row = state.values[0];
-                return (
-                  state.values.length === 0 ||
-                  (state.values.length === 1 &&
-                    (row?.[0] === 'sdk_config'
-                      ? typeof row[1] === 'string' && row[1].length > 0
-                      : row?.[0] === 'readiness_timeout' && row[1] === 50))
-                );
-              }
-            )
-          ) {
-            throw new TypeError('Permutive first-display parser state is invalid');
-          }
-          try {
-            installPermutiveGuard();
-            releaseContext = runtime.registerAuctionContext(PERMUTIVE_INTEGRATION_ID, () => {
-              const segments = snapshotSegments(getPermutiveSegments());
-              return segments.length === 0
-                ? undefined
-                : Object.freeze({ permutive_segments: segments });
-            });
-            if (!releaseContext) throw new Error('Permutive context registration failed');
-          } catch (error) {
-            releaseContext = undefined;
-            resetGuardState();
-            throw error;
-          }
-          takeoverActive = true;
-          onActivationDispose(() => {
-            takeoverActive = false;
-            const release = releaseContext;
-            releaseContext = undefined;
-            release?.();
-            resetGuardState();
-          });
-        },
-        interfaces: Object.freeze({ 'permutive_context.v1': capability }),
-      });
-    },
+    prepareSync: prepare,
+    prepare,
   });
 }

@@ -54,15 +54,29 @@ export interface PreparedIntegration {
   readonly interfaces?: Readonly<Record<string, unknown>>;
 }
 
-export interface IntegrationRegistration {
+export interface TakeoverIntegrationRegistration {
   readonly abi: 1;
   readonly id: string;
-  readonly phase: 'takeover' | 'deferred';
+  readonly phase: 'takeover';
+  readonly releaseId: string;
+  readonly prepareSync: (context: IntegrationPrepareContext) => PreparedIntegration;
+  readonly prepare: (
+    context: IntegrationPrepareContext
+  ) => PreparedIntegration | PromiseLike<PreparedIntegration>;
+}
+
+export interface DeferredIntegrationRegistration {
+  readonly abi: 1;
+  readonly id: string;
+  readonly phase: 'deferred';
   readonly releaseId: string;
   readonly prepare: (
     context: IntegrationPrepareContext
   ) => PreparedIntegration | PromiseLike<PreparedIntegration>;
 }
+
+export type IntegrationRegistration =
+  TakeoverIntegrationRegistration | DeferredIntegrationRegistration;
 
 export interface IntegrationRuntimeFailure {
   readonly id: string;
@@ -132,6 +146,8 @@ export interface IntegrationRegistryOptions {
     facade: Readonly<Record<string, unknown>>
   ) => void | DisposeCallback;
   readonly onRuntimeFailure?: (failure: IntegrationRuntimeFailure) => void;
+  /** Production transport hook; invoked inline after the final takeover registration. */
+  readonly onTakeoverRegistrationsReady?: () => void;
 }
 
 export interface IntegrationCatalogEntry {
@@ -148,12 +164,13 @@ export interface IntegrationRegistry {
   readonly manifest: BootManifestV1 | undefined;
   readonly register: (candidate: unknown) => boolean;
   readonly prepareDeferred: (
-    registration: IntegrationRegistration,
+    registration: DeferredIntegrationRegistration,
     owner: Readonly<{
       signal: AbortSignal;
       onDispose: (callback: DisposeCallback) => void;
     }>
   ) => PreparedIntegration | PromiseLike<PreparedIntegration>;
+  readonly installSync: (callbacks: IntegrationInstallCallbacks) => IntegrationInstallResult;
   readonly install: (callbacks: IntegrationInstallCallbacks) => Promise<IntegrationInstallResult>;
   readonly dispose: () => void;
 }
@@ -193,7 +210,7 @@ function readExactDataFields(
   return fields;
 }
 
-/** Snapshot the exact inert five-field registrar value without invoking bundle code. */
+/** Snapshot the exact phase-discriminated registrar value without invoking bundle code. */
 export function snapshotIntegrationRegistration(
   candidate: unknown
 ): IntegrationRegistration | undefined {
@@ -206,27 +223,46 @@ export function snapshotIntegrationRegistration(
     ) {
       return undefined;
     }
-    const fields = readExactDataFields(candidate, ['abi', 'id', 'phase', 'releaseId', 'prepare']);
+    const phaseDescriptor = Object.getOwnPropertyDescriptor(candidate, 'phase');
+    if (!phaseDescriptor?.enumerable || !('value' in phaseDescriptor)) return undefined;
+    const phase = phaseDescriptor.value;
+    const fields = readExactDataFields(
+      candidate,
+      phase === 'takeover'
+        ? ['abi', 'id', 'phase', 'releaseId', 'prepareSync', 'prepare']
+        : phase === 'deferred'
+          ? ['abi', 'id', 'phase', 'releaseId', 'prepare']
+          : []
+    );
     if (!fields) return undefined;
-    const { abi, id, phase, releaseId, prepare } = fields;
+    const { abi, id, releaseId, prepare } = fields;
     if (
       abi !== 1 ||
       typeof id !== 'string' ||
       !INTEGRATION_ID.test(id) ||
-      (phase !== 'takeover' && phase !== 'deferred') ||
       typeof releaseId !== 'string' ||
       !RELEASE_ID.test(releaseId) ||
-      typeof prepare !== 'function'
+      typeof prepare !== 'function' ||
+      (phase === 'takeover' && typeof fields.prepareSync !== 'function')
     ) {
       return undefined;
     }
-    return Object.freeze({
-      abi: 1,
-      id,
-      phase,
-      releaseId,
-      prepare: prepare as IntegrationRegistration['prepare'],
-    });
+    return phase === 'takeover'
+      ? Object.freeze({
+          abi: 1,
+          id,
+          phase,
+          releaseId,
+          prepareSync: fields.prepareSync as TakeoverIntegrationRegistration['prepareSync'],
+          prepare: prepare as TakeoverIntegrationRegistration['prepare'],
+        })
+      : Object.freeze({
+          abi: 1,
+          id,
+          phase,
+          releaseId,
+          prepare: prepare as DeferredIntegrationRegistration['prepare'],
+        });
   } catch {
     return undefined;
   }
@@ -584,7 +620,7 @@ class IntegrationRegistryOwner {
   private readonly takeoverScript: HTMLScriptElement | undefined;
   private readonly takeoverScriptId: 'trustedserver-js' | 'trustedserver-js-runtime';
   private readonly document: Document | undefined;
-  private readonly registrations = new Map<string, IntegrationRegistration>();
+  private readonly registrations = new Map<string, TakeoverIntegrationRegistration>();
   private readonly capabilities = new Map<string, Readonly<Record<string, unknown>>>();
   private readonly prepared: PreparedRecord[] = [];
   private readonly abortController = new AbortController();
@@ -600,9 +636,12 @@ class IntegrationRegistryOwner {
     IntegrationRegistryOptions['onCapabilityStaged']
   >;
   private readonly onRuntimeFailure: (failure: IntegrationRuntimeFailure) => void;
+  private readonly onTakeoverRegistrationsReady: () => void;
   private deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   private failureReason: BootFailureReason | undefined;
   private installPromise: Promise<IntegrationInstallResult> | undefined;
+  private installResult: IntegrationInstallResult | undefined;
+  private installSyncInProgress = false;
   private registrationWaiter: (() => void) | undefined;
   private registryState: IntegrationRegistryState = 'collecting';
   private nextTakeoverRegistrationIndex = 0;
@@ -627,6 +666,7 @@ class IntegrationRegistryOwner {
     this.onDisposalError = options.onDisposalError ?? (() => undefined);
     this.onCapabilityStaged = options.onCapabilityStaged ?? (() => undefined);
     this.onRuntimeFailure = options.onRuntimeFailure ?? (() => undefined);
+    this.onTakeoverRegistrationsReady = options.onTakeoverRegistrationsReady ?? (() => undefined);
     this.coreScope = new DisposableStack(this.onDisposalError);
     const knownIntegrationIds = validateKnownIntegrationIds(options.knownIntegrationIds);
     const catalogCandidate =
@@ -708,7 +748,7 @@ class IntegrationRegistryOwner {
         this.fail('abi_mismatch');
         return false;
       }
-      const { id, phase, releaseId, prepare } = registration;
+      const { id, phase, releaseId } = registration;
       const takeoverIntegrations = this.manifestValue?.integrations.filter(
         (entry) => entry.phase === 'takeover'
       );
@@ -740,11 +780,15 @@ class IntegrationRegistryOwner {
           id,
           phase,
           releaseId,
-          prepare: prepare as IntegrationRegistration['prepare'],
+          prepareSync: registration.prepareSync,
+          prepare: registration.prepare,
         })
       );
       this.nextTakeoverRegistrationIndex += 1;
-      if (this.hasEveryRequiredRegistration()) this.wakeRegistrationWaiter();
+      if (this.hasEveryRequiredRegistration()) {
+        this.wakeRegistrationWaiter();
+        this.onTakeoverRegistrationsReady();
+      }
       return true;
     } catch {
       this.fail('abi_mismatch');
@@ -782,6 +826,7 @@ class IntegrationRegistryOwner {
   }
 
   public install(callbacks: IntegrationInstallCallbacks): Promise<IntegrationInstallResult> {
+    if (this.installResult) return Promise.resolve(this.installResult);
     if (this.installPromise) return this.installPromise;
 
     let resolveInstall: ((result: IntegrationInstallResult) => void) | undefined;
@@ -789,9 +834,53 @@ class IntegrationRegistryOwner {
       resolveInstall = resolve;
     });
 
-    let acceptedCallbacks: IntegrationInstallCallbacks;
+    const acceptedCallbacks = this.snapshotInstallCallbacks(callbacks);
+    if (!acceptedCallbacks) {
+      this.fail('bundle_partial');
+      resolveInstall?.(this.fallbackResult());
+      return this.installPromise;
+    }
+
+    void this.installTransaction(acceptedCallbacks).then(
+      (result) => {
+        this.installResult = result;
+        resolveInstall?.(result);
+      },
+      () => {
+        this.fail('bundle_partial');
+        const result = this.fallbackResult();
+        this.installResult = result;
+        resolveInstall?.(result);
+      }
+    );
+    return this.installPromise;
+  }
+
+  public installSync(callbacks: IntegrationInstallCallbacks): IntegrationInstallResult {
+    if (this.installResult) return this.installResult;
+    if (this.installPromise || this.installSyncInProgress) {
+      this.fail('bundle_partial');
+      return this.fallbackResult();
+    }
+    this.installSyncInProgress = true;
     try {
-      acceptedCallbacks = Object.freeze({
+      const acceptedCallbacks = this.snapshotInstallCallbacks(callbacks);
+      if (!acceptedCallbacks) {
+        this.fail('bundle_partial');
+        return (this.installResult = this.fallbackResult());
+      }
+      return (this.installResult = this.installSyncTransaction(acceptedCallbacks));
+    } finally {
+      this.installSyncInProgress = false;
+      if (this.installResult) this.installPromise = Promise.resolve(this.installResult);
+    }
+  }
+
+  private snapshotInstallCallbacks(
+    callbacks: IntegrationInstallCallbacks
+  ): IntegrationInstallCallbacks | undefined {
+    try {
+      return Object.freeze({
         ...(callbacks.prepareCore ? { prepareCore: callbacks.prepareCore } : {}),
         activateCore: callbacks.activateCore,
         publish: callbacks.publish,
@@ -801,23 +890,12 @@ class IntegrationRegistryOwner {
           : {}),
       });
     } catch {
-      this.fail('bundle_partial');
-      resolveInstall?.(this.fallbackResult());
-      return this.installPromise;
+      return undefined;
     }
-
-    void this.installTransaction(acceptedCallbacks).then(
-      (result) => resolveInstall?.(result),
-      () => {
-        this.fail('bundle_partial');
-        resolveInstall?.(this.fallbackResult());
-      }
-    );
-    return this.installPromise;
   }
 
   public prepareDeferred(
-    registration: IntegrationRegistration,
+    registration: DeferredIntegrationRegistration,
     owner: Readonly<{
       signal: AbortSignal;
       onDispose: (callback: DisposeCallback) => void;
@@ -1124,6 +1202,107 @@ class IntegrationRegistryOwner {
     });
   }
 
+  private installSyncTransaction(callbacks: IntegrationInstallCallbacks): IntegrationInstallResult {
+    if (callbacks.coordinateTakeover) {
+      this.fail('bundle_partial');
+      return this.fallbackResult();
+    }
+    if (this.registryState === 'failed' || this.registryState === 'disposed') {
+      return this.fallbackResult();
+    }
+    if (
+      !this.manifestValue ||
+      !this.ownerIsCurrent() ||
+      this.deadlineExpired() ||
+      !this.hasEveryRequiredRegistration()
+    ) {
+      this.fail('bundle_partial');
+      return this.fallbackResult();
+    }
+
+    this.registryState = 'preparing';
+    if (callbacks.prepareCore) {
+      let corePreparationOpen = true;
+      const corePreparationContext: CorePreparationContext = Object.freeze({
+        signal: this.abortController.signal,
+        onDispose: (callback: DisposeCallback) => {
+          if (!corePreparationOpen && !this.coreScope.disposed) {
+            throw new Error('Core preparation disposal registration is closed');
+          }
+          this.coreScope.onDispose(callback);
+        },
+      });
+      this.enterOwnedCallback();
+      try {
+        const returned = callbacks.prepareCore(corePreparationContext);
+        if (isThenable(returned)) {
+          observeThenableRejection(returned);
+          throw new TypeError('Core preparation must be synchronous');
+        }
+      } catch {
+        this.fail('bundle_partial');
+        return this.fallbackResult();
+      } finally {
+        corePreparationOpen = false;
+        this.leaveOwnedCallback();
+      }
+      if (!this.canContinue('preparing')) return this.fallbackResult();
+    }
+
+    for (const entry of this.manifestValue.integrations) {
+      if (entry.phase !== 'takeover') continue;
+      if (!this.canContinue('preparing')) return this.fallbackResult();
+      const scope = new DisposableStack(this.onDisposalError);
+      const registration = this.registrations.get(entry.id);
+      if (!registration) {
+        this.fail('bundle_partial');
+        return this.fallbackResult();
+      }
+      this.prepared.push({
+        id: entry.id,
+        scope,
+        module: Object.freeze({ activate: () => undefined }),
+        afterCommit: undefined,
+      });
+      const recordIndex = this.prepared.length - 1;
+      const { context, close } = this.createPreparationContext(entry.id, scope);
+      try {
+        if (!this.canContinue('preparing')) return this.fallbackResult();
+        this.enterOwnedCallback();
+        let candidate: PreparedIntegration;
+        try {
+          candidate = registration.prepareSync(context);
+        } finally {
+          this.leaveOwnedCallback();
+        }
+        if (isThenable(candidate)) {
+          observeThenableRejection(candidate);
+          throw new TypeError('prepareSync must be synchronous');
+        }
+        if (!this.canContinue('preparing')) return this.fallbackResult();
+        const acceptedPrepared = this.snapshotPreparedIntegration(entry.id, candidate, scope);
+        if (!acceptedPrepared) {
+          throw new TypeError('prepareSync must return one exact activation module');
+        }
+        if (!this.canContinue('preparing')) return this.fallbackResult();
+        this.prepared[recordIndex] = {
+          id: entry.id,
+          scope,
+          module: acceptedPrepared,
+          afterCommit: undefined,
+        };
+      } catch {
+        this.fail('bundle_partial');
+        return this.fallbackResult();
+      } finally {
+        close();
+      }
+    }
+
+    if (!this.canContinue('preparing')) return this.fallbackResult();
+    return this.finishPreparedTransaction(callbacks);
+  }
+
   private async installTransaction(
     callbacks: IntegrationInstallCallbacks
   ): Promise<IntegrationInstallResult> {
@@ -1241,6 +1420,12 @@ class IntegrationRegistryOwner {
 
     if (!this.canContinue('preparing')) return this.fallbackResult();
 
+    return this.finishPreparedTransaction(callbacks);
+  }
+
+  private finishPreparedTransaction(
+    callbacks: IntegrationInstallCallbacks
+  ): IntegrationInstallResult {
     let activated = false;
     let committed: IntegrationKernelResult | undefined;
     let validatedHandoff: FirstDisplayHandoffV1 | undefined;
@@ -1477,12 +1662,13 @@ export function createIntegrationRegistry(
     },
     register: (candidate: unknown) => owner.register(candidate),
     prepareDeferred: (
-      registration: IntegrationRegistration,
+      registration: DeferredIntegrationRegistration,
       deferredOwner: Readonly<{
         signal: AbortSignal;
         onDispose: (callback: DisposeCallback) => void;
       }>
     ) => owner.prepareDeferred(registration, deferredOwner),
+    installSync: (callbacks: IntegrationInstallCallbacks) => owner.installSync(callbacks),
     install: (callbacks: IntegrationInstallCallbacks) => owner.install(callbacks),
     dispose: () => owner.dispose(),
   });

@@ -61,7 +61,14 @@ function registration(
   id: string,
   prepare: IntegrationRegistration['prepare']
 ): IntegrationRegistration {
-  return Object.freeze({ abi: 1, id, phase: 'takeover', releaseId: RELEASE_ID, prepare });
+  return Object.freeze({
+    abi: 1,
+    id,
+    phase: 'takeover',
+    releaseId: RELEASE_ID,
+    prepareSync: () => Object.freeze({ activate: () => undefined }),
+    prepare,
+  });
 }
 
 function runtimeCapability() {

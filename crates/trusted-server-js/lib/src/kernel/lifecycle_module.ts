@@ -111,49 +111,59 @@ export function createLifecycleIntegrationRegistration(
 ): IntegrationRegistration {
   const catalogEntry = RELEASE_CATALOG.find((entry) => entry.id === id);
   if (!catalogEntry) throw new TypeError(`Unknown release catalog module: ${id}`);
-  return Object.freeze({
-    abi: 1,
-    id,
-    phase: catalogEntry.phase,
-    releaseId,
-    prepare: async (context: IntegrationPrepareContext) => {
-      const { config, interfaces } = context;
-      const validateConfig = options.validateConfig ?? validFrozenConfig;
-      let configValid: boolean;
-      try {
-        configValid = validateConfig(config);
-      } catch {
-        configValid = false;
-      }
-      if (!configValid) {
-        throw new TypeError(`${id} integration config is invalid`);
-      }
-      const runtime = options.createOwnedRuntime?.(context) ?? readRuntime(id, interfaces);
-      if (!runtime) throw new TypeError(`${id} integration runtime is unavailable`);
+  const prepare = (context: IntegrationPrepareContext) => {
+    const { config, interfaces } = context;
+    const validateConfig = options.validateConfig ?? validFrozenConfig;
+    let configValid: boolean;
+    try {
+      configValid = validateConfig(config);
+    } catch {
+      configValid = false;
+    }
+    if (!configValid) {
+      throw new TypeError(`${id} integration config is invalid`);
+    }
+    const runtime = options.createOwnedRuntime?.(context) ?? readRuntime(id, interfaces);
+    if (!runtime) throw new TypeError(`${id} integration runtime is unavailable`);
 
-      return Object.freeze({
-        activate: ({ adoption, afterCommit, onDispose }: IntegrationActivationContext) => {
-          if (adoption !== undefined && options.firstDisplaySliceId !== undefined) {
-            if (
-              !validatePersistentFirstDisplaySliceAdoptionV1(
-                adoption,
-                options.firstDisplaySliceId,
-                options.validateFirstDisplayState
-              )
-            ) {
-              throw new TypeError(`${id} first-display parser state is invalid`);
-            }
+    return Object.freeze({
+      activate: ({ adoption, afterCommit, onDispose }: IntegrationActivationContext) => {
+        if (adoption !== undefined && options.firstDisplaySliceId !== undefined) {
+          if (
+            !validatePersistentFirstDisplaySliceAdoptionV1(
+              adoption,
+              options.firstDisplaySliceId,
+              options.validateFirstDisplayState
+            )
+          ) {
+            throw new TypeError(`${id} first-display parser state is invalid`);
           }
-          const runtimeRelease: { value?: () => void } = {};
-          onDispose(() => runtimeRelease.value?.());
-          const releaseRuntime = runtime.activate(config);
-          if (typeof releaseRuntime !== 'function') {
-            throw new TypeError(`${id} integration disposer is unavailable`);
-          }
-          runtimeRelease.value = releaseRuntime;
-          afterCommit(() => runtime.start(config));
-        },
+        }
+        const runtimeRelease: { value?: () => void } = {};
+        onDispose(() => runtimeRelease.value?.());
+        const releaseRuntime = runtime.activate(config);
+        if (typeof releaseRuntime !== 'function') {
+          throw new TypeError(`${id} integration disposer is unavailable`);
+        }
+        runtimeRelease.value = releaseRuntime;
+        afterCommit(() => runtime.start(config));
+      },
+    });
+  };
+  return catalogEntry.phase === 'takeover'
+    ? Object.freeze({
+        abi: 1,
+        id,
+        phase: catalogEntry.phase,
+        releaseId,
+        prepareSync: prepare,
+        prepare,
+      })
+    : Object.freeze({
+        abi: 1,
+        id,
+        phase: catalogEntry.phase,
+        releaseId,
+        prepare,
       });
-    },
-  });
 }

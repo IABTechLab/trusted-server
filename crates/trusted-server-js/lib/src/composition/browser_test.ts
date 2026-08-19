@@ -1856,70 +1856,76 @@ export function createTestBrowserRuntimeComposition(
   return Object.freeze({
     adapters: composition.adapters,
     runtime: runtimeOwner,
-    createDiagnosticsCapabilityProviderRegistrationForTest: () =>
-      Object.freeze({
+    createDiagnosticsCapabilityProviderRegistrationForTest: () => {
+      const prepare = () => {
+        const facts = gptDiagnosticsFacts;
+        const trace = renderTrace;
+        const observations = diagnosticsIngress;
+        if (!facts || !trace || !observations) {
+          throw new TypeError('Test diagnostics capabilities are unavailable');
+        }
+        return Object.freeze({
+          activate: () => undefined,
+          interfaces: Object.freeze({
+            'gpt.events.v1': Object.freeze({ subscribe: facts.activate }),
+            'trace.v1': Object.freeze({
+              record: trace.record,
+              enrich: trace.enrich,
+              prune: trace.prune,
+              diagnostics: trace.diagnostics,
+              observations: Object.freeze({
+                publish: observations.publish,
+              }),
+            }),
+            'trace.presentation.v1': Object.freeze({
+              attachPresentation: trace.attachPresentation,
+            }),
+          }),
+        });
+      };
+      return Object.freeze({
         abi: 1,
         id: BROWSER_TEST_DIAGNOSTICS_PROVIDER_ID,
         phase: 'takeover',
         releaseId: runtimeOptions.releaseId,
-        prepare: () => {
-          const facts = gptDiagnosticsFacts;
-          const trace = renderTrace;
-          const observations = diagnosticsIngress;
-          if (!facts || !trace || !observations) {
-            throw new TypeError('Test diagnostics capabilities are unavailable');
-          }
-          return Object.freeze({
-            activate: () => undefined,
-            interfaces: Object.freeze({
-              'gpt.events.v1': Object.freeze({ subscribe: facts.activate }),
-              'trace.v1': Object.freeze({
-                record: trace.record,
-                enrich: trace.enrich,
-                prune: trace.prune,
-                diagnostics: trace.diagnostics,
-                observations: Object.freeze({
-                  publish: observations.publish,
-                }),
-              }),
-              'trace.presentation.v1': Object.freeze({
-                attachPresentation: trace.attachPresentation,
+        prepareSync: prepare,
+        prepare,
+      });
+    },
+    createTraceCapabilityProviderRegistrationForTest: () => {
+      const prepare = () => {
+        const trace = renderTrace;
+        const observations = diagnosticsIngress;
+        if (!trace || !observations) {
+          throw new TypeError('Test trace capability is unavailable');
+        }
+        return Object.freeze({
+          activate: () => undefined,
+          interfaces: Object.freeze({
+            'trace.v1': Object.freeze({
+              record: trace.record,
+              enrich: trace.enrich,
+              prune: trace.prune,
+              diagnostics: trace.diagnostics,
+              observations: Object.freeze({
+                publish: observations.publish,
               }),
             }),
-          });
-        },
-      }),
-    createTraceCapabilityProviderRegistrationForTest: () =>
-      Object.freeze({
+            'trace.presentation.v1': Object.freeze({
+              attachPresentation: trace.attachPresentation,
+            }),
+          }),
+        });
+      };
+      return Object.freeze({
         abi: 1,
         id: BROWSER_TEST_TRACE_PROVIDER_ID,
         phase: 'takeover',
         releaseId: runtimeOptions.releaseId,
-        prepare: () => {
-          const trace = renderTrace;
-          const observations = diagnosticsIngress;
-          if (!trace || !observations) {
-            throw new TypeError('Test trace capability is unavailable');
-          }
-          return Object.freeze({
-            activate: () => undefined,
-            interfaces: Object.freeze({
-              'trace.v1': Object.freeze({
-                record: trace.record,
-                enrich: trace.enrich,
-                prune: trace.prune,
-                diagnostics: trace.diagnostics,
-                observations: Object.freeze({
-                  publish: observations.publish,
-                }),
-              }),
-              'trace.presentation.v1': Object.freeze({
-                attachPresentation: trace.attachPresentation,
-              }),
-            }),
-          });
-        },
-      }),
+        prepareSync: prepare,
+        prepare,
+      });
+    },
     runtimeSessionForTest: () => runtimeSession,
     pageBidsControllerForTest: (): PageBidsController | undefined => {
       const navigation = runtimeSession?.currentNavigation;

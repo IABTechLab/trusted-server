@@ -2,8 +2,8 @@ import type { BootManifestDeferredIntegrationV1, BootManifestV1 } from '../core/
 
 import { DisposableStack, type DisposeCallback } from './disposable';
 import type {
+  DeferredIntegrationRegistration,
   IntegrationActivationContext,
-  IntegrationRegistration,
   PreparedIntegration,
 } from './integration_registry';
 import { snapshotIntegrationRegistration } from './integration_registry';
@@ -224,7 +224,7 @@ export interface DeferredPhaseLoaderOptions {
   readonly runtimeScript: HTMLScriptElement;
   readonly document: Document;
   readonly prepare: (
-    registration: IntegrationRegistration,
+    registration: DeferredIntegrationRegistration,
     owner: Readonly<{
       signal: AbortSignal;
       onDispose: (callback: DisposeCallback) => void;
@@ -242,7 +242,7 @@ interface DeferredTransaction {
   readonly abortController: AbortController;
   readonly scope: DisposableStack;
   script: HTMLScriptElement | undefined;
-  registration: IntegrationRegistration | undefined;
+  registration: DeferredIntegrationRegistration | undefined;
   state: DeferredModuleState;
   reason: DeferredModuleUnavailableReason | undefined;
   timeout: TimerHandle | undefined;
