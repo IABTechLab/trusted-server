@@ -20,10 +20,10 @@ test_details = ["test", "--target", "aarch64-apple-darwin"]
 # native crate needs no change here. Axum (native), Cloudflare
 # (wasm32-unknown-unknown), Spin, the CLI (native), and integration-tests
 # (native) are simply not listed.
-build-fastly = ["build", "-p", "trusted-server-core", "-p", "trusted-server-adapter-fastly", "-p", "trusted-server-js", "-p", "trusted-server-openrtb", "--target", "wasm32-wasip1"]
-check-fastly = ["check", "-p", "trusted-server-core", "-p", "trusted-server-adapter-fastly", "-p", "trusted-server-js", "-p", "trusted-server-openrtb", "--target", "wasm32-wasip1"]
-clippy-fastly = ["clippy", "-p", "trusted-server-core", "-p", "trusted-server-adapter-fastly", "-p", "trusted-server-js", "-p", "trusted-server-openrtb", "--all-targets", "--all-features", "--target", "wasm32-wasip1", "--", "-D", "warnings"]
-test-fastly = ["test", "-p", "trusted-server-core", "-p", "trusted-server-adapter-fastly", "-p", "trusted-server-js", "-p", "trusted-server-openrtb", "--target", "wasm32-wasip1"]
+build-fastly = ["build", "-p", "trusted-server-core", "-p", "trusted-server-adapter-fastly", "-p", "trusted-server-device-fastly", "-p", "trusted-server-geo-fastly", "-p", "trusted-server-js", "-p", "trusted-server-openrtb", "--target", "wasm32-wasip1"]
+check-fastly = ["check", "-p", "trusted-server-core", "-p", "trusted-server-adapter-fastly", "-p", "trusted-server-device-fastly", "-p", "trusted-server-geo-fastly", "-p", "trusted-server-js", "-p", "trusted-server-openrtb", "--target", "wasm32-wasip1"]
+clippy-fastly = ["clippy", "-p", "trusted-server-core", "-p", "trusted-server-adapter-fastly", "-p", "trusted-server-device-fastly", "-p", "trusted-server-geo-fastly", "-p", "trusted-server-js", "-p", "trusted-server-openrtb", "--all-targets", "--all-features", "--target", "wasm32-wasip1", "--", "-D", "warnings"]
+test-fastly = ["test", "-p", "trusted-server-core", "-p", "trusted-server-adapter-fastly", "-p", "trusted-server-device-fastly", "-p", "trusted-server-geo-fastly", "-p", "trusted-server-js", "-p", "trusted-server-openrtb", "--target", "wasm32-wasip1"]
 
 # --- Axum adapter (native dev server) ---
 build-axum = ["build", "-p", "trusted-server-adapter-axum"]

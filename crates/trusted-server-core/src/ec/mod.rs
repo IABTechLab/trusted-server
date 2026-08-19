@@ -259,12 +259,14 @@ impl EcContext {
         // Read back an existing identifier only when the selected provider
         // accepts its shape, so an opaque vendor identifier (for example a signed
         // envelope) round-trips instead of being silently dropped by the built-in
-        // shape check. With no provider configured there is nothing to read back
-        // for, so fall back to the built-in shape.
+        // shape check. With no provider configured, Trusted Server is stateless:
+        // an existing identifier is treated as absent so it is never used or
+        // egressed, while the raw cookie value stays available to withdrawal
+        // handling below.
         let ec_value = parsed.cookie_ec.clone().filter(|v| {
             selected_provider
                 .as_ref()
-                .map_or_else(|| is_valid_ec_id(v), |selected| selected.accepts_id(v))
+                .is_some_and(|selected| selected.accepts_id(v))
         });
         let ec_was_present = ec_value.is_some();
 
@@ -275,17 +277,19 @@ impl EcContext {
         // Snapshot the request evidence a provider reads at generation time (the
         // headers, so it can read cookies and client hints, and the URL path and
         // query, so it can read request parameters). Capture only when a provider
-        // is configured, so a no-provider deployment clones nothing. Generation
-        // runs after the request body may be consumed, so the snapshot is owned.
-        let (request_headers, request_path, request_query) = if selected_provider.is_some() {
-            (
-                req.headers().clone(),
-                req.uri().path().to_owned(),
-                req.uri().query().unwrap_or_default().to_owned(),
-            )
-        } else {
-            (http::HeaderMap::new(), String::new(), String::new())
-        };
+        // is configured and no identifier already exists, so a no-provider
+        // deployment and a returning visitor clone nothing. Generation runs after
+        // the request body may be consumed, so the snapshot is owned.
+        let (request_headers, request_path, request_query) =
+            if selected_provider.is_some() && ec_value.is_none() {
+                (
+                    req.headers().clone(),
+                    req.uri().path().to_owned(),
+                    req.uri().query().unwrap_or_default().to_owned(),
+                )
+            } else {
+                (http::HeaderMap::new(), String::new(), String::new())
+            };
 
         // Capture the client IP from platform services (normalized).
         let client_ip = services
@@ -309,9 +313,11 @@ impl EcContext {
         // [`EcContext::permissions`] and [`EcContext::ec_allowed`] rather than
         // re-deriving it.
         let permissions = consent::assemble_permissions(settings, &consent, geo_info);
+        // With no provider selected nothing may mint or use an identifier, so
+        // the gate is closed rather than open by default.
         let ec_allowed = selected_provider
             .as_ref()
-            .is_none_or(|selected| permissions.all_set(selected.required_permissions()));
+            .is_some_and(|selected| permissions.all_set(selected.required_permissions()));
 
         log::info!(
             "EC context: present={}, cookie_present={}, ec_allowed={}, jurisdiction={}",
@@ -364,6 +370,14 @@ impl EcContext {
             return Ok(());
         }
 
+        // A deployment with no provider selected is stateless: nothing to
+        // generate, and not an error. Reuse the provider built at read time
+        // rather than building it again.
+        let Some(ec_provider) = self.selected_provider.clone() else {
+            log::trace!("EC generation skipped: no Edge Cookie provider configured");
+            return Ok(());
+        };
+
         if !self.ec_allowed {
             log::info!(
                 "EC generation skipped: required permissions not set (jurisdiction={})",
@@ -372,23 +386,15 @@ impl EcContext {
             return Ok(());
         }
 
-        // EC generation needs the client IP; fail early if it is unavailable. The
-        // provider reads it borrowed at generate time (see
-        // [`generate_with_provider`]), so nothing is cloned here.
+        // EC generation needs the client IP; checked after the cheap skip
+        // guards so a stateless deployment on a host with no client IP does not
+        // log spurious errors. The provider reads it borrowed at generate time
+        // (see [`generate_with_provider`]), so nothing is cloned here.
         if self.client_ip.is_none() {
             return Err(Report::new(TrustedServerError::EdgeCookie {
                 message: "Client IP required for EC generation but unavailable".to_owned(),
             }));
         }
-        let Some(ec_provider) = build_provider(
-            &settings.ec,
-            self.host_signals.clone(),
-            self.ec_provider.clone(),
-        )?
-        else {
-            log::info!("EC generation skipped: no Edge Cookie provider configured");
-            return Ok(());
-        };
 
         self.generate_with_provider(ec_provider.as_ref(), settings, kv)
     }
@@ -398,10 +404,11 @@ impl EcContext {
     /// Split out of [`generate_if_needed`](Self::generate_if_needed) so the
     /// provider is supplied explicitly: the configured path builds it from
     /// settings, and tests pass one in to observe the [`IdentityInput`] a
-    /// provider receives. This path passes no header snapshot (the built-ins
-    /// read only the client IP); a provider that needs request headers reads
-    /// them through [`RequestInfo`](crate::evidence::RequestInfo) where the
-    /// caller supplies them. The skip guards (existing EC, permission gate)
+    /// provider receives. The request evidence captured at read time (client
+    /// IP, headers, and the URL path and query) is passed borrowed through
+    /// [`RequestInfo`](crate::evidence::RequestInfo), so a provider can read
+    /// cookies and request parameters at generate time; the built-ins read
+    /// only the client IP. The skip guards (existing EC, permission gate)
     /// stay in [`generate_if_needed`](Self::generate_if_needed).
     ///
     /// # Errors
@@ -528,7 +535,9 @@ impl EcContext {
     ///
     /// Allows handlers to apply query-param fallback consent for the current
     /// request only when pre-routing consent extraction produced an empty
-    /// context.
+    /// context. Mutations do not re-derive [`ec_allowed`](Self::ec_allowed) or
+    /// [`permissions`](Self::permissions), which are resolved once at
+    /// construction.
     pub fn consent_mut(&mut self) -> &mut ConsentContext {
         &mut self.consent
     }
@@ -955,15 +964,31 @@ mod tests {
             "an opaque provider identifier should round-trip through read-back verbatim"
         );
 
-        // Control: without the provider, the built-in shape check drops the same
-        // value. This is the regression the round-trip guards against: a cookie
-        // that can be set but never read back.
-        let ec_without = EcContext::read_from_request(&settings, &req, &noop_services())
+        // Control: with the provider selected but not injected by the adapter,
+        // the request fails loudly instead of silently running stateless with
+        // the identifier dropped.
+        let err = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect_err("a selected but uninjected provider should fail the request");
+        assert!(
+            err.to_string().contains("opaque"),
+            "the error should name the selected provider, got: {err}"
+        );
+
+        // Control: with no provider selected at all, the identifier is treated
+        // as absent, so a stateless deployment never uses or egresses it.
+        let mut stateless = create_test_settings();
+        stateless.ec.provider = None;
+        stateless.ec.providers.hmac = None;
+        let ec_without = EcContext::read_from_request(&stateless, &req, &noop_services())
             .expect("should read EC context");
         assert_eq!(
             ec_without.ec_value(),
             None,
-            "without the provider, the built-in shape check drops the opaque identifier"
+            "with no provider selected, an existing identifier is treated as absent"
+        );
+        assert!(
+            !ec_without.ec_allowed(),
+            "with no provider selected, the gate stays closed"
         );
     }
 

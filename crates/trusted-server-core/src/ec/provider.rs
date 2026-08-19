@@ -282,6 +282,13 @@ impl EdgeCookieProvider for HostSignalProvider {
     ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
         let ja4 = self.host_signals.ja4().unwrap_or_default();
         let h2 = self.host_signals.h2().unwrap_or_default();
+        // With no fingerprint at all, minting would silently degrade to an
+        // IP-only identifier under the host-signals name. Defer instead: no
+        // identity this request, and the request proceeds.
+        if ja4.is_empty() && h2.is_empty() {
+            log::warn!("Host-signal EC provider found no TLS/HTTP-2 fingerprints; deferring");
+            return Ok(GeneratedEdgeCookie::default());
+        }
         let id = generation::generate_hmac_ec_id(
             self.passphrase.expose(),
             &[ja4, h2, request_info.client_ip()],
@@ -421,10 +428,22 @@ pub fn build_provider(
         // seam the device and geo providers use, so core never names a vendor.
         // The injected provider is used when its own id matches the selected key,
         // and its `[ec.providers.<key>]` block is read by the adapter that built
-        // it. A key with no matching injected provider resolves to `None`.
-        other => injected
-            .filter(|provider| provider.id() == other)
-            .map(|provider| Box::new(SharedProvider(provider)) as _),
+        // it. A selected key with no matching injected provider is a deployment
+        // error: fail loudly rather than silently running stateless.
+        other => {
+            let provider = injected
+                .filter(|provider| provider.id() == other)
+                .map(|provider| Box::new(SharedProvider(provider)) as _);
+            if provider.is_none() {
+                return Err(Report::new(TrustedServerError::EdgeCookie {
+                    message: format!(
+                        "Edge Cookie provider `{other}` is selected but this deployment's \
+                         adapter does not provide it"
+                    ),
+                }));
+            }
+            provider
+        }
     };
     Ok(provider)
 }
@@ -776,6 +795,38 @@ mod tests {
         assert!(
             generated.id.is_none(),
             "a server-side provider inherits the no-op resolve_from_client default"
+        );
+    }
+
+    #[test]
+    fn a_selected_but_uninjected_vendor_provider_fails_loudly() {
+        let ec = Ec {
+            provider: Some("acme".to_owned()),
+            ..Ec::default()
+        };
+
+        let err = build_provider(&ec, None, None)
+            .expect_err("selecting a provider the adapter does not inject should error");
+        assert!(
+            err.to_string().contains("acme"),
+            "the error should name the selected provider, got: {err}"
+        );
+    }
+
+    #[test]
+    fn host_signal_provider_defers_without_fingerprints() {
+        let signals = Arc::new(TestHostSignals {
+            ja4: None,
+            h2: None,
+        });
+        let provider = HostSignalProvider::new(test_passphrase(), signals);
+        let request_info = test_request_info();
+        let generated = provider
+            .generate(&request_info, &IdentityInput::default())
+            .expect("should generate");
+        assert!(
+            generated.id.is_none(),
+            "with no host fingerprints the provider should defer rather than              mint an IP-only identifier"
         );
     }
 }

@@ -543,6 +543,14 @@ impl Ec {
     /// key is unknown or its `[ec.providers.<key>]` block is absent.
     pub fn validate_provider_selection(&self) -> Result<(), Report<TrustedServerError>> {
         let Some(key) = self.provider.as_deref() else {
+            if !self.providers.is_empty() {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: "[ec.providers.*] blocks are configured but no [ec] provider is \
+                              selected. Set [ec] provider = \"<key>\" to activate one, or \
+                              remove the blocks to run statelessly"
+                        .to_owned(),
+                }));
+            }
             return Ok(());
         };
 
@@ -618,6 +626,16 @@ impl EcProviders {
     #[must_use]
     pub fn has_vendor(&self, key: &str) -> bool {
         self.vendor.contains_key(key)
+    }
+
+    /// Whether any provider configuration block is present.
+    ///
+    /// Used by [`Ec::validate_provider_selection`] to reject a half-migrated
+    /// configuration that carries provider blocks with no selector, which
+    /// would otherwise silently run stateless.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.hmac.is_none() && self.host_signals.is_none() && self.vendor.is_empty()
     }
 }
 
@@ -3067,6 +3085,29 @@ mod tests {
                 TrustedServerError::Configuration { .. }
             ),
             "unconfigured provider selection should be a configuration error, got: {:?}",
+            err.current_context()
+        );
+    }
+
+    #[test]
+    fn provider_blocks_without_a_selector_are_rejected() {
+        // A half-migrated configuration that carries an [ec.providers.hmac]
+        // block but never selects it would silently run stateless; reject it
+        // at startup instead.
+        let toml_str = crate_test_settings_str().replace(
+            "provider = \"hmac\"
+",
+            "",
+        );
+
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("a provider block with no selector should fail at startup");
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "should be a configuration error, got: {:?}",
             err.current_context()
         );
     }
