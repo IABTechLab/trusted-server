@@ -214,9 +214,9 @@ Release proof
 - [ ] **Step 3: Run focused Rust and JS regressions.**
 
   ```bash
-  cargo test-axum publisher
-  cargo test-axum integrations::gpt
-  cargo test-axum integrations::gpt_diagnostics
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" publisher
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" integrations::gpt
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" integrations::gpt_diagnostics
   npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/gpt/module.test.ts test/integrations/gpt_diagnostics test/integrations/datadome
   ```
 
@@ -265,8 +265,8 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 - [ ] **Step 2: Run the RED Rust tests.**
 
   ```bash
-  cargo test-axum tsjs::tests
-  cargo test-axum integrations::registry::tests
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" tsjs::tests
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" integrations::registry::tests
   ```
 
   Expected: FAIL because `TsjsBootV1` has no `integrations` field.
@@ -285,8 +285,8 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 - [ ] **Step 5: Run GREEN and adapter-facing Rust regressions.**
 
   ```bash
-  cargo test-axum tsjs::tests
-  cargo test-axum integrations::registry::tests
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" tsjs::tests
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" integrations::registry::tests
   cargo test-cloudflare
   cargo test-spin
   cargo fmt --all -- --check
@@ -465,7 +465,7 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
   ```bash
   npm --prefix crates/trusted-server-js/lib run check:aps-contract
   node --test crates/trusted-server-js/lib/test/contract/aps-renderer-es5.test.mjs
-  cargo test-axum integrations::aps::tests
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" integrations::aps::tests
   ```
 
 - [ ] **Step 4: Update the single renderer generator and generated contract.** Keep
@@ -495,7 +495,7 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
   npm --prefix crates/trusted-server-js/lib run check:aps-contract
   node --test crates/trusted-server-js/lib/test/contract/aps-renderer-es5.test.mjs
   cargo test-fastly integrations::aps::tests
-  cargo test-axum integrations::aps::tests
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" integrations::aps::tests
   cargo test-cloudflare
   cargo test-spin
   ./scripts/integration-tests-aps-runner-proxy.sh --runtime axum
@@ -784,9 +784,9 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
       must not describe an empty slot list as the implicit enablement switch.
 
   ```bash
-  cargo test-axum creative_opportunities
-  cargo test-axum publisher
-  cargo test-axum auction::endpoints
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" creative_opportunities
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" publisher
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" auction::endpoints
   cargo test-fastly creative_opportunities
   cargo fmt --all -- --check
   ```
@@ -834,8 +834,8 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
 
   ```bash
   npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/gpt_diagnostics test/integrations/gpt/diagnostics_facts.test.ts
-  cargo test-axum integrations::gpt_diagnostics
-  cargo test-axum publisher
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" integrations::gpt_diagnostics
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" publisher
   npm --prefix crates/trusted-server-integration-tests/browser test -- --project=chromium tests/nextjs/gpt-diagnostics.spec.ts
   ```
 
@@ -875,7 +875,7 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
       activation attribute, and duplicate fallback path.**
 
   ```bash
-  cargo test-axum integrations::gpt::tests
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" integrations::gpt::tests
   npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/gpt/module.test.ts test/first_display/slices.test.ts test/integrations/prebid/later.test.ts
   ```
 
@@ -1145,8 +1145,8 @@ prebid, sourcepoint, testlight`. Emit each enabled product once, omit disabled
   npm --prefix crates/trusted-server-js/lib run check:concept-audit
   npm --prefix crates/trusted-server-js/lib run typecheck
   npm --prefix crates/trusted-server-js/lib test -- --run test/integrations test/kernel test/first_display
-  cargo test-axum publisher
-  cargo test-axum integrations
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" publisher
+  cargo test --package trusted-server-core --target "$(rustc -vV | sed -n 's/^host: //p')" integrations
   ```
 
 - [ ] **Step 5: Commit an actual rc integration only when the tip advanced.**
