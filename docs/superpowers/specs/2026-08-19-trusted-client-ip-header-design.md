@@ -50,9 +50,19 @@ shared_secret = "replace-with-a-random-shared-secret"
 
 All three fields are required when the section is present. `shared_secret` uses
 the existing `Redacted<String>` type so debug representations do not disclose
-it. Configuration validation rejects empty secrets, invalid header names,
-identical header names, and header names that cannot safely be consumed and
-removed at request entry.
+it. Configuration validation rejects empty secrets, invalid header names, and
+identical header names.
+
+To ensure request entry can remove the fields without deleting a required HTTP
+field, `ip_header` must either be `fastly-client-ip` or begin with `x-`, and
+`auth_header` must begin with `x-`. Comparison is case-insensitive after parsing
+through `http::HeaderName`. The two Fastly-injected TLS bridge fields
+(`x-ts-tls-protocol` and `x-ts-tls-cipher`) are forbidden for either setting
+because the entry point owns and re-injects them after sanitization. These rules
+exclude framing, routing, representation, cookie, and authorization fields such
+as `host`, `content-length`, `accept`, `cookie`, and `authorization`. A fronting
+CDN whose native client-IP field does not meet this contract must copy it into a
+dedicated `x-` field before forwarding.
 
 The section is absent by default. Because the runtime configuration uses strict
 unknown-key validation, the example and configuration reference must document
@@ -65,11 +75,16 @@ loaded but before spoofable headers are sanitized:
 
 1. Capture `req.get_client_ip_addr()` as the fallback peer address.
 2. If `trusted_client_ip` is absent, select the peer address.
-3. If configured, read the configured authentication header and compare it with
-   the configured secret using fixed-size SHA-256 digests and a constant-time
-   comparison.
-4. Only after authentication succeeds, parse the configured IP header as a
-   single IPv4 or IPv6 address.
+3. If configured, require exactly one authentication-header field value. It
+   must be valid UTF-8 and match the configured secret byte-for-byte, without
+   trimming or other normalization. Compare fixed-size SHA-256 digests using a
+   constant-time comparison. A missing, duplicated, non-UTF-8, empty, or
+   mismatched authentication value fails authentication.
+4. Only after authentication succeeds, require exactly one IP-header field
+   value and parse it directly as `std::net::IpAddr`. Do not trim or normalize
+   the value. This accepts canonical or otherwise Rust-supported IPv4 and IPv6
+   spellings but rejects whitespace, ports, IPv6 zone identifiers,
+   comma-separated lists, empty values, non-UTF-8 bytes, and duplicate fields.
 5. Select the parsed forwarded address on success. Missing headers, a wrong
    secret, a malformed header value, or a non-IP value all select the peer
    address without rejecting the request.
@@ -136,8 +151,10 @@ Tests follow red-green-refactor and cover:
 - absent configuration uses the peer IP;
 - valid authentication plus an IPv4 header selects the forwarded IP;
 - valid authentication plus an IPv6 header selects the forwarded IP;
-- missing or incorrect authentication falls back to the peer IP;
-- malformed or multi-valued IP input falls back to the peer IP;
+- missing, empty, incorrect, non-UTF-8, or duplicate authentication falls back
+  to the peer IP;
+- whitespace-padded, port-bearing, zone-qualified, comma-separated, non-UTF-8,
+  empty, or duplicate IP input falls back to the peer IP;
 - configured headers are removed after resolution;
 - `Fastly-Client-IP` is stripped when configuration is absent;
 - settings parse, validation, secret redaction, and default behavior;
