@@ -388,9 +388,11 @@ immediate peer address. Both configured headers are removed before routing.
 Header names are validated case-insensitively. `ip_header` must be
 `fastly-client-ip` or start with `x-`, while `auth_header` must start with `x-`.
 The names must differ. Neither field may use the reserved
-`x-ts-tls-protocol` or `x-ts-tls-cipher` header. These restrictions prevent the
-configuration from consuming routing, framing, cookie, authorization, or
-Trusted Server TLS bridge headers.
+`x-ts-tls-protocol` or `x-ts-tls-cipher` header. These restrictions exclude
+standard sensitive headers such as `Host`, `Content-Length`, `Cookie`, and
+`Authorization`, as well as Trusted Server's TLS bridge headers. Choose
+dedicated `x-` names that no other application or routing logic uses, because
+Trusted Server removes the configured headers before routing.
 
 Generate `shared_secret` with a cryptographically secure random generator,
 store the same value only in the front door and Trusted Server configuration,
