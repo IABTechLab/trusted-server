@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use error_stack::Report;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use trusted_server_js::{
     TsjsModulePhase, all_integration_metadata, concatenated_hash, release_id, single_module_hash,
@@ -17,6 +17,237 @@ use crate::settings::{IntegrationConfig, Settings};
 /// projection fails closed.
 pub(crate) const EMPTY_AUCTION_PROJECTION_JSON_V1: &str = r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"slots":[],"bids":[]}"#;
 
+pub(crate) const INTEGRATION_CONFIG_IDS_V1: [&str; 11] = [
+    "aps",
+    "datadome",
+    "didomi",
+    "google_tag_manager",
+    "gpt",
+    "lockr",
+    "osano",
+    "permutive",
+    "prebid",
+    "sourcepoint",
+    "testlight",
+];
+pub(crate) const INTEGRATION_CONFIG_MAX_DEPTH_V1: usize = 16;
+pub(crate) const INTEGRATION_CONFIG_MAX_VALUES_V1: usize = 4_096;
+pub(crate) const INTEGRATION_CONFIG_MAX_STRING_BYTES_V1: usize = 4_096;
+pub(crate) const INTEGRATION_CONFIG_MAX_ENTRY_BYTES_V1: usize = 65_536;
+const INTEGRATION_CONFIG_MAX_CARRIER_BYTES_V1: usize = 524_288;
+
+/// One admitted browser-safe product configuration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct IntegrationConfigEntryV1 {
+    id: &'static str,
+    config: serde_json::Value,
+}
+
+/// The sole generic product configuration carrier in `BootV1`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct IntegrationConfigsV1 {
+    version: u8,
+    entries: Vec<IntegrationConfigEntryV1>,
+}
+
+impl IntegrationConfigsV1 {
+    /// Admit canonical, explicitly projected browser configuration entries.
+    pub(crate) fn new(
+        entries: Vec<(&'static str, serde_json::Value)>,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        if entries.len() > INTEGRATION_CONFIG_IDS_V1.len() {
+            return Err(integration_config_error("more than 11 product entries"));
+        }
+
+        let mut previous_index = None;
+        let mut value_count = 0;
+        let mut admitted = Vec::with_capacity(entries.len());
+        for (id, config) in entries {
+            let index = INTEGRATION_CONFIG_IDS_V1
+                .iter()
+                .position(|candidate| *candidate == id)
+                .ok_or_else(|| integration_config_error("unknown product id"))?;
+            if previous_index.is_some_and(|previous| index <= previous) {
+                return Err(integration_config_error(
+                    "product entries are duplicated or out of canonical order",
+                ));
+            }
+            if !config.is_object() {
+                return Err(integration_config_error(
+                    "product config must be a non-null object",
+                ));
+            }
+            validate_integration_config_value_v1(&config, 0, &mut value_count)?;
+            let entry = IntegrationConfigEntryV1 { id, config };
+            if serde_json::to_vec(&entry)
+                .map_err(|_| integration_config_error("product entry serialization failed"))?
+                .len()
+                > INTEGRATION_CONFIG_MAX_ENTRY_BYTES_V1
+            {
+                return Err(integration_config_error(
+                    "product entry exceeds 65,536 UTF-8 JSON bytes",
+                ));
+            }
+            admitted.push(entry);
+            previous_index = Some(index);
+        }
+
+        let carrier = Self {
+            version: 1,
+            entries: admitted,
+        };
+        if serde_json::to_vec(&carrier)
+            .map_err(|_| integration_config_error("carrier serialization failed"))?
+            .len()
+            > INTEGRATION_CONFIG_MAX_CARRIER_BYTES_V1
+        {
+            return Err(integration_config_error(
+                "carrier exceeds 524,288 UTF-8 JSON bytes",
+            ));
+        }
+        Ok(carrier)
+    }
+
+    /// Construct the exact empty carrier used by documents with no product modules.
+    #[must_use]
+    pub(crate) const fn empty() -> Self {
+        Self {
+            version: 1,
+            entries: Vec::new(),
+        }
+    }
+
+    /// Require exact equality between selected catalog products and carrier entries.
+    pub(crate) fn validate_manifest(
+        &self,
+        module_ids: &[&str],
+    ) -> Result<(), Report<TrustedServerError>> {
+        let selected = INTEGRATION_CONFIG_IDS_V1
+            .iter()
+            .copied()
+            .filter(|product_id| {
+                module_ids.iter().any(|module_id| {
+                    integration_config_product_for_module_v1(module_id) == Some(*product_id)
+                })
+            })
+            .collect::<Vec<_>>();
+        let configured = self
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        if configured != selected {
+            return Err(integration_config_error(
+                "manifest membership disagrees with product config entries",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Select the canonical product subset required by one generated manifest.
+    pub(crate) fn select_for_manifest(
+        &self,
+        module_ids: &[&str],
+    ) -> Result<Self, Report<TrustedServerError>> {
+        let entries = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                module_ids.iter().any(|module_id| {
+                    integration_config_product_for_module_v1(module_id) == Some(entry.id)
+                })
+            })
+            .map(|entry| (entry.id, entry.config.clone()))
+            .collect::<Vec<_>>();
+        let selected = Self::new(entries)?;
+        selected.validate_manifest(module_ids)?;
+        Ok(selected)
+    }
+}
+
+impl Default for IntegrationConfigsV1 {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+#[must_use]
+pub(crate) fn is_integration_config_product_v1(id: &str) -> bool {
+    INTEGRATION_CONFIG_IDS_V1.contains(&id)
+}
+
+#[must_use]
+pub(crate) fn integration_config_order_v1(id: &str) -> Option<usize> {
+    INTEGRATION_CONFIG_IDS_V1
+        .iter()
+        .position(|candidate| *candidate == id)
+}
+
+fn validate_integration_config_value_v1(
+    value: &serde_json::Value,
+    depth: usize,
+    value_count: &mut usize,
+) -> Result<(), Report<TrustedServerError>> {
+    if depth > INTEGRATION_CONFIG_MAX_DEPTH_V1 {
+        return Err(integration_config_error("config depth exceeds 16"));
+    }
+    *value_count += 1;
+    if *value_count > INTEGRATION_CONFIG_MAX_VALUES_V1 {
+        return Err(integration_config_error(
+            "carrier exceeds 4,096 JSON values",
+        ));
+    }
+    match value {
+        serde_json::Value::String(string) => {
+            if string.len() > INTEGRATION_CONFIG_MAX_STRING_BYTES_V1 {
+                return Err(integration_config_error(
+                    "config string exceeds 4,096 UTF-8 bytes",
+                ));
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                validate_integration_config_value_v1(value, depth + 1, value_count)?;
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                if key.len() > INTEGRATION_CONFIG_MAX_STRING_BYTES_V1 {
+                    return Err(integration_config_error(
+                        "config key exceeds 4,096 UTF-8 bytes",
+                    ));
+                }
+                validate_integration_config_value_v1(value, depth + 1, value_count)?;
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+    Ok(())
+}
+
+fn integration_config_product_for_module_v1(module_id: &str) -> Option<&'static str> {
+    match module_id {
+        "aps" => Some("aps"),
+        "datadome" => Some("datadome"),
+        "didomi" => Some("didomi"),
+        "google_tag_manager" => Some("google_tag_manager"),
+        "gpt" | "gpt_later" => Some("gpt"),
+        "lockr" => Some("lockr"),
+        "osano_consent" | "osano_lifecycle" => Some("osano"),
+        "permutive_context" | "permutive_lifecycle" => Some("permutive"),
+        "prebid" | "prebid_later" => Some("prebid"),
+        "sourcepoint_consent" | "sourcepoint_lifecycle" => Some("sourcepoint"),
+        "testlight" => Some("testlight"),
+        _ => None,
+    }
+}
+
+fn integration_config_error(message: &str) -> Report<TrustedServerError> {
+    Report::new(TrustedServerError::Configuration {
+        message: format!("TSJS integration config: {message}"),
+    })
+}
+
 /// Serialize the production size-admitted first-display bootstrap transport.
 ///
 /// # Errors
@@ -28,6 +259,9 @@ pub fn tsjs_bootstrap_fragment_v1(
     publisher_origin: &str,
 ) -> Result<String, Report<TrustedServerError>> {
     let selected = selected_metadata(config.module_ids)?;
+    config
+        .integration_configs
+        .validate_manifest(config.module_ids)?;
     let contains = |id: &str| selected.iter().any(|metadata| metadata.id == id);
     let creative_required =
         config.creative.enabled && (config.creative.click_guard || config.creative.render_guard);
@@ -178,6 +412,10 @@ pub fn tsjs_bootstrap_fragment_v1(
     );
     let manifest = escape_json_for_inline_script(&manifest);
     let projection = escape_json_for_inline_script(&projection);
+    let integration_configs = escape_json_for_inline_script(
+        &serde_json::to_string(config.integration_configs)
+            .map_err(|_| integration_config_error("carrier serialization failed"))?,
+    );
     let outline = escape_json_for_inline_script(&outline);
     let bootstrap = trusted_server_js::bootstrap_bundle();
     if bootstrap.to_ascii_lowercase().contains("</script") {
@@ -186,10 +424,11 @@ pub fn tsjs_bootstrap_fragment_v1(
         ));
     }
     let controller = format!(
-        "<script>const __TSJS_SERVER_BOOT_INPUT_V1__={{\"target\":(window.tsjs=window.tsjs||{{}}),\"boot\":{{\"abi\":1,\"releaseId\":\"{}\",\"manifest\":{},\"auctionProjection\":{},\"creative\":{{\"version\":1,\"enabled\":{},\"clickGuard\":{},\"renderGuard\":{}}},\"diagnostics\":{{\"version\":1,\"renderTraceOverlay\":{},\"gpt\":{{\"active\":{}}}}}}},\"outline\":{}}};{}</script>",
+        "<script>const __TSJS_SERVER_BOOT_INPUT_V1__={{\"target\":(window.tsjs=window.tsjs||{{}}),\"boot\":{{\"abi\":1,\"releaseId\":\"{}\",\"manifest\":{},\"auctionProjection\":{},\"integrations\":{},\"creative\":{{\"version\":1,\"enabled\":{},\"clickGuard\":{},\"renderGuard\":{}}},\"diagnostics\":{{\"version\":1,\"renderTraceOverlay\":{},\"gpt\":{{\"active\":{}}}}}}},\"outline\":{}}};{}</script>",
         release_id(),
         manifest,
         projection,
+        integration_configs,
         config.creative.enabled,
         config.creative.click_guard,
         config.creative.render_guard,
@@ -453,6 +692,8 @@ pub(crate) fn creative_boot_config_v1(
 pub struct TsjsBootScriptConfigV1<'a> {
     /// Enabled integration bundles in their actual injection order.
     pub module_ids: &'a [&'a str],
+    /// Exact browser-safe product configuration subset for this manifest.
+    pub(crate) integration_configs: &'a IntegrationConfigsV1,
     /// Canonical exact [`BrowserAuctionProjectionV1`](crate::auction::types::BrowserAuctionProjectionV1)
     /// JSON produced by the auction projection boundary.
     pub auction_projection_json: &'a str,
@@ -589,6 +830,7 @@ pub(crate) fn creative_tsjs_bootstrap_v1(
     let fragment = tsjs_bootstrap_fragment_v1(
         TsjsBootScriptConfigV1 {
             module_ids: CREATIVE_TSJS_MODULE_IDS,
+            integration_configs: &IntegrationConfigsV1::empty(),
             auction_projection_json: EMPTY_CREATIVE_AUCTION_PROJECTION_JSON,
             creative,
             render_trace_overlay: false,
@@ -676,6 +918,227 @@ mod tests {
 
     const VALID_BROWSER_AUCTION_PROJECTION_JSON: &str = r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"slots":[],"bids":[]}"#;
     const PERFORMANCE_ORIGIN: &str = "https://performance.example";
+
+    #[test]
+    fn integration_configs_serialize_once_in_canonical_product_order() {
+        let configs = IntegrationConfigsV1::new(vec![
+            ("aps", serde_json::json!({})),
+            ("datadome", serde_json::json!({})),
+            ("didomi", serde_json::json!({ "proxyPath": "/consent/" })),
+            ("google_tag_manager", serde_json::json!({})),
+            ("gpt", serde_json::json!({ "gamAttributionEnabled": true })),
+            ("lockr", serde_json::json!({})),
+            ("osano", serde_json::json!({})),
+            ("permutive", serde_json::json!({})),
+            ("prebid", serde_json::json!({ "accountId": "publisher" })),
+            ("sourcepoint", serde_json::json!({ "rewriteSdk": true })),
+            ("testlight", serde_json::json!({})),
+        ])
+        .expect("canonical browser-safe integration configs should be admitted");
+
+        assert_eq!(
+            serde_json::to_string(&configs).expect("carrier should serialize"),
+            r#"{"version":1,"entries":[{"id":"aps","config":{}},{"id":"datadome","config":{}},{"id":"didomi","config":{"proxyPath":"/consent/"}},{"id":"google_tag_manager","config":{}},{"id":"gpt","config":{"gamAttributionEnabled":true}},{"id":"lockr","config":{}},{"id":"osano","config":{}},{"id":"permutive","config":{}},{"id":"prebid","config":{"accountId":"publisher"}},{"id":"sourcepoint","config":{"rewriteSdk":true}},{"id":"testlight","config":{}}]}"#,
+        );
+    }
+
+    #[test]
+    fn integration_configs_reject_noncanonical_duplicate_unknown_or_non_object_entries() {
+        for entries in [
+            vec![
+                ("datadome", serde_json::json!({})),
+                ("aps", serde_json::json!({})),
+            ],
+            vec![
+                ("aps", serde_json::json!({})),
+                ("aps", serde_json::json!({})),
+            ],
+            vec![("unknown", serde_json::json!({}))],
+            vec![("aps", serde_json::json!(null))],
+        ] {
+            assert!(
+                IntegrationConfigsV1::new(entries).is_err(),
+                "invalid integration carrier entries must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn integration_configs_enforce_recursive_json_and_serialized_size_caps() {
+        let long_string = "a".repeat(INTEGRATION_CONFIG_MAX_STRING_BYTES_V1 + 1);
+        assert!(
+            IntegrationConfigsV1::new(vec![("aps", serde_json::json!({ "value": long_string }),)])
+                .is_err(),
+            "strings above the UTF-8 cap must be rejected"
+        );
+
+        let long_key = "k".repeat(INTEGRATION_CONFIG_MAX_STRING_BYTES_V1 + 1);
+        assert!(
+            IntegrationConfigsV1::new(vec![(
+                "aps",
+                serde_json::Value::Object(serde_json::Map::from_iter([(
+                    long_key,
+                    serde_json::Value::Null,
+                )])),
+            )])
+            .is_err(),
+            "keys above the UTF-8 cap must be rejected"
+        );
+
+        let mut too_deep = serde_json::Value::Null;
+        for _ in 0..=INTEGRATION_CONFIG_MAX_DEPTH_V1 {
+            too_deep = serde_json::json!([too_deep]);
+        }
+        assert!(
+            IntegrationConfigsV1::new(vec![("aps", serde_json::json!({ "value": too_deep }),)])
+                .is_err(),
+            "values above the recursive depth cap must be rejected"
+        );
+
+        let too_many_values = vec![serde_json::Value::Null; INTEGRATION_CONFIG_MAX_VALUES_V1];
+        assert!(
+            IntegrationConfigsV1::new(vec![(
+                "aps",
+                serde_json::json!({ "values": too_many_values }),
+            )])
+            .is_err(),
+            "the config object and array also count toward the value cap"
+        );
+
+        let oversized_entry = "x".repeat(INTEGRATION_CONFIG_MAX_ENTRY_BYTES_V1);
+        assert!(
+            IntegrationConfigsV1::new(vec![(
+                "aps",
+                serde_json::json!({ "value": oversized_entry }),
+            )])
+            .is_err(),
+            "canonical entry JSON above the byte cap must be rejected"
+        );
+
+        let chunk = "z".repeat(INTEGRATION_CONFIG_MAX_STRING_BYTES_V1);
+        let carrier_entries = INTEGRATION_CONFIG_IDS_V1
+            .iter()
+            .take(9)
+            .map(|id| {
+                (
+                    *id,
+                    serde_json::json!({ "chunks": vec![chunk.clone(); 15] }),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            IntegrationConfigsV1::new(carrier_entries).is_err(),
+            "the complete carrier byte cap must be enforced independently"
+        );
+    }
+
+    #[test]
+    fn integration_configs_must_match_manifest_product_predicates_exactly() {
+        let aps = IntegrationConfigsV1::new(vec![("aps", serde_json::json!({}))])
+            .expect("APS should admit its required empty browser projection");
+        let empty = IntegrationConfigsV1::empty();
+
+        assert!(
+            aps.validate_manifest(&["render_runtime", "aps"]).is_ok(),
+            "APS manifest membership must match its one product config"
+        );
+        assert!(
+            aps.validate_manifest(&["render_runtime"]).is_err(),
+            "an unselected product config must be rejected"
+        );
+        assert!(
+            empty.validate_manifest(&["render_runtime", "aps"]).is_err(),
+            "a selected product without config must be rejected"
+        );
+
+        let prebid = IntegrationConfigsV1::new(vec![("prebid", serde_json::json!({}))])
+            .expect("Prebid config should be admitted");
+        assert!(
+            prebid
+                .validate_manifest(&["render_runtime", "prebid", "prebid_later"])
+                .is_ok(),
+            "takeover and deferred modules must share one product config"
+        );
+    }
+
+    #[test]
+    fn production_bootstrap_embeds_the_carrier_and_rejects_manifest_mismatch() {
+        let aps = IntegrationConfigsV1::new(vec![("aps", serde_json::json!({}))])
+            .expect("APS browser projection should be admitted");
+        let script = tsjs_bootstrap_fragment_v1(
+            TsjsBootScriptConfigV1 {
+                module_ids: &["render_runtime", "aps"],
+                integration_configs: &aps,
+                auction_projection_json: VALID_BROWSER_AUCTION_PROJECTION_JSON,
+                creative: CreativeBootConfigV1 {
+                    enabled: false,
+                    click_guard: false,
+                    render_guard: false,
+                },
+                render_trace_overlay: false,
+                gpt_diagnostics_active: false,
+            },
+            PERFORMANCE_ORIGIN,
+        )
+        .expect("matching carrier and manifest should serialize");
+        assert!(
+            script.contains(r#""integrations":{"version":1,"entries":[{"id":"aps","config":{}}]}"#),
+            "boot must contain the sole typed integration carrier: {script}"
+        );
+
+        assert!(
+            tsjs_bootstrap_fragment_v1(
+                TsjsBootScriptConfigV1 {
+                    module_ids: &["render_runtime", "aps"],
+                    integration_configs: &IntegrationConfigsV1::empty(),
+                    auction_projection_json: VALID_BROWSER_AUCTION_PROJECTION_JSON,
+                    creative: CreativeBootConfigV1 {
+                        enabled: false,
+                        click_guard: false,
+                        render_guard: false,
+                    },
+                    render_trace_overlay: false,
+                    gpt_diagnostics_active: false,
+                },
+                PERFORMANCE_ORIGIN,
+            )
+            .is_err(),
+            "HTML emission must reject manifest/config mismatch"
+        );
+    }
+
+    #[test]
+    fn production_bootstrap_centrally_escapes_integration_config_markup() {
+        let configs = IntegrationConfigsV1::new(vec![(
+            "prebid",
+            serde_json::json!({
+                "accountId": "</ScRiPt><script>&",
+                "timeout": 1_000,
+                "debug": false,
+                "bidders": [],
+            }),
+        )])
+        .expect("Prebid browser projection should be admitted");
+        let script = tsjs_bootstrap_fragment_v1(
+            TsjsBootScriptConfigV1 {
+                module_ids: &["render_runtime", "prebid"],
+                integration_configs: &configs,
+                auction_projection_json: VALID_BROWSER_AUCTION_PROJECTION_JSON,
+                creative: CreativeBootConfigV1 {
+                    enabled: false,
+                    click_guard: false,
+                    render_guard: false,
+                },
+                render_trace_overlay: false,
+                gpt_diagnostics_active: false,
+            },
+            PERFORMANCE_ORIGIN,
+        )
+        .expect("valid integration config should serialize inside boot");
+
+        assert!(!script.contains("</ScRiPt><script>&"));
+        assert!(script.contains(r#"\u003c/ScRiPt\u003e\u003cscript\u003e\u0026"#));
+    }
 
     fn projection_with_adm(adm: &str) -> String {
         use crate::auction::types::{
@@ -765,6 +1228,11 @@ mod tests {
                     "diagnostics_presentation",
                     "gpt_later",
                 ],
+                integration_configs: &IntegrationConfigsV1::new(vec![(
+                    "gpt",
+                    serde_json::json!({ "gamAttributionEnabled": false }),
+                )])
+                .expect("GPT browser config should be admitted"),
                 auction_projection_json: VALID_BROWSER_AUCTION_PROJECTION_JSON,
                 creative: CreativeBootConfigV1 {
                     enabled: false,
@@ -806,6 +1274,7 @@ mod tests {
         let mismatched = tsjs_bootstrap_fragment_v1(
             TsjsBootScriptConfigV1 {
                 module_ids: &["render_runtime", "creative"],
+                integration_configs: &IntegrationConfigsV1::empty(),
                 auction_projection_json: r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"slots":[],"bids":[]}"#,
                 creative: CreativeBootConfigV1 {
                     enabled: true,
@@ -826,6 +1295,7 @@ mod tests {
         let script = tsjs_bootstrap_fragment_v1(
             TsjsBootScriptConfigV1 {
                 module_ids: &["render_runtime", "creative"],
+                integration_configs: &IntegrationConfigsV1::empty(),
                 auction_projection_json: &projection,
                 creative: CreativeBootConfigV1 {
                     enabled: true,
@@ -847,6 +1317,7 @@ mod tests {
         let script = tsjs_bootstrap_fragment_v1(
             TsjsBootScriptConfigV1 {
                 module_ids: &["render_runtime"],
+                integration_configs: &IntegrationConfigsV1::empty(),
                 auction_projection_json: r#"{"version":1,"auction":{"version":1,"auctionId":"initial","results":[]},"slots":[],"bids":[],"unexpected":true}"#,
                 creative: CreativeBootConfigV1 {
                     enabled: false,
@@ -1013,6 +1484,7 @@ mod tests {
             tsjs_bootstrap_fragment_v1(
                 TsjsBootScriptConfigV1 {
                     module_ids: &["render_runtime"],
+                    integration_configs: &IntegrationConfigsV1::empty(),
                     auction_projection_json: EMPTY_CREATIVE_AUCTION_PROJECTION_JSON,
                     creative: CreativeBootConfigV1 {
                         enabled: true,

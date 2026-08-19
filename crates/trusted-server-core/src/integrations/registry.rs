@@ -7,6 +7,7 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
 use http::{Method, Request, Response};
 use matchit::Router;
+use serde::Serialize;
 
 use crate::auction::AuctionPlan;
 use crate::constants::HEADER_X_TS_EC;
@@ -594,6 +595,7 @@ pub struct IntegrationRegistration {
     pub html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
     pub head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     pub request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    pub(crate) browser_config_v1: Option<serde_json::Value>,
 }
 
 impl IntegrationRegistration {
@@ -620,6 +622,7 @@ impl IntegrationRegistrationBuilder {
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                browser_config_v1: None,
             },
         }
     }
@@ -664,6 +667,47 @@ impl IntegrationRegistrationBuilder {
     pub fn with_request_filter(mut self, filter: Arc<dyn IntegrationRequestFilter>) -> Self {
         self.registration.request_filters.push(filter);
         self
+    }
+
+    /// Attach this product's explicit browser-safe version-1 projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the typed projection cannot be represented as JSON.
+    pub(crate) fn with_browser_config_v1<T: Serialize>(
+        mut self,
+        config: &T,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        self.registration.browser_config_v1 =
+            Some(serde_json::to_value(config).map_err(|error| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "Integration {} browser config serialization failed: {error}",
+                        self.registration.integration_id
+                    ),
+                })
+            })?);
+        Ok(self)
+    }
+
+    /// Attach an exact empty object for a product with no browser-selectable fields.
+    pub(crate) fn with_empty_browser_config_v1(
+        mut self,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        #[derive(Serialize)]
+        struct EmptyBrowserConfigV1 {}
+
+        self.registration.browser_config_v1 = Some(
+            serde_json::to_value(EmptyBrowserConfigV1 {}).map_err(|error| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "Integration {} browser config serialization failed: {error}",
+                        self.registration.integration_id
+                    ),
+                })
+            })?,
+        );
+        Ok(self)
     }
 
     /// Mark this integration's JS module for deferred loading via
@@ -711,6 +755,7 @@ struct IntegrationRegistryInner {
     html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
     head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    integration_configs_v1: crate::tsjs::IntegrationConfigsV1,
     tsjs_static_transport: TsjsStaticTransportV1,
 }
 
@@ -734,6 +779,7 @@ impl Default for IntegrationRegistryInner {
             html_post_processors: Vec::new(),
             head_injectors: Vec::new(),
             request_filters: Vec::new(),
+            integration_configs_v1: crate::tsjs::IntegrationConfigsV1::empty(),
             tsjs_static_transport: TsjsStaticTransportV1::default(),
         }
     }
@@ -1054,6 +1100,7 @@ impl IntegrationRegistry {
         plan: Arc<AuctionPlan>,
     ) -> Result<Self, Report<TrustedServerError>> {
         let mut inner = IntegrationRegistryInner::default();
+        let mut integration_configs_v1 = Vec::new();
         let creative_boot = crate::tsjs::creative_boot_config_v1(settings)?;
         let aps_proxy: Arc<dyn IntegrationProxy> =
             Arc::new(super::aps::ApsV1Integration::from_settings(settings)?);
@@ -1063,10 +1110,38 @@ impl IntegrationRegistry {
 
         for builder in crate::integrations::builders() {
             if let Some(registration) = (builder.build)(settings)? {
-                debug_assert_eq!(registration.integration_id, builder.id);
-                registrations.push(registration);
-            }
-        }
+                debug_assert_eq!(
+                    registration.integration_id, builder.id,
+                    "integration builder ID should match registration ID"
+                );
+                inner
+                    .enabled_integration_ids
+                    .push(registration.integration_id);
+                match (
+                    crate::tsjs::is_integration_config_product_v1(registration.integration_id),
+                    registration.browser_config_v1.clone(),
+                ) {
+                    (true, Some(config)) => {
+                        integration_configs_v1.push((registration.integration_id, config));
+                    }
+                    (true, None) => {
+                        return Err(Report::new(TrustedServerError::Configuration {
+                            message: format!(
+                                "Integration {} is missing its browser config projection",
+                                registration.integration_id
+                            ),
+                        }));
+                    }
+                    (false, Some(_)) => {
+                        return Err(Report::new(TrustedServerError::Configuration {
+                            message: format!(
+                                "Integration {} cannot emit a generic browser config",
+                                registration.integration_id
+                            ),
+                        }));
+                    }
+                    (false, None) => {}
+                }
 
         for registration in registrations {
             inner
@@ -1137,6 +1212,12 @@ impl IntegrationRegistry {
             }
         }
 
+        integration_configs_v1.sort_by_key(|(id, _)| {
+            crate::tsjs::integration_config_order_v1(id)
+                .expect("browser config product should have a canonical order")
+        });
+        inner.integration_configs_v1 =
+            crate::tsjs::IntegrationConfigsV1::new(integration_configs_v1)?;
         inner.tsjs_static_transport = TsjsStaticTransportV1::new(&inner, creative_boot);
         Ok(Self {
             inner: Arc::new(inner),
@@ -1509,6 +1590,20 @@ impl IntegrationRegistry {
             .collect()
     }
 
+    /// Return the exact browser-safe product configuration subset for one manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when manifest product predicates and registered projections disagree.
+    pub(crate) fn tsjs_integration_configs_v1(
+        &self,
+        module_ids: &[&str],
+    ) -> Result<crate::tsjs::IntegrationConfigsV1, Report<TrustedServerError>> {
+        self.inner
+            .integration_configs_v1
+            .select_for_manifest(module_ids)
+    }
+
     /// Return the enabled parser-blocking catalog slice in canonical order.
     #[must_use]
     pub fn tsjs_takeover_module_ids(&self, selection: TsjsCatalogSelectionV1) -> Vec<&'static str> {
@@ -1642,6 +1737,7 @@ impl IntegrationRegistry {
             request_filters: Vec::new(),
             deferred_js_ids: Vec::new(),
             disabled_js_ids: Vec::new(),
+            integration_configs_v1: crate::tsjs::IntegrationConfigsV1::empty(),
             tsjs_static_transport: TsjsStaticTransportV1::default(),
         };
         let creative_boot = crate::tsjs::CreativeBootConfigV1::default();
@@ -1677,6 +1773,7 @@ impl IntegrationRegistry {
             request_filters: Vec::new(),
             deferred_js_ids: Vec::new(),
             disabled_js_ids: Vec::new(),
+            integration_configs_v1: crate::tsjs::IntegrationConfigsV1::empty(),
             tsjs_static_transport: TsjsStaticTransportV1::default(),
         };
         let creative_boot = crate::tsjs::CreativeBootConfigV1::default();
@@ -1708,6 +1805,7 @@ impl IntegrationRegistry {
             request_filters,
             deferred_js_ids: Vec::new(),
             disabled_js_ids: Vec::new(),
+            integration_configs_v1: crate::tsjs::IntegrationConfigsV1::empty(),
             tsjs_static_transport: TsjsStaticTransportV1::default(),
         };
         let creative_boot = crate::tsjs::CreativeBootConfigV1::default();
@@ -1779,6 +1877,7 @@ impl IntegrationRegistry {
             request_filters: Vec::new(),
             deferred_js_ids: Vec::new(),
             disabled_js_ids: Vec::new(),
+            integration_configs_v1: crate::tsjs::IntegrationConfigsV1::empty(),
             tsjs_static_transport: TsjsStaticTransportV1::default(),
         };
         let creative_boot = crate::tsjs::CreativeBootConfigV1::default();
@@ -2977,6 +3076,127 @@ mod tests {
         assert_eq!(
             recombined, all_sorted,
             "should reconstruct full module list from immediate + deferred"
+        );
+    }
+
+    #[test]
+    fn registry_projects_every_enabled_product_once_without_private_server_fields() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        for (id, config) in [
+            (
+                "aps",
+                serde_json::json!({
+                    "enabled": true,
+                    "account_id": "private-aps-account",
+                    "endpoint": "https://private-aps.example/bid"
+                }),
+            ),
+            (
+                "datadome",
+                serde_json::json!({
+                    "enabled": true,
+                    "server_side_key_secret_store": "private-datadome-store",
+                    "server_side_key_secret_name": "private-datadome-key"
+                }),
+            ),
+            ("didomi", serde_json::json!({ "enabled": true })),
+            (
+                "google_tag_manager",
+                serde_json::json!({
+                    "enabled": true,
+                    "container_id": "GTM-TEST"
+                }),
+            ),
+            (
+                "gpt",
+                serde_json::json!({
+                    "enabled": true,
+                    "gam_attribution_enabled": true,
+                    "script_url": "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
+                    "slim_prebid_url": "https://private-prebid.example/slim.js"
+                }),
+            ),
+            (
+                "lockr",
+                serde_json::json!({ "enabled": true, "app_id": "private-lockr-app" }),
+            ),
+            ("osano", serde_json::json!({ "enabled": true })),
+            (
+                "permutive",
+                serde_json::json!({
+                    "enabled": true,
+                    "organization_id": "private-org",
+                    "workspace_id": "private-workspace"
+                }),
+            ),
+            (
+                "prebid",
+                serde_json::json!({
+                    "enabled": true,
+                    "server_url": "https://private-pbs.example/openrtb2/auction",
+                    "account_id": "browser-account",
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
+                    "bidders": ["mocktioneer"]
+                }),
+            ),
+            (
+                "sourcepoint",
+                serde_json::json!({
+                    "enabled": true,
+                    "auth_cookie_name": "private_sourcepoint_cookie"
+                }),
+            ),
+            (
+                "testlight",
+                serde_json::json!({
+                    "enabled": true,
+                    "endpoint": "https://private-testlight.example/bid"
+                }),
+            ),
+        ] {
+            settings
+                .integrations
+                .insert_config(id, &config)
+                .expect("test integration config should insert");
+        }
+
+        let registry = IntegrationRegistry::new(&settings).expect("registry should build");
+        let module_ids = registry.tsjs_catalog_module_ids(TsjsCatalogSelectionV1::default());
+        let carrier = registry
+            .tsjs_integration_configs_v1(&module_ids)
+            .expect("selected product configs should match the generated catalog");
+        let value = serde_json::to_value(carrier).expect("carrier should serialize");
+        let ids = value["entries"]
+            .as_array()
+            .expect("carrier entries should be an array")
+            .iter()
+            .map(|entry| entry["id"].as_str().expect("entry id should be a string"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, crate::tsjs::INTEGRATION_CONFIG_IDS_V1);
+        let serialized = value.to_string();
+        for private_value in [
+            "private-aps-account",
+            "private-aps.example",
+            "private-datadome-store",
+            "private-datadome-key",
+            "private-prebid.example",
+            "private-lockr-app",
+            "private-org",
+            "private-workspace",
+            "private-pbs.example",
+            "private_sourcepoint_cookie",
+            "private-testlight.example",
+        ] {
+            assert!(
+                !serialized.contains(private_value),
+                "private server field leaked into browser carrier: {private_value}"
+            );
+        }
+        assert_eq!(
+            value["entries"][0]["config"],
+            serde_json::json!({}),
+            "enabled APS must emit its required empty browser config"
         );
     }
 }

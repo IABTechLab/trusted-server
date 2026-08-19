@@ -38,23 +38,6 @@ pub use registry::{
     RequestFilterRegistryOutcome, ScriptRewriteAction, TsjsCatalogSelectionV1,
 };
 
-/// Emit one integration value into the sole transient pre-core config transport.
-///
-/// `config_json` must already be serialized and escaped for an inline script.
-/// The production core snapshots this object, freezes each value, deletes the
-/// transport, and then supplies the matching value only to its manifest module.
-pub(crate) fn integration_config_script(integration_id: &'static str, config_json: &str) -> String {
-    debug_assert!(
-        integration_id
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
-        "integration config id should be a trusted lowercase identifier"
-    );
-    format!(
-        "<script>(function(t){{var c=t._integrationConfig=t._integrationConfig||{{}};c.{integration_id}={config_json};}})(window.tsjs=window.tsjs||{{}});</script>"
-    )
-}
-
 /// Registers or retrieves a platform backend for the given URL.
 ///
 /// Parses `url`, builds a [`PlatformBackendSpec`] with TLS enabled and a

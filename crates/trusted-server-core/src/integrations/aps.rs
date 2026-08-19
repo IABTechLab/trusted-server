@@ -2253,6 +2253,7 @@ pub fn register_for_plan(
     Ok(Some(
         IntegrationRegistration::builder(APS_INTEGRATION_ID)
             .without_js()
+            .with_empty_browser_config_v1()?
             .build(),
     ))
 }
