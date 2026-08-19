@@ -34,9 +34,11 @@ pub fn copy_custom_headers(from: &Request<EdgeBody>, to: &mut Request<EdgeBody>)
 
 /// Headers that clients can spoof to hijack URL rewriting.
 ///
-/// On Fastly Compute the service is the edge — there is no upstream proxy that
-/// legitimately sets these. Stripping them forces [`RequestInfo::from_request`]
-/// to fall back to the trustworthy `Host` header and [`ClientInfo`] TLS detection.
+/// On Fastly Compute these values are client-spoofable at request entry. The
+/// Fastly adapter may first consume an authenticated `fastly-client-ip`, but
+/// removes it before routing along with every other listed header. Stripping
+/// them forces [`RequestInfo::from_request`] to fall back to the trustworthy
+/// `Host` header and [`ClientInfo`] TLS detection.
 pub const SPOOFABLE_FORWARDED_HEADERS: &[&str] = &[
     "forwarded",
     "x-forwarded-host",
