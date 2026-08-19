@@ -760,7 +760,10 @@ impl PlatformSecretStore for SpinSecretStoreAdapter {
 /// before routing. Secrets are read synchronously from Spin component
 /// variables because Trusted Server's platform secret trait is sync.
 #[must_use]
-pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> RuntimeServices {
+pub fn build_runtime_services(
+    ctx: &edgezero_core::context::RequestContext,
+    settings: &trusted_server_core::settings::Settings,
+) -> RuntimeServices {
     let client_ip = extract_client_ip(ctx);
 
     #[cfg(all(feature = "spin", target_arch = "wasm32"))]
@@ -789,7 +792,13 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         .kv_store(kv_store)
         .backend(Arc::new(NoopBackend))
         .http_client(http_client)
-        .geo(Arc::new(NullGeo))
+        // Routed through the [geo] provider selector like the Fastly adapter,
+        // so the selector behaves the same on every adapter. Spin has no host
+        // geo service, so the host default resolves nothing either way.
+        .geo(trusted_server_core::platform::build_geo_provider(
+            settings,
+            Arc::new(NullGeo),
+        ))
         .client_info(ClientInfo {
             client_ip,
             tls_protocol: None,
@@ -1039,7 +1048,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn build_runtime_services_uses_noop_native_stores_without_handles() {
         let ctx = make_ctx_without_spin_context();
-        let services = build_runtime_services(&ctx);
+        let services =
+            build_runtime_services(&ctx, &trusted_server_core::settings::Settings::default());
 
         assert!(
             services.client_info().client_ip.is_none(),

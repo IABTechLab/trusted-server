@@ -294,4 +294,48 @@ mod tests {
         assert_eq!(info.query_param("id").as_deref(), Some("abc123"));
         assert_eq!(info.header("cookie"), Some("client-id=abc123; ts-ec=xyz"));
     }
+
+    fn headers_with_user_agent(user_agent: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::USER_AGENT,
+            user_agent
+                .parse()
+                .expect("should parse a User-Agent header value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn request_info_reads_the_user_agent_from_attached_headers() {
+        let headers = headers_with_user_agent("ExampleAgent/1.0");
+
+        let owned = OwnedRequestInfo::new(String::new()).with_headers(headers.clone());
+        let borrowed = BorrowedRequestInfo::new("").with_headers(&headers);
+
+        assert_eq!(
+            owned.user_agent(),
+            "ExampleAgent/1.0",
+            "the owned snapshot should report the attached User-Agent"
+        );
+        assert_eq!(
+            borrowed.user_agent(),
+            "ExampleAgent/1.0",
+            "the borrowed view should report the attached User-Agent"
+        );
+    }
+
+    #[test]
+    fn request_info_reports_no_user_agent_without_headers() {
+        assert_eq!(
+            OwnedRequestInfo::new(String::new()).user_agent(),
+            "",
+            "a snapshot built without headers should report no User-Agent"
+        );
+        assert_eq!(
+            BorrowedRequestInfo::new("").user_agent(),
+            "",
+            "a borrowed view built without headers should report no User-Agent"
+        );
+    }
 }

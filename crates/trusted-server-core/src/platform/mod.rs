@@ -76,6 +76,48 @@ pub use types::{
 /// Default first-byte timeout for platform backends.
 pub(crate) const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 
+use std::net::IpAddr;
+use std::sync::Arc;
+
+use error_stack::Report;
+
+use crate::settings::Settings;
+
+/// A geo provider that resolves nothing.
+///
+/// Installed when `[geo] provider = "none"` is selected, so a client IP is
+/// never sent to any host geo service. Every geo consumer already treats
+/// [`GeoInfo`] as optional, so a `None` result degrades gracefully (the
+/// jurisdiction is unknown, the auction omits geo, and so on).
+pub struct DisabledGeo;
+
+impl PlatformGeo for DisabledGeo {
+    fn lookup(&self, _client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+        Ok(None)
+    }
+}
+
+/// Selects the geo provider named by the `[geo] provider` selector.
+///
+/// The host platform's geo lookup is the default: with no selector,
+/// `host_default` (the adapter's platform geo implementation) resolves the
+/// location, matching the behavior before the selector existed, and
+/// `provider = "platform"` spells the same choice explicitly. Selecting
+/// `provider = "none"` returns [`DisabledGeo`] instead, so a client IP is
+/// never sent to any host geo service. A selected-but-unknown provider is
+/// rejected at startup by
+/// [`GeoConfig::validate_provider_selection`](crate::settings::GeoConfig::validate_provider_selection).
+#[must_use]
+pub fn build_geo_provider(
+    settings: &Settings,
+    host_default: Arc<dyn PlatformGeo>,
+) -> Arc<dyn PlatformGeo> {
+    match settings.geo.provider.as_deref() {
+        Some("none") => Arc::new(DisabledGeo),
+        _ => host_default,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
@@ -166,6 +208,48 @@ mod tests {
             .lookup(services.client_info().client_ip)
             .expect("should not fail for noop geo with no ip");
         assert!(result.is_none(), "should return None when no IP is present");
+    }
+
+    #[test]
+    fn build_geo_provider_defaults_to_the_host_geo() {
+        let settings = Settings::default();
+        let host: Arc<dyn PlatformGeo> = Arc::new(test_support::NoopGeo);
+        let selected = build_geo_provider(&settings, Arc::clone(&host));
+        assert!(
+            Arc::ptr_eq(&host, &selected),
+            "default settings should use the host geo"
+        );
+    }
+
+    #[test]
+    fn build_geo_provider_none_selects_no_geo() {
+        let mut settings = Settings::default();
+        settings.geo.provider = Some("none".to_owned());
+        let host: Arc<dyn PlatformGeo> = Arc::new(test_support::NoopGeo);
+        let selected = build_geo_provider(&settings, Arc::clone(&host));
+        assert!(
+            !Arc::ptr_eq(&host, &selected),
+            "provider none should not use the host geo"
+        );
+        assert!(
+            selected
+                .lookup(Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))))
+                .expect("disabled geo lookup should not fail")
+                .is_none(),
+            "the disabled geo provider should resolve nothing"
+        );
+    }
+
+    #[test]
+    fn build_geo_provider_uses_host_geo_when_platform_is_selected() {
+        let mut settings = Settings::default();
+        settings.geo.provider = Some("platform".to_owned());
+        let host: Arc<dyn PlatformGeo> = Arc::new(test_support::NoopGeo);
+        let selected = build_geo_provider(&settings, Arc::clone(&host));
+        assert!(
+            Arc::ptr_eq(&host, &selected),
+            "the platform selector should use the host geo"
+        );
     }
 
     #[test]

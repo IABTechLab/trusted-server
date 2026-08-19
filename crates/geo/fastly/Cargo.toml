@@ -1,0 +1,19 @@
+[package]
+name = "trusted-server-geo-fastly"
+description = "Fastly host geo provider backed by the Fastly geolocation API."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+trusted-server-core = { workspace = true }
+error-stack = { workspace = true }
+fastly = { workspace = true }

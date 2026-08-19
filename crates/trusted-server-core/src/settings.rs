@@ -20,7 +20,7 @@ use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
 use crate::constants::INTERNAL_HEADERS;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
-use crate::ec::provider::{EcProviderSelection, HMAC_PROVIDER_KEY};
+use crate::ec::provider::{EcProviderSelection, HMAC_PROVIDER_KEY, HOST_SIGNALS_PROVIDER_KEY};
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
@@ -754,6 +754,13 @@ pub struct EcProviders {
     #[validate(nested)]
     pub hmac: Option<HmacProviderConfig>,
 
+    /// The built-in host-signal provider, keyed `host-signals`. Mints the Edge
+    /// Cookie from the host's TLS/HTTP-2 fingerprints plus the client IP, so it
+    /// requires a host that supplies those fingerprints.
+    #[serde(default, rename = "host-signals")]
+    #[validate(nested)]
+    pub host_signals: Option<HostSignalsProviderConfig>,
+
     /// Configuration blocks for vendor or host providers that live in their own
     /// crates and are injected by the adapter. Any `[ec.providers.<key>]` block
     /// whose key is not a built-in is captured here as raw values, and the
@@ -785,15 +792,16 @@ impl EcProviders {
 
     /// The keys of every configured `[ec.providers.<key>]` block.
     ///
-    /// The typed built-in block is reported under the name it is configured
+    /// Each typed built-in block is reported under the name it is configured
     /// with, so it appears alongside the vendor blocks rather than being
     /// counted separately by each caller. This is the one place that mapping is
-    /// made, and it goes away when the built-in provider becomes a module and
-    /// its block joins the others.
+    /// made, and each entry goes away when its built-in provider becomes a
+    /// module and its block joins the others.
     pub(crate) fn configured_keys(&self) -> impl Iterator<Item = &str> {
         self.hmac
             .iter()
             .map(|_| HMAC_PROVIDER_KEY)
+            .chain(self.host_signals.iter().map(|_| HOST_SIGNALS_PROVIDER_KEY))
             .chain(self.vendor.keys().map(String::as_str))
     }
 
@@ -819,6 +827,111 @@ pub struct HmacProviderConfig {
     /// Publisher passphrase used as the HMAC key for EC generation.
     #[validate(custom(function = Ec::validate_passphrase))]
     pub passphrase: Redacted<String>,
+}
+
+/// Configuration for the built-in host-signal Edge Cookie provider.
+///
+/// Mapped from the `[ec.providers.host-signals]` TOML block.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct HostSignalsProviderConfig {
+    /// Passphrase used as the HMAC key over the host fingerprints and client IP.
+    #[validate(custom(function = Ec::validate_passphrase))]
+    pub passphrase: Redacted<String>,
+}
+
+/// Device-detection configuration.
+///
+/// Mapped from the `[device]` TOML section. Selects which device-detection
+/// provider classifies a request into device signals, mirroring the Edge
+/// Cookie provider selection in [`Ec`].
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceConfig {
+    /// The key of the device-detection provider to activate.
+    ///
+    /// Defaults to the built-in `builtin` provider when absent, which classifies
+    /// from the User-Agent alone and makes no host-specific call, so the default
+    /// path stays host-neutral. The opt-in `fastly` provider strengthens the
+    /// browser/bot gate with the host's TLS/H2 fingerprints. Override it with the
+    /// `TRUSTED_SERVER__device__provider` environment variable so the same
+    /// compiled WebAssembly can switch providers at deployment. An unknown key is
+    /// rejected at startup by
+    /// [`validate_provider_selection`](Self::validate_provider_selection).
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
+impl DeviceConfig {
+    /// Returns the active device-detection provider key, defaulting to the
+    /// built-in heuristic.
+    #[must_use]
+    pub fn provider_key(&self) -> &str {
+        self.provider.as_deref().unwrap_or("builtin")
+    }
+
+    /// Validates that the selected device-detection provider is available in
+    /// this build.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when the selected provider
+    /// key is not one this build provides.
+    pub fn validate_provider_selection(&self) -> Result<(), Report<TrustedServerError>> {
+        match self.provider_key() {
+            "builtin" | "fastly" => Ok(()),
+            key => Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "Device detection provider `{key}` is not available in this build"
+                ),
+            })),
+        }
+    }
+}
+
+/// Geo / IP intelligence configuration.
+///
+/// Mapped from the `[geo]` TOML section. Selects which provider resolves a
+/// client IP into [`GeoInfo`](crate::platform::GeoInfo), mirroring the Edge
+/// Cookie provider selection in [`Ec`].
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct GeoConfig {
+    /// The key of the geo provider to activate.
+    ///
+    /// The host platform's geo lookup is the default when absent, matching the
+    /// behavior before this selector existed; `provider = "platform"` spells
+    /// the same choice explicitly. Selecting `provider = "none"` resolves no
+    /// geolocation and makes no host geo call, so a deployment can opt out of
+    /// any host geo service. Override it with the
+    /// `TRUSTED_SERVER__geo__provider` environment variable so the same compiled
+    /// WebAssembly can switch providers at deployment. An unknown key is rejected
+    /// at startup by
+    /// [`validate_provider_selection`](Self::validate_provider_selection).
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
+impl GeoConfig {
+    /// Validates that the selected geo provider is available in this build.
+    ///
+    /// No selector is valid and is the default, selecting the host platform's
+    /// geo lookup. The explicit `"none"` runs without geolocation, the same
+    /// way the Edge Cookie provider runs statelessly when `"none"` is
+    /// selected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when the selected provider
+    /// key is not one this build provides.
+    pub fn validate_provider_selection(&self) -> Result<(), Report<TrustedServerError>> {
+        match self.provider.as_deref() {
+            None | Some("platform") | Some("none") => Ok(()),
+            Some(key) => Err(Report::new(TrustedServerError::Configuration {
+                message: format!("Geo provider `{key}` is not available in this build"),
+            })),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
@@ -2793,6 +2906,18 @@ fn is_default_auction_debug_comment_options(value: &AuctionDebugCommentOptions) 
     *value == AuctionDebugCommentOptions::default()
 }
 
+// The provider selectors are new sections, so a serialized blob that carries
+// them is rejected by a base-revision binary that has never heard of them.
+// Omitting the default table keeps an unchanged `ts config push` readable
+// across a rollout or a rollback.
+fn is_default_device_config(value: &DeviceConfig) -> bool {
+    *value == DeviceConfig::default()
+}
+
+fn is_default_geo_config(value: &GeoConfig) -> bool {
+    *value == GeoConfig::default()
+}
+
 /// Behavior of the `<!-- ts-debug: ... -->` auction dump. Only consulted when
 /// [`DebugConfig::auction_html_comment`] is true.
 ///
@@ -3083,6 +3208,12 @@ pub struct Settings {
     pub tinybird: TinybirdSettings,
     #[serde(default)]
     pub debug: DebugConfig,
+    #[serde(default, skip_serializing_if = "is_default_device_config")]
+    #[validate(nested)]
+    pub device: DeviceConfig,
+    #[serde(default, skip_serializing_if = "is_default_geo_config")]
+    #[validate(nested)]
+    pub geo: GeoConfig,
 }
 
 impl Settings {
@@ -3172,6 +3303,8 @@ impl Settings {
 
         settings.ec.migrate_legacy_ec_layout()?;
         settings.ec.validate_provider_selection()?;
+        settings.device.validate_provider_selection()?;
+        settings.geo.validate_provider_selection()?;
         settings.validate_admin_coverage()?;
         settings.validate_admin_handler_passwords()?;
 
@@ -3266,6 +3399,11 @@ impl Settings {
             && Ec::is_placeholder_passphrase(hmac.passphrase.expose())
         {
             insecure_fields.push("ec.providers.hmac.passphrase".to_owned());
+        }
+        if let Some(host_signals) = &self.ec.providers.host_signals
+            && Ec::is_placeholder_passphrase(host_signals.passphrase.expose())
+        {
+            insecure_fields.push("ec.providers.host-signals.passphrase".to_owned());
         }
         if Publisher::is_placeholder_proxy_secret(self.publisher.proxy_secret.expose()) {
             insecure_fields.push("publisher.proxy_secret".to_owned());
@@ -4941,7 +5079,11 @@ mod tests {
         // A half-migrated configuration that carries an [ec.providers.hmac]
         // block but never selects it would silently run stateless; reject it
         // at startup instead.
-        let toml_str = crate_test_settings_str().replace("provider = \"hmac\"\n", "");
+        let toml_str = crate_test_settings_str().replace(
+            "provider = \"hmac\"
+",
+            "",
+        );
 
         let err = Settings::from_toml(&toml_str)
             .expect_err("a provider block with no selector should fail at startup");
@@ -5306,6 +5448,34 @@ mod tests {
     }
 
     #[test]
+    fn device_provider_defaults_to_builtin_and_rejects_unknown() {
+        let config = DeviceConfig::default();
+        assert_eq!(
+            config.provider_key(),
+            "builtin",
+            "no selector should default to the built-in provider"
+        );
+        config
+            .validate_provider_selection()
+            .expect("should validate the built-in default");
+
+        let fastly = DeviceConfig {
+            provider: Some("fastly".to_owned()),
+        };
+        fastly
+            .validate_provider_selection()
+            .expect("should validate the fastly opt-in");
+
+        let unknown = DeviceConfig {
+            provider: Some("acme".to_owned()),
+        };
+        assert!(
+            unknown.validate_provider_selection().is_err(),
+            "an unknown device provider should be rejected at startup"
+        );
+    }
+
+    #[test]
     fn an_unselected_provider_block_is_rejected() {
         // A vendor selector with the vendor block present, plus a stray hmac
         // block, is almost always a stale or mistyped configuration.
@@ -5322,6 +5492,67 @@ mod tests {
             ),
             "should be a configuration error, got: {:?}",
             err.current_context()
+        );
+    }
+
+    #[test]
+    fn geo_provider_accepts_default_platform_and_none_and_rejects_unknown() {
+        let config = GeoConfig::default();
+        assert!(
+            config.provider.is_none(),
+            "geo should default to no selector, which selects the host geo"
+        );
+        config
+            .validate_provider_selection()
+            .expect("should validate the default host geo selection");
+
+        let platform = GeoConfig {
+            provider: Some("platform".to_owned()),
+        };
+        platform
+            .validate_provider_selection()
+            .expect("should validate the explicit platform selection");
+
+        let none = GeoConfig {
+            provider: Some("none".to_owned()),
+        };
+        none.validate_provider_selection()
+            .expect("should validate the explicit opt-out of geolocation");
+
+        let unknown = GeoConfig {
+            provider: Some("acme".to_owned()),
+        };
+        assert!(
+            unknown.validate_provider_selection().is_err(),
+            "an unknown geo provider should be rejected at startup"
+        );
+    }
+
+    #[test]
+    fn unknown_keys_in_provider_sections_are_rejected() {
+        // A mistyped key must fail at startup rather than silently selecting
+        // a default behind the operator's back.
+        for (section, bad_key) in [
+            ("[geo]", "providr = \"platform\""),
+            ("[device]", "providr = \"builtin\""),
+        ] {
+            let toml_str = format!(
+                "{}\n\n            {section}\n            {bad_key}\n",
+                crate_test_settings_str()
+            );
+            assert!(
+                Settings::from_toml(&toml_str).is_err(),
+                "an unknown key in {section} should be rejected"
+            );
+        }
+
+        let toml_str = crate_test_settings_str().replace(
+            "[ec.providers.hmac]",
+            "[ec.providers.hmac]\n            unexpected = \"value\"",
+        );
+        assert!(
+            Settings::from_toml(&toml_str).is_err(),
+            "an unknown key in [ec.providers.hmac] should be rejected"
         );
     }
 
@@ -6364,6 +6595,7 @@ origin_host_header_overide = "www.example.com""#,
 
             [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
             "#,
         )
         .expect("should parse settings without max_buffered_body_bytes");
@@ -6400,9 +6632,10 @@ origin_host_header_overide = "www.example.com""#,
             passphrase = "test-secret-key-32-bytes-minimum"
             "#,
         );
+        let error = result.expect_err("should reject a zero buffered-body cap");
         assert!(
-            result.is_err(),
-            "publisher.max_buffered_body_bytes = 0 must fail config validation"
+            error.to_string().contains("max_buffered_body_bytes"),
+            "the rejection should be for the zero cap, not another validation, got: {error}"
         );
     }
 

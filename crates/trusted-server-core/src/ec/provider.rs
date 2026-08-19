@@ -4,11 +4,12 @@
 //! selected by configuration, with no default, and [`build_provider`] is the
 //! composition root that builds the selected one. A built-in provider is
 //! constructed from its `[ec.providers.<key>]` block, and a vendor provider is
-//! taken from the adapter that injected it. Construction reads no request data,
-//! so a selection this deployment cannot satisfy fails at startup rather than
-//! leaving it running without an identity. Fastly, Cloudflare and Spin resolve
-//! the provider once per application state and thread the result. Axum and
-//! embedders resolve per request.
+//! taken from the adapter that injected it. A built-in provider that also needs
+//! a host service, as the host-signal provider needs the [`HostSignals`]
+//! fingerprints, is built only on a host that supplies that service.
+//! Construction happens once, while application state is built, and reads no
+//! request data, so a selection this deployment cannot satisfy fails at startup
+//! rather than leaving it running without an identity.
 //!
 //! Request evidence reaches a provider at call time rather than at
 //! construction. [`EdgeCookieProvider::generate`] borrows a [`RequestInfo`],
@@ -29,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::consent::ConsentContext;
 use crate::error::TrustedServerError;
-use crate::evidence::RequestInfo;
+use crate::evidence::{HostSignals, RequestInfo};
 use crate::redacted::Redacted;
 use crate::settings::Ec;
 
@@ -109,7 +110,7 @@ impl From<EcProviderSelection> for String {
     }
 }
 
-/// The configuration name of the provider still built into core.
+/// The configuration name of the HMAC provider still built into core.
 ///
 /// The name lives in the same open-ended namespace every vendor provider name
 /// comes from, and nothing branches on it outside the resolution in
@@ -118,15 +119,25 @@ impl From<EcProviderSelection> for String {
 /// built-in provider becomes a module of its own.
 pub const HMAC_PROVIDER_KEY: &str = "hmac";
 
+/// The configuration name of the host-signal provider still built into core.
+///
+/// An ordinary name in the same open-ended namespace as [`HMAC_PROVIDER_KEY`],
+/// spelled exactly the way a vendor crate spells its own, and nothing branches
+/// on it outside the resolution in [`build_provider`]. It is also
+/// [`HostSignalProvider::id`]'s return value, and it goes with that resolution
+/// arm when the host-signal provider becomes a module of its own.
+pub const HOST_SIGNALS_PROVIDER_KEY: &str = "host-signals";
+
 /// The provider names core supplies itself.
 ///
 /// A name in this list is already taken, so an adapter that injects a provider
 /// under one of them has two suppliers claiming a single name and
-/// [`build_provider`] refuses the pair rather than picking one. The list grows
-/// and shrinks with the resolution arms in [`resolve_named_provider`], and it
-/// empties when the built-in HMAC provider becomes a module like every other
-/// provider, at which point no name is reserved and every provider is injected.
-const BUILTIN_PROVIDER_KEYS: &[&str] = &[HMAC_PROVIDER_KEY];
+/// [`build_provider`] refuses the pair rather than picking one. The list holds
+/// one entry per resolution arm in [`resolve_named_provider`], so it grows and
+/// shrinks with them, and it empties when the providers still built into core
+/// become modules like every other provider, at which point no name is
+/// reserved and every provider is injected.
+const BUILTIN_PROVIDER_KEYS: &[&str] = &[HMAC_PROVIDER_KEY, HOST_SIGNALS_PROVIDER_KEY];
 
 /// The registry code of the built-in HMAC provider.
 ///
@@ -612,6 +623,23 @@ pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
     /// sees its own value part.
     fn code(&self) -> ProviderCode;
 
+    /// Whether this provider was built from evidence about one request.
+    ///
+    /// Almost every provider is built from configuration and services that are
+    /// the same for every request, so one instance can be resolved once and
+    /// handed to all of them. [`HostSignalProvider`] is the exception, because
+    /// it is built from the TLS and HTTP/2 fingerprints of a single request and
+    /// answers `true` here. A composition root reads this through
+    /// [`build_reusable_provider`] to decide whether keeping the instance is
+    /// safe, and keeping a request-scoped one would serve every later request
+    /// from the first request's evidence.
+    ///
+    /// The default is `false`, which is right for a provider whose constructor
+    /// takes only configuration and long-lived services.
+    fn is_request_scoped(&self) -> bool {
+        false
+    }
+
     /// Derives an Edge Cookie identifier from the request evidence in
     /// `request_info` and the gating context in `input`.
     ///
@@ -711,6 +739,70 @@ impl EdgeCookieProvider for HmacProvider {
     }
 }
 
+/// The built-in host-signal Edge Cookie provider.
+///
+/// Derives the identifier from the host fingerprints (TLS JA4 and HTTP/2, read
+/// from the injected [`HostSignals`]) plus the client IP (from [`RequestInfo`]),
+/// keyed by the configured passphrase. It is host-agnostic: it depends on the
+/// `HostSignals` capability, so any host that supplies one can use it. A host
+/// that supplies no `HostSignals` cannot build it, and the request stops.
+#[derive(Debug, Clone)]
+pub struct HostSignalProvider {
+    passphrase: Redacted<String>,
+    host_signals: Arc<dyn HostSignals>,
+}
+
+impl HostSignalProvider {
+    /// Creates the provider with the passphrase and its injected host signals.
+    #[must_use]
+    pub fn new(passphrase: Redacted<String>, host_signals: Arc<dyn HostSignals>) -> Self {
+        Self {
+            passphrase,
+            host_signals,
+        }
+    }
+}
+
+impl EdgeCookieProvider for HostSignalProvider {
+    fn id(&self) -> &'static str {
+        HOST_SIGNALS_PROVIDER_KEY
+    }
+
+    // Built from the fingerprints of one request, so it is only ever valid for
+    // that request and must never be kept and reused.
+    fn is_request_scoped(&self) -> bool {
+        true
+    }
+
+    fn code(&self) -> ProviderCode {
+        crate::provider_code!("hs00")
+    }
+
+    fn generate(
+        &self,
+        request_info: &dyn RequestInfo,
+        _input: &IdentityInput<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        let ja4 = self.host_signals.ja4().unwrap_or_default();
+        let h2 = self.host_signals.h2().unwrap_or_default();
+        // With no fingerprint at all, minting would silently degrade to an
+        // IP-only identifier under the host-signals name. Defer instead: no
+        // identity this request, and the request proceeds.
+        if ja4.is_empty() && h2.is_empty() {
+            log::warn!("Host-signal EC provider found no TLS/HTTP-2 fingerprints; deferring");
+            return Ok(GeneratedEdgeCookie::default());
+        }
+        let id = generation::generate_hmac_ec_id(
+            self.passphrase.expose(),
+            &[ja4, h2, request_info.client_ip()],
+        )?;
+        Ok(GeneratedEdgeCookie {
+            id: Some(id),
+            response_headers: Vec::new(),
+        })
+    }
+}
+
 /// Refuses an injected provider that claims a name core supplies itself.
 ///
 /// Two suppliers cannot own one name. Core ships the `hmac` provider, and once
@@ -754,22 +846,23 @@ fn ensure_no_name_collision(
 
 /// Builds the Edge Cookie provider named by the `[ec] provider` selector.
 ///
-/// This is the composition root for the Edge Cookie provider. It reads the
-/// `[ec]` configuration and takes the adapter's optional injected provider,
-/// resolving the selector to the built-in provider or the injected one. The
-/// per-request [`RequestInfo`] is passed borrowed to
-/// [`generate`](EdgeCookieProvider::generate) at call time rather than stored,
-/// so no request snapshot is cloned here. Returns `Ok(None)` when no provider
-/// is selected, so the caller stays stateless.
+/// This is the composition root for the built-in providers: the adapter supplies
+/// the [`HostSignals`] when the host can produce them, and this constructs the
+/// selected provider. The per-request [`RequestInfo`] is passed borrowed to
+/// [`generate`](EdgeCookieProvider::generate) at call time rather than stored, so
+/// no request snapshot is cloned here. Returns `Ok(None)` when no provider is
+/// selected, so the caller stays stateless.
 ///
 /// # Errors
 ///
 /// Returns [`TrustedServerError::EdgeCookie`] when the named provider cannot be
-/// built: a built-in name whose configuration block is missing, or a name this
-/// deployment's adapter does not inject. Both fail loudly rather than leaving
-/// the deployment running stateless under a selector that says otherwise.
+/// built: a built-in name whose configuration block is missing, a built-in name
+/// whose host capability this host does not supply, or a name this deployment's
+/// adapter does not inject. All fail loudly rather than leaving the deployment
+/// running stateless under a selector that says otherwise.
 pub fn build_provider(
     ec: &Ec,
+    host_signals: Option<Arc<dyn HostSignals>>,
     injected: Option<Arc<dyn EdgeCookieProvider>>,
 ) -> Result<Option<Box<dyn EdgeCookieProvider>>, Report<TrustedServerError>> {
     ensure_no_name_collision(injected.as_deref())?;
@@ -782,7 +875,9 @@ pub fn build_provider(
         // Every provider is named, and this is the one place a name is resolved
         // to an implementation. Nothing else in the codebase asks whether a
         // name is built in.
-        EcProviderSelection::Named(key) => Some(resolve_named_provider(key, ec, injected)?),
+        EcProviderSelection::Named(key) => {
+            Some(resolve_named_provider(key, ec, host_signals, injected)?)
+        }
     };
     Ok(provider)
 }
@@ -803,17 +898,19 @@ pub fn build_provider(
 /// # Errors
 ///
 /// Returns [`TrustedServerError::EdgeCookie`] when the name matches no provider
-/// this deployment can build, or when a built-in name has no configuration
-/// block. Both fail loudly rather than silently running stateless.
+/// this deployment can build, when a built-in name has no configuration block,
+/// or when a built-in name needs a host capability this host does not supply.
+/// All fail loudly rather than silently running stateless.
 fn resolve_named_provider(
     key: &str,
     ec: &Ec,
+    host_signals: Option<Arc<dyn HostSignals>>,
     injected: Option<Arc<dyn EdgeCookieProvider>>,
 ) -> Result<Box<dyn EdgeCookieProvider>, Report<TrustedServerError>> {
     // The only place that knows a provider is built into core rather than
-    // supplied as a module. It disappears, along with `HMAC_PROVIDER_KEY`,
-    // when the HMAC provider becomes a module like every other provider, after
-    // which `hmac` resolves through the injected path below and nothing else
+    // supplied as a module. Each arm disappears, along with its name constant,
+    // when that provider becomes a module like every other provider, after
+    // which its name resolves through the injected path below and nothing else
     // changes.
     //
     // Settings validation rejects a built-in name with no block before this
@@ -830,6 +927,30 @@ fn resolve_named_provider(
             })
         })?;
         return Ok(Box::new(HmacProvider::new(config.passphrase.clone())));
+    }
+
+    // The host-signal provider needs fingerprints only some hosts supply, and
+    // that check cannot be made in settings validation at all, so it is made
+    // here rather than minting a degraded identifier under this name.
+    if key == HOST_SIGNALS_PROVIDER_KEY {
+        let config = ec.providers.host_signals.as_ref().ok_or_else(|| {
+            Report::new(TrustedServerError::EdgeCookie {
+                message: "Edge Cookie provider `host-signals` is selected but has no \
+                          `[ec.providers.host-signals]` configuration"
+                    .to_owned(),
+            })
+        })?;
+        let signals = host_signals.ok_or_else(|| {
+            Report::new(TrustedServerError::EdgeCookie {
+                message: "The host-signals Edge Cookie provider requires a host that supplies \
+                          TLS/HTTP-2 fingerprints, which this host does not"
+                    .to_owned(),
+            })
+        })?;
+        return Ok(Box::new(HostSignalProvider::new(
+            config.passphrase.clone(),
+            signals,
+        )));
     }
 
     injected
@@ -849,12 +970,18 @@ fn resolve_named_provider(
 /// by the `[ec] provider` selector.
 ///
 /// The composition root calls this while it builds application state, passing
-/// the same injected provider it will put into
+/// the same services it will put into
 /// [`RuntimeServices`](crate::platform::RuntimeServices) on every request.
 /// [`build_provider`] reads no request data, so the answer is the same for
 /// every request and a selection the adapter can never supply fails at startup
 /// rather than on the first request. A stateless deployment (no selector, or
 /// `"none"`) passes.
+///
+/// `host_signals` answers whether this adapter supplies a [`HostSignals`]
+/// service at all, which is fixed per deployment, rather than what any one
+/// request fingerprints to. An adapter that injects host signals on every
+/// request passes an instance here even though its values are empty at
+/// startup, and an adapter that never injects them passes `None`.
 ///
 /// # Errors
 ///
@@ -862,31 +989,76 @@ fn resolve_named_provider(
 /// be built from the services this deployment injects.
 pub fn ensure_provider_available(
     ec: &Ec,
+    host_signals: Option<Arc<dyn HostSignals>>,
     injected: Option<Arc<dyn EdgeCookieProvider>>,
 ) -> Result<(), Report<TrustedServerError>> {
-    build_shared_provider(ec, injected)?;
+    build_shared_provider(ec, host_signals, injected)?;
     Ok(())
 }
 
-/// Resolves the selected provider into a shared handle the composition root can
-/// keep and the request path can reuse.
+/// Resolves the selected provider into a shared handle.
 ///
 /// The same resolution as [`build_provider`], returned as an `Arc` rather than
-/// a `Box` so one instance can be threaded into
+/// a `Box` so one instance can be held in
 /// [`RuntimeServices`](crate::platform::RuntimeServices) and read by every
-/// request without being built again. An adapter that calls this while it
-/// builds application state gets the startup check
-/// [`ensure_provider_available`] performs and the provider itself for one piece
-/// of work rather than two.
+/// request. Use [`build_reusable_provider`] at a composition root, which adds
+/// the one check that decides whether keeping the instance is safe.
 ///
 /// # Errors
 ///
 /// The same errors as [`build_provider`].
 pub fn build_shared_provider(
     ec: &Ec,
+    host_signals: Option<Arc<dyn HostSignals>>,
     injected: Option<Arc<dyn EdgeCookieProvider>>,
 ) -> Result<Option<Arc<dyn EdgeCookieProvider>>, Report<TrustedServerError>> {
-    Ok(build_provider(ec, injected)?.map(Arc::from))
+    Ok(build_provider(ec, host_signals, injected)?.map(Arc::from))
+}
+
+/// The provider a composition root may keep and hand to every request, when
+/// the selection is one that can be kept at all.
+///
+/// Resolving is also the startup check, so a selection this deployment cannot
+/// satisfy fails here rather than on the first request, exactly as
+/// [`ensure_provider_available`] makes it fail. What this adds is the answer to
+/// a second question, which is whether the provider that came back is the same
+/// for every request. Most are, because they are built from configuration
+/// alone, and keeping one saves resolving the same settings again on every
+/// request.
+///
+/// [`HostSignalProvider`] is not, because it is built from the fingerprints of
+/// one request and reports
+/// [`is_request_scoped`](EdgeCookieProvider::is_request_scoped). Keeping that
+/// one would freeze the fingerprints captured while application state was built,
+/// which on every adapter here are empty, so every later request would find no
+/// fingerprints and defer. `Ok(None)` comes back for it, the adapter threads
+/// nothing, and the request path resolves it per request against that request's
+/// own fingerprints.
+///
+/// `Ok(None)` therefore means "nothing to keep", which covers both a stateless
+/// deployment and a provider that must be resolved per request. Both leave the
+/// request path resolving for itself, which is what it did before anything was
+/// kept.
+///
+/// # Errors
+///
+/// The same errors as [`build_provider`].
+pub fn build_reusable_provider(
+    ec: &Ec,
+    host_signals: Option<Arc<dyn HostSignals>>,
+    injected: Option<Arc<dyn EdgeCookieProvider>>,
+) -> Result<Option<Arc<dyn EdgeCookieProvider>>, Report<TrustedServerError>> {
+    let Some(provider) = build_shared_provider(ec, host_signals, injected)? else {
+        return Ok(None);
+    };
+    if provider.is_request_scoped() {
+        log::debug!(
+            "Edge Cookie provider `{}` is built from request evidence, so it is resolved per              request rather than kept",
+            provider.id(),
+        );
+        return Ok(None);
+    }
+    Ok(Some(provider))
 }
 
 /// The Edge Cookie provider to use for this request.
@@ -902,8 +1074,8 @@ pub fn build_shared_provider(
 ///
 /// # Errors
 ///
-/// The same errors as [`build_provider`], and only when the adapter threaded
-/// nothing, because a threaded provider has already been resolved successfully.
+/// The same errors as [`build_provider`], and only when nothing was threaded,
+/// because a threaded provider has already been resolved successfully.
 pub fn request_provider(
     ec: &Ec,
     services: &crate::platform::RuntimeServices,
@@ -911,7 +1083,7 @@ pub fn request_provider(
     if let Some(resolved) = services.resolved_ec_provider() {
         return Ok(Some(resolved));
     }
-    build_shared_provider(ec, None)
+    build_shared_provider(ec, services.host_signals(), None)
 }
 
 /// Adapts an injected, shared [`EdgeCookieProvider`] to the owned `Box` that
@@ -931,6 +1103,10 @@ impl EdgeCookieProvider for SharedProvider {
 
     fn id(&self) -> &'static str {
         self.0.id()
+    }
+
+    fn is_request_scoped(&self) -> bool {
+        self.0.is_request_scoped()
     }
 
     fn generate(
@@ -953,7 +1129,8 @@ impl EdgeCookieProvider for SharedProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{EcProviders, HmacProviderConfig};
+    use crate::evidence::OwnedRequestInfo;
+    use crate::settings::{EcProviders, HmacProviderConfig, HostSignalsProviderConfig};
 
     #[test]
     fn a_malformed_provider_code_is_refused_rather_than_panicking() {
@@ -1257,7 +1434,7 @@ mod tests {
             ..Ec::default()
         };
         assert!(
-            build_provider(&none, None)
+            build_provider(&none, None, None)
                 .expect("explicit statelessness should build")
                 .is_none(),
             "`none` should select no provider"
@@ -1273,7 +1450,7 @@ mod tests {
             providers,
             ..Ec::default()
         };
-        let built = build_provider(&hmac, None)
+        let built = build_provider(&hmac, None, None)
             .expect("the hmac selection should build")
             .expect("the hmac selection should yield a provider");
         assert_eq!(
@@ -1293,7 +1470,7 @@ mod tests {
             provider: Some(EcProviderSelection::Named("acme".to_owned())),
             ..Ec::default()
         };
-        let built = build_provider(&vendor, Some(Arc::new(VendorProvider)))
+        let built = build_provider(&vendor, None, Some(Arc::new(VendorProvider)))
             .expect("the vendor selection should build")
             .expect("the vendor selection should yield a provider");
         assert_eq!(
@@ -1326,6 +1503,26 @@ mod tests {
 
     fn test_passphrase() -> Redacted<String> {
         Redacted::from("a-test-passphrase-32-bytes-minimum".to_owned())
+    }
+
+    fn test_request_info() -> OwnedRequestInfo {
+        OwnedRequestInfo::new("203.0.113.1".to_owned())
+    }
+
+    /// Test host signals with fixed JA4/H2 values.
+    #[derive(Debug)]
+    struct TestHostSignals {
+        ja4: Option<String>,
+        h2: Option<String>,
+    }
+
+    impl HostSignals for TestHostSignals {
+        fn ja4(&self) -> Option<&str> {
+            self.ja4.as_deref()
+        }
+        fn h2(&self) -> Option<&str> {
+            self.h2.as_deref()
+        }
     }
 
     #[test]
@@ -1447,8 +1644,12 @@ mod tests {
             ..Ec::default()
         };
 
-        let err = build_provider(&selected_hmac, Some(Arc::new(VendorNamedHmacProvider)))
-            .expect_err("two providers claiming `hmac` should be refused");
+        let err = build_provider(
+            &selected_hmac,
+            None,
+            Some(Arc::new(VendorNamedHmacProvider)),
+        )
+        .expect_err("two providers claiming `hmac` should be refused");
         let message = err.to_string();
         assert!(
             message.contains(HMAC_PROVIDER_KEY),
@@ -1466,9 +1667,12 @@ mod tests {
             provider: Some(EcProviderSelection::None),
             ..Ec::default()
         };
-        let err =
-            ensure_provider_available(&selected_elsewhere, Some(Arc::new(VendorNamedHmacProvider)))
-                .expect_err("the clash should be refused whatever the selector says");
+        let err = ensure_provider_available(
+            &selected_elsewhere,
+            None,
+            Some(Arc::new(VendorNamedHmacProvider)),
+        )
+        .expect_err("the clash should be refused whatever the selector says");
         assert!(
             err.to_string().contains(HMAC_PROVIDER_KEY),
             "the startup check should name the contested name too, got: {err}"
@@ -1479,8 +1683,42 @@ mod tests {
             provider: Some(EcProviderSelection::Named("acme".to_owned())),
             ..Ec::default()
         };
-        build_provider(&vendor, Some(Arc::new(VendorProvider)))
+        build_provider(&vendor, None, Some(Arc::new(VendorProvider)))
             .expect("a vendor provider under its own name should still build");
+    }
+
+    #[test]
+    fn host_signal_provider_mints_from_fingerprints() {
+        let signals = Arc::new(TestHostSignals {
+            ja4: Some("t13d1516h2_8daaf6152771_e5627efa2ab1".to_owned()),
+            h2: Some("1:65536;4:6291456".to_owned()),
+        });
+        let provider = HostSignalProvider::new(test_passphrase(), signals);
+        let request_info = test_request_info();
+        let generated = provider
+            .generate(&request_info, &IdentityInput::default())
+            .expect("should generate");
+        assert!(
+            generated.id.is_some(),
+            "the host-signal provider mints an identifier from the fingerprints"
+        );
+    }
+
+    #[test]
+    fn host_signal_provider_defers_without_fingerprints() {
+        let signals = Arc::new(TestHostSignals {
+            ja4: None,
+            h2: None,
+        });
+        let provider = HostSignalProvider::new(test_passphrase(), signals);
+        let request_info = test_request_info();
+        let generated = provider
+            .generate(&request_info, &IdentityInput::default())
+            .expect("should generate");
+        assert!(
+            generated.id.is_none(),
+            "with no host fingerprints the provider should defer rather than              mint an IP-only identifier"
+        );
     }
 
     #[test]
@@ -1490,7 +1728,7 @@ mod tests {
             ..Ec::default()
         };
 
-        let err = build_provider(&ec, None)
+        let err = build_provider(&ec, None, None)
             .expect_err("selecting a provider the adapter does not inject should error");
         assert!(
             err.to_string().contains("acme"),
@@ -1509,11 +1747,81 @@ mod tests {
             ..Ec::default()
         };
 
-        let err = build_provider(&ec, None)
+        let err = build_provider(&ec, None, None)
             .expect_err("selecting hmac with no [ec.providers.hmac] block should error");
         assert!(
             err.to_string().contains("[ec.providers.hmac]"),
             "the error should name the missing block, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_provider_built_from_request_evidence_is_never_kept_and_reused() {
+        // The host-signal provider captures the fingerprints of the request it
+        // was built for. A composition root builds application state with an
+        // empty host-signal service, because there is no request yet, so
+        // keeping that instance would serve every later request from empty
+        // fingerprints and the provider would defer forever. It must come back
+        // as nothing to keep, leaving the request path to resolve it against
+        // the fingerprints each request actually carried.
+        let mut providers = EcProviders::default();
+        providers.host_signals = Some(HostSignalsProviderConfig {
+            passphrase: test_passphrase(),
+        });
+        let host_signals_selected = Ec {
+            provider: Some(EcProviderSelection::from(HOST_SIGNALS_PROVIDER_KEY)),
+            providers,
+            ..Ec::default()
+        };
+        let startup_signals: Arc<dyn HostSignals> = Arc::new(TestHostSignals {
+            ja4: None,
+            h2: None,
+        });
+
+        // It resolves, so the startup check still passes on a host that
+        // supplies the service.
+        let resolved = build_shared_provider(
+            &host_signals_selected,
+            Some(Arc::clone(&startup_signals)),
+            None,
+        )
+        .expect("the host-signal selection should resolve on a host that supplies signals")
+        .expect("the selection should yield a provider");
+        assert!(
+            resolved.is_request_scoped(),
+            "the host-signal provider should declare itself built from request evidence"
+        );
+
+        // It is not offered for reuse.
+        assert!(
+            build_reusable_provider(
+                &host_signals_selected,
+                Some(Arc::clone(&startup_signals)),
+                None
+            )
+            .expect("the host-signal selection should still pass the startup check")
+            .is_none(),
+            "a provider built from request evidence must never be kept for later requests"
+        );
+
+        // A provider built from configuration alone is still kept, so the
+        // saving stands for every selection that can take it.
+        let mut providers = EcProviders::default();
+        providers.hmac = Some(HmacProviderConfig {
+            passphrase: test_passphrase(),
+        });
+        let hmac_selected = Ec {
+            provider: Some(EcProviderSelection::from(HMAC_PROVIDER_KEY)),
+            providers,
+            ..Ec::default()
+        };
+        let kept = build_reusable_provider(&hmac_selected, None, None)
+            .expect("the hmac selection should resolve")
+            .expect("a provider built from configuration alone should be kept");
+        assert_eq!(
+            kept.id(),
+            HMAC_PROVIDER_KEY,
+            "the kept provider should be the selected one"
         );
     }
 
@@ -1529,7 +1837,7 @@ mod tests {
             provider: Some(EcProviderSelection::Named("acme".to_owned())),
             ..Ec::default()
         };
-        let resolved = build_shared_provider(&ec, Some(Arc::new(VendorProvider)))
+        let resolved = build_reusable_provider(&ec, None, Some(Arc::new(VendorProvider)))
             .expect("the composition root should resolve the selection")
             .expect("the selection should yield a provider");
 
@@ -1567,7 +1875,7 @@ mod tests {
             provider: Some(EcProviderSelection::from("acme")),
             ..Ec::default()
         };
-        let err = ensure_provider_available(&selected, None)
+        let err = ensure_provider_available(&selected, None, None)
             .expect_err("an uninjected provider should fail the startup check");
         assert!(
             err.to_string().contains("acme"),
@@ -1576,13 +1884,45 @@ mod tests {
 
         // Statelessness is a supported deployment, spelled either way, and must
         // never be turned into a startup error.
-        ensure_provider_available(&Ec::default(), None)
+        ensure_provider_available(&Ec::default(), None, None)
             .expect("should allow a deployment that selects no provider");
         let explicit_none = Ec {
             provider: Some(EcProviderSelection::None),
             ..Ec::default()
         };
-        ensure_provider_available(&explicit_none, None)
+        ensure_provider_available(&explicit_none, None, None)
             .expect("should allow the explicit `none` selection");
+    }
+
+    #[test]
+    fn the_startup_check_rejects_host_signals_on_a_host_that_supplies_none() {
+        // Whether the adapter injects a host-signal service is fixed per
+        // deployment, so selecting the host-signal provider on an adapter that
+        // injects none is knowable without a request.
+        let mut providers = EcProviders::default();
+        providers.host_signals = Some(HostSignalsProviderConfig {
+            passphrase: test_passphrase(),
+        });
+        let selected = Ec {
+            provider: Some(EcProviderSelection::from(HOST_SIGNALS_PROVIDER_KEY)),
+            providers,
+            ..Ec::default()
+        };
+
+        let err = ensure_provider_available(&selected, None, None).expect_err(
+            "the host-signal provider should fail the startup check with no host signals",
+        );
+        assert!(
+            err.to_string().contains("TLS/HTTP-2 fingerprints"),
+            "the error should say the host supplies no fingerprints, got: {err}"
+        );
+
+        let signals: Arc<dyn HostSignals> = Arc::new(TestHostSignals {
+            ja4: None,
+            h2: None,
+        });
+        ensure_provider_available(&selected, Some(signals), None).expect(
+            "should pass on a host that injects host signals, whatever this request fingerprints to",
+        );
     }
 }

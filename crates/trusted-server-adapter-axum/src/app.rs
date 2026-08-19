@@ -87,9 +87,9 @@ fn build_state_with_settings(
     // whose application state is built once at start-up while theirs is rebuilt
     // for every request. It injects and threads no provider, so `EcContext`
     // resolves the selection itself on every request, building a fresh built-in
-    // provider that reads no request data; this dev server accepts that
-    // per-request construction rather than caching a resolved provider.
-    ensure_provider_available(&settings.ec, None)?;
+    // provider that reads no request data. It supplies no host signals either,
+    // so the host-signals argument is `None`.
+    ensure_provider_available(&settings.ec, None, None)?;
     let orchestrator = build_orchestrator(&settings)?;
     let registry = IntegrationRegistry::new(&settings)?;
 
@@ -149,7 +149,7 @@ where
     F: FnOnce(Arc<AppState>, RuntimeServices, Request) -> Fut,
     Fut: Future<Output = Result<Response, Report<TrustedServerError>>>,
 {
-    let services = build_runtime_services(&ctx);
+    let services = build_runtime_services(&ctx, &state.settings);
     let mut req = ctx.into_request();
     if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
         &state.settings,
@@ -726,7 +726,7 @@ mod tests {
             .body(edgezero_core::body::Body::empty())
             .expect("should build test request");
         let ctx = RequestContext::new(req, PathParams::default());
-        let services = build_runtime_services(&ctx);
+        let services = build_runtime_services(&ctx, &state.settings);
         let req = ctx.into_request();
 
         let error = build_ec_context(&state, &services, &req)

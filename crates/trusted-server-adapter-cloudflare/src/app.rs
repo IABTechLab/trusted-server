@@ -18,7 +18,7 @@ use trusted_server_core::ec::admin::{
     admin_ec_lookup_not_supported as core_admin_ec_lookup_not_supported,
     deny_admin_diagnostic_fallback, handle_admin_eids_lookup,
 };
-use trusted_server_core::ec::provider::{EdgeCookieProvider, build_shared_provider};
+use trusted_server_core::ec::provider::{EdgeCookieProvider, build_reusable_provider};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -129,9 +129,10 @@ fn build_state_with_settings(
     // is served, so a selection this adapter can never supply fails here rather
     // than on the first request. Keeping what the resolution produced is what
     // stops the request path resolving the same settings again. This adapter
-    // injects no vendor Edge Cookie provider, so `None` is the injected
-    // argument, and one is passed here once this adapter supplies it.
-    let ec_provider = build_shared_provider(&settings.ec, None)?;
+    // supplies no host signals and injects no vendor Edge Cookie provider, so
+    // both arguments are `None`, and each is passed here once this adapter
+    // supplies it.
+    let ec_provider = build_reusable_provider(&settings.ec, None, None)?;
     let orchestrator = build_orchestrator(&settings)?;
     let registry = IntegrationRegistry::new(&settings)?;
 
@@ -149,9 +150,11 @@ fn build_state_with_settings(
 
 /// Builds the per-request services, carrying the Edge Cookie provider the
 /// composition root already resolved so the request path does not resolve
-/// `[ec] provider` a second time.
+/// `[ec] provider` a second time. Nothing is carried when the composition root
+/// found nothing safe to keep, and the request path resolves for itself.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
-    build_runtime_services(ctx).with_resolved_ec_provider(state.ec_provider.clone())
+    build_runtime_services(ctx, &state.settings)
+        .with_resolved_ec_provider(state.ec_provider.clone())
 }
 
 /// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
@@ -716,7 +719,7 @@ mod tests {
         // No resolved provider is threaded here, so the request path resolves
         // the selection itself, which is what an embedder driving core
         // directly does and where the loud failure has to stay.
-        let services = build_runtime_services(&ctx);
+        let services = build_runtime_services(&ctx, &settings);
         let req = ctx.into_request();
 
         let error = build_ec_context(&settings, &services, &req)

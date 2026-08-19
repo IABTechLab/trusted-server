@@ -1,0 +1,18 @@
+[package]
+name = "trusted-server-device-fastly"
+description = "Fastly host device provider exposing opt-in TLS and HTTP/2 signals."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+trusted-server-core = { workspace = true }
+fastly = { workspace = true }

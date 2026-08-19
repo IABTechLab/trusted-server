@@ -215,9 +215,10 @@ impl EcContext {
         // Take the selected provider once. It is used here to decide whether
         // the incoming cookie value is a usable identifier, and again by
         // generation, which reuses this one rather than asking for another.
-        // Resolving needs no request data, so an adapter that resolved the
-        // selection while it built application state hands the same instance
-        // back here and nothing is built a second time on this request.
+        // `request_provider` hands back the instance the composition root
+        // resolved when there is one, and otherwise resolves the selection from
+        // this request's own services, the host signals among them, so a
+        // provider built from request evidence reads this request's evidence.
         let selected_provider: Option<Arc<dyn crate::ec::provider::EdgeCookieProvider>> =
             provider::request_provider(&settings.ec, services)?;
 
@@ -948,8 +949,9 @@ mod tests {
         settings.ec.provider = Some(EcProviderSelection::from("opaque"));
 
         let ec_config = settings.ec.clone();
-        let resolved = crate::ec::provider::build_shared_provider(
+        let resolved = crate::ec::provider::build_reusable_provider(
             &ec_config,
+            None,
             Some(Arc::new(OpaqueIdProvider)),
         )
         .expect("the composition root should resolve the selection")

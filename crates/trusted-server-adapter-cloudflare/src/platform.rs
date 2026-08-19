@@ -598,7 +598,10 @@ impl PlatformSecretStore for CloudflareSecretStoreAdapter {
 /// Geo information is read from Cloudflare's injected request headers
 /// (`cf-ipcountry`, etc.) which are present on all plans; headers absent on
 /// the native host target simply produce empty/zero defaults.
-pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> RuntimeServices {
+pub fn build_runtime_services(
+    ctx: &edgezero_core::context::RequestContext,
+    settings: &trusted_server_core::settings::Settings,
+) -> RuntimeServices {
     let client_ip = extract_client_ip(ctx);
 
     #[cfg(target_arch = "wasm32")]
@@ -633,7 +636,9 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
 
     // Geo: read Cloudflare-injected headers — no #[cfg] needed; headers are
     // simply absent on the native host target, producing Ok(None) from lookup().
-    let geo = build_geo(ctx);
+    // Routed through the [geo] provider selector like the Fastly adapter, so
+    // the selector behaves the same on every adapter.
+    let geo = trusted_server_core::platform::build_geo_provider(settings, Arc::new(build_geo(ctx)));
 
     RuntimeServices::builder()
         .config_store(config_store)
@@ -641,7 +646,7 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         .kv_store(kv_store)
         .backend(Arc::new(NoopBackend))
         .http_client(http_client)
-        .geo(Arc::new(geo))
+        .geo(geo)
         .client_info(ClientInfo {
             client_ip,
             tls_protocol: None,
