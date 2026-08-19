@@ -28,16 +28,15 @@ use error_stack::{Report, ResultExt};
 use http::header::{self, HeaderValue};
 use http::{Method, Request, Response, StatusCode};
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 use validator::{Validate, ValidationError};
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
-    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationHeadInjector,
-    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, collect_body_bounded,
-    collect_response_bounded, ensure_integration_backend, integration_config_script,
+    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    collect_body_bounded, collect_response_bounded, ensure_integration_backend,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -770,11 +769,20 @@ pub fn register(
         return Ok(None);
     };
 
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct SourcepointBrowserConfigV1 {
+        rewrite_sdk: bool,
+    }
+    let browser_config = SourcepointBrowserConfigV1 {
+        rewrite_sdk: integration.config.rewrite_sdk,
+    };
+
     Ok(Some(
         IntegrationRegistration::builder(SOURCEPOINT_INTEGRATION_ID)
             .with_proxy(integration.clone())
             .with_attribute_rewriter(integration.clone())
-            .with_head_injector(integration)
+            .with_browser_config_v1(&browser_config)?
             .build(),
     ))
 }
@@ -1013,23 +1021,10 @@ impl IntegrationAttributeRewriter for SourcepointIntegration {
     }
 }
 
-impl IntegrationHeadInjector for SourcepointIntegration {
-    fn integration_id(&self) -> &'static str {
-        SOURCEPOINT_INTEGRATION_ID
-    }
-
-    fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        vec![integration_config_script(
-            SOURCEPOINT_INTEGRATION_ID,
-            &format!("{{\"rewriteSdk\":{}}}", self.config.rewrite_sdk),
-        )]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
+    use crate::integrations::IntegrationRegistry;
     use crate::test_support::tests::create_test_settings;
     use serde_json::json;
 
@@ -1388,54 +1383,43 @@ mod tests {
     }
 
     #[test]
-    fn head_injector_emits_only_transient_config_when_enabled() {
-        let integration = SourcepointIntegration::new(Arc::new(config(true)));
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "ts.example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-            document_state: &document_state,
-        };
+    fn registration_projects_rewrite_enabled_without_a_config_script() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                SOURCEPOINT_INTEGRATION_ID,
+                &json!({ "enabled": true, "rewrite_sdk": true }),
+            )
+            .expect("should insert Sourcepoint config");
+        let registration = register(&settings)
+            .expect("config should parse")
+            .expect("Sourcepoint should register");
 
-        let inserts = integration.head_inserts(&ctx);
-        assert_eq!(inserts.len(), 1, "the TS module owns the Sourcepoint guard");
-
-        let config_script = &inserts[0];
-        assert!(
-            config_script.contains("c.sourcepoint={\"rewriteSdk\":true}"),
-            "should emit rewrite SDK config script: {config_script}"
+        assert!(registration.head_injectors.is_empty());
+        assert_eq!(
+            registration.browser_config_v1,
+            Some(json!({ "rewriteSdk": true }))
         );
-        assert!(!config_script.contains("window.__tsjs_sourcepoint"));
-        assert!(!config_script.contains("Object.defineProperty"));
     }
 
     #[test]
-    fn head_injector_returns_config_when_rewrite_disabled() {
-        let mut cfg = config(true);
-        cfg.rewrite_sdk = false;
-        let integration = SourcepointIntegration::new(Arc::new(cfg));
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "ts.prospecta.com",
-            request_scheme: "https",
-            origin_host: "origin.prospecta.com",
-            document_state: &document_state,
-        };
+    fn registration_projects_rewrite_disabled() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                SOURCEPOINT_INTEGRATION_ID,
+                &json!({ "enabled": true, "rewrite_sdk": false }),
+            )
+            .expect("should insert Sourcepoint config");
+        let registration = register(&settings)
+            .expect("config should parse")
+            .expect("Sourcepoint should register");
 
-        let inserts = integration.head_inserts(&ctx);
         assert_eq!(
-            inserts.len(),
-            1,
-            "should emit only config script when rewrite_sdk is false"
-        );
-        assert!(
-            inserts[0].contains("c.sourcepoint={\"rewriteSdk\":false}"),
-            "should flag rewriteSdk false"
-        );
-        assert!(
-            !inserts[0].contains("Object.defineProperty"),
-            "should not emit runtime trap when rewrite_sdk is disabled"
+            registration.browser_config_v1,
+            Some(json!({ "rewriteSdk": false }))
         );
     }
 

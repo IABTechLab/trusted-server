@@ -32,8 +32,7 @@ use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
     IntegrationRegistration, UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
-    ensure_integration_backend_with_timeout, integration_config_script,
-    predict_integration_backend_name,
+    ensure_integration_backend_with_timeout, predict_integration_backend_name,
 };
 use crate::openrtb::{
     Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, ImpExt, ImpStoredRequest,
@@ -336,6 +335,19 @@ pub struct PrebidIntegrationConfig {
     /// suppresses every bidder when set.
     #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
     pub suppress_nurl_bidders: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PrebidBrowserConfigV1<'a> {
+    account_id: &'a str,
+    timeout: u32,
+    debug: bool,
+    bidders: &'a [String],
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    client_side_bidders: &'a [String],
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    excluded_gam_ad_unit_path_suffixes: &'a [String],
 }
 
 fn remove_aps_bidders(config: &mut PrebidIntegrationConfig) {
@@ -667,6 +679,17 @@ impl PrebidIntegration {
         Self::try_new(config).expect("should compile prebid bid param overrides")
     }
 
+    fn browser_config_v1(&self) -> PrebidBrowserConfigV1<'_> {
+        PrebidBrowserConfigV1 {
+            account_id: self.config.account_id.as_deref().unwrap_or_default(),
+            timeout: self.config.timeout_ms,
+            debug: self.config.debug,
+            bidders: &self.config.bidders,
+            client_side_bidders: &self.config.client_side_bidders,
+            excluded_gam_ad_unit_path_suffixes: &self.config.excluded_gam_ad_unit_path_suffixes,
+        }
+    }
+
     fn auction_provider(&self) -> PrebidAuctionProvider {
         PrebidAuctionProvider {
             config: self.config.clone(),
@@ -985,12 +1008,15 @@ pub fn register(
         return Ok(None);
     };
 
+    let browser_config = integration.browser_config_v1();
+
     Ok(Some(
         IntegrationRegistration::builder(PREBID_INTEGRATION_ID)
             .with_proxy(integration.clone())
             .with_attribute_rewriter(integration.clone())
-            .with_head_injector(integration)
+            .with_head_injector(integration.clone())
             .with_deferred_js()
+            .with_browser_config_v1(&browser_config)?
             .build(),
     ))
 }
@@ -1073,44 +1099,7 @@ impl IntegrationHeadInjector for PrebidIntegration {
     }
 
     fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct InjectedPrebidClientConfig<'a> {
-            account_id: &'a str,
-            timeout: u32,
-            debug: bool,
-            bidders: &'a [String],
-            #[serde(skip_serializing_if = "<[String]>::is_empty")]
-            client_side_bidders: &'a [String],
-            #[serde(skip_serializing_if = "<[String]>::is_empty")]
-            excluded_gam_ad_unit_path_suffixes: &'a [String],
-        }
-
-        let payload = InjectedPrebidClientConfig {
-            account_id: self.config.account_id.as_deref().unwrap_or_default(),
-            timeout: self.config.timeout_ms,
-            debug: self.config.debug,
-            bidders: &self.config.bidders,
-            client_side_bidders: &self.config.client_side_bidders,
-            excluded_gam_ad_unit_path_suffixes: &self.config.excluded_gam_ad_unit_path_suffixes,
-        };
-
-        // Escape `</` to prevent breaking out of the script tag.
-        let config_json = serde_json::to_string(&payload)
-            .unwrap_or_else(|e| {
-                log::warn!("Prebid: failed to serialize client config: {e}");
-                "{}".to_string()
-            })
-            .replace("</", "<\\/");
-
-        let mut inserts = vec![integration_config_script(
-            PREBID_INTEGRATION_ID,
-            &config_json,
-        )];
-
-        inserts.push(self.external_bundle_script_tag());
-
-        inserts
+        vec![self.external_bundle_script_tag()]
     }
 }
 
@@ -2765,6 +2754,11 @@ mod tests {
         }
     }
 
+    fn browser_config_json(integration: &PrebidIntegration) -> String {
+        serde_json::to_string(&integration.browser_config_v1())
+            .expect("browser-safe Prebid config should serialize")
+    }
+
     struct PredictOnlyBackend;
 
     impl PlatformBackend for PredictOnlyBackend {
@@ -3115,21 +3109,13 @@ server_url = "https://prebid.example/openrtb2/auction"
         );
 
         let integration = PrebidIntegration::new(config);
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
-        let inserts = integration.head_inserts(&ctx);
+        let browser_config = browser_config_json(&integration);
 
         assert!(
-            inserts[0].contains(
+            browser_config.contains(
                 r#""excludedGamAdUnitPathSuffixes":["/trackingonly","/measurement-only"]"#
             ),
-            "should inject the canonical suffix list: {}",
-            inserts[0]
+            "should project the canonical suffix list: {browser_config}"
         );
     }
 
@@ -3995,52 +3981,31 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn head_injector_emits_config_script() {
+    fn registration_browser_projection_contains_only_client_fields() {
         let integration = PrebidIntegration::new(base_config());
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
-
-        let inserts = integration.head_inserts(&ctx);
-        assert_eq!(inserts.len(), 2, "should produce config and bundle inserts");
-
-        let script = &inserts[0];
+        let config = browser_config_json(&integration);
         assert!(
-            script.starts_with("<script>") && script.ends_with("</script>"),
-            "should be wrapped in script tags"
+            config.contains(r#""accountId":"test-account""#),
+            "should include accountId from config: {config}"
         );
         assert!(
-            script.contains(r#""accountId":"test-account""#),
-            "should include accountId from config: {}",
-            script
+            config.contains(r#""timeout":1000"#),
+            "should include timeout: {config}"
         );
         assert!(
-            script.contains(r#""timeout":1000"#),
-            "should include timeout: {}",
-            script
+            config.contains(r#""debug":false"#),
+            "should include debug flag: {config}"
         );
         assert!(
-            script.contains(r#""debug":false"#),
-            "should include debug flag: {}",
-            script
+            config.contains(r#""bidders":["exampleBidder"]"#),
+            "should include bidders array: {config}"
         );
         assert!(
-            script.contains(r#""bidders":["exampleBidder"]"#),
-            "should include bidders array: {}",
-            script
+            !config.contains("excludedGamAdUnitPathSuffixes"),
+            "should omit empty refresh-auction exclusions: {config}"
         );
-        assert!(
-            !script.contains("excludedGamAdUnitPathSuffixes"),
-            "should omit empty refresh-auction exclusions: {}",
-            script
-        );
-        assert!(script.contains("c.prebid="));
-        assert!(!script.contains("window.__tsjs_prebid"));
-        assert!(!script.contains("window.pbjs"));
+        assert!(!config.contains("server_url"));
+        assert!(!config.contains("external_bundle_url"));
     }
 
     #[test]
@@ -4049,22 +4014,12 @@ external_bundle_sri = "sha384-AAAA"
         config.excluded_gam_ad_unit_path_suffixes =
             vec!["/trackingonly".to_string(), "/measurement-only".to_string()];
         let integration = PrebidIntegration::new(config);
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
-
-        let inserts = integration.head_inserts(&ctx);
-        let script = &inserts[0];
+        let config = browser_config_json(&integration);
         assert!(
-            script.contains(
+            config.contains(
                 r#""excludedGamAdUnitPathSuffixes":["/trackingonly","/measurement-only"]"#
             ),
-            "should inject refresh-auction exclusion suffixes: {}",
-            script
+            "should project refresh-auction exclusion suffixes: {config}"
         );
     }
 
@@ -4073,20 +4028,10 @@ external_bundle_sri = "sha384-AAAA"
         let mut config = base_config();
         config.account_id = None;
         let integration = PrebidIntegration::new(config);
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
-
-        let inserts = integration.head_inserts(&ctx);
-        let script = &inserts[0];
+        let config = browser_config_json(&integration);
         assert!(
-            script.contains(r#""accountId":"""#),
-            "should emit empty accountId when not configured: {}",
-            script
+            config.contains(r#""accountId":"""#),
+            "should emit empty accountId when not configured: {config}"
         );
     }
 
@@ -4109,21 +4054,25 @@ external_bundle_sri = "sha384-AAAA"
 
         let inserts = integration.head_inserts(&ctx);
 
-        assert_eq!(inserts.len(), 2, "should emit config and bundle scripts");
+        assert_eq!(
+            inserts.len(),
+            1,
+            "should emit only the vendor bundle script"
+        );
         assert!(
-            inserts[1].contains(&format!("src=\"{PREBID_BUNDLE_ROUTE}?v={sha256}\"")),
+            inserts[0].contains(&format!("src=\"{PREBID_BUNDLE_ROUTE}?v={sha256}\"")),
             "bundle script should use content-addressed first-party URL: {}",
-            inserts[1]
+            inserts[0]
         );
         assert!(
-            inserts[1].contains("integrity=\"sha384-"),
+            inserts[0].contains("integrity=\"sha384-"),
             "bundle script should include configured SRI: {}",
-            inserts[1]
+            inserts[0]
         );
         assert!(
-            !inserts[1].contains("crossorigin"),
+            !inserts[0].contains("crossorigin"),
             "same-origin bundle script should not include crossorigin: {}",
-            inserts[1]
+            inserts[0]
         );
     }
 
@@ -4143,58 +4092,42 @@ external_bundle_sri = "sha384-AAAA"
 
         let inserts = integration.head_inserts(&ctx);
 
-        assert_eq!(inserts.len(), 2, "should emit config and bundle scripts");
-        assert!(
-            inserts[1].contains(&format!("src=\"{PREBID_BUNDLE_ROUTE}\"")),
-            "bundle script should use first-party route without hash query: {}",
-            inserts[1]
+        assert_eq!(
+            inserts.len(),
+            1,
+            "should emit only the vendor bundle script"
         );
         assert!(
-            !inserts[1].contains("?v="),
+            inserts[0].contains(&format!("src=\"{PREBID_BUNDLE_ROUTE}\"")),
+            "bundle script should use first-party route without hash query: {}",
+            inserts[0]
+        );
+        assert!(
+            !inserts[0].contains("?v="),
             "unhashed bundle script should not include version query: {}",
-            inserts[1]
+            inserts[0]
         );
     }
 
     #[test]
-    fn head_injector_escapes_closing_script_tags_in_values() {
+    fn browser_projection_preserves_script_significant_values_for_boot_escaping() {
         let mut config = base_config();
         config.account_id = Some("</script><script>alert(1)</script>".to_string());
         let integration = PrebidIntegration::new(config);
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
-
-        let inserts = integration.head_inserts(&ctx);
-        let script = &inserts[0];
+        let config = browser_config_json(&integration);
         assert!(
-            script.contains(r#""accountId":"<\/script><script>alert(1)<\/script>""#),
-            "should escape closing script tags inside JSON values: {}",
-            script
+            config.contains(r#""accountId":"</script><script>alert(1)</script>""#),
+            "typed projection should preserve data before the central boot encoder: {config}"
         );
     }
 
     #[test]
     fn head_injector_omits_client_side_bidders_when_empty() {
         let integration = PrebidIntegration::new(base_config());
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
-
-        let inserts = integration.head_inserts(&ctx);
-        let script = &inserts[0];
+        let config = browser_config_json(&integration);
         assert!(
-            !script.contains("clientSideBidders"),
-            "should omit clientSideBidders when empty: {}",
-            script
+            !config.contains("clientSideBidders"),
+            "should omit clientSideBidders when empty: {config}"
         );
     }
 
@@ -4203,20 +4136,10 @@ external_bundle_sri = "sha384-AAAA"
         let mut config = base_config();
         config.client_side_bidders = vec!["rubicon".to_string(), "magnite".to_string()];
         let integration = PrebidIntegration::new(config);
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "pub.example",
-            request_scheme: "https",
-            origin_host: "origin.example",
-            document_state: &document_state,
-        };
-
-        let inserts = integration.head_inserts(&ctx);
-        let script = &inserts[0];
+        let config = browser_config_json(&integration);
         assert!(
-            script.contains(r#""clientSideBidders":["rubicon","magnite"]"#),
-            "should include clientSideBidders array: {}",
-            script
+            config.contains(r#""clientSideBidders":["rubicon","magnite"]"#),
+            "should include clientSideBidders array: {config}"
         );
     }
 

@@ -390,11 +390,21 @@ pub fn register(
         return Ok(None);
     };
 
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct GptBrowserConfigV1 {
+        gam_attribution_enabled: bool,
+    }
+    let browser_config = GptBrowserConfigV1 {
+        gam_attribution_enabled: integration.config.gam_attribution_enabled,
+    };
+
     Ok(Some(
         IntegrationRegistration::builder(GPT_INTEGRATION_ID)
             .with_proxy(integration.clone())
             .with_attribute_rewriter(integration.clone())
-            .with_head_injector(integration)
+            .with_head_injector(integration.clone())
+            .with_browser_config_v1(&browser_config)?
             .build(),
     ))
 }

@@ -1701,10 +1701,18 @@ fn seam_script_for(
     };
     let module_ids = integration_registry.tsjs_catalog_module_ids(selection);
     let diagnostics_active = module_ids.contains(&"gpt_diagnostics");
+    let integration_configs = match integration_registry.tsjs_integration_configs_v1(&module_ids) {
+        Ok(configs) => configs,
+        Err(error) => {
+            log::error!("invalid C2 TSJS integration config projection: {error:?}");
+            return String::new();
+        }
+    };
     let publisher_origin = request_origin(&params.request_scheme, &params.request_host);
     let boot = crate::tsjs::tsjs_bootstrap_fragment_v1(
         crate::tsjs::TsjsBootScriptConfigV1 {
             module_ids: &module_ids,
+            integration_configs: &integration_configs,
             auction_projection_json: projection_json,
             creative,
             render_trace_overlay: params.render_trace_overlay,
@@ -1717,6 +1725,7 @@ fn seam_script_for(
         crate::tsjs::tsjs_bootstrap_fragment_v1(
             crate::tsjs::TsjsBootScriptConfigV1 {
                 module_ids: &module_ids,
+                integration_configs: &integration_configs,
                 auction_projection_json: crate::tsjs::EMPTY_AUCTION_PROJECTION_JSON_V1,
                 creative,
                 render_trace_overlay: params.render_trace_overlay,

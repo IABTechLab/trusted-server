@@ -446,6 +446,15 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     };
                     let manifest_ids = integrations.tsjs_catalog_module_ids(selection);
                     let diagnostics_active = manifest_ids.contains(&"gpt_diagnostics");
+                    let integration_configs = match integrations
+                        .tsjs_integration_configs_v1(&manifest_ids)
+                    {
+                        Ok(configs) => configs,
+                        Err(error) => {
+                            log::error!("invalid TSJS integration config projection: {error:?}");
+                            return Ok(());
+                        }
+                    };
                     let state = ad_bids_state
                         .lock()
                         .expect("should lock boot projection state");
@@ -464,8 +473,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         snippet.push_str(debug_comment);
                         snippet.push('\n');
                     }
-                    // Integration config is one transient pre-core transport; each
-                    // module receives only its frozen typed value during preparation.
+                    // Non-TSJS vendor tags remain ordinary integration head inserts.
                     for insert in integrations.head_inserts(&ctx) {
                         snippet.push_str(&insert);
                     }
@@ -473,6 +481,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     let boot = tsjs::tsjs_bootstrap_fragment_v1(
                         tsjs::TsjsBootScriptConfigV1 {
                             module_ids: &manifest_ids,
+                            integration_configs: &integration_configs,
                             auction_projection_json: projection_json,
                             creative,
                             render_trace_overlay,
@@ -485,6 +494,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         tsjs::tsjs_bootstrap_fragment_v1(
                             tsjs::TsjsBootScriptConfigV1 {
                                 module_ids: &manifest_ids,
+                                integration_configs: &integration_configs,
                                 auction_projection_json: tsjs::EMPTY_AUCTION_PROJECTION_JSON_V1,
                                 creative,
                                 render_trace_overlay,

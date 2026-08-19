@@ -989,7 +989,8 @@ pub fn register(
     let mut builder = IntegrationRegistration::builder(DATADOME_INTEGRATION_ID)
         .with_proxy(integration.clone())
         .with_attribute_rewriter(integration.clone())
-        .with_head_injector(integration.clone());
+        .with_head_injector(integration.clone())
+        .with_empty_browser_config_v1()?;
 
     if integration.config.enable_protection {
         builder = builder.with_request_filter(integration);
