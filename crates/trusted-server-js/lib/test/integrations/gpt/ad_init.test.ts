@@ -7,7 +7,10 @@ import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vites
 
 import envelope from '../../fixtures/aps-renderer-v1.json';
 import type { AuctionBidData, TsjsApi } from '../../../src/core/types';
-import { APS_RENDERING_MODE_META_NAME } from '../../../src/integrations/aps/render';
+import {
+  APS_PREBID_CREATIVE_RUNNER_URL,
+  APS_RENDERING_MODE_META_NAME,
+} from '../../../src/integrations/aps/render';
 
 function enablePublisherNativeMode(): HTMLMetaElement {
   const marker = document.createElement('meta');
@@ -15,6 +18,26 @@ function enablePublisherNativeMode(): HTMLMetaElement {
   marker.content = 'publisher_native';
   document.head.appendChild(marker);
   return marker;
+}
+
+function nativeRunnerIn(divId: string): {
+  frame: HTMLIFrameElement;
+  runner: HTMLScriptElement;
+  event: CustomEvent<{ aaxResponse: string; seatBidId: string }>;
+} {
+  const container = document.getElementById(divId)!;
+  const frame = Array.from(container.querySelectorAll('iframe')).find(
+    (candidate) => candidate.title === 'Ad content'
+  );
+  expect(frame).not.toBeUndefined();
+  const runner = frame!.contentDocument?.querySelector<HTMLScriptElement>('script');
+  const frameWindow = frame!.contentWindow as unknown as {
+    _aps: Map<string, { queue: Array<CustomEvent<{ aaxResponse: string; seatBidId: string }>> }>;
+  };
+  const event = Array.from(frameWindow._aps.values())[0]?.queue[0];
+  expect(runner?.src).toBe(APS_PREBID_CREATIVE_RUNNER_URL);
+  expect(event).not.toBeUndefined();
+  return { frame: frame!, runner: runner!, event };
 }
 
 function apsRenderer() {
@@ -3206,14 +3229,12 @@ describe('installTsRenderBridge', () => {
     beaconSpy.mockRestore();
   });
 
-  it('contract test: delegates a server APS owner to the native hook without a Universal Creative response', async () => {
+  it('contract test: renders a server APS owner with the injected runner and no Universal Creative response', async () => {
     const renderer = apsRenderer();
-    const render = vi.fn().mockResolvedValue({ accepted: true });
     (window as TestWindow).tsjs.bids.homepage_header = {
       hb_adid: renderer.bidId,
       renderer,
     };
-    (window as TestWindow).tsjs.apsNativeRenderer = { render };
     const marker = enablePublisherNativeMode();
 
     try {
@@ -3229,15 +3250,17 @@ describe('installTsRenderBridge', () => {
 
       bridgeListener(request);
       bridgeListener(request);
+      const native = nativeRunnerIn('div-header');
+      expect(native.event.type).toBe('prebid/creative/render');
+      expect(native.event.detail).toEqual({
+        aaxResponse: renderer.aaxResponse,
+        seatBidId: renderer.bidId,
+      });
+      native.runner.dispatchEvent(new Event('load'));
       await Promise.resolve();
       await Promise.resolve();
 
-      expect(render).toHaveBeenCalledOnce();
-      expect(render).toHaveBeenCalledWith({
-        version: 1,
-        slotId: 'homepage_header',
-        renderer,
-      });
+      expect(native.frame.style.display).toBe('');
       expect(portMessages).toEqual([]);
       expect(document.querySelector('iframe[src*="/integrations/aps/renderer"]')).toBeNull();
     } finally {
@@ -3245,14 +3268,12 @@ describe('installTsRenderBridge', () => {
     }
   });
 
-  it('contract test: declines a server APS owner without a Universal Creative response or fallback', async () => {
+  it('contract test: fails a server APS runner without a Universal Creative response or fallback', async () => {
     const renderer = apsRenderer();
-    const render = vi.fn().mockResolvedValue({ accepted: false });
     (window as TestWindow).tsjs.bids.homepage_header = {
       hb_adid: renderer.bidId,
       renderer,
     };
-    (window as TestWindow).tsjs.apsNativeRenderer = { render };
     const marker = enablePublisherNativeMode();
 
     try {
@@ -3267,12 +3288,13 @@ describe('installTsRenderBridge', () => {
       }) as unknown as MessageEvent;
 
       bridgeListener(request);
+      nativeRunnerIn('div-header').runner.dispatchEvent(new Event('error'));
       await Promise.resolve();
       await Promise.resolve();
       bridgeListener(request);
 
-      expect(render).toHaveBeenCalledOnce();
       expect(portMessages).toEqual([]);
+      expect(document.querySelector('iframe[title="Ad content"]')).toBeNull();
       expect(document.querySelector('iframe[src*="/integrations/aps/renderer"]')).toBeNull();
     } finally {
       marker.remove();
@@ -3334,11 +3356,10 @@ describe('installTsRenderBridge', () => {
     foreignIframe.remove();
   });
 
-  it('contract test: declines a registered APS capability without a Universal Creative response or markUsed', async () => {
+  it('contract test: fails a registered APS runner without a Universal Creative response or markUsed', async () => {
     const renderer = apsRenderer();
     const prebidAdId = 'native-prebid-decline-ad-id';
     const markUsed = vi.fn();
-    const render = vi.fn().mockResolvedValue({ accepted: false });
     (window as TestWindow).tsjs.apsPrebidRenderers = {
       [prebidAdId]: {
         adUnitCode: 'div-header',
@@ -3348,7 +3369,6 @@ describe('installTsRenderBridge', () => {
         markUsed,
       },
     };
-    (window as TestWindow).tsjs.apsNativeRenderer = { render };
     const marker = enablePublisherNativeMode();
 
     try {
@@ -3363,25 +3383,25 @@ describe('installTsRenderBridge', () => {
       }) as unknown as MessageEvent;
 
       bridgeListener(request);
+      nativeRunnerIn('div-header').runner.dispatchEvent(new Event('error'));
       await Promise.resolve();
       await Promise.resolve();
       bridgeListener(request);
 
-      expect(render).toHaveBeenCalledOnce();
       expect(markUsed).not.toHaveBeenCalled();
       expect(portMessages).toEqual([]);
       expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
+      expect(document.querySelector('iframe[title="Ad content"]')).toBeNull();
       expect(document.querySelector('iframe[src*="/integrations/aps/renderer"]')).toBeNull();
     } finally {
       marker.remove();
     }
   });
 
-  it('contract test: consumes a registered APS capability and marks it used only after native acceptance', async () => {
+  it('contract test: consumes a registered APS capability and marks it used only after runner load', async () => {
     const renderer = apsRenderer();
     const prebidAdId = 'native-prebid-ad-id';
     const markUsed = vi.fn();
-    const render = vi.fn().mockResolvedValue({ accepted: true });
     (window as TestWindow).tsjs.apsPrebidRenderers = {
       [prebidAdId]: {
         adUnitCode: 'div-header',
@@ -3391,7 +3411,6 @@ describe('installTsRenderBridge', () => {
         markUsed,
       },
     };
-    (window as TestWindow).tsjs.apsNativeRenderer = { render };
     const marker = enablePublisherNativeMode();
 
     try {
@@ -3407,11 +3426,13 @@ describe('installTsRenderBridge', () => {
 
       bridgeListener(request);
       expect(markUsed).not.toHaveBeenCalled();
+      const native = nativeRunnerIn('div-header');
+      native.runner.dispatchEvent(new Event('load'));
       await Promise.resolve();
       await Promise.resolve();
       bridgeListener(request);
 
-      expect(render).toHaveBeenCalledOnce();
+      expect(native.frame.style.display).toBe('');
       expect(markUsed).toHaveBeenCalledOnce();
       expect(portMessages).toEqual([]);
       expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
