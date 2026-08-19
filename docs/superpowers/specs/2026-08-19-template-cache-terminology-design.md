@@ -31,7 +31,8 @@ Only three categories may retain the old spelling:
 
 1. the exact `<!--ts-c2-v3-seam-7f4c9e2d-bids-->` marker in the template schema-version
    history;
-2. before/after compatibility references in this migration design; and
+2. before/after compatibility references in this migration design and its implementation
+   plan; and
 3. documents already under `docs/superpowers/archive/`, which remain unchanged as
    historical records.
 
