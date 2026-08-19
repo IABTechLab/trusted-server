@@ -1034,8 +1034,8 @@ mod tests {
     fn single_known_per_render_registry_slot_is_refused() {
         let discovered = discover_gpt_slots(
             &[registry_slot(
-                "/22558409563/autoblog.com_In-Article_Desktop_ESP_jfOmMslaux",
-                "rh-gam-kso_26332072TPTy2yC1wkhc_ei_inarticle_1",
+                "/123456789/site_in-article_desktop_1",
+                "rh-gam-kso_12345678AbCdEfGh_ei_inarticle_1",
                 &[(300, 250)],
             )],
             &[],
@@ -1047,39 +1047,39 @@ mod tests {
             discovered.slots.is_empty(),
             "one observation of a known per-render family must not be written literally"
         );
-        assert_eq!(discovered.gam_network_id.as_deref(), Some("22558409563"));
+        assert_eq!(discovered.gam_network_id.as_deref(), Some("123456789"));
         assert_known_per_render_warning(&discovered);
     }
 
     #[test]
     fn single_known_per_render_request_slot_is_refused() {
         let discovered = from_requests(&[request(
-            "https://securepubads.g.doubleclick.net/gampad/ads?iu_parts=22558409563%2Cautoblog.com_In-Article_Desktop_ESP_jfOmMslaux&dids=rh-gam-kso_26332072TPTy2yC1wkhc_ei_inarticle_1&prev_iu_szs=300x250",
+            "https://securepubads.g.doubleclick.net/gampad/ads?iu_parts=123456789%2Csite_in-article_desktop_1&dids=rh-gam-kso_12345678AbCdEfGh_ei_inarticle_1&prev_iu_szs=300x250",
         )]);
 
         assert!(discovered.had_slot_evidence);
         assert!(discovered.slots.is_empty());
-        assert_eq!(discovered.gam_network_id.as_deref(), Some("22558409563"));
+        assert_eq!(discovered.gam_network_id.as_deref(), Some("123456789"));
         assert_known_per_render_warning(&discovered);
     }
 
     #[test]
     fn known_per_render_match_does_not_claim_arbitrary_vendor_ids() {
         assert_eq!(
-            known_per_render_div_prefix("rh-gam-kso_26332072TPTy2yC1wkhc_ei_inarticle_1"),
+            known_per_render_div_prefix("rh-gam-kso_12345678AbCdEfGh_ei_inarticle_1"),
             Some("rh-gam-kso")
         );
         assert_eq!(
-            known_per_render_div_prefix("rh-gam-kso_26332072TPTy2yC1wkhc_ei_overlay_1-container"),
+            known_per_render_div_prefix("rh-gam-kso_12345678AbCdEfGh_ei_overlay_1-container"),
             Some("rh-gam-kso")
         );
         for stable in [
             "rh-gam-kso_stable_ei_inarticle_1",
-            "rh-gam-kso_26332072_ei_inarticle_1",
-            "rh-gam-kso_26332072TPTy2yC1wkhc_ei_sidebar_1",
-            "rh-gam-kso_26332072TPTy2yC1wkhc_ei_overlay_stable",
-            "rh-gam-kso_26332072TPTy2yC1wkhc_ei_overlay_",
-            "rh-gam-kso_26332072TPTy2yC1wkhc_ei_overlay_1_extra",
+            "rh-gam-kso_12345678_ei_inarticle_1",
+            "rh-gam-kso_12345678AbCdEfGh_ei_sidebar_1",
+            "rh-gam-kso_12345678AbCdEfGh_ei_overlay_stable",
+            "rh-gam-kso_12345678AbCdEfGh_ei_overlay_",
+            "rh-gam-kso_12345678AbCdEfGh_ei_overlay_1_extra",
             "rh-gam-kso-header",
         ] {
             assert_eq!(
