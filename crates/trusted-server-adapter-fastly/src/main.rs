@@ -39,7 +39,7 @@ mod tinybird;
 use crate::app::{EcFinalizeState, TrustedServerApp, load_settings_from_config_store};
 use crate::ec_kv::FastlyEcKvStore;
 use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers, resolve_geo_for_response};
-use crate::platform::{FastlyPlatformGeo, client_info_from_request};
+use crate::platform::{FastlyPlatformGeo, client_info_from_request, resolve_client_ip};
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 
 const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
@@ -120,9 +120,13 @@ fn edgezero_main(mut req: FastlyRequest) {
 
     let (app, app_state) = TrustedServerApp::build_app_with_state();
     let settings_snapshot = app_state.as_ref().map(|state| Arc::clone(&state.settings));
+    let trusted_client_ip = settings_snapshot
+        .as_deref()
+        .and_then(|settings| settings.trusted_client_ip.as_ref());
+    let resolved_client_ip = resolve_client_ip(&req, req.get_client_ip_addr(), trusted_client_ip);
 
     // Strip client-spoofable forwarded headers before dispatch.
-    compat::sanitize_fastly_forwarded_headers(&mut req);
+    compat::sanitize_fastly_forwarded_headers(&mut req, trusted_client_ip);
 
     // Re-inject a trusted TLS scheme signal after sanitization has stripped any
     // client-sent fastly-ssl header. Setting it from Fastly's native TLS
@@ -133,9 +137,6 @@ fn edgezero_main(mut req: FastlyRequest) {
     {
         req.set_header("fastly-ssl", "1");
     }
-
-    // Capture client IP before the request is consumed by dispatch.
-    let client_ip = req.get_client_ip_addr();
 
     // Strip any client-supplied x-ts-tls-* headers before injecting the trusted
     // values from the Fastly SDK. Must run after sanitize_fastly_forwarded_headers.
@@ -156,7 +157,8 @@ fn edgezero_main(mut req: FastlyRequest) {
     // Capture metadata from the original FastlyRequest before conversion. These
     // accessors only return real values on the client request, so store them in
     // request extensions for build_per_request_services and EC bot classification.
-    let client_info = client_info_from_request(&req);
+    let client_info = client_info_from_request(&req, resolved_client_ip);
+    let client_ip = client_info.client_ip;
     let device_signals = derive_device_signals(&req);
 
     // Dispatch directly through the EdgeZero router without an intermediate

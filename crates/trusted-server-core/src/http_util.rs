@@ -42,6 +42,7 @@ pub const SPOOFABLE_FORWARDED_HEADERS: &[&str] = &[
     "x-forwarded-host",
     "x-forwarded-proto",
     "fastly-ssl",
+    "fastly-client-ip",
 ];
 
 /// Strip forwarded headers that clients can spoof.
