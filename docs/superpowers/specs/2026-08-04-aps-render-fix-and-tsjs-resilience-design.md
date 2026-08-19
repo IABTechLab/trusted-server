@@ -1,6 +1,6 @@
 # APS Render Fix and TSJS Resilience Architecture — Design
 
-- **Status:** revision 41 — hard-cutover contract with a lean first-display owner,
+- **Status:** revision 42 — hard-cutover contract with a lean first-display owner,
   atomic persistent-runtime takeover, an `rc/202608` implementation base,
   retired-branch concept-gap coverage, rc behavior reconciliation, and
   merge-blocking load-time remediation
@@ -1822,8 +1822,11 @@ An accepted transition first atomically promotes durable DOM/targeting ownership
 from the attempt into one `CommittedRenderArtifact` owned by the exact slot and
 navigation. The attempt disposer removes only uncommitted resources; promotion
 detaches the committed iframe, targeting snapshot, and physical-slot metadata before
-the terminal latch disposes the attempt. Direct and PUC APS top mounts are removed
-by artifact replacement or navigation disposal. The physical GPT/PUC surface remains
+the terminal latch disposes the attempt. Direct APS mounts retire on exact artifact
+replacement, owned-node/binding loss, or navigation disposal. PUC APS mounts also
+retire on the publisher/competing/ambiguous `slotRequested` and successful
+publisher-`destroySlots` paths defined below. Every retirement shares the same
+artifact exact-once latch. The physical GPT/PUC surface remains
 owned by its GPT slot: for a TS-owned slot the artifact may dispose it only through
 safe GPT destroy/redefine, while publisher-owned slot DOM remains publisher-controlled
 and the artifact releases only TS metadata and compare-restorable targeting. Before a
@@ -2041,8 +2044,9 @@ connected and inert behind the TS-owned overlay while the dynamic owner retains 
 Promise settlement authority. Direct rendering does not acquire overlay styling.
 Failure removes only the pending TS child, compare-restores only style values still
 owned by the attempt, and rejects the PUC Promise. Accepted style/DOM ownership is
-promoted to the `CommittedRenderArtifact` and released by exact replacement or
-navigation disposal.
+promoted to the `CommittedRenderArtifact` and follows the complete §4.1 exact-once
+retirement contract: replacement, publisher/competing/ambiguous cycle, successful
+publisher destruction, DOM-integrity loss, or navigation disposal as applicable.
 
 The mount has three document phases:
 
@@ -2338,21 +2342,21 @@ The shared protocol corpus fixes these bounds and encodings:
   25-character `t1_`, `b1_`, `n1_`, and `a1_` forms from §2.2;
 - `adServerDomain` is nonempty and at most 2,048 UTF-8 bytes. It is retained only for
   exact PUC-shape conformance and is never a fetch target or authority;
-- `publisherOrigin` and `rendererUrl` are at most 2,048 UTF-8 bytes. The former must
-  serialize an exact HTTP(S) origin with no path/query/fragment; the latter must equal
-  the current generation's absolute `/integrations/aps/renderer/v1` URL with no query
-  or fragment, after which the mount service appends the exact `b1_` bootstrap-nonce
-  fragment. The generated inner `data:` URL independently appends its exact `n1_`
-  renderer-nonce fragment;
+- `publisherOrigin` is at most 2,048 UTF-8 bytes and must serialize an exact HTTP(S)
+  origin with no path/query/fragment. The mount service locally derives the absolute
+  `/integrations/aps/renderer/v1` URL from that trusted origin, verifies no query or
+  fragment, and appends the exact `b1_` bootstrap-nonce fragment. `rendererUrl` is
+  never serialized in a v4 window or port message. The generated inner `data:` URL
+  independently appends its exact `n1_` renderer-nonce fragment;
 - a navigation/refresh generation is a nonnegative safe integer; and
 - the generated dynamic-owner `renderer` program is at most 64 KiB UTF-8 and the
   complete successful outer-response JSON is at most 72 KiB. Build tests enforce
   both; refusal responses contain no renderer.
 
-Structured-clone port payloads use their exact field-level limits: APS descriptor
-256 KiB decoded AAX; ADM 512 KiB; `creativeUrl` 4,096 UTF-8 bytes;
-`publisherOrigin`, `rendererUrl`, and
-`adServerDomain` 2,048 UTF-8 bytes; server slot id 1–256 UTF-8 bytes with no NUL or
+Across the exact global-message and structured-clone port corpora, fields use their
+own carrier's exact shape and these field-level limits: APS descriptor 256 KiB
+decoded AAX; ADM 512 KiB; `creativeUrl` 4,096 UTF-8 bytes;
+`publisherOrigin` and `adServerDomain` 2,048 UTF-8 bytes; server slot id 1–256 UTF-8 bytes with no NUL or
 ASCII control; and the fixed
 capability forms above. No generic unbounded string remains. Boundary-minus-one,
 boundary, boundary-plus-one, multi-byte UTF-8, duplicate-key, and malformed-encoding
