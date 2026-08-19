@@ -543,39 +543,54 @@ pub(crate) fn run_update_slots(
     let mut planned = None;
     let mut fold_error = None;
 
-    first_collector.collect_site(
-        &target_url,
-        request.cookies,
-        &mut |_, root| {
-            root_url = root.final_url().unwrap_or_else(|_| target_url.clone());
-            if root_url.origin() != target_url.origin() {
-                return cli_error(format!(
-                    "refusing cross-origin root redirect from {} to {}; the requested origin is the audit and cookie trust boundary",
-                    target_url, root_url
-                ));
-            }
-            let plan =
-                crawl_plan::plan_crawl(&root_url, &root.links, &root.sitemap_locs, request.budget);
-            let targets = plan.targets();
-            planned = Some(plan);
-            Ok(targets)
-        },
-        &mut |url, collected| {
-            match collected {
-                Ok(page) => {
-                    let final_url = page.final_url().unwrap_or_else(|_| url.clone());
-                    if let Err(error) = fold_collected(&mut table, &final_url, &page, &mut notes) {
-                        fold_error = Some(error);
-                        return Ok(collector::ControlFlow::Stop);
+    {
+        let mut progress_writer = CollectionProgressWriter {
+            out: err,
+            profile_label: first_label,
+        };
+        let mut report_progress =
+            |progress: collector::CollectionProgress<'_>| progress_writer.write(progress);
+        first_collector.collect_site(
+            &target_url,
+            request.cookies,
+            &mut report_progress,
+            &mut |_, root| {
+                root_url = root.final_url().unwrap_or_else(|_| target_url.clone());
+                if root_url.origin() != target_url.origin() {
+                    return cli_error(format!(
+                        "refusing cross-origin root redirect from {} to {}; the requested origin is the audit and cookie trust boundary",
+                        target_url, root_url
+                    ));
+                }
+                let plan = crawl_plan::plan_crawl(
+                    &root_url,
+                    &root.links,
+                    &root.sitemap_locs,
+                    request.budget,
+                );
+                let targets = plan.targets();
+                planned = Some(plan);
+                Ok(targets)
+            },
+            &mut |url, collected| {
+                match collected {
+                    Ok(page) => {
+                        let final_url = page.final_url().unwrap_or_else(|_| url.clone());
+                        if let Err(error) =
+                            fold_collected(&mut table, &final_url, &page, &mut notes)
+                        {
+                            fold_error = Some(error);
+                            return Ok(collector::ControlFlow::Stop);
+                        }
+                    }
+                    Err(error) => {
+                        notes.push(format!("skipped `{url}` on {first_label}: {error}"));
                     }
                 }
-                Err(error) => {
-                    notes.push(format!("skipped `{url}` on {first_label}: {error}"));
-                }
-            }
-            Ok(collector::ControlFlow::Continue)
-        },
-    )?;
+                Ok(collector::ControlFlow::Continue)
+            },
+        )?;
+    }
     if let Some(error) = fold_error {
         return Err(error);
     }
@@ -590,6 +605,10 @@ pub(crate) fn run_update_slots(
     // disagree about a slot's ad-unit path, that shows up as two observations of
     // one page, which inference already refuses to represent.
     for (label, collector) in collectors.iter().skip(1) {
+        let mut progress_writer = CollectionProgressWriter {
+            out: err,
+            profile_label: label,
+        };
         let successful_pages = crawl_sections(
             *collector,
             &root_url,
@@ -597,7 +616,7 @@ pub(crate) fn run_update_slots(
             request.cookies,
             &mut table,
             &mut notes,
-            label,
+            &mut progress_writer,
         )?;
         if successful_pages == 0 {
             return cli_error(format!(
@@ -837,6 +856,54 @@ fn emit_notes(out: &mut dyn Write, notes: &mut Vec<String>) -> CliResult<()> {
     Ok(())
 }
 
+/// Writes one immediately visible, profile-aware crawl progress line.
+fn write_collection_progress(
+    out: &mut dyn Write,
+    profile_label: &str,
+    progress: collector::CollectionProgress<'_>,
+) -> CliResult<()> {
+    let line = match progress {
+        collector::CollectionProgress::Launching => {
+            format!("Auditing {profile_label}: launching browser")
+        }
+        collector::CollectionProgress::Loading {
+            current,
+            total,
+            url,
+        } => {
+            let path = if url.path().is_empty() {
+                "/"
+            } else {
+                url.path()
+            };
+            let path = crate::ad_templates::output::escape_terminal_text(path);
+            let total = total.map_or_else(|| "?".to_string(), |total| total.to_string());
+            format!("Auditing {profile_label} [{current}/{total}]: {path}")
+        }
+        collector::CollectionProgress::Planning => {
+            format!("Auditing {profile_label}: planning site crawl")
+        }
+        collector::CollectionProgress::Finalizing => {
+            format!("Auditing {profile_label}: finalizing browser session")
+        }
+    };
+    writeln!(out, "{line}")
+        .map_err(|error| report_error(format!("failed to write audit progress: {error}")))?;
+    out.flush()
+        .map_err(|error| report_error(format!("failed to flush audit progress: {error}")))
+}
+
+struct CollectionProgressWriter<'a> {
+    out: &'a mut dyn Write,
+    profile_label: &'a str,
+}
+
+impl CollectionProgressWriter<'_> {
+    fn write(&mut self, progress: collector::CollectionProgress<'_>) -> CliResult<()> {
+        write_collection_progress(self.out, self.profile_label, progress)
+    }
+}
+
 /// Discovers a collected page's slots and folds them into `table`.
 ///
 /// Per-page collector warnings are appended to `notes`. They carry the reason a
@@ -886,7 +953,7 @@ fn crawl_sections(
     cookies: &[(String, String)],
     table: &mut evidence::EvidenceTable,
     notes: &mut Vec<String>,
-    profile_label: &str,
+    progress_writer: &mut CollectionProgressWriter<'_>,
 ) -> CliResult<usize> {
     let additional_targets = plan.targets();
     if additional_targets.is_empty() {
@@ -904,20 +971,32 @@ fn crawl_sections(
 
     let mut fold_error = None;
     let mut successful_pages = 0_usize;
-    collector.collect_pages(&targets, cookies, &mut |url, collected| {
-        match collected {
-            Ok(page) => {
-                successful_pages += 1;
-                let final_url = page.final_url().unwrap_or_else(|_| url.clone());
-                if let Err(error) = fold_collected(table, &final_url, &page, notes) {
-                    fold_error = Some(error);
-                    return Ok(collector::ControlFlow::Stop);
+    {
+        let profile_label = progress_writer.profile_label;
+        let mut report_progress =
+            |progress: collector::CollectionProgress<'_>| progress_writer.write(progress);
+        collector.collect_pages(
+            &targets,
+            cookies,
+            &mut report_progress,
+            &mut |url, collected| {
+                match collected {
+                    Ok(page) => {
+                        successful_pages += 1;
+                        let final_url = page.final_url().unwrap_or_else(|_| url.clone());
+                        if let Err(error) = fold_collected(table, &final_url, &page, notes) {
+                            fold_error = Some(error);
+                            return Ok(collector::ControlFlow::Stop);
+                        }
+                    }
+                    Err(error) => {
+                        notes.push(format!("skipped `{url}` on {profile_label}: {error}"));
+                    }
                 }
-            }
-            Err(error) => notes.push(format!("skipped `{url}` on {profile_label}: {error}")),
-        }
-        Ok(collector::ControlFlow::Continue)
-    })?;
+                Ok(collector::ControlFlow::Continue)
+            },
+        )?;
+    }
     match fold_error {
         Some(error) => Err(error),
         None => Ok(successful_pages),
@@ -1055,7 +1134,9 @@ fn validate_page_patterns(patterns: &[String]) -> CliResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
+    use std::io;
+    use std::rc::Rc;
 
     use tempfile::TempDir;
 
@@ -1116,6 +1197,210 @@ mod tests {
     }
 
     struct FailingCollector;
+
+    #[derive(Clone, Default)]
+    struct SharedProgressState {
+        bytes: Rc<RefCell<Vec<u8>>>,
+        flushes: Rc<Cell<usize>>,
+    }
+
+    struct SharedProgressWriter {
+        state: SharedProgressState,
+    }
+
+    impl Write for SharedProgressWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.state.bytes.borrow_mut().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.state.flushes.set(self.state.flushes.get() + 1);
+            Ok(())
+        }
+    }
+
+    struct ObservingProgressCollector {
+        collected: CollectedPage,
+        state: SharedProgressState,
+        saw_flushed_progress: Cell<bool>,
+    }
+
+    impl AuditCollector for ObservingProgressCollector {
+        fn collect_page(
+            &self,
+            _target_url: &Url,
+            _cookies: &[(String, String)],
+        ) -> CliResult<CollectedPage> {
+            Ok(self.collected.clone())
+        }
+
+        fn collect_site(
+            &self,
+            root: &Url,
+            _cookies: &[(String, String)],
+            on_progress: collector::ProgressSink<'_>,
+            planner: collector::RootPlanner<'_>,
+            on_page: collector::PageSink<'_>,
+        ) -> CliResult<()> {
+            on_progress(collector::CollectionProgress::Loading {
+                current: 1,
+                total: None,
+                url: root,
+            })?;
+            self.saw_flushed_progress
+                .set(!self.state.bytes.borrow().is_empty() && self.state.flushes.get() > 0);
+            on_progress(collector::CollectionProgress::Planning)?;
+            let _ = planner(root, &self.collected)?;
+            let _ = on_page(root, Ok(self.collected.clone()))?;
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct ProgressWriter {
+        bytes: Vec<u8>,
+        flushes: usize,
+        fail_write: bool,
+        fail_flush: bool,
+    }
+
+    impl Write for ProgressWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if self.fail_write {
+                return Err(io::Error::other("simulated progress write failure"));
+            }
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            if self.fail_flush {
+                return Err(io::Error::other("simulated progress flush failure"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn progress_lines_are_profile_aware_and_flush_immediately() {
+        let url =
+            Url::parse("https://user:pass@publisher.example/news\u{1b}[31m?token=secret#fragment")
+                .expect("should parse progress URL");
+        let mut writer = ProgressWriter::default();
+
+        for progress in [
+            collector::CollectionProgress::Launching,
+            collector::CollectionProgress::Loading {
+                current: 1,
+                total: None,
+                url: &url,
+            },
+            collector::CollectionProgress::Planning,
+            collector::CollectionProgress::Loading {
+                current: 2,
+                total: Some(17),
+                url: &url,
+            },
+            collector::CollectionProgress::Finalizing,
+        ] {
+            write_collection_progress(&mut writer, "desktop", progress)
+                .expect("should write progress");
+        }
+
+        let rendered = String::from_utf8(writer.bytes).expect("should render UTF-8 progress");
+        assert_eq!(
+            rendered,
+            "Auditing desktop: launching browser\n\
+             Auditing desktop [1/?]: /news%1B[31m\n\
+             Auditing desktop: planning site crawl\n\
+             Auditing desktop [2/17]: /news%1B[31m\n\
+             Auditing desktop: finalizing browser session\n"
+        );
+        assert_eq!(writer.flushes, 5, "should flush every progress line");
+        assert!(!rendered.contains("user"), "should omit URL userinfo");
+        assert!(!rendered.contains("secret"), "should omit URL query values");
+        assert!(!rendered.contains("fragment"), "should omit URL fragments");
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "should not emit terminal escapes"
+        );
+    }
+
+    #[test]
+    fn progress_write_and_flush_failures_are_reported() {
+        let mut write_failure = ProgressWriter {
+            fail_write: true,
+            ..ProgressWriter::default()
+        };
+        let write_error = write_collection_progress(
+            &mut write_failure,
+            "desktop",
+            collector::CollectionProgress::Launching,
+        )
+        .expect_err("should report progress write failure");
+        assert!(format!("{write_error:?}").contains("failed to write audit progress"));
+
+        let mut flush_failure = ProgressWriter {
+            fail_flush: true,
+            ..ProgressWriter::default()
+        };
+        let flush_error = write_collection_progress(
+            &mut flush_failure,
+            "desktop",
+            collector::CollectionProgress::Finalizing,
+        )
+        .expect_err("should report progress flush failure");
+        assert!(format!("{flush_error:?}").contains("failed to flush audit progress"));
+    }
+
+    #[test]
+    fn update_slots_flushes_progress_before_collection_returns() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        fs::write(
+            &config_path,
+            "[creative_opportunities]\ngam_network_id = \"123456789\"\n",
+        )
+        .expect("should write config");
+        let state = SharedProgressState::default();
+        let collector = ObservingProgressCollector {
+            collected: collected_page_with_header_slot(),
+            state: state.clone(),
+            saw_flushed_progress: Cell::new(false),
+        };
+        let mut progress_writer = SharedProgressWriter { state };
+        let mut out = Vec::new();
+
+        run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &collector)],
+            &mut out,
+            &mut progress_writer,
+        )
+        .expect("should generate slots");
+
+        assert!(
+            collector.saw_flushed_progress.get(),
+            "collector should observe flushed progress before returning"
+        );
+        assert!(
+            !String::from_utf8(out)
+                .expect("should write UTF-8 output")
+                .contains("Auditing "),
+            "stdout should not contain progress"
+        );
+    }
 
     impl AuditCollector for FailingCollector {
         fn collect_page(
@@ -2046,8 +2331,25 @@ mod tests {
         .expect_err("an all-refused crawl must not write an empty slot array");
 
         assert!(format!("{error:?}").contains("zero generated slots"));
+        let progress = String::from_utf8_lossy(&err);
+        for expected in [
+            "Auditing desktop [1/?]: /",
+            "Auditing desktop: planning site crawl",
+            "Auditing desktop [2/2]: /news",
+            "Auditing mobile [1/2]: /",
+            "Auditing mobile [2/2]: /news",
+        ] {
+            assert!(
+                progress.contains(expected),
+                "should report `{expected}` while crawling, got:\n{progress}"
+            );
+        }
         assert!(
-            String::from_utf8_lossy(&err).contains("skipped refused slot"),
+            !String::from_utf8_lossy(&out).contains("Auditing "),
+            "progress must remain on stderr"
+        );
+        assert!(
+            progress.contains("skipped refused slot"),
             "the refusal reason should be reported"
         );
         assert_eq!(

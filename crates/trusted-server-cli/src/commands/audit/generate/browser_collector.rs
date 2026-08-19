@@ -18,7 +18,7 @@ use crate::commands::audit::browser::{
 use crate::commands::audit::collector::GenerateBrowserOpts;
 use crate::commands::audit::generate::collector::{
     AuditCollector, CollectedGptSlot, CollectedLink, CollectedPage, CollectedRequest,
-    CollectedScriptTag, ControlFlow, PageSink, RootPlanner,
+    CollectedScriptTag, CollectionProgress, ControlFlow, PageSink, ProgressSink, RootPlanner,
 };
 use crate::error::{CliResult, report_error};
 
@@ -215,6 +215,10 @@ impl BrowserAuditCollector {
     }
 }
 
+fn ignore_collection_progress(_: CollectionProgress<'_>) -> CliResult<()> {
+    Ok(())
+}
+
 impl AuditCollector for BrowserAuditCollector {
     fn collect_page(
         &self,
@@ -233,11 +237,13 @@ impl AuditCollector for BrowserAuditCollector {
         let settings = self.session();
         runtime.block_on(async {
             let mut collected = None;
+            let mut ignore_progress = ignore_collection_progress;
             with_browser(
                 vec![target_url.clone()],
                 cookies,
                 settings,
                 None,
+                &mut ignore_progress,
                 &mut |_, result| {
                     collected = Some(result);
                     Ok(ControlFlow::Stop)
@@ -252,6 +258,7 @@ impl AuditCollector for BrowserAuditCollector {
         &self,
         targets: &[Url],
         cookies: &[(String, String)],
+        on_progress: ProgressSink<'_>,
         on_page: PageSink<'_>,
     ) -> CliResult<()> {
         if targets.is_empty() {
@@ -275,6 +282,7 @@ impl AuditCollector for BrowserAuditCollector {
             cookies,
             self.session(),
             None,
+            on_progress,
             &mut |url, result| {
                 collected_pages.push((url.clone(), result));
                 Ok(ControlFlow::Continue)
@@ -292,6 +300,7 @@ impl AuditCollector for BrowserAuditCollector {
         &self,
         root: &Url,
         cookies: &[(String, String)],
+        on_progress: ProgressSink<'_>,
         planner: RootPlanner<'_>,
         on_page: PageSink<'_>,
     ) -> CliResult<()> {
@@ -309,6 +318,7 @@ impl AuditCollector for BrowserAuditCollector {
             cookies,
             self.session(),
             Some(planner),
+            on_progress,
             &mut |url, result| {
                 collected_pages.push((url.clone(), result));
                 Ok(ControlFlow::Continue)
@@ -336,6 +346,7 @@ async fn with_browser(
     cookies: &[(String, String)],
     settings: SessionSettings,
     mut root_planner: Option<RootPlanner<'_>>,
+    on_progress: ProgressSink<'_>,
     sink: PageSink<'_>,
 ) -> CliResult<()> {
     let SessionSettings {
@@ -367,6 +378,7 @@ async fn with_browser(
     })
     .map_err(report_error)?;
 
+    on_progress(CollectionProgress::Launching)?;
     let (mut browser, mut handler) = Browser::launch(config).await.map_err(|error| {
         report_error(format!(
             "failed to launch Chrome/Chromium for audit: {error}"
@@ -376,10 +388,23 @@ async fn with_browser(
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
     // Sitemap discovery is a whole-site fact, so only the first target pays for it.
-    let mut result = Ok(());
+    let mut result: CliResult<()> = Ok(());
     let mut index = 0;
     while index < targets.len() {
         let target = targets[index].clone();
+        let total = if index == 0 && root_planner.is_some() {
+            None
+        } else {
+            Some(targets.len())
+        };
+        if let Err(error) = on_progress(CollectionProgress::Loading {
+            current: index + 1,
+            total,
+            url: &target,
+        }) {
+            result = Err(error);
+            break;
+        }
         // Pace the crawl. Back-to-back navigations are both discourteous to the
         // origin and a signal bot protection scores against the session.
         if index > 0 && !page_delay.is_zero() {
@@ -399,6 +424,10 @@ async fn with_browser(
             && let Some(planner) = root_planner.as_deref_mut()
             && let Ok(root_page) = &collected
         {
+            if let Err(error) = on_progress(CollectionProgress::Planning) {
+                result = Err(error);
+                break;
+            }
             match planner(&target, root_page) {
                 Ok(planned) => targets.extend(planned),
                 Err(error) => {
@@ -418,6 +447,7 @@ async fn with_browser(
         index += 1;
     }
 
+    let finalization_result = on_progress(CollectionProgress::Finalizing);
     let close_result = timeout(BROWSER_CLOSE_TIMEOUT, browser.close())
         .await
         .map_err(|_| report_error("timed out closing browser after audit"))
@@ -442,20 +472,20 @@ async fn with_browser(
     handler_task.abort();
     let _ = handler_task.await;
 
-    let teardown_result = combine_browser_teardown_results(close_result, wait_result);
-
-    match (result, teardown_result) {
-        (Ok(()), Ok(_)) => Ok(()),
-        (Ok(()), Err(error)) | (Err(error), _) => Err(error),
-    }
+    combine_browser_run_results(result, finalization_result, close_result, wait_result)
 }
 
-/// Combines already-attempted browser teardown phases, preserving the first error.
-fn combine_browser_teardown_results(
+/// Combines already-attempted browser phases, preserving the first error.
+fn combine_browser_run_results(
+    run_result: CliResult<()>,
+    finalization_result: CliResult<()>,
     close_result: CliResult<()>,
     wait_result: CliResult<()>,
 ) -> CliResult<()> {
-    close_result.and(wait_result)
+    run_result
+        .and(finalization_result)
+        .and(close_result)
+        .and(wait_result)
 }
 
 /// Collects one page on an already-launched browser.
@@ -1051,6 +1081,18 @@ mod tests {
 
     use super::*;
 
+    /// Skips optional local runs, but makes the scripted/CI contract fail loudly.
+    fn browser_fixture_available() -> bool {
+        if resolve_chrome(None).is_ok() {
+            return true;
+        }
+        assert!(
+            std::env::var_os("TS_AUDIT_BROWSER_TESTS").is_none(),
+            "TS_AUDIT_BROWSER_TESTS requires Chrome/Chromium; set CHROME to its executable"
+        );
+        false
+    }
+
     #[test]
     fn successful_navigation_status_allows_redirects_but_rejects_errors() {
         assert!(is_successful_navigation_status(200));
@@ -1099,8 +1141,10 @@ mod tests {
     }
 
     #[test]
-    fn browser_teardown_reports_close_error_before_wait_error() {
-        let result = combine_browser_teardown_results(
+    fn browser_run_reports_close_error_before_wait_error() {
+        let result = combine_browser_run_results(
+            Ok(()),
+            Ok(()),
             Err("close failed".to_string()),
             Err("wait failed".to_string()),
         );
@@ -1113,14 +1157,89 @@ mod tests {
     }
 
     #[test]
-    fn browser_teardown_reports_wait_error_when_close_succeeds() {
-        let result = combine_browser_teardown_results(Ok(()), Err("wait failed".to_string()));
+    fn browser_run_reports_wait_error_when_close_succeeds() {
+        let result =
+            combine_browser_run_results(Ok(()), Ok(()), Ok(()), Err("wait failed".to_string()));
 
         assert_eq!(
             result.expect_err("should preserve wait error"),
             "wait failed",
             "a wait failure must not be mislabeled as a close failure"
         );
+    }
+
+    #[test]
+    fn browser_run_preserves_collection_error_over_later_failures() {
+        let result = combine_browser_run_results(
+            Err("collection failed".to_string()),
+            Err("finalization progress failed".to_string()),
+            Err("close failed".to_string()),
+            Err("wait failed".to_string()),
+        );
+
+        assert_eq!(
+            result.expect_err("should preserve first browser run error"),
+            "collection failed"
+        );
+    }
+
+    #[test]
+    fn browser_run_reports_finalization_progress_before_teardown_errors() {
+        let result = combine_browser_run_results(
+            Ok(()),
+            Err("finalization progress failed".to_string()),
+            Err("close failed".to_string()),
+            Err("wait failed".to_string()),
+        );
+
+        assert_eq!(
+            result.expect_err("should preserve finalization progress error"),
+            "finalization progress failed"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Chrome/Chromium; run through scripts/test-cli.sh"]
+    fn progress_failure_still_finalizes_browser_session() {
+        if !browser_fixture_available() {
+            return;
+        }
+
+        let collector = BrowserAuditCollector::default();
+        let target = Url::parse("http://127.0.0.1:9/").expect("should parse fixture URL");
+        let mut phases = Vec::new();
+        let error = collector
+            .collect_pages(
+                &[target],
+                &[],
+                &mut |progress| match progress {
+                    CollectionProgress::Launching => {
+                        phases.push("launching");
+                        Ok(())
+                    }
+                    CollectionProgress::Loading { .. } => {
+                        phases.push("loading");
+                        Err(report_error("simulated progress failure"))
+                    }
+                    CollectionProgress::Planning => {
+                        phases.push("planning");
+                        Ok(())
+                    }
+                    CollectionProgress::Finalizing => {
+                        phases.push("finalizing");
+                        Ok(())
+                    }
+                },
+                &mut |_, _| panic!("page sink should not run after progress failure"),
+            )
+            .expect_err("should return progress failure after browser teardown");
+
+        let rendered_error = format!("{error:?}");
+        assert!(
+            rendered_error.contains("simulated progress failure"),
+            "should preserve progress failure, got {rendered_error}"
+        );
+        assert_eq!(phases, ["launching", "loading", "finalizing"]);
     }
 
     fn navigation_response_with_status(status: i64, status_text: &str) -> ArcHttpRequest {

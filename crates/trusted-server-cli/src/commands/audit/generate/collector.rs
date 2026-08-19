@@ -3,6 +3,33 @@ use url::Url;
 
 use crate::error::CliResult;
 
+/// A user-visible phase reached while collecting browser audit evidence.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CollectionProgress<'a> {
+    /// The browser process is about to launch.
+    Launching,
+    /// A page navigation is about to begin.
+    Loading {
+        /// One-based position of this attempted page in the crawl.
+        current: usize,
+        /// Total pages when planning has completed, or `None` for the root.
+        total: Option<usize>,
+        /// Target page; renderers must omit credentials, query, and fragment.
+        url: &'a Url,
+    },
+    /// Follow-up pages are being selected from the collected root page.
+    Planning,
+    /// The browser session is being closed and its process reaped.
+    Finalizing,
+}
+
+/// Sink invoked synchronously when browser collection reaches a visible phase.
+///
+/// Returning an error stops new collection work. An already-launched browser
+/// must still be finalized, closed, and waited on before that error is returned.
+pub(crate) type ProgressSink<'a> =
+    &'a mut dyn for<'event> FnMut(CollectionProgress<'event>) -> CliResult<()>;
+
 /// Sink invoked once per collected page during a batch crawl.
 ///
 /// Receives the per-page outcome so a failed page can be folded into the run as
@@ -53,9 +80,15 @@ pub(crate) trait AuditCollector {
         &self,
         targets: &[Url],
         cookies: &[(String, String)],
+        on_progress: ProgressSink<'_>,
         on_page: PageSink<'_>,
     ) -> CliResult<()> {
-        for target in targets {
+        for (index, target) in targets.iter().enumerate() {
+            on_progress(CollectionProgress::Loading {
+                current: index + 1,
+                total: Some(targets.len()),
+                url: target,
+            })?;
             let collected = self.collect_page(target, cookies);
             if on_page(target, collected)? == ControlFlow::Stop {
                 break;
@@ -73,15 +106,34 @@ pub(crate) trait AuditCollector {
         &self,
         root: &Url,
         cookies: &[(String, String)],
+        on_progress: ProgressSink<'_>,
         planner: RootPlanner<'_>,
         on_page: PageSink<'_>,
     ) -> CliResult<()> {
+        on_progress(CollectionProgress::Loading {
+            current: 1,
+            total: None,
+            url: root,
+        })?;
         let root_page = self.collect_page(root, cookies)?;
+        on_progress(CollectionProgress::Planning)?;
         let targets = planner(root, &root_page)?;
         if on_page(root, Ok(root_page))? == ControlFlow::Stop {
             return Ok(());
         }
-        self.collect_pages(&targets, cookies, on_page)
+        let total = targets.len() + 1;
+        for (index, target) in targets.iter().enumerate() {
+            on_progress(CollectionProgress::Loading {
+                current: index + 2,
+                total: Some(total),
+                url: target,
+            })?;
+            let collected = self.collect_page(target, cookies);
+            if on_page(target, collected)? == ControlFlow::Stop {
+                break;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -123,6 +175,141 @@ pub(crate) struct CollectedLink {
     /// `[role="navigation"]`). Nav links are the publisher's own declaration of
     /// its taxonomy, so they rank above body links when choosing sections.
     pub(crate) in_nav: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::{cli_error, report_error};
+
+    struct ProgressCollector;
+
+    impl AuditCollector for ProgressCollector {
+        fn collect_page(
+            &self,
+            target_url: &Url,
+            _cookies: &[(String, String)],
+        ) -> CliResult<CollectedPage> {
+            if target_url.path() == "/broken" {
+                return cli_error("simulated page failure");
+            }
+            Ok(CollectedPage {
+                requested_url: target_url.to_string(),
+                final_url: target_url.to_string(),
+                page_title: None,
+                html: String::new(),
+                script_tags: Vec::new(),
+                network_requests: Vec::new(),
+                gpt_slots: Vec::new(),
+                links: Vec::new(),
+                sitemap_locs: Vec::new(),
+                warnings: Vec::new(),
+            })
+        }
+    }
+
+    fn record_progress(event: CollectionProgress<'_>) -> String {
+        match event {
+            CollectionProgress::Launching => "launching".to_string(),
+            CollectionProgress::Loading {
+                current,
+                total,
+                url,
+            } => format!(
+                "loading:{current}/{}:{}",
+                total.map_or_else(|| "?".to_string(), |total| total.to_string()),
+                url.path()
+            ),
+            CollectionProgress::Planning => "planning".to_string(),
+            CollectionProgress::Finalizing => "finalizing".to_string(),
+        }
+    }
+
+    #[test]
+    fn default_collect_site_reports_root_planning_and_offset_followups() {
+        let collector = ProgressCollector;
+        let root = Url::parse("https://publisher.example/").expect("should parse root URL");
+        let news = Url::parse("https://publisher.example/news").expect("should parse news URL");
+        let broken =
+            Url::parse("https://publisher.example/broken").expect("should parse broken URL");
+        let mut events = Vec::new();
+        let mut outcomes = Vec::new();
+
+        collector
+            .collect_site(
+                &root,
+                &[],
+                &mut |event| {
+                    events.push(record_progress(event));
+                    Ok(())
+                },
+                &mut |_, _| Ok(vec![news.clone(), broken.clone()]),
+                &mut |url, result| {
+                    outcomes.push((url.path().to_string(), result.is_ok()));
+                    Ok(ControlFlow::Continue)
+                },
+            )
+            .expect("should collect site despite one page outcome failing");
+
+        assert_eq!(
+            events,
+            [
+                "loading:1/?:/",
+                "planning",
+                "loading:2/3:/news",
+                "loading:3/3:/broken",
+            ]
+        );
+        assert_eq!(
+            outcomes,
+            [
+                ("/".to_string(), true),
+                ("/news".to_string(), true),
+                ("/broken".to_string(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn default_collect_pages_reports_a_fixed_total() {
+        let collector = ProgressCollector;
+        let targets = [
+            Url::parse("https://publisher.example/").expect("should parse root URL"),
+            Url::parse("https://publisher.example/broken").expect("should parse broken URL"),
+        ];
+        let mut events = Vec::new();
+
+        collector
+            .collect_pages(
+                &targets,
+                &[],
+                &mut |event| {
+                    events.push(record_progress(event));
+                    Ok(())
+                },
+                &mut |_, _| Ok(ControlFlow::Continue),
+            )
+            .expect("should deliver failed page as an outcome");
+
+        assert_eq!(events, ["loading:1/2:/", "loading:2/2:/broken"]);
+    }
+
+    #[test]
+    fn default_collection_stops_when_progress_fails() {
+        let collector = ProgressCollector;
+        let targets = [Url::parse("https://publisher.example/").expect("should parse root URL")];
+
+        let error = collector
+            .collect_pages(
+                &targets,
+                &[],
+                &mut |_| Err(report_error("simulated progress failure")),
+                &mut |_, _| panic!("page sink should not run after progress failure"),
+            )
+            .expect_err("should return progress failure");
+
+        assert!(format!("{error:?}").contains("simulated progress failure"));
+    }
 }
 
 /// A single slot read from the page's live GPT registry.
