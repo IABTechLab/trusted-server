@@ -16,6 +16,7 @@
 //! auth-gated and operator-facing, responses intentionally include full
 //! internal detail (raw consent strings, partner UIDs, parse errors).
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
@@ -47,6 +48,22 @@ const ADMIN_EC_PATH: &str = "/_ts/admin/ec";
 /// Route used by the request-only EID cookie diagnostic.
 const ADMIN_EIDS_PATH: &str = "/_ts/admin/eids";
 
+/// Reserved Trusted Server admin prefix.
+///
+/// Mirrors the documented `^/_ts/admin` basic-auth handler regex, so every
+/// path that handler authenticates is also reserved at the fallback boundary.
+/// Matching on the bare prefix — rather than on `/_ts/admin` plus a literal
+/// `/` — also covers percent-encoded separators such as `/_ts/admin%2Fec`,
+/// which the auth handler matches but a literal-slash check does not.
+const ADMIN_NAMESPACE_PREFIX: &str = "/_ts/admin";
+
+/// Retired non-`/_ts` admin key alias prefix.
+///
+/// The exact `/admin/keys/rotate` and `/admin/keys/deactivate` aliases are
+/// routed to a local deny by each adapter; the rest of the retired namespace
+/// (trailing, descendant, and encoded-separator forms) is reserved here.
+const RETIRED_ADMIN_KEYS_PREFIX: &str = "/admin/keys";
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum AdminDiagnosticShape {
     ValidResource,
@@ -66,15 +83,36 @@ fn admin_diagnostic_shape(path: &str) -> Option<AdminDiagnosticShape> {
         });
     }
 
-    if path.starts_with("/_ts/admin/eids/") {
-        return Some(AdminDiagnosticShape::Malformed);
-    }
-
     // Reserve the complete admin namespace at the publisher-fallback boundary.
     // A successfully authenticated malformed or future admin path must never
     // forward its Authorization header or body to the publisher origin.
-    (path == "/_ts/admin" || path.starts_with("/_ts/admin/"))
-        .then_some(AdminDiagnosticShape::Malformed)
+    let reserved = is_reserved_admin_path(path)
+        || percent_decoded_path(path).is_some_and(|decoded| is_reserved_admin_path(&decoded));
+
+    reserved.then_some(AdminDiagnosticShape::Malformed)
+}
+
+/// Returns whether `path` sits in a namespace that must never reach publisher
+/// fallback, because doing so would forward Trusted Server admin credentials
+/// and request bodies to the publisher origin.
+fn is_reserved_admin_path(path: &str) -> bool {
+    path.starts_with(ADMIN_NAMESPACE_PREFIX) || path.starts_with(RETIRED_ADMIN_KEYS_PREFIX)
+}
+
+/// Percent-decodes `path` once, returning `None` when the path contains no
+/// escape sequence or decodes to invalid UTF-8.
+///
+/// Routers and the basic-auth matcher both operate on the raw path, so an
+/// encoded separator can shift a request out of the literal admin namespace
+/// while still matching the admin auth handler. Checking the decoded form as
+/// well keeps the reservation closed for `%2F`, `%2f`, and their
+/// double-encoded variants.
+fn percent_decoded_path(path: &str) -> Option<String> {
+    if !path.contains('%') {
+        return None;
+    }
+
+    urlencoding::decode(path).ok().map(Cow::into_owned)
 }
 
 /// Returns a local denial response when an admin diagnostic request reaches
@@ -82,8 +120,11 @@ fn admin_diagnostic_shape(path: &str) -> Option<AdminDiagnosticShape> {
 ///
 /// Valid diagnostic resources reject non-GET methods with `405 Method Not
 /// Allowed`. Malformed, trailing, unknown, and any valid GET admin route that
-/// unexpectedly reaches fallback return `404 Not Found`. Paths outside the
-/// reserved `/_ts/admin` namespace return `None`, preserving normal fallback.
+/// unexpectedly reaches fallback return `404 Not Found`. The reservation
+/// spans the whole `/_ts/admin` prefix — including percent-encoded separators
+/// such as `/_ts/admin%2Fec` — plus the retired `/admin/keys` alias namespace,
+/// evaluated on both the raw and the percent-decoded path. Paths outside those
+/// namespaces return `None`, preserving normal fallback.
 #[must_use]
 pub fn deny_admin_diagnostic_fallback(req: &Request<EdgeBody>) -> Option<Response<EdgeBody>> {
     let shape = admin_diagnostic_shape(req.uri().path())?;
@@ -748,13 +789,84 @@ mod tests {
     }
 
     #[test]
-    fn admin_diagnostic_fallback_ignores_unrelated_publisher_paths() {
-        let request = request_with_method(http::Method::POST, "/articles/example");
+    fn admin_diagnostic_fallback_reserves_encoded_admin_separators() {
+        // `/_ts/admin%2Fec` matches the documented `^/_ts/admin` basic-auth
+        // handler, so it is authenticated, but a literal-slash namespace check
+        // misses it. Reaching publisher fallback would forward the caller's
+        // `Authorization` header and body to the origin.
+        let paths = [
+            "/_ts/admin%2Fec",
+            "/_ts/admin%2fec",
+            "/_ts/admin%2Fkeys/rotate",
+            "/_ts/admin%252Fec",
+            "/_ts/admin%5Cec",
+            "/_ts/adminec",
+            "/%5Fts/admin/ec",
+        ];
 
-        assert!(
-            deny_admin_diagnostic_fallback(&request).is_none(),
-            "should leave unrelated publisher fallback unchanged"
-        );
+        for path in paths {
+            for method in [http::Method::GET, http::Method::POST] {
+                let request = request_with_method(method.clone(), path);
+                let response = deny_admin_diagnostic_fallback(&request)
+                    .unwrap_or_else(|| panic!("should deny {method} {path} locally"));
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "should deny {path} before publisher fallback"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn admin_diagnostic_fallback_reserves_retired_admin_keys_namespace() {
+        // The retired non-`/_ts` aliases are not covered by the `^/_ts/admin`
+        // basic-auth handler. Only the two exact paths are routed to a local
+        // deny, so trailing, descendant, and encoded-separator forms must be
+        // denied at the shared fallback boundary instead.
+        let paths = [
+            "/admin/keys",
+            "/admin/keys/",
+            "/admin/keys/rotate/",
+            "/admin/keys/rotate/extra",
+            "/admin/keys%2Frotate",
+            "/admin/keys%2frotate",
+            "/admin%2Fkeys/rotate",
+            "/admin%2fkeys%2Frotate",
+        ];
+
+        for path in paths {
+            for method in [http::Method::GET, http::Method::POST] {
+                let request = request_with_method(method.clone(), path);
+                let response = deny_admin_diagnostic_fallback(&request)
+                    .unwrap_or_else(|| panic!("should deny {method} {path} locally"));
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "should deny {path} before publisher fallback"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn admin_diagnostic_fallback_ignores_unrelated_publisher_paths() {
+        for path in [
+            "/articles/example",
+            "/admin",
+            "/admin/login",
+            "/admin/keyboards",
+            "/_ts/api/v1/batch-sync",
+        ] {
+            let request = request_with_method(http::Method::POST, path);
+
+            assert!(
+                deny_admin_diagnostic_fallback(&request).is_none(),
+                "should leave unrelated publisher fallback unchanged for {path}"
+            );
+        }
     }
 
     #[test]

@@ -126,6 +126,29 @@ mod tests {
     }
 
     #[test]
+    fn encoded_admin_separator_path_is_auth_gated() {
+        // `^/_ts/admin` matches the raw path, so a percent-encoded separator
+        // still consumes admin credentials. The publisher-fallback boundary
+        // reserves the same paths so those credentials are never forwarded
+        // upstream (see `ec::admin::deny_admin_diagnostic_fallback`).
+        let settings = create_test_settings();
+
+        for path in ["/_ts/admin%2Fec", "/_ts/admin%2fec"] {
+            let req = build_request(Method::GET, &format!("https://example.com{path}"));
+
+            let response = enforce_basic_auth(&settings, &req)
+                .expect("should evaluate auth")
+                .unwrap_or_else(|| panic!("should challenge {path}"));
+
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "should require credentials for {path}"
+            );
+        }
+    }
+
+    #[test]
     fn no_challenge_for_non_protected_path() {
         let settings = create_test_settings();
         let req = build_request(Method::GET, "https://example.com/open");

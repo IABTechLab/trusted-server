@@ -396,6 +396,18 @@ async fn authenticated_admin_diagnostic_fallback_is_denied_locally() {
         "/_ts/admin/eids.json".to_owned(),
         "/_ts/admin/ec;foo".to_owned(),
         format!("/_ts/admin/ec%2F{ec_id}"),
+        // Percent-encoded separators match the `^/_ts/admin` basic-auth
+        // handler but not a literal-slash namespace check, so they must be
+        // reserved before publisher fallback forwards credentials upstream.
+        "/_ts/admin%2Fec".to_owned(),
+        "/_ts/admin%2fec".to_owned(),
+        // Retired non-`/_ts` alias namespace: only the two exact paths are
+        // routed to a local deny, so descendants and encoded separators must
+        // be reserved at the shared fallback boundary.
+        "/admin/keys".to_owned(),
+        "/admin/keys/rotate/extra".to_owned(),
+        "/admin/keys%2Frotate".to_owned(),
+        "/admin%2fkeys/rotate".to_owned(),
     ] {
         for method in ["GET", "POST"] {
             let request = request_builder()
