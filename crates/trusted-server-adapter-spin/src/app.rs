@@ -372,9 +372,13 @@ fn health_response() -> Response {
 /// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
 /// `/_ts/page-bids`, and the publisher fallback).
 ///
-/// Spin's platform geo is a no-op, so jurisdiction stays Unknown unless the
-/// request carries TCF consent, and a geo lookup failure is logged and treated
-/// as no location.
+/// The geo lookup runs inside
+/// [`EcContext::read_from_request_resolving_geo`], so every adapter reports the
+/// same distinction: no location falls back to the configured
+/// `[geo] default_country` baseline, while a failed lookup resolves every
+/// permission at the requires-signal floor and is logged at error level.
+/// Spin's platform geo is a no-op, so a request resolves at the default country
+/// unless it carries a signal.
 ///
 /// Mirrors the Fastly entry point, which keeps the report and answers with an
 /// error response: when the Edge Cookie context cannot be read the request
@@ -392,14 +396,7 @@ fn build_ec_context(
     services: &RuntimeServices,
     req: &Request,
 ) -> Result<EcContext, Report<TrustedServerError>> {
-    let geo_info = services
-        .geo()
-        .lookup(services.client_info().client_ip)
-        .unwrap_or_else(|e| {
-            log::warn!("geo lookup failed: {e}");
-            None
-        });
-    EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref())
+    EcContext::read_from_request_resolving_geo(settings, req, services)
 }
 
 fn admin_key_management_not_supported() -> Response {

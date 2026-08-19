@@ -63,9 +63,8 @@ pub fn generate_ec_id(
     // host signals takes them from the injected `HostSignals` service rather
     // than from this request info.
     let request_info = BorrowedRequestInfo::new(&client_ip, request_headers);
-    // The publisher path gates creation on the request's consent context at
-    // the call site, and the built-in provider reads neither that result nor
-    // the consent context, so
+    // The publisher path applies the permission gate at the call site, and the
+    // built-in provider reads neither the resolved permissions nor consent, so
     // they are not threaded here.
     let generated = provider.generate(&request_info, &IdentityInput::default())?;
     let generated = crate::ec::provider::GeneratedEdgeCookie {

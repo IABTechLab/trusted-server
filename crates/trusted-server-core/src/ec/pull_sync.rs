@@ -55,10 +55,13 @@ struct PullSyncResponse {
 
 /// Builds post-send pull-sync context from the route EC context.
 ///
-/// Returns `None` when consent denies EC or there is no active EC ID.
+/// Returns `None` when sharing is not permitted or there is no active EC ID.
+/// Pull sync sends the identifier to a partner, so it needs the same
+/// permission pair as bidstream EIDs (storage plus personalised-ad
+/// selection), not only the provider's storage permission.
 #[must_use]
 pub fn build_pull_sync_context(ec_context: &EcContext) -> Option<PullSyncContext> {
-    if !ec_context.ec_allowed() {
+    if !ec_context.ec_sharing_allowed() {
         return None;
     }
 

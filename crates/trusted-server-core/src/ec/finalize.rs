@@ -12,7 +12,6 @@ use crate::constants::EC_RESPONSE_HEADERS;
 use crate::settings::Settings;
 
 use super::EcContext;
-use super::consent::ec_consent_withdrawn;
 use super::cookies::{expire_ec_cookie, set_ec_cookie};
 use super::kv::KvIdentityGraph;
 use super::log_id;
@@ -22,7 +21,7 @@ use super::registry::PartnerRegistry;
 
 /// Finalizes EC response behavior for all routes.
 ///
-/// Applies the resolved consent gate, cookie reconciliation, Prebid EID
+/// Applies the resolved permission state, cookie reconciliation, Prebid EID
 /// ingestion, and cookie writes for new EC generation.
 ///
 /// When the request carries an explicit withdrawal signal (a storage opt-out or
@@ -68,10 +67,10 @@ pub fn ec_finalize_response(
 
         // Only expire the browser cookie and tombstone the identity-graph row
         // when the request carries an explicit withdrawal signal. A pre-consent
-        // or fail-closed state (consent is simply not granted) strips headers
+        // or fail-closed state (the permission is simply not set) strips headers
         // but must not destroy an already-issued identifier, or a returning user
         // would be permanently withdrawn before they ever get to consent.
-        if ec_consent_withdrawn(ec_context.consent()) && ec_context.cookie_was_present() {
+        if ec_context.storage_withdrawn() && ec_context.cookie_was_present() {
             expire_ec_cookie(settings, response);
 
             // Compute once for the authoritative identity-graph tombstones.
@@ -477,9 +476,12 @@ mod tests {
     fn finalize_withdrawal_clears_cookie_and_headers() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("aBc123");
+        // A TCF record refusing storage is the withdrawal trigger. The test
+        // context resolves the storage baseline at the requires-signal floor,
+        // where refusing the signal storage depends on is destructive.
         let consent = ConsentContext {
-            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
-            gpc: true,
+            jurisdiction: Jurisdiction::Gdpr,
+            tcf: Some(refusing_tcf()),
             source: ConsentSource::Cookie,
             ..Default::default()
         };
@@ -527,6 +529,65 @@ mod tests {
         assert!(
             set_cookie.contains("Max-Age=0"),
             "withdrawal should set Max-Age=0"
+        );
+    }
+
+    /// A decoded TCF record refusing every purpose, storage included.
+    fn refusing_tcf() -> crate::consent::TcfConsent {
+        crate::consent::TcfConsent {
+            version: 2,
+            cmp_id: 0,
+            cmp_version: 0,
+            consent_screen: 0,
+            consent_language: "EN".to_owned(),
+            vendor_list_version: 0,
+            tcf_policy_version: 2,
+            created_ds: 0,
+            last_updated_ds: 0,
+            purpose_consents: vec![false; 24],
+            purpose_legitimate_interests: vec![false; 24],
+            vendor_consents: Vec::new(),
+            vendor_legitimate_interests: Vec::new(),
+            special_feature_opt_ins: vec![false; 12],
+        }
+    }
+
+    #[test]
+    fn finalize_gpc_suppresses_headers_but_keeps_the_cookie() {
+        // A US-style opt-out suppresses use (headers cleared, nothing egressed)
+        // but is never destructive: the browser cookie is not expired, so a
+        // visitor who later withdraws the opt-out keeps their identity.
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("aBc123");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let ec_context =
+            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent, false);
+        let mut response = empty_response();
+        set_header(&mut response, "x-ts-ec", "stale");
+
+        let test_registry = PartnerRegistry::empty();
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            None,
+            &test_registry,
+            None,
+            None,
+            &mut response,
+        );
+
+        assert!(
+            get_header(&response, "x-ts-ec").is_none(),
+            "the opt-out should clear the EC header"
+        );
+        assert!(
+            get_header(&response, "set-cookie").is_none(),
+            "the opt-out should not expire the browser cookie"
         );
     }
 
@@ -736,10 +797,10 @@ mod tests {
     }
 
     #[test]
-    fn closed_consent_gate_writes_no_ec_cookie() {
-        // The gate: with the consent gate closed (ec_allowed = false), no
+    fn closed_permission_gate_writes_no_ec_cookie() {
+        // The gate: with the permission gate closed (ec_allowed = false), no
         // ts-ec cookie is written, even when an EC value and a generated flag are
-        // present. The consent gate is what suppresses the cookie.
+        // present. The permission model is what suppresses the cookie.
         let settings = create_test_settings();
         let ec_id = sample_ec_id("gated1");
         let ec_context = make_context(
@@ -768,7 +829,7 @@ mod tests {
 
         assert!(
             get_header(&response, "set-cookie").is_none(),
-            "a closed consent gate must not write a ts-ec cookie"
+            "a closed permission gate must not write a ts-ec cookie"
         );
     }
 
@@ -778,11 +839,17 @@ mod tests {
         // land on the key the live row uses. Written under the raw cookie
         // value it creates a second row nothing reads, and the revocation
         // never takes effect for a provider whose canonical form differs.
+        //
+        // Destructive withdrawal is narrow, so the trigger here is a TCF record
+        // refusing storage, the same one
+        // `finalize_withdrawal_clears_cookie_and_headers` uses. An opt-out such
+        // as GPC suppresses use without destroying an issued identifier, so it
+        // would write no tombstone for this test to place.
         let settings = create_test_settings();
         let graph = graph_with_live_canonical_row();
         let consent = ConsentContext {
-            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
-            gpc: true,
+            jurisdiction: Jurisdiction::Gdpr,
+            tcf: Some(refusing_tcf()),
             source: ConsentSource::Cookie,
             ..Default::default()
         };

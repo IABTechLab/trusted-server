@@ -901,26 +901,58 @@ impl DeviceConfig {
 pub struct GeoConfig {
     /// The key of the geo provider to activate.
     ///
-    /// The host platform's geo lookup is the default when absent, matching the
-    /// behavior before this selector existed; `provider = "platform"` spells
-    /// the same choice explicitly. Selecting `provider = "none"` resolves no
-    /// geolocation and makes no host geo call, so a deployment can opt out of
-    /// any host geo service. Override it with the
+    /// No provider is the default: Trusted Server resolves no geolocation and
+    /// makes no host geo call, so a default deployment is not tied to any host
+    /// geo service, and the permission baseline comes from
+    /// [`default_country`](Self::default_country). `provider = "none"` spells
+    /// the same choice explicitly. The host platform's own geo lookup is
+    /// opt-in via `provider = "platform"`. Override it with the
     /// `TRUSTED_SERVER__geo__provider` environment variable so the same compiled
     /// WebAssembly can switch providers at deployment. An unknown key is rejected
     /// at startup by
     /// [`validate_provider_selection`](Self::validate_provider_selection).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+
+    /// The country, or country and region, whose permission rules apply when the
+    /// geo provider returns no country, or returns a country/region that has no
+    /// rule in `permissions.yaml`. One value, the same form as a
+    /// `permissions.yaml` rule key, a country code (`US`) or country/region
+    /// (`US/CA`), matched case-insensitively.
+    ///
+    /// Required. There must always be a default permission set, so startup fails
+    /// when this is unset. The value must resolve to a rule in `permissions.yaml`,
+    /// both checked at startup by
+    /// [`validate_default_country`](Self::validate_default_country).
+    ///
+    /// Because it is required, any deployment running the permission model
+    /// serializes a `[geo]` section, so its pushed config blob is rejected by a
+    /// binary that predates this section. Rolling back to one needs a compatible
+    /// blob restored first, the same trade-off a configured
+    /// [`trusted_client_ip`](Settings::trusted_client_ip) carries.
+    #[serde(default)]
+    pub default_country: Option<String>,
+
+    /// Acknowledges that, with no geo provider, every request is treated as
+    /// coming from [`default_country`](Self::default_country).
+    ///
+    /// With geolocation off, a visitor from any other jurisdiction silently
+    /// receives the default jurisdiction's permission rules. A deployment that
+    /// runs an Edge Cookie provider without a geo provider must set this to
+    /// `true`, checked at startup by
+    /// [`validate_jurisdiction_acknowledgment`](Self::validate_jurisdiction_acknowledgment),
+    /// so serving a single jurisdiction is an explicit operator decision rather
+    /// than an accident of the default configuration.
+    #[serde(default)]
+    pub assume_single_jurisdiction: bool,
 }
 
 impl GeoConfig {
     /// Validates that the selected geo provider is available in this build.
     ///
-    /// No selector is valid and is the default, selecting the host platform's
-    /// geo lookup. The explicit `"none"` runs without geolocation, the same
-    /// way the Edge Cookie provider runs statelessly when `"none"` is
-    /// selected.
+    /// No selector is valid and is the default, running without geolocation,
+    /// the same way the Edge Cookie provider runs statelessly when none is
+    /// selected. The explicit `"none"` spells the same choice.
     ///
     /// # Errors
     ///
@@ -933,6 +965,83 @@ impl GeoConfig {
                 message: format!("Geo provider `{key}` is not available in this build"),
             })),
         }
+    }
+
+    /// Validates that `default_country` is set and resolves to a rule in the
+    /// compiled `permissions.yaml`.
+    ///
+    /// A default is required: it is the permission baseline for a request the geo
+    /// provider leaves unmatched, so there must always be one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when `default_country` is
+    /// unset, or is set but matches no country or country/region rule.
+    pub fn validate_default_country(&self) -> Result<(), Report<TrustedServerError>> {
+        let Some(spec) = self.default_country.as_deref() else {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "[geo] default_country is required. There must always be a default \
+                          permission set, so set the country (`US`) or country/region \
+                          (`US/CA`) whose permissions.yaml rule applies to a request the geo \
+                          provider leaves unmatched"
+                    .to_owned(),
+            }));
+        };
+        let (country, region) = match spec.split_once('/') {
+            Some((country, region)) => (Some(country), Some(region)),
+            None => (Some(spec), None),
+        };
+        if crate::permissions::PermissionMaps::standard()
+            .rules_for(country, region)
+            .is_none()
+        {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[geo] default_country `{spec}` matches no rule in permissions.yaml \
+                     (use a country code like `US` or country/region like `US/CA` that \
+                     has a rule)"
+                ),
+            }));
+        }
+        Ok(())
+    }
+
+    /// Validates that running jurisdiction consumers without geolocation is
+    /// explicitly acknowledged.
+    ///
+    /// With no geo provider, every request resolves to the
+    /// [`default_country`](Self::default_country) permission baseline, so a
+    /// visitor from any other jurisdiction silently receives the default
+    /// jurisdiction's rules. That is acceptable only as an explicit operator
+    /// decision. When an Edge Cookie provider is configured (the permission
+    /// model gates it by jurisdiction) and no geo provider is selected,
+    /// [`assume_single_jurisdiction`](Self::assume_single_jurisdiction) must be
+    /// `true`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] when an Edge Cookie
+    /// provider is configured, no geo provider is selected, and
+    /// `assume_single_jurisdiction` is not set.
+    pub fn validate_jurisdiction_acknowledgment(
+        &self,
+        ec: &Ec,
+    ) -> Result<(), Report<TrustedServerError>> {
+        let geo_disabled = !matches!(self.provider.as_deref(), Some("platform"));
+        // The selector is a typed enum on this branch, so statelessness is the
+        // absent selector or the explicit `none`, matched rather than compared
+        // as a string.
+        let ec_active = !matches!(ec.provider, None | Some(EcProviderSelection::None));
+        if geo_disabled && ec_active && !self.assume_single_jurisdiction {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "[ec] provider is configured but no [geo] provider is selected, so \
+                          every request would be treated as [geo] default_country. Set \
+                          [geo] assume_single_jurisdiction = true to acknowledge \
+                          single-jurisdiction operation, or select a geo provider"
+                    .to_owned(),
+            }));
+        }
+        Ok(())
     }
 }
 
@@ -3307,12 +3416,37 @@ impl Settings {
         settings.ec.validate_provider_selection()?;
         settings.device.validate_provider_selection()?;
         settings.geo.validate_provider_selection()?;
+        settings.geo.validate_default_country()?;
+        settings
+            .geo
+            .validate_jurisdiction_acknowledgment(&settings.ec)?;
         settings.validate_admin_coverage()?;
         settings.validate_admin_handler_passwords()?;
 
         if settings.auction.enabled && !settings.auction.rewrite_creatives {
             log::warn!(
                 "Auction creative rewriting disabled; creative assets and clicks may contact third-party hosts directly"
+            );
+        }
+
+        // Log the configured default jurisdiction baseline once per settings
+        // load, so an operator can see which permissions the unmatched-request
+        // default grants without a signal.
+        if let Some(spec) = settings.geo.default_country.as_deref() {
+            let (country, region) = match spec.split_once('/') {
+                Some((country, region)) => (Some(country), Some(region)),
+                None => (Some(spec), None),
+            };
+            let baseline = crate::permissions::PermissionMaps::standard()
+                .baseline(country, region, country, region);
+            let granted: Vec<String> = baseline
+                .permissions()
+                .iter()
+                .map(|permission| permission.to_string())
+                .collect();
+            log::info!(
+                "Permission baseline: [geo] default_country = {spec}; granted without a signal: [{}]",
+                granted.join(", ")
             );
         }
 
@@ -4059,8 +4193,17 @@ mod tests {
 
     #[test]
     fn serialized_default_config_stays_readable_by_the_base_revision_schema() {
-        let settings = Settings::from_toml(&crate_test_settings_str())
+        let mut settings = Settings::from_toml(&crate_test_settings_str())
             .expect("should parse settings without trusted client IP configuration");
+
+        // The guarantee covers a config that configures none of the sections
+        // added since the base revision. A configured section is serialized and,
+        // like a configured `trusted_client_ip`, needs a compatible blob restored
+        // before rolling back to a binary that predates it. The shared test
+        // config sets `[geo]` because the permission model requires a default
+        // country, so both selector tables are reset to unset here.
+        settings.geo = GeoConfig::default();
+        settings.device = DeviceConfig::default();
 
         let value = serde_json::to_value(&settings).expect("should serialize settings");
 
@@ -5502,14 +5645,16 @@ mod tests {
         let config = GeoConfig::default();
         assert!(
             config.provider.is_none(),
-            "geo should default to no selector, which selects the host geo"
+            "geo should default to no selector, which selects no geo provider"
         );
         config
             .validate_provider_selection()
-            .expect("should validate the default host geo selection");
+            .expect("should validate the default of running without geolocation");
 
         let platform = GeoConfig {
             provider: Some("platform".to_owned()),
+            default_country: None,
+            assume_single_jurisdiction: false,
         };
         platform
             .validate_provider_selection()
@@ -5517,12 +5662,16 @@ mod tests {
 
         let none = GeoConfig {
             provider: Some("none".to_owned()),
+            default_country: None,
+            assume_single_jurisdiction: false,
         };
         none.validate_provider_selection()
             .expect("should validate the explicit opt-out of geolocation");
 
         let unknown = GeoConfig {
             provider: Some("acme".to_owned()),
+            default_country: None,
+            assume_single_jurisdiction: false,
         };
         assert!(
             unknown.validate_provider_selection().is_err(),
@@ -5556,6 +5705,72 @@ mod tests {
             Settings::from_toml(&toml_str).is_err(),
             "an unknown key in [ec.providers.hmac] should be rejected"
         );
+    }
+
+    #[test]
+    fn validate_default_country_checks_against_permissions_yaml() {
+        // Unset is rejected: a default permission set is required, so startup
+        // fails without one.
+        assert!(
+            GeoConfig::default().validate_default_country().is_err(),
+            "an unset default country should be rejected"
+        );
+
+        // A country, and a country/region, that have a rule are accepted.
+        for spec in ["US", "FR", "US/CA"] {
+            let config = GeoConfig {
+                provider: None,
+                default_country: Some(spec.to_owned()),
+                assume_single_jurisdiction: false,
+            };
+            config
+                .validate_default_country()
+                .unwrap_or_else(|e| panic!("default `{spec}` should validate, got {e:?}"));
+        }
+
+        // A code with no rule is rejected at startup.
+        let bad = GeoConfig {
+            provider: None,
+            default_country: Some("ZZ".to_owned()),
+            assume_single_jurisdiction: false,
+        };
+        assert!(
+            bad.validate_default_country().is_err(),
+            "a default country with no rule should be rejected"
+        );
+    }
+
+    #[test]
+    fn ec_without_geo_requires_the_single_jurisdiction_acknowledgment() {
+        // The base test settings acknowledge single-jurisdiction operation.
+        // Removing the acknowledgment while an EC provider is configured and
+        // no geo provider is selected must fail at startup.
+        let toml_str = crate_test_settings_str().replace("assume_single_jurisdiction = true\n", "");
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("an EC provider with no geo provider needs the acknowledgment");
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::Configuration { .. }
+            ),
+            "should be a configuration error, got: {:?}",
+            err.current_context()
+        );
+
+        // Selecting a geo provider removes the requirement.
+        let toml_str = crate_test_settings_str()
+            .replace("assume_single_jurisdiction = true\n", "")
+            .replace("[geo]", "[geo]\n            provider = \"platform\"");
+        Settings::from_toml(&toml_str)
+            .expect("a geo provider resolves jurisdictions, so no acknowledgment is needed");
+
+        // With no EC provider there is no jurisdiction consumer to protect.
+        let toml_str = crate_test_settings_str()
+            .replace("assume_single_jurisdiction = true\n", "")
+            .replace("provider = \"hmac\"", "")
+            .replace("[ec.providers.hmac]\n            passphrase = \"test-secret-key-32-bytes-minimum\"", "");
+        Settings::from_toml(&toml_str)
+            .expect("stateless operation needs no jurisdiction acknowledgment");
     }
 
     #[test]
@@ -6598,6 +6813,9 @@ origin_host_header_overide = "www.example.com""#,
             [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
+            [geo]
+            default_country = "FR"
+            assume_single_jurisdiction = true
             "#,
         )
         .expect("should parse settings without max_buffered_body_bytes");
@@ -6626,6 +6844,10 @@ origin_host_header_overide = "www.example.com""#,
             origin_url = "https://origin.example.com"
             proxy_secret = "unit-test-proxy-secret"
             max_buffered_body_bytes = 0
+
+            [geo]
+            default_country = "FR"
+            assume_single_jurisdiction = true
 
             [ec]
             provider = "hmac"
@@ -7791,6 +8013,10 @@ origin_host_header_overide = "www.example.com""#,
             [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
+            [geo]
+            default_country = "FR"
+            assume_single_jurisdiction = true
+
             [request_signing]
             config_store_id = "test-config-store-id"
             secret_store_id = "test-secret-store-id"
@@ -8121,6 +8347,10 @@ cookie_domain = ".example.com"
 origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
+[geo]
+default_country = "US"
+assume_single_jurisdiction = true
+
 [ec]
 provider = "hmac"
 
@@ -8208,6 +8438,10 @@ cookie_domain = ".example.com"
 origin_url = "https://origin.example.com"
 proxy_secret = "secret"
 
+[geo]
+default_country = "US"
+assume_single_jurisdiction = true
+
 [ec]
 provider = "hmac"
 
@@ -8246,6 +8480,10 @@ domain = "example.com"
 cookie_domain = ".example.com"
 origin_url = "https://origin.example.com"
 proxy_secret = "secret"
+
+[geo]
+default_country = "US"
+assume_single_jurisdiction = true
 
 [ec]
 provider = "hmac"
@@ -8291,6 +8529,10 @@ domain = "example.com"
 cookie_domain = ".example.com"
 origin_url = "https://origin.example.com"
 proxy_secret = "secret"
+
+[geo]
+default_country = "US"
+assume_single_jurisdiction = true
 
 [ec]
 provider = "hmac"

@@ -169,9 +169,13 @@ where
 /// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
 /// `/_ts/page-bids`, and the publisher fallback).
 ///
-/// Geo comes from the platform (a no-op on the local Axum dev server, so
-/// jurisdiction stays Unknown there unless the request carries TCF consent), and
-/// a geo lookup failure is logged and treated as no location.
+/// The geo lookup runs inside
+/// [`EcContext::read_from_request_resolving_geo`], so every adapter reports the
+/// same distinction: no location falls back to the configured
+/// `[geo] default_country` baseline, while a failed lookup resolves every
+/// permission at the requires-signal floor and is logged at error level.
+/// The platform geo is a no-op on the local Axum dev server, so a request there
+/// resolves at the default country unless it carries a signal.
 ///
 /// Mirrors the Fastly entry point, which keeps the report and answers with an
 /// error response: when the Edge Cookie context cannot be read the request
@@ -189,14 +193,7 @@ fn build_ec_context(
     services: &RuntimeServices,
     req: &Request,
 ) -> Result<EcContext, Report<TrustedServerError>> {
-    let geo_info = services
-        .geo()
-        .lookup(services.client_info().client_ip)
-        .unwrap_or_else(|e| {
-            log::warn!("geo lookup failed: {e}");
-            None
-        });
-    EcContext::read_from_request_with_geo(&state.settings, req, services, geo_info.as_ref())
+    EcContext::read_from_request_resolving_geo(&state.settings, req, services)
 }
 
 // ---------------------------------------------------------------------------
@@ -693,6 +690,13 @@ mod tests {
 
         [ec.providers.acme]
         endpoint = "https://ec.acme.example.com"
+
+        # An Edge Cookie provider is configured, so the permission model needs a
+        # default country, and single-jurisdiction operation acknowledged because
+        # no geo provider is selected.
+        [geo]
+        default_country = "FR"
+        assume_single_jurisdiction = true
     "#;
 
     /// Builds application state directly, bypassing the composition root's

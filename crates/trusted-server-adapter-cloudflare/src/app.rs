@@ -160,8 +160,12 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
 /// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
 /// `/_ts/page-bids`, and the publisher fallback).
 ///
-/// Geo comes from the Workers `cf` object when deployed, and a geo lookup
-/// failure is logged and treated as no location.
+/// The geo lookup runs inside
+/// [`EcContext::read_from_request_resolving_geo`], so every adapter reports the
+/// same distinction: no location falls back to the configured
+/// `[geo] default_country` baseline, while a failed lookup resolves every
+/// permission at the requires-signal floor and is logged at error level.
+/// Geo comes from the Workers `cf` object when deployed.
 ///
 /// Mirrors the Fastly entry point, which keeps the report and answers with an
 /// error response: when the Edge Cookie context cannot be read the request
@@ -179,14 +183,7 @@ fn build_ec_context(
     services: &RuntimeServices,
     req: &Request,
 ) -> Result<EcContext, Report<TrustedServerError>> {
-    let geo_info = services
-        .geo()
-        .lookup(services.client_info().client_ip)
-        .unwrap_or_else(|e| {
-            log::warn!("geo lookup failed: {e}");
-            None
-        });
-    EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref())
+    EcContext::read_from_request_resolving_geo(settings, req, services)
 }
 
 // ---------------------------------------------------------------------------

@@ -85,10 +85,12 @@ use crate::settings::Settings;
 
 /// A geo provider that resolves nothing.
 ///
-/// Installed when `[geo] provider = "none"` is selected, so a client IP is
-/// never sent to any host geo service. Every geo consumer already treats
-/// [`GeoInfo`] as optional, so a `None` result degrades gracefully (the
-/// jurisdiction is unknown, the auction omits geo, and so on).
+/// Installed when no geo provider is selected (`"none"` spells the same
+/// choice explicitly), so a client IP is never sent to any host geo service
+/// and a default deployment is not tied to any host geo capability. Every geo
+/// consumer already treats [`GeoInfo`] as optional, so a `None` result
+/// degrades gracefully (the permission baseline falls back to the configured
+/// `[geo] default_country`, the auction omits geo, and so on).
 pub struct DisabledGeo;
 
 impl PlatformGeo for DisabledGeo {
@@ -99,12 +101,12 @@ impl PlatformGeo for DisabledGeo {
 
 /// Selects the geo provider named by the `[geo] provider` selector.
 ///
-/// The host platform's geo lookup is the default: with no selector,
-/// `host_default` (the adapter's platform geo implementation) resolves the
-/// location, matching the behavior before the selector existed, and
-/// `provider = "platform"` spells the same choice explicitly. Selecting
-/// `provider = "none"` returns [`DisabledGeo`] instead, so a client IP is
-/// never sent to any host geo service. A selected-but-unknown provider is
+/// Returns [`DisabledGeo`] when no provider is selected, so a default
+/// deployment makes no host geo call and the permission baseline comes from
+/// the configured `[geo] default_country`; `provider = "none"` spells the
+/// same choice explicitly. The host platform's own geo lookup is opt-in:
+/// `provider = "platform"` returns `host_default`, which the adapter passes
+/// as its platform geo implementation. A selected-but-unknown provider is
 /// rejected at startup by
 /// [`GeoConfig::validate_provider_selection`](crate::settings::GeoConfig::validate_provider_selection).
 #[must_use]
@@ -113,8 +115,8 @@ pub fn build_geo_provider(
     host_default: Arc<dyn PlatformGeo>,
 ) -> Arc<dyn PlatformGeo> {
     match settings.geo.provider.as_deref() {
-        Some("none") => Arc::new(DisabledGeo),
-        _ => host_default,
+        Some("platform") => host_default,
+        _ => Arc::new(DisabledGeo),
     }
 }
 
@@ -186,6 +188,14 @@ mod tests {
     }
 
     #[test]
+    fn disabled_geo_requires_no_permissions() {
+        assert!(
+            DisabledGeo.required_permissions().is_empty(),
+            "the default disabled geo provider requires no permissions"
+        );
+    }
+
+    #[test]
     fn runtime_services_can_be_constructed_and_cloned() {
         let services = noop_services();
         let cloned = services.clone();
@@ -211,18 +221,25 @@ mod tests {
     }
 
     #[test]
-    fn build_geo_provider_defaults_to_the_host_geo() {
+    fn build_geo_provider_defaults_to_no_geo() {
         let settings = Settings::default();
         let host: Arc<dyn PlatformGeo> = Arc::new(test_support::NoopGeo);
         let selected = build_geo_provider(&settings, Arc::clone(&host));
         assert!(
-            Arc::ptr_eq(&host, &selected),
-            "default settings should use the host geo"
+            !Arc::ptr_eq(&host, &selected),
+            "default settings should not use the host geo"
+        );
+        assert!(
+            selected
+                .lookup(Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))))
+                .expect("disabled geo lookup should not fail")
+                .is_none(),
+            "the default geo provider should resolve nothing"
         );
     }
 
     #[test]
-    fn build_geo_provider_none_selects_no_geo() {
+    fn build_geo_provider_none_selects_no_geo_explicitly() {
         let mut settings = Settings::default();
         settings.geo.provider = Some("none".to_owned());
         let host: Arc<dyn PlatformGeo> = Arc::new(test_support::NoopGeo);
@@ -230,13 +247,6 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&host, &selected),
             "provider none should not use the host geo"
-        );
-        assert!(
-            selected
-                .lookup(Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))))
-                .expect("disabled geo lookup should not fail")
-                .is_none(),
-            "the disabled geo provider should resolve nothing"
         );
     }
 

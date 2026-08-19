@@ -192,6 +192,11 @@ s = s.replace('proxy_secret = "change-me-proxy-secret"',
 s = re.sub(r'passphrase = "[^"]*"',
            'passphrase = "local-harness-ec-passphrase-not-a-real-one"', s, count=1)
 
+# The example ships the most protective default jurisdiction (FR, where the
+# server-side auction needs TCF consent). The harness exercises the auction with
+# no consent signals, so it runs as a US opt-out state.
+s = s.replace('default_country = "FR"', 'default_country = "US/CA"', 1)
+
 # A real auction, pointed at the stub's slow endpoint, so the timings mean something.
 s = s.replace('[integrations.prebid]\nenabled = false\nserver_url = "https://prebid.example.com/openrtb2/auction"',
               f'[integrations.prebid]\nenabled = true\nserver_url = "http://127.0.0.1:{port}/bid"\n'

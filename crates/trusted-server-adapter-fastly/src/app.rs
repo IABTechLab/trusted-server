@@ -109,7 +109,6 @@ use trusted_server_core::ec::admin::{
     deny_admin_diagnostic_fallback, handle_admin_ec_lookup, handle_admin_eids_lookup,
 };
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
-use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
@@ -486,34 +485,29 @@ fn build_ec_request_state(
     let eids_cookie = crate::extract_cookie_value(req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(req, COOKIE_SHAREDID);
 
-    let geo_info = services
-        .geo()
-        .lookup(services.client_info().client_ip)
-        .unwrap_or_else(|e| {
-            log::warn!("geo lookup failed during EC setup: {e}");
-            None
-        });
-
     let (ec_context, setup_error) =
-        match EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref()) {
+        match EcContext::read_from_request_resolving_geo(settings, req, services) {
             Ok(mut context) => {
                 context.set_device_signals(device_signals);
                 (context, None)
             }
             Err(report) => (EcContext::default(), Some(report)),
         };
+    let geo_info = ec_context.geo_info().cloned();
 
     // Bot gate: suppress KV-backed EC writes for unrecognized clients, except
-    // consent withdrawals. Revocations keep the write path so tombstones stay
-    // authoritative even for privacy-extension-heavy clients.
+    // when the request carries an explicit withdrawal signal. The write path
+    // stays open for withdrawal so tombstones remain authoritative even for
+    // privacy-extension-heavy clients that do not look like known browsers. A
+    // merely not-permitted (pre-consent or fail-closed) request writes nothing,
+    // so it does not need the graph.
     let kv_graph = crate::maybe_identity_graph(settings);
-    let finalize_kv_graph = if setup_error.is_none()
-        && (is_real_browser || ec_consent_withdrawn(ec_context.consent()))
-    {
-        kv_graph.clone()
-    } else {
-        None
-    };
+    let finalize_kv_graph =
+        if setup_error.is_none() && (is_real_browser || ec_context.storage_withdrawn()) {
+            kv_graph.clone()
+        } else {
+            None
+        };
     let kv_graph = if is_real_browser { kv_graph } else { None };
 
     EcRequestState {
@@ -1336,7 +1330,7 @@ impl TrustedServerApp {
         let mut router = RouterService::builder()
             .middleware(FinalizeResponseMiddleware::new(
                 Arc::clone(&state.settings),
-                Arc::new(FastlyPlatformGeo),
+                build_geo_provider(&state.settings, Arc::new(FastlyPlatformGeo)),
             ))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
 
@@ -1459,6 +1453,10 @@ mod tests {
                 [ec.providers.hmac]
                 passphrase = "test-passphrase-at-least-32-bytes!!"
 
+                [geo]
+                default_country = "FR"
+                assume_single_jurisdiction = true
+
                 [request_signing]
                 enabled = false
                 config_store_id = "test-config-store-id"
@@ -1530,6 +1528,10 @@ mod tests {
 
             [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            default_country = "FR"
+            assume_single_jurisdiction = true
 
             [request_signing]
             enabled = false
@@ -1986,6 +1988,10 @@ mod tests {
 
             [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            default_country = "FR"
+            assume_single_jurisdiction = true
             "#,
         )
         .expect("should parse production-shaped settings");
@@ -2643,6 +2649,10 @@ mod tests {
             [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
+            [geo]
+            default_country = "FR"
+            assume_single_jurisdiction = true
+
             [request_signing]
             enabled = false
             config_store_id = "test-config-store-id"
@@ -3060,6 +3070,10 @@ mod tests {
 
             [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            default_country = "FR"
+            assume_single_jurisdiction = true
 
             [request_signing]
             enabled = false

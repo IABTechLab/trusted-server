@@ -21,6 +21,15 @@ pub mod tests {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
+            [geo]
+            # A gdpr-eu country, where every permission requires a signal. This
+            # reproduces the prior no-default floor, so existing tests are
+            # unaffected by the now-required default.
+            default_country = "FR"
+            # Tests run with no geo provider, so single-jurisdiction operation
+            # is acknowledged the same way a deployment would.
+            assume_single_jurisdiction = true
+
             [integrations.prebid]
             enabled = true
             server_url = "https://test-prebid.com/openrtb2/auction"

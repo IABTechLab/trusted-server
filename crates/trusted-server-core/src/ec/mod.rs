@@ -15,7 +15,7 @@
 //!
 //! - auth (private) — shared Bearer-token authentication helpers
 //! - [`generation`] — HMAC-based ID generation, IP normalization, format helpers
-//! - [`consent`] — EC-specific consent gating wrapper
+//! - [`consent`]: EC-specific permission gating, with consent as one input
 //! - [`cookies`] — `Set-Cookie` header creation and expiration helpers
 //! - [`kv`] — KV Store identity graph operations (CAS, tombstones, debounce)
 //! - [`kv_backend`] — Platform-neutral KV primitives implemented by adapters
@@ -76,6 +76,7 @@ use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
 use crate::evidence::BorrowedRequestInfo;
 use crate::geo::GeoInfo;
+use crate::permissions::{Acquisition, Permission, PermissionState};
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 use device::DeviceSignals;
@@ -140,10 +141,19 @@ pub struct EcContext {
     ec_generated: bool,
     /// The consent context for this request.
     consent: ConsentContext,
-    /// Whether Edge Cookie creation is allowed for this request. Resolved once
-    /// at construction: closed when no provider is selected, otherwise from the
-    /// request's consent context. Read via [`ec_allowed`](Self::ec_allowed).
+    /// Whether the configured Edge Cookie provider's required permissions are
+    /// set for this request. Resolved once at construction through the
+    /// permission model and read via [`ec_allowed`](Self::ec_allowed).
     ec_allowed: bool,
+    /// The permissions resolved for this request: the country/region baseline
+    /// augmented by the session's signals. Assembled once at construction and
+    /// read via [`permissions`](Self::permissions).
+    permissions: PermissionState,
+    /// The jurisdiction's acquisition rule for Edge Cookie storage, resolved
+    /// once at construction and used by
+    /// [`storage_withdrawn`](Self::storage_withdrawn) to scope destructive
+    /// withdrawal. Defaults to the requires-signal floor.
+    storage_acquisition: Acquisition,
     /// The normalized client IP, captured early before the request body
     /// is consumed. `None` when the platform cannot determine client IP.
     client_ip: Option<String>,
@@ -211,15 +221,71 @@ impl EcContext {
         services: &RuntimeServices,
         geo_info: Option<&GeoInfo>,
     ) -> Result<Self, Report<TrustedServerError>> {
+        Self::read_from_request_with_geo_status(
+            settings,
+            req,
+            services,
+            consent::GeoStatus::from(geo_info),
+        )
+    }
+
+    /// Reads the EC context, resolving the location through the configured geo
+    /// provider first.
+    ///
+    /// This is the constructor adapters use: it runs the geo lookup itself so
+    /// a failed lookup is distinguished from "no location resolved". No
+    /// location falls back to the configured `[geo] default_country`
+    /// baseline, while a failure resolves every permission to the
+    /// requires-signal floor (see [`consent::GeoStatus`]) and is logged at
+    /// error level so an outage is visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError`] when the selected Edge Cookie provider
+    /// cannot be built, the same as
+    /// [`read_from_request_with_geo`](Self::read_from_request_with_geo).
+    pub fn read_from_request_resolving_geo(
+        settings: &Settings,
+        req: &Request<EdgeBody>,
+        services: &RuntimeServices,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        let lookup = services.geo().lookup(services.client_info().client_ip);
+        let geo_info = match &lookup {
+            Ok(info) => info.clone(),
+            Err(error) => {
+                log::error!(
+                    "geo lookup failed; resolving permissions at the requires-signal floor: {error:?}"
+                );
+                None
+            }
+        };
+        let status = match (&lookup, &geo_info) {
+            (Err(_), _) => consent::GeoStatus::Failed,
+            (Ok(_), Some(info)) => consent::GeoStatus::Located(info),
+            (Ok(_), None) => consent::GeoStatus::NoLocation,
+        };
+        Self::read_from_request_with_geo_status(settings, req, services, status)
+    }
+
+    fn read_from_request_with_geo_status(
+        settings: &Settings,
+        req: &Request<EdgeBody>,
+        services: &RuntimeServices,
+        geo_status: consent::GeoStatus<'_>,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        let geo_info = geo_status.info();
         let parsed = parse_ec_from_request(req)?;
 
         // Take the selected provider once. It is used here to decide whether
-        // the incoming cookie value is a usable identifier, and again by
-        // generation, which reuses this one rather than asking for another.
-        // `request_provider` hands back the instance the composition root
-        // resolved when there is one, and otherwise resolves the selection from
-        // this request's own services, the host signals among them, so a
-        // provider built from request evidence reads this request's evidence.
+        // the incoming cookie value is a usable identifier, to read the
+        // provider's required permissions, and again by generation, which
+        // reuses this one rather than asking for another. `request_provider`
+        // hands back the instance the composition root resolved when there is
+        // one, and otherwise resolves the selection from this request's own
+        // services, the host signals among them, so a provider built from
+        // request evidence reads this request's evidence. A provider that needs
+        // a service the host did not supply fails to resolve, which stops the
+        // request.
         let selected_provider: Option<Arc<dyn crate::ec::provider::EdgeCookieProvider>> =
             provider::request_provider(&settings.ec, services)?;
 
@@ -264,24 +330,39 @@ impl EcContext {
             .client_ip
             .map(generation::normalize_ip);
 
+        // Jurisdiction detection for the consent gates follows the permission
+        // model's fallback: with no location resolved, the configured default
+        // country stands in, so a deployment that declared its jurisdiction is
+        // not treated as unknown. A failed lookup stays unknown, so the consent
+        // gates fail closed alongside the requires-signal floor.
+        let default_location = match geo_status {
+            consent::GeoStatus::NoLocation => consent::default_location_geo(settings),
+            consent::GeoStatus::Located(_) | consent::GeoStatus::Failed => None,
+        };
+        let consent_geo = geo_info.or(default_location.as_ref());
+
         // Build consent context from request-local cookies, headers, and geo.
         let consent = consent_mod::build_consent_context(&ConsentPipelineInput {
             jar: parsed.jar.as_ref(),
             req,
             config: &settings.consent,
-            geo: geo_info,
+            geo: consent_geo,
             ec_id: None,
             kv_store: None,
         });
 
-        // Gate Edge Cookie creation and use on the request's consent context
-        // (jurisdiction and consent signals). With no provider selected nothing
-        // may create or use an identifier, so the gate is closed rather than
-        // open by default. Downstream consumers read the stored result via
-        // [`EcContext::ec_allowed`] rather than re-deriving it.
+        // Assemble the permission state once, here, through the permission
+        // model, building the country/region baseline augmented by the session's
+        // signals. Downstream consumers read the stored result via
+        // [`EcContext::permissions`] and [`EcContext::ec_allowed`] rather than
+        // re-deriving it.
+        let permissions = consent::assemble_permissions(settings, &consent, geo_status);
+        let storage_acquisition = consent::storage_acquisition(settings, geo_status);
+        // With no provider selected nothing may mint or use an identifier, so
+        // the gate is closed rather than open by default.
         let ec_allowed = selected_provider
             .as_ref()
-            .is_some_and(|_| consent::ec_consent_granted(&consent));
+            .is_some_and(|selected| permissions.all_set(selected.required_permissions()));
 
         log::info!(
             "EC context: present={}, cookie_present={}, ec_allowed={}, jurisdiction={}",
@@ -298,6 +379,8 @@ impl EcContext {
             ec_generated: false,
             consent,
             ec_allowed,
+            permissions,
+            storage_acquisition,
             client_ip,
             geo_info: geo_info.cloned(),
             device_signals: None,
@@ -356,7 +439,7 @@ impl EcContext {
                 Jurisdiction::Unknown => "unknown",
             };
             log::info!(
-                "EC generation skipped: EC creation not permitted (jurisdiction={jurisdiction})"
+                "EC generation skipped: required permissions not set (jurisdiction={jurisdiction})"
             );
             return Ok(());
         }
@@ -380,9 +463,9 @@ impl EcContext {
     /// here rather than rebuilt. The request evidence captured at read time
     /// (client IP, headers, and the URL path and query) is passed borrowed
     /// through [`RequestInfo`](crate::evidence::RequestInfo), so a provider can
-    /// read cookies and request parameters at generate time; the built-in HMAC
-    /// provider reads only the client IP. The skip guards (existing EC, consent
-    /// gate) stay in [`generate_if_needed`](Self::generate_if_needed).
+    /// read cookies and request parameters at generate time, and the built-in
+    /// HMAC provider reads only the client IP. The skip guards (existing EC,
+    /// permission gate) stay in [`generate_if_needed`](Self::generate_if_needed).
     ///
     /// # Errors
     ///
@@ -399,6 +482,7 @@ impl EcContext {
         kv: Option<&KvIdentityGraph>,
     ) -> Result<(), Report<TrustedServerError>> {
         let input = IdentityInput {
+            permissions: Some(&self.permissions),
             consent: Some(&self.consent),
         };
         // Pass the request evidence captured at read time, borrowed: the client
@@ -616,8 +700,9 @@ impl EcContext {
     ///
     /// Allows handlers to apply query-param fallback consent for the current
     /// request only when pre-routing consent extraction produced an empty
-    /// context. Mutations do not re-derive [`ec_allowed`](Self::ec_allowed),
-    /// which is resolved once at construction.
+    /// context. Mutations do not re-derive [`ec_allowed`](Self::ec_allowed) or
+    /// [`permissions`](Self::permissions), which are resolved once at
+    /// construction.
     pub fn consent_mut(&mut self) -> &mut ConsentContext {
         &mut self.consent
     }
@@ -660,14 +745,53 @@ impl EcContext {
         self.geo_info.as_ref()
     }
 
-    /// Returns whether Edge Cookie creation is allowed for this request.
+    /// Returns whether the configured Edge Cookie provider's required
+    /// permissions are set for this request.
     ///
-    /// Resolved once at construction: closed when no provider is selected,
-    /// otherwise from the request's consent context (see
-    /// [`consent::ec_consent_granted`]).
+    /// Resolved once at construction through the permission model (see
+    /// [`consent::ec_permission_granted`]).
     #[must_use]
     pub fn ec_allowed(&self) -> bool {
         self.ec_allowed
+    }
+
+    /// Whether the request carries an explicit signal withdrawing Edge Cookie
+    /// storage, scoped to the jurisdiction's storage baseline.
+    ///
+    /// See [`consent::ec_storage_withdrawn`]: only a TCF record refusing
+    /// storage withdraws, and only where the storage baseline is not
+    /// `granted`. Suppression (the permission merely not set) is reported by
+    /// [`ec_allowed`](Self::ec_allowed) being `false` instead.
+    #[must_use]
+    pub fn storage_withdrawn(&self) -> bool {
+        consent::ec_storage_withdrawn(&self.consent, self.storage_acquisition)
+    }
+
+    /// Whether the Edge Cookie identifier may be shared beyond the edge for
+    /// this request: into the bidstream as `user.id`, in a partner identify
+    /// response, or in a partner sync call.
+    ///
+    /// Sharing rides on the same two permissions as bidstream EIDs (see
+    /// [`crate::consent::gate_eids_by_permissions`]): storage (the identifier
+    /// exists and is readable) and personalised-ad selection (it is shared to
+    /// select ads). [`ec_allowed`](Self::ec_allowed) covers only the
+    /// provider's own requirements, so a storage-only grant keeps first-party
+    /// use while withholding partner sharing.
+    #[must_use]
+    pub fn ec_sharing_allowed(&self) -> bool {
+        self.ec_allowed()
+            && self.permissions.is_set(Permission::StoreOnDevice)
+            && self.permissions.is_set(Permission::SelectPersonalisedAds)
+    }
+
+    /// Returns the permissions resolved for this request.
+    ///
+    /// Assembled once at construction, the country/region baseline augmented by
+    /// the session's signals. The core gates provider execution on these, and a
+    /// consumer may read them for its own logic.
+    #[must_use]
+    pub fn permissions(&self) -> &PermissionState {
+        &self.permissions
     }
 
     /// Returns the existing EC cookie value for revocation handling.
@@ -702,21 +826,19 @@ impl EcContext {
         self
     }
 
-    /// Creates a test-only `EcContext` whose creation gate is derived from the
-    /// consent context, matching the production construction path.
+    /// Creates a test-only `EcContext` with the permission gate open.
     ///
     /// Use [`new_for_test_gated`](Self::new_for_test_gated) when a test needs
-    /// an explicit gate.
+    /// the gate closed.
     #[cfg(test)]
     #[must_use]
     pub fn new_for_test(ec_value: Option<String>, consent: ConsentContext) -> Self {
-        let ec_allowed = consent::ec_consent_granted(&consent);
-        Self::new_for_test_gated(ec_value, consent, ec_allowed)
+        Self::new_for_test_gated(ec_value, consent, true)
     }
 
-    /// Creates a test-only `EcContext` with an explicit creation gate.
+    /// Creates a test-only `EcContext` with an explicit permission gate.
     ///
-    /// `ec_allowed` stands in for the gating decision the production path
+    /// `ec_allowed` stands in for the permission decision the production path
     /// resolves at construction, so a test can exercise the gate-open and
     /// gate-closed branches directly.
     #[cfg(test)]
@@ -726,6 +848,15 @@ impl EcContext {
         consent: ConsentContext,
         ec_allowed: bool,
     ) -> Self {
+        let permissions = if ec_allowed {
+            PermissionState::new(
+                [Permission::StoreOnDevice, Permission::SelectPersonalisedAds]
+                    .into_iter()
+                    .collect(),
+            )
+        } else {
+            PermissionState::default()
+        };
         Self {
             ec_was_present: ec_value.is_some(),
             cookie_ec_value: ec_value.clone(),
@@ -733,6 +864,8 @@ impl EcContext {
             ec_generated: false,
             consent,
             ec_allowed,
+            permissions,
+            storage_acquisition: Acquisition::default(),
             client_ip: None,
             geo_info: None,
             device_signals: None,
@@ -752,14 +885,15 @@ impl EcContext {
         consent: ConsentContext,
         client_ip: Option<String>,
     ) -> Self {
-        let ec_allowed = consent::ec_consent_granted(&consent);
         Self {
             ec_was_present: ec_value.is_some(),
             cookie_ec_value: ec_value.clone(),
             ec_value,
             ec_generated: false,
             consent,
-            ec_allowed,
+            ec_allowed: true,
+            storage_acquisition: Acquisition::default(),
+            permissions: PermissionState::default(),
             client_ip,
             geo_info: None,
             device_signals: None,
@@ -790,6 +924,8 @@ impl EcContext {
             ec_generated,
             consent,
             ec_allowed,
+            permissions: PermissionState::default(),
+            storage_acquisition: Acquisition::default(),
             client_ip: None,
             geo_info: None,
             device_signals: None,
@@ -934,7 +1070,13 @@ mod tests {
     }
 
     /// A geo that resolves to the non-regulated jurisdiction (US, no region),
-    /// so the consent gate is open and generation runs in provider tests.
+    /// so the permission gate is open and generation runs.
+    ///
+    /// A test that drives a built-in provider needs this. The test default
+    /// country is FR, whose baseline requires a signal before
+    /// `StoreOnDevice` is set, so the built-in providers are gated off
+    /// without one. A test double declaring no required permission runs
+    /// either way and can read the request without a location.
     fn non_regulated_geo() -> GeoInfo {
         GeoInfo {
             city: String::new(),
@@ -1164,8 +1306,7 @@ mod tests {
 
         // No existing cookie, so the edge creates one and persists it.
         let req = create_test_request(&[]);
-        let geo = non_regulated_geo();
-        let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
+        let mut ec = EcContext::read_from_request(&settings, &req, &services)
             .expect("should read EC context");
         ec.generate_if_needed(&settings, Some(&graph))
             .expect("should generate and persist");
@@ -1212,8 +1353,7 @@ mod tests {
             .expect("should build request");
 
         let services = noop_services_with_ec_provider_without_client_ip(provider.clone());
-        let geo = non_regulated_geo();
-        let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
+        let mut ec = EcContext::read_from_request(&settings, &req, &services)
             .expect("should read EC context");
         assert_eq!(
             ec.client_ip(),
@@ -1302,8 +1442,7 @@ mod tests {
         settings.ec.provider = Some(EcProviderSelection::from("illegal"));
         let services = noop_services_with_ec_provider(Arc::new(IllegalIdProvider));
         let req = create_test_request(&[]);
-        let geo = non_regulated_geo();
-        let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
+        let mut ec = EcContext::read_from_request(&settings, &req, &services)
             .expect("should read EC context");
 
         let err = ec
@@ -1373,8 +1512,7 @@ mod tests {
         settings.ec.provider = Some(EcProviderSelection::from("header-setting"));
         let services = noop_services_with_ec_provider(Arc::new(provider));
         let req = create_test_request(&[]);
-        let geo = non_regulated_geo();
-        let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
+        let mut ec = EcContext::read_from_request(&settings, &req, &services)
             .expect("should read EC context");
         let outcome = ec.generate_if_needed(&settings, graph).map(|()| ec);
         (settings, outcome)
@@ -1518,8 +1656,7 @@ mod tests {
         let services = noop_services_with_ec_provider(Arc::new(CanonicalizingProvider));
         let graph = KvIdentityGraph::in_memory("test-ec-store");
         let req = create_test_request(&[]);
-        let geo = non_regulated_geo();
-        let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
+        let mut ec = EcContext::read_from_request(&settings, &req, &services)
             .expect("should read EC context");
         ec.generate_if_needed(&settings, Some(&graph))
             .expect("should generate and persist");
@@ -1548,13 +1685,15 @@ mod tests {
 
     #[test]
     fn hmac_mints_a_coded_identifier_and_dual_reads_the_legacy_bare_form() {
-        let settings = create_test_settings();
+        let mut settings = create_test_settings();
+        // A granted-baseline default jurisdiction, so the storage permission
+        // is set with no signal and the mint runs.
+        settings.geo.default_country = Some("US/CA".to_owned());
         let req = create_test_request(&[]);
-        let geo = non_regulated_geo();
         let services = crate::platform::test_support::noop_services_with_client_ip(
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7)),
         );
-        let mut ec = EcContext::read_from_request_with_geo(&settings, &req, &services, Some(&geo))
+        let mut ec = EcContext::read_from_request(&settings, &req, &services)
             .expect("should read EC context");
         ec.generate_if_needed(&settings, None)
             .expect("should generate");
@@ -1593,6 +1732,44 @@ mod tests {
             ec.ec_value(),
             None,
             "an identifier with a foreign provider code is not this provider's"
+        );
+    }
+
+    #[test]
+    fn no_location_resolves_the_consent_jurisdiction_from_the_default_country() {
+        use crate::consent::jurisdiction::Jurisdiction;
+
+        let mut settings = create_test_settings();
+        settings.geo.default_country = Some("US/CA".to_owned());
+        let req = create_test_request(&[]);
+        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
+        assert_eq!(
+            ec.consent().jurisdiction,
+            Jurisdiction::UsState("CA".to_owned()),
+            "with no location the default country should decide the jurisdiction"
+        );
+
+        let mut settings = create_test_settings();
+        settings.geo.default_country = Some("FR".to_owned());
+        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
+        assert_eq!(
+            ec.consent().jurisdiction,
+            Jurisdiction::Gdpr,
+            "a GDPR default country should resolve the GDPR jurisdiction"
+        );
+    }
+
+    #[test]
+    fn sharing_requires_the_personalised_ads_permission_not_just_storage() {
+        let mut ec =
+            EcContext::new_for_test(Some(valid_ec_id("a", "ABC123")), ConsentContext::default());
+        ec.permissions = PermissionState::new([Permission::StoreOnDevice].into_iter().collect());
+        assert!(ec.ec_allowed(), "the provider gate is open");
+        assert!(
+            !ec.ec_sharing_allowed(),
+            "storage alone must not allow sharing beyond the edge"
         );
     }
 

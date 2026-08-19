@@ -129,11 +129,24 @@ pull_sync_concurrency = 3
 # [device]
 # provider = "builtin"
 
-# Geo / IP intelligence provider selection. The platform host geo is the
-# default. Set provider = "none" to resolve no location and make no host geo
-# call.
-# [geo]
+[geo]
+# Geo / IP intelligence provider selection. No provider is the default:
+# Trusted Server resolves no location and makes no host geo call. The host
+# platform's own lookup is opt-in.
 # provider = "platform"
+#
+# The permission baseline for a request the geo provider leaves unmatched
+# (and, with no geo provider, for every request). Required: startup fails
+# without it. A country ("US") or country/region ("US/CA") with a rule in
+# permissions.yaml.
+default_country = "US"
+#
+# With no geo provider, every request is treated as default_country, so a
+# visitor from another jurisdiction receives the default jurisdiction's
+# permission rules. A deployment that runs an Edge Cookie provider without a
+# geo provider must acknowledge that by uncommenting the line below, or
+# select a geo provider instead.
+# assume_single_jurisdiction = true
 
 # Custom headers added to every response (e.g. X-Robots-Tag: noindex).
 # [response_headers]

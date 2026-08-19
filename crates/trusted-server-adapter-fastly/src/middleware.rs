@@ -319,6 +319,10 @@ mod tests {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
+            [geo]
+            default_country = "FR"
+            assume_single_jurisdiction = true
+
             [ec]
             provider = "hmac"
 

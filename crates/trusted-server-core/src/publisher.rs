@@ -54,7 +54,7 @@ use crate::auction::types::{
 use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
 };
-use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
+use crate::consent::{consent_allows_server_side_auction, gate_eids_by_permissions};
 use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
 use crate::creative_opportunities::{AssemblyMode, CreativeOpportunitiesConfig};
@@ -4078,12 +4078,18 @@ pub async fn handle_publisher_request(
     // this handler; subresource requests are likewise filtered there.
     let ec_allowed = ec_context.ec_allowed();
     log::debug!(
-        "Proxy EC state: has_ec_id={}, ec_allowed={ec_allowed}",
+        "Proxy EC state: has_ec_id={}, ec_allowed={ec_allowed}, sharing={}",
         ec_context.ec_value().is_some(),
+        ec_context.ec_sharing_allowed(),
     );
 
     let consent_context = ec_context.consent().clone();
-    let ec_id = ec_context.ec_value().filter(|_| ec_allowed);
+    // The identifier forwarded into the auction request (user.id) is sharing
+    // beyond the edge, so it rides the same permission pair as bidstream EIDs
+    // (storage plus personalised-ad selection), not only the provider's gate.
+    let ec_id = ec_context
+        .ec_value()
+        .filter(|_| ec_context.ec_sharing_allowed());
     let cookie_jar = handle_request_cookies(&req)?;
     let geo = ec_context.geo_info().cloned();
 
@@ -4961,10 +4967,10 @@ fn apply_auction_eids_and_device(
     let merged_eids = merge_auction_eids(client_eids, kv_eids);
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
     auction_request.user.eids =
-        gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
+        gate_eids_by_permissions(merged_eids, targeting.ec_context.permissions());
     if had_eids && auction_request.user.eids.is_none() {
         log::warn!(
-            "{} auction EIDs stripped by TCF consent gating",
+            "{} auction EIDs stripped by permission gating",
             targeting.path_label
         );
     }
@@ -6404,7 +6410,12 @@ pub async fn handle_page_bids(
     };
 
     let request_info = crate::http_util::RequestInfo::from_request(&req, services.client_info());
-    let ec_id = ec_context.ec_value().filter(|_| ec_context.ec_allowed());
+    // Same sharing pair as the navigation path: page-bids builds an auction
+    // request, so its user.id egress needs storage plus personalised-ad
+    // selection, matching the EID gate.
+    let ec_id = ec_context
+        .ec_value()
+        .filter(|_| ec_context.ec_sharing_allowed());
     let consent_context = ec_context.consent();
     let geo = ec_context.geo_info().cloned();
     let cookie_jar = handle_request_cookies(&req)?;
