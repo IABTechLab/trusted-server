@@ -20,15 +20,11 @@ use fastly::cache::core::{CacheKey, Found, Transaction};
 use std::io::Write as _;
 use std::time::Duration;
 use trusted_server_core::platform::{
-    PlatformTemplateCache, PlatformTemplateCacheReservation, TemplateCacheError, TemplateCacheKey,
+    PlatformTemplateCache, PlatformTemplateCacheReservation,
+    TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY, TemplateCacheError, TemplateCacheKey,
     TemplateCacheLookup, TemplateCacheMiss, TemplateCacheReservation, TemplateEntry,
     TemplateMetadata,
 };
-
-/// Surrogate key attached to every stored template, so a single purge clears them
-/// all. This is the rollback lever: without it, backing out a bad template means
-/// waiting for the TTL.
-const PURGE_ALL_SURROGATE_KEY: &str = "ts-template";
 
 /// Fastly Core Cache implementation of the C2 template cache.
 #[derive(Default)]
@@ -82,13 +78,11 @@ fn read_found(found: &Found, key: &TemplateCacheKey) -> Result<TemplateEntry, Re
         return Err(ReadFoundError::Invalid(TemplateCacheMiss::Truncated));
     }
 
-    let stream = found
-        .to_stream()
-        .map_err(|error| {
-            ReadFoundError::Backend(backend_error(format!(
-                "opening cached template body failed: {error:?}"
-            )))
-        })?;
+    let stream = found.to_stream().map_err(|error| {
+        ReadFoundError::Backend(backend_error(format!(
+            "opening cached template body failed: {error:?}"
+        )))
+    })?;
     let body = read_cache_body(stream)?;
     if body.len() as u64 != metadata.body_len {
         return Err(ReadFoundError::Invalid(TemplateCacheMiss::Truncated));
@@ -115,13 +109,16 @@ impl PlatformTemplateCacheReservation for FastlyTemplateReservation {
                 body.len()
             )));
         }
+        let encoded_metadata = metadata.encode().map_err(|error| {
+            backend_error(format!("encoding template metadata failed: {error}"))
+        })?;
 
         let mut writer = self
             .transaction
             .insert(max_age)
             .surrogate_keys(self.surrogate_keys.iter().map(String::as_str))
             .known_length(body.len() as u64)
-            .user_metadata(metadata.encode().into())
+            .user_metadata(encoded_metadata.into())
             .execute()
             .map_err(|e| backend_error(format!("cache insert failed: {e:?}")))?;
         writer
@@ -206,6 +203,9 @@ impl PlatformTemplateCache for FastlyTemplateCache {
                 body.len()
             )));
         }
+        let encoded_metadata = metadata.encode().map_err(|error| {
+            backend_error(format!("encoding template metadata failed: {error}"))
+        })?;
 
         let cache_key = CacheKey::from(key.to_cache_key().into_bytes());
 
@@ -235,7 +235,7 @@ impl PlatformTemplateCache for FastlyTemplateCache {
             .insert(max_age)
             .surrogate_keys(surrogate_keys.iter().map(String::as_str))
             .known_length(body.len() as u64)
-            .user_metadata(metadata.encode().into())
+            .user_metadata(encoded_metadata.into())
             .execute()
             .map_err(|e| backend_error(format!("cache insert failed: {e:?}")))?;
 
@@ -260,7 +260,7 @@ impl PlatformTemplateCache for FastlyTemplateCache {
     }
 
     async fn purge_all(&self) -> Result<(), TemplateCacheError> {
-        fastly::http::purge::purge_surrogate_key(PURGE_ALL_SURROGATE_KEY)
+        fastly::http::purge::purge_surrogate_key(TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY)
             .map_err(|e| backend_error(format!("purging templates failed: {e:?}")))
     }
 }
@@ -332,10 +332,7 @@ mod tests {
         .expect_err("should reject an abandoned cache stream");
 
         assert!(
-            matches!(
-                error,
-                ReadFoundError::Invalid(TemplateCacheMiss::Truncated)
-            ),
+            matches!(error, ReadFoundError::Invalid(TemplateCacheMiss::Truncated)),
             "should classify a cache stream read failure as truncated"
         );
     }
@@ -441,7 +438,12 @@ mod tests {
 
         let mut writer = fastly::cache::core::insert(cache_key, Duration::from_secs(0))
             .stale_while_revalidate(Duration::from_secs(60))
-            .user_metadata(metadata.encode().into())
+            .user_metadata(
+                metadata
+                    .encode()
+                    .expect("valid metadata should encode")
+                    .into(),
+            )
             .execute()
             .expect("should begin insert");
         writer.write_all(&body).expect("should write body");

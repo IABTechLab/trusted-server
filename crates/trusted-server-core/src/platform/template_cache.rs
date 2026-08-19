@@ -36,6 +36,9 @@ use crate::creative_opportunities::AssemblyMode;
 /// | 4       | Marker is the shorter, accurate [`AD_ASSEMBLY_SEAM`](crate::publisher::AD_ASSEMBLY_SEAM) |
 pub const TEMPLATE_SCHEMA_VERSION: u32 = 4;
 
+/// Surrogate key attached to every template so an incident can purge C2 globally.
+pub const TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY: &str = "ts-template";
+
 /// Inputs that select one cached template.
 ///
 /// Every field changes the emitted bytes for the same URL. A signal that changes the
@@ -105,7 +108,7 @@ impl TemplateCacheKey {
             &(self.vary_values.len() as u64).to_be_bytes(),
         );
         for varied in &self.vary_values {
-            push(&mut canonical, varied.name.as_bytes());
+            push(&mut canonical, varied.name.to_ascii_lowercase().as_bytes());
             match &varied.values {
                 None => push(&mut canonical, b"absent"),
                 Some(values) => {
@@ -129,7 +132,10 @@ impl TemplateCacheKey {
     /// for an incident, the narrow one for ordinary invalidation.
     #[must_use]
     pub fn surrogate_keys(&self) -> Vec<String> {
-        vec!["ts-template".to_string(), self.url_surrogate_key()]
+        vec![
+            TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY.to_string(),
+            self.url_surrogate_key(),
+        ]
     }
 
     /// Surrogate key for every variant of this publisher URL.
@@ -354,22 +360,51 @@ pub struct TemplateMetadata {
     pub policy_headers: Vec<(String, String)>,
 }
 
+/// Why public template metadata could not be represented safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
+#[display("template metadata field `{field}` contains a line break")]
+pub struct TemplateMetadataEncodeError {
+    field: &'static str,
+}
+
+impl core::error::Error for TemplateMetadataEncodeError {}
+
 impl TemplateMetadata {
     /// Serialize for `user_metadata`. Deliberately a tiny hand-rolled format rather
     /// than JSON — one allocation, no dependency, and a parse failure is
     /// unambiguous.
-    #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any public string field contains CR or LF, which would
+    /// otherwise inject another record into the newline-delimited representation.
+    pub fn encode(&self) -> Result<Vec<u8>, TemplateMetadataEncodeError> {
+        fn reject_line_breaks(
+            field: &'static str,
+            value: &str,
+        ) -> Result<(), TemplateMetadataEncodeError> {
+            if value.contains(['\r', '\n']) {
+                return Err(TemplateMetadataEncodeError { field });
+            }
+            Ok(())
+        }
+
+        reject_line_breaks("content_encoding", &self.content_encoding)?;
+        reject_line_breaks("content_type", &self.content_type)?;
+        for (name, value) in &self.policy_headers {
+            reject_line_breaks("policy_header_name", name)?;
+            reject_line_breaks("policy_header_value", value)?;
+        }
+
         let mut out = format!(
             "v={}\nce={}\nct={}\nlen={}",
             self.schema_version, self.content_encoding, self.content_type, self.body_len
         );
         for (name, value) in &self.policy_headers {
-            // Header values cannot contain newlines (the HTTP parser rejects them), so a
-            // newline-delimited encoding cannot be broken by a header value.
+            // Line breaks were rejected above before constructing the delimited form.
             out.push_str(&format!("\nh={name}:{value}"));
         }
-        out.into_bytes()
+        Ok(out.into_bytes())
     }
 
     /// Parse `user_metadata`. Returns `None` on anything unexpected, which callers
@@ -597,6 +632,11 @@ impl fmt::Debug for dyn PlatformTemplateCache {
 #[async_trait::async_trait(?Send)]
 pub trait PlatformTemplateCache: Send + Sync {
     /// Transactionally look up a template before origin work begins.
+    ///
+    /// This compatibility default exists for implementations with no transactional
+    /// reservation support. It reports ordinary cold misses as `Unsupported`; an
+    /// adapter that supports C2 reservations must override it so cold requests can
+    /// return [`TemplateCacheLookup::Reserved`].
     async fn lookup_or_reserve(
         &self,
         key: &TemplateCacheKey,
@@ -731,6 +771,30 @@ mod tests {
         assert_eq!(cancellations.load(Ordering::SeqCst), 1);
     }
 
+    #[test]
+    fn fulfilling_a_reservation_does_not_also_cancel_on_drop() {
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        TemplateCacheReservation::new(Box::new(CountingReservation(Arc::clone(&cancellations))))
+            .insert(
+                &TemplateMetadata {
+                    content_encoding: "identity".to_string(),
+                    policy_headers: Vec::new(),
+                    content_type: "text/html".to_string(),
+                    schema_version: TEMPLATE_SCHEMA_VERSION,
+                    body_len: 0,
+                },
+                Vec::new(),
+                std::time::Duration::from_secs(1),
+            )
+            .expect("should fulfil the reservation");
+
+        assert_eq!(
+            cancellations.load(Ordering::SeqCst),
+            0,
+            "should discharge a fulfilled reservation without cancelling it"
+        );
+    }
+
     /// Every field must change the key. A field that does not is a cross-serving
     /// bug: two requests needing different templates would share one entry.
     #[test]
@@ -811,7 +875,10 @@ mod tests {
     #[test]
     fn rendered_key_is_fixed_size_and_contains_no_request_material() {
         let rendered = key().to_cache_key();
-        assert_eq!(rendered.len(), "ts-c2-v3-".len() + 64);
+        assert_eq!(
+            rendered.len(),
+            format!("ts-c2-v{TEMPLATE_SCHEMA_VERSION}-").len() + 64
+        );
         for sensitive in ["example.com", "/news/article", "rsc", "abc123"] {
             assert!(
                 !rendered.contains(sensitive),
@@ -824,7 +891,7 @@ mod tests {
     fn vary_header_names_are_matched_case_insensitively() {
         let mut upper = key();
         upper.vary_values = vec![VaryHeaderValues {
-            name: "RSC".to_ascii_lowercase(),
+            name: "RSC".to_string(),
             values: Some(vec![b"1".to_vec()]),
         }];
         assert_eq!(
@@ -867,7 +934,7 @@ mod tests {
     fn surrogate_keys_carry_a_global_and_a_per_url_lever() {
         let keys = key().surrogate_keys();
         assert!(
-            keys.contains(&"ts-template".to_string()),
+            keys.contains(&TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY.to_string()),
             "a global purge lever is what makes rollback possible"
         );
         assert_eq!(keys.len(), 2, "global plus per-URL");
@@ -1020,9 +1087,37 @@ mod tests {
             schema_version: TEMPLATE_SCHEMA_VERSION,
             body_len: 42,
         };
-        let decoded =
-            TemplateMetadata::decode(&metadata.encode()).expect("should decode what it encoded");
+        let encoded = metadata.encode().expect("valid metadata should encode");
+        let decoded = TemplateMetadata::decode(&encoded).expect("should decode what it encoded");
         assert_eq!(decoded, metadata);
+    }
+
+    #[test]
+    fn metadata_encoding_rejects_line_break_injection() {
+        for metadata in [
+            TemplateMetadata {
+                content_encoding: "identity\nh=link:</evil>".to_string(),
+                policy_headers: Vec::new(),
+                content_type: "text/html".to_string(),
+                schema_version: TEMPLATE_SCHEMA_VERSION,
+                body_len: 0,
+            },
+            TemplateMetadata {
+                content_encoding: "identity".to_string(),
+                policy_headers: vec![(
+                    "content-security-policy".to_string(),
+                    "default-src 'self'\r\nh=link:</evil>".to_string(),
+                )],
+                content_type: "text/html".to_string(),
+                schema_version: TEMPLATE_SCHEMA_VERSION,
+                body_len: 0,
+            },
+        ] {
+            assert!(
+                metadata.encode().is_err(),
+                "should reject metadata fields that can inject another line"
+            );
+        }
     }
 
     #[test]
