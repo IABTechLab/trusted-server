@@ -50,7 +50,7 @@ The directive detector will have one shared implementation used by core authoriz
 
 `TemplateCacheKey::to_cache_key` will normalize Vary names to lowercase at the serialization boundary so public fields cannot silently split keys by header-name case. The existing test will pass a literal uppercase name and verify the normalization.
 
-`TemplateMetadata::encode` will reject or prevent carriage-return/newline-bearing values through a typed or fallible boundary consistent with its callers. The implementation will avoid a production panic. Tests will cover injected line breaks and ordinary round trips.
+`TemplateMetadata::encode` will become fallible and return a concrete core metadata-encoding error when any encoded scalar or policy-header value contains carriage return or newline. Fastly insert callers will map that error to the existing `TemplateCacheError`; the publisher will then serve the freshly processed private origin response and report `miss-store-error`, matching other cache-write failures. Tests will cover injected line breaks, propagation through the cache adapter, and ordinary round trips. No production assertion or panic will enforce this boundary.
 
 The stale schema-prefix assertion will derive its prefix from `TEMPLATE_SCHEMA_VERSION`. The default cache trait behavior will explicitly document its unsupported/null-object role or be made explicit on implementations, whichever is smaller after checking all implementors.
 
@@ -68,15 +68,15 @@ The remediation will:
 - fold adjacent duplicate implementation blocks together;
 - remove the redundant test-only `must_use` and add required assertion messages;
 - move the ESI dependency declaration to workspace dependencies;
-- make the example Vary set complete and explain fail-closed coverage;
+- make the example Vary set `rsc`, `next-router-state-tree`, `next-router-prefetch`, and `next-router-segment-prefetch`, and explain that every origin `Vary` name must be covered or storage is refused;
 - correct the request `max-age` documentation and label the mode experimental under #1009;
-- remove or simplify the single-variant `PageBidsFormat` residue;
+- remove `PageBidsFormat`; accept an absent or `json` format through a direct guard and preserve the existing 400 response for every other value;
 - remove the dead cached-response content-encoding branch while preserving the identity invariant;
 - repair non-test rustdoc links;
 - document the local harness coupling at `build_seam_script`;
 - list `PlatformTemplateCache` in the platform module roster and consolidate exports;
-- reduce CI timing flake risk without weakening the streaming assertion;
-- move the two self-labelled historical documents to `docs/superpowers/archive/` and update all references.
+- run both C2 workflow invocations with `BID_DELAY=3`, keep the `first_body_byte < complete / 3` assertion, and stop after one diagnostic failure when probe timings are non-numeric instead of performing a second comparison with fabricated zero values;
+- move `docs/superpowers/plans/2026-08-10-1009-esi-validation-spike.md` and `docs/superpowers/specs/2026-08-08-esi-cacheable-root-validation-design.md` directly into `docs/superpowers/archive/`, then update every reference found by `rg` including links inside the moved documents.
 
 ## Error Handling
 
@@ -89,10 +89,10 @@ Each behavioral fix starts with a regression test and runs the narrowest relevan
 - `cargo fmt --all -- --check`;
 - all six target-matched clippy aliases;
 - `cargo test-fastly`, `cargo test-axum`, `cargo test-cloudflare`, and `cargo test-spin`;
-- cross-adapter parity and host CLI tests;
+- `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity` and `./scripts/test-cli.sh`;
 - Fastly template-cache and ESI assembly suites;
 - JavaScript Vitest, build, and formatting;
-- documentation formatting and `cargo doc --no-deps --all-features` on an appropriate target;
-- the C2 local harness or its CI-equivalent commands when local prerequisites are available.
+- `cd docs && npm run format` and the target-matched documentation command selected during planning after checking the workspace target guards;
+- `BID_DELAY=3 ./scripts/c2-local-test.sh esi` and `BID_DELAY=3 ./scripts/c2-local-test.sh inline` when Viceroy and the required local artifact are available.
 
 Any unavailable local prerequisite will be reported explicitly rather than represented as a passing check.
