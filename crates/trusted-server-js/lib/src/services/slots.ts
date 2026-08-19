@@ -140,6 +140,14 @@ export interface SlotServiceInventory {
   readonly records: number;
 }
 
+export interface ApsSlotMountBinding {
+  readonly bindingEpoch: object;
+  readonly cycle: Readonly<GoogletagTraceCycleHandle>;
+  readonly element: object;
+  readonly physicalSlot: object;
+  readonly isCurrent: () => boolean;
+}
+
 /** Runtime-owned slot registry and physical-cycle boundary. */
 export interface SlotService {
   readonly activate: () => void;
@@ -163,6 +171,11 @@ export interface SlotService {
     registeredSlotId: string,
     slot: object
   ) => boolean;
+  readonly resolveApsMountBinding: (
+    navigationGeneration: object,
+    registeredSlotId: string,
+    intentId: string
+  ) => Readonly<ApsSlotMountBinding> | undefined;
   readonly prepareProjectionSlots: (
     owner: NavigationSession,
     slots: readonly ProjectionSlotRegistration[]
@@ -256,7 +269,9 @@ interface PhysicalCycle {
 
 interface PhysicalSlot {
   activeCycle: PhysicalCycle | undefined;
+  apsMountClaim: Readonly<{ cycle: PhysicalCycle; token: object }> | undefined;
   artifactRetirementAttempted: boolean;
+  bindingEpoch: object;
   definition: GoogletagReplacementDefinition | undefined;
   domElement: object | undefined;
   elementIdPrefix: string | undefined;
@@ -828,9 +843,9 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
 
   const reconciliationElementIds = (
     record: InternalSlotRecord,
-    definition: GoogletagReplacementDefinition
+    definition: GoogletagReplacementDefinition | undefined
   ): readonly string[] => {
-    const values: string[] = [definition.elementId];
+    const values: string[] = definition ? [definition.elementId] : [];
     for (let aliasIndex = 0; aliasIndex < record.view.domAliases.length; aliasIndex += 1) {
       const alias = record.view.domAliases[aliasIndex];
       if (alias === undefined) continue;
@@ -848,7 +863,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
 
   const resolveReconciliationElement = (
     record: InternalSlotRecord,
-    definition: GoogletagReplacementDefinition
+    definition: GoogletagReplacementDefinition | undefined
   ): SlotReconciliationResolution | undefined => {
     if (!reconciliationBoundary || !reconciliationResolve) return undefined;
     try {
@@ -1045,7 +1060,9 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     const replacementTraceToken = traceTokenFor(replacement);
     const physical: PhysicalSlot = {
       activeCycle: undefined,
+      apsMountClaim: undefined,
       artifactRetirementAttempted: false,
+      bindingEpoch: Object.freeze({}),
       definition,
       domElement,
       elementIdPrefix: oldPhysical.elementIdPrefix,
@@ -1113,7 +1130,9 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     if (!orphanedSlot || orphanedSlot === source.slot) return;
     const orphan: PhysicalSlot = {
       activeCycle: undefined,
+      apsMountClaim: undefined,
       artifactRetirementAttempted: true,
+      bindingEpoch: Object.freeze({}),
       definition: source.definition,
       domElement: undefined,
       elementIdPrefix: source.elementIdPrefix,
@@ -2277,10 +2296,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     ) {
       return Object.freeze({ ok: false, reason: 'gpt_request_failed' });
     }
-    const initialResolution =
-      ownership === 'trusted_server' && definition
-        ? resolveReconciliationElement(record, definition)
-        : undefined;
+    const initialResolution = resolveReconciliationElement(record, definition);
     const domElement =
       initialResolution?.status === 'unique' ? initialResolution.element : undefined;
     const slotObject = slot as object;
@@ -2318,6 +2334,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       const previousDefinition = existing.definition;
       const previousDomElement = existing.domElement;
       const previousElementIdPrefix = existing.elementIdPrefix;
+      const previousBindingEpoch = existing.bindingEpoch;
       const previousPlacementKeys = existing.placementKeys;
       const previousPublisherElementIds = existing.publisherElementIds;
       const previousView = record.view;
@@ -2331,6 +2348,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         existing.definition = definition;
         existing.domElement = domElement;
         existing.elementIdPrefix = elementIdPrefix;
+        existing.bindingEpoch = Object.freeze({});
         existing.placementKeys = bindingPlacementKeys;
         existing.publisherElementIds =
           ownership === 'publisher' && definition
@@ -2347,6 +2365,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         existing.definition = previousDefinition;
         existing.domElement = previousDomElement;
         existing.elementIdPrefix = previousElementIdPrefix;
+        existing.bindingEpoch = previousBindingEpoch;
         existing.placementKeys = previousPlacementKeys;
         existing.publisherElementIds = previousPublisherElementIds;
         record.view = previousView;
@@ -2359,7 +2378,9 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     }
     const physical: PhysicalSlot = {
       activeCycle: undefined,
+      apsMountClaim: undefined,
       artifactRetirementAttempted: false,
+      bindingEpoch: Object.freeze({}),
       definition,
       domElement,
       elementIdPrefix,
@@ -3093,6 +3114,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     }
     physical.ownership = 'publisher';
     physical.publisherElementIds = aliases;
+    physical.bindingEpoch = Object.freeze({});
     physical.suppressPublisherDisplay = true;
     physical.suppressPublisherRefresh = initialLoadDisabled === true;
     return Object.freeze({ action: 'handoff', slot: physical.slot });
@@ -3225,6 +3247,124 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     };
   };
 
+  const resolveApsMountBinding = (
+    navigationGeneration: object,
+    registeredSlotId: string,
+    intentId: string
+  ): Readonly<ApsSlotMountBinding> | undefined => {
+    try {
+      const state = mapValue(navigationStates, navigationGeneration);
+      const record = state ? mapValue(state.records, registeredSlotId) : undefined;
+      const physical = record?.physical;
+      const cycle = physical?.lastCycle;
+      const intent = cycle?.intent;
+      if (
+        !state ||
+        state.disposed ||
+        !state.owner.isCurrent() ||
+        !record ||
+        !physical ||
+        physical.record !== record ||
+        physical.state !== 'live' ||
+        !cycle ||
+        cycle.kind !== 'trusted_server' ||
+        cycle.traceRetirement.retired ||
+        !intent ||
+        intent.input.intentId !== intentId ||
+        intent.input.registeredSlotId !== registeredSlotId ||
+        intent.input.navigationGeneration !== navigationGeneration ||
+        intent.input.expectedSlot !== physical.slot ||
+        !intent.terminal ||
+        !reconciliationBoundary ||
+        !reconciliationResolve ||
+        !reconciliationIsConnected
+      ) {
+        return undefined;
+      }
+
+      const ids: string[] = [];
+      const addId = (value: string | undefined): void => {
+        if (!value) return;
+        for (let index = 0; index < ids.length; index += 1) {
+          if (ids[index] === value) return;
+        }
+        ids[ids.length] = value;
+      };
+      addId(physical.definition?.elementId);
+      for (let index = 0; index < physical.publisherElementIds.length; index += 1) {
+        addId(physical.publisherElementIds[index]);
+      }
+      for (let index = 0; index < record.view.domAliases.length; index += 1) {
+        addId(record.view.domAliases[index]);
+      }
+      if (ids.length === 0) return undefined;
+
+      const resolution = Reflect.apply(reconciliationResolve, reconciliationBoundary, [
+        Object.freeze(ids),
+      ]) as SlotReconciliationResolution;
+      if (
+        resolution.status !== 'unique' ||
+        !Reflect.apply(reconciliationIsConnected, reconciliationBoundary, [resolution.element]) ||
+        physical.domElement === undefined ||
+        physical.domElement !== resolution.element ||
+        !Reflect.apply(reconciliationIsConnected, reconciliationBoundary, [physical.domElement])
+      ) {
+        return undefined;
+      }
+
+      const existingClaim = physical.apsMountClaim;
+      if (existingClaim && !existingClaim.cycle.traceRetirement.retired) return undefined;
+      const token = Object.freeze({});
+      const bindingEpoch = physical.bindingEpoch;
+      physical.apsMountClaim = Object.freeze({ cycle, token });
+      const current = (): boolean => {
+        try {
+          if (
+            state.disposed ||
+            !state.owner.isCurrent() ||
+            mapValue(state.records, registeredSlotId) !== record ||
+            record.physical !== physical ||
+            physical.record !== record ||
+            physical.state !== 'live' ||
+            intent.input.expectedSlot !== physical.slot ||
+            physical.bindingEpoch !== bindingEpoch ||
+            physical.lastCycle !== cycle ||
+            cycle.traceRetirement.retired ||
+            physical.apsMountClaim?.cycle !== cycle ||
+            physical.apsMountClaim.token !== token
+          ) {
+            return false;
+          }
+          const revalidated = Reflect.apply(reconciliationResolve, reconciliationBoundary, [
+            Object.freeze([...ids]),
+          ]) as SlotReconciliationResolution;
+          return (
+            revalidated.status === 'unique' &&
+            revalidated.element === resolution.element &&
+            Reflect.apply(reconciliationIsConnected, reconciliationBoundary, [
+              resolution.element,
+            ]) === true
+          );
+        } catch {
+          return false;
+        }
+      };
+      if (!current()) {
+        if (physical.apsMountClaim?.token === token) physical.apsMountClaim = undefined;
+        return undefined;
+      }
+      return Object.freeze({
+        bindingEpoch,
+        cycle: cycle.traceHandle,
+        element: resolution.element,
+        physicalSlot: physical.slot,
+        isCurrent: current,
+      });
+    } catch {
+      return undefined;
+    }
+  };
+
   const service: SlotService = Object.freeze({
     activate: (): void => {
       if (reconciliationActive) return;
@@ -3295,6 +3435,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         return false;
       }
     },
+    resolveApsMountBinding,
     prepareProjectionSlots: (
       owner: NavigationSession,
       slots: readonly ProjectionSlotRegistration[]

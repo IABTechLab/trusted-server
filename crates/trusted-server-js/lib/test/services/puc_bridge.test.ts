@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import apsEnvelope from '../fixtures/aps-renderer-v1.json';
 import { createBrowserMessagingAdapter } from '../../src/adapters/messaging';
+import { renderPucApsAttempt } from '../../src/integrations/aps/render';
 import {
   createPucBridge,
   PUC_DYNAMIC_OWNER,
@@ -50,29 +52,33 @@ interface HarnessOptions {
   readonly now?: PucBridgeOptions['now'];
   readonly publisherOrigin?: string;
   readonly resizeCollapsedShell?: PucBridgeOptions['resizeCollapsedShell'];
-  readonly rendererNonces?: PucBridgeOptions['rendererNonces'];
-  readonly rendererUrl?: string;
+  readonly mountAps?: PucBridgeOptions['mountAps'];
   readonly scheduler?: PucBridgeOptions['scheduler'];
+  readonly slots?: PucBridgeOptions['slots'];
 }
 
 function createHarness(
   recognize: (reservationId: unknown) => ReservationRecognition,
   options: HarnessOptions = {}
 ) {
-  let listener: ((event: MessageEvent) => void) | undefined;
+  const listeners: Array<(event: MessageEvent) => void> = [];
   const target = {
     addEventListener: vi.fn(
       (_type: 'message', next: (event: MessageEvent) => void, _capture: true) => {
-        listener = next;
+        listeners.push(next);
       }
     ),
-    removeEventListener: vi.fn(),
+    removeEventListener: vi.fn(
+      (_type: 'message', removed: (event: MessageEvent) => void, _capture: true) => {
+        const index = listeners.indexOf(removed);
+        if (index >= 0) listeners.splice(index, 1);
+      }
+    ),
     ...(options.messageChannel ? { MessageChannel: options.messageChannel } : {}),
   };
   const bridgeOptions: PucBridgeOptions = {
     messaging: createBrowserMessagingAdapter(target, {
       ...(options.publisherOrigin ? { expectedPublisherOrigin: options.publisherOrigin } : {}),
-      ...(options.rendererUrl ? { expectedRendererUrl: options.rendererUrl } : {}),
       validateApsRenderer: () => true,
     }),
     mintLifecycleTicket:
@@ -83,18 +89,19 @@ function createHarness(
       recognize,
     },
     ...(options.now ? { now: options.now } : {}),
-    ...(options.publisherOrigin ? { publisherOrigin: options.publisherOrigin } : {}),
     ...(options.resizeCollapsedShell ? { resizeCollapsedShell: options.resizeCollapsedShell } : {}),
-    ...(options.rendererNonces ? { rendererNonces: options.rendererNonces } : {}),
-    ...(options.rendererUrl ? { rendererUrl: options.rendererUrl } : {}),
+    ...(options.mountAps ? { mountAps: options.mountAps } : {}),
     ...(options.scheduler ? { scheduler: options.scheduler } : {}),
+    ...(options.slots ? { slots: options.slots } : {}),
   };
   const bridge = createPucBridge(bridgeOptions);
   const dispatch = (event: Record<string, unknown>): void => {
-    if (!listener) throw new Error('Expected the capture listener to be installed synchronously');
-    listener(event as unknown as MessageEvent);
+    if (listeners.length === 0) {
+      throw new Error('Expected the capture listener to be installed synchronously');
+    }
+    for (const listener of [...listeners]) listener(event as unknown as MessageEvent);
   };
-  return { bridge, dispatch, target };
+  return { bridge, dispatch, listeners, target };
 }
 
 function createGamAttempt(kind: 'aps' | 'adm' = 'aps', index = 0) {
@@ -108,6 +115,7 @@ function createGamAttempt(kind: 'aps' | 'adm' = 'aps', index = 0) {
   let outcome: RenderOutcome | undefined;
   let renderSource: ReservationRenderSource | undefined;
   const settlementObservers: Array<(outcome: RenderOutcome) => void> = [];
+  const apsBid = apsEnvelope.seatbid[0]!.bid[0]!;
   const owner = Object.freeze({
     id,
     slot: `slot-${index}`,
@@ -145,12 +153,12 @@ function createGamAttempt(kind: 'aps' | 'adm' = 'aps', index = 0) {
               type: 'aps',
               version: 1,
               accountId: 'publisher-account',
-              bidId: 'bid-1',
-              tagType: 'iframe',
-              creativeUrl: 'https://creative.example/render',
-              width: 300,
-              height: 250,
-              aaxResponse: 'renderer-envelope',
+              bidId: apsBid.id,
+              tagType: apsBid.ext.tagtype,
+              creativeUrl: apsBid.ext.creativeurl,
+              width: apsBid.w,
+              height: apsBid.h,
+              aaxResponse: btoa(JSON.stringify(apsEnvelope)),
             }
           : {
               type: 'adm',
@@ -342,44 +350,35 @@ describe('Universal Creative bridge dispatcher', () => {
     ).toBe(false);
   });
 
-  it('installs owner iframe lifecycle handlers before assigning either document source', () => {
+  it('keeps APS out of the PUC realm while preserving ADM iframe ordering', () => {
     const admStart = PUC_DYNAMIC_OWNER.indexOf('const insertAdm');
-    const apsStart = PUC_DYNAMIC_OWNER.indexOf('const insertAps');
     const controlStart = PUC_DYNAMIC_OWNER.indexOf('const receiveControl');
-    const admOwner = PUC_DYNAMIC_OWNER.slice(admStart, apsStart);
-    const apsOwner = PUC_DYNAMIC_OWNER.slice(apsStart, controlStart);
+    const admOwner = PUC_DYNAMIC_OWNER.slice(admStart, controlStart);
 
     expect(new TextEncoder().encode(PUC_DYNAMIC_OWNER).byteLength).toBeLessThanOrEqual(64 * 1_024);
     expect(admStart).toBeGreaterThanOrEqual(0);
-    expect(apsStart).toBeGreaterThan(admStart);
-    expect(controlStart).toBeGreaterThan(apsStart);
+    expect(controlStart).toBeGreaterThan(admStart);
     expect(admOwner.indexOf('next.onload =')).toBeLessThan(
       admOwner.indexOf('next.srcdoc = intendedSource;')
     );
     expect(admOwner.indexOf('next.onerror =')).toBeLessThan(
       admOwner.indexOf('next.srcdoc = intendedSource;')
     );
-    expect(apsOwner.indexOf('next.onload =')).toBeLessThan(
-      apsOwner.indexOf('next.src = intendedSource;')
-    );
-    expect(apsOwner.indexOf('next.onerror =')).toBeLessThan(
-      apsOwner.indexOf('next.src = intendedSource;')
-    );
+    expect(PUC_DYNAMIC_OWNER).not.toContain('const insertAps');
+    expect(PUC_DYNAMIC_OWNER).not.toContain('TS APS Start');
+    expect(PUC_DYNAMIC_OWNER).not.toContain('rendererUrl');
+    expect(PUC_DYNAMIC_OWNER).not.toContain('aaxResponse');
+    expect(PUC_DYNAMIC_OWNER).toContain('TS APS Top Mount Started');
   });
 
-  it('binds owner load and final acceptance to the exact inserted navigation', () => {
+  it('binds ADM load and final acceptance to the exact inserted navigation', () => {
     const admStart = PUC_DYNAMIC_OWNER.indexOf('const insertAdm');
-    const apsStart = PUC_DYNAMIC_OWNER.indexOf('const insertAps');
     const controlStart = PUC_DYNAMIC_OWNER.indexOf('const receiveControl');
-    const admOwner = PUC_DYNAMIC_OWNER.slice(admStart, apsStart);
-    const apsOwner = PUC_DYNAMIC_OWNER.slice(apsStart, controlStart);
+    const admOwner = PUC_DYNAMIC_OWNER.slice(admStart, controlStart);
 
     expect(admOwner).toContain('next.parentNode === creativeWindow.document.body');
     expect(admOwner).toContain('next.srcdoc === intendedSource');
     expect(admOwner).toContain('next.getAttribute("src") === null');
-    expect(apsOwner).toContain('next.parentNode === creativeWindow.document.body');
-    expect(apsOwner).toContain('next.getAttribute("src") === intendedSource');
-    expect(apsOwner).toContain('next.contentWindow === intendedWindow');
     expect(PUC_DYNAMIC_OWNER).toContain('ownerFrameCurrent?.() === true');
   });
 
@@ -427,7 +426,7 @@ describe('Universal Creative bridge dispatcher', () => {
             adId: RESERVATION_ID,
             message: 'Prebid Response',
             renderer: PUC_DYNAMIC_OWNER,
-            rendererVersion: '3',
+            rendererVersion: '4',
             tsOwner: {
               version: 1,
               status: 'ready',
@@ -551,7 +550,7 @@ describe('Universal Creative bridge dispatcher', () => {
             adId: RESERVATION_ID,
             message: 'Prebid Response',
             renderer: PUC_DYNAMIC_OWNER,
-            rendererVersion: '3',
+            rendererVersion: '4',
             tsOwner: {
               version: 1,
               status: 'ready',
@@ -656,7 +655,7 @@ describe('Universal Creative bridge dispatcher', () => {
           adId: RESERVATION_ID,
           message: 'Prebid Response',
           renderer: PUC_DYNAMIC_OWNER,
-          rendererVersion: '3',
+          rendererVersion: '4',
           tsOwner: {
             version: 1,
             status: 'ready',
@@ -779,7 +778,7 @@ describe('Universal Creative bridge dispatcher', () => {
             adId: RESERVATION_ID,
             message: 'Prebid Response',
             renderer: PUC_DYNAMIC_OWNER,
-            rendererVersion: '3',
+            rendererVersion: '4',
             tsOwner: {
               version: 1,
               status: 'ready',
@@ -904,7 +903,7 @@ describe('Universal Creative bridge dispatcher', () => {
             adId: RESERVATION_ID,
             message: 'Prebid Response',
             renderer: PUC_DYNAMIC_OWNER,
-            rendererVersion: '3',
+            rendererVersion: '4',
             tsOwner: {
               version: 1,
               status: 'ready',
@@ -996,7 +995,7 @@ describe('Universal Creative bridge dispatcher', () => {
     }
   });
 
-  it('accepts the optional APS creative id and preserves no-referrer on the owner iframe', async () => {
+  it('keeps APS DOM ownership out of the PUC frame after a data-free top-mount signal', async () => {
     const dynamicWindow = window as unknown as {
       render?: (
         data: Readonly<Record<string, unknown>>,
@@ -1026,8 +1025,6 @@ describe('Universal Creative bridge dispatcher', () => {
       },
       set onmessageerror(_listener: ((event: unknown) => void) | null) {},
     };
-    const documentPort = createPort();
-
     try {
       const rendered = dynamicWindow.render!(
         window.JSON.parse(
@@ -1035,7 +1032,7 @@ describe('Universal Creative bridge dispatcher', () => {
             adId: RESERVATION_ID,
             message: 'Prebid Response',
             renderer: PUC_DYNAMIC_OWNER,
-            rendererVersion: '3',
+            rendererVersion: '4',
             tsOwner: {
               version: 1,
               status: 'ready',
@@ -1058,34 +1055,14 @@ describe('Universal Creative bridge dispatcher', () => {
       });
       controlListener?.({
         data: {
-          message: 'TS APS Start',
+          message: 'TS APS Top Mount Started',
           version: 1,
           lifecycleTicket: LIFECYCLE_TICKET,
-          rendererUrl: 'https://publisher.example/integrations/aps/renderer/v1',
-          envelope: {
-            version: 1,
-            nonce: 'n1_abcdefghijklmnopqrstuv',
-            publisherOrigin: 'https://publisher.example',
-            renderer: {
-              type: 'aps',
-              version: 1,
-              accountId: 'publisher-account',
-              bidId: 'bid-1',
-              tagType: 'iframe',
-              creativeUrl: 'https://creative.example/render',
-              width: 300,
-              height: 250,
-              aaxResponse: 'renderer-envelope',
-              creativeId: 'creative-1',
-            },
-          },
         },
-        ports: [documentPort],
+        ports: [],
       });
 
-      const frame = document.body.querySelector<HTMLIFrameElement>('iframe');
-      expect(frame).not.toBeNull();
-      expect(frame?.getAttribute('referrerpolicy')).toBe('no-referrer');
+      expect(document.body.querySelector('iframe')).toBeNull();
       controlListener?.({
         data: {
           message: 'TS Owner Settled',
@@ -1096,13 +1073,14 @@ describe('Universal Creative bridge dispatcher', () => {
         ports: [],
       });
       await expect(rendered).resolves.toBeUndefined();
+      expect(controlPort.close).toHaveBeenCalledOnce();
     } finally {
       delete dynamicWindow.render;
       document.body.innerHTML = '';
     }
   });
 
-  it('keeps APS ownership alive after a local frame error until the kernel settles failure', async () => {
+  it('refuses the removed data-bearing APS start and closes every transferred port', async () => {
     vi.useFakeTimers();
     const dynamicWindow = window as unknown as {
       render?: (
@@ -1143,7 +1121,7 @@ describe('Universal Creative bridge dispatcher', () => {
             adId: RESERVATION_ID,
             message: 'Prebid Response',
             renderer: PUC_DYNAMIC_OWNER,
-            rendererVersion: '3',
+            rendererVersion: '4',
             tsOwner: {
               version: 1,
               status: 'ready',
@@ -1190,30 +1168,8 @@ describe('Universal Creative bridge dispatcher', () => {
         ports: [documentPort],
       });
 
-      const frame = document.body.querySelector<HTMLIFrameElement>('iframe');
-      expect(frame).not.toBeNull();
-      frame?.dispatchEvent(new Event('error'));
-      const immediate = rendered.then(
-        () => 'resolved',
-        () => 'rejected'
-      );
-      await Promise.resolve();
-      expect(await Promise.race([immediate, Promise.resolve('pending')])).toBe('pending');
-      expect(document.body.querySelector('iframe')).toBeNull();
+      await expect(rendered).rejects.toThrow('TS render owner control refused');
       expect(documentPort.close).toHaveBeenCalledOnce();
-      expect(controlPort.close).not.toHaveBeenCalled();
-
-      controlListener?.({
-        data: {
-          message: 'TS Owner Settled',
-          version: 1,
-          lifecycleTicket: LIFECYCLE_TICKET,
-          outcome: 'failed',
-          reason: 'runner_no_load',
-        },
-        ports: [],
-      });
-      await expect(rendered).rejects.toThrow('runner_no_load');
       expect(controlPort.close).toHaveBeenCalledOnce();
     } finally {
       await vi.runAllTimersAsync();
@@ -1243,7 +1199,7 @@ describe('Universal Creative bridge dispatcher', () => {
             adId: RESERVATION_ID,
             message: 'Prebid Response',
             renderer: PUC_DYNAMIC_OWNER,
-            rendererVersion: '3',
+            rendererVersion: '4',
             tsOwner: {
               version: 1,
               status: 'ready',
@@ -1303,7 +1259,7 @@ describe('Universal Creative bridge dispatcher', () => {
             adId: RESERVATION_ID,
             message: 'Prebid Response',
             renderer: PUC_DYNAMIC_OWNER,
-            rendererVersion: '3',
+            rendererVersion: '4',
             tsOwner: {
               version: 1,
               status: 'ready',
@@ -1384,7 +1340,7 @@ describe('Universal Creative bridge dispatcher', () => {
             adId: RESERVATION_ID,
             message: 'Prebid Response',
             renderer: PUC_DYNAMIC_OWNER,
-            rendererVersion: '3',
+            rendererVersion: '4',
             tsOwner: {
               version: 1,
               status: 'ready',
@@ -1450,132 +1406,90 @@ describe('Universal Creative bridge dispatcher', () => {
   });
 
   it.each([
-    {
-      caseName: 'cross-origin renderer route',
-      ownerKind: 'aps',
-      rendererOverrides: {},
-      rendererUrl: 'https://attacker.example/integrations/aps/renderer/v1',
-    },
-    {
-      caseName: 'semantically invalid renderer descriptor',
-      ownerKind: 'aps',
-      rendererOverrides: { tagType: 'native' },
-      rendererUrl: 'https://publisher.example/integrations/aps/renderer/v1',
-    },
-    {
-      caseName: 'mismatched declared owner kind',
-      ownerKind: 'adm',
-      rendererOverrides: {},
-      rendererUrl: 'https://publisher.example/integrations/aps/renderer/v1',
-    },
-  ])(
-    'refuses an APS owner start with a $caseName',
-    async ({ ownerKind, rendererOverrides, rendererUrl }) => {
-      vi.useFakeTimers();
-      const dynamicWindow = window as unknown as {
-        render?: (
-          data: Readonly<Record<string, unknown>>,
-          helper: Readonly<Record<string, unknown>>,
-          ownerWindow: Window
-        ) => Promise<void>;
-      };
-      window.eval(PUC_DYNAMIC_OWNER);
-      let registrationCallback: ((event: unknown) => void) | undefined;
-      const sendMessage = vi.fn(
-        (
-          _type: string,
-          _payload: Readonly<Record<string, unknown>>,
-          callback: (event: unknown) => void
-        ) => {
-          registrationCallback = callback;
-          return vi.fn();
-        }
-      );
-      let controlListener: ((event: unknown) => void) | undefined;
-      const controlPort = {
-        close: vi.fn(),
-        postMessage: vi.fn(),
-        start: vi.fn(),
-        set onmessage(listener: ((event: unknown) => void) | null) {
-          controlListener = listener ?? undefined;
-        },
-        set onmessageerror(_listener: ((event: unknown) => void) | null) {},
-      };
-      const documentPort = createPort();
-      let rendered: Promise<void> | undefined;
-
-      try {
-        rendered = dynamicWindow.render!(
-          window.JSON.parse(
-            JSON.stringify({
-              adId: RESERVATION_ID,
-              message: 'Prebid Response',
-              renderer: PUC_DYNAMIC_OWNER,
-              rendererVersion: '3',
-              tsOwner: {
-                version: 1,
-                status: 'ready',
-                kind: ownerKind,
-                lifecycleTicket: LIFECYCLE_TICKET,
-              },
-            })
-          ) as Readonly<Record<string, unknown>>,
-          { sendMessage },
-          window
-        );
-        registrationCallback?.({
-          data: JSON.stringify({
-            message: 'TS Render Owner Registered',
-            adId: RESERVATION_ID,
-            version: 1,
-            lifecycleTicket: LIFECYCLE_TICKET,
-          }),
-          ports: [controlPort],
-        });
-        controlListener?.({
-          data: {
-            message: 'TS APS Start',
-            version: 1,
-            lifecycleTicket: LIFECYCLE_TICKET,
-            rendererUrl,
-            envelope: {
-              version: 1,
-              nonce: 'n1_abcdefghijklmnopqrstuv',
-              publisherOrigin: 'https://publisher.example',
-              renderer: {
-                type: 'aps',
-                version: 1,
-                accountId: 'publisher-account',
-                bidId: 'bid-1',
-                tagType: 'iframe',
-                creativeUrl: 'https://creative.example/render',
-                width: 300,
-                height: 250,
-                aaxResponse: 'renderer-envelope',
-                ...rendererOverrides,
-              },
-            },
-          },
-          ports: [documentPort],
-        });
-        const immediate = rendered.then(
-          () => 'resolved',
-          () => 'rejected'
-        );
-
-        await Promise.resolve();
-        expect(await Promise.race([immediate, Promise.resolve('pending')])).toBe('rejected');
-        expect(document.body.querySelector('iframe')).toBeNull();
-        expect(documentPort.close).toHaveBeenCalledOnce();
-      } finally {
-        await vi.runAllTimersAsync();
-        await rendered?.catch(() => undefined);
-        vi.useRealTimers();
-        delete dynamicWindow.render;
-        document.body.innerHTML = '';
+    { caseName: 'unexpected field', message: { unexpected: true }, ports: [] },
+    { caseName: 'transferred port', message: {}, ports: [createPort()] },
+    { caseName: 'wrong message', message: { message: 'TS APS Start' }, ports: [] },
+  ])('refuses a malformed top-mount signal with an $caseName', async ({ message, ports }) => {
+    vi.useFakeTimers();
+    const dynamicWindow = window as unknown as {
+      render?: (
+        data: Readonly<Record<string, unknown>>,
+        helper: Readonly<Record<string, unknown>>,
+        ownerWindow: Window
+      ) => Promise<void>;
+    };
+    window.eval(PUC_DYNAMIC_OWNER);
+    let registrationCallback: ((event: unknown) => void) | undefined;
+    const sendMessage = vi.fn(
+      (
+        _type: string,
+        _payload: Readonly<Record<string, unknown>>,
+        callback: (event: unknown) => void
+      ) => {
+        registrationCallback = callback;
+        return vi.fn();
       }
+    );
+    let controlListener: ((event: unknown) => void) | undefined;
+    const controlPort = {
+      close: vi.fn(),
+      postMessage: vi.fn(),
+      start: vi.fn(),
+      set onmessage(listener: ((event: unknown) => void) | null) {
+        controlListener = listener ?? undefined;
+      },
+      set onmessageerror(_listener: ((event: unknown) => void) | null) {},
+    };
+    let rendered: Promise<void> | undefined;
+
+    try {
+      rendered = dynamicWindow.render!(
+        window.JSON.parse(
+          JSON.stringify({
+            adId: RESERVATION_ID,
+            message: 'Prebid Response',
+            renderer: PUC_DYNAMIC_OWNER,
+            rendererVersion: '4',
+            tsOwner: {
+              version: 1,
+              status: 'ready',
+              kind: 'aps',
+              lifecycleTicket: LIFECYCLE_TICKET,
+            },
+          })
+        ) as Readonly<Record<string, unknown>>,
+        { sendMessage },
+        window
+      );
+      registrationCallback?.({
+        data: JSON.stringify({
+          message: 'TS Render Owner Registered',
+          adId: RESERVATION_ID,
+          version: 1,
+          lifecycleTicket: LIFECYCLE_TICKET,
+        }),
+        ports: [controlPort],
+      });
+      controlListener?.({
+        data: {
+          message: 'TS APS Top Mount Started',
+          version: 1,
+          lifecycleTicket: LIFECYCLE_TICKET,
+          ...message,
+        },
+        ports,
+      });
+      await expect(rendered).rejects.toThrow('TS render owner control refused');
+      expect(document.body.querySelector('iframe')).toBeNull();
+      for (const port of ports) expect(port.close).toHaveBeenCalledOnce();
+    } finally {
+      await vi.runAllTimersAsync();
+      await rendered?.catch(() => undefined);
+      vi.useRealTimers();
+      delete dynamicWindow.render;
+      document.body.innerHTML = '';
     }
-  );
+  });
 
   it('installs one capture listener synchronously and removes only that listener on disposal', () => {
     const harness = createHarness(() => ({ recognized: false }));
@@ -1660,7 +1574,7 @@ describe('Universal Creative bridge dispatcher', () => {
     expect(JSON.parse(String(port.postMessage.mock.calls[0]?.[0]))).toEqual({
       message: 'Prebid Response',
       adId: RESERVATION_ID,
-      rendererVersion: '3',
+      rendererVersion: '4',
       tsOwner: { version: 1, status: 'refused' },
     });
     expect(port.postMessage.mock.calls[0]?.[1]).toEqual([]);
@@ -1690,7 +1604,7 @@ describe('Universal Creative bridge dispatcher', () => {
     expect(JSON.parse(String(first.postMessage.mock.calls[0]?.[0]))).toEqual({
       message: 'Prebid Response',
       adId: RESERVATION_ID,
-      rendererVersion: '3',
+      rendererVersion: '4',
       tsOwner: { version: 1, status: 'refused' },
     });
     expect(first.postMessage.mock.calls[0]?.[1]).toEqual([]);
@@ -1947,7 +1861,7 @@ describe('Universal Creative bridge dispatcher', () => {
       message: 'Prebid Response',
       adId: RESERVATION_ID,
       renderer: PUC_DYNAMIC_OWNER,
-      rendererVersion: '3',
+      rendererVersion: '4',
       tsOwner: {
         version: 1,
         status: 'ready',
@@ -2816,27 +2730,38 @@ describe('Universal Creative bridge dispatcher', () => {
     expect(gam.artifact.dispose).toHaveBeenCalledOnce();
   });
 
-  it('sends exact APS start with one document port and accepts exact document completion', () => {
+  it('mounts APS in the exact top-page slot and sends only the data-free owner signal', () => {
+    document.body.innerHTML =
+      '<div id="publisher-child"></div><div id="top-slot"><span>gam</span></div>';
     const gam = createGamAttempt('aps', 1_012);
     const pucSource = Object.freeze({ frame: 'authoritative' });
     const controlRetained = createPort();
     const controlTransferred = createPort();
-    const documentRetained = createPort();
-    const documentTransferred = createPort();
-    const channels = [
-      { port1: controlRetained, port2: controlTransferred },
-      { port1: documentRetained, port2: documentTransferred },
-    ];
-    let channelIndex = 0;
-    const issue = vi.fn(
-      (input: Parameters<NonNullable<PucBridgeOptions['rendererNonces']>['issue']>[0]) => {
-        const port = input.port;
-        if (!port) throw new Error('should receive the PUC renderer port');
-        expect(input.attempt.onSettled(() => port.close())).toBe(true);
-        return Object.freeze({ ok: true as const, nonce: 'n1_abcdefghijklmnopqrstuv' });
-      }
+    const bootstrapNonce = `b1_${'b'.repeat(22)}`;
+    const rendererNonce = `n1_${'n'.repeat(22)}`;
+    const nonceRegistry = (nonce: string) =>
+      Object.freeze({
+        bindSource: vi.fn(() => true),
+        consume: vi.fn(() => true),
+        dispose: vi.fn(),
+        issue: vi.fn(() => Object.freeze({ ok: true as const, nonce })),
+        snapshotForTest: vi.fn(() =>
+          Object.freeze({ bindings: 1, disposed: false, liveNonces: 1 })
+        ),
+      });
+    const bootstraps = nonceRegistry(bootstrapNonce);
+    const renderers = nonceRegistry(rendererNonce);
+    const topSlot = document.getElementById('top-slot')!;
+    const isCurrent = vi.fn(() => true);
+    const resolveApsMountBinding = vi.fn(() =>
+      Object.freeze({
+        bindingEpoch: Object.freeze({ binding: 1 }),
+        cycle: Object.freeze({ isRetired: () => false }),
+        element: topSlot,
+        physicalSlot: Object.freeze({ slot: 'physical' }),
+        isCurrent,
+      })
     );
-    const consume = vi.fn(() => true);
     const harness = createHarness(
       () => ({ recognized: true, state: 'renderable', expiresAt: 10_000 }),
       {
@@ -2847,267 +2772,108 @@ describe('Universal Creative bridge dispatcher', () => {
           expiresAt: 10_000,
         }),
         messageChannel: class {
-          readonly port1: unknown;
-          readonly port2: unknown;
-
-          constructor() {
-            const channel = channels[channelIndex];
-            channelIndex += 1;
-            if (!channel) throw new Error('Unexpected extra MessageChannel');
-            this.port1 = channel.port1;
-            this.port2 = channel.port2;
-          }
+          readonly port1 = controlRetained;
+          readonly port2 = controlTransferred;
         },
         mintLifecycleTicket: () => Object.freeze({ ok: true, value: LIFECYCLE_TICKET }),
-        publisherOrigin: 'https://publisher.example',
-        rendererNonces: Object.freeze({ issue, consume }),
-        rendererUrl: 'https://publisher.example/integrations/aps/renderer/v1',
+        mountAps: (input) =>
+          renderPucApsAttempt({
+            ...input,
+            bootstrapNonces: bootstraps,
+            nonces: renderers,
+            publisherOrigin: window.location.origin,
+          }),
+        slots: { resolveApsMountBinding },
       }
     );
-    issueReadyTicket(harness, gam, pucSource);
 
-    harness.dispatch({
-      data: exactOwnerRegistration(gam.reservationId),
-      ports: [createPort()],
-      source: pucSource,
-      stopImmediatePropagation: vi.fn(),
-    });
+    try {
+      issueReadyTicket(harness, gam, pucSource);
+      harness.dispatch({
+        data: exactOwnerRegistration(gam.reservationId),
+        ports: [createPort()],
+        source: pucSource,
+        stopImmediatePropagation: vi.fn(),
+      });
 
-    expect(channelIndex).toBe(2);
-    expect(issue).toHaveBeenCalledOnce();
-    expect(controlRetained.postMessage).toHaveBeenCalledOnce();
-    expect(controlRetained.postMessage.mock.calls[0]).toEqual([
-      {
-        message: 'TS APS Start',
-        version: 1,
-        lifecycleTicket: LIFECYCLE_TICKET,
-        rendererUrl: 'https://publisher.example/integrations/aps/renderer/v1',
-        envelope: {
+      expect(resolveApsMountBinding).toHaveBeenCalledWith(
+        gam.owner.navigationGeneration,
+        gam.owner.slot,
+        gam.attempt.id
+      );
+      expect(gam.attempt.fail.mock.calls).toEqual([]);
+      expect(bootstraps.issue).toHaveBeenCalledOnce();
+      expect(renderers.issue).toHaveBeenCalledOnce();
+      expect(gam.attempt.beginApsDocument).toHaveBeenCalledOnce();
+      expect(gam.artifact.dispose).not.toHaveBeenCalled();
+      expect(document.body.querySelector('#publisher-child iframe')).toBeNull();
+      expect(document.body.querySelectorAll('#top-slot iframe')).toHaveLength(1);
+      const frame = topSlot.querySelector<HTMLIFrameElement>('iframe')!;
+      expect(frame.style.position).toBe('absolute');
+      expect(frame.style.visibility).toBe('hidden');
+      expect(topSlot.querySelector('span')?.textContent).toBe('gam');
+      expect(controlRetained.postMessage).toHaveBeenCalledExactlyOnceWith(
+        {
+          message: 'TS APS Top Mount Started',
           version: 1,
-          nonce: 'n1_abcdefghijklmnopqrstuv',
-          publisherOrigin: 'https://publisher.example',
-          renderer: {
-            type: 'aps',
-            version: 1,
-            accountId: 'publisher-account',
-            bidId: 'bid-1',
-            tagType: 'iframe',
-            creativeUrl: 'https://creative.example/render',
-            width: 300,
-            height: 250,
-            aaxResponse: 'renderer-envelope',
-          },
+          lifecycleTicket: LIFECYCLE_TICKET,
         },
-      },
-      [documentTransferred],
-    ]);
+        []
+      );
 
-    dispatchPortMessage(documentRetained, {
-      message: 'TS APS Document Accepted',
-      version: 1,
-      nonce: 'n1_abcdefghijklmnopqrstuv',
-    });
-    expect(consume).not.toHaveBeenCalled();
-    expect(gam.attempt.apsDocumentAccepted).not.toHaveBeenCalled();
-
-    dispatchPortMessage(documentRetained, {
-      message: 'TS APS Runner Loaded',
-      version: 1,
-      nonce: 'n1_abcdefghijklmnopqrstuv',
-    });
-    dispatchPortMessage(documentRetained, {
-      message: 'TS APS Render Completed',
-      version: 1,
-      nonce: 'n1_abcdefghijklmnopqrstuv',
-    });
-    dispatchPortMessage(documentRetained, {
-      message: 'TS APS Render Failed',
-      version: 1,
-      nonce: 'n1_abcdefghijklmnopqrstuv',
-      reason: 'runner_failed',
-    });
-    expect(gam.attempt.accept).not.toHaveBeenCalled();
-
-    // Control and document messages travel over different ports, so delivery order
-    // is not defined even though the owner posts insertion before handing off.
-    dispatchPortMessage(controlRetained, {
-      message: 'TS Owner Inserted',
-      version: 1,
-      lifecycleTicket: LIFECYCLE_TICKET,
-    });
-    expect(gam.attempt.beginApsDocument).toHaveBeenCalledWith(gam.artifact);
-    expect(gam.artifact.dispose).not.toHaveBeenCalled();
-    expect(consume).toHaveBeenCalledOnce();
-    expect(gam.attempt.apsDocumentAccepted).toHaveBeenCalledOnce();
-    expect(gam.attempt.accept).toHaveBeenCalledOnce();
-    expect(controlRetained.postMessage.mock.calls[1]).toEqual([
-      {
-        message: 'TS Owner Settled',
-        version: 1,
-        lifecycleTicket: LIFECYCLE_TICKET,
-        outcome: 'accepted',
-      },
-      [],
-    ]);
-    expect(controlRetained.close).toHaveBeenCalledOnce();
-    expect(documentRetained.close).toHaveBeenCalledOnce();
-    expect(controlTransferred.close).not.toHaveBeenCalled();
-    expect(documentTransferred.close).not.toHaveBeenCalled();
-    expect(gam.artifact.dispose).not.toHaveBeenCalled();
-  });
-
-  it('keeps the first buffered APS failure when a later completion arrives', () => {
-    const gam = createGamAttempt('aps', 1_016);
-    const pucSource = Object.freeze({ frame: 'authoritative' });
-    const controlRetained = createPort();
-    const controlTransferred = createPort();
-    const documentRetained = createPort();
-    const documentTransferred = createPort();
-    const channels = [
-      { port1: controlRetained, port2: controlTransferred },
-      { port1: documentRetained, port2: documentTransferred },
-    ];
-    let channelIndex = 0;
-    const issue = vi.fn(
-      (input: Parameters<NonNullable<PucBridgeOptions['rendererNonces']>['issue']>[0]) => {
-        const port = input.port;
-        if (!port) throw new Error('should receive the PUC renderer port');
-        expect(input.attempt.onSettled(() => port.close())).toBe(true);
-        return Object.freeze({ ok: true as const, nonce: 'n1_abcdefghijklmnopqrstuv' });
-      }
-    );
-    const consume = vi.fn(() => true);
-    const harness = createHarness(
-      () => ({ recognized: true, state: 'renderable', expiresAt: 10_000 }),
-      {
-        claim: ({ pucSource: claimedSource }) => ({
-          recognized: true,
-          claimed: true,
-          pucSource: claimedSource as object,
-          expiresAt: 10_000,
+      const source = frame.contentWindow!;
+      harness.dispatch({
+        data: JSON.stringify({
+          message: 'TS APS Bootstrap Ready',
+          version: 1,
+          bootstrapNonce,
         }),
-        messageChannel: class {
-          readonly port1: unknown;
-          readonly port2: unknown;
-
-          constructor() {
-            const channel = channels[channelIndex];
-            channelIndex += 1;
-            if (!channel) throw new Error('Unexpected extra MessageChannel');
-            this.port1 = channel.port1;
-            this.port2 = channel.port2;
-          }
-        },
-        mintLifecycleTicket: () => Object.freeze({ ok: true, value: LIFECYCLE_TICKET }),
-        publisherOrigin: 'https://publisher.example',
-        rendererNonces: Object.freeze({ issue, consume }),
-        rendererUrl: 'https://publisher.example/integrations/aps/renderer/v1',
-      }
-    );
-    issueReadyTicket(harness, gam, pucSource);
-    harness.dispatch({
-      data: exactOwnerRegistration(gam.reservationId),
-      ports: [createPort()],
-      source: pucSource,
-      stopImmediatePropagation: vi.fn(),
-    });
-
-    dispatchPortMessage(documentRetained, {
-      message: 'TS APS Document Accepted',
-      version: 1,
-      nonce: 'n1_abcdefghijklmnopqrstuv',
-    });
-    dispatchPortMessage(documentRetained, {
-      message: 'TS APS Render Failed',
-      version: 1,
-      nonce: 'n1_abcdefghijklmnopqrstuv',
-      reason: 'runner_failed',
-    });
-    dispatchPortMessage(documentRetained, {
-      message: 'TS APS Render Completed',
-      version: 1,
-      nonce: 'n1_abcdefghijklmnopqrstuv',
-    });
-    dispatchPortMessage(controlRetained, {
-      message: 'TS Owner Inserted',
-      version: 1,
-      lifecycleTicket: LIFECYCLE_TICKET,
-    });
-
-    expect(consume).toHaveBeenCalledOnce();
-    expect(gam.attempt.accept).not.toHaveBeenCalled();
-    expect(gam.attempt.fail).toHaveBeenCalledWith('runner_failed');
-    expect(controlRetained.postMessage.mock.calls[1]).toEqual([
-      {
-        message: 'TS Owner Settled',
-        version: 1,
-        lifecycleTicket: LIFECYCLE_TICKET,
-        outcome: 'failed',
-        reason: 'runner_failed',
-      },
-      [],
-    ]);
-  });
-
-  it('closes a reentrant APS document channel before issuing nonce authority', () => {
-    const gam = createGamAttempt('aps', 1_015);
-    const pucSource = Object.freeze({ frame: 'authoritative' });
-    const controlRetained = createPort();
-    const controlTransferred = createPort();
-    const documentRetained = createPort();
-    const documentTransferred = createPort();
-    let channelIndex = 0;
-    const issue = vi.fn();
-    const harness = createHarness(
-      () => ({ recognized: true, state: 'renderable', expiresAt: 10_000 }),
-      {
-        claim: ({ pucSource: claimedSource }) => ({
-          recognized: true,
-          claimed: true,
-          pucSource: claimedSource as object,
-          expiresAt: 10_000,
+        origin: 'null',
+        ports: [],
+        source,
+      });
+      const rendererPort = createPort();
+      harness.dispatch({
+        data: JSON.stringify({
+          message: 'TS APS Container Ready',
+          version: 1,
+          bootstrapNonce,
+          rendererNonce,
         }),
-        messageChannel: class {
-          readonly port1: unknown;
-          readonly port2: unknown;
+        origin: 'null',
+        ports: [rendererPort],
+        source,
+      });
+      dispatchPortMessage(rendererPort, {
+        message: 'TS APS Document Accepted',
+        version: 1,
+        nonce: rendererNonce,
+      });
+      dispatchPortMessage(rendererPort, {
+        message: 'TS APS Render Completed',
+        version: 1,
+        nonce: rendererNonce,
+      });
 
-          constructor() {
-            channelIndex += 1;
-            if (channelIndex === 1) {
-              this.port1 = controlRetained;
-              this.port2 = controlTransferred;
-              return;
-            }
-            this.port1 = documentRetained;
-            this.port2 = documentTransferred;
-            gam.attempt.fail('internal_error');
-          }
+      expect(frame.style.visibility).toBe('visible');
+      expect(gam.attempt.accept).toHaveBeenCalledOnce();
+      expect(controlRetained.postMessage.mock.calls[1]).toEqual([
+        {
+          message: 'TS Owner Settled',
+          version: 1,
+          lifecycleTicket: LIFECYCLE_TICKET,
+          outcome: 'accepted',
         },
-        mintLifecycleTicket: () => Object.freeze({ ok: true, value: LIFECYCLE_TICKET }),
-        publisherOrigin: 'https://publisher.example',
-        rendererNonces: Object.freeze({ issue, consume: vi.fn() }),
-        rendererUrl: 'https://publisher.example/integrations/aps/renderer/v1',
-      }
-    );
-    issueReadyTicket(harness, gam, pucSource);
-
-    harness.dispatch({
-      data: exactOwnerRegistration(gam.reservationId),
-      ports: [createPort()],
-      source: pucSource,
-      stopImmediatePropagation: vi.fn(),
-    });
-
-    expect(channelIndex).toBe(2);
-    expect(issue).not.toHaveBeenCalled();
-    expect(documentRetained.close).toHaveBeenCalledOnce();
-    expect(documentTransferred.close).toHaveBeenCalledOnce();
-    expect(controlRetained.close).toHaveBeenCalledOnce();
-    expect(controlTransferred.close).not.toHaveBeenCalled();
-    expect(gam.artifact.dispose).toHaveBeenCalledOnce();
-    expect(harness.bridge.snapshotInventoryForTest().attempts).toBe(0);
+        [],
+      ]);
+      expect(controlRetained.close).toHaveBeenCalledOnce();
+    } finally {
+      bootstraps.dispose();
+      renderers.dispose();
+      harness.bridge.dispose();
+      document.body.innerHTML = '';
+    }
   });
-
   it('suppresses, refuses, and invalidates a live ticket used from the wrong source', () => {
     const gam = createGamAttempt('adm', 1_002);
     const pucSource = Object.freeze({ frame: 'authoritative' });

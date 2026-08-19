@@ -1017,27 +1017,24 @@ describe('browser composition', () => {
       aaxResponse: 'renderer-envelope',
     };
     const message = {
-      message: 'TS APS Start',
+      message: 'TS APS Top Mount Started',
       version: 1,
       lifecycleTicket: 't1_abcdefghijklmnopqrstuv',
-      rendererUrl: new URL('/integrations/aps/renderer/v1', window.location.origin).href,
-      envelope: {
-        version: 1,
-        nonce: 'n1_abcdefghijklmnopqrstuv',
-        publisherOrigin: window.location.origin,
-        renderer,
-      },
     };
-    const validation = { validateApsRenderer: () => true };
+    const validation = { validateApsRenderer: () => renderer !== undefined };
 
     const browser = createBrowserComposition({ messagingValidation: validation });
-    expect(browser.adapters.messaging.parseProtocolMessage('apsStart', message)).toBeDefined();
+    expect(
+      browser.adapters.messaging.parseProtocolMessage('apsTopMountStarted', message)
+    ).toBeDefined();
 
     const injected = createBrowserComposition({
       target: createTarget(),
       messagingValidation: validation,
     });
-    expect(injected.adapters.messaging.parseProtocolMessage('apsStart', message)).toBeUndefined();
+    expect(
+      injected.adapters.messaging.parseProtocolMessage('apsTopMountStarted', message)
+    ).toBeDefined();
   });
 
   it('installs the capture-phase message listener synchronously and disposes once', () => {

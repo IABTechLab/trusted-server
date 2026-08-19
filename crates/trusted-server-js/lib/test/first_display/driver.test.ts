@@ -144,6 +144,7 @@ function harness() {
   const cycle = Object.freeze({
     bid: value.projection.bids[0]!,
     element: document.createElement('div'),
+    isCurrent: () => true,
     ownership: 'trusted_server' as const,
     physicalSlot: {},
     placement: value.projection.slots[0]!,

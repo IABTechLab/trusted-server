@@ -3,19 +3,13 @@ import { TSJS_MESSAGE_PROTOCOL_V1 } from '../kernel/contracts/message_protocol';
 import { PUC_DYNAMIC_OWNER } from '../kernel/contracts/puc_dynamic_owner';
 import type { IdentityGenerationResult } from '../kernel/identity';
 
-interface CollapsedPucShellResizeInput {
-  readonly source: object;
-  readonly width: number;
-  readonly height: number;
-}
-
 import type {
   CommittedRenderArtifact,
   RenderAttempt,
   RenderFailureReason,
   RenderOutcome,
-  RendererNonceRegistry,
 } from './render';
+import type { SlotService } from './slots';
 import type {
   ReservationAttempt,
   ReservationRecognition,
@@ -24,6 +18,12 @@ import type {
 } from './reservations';
 
 export { PUC_DYNAMIC_OWNER };
+
+interface CollapsedPucShellResizeInput {
+  readonly source: object;
+  readonly width: number;
+  readonly height: number;
+}
 
 const CLAIM_DEADLINE_MS = 3_000;
 const LIFECYCLE_TICKET_TTL_MS = 3_000;
@@ -100,12 +100,20 @@ export interface PucBridgeOptions {
   readonly reservations: Pick<ReservationService, 'claim' | 'recognize'> &
     Partial<Pick<ReservationService, 'tombstone'>>;
   readonly mintLifecycleTicket: () => IdentityGenerationResult<string>;
+  readonly mountAps?: (input: PucApsMountInput) => boolean;
   readonly now?: () => number;
-  readonly publisherOrigin?: string;
   readonly resizeCollapsedShell?: (input: CollapsedPucShellResizeInput) => boolean;
-  readonly rendererNonces?: Pick<RendererNonceRegistry, 'consume' | 'issue'>;
-  readonly rendererUrl?: string;
+  readonly slots?: Pick<SlotService, 'resolveApsMountBinding'>;
   readonly scheduler?: PucBridgeScheduler;
+}
+
+export interface PucApsMountInput {
+  readonly attempt: RenderAttempt;
+  readonly baseArtifact: CommittedRenderArtifact;
+  readonly container: HTMLElement;
+  readonly isBindingCurrent: () => boolean;
+  readonly messaging: MessagingAdapter;
+  readonly onArtifactTransferred: () => void;
 }
 
 export interface PucBridgeInventory {
@@ -146,17 +154,9 @@ interface GamAttemptBinding {
   controlListenerDispose: (() => void) | undefined;
   controlPort: MessagingPort | undefined;
   controlStarted: boolean;
-  documentAccepted: boolean;
-  documentAcceptancePending: boolean;
-  documentTerminalPending: 'completed' | RenderFailureReason | undefined;
-  documentListenerDispose: (() => void) | undefined;
-  documentPort: MessagingPort | undefined;
-  documentPortRegistryOwned: boolean;
-  documentTransferredPort: MessagingPort | undefined;
   gamReady: boolean;
   joining: boolean;
   lifecycleTicket: string | undefined;
-  nonce: string | undefined;
   ownerInserted: boolean;
   pucSource: object | undefined;
   ticket: string | undefined;
@@ -259,56 +259,6 @@ function readMintedTicket(value: unknown): string | undefined {
       return ticket && ticket.enumerable && 'value' in ticket && validTicket(ticket.value)
         ? ticket.value
         : undefined;
-    }
-    return undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function readRendererNonceIssue(value: unknown):
-  | Readonly<{ ok: true; nonce: string }>
-  | Readonly<{
-      ok: false;
-      reason: 'capability_registry_full' | 'identity_generation_failed' | 'invalid_attempt';
-    }>
-  | undefined {
-  try {
-    if (
-      typeof value !== 'object' ||
-      value === null ||
-      !Object.isFrozen(value) ||
-      Object.getPrototypeOf(value) !== Object.prototype ||
-      Object.getOwnPropertySymbols(value).length !== 0
-    ) {
-      return undefined;
-    }
-    const names = Object.getOwnPropertyNames(value).sort();
-    if (names.length !== 2) return undefined;
-    const ok = Object.getOwnPropertyDescriptor(value, 'ok');
-    if (!ok || !ok.enumerable || !('value' in ok)) return undefined;
-    if (ok.value === true && names[0] === 'nonce' && names[1] === 'ok') {
-      const nonce = Object.getOwnPropertyDescriptor(value, 'nonce');
-      return nonce &&
-        nonce.enumerable &&
-        'value' in nonce &&
-        typeof nonce.value === 'string' &&
-        /^n1_[A-Za-z0-9_-]{22}$/.test(nonce.value)
-        ? frozen({ ok: true as const, nonce: nonce.value })
-        : undefined;
-    }
-    if (ok.value === false && names[0] === 'ok' && names[1] === 'reason') {
-      const reason = Object.getOwnPropertyDescriptor(value, 'reason');
-      if (
-        reason &&
-        reason.enumerable &&
-        'value' in reason &&
-        (reason.value === 'capability_registry_full' ||
-          reason.value === 'identity_generation_failed' ||
-          reason.value === 'invalid_attempt')
-      ) {
-        return frozen({ ok: false as const, reason: reason.value });
-      }
     }
     return undefined;
   } catch {
@@ -501,9 +451,8 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
   let reservations: PucBridgeOptions['reservations'];
   let mintLifecycleTicket: () => IdentityGenerationResult<string>;
   let nowSource: () => number;
-  let publisherOrigin: string | undefined;
-  let rendererNonces: PucBridgeOptions['rendererNonces'];
-  let rendererUrl: string | undefined;
+  let mountAps: PucBridgeOptions['mountAps'];
+  let slots: PucBridgeOptions['slots'];
   let resizeCollapsedShell: PucBridgeOptions['resizeCollapsedShell'];
   let scheduler: PucBridgeScheduler;
   try {
@@ -511,9 +460,8 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
     reservations = options.reservations;
     mintLifecycleTicket = options.mintLifecycleTicket;
     nowSource = options.now ?? defaultNow;
-    publisherOrigin = options.publisherOrigin;
-    rendererNonces = options.rendererNonces;
-    rendererUrl = options.rendererUrl;
+    mountAps = options.mountAps;
+    slots = options.slots;
     resizeCollapsedShell = options.resizeCollapsedShell;
     scheduler = options.scheduler ?? defaultScheduler();
   } catch {
@@ -521,9 +469,8 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
     reservations = options.reservations;
     mintLifecycleTicket = () => frozen({ ok: false, reason: 'identity_generation_failed' });
     nowSource = () => Number.NaN;
-    publisherOrigin = undefined;
-    rendererNonces = undefined;
-    rendererUrl = undefined;
+    mountAps = undefined;
+    slots = undefined;
     resizeCollapsedShell = undefined;
     scheduler = defaultScheduler();
   }
@@ -752,27 +699,10 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
         // Listener disposal is best-effort after the binding is already inert.
       }
     }
-    const disposeDocumentListener = binding.documentListenerDispose;
-    binding.documentListenerDispose = undefined;
-    if (disposeDocumentListener) {
-      try {
-        disposeDocumentListener();
-      } catch {
-        // Document listener disposal cannot interrupt endpoint cleanup.
-      }
-    }
-    const documentPort = binding.documentPort;
-    binding.documentPort = undefined;
-    if (documentPort && !binding.documentPortRegistryOwned) closePort(documentPort);
-    binding.documentPortRegistryOwned = false;
-    const documentTransferredPort = binding.documentTransferredPort;
-    binding.documentTransferredPort = undefined;
-    if (documentTransferredPort) closePort(documentTransferredPort);
     const controlPort = binding.controlPort;
     binding.controlPort = undefined;
     if (controlPort) closePort(controlPort);
     binding.lifecycleTicket = undefined;
-    binding.nonce = undefined;
     binding.pucSource = undefined;
     retireTicket(binding);
     tombstoneReservation(binding);
@@ -1190,259 +1120,64 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
 
   const startApsOwner = (binding: GamAttemptBinding, lifecycleTicket: string): boolean => {
     const controlPort = binding.controlPort;
-    const pucSource = binding.pucSource;
-    if (
-      !controlPort ||
-      !pucSource ||
-      binding.controlStarted ||
-      !binding.active ||
-      !rendererNonces ||
-      typeof publisherOrigin !== 'string' ||
-      typeof rendererUrl !== 'string'
-    ) {
+    if (!controlPort || binding.controlStarted || !binding.active || !mountAps || !slots) {
       failBinding(binding, 'internal_error', false);
       return false;
     }
-    const documentChannel = messaging.createChannel();
-    if (!documentChannel) {
-      failBinding(binding, 'internal_error', false);
+    const mountBinding = slots.resolveApsMountBinding(
+      binding.navigationGeneration,
+      binding.slot,
+      binding.attemptId
+    );
+    if (!mountBinding || !mountBinding.isCurrent()) {
+      failBinding(binding, 'slot_unresolved', false);
       return false;
     }
-    if (
-      !binding.active ||
-      binding.controlPort !== controlPort ||
-      !currentBindingState(binding, 'waiting_for_insertion')
-    ) {
-      closeChannel(documentChannel);
-      return false;
-    }
-    binding.documentPort = documentChannel.retained;
-    binding.documentTransferredPort = documentChannel.transferred;
-    binding.documentPortRegistryOwned = true;
-    let issuedValue: unknown;
-    try {
-      issuedValue = Reflect.apply(rendererNonces.issue, rendererNonces, [
-        frozen({
-          attempt: binding.attempt as unknown as RenderAttempt,
-          source: pucSource,
-          port: documentChannel.retained,
-        }),
-      ]);
-    } catch {
-      issuedValue = undefined;
-    }
-    const issued = readRendererNonceIssue(issuedValue);
-    if (!issued?.ok) {
-      binding.documentPortRegistryOwned = false;
-      if (!binding.active) {
-        closePort(documentChannel.retained);
-        closePort(documentChannel.transferred);
-        return false;
+    const receiveUnexpected = (event: unknown): void => {
+      const ports = messaging.inspectTransferredPorts(event)?.ports ?? [];
+      for (let index = 0; index < ports.length; index += 1) {
+        const port = ports[index];
+        if (port) closePort(port);
       }
-      const reason = issued?.reason;
-      failBinding(
-        binding,
-        reason === 'capability_registry_full' || reason === 'identity_generation_failed'
-          ? reason
-          : 'internal_error',
-        false
+      failBinding(binding, 'internal_error', false);
+    };
+    try {
+      binding.controlListenerDispose = controlPort.listen(receiveUnexpected, () =>
+        failBinding(binding, 'internal_error', false)
       );
+      binding.controlStarted = true;
+    } catch {
+      failBinding(binding, 'internal_error', false);
       return false;
     }
-    if (!binding.active) return false;
-    const nonce = issued.nonce;
-    binding.nonce = nonce;
-    let source: unknown;
-    try {
-      source = binding.attempt.renderSource;
-    } catch {
-      source = undefined;
-    }
-    const start = messaging.parseProtocolMessage('apsStart', {
-      message: TSJS_MESSAGE_PROTOCOL_V1.message.apsStart,
+    const start = messaging.parseProtocolMessage('apsTopMountStarted', {
+      message: TSJS_MESSAGE_PROTOCOL_V1.message.apsTopMountStarted,
       version: 1,
       lifecycleTicket,
-      rendererUrl,
-      envelope: {
-        version: 1,
-        nonce,
-        publisherOrigin,
-        renderer: source,
-      },
     });
     if (!start) {
-      failBinding(binding, 'winner_not_renderable', false);
+      failBinding(binding, 'internal_error', false);
       return false;
     }
-    const nonceExpectation = () =>
-      frozen({
-        nonce,
-        attempt: binding.attempt as unknown as RenderAttempt,
-        generation: binding.attempt.generation,
-        source: pucSource,
-        port: documentChannel.retained,
-      });
-    const acceptDocument = (): boolean => {
-      if (!binding.active || binding.documentAccepted || !binding.ownerInserted) return false;
-      const advanced = (() => {
-        try {
-          return (
-            Reflect.apply(rendererNonces.consume, rendererNonces, [nonceExpectation()]) === true &&
-            Reflect.apply(binding.attempt.apsDocumentAccepted, binding.attempt, []) === true
-          );
-        } catch {
-          return false;
-        }
-      })();
-      if (!advanced) {
-        failBinding(binding, 'renderer_document_no_load', false);
-        return false;
-      }
-      binding.documentAcceptancePending = false;
-      binding.documentAccepted = true;
-      return true;
-    };
-    const receiveDocument = (event: unknown): void => {
-      if (!binding.active || binding.documentPort !== documentChannel.retained) return;
-      if (!messaging.extractTransferredPorts(event, 0)) {
-        failBinding(
-          binding,
-          binding.documentAccepted ? 'runner_failed' : 'renderer_document_no_load',
-          false
-        );
-        return;
-      }
-      const data = eventData(event);
-      const accepted = messaging.parseProtocolMessage('apsDocumentAccepted', data);
-      if (accepted?.['nonce'] === nonce) {
-        if (binding.documentAccepted) return;
-        if (!binding.ownerInserted) {
-          binding.documentAcceptancePending = true;
-          return;
-        }
-        acceptDocument();
-        return;
-      }
-      const loaded = messaging.parseProtocolMessage('apsRunnerLoaded', data);
-      if (loaded?.['nonce'] === nonce) {
-        if (!binding.documentAccepted && !binding.documentAcceptancePending) {
-          failBinding(binding, 'renderer_document_no_load', false);
-        }
-        return;
-      }
-      const completed = messaging.parseProtocolMessage('apsRenderCompleted', data);
-      if (completed?.['nonce'] === nonce) {
-        if (!binding.documentAccepted) {
-          if (binding.documentAcceptancePending) {
-            if (binding.documentTerminalPending === undefined) {
-              binding.documentTerminalPending = 'completed';
-            }
-            return;
-          }
-          failBinding(binding, 'renderer_document_no_load', false);
-          return;
-        }
-        const rendered = (() => {
-          try {
-            return Reflect.apply(binding.attempt.accept, binding.attempt, []) === true;
-          } catch {
-            return false;
-          }
-        })();
-        if (!rendered && binding.active) failBinding(binding, 'internal_error', false);
-        return;
-      }
-      const failed = messaging.parseProtocolMessage('apsRenderFailed', data);
-      if (failed?.['nonce'] === nonce) {
-        const reason = failed['reason'];
-        const mapped =
-          reason === 'descriptor_invalid' ||
-          reason === 'runner_no_load' ||
-          reason === 'runner_failed'
-            ? reason
-            : 'winner_not_renderable';
-        if (!binding.documentAccepted && binding.documentAcceptancePending) {
-          if (binding.documentTerminalPending === undefined) {
-            binding.documentTerminalPending = mapped;
-          }
-          return;
-        }
-        failBinding(binding, mapped, false);
-        return;
-      }
-      failBinding(
-        binding,
-        binding.documentAccepted ? 'runner_failed' : 'renderer_document_no_load',
-        false
-      );
-    };
-    const receiveDocumentError = (): void =>
-      failBinding(
-        binding,
-        binding.documentAccepted ? 'runner_failed' : 'renderer_document_no_load',
-        false
-      );
-    const receiveControl = (event: unknown): void => {
-      if (!binding.active || binding.controlPort !== controlPort || !binding.controlStarted) return;
-      if (!messaging.extractTransferredPorts(event, 0)) {
-        failBinding(binding, 'internal_error', false);
-        return;
-      }
-      const inserted = messaging.parseProtocolMessage('ownerInserted', eventData(event));
-      if (inserted?.['lifecycleTicket'] !== lifecycleTicket) {
-        failBinding(binding, 'internal_error', false);
-        return;
-      }
-      if (binding.ownerInserted) return;
-      binding.artifactOwned = false;
-      const began = (() => {
-        try {
-          return (
-            Reflect.apply(binding.attempt.beginApsDocument, binding.attempt, [binding.artifact]) ===
-            true
-          );
-        } catch {
-          return false;
-        }
-      })();
-      if (!began) {
-        if (binding.active) binding.artifactOwned = true;
-        failBinding(binding, 'internal_error', false);
-        return;
-      }
-      binding.ownerInserted = true;
-      if (binding.documentAcceptancePending) {
-        acceptDocument();
-        if (!binding.active) return;
-        const terminal = binding.documentTerminalPending;
-        binding.documentTerminalPending = undefined;
-        if (terminal === 'completed') {
-          const rendered = (() => {
-            try {
-              return Reflect.apply(binding.attempt.accept, binding.attempt, []) === true;
-            } catch {
-              return false;
-            }
-          })();
-          if (!rendered && binding.active) failBinding(binding, 'internal_error', false);
-        } else if (terminal) {
-          failBinding(binding, terminal, false);
-        }
-      }
-    };
-    const receiveControlError = (): void => failBinding(binding, 'internal_error', false);
     try {
-      binding.documentListenerDispose = documentChannel.retained.listen(
-        receiveDocument,
-        receiveDocumentError
-      );
-      binding.controlListenerDispose = controlPort.listen(receiveControl, receiveControlError);
-      binding.controlStarted = true;
-      if (controlPort.post(start, [documentChannel.transferred]) !== true) {
+      const mounted = Reflect.apply(mountAps, undefined, [
+        {
+          attempt: binding.attempt as unknown as RenderAttempt,
+          baseArtifact: binding.artifact,
+          container: mountBinding.element as HTMLElement,
+          isBindingCurrent: mountBinding.isCurrent,
+          messaging,
+          onArtifactTransferred: () => {
+            binding.artifactOwned = false;
+            binding.ownerInserted = true;
+          },
+        },
+      ]) as boolean;
+      if (!mounted || !binding.active || !binding.ownerInserted) return false;
+      if (controlPort.post(start, []) !== true) {
         failBinding(binding, 'internal_error', false);
         return false;
       }
-      closePort(documentChannel.transferred);
       return binding.active;
     } catch {
       failBinding(binding, 'internal_error', false);
@@ -1781,17 +1516,9 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
         controlListenerDispose: undefined,
         controlPort: undefined,
         controlStarted: false,
-        documentAccepted: false,
-        documentAcceptancePending: false,
-        documentTerminalPending: undefined,
-        documentListenerDispose: undefined,
-        documentPort: undefined,
-        documentPortRegistryOwned: false,
-        documentTransferredPort: undefined,
         gamReady: false,
         joining: false,
         lifecycleTicket: undefined,
-        nonce: undefined,
         ownerInserted: false,
         pucSource: undefined,
         ticket: undefined,

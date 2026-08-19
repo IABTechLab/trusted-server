@@ -63,11 +63,11 @@ export const PROTOCOL_MESSAGE_SCHEMAS_V1 = Object.freeze({
   prebidResponse: schema(
     'structured',
     ['message', 'adId', 'renderer', 'rendererVersion', 'tsOwner'],
-    { message: TSJS_MESSAGE_PROTOCOL_V1.message.prebidResponse, rendererVersion: '3' }
+    { message: TSJS_MESSAGE_PROTOCOL_V1.message.prebidResponse, rendererVersion: '4' }
   ),
   prebidResponseRefused: schema('structured', ['message', 'adId', 'rendererVersion', 'tsOwner'], {
     message: TSJS_MESSAGE_PROTOCOL_V1.message.prebidResponse,
-    rendererVersion: '3',
+    rendererVersion: '4',
   }),
   tsOwnerReady: schema('structured', ['version', 'status', 'kind', 'lifecycleTicket'], {
     version: 1,
@@ -85,11 +85,10 @@ export const PROTOCOL_MESSAGE_SCHEMAS_V1 = Object.freeze({
     message: TSJS_MESSAGE_PROTOCOL_V1.message.ownerRefused,
     version: 1,
   }),
-  apsStart: schema(
-    'structured',
-    ['message', 'version', 'lifecycleTicket', 'rendererUrl', 'envelope'],
-    { message: TSJS_MESSAGE_PROTOCOL_V1.message.apsStart, version: 1 }
-  ),
+  apsTopMountStarted: schema('structured', ['message', 'version', 'lifecycleTicket'], {
+    message: TSJS_MESSAGE_PROTOCOL_V1.message.apsTopMountStarted,
+    version: 1,
+  }),
   apsEnvelope: schema('structured', ['version', 'nonce', 'publisherOrigin', 'renderer'], {
     version: 1,
   }),
@@ -379,29 +378,6 @@ function exactHttpOrigin(value: unknown): value is string {
   }
 }
 
-function rendererUrl(value: unknown, expected?: string): value is string {
-  const valid = (candidate: unknown): candidate is string => {
-    if (!boundedString(candidate, 2_048)) return false;
-    try {
-      const parsed = new URL(candidate);
-      return (
-        (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
-        parsed.hostname !== '' &&
-        parsed.username === '' &&
-        parsed.password === '' &&
-        parsed.pathname === '/integrations/aps/renderer/v1' &&
-        parsed.search === '' &&
-        parsed.hash === ''
-      );
-    } catch {
-      return false;
-    }
-  };
-  if (!valid(value)) return false;
-  if (expected !== undefined) return valid(expected) && value === expected;
-  return true;
-}
-
 function apsContainerUrl(value: unknown, bootstrapNonce: unknown): value is string {
   if (
     !capability(bootstrapNonce, 'bootstrapNonce') ||
@@ -640,7 +616,7 @@ function parseTsOwner(candidate: unknown): Readonly<Record<string, unknown>> | u
 function validProtocolFields(
   kind: ProtocolMessageKind,
   record: Readonly<Record<string, unknown>>,
-  options: MessagingValidationOptions
+  _options: MessagingValidationOptions
 ): boolean {
   const ticket = (): boolean => capability(record['lifecycleTicket'], 'ticket');
   const nonce = (): boolean => capability(record['nonce'], 'nonce');
@@ -678,12 +654,8 @@ function validProtocolFields(
       return capability(record['adId'], 'reservation') && ticket();
     case 'ownerRefused':
       return capability(record['adId'], 'reservation');
-    case 'apsStart':
-      return (
-        ticket() &&
-        options.expectedRendererUrl !== undefined &&
-        rendererUrl(record['rendererUrl'], options.expectedRendererUrl)
-      );
+    case 'apsTopMountStarted':
+      return ticket();
     case 'apsEnvelope':
       return true;
     case 'admStart':
@@ -758,22 +730,7 @@ function canonicalProtocolRecord(
     const owner = parseTsOwner(record['tsOwner']);
     return owner ? replaceNested(record, keys, { tsOwner: owner }) : undefined;
   }
-  if (kind === 'apsStart' || kind === 'apsEnvelope') {
-    if (
-      kind === 'apsStart' &&
-      (!capability(record['lifecycleTicket'], 'ticket') ||
-        options.expectedRendererUrl === undefined ||
-        !rendererUrl(record['rendererUrl'], options.expectedRendererUrl))
-    ) {
-      return undefined;
-    }
-    const candidate = kind === 'apsStart' ? record['envelope'] : record;
-    const canonicalEnvelope = canonicalApsEnvelope(candidate, options);
-    if (!canonicalEnvelope) return undefined;
-    return kind === 'apsStart'
-      ? replaceNested(record, keys, { envelope: canonicalEnvelope })
-      : canonicalEnvelope;
-  }
+  if (kind === 'apsEnvelope') return canonicalApsEnvelope(record, options);
   if (kind === 'admStart') {
     const source = exactRecord(record['source'], ['type', 'version', 'adm', 'width', 'height']);
     return source ? replaceNested(record, keys, { source }) : undefined;

@@ -610,6 +610,7 @@ describe('bounded first-display agent', () => {
             Object.freeze({
               bid: projectedBatch.projection.bids[0]!,
               element,
+              isCurrent: () => true,
               ownership: 'trusted_server' as const,
               physicalSlot,
               placement: projectedBatch.projection.slots[0]!,

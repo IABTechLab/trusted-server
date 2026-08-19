@@ -679,14 +679,14 @@ describe('browser messaging adapter', () => {
   it('centralizes every protocol literal and exact message shape as frozen data', () => {
     expect(TSJS_MESSAGE_PROTOCOL_V1).toEqual({
       version: 1,
-      rendererVersion: '3',
+      rendererVersion: '4',
       message: {
         prebidRequest: 'Prebid Request',
         prebidResponse: 'Prebid Response',
         ownerRegister: 'TS Render Owner Register',
         ownerRegistered: 'TS Render Owner Registered',
         ownerRefused: 'TS Render Owner Refused',
-        apsStart: 'TS APS Start',
+        apsTopMountStarted: 'TS APS Top Mount Started',
         admStart: 'TS ADM Start',
         ownerInserted: 'TS Owner Inserted',
         ownerSettled: 'TS Owner Settled',
@@ -719,7 +719,7 @@ describe('browser messaging adapter', () => {
     expect(Object.isFrozen(TSJS_MESSAGE_PROTOCOL_V1)).toBe(true);
     expect(Object.isFrozen(TSJS_MESSAGE_PROTOCOL_V1.message)).toBe(true);
     expect(Object.isFrozen(PROTOCOL_MESSAGE_SCHEMAS_V1)).toBe(true);
-    expect(Object.isFrozen(PROTOCOL_MESSAGE_SCHEMAS_V1.apsStart.keys)).toBe(true);
+    expect(Object.isFrozen(PROTOCOL_MESSAGE_SCHEMAS_V1.apsTopMountStarted.keys)).toBe(true);
   });
 
   it('parses global JSON and structured messages through exact descriptor-safe schemas', () => {
@@ -1070,44 +1070,20 @@ describe('browser messaging adapter', () => {
     ).toBeUndefined();
   });
 
-  it('fails APS start closed without exact generation expectations and semantic validation', () => {
+  it('accepts only the exact data-free APS top-mount notification', () => {
     const message = {
-      message: 'TS APS Start',
+      message: 'TS APS Top Mount Started',
       version: 1,
       lifecycleTicket: 't1_abcdefghijklmnopqrstuv',
-      rendererUrl: 'https://publisher.example/integrations/aps/renderer/v1',
-      envelope: {
-        version: 1,
-        nonce: 'n1_abcdefghijklmnopqrstuv',
-        publisherOrigin: 'https://publisher.example',
-        renderer: Object.freeze(createApsRenderer()),
-      },
     };
+    const adapter = createBrowserMessagingAdapter(createTarget());
+    expect(adapter.parseProtocolMessage('apsTopMountStarted', message)).toEqual(message);
     expect(
-      createBrowserMessagingAdapter(createTarget()).parseProtocolMessage('apsStart', message)
-    ).toBeUndefined();
-
-    const adapter = createBrowserMessagingAdapter(createTarget(), {
-      expectedPublisherOrigin: 'https://publisher.example',
-      expectedRendererUrl: 'https://publisher.example/integrations/aps/renderer/v1',
-      validateApsRenderer: () => true,
-    });
-    expect(adapter.parseProtocolMessage('apsStart', message)).toBeDefined();
-    expect(
-      adapter.parseProtocolMessage('apsStart', {
+      adapter.parseProtocolMessage('apsTopMountStarted', {
         ...message,
-        envelope: { ...message.envelope, publisherOrigin: 'https://wrong.example' },
+        rendererUrl: 'https://publisher.example/integrations/aps/renderer/v1',
       })
     ).toBeUndefined();
-    const throwing = createBrowserMessagingAdapter(createTarget(), {
-      expectedPublisherOrigin: 'https://publisher.example',
-      expectedRendererUrl: 'https://publisher.example/integrations/aps/renderer/v1',
-      validateApsRenderer: () => {
-        throw new Error('validator failed');
-      },
-    });
-    expect(() => throwing.parseProtocolMessage('apsStart', message)).not.toThrow();
-    expect(throwing.parseProtocolMessage('apsStart', message)).toBeUndefined();
   });
 
   it('canonicalizes an exact APS renderer before invoking the semantic validator', () => {
@@ -1123,17 +1099,11 @@ describe('browser messaging adapter', () => {
       expectedRendererUrl: 'https://publisher.example/integrations/aps/renderer/v1',
       validateApsRenderer: validator,
     });
-    const parsed = adapter.parseProtocolMessage('apsStart', {
-      message: 'TS APS Start',
+    const parsed = adapter.parseProtocolMessage('apsEnvelope', {
       version: 1,
-      lifecycleTicket: 't1_abcdefghijklmnopqrstuv',
-      rendererUrl: 'https://publisher.example/integrations/aps/renderer/v1',
-      envelope: {
-        version: 1,
-        nonce: 'n1_abcdefghijklmnopqrstuv',
-        publisherOrigin: 'https://publisher.example',
-        renderer,
-      },
+      nonce: 'n1_abcdefghijklmnopqrstuv',
+      publisherOrigin: 'https://publisher.example',
+      renderer,
     });
 
     expect(validator).toHaveBeenCalledTimes(1);
@@ -1141,9 +1111,7 @@ describe('browser messaging adapter', () => {
     expect(Object.getPrototypeOf(canonical)).toBeNull();
     expect(Object.isFrozen(canonical)).toBe(true);
     expect((canonical as Record<string, unknown>)['bidId']).toBe('bid-1');
-    expect(
-      (parsed?.['envelope'] as Readonly<Record<string, unknown>> | undefined)?.['renderer']
-    ).toBe(canonical);
+    expect(parsed?.['renderer']).toBe(canonical);
   });
 
   it('rejects APS renderer accessors, proxies, and unknown keys before validation', () => {
@@ -1177,38 +1145,6 @@ describe('browser messaging adapter', () => {
     expect(validator).not.toHaveBeenCalled();
   });
 
-  it('validates both renderer URL expectations and candidates before exact equality', () => {
-    const invalidUrls = [
-      '/integrations/aps/renderer/v1',
-      'ftp://publisher.example/integrations/aps/renderer/v1',
-      'https://user@publisher.example/integrations/aps/renderer/v1',
-      'https://publisher.example/integrations/aps/renderer/v1?query=1',
-      'https://publisher.example/integrations/aps/renderer/v1#fragment',
-      'https://publisher.example/wrong-path',
-    ];
-    for (const invalidUrl of invalidUrls) {
-      const adapter = createBrowserMessagingAdapter(createTarget(), {
-        expectedPublisherOrigin: 'https://publisher.example',
-        expectedRendererUrl: invalidUrl,
-        validateApsRenderer: () => true,
-      });
-      expect(
-        adapter.parseProtocolMessage('apsStart', {
-          message: 'TS APS Start',
-          version: 1,
-          lifecycleTicket: 't1_abcdefghijklmnopqrstuv',
-          rendererUrl: invalidUrl,
-          envelope: {
-            version: 1,
-            nonce: 'n1_abcdefghijklmnopqrstuv',
-            publisherOrigin: 'https://publisher.example',
-            renderer: createApsRenderer(),
-          },
-        })
-      ).toBeUndefined();
-    }
-  });
-
   it('returns canonical frozen nested records without invoking prototype serialization hooks', () => {
     const adapter = createBrowserMessagingAdapter(createTarget());
     const owner = {
@@ -1226,7 +1162,7 @@ describe('browser messaging adapter', () => {
         message: 'Prebid Response',
         adId: 'r1_abcdefghijklmnopqrstuv',
         renderer: 'renderer program',
-        rendererVersion: '3',
+        rendererVersion: '4',
         tsOwner: owner,
       });
       expect(parsed).toBeDefined();
@@ -1245,7 +1181,7 @@ describe('browser messaging adapter', () => {
     const refused = {
       message: 'Prebid Response',
       adId: 'r1_abcdefghijklmnopqrstuv',
-      rendererVersion: '3',
+      rendererVersion: '4',
       tsOwner: { version: 1, status: 'refused' },
     };
     expect(adapter.parseProtocolMessage('prebidResponseRefused', refused)).toBeDefined();

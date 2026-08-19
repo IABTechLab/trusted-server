@@ -106,6 +106,16 @@ export interface DirectApsAttemptOptions {
   readonly publisherOrigin: string;
 }
 
+export interface PucApsAttemptOptions extends DirectApsAttemptOptions {
+  readonly baseArtifact: CommittedRenderArtifact;
+  readonly isBindingCurrent: () => boolean;
+  readonly onArtifactTransferred: () => void;
+}
+
+type ApsTopPageAttemptOptions =
+  | (DirectApsAttemptOptions & Readonly<{ mode: 'direct' }>)
+  | (PucApsAttemptOptions & Readonly<{ mode: 'puc_overlay' }>);
+
 function freeze<Value extends object>(value: Value): Readonly<Value> {
   return Reflect.apply(objectFreezeIntrinsic, Object, [value]) as Readonly<Value>;
 }
@@ -208,8 +218,8 @@ function readNonceIssueResult(
   }
 }
 
-/** Drive one direct APS attempt through the three-phase top-page mount protocol. */
-export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolean {
+/** Drive one APS attempt through the shared three-phase top-page mount protocol. */
+export function mountApsTopPageAttempt(options: ApsTopPageAttemptOptions): boolean {
   if (
     !directRenderDocument ||
     !directIframePrototype ||
@@ -247,6 +257,10 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
   let attemptGeneration: object;
   let navigationGeneration: object;
   let ownerDocument: Document;
+  let mode: ApsTopPageAttemptOptions['mode'];
+  let baseArtifact: CommittedRenderArtifact | undefined;
+  let isBindingCurrent: () => boolean;
+  let onArtifactTransferred: () => void;
   try {
     attempt = options.attempt;
     bootstrapNonces = options.bootstrapNonces;
@@ -260,6 +274,11 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
     attemptGeneration = attempt.generation;
     navigationGeneration = attempt.navigationGeneration;
     ownerDocument = Reflect.apply(nodeOwnerDocumentGetter, container, []) as Document;
+    mode = options.mode;
+    baseArtifact = options.mode === 'puc_overlay' ? options.baseArtifact : undefined;
+    isBindingCurrent = options.mode === 'puc_overlay' ? options.isBindingCurrent : () => true;
+    onArtifactTransferred =
+      options.mode === 'puc_overlay' ? options.onArtifactTransferred : () => undefined;
   } catch {
     return false;
   }
@@ -327,13 +346,15 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
       typeof issueRendererMethod !== 'function' ||
       typeof bindRendererMethod !== 'function' ||
       typeof consumeRendererMethod !== 'function' ||
-      typeof beginDirectMethod !== 'function' ||
       typeof beginDocumentMethod !== 'function' ||
       typeof documentAcceptedMethod !== 'function' ||
       typeof acceptMethod !== 'function' ||
       typeof failMethod !== 'function' ||
       typeof snapshotMethod !== 'function' ||
-      Reflect.apply(beginDirectMethod, attempt, []) !== true
+      (mode === 'direct'
+        ? typeof beginDirectMethod !== 'function' ||
+          Reflect.apply(beginDirectMethod, attempt, []) !== true
+        : attempt.snapshot().state !== 'waiting_for_insertion' || !isBindingCurrent())
     ) {
       return false;
     }
@@ -362,7 +383,8 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
         attempt.id === attemptId &&
         attempt.slot === attemptSlot &&
         attempt.generation === attemptGeneration &&
-        attempt.navigationGeneration === navigationGeneration
+        attempt.navigationGeneration === navigationGeneration &&
+        (mode === 'direct' || isBindingCurrent())
       );
     } catch {
       return false;
@@ -428,11 +450,17 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
       ['sandbox', APS_RENDERER_SANDBOX],
       [
         'style',
-        'border: 0; display: block; height: ' +
-          String(renderer.height) +
-          'px; margin: 0; overflow: hidden; width: ' +
-          String(renderer.width) +
-          'px',
+        mode === 'puc_overlay'
+          ? 'border: 0; display: block; height: ' +
+            String(renderer.height) +
+            'px; inset: 0; margin: 0; overflow: hidden; position: absolute; visibility: hidden; width: ' +
+            String(renderer.width) +
+            'px; z-index: 2147483647'
+          : 'border: 0; display: block; height: ' +
+            String(renderer.height) +
+            'px; margin: 0; overflow: hidden; width: ' +
+            String(renderer.width) +
+            'px',
       ],
     ] as const;
     for (let attributeIndex = 0; attributeIndex < attributes.length; attributeIndex += 1) {
@@ -459,7 +487,40 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
   let documentPort: MessagingPort | undefined;
   let releaseGlobalListener: (() => void) | undefined;
   let insertionPredecessors: readonly Element[] = [];
+  let baseArtifactDisposed = false;
+  let baseArtifactTransferred = false;
+  let hostPositionOwned = false;
+  let previousHostPosition = '';
+  let previousHostPositionPriority = '';
   const expectedFrameSource = rendererUrl + '#' + bootstrapNonce;
+
+  const disposeBaseArtifact = (): void => {
+    if (mode !== 'puc_overlay' || !baseArtifactTransferred || baseArtifactDisposed) return;
+    baseArtifactDisposed = true;
+    try {
+      baseArtifact?.dispose();
+    } catch {
+      // The combined artifact remains terminal even when prior cleanup is hostile.
+    }
+  };
+
+  const restoreHostPosition = (): void => {
+    if (!hostPositionOwned) return;
+    hostPositionOwned = false;
+    try {
+      const style = container.style;
+      if (
+        style.getPropertyValue('position') !== 'relative' ||
+        style.getPropertyPriority('position') !== ''
+      ) {
+        return;
+      }
+      if (previousHostPosition === '') style.removeProperty('position');
+      else style.setProperty('position', previousHostPosition, previousHostPositionPriority);
+    } catch {
+      // Compare-owned style restoration cannot expand into publisher styles.
+    }
+  };
 
   const bootstrapListenerResource = freeze({
     close: (): void => {
@@ -483,7 +544,7 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
   };
 
   const artifact: CommittedRenderArtifact = freeze({
-    kind: 'direct_iframe' as const,
+    kind: mode === 'direct' ? ('direct_iframe' as const) : ('puc' as const),
     attemptId,
     slot: attemptSlot,
     navigationGeneration,
@@ -502,6 +563,8 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
       } catch {
         // DOM removal remains best-effort under a hostile publisher realm.
       }
+      restoreHostPosition();
+      disposeBaseArtifact();
     },
   });
 
@@ -541,6 +604,27 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
       }
     } catch {
       // A hostile predecessor cannot revoke the accepted artifact.
+    }
+  };
+
+  const acquireOverlayPosition = (): boolean => {
+    if (mode !== 'puc_overlay') return true;
+    try {
+      if (!isBindingCurrent()) return false;
+      const view = ownerDocument.defaultView;
+      if (!view) return false;
+      const computed = view.getComputedStyle(container);
+      if (computed.position !== 'static') return true;
+      const style = container.style;
+      previousHostPosition = style.getPropertyValue('position');
+      previousHostPositionPriority = style.getPropertyPriority('position');
+      style.setProperty('position', 'relative');
+      hostPositionOwned =
+        style.getPropertyValue('position') === 'relative' &&
+        style.getPropertyPriority('position') === '';
+      return hostPositionOwned && isBindingCurrent();
+    } catch {
+      return false;
     }
   };
 
@@ -639,13 +723,29 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
     if (loaded?.['nonce'] === rendererNonce) return;
     const completed = Reflect.apply(parseMessageMethod, messaging, ['apsRenderCompleted', data]);
     if (completed?.['nonce'] === rendererNonce) {
+      if (!documentAccepted) return;
+      if (mode === 'puc_overlay') {
+        try {
+          if (!exactFrameBinding(true) || !isBindingCurrent()) {
+            fail('slot_unresolved');
+            return;
+          }
+          iframe.style.setProperty('visibility', 'visible');
+          if (iframe.style.getPropertyValue('visibility') !== 'visible') {
+            fail('internal_error');
+            return;
+          }
+        } catch {
+          fail('internal_error');
+          return;
+        }
+      }
       if (
-        documentAccepted &&
         Reflect.apply(acceptMethod, attempt, []) === true &&
         !disposed &&
         exactFrameBinding(true)
       ) {
-        commitContainer(insertionPredecessors);
+        if (mode === 'direct') commitContainer(insertionPredecessors);
       }
       return;
     }
@@ -786,6 +886,7 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
   }
 
   try {
+    const initialState = mode === 'direct' ? 'rendering_direct' : 'waiting_for_insertion';
     releaseGlobalListener = Reflect.apply(installCaptureMethod, messaging, [receiveGlobal]);
     if (!releaseGlobalListener) return startupFailure('renderer_document_no_load');
     Reflect.apply(eventTargetAddListenerIntrinsic, iframe, ['error', onFrameError]);
@@ -793,16 +894,17 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
     if (
       Reflect.apply(elementGetAttributeIntrinsic, iframe, ['src']) !== expectedFrameSource ||
       Reflect.apply(iframeSourceGetter!, iframe, []) !== expectedFrameSource ||
-      attemptState() !== 'rendering_direct' ||
+      attemptState() !== initialState ||
       Reflect.apply(nodeIsConnectedGetter, container, []) !== true
     ) {
       return startupFailure('renderer_document_no_load');
     }
-    insertionPredecessors = snapshotContainerPredecessors();
+    insertionPredecessors = mode === 'direct' ? snapshotContainerPredecessors() : [];
     if (
       disposed ||
-      attemptState() !== 'rendering_direct' ||
-      Reflect.apply(nodeIsConnectedGetter, container, []) !== true
+      attemptState() !== initialState ||
+      Reflect.apply(nodeIsConnectedGetter, container, []) !== true ||
+      !acquireOverlayPosition()
     ) {
       return startupFailure('renderer_document_no_load');
     }
@@ -828,6 +930,14 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
       return startupFailure('internal_error');
     }
     artifactOwnedByAttempt = true;
+    if (mode === 'puc_overlay') {
+      try {
+        onArtifactTransferred();
+        baseArtifactTransferred = true;
+      } catch {
+        return fail('internal_error');
+      }
+    }
     if (
       disposed ||
       frameErrorObserved ||
@@ -840,4 +950,14 @@ export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolea
   } catch {
     return startupFailure('renderer_document_no_load');
   }
+}
+
+/** Drive one direct APS attempt through the shared top-page mount service. */
+export function renderDirectApsAttempt(options: DirectApsAttemptOptions): boolean {
+  return mountApsTopPageAttempt({ ...options, mode: 'direct' });
+}
+
+/** Drive one PUC APS attempt through a hidden top-page overlay. */
+export function renderPucApsAttempt(options: PucApsAttemptOptions): boolean {
+  return mountApsTopPageAttempt({ ...options, mode: 'puc_overlay' });
 }

@@ -79,9 +79,13 @@ interface Attempt {
   documentTimer: unknown;
   documentTransferred: PortLike | undefined;
   gam: FirstDisplayGptRenderResult | undefined;
+  hostPositionOwned: boolean;
   inserted: boolean;
   insertionTimer: unknown;
   ownerTicket: string | undefined;
+  overlay: boolean;
+  previousHostPosition: string;
+  previousHostPositionPriority: string;
   rendererNonce: string | undefined;
   ownerSource: object | undefined;
   pendingDocumentTerminal:
@@ -457,11 +461,21 @@ function encodeOpaque(bytes: Uint8Array): string {
 function validCycle(cycle: FirstDisplayGptBoundCycleV1): boolean {
   try {
     const source = cycle.bid.renderSource;
+    const document = cycle.element.ownerDocument;
+    let exactElementMatches = 0;
+    const elements = document.getElementsByTagName('*');
+    for (let index = 0; index < elements.length; index += 1) {
+      const candidate = elements.item(index);
+      if (candidate?.id !== cycle.element.id) continue;
+      if (candidate !== cycle.element) return false;
+      exactElementMatches += 1;
+    }
     return (
+      cycle.isCurrent() &&
       cycle.slotId === cycle.bid.slot &&
       cycle.slotId === cycle.placement.slot &&
-      cycle.element.ownerDocument !== null &&
-      cycle.element.ownerDocument.getElementById(cycle.element.id) === cycle.element &&
+      exactElementMatches === 1 &&
+      document.getElementById(cycle.element.id) === cycle.element &&
       RESERVATION_ID.test(cycle.bid.rendererReservationId) &&
       (source.type === 'adm' || source.type === 'aps')
     );
@@ -474,7 +488,7 @@ function refusedResponse(adId: string): string {
   return JSON.stringify({
     message: 'Prebid Response',
     adId,
-    rendererVersion: '3',
+    rendererVersion: '4',
     tsOwner: { version: 1, status: 'refused' },
   });
 }
@@ -735,6 +749,27 @@ export function createFirstDisplayRenderBridge(
         // The exact frame is no longer authoritative after terminal settlement.
       }
     }
+    if (removeFrame && attempt.hostPositionOwned) {
+      attempt.hostPositionOwned = false;
+      try {
+        const style = attempt.cycle.element.style;
+        if (
+          style.getPropertyValue('position') === 'relative' &&
+          style.getPropertyPriority('position') === ''
+        ) {
+          if (attempt.previousHostPosition === '') style.removeProperty('position');
+          else {
+            style.setProperty(
+              'position',
+              attempt.previousHostPosition,
+              attempt.previousHostPositionPriority
+            );
+          }
+        }
+      } catch {
+        // Compare-owned publisher style restoration is best-effort.
+      }
+    }
     attempt.directFrame = undefined;
   };
 
@@ -806,7 +841,7 @@ export function createFirstDisplayRenderBridge(
     return nonce;
   };
 
-  const exactDirectApsFrame = (attempt: Attempt, permanent: boolean): boolean => {
+  const exactApsFrame = (attempt: Attempt, permanent: boolean): boolean => {
     const aps = apsProtocol();
     const frame = attempt.directFrame;
     const bootstrapNonce = attempt.bootstrapNonce;
@@ -814,7 +849,9 @@ export function createFirstDisplayRenderBridge(
     try {
       return (
         attempt.active &&
-        attempt.phaseValue === 'rendering_direct' &&
+        (attempt.phaseValue === 'rendering_direct' ||
+          (attempt.overlay && attempt.phaseValue === 'waiting_for_insertion')) &&
+        validCycle(attempt.cycle) &&
         attempt.inserted &&
         frame.isConnected &&
         frame.parentNode === attempt.cycle.element &&
@@ -873,7 +910,7 @@ export function createFirstDisplayRenderBridge(
         return true;
       }
       const aps = apsProtocol();
-      if (!aps || attempt.bootstrapNavigated || !exactDirectApsFrame(attempt, false)) {
+      if (!aps || attempt.bootstrapNavigated || !exactApsFrame(attempt, false)) {
         fail(attempt, 'renderer_document_no_load');
         return true;
       }
@@ -894,7 +931,7 @@ export function createFirstDisplayRenderBridge(
         bootstrapNonce,
         containerUrl,
       });
-      if (!exactDirectApsFrame(attempt, true) || !postWindow(source, navigation)) {
+      if (!exactApsFrame(attempt, true) || !postWindow(source, navigation)) {
         fail(attempt, 'renderer_document_no_load');
         return true;
       }
@@ -938,7 +975,7 @@ export function createFirstDisplayRenderBridge(
       !port ||
       !attempt.bootstrapNavigated ||
       attempt.documentPort ||
-      !exactDirectApsFrame(attempt, true)
+      !exactApsFrame(attempt, true)
     ) {
       for (const candidate of inspection?.ports ?? []) closePort(candidate);
       fail(attempt, 'renderer_document_no_load');
@@ -964,7 +1001,7 @@ export function createFirstDisplayRenderBridge(
         publisherOrigin: aps.publisherOrigin,
         renderer: attempt.cycle.bid.renderSource,
       }) ||
-      !exactDirectApsFrame(attempt, true)
+      !exactApsFrame(attempt, true)
     ) {
       fail(attempt, 'renderer_document_no_load');
     }
@@ -974,7 +1011,7 @@ export function createFirstDisplayRenderBridge(
   function handleApsDocument(attempt: Attempt, event: unknown): void {
     const aps = apsProtocol();
     if (!attempt.active || !attempt.rendererNonce || !aps) return;
-    if (attempt.phaseValue === 'rendering_direct' && !exactDirectApsFrame(attempt, true)) {
+    if (!exactApsFrame(attempt, true)) {
       fail(attempt, attempt.documentAccepted ? 'runner_failed' : 'renderer_document_no_load');
       return;
     }
@@ -1006,7 +1043,7 @@ export function createFirstDisplayRenderBridge(
       );
       const pending = attempt.pendingDocumentTerminal;
       attempt.pendingDocumentTerminal = undefined;
-      if (pending === 'completed') settle(attempt, 'accepted');
+      if (pending === 'completed') completeAps(attempt);
       else if (pending) fail(attempt, pending);
     };
     if (parsed.kind === 'document_accepted') {
@@ -1019,7 +1056,7 @@ export function createFirstDisplayRenderBridge(
       return;
     }
     if (parsed.kind === 'render_completed') {
-      if (attempt.documentAccepted) settle(attempt, 'accepted');
+      if (attempt.documentAccepted) completeAps(attempt);
       else if (attempt.documentAcceptancePending && !attempt.pendingDocumentTerminal) {
         attempt.pendingDocumentTerminal = 'completed';
       } else fail(attempt, 'renderer_document_no_load');
@@ -1031,6 +1068,31 @@ export function createFirstDisplayRenderBridge(
     else if (attempt.documentAcceptancePending && !attempt.pendingDocumentTerminal) {
       attempt.pendingDocumentTerminal = failureReason;
     } else fail(attempt, 'renderer_document_no_load');
+  }
+
+  function completeAps(attempt: Attempt): void {
+    if (!attempt.active || !exactApsFrame(attempt, true)) {
+      fail(attempt, 'slot_unresolved');
+      return;
+    }
+    if (attempt.overlay) {
+      try {
+        const frame = attempt.directFrame;
+        if (!frame) {
+          fail(attempt, 'slot_unresolved');
+          return;
+        }
+        frame.style.setProperty('visibility', 'visible');
+        if (frame.style.getPropertyValue('visibility') !== 'visible') {
+          fail(attempt, 'internal_error');
+          return;
+        }
+      } catch {
+        fail(attempt, 'internal_error');
+        return;
+      }
+    }
+    settle(attempt, 'accepted');
   }
 
   const ownerInserted = (attempt: Attempt): void => {
@@ -1071,6 +1133,7 @@ export function createFirstDisplayRenderBridge(
     const ticket = attempt.ownerTicket;
     const inserted = exactRecord(data, ['message', 'version', 'lifecycleTicket']);
     if (
+      attempt.cycle.bid.renderSource.type === 'adm' &&
       inserted?.message === 'TS Owner Inserted' &&
       inserted.version === 1 &&
       inserted.lifecycleTicket === ticket
@@ -1121,41 +1184,15 @@ export function createFirstDisplayRenderBridge(
       });
     }
     if (!aps) return fail(attempt, 'winner_not_renderable');
-    const nonce = issueRendererNonce(attempt);
-    if (!nonce) return fail(attempt, 'capability_registry_full');
-    let channel: ChannelLike;
-    try {
-      channel = options.createChannel();
-    } catch {
-      return fail(attempt, 'internal_error');
-    }
-    attempt.documentPort = channel.port1;
-    attempt.documentTransferred = channel.port2;
-    attempt.documentRelease = listen(
-      channel.port1,
-      (event) => handleApsDocument(attempt, event),
-      () => fail(attempt, attempt.documentAccepted ? 'runner_failed' : 'renderer_document_no_load')
-    );
-    if (!attempt.documentRelease) return fail(attempt, 'internal_error');
-    const started = post(
-      controlPort,
-      {
-        message: 'TS APS Start',
+    attempt.overlay = true;
+    if (!renderAps(attempt)) return false;
+    return (
+      post(controlPort, {
+        message: 'TS APS Top Mount Started',
         version: 1,
         lifecycleTicket: ticket,
-        rendererUrl: aps.rendererUrl,
-        envelope: {
-          version: 1,
-          nonce,
-          publisherOrigin: aps.publisherOrigin,
-          renderer: attempt.cycle.bid.renderSource,
-        },
-      },
-      [channel.port2]
+      }) || fail(attempt, 'internal_error')
     );
-    closePort(channel.port2);
-    attempt.documentTransferred = undefined;
-    return started || fail(attempt, 'internal_error');
   };
 
   const handleOwnerRegistration = (
@@ -1302,7 +1339,7 @@ export function createFirstDisplayRenderBridge(
       message: 'Prebid Response',
       adId: attempt.reservationId,
       renderer: PUC_DYNAMIC_OWNER,
-      rendererVersion: '3',
+      rendererVersion: '4',
       tsOwner: owner,
     });
     attempt.claim = undefined;
@@ -1324,7 +1361,8 @@ export function createFirstDisplayRenderBridge(
     frame: HTMLIFrameElement,
     width: number,
     height: number,
-    sandbox: string
+    sandbox: string,
+    overlay = false
   ): void => {
     frame.setAttribute('sandbox', sandbox);
     frame.setAttribute('referrerpolicy', 'no-referrer');
@@ -1338,8 +1376,30 @@ export function createFirstDisplayRenderBridge(
     frame.setAttribute('aria-label', 'Advertisement');
     frame.setAttribute(
       'style',
-      `border: 0; margin: 0; overflow: hidden; display: block; width: ${width}px; height: ${height}px;`
+      overlay
+        ? `border: 0; display: block; height: ${height}px; inset: 0; margin: 0; overflow: hidden; position: absolute; visibility: hidden; width: ${width}px; z-index: 2147483647;`
+        : `border: 0; margin: 0; overflow: hidden; display: block; width: ${width}px; height: ${height}px;`
     );
+  };
+
+  const acquireOverlayPosition = (attempt: Attempt): boolean => {
+    if (!attempt.overlay) return true;
+    try {
+      if (!validCycle(attempt.cycle)) return false;
+      const host = attempt.cycle.element;
+      const browser = host.ownerDocument.defaultView;
+      if (!browser) return false;
+      if (browser.getComputedStyle(host).position !== 'static') return true;
+      attempt.previousHostPosition = host.style.getPropertyValue('position');
+      attempt.previousHostPositionPriority = host.style.getPropertyPriority('position');
+      host.style.setProperty('position', 'relative');
+      attempt.hostPositionOwned =
+        host.style.getPropertyValue('position') === 'relative' &&
+        host.style.getPropertyPriority('position') === '';
+      return attempt.hostPositionOwned && validCycle(attempt.cycle);
+    } catch {
+      return false;
+    }
   };
 
   const renderDirectAdm = (attempt: Attempt): boolean => {
@@ -1374,14 +1434,16 @@ export function createFirstDisplayRenderBridge(
     }
   };
 
-  const renderDirectAps = (attempt: Attempt): boolean => {
+  const renderAps = (attempt: Attempt): boolean => {
     const source = attempt.cycle.bid.renderSource;
     const aps = apsProtocol();
     if (source.type !== 'aps' || !aps) return false;
-    attempt.insertionTimer = arm(
-      () => fail(attempt, 'owner_insertion_timeout'),
-      aps.deadlines.insertionMs
-    );
+    if (attempt.insertionTimer === undefined) {
+      attempt.insertionTimer = arm(
+        () => fail(attempt, 'owner_insertion_timeout'),
+        aps.deadlines.insertionMs
+      );
+    }
     if (attempt.insertionTimer === undefined) return fail(attempt, 'internal_error');
     const bootstrapNonce = issueBootstrapNonce(attempt);
     const rendererNonce = issueRendererNonce(attempt);
@@ -1403,18 +1465,19 @@ export function createFirstDisplayRenderBridge(
     }
     try {
       const frame = options.document.createElement('iframe');
-      configureFrame(frame, source.width, source.height, aps.sandbox);
+      configureFrame(frame, source.width, source.height, aps.sandbox, attempt.overlay);
       const intended = aps.rendererUrl + '#' + bootstrapNonce;
       frame.onerror = () => fail(attempt, 'renderer_document_no_load');
       frame.src = intended;
       attempt.apsContainerUrl = documents.outerUrl;
       attempt.directFrame = frame;
+      if (!acquireOverlayPosition(attempt)) return fail(attempt, 'slot_unresolved');
       attempt.cycle.element.appendChild(frame);
       const intendedWindow = frame.contentWindow;
       if (!intendedWindow) return fail(attempt, 'renderer_document_no_load');
       attempt.bootstrapSource = intendedWindow;
       ownerInserted(attempt);
-      return exactDirectApsFrame(attempt, false) || fail(attempt, 'renderer_document_no_load');
+      return exactApsFrame(attempt, false) || fail(attempt, 'renderer_document_no_load');
     } catch {
       return fail(attempt, 'renderer_document_no_load');
     }
@@ -1431,7 +1494,7 @@ export function createFirstDisplayRenderBridge(
     }
     return attempt.cycle.bid.renderSource.type === 'adm'
       ? renderDirectAdm(attempt)
-      : renderDirectAps(attempt);
+      : renderAps(attempt);
   };
 
   const dispatch = (event: unknown): void => {
@@ -1535,9 +1598,13 @@ export function createFirstDisplayRenderBridge(
         documentTimer: undefined,
         documentTransferred: undefined,
         gam: undefined,
+        hostPositionOwned: false,
         inserted: false,
         insertionTimer: undefined,
         ownerTicket: undefined,
+        overlay: false,
+        previousHostPosition: '',
+        previousHostPositionPriority: '',
         rendererNonce: undefined,
         onTerminal,
         ownerSource: undefined,

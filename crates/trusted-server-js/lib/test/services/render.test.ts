@@ -12,6 +12,7 @@ import {
   APS_RENDERER_SANDBOX,
   APS_RENDERER_V1_PATH,
   renderDirectApsAttempt,
+  renderPucApsAttempt,
   resolveApsRendererV1Url,
 } from '../../src/integrations/aps/render';
 import {
@@ -1686,6 +1687,157 @@ describe('direct APS attempt rendering', () => {
       'http://[::1]:8080/integrations/aps/renderer/v1'
     );
     expect(resolveApsRendererV1Url('http://publisher.example')).toBeUndefined();
+  });
+
+  it('keeps a PUC APS overlay hidden until completion and preserves the slot host', () => {
+    document.body.innerHTML = '<div id="fictional-slot"><span>GAM content</span></div>';
+    const scope = owner();
+    const render = attempt(scope);
+    expect(render.beginGamClaim()).toBe(true);
+    expect(render.admitClaimedWinner(claimed(render, scope, DIRECT_APS_SOURCE))).toBe(true);
+    expect(render.ownerClaimed()).toBe(true);
+    expect(render.ownerRegistered()).toBe(true);
+    const baseArtifact = artifact(scope, 'puc');
+    const bootstrapNonce = indexedBootstrapNonce(41);
+    const rendererNonce = indexedRendererNonce(41);
+    const bootstraps = createBootstrapNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: bootstrapNonce }),
+    });
+    const renderers = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: rendererNonce }),
+    });
+    let captureListener: ((event: MessageEvent) => void) | undefined;
+    const messaging = createBrowserMessagingAdapter({
+      addEventListener: (
+        _type: 'message',
+        listener: (event: MessageEvent) => void,
+        _capture: true
+      ) => {
+        captureListener = listener;
+      },
+      removeEventListener: vi.fn(),
+    });
+    const container = document.getElementById('fictional-slot')!;
+    const rendererPort = browserMessagePort();
+    const isBindingCurrent = vi.fn(() => true);
+    const onArtifactTransferred = vi.fn();
+
+    try {
+      expect(
+        renderPucApsAttempt({
+          attempt: render,
+          baseArtifact,
+          bootstrapNonces: bootstraps,
+          container,
+          isBindingCurrent,
+          messaging,
+          nonces: renderers,
+          onArtifactTransferred,
+          publisherOrigin: window.location.origin,
+        })
+      ).toBe(true);
+      const frame = container.querySelector<HTMLIFrameElement>('iframe')!;
+      const source = frame.contentWindow!;
+      expect(onArtifactTransferred).toHaveBeenCalledOnce();
+      expect(container.querySelector('span')?.textContent).toBe('GAM content');
+      expect(container.style.position).toBe('relative');
+      expect(frame.style.position).toBe('absolute');
+      expect(frame.style.visibility).toBe('hidden');
+
+      captureListener?.({
+        data: JSON.stringify({
+          message: 'TS APS Bootstrap Ready',
+          version: 1,
+          bootstrapNonce,
+        }),
+        origin: 'null',
+        ports: [],
+        source,
+      } as unknown as MessageEvent);
+      captureListener?.({
+        data: JSON.stringify({
+          message: 'TS APS Container Ready',
+          version: 1,
+          bootstrapNonce,
+          rendererNonce,
+        }),
+        origin: 'null',
+        ports: [rendererPort],
+        source,
+      } as unknown as MessageEvent);
+      rendererPort.emit({
+        message: 'TS APS Document Accepted',
+        version: 1,
+        nonce: rendererNonce,
+      });
+      rendererPort.emit({
+        message: 'TS APS Runner Loaded',
+        version: 1,
+        nonce: rendererNonce,
+      });
+      expect(frame.style.visibility).toBe('hidden');
+      rendererPort.emit({
+        message: 'TS APS Render Completed',
+        version: 1,
+        nonce: rendererNonce,
+      });
+
+      expect(render.snapshot().outcome).toEqual({ outcome: 'accepted' });
+      expect(frame.style.visibility).toBe('visible');
+      expect(container.querySelector('span')?.textContent).toBe('GAM content');
+      expect(baseArtifact.dispose).not.toHaveBeenCalled();
+    } finally {
+      bootstraps.dispose();
+      renderers.dispose();
+      document.body.innerHTML = '';
+    }
+  });
+
+  it('removes only the failed PUC overlay and compare-restores its host position', () => {
+    document.body.innerHTML = '<div id="fictional-slot"><span>publisher</span></div>';
+    const scope = owner();
+    const render = attempt(scope);
+    expect(render.beginGamClaim()).toBe(true);
+    expect(render.admitClaimedWinner(claimed(render, scope, DIRECT_APS_SOURCE))).toBe(true);
+    expect(render.ownerClaimed()).toBe(true);
+    expect(render.ownerRegistered()).toBe(true);
+    const baseArtifact = artifact(scope, 'puc');
+    const bootstraps = createBootstrapNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: indexedBootstrapNonce(42) }),
+    });
+    const renderers = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: indexedRendererNonce(42) }),
+    });
+    const container = document.getElementById('fictional-slot')!;
+
+    try {
+      expect(
+        renderPucApsAttempt({
+          attempt: render,
+          baseArtifact,
+          bootstrapNonces: bootstraps,
+          container,
+          isBindingCurrent: () => true,
+          messaging: createBrowserMessagingAdapter({
+            addEventListener: vi.fn(),
+            removeEventListener: vi.fn(),
+          }),
+          nonces: renderers,
+          onArtifactTransferred: vi.fn(),
+          publisherOrigin: window.location.origin,
+        })
+      ).toBe(true);
+      expect(container.style.position).toBe('relative');
+      expect(render.fail('runner_failed')).toBe(true);
+      expect(container.querySelector('iframe')).toBeNull();
+      expect(container.querySelector('span')?.textContent).toBe('publisher');
+      expect(container.style.position).toBe('');
+      expect(baseArtifact.dispose).toHaveBeenCalledOnce();
+    } finally {
+      bootstraps.dispose();
+      renderers.dispose();
+      document.body.innerHTML = '';
+    }
   });
 });
 

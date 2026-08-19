@@ -7,6 +7,7 @@ import type {
   PreparedIntegration,
 } from '../../../src/kernel/integration_registry';
 import type { RenderAttempt } from '../../../src/services/render';
+import type { PucApsMountInput } from '../../../src/services/puc_bridge';
 
 const RELEASE_ID = 'a'.repeat(64);
 
@@ -51,12 +52,14 @@ describe('APS provider', () => {
     ) as PreparedIntegration;
     const aps = prepared.interfaces?.['aps.v1'] as {
       render: (attempt: RenderAttempt, container: HTMLElement) => boolean;
+      renderPuc: (input: PucApsMountInput) => boolean;
     };
 
     expect(Object.isFrozen(aps)).toBe(true);
     expect(render.registerRenderer).not.toHaveBeenCalled();
     expect(messages.registerApsValidation).not.toHaveBeenCalled();
     expect(aps.render({} as RenderAttempt, document.createElement('div'))).toBe(false);
+    expect(aps.renderPuc({} as PucApsMountInput)).toBe(false);
 
     prepared.activate(
       Object.freeze({
@@ -79,6 +82,7 @@ describe('APS provider', () => {
     expect(registeredRenderer).toBeUndefined();
     expect(registeredValidation).toBeUndefined();
     expect(aps.render({} as RenderAttempt, document.createElement('div'))).toBe(false);
+    expect(aps.renderPuc({} as PucApsMountInput)).toBe(false);
     preparationRelease.reverse().forEach((callback) => callback());
   });
 

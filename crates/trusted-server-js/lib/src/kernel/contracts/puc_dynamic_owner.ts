@@ -12,8 +12,6 @@ function installPucDynamicOwner(): void {
   const reservationPattern = /^r1_[A-Za-z0-9_-]{22}$/;
   const admSandbox =
     'allow-forms allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation';
-  const apsSandbox =
-    'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation';
   const renderFailureReasons = new Set([
     'auction_timeout',
     'auction_disabled',
@@ -318,56 +316,6 @@ function installPucDynamicOwner(): void {
     }
     return true;
   };
-  const utf8Length = (value: string): number => new TextEncoder().encode(value).byteLength;
-  const containsAsciiControl = (value: string): boolean =>
-    Array.from(value).some((character) => {
-      const codePoint = character.codePointAt(0);
-      return codePoint !== undefined && (codePoint <= 0x1f || codePoint === 0x7f);
-    });
-  const validApsRenderer = (renderer: Record<string, unknown>, publisherOrigin: URL): boolean => {
-    const accountId = renderer['accountId'];
-    const bidId = renderer['bidId'];
-    const creativeId = renderer['creativeId'];
-    const creativeUrl = renderer['creativeUrl'];
-    const aaxResponse = renderer['aaxResponse'];
-    if (
-      renderer['type'] !== 'aps' ||
-      renderer['version'] !== 1 ||
-      typeof accountId !== 'string' ||
-      accountId.length === 0 ||
-      utf8Length(accountId) > 1024 ||
-      typeof bidId !== 'string' ||
-      bidId.length === 0 ||
-      utf8Length(bidId) > 64 ||
-      containsAsciiControl(bidId) ||
-      (renderer['tagType'] !== 'iframe' && renderer['tagType'] !== 'script') ||
-      !validDimension(renderer['width']) ||
-      !validDimension(renderer['height']) ||
-      typeof creativeUrl !== 'string' ||
-      utf8Length(creativeUrl) > 4096 ||
-      typeof aaxResponse !== 'string' ||
-      aaxResponse.length > 349_528 ||
-      (Object.prototype.hasOwnProperty.call(renderer, 'creativeId') &&
-        (typeof creativeId !== 'string' ||
-          creativeId.length === 0 ||
-          utf8Length(creativeId) > 1024))
-    ) {
-      return false;
-    }
-    try {
-      const parsedCreativeUrl = new URL(creativeUrl);
-      return (
-        parsedCreativeUrl.protocol === 'https:' &&
-        parsedCreativeUrl.hostname !== '' &&
-        parsedCreativeUrl.username === '' &&
-        parsedCreativeUrl.password === '' &&
-        parsedCreativeUrl.origin !== publisherOrigin.origin
-      );
-    } catch {
-      return false;
-    }
-  };
-
   ownerWindow.render = (data, helper, creativeWindow) =>
     new Promise<void>((resolve, reject) => {
       let outer: Record<string, unknown> | undefined;
@@ -392,7 +340,7 @@ function installPucDynamicOwner(): void {
         !outer ||
         !owner ||
         outer['message'] !== 'Prebid Response' ||
-        outer['rendererVersion'] !== '3' ||
+        outer['rendererVersion'] !== '4' ||
         typeof adId !== 'string' ||
         !reservationPattern.test(adId) ||
         owner['version'] !== 1 ||
@@ -413,11 +361,9 @@ function installPucDynamicOwner(): void {
       let helperDisposer: (() => void) | undefined;
       let ownerTimer: number | undefined;
       let controlPort: MessagePort | undefined;
-      let documentPort: MessagePort | undefined;
       let frame: HTMLIFrameElement | undefined;
       let ownerFrameCurrent: (() => boolean) | undefined;
       let frameCommitted = false;
-      let localApsFailure = false;
       let started = false;
 
       const removeFrameHandlers = (): void => {
@@ -485,9 +431,7 @@ function installPucDynamicOwner(): void {
               // One hostile handler setter cannot retain the remaining authority.
             }
           }
-          closePort(documentPort);
           closePort(controlPort);
-          documentPort = undefined;
           controlPort = undefined;
           ownerFrameCurrent = undefined;
         } finally {
@@ -579,139 +523,12 @@ function installPucDynamicOwner(): void {
           lifecycleTicket,
         });
       };
-      const insertAps = (start: Record<string, unknown>, ports: MessagePort[]): void => {
-        const envelope = exactRecord(start['envelope'], [
-          'version',
-          'nonce',
-          'publisherOrigin',
-          'renderer',
-        ]);
-        const rendererCandidate = envelope?.['renderer'];
-        const renderer = envelope
-          ? exactRecord(rendererCandidate, [
-              'type',
-              'version',
-              'accountId',
-              'bidId',
-              'tagType',
-              'creativeUrl',
-              'width',
-              'height',
-              'aaxResponse',
-              ...(typeof rendererCandidate === 'object' &&
-              rendererCandidate !== null &&
-              Object.prototype.hasOwnProperty.call(rendererCandidate, 'creativeId')
-                ? ['creativeId']
-                : []),
-            ])
-          : undefined;
-        const rendererUrl = start['rendererUrl'];
-        let parsedUrl: URL | undefined;
-        let parsedPublisherOrigin: URL | undefined;
-        try {
-          parsedUrl = typeof rendererUrl === 'string' ? new URL(rendererUrl) : undefined;
-          parsedPublisherOrigin =
-            typeof envelope?.['publisherOrigin'] === 'string'
-              ? new URL(envelope['publisherOrigin'])
-              : undefined;
-        } catch {
-          parsedUrl = undefined;
-          parsedPublisherOrigin = undefined;
-        }
-        if (
-          !envelope ||
-          !renderer ||
-          envelope['version'] !== 1 ||
-          typeof envelope['nonce'] !== 'string' ||
-          !/^n1_[A-Za-z0-9_-]{22}$/.test(envelope['nonce']) ||
-          typeof envelope['publisherOrigin'] !== 'string' ||
-          new TextEncoder().encode(envelope['publisherOrigin']).byteLength > 2048 ||
-          !parsedUrl ||
-          !parsedPublisherOrigin ||
-          !validApsRenderer(renderer, parsedPublisherOrigin) ||
-          new TextEncoder().encode(String(rendererUrl)).byteLength > 2048 ||
-          (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') ||
-          parsedUrl.hostname === '' ||
-          parsedUrl.username !== '' ||
-          parsedUrl.password !== '' ||
-          parsedUrl.pathname !== '/integrations/aps/renderer/v1' ||
-          parsedUrl.search !== '' ||
-          parsedUrl.hash !== '' ||
-          (parsedPublisherOrigin.protocol !== 'https:' &&
-            parsedPublisherOrigin.protocol !== 'http:') ||
-          parsedPublisherOrigin.hostname === '' ||
-          parsedPublisherOrigin.username !== '' ||
-          parsedPublisherOrigin.password !== '' ||
-          parsedPublisherOrigin.origin !== envelope['publisherOrigin'] ||
-          parsedPublisherOrigin.pathname !== '/' ||
-          parsedPublisherOrigin.search !== '' ||
-          parsedPublisherOrigin.hash !== '' ||
-          parsedUrl.origin !== parsedPublisherOrigin.origin ||
-          ports.length !== 1 ||
-          !creativeWindow.document.body
-        ) {
-          closePort(ports[0]);
-          finish(false, 'TS APS start refused');
-          return;
-        }
-        prepareDocument();
-        documentPort = ports[0];
-        const next = configureFrame(renderer, apsSandbox);
-        const intendedSource = `${parsedUrl.href}#tsaps=${envelope['nonce'] as string}`;
-        let intendedWindow: Window | null = null;
-        ownerFrameCurrent = () =>
-          frame === next &&
-          next.parentNode === creativeWindow.document.body &&
-          next.getAttribute('src') === intendedSource &&
-          next.contentWindow === intendedWindow;
-        const containLocalFailure = (transferred?: MessagePort): void => {
-          localApsFailure = true;
-          try {
-            next.onload = null;
-          } catch {
-            // Local containment continues through hostile DOM setters.
-          }
-          try {
-            next.onerror = null;
-          } catch {
-            // Local containment continues through hostile DOM setters.
-          }
-          closePort(transferred);
-          if (documentPort) {
-            closePort(documentPort);
-            documentPort = undefined;
-          }
-          removeFrame(next);
-        };
-        next.onload = () => {
-          if (settled || ownerFrameCurrent?.() !== true || !documentPort) return;
-          const transferred = documentPort;
-          documentPort = undefined;
-          try {
-            const target = next.contentWindow;
-            if (!target) throw new Error('APS document target is unavailable');
-            target.postMessage(envelope, '*', [transferred]);
-          } catch {
-            containLocalFailure(transferred);
-          }
-        };
-        next.onerror = () => containLocalFailure();
-        next.src = intendedSource;
-        frame = next;
-        creativeWindow.document.body.appendChild(next);
-        intendedWindow = next.contentWindow;
-        postControl({
-          message: 'TS Owner Inserted',
-          version: 1,
-          lifecycleTicket,
-        });
-      };
       const receiveControl = (event: MessageEvent): void => {
         if (settled) {
           closeEventPorts(event);
           return;
         }
-        const ports = eventPorts(event, 0) ?? eventPorts(event, 1);
+        const ports = eventPorts(event, 0);
         const dataValue = eventDataValue(event);
         const routedMessage = ownDataValue(dataValue, 'message');
         const routedOutcome = ownDataValue(dataValue, 'outcome');
@@ -719,15 +536,13 @@ function installPucDynamicOwner(): void {
           'message',
           'version',
           'lifecycleTicket',
-          ...(routedMessage === 'TS APS Start'
-            ? ['rendererUrl', 'envelope']
-            : routedMessage === 'TS ADM Start'
-              ? ['source']
-              : routedMessage === 'TS Owner Settled' && routedOutcome !== undefined
-                ? routedOutcome === 'accepted'
-                  ? ['outcome']
-                  : ['outcome', 'reason']
-                : []),
+          ...(routedMessage === 'TS ADM Start'
+            ? ['source']
+            : routedMessage === 'TS Owner Settled' && routedOutcome !== undefined
+              ? routedOutcome === 'accepted'
+                ? ['outcome']
+                : ['outcome', 'reason']
+              : []),
         ]);
         if (
           !message ||
@@ -750,20 +565,19 @@ function installPucDynamicOwner(): void {
           return;
         }
         if (
-          message['message'] === 'TS APS Start' &&
+          message['message'] === 'TS APS Top Mount Started' &&
           ownerKind === 'aps' &&
-          ports.length === 1 &&
+          ports.length === 0 &&
           !started
         ) {
           started = true;
-          insertAps(message, ports);
           return;
         }
         if (message['message'] === 'TS Owner Settled' && ports.length === 0) {
           if (
             message['outcome'] === 'accepted' &&
-            !localApsFailure &&
-            ownerFrameCurrent?.() === true
+            started &&
+            (ownerKind === 'aps' || ownerFrameCurrent?.() === true)
           ) {
             frameCommitted = true;
             finish(true, '');

@@ -1022,6 +1022,112 @@ describe('slot registry', () => {
 describe('navigation-owned DOM reconciliation', () => {
   afterEach(() => vi.useRealTimers());
 
+  async function completedApsMountCycle(
+    ownership: 'publisher' | 'trusted_server' = 'trusted_server'
+  ) {
+    const gpt = createGptHarness();
+    const dom = createReconciliationBoundary();
+    const element = Object.freeze({ element: 'top-slot' });
+    dom.put('slot-div', element);
+    const service = createSlotService({ googletag: gpt.adapter, reconciliation: dom.boundary });
+    const navigation = createNavigation();
+    let slot: object;
+    if (ownership === 'trusted_server') {
+      slot = bindTrustedSlot(service, navigation);
+    } else {
+      slot = Object.freeze({ publisher: true });
+      expect(service.register(navigation, [serverRegistration('slot')])).toMatchObject({
+        ok: true,
+      });
+      expect(
+        service.adoptGptSlot(navigation.generation, 'slot', {
+          definition: Object.freeze({
+            adUnitPath: '/network/slot',
+            elementId: 'slot-div',
+            sizes: Object.freeze([[300, 250] as const]),
+          }),
+          ownership,
+          slot,
+        })
+      ).toEqual({ ok: true });
+    }
+    const intentId = `a1_${'m'.repeat(22)}`;
+    const request = service.request({
+      intentId,
+      expectedSlot: slot,
+      navigationGeneration: navigation.generation,
+      operation: 'refresh',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+    await Promise.resolve();
+    service.handleGptEvent('slotRequested', { slot });
+    service.handleGptEvent('slotRenderEnded', {
+      isEmpty: false,
+      responseIdentifier: 'aps-top-mount',
+      slot,
+    });
+    await expect(request.result).resolves.toMatchObject({ status: 'rendered' });
+    return { dom, element, intentId, navigation, service, slot };
+  }
+
+  it('claims one exact completed TS cycle and invalidates it on DOM replacement', async () => {
+    const h = await completedApsMountCycle();
+    const binding = h.service.resolveApsMountBinding(h.navigation.generation, 'slot', h.intentId);
+
+    expect(binding).toMatchObject({ element: h.element, physicalSlot: h.slot });
+    expect(binding?.isCurrent()).toBe(true);
+    expect(
+      h.service.resolveApsMountBinding(h.navigation.generation, 'slot', h.intentId)
+    ).toBeUndefined();
+
+    h.dom.replace('slot-div', Object.freeze({ element: 'replacement' }));
+    expect(binding?.isCurrent()).toBe(false);
+  });
+
+  it('refuses a publisher-owned cycle when its exact host was replaced before binding', async () => {
+    const h = await completedApsMountCycle('publisher');
+    h.dom.replace('slot-div', Object.freeze({ element: 'publisher-replacement' }));
+
+    expect(
+      h.service.resolveApsMountBinding(h.navigation.generation, 'slot', h.intentId)
+    ).toBeUndefined();
+  });
+
+  it('refuses missing, ambiguous, disconnected, and stale APS mount bindings', async () => {
+    const ambiguous = await completedApsMountCycle();
+    ambiguous.dom.replaceAmbiguously('slot-div', [
+      Object.freeze({ element: 'first' }),
+      Object.freeze({ element: 'second' }),
+    ]);
+    expect(
+      ambiguous.service.resolveApsMountBinding(
+        ambiguous.navigation.generation,
+        'slot',
+        ambiguous.intentId
+      )
+    ).toBeUndefined();
+
+    const disconnected = await completedApsMountCycle();
+    disconnected.dom.disconnect('slot-div');
+    expect(
+      disconnected.service.resolveApsMountBinding(
+        disconnected.navigation.generation,
+        'slot',
+        disconnected.intentId
+      )
+    ).toBeUndefined();
+
+    const stale = await completedApsMountCycle();
+    stale.navigation.dispose();
+    expect(
+      stale.service.resolveApsMountBinding(stale.navigation.generation, 'slot', stale.intentId)
+    ).toBeUndefined();
+    expect(
+      stale.service.resolveApsMountBinding(stale.navigation.generation, 'missing', stale.intentId)
+    ).toBeUndefined();
+  });
+
   it('installs reconciliation only for one explicit reversible deferred owner', () => {
     const gpt = createGptHarness();
     const dom = createReconciliationBoundary();

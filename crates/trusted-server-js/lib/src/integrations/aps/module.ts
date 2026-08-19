@@ -11,8 +11,14 @@ import type {
   RenderAttempt,
 } from '../../services/render';
 import { validatePersistentFirstDisplaySliceAdoptionV1 } from '../../shared/takeover';
+import type { PucApsMountInput } from '../../services/puc_bridge';
 
-import { renderDirectApsAttempt, resolveApsRendererV1Url, validateApsRenderer } from './render';
+import {
+  renderDirectApsAttempt,
+  renderPucApsAttempt,
+  resolveApsRendererV1Url,
+  validateApsRenderer,
+} from './render';
 
 interface RenderCapability {
   readonly bootstrapNonces: BootstrapNonceRegistry;
@@ -76,7 +82,16 @@ export function createApsIntegrationRegistration(releaseId: string): Integration
         nonces: render.rendererNonces,
         publisherOrigin: render.publisherOrigin,
       });
-    const apsCapability = Object.freeze({ render: renderer });
+    const renderPuc = (input: PucApsMountInput): boolean =>
+      active &&
+      renderPucApsAttempt({
+        ...input,
+        bootstrapNonces: render.bootstrapNonces,
+        messaging: messages.messaging,
+        nonces: render.rendererNonces,
+        publisherOrigin: render.publisherOrigin,
+      });
+    const apsCapability = Object.freeze({ render: renderer, renderPuc });
     const validation = Object.freeze({
       expectedPublisherOrigin: render.publisherOrigin,
       expectedRendererUrl: rendererUrl,

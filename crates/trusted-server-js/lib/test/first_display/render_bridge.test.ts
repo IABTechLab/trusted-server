@@ -79,16 +79,18 @@ function fixture(kind: 'adm' | 'aps' = 'adm') {
     formats: Object.freeze([Object.freeze([300, 250] as const)]),
     targeting: Object.freeze({}),
   });
+  let cycleCurrent = true;
   const cycle: FirstDisplayGptBoundCycleV1 = Object.freeze({
     bid,
     element,
     ownership: 'trusted_server',
     physicalSlot: {},
+    isCurrent: () => cycleCurrent,
     placement,
     slotId: 'slot-1',
     traceToken: 'gt1_1',
   });
-  return { cycle, dom, element };
+  return { cycle, dom, element, invalidateCycle: () => (cycleCurrent = false) };
 }
 
 function harness(kind: 'adm' | 'aps' = 'adm', onNativeMutation?: () => boolean) {
@@ -294,6 +296,49 @@ function registerOwner(h: ReturnType<typeof harness>) {
   return { source, ticket };
 }
 
+function startApsDocument(h: ReturnType<typeof harness>) {
+  const frame = h.element.querySelector<HTMLIFrameElement>('iframe');
+  if (!frame?.contentWindow) throw new Error('expected the top-page APS frame');
+  const bootstrapNonce = new URL(frame.src).hash.slice(1);
+  const postMessage = vi
+    .spyOn(frame.contentWindow, 'postMessage')
+    .mockImplementation(() => undefined);
+  h.dispatch({
+    data: JSON.stringify({
+      message: 'TS APS Bootstrap Ready',
+      version: 1,
+      bootstrapNonce,
+    }),
+    origin: 'null',
+    ports: [],
+    source: frame.contentWindow,
+  });
+  const navigation = JSON.parse(postMessage.mock.calls[0]?.[0] as string) as Record<
+    string,
+    unknown
+  >;
+  const decodedOuter = decodeURIComponent(
+    (navigation.containerUrl as string)
+      .slice('data:text/html;charset=utf-8,'.length)
+      .split('#')[0] ?? ''
+  );
+  const nonce = /rendererNonce=(n1_[A-Za-z0-9_-]{22})/.exec(decodedOuter)?.[1];
+  if (!nonce) throw new Error('expected the renderer nonce');
+  const documentPort = new FakePort();
+  h.dispatch({
+    data: JSON.stringify({
+      message: 'TS APS Container Ready',
+      version: 1,
+      bootstrapNonce,
+      rendererNonce: nonce,
+    }),
+    origin: 'null',
+    ports: [documentPort],
+    source: frame.contentWindow,
+  });
+  return { documentPort, frame, nonce };
+}
+
 describe('bounded first-display render bridge', () => {
   it('observes admitted bridge activity and terminal tombstone expiry', () => {
     const mutations = vi.fn(() => true);
@@ -339,7 +384,7 @@ describe('bounded first-display render bridge', () => {
     expect(JSON.parse(refusedPort.postMessage.mock.calls[0]?.[0] as string)).toEqual({
       message: 'Prebid Response',
       adId: RESERVATION_ID,
-      rendererVersion: '3',
+      rendererVersion: '4',
       tsOwner: { version: 1, status: 'refused' },
     });
     expect(refusedPort.close).toHaveBeenCalledOnce();
@@ -388,7 +433,7 @@ describe('bounded first-display render bridge', () => {
       message: 'Prebid Response',
       adId: RESERVATION_ID,
       renderer: PUC_DYNAMIC_OWNER,
-      rendererVersion: '3',
+      rendererVersion: '4',
       tsOwner: { version: 1, status: 'ready', kind: 'adm' },
     });
     const ticket = (outer.tsOwner as Record<string, unknown>).lifecycleTicket;
@@ -449,6 +494,25 @@ describe('bounded first-display render bridge', () => {
     });
   });
 
+  it('refuses delayed APS owner registration after a later physical GPT request', () => {
+    const h = harness('aps');
+    const source = {};
+    const responsePort = new FakePort();
+    h.dispatch(requestEvent(responsePort, { source }));
+    expect(h.bridge.recordGam(h.cycle, 'nonempty_gam')).toBe(true);
+    const response = JSON.parse(responsePort.postMessage.mock.calls[0]?.[0] as string);
+
+    h.invalidateCycle();
+    const registrationPort = new FakePort();
+    h.dispatch(
+      ownerRegistration(response.tsOwner.lifecycleTicket as string, registrationPort, source)
+    );
+
+    expect(h.terminals).toEqual(['failed']);
+    expect(h.terminalFacts).toEqual([['failed', 'slot_unresolved']]);
+    expect(h.element.querySelector('iframe')).toBeNull();
+  });
+
   it('never resizes an anchored or already-expanded PUC shell', () => {
     const cases = [
       {
@@ -477,8 +541,9 @@ describe('bounded first-display render bridge', () => {
     }
   });
 
-  it('requires APS document acceptance and callback completion after owner insertion', () => {
+  it('requires APS document acceptance and completion in a hidden top-page PUC overlay', () => {
     const h = harness('aps');
+    h.element.innerHTML = '<span>publisher GAM content</span>';
     const source = {};
     const responsePort = new FakePort();
     h.dispatch(requestEvent(responsePort, { source }));
@@ -489,43 +554,46 @@ describe('bounded first-display render bridge', () => {
     h.dispatch(ownerRegistration(ticket, registrationPort, source));
 
     const start = h.channels[0]?.port1.postMessage.mock.calls[0]?.[0] as Record<string, unknown>;
-    expect(start).toMatchObject({
-      message: 'TS APS Start',
+    expect(start).toEqual({
+      message: 'TS APS Top Mount Started',
       version: 1,
       lifecycleTicket: ticket,
-      rendererUrl: 'https://publisher.example/integrations/aps/renderer/v1',
-      envelope: {
-        version: 1,
-        publisherOrigin: 'https://publisher.example',
-        renderer: h.cycle.bid.renderSource,
-      },
     });
-    const nonce = (start.envelope as Record<string, unknown>).nonce as string;
-    expect(nonce).toMatch(/^n1_[A-Za-z0-9_-]{22}$/);
-    expect(h.channels[0]?.port1.postMessage.mock.calls[0]?.[1]).toEqual([h.channels[1]?.port2]);
+    expect(h.channels[0]?.port1.postMessage.mock.calls[0]?.[1]).toEqual([]);
+    expect(h.channels).toHaveLength(1);
+    expect(h.element.querySelector('span')?.textContent).toBe('publisher GAM content');
+    const { documentPort, frame, nonce } = startApsDocument(h);
+    expect(frame.parentNode).toBe(h.element);
+    expect(frame.style.position).toBe('absolute');
+    expect(frame.style.visibility).toBe('hidden');
+    expect(h.element.style.position).toBe('relative');
 
-    h.channels[1]?.port1.dispatch({
+    documentPort.dispatch({
       message: 'TS APS Document Accepted',
       version: 1,
       nonce,
     });
-    h.channels[1]?.port1.dispatch({
+    documentPort.dispatch({
       message: 'TS APS Runner Loaded',
       version: 1,
       nonce,
     });
     expect(h.terminals).toEqual([]);
-    h.channels[0]?.port1.dispatch({
-      message: 'TS Owner Inserted',
-      version: 1,
-      lifecycleTicket: ticket,
-    });
-    h.channels[1]?.port1.dispatch({
+    expect(frame.style.visibility).toBe('hidden');
+    documentPort.dispatch({
       message: 'TS APS Render Completed',
       version: 1,
       nonce,
     });
     expect(h.terminals).toEqual(['accepted']);
+    expect(frame.style.visibility).toBe('visible');
+    expect(h.element.querySelector('span')?.textContent).toBe('publisher GAM content');
+    expect(h.channels[0]?.port1.postMessage.mock.calls[1]?.[0]).toEqual({
+      message: 'TS Owner Settled',
+      version: 1,
+      lifecycleTicket: ticket,
+      outcome: 'accepted',
+    });
   });
 
   it('renders an attributable empty-GAM ADM fallback directly into the bound element', () => {
@@ -731,29 +799,15 @@ describe('bounded first-display render bridge', () => {
     expect(adm.terminalFacts).toEqual([['failed', 'adm_document_no_load']]);
 
     const document = harness('aps');
-    const documentOwner = registerOwner(document);
-    document.channels[0]?.port1.dispatch({
-      message: 'TS Owner Inserted',
-      version: 1,
-      lifecycleTicket: documentOwner.ticket,
-    });
+    registerOwner(document);
     document.fireLast(3_000);
     expect(document.terminals).toEqual(['failed']);
     expect(document.terminalFacts).toEqual([['failed', 'renderer_document_no_load']]);
 
     const completion = harness('aps');
-    const completionOwner = registerOwner(completion);
-    const start = completion.channels[0]?.port1.postMessage.mock.calls[0]?.[0] as Record<
-      string,
-      unknown
-    >;
-    const nonce = (start.envelope as Record<string, unknown>).nonce;
-    completion.channels[0]?.port1.dispatch({
-      message: 'TS Owner Inserted',
-      version: 1,
-      lifecycleTicket: completionOwner.ticket,
-    });
-    completion.channels[1]?.port1.dispatch({
+    registerOwner(completion);
+    const { documentPort, nonce } = startApsDocument(completion);
+    documentPort.dispatch({
       message: 'TS APS Document Accepted',
       version: 1,
       nonce,

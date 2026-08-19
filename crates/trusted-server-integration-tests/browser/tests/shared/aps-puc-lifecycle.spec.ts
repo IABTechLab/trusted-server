@@ -1,14 +1,51 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { expect, test, type Page } from "@playwright/test";
 import { installGptStub } from "../../helpers/gpt-stub.js";
+import { runtimeUrl } from "../../helpers/state.js";
 import {
   loadRuntimeTsjsFixture,
   runtimeTsjsFixture,
 } from "../../helpers/tsjs-fixture.js";
 
-const GPT_FIXTURE = runtimeTsjsFixture(["render_runtime", "gpt"]);
+const GPT_FIXTURE = runtimeTsjsFixture(["render_runtime", "aps", "gpt"]);
 
 const SLOT = "puc-lifecycle-slot";
 const RESERVATION_ID = "r1_AAAAAAAAAAAAAAAAAAAAAA";
+const APS_RENDERER_URL = "https://puc.test/integrations/aps/renderer/v1";
+const APS_RUNNER_URL = "https://puc.test/integrations/aps/runner.js";
+const FICTIONAL_APS_RUNNER = readFileSync(
+  resolve(__dirname, "../../fixtures/fictional-aps-runner.js"),
+  "utf8",
+);
+
+function apsDescriptor() {
+  const bid = {
+    id: "duplicate-puc-top-mount-bid",
+    price: 1.25,
+    w: 300,
+    h: 250,
+    ext: {
+      creativeurl: "https://creative.example/render",
+      tagtype: "iframe",
+    },
+  };
+  return {
+    type: "aps",
+    version: 1,
+    accountId: "fictional-account",
+    bidId: bid.id,
+    creativeId: "fictional-creative",
+    tagType: bid.ext.tagtype,
+    creativeUrl: bid.ext.creativeurl,
+    width: bid.w,
+    height: bid.h,
+    aaxResponse: Buffer.from(
+      JSON.stringify({ seatbid: [{ bid: [bid] }] }),
+      "utf8",
+    ).toString("base64"),
+  };
+}
 
 function boot() {
   return {
@@ -43,13 +80,7 @@ function boot() {
           currency: "USD",
           targeting: { hb_bidder: "fictional" },
           rendererReservationId: RESERVATION_ID,
-          renderSource: {
-            type: "adm",
-            version: 1,
-            adm: '<main id="fictional-creative">fictional creative</main>',
-            width: 300,
-            height: 250,
-          },
+          renderSource: apsDescriptor(),
         },
       ],
     },
@@ -72,6 +103,31 @@ async function openLifecyclePage(
   nonemptyCompletionOnDisplay = false,
 ): Promise<void> {
   await installGptStub(page);
+  const rendererResponse = await page.request.get(
+    runtimeUrl("/integrations/aps/renderer/v1"),
+  );
+  expect(rendererResponse.status()).toBe(200);
+  const rendererDocument = await rendererResponse.text();
+  await page.route(APS_RENDERER_URL, (route) =>
+    route.fulfill({
+      status: 200,
+      body: rendererDocument,
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        "content-security-policy":
+          rendererResponse.headers()["content-security-policy"] ?? "",
+        "referrer-policy": "no-referrer",
+        "x-content-type-options": "nosniff",
+      },
+    }),
+  );
+  await page.route(APS_RUNNER_URL, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/javascript",
+      body: FICTIONAL_APS_RUNNER,
+    }),
+  );
   await page.route("https://puc.test/fixture", (route) =>
     route.fulfill({
       status: 200,
@@ -96,7 +152,7 @@ async function openLifecyclePage(
       browserWindow.tsjs = {
         boot: initialBoot,
         que: [],
-        _integrationConfig: { gpt: {} },
+        _integrationConfig: { aps: {}, gpt: {} },
       };
     },
     {
@@ -180,8 +236,8 @@ async function expectAcceptedLifecycle(page: Page): Promise<void> {
     .toEqual({
       lifecycle: ["accepted"],
       pucFrames: 1,
-      ownerFrames: [1],
-      ownerSources: [expect.stringContaining("fictional creative")],
+      ownerFrames: [0],
+      ownerSources: [""],
       emissions: [
         { name: "slotRequested", listeners: 1, physical: true },
         { name: "slotRenderEnded", listeners: 1, physical: true },
@@ -194,6 +250,12 @@ async function expectAcceptedLifecycle(page: Page): Promise<void> {
       refreshes: [],
       slotChildren: [
         { tag: "IFRAME", fictionalPuc: true, title: null, adm: false },
+        {
+          tag: "IFRAME",
+          fictionalPuc: false,
+          title: "Ad content",
+          adm: false,
+        },
       ],
     });
 
@@ -203,8 +265,8 @@ async function expectAcceptedLifecycle(page: Page): Promise<void> {
       const puc = root?.querySelector<HTMLIFrameElement>(
         "iframe[data-fictional-puc]",
       );
-      const creative = puc?.contentDocument?.querySelector<HTMLIFrameElement>(
-        'iframe[title="Ad content"]',
+      const creative = root?.querySelector<HTMLIFrameElement>(
+        ':scope > iframe[title="Ad content"]',
       );
       return {
         hbAdId: (
@@ -215,12 +277,15 @@ async function expectAcceptedLifecycle(page: Page): Promise<void> {
           }
         ).__gptDiagnosticsStub.targeting(slot, "hb_adid"),
         pucCount: root?.querySelectorAll("iframe[data-fictional-puc]").length,
-        creativeCount: puc?.contentDocument?.querySelectorAll(
+        ownerCreativeCount: puc?.contentDocument?.querySelectorAll(
           'iframe[title="Ad content"]',
+        ).length,
+        creativeCount: root?.querySelectorAll(
+          ':scope > iframe[title="Ad content"]',
         ).length,
         creativeWidth: creative?.getAttribute("width"),
         creativeHeight: creative?.getAttribute("height"),
-        creativeSource: creative?.srcdoc,
+        creativeVisibility: creative?.style.visibility,
       };
     }, SLOT),
   ).toEqual({
@@ -229,7 +294,8 @@ async function expectAcceptedLifecycle(page: Page): Promise<void> {
     creativeCount: 1,
     creativeWidth: "300",
     creativeHeight: "250",
-    creativeSource: expect.stringContaining("fictional creative"),
+    creativeVisibility: "visible",
+    ownerCreativeCount: 0,
   });
 }
 
@@ -303,7 +369,7 @@ test.describe("APS/PUC lifecycle over the hard-cutover runtime", () => {
         );
         return {
           pucFrames: pucFrames.length,
-          creativeFrames: pucFrames.reduce(
+          ownerCreativeFrames: pucFrames.reduce(
             (total, frame) =>
               total +
               (frame.contentDocument?.querySelectorAll(
@@ -311,8 +377,15 @@ test.describe("APS/PUC lifecycle over the hard-cutover runtime", () => {
               ).length ?? 0),
             0,
           ),
+          topCreativeFrames:
+            root?.querySelectorAll(':scope > iframe[title="Ad content"]')
+              .length ?? 0,
         };
       }, SLOT),
-    ).toEqual({ pucFrames: 2, creativeFrames: 1 });
+    ).toEqual({
+      pucFrames: 2,
+      ownerCreativeFrames: 0,
+      topCreativeFrames: 1,
+    });
   });
 });

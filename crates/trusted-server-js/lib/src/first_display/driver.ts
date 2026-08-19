@@ -63,6 +63,7 @@ function sameCycle(
     candidate.slotId === expected.slotId &&
     candidate.bid === expected.bid &&
     candidate.element === expected.element &&
+    candidate.isCurrent === expected.isCurrent &&
     candidate.placement === expected.placement &&
     candidate.physicalSlot === expected.physicalSlot &&
     candidate.ownership === expected.ownership &&
