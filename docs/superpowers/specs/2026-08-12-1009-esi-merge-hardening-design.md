@@ -1,7 +1,7 @@
 # #1009 ESI Merge and Hardening Design
 
-**Date:** 2026-08-12  
-**Status:** Approved for implementation  
+**Date:** 2026-08-12
+**Status:** Approved for implementation
 **Branch:** `1009-esi-cacheable-root-spec`
 
 ## Goal
