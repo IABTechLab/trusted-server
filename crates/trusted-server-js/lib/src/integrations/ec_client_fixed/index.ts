@@ -3,7 +3,8 @@
 // Client and server share one fixed, known word. When the resolved marker is
 // absent, this posts that word to the resolve endpoint. With the `client-fixed`
 // provider selected, the server verifies the word and, on a match, persists the
-// identity-graph row and sets the word as an HttpOnly Edge Cookie on the
+// identity-graph row and sets the coded form of the word (cfix~an-ec) as an
+// HttpOnly Edge Cookie on the
 // response, together with a non-HttpOnly marker cookie. The Edge Cookie itself
 // is HttpOnly, so this script can never see it; the marker is what tells it a
 // resolve already succeeded, so it does not post again on every page view.

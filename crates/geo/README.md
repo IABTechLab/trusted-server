@@ -12,8 +12,9 @@ implementing the `PlatformGeo` trait from `trusted-server-core`:
 
 Whatever the source, a provider returns the same `GeoInfo` coding. The country
 is an ISO 3166-1 alpha-2 code (`US`) and the region is the ISO 3166-2 subdivision
-code with no country prefix (`CA`), so the Fastly and other providers feed the
-same downstream rules without translation.
+code with no country prefix (`CA`). The permission model keys its country and
+region rules on these codes, matched case-insensitively, so the Fastly and
+other providers feed the same rules without translation.
 
 The platform-neutral `PlatformGeo` trait and the `DisabledGeo` default (no
 location) both live in `trusted-server-core`, so the default deployment resolves
