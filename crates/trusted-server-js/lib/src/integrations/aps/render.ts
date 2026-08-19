@@ -1,7 +1,14 @@
 import { log } from '../../core/log';
-import type { ApsPrebidRendererEntry, ApsRendererV1, TsjsApi } from '../../core/types';
+import type {
+  ApsNativeRendererHook,
+  ApsPrebidRendererEntry,
+  ApsRendererV1,
+  TsjsApi,
+} from '../../core/types';
 
 export const APS_RENDERER_PATH = '/integrations/aps/renderer';
+export const APS_RENDERING_MODE_META_NAME = 'trusted-server-aps-rendering-mode';
+export const APS_NATIVE_RENDERER_ACK_TIMEOUT_MS = 10_000;
 export const APS_RENDERER_SANDBOX =
   'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation';
 export const APS_UNIVERSAL_CREATIVE_RENDERER_VERSION = 4;
@@ -38,6 +45,13 @@ type ValidatedRendererCacheEntry = {
   renderer: ApsRendererV1;
 };
 const validatedRendererCache = new WeakMap<object, ValidatedRendererCacheEntry>();
+const nativeDispatches = new Map<string, symbol>();
+
+function releaseNativeDispatch(slotId: string, dispatch: symbol): boolean {
+  if (nativeDispatches.get(slotId) !== dispatch) return false;
+  nativeDispatches.delete(slotId);
+  return true;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -275,6 +289,133 @@ export function consumeApsPrebidRenderer(adId: string, expected: ApsPrebidRender
   if (!registry || registry[adId] !== expected) return false;
   delete registry[adId];
   return true;
+}
+
+/** Whether the server explicitly selected the opt-in publisher-native hook mode. */
+export function isPublisherNativeApsRendering(): boolean {
+  return (
+    document.head.querySelector(
+      `meta[name="${APS_RENDERING_MODE_META_NAME}"][content="publisher_native"]`
+    ) !== null
+  );
+}
+
+export interface DispatchApsRenderingOptions {
+  slotId: string;
+  renderer: unknown;
+  /** Existing Trusted Server owner, invoked only in the default mode. */
+  trustedServer: (renderer: ApsRendererV1) => boolean;
+}
+
+/**
+ * Dispatch a validated APS descriptor to exactly one configured rendering owner.
+ *
+ * Publisher hooks own side-effect cancellation and render completion. Trusted Server
+ * ignores superseded hook acknowledgements and never falls back to its iframe.
+ */
+export function dispatchApsRendering({
+  slotId,
+  renderer: input,
+  trustedServer,
+}: DispatchApsRenderingOptions): boolean | Promise<boolean> {
+  // Record every attempt before any early return so it supersedes an older
+  // pending native acknowledgement for the same slot.
+  const dispatch = Symbol(slotId);
+  nativeDispatches.set(slotId, dispatch);
+
+  const renderer = validateApsRenderer(input);
+  if (!renderer) {
+    releaseNativeDispatch(slotId, dispatch);
+    log.warn('APS renderer: rejected descriptor');
+    return false;
+  }
+  if (!isPublisherNativeApsRendering()) {
+    try {
+      return trustedServer(renderer);
+    } finally {
+      releaseNativeDispatch(slotId, dispatch);
+    }
+  }
+
+  let hook: ApsNativeRendererHook | undefined;
+  let render: ApsNativeRendererHook['render'] | undefined;
+  try {
+    hook = window.tsjs?.apsNativeRenderer;
+    render = hook?.render;
+  } catch {
+    releaseNativeDispatch(slotId, dispatch);
+    log.warn('APS native renderer: publisher hook lookup threw');
+    return Promise.resolve(false);
+  }
+  if (!hook || typeof render !== 'function') {
+    releaseNativeDispatch(slotId, dispatch);
+    log.warn('APS native renderer: publisher hook is unavailable');
+    return Promise.resolve(false);
+  }
+
+  let response: unknown;
+  try {
+    response = Reflect.apply(render, hook, [{ version: 1, slotId, renderer }]);
+  } catch {
+    releaseNativeDispatch(slotId, dispatch);
+    log.warn('APS native renderer: publisher hook threw');
+    return Promise.resolve(false);
+  }
+
+  if (nativeDispatches.get(slotId) !== dispatch) {
+    log.warn('APS native renderer: ignored stale acknowledgement');
+    return Promise.resolve(false);
+  }
+
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const settle = (accepted: boolean, warning?: string): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (!releaseNativeDispatch(slotId, dispatch)) {
+        log.warn('APS native renderer: ignored stale acknowledgement');
+        resolve(false);
+        return;
+      }
+      if (warning) log.warn(warning);
+      resolve(accepted);
+    };
+    const timeout = setTimeout(() => {
+      settle(false, 'APS native renderer: publisher hook acknowledgement timed out');
+    }, APS_NATIVE_RENDERER_ACK_TIMEOUT_MS);
+
+    Promise.resolve(response).then(
+      (value) => {
+        let accepted: boolean;
+        try {
+          if (
+            !isRecord(value) ||
+            (!hasExactKeys(value, ['accepted']) && !hasExactKeys(value, ['accepted', 'reason'])) ||
+            typeof value.accepted !== 'boolean' ||
+            (Object.prototype.hasOwnProperty.call(value, 'reason') &&
+              typeof value.reason !== 'string')
+          ) {
+            settle(false, 'APS native renderer: publisher hook returned malformed acknowledgement');
+            return;
+          }
+          accepted = value.accepted;
+        } catch {
+          settle(false, 'APS native renderer: publisher hook returned malformed acknowledgement');
+          return;
+        }
+
+        if (!accepted) {
+          settle(false, 'APS native renderer: publisher hook declined descriptor');
+          return;
+        }
+        settle(true);
+      },
+      () => {
+        settle(false, 'APS native renderer: publisher hook rejected');
+      }
+    );
+  });
 }
 
 function createNonce(): string | undefined {
